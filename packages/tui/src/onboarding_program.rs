@@ -93,6 +93,9 @@ impl OnboardingProgram {
     fn open_settings(&mut self, key: KeyCode) {
         let path = bcode_config::default_config_dir().join("bcode.toml");
         self.settings_form = match key {
+            KeyCode::Char('A') => bcode_config::load_config().ok().map(|config| {
+                super::setup_settings_form::SetupSettingsForm::accounts(&path, config)
+            }),
             KeyCode::Char('N') => {
                 Some(super::setup_settings_form::SetupSettingsForm::create_context(&path))
             }
@@ -210,7 +213,7 @@ impl OnboardingProgram {
             code
         };
         match code {
-            KeyCode::Char('N' | 'o' | 'r' | 'g' | 'x')
+            KeyCode::Char('A' | 'N' | 'o' | 'r' | 'g' | 'x')
                 if !self.shell.has_pending_confirmation() =>
             {
                 self.open_settings(code);

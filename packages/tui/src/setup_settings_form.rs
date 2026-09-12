@@ -30,6 +30,7 @@ pub struct SetupSettingsForm {
     selected_profile: usize,
     create_context: bool,
     discovered_models: Option<(Option<String>, String, String, Vec<String>)>,
+    account_selection: Option<(Box<bcode_config::BcodeConfig>, Vec<String>)>,
     contexts: Option<Vec<(String, String)>>,
 }
 
@@ -47,6 +48,7 @@ impl SetupSettingsForm {
             selected_profile: 0,
             create_context: false,
             contexts: None,
+            account_selection: None,
             discovered_models: None,
         }
     }
@@ -76,6 +78,21 @@ impl SetupSettingsForm {
                 })
                 .collect(),
         );
+        form.refresh_profile();
+        form
+    }
+
+    /// Choose a context-local account without reading or changing its credentials.
+    pub fn accounts(path: &std::path::Path, config: bcode_config::BcodeConfig) -> Self {
+        let mut form = Self::new(path, "context account selection");
+        form.focused = 0;
+        let names = config
+            .active_context
+            .as_ref()
+            .and_then(|id| config.contexts.as_ref()?.entries.get(id))
+            .map(|context| context.auth.profiles.keys().cloned().collect())
+            .unwrap_or_default();
+        form.account_selection = Some((Box::new(config), names));
         form.refresh_profile();
         form
     }
@@ -130,6 +147,19 @@ impl SetupSettingsForm {
     }
 
     fn refresh_profile(&mut self) {
+        if let Some((config, accounts)) = &self.account_selection {
+            if let Some(account) = accounts.get(self.selected_profile) {
+                self.inputs[2] = TextInputState::new(TextEditBuffer::from_text(account.clone()));
+                self.status = format!(
+                    "Context: {}; account: {account}. Up/Down selects; Enter reviews provider/account selection and clearing model/pool overrides.",
+                    config.active_context.as_deref().unwrap_or("none")
+                );
+            } else {
+                "No context accounts. Select a context and connect an account first."
+                    .clone_into(&mut self.status);
+            }
+            return;
+        }
         if let Some((context, provider, account, models)) = &self.discovered_models {
             if let Some(model) = models.get(self.selected_profile) {
                 self.inputs[2] = TextInputState::new(TextEditBuffer::from_text(model.clone()));
@@ -187,6 +217,11 @@ impl SetupSettingsForm {
                 .contexts
                 .as_ref()
                 .map(Vec::len)
+                .or_else(|| {
+                    self.account_selection
+                        .as_ref()
+                        .map(|(_, accounts)| accounts.len())
+                })
                 .or_else(|| self.model_profiles.as_ref().map(Vec::len))
                 .or_else(|| {
                     self.discovered_models
@@ -214,6 +249,7 @@ impl SetupSettingsForm {
             Event::Key(key) if key.key == KeyCode::Enter => self.submit(),
             Event::Key(key) if key.key == KeyCode::Tab && self.pending.is_none() => {
                 if self.model_profiles.is_some()
+                    || self.account_selection.is_some()
                     || self.contexts.is_some()
                     || self.discovered_models.is_some()
                 {
@@ -262,6 +298,20 @@ impl SetupSettingsForm {
         let path = self.inputs[0].buffer().text();
         let key = self.inputs[1].buffer().text();
         let value = self.inputs[2].buffer().text();
+        if let Some((config, accounts)) = &self.account_selection {
+            let Some(account) = accounts.get(self.selected_profile) else {
+                return;
+            };
+            match bcode_config::edit::plan_context_account_selection(path.into(), config, account) {
+                Ok(edit) => {
+                    self.pending = Some(edit);
+                    "Review context/account selection. Enter saves; then M discovers models. No credentials change.".clone_into(&mut self.status);
+                }
+                Err(_) => "Cannot safely select account. Review context configuration."
+                    .clone_into(&mut self.status),
+            }
+            return;
+        }
         if let Some((context, provider, account, models)) = &self.discovered_models {
             let Some(model) = models.get(self.selected_profile) else {
                 return;
@@ -397,6 +447,33 @@ fn write(frame: &mut PaintCx<'_, '_>, area: Rect, text: &str, style: Style) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn account_picker_selects_provider_and_clears_stale_model_without_credentials() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("bcode.toml");
+        std::fs::write(&path, "[contexts]\nactive = 'custom'\n[contexts.entries.custom.model]\nprofile = 'old'\nmodel_id = 'old-model'\nauth_pool = 'old-pool'\n[contexts.entries.custom.auth.profiles.account]\nbackend = 'env'\nowner_plugin_id = 'example.plugin'\n").unwrap();
+        let config = bcode_config::load_config_from_paths(std::slice::from_ref(&path)).unwrap();
+        let mut form = SetupSettingsForm::accounts(&path, config);
+        let before = std::fs::read(&path).unwrap();
+        form.submit();
+        assert!(form.pending.is_some());
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+        form.submit();
+        let selected = bcode_config::load_config_from_paths(&[path]).unwrap();
+        assert_eq!(
+            selected.model.provider_plugin_id.as_deref(),
+            Some("example.plugin")
+        );
+        assert!(selected.model.profile.is_none());
+        assert!(selected.model.model_id.is_none());
+        assert!(selected.model.auth_pool.is_none());
+        assert_eq!(
+            selected.model.auth_profile.as_deref(),
+            Some("ctx-6-custom-account")
+        );
+        assert_eq!(selected.auth.profiles.len(), 1);
+    }
 
     #[test]
     fn discovered_model_selection_writes_context_account_and_model_atomically() {

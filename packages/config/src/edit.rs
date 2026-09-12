@@ -318,6 +318,38 @@ pub fn plan_scoped_model_selection(
     })
 }
 
+/// Plan a context-local account/provider selection, clearing model and pool overrides.
+/// The account must already exist in the caller's effective context configuration.
+///
+/// # Errors
+/// Rejects invalid IDs, unavailable accounts, and malformed destination files.
+pub fn plan_context_account_selection(
+    path: PathBuf,
+    config: &BcodeConfig,
+    local: &str,
+) -> Result<ConfigEdit, ConfigError> {
+    let discovery = crate::contexts::prepare_model_discovery(config, Some(local))?;
+    let edit = plan_scoped_model_selection(
+        path,
+        Some(&discovery.context),
+        &discovery.provider_plugin_id,
+        "selection-pending",
+        Some(local),
+    )?;
+    let mut document = edit
+        .updated
+        .parse::<toml_edit::DocumentMut>()
+        .map_err(|_| invalid("Invalid account selection"))?;
+    document["contexts"]["entries"][&discovery.context]["model"]
+        .as_table_mut()
+        .ok_or_else(|| invalid("Missing context model table"))?
+        .remove("model_id");
+    Ok(ConfigEdit {
+        updated: document.to_string(),
+        ..edit
+    })
+}
+
 fn read_optional(path: &Path) -> Result<Option<String>, ConfigError> {
     match std::fs::read_to_string(path) {
         Ok(contents) => Ok(Some(contents)),
