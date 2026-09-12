@@ -29,6 +29,15 @@ pub fn open_child(parent: &File, name: &CStr, directory: bool) -> io::Result<Fil
     Ok(unsafe { File::from_raw_fd(descriptor) })
 }
 
+pub fn open_parent(root: &Path, parent: &Path) -> io::Result<File> {
+    let relative = parent.strip_prefix(root).map_err(|_| invalid())?;
+    if relative.as_os_str().is_empty() {
+        File::open(root)
+    } else {
+        open_relative(root, relative)
+    }
+}
+
 pub fn open_relative(root: &Path, relative: &Path) -> io::Result<File> {
     let mut directory = File::open(root)?;
     if !directory.metadata()?.is_dir() {
@@ -46,6 +55,99 @@ pub fn open_relative(root: &Path, relative: &Path) -> io::Result<File> {
         directory = open_child(&directory, &name, parts.peek().is_some())?;
     }
     Ok(directory)
+}
+
+pub fn create_candidate(parent: &File, name: &CStr) -> io::Result<(File, File)> {
+    let directory = create_directory(parent, name)?;
+    match create_payload(&directory) {
+        Ok(payload) => Ok((directory, payload)),
+        Err(error) => {
+            let _ = remove_owned(parent, name, &directory, None);
+            Err(error)
+        }
+    }
+}
+
+pub fn create_directory(parent: &File, name: &CStr) -> io::Result<File> {
+    // SAFETY: parent is live and name is a caller-validated single component.
+    if unsafe { libc::mkdirat(parent.as_raw_fd(), name.as_ptr(), 0o700) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    open_child(parent, name, true)
+}
+
+pub fn create_payload(directory: &File) -> io::Result<File> {
+    // SAFETY: fixed single-component name and a live directory descriptor.
+    let fd = unsafe {
+        libc::openat(
+            directory.as_raw_fd(),
+            c"content.v1.zstd".as_ptr(),
+            libc::O_RDWR | libc::O_CREAT | libc::O_EXCL | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            0o600,
+        )
+    };
+    if fd < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: fd is a newly owned descriptor.
+    Ok(unsafe { File::from_raw_fd(fd) })
+}
+
+pub fn same_object(left: &File, right: &File) -> io::Result<bool> {
+    use std::os::unix::fs::MetadataExt as _;
+    let left = left.metadata()?;
+    let right = right.metadata()?;
+    Ok(left.dev() == right.dev() && left.ino() == right.ino())
+}
+
+pub fn verify_child(parent: &File, name: &CStr, expected: &File) -> io::Result<()> {
+    if same_object(&open_child(parent, name, false)?, expected)? {
+        Ok(())
+    } else {
+        Err(invalid())
+    }
+}
+
+fn unlink(parent: &File, name: &CStr, directory: bool) -> io::Result<()> {
+    // SAFETY: parent is pinned and name is one component; unlinkat never follows the final symlink.
+    let result = unsafe {
+        libc::unlinkat(
+            parent.as_raw_fd(),
+            name.as_ptr(),
+            if directory { libc::AT_REMOVEDIR } else { 0 },
+        )
+    };
+    if result == 0 {
+        Ok(())
+    } else {
+        Err(io::Error::last_os_error())
+    }
+}
+
+/// Remove only an identity-checked object. Unknown contents or substitutions remain untouched.
+pub fn remove_owned(
+    parent: &File,
+    name: &CStr,
+    expected: &File,
+    payload: Option<&File>,
+) -> io::Result<()> {
+    verify_child(parent, name, expected)?;
+    if expected.metadata()?.is_dir() {
+        let names = container_names(expected)?;
+        if names.is_empty() && payload.is_none() {
+            return unlink(parent, name, true);
+        }
+        if names != [OsString::from("content.v1.zstd")] {
+            return Err(invalid());
+        }
+        let payload = payload.ok_or_else(invalid)?;
+        verify_child(expected, c"content.v1.zstd", payload)?;
+        unlink(expected, c"content.v1.zstd", false)?;
+        verify_child(parent, name, expected)?;
+        unlink(parent, name, true)
+    } else {
+        unlink(parent, name, false)
+    }
 }
 
 struct Directory(*mut libc::DIR);
@@ -96,6 +198,25 @@ pub fn container_names(directory: &File) -> io::Result<Vec<OsString>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cleanup_refuses_substituted_objects() {
+        let root = tempfile::tempdir().expect("root");
+        let parent = File::open(root.path()).expect("parent");
+        let (directory, payload) = create_candidate(&parent, c"pending").expect("candidate");
+        std::fs::rename(root.path().join("pending"), root.path().join("moved")).expect("move");
+        std::fs::create_dir(root.path().join("pending")).expect("replacement");
+        std::fs::write(root.path().join("pending/content.v1.zstd"), b"preserve")
+            .expect("replacement content");
+        assert!(remove_owned(&parent, c"pending", &directory, Some(&payload)).is_err());
+        assert_eq!(
+            std::fs::read(root.path().join("pending/content.v1.zstd")).expect("unchanged"),
+            b"preserve"
+        );
+        assert!(root.path().join("moved/content.v1.zstd").exists());
+        remove_owned(&parent, c"moved", &directory, Some(&payload)).expect("owned cleanup");
+        assert!(!root.path().join("moved").exists());
+    }
 
     #[test]
     fn descriptor_traversal_rejects_symlinks_in_every_component() {

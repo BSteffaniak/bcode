@@ -347,6 +347,7 @@ pub fn compress_session_artifact(
     )
 }
 
+#[cfg(unix)]
 fn compress_artifact_with_maintenance(
     sessions_root: &Path,
     session_id: SessionId,
@@ -364,7 +365,7 @@ fn compress_artifact_with_maintenance(
     )?;
     let path = confined(&root.join(relative_artifact_path), &root)?;
     let parent = path.parent().ok_or_else(invalid)?;
-    let parent_handle = File::open(parent)?;
+    let parent_handle = confined::open_parent(&root, parent)?;
     let name = path
         .file_name()
         .ok_or_else(invalid)?
@@ -372,13 +373,21 @@ fn compress_artifact_with_maintenance(
         .ok_or_else(invalid)?;
     let staging = parent.join(format!(".{name}.compression-pending"));
     let (mut original, encoding) = open_content(&path, &root)?;
-    fs::create_dir(&staging)?;
+    let source_name = std::ffi::CString::new(name).map_err(|_| invalid())?;
+    let staging_name =
+        std::ffi::CString::new(format!(".{name}.compression-pending")).map_err(|_| invalid())?;
+    let source_object = confined::open_child(&parent_handle, &source_name, false)?;
+    let source_content = if source_object.metadata()?.is_dir() {
+        confined::open_child(&source_object, c"content.v1.zstd", false)?
+    } else {
+        source_object.try_clone()?
+    };
+    if !confined::same_object(&original, &source_content)? {
+        return Err(invalid());
+    }
+    let (staging_object, mut candidate) =
+        confined::create_candidate(&parent_handle, &staging_name)?;
     let result = (|| {
-        let mut candidate = fs::OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create_new(true)
-            .open(staging.join(PAYLOAD))?;
         let outcome = prepare_artifact_transition(
             &mut original,
             encoding,
@@ -391,23 +400,36 @@ fn compress_artifact_with_maintenance(
             return Ok(None);
         };
         candidate.sync_all()?;
-        File::open(&staging)?.sync_all()?;
+        staging_object.sync_all()?;
         check_cancelled()?;
         Ok(Some(saved_bytes))
     })();
     let saved_bytes = match result {
         Ok(Some(saved_bytes)) => saved_bytes,
         Ok(None) => {
-            remove_container(&staging)?;
+            confined::remove_owned(
+                &parent_handle,
+                &staging_name,
+                &staging_object,
+                Some(&candidate),
+            )?;
             return Ok(ArtifactStorageOutcome::Unchanged);
         }
         Err(error) => {
-            let _ = remove_container(&staging);
+            let _ = confined::remove_owned(
+                &parent_handle,
+                &staging_name,
+                &staging_object,
+                Some(&candidate),
+            );
             return Err(error);
         }
     };
     #[cfg(test)]
     crash_boundary("prepared");
+    confined::verify_child(&parent_handle, &source_name, &source_object)?;
+    confined::verify_child(&parent_handle, &staging_name, &staging_object)?;
+    confined::verify_child(&staging_object, c"content.v1.zstd", &candidate)?;
     exchange(&parent_handle, parent, &path, &staging)?;
     #[cfg(test)]
     crash_boundary("exchanged");
@@ -415,8 +437,15 @@ fn compress_artifact_with_maintenance(
     #[cfg(test)]
     crash_boundary("committed");
     drop(original);
-    let retained_backup = if remove_container(&staging).is_ok() {
-        File::open(parent)?.sync_all()?;
+    let retained_backup = if confined::remove_owned(
+        &parent_handle,
+        &staging_name,
+        &source_object,
+        Some(&source_content),
+    )
+    .is_ok()
+    {
+        parent_handle.sync_all()?;
         None
     } else {
         Some(staging)
@@ -427,20 +456,28 @@ fn compress_artifact_with_maintenance(
     })
 }
 
+#[cfg(not(unix))]
+fn compress_artifact_with_maintenance(
+    _sessions_root: &Path,
+    _session_id: SessionId,
+    _relative_artifact_path: &Path,
+    _compression: ArtifactCompression,
+    _minimum_saved_bytes: u64,
+    _check_cancelled: impl FnMut() -> io::Result<()>,
+    _maintenance: crate::lease::SessionMaintenanceGuard,
+) -> io::Result<ArtifactStorageOutcome> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "confined artifact publication unavailable",
+    ))
+}
+
 #[cfg(test)]
 fn crash_boundary(phase: &str) {
     if std::env::var("BCODE_ARTIFACT_CRASH_PHASE").as_deref() == Ok(phase) {
         // Exit without unwinding: neither local cleanup nor lease destructors may run.
         std::process::exit(91);
     }
-}
-
-fn remove_container(path: &Path) -> io::Result<()> {
-    if fs::symlink_metadata(path)?.is_file() {
-        return fs::remove_file(path);
-    }
-    fs::remove_file(path.join(PAYLOAD))?;
-    fs::remove_dir(path)
 }
 
 #[cfg(any(target_os = "macos", target_os = "linux"))]

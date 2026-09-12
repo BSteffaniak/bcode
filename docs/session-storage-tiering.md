@@ -186,8 +186,13 @@ Atomic exchange now uses `renameatx_np`/`renameat2` with single-component names 
 directory descriptor, not absolute pathname traversal. Before exchange it verifies the parent path
 still names the pinned device/inode. A replacement-parent test proves that neither the replacement
 nor original files are exchanged on detected substitution. Parent syncing after publication uses
-the pinned handle. Staging creation and cleanup still need descriptor-relative conversion and
-object-identity validation; this change alone does not make automatic activation safe.
+the pinned handle. Staging creation, payload creation, and cleanup now use descriptor-relative
+operations too. Publication verifies source, staging, and candidate descriptor identities. Cleanup
+checks the prior object's identity and exact known payload before unlinking; substitution or unknown
+contents are retained instead of removed. A regression test swaps the staging pathname and verifies
+that replacement content survives. Concurrent same-user mutation between identity checks and
+syscalls still requires explicit threat-model review; this is not a claim of adversarial atomic
+compare-and-swap on inodes.
 
 ## Remaining implementation
 
