@@ -946,7 +946,41 @@ async fn watch_cli_workflows() -> Result<(), CliError> {
     }
 }
 
+async fn cli_launch_catalog(
+    request: bcode_workflow::WorkflowLaunchCatalogRequest,
+) -> Result<bcode_workflow::WorkflowLaunchCatalogPage, CliError> {
+    let client = BcodeClient::default_endpoint();
+    #[cfg(unix)]
+    let mut interrupt = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())?;
+    let mut signal_error: Option<std::io::Error> = None;
+    let interrupted = async {
+        #[cfg(unix)]
+        {
+            interrupt.recv().await;
+        }
+        #[cfg(not(unix))]
+        {
+            signal_error = tokio::signal::ctrl_c().await.err();
+        }
+    };
+    let page = Box::pin(client.workflow_launch_catalog_until(request, interrupted)).await?;
+    if let Some(error) = signal_error.take() {
+        return Err(error.into());
+    }
+    page.ok_or_else(|| CliError::InvalidArguments("workflow discovery interrupted".to_string()))
+}
+
 async fn handle_workflow_command(command: Box<WorkflowCommand>) -> Result<(), CliError> {
+    if let WorkflowCommand::CancelDiscovery { token } = command.as_ref() {
+        let released = Box::pin(
+            bcode_workflow::WorkflowAuthoringApplication::cancel_workflow_discovery(
+                &BcodeClient::default_endpoint(),
+                token.clone(),
+            ),
+        )
+        .await?;
+        return print_json(&serde_json::json!({"released": released}));
+    }
     if let WorkflowCommand::LaunchCatalog { request } = command.as_ref() {
         let request: bcode_workflow::WorkflowLaunchCatalogRequest =
             serde_json::from_value(read_bounded_json(request)?).map_err(|_| {
@@ -955,15 +989,7 @@ async fn handle_workflow_command(command: Box<WorkflowCommand>) -> Result<(), Cl
         request
             .validate()
             .map_err(|error| CliError::InvalidArguments(error.to_string()))?;
-        return print_json(
-            &Box::pin(
-                bcode_workflow::WorkflowAuthoringApplication::workflow_launch_catalog(
-                    &BcodeClient::default_endpoint(),
-                    request,
-                ),
-            )
-            .await?,
-        );
+        return print_json(&Box::pin(cli_launch_catalog(request)).await?);
     }
     if matches!(command.as_ref(), WorkflowCommand::Watch) {
         return Box::pin(watch_cli_workflows()).await;
@@ -1150,7 +1176,8 @@ async fn dispatch_workflow_command(command: Box<WorkflowCommand>) -> Result<(), 
                 .await?,
             )?;
         }
-        WorkflowCommand::LaunchCatalog { .. }
+        WorkflowCommand::CancelDiscovery { .. }
+        | WorkflowCommand::LaunchCatalog { .. }
         | WorkflowCommand::Watch
         | WorkflowCommand::CatchUp { .. }
         | WorkflowCommand::RepairAttempt { .. }
@@ -4012,6 +4039,11 @@ enum WorkflowCommand {
         /// Bounded JSON `WorkflowRunGraphEditBatch`, including run, revision, and mutation identity.
         #[arg(long)]
         file: PathBuf,
+    },
+    /// Release a retained discovery token; does not cancel workflow runs.
+    CancelDiscovery {
+        /// Opaque continuation returned by launch-catalog.
+        token: String,
     },
     /// Query a bounded launch catalog page with domain-owned cursors and filters as JSON.
     LaunchCatalog {

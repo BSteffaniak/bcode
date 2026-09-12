@@ -5370,6 +5370,7 @@ const fn request_kind(request: &Request) -> &'static str {
         Request::ListWorkflowPresets { .. } => "list_workflow_presets",
         Request::GetWorkflowPreset { .. } => "get_workflow_preset",
         Request::WorkflowAuthoringCatalog => "workflow_authoring_catalog",
+        Request::CancelWorkflowDiscovery { .. } => "cancel_workflow_discovery",
         Request::WorkflowLaunchCatalog(_) => "workflow_launch_catalog",
         Request::WorkflowLaunchDetail(_) => "workflow_launch_detail",
         Request::GetWorkflowPackagePublication { .. } => "get_workflow_package_publication",
@@ -6683,6 +6684,22 @@ async fn handle_workflow_validation_request(
             .await;
             let response = match catalog {
                 Ok(catalog) => Response::Ok(ResponsePayload::WorkflowAuthoringCatalog { catalog }),
+                Err(failure) => {
+                    Response::Err(ErrorResponse::new(failure.code(), failure.to_string()))
+                }
+            };
+            send_response(writer, request_id, response).await
+        }
+        WorkflowDefinitionRequest::CancelWorkflowDiscovery { token } => {
+            let result = bcode_workflow::WorkflowAuthoringApplication::cancel_workflow_discovery(
+                &workflow_operations::WorkflowAuthoringApplication::new(state, client_id),
+                token,
+            )
+            .await;
+            let response = match result {
+                Ok(released) => {
+                    Response::Ok(ResponsePayload::WorkflowDiscoveryCancelled { released })
+                }
                 Err(failure) => {
                     Response::Err(ErrorResponse::new(failure.code(), failure.to_string()))
                 }
@@ -36961,6 +36978,196 @@ mod tests {
         ));
         drop(stream);
         server.await.expect("server task");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn mixed_launch_discovery_filters_match_across_continuations() {
+        let workspace = tempfile::tempdir().unwrap();
+        let root = workspace.path().join("workflows");
+        std::fs::create_dir_all(&root).unwrap();
+        let source = include_str!("../../../fixtures/workflows/concise-run.workflow.yaml");
+        std::fs::write(root.join("member.workflow.yaml"), source).unwrap();
+        std::fs::write(
+            root.join("standalone.workflow.yaml"),
+            source.replace("example/concise-run", "example/standalone"),
+        )
+        .unwrap();
+        let package_count = 20;
+        for index in 0..package_count {
+            std::fs::write(root.join(format!("{index}.workflow-package.yaml")), format!("version: 3\npackage_id: example/package-{index:04}\nexports: {{ main: member }}\nmembers:\n  - member_id: member\n    source_name: member.workflow.yaml\n")).unwrap();
+        }
+        let mut state = test_server_state_with_shell_plugin(SessionManager::default());
+        state.startup_config.workflows = bcode_config::WorkflowsConfig {
+            include_repo_workflows: true,
+            include_user_workflows: false,
+            paths: Vec::new(),
+        };
+        for kind in [
+            None,
+            Some(bcode_workflow::WorkflowLaunchSourceKind::PackageExport),
+            Some(bcode_workflow::WorkflowLaunchSourceKind::StandaloneSource),
+        ] {
+            let mut request = bcode_workflow::WorkflowLaunchCatalogRequest {
+                version: bcode_workflow::WORKFLOW_LAUNCH_CATALOG_VERSION,
+                incremental: false,
+                discovery_token: None,
+                workspace: workspace.path().into(),
+                limit: 1,
+                cursor: None,
+                search: Some("concise".into()),
+                source_kind: kind,
+                readiness: Some(bcode_workflow::WorkflowLaunchReadiness::Unpublished),
+            };
+            let capacity = state.workflow_discovery_capacity.available_permits();
+            for page_index in 0..2 {
+                request.incremental = false;
+                request.discovery_token = None;
+                let expected = workflow_operations::launch_catalog(&state, &request)
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    expected.items.len(),
+                    usize::from(
+                        page_index == 0
+                            || kind
+                                != Some(bcode_workflow::WorkflowLaunchSourceKind::StandaloneSource)
+                    )
+                );
+                request.incremental = true;
+                let mut actual = workflow_operations::launch_catalog(&state, &request)
+                    .await
+                    .unwrap();
+                let mut resumptions = 0;
+                for _ in 0..package_count * 4 {
+                    let Some(token) = actual.discovery_token.clone() else {
+                        break;
+                    };
+                    assert!(actual.items.len() <= request.limit);
+                    request.discovery_token = Some(token);
+                    actual = workflow_operations::launch_catalog(&state, &request)
+                        .await
+                        .unwrap();
+                    resumptions += 1;
+                }
+                assert!(resumptions > 2);
+                assert_eq!(actual, expected);
+                assert!(state.workflow_discovery_scans.lock().unwrap().is_empty());
+                assert_eq!(
+                    state.workflow_discovery_capacity.available_permits(),
+                    capacity
+                );
+                let Some(cursor) = expected.next_cursor else {
+                    break;
+                };
+                request.cursor = Some(cursor);
+            }
+        }
+        drop(state);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn workflow_discovery_resume_matches_and_invalidates_after_mutation() {
+        let workspace = tempfile::tempdir().unwrap();
+        let root = workspace.path().join("workflows");
+        std::fs::create_dir_all(&root).unwrap();
+        for index in 0..40 {
+            std::fs::write(
+                root.join(format!("{index}.workflow.yaml")),
+                include_str!("../../../fixtures/workflows/concise-run.workflow.yaml"),
+            )
+            .unwrap();
+        }
+        let mut state = test_server_state_with_shell_plugin(SessionManager::default());
+        state.startup_config.workflows = bcode_config::WorkflowsConfig {
+            include_repo_workflows: true,
+            include_user_workflows: false,
+            paths: Vec::new(),
+        };
+        let mut request = bcode_workflow::WorkflowLaunchCatalogRequest {
+            version: bcode_workflow::WORKFLOW_LAUNCH_CATALOG_VERSION,
+            incremental: false,
+            discovery_token: None,
+            workspace: workspace.path().into(),
+            limit: 10,
+            cursor: None,
+            search: None,
+            source_kind: None,
+            readiness: None,
+        };
+        let expected = workflow_operations::launch_catalog(&state, &request)
+            .await
+            .unwrap();
+        request.incremental = true;
+        let mut page = workflow_operations::launch_catalog(&state, &request)
+            .await
+            .unwrap();
+        for _ in 0..100 {
+            let Some(token) = page.discovery_token.clone() else {
+                break;
+            };
+            request.discovery_token = Some(token);
+            page = workflow_operations::launch_catalog(&state, &request)
+                .await
+                .unwrap();
+        }
+        assert!(page.discovery_token.is_none());
+        assert_eq!(page.items, expected.items);
+        assert_eq!(page.diagnostics, expected.diagnostics);
+        let capacity = state.workflow_discovery_capacity.available_permits();
+        request.discovery_token = None;
+        page = workflow_operations::launch_catalog(&state, &request)
+            .await
+            .unwrap();
+        request.discovery_token = page.discovery_token;
+        assert!(request.discovery_token.is_some());
+        let mut populated = false;
+        for _ in 0..100 {
+            populated = state
+                .workflow_discovery_scans
+                .lock()
+                .unwrap()
+                .values()
+                .any(|pending| pending.retained_preview_count() > 0);
+            if populated {
+                break;
+            }
+            page = workflow_operations::launch_catalog(&state, &request)
+                .await
+                .unwrap();
+            request.discovery_token = page.discovery_token;
+            assert!(
+                request.discovery_token.is_some(),
+                "scan completed before testing retained previews"
+            );
+        }
+        assert!(populated);
+        state
+            .workflow_store
+            .lock()
+            .unwrap()
+            .create_authored_workflow(&bcode_workflow_store::AuthoredWorkflow {
+                workflow_id: "mutation".into(),
+                title: "Mutation".into(),
+                description: None,
+                archived: false,
+                active_revision: None,
+                created_at_ms: 1,
+                updated_at_ms: 1,
+            })
+            .unwrap();
+        assert!(
+            workflow_operations::launch_catalog(&state, &request)
+                .await
+                .is_err()
+        );
+        assert!(state.workflow_discovery_scans.lock().unwrap().is_empty());
+        assert_eq!(
+            state.workflow_discovery_capacity.available_permits(),
+            capacity
+        );
+        drop(state);
     }
 
     #[cfg(unix)]

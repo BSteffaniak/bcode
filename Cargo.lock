@@ -3120,6 +3120,7 @@ version = "0.0.1-alpha.0"
 dependencies = [
  "bcode_config",
  "bcode_workflow",
+ "rusqlite",
  "serde",
  "serde_json",
  "tempfile",

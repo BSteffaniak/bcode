@@ -623,6 +623,10 @@ pub enum Request {
     },
     /// Return the portable runtime-workflow authoring catalog.
     WorkflowAuthoringCatalog,
+    /// Release a retained discovery continuation; never cancels workflow execution.
+    CancelWorkflowDiscovery {
+        token: String,
+    },
     /// Discover one bounded page of launchable workflow sources for a workspace.
     WorkflowLaunchCatalog(bcode_workflow::WorkflowLaunchCatalogRequest),
     /// Inspect one exact launch source without mutation.
@@ -2047,6 +2051,9 @@ pub enum ResponsePayload {
     },
     WorkflowAuthoringCatalog {
         catalog: bcode_workflow::WorkflowAuthoringCatalogSnapshot,
+    },
+    WorkflowDiscoveryCancelled {
+        released: bool,
     },
     WorkflowLaunchCatalog {
         page: bcode_workflow::WorkflowLaunchCatalogPage,

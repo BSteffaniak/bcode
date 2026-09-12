@@ -271,10 +271,13 @@ pub struct WorkflowLaunchCatalogCursor {
 pub struct WorkflowLaunchCatalogRequest {
     pub version: u32,
     pub workspace: PathBuf,
-    /// Opt into bounded discovery advances. Pending responses contain no catalog items.
+    /// Opt into bounded discovery advances. The initial response admits a cancellable token
+    /// before opening sources; pending responses contain no catalog items.
     #[serde(default)]
     pub incremental: bool,
-    /// Continue a process-local scan using its latest token and the unchanged request.
+    /// Continue a process-local scan using its latest token and unchanged query fields.
+    /// Set `incremental` to false to finish an admitted scan in this call; its token remains
+    /// usable for cancellation while work runs, but cannot admit a second concurrent reader.
     /// Tokens are single-use: successful admission consumes one even if the response is lost.
     /// Unknown, consumed, expired, or request-mismatched tokens fail; restart without a token
     /// after response loss or daemon replacement. No durable resume or retry idempotency is promised.
@@ -317,7 +320,7 @@ impl WorkflowLaunchCatalogRequest {
         if self
             .discovery_token
             .as_ref()
-            .is_some_and(|token| !self.incremental || token.is_empty() || token.len() > 128)
+            .is_some_and(|token| token.is_empty() || token.len() > 128)
         {
             return Err(authoring_error(
                 "launch_catalog.discovery_token",
@@ -456,7 +459,7 @@ mod launch_catalog_contract_tests {
         assert!(request(1).validate().is_err());
         let mut next = request(WORKFLOW_LAUNCH_CATALOG_VERSION);
         next.discovery_token = Some("scan-token".into());
-        assert!(next.validate().is_err());
+        assert!(next.validate().is_ok());
         next.incremental = true;
         assert!(next.validate().is_ok());
         next.discovery_token = Some(String::new());

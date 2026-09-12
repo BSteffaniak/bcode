@@ -262,6 +262,18 @@ pub trait WorkflowAuthoringApplication: Sync {
         request: crate::WorkflowLaunchCatalogRequest,
     ) -> impl std::future::Future<Output = Result<crate::WorkflowLaunchCatalogPage, Self::Error>> + Send;
 
+    /// Release retained or resumed discovery continuation authority. Absent tokens return `false`.
+    /// In-flight bounded work keeps its admission permit until it exits; cancellation fences
+    /// publication of its result or replacement continuation. Initial scans without a token
+    /// cannot be cancelled through this operation.
+    ///
+    /// # Errors
+    /// Returns an error on transport failure.
+    fn cancel_workflow_discovery(
+        &self,
+        token: String,
+    ) -> impl std::future::Future<Output = Result<bool, Self::Error>> + Send;
+
     /// Inspect an exact launch target without mutation.
     ///
     /// # Errors

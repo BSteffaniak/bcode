@@ -163,6 +163,29 @@ fn verify_catalog_admission(root: &std::path::Path, base: &serde_json::Value) {
     let rejected = run_cli_at_root(root, &command, Stdio::piped(), Stdio::piped());
     assert!(!rejected.status.success(), "ninth scan bypassed admission");
     assert!(String::from_utf8_lossy(&rejected.stderr).contains("workflow_discovery_capacity"));
+    let cancelled = pending.pop().unwrap();
+    let token = cancelled["discovery_token"].as_str().unwrap();
+    let cancel = ["workflow", "cancel-discovery", token];
+    assert_eq!(graph_cli_json(root, &cancel)["released"], true);
+    assert_eq!(graph_cli_json(root, &cancel)["released"], false);
+    write(&cancelled);
+    let resumed = run_cli_at_root(root, &command, Stdio::piped(), Stdio::piped());
+    assert!(!resumed.status.success());
+    assert!(
+        String::from_utf8_lossy(&resumed.stderr)
+            .contains("workflow_discovery_continuation_invalid")
+    );
+    // Cancellation must free admission immediately, without waiting for expiry.
+    write(base);
+    let replacement = graph_cli_json(root, &command);
+    let mut replacement_request = base.clone();
+    replacement_request["discovery_token"] = replacement["discovery_token"].clone();
+    // An admitted scan can finish in one call without acquiring a second capacity permit.
+    replacement_request["incremental"] = false.into();
+    write(&replacement_request);
+    let finished = graph_cli_json(root, &command);
+    assert_eq!(finished["items"].as_array().unwrap().len(), 3);
+    assert!(finished.get("discovery_token").is_none());
     for mut request in pending {
         let mut completed = false;
         for _ in 0..32 {

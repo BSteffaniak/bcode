@@ -6,6 +6,9 @@
 //!
 //! This package owns filesystem source discovery and confinement. It does not validate against the
 //! live plugin catalog, persist authored state, publish revisions, or start runs.
+//! Member suppression uses a private request-local temporary `SQLite` index with a bounded page
+//! cache. It is never reopened or treated as canonical; normal drop removes its directory.
+//! Abrupt process death may leave temporary files for operating-system cleanup.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
@@ -34,6 +37,8 @@ pub enum WorkflowDiscoveryError {
     Json(#[from] serde_json::Error),
     #[error("workflow discovery TOML error: {0}")]
     Toml(#[from] toml::de::Error),
+    #[error("workflow discovery temporary index failure")]
+    Index(#[from] rusqlite::Error),
     #[error("workflow discovery failed: {0}")]
     Invalid(String),
 }
@@ -90,6 +95,20 @@ impl DiscoveredWorkflowSource {
             Self::Package { precedence, .. } | Self::Standalone { precedence, .. } => *precedence,
         }
     }
+}
+
+/// Sources produced by one bounded discovery advance.
+///
+/// Sources are reconciled but not globally sorted. Consumers must discard accumulated output
+/// if a later advance fails; completion is authoritative only when `complete` is true.
+#[derive(Debug)]
+pub struct WorkflowDiscoveryBatch {
+    /// Reconciled sources produced by this advance, at most the requested budget.
+    pub sources: Vec<DiscoveredWorkflowSource>,
+    /// Whether enumeration and reconciliation have finished.
+    pub complete: bool,
+    /// Bounded diagnostics, delivered only at completion.
+    pub diagnostics: Vec<WorkflowDiscoveryDiagnostic>,
 }
 
 /// Complete bounded, non-mutating discovery result.
@@ -168,11 +187,167 @@ pub fn discover_workflows(
     }
 }
 
+/// Request-local member suppression index, never canonical or reopened after process loss.
+/// The private temporary directory is removed after the connection closes.
+#[derive(Debug)]
+struct PackageMemberIndex {
+    connection: rusqlite::Connection,
+    directory: tempfile::TempDir,
+}
+
+struct IndexedPackage {
+    id: String,
+    label: String,
+    precedence: u32,
+    path: PathBuf,
+    slot: usize,
+}
+
+impl PackageMemberIndex {
+    fn new() -> Result<Self, WorkflowDiscoveryError> {
+        let directory = tempfile::Builder::new()
+            .prefix("bcode-discovery-")
+            .tempdir()?;
+        let connection = rusqlite::Connection::open(directory.path().join("members.sqlite"))?;
+        connection.execute_batch("PRAGMA journal_mode=OFF; PRAGMA synchronous=OFF; PRAGMA cache_size=-1024; PRAGMA mmap_size=0; CREATE TABLE members(path BLOB PRIMARY KEY) WITHOUT ROWID; CREATE TABLE ambiguous_packages(id TEXT PRIMARY KEY) WITHOUT ROWID; CREATE TABLE packages(id TEXT PRIMARY KEY, precedence INTEGER NOT NULL, slot INTEGER NOT NULL, metadata TEXT NOT NULL) WITHOUT ROWID;")?;
+        Ok(Self {
+            connection,
+            directory,
+        })
+    }
+
+    fn insert(&mut self, members: BTreeSet<PathBuf>) -> Result<(), WorkflowDiscoveryError> {
+        let transaction = self.connection.transaction()?;
+        for member in members {
+            transaction.execute(
+                "INSERT OR IGNORE INTO members(path) VALUES (?1)",
+                [member.as_os_str().as_encoded_bytes()],
+            )?;
+        }
+        transaction.commit()?;
+        Ok(())
+    }
+
+    fn store_closure(
+        &self,
+        slot: usize,
+        closure: &bcode_workflow::WorkflowPackageClosure,
+    ) -> Result<(), WorkflowDiscoveryError> {
+        let path = self.directory.path().join(format!("closure-{slot}.json"));
+        let file = fs::File::create(path)?;
+        let mut writer = std::io::BufWriter::new(file);
+        serde_json::to_writer(&mut writer, closure)?;
+        std::io::Write::flush(&mut writer)?;
+        Ok(())
+    }
+
+    fn load_closure(
+        &self,
+        slot: usize,
+    ) -> Result<bcode_workflow::WorkflowPackageClosure, WorkflowDiscoveryError> {
+        let path = self.directory.path().join(format!("closure-{slot}.json"));
+        let file = fs::File::open(&path)?;
+        let closure = serde_json::from_reader(std::io::BufReader::new(file))?;
+        fs::remove_file(path)?;
+        Ok(closure)
+    }
+
+    fn discard_closure(&self, slot: usize) -> Result<(), WorkflowDiscoveryError> {
+        fs::remove_file(self.directory.path().join(format!("closure-{slot}.json")))?;
+        Ok(())
+    }
+
+    fn package_position(&self, id: &str) -> Result<Option<(u32, usize)>, WorkflowDiscoveryError> {
+        use rusqlite::OptionalExtension;
+        Ok(self
+            .connection
+            .query_row(
+                "SELECT precedence, slot FROM packages WHERE id=?1",
+                [id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?)
+    }
+
+    fn store_package(
+        &self,
+        id: &str,
+        label: &str,
+        precedence: u32,
+        path: &Path,
+        slot: usize,
+    ) -> Result<(), WorkflowDiscoveryError> {
+        // This index is request-local and never reopened on another platform. Serde's
+        // native OS-string representation preserves paths that are not Unicode.
+        let metadata = serde_json::to_string(&(label, path.as_os_str()))?;
+        self.connection.execute("INSERT INTO packages(id, precedence, slot, metadata) VALUES (?1, ?2, ?3, ?4) ON CONFLICT(id) DO UPDATE SET precedence=excluded.precedence, slot=excluded.slot, metadata=excluded.metadata", rusqlite::params![id, precedence, slot, metadata])?;
+        Ok(())
+    }
+
+    fn pop_package(&self) -> Result<Option<IndexedPackage>, WorkflowDiscoveryError> {
+        use rusqlite::OptionalExtension;
+        let row = self
+            .connection
+            .query_row(
+                "SELECT id, precedence, slot, metadata FROM packages ORDER BY id LIMIT 1",
+                [],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, u32>(1)?,
+                        row.get::<_, usize>(2)?,
+                        row.get::<_, String>(3)?,
+                    ))
+                },
+            )
+            .optional()?;
+        let Some((id, precedence, slot, metadata)) = row else {
+            return Ok(None);
+        };
+        let (label, path): (String, std::ffi::OsString) = serde_json::from_str(&metadata)?;
+        let path = PathBuf::from(path);
+        self.connection
+            .execute("DELETE FROM packages WHERE id=?1", [&id])?;
+        Ok(Some(IndexedPackage {
+            id,
+            label,
+            precedence,
+            path,
+            slot,
+        }))
+    }
+
+    fn mark_ambiguous(&self, id: &str) -> Result<(), WorkflowDiscoveryError> {
+        self.connection.execute(
+            "INSERT OR IGNORE INTO ambiguous_packages(id) VALUES (?1)",
+            [id],
+        )?;
+        Ok(())
+    }
+
+    fn is_ambiguous(&self, id: &str) -> Result<bool, WorkflowDiscoveryError> {
+        Ok(self.connection.query_row(
+            "SELECT EXISTS(SELECT 1 FROM ambiguous_packages WHERE id=?1)",
+            [id],
+            |row| row.get(0),
+        )?)
+    }
+
+    fn contains(&self, path: &Path) -> Result<bool, WorkflowDiscoveryError> {
+        Ok(self.connection.query_row(
+            "SELECT EXISTS(SELECT 1 FROM members WHERE path=?1)",
+            [path.as_os_str().as_encoded_bytes()],
+            |row| row.get(0),
+        )?)
+    }
+}
+
 /// Process-local discovery and reconciliation across bounded enumeration advances.
 ///
-/// No partial sources are exposed: all package roots are processed before standalone member
-/// suppression. The retained candidate allowance is explicit and overflow fails closed. This
-/// bounded collector is not yet a large-catalog index, snapshot, or durable transport cursor.
+/// Package roots are reconciled before sources are delivered. Collecting mode retains an
+/// aggregate candidate allowance and fails closed on overflow. Streaming mode instead bounds
+/// each advance and retains reconciliation in temporary indexed storage. Neither mode provides
+/// a durable snapshot or transport cursor.
 #[derive(Debug)]
 pub struct WorkflowDiscoveryScan {
     roots: Vec<DiscoveryRoot>,
@@ -182,10 +357,9 @@ pub struct WorkflowDiscoveryScan {
     limit: usize,
     candidates: usize,
     result: WorkflowDiscoveryResult,
-    packages: BTreeMap<String, DiscoveredWorkflowSource>,
-    ambiguous_packages: BTreeSet<String>,
-    package_members: BTreeSet<PathBuf>,
+    package_members: Option<PackageMemberIndex>,
     terminal: bool,
+    streaming: Option<bool>,
 }
 
 impl WorkflowDiscoveryScan {
@@ -212,10 +386,9 @@ impl WorkflowDiscoveryScan {
             limit,
             candidates: 0,
             result: WorkflowDiscoveryResult::default(),
-            packages: BTreeMap::new(),
-            ambiguous_packages: BTreeSet::new(),
-            package_members: BTreeSet::new(),
+            package_members: Some(PackageMemberIndex::new()?),
             terminal: false,
+            streaming: None,
         })
     }
 
@@ -231,6 +404,24 @@ impl WorkflowDiscoveryScan {
         &mut self,
         budget: usize,
     ) -> Result<Option<WorkflowDiscoveryResult>, WorkflowDiscoveryError> {
+        self.select_delivery(false)?;
+        self.advance_checked(budget)
+    }
+
+    fn select_delivery(&mut self, streaming: bool) -> Result<(), WorkflowDiscoveryError> {
+        if self.streaming.is_some_and(|previous| previous != streaming) {
+            return Err(WorkflowDiscoveryError::Invalid(
+                "cannot mix discovery delivery modes".into(),
+            ));
+        }
+        self.streaming = Some(streaming);
+        Ok(())
+    }
+
+    fn advance_checked(
+        &mut self,
+        budget: usize,
+    ) -> Result<Option<WorkflowDiscoveryResult>, WorkflowDiscoveryError> {
         if budget == 0 || budget > MAX_DISCOVERY_RESULTS || self.terminal {
             return Err(WorkflowDiscoveryError::Invalid(
                 "invalid discovery advance or terminal scan".into(),
@@ -242,12 +433,41 @@ impl WorkflowDiscoveryScan {
             self.terminal = false;
         } else {
             self.directory = None;
-            self.packages.clear();
-            self.package_members.clear();
-            self.ambiguous_packages.clear();
+            self.package_members = None;
             self.result = WorkflowDiscoveryResult::default();
         }
         outcome
+    }
+
+    /// Deliver reconciled sources without retaining earlier source payloads.
+    ///
+    /// Call this method exclusively on a fresh scan; do not mix it with `advance`.
+    /// Package sources are delivered only after all package roots have been reconciled.
+    /// Dropping the scan releases temporary storage. A later failure invalidates prior batches.
+    /// Streaming has no aggregate candidate ceiling: `limit` bounds retained diagnostics,
+    /// and each advance's budget bounds delivered sources and enumeration work. Package
+    /// reconciliation is request-local indexed storage; consumers must not accumulate batches.
+    ///
+    /// # Errors
+    /// Returns the same budget, terminal, I/O, and overflow errors as `advance`.
+    pub fn advance_sources(
+        &mut self,
+        budget: usize,
+    ) -> Result<WorkflowDiscoveryBatch, WorkflowDiscoveryError> {
+        self.select_delivery(true)?;
+        let result = self.advance_checked(budget)?;
+        Ok(match result {
+            Some(result) => WorkflowDiscoveryBatch {
+                sources: result.sources,
+                diagnostics: result.diagnostics,
+                complete: true,
+            },
+            None => WorkflowDiscoveryBatch {
+                sources: std::mem::take(&mut self.result.sources),
+                diagnostics: Vec::new(),
+                complete: false,
+            },
+        })
     }
 
     fn advance_inner(
@@ -258,12 +478,35 @@ impl WorkflowDiscoveryScan {
             let Some(root) = self.roots.get(self.root_index).cloned() else {
                 match self.kind {
                     WorkflowCandidateKind::Package => {
-                        for id in &self.ambiguous_packages {
-                            self.packages.remove(id);
+                        // Reconciliation consumes the same budget as enumeration. Do not
+                        // drain every retained closure in a single interactive advance.
+                        if let Some(IndexedPackage {
+                            id: package_id,
+                            label: source_label,
+                            precedence,
+                            path: manifest_path,
+                            slot,
+                        }) = self
+                            .package_members
+                            .as_ref()
+                            .expect("active index")
+                            .pop_package()?
+                        {
+                            let index = self.package_members.as_ref().expect("active index");
+                            if index.is_ambiguous(&package_id)? {
+                                index.discard_closure(slot)?;
+                            } else {
+                                let closure = index.load_closure(slot)?;
+                                self.result.sources.push(DiscoveredWorkflowSource::Package {
+                                    package_id,
+                                    source_label,
+                                    precedence,
+                                    manifest_path,
+                                    closure,
+                                });
+                            }
+                            continue;
                         }
-                        self.result
-                            .sources
-                            .extend(std::mem::take(&mut self.packages).into_values());
                         self.kind = WorkflowCandidateKind::Standalone;
                         self.root_index = 0;
                         continue;
@@ -283,16 +526,21 @@ impl WorkflowDiscoveryScan {
                 .expect("opened directory")
                 .advance(1)?;
             for path in batch.paths {
-                self.candidates += 1;
-                if self.candidates > self.limit {
+                self.candidates = self.candidates.checked_add(1).ok_or_else(|| {
+                    WorkflowDiscoveryError::Invalid(
+                        "workflow discovery candidate identity exhausted".into(),
+                    )
+                })?;
+                if self.streaming != Some(true) && self.candidates > self.limit {
                     return Err(WorkflowDiscoveryError::Invalid(
                         "workflow discovery exceeds the aggregate candidate allowance; narrow configured discovery roots".into()
                     ));
                 }
                 match self.kind {
-                    WorkflowCandidateKind::Package => self.package(&root, path),
-                    WorkflowCandidateKind::Standalone => self.standalone(&root, path),
+                    WorkflowCandidateKind::Package => self.package(&root, path)?,
+                    WorkflowCandidateKind::Standalone => self.standalone(&root, path)?,
                 }
+                self.trim_diagnostics();
             }
             if batch.complete {
                 self.directory = None;
@@ -302,21 +550,29 @@ impl WorkflowDiscoveryScan {
         Ok(None)
     }
 
-    fn package(&mut self, root: &DiscoveryRoot, manifest_path: PathBuf) {
+    fn package(
+        &mut self,
+        root: &DiscoveryRoot,
+        manifest_path: PathBuf,
+    ) -> Result<(), WorkflowDiscoveryError> {
         match read_package_closure(&manifest_path, &root.path) {
             Ok((closure, members)) => {
-                self.package_members.extend(members);
+                self.package_members
+                    .as_mut()
+                    .expect("active index")
+                    .insert(members)?;
                 let package_id = closure.entry_package_id.clone();
-                let candidate = DiscoveredWorkflowSource::Package {
-                    package_id: package_id.clone(),
-                    source_label: root.label.clone(),
-                    precedence: root.precedence,
-                    manifest_path: manifest_path.clone(),
-                    closure,
-                };
-                match self.packages.get(&package_id) {
-                    Some(existing) if existing.precedence() == root.precedence => {
-                        self.ambiguous_packages.insert(package_id.clone());
+                match self
+                    .package_members
+                    .as_ref()
+                    .expect("active index")
+                    .package_position(&package_id)?
+                {
+                    Some((precedence, _)) if precedence == root.precedence => {
+                        self.package_members
+                            .as_ref()
+                            .expect("active index")
+                            .mark_ambiguous(&package_id)?;
                         self.result.diagnostics.push(WorkflowDiscoveryDiagnostic {
                             source_label: root.label.clone(),
                             path: manifest_path,
@@ -327,9 +583,23 @@ impl WorkflowDiscoveryScan {
                             ),
                         });
                     }
-                    Some(existing) if existing.precedence() < root.precedence => {}
-                    _ => {
-                        self.packages.insert(package_id, candidate);
+                    Some((precedence, _)) if precedence < root.precedence => {}
+                    existing => {
+                        let slot = existing.map_or(self.candidates, |(_, slot)| slot);
+                        self.package_members
+                            .as_ref()
+                            .expect("active index")
+                            .store_closure(slot, &closure)?;
+                        self.package_members
+                            .as_ref()
+                            .expect("active index")
+                            .store_package(
+                                &package_id,
+                                &root.label,
+                                root.precedence,
+                                &manifest_path,
+                                slot,
+                            )?;
                     }
                 }
             }
@@ -340,9 +610,14 @@ impl WorkflowDiscoveryScan {
                 message: error.to_string(),
             }),
         }
+        Ok(())
     }
 
-    fn standalone(&mut self, root: &DiscoveryRoot, source_path: PathBuf) {
+    fn standalone(
+        &mut self,
+        root: &DiscoveryRoot,
+        source_path: PathBuf,
+    ) -> Result<(), WorkflowDiscoveryError> {
         let canonical = match fs::canonicalize(&source_path) {
             Ok(path) => path,
             Err(error) => {
@@ -352,16 +627,21 @@ impl WorkflowDiscoveryScan {
                     code: "unreadable_source".to_string(),
                     message: error.to_string(),
                 });
-                return;
+                return Ok(());
             }
         };
-        if self.package_members.contains(&canonical) {
-            return;
+        if self
+            .package_members
+            .as_ref()
+            .expect("active index")
+            .contains(&canonical)?
+        {
+            return Ok(());
         }
         match read_bounded_source(&canonical) {
             Ok(source) => {
                 let Some(name) = canonical.file_name().and_then(std::ffi::OsStr::to_str) else {
-                    return;
+                    return Ok(());
                 };
                 match bcode_workflow::WorkflowSourceFormat::from_file_name(name) {
                     Ok(source_format) => {
@@ -390,17 +670,25 @@ impl WorkflowDiscoveryScan {
                 message: error.to_string(),
             }),
         }
+        Ok(())
     }
 
     fn finish(&mut self) -> Result<(), WorkflowDiscoveryError> {
         self.result.sources.sort_by(|left, right| {
             (left.precedence(), left.source_key()).cmp(&(right.precedence(), right.source_key()))
         });
-        if self.result.sources.len() > self.limit {
+        if self.streaming != Some(true) && self.result.sources.len() > self.limit {
             return Err(WorkflowDiscoveryError::Invalid(
             "workflow discovery exceeds the bounded candidate window; narrow configured discovery roots".to_string(),
         ));
         }
+        self.trim_diagnostics();
+        Ok(())
+    }
+
+    fn trim_diagnostics(&mut self) {
+        // Stable ordering preserves which equal-key diagnostic wins at the boundary.
+        // Each candidate adds at most one entry, so transient retention is limit + 1.
         self.result.diagnostics.sort_by(|left, right| {
             (&left.source_label, &left.path, &left.code).cmp(&(
                 &right.source_label,
@@ -409,7 +697,6 @@ impl WorkflowDiscoveryScan {
             ))
         });
         self.result.diagnostics.truncate(self.limit);
-        Ok(())
     }
 }
 
@@ -595,10 +882,10 @@ impl WorkflowDirectoryScan {
             return Ok(batch);
         };
         self.failed = true;
-        self.check_directory_stamp()?;
+        self.checkdirectory_stamp()?;
         for _ in 0..budget {
             let Some(entry) = entries.next() else {
-                self.check_directory_stamp()?;
+                self.checkdirectory_stamp()?;
                 self.failed = false;
                 batch.complete = true;
                 return Ok(batch);
@@ -618,13 +905,13 @@ impl WorkflowDirectoryScan {
                 batch.paths.push(path);
             }
         }
-        self.check_directory_stamp()?;
+        self.checkdirectory_stamp()?;
         self.failed = false;
         self.entries = Some(entries);
         Ok(batch)
     }
 
-    fn check_directory_stamp(&self) -> Result<(), std::io::Error> {
+    fn checkdirectory_stamp(&self) -> Result<(), std::io::Error> {
         if Some(fs::metadata(&self.root)?.modified()?) != self.modified {
             return Err(std::io::Error::other(
                 "workflow discovery directory changed during enumeration; restart discovery",
@@ -888,7 +1175,88 @@ fn read_bounded_source(path: &Path) -> Result<String, WorkflowDiscoveryError> {
 #[cfg(test)]
 mod tests {
     #[test]
-    fn changed_directory_stamp_invalidates_scan_permanently() {
+    fn streaming_crosses_candidate_ceiling_without_retaining_sources() {
+        let root = tempfile::tempdir().unwrap();
+        let directory = root.path().join("workflows");
+        std::fs::create_dir(&directory).unwrap();
+        let count = super::MAX_DISCOVERY_RESULTS + 3;
+        for index in 0..count {
+            std::fs::write(directory.join(format!("{index}.workflow.json")), "{}").unwrap();
+        }
+        let config = bcode_config::WorkflowsConfig {
+            include_repo_workflows: true,
+            include_user_workflows: false,
+            paths: Vec::new(),
+            ..Default::default()
+        };
+        let mut scan = super::WorkflowDiscoveryScan::open(root.path(), &config, 1).unwrap();
+        let mut delivered = 0;
+        loop {
+            let batch = scan.advance_sources(16).unwrap();
+            assert!(batch.sources.len() <= 16);
+            assert!(scan.result.sources.is_empty());
+            assert!(scan.result.diagnostics.len() <= 1);
+            delivered += batch.sources.len();
+            if batch.complete {
+                break;
+            }
+        }
+        assert_eq!(delivered, count);
+        assert!(super::discover_workflows(root.path(), &config, 1).is_err());
+    }
+
+    #[test]
+    fn diagnostic_window_matches_stable_full_projection() {
+        let root = tempfile::tempdir().unwrap();
+        let config = bcode_config::WorkflowsConfig {
+            include_repo_workflows: false,
+            include_user_workflows: false,
+            paths: Vec::new(),
+            ..Default::default()
+        };
+        let mut scan = super::WorkflowDiscoveryScan::open(root.path(), &config, 2).unwrap();
+        let mut all = Vec::new();
+        for (index, label) in ["z", "b", "b", "a", "b"].into_iter().enumerate() {
+            let diagnostic = super::WorkflowDiscoveryDiagnostic {
+                source_label: label.into(),
+                path: "source".into(),
+                code: "invalid".into(),
+                message: index.to_string(),
+            };
+            all.push(diagnostic.clone());
+            scan.result.diagnostics.push(diagnostic);
+            scan.trim_diagnostics();
+            assert!(scan.result.diagnostics.len() <= 2);
+        }
+        all.sort_by(|left, right| {
+            (&left.source_label, &left.path, &left.code).cmp(&(
+                &right.source_label,
+                &right.path,
+                &right.code,
+            ))
+        });
+        all.truncate(2);
+        assert_eq!(scan.result.diagnostics, all);
+    }
+    #[cfg(unix)]
+    #[test]
+    fn indexed_metadata_preserves_non_unicode_paths() {
+        use std::os::unix::ffi::OsStringExt;
+        let index = super::PackageMemberIndex::new().unwrap();
+        let path = std::path::PathBuf::from(std::ffi::OsString::from_vec(
+            b"/workflow-\xff/manifest.json".to_vec(),
+        ));
+        index
+            .store_package("package", "repository", 10, &path, 7)
+            .unwrap();
+        assert_eq!(index.package_position("package").unwrap(), Some((10, 7)));
+        let package = index.pop_package().unwrap().unwrap();
+        assert_eq!(package.path, path);
+        assert_eq!(package.label, "repository");
+        assert!(index.pop_package().unwrap().is_none());
+    }
+    #[test]
+    fn changeddirectory_stamp_invalidates_scan_permanently() {
         let root = tempfile::tempdir().unwrap();
         std::fs::write(root.path().join("one.workflow.json"), "{}").unwrap();
         let mut scan = super::WorkflowDirectoryScan::open(
@@ -930,6 +1298,36 @@ mod tests {
         }
         assert!(completed);
         assert!(scan.advance(1).is_err());
+    }
+
+    #[test]
+    fn source_delivery_drains_payloads_and_rejects_mode_switching() {
+        let root = tempfile::tempdir().unwrap();
+        let directory = root.path().join("workflows");
+        std::fs::create_dir(&directory).unwrap();
+        for name in ["a.workflow.json", "b.workflow.json"] {
+            std::fs::write(directory.join(name), "{}").unwrap();
+        }
+        let config = bcode_config::WorkflowsConfig {
+            include_repo_workflows: true,
+            include_user_workflows: false,
+            paths: Vec::new(),
+            ..Default::default()
+        };
+        let mut scan = super::WorkflowDiscoveryScan::open(root.path(), &config, 10).unwrap();
+        let mut delivered = Vec::new();
+        loop {
+            let batch = scan.advance_sources(1).unwrap();
+            assert!(batch.sources.len() <= 1);
+            assert!(scan.result.sources.is_empty());
+            delivered.extend(batch.sources);
+            if batch.complete {
+                break;
+            }
+            assert!(scan.advance(1).is_err());
+        }
+        assert_eq!(delivered.len(), 2);
+        assert!(scan.advance_sources(1).is_err());
     }
 
     #[test]
@@ -1078,6 +1476,125 @@ members:
             DiscoveredWorkflowSource::Standalone { source_path, .. }
                 if source_path.ends_with("standalone.workflow.yaml")
         )));
+    }
+
+    #[test]
+    fn mixed_streaming_matches_collection_and_releases_temporary_state() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("workflows");
+        fs::create_dir_all(&root).unwrap();
+        fs::write(
+            root.join("member.workflow.yaml"),
+            source("member", "Member"),
+        )
+        .unwrap();
+        fs::write(
+            root.join("standalone.workflow.yaml"),
+            source("standalone", "Standalone"),
+        )
+        .unwrap();
+        fs::write(root.join("example.workflow-package.yaml"), "version: 3\npackage_id: example/package\nexports: { main: member }\nmembers:\n  - member_id: member\n    source_name: member.workflow.yaml\n").unwrap();
+        let config = bcode_config::WorkflowsConfig {
+            include_repo_workflows: true,
+            include_user_workflows: false,
+            paths: Vec::new(),
+            ..Default::default()
+        };
+        let expected = discover_workflows(temp.path(), &config, 20).unwrap();
+        for budget in [1, 2, 7] {
+            let mut scan = WorkflowDiscoveryScan::open(temp.path(), &config, 20).unwrap();
+            let temporary = scan
+                .package_members
+                .as_ref()
+                .unwrap()
+                .directory
+                .path()
+                .to_path_buf();
+            let mut actual = WorkflowDiscoveryResult::default();
+            loop {
+                let batch = scan.advance_sources(budget).unwrap();
+                assert!(batch.sources.len() <= budget);
+                actual.sources.extend(batch.sources);
+                if batch.complete {
+                    actual.diagnostics = batch.diagnostics;
+                    break;
+                }
+            }
+            actual
+                .sources
+                .sort_by_key(|source| (source.precedence(), source.source_key()));
+            assert_eq!(actual, expected);
+            assert!(!temporary.exists());
+        }
+        let mut scan = WorkflowDiscoveryScan::open(temp.path(), &config, 20).unwrap();
+        let temporary = scan
+            .package_members
+            .as_ref()
+            .unwrap()
+            .directory
+            .path()
+            .to_path_buf();
+        assert!(!scan.advance_sources(1).unwrap().complete);
+        drop(scan);
+        assert!(!temporary.exists());
+    }
+
+    #[test]
+    fn package_streaming_crosses_ceiling_and_releases_spools() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("workflows");
+        fs::create_dir(&root).unwrap();
+        fs::write(
+            root.join("member.workflow.yaml"),
+            source("member", "Member"),
+        )
+        .unwrap();
+        let count = super::MAX_DISCOVERY_RESULTS + 3;
+        for index in 0..count {
+            fs::write(root.join(format!("{index}.workflow-package.yaml")), format!("version: 3\npackage_id: example/package-{index:04}\nexports: {{ main: member }}\nmembers:\n  - member_id: member\n    source_name: member.workflow.yaml\n")).unwrap();
+        }
+        let config = bcode_config::WorkflowsConfig {
+            include_repo_workflows: true,
+            include_user_workflows: false,
+            paths: Vec::new(),
+            ..Default::default()
+        };
+        for complete in [false, true] {
+            let mut scan = WorkflowDiscoveryScan::open(temp.path(), &config, 1).unwrap();
+            let temporary = scan
+                .package_members
+                .as_ref()
+                .unwrap()
+                .directory
+                .path()
+                .to_path_buf();
+            let mut delivered = 0;
+            loop {
+                let batch = scan.advance_sources(16).unwrap();
+                assert!(batch.sources.len() <= 16);
+                assert!(scan.result.sources.is_empty());
+                assert!(batch.diagnostics.is_empty());
+                for source in batch.sources {
+                    assert!(matches!(
+                        source,
+                        super::DiscoveredWorkflowSource::Package { .. }
+                    ));
+                    delivered += 1;
+                }
+                if batch.complete {
+                    assert!(complete);
+                    assert_eq!(delivered, count);
+                    assert!(!temporary.exists());
+                    break;
+                }
+                if !complete && delivered > 0 {
+                    assert!(temporary.exists());
+                    break;
+                }
+            }
+            drop(scan);
+            assert!(!temporary.exists());
+        }
     }
 
     #[test]

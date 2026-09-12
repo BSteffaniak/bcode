@@ -447,6 +447,9 @@ pub enum WorkflowDefinitionRequest {
     /// Return the portable runtime-workflow authoring catalog.
     WorkflowAuthoringCatalog,
     /// Discover one bounded page of launchable workflow sources for a workspace.
+    CancelWorkflowDiscovery {
+        token: String,
+    },
     WorkflowLaunchCatalog(bcode_workflow::WorkflowLaunchCatalogRequest),
     /// Inspect one exact launch source without mutation.
     WorkflowLaunchDetail(bcode_workflow::WorkflowLaunchDetailRequest),
@@ -1094,6 +1097,9 @@ impl RoutedRequest {
             }),
             Request::WorkflowAuthoringCatalog => Self::WorkflowDefinition(Box::new(
                 WorkflowDefinitionRequest::WorkflowAuthoringCatalog,
+            )),
+            Request::CancelWorkflowDiscovery { token } => Self::WorkflowDefinition(Box::new(
+                WorkflowDefinitionRequest::CancelWorkflowDiscovery { token },
             )),
             Request::WorkflowLaunchCatalog(request) => Self::WorkflowDefinition(Box::new(
                 WorkflowDefinitionRequest::WorkflowLaunchCatalog(request),

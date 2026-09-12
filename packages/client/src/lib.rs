@@ -779,6 +779,15 @@ impl bcode_workflow::WorkflowAuthoringApplication for BcodeClient {
     ) -> Result<Option<bcode_workflow::WorkflowPackagePublicationReceipt>, Self::Error> {
         Self::workflow_package_publication(self, package_id).await
     }
+    async fn cancel_workflow_discovery(&self, token: String) -> Result<bool, Self::Error> {
+        match self
+            .send_request(Request::CancelWorkflowDiscovery { token })
+            .await?
+        {
+            ResponsePayload::WorkflowDiscoveryCancelled { released } => Ok(released),
+            _ => Err(ClientError::UnexpectedResponse),
+        }
+    }
     async fn workflow_launch_catalog(
         &self,
         request: bcode_workflow::WorkflowLaunchCatalogRequest,
@@ -4219,6 +4228,64 @@ impl BcodeClient {
         }
     }
 
+    /// Run catalog discovery with caller-owned interruption, without terminal dependencies.
+    ///
+    /// Tokenless requests first acquire admission. Interruption during admission waits for
+    /// its bounded response to release the token. Ready interruption takes precedence over
+    /// a simultaneously ready response at the local client. `None` means interrupted, not confirmed
+    /// worker termination; active blocking work retains capacity until it exits.
+    /// Dropping this future is not an explicit cancellation request. Lost responses may
+    /// retain admission until expiry. No retries or durable resume are provided.
+    ///
+    /// # Errors
+    /// Returns transport, protocol, discovery, or cancellation-request errors.
+    pub async fn workflow_launch_catalog_until<F>(
+        &self,
+        mut request: bcode_workflow::WorkflowLaunchCatalogRequest,
+        interrupted: F,
+    ) -> Result<Option<bcode_workflow::WorkflowLaunchCatalogPage>, ClientError>
+    where
+        F: std::future::Future<Output = ()> + Send,
+    {
+        use bcode_workflow::WorkflowAuthoringApplication;
+        tokio::pin!(interrupted);
+        if request.discovery_token.is_none() {
+            let mut admission = request.clone();
+            admission.incremental = true;
+            let admission = self.workflow_launch_catalog(admission);
+            tokio::pin!(admission);
+            let (page, cancelled) = tokio::select! {
+                biased;
+                () = &mut interrupted => (admission.await?, true),
+                page = &mut admission => (page?, false),
+            };
+            let token = page
+                .discovery_token
+                .clone()
+                .ok_or(ClientError::UnexpectedResponse)?;
+            if cancelled {
+                self.cancel_workflow_discovery(token).await?;
+                return Ok(None);
+            }
+            if request.incremental {
+                return Ok(Some(page));
+            }
+            request.discovery_token = Some(token);
+        }
+        let token = request
+            .discovery_token
+            .clone()
+            .ok_or(ClientError::UnexpectedResponse)?;
+        tokio::select! {
+            biased;
+            () = &mut interrupted => {
+                self.cancel_workflow_discovery(token).await?;
+                Ok(None)
+            }
+            result = self.workflow_launch_catalog(request) => result.map(Some),
+        }
+    }
+
     /// Inspect one exact workflow launch target without mutation.
     ///
     /// # Errors
@@ -7282,6 +7349,78 @@ mod client_timeout_tests {
             assert!(message.contains("protocol="));
             assert!(message.contains("build="));
         }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn interrupted_catalog_admission_releases_token_without_discovery() {
+        let dir = std::path::PathBuf::from(format!("/tmp/bcc-{}", SessionOpenOperationId::new()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let endpoint = bcode_ipc::IpcEndpoint::unix_socket(dir.join("catalog.sock"));
+        let listener = bcode_ipc::LocalIpcListener::bind(&endpoint).unwrap();
+        let server = tokio::spawn(async move {
+            for admission in [true, false] {
+                let mut stream = listener.accept().await.unwrap();
+                let hello = bcode_ipc::recv_envelope(&mut stream).await.unwrap();
+                let response = bcode_ipc::Response::Ok(bcode_ipc::ResponsePayload::Hello {
+                    protocol_version: bcode_ipc::ProtocolVersion::current(),
+                    client_id: bcode_session_models::ClientId::new(),
+                    daemon: matching_daemon_status(),
+                });
+                bcode_ipc::send_envelope(
+                    &mut stream,
+                    &bcode_ipc::response_envelope(hello.request_id, &response).unwrap(),
+                )
+                .await
+                .unwrap();
+                let request = bcode_ipc::recv_envelope(&mut stream).await.unwrap();
+                let operation = bcode_ipc::decode_request(&request.payload).unwrap();
+                let payload = if admission {
+                    assert!(
+                        matches!(operation, bcode_ipc::Request::WorkflowLaunchCatalog(ref request)
+                        if request.incremental && request.discovery_token.is_none())
+                    );
+                    bcode_ipc::ResponsePayload::WorkflowLaunchCatalog {
+                        page: bcode_workflow::WorkflowLaunchCatalogPage {
+                            version: bcode_workflow::WORKFLOW_LAUNCH_CATALOG_VERSION,
+                            discovery_token: Some("admitted".to_string()),
+                            items: vec![],
+                            diagnostics: vec![],
+                            next_cursor: None,
+                        },
+                    }
+                } else {
+                    assert!(
+                        matches!(operation, bcode_ipc::Request::CancelWorkflowDiscovery { token } if token == "admitted")
+                    );
+                    bcode_ipc::ResponsePayload::WorkflowDiscoveryCancelled { released: true }
+                };
+                let response = bcode_ipc::Response::Ok(payload);
+                bcode_ipc::send_envelope(
+                    &mut stream,
+                    &bcode_ipc::response_envelope(request.request_id, &response).unwrap(),
+                )
+                .await
+                .unwrap();
+            }
+        });
+        let client = BcodeClient::new(endpoint);
+        let request = serde_json::from_value(serde_json::json!({
+            "version": bcode_workflow::WORKFLOW_LAUNCH_CATALOG_VERSION,
+            "workspace": ".", "limit": 1,
+        }))
+        .unwrap();
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            Box::pin(client.workflow_launch_catalog_until(request, std::future::ready(()))),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert!(result.is_none());
+        server.await.unwrap();
+        std::fs::remove_file(dir.join("catalog.sock")).unwrap();
+        std::fs::remove_dir(dir).unwrap();
     }
 
     #[cfg(unix)]

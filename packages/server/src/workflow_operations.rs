@@ -617,6 +617,15 @@ impl bcode_workflow::WorkflowAuthoringApplication for WorkflowAuthoringApplicati
         package_publication(self.state, &package_id)
             .map_err(|error| authoring_failure(error.into()))
     }
+    async fn cancel_workflow_discovery(&self, token: String) -> Result<bool, Self::Error> {
+        let released = self
+            .state
+            .workflow_discovery_scans
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(&token);
+        Ok(released.is_some())
+    }
     async fn workflow_launch_catalog(
         &self,
         request: bcode_workflow::WorkflowLaunchCatalogRequest,
@@ -3180,15 +3189,25 @@ async fn launch_detail_for_catalog_item(
 #[derive(Debug)]
 pub struct PendingDiscovery {
     request: bcode_workflow::WorkflowLaunchCatalogRequest,
-    scan: AdmittedDiscovery,
+    scan: Option<AdmittedDiscovery>,
     expires: std::time::Instant,
-    expiration: DiscoveryExpiration,
+    _expiration: DiscoveryExpiration,
+}
+
+impl PendingDiscovery {
+    #[cfg(test)]
+    pub(super) fn retained_preview_count(&self) -> usize {
+        self.scan.as_ref().map_or(0, |scan| scan.previews.len())
+    }
 }
 
 /// Keeps capacity occupied until both retained state and any active blocking work are dropped.
 #[derive(Debug)]
 struct AdmittedDiscovery {
-    scan: bcode_workflow_discovery::WorkflowDiscoveryScan,
+    scan: Option<bcode_workflow_discovery::WorkflowDiscoveryScan>,
+    previews: Vec<bcode_workflow::WorkflowLaunchCatalogItem>,
+    catalog: Option<bcode_workflow::WorkflowAuthoringCatalogSnapshot>,
+    publication_fence: Option<bcode_workflow_store::WorkflowPublicationReadFence>,
     _permit: tokio::sync::OwnedSemaphorePermit,
 }
 
@@ -3201,10 +3220,188 @@ impl Drop for DiscoveryExpiration {
     }
 }
 
+/// Removes an in-flight continuation on completion, error, or dropped request.
+struct DiscoveryContinuation<'a> {
+    scans: &'a std::sync::Mutex<BTreeMap<String, PendingDiscovery>>,
+    token: Option<&'a str>,
+}
+
+impl DiscoveryContinuation<'_> {
+    async fn checkpoint(&self) -> Result<(), super::ServerError> {
+        tokio::task::yield_now().await;
+        if let Some(token) = self.token {
+            let scans = self
+                .scans
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if scans
+                .get(token)
+                .is_none_or(|pending| pending.expires <= std::time::Instant::now())
+            {
+                return Err(super::ServerError::WorkflowAuthoring(
+                    bcode_workflow::WorkflowAuthoringFailure::Cancelled,
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    fn finish(
+        &self,
+        scans: &mut BTreeMap<String, PendingDiscovery>,
+    ) -> Result<(), super::ServerError> {
+        if let Some(token) = self.token {
+            let pending = scans.remove(token);
+            if pending.is_none_or(|pending| pending.expires <= std::time::Instant::now()) {
+                return Err(super::ServerError::WorkflowAuthoring(
+                    bcode_workflow::WorkflowAuthoringFailure::Cancelled,
+                ));
+            }
+        }
+        Ok(())
+    }
+}
+
+impl Drop for DiscoveryContinuation<'_> {
+    fn drop(&mut self) {
+        if let Some(token) = self.token {
+            self.scans
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .remove(token);
+        }
+    }
+}
+
+#[cfg(test)]
+mod discovery_continuation_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn cancelled_inflight_continuation_cannot_publish() {
+        let token = "inflight";
+        let capacity = std::sync::Arc::new(tokio::sync::Semaphore::new(1));
+        let scan = AdmittedDiscovery {
+            scan: None,
+            previews: Vec::new(),
+            catalog: None,
+            publication_fence: None,
+            _permit: capacity.clone().try_acquire_owned().unwrap(),
+        };
+        let request = serde_json::from_value(serde_json::json!({
+            "version": bcode_workflow::WORKFLOW_LAUNCH_CATALOG_VERSION,
+            "workspace": ".", "incremental": true, "limit": 1
+        }))
+        .unwrap();
+        let scans = std::sync::Mutex::new(BTreeMap::from([(
+            token.to_string(),
+            PendingDiscovery {
+                request,
+                scan: Some(scan),
+                expires: std::time::Instant::now() + std::time::Duration::from_mins(1),
+                _expiration: DiscoveryExpiration(tokio::spawn(std::future::pending())),
+            },
+        )]));
+        // Match resume: transfer the scan/permit to a worker but retain cancellation authority.
+        let scan = scans
+            .lock()
+            .unwrap()
+            .get_mut(token)
+            .unwrap()
+            .scan
+            .take()
+            .unwrap();
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let worker = tokio::task::spawn_blocking(move || {
+            started_tx.send(()).unwrap();
+            release_rx
+                .recv_timeout(std::time::Duration::from_secs(10))
+                .unwrap();
+            scan
+        });
+        started_rx.await.unwrap();
+        let continuation = DiscoveryContinuation {
+            scans: &scans,
+            token: Some(token),
+        };
+        assert!(continuation.checkpoint().await.is_ok());
+        // Match cancellation while the worker is held at the deterministic barrier.
+        assert!(scans.lock().unwrap().remove(token).is_some());
+        assert_eq!(capacity.available_permits(), 0);
+        release_tx.send(()).unwrap();
+        let scan = worker.await.unwrap();
+        assert_eq!(capacity.available_permits(), 0);
+        assert!(matches!(
+            continuation.checkpoint().await,
+            Err(super::super::ServerError::WorkflowAuthoring(
+                bcode_workflow::WorkflowAuthoringFailure::Cancelled
+            ))
+        ));
+        // Cancellation removes the in-flight entry while its worker owns the scan.
+        let result = continuation.finish(&mut scans.lock().unwrap());
+        assert!(matches!(
+            result,
+            Err(super::super::ServerError::WorkflowAuthoring(
+                bcode_workflow::WorkflowAuthoringFailure::Cancelled
+            ))
+        ));
+        drop(scan);
+        assert_eq!(capacity.available_permits(), 1);
+        drop(continuation);
+        assert!(scans.lock().unwrap().is_empty());
+    }
+}
+
+fn retain_discovery(
+    state: &ServerState,
+    request: bcode_workflow::WorkflowLaunchCatalogRequest,
+    scan: AdmittedDiscovery,
+    continuation: &DiscoveryContinuation<'_>,
+) -> Result<bcode_workflow::WorkflowLaunchCatalogPage, super::ServerError> {
+    let token = uuid::Uuid::new_v4().to_string();
+    let lifetime = std::time::Duration::from_mins(1);
+    let scans = std::sync::Arc::downgrade(&state.workflow_discovery_scans);
+    let expired_token = token.clone();
+    let expiration = DiscoveryExpiration(tokio::spawn(async move {
+        tokio::time::sleep(lifetime).await;
+        if let Some(scans) = scans.upgrade() {
+            scans
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .remove(&expired_token);
+        }
+    }));
+    {
+        let mut scans = state
+            .workflow_discovery_scans
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        continuation.finish(&mut scans)?;
+        scans.insert(
+            token.clone(),
+            PendingDiscovery {
+                request,
+                scan: Some(scan),
+                expires: std::time::Instant::now() + lifetime,
+                _expiration: expiration,
+            },
+        );
+    }
+    Ok(bcode_workflow::WorkflowLaunchCatalogPage {
+        version: bcode_workflow::WORKFLOW_LAUNCH_CATALOG_VERSION,
+        discovery_token: Some(token),
+        items: Vec::new(),
+        diagnostics: Vec::new(),
+        next_cursor: None,
+    })
+}
+
 /// Discover and semantically preview one bounded workflow launch-catalog page.
 ///
 /// Discovery is read-only. It never applies, publishes, repairs, or starts a workflow.
-#[allow(clippy::too_many_lines)]
+// Every loop exit moves the scan into retained state or drops it; it must survive each batch.
+#[allow(clippy::too_many_lines, clippy::significant_drop_tightening)]
 pub async fn launch_catalog(
     state: &ServerState,
     request: &bcode_workflow::WorkflowLaunchCatalogRequest,
@@ -3212,6 +3409,8 @@ pub async fn launch_catalog(
     request.validate()?;
     let mut binding = request.clone();
     binding.discovery_token = None;
+    // Batch delivery does not change query identity or cancellation authority.
+    binding.incremental = true;
     let mut resumed = if let Some(token) = &request.discovery_token {
         let mut scans = state
             .workflow_discovery_scans
@@ -3222,7 +3421,7 @@ pub async fn launch_catalog(
                 bcode_workflow::WorkflowAuthoringFailure::DiscoveryContinuationInvalid,
             )
         };
-        let pending = scans.get(token).ok_or_else(invalid)?;
+        let pending = scans.get_mut(token).ok_or_else(invalid)?;
         if pending.expires <= std::time::Instant::now() {
             scans.remove(token);
             return Err(invalid());
@@ -3230,12 +3429,13 @@ pub async fn launch_catalog(
         if pending.request != binding {
             return Err(invalid());
         }
-        scans.remove(token).map(|pending| {
-            drop(pending.expiration);
-            pending.scan
-        })
+        Some(pending.scan.take().ok_or_else(invalid)?)
     } else {
         None
+    };
+    let continuation = DiscoveryContinuation {
+        scans: &state.workflow_discovery_scans,
+        token: request.discovery_token.as_deref(),
     };
     let workspace = request.workspace.clone();
     let config = state.startup_config.workflows.clone();
@@ -3249,128 +3449,118 @@ pub async fn launch_catalog(
                     bcode_workflow::WorkflowAuthoringFailure::DiscoveryCapacity,
                 )
             })?;
-        tokio::task::spawn_blocking(move || {
-            bcode_workflow_discovery::WorkflowDiscoveryScan::open(
-                &workspace,
-                &config,
-                bcode_workflow_discovery::MAX_DISCOVERY_RESULTS,
-            )
-            .map(|scan| AdmittedDiscovery {
-                scan,
-                _permit: permit,
-            })
-        })
-        .await
-        .map_err(super::ServerError::BlockingTask)??
+        AdmittedDiscovery {
+            scan: None,
+            previews: Vec::new(),
+            catalog: None,
+            publication_fence: None,
+            _permit: permit,
+        }
     };
     drop(resumed);
+    if request.incremental && request.discovery_token.is_none() {
+        return retain_discovery(state, binding, scan, &continuation);
+    }
+    let publication_fence = {
+        let store = state
+            .workflow_store
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        match scan.publication_fence.take() {
+            Some(fence) => {
+                store.validate_publication_read_fence(&fence)?;
+                fence
+            }
+            None => store.publication_read_fence()?,
+        }
+    };
+    // Pin compilation inputs for the entire process-local discovery, including resumes.
+    let catalog = match scan.catalog.take() {
+        Some(catalog) => catalog,
+        None => authoring_catalog(state).await?,
+    };
+    let mut items = LaunchCatalogWindow::new(request);
+    items.items = std::mem::take(&mut scan.previews);
     let discovery = loop {
+        continuation.checkpoint().await?;
         // Transfer ownership into just one bounded batch. Dropping this request can leave that
         // batch running, but cannot schedule another; its output then releases the scan handles.
+        let workspace = workspace.clone();
+        let config = config.clone();
         let (next_scan, result) = tokio::task::spawn_blocking(move || {
-            let result = scan
-                .scan
-                .advance(16.min(bcode_workflow_discovery::MAX_DISCOVERY_RESULTS));
+            let result = (|| {
+                if scan.scan.is_none() {
+                    scan.scan = Some(bcode_workflow_discovery::WorkflowDiscoveryScan::open(
+                        &workspace,
+                        &config,
+                        bcode_workflow_discovery::MAX_DISCOVERY_RESULTS,
+                    )?);
+                }
+                scan.scan
+                    .as_mut()
+                    .expect("scan was opened")
+                    .advance_sources(16.min(bcode_workflow_discovery::MAX_DISCOVERY_RESULTS))
+            })();
             (scan, result)
         })
         .await
         .map_err(super::ServerError::BlockingTask)?;
         scan = next_scan;
-        if let Some(discovery) = result? {
-            drop(scan);
-            break discovery;
-        }
-        if request.incremental {
-            let token = uuid::Uuid::new_v4().to_string();
-            let lifetime = std::time::Duration::from_mins(1);
-            let scans = std::sync::Arc::downgrade(&state.workflow_discovery_scans);
-            let expired_token = token.clone();
-            let expiration = DiscoveryExpiration(tokio::spawn(async move {
-                tokio::time::sleep(lifetime).await;
-                if let Some(scans) = scans.upgrade() {
-                    scans
-                        .lock()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner)
-                        .remove(&expired_token);
-                }
-            }));
-            {
-                let mut scans = state
-                    .workflow_discovery_scans
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner);
-                scans.insert(
-                    token.clone(),
-                    PendingDiscovery {
-                        request: binding,
-                        scan,
-                        expires: std::time::Instant::now() + lifetime,
-                        expiration,
-                    },
-                );
-            }
-            return Ok(bcode_workflow::WorkflowLaunchCatalogPage {
-                version: bcode_workflow::WORKFLOW_LAUNCH_CATALOG_VERSION,
-                discovery_token: Some(token),
-                items: Vec::new(),
-                diagnostics: Vec::new(),
-                next_cursor: None,
-            });
-        }
-        tokio::task::yield_now().await;
-    };
-    let catalog = authoring_catalog(state).await?;
-    let mut items = Vec::new();
-    for source in discovery.sources {
-        match source {
-            bcode_workflow_discovery::DiscoveredWorkflowSource::Package {
-                source_label,
-                precedence,
-                manifest_path,
-                closure,
-                ..
-            } => {
-                let plan = bcode_workflow::plan_workflow_package_closure(&closure, &catalog)?;
-                let entry_index = plan
-                    .packages
-                    .iter()
-                    .position(|entry| entry.package_id == plan.entry_package_id)
-                    .ok_or_else(|| {
-                        bcode_workflow_store::WorkflowStoreError::InvalidData(
-                            "planned workflow package closure has no entry package".to_string(),
-                        )
-                    })?;
-                let entry = &plan.packages[entry_index];
-                let mut preview_catalog = catalog.clone();
-                for dependency in &plan.packages[..entry_index] {
-                    for member in &dependency.plan.members {
-                        preview_catalog.workflow_definitions.insert(
-                            member.definition_identity.definition_id.clone(),
-                            member.lowering.document.definition.clone(),
-                        );
-                    }
-                }
-                let preview = bcode_workflow::preview_workflow_package(
-                    &entry.plan,
-                    &preview_catalog,
-                    &BTreeMap::new(),
-                )?;
-                let receipt = package_publication(state, &entry.package_id)?;
-                let lock_digest = preview.lock.digest_sha256()?;
-                let readiness = receipt.as_ref().map_or(
-                    bcode_workflow::WorkflowLaunchReadiness::Unpublished,
-                    |receipt| {
-                        if receipt.package_lock_digest_sha256 == lock_digest {
-                            bcode_workflow::WorkflowLaunchReadiness::Ready
-                        } else {
-                            bcode_workflow::WorkflowLaunchReadiness::Drifted
+        continuation.checkpoint().await?;
+        let discovery = result?;
+        for source in discovery.sources {
+            continuation.checkpoint().await?;
+            match source {
+                bcode_workflow_discovery::DiscoveredWorkflowSource::Package {
+                    source_label,
+                    precedence,
+                    manifest_path,
+                    closure,
+                    ..
+                } => {
+                    let plan = bcode_workflow::plan_workflow_package_closure(&closure, &catalog)?;
+                    let entry_index = plan
+                        .packages
+                        .iter()
+                        .position(|entry| entry.package_id == plan.entry_package_id)
+                        .ok_or_else(|| {
+                            bcode_workflow_store::WorkflowStoreError::InvalidData(
+                                "planned workflow package closure has no entry package".to_string(),
+                            )
+                        })?;
+                    let entry = &plan.packages[entry_index];
+                    let mut preview_catalog = catalog.clone();
+                    for dependency in &plan.packages[..entry_index] {
+                        for member in &dependency.plan.members {
+                            continuation.checkpoint().await?;
+                            preview_catalog.workflow_definitions.insert(
+                                member.definition_identity.definition_id.clone(),
+                                member.lowering.document.definition.clone(),
+                            );
                         }
-                    },
-                );
-                for locked_export in &entry.plan.lock.exports {
-                    let export = &locked_export.export;
-                    let member_id = &locked_export.member_id;
-                    let member = preview
+                    }
+                    let preview = bcode_workflow::preview_workflow_package(
+                        &entry.plan,
+                        &preview_catalog,
+                        &BTreeMap::new(),
+                    )?;
+                    let receipt = package_publication(state, &entry.package_id)?;
+                    let lock_digest = preview.lock.digest_sha256()?;
+                    let readiness = receipt.as_ref().map_or(
+                        bcode_workflow::WorkflowLaunchReadiness::Unpublished,
+                        |receipt| {
+                            if receipt.package_lock_digest_sha256 == lock_digest {
+                                bcode_workflow::WorkflowLaunchReadiness::Ready
+                            } else {
+                                bcode_workflow::WorkflowLaunchReadiness::Drifted
+                            }
+                        },
+                    );
+                    for locked_export in &entry.plan.lock.exports {
+                        continuation.checkpoint().await?;
+                        let export = &locked_export.export;
+                        let member_id = &locked_export.member_id;
+                        let member = preview
                         .members
                         .iter()
                         .find(|member| &member.member_id == member_id)
@@ -3379,7 +3569,7 @@ pub async fn launch_catalog(
                                 "workflow package export '{export}' references missing member '{member_id}'"
                             ))
                         })?;
-                    let planned = entry
+                        let planned = entry
                         .plan
                         .members
                         .iter()
@@ -3389,91 +3579,111 @@ pub async fn launch_catalog(
                                 "workflow package export '{export}' has no planned member '{member_id}'"
                             ))
                         })?;
-                    let compiled = member.compilation.compiled.as_ref();
-                    items.push(bcode_workflow::WorkflowLaunchCatalogItem {
-                        source: bcode_workflow::WorkflowLaunchSourceIdentity::PackageExport {
-                            package_id: entry.package_id.clone(),
-                            export: export.clone(),
-                            manifest_path: manifest_path.clone(),
-                        },
-                        source_label: source_label.clone(),
-                        precedence,
-                        title: planned.lowering.document.metadata.title.clone(),
-                        description: planned.lowering.document.metadata.description.clone(),
-                        readiness,
-                        unavailable_reason: match readiness {
-                            bcode_workflow::WorkflowLaunchReadiness::Ready => None,
-                            bcode_workflow::WorkflowLaunchReadiness::Unpublished => {
-                                Some("package must be explicitly applied and published".to_string())
-                            }
-                            bcode_workflow::WorkflowLaunchReadiness::Drifted => Some(
-                                "published package lock differs from discovered source".to_string(),
-                            ),
-                            _ => Some("workflow package is unavailable".to_string()),
-                        },
-                        package_lock_digest_sha256: Some(lock_digest.clone()),
-                        publication: receipt
-                            .as_ref()
-                            .and_then(|receipt| {
-                                receipt
-                                    .exports
-                                    .iter()
-                                    .find(|candidate| candidate.export == *export)
-                            })
-                            .and_then(|published| {
-                                published.published_revision.as_ref().map(|revision| {
-                                    bcode_workflow::WorkflowLaunchPublicationIdentity {
-                                        workflow_id: revision.workflow_id.clone(),
-                                        revision: revision.revision,
-                                        definition_identity: published.definition_identity.clone(),
-                                    }
+                        let compiled = member.compilation.compiled.as_ref();
+                        items.push(bcode_workflow::WorkflowLaunchCatalogItem {
+                            source: bcode_workflow::WorkflowLaunchSourceIdentity::PackageExport {
+                                package_id: entry.package_id.clone(),
+                                export: export.clone(),
+                                manifest_path: manifest_path.clone(),
+                            },
+                            source_label: source_label.clone(),
+                            precedence,
+                            title: planned.lowering.document.metadata.title.clone(),
+                            description: planned.lowering.document.metadata.description.clone(),
+                            readiness,
+                            unavailable_reason: match readiness {
+                                bcode_workflow::WorkflowLaunchReadiness::Ready => None,
+                                bcode_workflow::WorkflowLaunchReadiness::Unpublished => Some(
+                                    "package must be explicitly applied and published".to_string(),
+                                ),
+                                bcode_workflow::WorkflowLaunchReadiness::Drifted => Some(
+                                    "published package lock differs from discovered source"
+                                        .to_string(),
+                                ),
+                                _ => Some("workflow package is unavailable".to_string()),
+                            },
+                            package_lock_digest_sha256: Some(lock_digest.clone()),
+                            publication: receipt
+                                .as_ref()
+                                .and_then(|receipt| {
+                                    receipt
+                                        .exports
+                                        .iter()
+                                        .find(|candidate| candidate.export == *export)
                                 })
-                            }),
-                        actions: package_launch_actions(readiness),
-                        requirements: compiled
-                            .map(|compiled| compiled.requirements.clone())
-                            .unwrap_or_default(),
-                        effects: compiled
-                            .map(|compiled| compiled.effects.clone())
-                            .unwrap_or_default(),
-                        permissions: compiled
-                            .map(|compiled| compiled.permissions.clone())
-                            .unwrap_or_default(),
-                        input_schema: planned.lowering.document.definition.input.clone(),
-                        configuration_schema: planned
-                            .lowering
-                            .document
-                            .configuration_schema
-                            .clone(),
-                        diagnostics: member.compilation.validation.diagnostics.clone(),
-                    });
+                                .and_then(|published| {
+                                    published.published_revision.as_ref().map(|revision| {
+                                        bcode_workflow::WorkflowLaunchPublicationIdentity {
+                                            workflow_id: revision.workflow_id.clone(),
+                                            revision: revision.revision,
+                                            definition_identity: published
+                                                .definition_identity
+                                                .clone(),
+                                        }
+                                    })
+                                }),
+                            actions: package_launch_actions(readiness),
+                            requirements: compiled
+                                .map(|compiled| compiled.requirements.clone())
+                                .unwrap_or_default(),
+                            effects: compiled
+                                .map(|compiled| compiled.effects.clone())
+                                .unwrap_or_default(),
+                            permissions: compiled
+                                .map(|compiled| compiled.permissions.clone())
+                                .unwrap_or_default(),
+                            input_schema: planned.lowering.document.definition.input.clone(),
+                            configuration_schema: planned
+                                .lowering
+                                .document
+                                .configuration_schema
+                                .clone(),
+                            diagnostics: member.compilation.validation.diagnostics.clone(),
+                        });
+                    }
                 }
-            }
-            bcode_workflow_discovery::DiscoveredWorkflowSource::Standalone {
-                source_label,
-                precedence,
-                source_path,
-                source_format,
-                source,
-            } => {
-                let lowering = bcode_workflow::lower_workflow_authoring_source(
-                    &source,
-                    source_format,
-                    &catalog,
-                )?;
-                let preview = lowering.document.compilation_preview(&catalog, None);
-                items.push(standalone_launch_item(
+                bcode_workflow_discovery::DiscoveredWorkflowSource::Standalone {
                     source_label,
                     precedence,
                     source_path,
                     source_format,
-                    &lowering,
-                    &preview,
-                    false,
-                ));
+                    source,
+                } => {
+                    let lowering = bcode_workflow::lower_workflow_authoring_source(
+                        &source,
+                        source_format,
+                        &catalog,
+                    )?;
+                    let preview = lowering.document.compilation_preview(&catalog, None);
+                    items.push(standalone_launch_item(
+                        source_label,
+                        precedence,
+                        source_path,
+                        source_format,
+                        &lowering,
+                        &preview,
+                        false,
+                    ));
+                }
             }
         }
-    }
+        if discovery.complete {
+            drop(scan);
+            break discovery.diagnostics;
+        }
+        if request.incremental {
+            scan.previews = items.items;
+            scan.catalog = Some(catalog);
+            state
+                .workflow_store
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .validate_publication_read_fence(&publication_fence)?;
+            scan.publication_fence = Some(publication_fence);
+            return retain_discovery(state, binding, scan, &continuation);
+        }
+        tokio::task::yield_now().await;
+    };
     for template in list_templates(
         state,
         request
@@ -3481,6 +3691,7 @@ pub async fn launch_catalog(
             .saturating_add(1)
             .min(bcode_workflow::MAX_WORKFLOW_LAUNCH_CATALOG_PAGE_SIZE),
     )? {
+        continuation.checkpoint().await?;
         let Some(document) = template.authoring_document else {
             continue;
         };
@@ -3528,10 +3739,21 @@ pub async fn launch_catalog(
             diagnostics: preview.validation.diagnostics,
         });
     }
+    continuation.finish(
+        &mut state
+            .workflow_discovery_scans
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner),
+    )?;
+    drop(continuation);
+    state
+        .workflow_store
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .validate_publication_read_fence(&publication_fence)?;
     Ok(project_launch_catalog_page(
-        items,
+        items.items,
         discovery
-            .diagnostics
             .into_iter()
             .map(|diagnostic| bcode_workflow::WorkflowLaunchDiagnostic {
                 source_label: diagnostic.source_label,
@@ -3542,6 +3764,33 @@ pub async fn launch_catalog(
             .collect(),
         request,
     ))
+}
+
+struct LaunchCatalogWindow<'a> {
+    request: &'a bcode_workflow::WorkflowLaunchCatalogRequest,
+    items: Vec<bcode_workflow::WorkflowLaunchCatalogItem>,
+}
+
+impl<'a> LaunchCatalogWindow<'a> {
+    const fn new(request: &'a bcode_workflow::WorkflowLaunchCatalogRequest) -> Self {
+        Self {
+            request,
+            items: Vec::new(),
+        }
+    }
+
+    fn push(&mut self, item: bcode_workflow::WorkflowLaunchCatalogItem) {
+        // Keep one lookahead item, preserving the ordinary page cursor semantics.
+        let mut window_request = self.request.clone();
+        window_request.limit = self.request.limit.saturating_add(1);
+        self.items.push(item);
+        self.items = project_launch_catalog_page(
+            std::mem::take(&mut self.items),
+            Vec::new(),
+            &window_request,
+        )
+        .items;
+    }
 }
 
 fn project_launch_catalog_page(
@@ -3578,10 +3827,6 @@ fn project_launch_catalog_page(
                     || item.source_label.to_lowercase().contains(search)
             })
     });
-    items.sort_by(|left, right| {
-        (&left.title, launch_source_key(&left.source))
-            .cmp(&(&right.title, launch_source_key(&right.source)))
-    });
     if let Some(cursor) = &request.cursor {
         items.retain(|item| {
             (&item.title, launch_source_key(&item.source))
@@ -3589,7 +3834,16 @@ fn project_launch_catalog_page(
         });
     }
     let has_more = items.len() > request.limit;
-    items.truncate(request.limit);
+    let compare = |left: &bcode_workflow::WorkflowLaunchCatalogItem,
+                   right: &bcode_workflow::WorkflowLaunchCatalogItem| {
+        (&left.title, launch_source_key(&left.source))
+            .cmp(&(&right.title, launch_source_key(&right.source)))
+    };
+    if has_more {
+        items.select_nth_unstable_by(request.limit, compare);
+        items.truncate(request.limit);
+    }
+    items.sort_by(compare);
     let next_cursor = has_more.then(|| items.last()).flatten().map(|item| {
         bcode_workflow::WorkflowLaunchCatalogCursor {
             title: item.title.clone(),

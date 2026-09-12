@@ -1101,12 +1101,21 @@ pub struct WorkflowAuthoringRepairReport {
     pub remaining_issues: Vec<WorkflowAuthoringIssue>,
 }
 
+/// Process-local read fence. Any database change invalidates it; it is not a durable snapshot.
+#[derive(Debug)]
+pub struct WorkflowPublicationReadFence {
+    identity: std::sync::Arc<()>,
+    data_version: i64,
+    total_changes: u64,
+}
+
 /// Durable workflow database.
 #[derive(Debug)]
 pub struct WorkflowStore {
     path: PathBuf,
     connection: Connection,
     _ownership: File,
+    read_identity: std::sync::Arc<()>,
 }
 
 impl WorkflowStore {
@@ -1249,6 +1258,7 @@ impl WorkflowStore {
             path: path.to_path_buf(),
             connection,
             _ownership: ownership,
+            read_identity: std::sync::Arc::new(()),
         })
     }
 
@@ -2209,6 +2219,43 @@ impl WorkflowStore {
             .validate()
             .map_err(|error| WorkflowStoreError::InvalidData(error.to_string()))?;
         Ok(result)
+    }
+
+    /// Capture a process-local publication read fence without retaining database locks.
+    ///
+    /// # Errors
+    /// Returns a database error if the connection change counter cannot be read.
+    pub fn publication_read_fence(
+        &self,
+    ) -> Result<WorkflowPublicationReadFence, WorkflowStoreError> {
+        Ok(WorkflowPublicationReadFence {
+            identity: self.read_identity.clone(),
+            data_version: self
+                .connection
+                .pragma_query_value(None, "data_version", |row| row.get(0))?,
+            total_changes: self.connection.total_changes(),
+        })
+    }
+
+    /// Reject a read fence after any local write, external commit, or store replacement.
+    /// This deliberately invalidates on unrelated writes rather than guessing consistency.
+    ///
+    /// # Errors
+    /// Returns an error if the fence is stale or the database cannot be queried.
+    pub fn validate_publication_read_fence(
+        &self,
+        fence: &WorkflowPublicationReadFence,
+    ) -> Result<(), WorkflowStoreError> {
+        let current = self.publication_read_fence()?;
+        if !std::sync::Arc::ptr_eq(&current.identity, &fence.identity)
+            || current.data_version != fence.data_version
+            || current.total_changes != fence.total_changes
+        {
+            return Err(WorkflowStoreError::InvalidData(
+                "workflow discovery state changed; restart discovery".into(),
+            ));
+        }
+        Ok(())
     }
 
     /// Read one exact or latest bounded package publication receipt.
@@ -15975,6 +16022,27 @@ mod tests {
         assert!(validate_id("test_id", &"x".repeat(MAX_ID_BYTES)).is_ok());
         assert!(validate_id("test_id", " x ").is_ok());
         assert!(validate_id("test_id", "\u{2003}").is_err());
+    }
+
+    #[test]
+    fn publication_read_fence_rejects_local_external_and_reopened_state() {
+        let root = tempfile::tempdir().unwrap();
+        let store = WorkflowStore::open_in_state_dir(root.path()).unwrap();
+        let fence = store.publication_read_fence().unwrap();
+        store.validate_publication_read_fence(&fence).unwrap();
+        // The timestamp is intentionally irrelevant: invalidation follows commits, not clocks.
+        store.connection.execute("INSERT INTO workflow_package_publications VALUES ('local', 'digest', '{}', '{}', 100)", []).unwrap();
+        assert!(store.validate_publication_read_fence(&fence).is_err());
+        let fence = store.publication_read_fence().unwrap();
+        let external = Connection::open(&store.path).unwrap();
+        external.execute("INSERT INTO workflow_package_publications VALUES ('external', 'digest', '{}', '{}', 1)", []).unwrap();
+        assert!(store.validate_publication_read_fence(&fence).is_err());
+        let fence = store.publication_read_fence().unwrap();
+        store.validate_publication_read_fence(&fence).unwrap();
+        drop(external);
+        drop(store);
+        let reopened = WorkflowStore::open_in_state_dir(root.path()).unwrap();
+        assert!(reopened.validate_publication_read_fence(&fence).is_err());
     }
 
     struct RejectPackageMutationBoundary(WorkflowPackageMutationBoundary);
