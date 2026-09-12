@@ -12714,13 +12714,9 @@ fn apply_attempt_observation(
     }
     let cancellation_requested = cancellation_requested_for_run(transaction, &request.run_id)?
         || sibling_cancellation_requested_for_attempt(transaction, &request.dispatch_identity)?;
-    let child_attempt = request
-        .receipt
-        .get("owner")
-        .and_then(serde_json::Value::as_str)
-        == Some("bcode.server.workflow-child/v1");
+    // Intent is not evidence that the owner stopped. Keep every owner kind
+    // nonterminal until a terminal observation confirms its execution ended.
     if cancellation_requested
-        && child_attempt
         && matches!(
             observation,
             AttemptObservation::Admitted | AttemptObservation::Running
@@ -12728,6 +12724,15 @@ fn apply_attempt_observation(
     {
         transition_attempt(transaction, request, "cancelling", None)?;
         summary.running.push(request.dispatch_identity.clone());
+        return Ok(());
+    }
+    if cancellation_requested
+        && matches!(
+            observation,
+            AttemptObservation::Deferred { .. } | AttemptObservation::Unknown
+        )
+    {
+        summary.deferred.push(request.dispatch_identity.clone());
         return Ok(());
     }
     if cancellation_requested {
@@ -30531,6 +30536,51 @@ mod tests {
     }
 
     #[test]
+    fn cancellation_requires_terminal_owner_evidence() {
+        for observation in [
+            AttemptObservation::Admitted,
+            AttemptObservation::Running,
+            AttemptObservation::Deferred {
+                reason: "still waiting".into(),
+            },
+            AttemptObservation::Unknown,
+        ] {
+            let (_temp, mut store) = initialized_store();
+            let identity = prepare_receipt_backed_attempt(&mut store, DispatchSideEffect::Mutating);
+            store.request_cancellation("run-1", 20).expect("intent");
+            let summary = store
+                .apply_attempt_observation(&identity, observation, 21)
+                .expect("nonterminal owner");
+            assert!(summary.cancelled.is_empty());
+            assert_eq!(
+                store
+                    .run_summary("run-1")
+                    .expect("summary")
+                    .expect("run")
+                    .status,
+                RunStatus::Running
+            );
+            assert!(
+                store.attempt_history("run-1", None, 10).expect("attempts")[0]
+                    .terminal_at_ms
+                    .is_none()
+            );
+            let summary = store
+                .apply_attempt_observation(&identity, AttemptObservation::Cancelled, 22)
+                .expect("owner stopped");
+            assert_eq!(summary.cancelled, [identity]);
+            assert_eq!(
+                store
+                    .run_summary("run-1")
+                    .expect("summary")
+                    .expect("run")
+                    .status,
+                RunStatus::Cancelled
+            );
+        }
+    }
+
+    #[test]
     fn cancellation_intent_wins_over_late_success_observation() {
         let (_temp, mut store) = initialized_store();
         let identity = prepare_receipt_backed_attempt(&mut store, DispatchSideEffect::Mutating);
@@ -37731,6 +37781,13 @@ mod tests {
             reopened
                 .apply_attempt_observation(&right_identity, AttemptObservation::Running, 8)
                 .expect("late sibling observation")
+                .running
+                .contains(&right_identity)
+        );
+        assert!(
+            reopened
+                .apply_attempt_observation(&right_identity, AttemptObservation::Cancelled, 9)
+                .expect("sibling owner stopped")
                 .cancelled
                 .contains(&right_identity)
         );

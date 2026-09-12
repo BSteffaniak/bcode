@@ -38,6 +38,10 @@ The public tree-cancellation path resolves and retains each selected run's autho
 uses owned intent writes, and passes those authorities into propagation. Selection remains
 a bounded descendant snapshot, not an atomic tree operation; newly admitted descendants
 and recursive/sibling owner signalling still require reconciliation.
+Cancellation intent does not prove owner termination. For every owner kind, admitted or
+running observations retain cancelling state, and deferred or unknown observations leave
+settlement pending. Only terminal owner observations can settle cancellation. This also
+applies to fail-fast sibling intent; a running sibling must not be recorded as stopped.
 
 ## Workflow-owned gate cancellation
 
