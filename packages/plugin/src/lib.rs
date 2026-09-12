@@ -1724,6 +1724,9 @@ impl LoadedPlugin {
 /// Plugin discovery/loading errors.
 #[derive(Debug, Error)]
 pub enum PluginLoadError {
+    /// The selected invocation bridge cannot be used by the plugin executor.
+    #[error("plugin '{plugin_id}' does not support asynchronous invocation bridges")]
+    UnsupportedAsyncBridge { plugin_id: String },
     /// An event dispatcher failed delivery or termination; the retained cause is stable.
     #[error("plugin '{plugin_id}' event dispatcher cleanup failed: {source}")]
     EventDispatcherCleanup {
@@ -2451,20 +2454,37 @@ fn next_plugin_invocation_id() -> PluginInvocationId {
     PluginInvocationId(NEXT_PLUGIN_INVOCATION_ID.fetch_add(1, Ordering::Relaxed))
 }
 
+type BridgeResult = Result<ServiceBridgeResponse, String>;
+
+enum InvocationBridgeHandler {
+    Synchronous(
+        Arc<
+            dyn Fn(ServiceBridgeRequest, bcode_plugin_sdk::ServiceCancellation) -> BridgeResult
+                + Send
+                + Sync,
+        >,
+    ),
+    Asynchronous(bcode_plugin_sdk::AsyncServiceBridge),
+}
+
 /// Thread-safe request/reply handler attached to one plugin invocation.
 #[derive(Clone)]
 pub struct PluginInvocationBridge {
-    handler: Arc<
-        dyn Fn(
-                ServiceBridgeRequest,
-                bcode_plugin_sdk::ServiceCancellation,
-            ) -> Result<ServiceBridgeResponse, String>
-            + Send
-            + Sync,
-    >,
+    handler: Arc<InvocationBridgeHandler>,
 }
 
 impl PluginInvocationBridge {
+    fn require_synchronous(&self, plugin_id: &str) -> Result<(), PluginLoadError> {
+        match self.handler.as_ref() {
+            InvocationBridgeHandler::Synchronous(_) => Ok(()),
+            InvocationBridgeHandler::Asynchronous(_) => {
+                Err(PluginLoadError::UnsupportedAsyncBridge {
+                    plugin_id: plugin_id.to_owned(),
+                })
+            }
+        }
+    }
+
     /// Create a bridge from a thread-safe request handler.
     #[must_use]
     pub fn new(
@@ -2477,7 +2497,55 @@ impl PluginInvocationBridge {
         + 'static,
     ) -> Self {
         Self {
-            handler: Arc::new(handler),
+            handler: Arc::new(InvocationBridgeHandler::Synchronous(Arc::new(handler))),
+        }
+    }
+
+    /// Create an owned asynchronous bridge handler without selecting an executor.
+    ///
+    /// Each returned future retains its request state until completion or drop. The handler
+    /// owns cancellation and cleanup policy; callers must retain admitted work as required.
+    #[must_use]
+    pub fn new_async<F, Fut>(handler: F) -> Self
+    where
+        F: Fn(ServiceBridgeRequest, bcode_plugin_sdk::ServiceCancellation) -> Fut
+            + Send
+            + Sync
+            + 'static,
+        Fut: std::future::Future<Output = Result<ServiceBridgeResponse, String>> + Send + 'static,
+    {
+        Self {
+            handler: Arc::new(InvocationBridgeHandler::Asynchronous(
+                bcode_plugin_sdk::AsyncServiceBridge::new(move |request, cancellation| {
+                    let future = handler(request, cancellation);
+                    async move {
+                        future
+                            .await
+                            .map_err(|_| bcode_plugin_sdk::ServiceBridgeError::Host { status: -1 })
+                    }
+                }),
+            )),
+        }
+    }
+
+    /// Execute an asynchronous host bridge request without a synchronous fallback.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if this bridge is synchronous or the handler rejects the request.
+    pub async fn request_async(
+        &self,
+        request: ServiceBridgeRequest,
+        cancellation: bcode_plugin_sdk::ServiceCancellation,
+    ) -> Result<ServiceBridgeResponse, String> {
+        match self.handler.as_ref() {
+            InvocationBridgeHandler::Asynchronous(handler) => handler
+                .request(request, cancellation)
+                .await
+                .map_err(|error| error.to_string()),
+            InvocationBridgeHandler::Synchronous(_) => {
+                Err("bridge requires synchronous execution".to_owned())
+            }
         }
     }
 
@@ -2491,7 +2559,12 @@ impl PluginInvocationBridge {
         request: ServiceBridgeRequest,
         cancellation: bcode_plugin_sdk::ServiceCancellation,
     ) -> Result<ServiceBridgeResponse, String> {
-        (self.handler)(request, cancellation)
+        match self.handler.as_ref() {
+            InvocationBridgeHandler::Synchronous(handler) => handler(request, cancellation),
+            InvocationBridgeHandler::Asynchronous(_) => {
+                Err("bridge requires asynchronous execution".to_owned())
+            }
+        }
     }
 }
 
@@ -3930,6 +4003,9 @@ impl PluginRuntimeHost {
         scope: PluginInvocationScope,
         bridge: Option<PluginInvocationBridge>,
     ) -> Result<ServiceResponse, PluginLoadError> {
+        if let Some(bridge) = &bridge {
+            bridge.require_synchronous(plugin_id)?;
+        }
         let interface_id = interface_id.into();
         let operation = operation.into();
         let executor = self
@@ -4039,6 +4115,9 @@ impl PluginRuntimeHost {
         scope: PluginInvocationScope,
         bridge: Option<PluginInvocationBridge>,
     ) -> Result<StreamingServiceInvocation, PluginLoadError> {
+        if let Some(bridge) = &bridge {
+            bridge.require_synchronous(plugin_id)?;
+        }
         let interface_id = interface_id.into();
         let operation = operation.into();
         let executor = self
@@ -6849,6 +6928,38 @@ library = "libexample_plugin.dylib"
         })
     }
 
+    #[tokio::test]
+    async fn invocation_bridge_async_waits_and_rejects_execution_mismatch() {
+        let request = || ServiceBridgeRequest::ReceiveInput {
+            invocation_id: "bridge-test".to_owned(),
+            timeout_ms: None,
+        };
+        let bridge = PluginInvocationBridge::new_async(|request, cancellation| async move {
+            tokio::task::yield_now().await;
+            hello_bridge_response(request, cancellation)
+        });
+        assert!(
+            bridge
+                .request(request(), bcode_plugin_sdk::ServiceCancellation::default())
+                .is_err()
+        );
+        assert_eq!(
+            bridge
+                .request_async(request(), bcode_plugin_sdk::ServiceCancellation::default())
+                .await
+                .unwrap(),
+            ServiceBridgeResponse::Input(bcode_tool::ToolInvocationInputResolution::Closed)
+        );
+        let synchronous =
+            PluginInvocationBridge::new(|_, _| panic!("must not invoke synchronous handler"));
+        assert!(
+            synchronous
+                .request_async(request(), bcode_plugin_sdk::ServiceCancellation::default())
+                .await
+                .is_err()
+        );
+    }
+
     fn assert_hello_plugin_bridge_and_cancellation(plugin: LoadedPlugin) {
         let plugin = Arc::new(plugin);
         let mut events = Vec::new();
@@ -6968,6 +7079,53 @@ library = "libexample_plugin.dylib"
                 .expect("example provider registered");
             assert_eq!(provider.plugin_id, "example.hello");
         }
+    }
+
+    #[tokio::test]
+    async fn synchronous_runtime_rejects_async_bridge_before_service_dispatch() {
+        let manifest = toml::from_str::<PluginManifest>(include_str!(
+            "../../../examples/hello-plugin/bcode-plugin.toml"
+        ))
+        .unwrap();
+        let host =
+            PluginHost::load_static_plugins(&[(manifest, bcode_hello_plugin::static_plugin())])
+                .unwrap();
+        let runtime = PluginRuntimeHost::from(host);
+        let bridge = PluginInvocationBridge::new_async(|_, _| async {
+            panic!("unsupported bridge must never run")
+        });
+        let result = runtime
+            .invoke_service_with_bridge_scoped(
+                "example.hello",
+                "example-hello/v1",
+                "emit-event",
+                Vec::new(),
+                PluginInvocationScope::Global,
+                Some(bridge.clone()),
+            )
+            .await;
+        assert!(matches!(
+            result,
+            Err(PluginLoadError::UnsupportedAsyncBridge { .. })
+        ));
+        let streaming = runtime
+            .invoke_service_with_events_and_bridge_scoped(
+                "example.hello",
+                "example-hello/v1",
+                "emit-event",
+                Vec::new(),
+                PluginInvocationScope::Global,
+                Some(bridge),
+            )
+            .await;
+        assert!(matches!(
+            streaming,
+            Err(PluginLoadError::UnsupportedAsyncBridge { .. })
+        ));
+        drop(streaming);
+        let status = runtime.executors.get("example.hello").unwrap().status();
+        drop(runtime);
+        assert_eq!(status.completed, 0);
     }
 
     #[tokio::test]

@@ -1242,6 +1242,142 @@ impl std::fmt::Display for ServiceBridgeError {
 
 impl std::error::Error for ServiceBridgeError {}
 
+type AsyncBridgeFuture = std::pin::Pin<
+    Box<dyn std::future::Future<Output = Result<ServiceBridgeResponse, ServiceBridgeError>> + Send>,
+>;
+
+/// Owned, in-process asynchronous request/reply bridge.
+///
+/// This Rust contract requires a matching SDK build; it is not a native ABI v4 extension.
+/// Each request owns its correlation scope. Handlers must cooperate with cancellation and
+/// retain any separately spawned work until cleanup is acknowledged. No executor is selected.
+#[derive(Clone)]
+pub struct AsyncServiceBridge {
+    handler:
+        Arc<dyn Fn(ServiceBridgeRequest, ServiceCancellation) -> AsyncBridgeFuture + Send + Sync>,
+}
+
+impl std::fmt::Debug for AsyncServiceBridge {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("AsyncServiceBridge")
+            .finish_non_exhaustive()
+    }
+}
+
+// Count encoded bytes without allocating a second copy of an untrusted payload.
+// Stop serialization at the limit; an oversized result is a lower bound, not an exact size.
+fn bounded_bridge_size(
+    value: &impl Serialize,
+    maximum: usize,
+) -> Result<usize, ServiceBridgeError> {
+    struct Counter {
+        bytes: usize,
+        maximum: usize,
+    }
+    impl std::io::Write for Counter {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.bytes = self.bytes.saturating_add(bytes.len()).min(self.maximum + 1);
+            if self.bytes > self.maximum {
+                return Err(std::io::Error::other("bridge size limit exceeded"));
+            }
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    let mut counter = Counter { bytes: 0, maximum };
+    let result = serde_json::to_writer(&mut counter, value);
+    if counter.bytes > maximum {
+        return Ok(counter.bytes);
+    }
+    result.map_err(|error| ServiceBridgeError::Encode(error.to_string()))?;
+    Ok(counter.bytes)
+}
+
+#[cfg(test)]
+mod bridge_size_tests {
+    #[test]
+    fn encoded_size_respects_exact_limits_and_escaping() {
+        for value in ["", "hello", "\"\\\n", "界🙂"] {
+            let expected = serde_json::to_vec(value).unwrap().len();
+            assert_eq!(
+                super::bounded_bridge_size(&value, expected).unwrap(),
+                expected
+            );
+            assert_eq!(
+                super::bounded_bridge_size(&value, expected - 1).unwrap(),
+                expected
+            );
+            assert_eq!(super::bounded_bridge_size(&value, 0).unwrap(), 1);
+        }
+        assert_eq!(
+            super::bounded_bridge_size(&"x".repeat(100_000), 16).unwrap(),
+            17
+        );
+    }
+}
+
+impl AsyncServiceBridge {
+    /// Create a bridge from an owned asynchronous handler.
+    #[must_use]
+    pub fn new<F, Fut>(handler: F) -> Self
+    where
+        F: Fn(ServiceBridgeRequest, ServiceCancellation) -> Fut + Send + Sync + 'static,
+        Fut: std::future::Future<Output = Result<ServiceBridgeResponse, ServiceBridgeError>>
+            + Send
+            + 'static,
+    {
+        Self {
+            handler: Arc::new(move |request, cancellation| {
+                Box::pin(handler(request, cancellation))
+            }),
+        }
+    }
+
+    /// Await a bounded, correlated reply without a synchronous fallback.
+    ///
+    /// Cancellation is checked before handler admission and after completion; the handler
+    /// receives the same cancellation signal to wake its own pending work.
+    /// Size validation stops at the limit without allocating encoded payloads; oversized
+    /// error sizes are lower bounds rather than exact encoded lengths.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for cancellation, encoding failure, oversized payloads, handler failure,
+    /// or a reply from a different operation family.
+    pub async fn request(
+        &self,
+        request: ServiceBridgeRequest,
+        cancellation: ServiceCancellation,
+    ) -> Result<ServiceBridgeResponse, ServiceBridgeError> {
+        if cancellation.is_cancelled() {
+            return Err(ServiceBridgeError::Cancelled);
+        }
+        let actual = bounded_bridge_size(&request, SERVICE_BRIDGE_MAX_REQUEST_BYTES)?;
+        if actual > SERVICE_BRIDGE_MAX_REQUEST_BYTES {
+            return Err(ServiceBridgeError::RequestTooLarge {
+                actual,
+                maximum: SERVICE_BRIDGE_MAX_REQUEST_BYTES,
+            });
+        }
+        let response = (self.handler)(request.clone(), cancellation.clone()).await;
+        if cancellation.is_cancelled() {
+            return Err(ServiceBridgeError::Cancelled);
+        }
+        let response = response?;
+        let required = bounded_bridge_size(&response, SERVICE_BRIDGE_MAX_RESPONSE_BYTES)?;
+        if required > SERVICE_BRIDGE_MAX_RESPONSE_BYTES {
+            return Err(ServiceBridgeError::ResponseTooLarge {
+                required,
+                maximum: SERVICE_BRIDGE_MAX_RESPONSE_BYTES,
+            });
+        }
+        validate_bridge_response_kind(&request, response)
+    }
+}
+
 /// Cloneable bounded request/reply bridge scoped to one native service invocation.
 #[derive(Debug, Clone, Default)]
 pub struct ServiceBridge {
