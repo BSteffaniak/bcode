@@ -84,12 +84,16 @@ successful consumption. Full, recent, and projection-window attach paths now als
 access, and model request construction registers model-context consumption. Shared low-level
 history reads used by indexing and background invariant selection are unchanged. Registration
 currently waits
-for a bounded record update rather than coalescing. Optional tracking failures emit a secret-safe
+for a bounded metadata operation. Session timestamps round **forward** to one-minute boundaries,
+coalescing record writes within each window without understating access age. The delay to compression
+is less than one minute; saturation at the maximum timestamp remains conservative. Each read still
+opens and locks the record and syncs the directory; this is not an asynchronous I/O optimization.
+Optional tracking failures emit a secret-safe
 warning and do not fail the successful content read; **automatic tiering remains disabled globally**,
 so these failures cannot authorize compression. Before maintenance can use this state, registration
 and maintenance must coordinate so pending/failed writes, untracked old clients, and the
-read-to-registration race cannot authorize compression based on stale age. Coalescing and durable
-degraded-state handling remain required before activating scheduling.
+read-to-registration race cannot authorize compression based on stale age. Durable degraded-state
+handling remains required before activating scheduling.
 
 ## Remaining implementation
 

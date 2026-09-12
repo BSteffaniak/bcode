@@ -12,6 +12,17 @@ use std::path::Path;
 const MAGIC: &[u8; 8] = b"BCACCESS";
 const VERSION: u64 = 1;
 const BYTES: usize = 64;
+// Round forward, never backward: coalescing may delay compression by at most one minute.
+const ACCESS_WINDOW_MS: u64 = 60_000;
+
+const fn conservative_access_time(now_ms: u64) -> u64 {
+    let remainder = now_ms % ACCESS_WINDOW_MS;
+    if remainder == 0 {
+        now_ms
+    } else {
+        now_ms.saturating_add(ACCESS_WINDOW_MS - remainder)
+    }
+}
 
 /// Successful application reads that influence storage temperature.
 #[derive(Debug, Clone, Copy)]
@@ -27,7 +38,8 @@ pub enum StorageAccessKind {
 /// A versioned access record. `observed_at_ms` never decreases.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct StorageAccessRecord {
-    /// Latest meaningful access, or conservative initialization time, in Unix milliseconds.
+    /// Conservative upper bound on latest meaningful access or initialization, in Unix ms.
+    /// Session-level recording rounds forward to coalesce writes, never making content look older.
     pub observed_at_ms: u64,
     /// Number of committed updates. Overflow fails closed rather than reusing a generation.
     pub generation: u64,
@@ -47,6 +59,9 @@ pub enum StorageAccessObservation {
 /// The metadata is optional and separate from canonical events. Callers must surface failures to
 /// the tiering coordinator; an error is not evidence that the previous timestamp is still valid.
 /// Only call after a successful meaningful read. This does not acquire maintenance authority.
+/// Timestamps round forward to one-minute boundaries. Reads within one boundary share a durable
+/// update; the rounding can only postpone eligibility, never accelerate it. No queued timestamp
+/// or in-memory cache is trusted instead of the locked record.
 ///
 /// # Errors
 ///
@@ -60,7 +75,7 @@ pub fn record_session_access(
 ) -> io::Result<StorageAccessRecord> {
     let root = root.canonicalize()?;
     let (mut file, directory_handle) = open_session_access_file(&root, session_id)?;
-    let result = record_access(&mut file, kind, now_ms)?;
+    let result = record_access(&mut file, kind, conservative_access_time(now_ms))?;
     directory_handle.sync_all()?;
     Ok(result)
 }
@@ -250,7 +265,7 @@ mod tests {
         fs::remove_file(&tracking).expect("remove test link");
         let record = record_session_access(root.path(), id, StorageAccessKind::History, 500)
             .expect("record");
-        assert_eq!(record.observed_at_ms, 500);
+        assert_eq!(record.observed_at_ms, ACCESS_WINDOW_MS);
         assert_eq!(
             fs::read(session.join("session.db")).expect("unchanged"),
             b"canonical bytes"
@@ -260,6 +275,44 @@ mod tests {
             observe_access(&mut file).expect("observe"),
             StorageAccessObservation::Recorded(record)
         );
+    }
+
+    #[test]
+    fn coalescing_never_understates_access_or_overflows() {
+        for now in [0, 1, 59_999, 60_000, 60_001, u64::MAX - 1, u64::MAX] {
+            let rounded = conservative_access_time(now);
+            assert!(rounded >= now);
+            assert!(rounded - now < ACCESS_WINDOW_MS);
+        }
+        assert_eq!(
+            conservative_access_time(1),
+            conservative_access_time(59_999)
+        );
+        assert_eq!(conservative_access_time(60_000), 60_000);
+        assert_eq!(conservative_access_time(60_001), 120_000);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn session_reads_in_same_window_share_one_committed_update() {
+        let root = tempfile::tempdir().expect("root");
+        let id = SessionId::new();
+        let session = root.path().join(id.to_string());
+        std::fs::create_dir(&session).expect("session");
+        std::fs::write(session.join("session.db"), b"canonical").expect("canonical");
+        let first =
+            record_session_access(root.path(), id, StorageAccessKind::History, 1).expect("first");
+        for now in [2, 30_000, 59_999, 60_000] {
+            assert_eq!(
+                record_session_access(root.path(), id, StorageAccessKind::Artifact, now)
+                    .expect("coalesced"),
+                first
+            );
+        }
+        let next = record_session_access(root.path(), id, StorageAccessKind::History, 60_001)
+            .expect("next");
+        assert_eq!(next.generation, first.generation + 1);
+        assert_eq!(next.observed_at_ms, 120_000);
     }
 
     #[test]
