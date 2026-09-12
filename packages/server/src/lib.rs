@@ -68098,18 +68098,20 @@ event_symbol = "bcode_plugin_handle_event_v1"
             })
             .await
             .expect("template admission");
-        let direct = bcode_workflow::WorkflowRunApplication::start_workflow_template(
-            &workflow_operations::WorkflowAuthoringApplication::new(&state, ClientId::new()),
-            bcode_workflow::WorkflowTemplateStartRequest {
-                owner_plugin_id: "bcode.shell".into(),
-                template_id: "external".into(),
-                template_version: 1,
-                run_id: Some("template-direct".into()),
-                workspace_snapshot: None,
-                parent_session_id: parent.id,
-                configuration: serde_json::json!({}),
-                limits: bcode_workflow::WorkflowRunLimits::default(),
-            },
+        let direct = Box::pin(
+            bcode_workflow::WorkflowRunApplication::start_workflow_template(
+                &workflow_operations::WorkflowAuthoringApplication::new(&state, ClientId::new()),
+                bcode_workflow::WorkflowTemplateStartRequest {
+                    owner_plugin_id: "bcode.shell".into(),
+                    template_id: "external".into(),
+                    template_version: 1,
+                    run_id: Some("template-direct".into()),
+                    workspace_snapshot: None,
+                    parent_session_id: parent.id,
+                    configuration: serde_json::json!({}),
+                    limits: bcode_workflow::WorkflowRunLimits::default(),
+                },
+            ),
         )
         .await
         .expect("direct template admission");

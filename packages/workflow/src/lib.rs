@@ -9368,13 +9368,27 @@ impl WorkflowAuthoringDocument {
     #[must_use]
     pub fn validation_report(&self) -> WorkflowValidationReport {
         match self.validate() {
-            Ok(()) => WorkflowValidationReport {
-                authoring_version: self.schema_version,
-                valid: true,
-                source_digest_sha256: self.source_digest_sha256().ok(),
-                executable_source_digest_sha256: self.executable_source_digest_sha256().ok(),
-                diagnostics: Vec::new(),
-            },
+            Ok(()) => {
+                let normalized = self.normalize_validated();
+                WorkflowValidationReport {
+                    authoring_version: self.schema_version,
+                    valid: true,
+                    source_digest_sha256: normalized
+                        .as_ref()
+                        .ok()
+                        .and_then(|document| canonical_sha256(document, "workflow").ok()),
+                    executable_source_digest_sha256: normalized.as_ref().ok().and_then(
+                        |document| {
+                            canonical_sha256(
+                                &document.executable_semantics(),
+                                "workflow.executable_source",
+                            )
+                            .ok()
+                        },
+                    ),
+                    diagnostics: Vec::new(),
+                }
+            }
             Err(WorkflowError::Build { path, message }) => WorkflowValidationReport {
                 authoring_version: self.schema_version,
                 valid: false,
@@ -9452,7 +9466,7 @@ impl WorkflowAuthoringDocument {
         let configuration =
             merge_authoring_configuration(self.configuration_defaults.as_ref(), configuration)?;
         validate_value_against_schema("configuration", &configuration, &self.configuration_schema)?;
-        let normalized = self.normalized()?;
+        let normalized = self.normalize_validated()?;
         let mut definition = normalized.definition;
         let mut run_limits = normalized.run_limits;
         let mut plugin_input_defaults = normalized.plugin_input_defaults.clone();
@@ -9692,6 +9706,12 @@ impl WorkflowAuthoringDocument {
     /// Returns an error when the source is invalid or an edge target cannot be remapped uniquely.
     pub fn normalized(&self) -> Result<Self, WorkflowError> {
         self.validate()?;
+        self.normalize_validated()
+    }
+
+    // Only for immutable documents validated by the enclosing operation. Public entry
+    // points must validate on every call; this is not a cross-call validation cache.
+    fn normalize_validated(&self) -> Result<Self, WorkflowError> {
         let mut normalized = self.clone();
         normalized.definition.entries.sort();
         normalized.definition.entries.dedup();
@@ -9862,9 +9882,7 @@ fn validate_value_against_schema(
     value: &serde_json::Value,
     schema: &ValueSchema,
 ) -> Result<(), WorkflowError> {
-    validate_runtime_value_schema(path, schema)?;
-    let validator = jsonschema::validator_for(&schema.schema)
-        .map_err(|error| authoring_error(path, format!("invalid schema: {error}")))?;
+    let validator = compile_runtime_value_schema(path, schema)?;
     validator
         .validate(value)
         .map_err(|error| authoring_error(path, format!("value does not match schema: {error}")))
@@ -10662,6 +10680,15 @@ struct RuntimeSchemaCounts {
 }
 
 fn validate_runtime_value_schema(path: &str, schema: &ValueSchema) -> Result<(), WorkflowError> {
+    compile_runtime_value_schema(path, schema).map(|_| ())
+}
+
+// Keep safety validation and compilation together so value checks reuse the validator
+// produced by schema admission rather than compiling the same schema a second time.
+fn compile_runtime_value_schema(
+    path: &str,
+    schema: &ValueSchema,
+) -> Result<jsonschema::Validator, WorkflowError> {
     if schema.type_name.trim().is_empty()
         || schema.type_name.len() > MAX_WORKFLOW_AUTHORING_ID_BYTES
     {
@@ -10692,8 +10719,7 @@ fn validate_runtime_value_schema(path: &str, schema: &ValueSchema) -> Result<(),
     validate_runtime_schema_value(path, &schema.schema, 0, &mut counts)?;
     validate_local_schema_references(path, &schema.schema)?;
     jsonschema::validator_for(&schema.schema)
-        .map_err(|error| authoring_error(path, format!("invalid JSON Schema: {error}")))?;
-    Ok(())
+        .map_err(|error| authoring_error(path, format!("invalid JSON Schema: {error}")))
 }
 
 fn validate_runtime_schema_value(
@@ -19966,6 +19992,32 @@ steps:
         assert_eq!(
             compiled.effects.maximum_capability,
             WorkflowToolCapability::Mutating
+        );
+    }
+
+    #[test]
+    fn validation_report_digests_match_public_normalization_and_revalidate_changes() {
+        let mut document = authored_document();
+        let report = document.validation_report();
+        assert!(report.is_valid());
+        assert_eq!(
+            report.source_digest_sha256,
+            Some(document.source_digest_sha256().unwrap())
+        );
+        assert_eq!(
+            report.executable_source_digest_sha256,
+            Some(document.executable_source_digest_sha256().unwrap())
+        );
+        document.schema_version += 1;
+        let invalid = document.validation_report();
+        assert!(!invalid.is_valid());
+        assert!(invalid.source_digest_sha256.is_none());
+        assert!(invalid.executable_source_digest_sha256.is_none());
+        assert!(document.normalized().is_err());
+        assert!(
+            !document
+                .compilation_preview(&authoring_catalog(), None)
+                .is_compiled()
         );
     }
 
