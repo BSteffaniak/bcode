@@ -10731,6 +10731,39 @@ async fn read_session_artifact_range(
     offset: u64,
     length: u32,
 ) -> Result<bcode_session_models::SessionArtifactRange, String> {
+    let range = read_session_artifact_range_untracked(
+        state,
+        session_id,
+        artifact_id,
+        reference_key,
+        offset,
+        length,
+    )
+    .await?;
+    if state
+        .sessions
+        .record_storage_access(
+            session_id,
+            bcode_session::storage_access::StorageAccessKind::Artifact,
+        )
+        .await
+        .is_err()
+    {
+        tracing::warn!(
+            "session artifact access tracking unavailable; automatic tiering remains disabled"
+        );
+    }
+    Ok(range)
+}
+
+async fn read_session_artifact_range_untracked(
+    state: &ServerState,
+    session_id: SessionId,
+    artifact_id: &str,
+    reference_key: &str,
+    offset: u64,
+    length: u32,
+) -> Result<bcode_session_models::SessionArtifactRange, String> {
     if length == 0 || length > MAX_ARTIFACT_RANGE_BYTES {
         return Err(format!(
             "artifact range length must be between 1 and {MAX_ARTIFACT_RANGE_BYTES} bytes"

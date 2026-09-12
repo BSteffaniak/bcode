@@ -3,9 +3,11 @@
 //! The caller owns path confinement, file creation, and scheduling. An empty file is unknown,
 //! never proof of inactivity. This store does not publish session events or use filesystem atime.
 
+use bcode_session_models::SessionId;
 use sha2::{Digest as _, Sha256};
 use std::fs::File;
 use std::io::{self, Read, Seek, SeekFrom, Write};
+use std::path::Path;
 
 const MAGIC: &[u8; 8] = b"BCACCESS";
 const VERSION: u64 = 1;
@@ -38,6 +40,77 @@ pub enum StorageAccessObservation {
     Unknown,
     /// A complete current record.
     Recorded(StorageAccessRecord),
+}
+
+/// Record access in the owning session directory without creating canonical session storage.
+///
+/// The metadata is optional and separate from canonical events. Callers must surface failures to
+/// the tiering coordinator; an error is not evidence that the previous timestamp is still valid.
+/// Only call after a successful meaningful read. This does not acquire maintenance authority.
+///
+/// # Errors
+///
+/// Returns an error for missing canonical storage, unsafe paths, nonregular metadata, contention,
+/// corrupt/future state, or I/O. On unsupported platforms it fails closed without creating files.
+pub fn record_session_access(
+    root: &Path,
+    session_id: SessionId,
+    kind: StorageAccessKind,
+    now_ms: u64,
+) -> io::Result<StorageAccessRecord> {
+    let root = root.canonicalize()?;
+    let (mut file, directory_handle) = open_session_access_file(&root, session_id)?;
+    let result = record_access(&mut file, kind, now_ms)?;
+    directory_handle.sync_all()?;
+    Ok(result)
+}
+
+#[cfg(unix)]
+fn open_session_access_file(root: &Path, session_id: SessionId) -> io::Result<(File, File)> {
+    use std::ffi::CString;
+    use std::os::fd::{AsRawFd as _, FromRawFd as _};
+    use std::os::unix::fs::MetadataExt as _;
+    fn child(parent: &File, name: &std::ffi::CStr, flags: i32) -> io::Result<File> {
+        // SAFETY: parent is an owned valid descriptor, name is NUL-terminated, and the returned
+        // descriptor is transferred exactly once into File. All traversal is relative to handles.
+        let fd = unsafe {
+            libc::openat(
+                parent.as_raw_fd(),
+                name.as_ptr(),
+                flags | libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_NONBLOCK,
+                0o600,
+            )
+        };
+        if fd < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        // SAFETY: openat returned a fresh descriptor owned by this function.
+        Ok(unsafe { File::from_raw_fd(fd) })
+    }
+    let root = File::open(root)?;
+    let name = CString::new(session_id.to_string()).map_err(|_| invalid())?;
+    let directory = child(&root, &name, libc::O_RDONLY | libc::O_DIRECTORY)?;
+    let canonical = child(&directory, c"session.db", libc::O_RDONLY)?;
+    if !canonical.metadata()?.is_file() {
+        return Err(invalid());
+    }
+    let file = child(
+        &directory,
+        c"storage-access.bin",
+        libc::O_RDWR | libc::O_CREAT,
+    )?;
+    if !file.metadata()?.is_file() || file.metadata()?.nlink() != 1 {
+        return Err(invalid());
+    }
+    Ok((file, directory))
+}
+
+#[cfg(not(unix))]
+fn open_session_access_file(_root: &Path, _session_id: SessionId) -> io::Result<(File, File)> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "confined storage access tracking is unavailable on this platform",
+    ))
 }
 
 fn invalid() -> io::Error {
@@ -153,6 +226,41 @@ fn update_locked(file: &mut File, now_ms: u64) -> io::Result<StorageAccessRecord
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn session_tracking_requires_canonical_storage_and_rejects_links() {
+        use std::fs;
+        use std::os::unix::fs::symlink;
+        let root = tempfile::tempdir().expect("root");
+        let id = SessionId::new();
+        assert!(record_session_access(root.path(), id, StorageAccessKind::History, 1).is_err());
+        let session = root.path().join(id.to_string());
+        assert!(!session.exists());
+        fs::create_dir(&session).expect("session");
+        fs::write(session.join("session.db"), b"canonical bytes").expect("canonical");
+        let outside = tempfile::NamedTempFile::new().expect("outside");
+        let tracking = session.join("storage-access.bin");
+        symlink(outside.path(), &tracking).expect("symlink");
+        assert!(record_session_access(root.path(), id, StorageAccessKind::History, 1).is_err());
+        assert_eq!(outside.as_file().metadata().expect("metadata").len(), 0);
+        fs::remove_file(&tracking).expect("remove test link");
+        fs::hard_link(outside.path(), &tracking).expect("hard link");
+        assert!(record_session_access(root.path(), id, StorageAccessKind::History, 1).is_err());
+        fs::remove_file(&tracking).expect("remove test link");
+        let record = record_session_access(root.path(), id, StorageAccessKind::History, 500)
+            .expect("record");
+        assert_eq!(record.observed_at_ms, 500);
+        assert_eq!(
+            fs::read(session.join("session.db")).expect("unchanged"),
+            b"canonical bytes"
+        );
+        let mut file = File::open(tracking).expect("open");
+        assert_eq!(
+            observe_access(&mut file).expect("observe"),
+            StorageAccessObservation::Recorded(record)
+        );
+    }
 
     #[test]
     fn unknown_then_monotonic_and_duplicate_safe() {

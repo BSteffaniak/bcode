@@ -35,6 +35,9 @@ tokio = { workspace = true, features = ["macros", "rt", "sync"] }
 tracing = { workspace = true }
 zstd = { workspace = true }
 
+[target.'cfg(unix)'.dependencies]
+libc = { workspace = true }
+
 [dev-dependencies]
 tempfile = { workspace = true }
 

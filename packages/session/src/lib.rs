@@ -867,6 +867,30 @@ impl SessionManager {
         .map_err(|_| std::io::Error::other("storage measurement task failed"))?
     }
 
+    /// Record successful application consumption independently of canonical history.
+    ///
+    /// In-memory sessions have no durable tracking. Callers must not use this for catalog or
+    /// index scans. Tracking failures are reported, never converted into old access age.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for unsafe paths, missing storage, tracking contention/damage, or I/O.
+    pub async fn record_storage_access(
+        &self,
+        session_id: SessionId,
+        kind: storage_access::StorageAccessKind,
+    ) -> std::io::Result<()> {
+        let Some(root) = self.session_store_root() else {
+            return Ok(());
+        };
+        let now_ms = current_unix_millis();
+        tokio::task::spawn_blocking(move || {
+            storage_access::record_session_access(&root, session_id, kind, now_ms).map(|_| ())
+        })
+        .await
+        .map_err(|_| std::io::Error::other("storage access task failed"))?
+    }
+
     /// Return the configured runtime lease owner identity.
     #[must_use]
     pub fn session_lease_owner(&self) -> Option<SessionLeaseOwnerContext> {

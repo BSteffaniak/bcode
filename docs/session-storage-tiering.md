@@ -60,7 +60,7 @@ artifacts, and ownership not verifiably released all defer. These facts are supp
 the decision is not authorization and must be rechecked under durable maintenance ownership.
 Access tracking integration and the scheduler/config adapter remain to be implemented.
 
-### Access-record persistence primitive (not wired to reads)
+### Access-record persistence and initial read integration
 
 `storage_access` implements bounded observation and durable updates on caller-supplied confined
 file handles. The fixed 64-byte record carries a magic identifier, version, timestamp, monotonically
@@ -73,11 +73,21 @@ maintenance rather than falling back to an older timestamp that could incorrectl
 
 Meaningful access includes explicit history navigation/inspection/attach/export, original artifact
 reads, and model-context consumption. Catalog, indexing, and maintenance scans are excluded.
-The primitive does not create files or choose paths, and is not called on production read paths yet.
-Its caller must own safe path creation, coalescing, lifecycle, and error handling. Before maintenance
-can use this state, access registration and maintenance must coordinate so pending/failed writes,
-untracked old clients, and the read-to-registration race cannot authorize compression based on stale
-age. Do not hide a failed access update and continue tiering from the previous timestamp.
+The low-level handle API remains path-neutral. A session-owned adapter now creates
+`<session-id>/storage-access.bin` only when canonical storage already exists. Unix traversal uses
+relative directory descriptors and no-follow opens; tracking hard links and nonregular files are
+rejected. The record and directory entry are synced. Other platforms currently report unsupported
+tracking without creating metadata.
+
+Explicit application history page/window/inspection/export and artifact range reads now register
+successful consumption. Shared low-level history reads used by indexing are unchanged. Attach,
+projection-window, and model-context integration remain incomplete. Registration currently waits
+for a bounded record update rather than coalescing. Optional tracking failures emit a secret-safe
+warning and do not fail the successful content read; **automatic tiering remains disabled globally**,
+so these failures cannot authorize compression. Before maintenance can use this state, registration
+and maintenance must coordinate so pending/failed writes, untracked old clients, and the
+read-to-registration race cannot authorize compression based on stale age. Coalescing and durable
+degraded-state handling remain required before activating scheduling.
 
 ## Remaining implementation
 

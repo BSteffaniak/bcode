@@ -377,7 +377,9 @@ pub async fn complete_history(
     {
         return Err(ReadHistoryError::IncompatibleActiveNamespace(namespace));
     }
-    Ok(state.sessions.session_history(session_id).await?)
+    let history = state.sessions.session_history(session_id).await?;
+    record_history_access(state, session_id).await;
+    Ok(history)
 }
 
 /// Return one bounded semantic session-inspection page without transport framing.
@@ -393,10 +395,12 @@ pub async fn inspect(
     {
         return Err(ReadHistoryError::IncompatibleActiveNamespace(namespace));
     }
-    Ok(state
+    let page = state
         .sessions
         .session_inspection_page(session_id, query)
-        .await?)
+        .await?;
+    record_history_access(state, session_id).await;
+    Ok(page)
 }
 
 /// Measure one session's physical files without reading canonical history.
@@ -438,10 +442,12 @@ pub async fn history_page(
     {
         return Err(ReadHistoryError::IncompatibleActiveNamespace(namespace));
     }
-    Ok(state
+    let page = state
         .sessions
         .session_history_page(session_id, query)
-        .await?)
+        .await?;
+    record_history_access(state, session_id).await;
+    Ok(page)
 }
 
 /// Return one bounded history window around a sequence without transport framing.
@@ -457,10 +463,30 @@ pub async fn history_around(
     {
         return Err(ReadHistoryError::IncompatibleActiveNamespace(namespace));
     }
-    Ok(state
+    let window = state
         .sessions
         .session_history_around(session_id, query)
-        .await?)
+        .await?;
+    record_history_access(state, session_id).await;
+    Ok(window)
+}
+
+async fn record_history_access(state: &ServerState, session_id: bcode_session_models::SessionId) {
+    if state
+        .sessions
+        .record_storage_access(
+            session_id,
+            bcode_session::storage_access::StorageAccessKind::History,
+        )
+        .await
+        .is_err()
+    {
+        // Optional tracking must not make otherwise healthy canonical reads unavailable. Automatic
+        // tiering remains disabled until durable degraded-state/maintenance coordination exists.
+        tracing::warn!(
+            "session storage access tracking unavailable; automatic tiering remains disabled"
+        );
+    }
 }
 
 /// Request canonical turn cancellation through the queued command path.
