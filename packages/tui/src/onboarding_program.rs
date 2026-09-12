@@ -319,42 +319,43 @@ impl OnboardingProgram {
 }
 
 async fn discover_setup_models() -> Result<super::setup_settings_form::SetupSettingsForm, String> {
-    let (config, context, provider, local, client) = tokio::task::spawn_blocking(|| {
-        let mut config = bcode_config::load_config().map_err(|_| "Cannot load configuration".to_owned())?;
-        let context = config.active_context.clone().ok_or_else(|| "Select a context before discovering account-specific models.".to_owned())?;
-        let accounts = &config.contexts.as_ref().ok_or_else(|| "Missing contexts".to_owned())?.entries[&context].auth.profiles;
-        if accounts.len() != 1 { return Err("Model discovery currently requires exactly one declared account in the selected context. Select a model profile for multi-account setups.".to_owned()); }
-        let (local, account) = accounts.iter().next().ok_or_else(|| "Connect an account first".to_owned())?;
-        let local = local.clone();
-        let provider = account.owner_plugin_id.clone().ok_or_else(|| "Account ownership is missing".to_owned())?;
-        let definition = config.contexts.as_mut().unwrap().entries.get_mut(&context).unwrap();
-        definition.model.provider_plugin_id = Some(provider.clone());
-        definition.model.auth_profile = Some(local.clone());
-        definition.model.profile = None;
-        definition.model.auth_pool = None;
-        let encoded = bcode_config::encode_effective_config(&config).map_err(|_| "Cannot prepare discovery".to_owned())?;
-        let resolved = bcode_config::load_config_from_paths_with_overrides(&[], &bcode_config::ConfigLoadOverrides::default().with_cli_config_toml(Some(encoded))).map_err(|_| "Cannot resolve discovery context".to_owned())?;
-        let selection = resolved.resolved_model_selection();
-        let auth = bcode_provider_auth::try_resolve_provider_request_context(bcode_provider_auth::ProviderRequestContextResolution { config: &resolved, selection }).map_err(|_| "Account is unavailable".to_owned())?;
+    let (snapshot, discovery, client) = tokio::task::spawn_blocking(|| {
+        let snapshot = bcode_config::load_config().map_err(|_| "Cannot load configuration".to_owned())?;
+        let discovery = bcode_config::contexts::prepare_model_discovery(&snapshot, None)
+            .map_err(|_| "Select a context and account before discovering models. Ambiguous accounts are not chosen automatically.".to_owned())?;
+        let selection = discovery.config.resolved_model_selection();
+        let auth = bcode_provider_auth::try_resolve_provider_request_context(bcode_provider_auth::ProviderRequestContextResolution {
+            config: &discovery.config, selection,
+        }).map_err(|_| "Account is unavailable".to_owned())?;
         let runtime = bcode_ipc::ClientRuntimeContext {
-            effective_config_toml: Some(Box::new(bcode_config::encode_effective_config(&resolved).map_err(|_| "Cannot encode discovery context".to_owned())?)),
-            selected_provider_plugin_id: Some(provider.clone()), provider_context: auth,
+            effective_config_toml: Some(Box::new(bcode_config::encode_effective_config(&discovery.config).map_err(|_| "Cannot encode discovery context".to_owned())?)),
+            selected_provider_plugin_id: Some(discovery.provider_plugin_id.clone()), provider_context: auth,
             ..Default::default()
         };
-        let client = bcode_client::BcodeClient::default_endpoint().with_runtime_context(Some(runtime));
-        Ok::<_, String>((resolved, context, provider, local, client))
+        let client = bcode_client::BcodeClient::new(bcode_ipc::default_endpoint())
+            .with_daemon_availability(bcode_client::DaemonAvailability::AutoStart)
+            .with_runtime_context(Some(runtime));
+        Ok::<_, String>((snapshot, discovery, client))
     }).await.map_err(|_| "Could not prepare model discovery".to_owned())??;
     let models = client
-        .session_model_list(Some(provider.clone()))
+        .session_model_list(Some(discovery.provider_plugin_id.clone()))
         .await
         .map_err(|_| "Model discovery failed. Check Connections and retry.".to_owned())?;
-    let _ = config;
+    let current = tokio::task::spawn_blocking(bcode_config::load_config)
+        .await
+        .map_err(|_| "Cannot recheck discovery configuration".to_owned())?
+        .map_err(|_| "Configuration changed or became unavailable during discovery".to_owned())?;
+    if current != snapshot {
+        return Err(
+            "Configuration changed during discovery. Review the context and retry.".to_owned(),
+        );
+    }
     Ok(
         super::setup_settings_form::SetupSettingsForm::discovered_models(
             &bcode_config::default_config_dir().join("bcode.toml"),
-            Some(context),
-            provider,
-            local,
+            Some(discovery.context),
+            discovery.provider_plugin_id,
+            discovery.account,
             models,
         ),
     )

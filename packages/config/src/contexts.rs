@@ -39,6 +39,81 @@ pub struct ContextDefinition {
     pub auth: AuthConfig,
 }
 
+/// Configuration prepared for discovery using one explicitly selected context account.
+pub struct ContextModelDiscovery {
+    /// Resolved request configuration; no ambient layers are loaded during preparation.
+    pub config: crate::BcodeConfig,
+    /// Stable context ID.
+    pub context: String,
+    /// Local account name for an eventual reviewed model-selection edit.
+    pub account: String,
+    /// Registered provider plugin declared by the account.
+    pub provider_plugin_id: String,
+}
+
+/// Prepare discovery from a context snapshot and optional local account selection.
+/// Uses the selected model's account, or the sole declared account, when no override is supplied.
+///
+/// # Errors
+/// Rejects absent contexts/accounts, ambiguous account selection, and missing ownership.
+pub fn prepare_model_discovery(
+    config: &crate::BcodeConfig,
+    account: Option<&str>,
+) -> Result<ContextModelDiscovery, ConfigError> {
+    let context = config
+        .active_context
+        .as_deref()
+        .ok_or_else(|| invalid("select a context before discovering models"))?;
+    let definition = config
+        .contexts
+        .as_ref()
+        .and_then(|contexts| contexts.entries.get(context))
+        .ok_or_else(|| invalid("selected context definition is missing"))?;
+    let selected = definition
+        .model
+        .profile
+        .as_ref()
+        .and_then(|name| definition.model.profiles.get(name))
+        .and_then(|profile| profile.auth_profile.as_deref())
+        .or(definition.model.auth_profile.as_deref());
+    let account = account.or(selected).or_else(|| {
+        (definition.auth.profiles.len() == 1).then(|| definition.auth.profiles.keys().next().map(String::as_str)).flatten()
+    }).ok_or_else(|| invalid("select an account before discovering models; multiple accounts are not chosen automatically"))?;
+    let profile = definition
+        .auth
+        .profiles
+        .get(account)
+        .ok_or_else(|| invalid("selected discovery account is not declared"))?;
+    let provider = profile
+        .owner_plugin_id
+        .as_deref()
+        .filter(|owner| !owner.trim().is_empty())
+        .ok_or_else(|| invalid("discovery account provider ownership is missing"))?;
+    let mut snapshot = config.clone();
+    let model = &mut snapshot
+        .contexts
+        .as_mut()
+        .ok_or_else(|| invalid("missing contexts"))?
+        .entries
+        .get_mut(context)
+        .ok_or_else(|| invalid("missing context"))?
+        .model;
+    model.provider_plugin_id = Some(provider.to_owned());
+    model.auth_profile = Some(account.to_owned());
+    model.profile = None;
+    model.auth_pool = None;
+    let mut value =
+        toml::Value::try_from(snapshot).map_err(|_| invalid("cannot encode discovery snapshot"))?;
+    resolve(&mut value)?;
+    let config = crate::validate_config_value(value, "context discovery")?;
+    Ok(ContextModelDiscovery {
+        config,
+        context: context.to_owned(),
+        account: account.to_owned(),
+        provider_plugin_id: provider.to_owned(),
+    })
+}
+
 fn invalid(message: &str) -> ConfigError {
     ConfigError::Composition {
         message: message.to_owned(),
@@ -377,6 +452,55 @@ scheme = "oauth"
             crate::decode_effective_config(&crate::encode_effective_config(&forged).unwrap())
                 .is_err()
         );
+    }
+
+    #[test]
+    fn discovery_uses_selected_account_and_does_not_reload_ambient_layers() {
+        let mut config = fixture("alpha");
+        let definition = config
+            .contexts
+            .as_mut()
+            .unwrap()
+            .entries
+            .get_mut("alpha")
+            .unwrap();
+        let mut other = definition.auth.profiles["account"].clone();
+        other.owner_plugin_id = Some("other.plugin".to_owned());
+        definition.auth.profiles.insert("second".to_owned(), other);
+        let discovery = prepare_model_discovery(&config, None).unwrap();
+        assert_eq!(discovery.account, "account");
+        assert_eq!(discovery.provider_plugin_id, "example.plugin");
+        assert!(discovery.config.model.auth_pool.is_none());
+        assert_eq!(
+            discovery.config.model.auth_profile.as_deref(),
+            Some(qualify("alpha", "account").unwrap().as_str())
+        );
+        assert!(
+            crate::decode_effective_config(
+                &crate::encode_effective_config(&discovery.config).unwrap()
+            )
+            .is_ok()
+        );
+        let selected = prepare_model_discovery(&config, Some("second")).unwrap();
+        assert_eq!(selected.provider_plugin_id, "other.plugin");
+        assert_eq!(
+            config.contexts.as_ref().unwrap().entries["alpha"]
+                .model
+                .profile
+                .as_deref(),
+            Some("fast")
+        );
+        let definition = config
+            .contexts
+            .as_mut()
+            .unwrap()
+            .entries
+            .get_mut("alpha")
+            .unwrap();
+        definition.model.profile = None;
+        definition.model.auth_profile = None;
+        assert!(prepare_model_discovery(&config, None).is_err());
+        assert!(prepare_model_discovery(&config, Some("missing")).is_err());
     }
 
     #[test]
