@@ -183,6 +183,28 @@ pub async fn compress_finalized_artifact(
     .await
 }
 
+/// Cancellation shared between an async maintenance caller and its blocking codec work.
+#[derive(Debug, Clone, Default)]
+pub struct ArtifactMaintenanceCancellation(std::sync::Arc<std::sync::atomic::AtomicBool>);
+
+impl ArtifactMaintenanceCancellation {
+    /// Request cancellation before publication. Committed publication is never rolled back.
+    pub fn cancel(&self) {
+        self.0.store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    fn check(&self) -> io::Result<()> {
+        if self.0.load(std::sync::atomic::Ordering::SeqCst) {
+            Err(io::Error::new(
+                io::ErrorKind::Interrupted,
+                "artifact maintenance cancelled",
+            ))
+        } else {
+            Ok(())
+        }
+    }
+}
+
 /// Compress a finalized reference only if its durable access age still meets the supplied policy.
 ///
 /// # Errors
@@ -197,6 +219,36 @@ pub async fn compress_finalized_artifact_with_age(
     minimum_saved_bytes: u64,
     age: Option<(u64, u64)>,
 ) -> io::Result<ArtifactStorageOutcome> {
+    compress_finalized_artifact_cancellable(
+        sessions_root,
+        session_id,
+        artifact_id,
+        reference_key,
+        compression,
+        minimum_saved_bytes,
+        age,
+        ArtifactMaintenanceCancellation::default(),
+    )
+    .await
+}
+
+/// Run verified maintenance with end-to-end cooperative cancellation.
+///
+/// # Errors
+/// Returns the same safety/IO failures as age-checked maintenance, or `Interrupted` if cancelled
+/// before publication. The caller must await completion after requesting cancellation.
+#[allow(clippy::too_many_arguments)]
+pub async fn compress_finalized_artifact_cancellable(
+    sessions_root: &Path,
+    session_id: SessionId,
+    artifact_id: &str,
+    reference_key: &str,
+    compression: ArtifactCompression,
+    minimum_saved_bytes: u64,
+    age: Option<(u64, u64)>,
+    cancellation: ArtifactMaintenanceCancellation,
+) -> io::Result<ArtifactStorageOutcome> {
+    cancellation.check()?;
     let root = sessions_root.canonicalize()?;
     let session = confined(&root.join(session_id.to_string()), &root)?;
     if !fs::symlink_metadata(session.join("session.db"))?.is_file() {
@@ -268,6 +320,7 @@ pub async fn compress_finalized_artifact_with_age(
         .to_path_buf();
     let expected_bytes = reference.byte_len.ok_or_else(invalid)?;
     tokio::task::spawn_blocking(move || {
+        cancellation.check()?;
         let artifacts = confined(
             &root.join("session-artifacts").join(session_id.to_string()),
             &root,
@@ -284,7 +337,7 @@ pub async fn compress_finalized_artifact_with_age(
             &relative,
             compression,
             minimum_saved_bytes,
-            || Ok(()),
+            || cancellation.check(),
             maintenance,
         )
     })
@@ -539,6 +592,28 @@ fn exchange(_parent: &File, _parent_path: &Path, _left: &Path, _right: &Path) ->
 #[cfg(all(test, any(target_os = "macos", target_os = "linux")))]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn cancelled_verified_maintenance_does_not_touch_missing_storage() {
+        let root = tempfile::tempdir().expect("root");
+        let cancellation = ArtifactMaintenanceCancellation::default();
+        cancellation.cancel();
+        let id = SessionId::new();
+        let error = compress_finalized_artifact_cancellable(
+            root.path(),
+            id,
+            "artifact",
+            "recording",
+            ArtifactCompression::Light,
+            1,
+            None,
+            cancellation,
+        )
+        .await
+        .expect_err("cancelled");
+        assert_eq!(error.kind(), io::ErrorKind::Interrupted);
+        assert_eq!(fs::read_dir(root.path()).expect("root entries").count(), 0);
+    }
 
     #[test]
     fn publication_rejects_replaced_parent_without_touching_replacement() {

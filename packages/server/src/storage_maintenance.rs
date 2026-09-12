@@ -9,7 +9,9 @@ mod tests;
 
 use super::ServerState;
 use bcode_session::artifact_compression::ArtifactCompression;
-use bcode_session::artifact_storage::compress_finalized_artifact_with_age;
+use bcode_session::artifact_storage::{
+    ArtifactMaintenanceCancellation, compress_finalized_artifact_cancellable,
+};
 use bcode_session::storage_access::{StorageAccessObservation, observe_access};
 use bcode_session_models::SessionId;
 use std::sync::Arc;
@@ -159,7 +161,9 @@ async fn maintain_session_at(
                 return Ok(None);
             }
             cursor = Some((artifact.clone(), reference.clone()));
-            if compress_finalized_artifact_with_age(
+            let cancellation = ArtifactMaintenanceCancellation::default();
+            let mut shutdown = state.subscribe_shutdown();
+            let conversion = compress_finalized_artifact_cancellable(
                 root,
                 id,
                 &artifact,
@@ -167,10 +171,20 @@ async fn maintain_session_at(
                 compression,
                 4096,
                 Some((now, minimum_age)),
-            )
-            .await
-            .is_err()
-            {
+                cancellation.clone(),
+            );
+            tokio::pin!(conversion);
+            let outcome = tokio::select! {
+                biased;
+                _ = shutdown.recv() => {
+                    cancellation.cancel();
+                    // A blocking codec task cannot be aborted by dropping its async waiter.
+                    // Keep awaiting so the maintenance fence outlives actual IO completion.
+                    conversion.await
+                }
+                outcome = &mut conversion => outcome,
+            };
+            if outcome.is_err() {
                 tracing::debug!("automatic artifact candidate deferred");
             }
         }

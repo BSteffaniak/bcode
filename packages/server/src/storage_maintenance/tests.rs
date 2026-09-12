@@ -180,6 +180,44 @@ async fn scheduler_recent_access_and_damage_defer_but_cold_content_reaches_deep_
 }
 
 #[tokio::test]
+async fn worker_shutdown_before_first_poll_starts_no_compression() {
+    let (root, state, id, artifacts, _) = fixture(1).await;
+    let state = Arc::new(state);
+    state.request_shutdown();
+    tokio::time::timeout(Duration::from_secs(2), run(Arc::clone(&state)))
+        .await
+        .expect("worker stops");
+    drop(state);
+    assert!(artifacts.join("recording-000").is_file());
+    assert!(
+        !artifacts
+            .join(".recording-000.compression-pending")
+            .exists()
+    );
+    assert!(
+        root.path()
+            .join(id.to_string())
+            .join("session.db")
+            .is_file()
+    );
+}
+
+#[tokio::test]
+async fn worker_waiting_between_ticks_stops_on_shutdown() {
+    let (_root, state, _id, artifacts, _) = fixture(1).await;
+    let state = Arc::new(state);
+    let worker = tokio::spawn(run(Arc::clone(&state)));
+    tokio::task::yield_now().await;
+    state.request_shutdown();
+    tokio::time::timeout(Duration::from_secs(2), worker)
+        .await
+        .expect("bounded shutdown")
+        .expect("worker");
+    drop(state);
+    assert!(artifacts.join("recording-000").is_file());
+}
+
+#[tokio::test]
 async fn scheduler_respects_disable_and_live_ownership() {
     let (root, state, id, artifacts, _) = fixture(1).await;
     let mut config = bcode_config::BcodeConfig::default();

@@ -217,6 +217,16 @@ of every reader participant without making optional maintenance block unrelated 
 Until that integration exists, the worker remains unstarted; this primitive alone does not prove
 that stale timestamps from other daemons are safe.
 
+## Worker cancellation
+
+The scheduled conversion path now supplies a shared cancellation token through verified maintenance
+into blocking encode/verify work. Shutdown requests cancellation and then awaits actual completion;
+it does not drop the async waiter and mistakenly release maintenance ownership while IO continues.
+Cancellation is checked before storage access and between codec chunks. Tests cover cancellation
+before touching missing storage, worker shutdown before first poll, and shutdown between ticks.
+Normal daemon startup still does not launch the worker: multi-daemon tracking-health coordination
+and its lifecycle registration remain incomplete.
+
 ## Remaining implementation
 
 ### Access policy and scheduling
