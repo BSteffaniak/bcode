@@ -122,6 +122,32 @@ pub async fn compress_finalized_artifact(
     compression: ArtifactCompression,
     minimum_saved_bytes: u64,
 ) -> io::Result<ArtifactStorageOutcome> {
+    compress_finalized_artifact_with_age(
+        sessions_root,
+        session_id,
+        artifact_id,
+        reference_key,
+        compression,
+        minimum_saved_bytes,
+        None,
+    )
+    .await
+}
+
+/// Compress a finalized reference only if its durable access age still meets the supplied policy.
+///
+/// # Errors
+/// Returns an error for unknown/stale access evidence or any finalized maintenance failure.
+#[allow(clippy::too_many_arguments)]
+pub async fn compress_finalized_artifact_with_age(
+    sessions_root: &Path,
+    session_id: SessionId,
+    artifact_id: &str,
+    reference_key: &str,
+    compression: ArtifactCompression,
+    minimum_saved_bytes: u64,
+    age: Option<(u64, u64)>,
+) -> io::Result<ArtifactStorageOutcome> {
     let root = sessions_root.canonicalize()?;
     let session = confined(&root.join(session_id.to_string()), &root)?;
     if !fs::symlink_metadata(session.join("session.db"))?.is_file() {
@@ -129,6 +155,20 @@ pub async fn compress_finalized_artifact(
     }
     let maintenance = crate::lease::acquire_session_maintenance_guard(&root, session_id)
         .map_err(io::Error::other)?;
+    if let Some((now_ms, minimum_age_ms)) = age {
+        let mut access = File::open(session.join("storage-access.bin"))?;
+        let crate::storage_access::StorageAccessObservation::Recorded(record) =
+            crate::storage_access::observe_access(&mut access)?
+        else {
+            return Err(invalid());
+        };
+        if now_ms
+            .checked_sub(record.observed_at_ms)
+            .is_none_or(|elapsed| elapsed < minimum_age_ms)
+        {
+            return Ok(ArtifactStorageOutcome::Unchanged);
+        }
+    }
     let db = crate::db::SessionDb::open_existing_turso_in_root(session_id, &root)
         .await
         .map_err(io::Error::other)?;
