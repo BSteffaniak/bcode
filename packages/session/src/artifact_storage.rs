@@ -364,6 +364,7 @@ fn compress_artifact_with_maintenance(
     )?;
     let path = confined(&root.join(relative_artifact_path), &root)?;
     let parent = path.parent().ok_or_else(invalid)?;
+    let parent_handle = File::open(parent)?;
     let name = path
         .file_name()
         .ok_or_else(invalid)?
@@ -407,10 +408,10 @@ fn compress_artifact_with_maintenance(
     };
     #[cfg(test)]
     crash_boundary("prepared");
-    exchange(&path, &staging)?;
+    exchange(&parent_handle, parent, &path, &staging)?;
     #[cfg(test)]
     crash_boundary("exchanged");
-    File::open(parent)?.sync_all()?;
+    parent_handle.sync_all()?;
     #[cfg(test)]
     crash_boundary("committed");
     drop(original);
@@ -443,20 +444,42 @@ fn remove_container(path: &Path) -> io::Result<()> {
 }
 
 #[cfg(any(target_os = "macos", target_os = "linux"))]
-fn exchange(left: &Path, right: &Path) -> io::Result<()> {
+fn exchange(parent: &File, parent_path: &Path, left: &Path, right: &Path) -> io::Result<()> {
+    use std::os::fd::AsRawFd as _;
     use std::os::unix::ffi::OsStrExt as _;
-    let left = std::ffi::CString::new(left.as_os_str().as_bytes()).map_err(|_| invalid())?;
-    let right = std::ffi::CString::new(right.as_os_str().as_bytes()).map_err(|_| invalid())?;
-    // SAFETY: both strings are valid NUL-terminated paths, and the atomic exchange operates only
-    // on the already-confined same-parent paths while exclusive session maintenance is held.
+    use std::os::unix::fs::MetadataExt as _;
+    let pinned = parent.metadata()?;
+    let current = fs::symlink_metadata(parent_path)?;
+    if !current.is_dir()
+        || pinned.dev() != current.dev()
+        || pinned.ino() != current.ino()
+        || left.parent() != Some(parent_path)
+        || right.parent() != Some(parent_path)
+    {
+        return Err(invalid());
+    }
+    let left = std::ffi::CString::new(left.file_name().ok_or_else(invalid)?.as_bytes())
+        .map_err(|_| invalid())?;
+    let right = std::ffi::CString::new(right.file_name().ok_or_else(invalid)?.as_bytes())
+        .map_err(|_| invalid())?;
+    // SAFETY: names are single NUL-terminated components and parent is a pinned directory handle.
+    // Neither syscall traverses a tool-controlled parent path during atomic exchange.
     #[cfg(target_os = "macos")]
-    let result = unsafe { libc::renamex_np(left.as_ptr(), right.as_ptr(), libc::RENAME_SWAP) };
+    let result = unsafe {
+        libc::renameatx_np(
+            parent.as_raw_fd(),
+            left.as_ptr(),
+            parent.as_raw_fd(),
+            right.as_ptr(),
+            libc::RENAME_SWAP,
+        )
+    };
     #[cfg(target_os = "linux")]
     let result = unsafe {
         libc::renameat2(
-            libc::AT_FDCWD,
+            parent.as_raw_fd(),
             left.as_ptr(),
-            libc::AT_FDCWD,
+            parent.as_raw_fd(),
             right.as_ptr(),
             libc::RENAME_EXCHANGE,
         )
@@ -469,7 +492,7 @@ fn exchange(left: &Path, right: &Path) -> io::Result<()> {
 }
 
 #[cfg(not(any(target_os = "macos", target_os = "linux")))]
-fn exchange(_left: &Path, _right: &Path) -> io::Result<()> {
+fn exchange(_parent: &File, _parent_path: &Path, _left: &Path, _right: &Path) -> io::Result<()> {
     Err(io::Error::new(
         io::ErrorKind::Unsupported,
         "atomic artifact exchange is unavailable",
@@ -479,6 +502,37 @@ fn exchange(_left: &Path, _right: &Path) -> io::Result<()> {
 #[cfg(all(test, any(target_os = "macos", target_os = "linux")))]
 mod tests {
     use super::*;
+
+    #[test]
+    fn publication_rejects_replaced_parent_without_touching_replacement() {
+        let root = tempfile::tempdir().expect("root");
+        let parent = root.path().join("parent");
+        fs::create_dir(&parent).expect("parent");
+        fs::write(parent.join("raw"), b"original").expect("raw");
+        fs::create_dir(parent.join("candidate")).expect("candidate");
+        let pinned = File::open(&parent).expect("pin");
+        fs::rename(&parent, root.path().join("moved")).expect("move parent");
+        fs::create_dir(&parent).expect("replacement");
+        fs::write(parent.join("raw"), b"replacement").expect("replacement raw");
+        fs::create_dir(parent.join("candidate")).expect("replacement candidate");
+        assert!(
+            exchange(
+                &pinned,
+                &parent,
+                &parent.join("raw"),
+                &parent.join("candidate")
+            )
+            .is_err()
+        );
+        assert_eq!(
+            fs::read(parent.join("raw")).expect("untouched replacement"),
+            b"replacement"
+        );
+        assert_eq!(
+            fs::read(root.path().join("moved/raw")).expect("untouched original"),
+            b"original"
+        );
+    }
 
     #[tokio::test]
     async fn verified_maintenance_rejects_corrupt_canonical_storage_without_publication() {

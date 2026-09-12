@@ -180,6 +180,15 @@ This bounds candidate count per tick, not elapsed I/O time or individual artifac
 is still not activated at daemon startup: durable access-failure fencing and publication path-race
 hardening remain unresolved.
 
+## Descriptor-relative publication
+
+Atomic exchange now uses `renameatx_np`/`renameat2` with single-component names and a pinned parent
+directory descriptor, not absolute pathname traversal. Before exchange it verifies the parent path
+still names the pinned device/inode. A replacement-parent test proves that neither the replacement
+nor original files are exchanged on detected substitution. Parent syncing after publication uses
+the pinned handle. Staging creation and cleanup still need descriptor-relative conversion and
+object-identity validation; this change alone does not make automatic activation safe.
+
 ## Remaining implementation
 
 ### Access policy and scheduling
