@@ -154,8 +154,11 @@ scheduling. It does not compress canonical session databases.
 current session storage. Unsupported contracts, stale projections, absent/incomplete references,
 and logical-length mismatches prevent publication. It closes the database before file conversion
 and transfers the maintenance guard into the blocking task so cancellation cannot release the fence
-while conversion runs. This entry point currently accepts only relative local references; capability
-URIs and legacy file-URI resolution remain unimplemented. The lower-level path-based operation still
+while conversion runs. Invocation capability URIs, relative paths, and historical local file paths
+now use one session-owned resolver shared with server reads, with filesystem confinement enforced
+before maintenance. Malformed capability fields and unsupported schemes are rejected. A database
+integration test verifies actual publication and logical range reads for a capability reference.
+The lower-level path-based operation still
 exists for callers that separately establish finalization and is not safe to schedule blindly.
 
 ## Remaining implementation

@@ -10961,6 +10961,75 @@ mod tests {
         ));
     }
 
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[tokio::test]
+    async fn capability_artifact_compresses_through_verified_maintenance() {
+        let root = tempfile::tempdir().expect("root");
+        let id = SessionId::new();
+        let db = SessionDb::open_turso_in_root(id, root.path())
+            .await
+            .expect("database");
+        db.append_event(&event(
+            id,
+            0,
+            SessionEventKind::SessionCreated {
+                name: None,
+                working_directory: root.path().to_path_buf(),
+            },
+        ))
+        .await
+        .expect("created");
+        let invocation = "a".repeat(64);
+        let artifact = "b".repeat(64);
+        let artifact_root = root.path().join("session-artifacts").join(id.to_string());
+        let parent = artifact_root.join("invocation-artifacts").join(&invocation);
+        std::fs::create_dir_all(&parent).expect("directory");
+        let path = parent.join(format!("{artifact}.bin"));
+        let bytes = b"terminal output\n".repeat(100_000);
+        std::fs::write(&path, &bytes).expect("raw");
+        db.database()
+            .insert("artifact_references")
+            .value("artifact_id", "artifact")
+            .value("reference_key", "recording")
+            .value("producer_plugin_id", "fixture")
+            .value("schema", "fixture")
+            .value("schema_version", 1)
+            .value("complete", true)
+            .value("availability", "complete")
+            .value("byte_len", i64::try_from(bytes.len()).expect("length"))
+            .value(
+                "storage_uri",
+                format!("bcode-artifact://invocation/{invocation}/{artifact}"),
+            )
+            .value("finalized_event_seq", 0)
+            .execute(db.database())
+            .await
+            .expect("reference");
+        db.database().close().await.expect("close");
+        drop(db);
+        let outcome = crate::artifact_storage::compress_finalized_artifact(
+            root.path(),
+            id,
+            "artifact",
+            "recording",
+            crate::artifact_compression::ArtifactCompression::Light,
+            4096,
+        )
+        .await
+        .expect("compress");
+        assert!(matches!(
+            outcome,
+            crate::artifact_storage::ArtifactStorageOutcome::Compressed { .. }
+        ));
+        assert!(path.is_dir());
+        assert_eq!(
+            crate::artifact_storage::read_artifact_range(&artifact_root, &path, 262_140, 80)
+                .expect("read")
+                .1,
+            bytes[262_140..262_220]
+        );
+    }
+
     #[tokio::test]
     async fn finalized_artifact_references_are_projected_for_bounded_lookup() {
         let temp_dir = tempfile::tempdir().expect("temp dir");

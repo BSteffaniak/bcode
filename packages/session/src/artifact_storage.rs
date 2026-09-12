@@ -122,12 +122,12 @@ pub async fn maintenance_candidates(
     result.map_err(io::Error::other)
 }
 
-/// Verify a finalized relative artifact reference and compress it under one maintenance fence.
+/// Verify a finalized artifact reference and compress it under one maintenance fence.
 ///
 /// Uses the current session database boundary, rejects stale projections and unsupported writer
 /// contracts, and requires explicit completeness and a logical length matching the stored content.
-/// Only relative local references are supported by this operation; capability and historical URI
-/// resolution must remain application-owned rather than guessed here.
+/// Relative, invocation-capability, and historical local references use the same session-owned
+/// resolver as application reads, followed by confinement beneath the owning artifact root.
 ///
 /// # Errors
 ///
@@ -202,14 +202,20 @@ pub async fn compress_finalized_artifact_with_age(
     if reference.complete != Some(true) || reference.availability.as_deref() != Some("complete") {
         return Err(invalid());
     }
-    let relative = PathBuf::from(reference.storage_uri.ok_or_else(invalid)?);
-    if relative.as_os_str().is_empty()
-        || relative
-            .components()
-            .any(|part| !matches!(part, std::path::Component::Normal(_)))
-    {
-        return Err(invalid());
-    }
+    let artifacts = confined(
+        &root.join("session-artifacts").join(session_id.to_string()),
+        &root,
+    )?;
+    let resolved = crate::artifact_reference::resolve_artifact_reference(
+        &reference.storage_uri.ok_or_else(invalid)?,
+        &artifacts,
+    )
+    .map_err(|_| invalid())?;
+    let resolved = confined(&resolved, &artifacts)?;
+    let relative = resolved
+        .strip_prefix(&artifacts)
+        .map_err(|_| invalid())?
+        .to_path_buf();
     let expected_bytes = reference.byte_len.ok_or_else(invalid)?;
     tokio::task::spawn_blocking(move || {
         let artifacts = confined(

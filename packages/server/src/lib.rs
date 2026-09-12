@@ -11078,51 +11078,8 @@ fn read_artifact_file_range(
 }
 
 fn artifact_reference_path(uri: &str, artifact_root: &Path) -> Result<PathBuf, String> {
-    if let Ok(url) = url::Url::parse(uri) {
-        if url.scheme() == "bcode-artifact" {
-            if url.host_str() != Some("invocation") {
-                return Err("artifact capability URI has an unsupported owner".to_owned());
-            }
-            let segments = url
-                .path_segments()
-                .map(Iterator::collect::<Vec<_>>)
-                .unwrap_or_default();
-            let [invocation_key, artifact_key] = segments.as_slice() else {
-                return Err("artifact capability URI has an invalid path".to_owned());
-            };
-            if ![invocation_key, artifact_key]
-                .into_iter()
-                .all(|key| key.len() == 64 && key.bytes().all(|byte| byte.is_ascii_hexdigit()))
-            {
-                return Err("artifact capability URI has an invalid identity".to_owned());
-            }
-            return Ok(artifact_root
-                .join("invocation-artifacts")
-                .join(invocation_key)
-                .join(format!("{artifact_key}.bin")));
-        }
-        if url.scheme() != "file" {
-            return Err("artifact storage URI is not locally readable".to_owned());
-        }
-        return url
-            .to_file_path()
-            .map_err(|()| "artifact file path is invalid".to_owned());
-    }
-    let path = PathBuf::from(uri);
-    if path.is_absolute() {
-        return Ok(path);
-    }
-    if path.components().any(|component| {
-        matches!(
-            component,
-            std::path::Component::ParentDir
-                | std::path::Component::RootDir
-                | std::path::Component::Prefix(_)
-        )
-    }) {
-        return Err("artifact relative storage path is invalid".to_owned());
-    }
-    Ok(artifact_root.join(path))
+    bcode_session::artifact_reference::resolve_artifact_reference(uri, artifact_root)
+        .map_err(str::to_owned)
 }
 
 fn artifact_reference_unavailability(
