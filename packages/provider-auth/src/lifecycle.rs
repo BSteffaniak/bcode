@@ -1110,6 +1110,178 @@ mod tests {
         );
     }
 
+    #[cfg(target_os = "macos")]
+    struct NativeTestSource {
+        source: crate::native_device::MacosOperationFactorSource,
+        slots: std::sync::Mutex<Vec<String>>,
+    }
+
+    #[cfg(target_os = "macos")]
+    impl crate::operations::AuthDeviceFactorSource for NativeTestSource {
+        fn provisioning_identity(
+            &self,
+            profile: &ResolvedAuthProfile,
+        ) -> Result<(String, String), AuthVaultLifecycleError> {
+            self.source.provisioning_identity(profile)
+        }
+        fn provision_attempt(
+            &self,
+            intent: &crate::operations::AuthProvisioningIntent,
+        ) -> Result<crate::operations::AuthProvisionedDeviceFactor, AuthVaultLifecycleError>
+        {
+            use sha2::Digest as _;
+            let slot = format!(
+                "{:x}",
+                sha2::Sha256::digest(
+                    format!(
+                        "sshenv-operation-v1:{}:{}",
+                        intent.profile_binding, intent.operation
+                    )
+                    .as_bytes()
+                )
+            );
+            self.slots.lock().unwrap().push(slot);
+            self.source.provision_attempt(intent)
+        }
+        fn retrieve(
+            &self,
+            id: &str,
+            recipient: Option<&str>,
+            params: &BTreeMap<String, String>,
+        ) -> Result<Zeroizing<[u8; 32]>, AuthVaultLifecycleError> {
+            self.source.retrieve(id, recipient, params)
+        }
+        fn reconcile_provisioning(
+            &self,
+            intent: &crate::operations::AuthProvisioningIntent,
+        ) -> Result<(), AuthVaultLifecycleError> {
+            self.source.reconcile_provisioning(intent)
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    impl Drop for NativeTestSource {
+        fn drop(&mut self) {
+            for slot in self.slots.get_mut().unwrap().iter() {
+                // Delete only the unique disposable records allocated by this test.
+                let output = std::process::Command::new("/usr/bin/security")
+                    .args([
+                        "delete-generic-password",
+                        "-s",
+                        "sshenv.operation-factor.v1",
+                        "-a",
+                        slot,
+                    ])
+                    .output()
+                    .expect("run test record cleanup");
+                if !output.status.success() {
+                    eprintln!(
+                        "Disposable Keychain record cleanup failed for {slot}: status {}",
+                        output.status
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    #[ignore = "creates disposable native Keychain factors; requires authorization"]
+    #[cfg(target_os = "macos")]
+    fn native_custody_publication_failure_reopen_reconcile_and_retry() {
+        use crate::operations::{
+            AuthCredentialCustody as _, AuthRequestCustody as _, RetainedAuthRequestCustody,
+        };
+        struct FailedKey;
+        impl crate::operations::AuthCustodyKeySource for FailedKey {
+            fn generate(&self) -> Result<Zeroizing<[u8; 32]>, AuthVaultLifecycleError> {
+                Err(AuthVaultLifecycleError::InvalidCredential)
+            }
+        }
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("identity");
+        let public = crate::security::ensure_vault_recipient_key(&path).unwrap();
+        let identity = Zeroizing::new(
+            std::fs::read_to_string(crate::security::vault_private_key_path(&path)).unwrap(),
+        );
+        let (mut vault, key) = sshenv_vault::Vault::create(&public).unwrap();
+        vault.migrate_to_v2(&[public]).unwrap();
+        vault.enable_profile_keys().unwrap();
+        vault.profiles.profiles.insert(
+            "exa".into(),
+            BTreeMap::from([("TEST_PROVIDER_API_KEY".into(), "original".into())]),
+        );
+        let mut bytes = Vec::new();
+        vault
+            .save_with_storage(&key, |value, _| {
+                bytes = value.to_vec();
+                Ok(())
+            })
+            .unwrap();
+        let directory = root.path().join("custody");
+        let storage =
+            crate::custody_storage::CredentialCustodyStorage::create(&directory, &bytes).unwrap();
+        let mut profile = resolved(&root.path().join("unused"));
+        profile
+            .profile
+            .settings
+            .insert("device_seal".into(), "required".into());
+        profile.profile.settings.insert(
+            "device_seal_backend".into(),
+            "macos-keychain-device-only".into(),
+        );
+        let source = std::sync::Arc::new(NativeTestSource {
+            source: crate::native_device::MacosOperationFactorSource::new(profile.clone()).unwrap(),
+            slots: std::sync::Mutex::new(Vec::new()),
+        });
+        let open = |storage| {
+            RetainedAuthRequestCustody::new(
+                storage,
+                profile.clone(),
+                "exa",
+                "bcode.web-search",
+                method(),
+                vec![identity.clone()],
+                None,
+            )
+            .unwrap()
+            .device_source(source.clone())
+        };
+        let retained = open(storage).key_source(std::sync::Arc::new(FailedKey));
+        let changes = BTreeMap::from([("TEST_PROVIDER_API_KEY".into(), Some("updated".into()))]);
+        assert!(retained.persist(&profile, changes.clone()).is_err());
+        assert_eq!(source.slots.lock().unwrap().len(), 1);
+        // Prove provisioning succeeded before the injected publication failure.
+        let slot = source.slots.lock().unwrap()[0].clone();
+        let factor_key = sshenv_vault::device::retrieve_operation_factor(&slot).unwrap();
+        drop(retained);
+        let storage = crate::custody_storage::CredentialCustodyStorage::open(&directory).unwrap();
+        assert_eq!(storage.read().unwrap(), bytes);
+        let retained = open(storage);
+        assert!(retained.persist(&profile, changes.clone()).is_err());
+        assert_eq!(source.slots.lock().unwrap().len(), 1);
+        retained.reconcile_provisioning().unwrap();
+        assert_eq!(
+            *sshenv_vault::device::retrieve_operation_factor(&slot).unwrap(),
+            *factor_key
+        );
+        assert!(retained.persist(&profile, changes).unwrap().is_empty());
+        drop(retained);
+        let retained =
+            open(crate::custody_storage::CredentialCustodyStorage::open(&directory).unwrap());
+        let context = bcode_model::ProviderRequestContext {
+            auth_profile: Some("exa".into()),
+            ..Default::default()
+        };
+        assert_eq!(
+            retained
+                .materialize("bcode.web-search", &context)
+                .unwrap()
+                .env,
+            BTreeMap::from([("TEST_PROVIDER_API_KEY".into(), "updated".into())])
+        );
+        assert_eq!(source.slots.lock().unwrap().len(), 2);
+    }
+
     fn method() -> AuthMethodContribution {
         AuthMethodContribution::SecretFields {
             method_id: "api_key".to_owned(),
