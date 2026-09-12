@@ -196,8 +196,14 @@ pub fn compress_session_artifact(
             return Err(error);
         }
     };
+    #[cfg(test)]
+    crash_boundary("prepared");
     exchange(&path, &staging)?;
+    #[cfg(test)]
+    crash_boundary("exchanged");
     File::open(parent)?.sync_all()?;
+    #[cfg(test)]
+    crash_boundary("committed");
     drop(original);
     let retained_backup = if remove_container(&staging).is_ok() {
         File::open(parent)?.sync_all()?;
@@ -209,6 +215,14 @@ pub fn compress_session_artifact(
         saved_bytes,
         retained_backup,
     })
+}
+
+#[cfg(test)]
+fn crash_boundary(phase: &str) {
+    if std::env::var("BCODE_ARTIFACT_CRASH_PHASE").as_deref() == Ok(phase) {
+        // Exit without unwinding: neither local cleanup nor lease destructors may run.
+        std::process::exit(91);
+    }
 }
 
 fn remove_container(path: &Path) -> io::Result<()> {
@@ -256,6 +270,86 @@ fn exchange(_left: &Path, _right: &Path) -> io::Result<()> {
 #[cfg(all(test, any(target_os = "macos", target_os = "linux")))]
 mod tests {
     use super::*;
+
+    #[test]
+    fn crash_child() {
+        let Ok(root) = std::env::var("BCODE_ARTIFACT_CRASH_ROOT") else {
+            return;
+        };
+        let id: SessionId = std::env::var("BCODE_ARTIFACT_CRASH_SESSION")
+            .expect("session")
+            .parse()
+            .expect("id");
+        compress_session_artifact(
+            Path::new(&root),
+            id,
+            Path::new("recording"),
+            ArtifactCompression::Light,
+            1,
+            || Ok(()),
+        )
+        .expect("child compression");
+        panic!("crash boundary was not reached");
+    }
+
+    #[test]
+    fn process_crashes_keep_exactly_one_logical_authority() {
+        for phase in ["prepared", "exchanged", "committed"] {
+            let root = tempfile::tempdir().expect("root");
+            let id = SessionId::new();
+            let session = root.path().join(id.to_string());
+            fs::create_dir(&session).expect("session");
+            fs::write(session.join("session.db"), b"fixture").expect("database");
+            let artifacts = root.path().join("session-artifacts").join(id.to_string());
+            fs::create_dir_all(&artifacts).expect("artifacts");
+            let bytes = "terminal crash fixture 世界\n".repeat(40_000).into_bytes();
+            let path = artifacts.join("recording");
+            fs::write(&path, &bytes).expect("original");
+            let status =
+                std::process::Command::new(std::env::current_exe().expect("test executable"))
+                    .args([
+                        "--exact",
+                        "artifact_storage::tests::crash_child",
+                        "--nocapture",
+                    ])
+                    .env("BCODE_ARTIFACT_CRASH_ROOT", root.path())
+                    .env("BCODE_ARTIFACT_CRASH_SESSION", id.to_string())
+                    .env("BCODE_ARTIFACT_CRASH_PHASE", phase)
+                    .status()
+                    .expect("child");
+            assert_eq!(status.code(), Some(91), "{phase}");
+            assert_eq!(path.is_file(), phase == "prepared");
+            let pending = artifacts.join(".recording.compression-pending");
+            assert!(pending.exists());
+            let mut actual = Vec::new();
+            let mut offset = 0;
+            while offset < bytes.len() as u64 {
+                let (_, block) = read_artifact_range(&artifacts, &path, offset, 65536)
+                    .expect("authoritative read");
+                offset += block.len() as u64;
+                actual.extend(block);
+            }
+            assert_eq!(actual, bytes, "{phase}");
+            // Process death released maintenance ownership, but residue blocks a new conversion.
+            assert!(crate::lease::acquire_session_maintenance_guard(root.path(), id).is_ok());
+            assert!(
+                compress_session_artifact(
+                    root.path(),
+                    id,
+                    Path::new("recording"),
+                    ArtifactCompression::Deep,
+                    1,
+                    || Ok(())
+                )
+                .is_err()
+            );
+            assert!(pending.exists());
+            assert_eq!(
+                fs::read(session.join("session.db")).expect("database unchanged"),
+                b"fixture"
+            );
+        }
+    }
 
     #[test]
     fn publishes_at_same_path_and_reads_original_bytes() {

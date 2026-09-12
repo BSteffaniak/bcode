@@ -139,9 +139,14 @@ exchange, cancellation leaves raw authority intact; after exchange, the logical 
 committed and old content is disposable cleanup. Tests cover actual file publication, server range
 parity, active-owner refusal, cancellation, staging residue, and unknown container versions.
 
+Process-crash tests now terminate a separate process without unwinding after candidate sync,
+immediately after exchange, and after parent-directory sync. Every case preserves byte-exact reads
+at the one logical path, releases the dead process's maintenance lock, and retains staging residue
+without treating it as fallback authority. These tests cover process death, not power-loss durability.
+
 This implementation still requires security review of path races against untrusted concurrent
-filesystem mutation, stronger finalization/ownership capabilities, and process-crash fault tests
-before enabling automatic scheduling. It does not compress canonical session databases.
+filesystem mutation and stronger finalization/ownership capabilities before enabling automatic
+scheduling. It does not compress canonical session databases.
 
 ## Remaining implementation
 
