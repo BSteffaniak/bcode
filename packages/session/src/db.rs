@@ -3368,13 +3368,14 @@ impl SessionDb {
     ///
     /// # Errors
     ///
-    /// Returns an error if the projection query fails, projection rows are malformed, or the
-    /// artifact projection does not match the canonical event tail.
+    /// Returns an error if the storage contract is missing or unsupported, the projection query
+    /// fails, projection rows are malformed, or the artifact projection does not match the tail.
     pub async fn finalized_artifact_reference(
         &self,
         artifact_id: &str,
         reference_key: &str,
     ) -> SessionDbResult<Option<FinalizedArtifactReference>> {
+        validate_storage_writer_contract(&**self.db).await?;
         let expected = self.last_event_sequence().await?.unwrap_or_default();
         let checkpoint = self
             .materialized_projection_checkpoint(MaterializedProjection::ArtifactReferences)
@@ -10798,6 +10799,49 @@ mod tests {
             .await
             .expect("rows");
         assert_eq!(rows.len(), 3);
+    }
+
+    #[tokio::test]
+    async fn finalized_artifact_lookup_rejects_unsupported_storage_before_projection_access() {
+        let root = tempfile::tempdir().expect("root");
+        let id = SessionId::new();
+        let db = SessionDb::open_turso_in_root(id, root.path())
+            .await
+            .expect("database");
+        for epoch in [
+            0,
+            CURRENT_SESSION_STORAGE_WRITER_EPOCH - 1,
+            CURRENT_SESSION_STORAGE_WRITER_EPOCH + 1,
+        ] {
+            db.database()
+                .update("session_storage_contract")
+                .value("writer_epoch", i64::from(epoch))
+                .where_eq("contract_id", SESSION_STORAGE_CONTRACT_ID)
+                .execute(db.database())
+                .await
+                .expect("fixture epoch");
+            let error = db
+                .finalized_artifact_reference("missing", "recording")
+                .await
+                .expect_err("unsupported");
+            assert!(
+                matches!(error, SessionDbError::WriterIncompatible { actual: Some(actual), .. } if actual == u64::from(epoch))
+            );
+            assert_eq!(
+                db.storage_writer_epoch().await.expect("unchanged"),
+                u64::from(epoch)
+            );
+        }
+        db.database()
+            .delete("session_storage_contract")
+            .execute(db.database())
+            .await
+            .expect("remove fixture contract");
+        assert!(matches!(
+            db.finalized_artifact_reference("missing", "recording")
+                .await,
+            Err(SessionDbError::WriterIncompatible { .. })
+        ));
     }
 
     #[tokio::test]

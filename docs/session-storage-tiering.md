@@ -137,6 +137,11 @@ chunk container must identify its own authoritative representation; a disposable
 be the only way to distinguish compressed bytes from raw content. Include integrity and expanded
 size checks and a bounded seek index; tiny reads must not decompress entire recordings.
 
+The current finalized-artifact database lookup now validates the storage writer contract before
+checking projection freshness or resolving a URI. Missing and non-current contracts fail closed,
+without mutating storage. This strengthens the updated reader but does not retrofit older binaries:
+it is not sufficient by itself to permit compressed-file replacement.
+
 Older daemons must be fenced from formats they cannot read, including finalized artifact paths that
 bypass normal canonical-history loading. Implement ownership-verified, interruption-safe replacement
 and recovery before enabling any background writer. Never leave both old and new representations
