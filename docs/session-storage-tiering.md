@@ -203,6 +203,20 @@ refusal, recent-access deferral, corrupt-tracking preservation, and deep-tier ou
 The worker remains unstarted in production pending durable access-failure fencing; these passing
 pass-level tests do not imply lifecycle integration or automatic startup is complete.
 
+## Durable tracking-health primitive
+
+A tracking-epoch fence now persists dirty state before serving its coordinated reader population,
+keeps an exclusive OS lock, and requires explicit healthy/drained completion to mark clean. A failed
+access update only needs to set an in-memory failed bit because dirty state is already durable.
+Crash/abandoned epochs and unknown formats are not silently reset. Tests include process death:
+the OS lock releases but the durable dirty state still refuses a new healthy epoch.
+
+This primitive is **not wired into daemon startup**. It currently models one exclusively coordinated
+reader population, not all coexisting daemon versions. Activation requires registration and draining
+of every reader participant without making optional maintenance block unrelated daemon operation.
+Until that integration exists, the worker remains unstarted; this primitive alone does not prove
+that stale timestamps from other daemons are safe.
+
 ## Remaining implementation
 
 ### Access policy and scheduling
