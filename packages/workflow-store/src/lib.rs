@@ -11645,6 +11645,21 @@ fn validate_retained_successor_inputs(
     Ok(())
 }
 
+fn successor_already_admitted(
+    transaction: &Transaction<'_>,
+    run_id: &str,
+    node_id: &str,
+    generation: u64,
+) -> Result<bool, WorkflowStoreError> {
+    let Some((activation_id, _)) =
+        activation_at_generation(transaction, run_id, node_id, generation)?
+    else {
+        return Ok(false);
+    };
+    run_graph::reconciled_activation_exit(transaction, run_id, node_id, &activation_id)?;
+    Ok(true)
+}
+
 fn materialize_selected_successors(
     transaction: &Transaction<'_>,
     output: &ValidatedOutput,
@@ -11657,9 +11672,7 @@ fn materialize_selected_successors(
     targets.dedup();
     let mut activated = Vec::new();
     for node_id in targets {
-        if activation_status_at_generation(transaction, &output.run_id, &node_id, generation)?
-            .is_some()
-        {
+        if successor_already_admitted(transaction, &output.run_id, &node_id, generation)? {
             continue;
         }
         if !successor_dependencies_ready(transaction, output, &node_id, generation)? {
@@ -34570,6 +34583,19 @@ mod tests {
              VALUES ('run-1', 'second', 'existing-successor', 0, '7', ?1, 10)",
             [status],
         ).expect("existing successor");
+            let transaction = store
+                .connection
+                .transaction()
+                .expect("admission transaction");
+            record_activation_graph_binding(
+                &transaction,
+                "run-1",
+                "second",
+                "existing-successor",
+                1,
+            )
+            .expect("existing successor admission");
+            transaction.commit().expect("admission commit");
             let result = store
                 .persist_validated_output(&ValidatedOutput {
                     output_id: "first-output".to_string(),
@@ -35688,6 +35714,81 @@ mod tests {
             store.validated_outputs(&run.run_id, 10).expect("outputs"),
             vec![output]
         );
+    }
+
+    #[test]
+    fn successor_reuse_requires_current_graph_reconciliation() {
+        let (_temp, mut store) = initialized_store();
+        store
+            .persist_definition("sequential", 1, &sequential_definition())
+            .expect("definition");
+        let mut run = new_run();
+        run.definition_id = "sequential".into();
+        run.run_id = "sequential-run".into();
+        store.create_run(&run).expect("run");
+        let successor_id = activation_identity(&run.run_id, "second", 0);
+        store
+            .create_activation(&NewActivation {
+                run_id: run.run_id.clone(),
+                node_id: "second".into(),
+                activation_id: successor_id.clone(),
+                dependency_generation: 0,
+                input: Some(serde_json::json!(2)),
+                created_at_ms: 10,
+            })
+            .expect("historical successor");
+        store
+            .connection
+            .execute(
+                "UPDATE workflow_run_graphs SET revision = 2 WHERE run_id = ?1",
+                [&run.run_id],
+            )
+            .expect("revised fixture");
+        let output = ValidatedOutput {
+            output_id: "source".into(),
+            run_id: run.run_id.clone(),
+            node_id: "first".into(),
+            activation_id: activation_identity(&run.run_id, "first", 0),
+            schema_id: "u32".into(),
+            schema_version: 1,
+            value: serde_json::json!(2),
+            artifact_reference: None,
+            created_at_ms: 20,
+        };
+        let transaction = store.connection.transaction().expect("transaction");
+        let error = materialize_selected_successors(
+            &transaction,
+            &output,
+            0,
+            2,
+            vec!["second".into()],
+            &BTreeMap::new(),
+        )
+        .expect_err("historical identity is not current authority");
+        assert!(error.to_string().contains("reconciliation"));
+        transaction
+            .execute(
+                "INSERT INTO workflow_leaf_retentions VALUES (?1, 'second', ?2, 2)",
+                (&run.run_id, &successor_id),
+            )
+            .expect("explicit retention");
+        assert!(
+            materialize_selected_successors(
+                &transaction,
+                &output,
+                0,
+                2,
+                vec!["second".into()],
+                &BTreeMap::new(),
+            )
+            .expect("reconciled reuse")
+            .is_empty()
+        );
+        let admitted: u64 = transaction.query_row(
+            "SELECT graph_revision FROM workflow_activation_graph_bindings WHERE run_id = ?1 AND activation_id = ?2",
+            (&run.run_id, &successor_id), |row| row.get(0),
+        ).expect("historical admission");
+        assert_eq!(admitted, 1);
     }
 
     #[test]
