@@ -38,6 +38,13 @@ It does not publish, sync, replace, migrate, or auto-detect any artifact. An uns
 incomplete output, never authoritative content. No existing artifact reader or writer uses the codec
 yet; a durable representation selector and compatibility fencing must precede activation.
 
+An explicit maintenance verifier now compares every decoded chunk directly against the original
+stream with bounded memory and cancellation between chunks. It additionally requires contiguous,
+ordered physical chunk ranges and exact physical/logical lengths, rejecting overlaps, gaps, trailing
+bytes, or a changed original. Range reads remain independent of this full traversal. Verification
+does not itself publish data or establish ownership: maintenance must keep both sources immutable
+through publication and validate any authoritative original checksum separately.
+
 ## Configured policy (not activated)
 
 The configuration loader accepts and validates:

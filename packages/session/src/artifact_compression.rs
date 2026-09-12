@@ -225,6 +225,67 @@ pub fn read_compressed_artifact_range(
     Ok((total, output))
 }
 
+/// Verify an entire candidate container against its original bytes before maintenance publication.
+///
+/// This is explicit maintenance work, never a normal range-read operation. Memory is bounded to
+/// one chunk pair and cancellation is checked between chunks. Every index entry must describe the
+/// exact contiguous encoded layout; gaps, overlaps, and trailing bytes are rejected. Original bytes
+/// are compared directly, not merely against candidate-supplied checksums. Returns the verified
+/// logical byte count. The caller must keep both handles immutable throughout verification and
+/// subsequent publication, and separately validate any authoritative original checksum.
+///
+/// # Errors
+///
+/// Returns an error on cancellation, malformed/unsupported metadata, integrity failure, differing
+/// original bytes or length, or I/O. Success does not grant ownership or publish any files.
+pub fn verify_compressed_artifact(
+    candidate: &mut (impl Read + Seek),
+    original: &mut impl Read,
+    mut check_cancelled: impl FnMut() -> io::Result<()>,
+) -> io::Result<u64> {
+    check_cancelled()?;
+    // The normal reader owns header compatibility and bounded decoder validation.
+    let (total, _) = read_compressed_artifact_range(candidate, 0, 1)?;
+    let count = total.div_ceil(u64::from(CHUNK));
+    let mut expected_position = data_start(count)?;
+    let mut original_chunk = vec![0; CHUNK as usize];
+    for ordinal in 0..count {
+        check_cancelled()?;
+        candidate.seek(SeekFrom::Start(HEADER + ordinal * ENTRY))?;
+        let mut entry = [0; ENTRY_BYTES];
+        candidate.read_exact(&mut entry)?;
+        if entry[48..] != entry_digest(ordinal, &entry[..48])
+            || number(&entry[..8])? != expected_position
+        {
+            return Err(invalid());
+        }
+        expected_position = expected_position
+            .checked_add(number(&entry[8..16])?)
+            .ok_or_else(invalid)?;
+        let (_, plain) =
+            read_compressed_artifact_range(candidate, ordinal * u64::from(CHUNK), CHUNK)?;
+        original.read_exact(&mut original_chunk[..plain.len()])?;
+        if original_chunk[..plain.len()] != plain {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "compressed artifact differs from original",
+            ));
+        }
+    }
+    check_cancelled()?;
+    if candidate.seek(SeekFrom::End(0))? != expected_position {
+        return Err(invalid());
+    }
+    let mut extra = [0];
+    if original.read(&mut extra)? != 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "artifact original length differs",
+        ));
+    }
+    Ok(total)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -241,6 +302,107 @@ mod tests {
         )
         .expect("encode");
         destination.into_inner()
+    }
+
+    #[test]
+    fn maintenance_verification_compares_every_original_byte() {
+        for bytes in [
+            vec![],
+            b"terminal output".to_vec(),
+            vec![42; CHUNK as usize * 3 + 5],
+        ] {
+            for policy in [ArtifactCompression::Light, ArtifactCompression::Deep] {
+                let encoded = encode(&bytes, policy);
+                assert_eq!(
+                    verify_compressed_artifact(
+                        &mut Cursor::new(&encoded),
+                        &mut bytes.as_slice(),
+                        || Ok(())
+                    )
+                    .expect("verified"),
+                    bytes.len() as u64
+                );
+                let mut longer = bytes.clone();
+                longer.push(1);
+                assert!(
+                    verify_compressed_artifact(
+                        &mut Cursor::new(&encoded),
+                        &mut longer.as_slice(),
+                        || Ok(())
+                    )
+                    .is_err()
+                );
+                if !bytes.is_empty() {
+                    let mut changed = bytes.clone();
+                    *changed.last_mut().expect("last") ^= 1;
+                    assert!(
+                        verify_compressed_artifact(
+                            &mut Cursor::new(&encoded),
+                            &mut changed.as_slice(),
+                            || Ok(())
+                        )
+                        .is_err()
+                    );
+                    assert!(
+                        verify_compressed_artifact(
+                            &mut Cursor::new(&encoded),
+                            &mut &bytes[..bytes.len() - 1],
+                            || Ok(())
+                        )
+                        .is_err()
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn maintenance_verification_rejects_trailing_data_and_overlapping_chunks() {
+        let bytes = vec![42; CHUNK as usize * 2];
+        let encoded = encode(&bytes, ArtifactCompression::Light);
+        let mut trailing = encoded.clone();
+        trailing.push(0);
+        assert!(
+            verify_compressed_artifact(
+                &mut Cursor::new(trailing),
+                &mut bytes.as_slice(),
+                || Ok(())
+            )
+            .is_err()
+        );
+        let mut overlap = encoded;
+        let first = overlap[HEADER_BYTES..HEADER_BYTES + 48].to_vec();
+        let second = HEADER_BYTES + ENTRY_BYTES;
+        overlap[second..second + 48].copy_from_slice(&first);
+        let checksum = entry_digest(1, &first);
+        overlap[second + 48..second + ENTRY_BYTES].copy_from_slice(&checksum);
+        // Individual range bytes remain valid, but this is not the canonical contiguous layout.
+        assert!(
+            read_compressed_artifact_range(&mut Cursor::new(&overlap), u64::from(CHUNK), 1).is_ok()
+        );
+        assert!(
+            verify_compressed_artifact(&mut Cursor::new(overlap), &mut bytes.as_slice(), || Ok(()))
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn maintenance_verification_is_cancellable_between_chunks() {
+        let bytes = vec![42; CHUNK as usize * 3];
+        let encoded = encode(&bytes, ArtifactCompression::Light);
+        let mut calls = 0;
+        let mut original = Cursor::new(&bytes);
+        let error = verify_compressed_artifact(&mut Cursor::new(encoded), &mut original, || {
+            calls += 1;
+            if calls == 3 {
+                Err(io::Error::new(io::ErrorKind::Interrupted, "cancelled"))
+            } else {
+                Ok(())
+            }
+        })
+        .expect_err("cancelled");
+        assert_eq!(error.kind(), io::ErrorKind::Interrupted);
+        assert_eq!(original.position(), u64::from(CHUNK));
     }
 
     #[test]
