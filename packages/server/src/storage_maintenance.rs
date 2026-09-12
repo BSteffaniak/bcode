@@ -22,6 +22,8 @@ pub async fn run(state: Arc<ServerState>) {
     let mut interval = tokio::time::interval(Duration::from_mins(1));
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut directories = None;
+    let mut pending: std::collections::VecDeque<(SessionId, Option<(String, String)>)> =
+        std::collections::VecDeque::new();
     loop {
         tokio::select! {
             biased;
@@ -37,47 +39,46 @@ pub async fn run(state: Arc<ServerState>) {
         if !state.startup_config.session_storage.enabled {
             continue;
         }
-        let result = tokio::task::spawn_blocking({
-            let root = root.clone();
-            let mut current = directories.take();
-            move || -> std::io::Result<_> {
-                if current.is_none() {
-                    current = Some(std::fs::read_dir(root)?);
-                }
-                let mut ids = Vec::new();
-                for _ in 0..16 {
-                    let Some(entry) = current.as_mut().and_then(Iterator::next) else {
-                        current = None;
-                        break;
-                    };
-                    let entry = entry?;
-                    if entry.file_type()?.is_dir()
-                        && let Some(name) = entry.file_name().to_str()
-                        && let Ok(id) = name.parse::<SessionId>()
-                    {
-                        ids.push(id);
+        if pending.is_empty() {
+            let result = tokio::task::spawn_blocking({
+                let root = root.clone();
+                let mut current = directories.take();
+                move || -> std::io::Result<_> {
+                    if current.is_none() {
+                        current = Some(std::fs::read_dir(root)?);
                     }
+                    let mut ids = Vec::new();
+                    for _ in 0..16 {
+                        let Some(entry) = current.as_mut().and_then(Iterator::next) else {
+                            current = None;
+                            break;
+                        };
+                        let entry = entry?;
+                        if entry.file_type()?.is_dir()
+                            && let Some(name) = entry.file_name().to_str()
+                            && let Ok(id) = name.parse::<SessionId>()
+                        {
+                            ids.push(id);
+                        }
+                    }
+                    Ok((current, ids))
                 }
-                Ok((current, ids))
-            }
-        })
-        .await;
-        let Ok(Ok((next, ids))) = result else {
-            tracing::warn!("automatic artifact maintenance discovery unavailable");
-            continue;
-        };
-        directories = next;
-        for id in ids {
-            if state
-                .shutdown_requested
-                .load(std::sync::atomic::Ordering::SeqCst)
-            {
-                return;
-            }
-            if maintain_session(&state, &root, id).await.is_err() {
-                tracing::debug!(
+            })
+            .await;
+            let Ok(Ok((next, ids))) = result else {
+                tracing::warn!("automatic artifact maintenance discovery unavailable");
+                continue;
+            };
+            directories = next;
+            pending.extend(ids.into_iter().map(|id| (id, None)));
+        }
+        if let Some((id, cursor)) = pending.pop_front() {
+            match maintain_session(&state, &root, id, cursor).await {
+                Ok(Some(next)) => pending.push_back((id, Some(next))),
+                Ok(None) => {}
+                Err(_) => tracing::debug!(
                     "automatic artifact maintenance deferred: ownership or storage evidence unavailable"
-                );
+                ),
             }
         }
     }
@@ -87,18 +88,19 @@ async fn maintain_session(
     state: &ServerState,
     root: &std::path::Path,
     id: SessionId,
-) -> Result<(), String> {
+    after: Option<(String, String)>,
+) -> Result<Option<(String, String)>, String> {
     if !state
         .session_catalog
         .ambiguous_location_ids(id)
         .await
         .is_empty()
     {
-        return Ok(());
+        return Ok(None);
     }
     let config = state.session_config(id).await.session_storage;
     if !config.enabled {
-        return Ok(());
+        return Ok(None);
     }
     let now = super::current_time_ms();
     let path = root.join(id.to_string()).join("storage-access.bin");
@@ -110,10 +112,10 @@ async fn maintain_session(
     .map_err(|_| "access task failed")?
     .map_err(|_| "access unavailable")?;
     let StorageAccessObservation::Recorded(record) = observation else {
-        return Ok(());
+        return Ok(None);
     };
     let Some(age) = now.checked_sub(record.observed_at_ms) else {
-        return Ok(());
+        return Ok(None);
     };
     let light = u64::from(config.light_after_days) * 86_400_000;
     let deep = u64::from(config.deep_after_days) * 86_400_000;
@@ -122,10 +124,10 @@ async fn maintain_session(
     } else if age >= light {
         (ArtifactCompression::Light, light)
     } else {
-        return Ok(());
+        return Ok(None);
     };
-    let mut cursor: Option<(String, String)> = None;
-    loop {
+    let mut cursor = after;
+    {
         let rows = bcode_session::artifact_storage::maintenance_candidates(
             root,
             id,
@@ -134,14 +136,15 @@ async fn maintain_session(
         .await
         .map_err(|_| "references unavailable")?;
         if rows.is_empty() {
-            break;
+            return Ok(None);
         }
+        let has_more = rows.len() == 16;
         for (artifact, reference) in rows {
             if state
                 .shutdown_requested
                 .load(std::sync::atomic::Ordering::SeqCst)
             {
-                return Ok(());
+                return Ok(None);
             }
             cursor = Some((artifact.clone(), reference.clone()));
             if compress_finalized_artifact_with_age(
@@ -159,7 +162,6 @@ async fn maintain_session(
                 tracing::debug!("automatic artifact candidate deferred");
             }
         }
-        tokio::task::yield_now().await;
+        Ok(if has_more { cursor } else { None })
     }
-    Ok(())
 }

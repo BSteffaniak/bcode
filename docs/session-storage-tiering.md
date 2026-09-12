@@ -169,6 +169,17 @@ session access timestamp and compress immediately. Missing, malformed, or future
 metadata defers rather than guessing an age. An integration regression verifies that an old access
 record with a young finalization leaves the raw artifact unchanged.
 
+## Scheduler paging
+
+The experimental worker now processes one reference page per minute and retains an exclusive key
+cursor across ticks. Pending sessions from each bounded directory batch are rotated, so a large
+session no longer drains its entire reference set in a single tick. The queue retains at most the
+sixteen sessions discovered in that batch. Each resumed page reevaluates configuration and access
+age; disabled, recently read, ambiguous, or unavailable sessions leave the queue until rediscovery.
+This bounds candidate count per tick, not elapsed I/O time or individual artifact size. The worker
+is still not activated at daemon startup: durable access-failure fencing and publication path-race
+hardening remain unresolved.
+
 ## Remaining implementation
 
 ### Access policy and scheduling
