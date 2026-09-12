@@ -190,7 +190,7 @@ pub trait AuthCustodyKeySource: Send + Sync {
 /// remote-factor limitations remain those of the lifecycle custody reader.
 #[cfg(unix)]
 pub struct RetainedAuthRequestCustody {
-    storage: std::sync::Mutex<crate::custody_storage::CredentialCustodyStorage>,
+    storage: std::sync::Mutex<Box<dyn crate::custody_storage::AuthCustodyStorage>>,
     resolved: ResolvedAuthProfile,
     method: AuthMethodContribution,
     identities: Vec<zeroize::Zeroizing<String>>,
@@ -269,6 +269,33 @@ impl RetainedAuthRequestCustody {
         identities: Vec<zeroize::Zeroizing<String>>,
         passphrase: Option<zeroize::Zeroizing<String>>,
     ) -> Result<Self, crate::lifecycle::AuthVaultLifecycleError> {
+        Self::from_storage(
+            Box::new(storage),
+            resolved,
+            provider_id,
+            plugin_id,
+            method,
+            identities,
+            passphrase,
+        )
+    }
+
+    /// Bind a caller-acquired storage owner without native storage acquisition or fallback.
+    ///
+    /// The owner must uphold [`crate::custody_storage::AuthCustodyStorage`]'s confinement,
+    /// publication, and provisioning-fence contract. Vault policy remains lifecycle-owned.
+    ///
+    /// # Errors
+    /// Rejects mismatched provider, plugin, backend, or method ownership.
+    pub fn from_storage(
+        storage: Box<dyn crate::custody_storage::AuthCustodyStorage>,
+        resolved: ResolvedAuthProfile,
+        provider_id: &str,
+        plugin_id: &str,
+        method: AuthMethodContribution,
+        identities: Vec<zeroize::Zeroizing<String>>,
+        passphrase: Option<zeroize::Zeroizing<String>>,
+    ) -> Result<Self, crate::lifecycle::AuthVaultLifecycleError> {
         AuthVaultLifecycle::new(&resolved, provider_id, plugin_id, &method)?;
         Ok(Self {
             storage: std::sync::Mutex::new(storage),
@@ -317,7 +344,7 @@ impl AuthRequestCustody for RetainedAuthRequestCustody {
             )
         })?;
         lifecycle.materialize_from_custody_with_device(
-            &storage,
+            storage.as_ref(),
             &identities,
             self.passphrase.as_ref().map(|value| value.as_str()),
             self.device_source.as_deref(),
@@ -359,7 +386,7 @@ impl AuthCredentialCustody for RetainedAuthRequestCustody {
             )
         })?;
         lifecycle.persist_to_custody(
-            &mut storage,
+            storage.as_mut(),
             &identities,
             self.passphrase.as_ref().map(|value| value.as_str()),
             changes,

@@ -23,6 +23,62 @@ pub enum CustodyStorageError {
     Io(#[source] std::io::Error),
 }
 
+/// Retained ownership of encrypted credential state and its provisioning fence.
+///
+/// Implementations must confine access to an exclusively acquired location, bound reads,
+/// preserve unsupported state, and release all ownership on drop. Publication must compare
+/// expected ciphertext and atomically replace it under that ownership. Native implementations
+/// must durably publish both ciphertext and provisioning intents; simulated implementations
+/// must explicitly document their durability limits. Errors must never trigger native fallback.
+/// This contract selects storage effects only, not vault policy or credential mapping.
+pub trait AuthCustodyStorage: Send {
+    /// Read bounded, validated current-format vault ciphertext without mutation or repair.
+    ///
+    /// # Errors
+    /// Returns errors for unavailable, damaged, or unsupported state.
+    fn read(&self) -> Result<Vec<u8>, CustodyStorageError>;
+
+    /// Compare and publish validated ciphertext, preserving unrelated state.
+    ///
+    /// # Errors
+    /// Rejects stale expected bytes or invalid state. Failure after publication is uncertain
+    /// and must not be interpreted as rollback.
+    fn compare_and_publish(
+        &mut self,
+        expected: &[u8],
+        ciphertext: &[u8],
+    ) -> Result<(), CustodyStorageError>;
+
+    /// Verify no unresolved provisioning fence exists before admitting mutation.
+    ///
+    /// # Errors
+    /// Fails closed if absence cannot be verified.
+    fn ensure_no_provisioning(&self) -> Result<(), CustodyStorageError>;
+
+    /// Exclusively publish an intent before invoking external provisioning effects.
+    ///
+    /// # Errors
+    /// Rejects existing, unsupported, or unpublishable intents without replacing a fence.
+    fn begin_provisioning(
+        &self,
+        intent: &crate::operations::AuthProvisioningIntent,
+    ) -> Result<(), CustodyStorageError>;
+
+    /// Read a bounded current-format intent without guessing historical representations.
+    ///
+    /// # Errors
+    /// Returns errors for missing, damaged, or unsupported intents.
+    fn provisioning_intent(
+        &self,
+    ) -> Result<crate::operations::AuthProvisioningIntent, CustodyStorageError>;
+
+    /// Clear a fence only after caller-verified publication or source reconciliation.
+    ///
+    /// # Errors
+    /// Returns storage errors; failed removal must not be treated as acknowledged completion.
+    fn finish_provisioning(&self) -> Result<(), CustodyStorageError>;
+}
+
 /// An exclusively owned Unix custody directory containing only encrypted vault data.
 ///
 /// Callers must control the directory's ancestors and exclude hostile same-user filesystem
@@ -237,6 +293,42 @@ impl CredentialCustodyStorage {
             return Err(CustodyStorageError::Io(std::io::Error::last_os_error()));
         }
         self.directory.sync_all().map_err(CustodyStorageError::Io)
+    }
+}
+
+#[cfg(unix)]
+impl AuthCustodyStorage for CredentialCustodyStorage {
+    fn read(&self) -> Result<Vec<u8>, CustodyStorageError> {
+        Self::read(self)
+    }
+
+    fn compare_and_publish(
+        &mut self,
+        expected: &[u8],
+        ciphertext: &[u8],
+    ) -> Result<(), CustodyStorageError> {
+        Self::compare_and_publish(self, expected, ciphertext)
+    }
+
+    fn ensure_no_provisioning(&self) -> Result<(), CustodyStorageError> {
+        Self::ensure_no_provisioning(self)
+    }
+
+    fn begin_provisioning(
+        &self,
+        intent: &crate::operations::AuthProvisioningIntent,
+    ) -> Result<(), CustodyStorageError> {
+        Self::begin_provisioning(self, intent)
+    }
+
+    fn provisioning_intent(
+        &self,
+    ) -> Result<crate::operations::AuthProvisioningIntent, CustodyStorageError> {
+        Self::provisioning_intent(self)
+    }
+
+    fn finish_provisioning(&self) -> Result<(), CustodyStorageError> {
+        Self::finish_provisioning(self)
     }
 }
 

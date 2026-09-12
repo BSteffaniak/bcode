@@ -243,7 +243,7 @@ impl<'a> AuthVaultLifecycle<'a> {
     #[cfg(unix)]
     pub fn read_from_custody(
         &self,
-        custody: &crate::custody_storage::CredentialCustodyStorage,
+        custody: &dyn crate::custody_storage::AuthCustodyStorage,
         identities: &[&str],
         passphrase: Option<&str>,
     ) -> Result<BTreeMap<String, String>, AuthVaultLifecycleError> {
@@ -253,7 +253,7 @@ impl<'a> AuthVaultLifecycle<'a> {
     #[cfg(unix)]
     fn read_from_custody_with_device(
         &self,
-        custody: &crate::custody_storage::CredentialCustodyStorage,
+        custody: &dyn crate::custody_storage::AuthCustodyStorage,
         identities: &[&str],
         passphrase: Option<&str>,
         device: Option<&dyn crate::operations::AuthDeviceFactorSource>,
@@ -344,7 +344,7 @@ impl<'a> AuthVaultLifecycle<'a> {
     #[cfg(unix)]
     pub fn materialize_from_custody(
         &self,
-        custody: &crate::custody_storage::CredentialCustodyStorage,
+        custody: &dyn crate::custody_storage::AuthCustodyStorage,
         identities: &[&str],
         passphrase: Option<&str>,
     ) -> Result<crate::ResolvedProviderAuth, AuthVaultLifecycleError> {
@@ -354,7 +354,7 @@ impl<'a> AuthVaultLifecycle<'a> {
     #[cfg(unix)]
     pub(crate) fn materialize_from_custody_with_device(
         &self,
-        custody: &crate::custody_storage::CredentialCustodyStorage,
+        custody: &dyn crate::custody_storage::AuthCustodyStorage,
         identities: &[&str],
         passphrase: Option<&str>,
         device: Option<&dyn crate::operations::AuthDeviceFactorSource>,
@@ -388,7 +388,7 @@ impl<'a> AuthVaultLifecycle<'a> {
     #[cfg(unix)]
     pub(crate) fn persist_to_custody(
         &self,
-        custody: &mut crate::custody_storage::CredentialCustodyStorage,
+        custody: &mut dyn crate::custody_storage::AuthCustodyStorage,
         identities: &[&str],
         passphrase: Option<&str>,
         changes: BTreeMap<String, Option<String>>,
@@ -498,7 +498,7 @@ impl<'a> AuthVaultLifecycle<'a> {
     #[cfg(unix)]
     fn begin_custody_provisioning(
         &self,
-        custody: &crate::custody_storage::CredentialCustodyStorage,
+        custody: &dyn crate::custody_storage::AuthCustodyStorage,
         vault: &sshenv_vault::Vault,
         selected: Option<&dyn crate::operations::AuthDeviceFactorSource>,
     ) -> Result<Option<crate::operations::AuthProvisioningIntent>, AuthVaultLifecycleError> {
@@ -1721,8 +1721,8 @@ mod tests {
         assert_eq!(custody.read().unwrap(), bytes);
         assert!(!unused.exists());
         let update_profile = resolved.clone();
-        let retained = crate::operations::RetainedAuthRequestCustody::new(
-            custody,
+        let retained = crate::operations::RetainedAuthRequestCustody::from_storage(
+            Box::new(custody),
             resolved,
             "exa",
             "bcode.web-search",
