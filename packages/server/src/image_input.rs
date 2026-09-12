@@ -144,6 +144,7 @@ pub async fn read_image_artifact(
 ) -> Result<String, String> {
     let raw_limit = encoded_limit.saturating_mul(3) / 4;
     let mut offset = 0_u64;
+    let mut expected_total = None;
     let mut bytes = Vec::new();
     loop {
         let remaining = raw_limit.saturating_add(1).saturating_sub(offset);
@@ -163,6 +164,15 @@ pub async fn read_image_artifact(
         .await?;
         let total_bytes = response.total_bytes;
         let chunk = response.bytes;
+        validate_image_chunk(
+            expected_total,
+            total_bytes,
+            offset,
+            chunk.len(),
+            u64::from(length),
+            raw_limit,
+        )?;
+        expected_total = Some(total_bytes);
         bytes.extend_from_slice(&chunk);
         offset = offset.saturating_add(u64::try_from(chunk.len()).unwrap_or(u64::MAX));
         if offset >= total_bytes {
@@ -174,6 +184,30 @@ pub async fn read_image_artifact(
     }
     let encoded = encode_image_bytes(bytes, encoded_limit)?;
     Ok(encoded)
+}
+
+fn validate_image_chunk(
+    expected_total: Option<u64>,
+    total: u64,
+    offset: u64,
+    chunk_len: usize,
+    requested: u64,
+    raw_limit: u64,
+) -> Result<(), String> {
+    let len = u64::try_from(chunk_len).map_err(|_| "invalid image artifact range")?;
+    if expected_total.is_some_and(|expected| expected != total)
+        || total > raw_limit
+        || offset > total
+        || len > requested
+        || len > total.saturating_sub(offset)
+        || (len == 0 && offset < total)
+    {
+        return Err(
+            "image artifact returned an inconsistent, oversized, or non-progressing range"
+                .to_string(),
+        );
+    }
+    Ok(())
 }
 
 fn encode_image_bytes(bytes: Vec<u8>, encoded_limit: u64) -> Result<String, String> {
@@ -234,6 +268,23 @@ mod tests {
             pricing: None,
             api_surface: None,
             visibility: bcode_model::ModelVisibility::Visible,
+        }
+    }
+
+    #[test]
+    fn artifact_ranges_require_progress_consistent_totals_and_requested_bounds() {
+        assert!(validate_image_chunk(None, 8, 0, 4, 4, 8).is_ok());
+        assert!(validate_image_chunk(Some(8), 8, 4, 4, 4, 8).is_ok());
+        assert!(validate_image_chunk(None, 0, 0, 0, 4, 8).is_ok());
+        for (expected, total, offset, len, requested, limit) in [
+            (None, 8, 0, 0, 4, 8),
+            (Some(8), 9, 4, 4, 4, 16),
+            (None, 9, 0, 4, 4, 8),
+            (None, 8, 0, 5, 4, 8),
+            (Some(8), 8, 7, 2, 4, 8),
+            (Some(8), 8, 9, 0, 4, 8),
+        ] {
+            assert!(validate_image_chunk(expected, total, offset, len, requested, limit).is_err());
         }
     }
 
