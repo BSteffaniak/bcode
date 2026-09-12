@@ -4693,76 +4693,102 @@ fn spawn_exclusive_plugin_executor(
     mut receiver: mpsc::Receiver<PluginExecutorMessage>,
     metrics: Arc<PluginExecutorMetrics>,
 ) -> tokio::task::JoinHandle<()> {
-    tokio::task::spawn_blocking(move || {
+    tokio::spawn(async move {
         let plugin_id = plugin.manifest.id.clone();
         let mut plugin = Some(plugin);
         let mut stopping = false;
-        while let Some(mut message) = receiver.blocking_recv() {
-            while let PluginExecutorMessage::Queued(inner, mut count) = message {
-                count.dispatched = true;
-                drop(count);
-                message = *inner;
-            }
-            match message {
-                PluginExecutorMessage::Queued(_, _) => unreachable!("queue envelopes removed"),
-                PluginExecutorMessage::Service(mut invocation) => {
-                    let queue_wait_ms = elapsed_ms(invocation.enqueued_at);
-                    metrics.registry().record_histogram_with_labels(
-                        "plugin.queue_wait.duration_ms",
-                        queue_wait_ms,
-                        plugin_runtime_metric_labels(
-                            &plugin_id,
-                            &invocation.interface_id,
-                            &invocation.operation,
-                            invocation.class,
-                            &invocation.scope,
-                        ),
-                    );
-                    let (unused_response, _) = oneshot::channel();
-                    let response_sender =
-                        std::mem::replace(&mut invocation.response, unused_response);
-                    let response = plugin.as_ref().filter(|_| !stopping).map_or_else(
-                        || {
-                            metrics.failed.fetch_add(1, Ordering::Relaxed);
-                            Err(PluginLoadError::PluginNotLoaded(plugin_id.clone()))
-                        },
-                        |plugin| execute_plugin_service_invocation(plugin, invocation, &metrics),
-                    );
-                    let _ = response_sender.send(response);
+        while let Some(message) = receiver.recv().await {
+            let metrics = Arc::clone(&metrics);
+            let plugin_id = plugin_id.clone();
+            // Move ownership into the callback task: aborting the dispatcher cannot unload
+            // plugin code while a synchronous invocation is still running.
+            let callback = tokio::task::spawn_blocking(move || {
+                let mut plugin = plugin;
+                let mut stopping = stopping;
+                let mut message = message;
+                let mut close = false;
+                while let PluginExecutorMessage::Queued(inner, mut count) = message {
+                    count.dispatched = true;
+                    drop(count);
+                    message = *inner;
                 }
-                PluginExecutorMessage::Event(mut invocation) => {
-                    let (unused_response, _) = oneshot::channel();
-                    let response_sender =
-                        std::mem::replace(&mut invocation.response, unused_response);
-                    let response = plugin.as_ref().filter(|_| !stopping).map_or_else(
-                        || {
-                            metrics.failed.fetch_add(1, Ordering::Relaxed);
-                            Err(PluginLoadError::PluginNotLoaded(plugin_id.clone()))
-                        },
-                        |plugin| execute_plugin_event_invocation(plugin, invocation, &metrics),
-                    );
-                    let _ = response_sender.send(response);
-                }
-                PluginExecutorMessage::Deactivate(response) => {
-                    stopping = true;
-                    let result = plugin.as_ref().map_or(Ok(()), LoadedPlugin::deactivate);
-                    if result.is_ok() {
-                        receiver.close();
-                        drop(plugin.take());
+                match message {
+                    PluginExecutorMessage::Queued(_, _) => unreachable!("queue envelopes removed"),
+                    PluginExecutorMessage::Service(mut invocation) => {
+                        let queue_wait_ms = elapsed_ms(invocation.enqueued_at);
+                        metrics.registry().record_histogram_with_labels(
+                            "plugin.queue_wait.duration_ms",
+                            queue_wait_ms,
+                            plugin_runtime_metric_labels(
+                                &plugin_id,
+                                &invocation.interface_id,
+                                &invocation.operation,
+                                invocation.class,
+                                &invocation.scope,
+                            ),
+                        );
+                        let (unused_response, _) = oneshot::channel();
+                        let response_sender =
+                            std::mem::replace(&mut invocation.response, unused_response);
+                        let response = plugin.as_ref().filter(|_| !stopping).map_or_else(
+                            || {
+                                metrics.failed.fetch_add(1, Ordering::Relaxed);
+                                Err(PluginLoadError::PluginNotLoaded(plugin_id.clone()))
+                            },
+                            |plugin| {
+                                execute_plugin_service_invocation(plugin, invocation, &metrics)
+                            },
+                        );
+                        let _ = response_sender.send(response);
                     }
-                    let _ = response.send(result);
+                    PluginExecutorMessage::Event(mut invocation) => {
+                        let (unused_response, _) = oneshot::channel();
+                        let response_sender =
+                            std::mem::replace(&mut invocation.response, unused_response);
+                        let response = plugin.as_ref().filter(|_| !stopping).map_or_else(
+                            || {
+                                metrics.failed.fetch_add(1, Ordering::Relaxed);
+                                Err(PluginLoadError::PluginNotLoaded(plugin_id.clone()))
+                            },
+                            |plugin| execute_plugin_event_invocation(plugin, invocation, &metrics),
+                        );
+                        let _ = response_sender.send(response);
+                    }
+                    PluginExecutorMessage::Deactivate(response) => {
+                        stopping = true;
+                        let result = plugin.as_ref().map_or(Ok(()), LoadedPlugin::deactivate);
+                        if result.is_ok() {
+                            close = true;
+                            drop(plugin.take());
+                        }
+                        let _ = response.send(result);
+                    }
                 }
+                (plugin, stopping, close)
+            });
+            // Lost callback ownership must remain a failed worker join, never a clean stop.
+            let (returned_plugin, returned_stopping, close) = callback.await.unwrap_or_else(|_| {
+                panic!("exclusive plugin callback terminated without acknowledgment")
+            });
+            plugin = returned_plugin;
+            stopping = returned_stopping;
+            if close {
+                receiver.close();
             }
         }
-        if let Some(plugin) = plugin
-            && plugin.deactivate().is_err()
-        {
-            tracing::warn!(
-                target: "bcode_plugin::runtime",
-                plugin_id = %plugin_id,
-                "exclusive plugin executor stopped with incomplete deactivation"
-            );
-        }
+        tokio::task::spawn_blocking(move || {
+            if let Some(plugin) = plugin
+                && plugin.deactivate().is_err()
+            {
+                tracing::warn!(
+                    target: "bcode_plugin::runtime",
+                    plugin_id = %plugin_id,
+                    "exclusive plugin executor stopped with incomplete deactivation"
+                );
+            }
+        })
+        .await
+        .expect("exclusive plugin cleanup terminated without acknowledgment");
     })
 }
 
@@ -8722,6 +8748,36 @@ library = "libexample_plugin.dylib"
         drop(active);
         executor.deactivate().await.unwrap();
         drop(executor);
+    }
+
+    #[test]
+    fn idle_exclusive_executor_does_not_occupy_blocking_capacity() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .max_blocking_threads(1)
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let (sender, receiver) = mpsc::channel(1);
+            let worker = spawn_exclusive_plugin_executor(
+                LoadedPlugin {
+                    config: ResolvedPluginConfig::default(),
+                    manifest: test_manifest("idle-exclusive"),
+                    backend: LoadedPluginBackend::Static {
+                        vtable: test_large_vtable(),
+                    },
+                },
+                receiver,
+                Arc::new(PluginExecutorMetrics::default()),
+            );
+            tokio::task::yield_now().await;
+            let probe = tokio::task::spawn_blocking(|| 42);
+            let result = tokio::time::timeout(Duration::from_secs(2), probe).await;
+            // Always release the worker, including on regression, so runtime shutdown cannot hang.
+            drop(sender);
+            worker.await.unwrap();
+            assert_eq!(result.unwrap().unwrap(), 42);
+        });
     }
 
     #[tokio::test]
