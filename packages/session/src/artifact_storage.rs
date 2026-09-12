@@ -103,6 +103,80 @@ pub enum ArtifactStorageOutcome {
     },
 }
 
+/// Verify a finalized relative artifact reference and compress it under one maintenance fence.
+///
+/// Uses the current session database boundary, rejects stale projections and unsupported writer
+/// contracts, and requires explicit completeness and a logical length matching the stored content.
+/// Only relative local references are supported by this operation; capability and historical URI
+/// resolution must remain application-owned rather than guessed here.
+///
+/// # Errors
+///
+/// Returns an error for ownership, compatibility, projection, reference, length, codec or I/O
+/// failures. No publication occurs when finalization cannot be verified.
+pub async fn compress_finalized_artifact(
+    sessions_root: &Path,
+    session_id: SessionId,
+    artifact_id: &str,
+    reference_key: &str,
+    compression: ArtifactCompression,
+    minimum_saved_bytes: u64,
+) -> io::Result<ArtifactStorageOutcome> {
+    let root = sessions_root.canonicalize()?;
+    let session = confined(&root.join(session_id.to_string()), &root)?;
+    if !fs::symlink_metadata(session.join("session.db"))?.is_file() {
+        return Err(invalid());
+    }
+    let maintenance = crate::lease::acquire_session_maintenance_guard(&root, session_id)
+        .map_err(io::Error::other)?;
+    let db = crate::db::SessionDb::open_existing_turso_in_root(session_id, &root)
+        .await
+        .map_err(io::Error::other)?;
+    let reference_result = db
+        .finalized_artifact_reference(artifact_id, reference_key)
+        .await;
+    let close_result = db.database().close().await;
+    close_result.map_err(io::Error::other)?;
+    let reference = reference_result
+        .map_err(io::Error::other)?
+        .ok_or_else(invalid)?;
+    if reference.complete != Some(true) || reference.availability.as_deref() != Some("complete") {
+        return Err(invalid());
+    }
+    let relative = PathBuf::from(reference.storage_uri.ok_or_else(invalid)?);
+    if relative.as_os_str().is_empty()
+        || relative
+            .components()
+            .any(|part| !matches!(part, std::path::Component::Normal(_)))
+    {
+        return Err(invalid());
+    }
+    let expected_bytes = reference.byte_len.ok_or_else(invalid)?;
+    tokio::task::spawn_blocking(move || {
+        let artifacts = confined(
+            &root.join("session-artifacts").join(session_id.to_string()),
+            &root,
+        )?;
+        let (file, encoding) = open_content(&artifacts.join(&relative), &artifacts)?;
+        let reader = ArtifactReader::new(file, encoding)?;
+        if reader.logical_bytes() != expected_bytes {
+            return Err(invalid());
+        }
+        drop(reader);
+        compress_artifact_with_maintenance(
+            &root,
+            session_id,
+            &relative,
+            compression,
+            minimum_saved_bytes,
+            || Ok(()),
+            maintenance,
+        )
+    })
+    .await
+    .map_err(|_| io::Error::other("artifact maintenance task failed"))?
+}
+
 /// Compress one finalized artifact during explicit offline maintenance.
 ///
 /// Acquires the owning session's maintenance fence before opening any artifact, verifies the
@@ -145,13 +219,33 @@ pub fn compress_session_artifact(
     if !fs::symlink_metadata(session.join("session.db"))?.is_file() {
         return Err(invalid());
     }
-    let _maintenance = crate::lease::acquire_session_maintenance_guard(&sessions_root, session_id)
+    let maintenance = crate::lease::acquire_session_maintenance_guard(&sessions_root, session_id)
         .map_err(io::Error::other)?;
+    compress_artifact_with_maintenance(
+        &sessions_root,
+        session_id,
+        relative_artifact_path,
+        compression,
+        minimum_saved_bytes,
+        check_cancelled,
+        maintenance,
+    )
+}
+
+fn compress_artifact_with_maintenance(
+    sessions_root: &Path,
+    session_id: SessionId,
+    relative_artifact_path: &Path,
+    compression: ArtifactCompression,
+    minimum_saved_bytes: u64,
+    mut check_cancelled: impl FnMut() -> io::Result<()>,
+    _maintenance: crate::lease::SessionMaintenanceGuard,
+) -> io::Result<ArtifactStorageOutcome> {
     let root = confined(
         &sessions_root
             .join("session-artifacts")
             .join(session_id.to_string()),
-        &sessions_root,
+        sessions_root,
     )?;
     let path = confined(&root.join(relative_artifact_path), &root)?;
     let parent = path.parent().ok_or_else(invalid)?;
@@ -270,6 +364,36 @@ fn exchange(_left: &Path, _right: &Path) -> io::Result<()> {
 #[cfg(all(test, any(target_os = "macos", target_os = "linux")))]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn verified_maintenance_rejects_corrupt_canonical_storage_without_publication() {
+        let root = tempfile::tempdir().expect("root");
+        let id = SessionId::new();
+        let session = root.path().join(id.to_string());
+        fs::create_dir(&session).expect("session");
+        fs::write(session.join("session.db"), b"not a database").expect("database");
+        let artifacts = root.path().join("session-artifacts").join(id.to_string());
+        fs::create_dir_all(&artifacts).expect("artifacts");
+        let bytes = vec![42; 100_000];
+        fs::write(artifacts.join("recording"), &bytes).expect("raw");
+        assert!(
+            compress_finalized_artifact(
+                root.path(),
+                id,
+                "artifact",
+                "recording",
+                ArtifactCompression::Light,
+                1
+            )
+            .await
+            .is_err()
+        );
+        assert_eq!(
+            fs::read(artifacts.join("recording")).expect("unchanged"),
+            bytes
+        );
+        assert!(!artifacts.join(".recording.compression-pending").exists());
+    }
 
     #[test]
     fn crash_child() {

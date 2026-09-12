@@ -148,6 +148,16 @@ This implementation still requires security review of path races against untrust
 filesystem mutation and stronger finalization/ownership capabilities before enabling automatic
 scheduling. It does not compress canonical session databases.
 
+## Verified finalized-reference maintenance
+
+`compress_finalized_artifact` acquires maintenance ownership before resolving the reference through
+current session storage. Unsupported contracts, stale projections, absent/incomplete references,
+and logical-length mismatches prevent publication. It closes the database before file conversion
+and transfers the maintenance guard into the blocking task so cancellation cannot release the fence
+while conversion runs. This entry point currently accepts only relative local references; capability
+URIs and legacy file-URI resolution remain unimplemented. The lower-level path-based operation still
+exists for callers that separately establish finalization and is not safe to schedule blindly.
+
 ## Remaining implementation
 
 ### Access policy and scheduling
