@@ -15656,9 +15656,10 @@ async fn drive_workflow_run(state: &Arc<ServerState>, run_id: &str) -> Result<()
         let settled = bcode_workflow_store::WorkflowStore::open_at_path(&store_path)?
             .settle_pending_control_nodes(run_id, 1_000, now_ms)?;
         let dispatched = bcode_workflow_store::WorkflowStore::open_at_path(&store_path)?
-            .dispatch_pending_activations_for_run(
+            .dispatch_owned_pending_activations_for_run(
                 &WorkflowActivationOwner { state },
                 run_id,
+                &authority.authority,
                 1_000,
                 now_ms,
             )

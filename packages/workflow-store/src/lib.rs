@@ -6114,6 +6114,35 @@ impl WorkflowStore {
             &NoopWorkflowDispatchFault,
             pending,
             dispatched_at_ms,
+            None,
+        )
+        .await
+    }
+
+    /// Dispatch one run using the caller's existing durable execution authority.
+    ///
+    /// # Errors
+    /// Rejects stale authority before discovery and again at handoff, plus ordinary
+    /// planning, dispatch, and persistence failures.
+    pub async fn dispatch_owned_pending_activations_for_run<O>(
+        &mut self,
+        owner: &O,
+        run_id: &str,
+        authority: &WorkflowExecutionAuthority,
+        limit: usize,
+        dispatched_at_ms: u64,
+    ) -> Result<ActivationDispatchSummary, WorkflowStoreError>
+    where
+        O: ActivationDispatchOwner + ?Sized,
+    {
+        self.verify_execution_authority(run_id, authority)?;
+        let pending = self.pending_activations_for_run(run_id, limit)?;
+        self.dispatch_activations_with_fault(
+            owner,
+            &NoopWorkflowDispatchFault,
+            pending,
+            dispatched_at_ms,
+            Some(authority),
         )
         .await
     }
@@ -6136,7 +6165,7 @@ impl WorkflowStore {
         F: WorkflowDispatchFault + ?Sized,
     {
         let pending = self.pending_activations(limit)?;
-        self.dispatch_activations_with_fault(owner, fault, pending, dispatched_at_ms)
+        self.dispatch_activations_with_fault(owner, fault, pending, dispatched_at_ms, None)
             .await
     }
 
@@ -6146,6 +6175,7 @@ impl WorkflowStore {
         fault: &F,
         pending: Vec<PendingActivation>,
         dispatched_at_ms: u64,
+        expected_authority: Option<&WorkflowExecutionAuthority>,
     ) -> Result<ActivationDispatchSummary, WorkflowStoreError>
     where
         O: ActivationDispatchOwner + ?Sized,
@@ -6153,6 +6183,12 @@ impl WorkflowStore {
     {
         let mut summary = ActivationDispatchSummary::default();
         for activation in pending {
+            let authority = if let Some(authority) = expected_authority {
+                self.verify_execution_authority(&activation.run_id, authority)?;
+                Some(authority.clone())
+            } else {
+                self.execution_authority(&activation.run_id)?
+            };
             let Some(plan) = owner.plan(&activation).await? else {
                 summary.unsupported.push(activation.activation_id);
                 continue;
@@ -6177,7 +6213,7 @@ impl WorkflowStore {
                 continue;
             };
             fault.after_boundary(WorkflowDispatchBoundary::IntentCommitted, &prepared)?;
-            self.record_dispatch_handoff(&prepared)?;
+            self.record_dispatch_handoff(&prepared, authority.as_ref())?;
             let receipt = owner.dispatch(&prepared).await?;
             fault.after_boundary(WorkflowDispatchBoundary::OwnerAccepted, &prepared)?;
             self.persist_dispatch_receipt(&DispatchReceipt {
@@ -6292,10 +6328,20 @@ impl WorkflowStore {
     }
 
     fn record_dispatch_handoff(
-        &mut self,
+        &self,
         request: &PreparedActivationDispatch,
+        expected_authority: Option<&WorkflowExecutionAuthority>,
     ) -> Result<(), WorkflowStoreError> {
-        let transaction = self.connection.transaction()?;
+        let transaction = self.connection.unchecked_transaction()?;
+        if self
+            .execution_authority(&request.activation.run_id)?
+            .as_ref()
+            != expected_authority
+        {
+            return Err(WorkflowStoreError::InvalidData(
+                "dispatch handoff execution authority changed".to_string(),
+            ));
+        }
         let eligible: bool = transaction.query_row(
             "SELECT EXISTS(SELECT 1 FROM workflow_attempts attempt
              JOIN workflow_activations activation USING (run_id, node_id, activation_id)
@@ -6991,7 +7037,8 @@ impl WorkflowStore {
         let prepared = prepared_read_only_dispatches(&self.connection, bounded_limit(limit)?)?;
         let mut admitted = Vec::with_capacity(prepared.len());
         for request in prepared {
-            self.record_dispatch_handoff(&request)?;
+            let authority = self.execution_authority(&request.activation.run_id)?;
+            self.record_dispatch_handoff(&request, authority.as_ref())?;
             let receipt = owner.dispatch(&request).await?;
             self.persist_dispatch_receipt(&DispatchReceipt {
                 run_id: request.activation.run_id.clone(),
@@ -7028,7 +7075,8 @@ impl WorkflowStore {
             prepared_read_only_dispatches_for_run(&self.connection, run_id, bounded_limit(limit)?)?;
         let mut admitted = Vec::with_capacity(prepared.len());
         for request in prepared {
-            self.record_dispatch_handoff(&request)?;
+            let authority = self.execution_authority(&request.activation.run_id)?;
+            self.record_dispatch_handoff(&request, authority.as_ref())?;
             let receipt = owner.dispatch(&request).await?;
             self.persist_dispatch_receipt(&DispatchReceipt {
                 run_id: request.activation.run_id.clone(),
@@ -36026,6 +36074,42 @@ mod tests {
     }
 
     #[test]
+    fn dispatch_handoff_rejects_changed_execution_authority_without_marking_handoff() {
+        let (_temp, mut store, run, authority, _) = connected_publication_fixture();
+        let id = activation_identity(&run.run_id, "first", 0);
+        let prepared = store
+            .prepare_pending_activation(
+                &run.run_id,
+                "first",
+                &id,
+                DispatchSideEffect::ReadOnly,
+                serde_json::json!({}),
+                25,
+            )
+            .expect("prepare")
+            .expect("pending");
+        store.connection.execute(
+            "UPDATE workflow_runs SET coordinator_generation = coordinator_generation + 1 WHERE run_id = ?1",
+            [&run.run_id],
+        ).expect("ownership changed");
+        assert!(
+            store
+                .record_dispatch_handoff(&prepared, Some(&authority))
+                .is_err()
+        );
+        let handed_off: bool = store
+            .connection
+            .query_row(
+                "SELECT handed_off FROM workflow_dispatch_handoffs WHERE dispatch_identity = ?1",
+                [&prepared.dispatch_identity],
+                |row| row.get(0),
+            )
+            .expect("handoff proof");
+        assert!(!handed_off);
+        assert!(store.record_dispatch_handoff(&prepared, None).is_err());
+    }
+
+    #[test]
     fn schema_29_upgrade_does_not_invent_dispatch_handoff_evidence() {
         let (temp, mut store, run, _, _) = connected_publication_fixture();
         let id = activation_identity(&run.run_id, "first", 0);
@@ -36080,7 +36164,9 @@ mod tests {
                 .expect("prepare")
                 .expect("pending");
             if handed_off {
-                store.record_dispatch_handoff(&prepared).expect("handoff");
+                store
+                    .record_dispatch_handoff(&prepared, Some(&authority))
+                    .expect("handoff");
             }
             let request = bcode_workflow::WorkflowRunGraphEditBatch {
                 version: bcode_workflow::WORKFLOW_RUN_GRAPH_EDIT_VERSION,
@@ -36109,7 +36195,11 @@ mod tests {
                 );
             } else {
                 assert_eq!(result.expect("cancel before handoff"), 3);
-                assert!(store.record_dispatch_handoff(&prepared).is_err());
+                assert!(
+                    store
+                        .record_dispatch_handoff(&prepared, Some(&authority))
+                        .is_err()
+                );
                 assert!(
                     store
                         .persist_dispatch_receipt(&DispatchReceipt {
