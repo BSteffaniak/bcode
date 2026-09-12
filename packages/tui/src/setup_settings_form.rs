@@ -29,6 +29,7 @@ pub struct SetupSettingsForm {
     model_profiles: Option<Vec<(String, bcode_config::ResolvedModelSelection)>>,
     selected_profile: usize,
     create_context: bool,
+    discovered_models: Option<(Option<String>, String, String, Vec<String>)>,
     contexts: Option<Vec<(String, String)>>,
 }
 
@@ -46,6 +47,7 @@ impl SetupSettingsForm {
             selected_profile: 0,
             create_context: false,
             contexts: None,
+            discovered_models: None,
         }
     }
 
@@ -78,6 +80,31 @@ impl SetupSettingsForm {
         form
     }
 
+    /// Present catalog-resolved models for an explicitly selected account.
+    pub fn discovered_models(
+        path: &std::path::Path,
+        context: Option<String>,
+        provider: String,
+        account: String,
+        models: bcode_model::ModelList,
+    ) -> Self {
+        let mut form = Self::new(path, "model selection");
+        form.focused = 0;
+        form.discovered_models = Some((
+            context,
+            provider,
+            account,
+            models
+                .models
+                .into_iter()
+                .filter(|model| matches!(model.visibility, bcode_model::ModelVisibility::Visible))
+                .map(|model| model.model_id)
+                .collect(),
+        ));
+        form.refresh_profile();
+        form
+    }
+
     /// Select a configured profile while retaining an explicit, reviewed edit destination.
     pub fn models(path: &std::path::Path, config: &bcode_config::BcodeConfig) -> Self {
         let key = config.active_context.as_ref().map_or_else(
@@ -103,6 +130,18 @@ impl SetupSettingsForm {
     }
 
     fn refresh_profile(&mut self) {
+        if let Some((context, provider, account, models)) = &self.discovered_models {
+            if let Some(model) = models.get(self.selected_profile) {
+                self.inputs[2] = TextInputState::new(TextEditBuffer::from_text(model.clone()));
+                self.status = format!(
+                    "Context: {}; provider: {provider}; account: {account}; model: {model}. Up/Down selects; Enter reviews.",
+                    context.as_deref().unwrap_or("global")
+                );
+            } else {
+                "No available models returned. Esc returns to setup.".clone_into(&mut self.status);
+            }
+            return;
+        }
         if let Some(contexts) = &self.contexts {
             if let Some((id, label)) = contexts.get(self.selected_profile) {
                 self.inputs[2] = TextInputState::new(TextEditBuffer::from_text(
@@ -149,6 +188,11 @@ impl SetupSettingsForm {
                 .as_ref()
                 .map(Vec::len)
                 .or_else(|| self.model_profiles.as_ref().map(Vec::len))
+                .or_else(|| {
+                    self.discovered_models
+                        .as_ref()
+                        .map(|(_, _, _, models)| models.len())
+                })
             && let Event::Key(key) = event
             && matches!(key.key, KeyCode::Up | KeyCode::Down)
         {
@@ -169,7 +213,10 @@ impl SetupSettingsForm {
             }
             Event::Key(key) if key.key == KeyCode::Enter => self.submit(),
             Event::Key(key) if key.key == KeyCode::Tab && self.pending.is_none() => {
-                if self.model_profiles.is_some() || self.contexts.is_some() {
+                if self.model_profiles.is_some()
+                    || self.contexts.is_some()
+                    || self.discovered_models.is_some()
+                {
                     self.focused = 0;
                 } else {
                     self.focused = (self.focused + 1) % self.inputs.len();
@@ -215,6 +262,26 @@ impl SetupSettingsForm {
         let path = self.inputs[0].buffer().text();
         let key = self.inputs[1].buffer().text();
         let value = self.inputs[2].buffer().text();
+        if let Some((context, provider, account, models)) = &self.discovered_models {
+            let Some(model) = models.get(self.selected_profile) else {
+                return;
+            };
+            match bcode_config::edit::plan_scoped_model_selection(
+                path.into(),
+                context.as_deref(),
+                provider,
+                model,
+                Some(account),
+            ) {
+                Ok(edit) => {
+                    self.pending = Some(edit);
+                    "Review provider, account, model, context and file. Enter saves this selection; Esc cancels.".clone_into(&mut self.status);
+                }
+                Err(_) => "Cannot safely edit model selection. Review configuration."
+                    .clone_into(&mut self.status),
+            }
+            return;
+        }
         if self.create_context {
             match bcode_config::edit::plan_context_creation(path.into(), key, value) {
                 Ok(edit) => {
@@ -330,6 +397,30 @@ fn write(frame: &mut PaintCx<'_, '_>, area: Rect, text: &str, style: Style) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn discovered_model_selection_writes_context_account_and_model_atomically() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("bcode.toml");
+        let models: bcode_model::ModelList = serde_json::from_value(serde_json::json!({"models":[{"model_id":"catalog-model","display_name":"Catalog model"}]})).unwrap();
+        let mut form = SetupSettingsForm::discovered_models(
+            &path,
+            Some("custom".to_owned()),
+            "example.plugin".to_owned(),
+            "account".to_owned(),
+            models,
+        );
+        form.submit();
+        assert!(form.pending.is_some());
+        assert!(!path.exists());
+        form.submit();
+        let value: toml::Value = toml::from_str(&std::fs::read_to_string(path).unwrap()).unwrap();
+        let model = &value["contexts"]["entries"]["custom"]["model"];
+        assert_eq!(model["model_id"].as_str(), Some("catalog-model"));
+        assert_eq!(model["auth_profile"].as_str(), Some("account"));
+        assert_eq!(model["provider_plugin_id"].as_str(), Some("example.plugin"));
+        assert!(value.get("model").is_none());
+    }
 
     #[test]
     fn context_creation_and_selection_require_separate_reviewed_edits() {

@@ -260,6 +260,24 @@ pub fn plan_model_selection(
     provider_plugin_id: &str,
     model_id: &str,
 ) -> Result<ConfigEdit, ConfigError> {
+    plan_scoped_model_selection(path, None, provider_plugin_id, model_id, None)
+}
+
+/// Plan provider, model, and optional local account selection as one reviewed edit.
+/// Context selection never modifies global model defaults or sibling contexts.
+///
+/// # Errors
+/// Rejects invalid context/account IDs, empty targets, and malformed configuration.
+pub fn plan_scoped_model_selection(
+    path: PathBuf,
+    context: Option<&str>,
+    provider_plugin_id: &str,
+    model_id: &str,
+    auth_profile: Option<&str>,
+) -> Result<ConfigEdit, ConfigError> {
+    if let Some(context) = context {
+        crate::contexts::qualify(context, auth_profile.unwrap_or("validation"))?;
+    }
     if provider_plugin_id.is_empty() || model_id.is_empty() {
         return Err(invalid("Provider and model are required"));
     }
@@ -269,16 +287,28 @@ pub fn plan_model_selection(
         .unwrap_or("")
         .parse::<toml_edit::DocumentMut>()
         .map_err(|_| invalid("Existing configuration cannot be edited safely"))?;
-    if !document.contains_key("model") {
-        document["model"] = toml_edit::Item::Table(toml_edit::Table::new());
+    let keys = context.map_or_else(
+        || vec!["model"],
+        |context| vec!["contexts", "entries", context, "model"],
+    );
+    let mut model = document.as_table_mut();
+    for key in keys {
+        if !model.contains_key(key) {
+            model.insert(key, toml_edit::Item::Table(toml_edit::Table::new()));
+        }
+        model = model
+            .get_mut(key)
+            .and_then(toml_edit::Item::as_table_mut)
+            .ok_or_else(|| invalid("Model selection path must be a table"))?;
     }
-    let model = document["model"]
-        .as_table_mut()
-        .ok_or_else(|| invalid("model must be a table"))?;
     model.insert("provider_plugin_id", toml_edit::value(provider_plugin_id));
     model.insert("model_id", toml_edit::value(model_id));
     model.remove("profile");
-    // Auth profile/pool references are preserved and must be reconciled before launch.
+    if let Some(profile) = auth_profile {
+        model.insert("auth_profile", toml_edit::value(profile));
+        model.remove("auth_pool");
+    }
+    // An explicitly selected account replaces pool routing; otherwise references are preserved.
     let updated = document.to_string();
     toml::from_str::<BcodeConfig>(&updated).map_err(|_| invalid("Invalid model configuration"))?;
     Ok(ConfigEdit {

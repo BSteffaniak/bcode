@@ -22,6 +22,10 @@ pub enum OnboardingMessage {
         generation: u64,
         result: Result<(), String>,
     },
+    ModelsDiscovered {
+        generation: u64,
+        result: Result<Box<super::setup_settings_form::SetupSettingsForm>, String>,
+    },
     InputFailed(std::io::Error),
 }
 
@@ -35,6 +39,7 @@ pub struct OnboardingProgram {
     area: Rect,
     continuation: bcode_settings::SetupContinuation,
     launch_generation: u64,
+    model_discovery_requested: bool,
     launch_pending: bool,
     connection_form: Option<super::setup_connection_form::ConnectionForm>,
     settings_form: Option<super::setup_settings_form::SetupSettingsForm>,
@@ -60,6 +65,7 @@ impl OnboardingProgram {
             continuation: bcode_settings::SetupContinuation::Close,
             launch_generation: 0,
             launch_pending: false,
+            model_discovery_requested: false,
             connection_form: None,
             settings_form: None,
         })
@@ -109,10 +115,66 @@ impl OnboardingProgram {
         };
     }
 
+    fn complete_model_discovery(
+        &mut self,
+        generation: u64,
+        result: Result<Box<super::setup_settings_form::SetupSettingsForm>, String>,
+    ) -> Update<OnboardingMessage> {
+        if generation == self.launch_generation && self.model_discovery_requested {
+            self.model_discovery_requested = false;
+            match result {
+                Ok(form) => self.settings_form = Some(*form),
+                Err(message) => self.shell.set_status_message(message),
+            }
+        }
+        Update {
+            invalidation: Invalidation::Redraw,
+            ..Update::none()
+        }
+    }
+
+    fn pending_commands(
+        &self,
+        previous: u64,
+        had_connection: bool,
+    ) -> Vec<bmux_tui_runtime::Command<OnboardingMessage>> {
+        if self.model_discovery_requested && previous != self.launch_generation {
+            let generation = self.launch_generation;
+            vec![bmux_tui_runtime::Command::concurrent(async move {
+                Some(OnboardingMessage::ModelsDiscovered {
+                    generation,
+                    result: discover_setup_models().await.map(Box::new),
+                })
+            })]
+        } else if self.launch_pending && previous != self.launch_generation {
+            vec![launch_validation_command(self.launch_generation)]
+        } else if !had_connection && self.connection_form.is_some() {
+            vec![Self::auth_progress_command()]
+        } else {
+            Vec::new()
+        }
+    }
+
+    fn start_model_discovery(&mut self, code: KeyCode) -> bool {
+        self.model_discovery_requested = false;
+        self.launch_generation = self.launch_generation.wrapping_add(1);
+        if code != KeyCode::Char('M') {
+            return false;
+        }
+        self.model_discovery_requested = true;
+        self.shell.set_status_message(
+            "Discovering models for the context's account… Any key cancels.".to_owned(),
+        );
+        true
+    }
+
     fn handle_key(&mut self, code: KeyCode) -> Result<Lifecycle, TuiError> {
         if self.launch_pending {
             self.launch_pending = false;
             self.launch_generation = self.launch_generation.wrapping_add(1);
+        }
+        if self.start_model_discovery(code) {
+            return Ok(Lifecycle::Continue);
         }
         let code = if code == KeyCode::Enter && !self.shell.has_pending_confirmation() {
             use bcode_settings::SetupSectionId;
@@ -256,6 +318,48 @@ impl OnboardingProgram {
     }
 }
 
+async fn discover_setup_models() -> Result<super::setup_settings_form::SetupSettingsForm, String> {
+    let (config, context, provider, local, client) = tokio::task::spawn_blocking(|| {
+        let mut config = bcode_config::load_config().map_err(|_| "Cannot load configuration".to_owned())?;
+        let context = config.active_context.clone().ok_or_else(|| "Select a context before discovering account-specific models.".to_owned())?;
+        let accounts = &config.contexts.as_ref().ok_or_else(|| "Missing contexts".to_owned())?.entries[&context].auth.profiles;
+        if accounts.len() != 1 { return Err("Model discovery currently requires exactly one declared account in the selected context. Select a model profile for multi-account setups.".to_owned()); }
+        let (local, account) = accounts.iter().next().ok_or_else(|| "Connect an account first".to_owned())?;
+        let local = local.clone();
+        let provider = account.owner_plugin_id.clone().ok_or_else(|| "Account ownership is missing".to_owned())?;
+        let definition = config.contexts.as_mut().unwrap().entries.get_mut(&context).unwrap();
+        definition.model.provider_plugin_id = Some(provider.clone());
+        definition.model.auth_profile = Some(local.clone());
+        definition.model.profile = None;
+        definition.model.auth_pool = None;
+        let encoded = bcode_config::encode_effective_config(&config).map_err(|_| "Cannot prepare discovery".to_owned())?;
+        let resolved = bcode_config::load_config_from_paths_with_overrides(&[], &bcode_config::ConfigLoadOverrides::default().with_cli_config_toml(Some(encoded))).map_err(|_| "Cannot resolve discovery context".to_owned())?;
+        let selection = resolved.resolved_model_selection();
+        let auth = bcode_provider_auth::try_resolve_provider_request_context(bcode_provider_auth::ProviderRequestContextResolution { config: &resolved, selection }).map_err(|_| "Account is unavailable".to_owned())?;
+        let runtime = bcode_ipc::ClientRuntimeContext {
+            effective_config_toml: Some(Box::new(bcode_config::encode_effective_config(&resolved).map_err(|_| "Cannot encode discovery context".to_owned())?)),
+            selected_provider_plugin_id: Some(provider.clone()), provider_context: auth,
+            ..Default::default()
+        };
+        let client = bcode_client::BcodeClient::default_endpoint().with_runtime_context(Some(runtime));
+        Ok::<_, String>((resolved, context, provider, local, client))
+    }).await.map_err(|_| "Could not prepare model discovery".to_owned())??;
+    let models = client
+        .session_model_list(Some(provider.clone()))
+        .await
+        .map_err(|_| "Model discovery failed. Check Connections and retry.".to_owned())?;
+    let _ = config;
+    Ok(
+        super::setup_settings_form::SetupSettingsForm::discovered_models(
+            &bcode_config::default_config_dir().join("bcode.toml"),
+            Some(context),
+            provider,
+            local,
+            models,
+        ),
+    )
+}
+
 fn launch_validation_command(generation: u64) -> bmux_tui_runtime::Command<OnboardingMessage> {
     bmux_tui_runtime::Command::concurrent(async move {
         let result = validate_launch_provider().await;
@@ -339,6 +443,11 @@ impl Program for OnboardingProgram {
         &mut self,
         event: RuntimeEvent<Self::Message>,
     ) -> Result<Update<Self::Message>, Self::Error> {
+        if let RuntimeEvent::Message(OnboardingMessage::ModelsDiscovered { generation, result }) =
+            event
+        {
+            return Ok(self.complete_model_discovery(generation, result));
+        }
         if let RuntimeEvent::Message(OnboardingMessage::LaunchValidated { generation, result }) =
             event
         {
@@ -414,9 +523,10 @@ impl Program for OnboardingProgram {
                 Event::Paste(_) | Event::Focus(_) | Event::Tick | Event::User(_),
             )
             | RuntimeEvent::Timer(_)
-            | RuntimeEvent::Message(OnboardingMessage::LaunchValidated { .. }) => {
-                Invalidation::None
-            }
+            | RuntimeEvent::Message(
+                OnboardingMessage::ModelsDiscovered { .. }
+                | OnboardingMessage::LaunchValidated { .. },
+            ) => Invalidation::None,
             RuntimeEvent::Message(OnboardingMessage::AuthProgress) => Invalidation::Redraw,
             RuntimeEvent::Message(OnboardingMessage::InputFailed(error)) => {
                 return Err(error.into());
@@ -424,14 +534,7 @@ impl Program for OnboardingProgram {
         };
         self.refresh_persisted_state()?;
         Ok(Update {
-            commands: if self.launch_pending && previous_launch_generation != self.launch_generation
-            {
-                vec![launch_validation_command(self.launch_generation)]
-            } else if !had_connection && self.connection_form.is_some() {
-                vec![Self::auth_progress_command()]
-            } else {
-                Vec::new()
-            },
+            commands: self.pending_commands(previous_launch_generation, had_connection),
             invalidation,
             lifecycle,
             ..Update::none()

@@ -28,6 +28,10 @@ A selected context replaces global model/auth configuration rather than inheriti
 
 Resolved context identity crosses effective-config transport. Model profile names remain local. Local account names supplied to auth lookup resolve within the selected context; global default provider bindings are not consulted. Missing contexts fail rather than selecting another context. Existing configurations without `contexts` retain their behavior.
 
+## Discovered model selection
+
+In onboarding, `M` discovers models for a context containing exactly one declared account. The account's registered plugin supplies the catalog through the application client. Up/Down selects a returned model; Enter reviews and confirms an atomic context-local provider/model/account edit. No global model default is changed. Missing or ambiguous account selection is reported instead of guessing. Multi-account discovery selection is not yet implemented; configured model profiles remain available through `m`.
+
 ## Current limitations — not product completion
 
 * Context account enrollment uses an explicit reviewed declaration before sign-in. The declaration does not select a model or provider binding. Automatic unscoped runtime registration remains prohibited for contexts.
