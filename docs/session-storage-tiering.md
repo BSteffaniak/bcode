@@ -66,6 +66,9 @@ deep_after_days = 30
 These are the defaults. Thresholds require `0 < light_after_days < deep_after_days`, including when
 disabled; unknown fields and invalid values are rejected. Days mean elapsed 24-hour durations.
 The settings are documented by the configuration schema but **do not yet start maintenance**.
+`enabled` controls scheduling only: meaningful access tracking continues while disabled so later
+re-enablement cannot use timestamps that omit reads during the opt-out. Existing compressed data
+must remain readable independently of scheduling. This is not a switch disabling metadata writes.
 
 The session domain provides a pure, separately validated eligibility policy. It proposes only colder
 representations; it never promotes data after a read. Eligibility uses the later of finalization

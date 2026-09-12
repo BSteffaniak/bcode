@@ -2007,6 +2007,7 @@ impl Default for SessionSearchConfig {
 #[serde(default, deny_unknown_fields)]
 pub struct SessionStorageConfig {
     /// Allow automatic lossless storage transitions once the maintenance implementation is ready.
+    /// Does not disable access tracking or decoding existing compressed data.
     pub enabled: bool,
     /// Inactivity before light compression; must be positive and less than `deep_after_days`.
     pub light_after_days: u32,

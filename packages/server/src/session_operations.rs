@@ -487,7 +487,9 @@ pub async fn record_history_access(
     .await;
 }
 
-/// Track application consumption; automatic tiering remains disabled on all paths.
+/// Track application consumption even when scheduling is opted out, so re-enabling cannot use
+/// timestamps that omit reads performed while disabled. Decoding and tracking are independent of
+/// the scheduling toggle. Automatic tiering remains disabled on all paths.
 pub async fn record_consumption(
     state: &ServerState,
     session_id: bcode_session_models::SessionId,
