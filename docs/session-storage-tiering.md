@@ -38,6 +38,28 @@ It does not publish, sync, replace, migrate, or auto-detect any artifact. An uns
 incomplete output, never authoritative content. No existing artifact reader or writer uses the codec
 yet; a durable representation selector and compatibility fencing must precede activation.
 
+## Configured policy (not activated)
+
+The configuration loader accepts and validates:
+
+```toml
+[session_storage]
+enabled = true
+light_after_days = 5
+deep_after_days = 30
+```
+
+These are the defaults. Thresholds require `0 < light_after_days < deep_after_days`, including when
+disabled; unknown fields and invalid values are rejected. Days mean elapsed 24-hour durations.
+The settings are documented by the configuration schema but **do not yet start maintenance**.
+
+The session domain provides a pure, separately validated eligibility policy. It proposes only colder
+representations; it never promotes data after a read. Eligibility uses the later of finalization
+and last meaningful access, with inclusive thresholds. Missing tracking, clock rollback, incomplete
+artifacts, and ownership not verifiably released all defer. These facts are supplied by a scheduler;
+the decision is not authorization and must be rechecked under durable maintenance ownership.
+Persisted access tracking and the scheduler/config adapter remain to be implemented.
+
 ## Remaining implementation
 
 ### Access policy and scheduling

@@ -256,6 +256,9 @@ pub struct BcodeConfig {
     pub session_import: SessionImportConfig,
     #[serde(default)]
     pub session_search: SessionSearchConfig,
+    /// Lossless storage tiering policy (automatic transitions are not activated yet).
+    #[serde(default)]
+    pub session_storage: SessionStorageConfig,
     /// Durable state location selection.
     #[serde(default)]
     pub state: StateConfig,
@@ -293,6 +296,7 @@ impl Default for BcodeConfig {
             tui: TuiConfig::default(),
             session_import: SessionImportConfig::default(),
             session_search: SessionSearchConfig::default(),
+            session_storage: SessionStorageConfig::default(),
             state: StateConfig::default(),
             client: ClientConfig::default(),
             daemon: DaemonConfig::default(),
@@ -376,6 +380,10 @@ impl ConfigDocSchema for BcodeConfig {
             schema_section_doc::<SessionSearchConfig>(
                 "session_search",
                 "Global derived session-search enablement.",
+            ),
+            schema_section_doc::<SessionStorageConfig>(
+                "session_storage",
+                "Lossless storage tiering policy; automatic transitions are not activated yet.",
             ),
             schema_section_doc::<StateConfig>(
                 "state",
@@ -1987,6 +1995,32 @@ pub struct SessionSearchConfig {
 impl Default for SessionSearchConfig {
     fn default() -> Self {
         Self { enabled: true }
+    }
+}
+
+/// Declarative lossless session-storage policy.
+///
+/// Automatic transitions are not activated yet. Disabling scheduling must never disable decoding
+/// existing compressed storage. Days are fixed 24-hour durations, not calendar boundaries.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ConfigDoc)]
+#[config_doc(section = "session_storage")]
+#[serde(default, deny_unknown_fields)]
+pub struct SessionStorageConfig {
+    /// Allow automatic lossless storage transitions once the maintenance implementation is ready.
+    pub enabled: bool,
+    /// Inactivity before light compression; must be positive and less than `deep_after_days`.
+    pub light_after_days: u32,
+    /// Inactivity before deep compression; must exceed `light_after_days`.
+    pub deep_after_days: u32,
+}
+
+impl Default for SessionStorageConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            light_after_days: 5,
+            deep_after_days: 30,
+        }
     }
 }
 
@@ -4320,6 +4354,13 @@ pub enum ConfigError {
 }
 
 fn validate_config(config: &BcodeConfig) -> Result<(), ConfigError> {
+    if config.session_storage.light_after_days == 0
+        || config.session_storage.deep_after_days <= config.session_storage.light_after_days
+    {
+        return Err(ConfigError::Composition {
+            message: "session_storage requires 0 < light_after_days < deep_after_days".to_owned(),
+        });
+    }
     if config.client.request_timeout_secs == 0 {
         return Err(ConfigError::Composition {
             message: "client.request_timeout_secs must be greater than zero".to_owned(),
@@ -9482,6 +9523,43 @@ curve = "bounce"
             )
             .is_err()
         );
+    }
+
+    #[test]
+    fn session_storage_defaults_and_overrides_are_validated() {
+        let defaults = BcodeConfig::default().session_storage;
+        assert!(defaults.enabled);
+        assert_eq!(
+            (defaults.light_after_days, defaults.deep_after_days),
+            (5, 30)
+        );
+        let value = toml::from_str(
+            "[session_storage]\nenabled = false\nlight_after_days = 2\ndeep_after_days = 60",
+        )
+        .expect("toml");
+        let config = super::validate_config_value(value, "test").expect("valid");
+        assert!(!config.session_storage.enabled);
+        assert_eq!(
+            (
+                config.session_storage.light_after_days,
+                config.session_storage.deep_after_days
+            ),
+            (2, 60)
+        );
+        for fields in [
+            "light_after_days = 0",
+            "deep_after_days = 5",
+            "deep_after_days = 2",
+            "light_after_days = -1",
+            "deep_after_days = 4294967296",
+            "deep_after_day = 30",
+        ] {
+            let value = toml::from_str(&format!("[session_storage]\n{fields}")).expect("toml");
+            assert!(
+                super::validate_config_value(value, "test").is_err(),
+                "{fields}"
+            );
+        }
     }
 
     #[test]
