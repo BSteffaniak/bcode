@@ -45,6 +45,13 @@ bytes, or a changed original. Range reads remain independent of this full traver
 does not itself publish data or establish ownership: maintenance must keep both sources immutable
 through publication and validate any authoritative original checksum separately.
 
+Candidate preparation combines encoding, total-length savings checks, and whole-original
+verification. A candidate is ready only when it is strictly smaller and meets a caller-supplied
+absolute savings threshold including all container overhead. Empty/tiny or insufficiently
+compressible inputs are explicitly rejected without modifying the original. Cancellation and
+verification failures never publish a candidate. The result describes byte lengths, not allocated
+disk savings; atomic replacement, syncing, and compatibility fencing are still not implemented.
+
 ## Configured policy (not activated)
 
 The configuration loader accepts and validates:

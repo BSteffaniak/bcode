@@ -225,6 +225,84 @@ pub fn read_compressed_artifact_range(
     Ok((total, output))
 }
 
+/// Result of preparing a verified, unpublished compressed artifact candidate.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ArtifactPreparation {
+    /// Candidate is byte-equivalent and meets the caller's minimum absolute space saving.
+    Ready {
+        /// Original logical bytes, also the raw input file length.
+        logical_bytes: u64,
+        /// Complete candidate length including its index and header.
+        candidate_bytes: u64,
+        /// Raw file bytes minus candidate bytes, not an allocated-filesystem-space estimate.
+        saved_bytes: u64,
+    },
+    /// Candidate would grow the data or fails the requested savings threshold.
+    InsufficientSavings {
+        /// Original logical length.
+        logical_bytes: u64,
+        /// Complete encoded length.
+        candidate_bytes: u64,
+    },
+}
+
+/// Encode and verify an unpublished candidate, retaining the original unchanged.
+///
+/// Operates on complete caller-owned streams from byte zero. The destination must be empty and
+/// seekable. Content is encoded with bounded memory, then compared against the entire original;
+/// output is eligible only when it is strictly smaller and saves at least `minimum_saved_bytes`.
+/// All container overhead counts against savings. Cancellation is checked through both passes.
+///
+/// This does not sync, publish, truncate, or remove any file. Even `Ready` requires durable
+/// ownership, original identity/checksum verification, compatibility fencing, and interruption-safe
+/// publication by the caller. A rejected or failed candidate remains disposable temporary output.
+/// Both streams must remain exclusively controlled throughout preparation and publication.
+///
+/// # Errors
+///
+/// Returns an error for nonempty output, source changes, verification or codec failure,
+/// cancellation, or I/O. Never modifies the original stream's contents.
+pub fn prepare_compressed_artifact(
+    original: &mut (impl Read + Seek),
+    candidate: &mut (impl Read + Write + Seek),
+    compression: ArtifactCompression,
+    minimum_saved_bytes: u64,
+    mut check_cancelled: impl FnMut() -> io::Result<()>,
+) -> io::Result<ArtifactPreparation> {
+    check_cancelled()?;
+    let logical_bytes = original.seek(SeekFrom::End(0))?;
+    original.rewind()?;
+    encode_artifact(
+        original,
+        candidate,
+        logical_bytes,
+        compression,
+        &mut check_cancelled,
+    )?;
+    let candidate_bytes = candidate.seek(SeekFrom::End(0))?;
+    check_cancelled()?;
+    let Some(saved_bytes) = logical_bytes
+        .checked_sub(candidate_bytes)
+        .filter(|saved| *saved > 0 && *saved >= minimum_saved_bytes)
+    else {
+        return Ok(ArtifactPreparation::InsufficientSavings {
+            logical_bytes,
+            candidate_bytes,
+        });
+    };
+    original.rewind()?;
+    let verified_bytes = verify_compressed_artifact(candidate, original, &mut check_cancelled)?;
+    if verified_bytes != logical_bytes || original.seek(SeekFrom::End(0))? != logical_bytes {
+        return Err(invalid());
+    }
+    check_cancelled()?;
+    Ok(ArtifactPreparation::Ready {
+        logical_bytes,
+        candidate_bytes,
+        saved_bytes,
+    })
+}
+
 /// Verify an entire candidate container against its original bytes before maintenance publication.
 ///
 /// This is explicit maintenance work, never a normal range-read operation. Memory is bounded to
@@ -302,6 +380,84 @@ mod tests {
         )
         .expect("encode");
         destination.into_inner()
+    }
+
+    #[test]
+    fn preparation_counts_container_overhead_and_preserves_original() {
+        for bytes in [vec![], b"tiny artifact".to_vec()] {
+            let mut original = Cursor::new(bytes.clone());
+            let mut candidate = Cursor::new(Vec::new());
+            assert!(matches!(
+                prepare_compressed_artifact(
+                    &mut original,
+                    &mut candidate,
+                    ArtifactCompression::Light,
+                    0,
+                    || Ok(())
+                )
+                .expect("prepare"),
+                ArtifactPreparation::InsufficientSavings { .. }
+            ));
+            assert_eq!(original.into_inner(), bytes);
+        }
+        let bytes = vec![42; CHUNK as usize * 2];
+        let mut original = Cursor::new(bytes.clone());
+        let mut candidate = Cursor::new(Vec::new());
+        let ArtifactPreparation::Ready {
+            logical_bytes,
+            candidate_bytes,
+            saved_bytes,
+        } = prepare_compressed_artifact(
+            &mut original,
+            &mut candidate,
+            ArtifactCompression::Deep,
+            4096,
+            || Ok(()),
+        )
+        .expect("prepare")
+        else {
+            panic!("compressible candidate")
+        };
+        assert_eq!(logical_bytes, bytes.len() as u64);
+        assert_eq!(candidate_bytes, candidate.get_ref().len() as u64);
+        assert_eq!(saved_bytes, logical_bytes - candidate_bytes);
+        assert_eq!(original.get_ref(), &bytes);
+        assert_eq!(
+            read_compressed_artifact_range(&mut candidate, u64::from(CHUNK), 1)
+                .expect("read")
+                .1,
+            [42]
+        );
+        let rejected = prepare_compressed_artifact(
+            &mut original,
+            &mut Cursor::new(Vec::new()),
+            ArtifactCompression::Deep,
+            logical_bytes,
+            || Ok(()),
+        )
+        .expect("savings rejected");
+        assert!(matches!(
+            rejected,
+            ArtifactPreparation::InsufficientSavings { .. }
+        ));
+    }
+
+    #[test]
+    fn preparation_cancellation_leaves_original_unchanged() {
+        let bytes = vec![42; CHUNK as usize * 2];
+        let mut original = Cursor::new(bytes.clone());
+        let mut candidate = Cursor::new(Vec::new());
+        let error = prepare_compressed_artifact(
+            &mut original,
+            &mut candidate,
+            ArtifactCompression::Light,
+            1,
+            || Err(io::Error::new(io::ErrorKind::Interrupted, "cancelled")),
+        )
+        .expect_err("cancelled");
+        assert_eq!(error.kind(), io::ErrorKind::Interrupted);
+        assert_eq!(original.into_inner(), bytes);
+        assert!(candidate.into_inner().is_empty());
     }
 
     #[test]
