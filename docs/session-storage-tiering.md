@@ -79,9 +79,11 @@ relative directory descriptors and no-follow opens; tracking hard links and nonr
 rejected. The record and directory entry are synced. Other platforms currently report unsupported
 tracking without creating metadata.
 
-Explicit application history page/window/inspection/export and artifact range reads now register
-successful consumption. Shared low-level history reads used by indexing are unchanged. Attach,
-projection-window, and model-context integration remain incomplete. Registration currently waits
+Explicit application history page/window/inspection/export and artifact range reads register
+successful consumption. Full, recent, and projection-window attach paths now also register history
+access, and model request construction registers model-context consumption. Shared low-level
+history reads used by indexing and background invariant selection are unchanged. Registration
+currently waits
 for a bounded record update rather than coalescing. Optional tracking failures emit a secret-safe
 warning and do not fail the successful content read; **automatic tiering remains disabled globally**,
 so these failures cannot authorize compression. Before maintenance can use this state, registration

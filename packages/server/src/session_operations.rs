@@ -1,5 +1,8 @@
 //! Transport-neutral application operations for session lifecycle behavior.
 
+#[cfg(all(test, unix))]
+mod storage_access_tests;
+
 use super::{ServerState, session_catalog::SessionCatalogSnapshot};
 use bcode_session_models::SessionCatalogStatus;
 use bcode_session_models::SessionSummary;
@@ -471,13 +474,28 @@ pub async fn history_around(
     Ok(window)
 }
 
-async fn record_history_access(state: &ServerState, session_id: bcode_session_models::SessionId) {
+/// Track successful history consumption without making optional metadata a read prerequisite.
+pub async fn record_history_access(
+    state: &ServerState,
+    session_id: bcode_session_models::SessionId,
+) {
+    record_consumption(
+        state,
+        session_id,
+        bcode_session::storage_access::StorageAccessKind::History,
+    )
+    .await;
+}
+
+/// Track application consumption; automatic tiering remains disabled on all paths.
+pub async fn record_consumption(
+    state: &ServerState,
+    session_id: bcode_session_models::SessionId,
+    kind: bcode_session::storage_access::StorageAccessKind,
+) {
     if state
         .sessions
-        .record_storage_access(
-            session_id,
-            bcode_session::storage_access::StorageAccessKind::History,
-        )
+        .record_storage_access(session_id, kind)
         .await
         .is_err()
     {

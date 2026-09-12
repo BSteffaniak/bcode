@@ -10740,19 +10740,12 @@ async fn read_session_artifact_range(
         length,
     )
     .await?;
-    if state
-        .sessions
-        .record_storage_access(
-            session_id,
-            bcode_session::storage_access::StorageAccessKind::Artifact,
-        )
-        .await
-        .is_err()
-    {
-        tracing::warn!(
-            "session artifact access tracking unavailable; automatic tiering remains disabled"
-        );
-    }
+    session_operations::record_consumption(
+        state,
+        session_id,
+        bcode_session::storage_access::StorageAccessKind::Artifact,
+    )
+    .await;
     Ok(range)
 }
 
@@ -12056,6 +12049,7 @@ async fn handle_attach_session(
     }
     match state.sessions.attach_session(session_id, client_id).await {
         Ok(attachment) => {
+            session_operations::record_history_access(state, session_id).await;
             state.complete_session_namespace_attach(session_id).await;
             restore_active_skills_from_history(&attachment.history, state, session_id).await;
             *attached_session = Some(session_id);
@@ -12391,6 +12385,7 @@ async fn finish_attach_session_projection_window_success(
 ) -> Result<(), ServerError> {
     let projection_window = window_attachment.projection_window;
     let attachment = window_attachment.attachment;
+    session_operations::record_history_access(state, session_id).await;
     state.metrics.record_histogram(
         "server.attach_projection_window.session_attach_duration_ms",
         elapsed_ms(timings.attach_started_at),
@@ -12494,6 +12489,7 @@ async fn finish_attach_session_recent_success(
     attachment: bcode_session::SessionAttachment,
     timings: AttachRecentTimings,
 ) -> Result<(), ServerError> {
+    session_operations::record_history_access(state, session_id).await;
     state.metrics.record_histogram(
         "server.attach_recent.session_attach_duration_ms",
         elapsed_ms(timings.attach_started_at),
@@ -22531,6 +22527,12 @@ async fn build_model_turn_request(
     let build_timer = state.metrics.timer();
     let history_timer = state.metrics.timer();
     let history = state.sessions.model_context_events(session_id).await?;
+    session_operations::record_consumption(
+        state,
+        session_id,
+        bcode_session::storage_access::StorageAccessKind::ModelContext,
+    )
+    .await;
     let context_through_sequence = history
         .iter()
         .map(|event| event.sequence)
