@@ -281,6 +281,22 @@ pub fn plan_scoped_model_selection(
     if provider_plugin_id.is_empty() || model_id.is_empty() {
         return Err(invalid("Provider and model are required"));
     }
+    plan_model_target_edit(
+        path,
+        context,
+        provider_plugin_id,
+        Some(model_id),
+        auth_profile,
+    )
+}
+
+fn plan_model_target_edit(
+    path: PathBuf,
+    context: Option<&str>,
+    provider_plugin_id: &str,
+    model_id: Option<&str>,
+    auth_profile: Option<&str>,
+) -> Result<ConfigEdit, ConfigError> {
     let original = read_optional(&path)?;
     let mut document = original
         .as_deref()
@@ -302,7 +318,11 @@ pub fn plan_scoped_model_selection(
             .ok_or_else(|| invalid("Model selection path must be a table"))?;
     }
     model.insert("provider_plugin_id", toml_edit::value(provider_plugin_id));
-    model.insert("model_id", toml_edit::value(model_id));
+    if let Some(model_id) = model_id {
+        model.insert("model_id", toml_edit::value(model_id));
+    } else {
+        model.remove("model_id");
+    }
     model.remove("profile");
     if let Some(profile) = auth_profile {
         model.insert("auth_profile", toml_edit::value(profile));
@@ -329,25 +349,13 @@ pub fn plan_context_account_selection(
     local: &str,
 ) -> Result<ConfigEdit, ConfigError> {
     let discovery = crate::contexts::prepare_model_discovery(config, Some(local))?;
-    let edit = plan_scoped_model_selection(
+    plan_model_target_edit(
         path,
         Some(&discovery.context),
         &discovery.provider_plugin_id,
-        "selection-pending",
+        None,
         Some(local),
-    )?;
-    let mut document = edit
-        .updated
-        .parse::<toml_edit::DocumentMut>()
-        .map_err(|_| invalid("Invalid account selection"))?;
-    document["contexts"]["entries"][&discovery.context]["model"]
-        .as_table_mut()
-        .ok_or_else(|| invalid("Missing context model table"))?
-        .remove("model_id");
-    Ok(ConfigEdit {
-        updated: document.to_string(),
-        ..edit
-    })
+    )
 }
 
 fn read_optional(path: &Path) -> Result<Option<String>, ConfigError> {

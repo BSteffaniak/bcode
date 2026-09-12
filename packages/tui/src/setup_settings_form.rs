@@ -31,6 +31,7 @@ pub struct SetupSettingsForm {
     create_context: bool,
     discovered_models: Option<(Option<String>, String, String, Vec<String>)>,
     account_selection: Option<(Box<bcode_config::BcodeConfig>, Vec<String>)>,
+    selection_snapshot: Option<Box<bcode_config::BcodeConfig>>,
     contexts: Option<Vec<(String, String)>>,
 }
 
@@ -48,9 +49,16 @@ impl SetupSettingsForm {
             selected_profile: 0,
             create_context: false,
             contexts: None,
+            selection_snapshot: None,
             account_selection: None,
             discovered_models: None,
         }
+    }
+
+    /// Retain the effective configuration against which asynchronous choices were obtained.
+    pub fn with_selection_snapshot(mut self, config: bcode_config::BcodeConfig) -> Self {
+        self.selection_snapshot = Some(Box::new(config));
+        self
     }
 
     /// Review a new empty context without selecting it or copying credentials.
@@ -272,6 +280,17 @@ impl SetupSettingsForm {
     }
 
     fn submit(&mut self) {
+        if let Some(expected) = &self.selection_snapshot {
+            let current = bcode_config::load_config();
+            if !current
+                .as_ref()
+                .is_ok_and(|current| current == expected.as_ref())
+            {
+                self.pending = None;
+                "Configuration changed since these choices were loaded. Return to setup and reload the picker before saving.".clone_into(&mut self.status);
+                return;
+            }
+        }
         if self.contexts.as_ref().is_some_and(Vec::is_empty) {
             self.refresh_profile();
             return;
@@ -447,6 +466,23 @@ fn write(frame: &mut PaintCx<'_, '_>, area: Rect, text: &str, style: Style) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn stale_picker_snapshot_never_creates_a_review_or_writes_a_file() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("bcode.toml");
+        let expected = bcode_config::BcodeConfig {
+            active_context: Some("nonexistent-snapshot-context".to_owned()),
+            ..Default::default()
+        };
+        let mut form =
+            SetupSettingsForm::new(&path, "model/profile").with_selection_snapshot(expected);
+        form.inputs[2] = TextInputState::new(TextEditBuffer::from_text("'profile'"));
+        form.submit();
+        assert!(form.pending.is_none());
+        assert!(!path.exists());
+        assert!(form.status.contains("reload the picker"));
+    }
 
     #[test]
     fn account_picker_selects_provider_and_clears_stale_model_without_credentials() {

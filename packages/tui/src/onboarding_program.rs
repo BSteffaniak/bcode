@@ -94,7 +94,8 @@ impl OnboardingProgram {
         let path = bcode_config::default_config_dir().join("bcode.toml");
         self.settings_form = match key {
             KeyCode::Char('A') => bcode_config::load_config().ok().map(|config| {
-                super::setup_settings_form::SetupSettingsForm::accounts(&path, config)
+                super::setup_settings_form::SetupSettingsForm::accounts(&path, config.clone())
+                    .with_selection_snapshot(config)
             }),
             KeyCode::Char('N') => {
                 Some(super::setup_settings_form::SetupSettingsForm::create_context(&path))
@@ -360,7 +361,8 @@ async fn discover_setup_models() -> Result<super::setup_settings_form::SetupSett
             discovery.provider_plugin_id,
             discovery.account,
             models,
-        ),
+        )
+        .with_selection_snapshot(snapshot),
     )
 }
 
