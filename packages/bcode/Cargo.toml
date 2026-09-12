@@ -292,4 +292,6 @@ testing = ["bcode_agent_runtime/testing"]
 # Development-only backend selection for the bounded scripted-provider example.
 # This is not an admitted or certified deterministic SDK profile.
 simulation-example = ["testing", "switchy/simulator"]
+# Explicit synthetic custody profile; never use with real credentials.
+custody-simulation = ["config", "bcode_provider_auth/custody-simulation"]
 web-renderer       = ["cli", "bcode_cli/web-renderer"]

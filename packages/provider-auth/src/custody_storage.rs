@@ -3,6 +3,9 @@
 use std::io::{Read as _, Write as _};
 use std::path::Path;
 
+#[cfg(feature = "simulation")]
+pub mod simulation;
+
 const MAGIC: &[u8] = b"BCODE-CUSTODY\0\x01";
 const MAX_BYTES: usize = 4 * 1024 * 1024;
 

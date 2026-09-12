@@ -37,6 +37,9 @@ pub enum AuthStoreError {
     /// An I/O operation failed. Publication may have occurred before a sync failure.
     #[error("auth state I/O failed")]
     Io(#[source] std::io::Error),
+    /// Selected provider/account metadata is unresolved or inconsistent.
+    #[error("auth selection is invalid")]
+    InvalidSelection,
     /// Preference validation failed without committing state.
     #[error("auth preference is invalid")]
     InvalidPreference,
@@ -287,6 +290,8 @@ impl AuthStore {
         resolve: impl FnMut(&str, &bcode_config::AuthProfileConfig) -> crate::ResolvedProviderAuth,
     ) -> Result<bcode_model::ProviderRequestContext, AuthStoreError> {
         let snapshot = self.snapshot()?;
+        crate::validate_auth_selection_metadata(&request, &snapshot.subscriptions)
+            .map_err(|_| AuthStoreError::InvalidSelection)?;
         Ok(crate::resolve_provider_request_context_with_resolver(
             request,
             &snapshot.subscriptions,
@@ -523,6 +528,27 @@ mod tests {
         assert!(AuthStore::open(&path).is_err());
         assert!(!path.join("owner.lock").exists());
         assert_eq!(fs::read(path.join("state.json")).unwrap(), before);
+    }
+
+    #[test]
+    fn unresolved_selection_fails_before_materialization_without_mutating_storage() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = AuthStore::create(&temp.path().join("auth")).unwrap();
+        let before = store.snapshot().unwrap();
+        let config = bcode_config::BcodeConfig::default();
+        let result = store.resolve_provider_context(
+            crate::ProviderRequestContextResolution {
+                config: &config,
+                selection: bcode_config::ResolvedModelSelection {
+                    auth_pool: Some("missing".into()),
+                    provider_plugin_id: Some("bcode.openai-compatible".into()),
+                    ..Default::default()
+                },
+            },
+            |_, _| panic!("invalid selection must not acquire credentials"),
+        );
+        assert!(matches!(result, Err(AuthStoreError::InvalidSelection)));
+        assert_eq!(store.snapshot().unwrap(), before);
     }
 
     #[test]

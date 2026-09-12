@@ -118,6 +118,7 @@ mod tests {
                             storage_profile: "stored".into(),
                             vault: "/not-a-native-vault".into(),
                             provider: "openai".into(),
+                            owner_plugin_id: Some("bcode.openai-compatible".into()),
                             scheme: "api_key".into(),
                             ..Default::default()
                         }],
@@ -135,6 +136,7 @@ mod tests {
                     config: &config,
                     selection: bcode_config::ResolvedModelSelection {
                         auth_pool: Some("pool".into()),
+                        provider_plugin_id: Some("bcode.openai-compatible".into()),
                         ..Default::default()
                     },
                 },

@@ -4421,6 +4421,22 @@ impl PluginModelProviderInvoker {
         self
     }
 
+    /// Bind one retained profile owner to both request reads and provider credential updates.
+    ///
+    /// This replaces both custody selections together so refresh writes and subsequent reads
+    /// use the same owner. Configuration/subscriptions still require explicit `auth_inputs` or
+    /// `auth_store` selection; authorization and profile validation remain provider-auth-owned.
+    #[cfg(all(feature = "config", unix))]
+    #[must_use]
+    pub fn retained_custody(
+        mut self,
+        custody: Arc<bcode_provider_auth::operations::RetainedAuthRequestCustody>,
+    ) -> Self {
+        self.request_custody = Some(custody.clone());
+        self.custody = Some(custody);
+        self
+    }
+
     /// Select trusted host custody for credential updates without changing authorization.
     ///
     /// The service must enforce profile confinement, atomic persistence, and device-seal policy.

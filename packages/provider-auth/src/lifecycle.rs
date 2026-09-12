@@ -73,6 +73,54 @@ pub struct AuthVaultLifecycle<'a> {
 }
 
 impl<'a> AuthVaultLifecycle<'a> {
+    /// Prepare an empty current-format custody vault using explicit recipient and key effects.
+    ///
+    /// This does not acquire storage or persist credentials. Callers authorize creation,
+    /// exclusively publish the result, then bind that owner through retained custody.
+    /// Credential writes enforce the resolved device policy in the retained transaction.
+    /// Recipient wrapping uses the vault's compile-time backend; native wrapping may acquire
+    /// native entropy. Controlled wrapping requires its simulator backend. Production key
+    /// sources must provide fresh cryptographically secure keys.
+    ///
+    /// # Errors
+    /// Returns normalized recipient, key acquisition, or encoding errors without storage effects.
+    pub fn prepare_custody(
+        &self,
+        recipient: &str,
+        keys: &dyn crate::operations::AuthCustodyKeySource,
+    ) -> Result<Vec<u8>, AuthVaultLifecycleError> {
+        let failure =
+            || AuthVaultLifecycleError::WriteFailed("custody initialization failed".into());
+        let key = keys.generate()?;
+        let (mut vault, key) =
+            sshenv_vault::Vault::create_with_data_key(recipient, sshenv_vault::DataKey::new(*key))
+                .map_err(|_| failure())?;
+        vault
+            .migrate_to_v2(&[recipient.to_owned()])
+            .map_err(|_| failure())?;
+        vault.enable_profile_keys().map_err(|_| failure())?;
+        vault
+            .profiles
+            .profiles
+            .insert(self.storage_profile().to_owned(), BTreeMap::new());
+        let mut ciphertext = Vec::new();
+        vault
+            .save_with_effects(
+                &key,
+                || {
+                    keys.generate()
+                        .map(|key| sshenv_vault::DataKey::new(*key))
+                        .map_err(Into::into)
+                },
+                |bytes, _| {
+                    ciphertext = bytes.to_vec();
+                    Ok(())
+                },
+            )
+            .map_err(|_| failure())?;
+        Ok(ciphertext)
+    }
+
     /// Construct a lifecycle service after validating provider, plugin, profile, scheme, method,
     /// and credential ownership.
     ///
@@ -1282,6 +1330,72 @@ mod tests {
         assert_eq!(source.slots.lock().unwrap().len(), 2);
     }
 
+    #[test]
+    #[cfg(all(unix, feature = "custody-simulation"))]
+    fn controlled_initialization_updates_and_reopens_real_custody() {
+        use crate::operations::{
+            AuthCredentialCustody as _, AuthRequestCustody as _, RetainedAuthRequestCustody,
+        };
+        struct Keys;
+        impl crate::operations::AuthCustodyKeySource for Keys {
+            fn generate(&self) -> Result<Zeroizing<[u8; 32]>, AuthVaultLifecycleError> {
+                Ok(Zeroizing::new([7; 32]))
+            }
+        }
+        fn run() -> Vec<u8> {
+            let profile = resolved(Path::new("/not-accessed"));
+            let method = method();
+            let lifecycle =
+                AuthVaultLifecycle::new(&profile, "exa", "bcode.web-search", &method).unwrap();
+            let bytes = lifecycle.prepare_custody("sim-age:owned", &Keys).unwrap();
+            let (simulation, storage) =
+                crate::custody_storage::simulation::CustodySimulation::create(&bytes).unwrap();
+            let retained = RetainedAuthRequestCustody::from_storage(
+                storage,
+                profile.clone(),
+                "exa",
+                "bcode.web-search",
+                method.clone(),
+                vec![Zeroizing::new("sim-age:owned".into())],
+                None,
+            )
+            .unwrap()
+            .key_source(std::sync::Arc::new(Keys));
+            retained
+                .persist(
+                    &profile,
+                    BTreeMap::from([("TEST_PROVIDER_API_KEY".into(), Some("synthetic".into()))]),
+                )
+                .unwrap();
+            drop(retained);
+            let storage = simulation.open().unwrap();
+            let after = storage.read().unwrap();
+            let retained = RetainedAuthRequestCustody::from_storage(
+                storage,
+                profile,
+                "exa",
+                "bcode.web-search",
+                method,
+                vec![Zeroizing::new("sim-age:owned".into())],
+                None,
+            )
+            .unwrap();
+            let context = bcode_model::ProviderRequestContext {
+                auth_profile: Some("exa".into()),
+                ..Default::default()
+            };
+            assert_eq!(
+                retained
+                    .materialize("bcode.web-search", &context)
+                    .unwrap()
+                    .env["TEST_PROVIDER_API_KEY"],
+                "synthetic"
+            );
+            after
+        }
+        assert_eq!(run(), run());
+    }
+
     fn method() -> AuthMethodContribution {
         AuthMethodContribution::SecretFields {
             method_id: "api_key".to_owned(),
@@ -1667,6 +1781,25 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
+    fn selected_test_storage(
+        custody: crate::custody_storage::CredentialCustodyStorage,
+        bytes: &[u8],
+    ) -> Box<dyn crate::custody_storage::AuthCustodyStorage> {
+        #[cfg(feature = "simulation")]
+        {
+            drop(custody);
+            crate::custody_storage::simulation::CustodySimulation::create(bytes)
+                .unwrap()
+                .1
+        }
+        #[cfg(not(feature = "simulation"))]
+        {
+            let _ = bytes;
+            Box::new(custody)
+        }
+    }
+
     #[test]
     #[cfg(unix)]
     fn retained_custody_reads_canonical_credentials_without_native_fallback() {
@@ -1721,8 +1854,9 @@ mod tests {
         assert_eq!(custody.read().unwrap(), bytes);
         assert!(!unused.exists());
         let update_profile = resolved.clone();
+        let selected = selected_test_storage(custody, &bytes);
         let retained = crate::operations::RetainedAuthRequestCustody::from_storage(
-            Box::new(custody),
+            selected,
             resolved,
             "exa",
             "bcode.web-search",

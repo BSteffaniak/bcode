@@ -52,3 +52,5 @@ sshenv_vault = { workspace = true, features = ["passphrase-factor"] }
 default          = []
 fail-on-warnings = []
 simulation       = ["switchy_fs/simulator"]
+# Synthetic recipient wrapping is explicit: never use this profile with real credentials.
+custody-simulation = ["simulation", "sshenv_vault/simulator"]

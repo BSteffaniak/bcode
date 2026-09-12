@@ -11714,6 +11714,7 @@ version = "0.4.0"
 source = "git+https://github.com/MoosicBox/MoosicBox.git?branch=master#68129ec7abe4f1f059d2c862d3f78cc551a077fb"
 dependencies = [
  "age",
+ "sha2 0.11.0",
  "thiserror 2.0.20",
 ]
 

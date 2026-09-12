@@ -161,6 +161,7 @@ fn owned_store_initializes_sdk_defaults() {
                         storage_profile: "stored".into(),
                         vault: "/not-accessed".into(),
                         provider: "openai".into(),
+                        owner_plugin_id: Some("bcode.openai-compatible".into()),
                         scheme: "api_key".into(),
                         ..Default::default()
                     }],
@@ -172,6 +173,7 @@ fn owned_store_initializes_sdk_defaults() {
         .unwrap();
     let mut config = BcodeConfig::default();
     config.model.auth_pool = Some("pool".into());
+    config.model.provider_plugin_id = Some("bcode.openai-compatible".into());
     let sdk = Bcode::builder()
         .provider_defaults_from_store(
             &config,
@@ -232,6 +234,7 @@ async fn explicit_sdk_inputs_materialize_auth_pool_and_model_defaults() {
                     storage_profile: "stored-profile".into(),
                     vault: "/fixture/auth.vault".into(),
                     provider: "openai".into(),
+                    owner_plugin_id: Some("example.provider".into()),
                     scheme: "api_key".into(),
                     ..Default::default()
                 }],
