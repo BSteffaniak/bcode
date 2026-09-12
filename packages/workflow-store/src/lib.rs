@@ -23040,6 +23040,58 @@ mod tests {
     }
 
     #[test]
+    fn candidate_requires_complete_active_source_bindings() {
+        let temp = tempfile::tempdir().expect("temp");
+        let mut store = WorkflowStore::open_in_state_dir(temp.path()).expect("store");
+        let graph = sequential_definition();
+        store
+            .persist_definition("sequential", 1, &graph)
+            .expect("definition");
+        let mut run = new_run();
+        run.definition_id = "sequential".into();
+        store.create_run(&run).expect("run");
+        let mut node = graph.nodes["first"].clone();
+        node.id = "added".into();
+        let request = bcode_workflow::WorkflowRunGraphEditBatch {
+            version: bcode_workflow::WORKFLOW_RUN_GRAPH_EDIT_VERSION,
+            run_id: run.run_id.clone(),
+            mutation_id: "missing-bindings".into(),
+            expected_revision: 1,
+            edits: vec![bcode_workflow::WorkflowRunGraphEdit::AddNode {
+                node,
+                entry: true,
+                exit: true,
+            }],
+            reconciliation: vec![bcode_workflow::WorkflowRunGraphReconciliation::Retain {
+                activation_id: activation_identity(&run.run_id, "first", 0),
+            }],
+        };
+        store
+            .connection
+            .execute_batch(
+                "UPDATE workflow_runs SET target_artifact_id = 'artifact-a',
+             coordinator_daemon_instance_id = 'daemon-a', coordinator_generation = 1,
+             coordinator_fencing_token = 'token-a';",
+            )
+            .expect("owner");
+        let authority = store
+            .execution_authority(&run.run_id)
+            .expect("authority")
+            .expect("owner");
+        store
+            .stage_run_graph_edit(&request, &authority, 20)
+            .expect("stage");
+        let error = store
+            .publish_retained_leaf_run_graph_edit(&run.run_id, &request.mutation_id, &authority, 21)
+            .expect_err("incomplete reconciliation");
+        assert!(error.to_string().contains("every candidate outgoing edge"));
+        assert_eq!(
+            run_graph::graph_revision(&store.connection, &run.run_id).expect("revision"),
+            Some(1)
+        );
+    }
+
+    #[test]
     fn retained_leaf_publication_preserves_admission_and_settles() {
         let (temp, mut store) = initialized_store();
         store

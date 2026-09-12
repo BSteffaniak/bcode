@@ -1341,12 +1341,15 @@ fn validate_retained_bindings(
 ) -> Result<(), WorkflowStoreError> {
     let mut claimed_edges = BTreeSet::new();
     for disposition in &request.reconciliation {
-        let bcode_workflow::WorkflowRunGraphReconciliation::RetainWithBindings {
-            activation_id,
-            edge_ids,
-        } = disposition
-        else {
-            continue;
+        let (activation_id, edge_ids) = match disposition {
+            bcode_workflow::WorkflowRunGraphReconciliation::Cancel { .. } => continue,
+            bcode_workflow::WorkflowRunGraphReconciliation::Retain { activation_id } => {
+                (activation_id, &[][..])
+            }
+            bcode_workflow::WorkflowRunGraphReconciliation::RetainWithBindings {
+                activation_id,
+                edge_ids,
+            } => (activation_id, edge_ids.as_slice()),
         };
         for edge_id in edge_ids {
             if !claimed_edges.insert(*edge_id) {
@@ -1360,6 +1363,18 @@ fn validate_retained_bindings(
             (&request.run_id, activation_id),
             |row| Ok((row.get(0)?, row.get(1)?)),
         )?;
+        // Active retained work settles against the new topology, so every outgoing edge
+        // needs an explicit source binding. Completed results may deliberately bind a subset.
+        if !completed
+            && edges
+                .iter()
+                .any(|(id, edge)| edge.from == source_id && !edge_ids.contains(id))
+        {
+            return Err(WorkflowStoreError::InvalidData(
+                "active retained source requires bindings for every candidate outgoing edge"
+                    .to_string(),
+            ));
+        }
         let completed_value = completed
             .then(|| {
                 super::activation_output_value_by_identity(
