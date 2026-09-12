@@ -5973,13 +5973,19 @@ impl WorkflowStore {
     ///
     /// Returns an error for malformed claims, incompatible active leases, or database failure.
     fn acquire_activation_resources(
-        &mut self,
+        &self,
         activation: &PendingActivation,
         acquired_at_ms: u64,
+        expected_authority: Option<&WorkflowExecutionAuthority>,
     ) -> Result<(), WorkflowStoreError> {
         let mut claims = activation.node.resources.clone();
         claims.sort_by(|left, right| left.resource.cmp(&right.resource));
-        let transaction = self.connection.transaction()?;
+        let transaction = self.connection.unchecked_transaction()?;
+        if self.execution_authority(&activation.run_id)?.as_ref() != expected_authority {
+            return Err(WorkflowStoreError::InvalidData(
+                "resource acquisition execution authority changed".into(),
+            ));
+        }
         for claim in claims {
             let mode = match claim.access {
                 bcode_workflow::ResourceAccess::Read => ResourceLeaseMode::Read,
@@ -6193,20 +6199,23 @@ impl WorkflowStore {
                 summary.unsupported.push(activation.activation_id);
                 continue;
             };
-            if let Err(error) = self.acquire_activation_resources(&activation, dispatched_at_ms) {
+            if let Err(error) =
+                self.acquire_activation_resources(&activation, dispatched_at_ms, authority.as_ref())
+            {
                 if error.to_string().contains("already leased incompatibly") {
                     summary.raced.push(activation.activation_id);
                     continue;
                 }
                 return Err(error);
             }
-            let Some(prepared) = self.prepare_pending_activation(
+            let Some(prepared) = self.prepare_pending_activation_with_authority(
                 &activation.run_id,
                 &activation.node_id,
                 &activation.activation_id,
                 plan.side_effect,
                 plan.intent,
                 dispatched_at_ms,
+                authority.as_ref(),
             )?
             else {
                 summary.raced.push(activation.activation_id);
@@ -6251,13 +6260,39 @@ impl WorkflowStore {
         intent: serde_json::Value,
         prepared_at_ms: u64,
     ) -> Result<Option<PreparedActivationDispatch>, WorkflowStoreError> {
+        let authority = self.execution_authority(run_id)?;
+        self.prepare_pending_activation_with_authority(
+            run_id,
+            node_id,
+            activation_id,
+            side_effect,
+            intent,
+            prepared_at_ms,
+            authority.as_ref(),
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn prepare_pending_activation_with_authority(
+        &self,
+        run_id: &str,
+        node_id: &str,
+        activation_id: &str,
+        side_effect: DispatchSideEffect,
+        intent: serde_json::Value,
+        prepared_at_ms: u64,
+        expected_authority: Option<&WorkflowExecutionAuthority>,
+    ) -> Result<Option<PreparedActivationDispatch>, WorkflowStoreError> {
         validate_id("run_id", run_id)?;
         validate_id("node_id", node_id)?;
         validate_id("activation_id", activation_id)?;
         let intent_json = bounded_json("dispatch intent", &intent)?;
-        let transaction = self
-            .connection
-            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let transaction = self.connection.unchecked_transaction()?;
+        if self.execution_authority(run_id)?.as_ref() != expected_authority {
+            return Err(WorkflowStoreError::InvalidData(
+                "preparation execution authority changed".into(),
+            ));
+        }
         let activation =
             match pending_activation_by_identity(&transaction, run_id, node_id, activation_id)? {
                 Some(activation) => Some(activation),
@@ -36071,6 +36106,53 @@ mod tests {
             })
             .expect("settle new successor");
         assert_eq!(finished.run_status, RunStatus::Completed);
+    }
+
+    #[test]
+    fn stale_preparation_authority_creates_no_attempt_or_resources() {
+        let (_temp, store, run, mut authority, _) = connected_publication_fixture();
+        let pending = store
+            .pending_activations_for_run(&run.run_id, 10)
+            .expect("pending")
+            .remove(0);
+        authority.generation += 1;
+        assert!(
+            store
+                .acquire_activation_resources(&pending, 25, Some(&authority))
+                .is_err()
+        );
+        assert!(
+            store
+                .prepare_pending_activation_with_authority(
+                    &run.run_id,
+                    &pending.node_id,
+                    &pending.activation_id,
+                    DispatchSideEffect::Mutating,
+                    serde_json::json!({}),
+                    25,
+                    Some(&authority)
+                )
+                .is_err()
+        );
+        assert!(
+            store
+                .attempt_history(&run.run_id, None, 10)
+                .expect("attempts")
+                .is_empty()
+        );
+        assert!(
+            store
+                .resource_leases_for_run(&run.run_id, 10)
+                .expect("leases")
+                .is_empty()
+        );
+        assert_eq!(
+            store
+                .pending_activations_for_run(&run.run_id, 10)
+                .expect("still pending")
+                .len(),
+            1
+        );
     }
 
     #[test]

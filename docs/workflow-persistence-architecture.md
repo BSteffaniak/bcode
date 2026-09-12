@@ -11,8 +11,10 @@ No evidence is fabricated for historical or low-level preparations. Receipt-less
 recovery remains conservative, including after handoff; the marker is not an owner receipt.
 Handed-off work and linked execution still require owner reconciliation and remain guarded.
 The normal daemon driver passes held execution authority into pending dispatch; handoff
-rechecks it transactionally. Authority fencing of preparation/resource acquisition and
-caller-qualified redispatch remain required before this is a complete ownership protocol.
+rechecks it transactionally. Resource acquisition and preparation each recheck the same
+expected authority within their own mutation transaction. They are not one atomic admission:
+a lease committed before an ownership transfer may still require recovery if preparation fails.
+Caller-qualified redispatch remains required before this is a complete ownership protocol.
 
 ## Workflow-owned gate cancellation
 
