@@ -58,7 +58,26 @@ representations; it never promotes data after a read. Eligibility uses the later
 and last meaningful access, with inclusive thresholds. Missing tracking, clock rollback, incomplete
 artifacts, and ownership not verifiably released all defer. These facts are supplied by a scheduler;
 the decision is not authorization and must be rechecked under durable maintenance ownership.
-Persisted access tracking and the scheduler/config adapter remain to be implemented.
+Access tracking integration and the scheduler/config adapter remain to be implemented.
+
+### Access-record persistence primitive (not wired to reads)
+
+`storage_access` implements bounded observation and durable updates on caller-supplied confined
+file handles. The fixed 64-byte record carries a magic identifier, version, timestamp, monotonically
+increasing generation, and SHA-256 checksum. Empty tracking is unknown, not old. The API takes
+nonblocking shared/exclusive OS file locks and merges stale deliveries against the maximum timestamp.
+Duplicate timestamps and clock rollback never reduce that timestamp or rewrite the record. Changed
+records are synced before success. Damage, future versions, contention, and generation overflow
+return errors; damaged bytes are never automatically reset. Interrupted writes may require explicit
+maintenance rather than falling back to an older timestamp that could incorrectly permit tiering.
+
+Meaningful access includes explicit history navigation/inspection/attach/export, original artifact
+reads, and model-context consumption. Catalog, indexing, and maintenance scans are excluded.
+The primitive does not create files or choose paths, and is not called on production read paths yet.
+Its caller must own safe path creation, coalescing, lifecycle, and error handling. Before maintenance
+can use this state, access registration and maintenance must coordinate so pending/failed writes,
+untracked old clients, and the read-to-registration race cannot authorize compression based on stale
+age. Do not hide a failed access update and continue tiering from the previous timestamp.
 
 ## Remaining implementation
 
@@ -67,7 +86,7 @@ Persisted access tracking and the scheduler/config adapter remain to be implemen
 * Persist application-owned, coalesced usage metadata separately from canonical history. Ordinary
   reads must not rewrite canonical events, perform repair, or trigger format migration.
 * History hydration and artifact range reads count as access; catalog listings, compression scans,
-  and background indexing do not. Define treatment of model-context reads explicitly.
+  and background indexing do not. Model-context consumption counts as meaningful access.
 * Unknown access age must not be guessed from filesystem atime. Initialize tracking conservatively.
 * Keep active artifacts and currently owned sessions out of maintenance. Scheduling policy should
   be disableable without disabling readers for already-compressed storage.
