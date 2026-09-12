@@ -37003,6 +37003,7 @@ mod tests {
             include_repo_workflows: true,
             include_user_workflows: false,
             paths: Vec::new(),
+            ..Default::default()
         };
         for kind in [
             None,
@@ -37085,6 +37086,7 @@ mod tests {
             include_repo_workflows: true,
             include_user_workflows: false,
             paths: Vec::new(),
+            ..Default::default()
         };
         let mut request = bcode_workflow::WorkflowLaunchCatalogRequest {
             version: bcode_workflow::WORKFLOW_LAUNCH_CATALOG_VERSION,
