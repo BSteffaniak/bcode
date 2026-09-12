@@ -67,12 +67,23 @@ fn validate_id(id: &str) -> Result<(), ConfigError> {
 /// Returns an error for an invalid context ID or empty local name.
 pub fn qualify(context: &str, local: &str) -> Result<String, ConfigError> {
     validate_id(context)?;
-    if local.is_empty() || local.starts_with("ctx-") {
+    if local.is_empty()
+        || local.starts_with("ctx-")
+        || !local.bytes().all(|byte| {
+            byte.is_ascii_lowercase() || byte.is_ascii_digit() || matches!(byte, b'.' | b'-' | b'_')
+        })
+    {
         return Err(invalid(
-            "context-local reference must not be empty or use the reserved ctx- prefix",
+            "context-local account and pool IDs require lowercase ASCII letters, digits, dots, hyphens, or underscores and must not use the reserved ctx- prefix",
         ));
     }
-    Ok(format!("ctx-{}-{context}-{local}", context.len()))
+    let qualified = format!("ctx-{}-{context}-{local}", context.len());
+    if qualified.len() > 64 {
+        return Err(invalid(
+            "qualified context account or pool ID exceeds the 64-byte authentication contract limit",
+        ));
+    }
+    Ok(qualified)
 }
 
 fn qualify_option(context: &str, value: &mut Option<String>) -> Result<(), ConfigError> {
@@ -366,6 +377,24 @@ scheme = "oauth"
             crate::decode_effective_config(&crate::encode_effective_config(&forged).unwrap())
                 .is_err()
         );
+    }
+
+    #[test]
+    fn qualified_names_fit_auth_contract_and_reject_unusable_local_ids() {
+        for local in [
+            "",
+            "has space",
+            "../escape",
+            "UPPER",
+            "ctx-foreign",
+            "emoji-🙂",
+        ] {
+            assert!(qualify("alpha", local).is_err());
+        }
+        assert!(qualify("alpha", &"a".repeat(64)).is_err());
+        let maximum = qualify(&"a".repeat(48), "12345678").unwrap();
+        assert_eq!(maximum.len(), 64);
+        assert!(qualify(&"a".repeat(48), "123456789").is_err());
     }
 
     #[test]

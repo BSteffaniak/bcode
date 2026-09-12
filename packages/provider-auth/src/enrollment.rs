@@ -222,6 +222,22 @@ pub fn new_profile_name(
     runtime: &RuntimeAuthSubscriptions,
     provider_id: &str,
 ) -> String {
+    if let Some(context) = config.active_context.as_deref()
+        && let Some(definition) = config
+            .contexts
+            .as_ref()
+            .and_then(|contexts| contexts.entries.get(context))
+    {
+        let local_config = BcodeConfig {
+            auth: definition.auth.clone(),
+            ..BcodeConfig::default()
+        };
+        return new_profile_name(
+            &local_config,
+            &RuntimeAuthSubscriptions::default(),
+            provider_id,
+        );
+    }
     let mut occupied: BTreeSet<&str> = config
         .auth
         .profiles
@@ -306,6 +322,89 @@ pub fn publish(resolved: &ResolvedAuthProfile) -> Result<(), bcode_config::Confi
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn context_enrollment_declaration_resolves_local_name_without_global_binding() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("bcode.toml");
+        std::fs::write(
+            &path,
+            "[contexts]\nactive = 'alpha'\n[contexts.entries.alpha]\n[contexts.entries.beta]\n",
+        )
+        .unwrap();
+        let provider = AuthProviderContribution {
+            schema_version: bcode_provider_auth_models::AUTH_PROVIDER_CONTRIBUTION_SCHEMA_VERSION,
+            provider_id: "example".to_owned(),
+            display_name: "Example".to_owned(),
+            methods: vec![AuthMethodContribution::Interactive {
+                method_id: "browser".to_owned(),
+                display_name: "Browser".to_owned(),
+                operation: "auth.browser".to_owned(),
+                credentials: Vec::new(),
+                supports_revocation: false,
+            }],
+        };
+        let vault = temp.path().join("vault");
+        let edit = plan_context_account(
+            path.clone(),
+            "alpha",
+            "example",
+            &provider,
+            "example.plugin",
+            "browser",
+            vault.clone(),
+        )
+        .unwrap();
+        assert!(!vault.exists());
+        edit.apply().unwrap();
+        let config = bcode_config::load_config_from_paths(std::slice::from_ref(&path)).unwrap();
+        assert_eq!(
+            new_profile_name(&config, &RuntimeAuthSubscriptions::default(), "example"),
+            "example-2"
+        );
+        let prepared = prepare(
+            &config,
+            &RuntimeAuthSubscriptions::default(),
+            &provider,
+            "example.plugin",
+            "browser",
+            EnrollmentDestination {
+                profile: Some("example".to_owned()),
+                vault: Some(vault.clone()),
+                recipient_key: None,
+            },
+        )
+        .unwrap();
+        let identity = bcode_config::contexts::qualify("alpha", "example").unwrap();
+        assert_eq!(prepared.resolved.profile_name, identity);
+        assert_eq!(prepared.resolved.profile.settings["profile"], identity);
+        assert!(!prepared.publish_runtime);
+        assert!(!vault.exists());
+        let beta = bcode_config::load_config_from_paths_with_overrides(
+            &[path],
+            &bcode_config::ConfigLoadOverrides::default()
+                .with_cli_config_toml(Some("[contexts]\nactive = 'beta'".to_owned())),
+        )
+        .unwrap();
+        assert_eq!(
+            new_profile_name(&beta, &RuntimeAuthSubscriptions::default(), "example"),
+            "example"
+        );
+        assert!(
+            prepare(
+                &beta,
+                &RuntimeAuthSubscriptions::default(),
+                &provider,
+                "example.plugin",
+                "browser",
+                EnrollmentDestination {
+                    profile: Some("example".to_owned()),
+                    ..Default::default()
+                }
+            )
+            .is_err()
+        );
+    }
 
     #[test]
     fn new_account_names_do_not_reuse_pool_members_or_dangling_bindings() {
