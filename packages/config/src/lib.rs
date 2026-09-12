@@ -2013,6 +2013,13 @@ pub struct SessionStorageConfig {
     pub light_after_days: u32,
     /// Inactivity before deep compression; must exceed `light_after_days`.
     pub deep_after_days: u32,
+    /// Seconds between bounded automatic candidate passes; must be positive.
+    pub maintenance_interval_secs: u32,
+    /// Cooperative time allowance per artifact conversion, in seconds; must be positive.
+    /// Expiry cancels between codec chunks and waits for completion before releasing ownership.
+    pub artifact_timeout_secs: u32,
+    /// Minimum additional file-byte saving required before publishing a replacement.
+    pub minimum_saved_bytes: u64,
 }
 
 impl Default for SessionStorageConfig {
@@ -2021,6 +2028,9 @@ impl Default for SessionStorageConfig {
             enabled: true,
             light_after_days: 5,
             deep_after_days: 30,
+            maintenance_interval_secs: 60,
+            artifact_timeout_secs: 30,
+            minimum_saved_bytes: 4096,
         }
     }
 }
@@ -4355,6 +4365,11 @@ pub enum ConfigError {
 }
 
 fn validate_config(config: &BcodeConfig) -> Result<(), ConfigError> {
+    if config.session_storage.maintenance_interval_secs == 0
+        || config.session_storage.artifact_timeout_secs == 0
+    {
+        return Err(ConfigError::Composition { message: "session_storage maintenance_interval_secs and artifact_timeout_secs must be positive".to_owned() });
+    }
     if config.session_storage.light_after_days == 0
         || config.session_storage.deep_after_days <= config.session_storage.light_after_days
     {
@@ -9574,6 +9589,19 @@ curve = "bounce"
             )
             .is_err()
         );
+    }
+
+    #[test]
+    fn session_storage_resource_limits_load_and_reject_zero_timers() {
+        let value = toml::from_str("[session_storage]\nmaintenance_interval_secs = 120\nartifact_timeout_secs = 7\nminimum_saved_bytes = 8192").expect("toml");
+        let config = super::validate_config_value(value, "test").expect("validated");
+        assert_eq!(config.session_storage.maintenance_interval_secs, 120);
+        assert_eq!(config.session_storage.artifact_timeout_secs, 7);
+        assert_eq!(config.session_storage.minimum_saved_bytes, 8192);
+        for field in ["maintenance_interval_secs", "artifact_timeout_secs"] {
+            let value = toml::from_str(&format!("[session_storage]\n{field} = 0")).expect("toml");
+            assert!(super::validate_config_value(value, "test").is_err());
+        }
     }
 
     #[test]

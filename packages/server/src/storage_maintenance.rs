@@ -24,7 +24,15 @@ pub async fn run(state: Arc<ServerState>) {
         return;
     };
     let mut shutdown = state.subscribe_shutdown();
-    let mut interval = tokio::time::interval(Duration::from_mins(1));
+    let cadence = state
+        .startup_config
+        .session_storage
+        .maintenance_interval_secs;
+    if cadence == 0 || state.startup_config.session_storage.artifact_timeout_secs == 0 {
+        tracing::warn!("automatic artifact maintenance disabled: invalid timing configuration");
+        return;
+    }
+    let mut interval = tokio::time::interval(Duration::from_secs(u64::from(cadence)));
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut directories = None;
     let mut pending: std::collections::VecDeque<(SessionId, Option<(String, String)>)> =
@@ -169,7 +177,7 @@ async fn maintain_session_at(
                 &artifact,
                 &reference,
                 compression,
-                4096,
+                config.minimum_saved_bytes,
                 Some((now, minimum_age)),
                 cancellation.clone(),
             );
@@ -180,6 +188,10 @@ async fn maintain_session_at(
                     cancellation.cancel();
                     // A blocking codec task cannot be aborted by dropping its async waiter.
                     // Keep awaiting so the maintenance fence outlives actual IO completion.
+                    conversion.await
+                }
+                () = tokio::time::sleep(Duration::from_secs(u64::from(config.artifact_timeout_secs))) => {
+                    cancellation.cancel();
                     conversion.await
                 }
                 outcome = &mut conversion => outcome,

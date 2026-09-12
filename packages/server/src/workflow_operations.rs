@@ -197,7 +197,7 @@ impl bcode_workflow::WorkflowRunApplication for WorkflowAuthoringApplication<'_>
         self.state
             .require_workflow_store()
             .map_err(run_operation_failure)?;
-        start_template(self.state, request)
+        Box::pin(start_template(self.state, request))
             .await
             .map_err(run_operation_failure)
     }

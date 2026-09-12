@@ -70,6 +70,9 @@ The configuration loader accepts and validates:
 enabled = true
 light_after_days = 5
 deep_after_days = 30
+maintenance_interval_secs = 60
+artifact_timeout_secs = 30
+minimum_saved_bytes = 4096
 ```
 
 These are the defaults. Thresholds require `0 < light_after_days < deep_after_days`, including when
@@ -226,6 +229,15 @@ Cancellation is checked before storage access and between codec chunks. Tests co
 before touching missing storage, worker shutdown before first poll, and shutdown between ticks.
 Normal daemon startup still does not launch the worker: multi-daemon tracking-health coordination
 and its lifecycle registration remain incomplete.
+
+## Configurable work allowances
+
+The worker consumes configured maintenance cadence, minimum physical saving, and a cooperative
+per-artifact timeout. Timer expiry uses the same cancellation token as shutdown and awaits actual
+codec completion before releasing ownership. Timers must be positive; invalid direct configurations
+fail closed. The timeout is not a hard syscall deadline: blocking filesystem work and a single codec
+chunk must return before cancellation can be observed. These controls do not activate startup by
+themselves or substitute for multi-daemon tracking-health registration.
 
 ## Remaining implementation
 
