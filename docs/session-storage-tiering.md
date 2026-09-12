@@ -142,6 +142,13 @@ checking projection freshness or resolving a URI. Missing and non-current contra
 without mutating storage. This strengthens the updated reader but does not retrofit older binaries:
 it is not sufficient by itself to permit compressed-file replacement.
 
+Artifact reads now retain a session runtime-work ownership guard from before reference resolution
+through physical byte consumption and access registration. This closes the idle-release gap between
+lookup and file I/O: offline maintenance cannot acquire authority during a successful guarded read.
+The guard also drops on errors/cancellation through the normal session ownership lifecycle. Invalid
+range sizes are rejected before acquiring ownership. This does not fix untracked older binaries or
+replace the required format fence.
+
 Older daemons must be fenced from formats they cannot read, including finalized artifact paths that
 bypass normal canonical-history loading. Implement ownership-verified, interruption-safe replacement
 and recovery before enabling any background writer. Never leave both old and new representations

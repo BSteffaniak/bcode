@@ -10731,6 +10731,16 @@ async fn read_session_artifact_range(
     offset: u64,
     length: u32,
 ) -> Result<bcode_session_models::SessionArtifactRange, String> {
+    if length == 0 || length > MAX_ARTIFACT_RANGE_BYTES {
+        return Err("invalid artifact range length".to_owned());
+    }
+    // Keep the lease through both the physical read and its access update. Resolving a finalized
+    // reference alone is not enough: it can release idle actor resources before file I/O begins.
+    let ownership = state
+        .sessions
+        .acquire_session_ownership(session_id, bcode_session::SessionOwnershipKind::RuntimeWork)
+        .await
+        .map_err(|error| error.to_string())?;
     let range = read_session_artifact_range_untracked(
         state,
         session_id,
@@ -10746,6 +10756,7 @@ async fn read_session_artifact_range(
         bcode_session::storage_access::StorageAccessKind::Artifact,
     )
     .await;
+    drop(ownership);
     Ok(range)
 }
 
