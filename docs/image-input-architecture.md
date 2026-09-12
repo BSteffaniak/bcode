@@ -25,9 +25,16 @@ Implemented first slice:
   the no-image control, and failure after image reordering. It does not implement general vision,
   conversation storage, uploads, or transport measurements. Existing fake models remain unchanged.
 
+* `bash scripts/check-image-input-eval.sh` builds a real CLI/daemon with bundled plugins in a
+  scrubbed, isolated environment. It generates a PNG, reads it through `filesystem.read`,
+  restarts the daemon, and verifies exact pixel-derived answers and completed outcomes in both
+  exported transcripts. Artifacts are retained for inspection. Requires Python 3 and Cargo;
+  no credentials or remote provider calls are needed. This proves inline artifact hydration and
+  replay, not native conversation storage or upload reuse.
+
 Not implemented or verified by this slice: provider uploads/file IDs, authorized hosted URLs,
 request compression, lazy image hydration, durable reference lifecycle,
-daemon restart/fault evals, and live provider results.
+fault-injection evals, and live provider results.
 No provider capability claims have been upgraded based on offline tests.
 
 ## Ownership and target request pipeline
