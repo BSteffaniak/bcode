@@ -161,6 +161,14 @@ integration test verifies actual publication and logical range reads for a capab
 The lower-level path-based operation still
 exists for callers that separately establish finalization and is not safe to schedule blindly.
 
+## Automatic age eligibility
+
+Automatic maintenance now checks both durable last access and the canonical finalizing event's
+`created_at_ms` under its maintenance fence. A newly finalized artifact cannot inherit an old
+session access timestamp and compress immediately. Missing, malformed, or future finalization
+metadata defers rather than guessing an age. An integration regression verifies that an old access
+record with a young finalization leaves the raw artifact unchanged.
+
 ## Remaining implementation
 
 ### Access policy and scheduling

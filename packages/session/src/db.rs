@@ -3429,6 +3429,24 @@ impl SessionDb {
         Ok(result)
     }
 
+    /// Return a bounded finalization timestamp from canonical event metadata.
+    ///
+    /// # Errors
+    /// Rejects missing or malformed canonical timestamp evidence and database failures.
+    pub async fn artifact_finalized_at_ms(&self, sequence: u64) -> SessionDbResult<u64> {
+        let row = self
+            .db
+            .select("events")
+            .columns(&["created_at_ms"])
+            .where_eq("event_seq", seq_to_value(sequence))
+            .execute_first(&**self.db)
+            .await?
+            .ok_or_else(|| SessionDbError::InvalidRow {
+                column: "artifact.finalized_event_seq".to_owned(),
+            })?;
+        required_non_negative_u64(&row, "created_at_ms")
+    }
+
     /// Resolve one finalized artifact reference from the bounded materialized projection.
     ///
     /// # Errors
@@ -11005,8 +11023,44 @@ mod tests {
             .execute(db.database())
             .await
             .expect("reference");
+        db.database()
+            .update("events")
+            .value("created_at_ms", 1_000_000_i64)
+            .where_eq("event_seq", 0)
+            .execute(db.database())
+            .await
+            .expect("finalization timestamp");
         db.database().close().await.expect("close");
         drop(db);
+        let mut tracking = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .open(root.path().join(id.to_string()).join("storage-access.bin"))
+            .expect("tracking");
+        crate::storage_access::record_access(
+            &mut tracking,
+            crate::storage_access::StorageAccessKind::History,
+            1,
+        )
+        .expect("old access");
+        drop(tracking);
+        let young = crate::artifact_storage::compress_finalized_artifact_with_age(
+            root.path(),
+            id,
+            "artifact",
+            "recording",
+            crate::artifact_compression::ArtifactCompression::Light,
+            4096,
+            Some((1_000_010, 100)),
+        )
+        .await
+        .expect("young artifact");
+        assert_eq!(
+            young,
+            crate::artifact_storage::ArtifactStorageOutcome::Unchanged
+        );
+        assert!(path.is_file());
         let outcome = crate::artifact_storage::compress_finalized_artifact(
             root.path(),
             id,

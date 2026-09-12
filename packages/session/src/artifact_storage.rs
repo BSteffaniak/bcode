@@ -194,8 +194,28 @@ pub async fn compress_finalized_artifact_with_age(
     let reference_result = db
         .finalized_artifact_reference(artifact_id, reference_key)
         .await;
+    let finalized_age = if age.is_some() {
+        match &reference_result {
+            Ok(Some(reference)) => Some(
+                db.artifact_finalized_at_ms(reference.finalized_event_seq)
+                    .await,
+            ),
+            _ => None,
+        }
+    } else {
+        None
+    };
     let close_result = db.database().close().await;
     close_result.map_err(io::Error::other)?;
+    if let (Some((now_ms, minimum_age_ms)), Some(timestamp)) = (age, finalized_age) {
+        let timestamp = timestamp.map_err(io::Error::other)?;
+        if now_ms
+            .checked_sub(timestamp)
+            .is_none_or(|elapsed| elapsed < minimum_age_ms)
+        {
+            return Ok(ArtifactStorageOutcome::Unchanged);
+        }
+    }
     let reference = reference_result
         .map_err(io::Error::other)?
         .ok_or_else(invalid)?;
