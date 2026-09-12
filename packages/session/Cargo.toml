@@ -33,6 +33,7 @@ switchy = { workspace = true, features = [
 thiserror = { workspace = true }
 tokio = { workspace = true, features = ["macros", "rt", "sync"] }
 tracing = { workspace = true }
+zstd = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }

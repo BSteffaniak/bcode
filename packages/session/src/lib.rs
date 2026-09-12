@@ -15,6 +15,7 @@
 //! repairing the complete event log.
 
 mod actor;
+pub mod artifact_compression;
 mod attach;
 mod attachment;
 mod catalog;

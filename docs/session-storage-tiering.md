@@ -20,6 +20,24 @@ must not be presented as a complete total. Database totals include projections a
 interpreted as canonical event payload size. Global catalog and provider-owned search indexes are
 excluded, not treated as zero. No compression ratio or space saving is inferred from file lengths.
 
+## Implemented codec foundation (not activated)
+
+The session domain now contains an explicit compressed-artifact codec. Version 1 uses 256 KiB
+independent Zstd frames, levels 1 (light) and 12 (deep), a 64-byte checked header, and fixed 80-byte
+index entries. Header fields identify the version, chunk size, logical length, and chunk count.
+Each entry records physical position/length, expanded SHA-256, and an ordinal-bound entry checksum.
+These checks detect damage; they are not authentication against an attacker who can rewrite files.
+Levels are provisional until representative benchmarks establish the policy.
+
+Range reads inspect only intersecting entries and frames, enforce the existing 1 MiB request limit,
+limit decoder windows to 256 KiB, and reject invalid checksums, expansion lengths, arithmetic,
+unsupported versions, and truncated data. Full-container verification is intentionally separate
+from bounded reading. The encoder processes one chunk at a time, checks cancellation between chunks,
+requires empty output and an exact source length, and writes the checked header only at completion.
+It does not publish, sync, replace, migrate, or auto-detect any artifact. An unsuccessful encode is
+incomplete output, never authoritative content. No existing artifact reader or writer uses the codec
+yet; a durable representation selector and compatibility fencing must precede activation.
+
 ## Remaining implementation
 
 ### Access policy and scheduling
