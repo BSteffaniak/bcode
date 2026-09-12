@@ -32143,17 +32143,54 @@ async fn propagate_persisted_workflow_cancellation(
     state: &ServerState,
     attempts: Vec<bcode_workflow_store::ActiveAttemptCancellation>,
 ) -> Result<Vec<String>, WorkflowStoreError> {
+    propagate_persisted_workflow_cancellation_with_authorities(state, attempts, None).await
+}
+
+async fn propagate_persisted_workflow_cancellation_with_authorities(
+    state: &ServerState,
+    attempts: Vec<bcode_workflow_store::ActiveAttemptCancellation>,
+    authorities: Option<&BTreeMap<String, bcode_workflow_store::WorkflowExecutionAuthority>>,
+) -> Result<Vec<String>, WorkflowStoreError> {
     let mut signalled = Vec::new();
     for attempt in attempts {
+        let authority = {
+            let store = state
+                .workflow_store
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let authority = if let Some(authorities) = authorities {
+                let authority = authorities.get(&attempt.run_id).ok_or_else(|| {
+                    WorkflowStoreError::InvalidData(
+                        "caller cancellation authority is missing".into(),
+                    )
+                })?;
+                store.verify_execution_authority(&attempt.run_id, authority)?;
+                authority.clone()
+            } else {
+                store.execution_authority(&attempt.run_id)?.ok_or_else(|| {
+                    WorkflowStoreError::InvalidData(
+                        "cancellation requires execution authority".into(),
+                    )
+                })?
+            };
+            drop(store);
+            if authority.daemon_instance_id != state.daemon_status.instance_id {
+                return Err(WorkflowStoreError::InvalidData(
+                    "cancellation belongs to a foreign daemon".into(),
+                ));
+            }
+            authority
+        };
         match signal_workflow_attempt_cancellation(state, &attempt).await {
             Ok(()) => {
                 let changed = state
                     .workflow_store
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .mark_cancellation_signalled(
+                    .mark_cancellation_signalled_owned(
                         &attempt.dispatch_identity,
                         current_unix_millis(),
+                        &authority,
                     )?;
                 if changed {
                     signalled.push(attempt.dispatch_identity);
@@ -32166,9 +32203,10 @@ async fn propagate_persisted_workflow_cancellation(
                     .workflow_store
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .settle_orphaned_attempt_cancellation(
+                    .settle_orphaned_attempt_cancellation_owned(
                         &attempt.dispatch_identity,
                         current_unix_millis(),
+                        &authority,
                     )?;
             }
             Err(error) => return Err(error),
@@ -64687,7 +64725,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
                 binding: None,
                 authored_provenance: None,
                 input: Some(serde_json::json!(1)),
-                execution_authority: None,
+                execution_authority: Some(test_workflow_execution_authority()),
                 created_at_ms: 1,
                 authorization_profile: bcode_workflow::WorkflowAuthorizationProfileIdentity {
                     version: 1,
@@ -64736,7 +64774,8 @@ event_symbol = "bcode_plugin_handle_event_v1"
         let attempts = store
             .active_attempt_cancellations("orphaned-cancellation-run", 10)
             .expect("attempts");
-        let state = test_server_state_with_fake_provider_and_workflow_store(sessions, store);
+        let mut state = test_server_state_with_fake_provider_and_workflow_store(sessions, store);
+        state.daemon_status.instance_id = test_workflow_execution_authority().daemon_instance_id;
 
         let signalled = propagate_persisted_workflow_cancellation(&state, attempts)
             .await
@@ -64839,7 +64878,10 @@ event_symbol = "bcode_plugin_handle_event_v1"
                     binding: None,
                     authored_provenance: None,
                     input: Some(serde_json::json!(1)),
-                    execution_authority: None,
+                    execution_authority: Some(bcode_workflow_store::WorkflowExecutionAuthority {
+                        daemon_instance_id: state.daemon_status.instance_id.clone(),
+                        ..test_workflow_execution_authority()
+                    }),
                     created_at_ms: 1,
                     authorization_profile: bcode_workflow::WorkflowAuthorizationProfileIdentity {
                         version: 1,

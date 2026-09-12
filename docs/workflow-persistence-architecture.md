@@ -19,6 +19,26 @@ handoff, and receipt commit. Startup preparation recovery also checks held autho
 its classification/mutation transaction. Historical orphan lease reconciliation and handed-off
 owner cancellation remain outside this new-admission guarantee.
 
+If cancellation signalling wins the race with owner receipt persistence, the receipt can
+still be recorded on a nonterminal cancelling attempt without restoring admitted status.
+Identical duplicate receipts are idempotent; conflicting receipts and receipts for terminal
+attempts reject. This preserves owner evidence for reconciliation, but does not authorize
+publication to replace handed-off work or establish an owner-admission cancellation fence.
+Missing runtime work cannot settle a receipt-less attempt with durable handoff evidence:
+orphan cancellation leaves it unchanged and discoverable until owner evidence arrives.
+A permanently lost admission still requires ownership-qualified recovery; this deferral is
+not proof of orphanhood and does not complete the cancellation protocol.
+Normal daemon cancellation propagation rejects missing/foreign execution authority before
+owner signalling and passes the captured authority to transactional signal marking and
+orphan settlement after the await. Stale authority rejects those writes. This does not yet
+fence all initial intent writes, recursive/sibling signalling, or graph-edit cancellation.
+Associated-run Cancel control now persists intent transactionally under its held authority
+and passes that same authority through pre-signal verification and post-signal persistence.
+The public tree-cancellation path resolves and retains each selected run's authority,
+uses owned intent writes, and passes those authorities into propagation. Selection remains
+a bounded descendant snapshot, not an atomic tree operation; newly admitted descendants
+and recursive/sibling owner signalling still require reconciliation.
+
 ## Workflow-owned gate cancellation
 
 Graph publication can cancel waiting input and approval gates without attempts or linked work.

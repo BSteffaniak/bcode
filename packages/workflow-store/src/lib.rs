@@ -7034,9 +7034,11 @@ impl WorkflowStore {
             ));
         }
         let changed = transaction.execute(
-            "UPDATE workflow_attempts SET status = 'admitted', receipt_json = ?6, admitted_at_ms = ?7 \
+            "UPDATE workflow_attempts SET status = CASE WHEN status = 'prepared' THEN 'admitted' ELSE status END, \
+             receipt_json = ?6, admitted_at_ms = ?7 \
              WHERE run_id = ?1 AND node_id = ?2 AND activation_id = ?3 AND attempt = ?4 \
-               AND dispatch_identity = ?5 AND status = 'prepared'",
+               AND dispatch_identity = ?5 AND status IN ('prepared', 'cancelling', 'sibling_cancelling') \
+               AND receipt_json IS NULL",
             (
                 &receipt.run_id,
                 &receipt.node_id,
@@ -7052,7 +7054,7 @@ impl WorkflowStore {
                 .query_row(
                     "SELECT receipt_json FROM workflow_attempts WHERE run_id = ?1 AND node_id = ?2 \
                      AND activation_id = ?3 AND attempt = ?4 AND dispatch_identity = ?5 \
-                       AND status IN ('admitted', 'running')",
+                       AND status IN ('admitted', 'running', 'cancelling', 'sibling_cancelling')",
                     (
                         &receipt.run_id,
                         &receipt.node_id,
@@ -7072,10 +7074,19 @@ impl WorkflowStore {
                 receipt.dispatch_identity
             )));
         }
+        let status: String = transaction.query_row(
+            "SELECT status FROM workflow_attempts WHERE dispatch_identity = ?1",
+            [&receipt.dispatch_identity],
+            |row| row.get(0),
+        )?;
         append_event(
             &transaction,
             &receipt.run_id,
-            "attempt_admitted",
+            if status == "admitted" {
+                "attempt_admitted"
+            } else {
+                "attempt_cancellation_receipt_recorded"
+            },
             &serde_json::to_string(receipt)?,
             receipt.admitted_at_ms,
         )?;
@@ -8884,8 +8895,33 @@ impl WorkflowStore {
         run_id: &str,
         requested_at_ms: u64,
     ) -> Result<bool, WorkflowStoreError> {
+        self.request_cancellation_with_authority(run_id, requested_at_ms, None)
+    }
+
+    /// Persist cancellation intent under the initiating caller's execution authority.
+    ///
+    /// # Errors
+    /// Rejects stale authority, invalid run identity, or database failure.
+    pub fn request_cancellation_owned(
+        &mut self,
+        run_id: &str,
+        requested_at_ms: u64,
+        authority: &WorkflowExecutionAuthority,
+    ) -> Result<bool, WorkflowStoreError> {
+        self.request_cancellation_with_authority(run_id, requested_at_ms, Some(authority))
+    }
+
+    fn request_cancellation_with_authority(
+        &self,
+        run_id: &str,
+        requested_at_ms: u64,
+        authority: Option<&WorkflowExecutionAuthority>,
+    ) -> Result<bool, WorkflowStoreError> {
         validate_id("run_id", run_id)?;
-        let transaction = self.connection.transaction()?;
+        let transaction = self.connection.unchecked_transaction()?;
+        if let Some(authority) = authority {
+            self.verify_execution_authority(run_id, authority)?;
+        }
         let changed = transaction.execute(
             "UPDATE workflow_runs SET cancellation_requested_at_ms = ?2, updated_at_ms = ?2 \
              WHERE run_id = ?1 AND cancellation_requested_at_ms IS NULL \
@@ -9038,6 +9074,10 @@ impl WorkflowStore {
     /// attempt instead becomes repair-required because its external outcome cannot be proven after
     /// owner loss.
     ///
+    /// A receipt-less attempt with durable handoff evidence is left unchanged: absence
+    /// from a runtime registry does not prove that owner admission has finished. Such
+    /// attempts remain discoverable for cancellation after their receipt arrives.
+    ///
     /// # Errors
     ///
     /// Returns an error when the attempt is missing, cancellation was not requested, or the
@@ -9047,8 +9087,38 @@ impl WorkflowStore {
         dispatch_identity: &str,
         settled_at_ms: u64,
     ) -> Result<RunStatus, WorkflowStoreError> {
+        self.settle_orphaned_attempt_cancellation_with_authority(
+            dispatch_identity,
+            settled_at_ms,
+            None,
+        )
+    }
+
+    /// Reconcile an unavailable cancellation owner under the caller's held authority.
+    ///
+    /// # Errors
+    /// Rejects stale authority, missing cancellation intent, or database failure.
+    pub fn settle_orphaned_attempt_cancellation_owned(
+        &mut self,
+        dispatch_identity: &str,
+        settled_at_ms: u64,
+        authority: &WorkflowExecutionAuthority,
+    ) -> Result<RunStatus, WorkflowStoreError> {
+        self.settle_orphaned_attempt_cancellation_with_authority(
+            dispatch_identity,
+            settled_at_ms,
+            Some(authority),
+        )
+    }
+
+    fn settle_orphaned_attempt_cancellation_with_authority(
+        &self,
+        dispatch_identity: &str,
+        settled_at_ms: u64,
+        authority: Option<&WorkflowExecutionAuthority>,
+    ) -> Result<RunStatus, WorkflowStoreError> {
         validate_id("dispatch_identity", dispatch_identity)?;
-        let transaction = self.connection.transaction()?;
+        let transaction = self.connection.unchecked_transaction()?;
         let (run_id, node_id, activation_id, status, side_effect) = transaction.query_row(
             "SELECT run_id, node_id, activation_id, status, side_effect \
                  FROM workflow_attempts WHERE dispatch_identity = ?1",
@@ -9063,6 +9133,9 @@ impl WorkflowStore {
                 ))
             },
         )?;
+        if let Some(authority) = authority {
+            self.verify_execution_authority(&run_id, authority)?;
+        }
         require_cancellation_requested(&transaction, &run_id)?;
         if !matches!(
             status.as_str(),
@@ -9072,6 +9145,19 @@ impl WorkflowStore {
                 "SELECT status FROM workflow_runs WHERE run_id = ?1",
                 [&run_id],
                 |row| row.get::<_, String>(0),
+            )?;
+            return parse_run_status(&run_status);
+        }
+        // A missing runtime entry is not proof of orphanhood while owner admission
+        // is between durable handoff and receipt commit. Keep cancellation discoverable
+        // until the owner supplies evidence; do not destroy the late receipt's target.
+        let admission_in_flight =
+            cancellation_admission_in_flight(&transaction, dispatch_identity)?;
+        if admission_in_flight {
+            let run_status: String = transaction.query_row(
+                "SELECT status FROM workflow_runs WHERE run_id = ?1",
+                [&run_id],
+                |row| row.get(0),
             )?;
             return parse_run_status(&run_status);
         }
@@ -9147,7 +9233,30 @@ impl WorkflowStore {
         dispatch_identity: &str,
         signalled_at_ms: u64,
     ) -> Result<bool, WorkflowStoreError> {
-        self.mark_cancellation_signalled_with_requirement(dispatch_identity, signalled_at_ms, true)
+        self.mark_cancellation_signalled_with_requirement(
+            dispatch_identity,
+            signalled_at_ms,
+            true,
+            None,
+        )
+    }
+
+    /// Persist successful cancellation signalling only under the caller's held authority.
+    ///
+    /// # Errors
+    /// Rejects stale authority, missing intent, invalid identity, or database failure.
+    pub fn mark_cancellation_signalled_owned(
+        &mut self,
+        dispatch_identity: &str,
+        signalled_at_ms: u64,
+        authority: &WorkflowExecutionAuthority,
+    ) -> Result<bool, WorkflowStoreError> {
+        self.mark_cancellation_signalled_with_requirement(
+            dispatch_identity,
+            signalled_at_ms,
+            true,
+            Some(authority),
+        )
     }
 
     /// Mark a fail-fast sibling attempt as signalled after its durable attempt-local intent.
@@ -9160,17 +9269,23 @@ impl WorkflowStore {
         dispatch_identity: &str,
         signalled_at_ms: u64,
     ) -> Result<bool, WorkflowStoreError> {
-        self.mark_cancellation_signalled_with_requirement(dispatch_identity, signalled_at_ms, false)
+        self.mark_cancellation_signalled_with_requirement(
+            dispatch_identity,
+            signalled_at_ms,
+            false,
+            None,
+        )
     }
 
     fn mark_cancellation_signalled_with_requirement(
-        &mut self,
+        &self,
         dispatch_identity: &str,
         signalled_at_ms: u64,
         require_run_cancellation: bool,
+        authority: Option<&WorkflowExecutionAuthority>,
     ) -> Result<bool, WorkflowStoreError> {
         validate_id("dispatch_identity", dispatch_identity)?;
-        let transaction = self.connection.transaction()?;
+        let transaction = self.connection.unchecked_transaction()?;
         let run_id = transaction
             .query_row(
                 "SELECT run_id FROM workflow_attempts WHERE dispatch_identity = ?1",
@@ -9183,6 +9298,9 @@ impl WorkflowStore {
                     "workflow attempt not found: {dispatch_identity}"
                 ))
             })?;
+        if let Some(authority) = authority {
+            self.verify_execution_authority(&run_id, authority)?;
+        }
         if require_run_cancellation {
             require_cancellation_requested(&transaction, &run_id)?;
         }
@@ -11974,6 +12092,20 @@ fn active_attempt_cancellation(
             .map(|receipt| serde_json::from_str(&receipt))
             .transpose()?,
     })
+}
+
+fn cancellation_admission_in_flight(
+    connection: &Connection,
+    dispatch_identity: &str,
+) -> Result<bool, WorkflowStoreError> {
+    Ok(connection.query_row(
+        "SELECT EXISTS(SELECT 1 FROM workflow_attempts attempt \
+         JOIN workflow_dispatch_handoffs handoff USING (dispatch_identity) \
+         WHERE attempt.dispatch_identity = ?1 AND handoff.handed_off = 1 \
+           AND attempt.receipt_json IS NULL)",
+        [dispatch_identity],
+        |row| row.get(0),
+    )?)
 }
 
 fn sibling_cancellation_requested_for_attempt(
@@ -36480,6 +36612,229 @@ mod tests {
                 .expect("conservative recovery")
                 .repair_required,
             vec![prepared.dispatch_identity]
+        );
+    }
+
+    #[test]
+    fn cancellation_intent_rejects_stale_authority_without_mutation() {
+        let (_temp, mut store, run, authority, _) = connected_publication_fixture();
+        let mut stale = authority.clone();
+        stale.generation += 1;
+        assert!(
+            store
+                .request_cancellation_owned(&run.run_id, 25, &stale)
+                .is_err()
+        );
+        assert!(!cancellation_requested_for_run(&store.connection, &run.run_id).expect("intent"));
+        assert!(
+            store
+                .request_cancellation_owned(&run.run_id, 26, &authority)
+                .expect("owned intent")
+        );
+        assert!(
+            !store
+                .request_cancellation_owned(&run.run_id, 27, &authority)
+                .expect("duplicate")
+        );
+    }
+
+    #[test]
+    fn cancellation_settlement_rejects_stale_caller_authority() {
+        let (_temp, mut store, run, authority, _) = connected_publication_fixture();
+        let id = activation_identity(&run.run_id, "first", 0);
+        let prepared = store
+            .prepare_pending_activation(
+                &run.run_id,
+                "first",
+                &id,
+                DispatchSideEffect::ReadOnly,
+                serde_json::json!({}),
+                25,
+            )
+            .expect("prepare")
+            .expect("pending");
+        store.request_cancellation(&run.run_id, 26).expect("cancel");
+        let mut stale = authority.clone();
+        stale.generation += 1;
+        assert!(
+            store
+                .mark_cancellation_signalled_owned(&prepared.dispatch_identity, 27, &stale)
+                .is_err()
+        );
+        assert!(
+            store
+                .settle_orphaned_attempt_cancellation_owned(&prepared.dispatch_identity, 27, &stale)
+                .is_err()
+        );
+        assert_eq!(
+            store
+                .active_attempt_cancellations(&run.run_id, 10)
+                .expect("pending")
+                .len(),
+            1
+        );
+        assert!(
+            store
+                .mark_cancellation_signalled_owned(&prepared.dispatch_identity, 28, &authority)
+                .expect("signal")
+        );
+        assert_eq!(
+            store
+                .settle_orphaned_attempt_cancellation_owned(
+                    &prepared.dispatch_identity,
+                    29,
+                    &authority
+                )
+                .expect("settle"),
+            RunStatus::Cancelled
+        );
+    }
+
+    #[test]
+    fn missing_runtime_during_handoff_defers_cancellation_until_receipt() {
+        for side_effect in [DispatchSideEffect::ReadOnly, DispatchSideEffect::Mutating] {
+            let (_temp, mut store, run, authority, _) = connected_publication_fixture();
+            let id = activation_identity(&run.run_id, "first", 0);
+            let prepared = store
+                .prepare_pending_activation(
+                    &run.run_id,
+                    "first",
+                    &id,
+                    side_effect,
+                    serde_json::json!({}),
+                    25,
+                )
+                .expect("prepare")
+                .expect("pending");
+            store
+                .record_dispatch_handoff(&prepared, Some(&authority))
+                .expect("handoff");
+            store.request_cancellation(&run.run_id, 26).expect("cancel");
+            assert_eq!(
+                store
+                    .settle_orphaned_attempt_cancellation(&prepared.dispatch_identity, 27)
+                    .expect("defer"),
+                RunStatus::Running
+            );
+            let pending = store
+                .active_attempt_cancellations(&run.run_id, 10)
+                .expect("retry discovery");
+            assert_eq!(pending.len(), 1);
+            assert!(pending[0].receipt.is_none());
+            store
+                .persist_dispatch_receipt(&DispatchReceipt {
+                    run_id: run.run_id.clone(),
+                    node_id: "first".into(),
+                    activation_id: id,
+                    attempt: prepared.attempt,
+                    dispatch_identity: prepared.dispatch_identity.clone(),
+                    receipt: serde_json::json!({"accepted": true}),
+                    admitted_at_ms: 28,
+                })
+                .expect("late owner acceptance");
+            assert!(
+                store
+                    .active_attempt_cancellations(&run.run_id, 10)
+                    .expect("retry")[0]
+                    .receipt
+                    .is_some()
+            );
+            store
+                .mark_cancellation_signalled(&prepared.dispatch_identity, 29)
+                .expect("signal");
+            store
+                .apply_attempt_observation(
+                    &prepared.dispatch_identity,
+                    AttemptObservation::Cancelled,
+                    30,
+                )
+                .expect("settle");
+            assert_eq!(
+                store
+                    .run_summary(&run.run_id)
+                    .expect("summary")
+                    .expect("run")
+                    .status,
+                RunStatus::Cancelled
+            );
+        }
+    }
+
+    #[test]
+    fn cancellation_before_receipt_preserves_owner_receipt_without_reopening_attempt() {
+        let (_temp, mut store, run, authority, _) = connected_publication_fixture();
+        let id = activation_identity(&run.run_id, "first", 0);
+        let prepared = store
+            .prepare_pending_activation(
+                &run.run_id,
+                "first",
+                &id,
+                DispatchSideEffect::Mutating,
+                serde_json::json!({}),
+                25,
+            )
+            .expect("prepare")
+            .expect("pending");
+        store
+            .record_dispatch_handoff(&prepared, Some(&authority))
+            .expect("handoff");
+        store.request_cancellation(&run.run_id, 26).expect("cancel");
+        store
+            .mark_cancellation_signalled(&prepared.dispatch_identity, 27)
+            .expect("signal");
+        let mut receipt = DispatchReceipt {
+            run_id: run.run_id.clone(),
+            node_id: "first".into(),
+            activation_id: id,
+            attempt: prepared.attempt,
+            dispatch_identity: prepared.dispatch_identity.clone(),
+            receipt: serde_json::json!({"owner": "accepted"}),
+            admitted_at_ms: 28,
+        };
+        store
+            .persist_dispatch_receipt(&receipt)
+            .expect("late receipt");
+        store
+            .persist_dispatch_receipt(&receipt)
+            .expect("duplicate receipt");
+        let status: String = store
+            .connection
+            .query_row(
+                "SELECT status FROM workflow_attempts WHERE dispatch_identity = ?1",
+                [&prepared.dispatch_identity],
+                |row| row.get(0),
+            )
+            .expect("status");
+        assert_eq!(status, "cancelling");
+        let recorded: String = store
+            .connection
+            .query_row(
+                "SELECT receipt_json FROM workflow_attempts WHERE dispatch_identity = ?1",
+                [&prepared.dispatch_identity],
+                |row| row.get(0),
+            )
+            .expect("receipt");
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&recorded).expect("JSON"),
+            receipt.receipt
+        );
+        receipt.receipt = serde_json::json!({"owner": "conflicting"});
+        assert!(store.persist_dispatch_receipt(&receipt).is_err());
+        store
+            .apply_attempt_observation(
+                &prepared.dispatch_identity,
+                AttemptObservation::Cancelled,
+                29,
+            )
+            .expect("settled");
+        assert!(store.persist_dispatch_receipt(&receipt).is_err());
+        assert_eq!(
+            store
+                .run_summary(&run.run_id)
+                .expect("summary")
+                .expect("run")
+                .status,
+            RunStatus::Cancelled
         );
     }
 

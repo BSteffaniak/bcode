@@ -5095,31 +5095,84 @@ pub async fn cancel_run(
     state: &std::sync::Arc<ServerState>,
     run_id: &str,
 ) -> Result<bool, super::ServerError> {
-    let _authority = execution_authority(state, run_id).await?.ok_or_else(|| {
-        bcode_workflow_store::WorkflowStoreError::InvalidData(
-            "active workflow has no durable execution authority".to_string(),
-        )
-    })?;
+    let targets = {
+        let store = state
+            .workflow_store
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let descendants = store.descendant_run_summaries(
+            run_id,
+            bcode_workflow_store::MAX_WORKFLOW_RUN_DESCENDANTS as usize,
+        )?;
+        let root = store.run_summary(run_id)?.ok_or_else(|| {
+            bcode_workflow_store::WorkflowStoreError::RunNotFound {
+                run_id: run_id.to_string(),
+            }
+        })?;
+        drop(store);
+        let mut targets = Vec::new();
+        if matches!(
+            root.status,
+            bcode_workflow_store::RunStatus::Running | bcode_workflow_store::RunStatus::Paused
+        ) {
+            targets.push(run_id.to_string());
+        }
+        targets.extend(
+            descendants
+                .into_iter()
+                .filter(|descendant| {
+                    matches!(
+                        descendant.run.status,
+                        bcode_workflow_store::RunStatus::Running
+                            | bcode_workflow_store::RunStatus::Paused
+                    )
+                })
+                .map(|descendant| descendant.run.run_id),
+        );
+        targets
+    };
+    // Resolve each run independently; root authority does not authorize its children.
+    // Retain ownership guards across both intent persistence and asynchronous signalling.
+    let mut guards = Vec::new();
+    let mut authorities = BTreeMap::new();
+    for target in &targets {
+        let guard = execution_authority(state, target).await?.ok_or_else(|| {
+            bcode_workflow_store::WorkflowStoreError::InvalidData(
+                "active workflow has no durable execution authority".to_string(),
+            )
+        })?;
+        authorities.insert(target.clone(), guard.authority.clone());
+        guards.push(guard);
+    }
     let (recorded, attempts) = {
         let mut store = state
             .workflow_store
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let (recorded, cancelled_run_ids) =
-            store.request_cancellation_tree(run_id, super::current_unix_millis())?;
+        let mut recorded = false;
         let mut attempts = Vec::new();
-        for cancelled_run_id in cancelled_run_ids {
+        for target in &targets {
+            recorded |= store.request_cancellation_owned(
+                target,
+                super::current_unix_millis(),
+                &authorities[target],
+            )?;
             let remaining = 1_000_usize.saturating_sub(attempts.len());
-            if remaining == 0 {
-                break;
+            if remaining > 0 {
+                attempts.extend(store.active_attempt_cancellations(target, remaining)?);
             }
-            attempts.extend(store.active_attempt_cancellations(&cancelled_run_id, remaining)?);
         }
         drop(store);
         (recorded, attempts)
     };
-    super::propagate_persisted_workflow_cancellation(state, attempts).await?;
+    super::propagate_persisted_workflow_cancellation_with_authorities(
+        state,
+        attempts,
+        Some(&authorities),
+    )
+    .await?;
     super::settle_workflow_runtime_work(state, run_id).await?;
+    drop(guards);
     Ok(recorded)
 }
 
@@ -6921,7 +6974,7 @@ pub async fn control_associated_run(
                 resume_run(state, &run.run_id).await?
             }
             bcode_workflow::WorkflowRunControlAction::Cancel => {
-                let _authority =
+                let authority =
                     execution_authority(state, &run.run_id)
                         .await?
                         .ok_or_else(|| {
@@ -6934,13 +6987,23 @@ pub async fn control_associated_run(
                         .workflow_store
                         .lock()
                         .unwrap_or_else(std::sync::PoisonError::into_inner);
-                    let recorded =
-                        store.request_cancellation(&run.run_id, super::current_unix_millis())?;
+                    let recorded = store.request_cancellation_owned(
+                        &run.run_id,
+                        super::current_unix_millis(),
+                        &authority.authority,
+                    )?;
                     let attempts = store.active_attempt_cancellations(&run.run_id, 1_000)?;
                     drop(store);
                     (recorded, attempts)
                 };
-                super::propagate_persisted_workflow_cancellation(state, attempts).await?;
+                let authorities =
+                    BTreeMap::from([(run.run_id.clone(), authority.authority.clone())]);
+                super::propagate_persisted_workflow_cancellation_with_authorities(
+                    state,
+                    attempts,
+                    Some(&authorities),
+                )
+                .await?;
                 // A quiescent run cancels immediately; settle its runtime work so the daemon does
                 // not keep a phantom registration for a run that is already terminal.
                 super::settle_workflow_runtime_work(state, &run.run_id).await?;
