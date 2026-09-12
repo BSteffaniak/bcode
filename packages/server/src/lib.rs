@@ -10682,6 +10682,7 @@ async fn read_active_artifact_range(
     offset: u64,
     length: u32,
     active: ActiveArtifactReference,
+    ownership: bcode_session::SessionOwnershipGuard,
 ) -> Result<bcode_session_models::SessionArtifactRange, String> {
     if active.abandoned {
         return Err(
@@ -10692,13 +10693,15 @@ async fn read_active_artifact_range(
     let path = active.path.clone();
     let committed_bytes = active.committed_bytes;
     let (total_bytes, bytes) = tokio::task::spawn_blocking(move || {
-        read_artifact_file_range_at_length(
+        let result = read_artifact_file_range_at_length(
             &path,
             &artifact_root,
             offset,
             length,
             Some(committed_bytes),
-        )
+        );
+        drop(ownership);
+        result
     })
     .await
     .map_err(|error| format!("active artifact range reader task failed: {error}"))??;
@@ -10748,6 +10751,7 @@ async fn read_session_artifact_range(
         reference_key,
         offset,
         length,
+        ownership.clone(),
     )
     .await?;
     session_operations::record_consumption(
@@ -10767,6 +10771,7 @@ async fn read_session_artifact_range_untracked(
     reference_key: &str,
     offset: u64,
     length: u32,
+    ownership: bcode_session::SessionOwnershipGuard,
 ) -> Result<bcode_session_models::SessionArtifactRange, String> {
     if length == 0 || length > MAX_ARTIFACT_RANGE_BYTES {
         return Err(format!(
@@ -10782,6 +10787,7 @@ async fn read_session_artifact_range_untracked(
             offset,
             length,
             active.clone(),
+            ownership,
         )
         .await;
     }
@@ -10808,6 +10814,7 @@ async fn read_session_artifact_range_untracked(
                     offset,
                     length,
                     active,
+                    ownership,
                 )
                 .await;
             }
@@ -10824,6 +10831,7 @@ async fn read_session_artifact_range_untracked(
                 offset,
                 length,
                 active,
+                ownership,
             )
             .await;
         }
@@ -10841,7 +10849,9 @@ async fn read_session_artifact_range_untracked(
     let artifact_root = session_artifact_dir(state, session_id)?;
     let path = artifact_reference_path(uri, &artifact_root)?;
     let (total_bytes, bytes) = tokio::task::spawn_blocking(move || {
-        read_artifact_file_range(&path, &artifact_root, offset, length)
+        let result = read_artifact_file_range(&path, &artifact_root, offset, length);
+        drop(ownership);
+        result
     })
     .await
     .map_err(|error| format!("artifact range reader task failed: {error}"))??;

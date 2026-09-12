@@ -145,7 +145,9 @@ it is not sufficient by itself to permit compressed-file replacement.
 Artifact reads now retain a session runtime-work ownership guard from before reference resolution
 through physical byte consumption and access registration. This closes the idle-release gap between
 lookup and file I/O: offline maintenance cannot acquire authority during a successful guarded read.
-The guard also drops on errors/cancellation through the normal session ownership lifecycle. Invalid
+The async caller retains its guard through access registration, and each blocking file task owns a
+clone until physical I/O ends. Cancelling the async caller therefore cannot release ownership while
+an uncancellable `spawn_blocking` read is still running. Invalid
 range sizes are rejected before acquiring ownership. This does not fix untracked older binaries or
 replace the required format fence.
 
