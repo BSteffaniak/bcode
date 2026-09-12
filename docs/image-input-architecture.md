@@ -22,7 +22,7 @@ Implemented first slice:
 
 Not implemented or verified by this slice: provider uploads/file IDs, authorized hosted URLs,
 request compression, lazy image hydration, durable reference lifecycle, automatic generated visual
-fixtures, multiple-image probes, daemon restart/fault evals, and live provider results.
+fixtures, daemon restart/fault evals, and live provider results.
 No provider capability claims have been upgraded based on offline tests.
 
 ## Ownership and target request pipeline
@@ -95,7 +95,11 @@ The harness does not delete retained conversations: no portable deletion operati
 Provider retention policy continues to apply. It finishes local provider turn handles after each
 probe and attempts cancellation plus finish on failures.
 
-PNG/JPEG/GIF/WebP fixtures are signature-checked and bounded to 3 MiB in the CLI. Use nonsensitive
+PNG/JPEG/GIF/WebP fixtures are signature-checked. Repeat `--image` to supply up to eight images
+in order, bounded to 3 MiB total in the CLI (5 MiB total base64 in the harness). Duplicate images
+remain separate context occurrences. Use an order-sensitive question, such as asking for each
+image's color in sequence, to test ordering. The same ordered set is replayed in baseline and
+continuation variants, for either user or tool-result input. Use nonsensitive
 fixtures: the image/question are sent to the selected provider. Command-line arguments, including
 expected answers, can appear in shell history/process listings. Harness reports omit image bytes,
 answers, and remote IDs; they are not a promise to suppress separately configured provider tracing.

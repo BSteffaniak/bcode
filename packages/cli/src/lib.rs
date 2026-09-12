@@ -4924,9 +4924,9 @@ enum ModelCommand {
 /// Arguments for bounded, explicitly requested image verification.
 #[derive(Debug, clap::Args)]
 struct VerifyImagesArgs {
-    /// Local PNG, JPEG, GIF, or WebP fixture; required unless dry-run.
+    /// Ordered PNG, JPEG, GIF, or WebP fixtures; repeat --image (maximum eight).
     #[arg(long)]
-    image: Option<PathBuf>,
+    image: Vec<PathBuf>,
     /// Question about the image; the answer must not appear in this question.
     #[arg(long)]
     question: Option<String>,
@@ -10897,7 +10897,7 @@ async fn verify_cache_candidates(
 
 fn image_verification_fixture(
     args: &VerifyImagesArgs,
-) -> Result<Option<bcode_model::ImageContent>, CliError> {
+) -> Result<Option<Vec<bcode_model::ImageContent>>, CliError> {
     use std::io::Read as _;
 
     if args.max_models == 0 || args.timeout_seconds == 0 {
@@ -10908,10 +10908,11 @@ fn image_verification_fixture(
     let fixture = if args.dry_run {
         None
     } else {
-        let path = args
-            .image
-            .as_ref()
-            .ok_or_else(|| CliError::PluginCli("--image is required".to_string()))?;
+        if args.image.is_empty() || args.image.len() > 8 {
+            return Err(CliError::PluginCli(
+                "provide one to eight --image fixtures".to_string(),
+            ));
+        }
         if args
             .question
             .as_deref()
@@ -10925,33 +10926,39 @@ fn image_verification_fixture(
                 "--question and --expected-answer are required".to_string(),
             ));
         }
-        let mut bytes = Vec::new();
-        fs::File::open(path)?
-            .take(3 * 1024 * 1024 + 1)
-            .read_to_end(&mut bytes)?;
-        if bytes.len() > 3 * 1024 * 1024 {
-            return Err(CliError::PluginCli(
-                "image probe fixture exceeds 3 MiB".to_string(),
-            ));
+        let mut remaining = 3 * 1024 * 1024;
+        let mut images = Vec::new();
+        for path in &args.image {
+            let mut bytes = Vec::new();
+            fs::File::open(path)?
+                .take(remaining as u64 + 1)
+                .read_to_end(&mut bytes)?;
+            if bytes.len() > remaining {
+                return Err(CliError::PluginCli(
+                    "image probe fixture exceeds 3 MiB".to_string(),
+                ));
+            }
+            let mime_type = if bytes.starts_with(b"\x89PNG\r\n\x1a\n") {
+                "image/png"
+            } else if bytes.starts_with(&[0xff, 0xd8, 0xff]) {
+                "image/jpeg"
+            } else if bytes.starts_with(b"GIF87a") || bytes.starts_with(b"GIF89a") {
+                "image/gif"
+            } else if bytes.starts_with(b"RIFF") && bytes.get(8..12) == Some(b"WEBP") {
+                "image/webp"
+            } else {
+                return Err(CliError::PluginCli(
+                    "unsupported image fixture signature".to_string(),
+                ));
+            };
+            remaining -= bytes.len();
+            images.push(bcode_model::ImageContent {
+                mime_type: mime_type.to_string(),
+                data_base64: base64::engine::general_purpose::STANDARD.encode(bytes),
+                metadata: bcode_model::ImageMetadata::default(),
+            });
         }
-        let mime_type = if bytes.starts_with(b"\x89PNG\r\n\x1a\n") {
-            "image/png"
-        } else if bytes.starts_with(&[0xff, 0xd8, 0xff]) {
-            "image/jpeg"
-        } else if bytes.starts_with(b"GIF87a") || bytes.starts_with(b"GIF89a") {
-            "image/gif"
-        } else if bytes.starts_with(b"RIFF") && bytes.get(8..12) == Some(b"WEBP") {
-            "image/webp"
-        } else {
-            return Err(CliError::PluginCli(
-                "unsupported image fixture signature".to_string(),
-            ));
-        };
-        Some(bcode_model::ImageContent {
-            mime_type: mime_type.to_string(),
-            data_base64: base64::engine::general_purpose::STANDARD.encode(bytes),
-            metadata: bcode_model::ImageMetadata::default(),
-        })
+        Some(images)
     };
     Ok(fixture)
 }
@@ -11009,7 +11016,7 @@ async fn verify_model_images(args: &VerifyImagesArgs) -> Result<(), CliError> {
                     provider_plugin_id: Some(provider.clone()),
                     provider_context,
                     model,
-                    image: image.clone(),
+                    images: image.clone(),
                     source: if args.tool_result {
                         bcode_model_provider_runtime::image_verification::ImageVerificationSource::ToolResult
                     } else {

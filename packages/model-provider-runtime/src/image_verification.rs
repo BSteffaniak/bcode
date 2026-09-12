@@ -46,8 +46,8 @@ pub struct ImageVerificationOptions {
     pub provider_context: ProviderRequestContext,
     /// Catalog-resolved model, not an ad-hoc model identifier match.
     pub model: ModelInfo,
-    /// Authorized image fixture. This is not persisted by the harness.
-    pub image: ImageContent,
+    /// Ordered authorized image fixtures. These are not persisted by the harness.
+    pub images: Vec<ImageContent>,
     /// Which independently negotiated message shape to probe.
     pub source: ImageVerificationSource,
     /// Visual question, without the expected answer.
@@ -317,12 +317,22 @@ fn validate_options(options: &ImageVerificationOptions) -> Result<(), String> {
         || options.expected_answer.trim().is_empty()
         || options.question.len() > MAX_TEXT_BYTES
         || options.expected_answer.len() > MAX_TEXT_BYTES
-        || options.image.data_base64.is_empty()
-        || options.image.data_base64.len() > MAX_IMAGE_BASE64_BYTES
+        || options.images.is_empty()
+        || options.images.len() > 8
+        || options.images.iter().any(|image| {
+            image.data_base64.is_empty()
+                || options
+                    .model
+                    .max_image_input_base64_bytes
+                    .is_some_and(|limit| image.data_base64.len() as u64 > limit)
+        })
         || options
-            .model
-            .max_image_input_base64_bytes
-            .is_some_and(|limit| options.image.data_base64.len() as u64 > limit)
+            .images
+            .iter()
+            .try_fold(0usize, |total, image| {
+                total.checked_add(image.data_base64.len())
+            })
+            .is_none_or(|total| total > MAX_IMAGE_BASE64_BYTES)
     {
         return Err("image verification input is empty or exceeds probe bounds".to_string());
     }
@@ -347,11 +357,13 @@ fn image_messages(
         ImageVerificationSource::User => {
             let mut message = text_message(MessageRole::User, prompt);
             if include_image {
-                message.content.insert(
-                    0,
-                    ContentBlock::Image {
-                        image: options.image.clone(),
-                    },
+                message.content.splice(
+                    0..0,
+                    options
+                        .images
+                        .iter()
+                        .cloned()
+                        .map(|image| ContentBlock::Image { image }),
                 );
             }
             vec![message]
@@ -376,9 +388,12 @@ fn image_messages(
                         output: "Fixture result.".to_string(),
                         is_error: false,
                         content: if include_image {
-                            vec![bcode_model::ToolResultContent::Image {
-                                image: options.image.clone(),
-                            }]
+                            options
+                                .images
+                                .iter()
+                                .cloned()
+                                .map(|image| bcode_model::ToolResultContent::Image { image })
+                                .collect()
                         } else {
                             Vec::new()
                         },
@@ -738,11 +753,11 @@ mod tests {
             provider_plugin_id: None,
             provider_context: ProviderRequestContext::default(),
             model,
-            image: ImageContent {
+            images: vec![ImageContent {
                 mime_type: "image/png".to_string(),
                 data_base64: "AQID".to_string(),
                 metadata: bcode_model::ImageMetadata::default(),
-            },
+            }],
             source: ImageVerificationSource::User,
             question: "What color is the square?".to_string(),
             expected_answer: "BLUE".to_string(),
@@ -851,6 +866,39 @@ mod tests {
                 .iter()
                 .all(|request| request.tools.is_empty())
         );
+    }
+
+    #[test]
+    fn multiple_images_preserve_order_and_total_bounds_before_invocation() {
+        let mut options = probe_options(false);
+        let mut second = options.images[0].clone();
+        second.data_base64 = "BAUG".to_string();
+        options.images.push(second);
+        for source in [
+            ImageVerificationSource::User,
+            ImageVerificationSource::ToolResult,
+        ] {
+            options.source = source;
+            let messages = image_messages(&options, "Compare images in order.", true);
+            let mut actual = Vec::new();
+            for block in messages.iter().flat_map(|message| &message.content) {
+                match block {
+                    ContentBlock::Image { image } => actual.push(image.clone()),
+                    ContentBlock::ToolResult { result } => {
+                        actual.extend(result.content.iter().filter_map(|content| match content {
+                            bcode_model::ToolResultContent::Image { image } => Some(image.clone()),
+                            _ => None,
+                        }));
+                    }
+                    _ => {}
+                }
+            }
+            assert_eq!(actual, options.images);
+        }
+        options.images[0].data_base64 = "A".repeat(MAX_IMAGE_BASE64_BYTES);
+        let mut provider = ProbeProvider::default();
+        assert!(run_image_verification(&mut provider, &options).is_err());
+        assert!(provider.requests.is_empty());
     }
 
     #[test]

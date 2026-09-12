@@ -697,6 +697,47 @@ mod tests {
     }
 
     #[test]
+    fn tool_image_projection_preserves_order_and_duplicates() {
+        let content = ["AAAA", "BBBB", "AAAA"]
+            .into_iter()
+            .map(|data| bcode_model::ToolResultContent::Image {
+                image: bcode_model::ImageContent {
+                    mime_type: "image/png".to_string(),
+                    data_base64: data.to_string(),
+                    metadata: bcode_model::ImageMetadata::default(),
+                },
+            })
+            .collect();
+        let message = bcode_model::ModelMessage {
+            role: bcode_model::MessageRole::Tool,
+            content: vec![bcode_model::ContentBlock::ToolResult {
+                result: bcode_model::ToolResult {
+                    call_id: "call_order".to_string(),
+                    output: "ordered fixtures".to_string(),
+                    content,
+                    is_error: false,
+                },
+            }],
+        };
+        let items = serde_json::to_value(responses_tool_items(&message)).expect("items");
+        let urls: Vec<_> = items
+            .as_array()
+            .expect("array")
+            .iter()
+            .skip(1)
+            .map(|item| item["content"][1]["image_url"].as_str().expect("image URL"))
+            .collect();
+        assert_eq!(
+            urls,
+            [
+                "data:image/png;base64,AAAA",
+                "data:image/png;base64,BBBB",
+                "data:image/png;base64,AAAA"
+            ]
+        );
+    }
+
+    #[test]
     fn image_reference_text_omits_absent_metadata() {
         let image = bcode_model::ImageRefContent {
             path: "/tmp/a.png".to_string(),
