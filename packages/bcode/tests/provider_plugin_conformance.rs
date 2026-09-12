@@ -119,7 +119,41 @@ async fn retained_custody_refreshes_through_real_plugin_bridge() {
             .env["FAKE_ACCESS_TOKEN"],
         "refreshed"
     );
+    verify_refreshed_dispatch(&sdk, context).await;
     assert!(!root.path().join("unused").exists());
+}
+
+#[cfg(all(feature = "config", unix))]
+async fn verify_refreshed_dispatch(sdk: &Bcode, mut context: bcode_model::ProviderRequestContext) {
+    context.settings.clear();
+    context
+        .settings
+        .insert("fake_expected_access_token".into(), "refreshed".into());
+    // Stale caller credentials must be replaced, not merged with selected custody.
+    context
+        .env
+        .insert("FAKE_ACCESS_TOKEN".into(), "stale".into());
+    let response = sdk
+        .agent()
+        .provider_context(context.clone())
+        .build()
+        .generate_text("second request")
+        .await
+        .unwrap();
+    assert_eq!(response.runtime.stop_reason, Some(StopReason::EndTurn));
+    context.auth_profile = Some("foreign".into());
+    // A dispatch here would persist the marker via the provider's existing refresh operation.
+    context.settings.insert(
+        "fake_persist_refreshed_access_token".into(),
+        "must-not-persist".into(),
+    );
+    let result = sdk
+        .agent()
+        .provider_context(context)
+        .build()
+        .generate_text("rejected request")
+        .await;
+    assert!(result.is_err());
 }
 
 #[cfg(all(feature = "config", unix))]

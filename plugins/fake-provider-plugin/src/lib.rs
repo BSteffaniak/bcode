@@ -1495,7 +1495,24 @@ fn has_direct_images(request: &ModelTurnRequest) -> bool {
         .any(|block| matches!(block, ContentBlock::Image { .. }))
 }
 
+fn validate_fake_auth(request: &ModelTurnRequest) -> Option<ProviderError> {
+    request
+        .provider_context
+        .settings
+        .get("fake_expected_access_token")
+        .filter(|expected| request.provider_context.env.get("FAKE_ACCESS_TOKEN") != Some(*expected))
+        .map(|_| {
+            unsupported_fake_error(
+                "fake_auth_expectation_failed",
+                "fake provider received unexpected credentials",
+            )
+        })
+}
+
 fn validate_fake_request(request: &ModelTurnRequest) -> Option<ProviderError> {
+    if let Some(error) = validate_fake_auth(request) {
+        return Some(error);
+    }
     if let Some((code, message)) = unsupported_fake_sampling_parameters(&request.parameters) {
         return Some(unsupported_fake_error(code, message));
     }

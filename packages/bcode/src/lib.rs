@@ -4258,7 +4258,13 @@ fn provider_auth_bridge_resolution(
                 message: "authentication configuration is unavailable".to_owned(),
             };
         };
-        acquired = (config, bcode_config::load_runtime_auth_subscriptions());
+        let Ok(subscriptions) = bcode_config::try_load_runtime_auth_subscriptions() else {
+            return bcode_tool::ToolInvocationServiceResolution::Failed {
+                code: "auth_state_unavailable".to_owned(),
+                message: "authentication state is unavailable".to_owned(),
+            };
+        };
+        acquired = (config, subscriptions);
         &acquired
     };
     bcode_provider_auth::operations::resolve_credential_update_service_request_with_custody(
