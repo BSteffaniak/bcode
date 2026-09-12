@@ -31875,9 +31875,12 @@ async fn restore_workflow_runtime_work(state: &Arc<ServerState>) {
             tracing::debug!(run_id, %error, "workflow recovery lost execution authority");
             continue;
         }
-        if let Err(error) =
-            store.reconcile_prepared_attempts_for_run(&run_id, 1_000, current_unix_millis())
-        {
+        if let Err(error) = store.reconcile_owned_prepared_attempts_for_run(
+            &run_id,
+            &authority.authority,
+            1_000,
+            current_unix_millis(),
+        ) {
             tracing::warn!(run_id, %error, "failed to reconcile prepared workflow attempts");
             continue;
         }

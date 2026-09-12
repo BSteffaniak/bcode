@@ -7194,7 +7194,7 @@ impl WorkflowStore {
         limit: usize,
         reconciled_at_ms: u64,
     ) -> Result<ReconciliationSummary, WorkflowStoreError> {
-        self.reconcile_prepared_attempts_scoped(None, limit, reconciled_at_ms)
+        self.reconcile_prepared_attempts_scoped(None, limit, reconciled_at_ms, None)
     }
 
     /// Reconcile receipt-less attempts for one authority-qualified run.
@@ -7209,14 +7209,35 @@ impl WorkflowStore {
         reconciled_at_ms: u64,
     ) -> Result<ReconciliationSummary, WorkflowStoreError> {
         validate_id("run_id", run_id)?;
-        self.reconcile_prepared_attempts_scoped(Some(run_id), limit, reconciled_at_ms)
+        self.reconcile_prepared_attempts_scoped(Some(run_id), limit, reconciled_at_ms, None)
+    }
+
+    /// Reconcile receipt-less preparations under the caller's held execution authority.
+    ///
+    /// # Errors
+    /// Rejects stale authority within the recovery transaction, invalid bounds,
+    /// malformed durable attempts, or persistence failures.
+    pub fn reconcile_owned_prepared_attempts_for_run(
+        &mut self,
+        run_id: &str,
+        authority: &WorkflowExecutionAuthority,
+        limit: usize,
+        reconciled_at_ms: u64,
+    ) -> Result<ReconciliationSummary, WorkflowStoreError> {
+        self.reconcile_prepared_attempts_scoped(
+            Some(run_id),
+            limit,
+            reconciled_at_ms,
+            Some(authority),
+        )
     }
 
     fn reconcile_prepared_attempts_scoped(
-        &mut self,
+        &self,
         run_id: Option<&str>,
         limit: usize,
         reconciled_at_ms: u64,
+        authority: Option<&WorkflowExecutionAuthority>,
     ) -> Result<ReconciliationSummary, WorkflowStoreError> {
         if limit == 0 {
             return Err(WorkflowStoreError::InvalidData(
@@ -7224,7 +7245,13 @@ impl WorkflowStore {
             ));
         }
         let limit = i64::try_from(limit).unwrap_or(i64::MAX);
-        let transaction = self.connection.transaction()?;
+        let transaction = self.connection.unchecked_transaction()?;
+        if let Some(authority) = authority {
+            let run_id = run_id.ok_or_else(|| {
+                WorkflowStoreError::InvalidData("owned recovery requires a run".into())
+            })?;
+            self.verify_execution_authority(run_id, authority)?;
+        }
         let rows = {
             let mut statement = transaction.prepare(
                 "SELECT run_id, dispatch_identity, side_effect FROM workflow_attempts \
@@ -36160,6 +36187,55 @@ mod tests {
             })
             .expect("settle new successor");
         assert_eq!(finished.run_status, RunStatus::Completed);
+    }
+
+    #[test]
+    fn owned_preparation_recovery_rejects_stale_authority_without_terminalizing() {
+        let (_temp, mut store, run, mut authority, _) = connected_publication_fixture();
+        let id = activation_identity(&run.run_id, "first", 0);
+        store
+            .prepare_pending_activation(
+                &run.run_id,
+                "first",
+                &id,
+                DispatchSideEffect::Mutating,
+                serde_json::json!({}),
+                25,
+            )
+            .expect("prepare")
+            .expect("pending");
+        authority.generation += 1;
+        assert!(
+            store
+                .reconcile_owned_prepared_attempts_for_run(&run.run_id, &authority, 10, 26)
+                .is_err()
+        );
+        let status: String = store
+            .connection
+            .query_row(
+                "SELECT status FROM workflow_attempts WHERE run_id = ?1 AND terminal_at_ms IS NULL",
+                [&run.run_id],
+                |row| row.get(0),
+            )
+            .expect("untouched attempt");
+        assert_eq!(status, "prepared");
+        assert_eq!(
+            store
+                .run_summary(&run.run_id)
+                .expect("summary")
+                .expect("run")
+                .status,
+            RunStatus::Running
+        );
+        authority.generation -= 1;
+        assert_eq!(
+            store
+                .reconcile_owned_prepared_attempts_for_run(&run.run_id, &authority, 10, 27)
+                .expect("owner recovery")
+                .repair_required
+                .len(),
+            1
+        );
     }
 
     #[test]

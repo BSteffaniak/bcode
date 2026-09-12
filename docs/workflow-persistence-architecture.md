@@ -15,8 +15,9 @@ rechecks it transactionally. Resource acquisition and preparation each recheck t
 expected authority within their own mutation transaction. They are not one atomic admission:
 a lease committed before an ownership transfer may still require recovery if preparation fails.
 Startup recovery uses caller-qualified redispatch with expected-authority checks at discovery,
-handoff, and receipt commit. Preparation recovery and lease/admission reconciliation remain
-required before this is a complete ownership protocol.
+handoff, and receipt commit. Startup preparation recovery also checks held authority within
+its classification/mutation transaction. Lease/admission reconciliation remains required
+before this is a complete ownership protocol.
 
 ## Workflow-owned gate cancellation
 
