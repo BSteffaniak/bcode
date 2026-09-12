@@ -1,13 +1,28 @@
 # Workflow Persistence Architecture
 
+## Connected direct-chain publication
+
+The existing authenticated application and invocation publication paths now accept direct chains
+with explicit retained-source bindings, schema-identical untransformed edges, and targets that have
+never had an activation. Candidate validation, retention, cancellation, graph publication, and
+admission remain one transaction. Existing admission identities remain historical. Controller
+nodes, joins, fan-out, and previously admitted targets remain rejected; this is a bounded supported
+subset, not general connected reconciliation. The existing leaf-named store methods retain their
+names for compatibility but also accept this subset.
+
+Store coverage publishes a replacement successor through staging/publication, reopens storage,
+settles the retained source, and completes the revised successor. Application coverage checks
+invocation authorization, exact candidate identity, duplicate publication, and wake delivery.
+This does not establish a complete connected publisher-to-worker recovery path.
+
 ## Retained edge publication storage
 
 Schema 29 adds revision-scoped retained-edge bindings through the existing exclusive upgrade
 coordinator, including upgrades from schema 28. Publication records the exact source activation
 and committed edge revision atomically with its publication receipt. Foreign keys preserve those
-historical identities; one edge has at most one retained source per graph revision. Connected
-publication remains rejected until readiness, input resolution, and settlement consume these
-bindings. This storage addition does not itself enable connected revised execution.
+historical identities; one edge has at most one retained source per graph revision. The original
+storage addition did not enable connected revised execution; the supported direct-chain subset
+is described above.
 
 ## Retained leaf publication
 

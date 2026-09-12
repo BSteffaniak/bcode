@@ -49678,6 +49678,46 @@ library = "test"
 
     #[tokio::test]
     async fn execution_publication_requires_distinct_policy_and_exact_candidate() {
+        assert_execution_publication_authorization(false).await;
+    }
+
+    #[tokio::test]
+    async fn connected_execution_publication_requires_distinct_policy_and_exact_candidate() {
+        assert_execution_publication_authorization(true).await;
+    }
+
+    fn publication_edit(
+        activation_id: String,
+        connected: bool,
+    ) -> bcode_workflow::WorkflowRunGraphEditBatch {
+        let mut edit = publication_leaf_edit(activation_id.clone());
+        if connected {
+            let bcode_workflow::WorkflowRunGraphEdit::AddNode { entry, .. } = &mut edit.edits[0]
+            else {
+                panic!("added successor");
+            };
+            *entry = false;
+            edit.edits
+                .push(bcode_workflow::WorkflowRunGraphEdit::AddEdge {
+                    edge_id: 0,
+                    edge: bcode_workflow::EdgeDefinition {
+                        from: "agent".to_owned(),
+                        to: "next".to_owned(),
+                        kind: bcode_workflow::EdgeKind::Direct,
+                        transform: None,
+                    },
+                });
+            edit.reconciliation = vec![
+                bcode_workflow::WorkflowRunGraphReconciliation::RetainWithBindings {
+                    activation_id,
+                    edge_ids: vec![0],
+                },
+            ];
+        }
+        edit
+    }
+
+    async fn assert_execution_publication_authorization(connected: bool) {
         let (mut state, child_id, _root) = active_edit_execution_fixture().await;
         let (sender, mut scheduled) = mpsc::channel(2);
         state.workflow_driver_sender.set(sender).expect("scheduler");
@@ -49689,7 +49729,7 @@ library = "test"
             .execution
             .expect("execution")
             .provenance;
-        let edit = publication_leaf_edit(provenance.activation_id.expect("activation"));
+        let edit = publication_edit(provenance.activation_id.expect("activation"), connected);
         let cancel = TurnCancelState::default();
         state
             .stage_workflow_run_graph_edit_from_invocation(
@@ -49720,24 +49760,7 @@ library = "test"
                 )
             }),
         });
-        let mut mismatch = edit.clone();
-        mismatch.edits.clear();
-        mismatch
-            .edits
-            .push(bcode_workflow::WorkflowRunGraphEdit::RemoveNode {
-                node_id: "next".to_owned(),
-            });
-        assert!(matches!(
-            state
-                .publish_workflow_run_graph_edit_from_invocation(
-                    child_id,
-                    "bcode.workflow",
-                    mismatch,
-                    &cancel
-                )
-                .await,
-            Err(ServerError::WorkflowApplicationOperationUnauthorized(_))
-        ));
+        assert_mismatched_publication_denied(&state, child_id, &edit, &cancel).await;
         assert_eq!(
             state
                 .publish_workflow_run_graph_edit_from_invocation(
@@ -49777,6 +49800,29 @@ library = "test"
                 .expect("revision"),
             Some(2)
         );
+    }
+
+    async fn assert_mismatched_publication_denied(
+        state: &ServerState,
+        child_id: SessionId,
+        edit: &bcode_workflow::WorkflowRunGraphEditBatch,
+        cancel: &TurnCancelState,
+    ) {
+        let mut mismatch = edit.clone();
+        mismatch.edits = vec![bcode_workflow::WorkflowRunGraphEdit::RemoveNode {
+            node_id: "next".to_owned(),
+        }];
+        assert!(matches!(
+            state
+                .publish_workflow_run_graph_edit_from_invocation(
+                    child_id,
+                    "bcode.workflow",
+                    mismatch,
+                    cancel
+                )
+                .await,
+            Err(ServerError::WorkflowApplicationOperationUnauthorized(_))
+        ));
     }
 
     async fn assert_publication_queue_full(

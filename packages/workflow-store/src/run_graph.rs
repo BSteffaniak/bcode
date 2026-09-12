@@ -457,11 +457,12 @@ impl WorkflowStore {
         Ok(request)
     }
 
-    /// Publish a validated leaf-only graph while the run has no active activations.
+    /// Publish a validated graph while the run has no active activations.
     ///
-    /// This deliberately rejects connected graphs and reconciliation requests until their
-    /// settlement paths support published bindings. Returns the committed revision, including
-    /// on duplicate delivery. The caller must authorize the edit before calling this method.
+    /// Connected graphs are limited to direct chains with never-admitted targets and no
+    /// controllers. Reconciliation requests require the retained publication operation.
+    /// Returns the committed revision, including on duplicate delivery.
+    /// The caller must authorize the edit before calling this method.
     ///
     /// # Errors
     ///
@@ -477,7 +478,7 @@ impl WorkflowStore {
         self.publish_leaf_run_graph_edit(run_id, mutation_id, authority, created_at_ms, false, None)
     }
 
-    /// Publish a leaf-only edit while retaining unchanged work or cancelling unstarted work.
+    /// Publish an edit while retaining unchanged work or cancelling unstarted work.
     /// Newly added entry nodes are admitted atomically using the run input and current limits.
     /// Existing nodes and their historical activations are never implicitly restarted.
     ///
@@ -485,7 +486,8 @@ impl WorkflowStore {
     /// dispatched and waiting work requires operation-owner reconciliation.
     ///
     /// Admission bindings remain historical. Settlement consumes the publication's retained
-    /// identities. Connected topology and edits to retained nodes remain unsupported.
+    /// identities. Direct chains with never-admitted targets and explicit source bindings
+    /// are supported; controllers, joins, and edits to retained nodes remain unsupported.
     /// The caller must authorize the operation before invoking this method.
     ///
     /// # Errors
@@ -592,14 +594,100 @@ impl WorkflowStore {
             (run_id, mutation_id), |row| row.get(0),
         )?;
         if connected {
-            return Err(WorkflowStoreError::InvalidData(
-                "publication requires binding-aware successor settlement".to_string(),
-            ));
+            self.validate_connected_publication(&request)?;
         }
         let revision =
             persist_graph_publication(&transaction, &request, &retentions, created_at_ms)?;
         transaction.commit()?;
         Ok(revision)
+    }
+
+    // Connected publication currently admits direct chains whose targets have never
+    // executed. This preserves exact retained inputs without guessing how to reconcile
+    // joins, controllers, or previously admitted downstream work.
+    fn validate_connected_publication(
+        &self,
+        request: &bcode_workflow::WorkflowRunGraphEditBatch,
+    ) -> Result<(), WorkflowStoreError> {
+        let page = self.current_run_graph_page(
+            &request.run_id,
+            Some(request.expected_revision),
+            None,
+            None,
+            GRAPH_PAGE_LIMIT,
+        )?;
+        if !page.nodes_complete || !page.edges_complete {
+            return Err(WorkflowStoreError::InvalidData(
+                "publication requires incremental graph validation".to_string(),
+            ));
+        }
+        let mut nodes = page
+            .nodes
+            .into_iter()
+            .map(|record| (record.node.id.clone(), (record.node, record.entry)))
+            .collect::<std::collections::BTreeMap<_, _>>();
+        let mut edges = page
+            .edges
+            .into_iter()
+            .map(|record| (record.edge_id, record.edge))
+            .collect::<std::collections::BTreeMap<_, _>>();
+        for edit in &request.edits {
+            use bcode_workflow::WorkflowRunGraphEdit as Edit;
+            match edit {
+                Edit::AddNode { node, entry, .. } | Edit::ReplaceNode { node, entry, .. } => {
+                    nodes.insert(node.id.clone(), (node.clone(), *entry));
+                }
+                Edit::RemoveNode { node_id } => {
+                    nodes.remove(node_id);
+                }
+                Edit::AddEdge { edge_id, edge } | Edit::ReplaceEdge { edge_id, edge } => {
+                    edges.insert(*edge_id, edge.clone());
+                }
+                Edit::RemoveEdge { edge_id } => {
+                    edges.remove(edge_id);
+                }
+            }
+        }
+        let invalid = || {
+            WorkflowStoreError::InvalidData(
+            "connected publication requires direct chains with unstarted targets and no controllers".to_string(),
+        )
+        };
+        if nodes.values().any(|(node, _)| {
+            !matches!(
+                node.kind,
+                bcode_workflow::NodeKind::Task
+                    | bcode_workflow::NodeKind::Agent
+                    | bcode_workflow::NodeKind::PluginBlock
+                    | bcode_workflow::NodeKind::Input
+                    | bcode_workflow::NodeKind::Approval
+            )
+        }) {
+            return Err(invalid());
+        }
+        let mut targets = BTreeSet::new();
+        let mut sources = BTreeSet::new();
+        for edge in edges.values() {
+            let (source, _) = nodes.get(&edge.from).ok_or_else(invalid)?;
+            let (target, entry) = nodes.get(&edge.to).ok_or_else(invalid)?;
+            if edge.kind != bcode_workflow::EdgeKind::Direct
+                || edge.transform.is_some()
+                || source.output != target.input
+                || *entry
+                || !targets.insert(&edge.to)
+                || !sources.insert(&edge.from)
+            {
+                return Err(invalid());
+            }
+            let admitted: bool = self.connection.query_row(
+                "SELECT EXISTS(SELECT 1 FROM workflow_activations WHERE run_id = ?1 AND node_id = ?2)",
+                (&request.run_id, &edge.to), |row| row.get(0),
+            )?;
+            if admitted {
+                return Err(invalid());
+            }
+        }
+        Ok(())
     }
 
     /// Durably stage a live graph edit without publishing executable topology.

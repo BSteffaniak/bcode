@@ -35819,6 +35819,231 @@ mod tests {
         assert_eq!(admitted, 1);
     }
 
+    fn connected_publication_fixture() -> (
+        tempfile::TempDir,
+        WorkflowStore,
+        NewWorkflowRun,
+        WorkflowExecutionAuthority,
+        bcode_workflow::WorkflowRunGraphEditBatch,
+    ) {
+        let temp = tempfile::tempdir().expect("temp");
+        let mut store = WorkflowStore::open_in_state_dir(temp.path()).expect("store");
+        store
+            .persist_definition("sequential", 1, &sequential_definition())
+            .expect("definition");
+        let mut run = new_run();
+        run.definition_id = "sequential".into();
+        store.create_run(&run).expect("run");
+        store
+            .connection
+            .execute_batch(
+                "UPDATE workflow_runs SET target_artifact_id = 'artifact-a',
+             coordinator_daemon_instance_id = 'daemon-a', coordinator_generation = 1,
+             coordinator_fencing_token = 'token-a' WHERE run_id = 'run-1';",
+            )
+            .expect("owner");
+        let authority = store
+            .execution_authority(&run.run_id)
+            .expect("authority")
+            .expect("owner");
+        let first_id = activation_identity(&run.run_id, "first", 0);
+        let mut second = store
+            .current_run_graph_node(&run.run_id, "second")
+            .expect("node")
+            .expect("second")
+            .node;
+        second.name = "revised successor".into();
+        let mut request = bcode_workflow::WorkflowRunGraphEditBatch {
+            version: bcode_workflow::WORKFLOW_RUN_GRAPH_EDIT_VERSION,
+            run_id: run.run_id.clone(),
+            mutation_id: "connected".into(),
+            expected_revision: 1,
+            edits: vec![bcode_workflow::WorkflowRunGraphEdit::ReplaceNode {
+                node: second,
+                entry: false,
+                exit: true,
+            }],
+            reconciliation: vec![bcode_workflow::WorkflowRunGraphReconciliation::Retain {
+                activation_id: first_id.clone(),
+            }],
+        };
+        store
+            .stage_run_graph_edit(&request, &authority, 20)
+            .expect("stage missing binding");
+        assert!(
+            store
+                .publish_retained_leaf_run_graph_edit(
+                    &run.run_id,
+                    &request.mutation_id,
+                    &authority,
+                    21
+                )
+                .is_err()
+        );
+        assert_eq!(
+            store.run_graph_revision(&run.run_id).expect("revision"),
+            Some(1)
+        );
+        request.mutation_id = "bound-connected".into();
+        request.reconciliation = vec![
+            bcode_workflow::WorkflowRunGraphReconciliation::RetainWithBindings {
+                activation_id: first_id,
+                edge_ids: vec![0],
+            },
+        ];
+        store
+            .stage_run_graph_edit(&request, &authority, 22)
+            .expect("stage");
+        assert_eq!(
+            store
+                .publish_retained_leaf_run_graph_edit(
+                    &run.run_id,
+                    &request.mutation_id,
+                    &authority,
+                    23
+                )
+                .expect("publish"),
+            2
+        );
+        (temp, store, run, authority, request)
+    }
+
+    #[test]
+    fn connected_publication_executes_replaced_unstarted_successor_after_reopen() {
+        let (temp, mut store, run, authority, request) = connected_publication_fixture();
+        let first_id = activation_identity(&run.run_id, "first", 0);
+        let bcode_workflow::WorkflowRunGraphEdit::ReplaceNode { node: second, .. } =
+            &request.edits[0]
+        else {
+            panic!("replacement");
+        };
+        drop(store);
+        store = WorkflowStore::open_in_state_dir(temp.path()).expect("reopen");
+        assert_eq!(
+            store
+                .publish_retained_leaf_run_graph_edit(
+                    &run.run_id,
+                    &request.mutation_id,
+                    &authority,
+                    24
+                )
+                .expect("duplicate"),
+            2
+        );
+        assert_eq!(
+            store
+                .activation_admitted_graph_revision(&run.run_id, "first", &first_id)
+                .expect("original admission"),
+            Some(1)
+        );
+        let result = store
+            .persist_validated_output(&ValidatedOutput {
+                output_id: "first-result".into(),
+                run_id: run.run_id.clone(),
+                node_id: "first".into(),
+                activation_id: first_id,
+                schema_id: "u32".into(),
+                schema_version: 1,
+                value: serde_json::json!(2),
+                artifact_reference: None,
+                created_at_ms: 25,
+            })
+            .expect("settle retained source");
+        assert_eq!(result.activated.len(), 1);
+        let successor = &result.activated[0];
+        assert_eq!(successor.node_id, "second");
+        assert_eq!(successor.input, Some(serde_json::json!(2)));
+        assert_eq!(
+            store
+                .activation_admitted_graph_revision(&run.run_id, "second", &successor.activation_id)
+                .expect("new admission"),
+            Some(2)
+        );
+        assert_eq!(
+            store
+                .activation_graph_node(&run.run_id, "second", &successor.activation_id)
+                .expect("bound node")
+                .map(|record| record.node),
+            Some(second.clone())
+        );
+        let finished = store
+            .persist_validated_output(&ValidatedOutput {
+                output_id: "second-result".into(),
+                run_id: run.run_id.clone(),
+                node_id: "second".into(),
+                activation_id: successor.activation_id.clone(),
+                schema_id: "u32".into(),
+                schema_version: 1,
+                value: serde_json::json!(3),
+                artifact_reference: None,
+                created_at_ms: 26,
+            })
+            .expect("settle new successor");
+        assert_eq!(finished.run_status, RunStatus::Completed);
+    }
+
+    #[test]
+    fn connected_publication_rejects_readmitting_a_historical_target() {
+        let (_temp, mut store, run, authority, _) = connected_publication_fixture();
+        let first_id = activation_identity(&run.run_id, "first", 0);
+        store
+            .persist_validated_output(&ValidatedOutput {
+                output_id: "first-result".into(),
+                run_id: run.run_id.clone(),
+                node_id: "first".into(),
+                activation_id: first_id.clone(),
+                schema_id: "u32".into(),
+                schema_version: 1,
+                value: serde_json::json!(2),
+                artifact_reference: None,
+                created_at_ms: 25,
+            })
+            .expect("admit second");
+        let second_id = activation_identity(&run.run_id, "second", 0);
+        let request = bcode_workflow::WorkflowRunGraphEditBatch {
+            version: bcode_workflow::WORKFLOW_RUN_GRAPH_EDIT_VERSION,
+            run_id: run.run_id.clone(),
+            mutation_id: "cancel-target".into(),
+            expected_revision: 2,
+            edits: vec![bcode_workflow::WorkflowRunGraphEdit::ReplaceEdge {
+                edge_id: 0,
+                edge: bcode_workflow::EdgeDefinition {
+                    from: "first".into(),
+                    to: "second".into(),
+                    kind: bcode_workflow::EdgeKind::Direct,
+                    transform: None,
+                },
+            }],
+            reconciliation: vec![
+                bcode_workflow::WorkflowRunGraphReconciliation::RetainWithBindings {
+                    activation_id: first_id,
+                    edge_ids: vec![0],
+                },
+                bcode_workflow::WorkflowRunGraphReconciliation::Cancel {
+                    activation_id: second_id,
+                },
+            ],
+        };
+        store
+            .stage_run_graph_edit(&request, &authority, 26)
+            .expect("stage");
+        assert!(
+            store
+                .publish_retained_leaf_run_graph_edit(
+                    &run.run_id,
+                    &request.mutation_id,
+                    &authority,
+                    27
+                )
+                .is_err()
+        );
+        assert_eq!(
+            store.run_graph_revision(&run.run_id).expect("revision"),
+            Some(2)
+        );
+        assert_eq!(store.pending_activations(10).expect("pending").len(), 1);
+    }
+
     #[test]
     fn retained_connected_successor_requires_binding_and_commits_current_revision() {
         let temp = tempfile::tempdir().expect("temp");
