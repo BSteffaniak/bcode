@@ -11,55 +11,57 @@ repository  = { workspace = true }
 version     = { workspace = true }
 
 [dependencies]
-base64                       = { workspace = true }
-bcode_build_info             = { workspace = true }
-bcode_client                 = { workspace = true }
-bcode_config                 = { workspace = true }
-bcode_daemon_lifecycle       = { workspace = true }
-bcode_hyperchad              = { workspace = true, optional = true }
-bcode_ipc                    = { workspace = true }
-bcode_metrics                = { workspace = true }
-bcode_model                  = { workspace = true }
-bcode_model_catalog          = { workspace = true }
-bcode_model_provider_runtime = { workspace = true }
-bcode_plugin                 = { workspace = true }
-bcode_plugin_sdk             = { workspace = true }
-bcode_prompt_cache           = { workspace = true }
-bcode_provider_auth          = { workspace = true }
-bcode_provider_auth_models   = { workspace = true }
-bcode_server                 = { workspace = true }
-bcode_session                = { workspace = true }
-bcode_session_import         = { workspace = true }
-bcode_session_migration      = { workspace = true }
-bcode_session_models         = { workspace = true }
-bcode_session_search         = { workspace = true }
-bcode_settings               = { workspace = true }
-bcode_skill_models           = { workspace = true }
-bcode_tool_models            = { workspace = true }
-bcode_tui                    = { workspace = true }
-bcode_workflow               = { workspace = true }
-bcode_workflow_discovery     = { workspace = true }
-bcode_workflow_store         = { workspace = true }
-bcode_worktree_models        = { workspace = true }
-bmux_keyboard                = { workspace = true }
-bmux_tui                     = { workspace = true, features = ["crossterm"] }
-chrono                       = { workspace = true }
-clap                         = { workspace = true, features = ["derive", "help", "std", "usage"] }
-crossterm                    = { workspace = true, features = ["events"] }
-open                         = { workspace = true, optional = true }
-rand                         = { workspace = true }
-reqwest                      = { workspace = true }
-rpassword                    = { workspace = true }
-serde                        = { workspace = true, features = ["derive"] }
-serde_json                   = { workspace = true }
-sha2                         = { workspace = true }
-thiserror                    = { workspace = true }
-tokio                        = { workspace = true, features = ["process", "signal", "time"] }
-toml                         = { workspace = true, features = ["parse", "serde"] }
-tracing                      = { workspace = true }
-tracing-subscriber           = { workspace = true }
-yaml_serde                   = { workspace = true }
-zeroize                      = { workspace = true }
+base64 = { workspace = true }
+bcode_build_info = { workspace = true }
+bcode_client = { workspace = true }
+bcode_config = { workspace = true }
+bcode_daemon_lifecycle = { workspace = true }
+bcode_hyperchad = { workspace = true, optional = true }
+bcode_ipc = { workspace = true }
+bcode_metrics = { workspace = true }
+bcode_model = { workspace = true }
+bcode_model_catalog = { workspace = true }
+bcode_model_provider_runtime = { workspace = true, features = [
+    "image-fixtures",
+] }
+bcode_plugin = { workspace = true }
+bcode_plugin_sdk = { workspace = true }
+bcode_prompt_cache = { workspace = true }
+bcode_provider_auth = { workspace = true }
+bcode_provider_auth_models = { workspace = true }
+bcode_server = { workspace = true }
+bcode_session = { workspace = true }
+bcode_session_import = { workspace = true }
+bcode_session_migration = { workspace = true }
+bcode_session_models = { workspace = true }
+bcode_session_search = { workspace = true }
+bcode_settings = { workspace = true }
+bcode_skill_models = { workspace = true }
+bcode_tool_models = { workspace = true }
+bcode_tui = { workspace = true }
+bcode_workflow = { workspace = true }
+bcode_workflow_discovery = { workspace = true }
+bcode_workflow_store = { workspace = true }
+bcode_worktree_models = { workspace = true }
+bmux_keyboard = { workspace = true }
+bmux_tui = { workspace = true, features = ["crossterm"] }
+chrono = { workspace = true }
+clap = { workspace = true, features = ["derive", "help", "std", "usage"] }
+crossterm = { workspace = true, features = ["events"] }
+open = { workspace = true, optional = true }
+rand = { workspace = true }
+reqwest = { workspace = true }
+rpassword = { workspace = true }
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
+sha2 = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true, features = ["process", "signal", "time"] }
+toml = { workspace = true, features = ["parse", "serde"] }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+yaml_serde = { workspace = true }
+zeroize = { workspace = true }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 sshenv_vault = { workspace = true, features = [

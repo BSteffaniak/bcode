@@ -2219,11 +2219,13 @@ dependencies = [
 name = "bcode_model_provider_runtime"
 version = "0.0.1-alpha.0"
 dependencies = [
+ "base64 0.22.1",
  "bcode_fake_provider_plugin",
  "bcode_model",
  "bcode_plugin_sdk",
  "bcode_session_models",
  "httpdate",
+ "image",
  "serde",
  "serde_json",
  "tokio",

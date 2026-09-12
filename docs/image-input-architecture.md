@@ -21,8 +21,8 @@ Implemented first slice:
 * Deterministic provider-operation tests and an actual Responses request-projection test.
 
 Not implemented or verified by this slice: provider uploads/file IDs, authorized hosted URLs,
-request compression, lazy image hydration, durable reference lifecycle, automatic generated visual
-fixtures, daemon restart/fault evals, and live provider results.
+request compression, lazy image hydration, durable reference lifecycle,
+daemon restart/fault evals, and live provider results.
 No provider capability claims have been upgraded based on offline tests.
 
 ## Ownership and target request pipeline
@@ -88,6 +88,20 @@ bcode model verify-images --id-pattern 'MODEL_ID' \
   --question 'What color is the square? Reply with one word.' \
   --expected-answer blue
 ```
+
+For a nonsensitive generated probe, no local files or expected-answer arguments are needed:
+
+```sh
+bcode model verify-images --generated-seed 726
+bcode model verify-images --generated-seed 726 --tool-result
+```
+
+The optional `image-fixtures` provider-runtime feature generates two PNGs with two color panels
+each. The CLI enables it; provider-only builds need not acquire image encoding dependencies.
+Seeds select reproducible four-color sequences (1,296 combinations). They are not secrets or
+cryptographic randomness. The question contains no selected colors; the expected sequence remains
+local. Decode-based tests verify the actual PNG pixels and ordering. Run different seeds to reduce
+accidental agreement, and retain the no-image control; generated fixtures are evidence, not proof.
 
 Add `--allow-conversation-storage` only when provider-side conversation retention is acceptable.
 This authorizes the existing provider conversation-reuse mechanism, not a new upload service.

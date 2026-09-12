@@ -4924,6 +4924,9 @@ enum ModelCommand {
 /// Arguments for bounded, explicitly requested image verification.
 #[derive(Debug, clap::Args)]
 struct VerifyImagesArgs {
+    /// Generate two nonsensitive, order-sensitive images from a reproducible seed.
+    #[arg(long, conflicts_with_all = ["image", "question", "expected_answer"])]
+    generated_seed: Option<u64>,
     /// Ordered PNG, JPEG, GIF, or WebP fixtures; repeat --image (maximum eight).
     #[arg(long)]
     image: Vec<PathBuf>,
@@ -10963,11 +10966,40 @@ fn image_verification_fixture(
     Ok(fixture)
 }
 
+fn prepare_image_probe(
+    args: &VerifyImagesArgs,
+) -> Result<(Option<Vec<bcode_model::ImageContent>>, String, String), CliError> {
+    let generated = args
+        .generated_seed
+        .map(bcode_model_provider_runtime::image_fixtures::generate_image_fixture)
+        .transpose()
+        .map_err(CliError::PluginCli)?;
+    let fixture = if generated.is_some() && !args.dry_run {
+        if args.max_models == 0 || args.timeout_seconds == 0 {
+            return Err(CliError::PluginCli(
+                "image probe model budget and timeout must be positive".to_string(),
+            ));
+        }
+        generated.as_ref().map(|fixture| fixture.images.clone())
+    } else {
+        image_verification_fixture(args)?
+    };
+    let question = generated.as_ref().map_or_else(
+        || args.question.clone().unwrap_or_default(),
+        |fixture| fixture.question.clone(),
+    );
+    let expected_answer = generated.as_ref().map_or_else(
+        || args.expected_answer.clone().unwrap_or_default(),
+        |fixture| fixture.expected_answer.clone(),
+    );
+    Ok((fixture, question, expected_answer))
+}
+
 async fn verify_model_images(args: &VerifyImagesArgs) -> Result<(), CliError> {
     use bcode_model_provider_runtime::image_verification::{
         ImageVerificationOptions, run_image_verification,
     };
-    let fixture = image_verification_fixture(args)?;
+    let (fixture, question, expected_answer) = prepare_image_probe(args)?;
     let config = bcode_config::load_config()?;
     let context = configured_provider_context(&config);
     let selection = config.resolved_model_selection();
@@ -11022,8 +11054,8 @@ async fn verify_model_images(args: &VerifyImagesArgs) -> Result<(), CliError> {
                     } else {
                         bcode_model_provider_runtime::image_verification::ImageVerificationSource::User
                     },
-                    question: args.question.clone().unwrap_or_default(),
-                    expected_answer: args.expected_answer.clone().unwrap_or_default(),
+                    question: question.clone(),
+                    expected_answer: expected_answer.clone(),
                     allow_conversation_storage: args.allow_conversation_storage,
                     timeout: Duration::from_secs(args.timeout_seconds),
                 },
@@ -22926,6 +22958,42 @@ mod model_cli_tests {
             panic!("expected image verification");
         };
         assert!(super::image_verification_fixture(&args).is_err());
+    }
+
+    #[test]
+    fn generated_image_probe_needs_no_local_files_or_answer_arguments() {
+        let cli = Cli::try_parse_from([
+            "bcode",
+            "model",
+            "verify-images",
+            "--generated-seed",
+            "726",
+            "--tool-result",
+        ])
+        .expect("generated probe parses");
+        let Some(Commands::Model {
+            command: ModelCommand::VerifyImages(args),
+        }) = cli.command
+        else {
+            panic!("probe")
+        };
+        let (images, question, answer) = super::prepare_image_probe(&args).expect("fixture");
+        assert_eq!(images.expect("images").len(), 2);
+        assert_eq!(answer, "red green blue yellow");
+        assert!(!question.contains(&answer));
+        assert!(args.tool_result);
+        assert!(
+            Cli::try_parse_from([
+                "bcode",
+                "model",
+                "verify-images",
+                "--generated-seed",
+                "1",
+                "--image",
+                "private.png"
+            ])
+            .is_err()
+        );
     }
 
     #[test]

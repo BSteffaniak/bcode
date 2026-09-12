@@ -20,6 +20,9 @@ use usage_capture::append_usage_capture;
 
 pub mod image_verification;
 
+#[cfg(feature = "image-fixtures")]
+pub mod image_fixtures;
+
 mod conformance;
 pub use conformance::{
     ProviderConformanceCase, ProviderConformanceError, ProviderConformanceOptions,
