@@ -52,6 +52,15 @@ compressible inputs are explicitly rejected without modifying the original. Canc
 verification failures never publish a candidate. The result describes byte lengths, not allocated
 disk savings; atomic replacement, syncing, and compatibility fencing are still not implemented.
 
+The logical artifact reader now streams and seeks over either explicitly selected raw storage or
+chunked Zstd, retaining only one 256 KiB decoded buffer. Maintenance can prepare light-to-deep
+candidates directly from compressed storage without a full-size decompressed temporary, and can
+restore original bytes through a cancellable bounded stream. Transition savings are checked against
+the existing **physical** representation, not logical content length; repeating the same encoding
+does not falsely report the raw/compressed ratio as additional savings. Verified preparation remains
+separate from publication. Tests exercise raw-to-light-to-deep-to-raw byte identity, chunk-boundary
+seeks, duplicate-tier rejection, explicit format selection, and cancellation.
+
 ## Configured policy (not activated)
 
 The configuration loader accepts and validates:
