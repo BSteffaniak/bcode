@@ -8667,6 +8667,18 @@ impl WorkflowStore {
         settled_at_ms: u64,
     ) -> Result<Vec<NewActivation>, WorkflowStoreError> {
         let transaction = self.connection.transaction()?;
+        let graph_revision = run_graph::graph_revision(&transaction, &activation.run_id)?
+            .ok_or_else(|| WorkflowStoreError::InvalidData("repeat graph is missing".into()))?;
+        run_graph::reconciled_activation_exit(
+            &transaction,
+            &activation.run_id,
+            &activation.node_id,
+            &activation.activation_id,
+        )?;
+        let admitted: u64 = transaction.query_row(
+            "SELECT graph_revision FROM workflow_activation_graph_bindings WHERE run_id = ?1 AND activation_id = ?2",
+            (&activation.run_id, &activation.activation_id), |row| row.get(0),
+        )?;
         let predicate: bcode_workflow::PredicateExpression = serde_json::from_value(
             activation
                 .node
@@ -8774,26 +8786,47 @@ impl WorkflowStore {
         if should_repeat && within_iteration_bound {
             let mut after_edge_id = None;
             loop {
-                let edges = run_graph::initial_outgoing_edges(
+                let edges = Self::current_run_graph_edges_in_snapshot(
                     &transaction,
                     &activation.run_id,
-                    &activation.node_id,
+                    graph_revision,
                     after_edge_id,
+                    100,
+                    Some(run_graph::EdgeEndpoint::Source(&activation.node_id)),
                 )?;
                 let Some(last) = edges.last() else { break };
                 after_edge_id = Some(last.edge_id);
                 for record in edges {
+                    if admitted != graph_revision
+                        && run_graph::retained_edge_activation(
+                            &transaction,
+                            &activation.run_id,
+                            graph_revision,
+                            &record,
+                        )?
+                        .as_deref()
+                            != Some(activation.activation_id.as_str())
+                    {
+                        return Err(WorkflowStoreError::InvalidData(
+                            "repeat continuation requires an exact retained edge binding".into(),
+                        ));
+                    }
                     let edge = record.edge;
                     if !matches!(edge.kind, bcode_workflow::EdgeKind::Back { .. }) {
                         continue;
                     }
-                    let node = run_graph::initial_node(&transaction, &activation.run_id, &edge.to)?
-                        .ok_or_else(|| {
-                            WorkflowStoreError::InvalidData(format!(
-                                "workflow repeat target is missing from run graph: {}",
-                                edge.to
-                            ))
-                        })?;
+                    let target = Self::current_run_graph_node_in_snapshot(
+                        &transaction,
+                        &activation.run_id,
+                        &edge.to,
+                    )?
+                    .ok_or_else(|| {
+                        WorkflowStoreError::InvalidData(format!(
+                            "workflow repeat target is missing from run graph: {}",
+                            edge.to
+                        ))
+                    })?;
+                    let node = &target.node;
                     let transformed_input = if let Some(transform) = &edge.transform {
                         let run_input_json: Option<String> = transaction.query_row(
                             "SELECT input_json FROM workflow_runs WHERE run_id = ?1",
@@ -8849,10 +8882,20 @@ impl WorkflowStore {
                             },
                         ))
                     })?;
-                    insert_activation_with_status(
+                    enforce_activation_limits(&transaction, &next)?;
+                    insert_activation_bound_to_node(
                         &transaction,
                         &next,
-                        activation_status_for_node(&node),
+                        activation_status_for_node(node),
+                        node,
+                        target.revision,
+                    )?;
+                    record_activation_graph_binding(
+                        &transaction,
+                        &next.run_id,
+                        &next.node_id,
+                        &next.activation_id,
+                        graph_revision,
                     )?;
                     activated.push(next);
                 }
@@ -32831,11 +32874,50 @@ mod tests {
                 rusqlite::params![json, sha256_hex(json.as_bytes())],
             )
             .expect("source fixture");
+        // Reconcile the pending control activation against a newer committed graph.
+        let control_id = activation_identity(&run.run_id, "repeat-control", 0);
+        store.connection.execute_batch(
+            "UPDATE workflow_run_graphs SET revision = 2;
+             INSERT INTO workflow_graph_edit_candidates VALUES ('run-1', 'repeat-retention', 1, '{}', '{}', 1);
+             INSERT INTO workflow_graph_edit_publications VALUES ('run-1', 'repeat-retention', 2);"
+        ).expect("revised fixture");
+        store
+            .connection
+            .execute(
+                "INSERT INTO workflow_leaf_retentions VALUES ('run-1', 'repeat-control', ?1, 2)",
+                [&control_id],
+            )
+            .expect("retain control");
+        store
+            .connection
+            .execute(
+                "INSERT INTO workflow_retained_edge_bindings
+             SELECT run_id, 'repeat-retention', 2, edge_id, revision, source_node_id, ?1
+             FROM workflow_run_graph_edges WHERE source_node_id = 'repeat-control'",
+                [&control_id],
+            )
+            .expect("retain outgoing edges");
         drop(store);
         let mut store = WorkflowStore::open_in_state_dir(temp.path()).expect("reopen");
         let settled = store
             .settle_pending_control_nodes(&run.run_id, 10, 3)
             .expect("settle");
+        assert_eq!(
+            store
+                .activation_admitted_graph_revision(
+                    &run.run_id,
+                    "body",
+                    &activation_identity(&run.run_id, "body", 1),
+                )
+                .expect("successor admission"),
+            Some(2)
+        );
+        assert_eq!(
+            store
+                .activation_admitted_graph_revision(&run.run_id, "repeat-control", &control_id,)
+                .expect("historical admission"),
+            Some(1)
+        );
         assert_eq!(settled.activated.len(), 1);
         assert_eq!(settled.activated[0].node_id, "body");
         assert_eq!(settled.activated[0].dependency_generation, 1);

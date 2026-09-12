@@ -1972,6 +1972,7 @@ pub fn initial_incoming_edges(
     )
 }
 
+#[cfg(test)]
 pub fn initial_outgoing_edges(
     connection: &Connection,
     run_id: &str,
