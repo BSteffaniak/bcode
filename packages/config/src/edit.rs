@@ -211,6 +211,45 @@ pub fn plan_context_creation(
     Ok(edit)
 }
 
+/// Plan a context-local account declaration without writing credentials or changing bindings.
+///
+/// # Errors
+/// Rejects invalid local IDs, duplicate declarations, or malformed destination files.
+pub fn plan_context_auth_profile(
+    path: PathBuf,
+    context: &str,
+    local: &str,
+    profile: &crate::AuthProfileConfig,
+) -> Result<ConfigEdit, ConfigError> {
+    crate::contexts::qualify(context, local)?;
+    let original = read_optional(&path)?;
+    let parsed: toml::Value = toml::from_str(original.as_deref().unwrap_or(""))
+        .map_err(|_| invalid("Existing configuration cannot be edited safely"))?;
+    if parsed
+        .get("contexts")
+        .and_then(|v| v.get("entries"))
+        .and_then(|v| v.get(context))
+        .and_then(|v| v.get("auth"))
+        .and_then(|v| v.get("profiles"))
+        .and_then(|v| v.get(local))
+        .is_some()
+    {
+        return Err(invalid(
+            "Context account already exists; declaration cannot overwrite it",
+        ));
+    }
+    let value =
+        toml::Value::try_from(profile).map_err(|_| invalid("Invalid account declaration"))?;
+    let keys = ["contexts", "entries", context, "auth", "profiles", local].map(str::to_owned);
+    let edit = plan_validated_field_edit(path, &keys, Some(value))?;
+    if edit.original != original {
+        return Err(invalid(
+            "Configuration changed during declaration; review again",
+        ));
+    }
+    Ok(edit)
+}
+
 /// Plan a complete default model selection in one atomic file replacement.
 /// The caller must resolve the model through the catalog before presenting this edit.
 ///
@@ -271,6 +310,33 @@ fn io_error(path: &Path, source: std::io::Error) -> ConfigError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn context_account_declaration_is_reviewed_and_uses_isolated_storage() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("bcode.toml");
+        std::fs::write(
+            &path,
+            "[contexts]\nactive = 'custom'\n[contexts.entries.custom]\n",
+        )
+        .unwrap();
+        let profile = crate::AuthProfileConfig {
+            backend: "sshenv".to_owned(),
+            provider_id: Some("example".to_owned()),
+            owner_plugin_id: Some("example.plugin".to_owned()),
+            scheme: Some("oauth".to_owned()),
+            ..Default::default()
+        };
+        let edit = plan_context_auth_profile(path.clone(), "custom", "account", &profile).unwrap();
+        let before = crate::load_config_from_paths(std::slice::from_ref(&path)).unwrap();
+        assert!(before.auth.profiles.is_empty());
+        edit.apply().unwrap();
+        assert!(plan_context_auth_profile(path.clone(), "custom", "account", &profile).is_err());
+        let loaded = crate::load_config_from_paths(&[path]).unwrap();
+        let id = crate::contexts::qualify("custom", "account").unwrap();
+        assert_eq!(loaded.auth.profiles[&id].settings["profile"], id);
+        assert!(loaded.auth.bindings.is_empty());
+    }
+
     #[test]
     fn context_creation_is_reviewed_nonselecting_and_conflict_fenced() {
         let temp = tempfile::tempdir().unwrap();

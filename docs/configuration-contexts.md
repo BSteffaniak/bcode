@@ -30,7 +30,7 @@ Resolved context identity crosses effective-config transport. Model profile name
 
 ## Current limitations — not product completion
 
-* Contexts currently require predeclared authentication profiles; automatic enrollment into an undeclared context profile fails closed.
+* Context account enrollment uses an explicit reviewed declaration before sign-in. The declaration does not select a model or provider binding. Automatic unscoped runtime registration remains prohibited for contexts.
 * Scoped runtime account registration, adoption review, and durable session context selection are not implemented.
 * Full launch handoff is not atomic with validation. Context switching is not yet a supported live-session operation.
 * Compatibility work must address existing global names that resemble qualified names; the qualification format is not a general credential authorization boundary.

@@ -181,6 +181,39 @@ fn validate_enrollment_binding(
     Ok(())
 }
 
+/// Plan an explicit context account declaration using the registered provider method.
+/// No provider calls, vault reads, credential writes, or binding changes occur.
+///
+/// # Errors
+/// Returns an error for invalid provider/method ownership or conflicting configuration.
+pub fn plan_context_account(
+    path: PathBuf,
+    context: &str,
+    local: &str,
+    provider: &AuthProviderContribution,
+    owner: &str,
+    method: &str,
+    vault: PathBuf,
+) -> Result<bcode_config::edit::ConfigEdit, String> {
+    let prepared = prepare(
+        &BcodeConfig::default(),
+        &RuntimeAuthSubscriptions::default(),
+        provider,
+        owner,
+        method,
+        EnrollmentDestination {
+            profile: Some(local.to_owned()),
+            vault: Some(vault),
+            recipient_key: None,
+        },
+    )
+    .map_err(|error| error.to_string())?;
+    let mut profile = prepared.resolved.profile;
+    profile.settings.remove("profile");
+    bcode_config::edit::plan_context_auth_profile(path, context, local, &profile)
+        .map_err(|error| error.to_string())
+}
+
 /// Allocate a default name for a new account without reusing existing metadata.
 /// Selection is advisory: enrollment must still verify ownership at commit time.
 #[must_use]

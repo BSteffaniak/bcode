@@ -33,6 +33,7 @@ pub struct ConnectionForm {
     focus: usize,
     secret: zeroize::Zeroizing<String>,
     review: bool,
+    pending_declaration: Option<bcode_config::edit::ConfigEdit>,
     status: String,
 }
 
@@ -47,11 +48,16 @@ impl ConnectionForm {
             fields: [String::new(), "api_key".to_owned(), String::new(), bcode_config::default_auth_vault_path().display().to_string()]
                 .map(|text| TextInputState::new(TextEditBuffer::from_text(text))),
             focus: 0, secret: zeroize::Zeroizing::new(String::new()), review: false,
+            pending_declaration: None,
             status: "Provider ID, method, profile, vault, then secret. Tab moves fields; Enter reviews; Esc returns.".to_owned(),
         }
     }
 
     pub fn handle_event(&mut self, event: &Event) -> bool {
+        if self.pending_declaration.is_some() {
+            self.handle_declaration_review(event);
+            return false;
+        }
         if self.picker.is_some() {
             return self.handle_picker(event);
         }
@@ -106,14 +112,11 @@ impl ConnectionForm {
                 };
             }
             Event::Key(key) if key.key == KeyCode::Enter => {
+                if self.review && self.prepare_declaration_review() {
+                    return false;
+                }
                 if self.review && !self.importing && self.interactive {
-                    self.device = Some(super::setup_device_login::DeviceLogin::start(
-                        self.fields[0].buffer().text().to_owned(),
-                        self.fields[1].buffer().text().to_owned(),
-                        self.fields[2].buffer().text().to_owned(),
-                        self.fields[3].buffer().text().to_owned(),
-                    ));
-                    self.review = false;
+                    self.start_device_login();
                 } else if self.review {
                     self.status = self.save().map_or_else(
                         |message| message,
@@ -149,6 +152,99 @@ impl ConnectionForm {
             _ => {}
         }
         false
+    }
+
+    fn start_device_login(&mut self) {
+        self.device = Some(super::setup_device_login::DeviceLogin::start(
+            self.fields[0].buffer().text().to_owned(),
+            self.fields[1].buffer().text().to_owned(),
+            self.fields[2].buffer().text().to_owned(),
+            self.fields[3].buffer().text().to_owned(),
+        ));
+        self.review = false;
+    }
+
+    fn prepare_declaration_review(&mut self) -> bool {
+        match self.context_declaration() {
+            Ok(Some(edit)) => {
+                self.status = format!(
+                    "Create context-local account declaration in {}? Enter confirms configuration only; Esc cancels. Sign-in starts separately.",
+                    edit.path().display()
+                );
+                self.pending_declaration = Some(edit);
+                true
+            }
+            Err(message) => {
+                self.status = message;
+                true
+            }
+            Ok(None) => false,
+        }
+    }
+
+    fn handle_declaration_review(&mut self, event: &Event) {
+        match event {
+            Event::Key(key) if key.key == KeyCode::Escape => {
+                self.pending_declaration = None;
+                "Declaration cancelled; no credentials changed.".clone_into(&mut self.status);
+            }
+            Event::Key(key) if key.key == KeyCode::Enter => {
+                if let Some(edit) = self.pending_declaration.take() {
+                    self.status = match edit.apply() {
+                        Ok(_) => {
+                            "Account declaration saved. Enter again to start sign-in.".to_owned()
+                        }
+                        Err(_) => {
+                            "Could not save declaration safely. Review configuration and retry."
+                                .to_owned()
+                        }
+                    };
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn context_declaration(&self) -> Result<Option<bcode_config::edit::ConfigEdit>, String> {
+        let config =
+            bcode_config::load_config().map_err(|_| "Cannot load configuration".to_owned())?;
+        let Some(context) = &config.active_context else {
+            return Ok(None);
+        };
+        let local = self.fields[2].buffer().text();
+        let qualified = bcode_config::contexts::qualify(context, local)
+            .map_err(|_| "Invalid context-local account name".to_owned())?;
+        if config.auth.profiles.contains_key(&qualified) {
+            return Ok(None);
+        }
+        let selection = bcode_config::plugin_selection_with_default_plugin_ids(
+            &config,
+            std::iter::empty::<&str>(),
+        );
+        let mut host = bcode_plugin::PluginHost::load_defaults_with_static_bundled(
+            &selection,
+            &super::static_bundled_plugins(),
+        )
+        .map_err(|_| "Cannot load authentication providers".to_owned())?;
+        let result = (|| {
+            let provider = host
+                .auth_provider_registry()
+                .get(self.fields[0].buffer().text())
+                .ok_or_else(|| "Unknown provider".to_owned())?;
+            bcode_provider_auth::enrollment::plan_context_account(
+                bcode_config::default_config_dir().join("bcode.toml"),
+                context,
+                local,
+                &provider.contribution,
+                &provider.plugin_id,
+                self.fields[1].buffer().text(),
+                self.fields[3].buffer().text().into(),
+            )
+            .map(Some)
+        })();
+        host.deactivate_all()
+            .map_err(|_| "Provider cleanup failed".to_owned())?;
+        result
     }
 
     fn choices(&self) -> Vec<(usize, String)> {
@@ -754,6 +850,7 @@ mod tests {
             focus: 4,
             secret: zeroize::Zeroizing::new(String::new()),
             review: false,
+            pending_declaration: None,
             status: String::new(),
         };
         assert!(
@@ -787,6 +884,7 @@ mod tests {
                 focus: 4,
                 secret: zeroize::Zeroizing::new(String::new()),
                 review: false,
+                pending_declaration: None,
                 status: String::new(),
             };
             assert!(!form.handle_event(&Event::Key(bmux_keyboard::KeyStroke::simple(key))));
