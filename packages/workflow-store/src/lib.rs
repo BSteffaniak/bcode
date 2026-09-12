@@ -8924,21 +8924,24 @@ impl WorkflowStore {
                 settled_at_ms,
             )?;
         } else {
-            let output_id = format!("{}:control-output", activation.activation_id);
-            let checksum = sha256_hex(value_json.as_bytes());
-            transaction.execute(
-                "UPDATE workflow_runs SET status = 'completed', terminal_output_id = ?3, \
-                 terminal_output_checksum_sha256 = ?4, updated_at_ms = ?2 \
-                 WHERE run_id = ?1 AND status = 'running'",
-                (&activation.run_id, settled_at_ms, &output_id, &checksum),
-            )?;
-            append_event(
+            let output = ValidatedOutput {
+                output_id: format!("{}:control-output", activation.activation_id),
+                run_id: activation.run_id.clone(),
+                node_id: activation.node_id.clone(),
+                activation_id: activation.activation_id.clone(),
+                schema_id: activation.node.output.type_name.clone(),
+                schema_version: 1,
+                value: persisted_value,
+                artifact_reference: None,
+                created_at_ms: settled_at_ms,
+            };
+            activated = settle_output_successors(
                 &transaction,
-                &activation.run_id,
-                "run_completed",
-                "{}",
-                settled_at_ms,
-            )?;
+                &output,
+                &sha256_hex(value_json.as_bytes()),
+                &NoopWorkflowOutputFault,
+            )?
+            .activated;
         }
         append_event(
             &transaction,
@@ -10707,6 +10710,15 @@ where
         &serde_json::to_string(output)?,
         output.created_at_ms,
     )?;
+    settle_output_successors(transaction, output, &checksum, fault)
+}
+
+fn settle_output_successors<F: WorkflowOutputFault + ?Sized>(
+    transaction: &Transaction<'_>,
+    output: &ValidatedOutput,
+    checksum: &str,
+    fault: &F,
+) -> Result<OutputPersistenceResult, WorkflowStoreError> {
     let (activated, completed_is_exit) = materialize_direct_successors(transaction, output, fault)?;
     let parallel_failure = settle_parallel_failure(
         transaction,
@@ -32831,6 +32843,68 @@ mod tests {
                 .expect("pending")
                 .iter()
                 .all(|activation| activation.node_id != "selected")
+        );
+    }
+
+    #[test]
+    fn repeat_completion_does_not_terminalize_unfinished_work() {
+        let temp = tempfile::tempdir().expect("temp");
+        let mut store = WorkflowStore::open_in_state_dir(temp.path()).expect("store");
+        store
+            .persist_definition("example", 1, &repeat_definition())
+            .expect("definition");
+        let mut run = new_run();
+        run.input = Some(serde_json::json!({"condition_met": true}));
+        store.create_run(&run).expect("run");
+        let body = store
+            .pending_activations(10)
+            .expect("pending")
+            .pop()
+            .expect("body");
+        store
+            .persist_validated_output(&ValidatedOutput {
+                output_id: "body-output".into(),
+                run_id: run.run_id.clone(),
+                node_id: body.node_id,
+                activation_id: body.activation_id,
+                schema_id: body.node.output.type_name,
+                schema_version: 1,
+                value: run.input.clone().expect("input"),
+                artifact_reference: None,
+                created_at_ms: 2,
+            })
+            .expect("body output");
+        store
+            .create_activation(&NewActivation {
+                run_id: run.run_id.clone(),
+                node_id: "body".into(),
+                activation_id: "other-body".into(),
+                dependency_generation: 9,
+                input: run.input.clone(),
+                created_at_ms: 3,
+            })
+            .expect("other work");
+        let result = store
+            .settle_pending_control_nodes(&run.run_id, 10, 4)
+            .expect("settle repeat");
+        assert!(result.activated.is_empty());
+        assert_eq!(
+            store
+                .run_summary(&run.run_id)
+                .expect("summary")
+                .expect("run")
+                .status,
+            RunStatus::Running
+        );
+        drop(store);
+        let store = WorkflowStore::open_in_state_dir(temp.path()).expect("reopen");
+        assert_eq!(
+            store
+                .run_summary(&run.run_id)
+                .expect("summary")
+                .expect("run")
+                .status,
+            RunStatus::Running
         );
     }
 
