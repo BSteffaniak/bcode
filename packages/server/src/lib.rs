@@ -5109,6 +5109,7 @@ const fn request_session_id(request: &Request) -> Option<SessionId> {
         | Request::InvocationInput { session_id, .. }
         | Request::SessionHistory { session_id }
         | Request::RepriceSession { session_id, .. }
+        | Request::SessionStorageUsage { session_id, .. }
         | Request::SessionHistoryPage { session_id, .. }
         | Request::SessionHistoryAround { session_id, .. }
         | Request::SessionInspection { session_id, .. }
@@ -5168,6 +5169,7 @@ const fn request_kind(request: &Request) -> &'static str {
         Request::InvocationInput { .. } => "invocation_input",
         Request::SessionHistory { .. } => "session_history",
         Request::RepriceSession { .. } => "session_reprice",
+        Request::SessionStorageUsage { .. } => "session_storage_usage",
         Request::SessionHistoryPage { .. } => "session_history_page",
         Request::SessionHistoryAround { .. } => "session_history_around",
         Request::SessionInspection { .. } => "session_inspection",
@@ -5700,6 +5702,19 @@ async fn handle_request_inner(
             range,
             catalog,
         } => handle_reprice_session(state, writer, request_id, session_id, range, *catalog).await,
+        SessionLifecycleRequest::SessionStorageUsage {
+            session_id,
+            entry_budget,
+        } => {
+            let response =
+                match session_operations::storage_usage(state, session_id, entry_budget).await {
+                    Ok(usage) => Response::Ok(ResponsePayload::SessionStorageUsage { usage }),
+                    Err(message) => {
+                        Response::Err(ErrorResponse::new("session_storage_unavailable", message))
+                    }
+                };
+            send_response(writer, request_id, response).await
+        }
         SessionLifecycleRequest::SessionHistoryPage { session_id, query } => {
             handle_session_history_page(request_id, client_id, state, writer, session_id, query)
                 .await
@@ -33665,6 +33680,7 @@ const fn response_payload_kind(response: &Response) -> &'static str {
         Response::Ok(payload) => match payload {
             ResponsePayload::Attached { .. } => "attached",
             ResponsePayload::SessionHistory { .. } => "session_history",
+            ResponsePayload::SessionStorageUsage { .. } => "session_storage_usage",
             ResponsePayload::SessionHistoryPage { .. } => "session_history_page",
             ResponsePayload::SessionHistoryAround { .. } => "session_history_around",
             ResponsePayload::SessionInspection { .. } => "session_inspection",

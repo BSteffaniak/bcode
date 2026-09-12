@@ -4129,6 +4129,13 @@ struct ArtifactRangeArgs {
 
 #[derive(Debug, Subcommand)]
 enum SessionCommand {
+    /// Measure session database, artifact, and other file bytes without replaying history (JSON).
+    StorageUsage {
+        session_id: SessionId,
+        /// Maximum directory entries visited; partial results are explicitly marked.
+        #[arg(long, default_value_t = 10_000, value_parser = clap::value_parser!(u32).range(1..=100_000))]
+        entry_budget: u32,
+    },
     /// Read a bounded artifact byte range as JSON, including reference and availability metadata.
     ArtifactRange(ArtifactRangeArgs),
     /// List agent profiles available from the daemon for session selection.
@@ -5665,6 +5672,16 @@ async fn describe_skill(skill_id: String, json: bool) -> Result<(), CliError> {
 #[allow(clippy::too_many_lines)]
 async fn handle_session_command(command: Box<SessionCommand>) -> Result<(), CliError> {
     match *command {
+        SessionCommand::StorageUsage {
+            session_id,
+            entry_budget,
+        } => {
+            ensure_server_running().await?;
+            let usage = BcodeClient::default_endpoint()
+                .session_storage_usage(session_id, entry_budget)
+                .await?;
+            print_json(&usage)?;
+        }
         SessionCommand::ArtifactRange(args) => {
             Box::pin(read_artifact_range_to(
                 &BcodeClient::default_endpoint(),

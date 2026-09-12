@@ -1,5 +1,8 @@
 # Session Persistence Architecture
 
+See [Session storage tiering](session-storage-tiering.md) for the implemented bounded storage
+measurement command and the remaining transparent-compression design.
+
 ## Canonical storage and authority
 
 A Bcode session id maps to exactly one canonical database within the state location that owns it:

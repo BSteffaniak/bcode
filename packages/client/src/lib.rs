@@ -2338,6 +2338,28 @@ impl BcodeClient {
         }
     }
 
+    /// Measure physical session files with an explicit directory-entry budget.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the daemon rejects the budget or cannot inspect the storage roots.
+    pub async fn session_storage_usage(
+        &self,
+        session_id: SessionId,
+        entry_budget: u32,
+    ) -> Result<bcode_session_models::SessionStorageUsage, ClientError> {
+        match self
+            .send_request(Request::SessionStorageUsage {
+                session_id,
+                entry_budget,
+            })
+            .await?
+        {
+            ResponsePayload::SessionStorageUsage { usage } => Ok(usage),
+            _ => Err(ClientError::UnexpectedResponse),
+        }
+    }
+
     /// Read a bounded canonical history page.
     ///
     /// # Errors

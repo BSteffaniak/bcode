@@ -43,6 +43,7 @@ pub mod projection;
 pub mod repair;
 mod runtime_work;
 pub(crate) mod state;
+pub mod storage_usage;
 mod store;
 mod store_executor;
 mod subscription;
@@ -834,6 +835,33 @@ impl SessionManager {
     #[must_use]
     pub fn session_store_root(&self) -> Option<PathBuf> {
         self.store.as_ref().map(SessionStoreExecutor::root_path)
+    }
+
+    /// Measure physical session storage without loading canonical history.
+    ///
+    /// This explicit diagnostic is bounded by `entry_budget` and does not include global search
+    /// indexes. The observation is not a transactional snapshot or canonical validation.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for an invalid budget, unavailable persistent root, missing canonical
+    /// storage, unsafe session roots, or a failed filesystem task.
+    pub async fn storage_usage(
+        &self,
+        session_id: SessionId,
+        entry_budget: u32,
+    ) -> std::io::Result<bcode_session_models::SessionStorageUsage> {
+        let root = self.session_store_root().ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "session storage is not persistent",
+            )
+        })?;
+        tokio::task::spawn_blocking(move || {
+            storage_usage::measure_session_storage(&root, session_id, entry_budget)
+        })
+        .await
+        .map_err(|_| std::io::Error::other("storage measurement task failed"))?
     }
 
     /// Return the configured runtime lease owner identity.

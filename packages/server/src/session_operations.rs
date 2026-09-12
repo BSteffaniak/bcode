@@ -399,6 +399,32 @@ pub async fn inspect(
         .await?)
 }
 
+/// Measure one session's physical files without reading canonical history.
+///
+/// # Errors
+///
+/// Returns a secret-safe error when storage is unavailable, ambiguous, unsafe, or the budget is
+/// invalid. Partial nested traversal is reported explicitly in the returned observation.
+pub async fn storage_usage(
+    state: &ServerState,
+    session_id: bcode_session_models::SessionId,
+    entry_budget: u32,
+) -> Result<bcode_session_models::SessionStorageUsage, &'static str> {
+    if !state
+        .session_catalog
+        .ambiguous_location_ids(session_id)
+        .await
+        .is_empty()
+    {
+        return Err("session storage location is ambiguous");
+    }
+    state
+        .sessions
+        .storage_usage(session_id, entry_budget)
+        .await
+        .map_err(|_| "session storage measurement is unavailable or the entry budget is invalid")
+}
+
 /// Return one bounded session history page without transport framing.
 pub async fn history_page(
     state: &ServerState,

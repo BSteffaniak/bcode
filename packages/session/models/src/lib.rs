@@ -30,6 +30,9 @@ use std::str::FromStr;
 use std::time::{SystemTime, UNIX_EPOCH};
 use uuid::Uuid;
 
+mod storage;
+pub use storage::{SessionStorageBytes, SessionStorageUsage};
+
 mod original_usage;
 pub use original_usage::{
     MAX_ORIGINAL_USAGE_BYTES, MAX_ORIGINAL_USAGE_REPORTS, OriginalUsage, OriginalUsageReport,

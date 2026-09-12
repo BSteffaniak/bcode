@@ -101,7 +101,7 @@ const MAX_CHUNK_DATA_SIZE: usize = MAX_FRAME_PAYLOAD_SIZE / 2;
 /// a daemon across config directories.
 /// Version 35 includes the selected edge revision in workflow graph inspection.
 /// Older positional payloads are rejected rather than assigned a guessed revision.
-pub const CURRENT_PROTOCOL_VERSION: u16 = 36;
+pub const CURRENT_PROTOCOL_VERSION: u16 = 37;
 
 /// Durable session-storage writer epoch expected by this IPC build.
 pub const CURRENT_SESSION_STORAGE_WRITER_EPOCH: u32 =
@@ -454,6 +454,11 @@ pub enum Request {
     /// typed read-model endpoints instead.
     SessionHistory {
         session_id: SessionId,
+    },
+    /// Explicit bounded physical storage measurement; never loads session history.
+    SessionStorageUsage {
+        session_id: SessionId,
+        entry_budget: u32,
     },
     SessionHistoryPage {
         session_id: SessionId,
@@ -2763,6 +2768,9 @@ pub enum ResponsePayload {
         session_id: SessionId,
         history: Vec<SessionEvent>,
     },
+    SessionStorageUsage {
+        usage: bcode_session_models::SessionStorageUsage,
+    },
     SessionHistoryPage {
         page: SessionHistoryPage,
     },
@@ -4175,6 +4183,42 @@ mod tests {
     };
     use bcode_skill_models::SkillActivationMode;
     use std::collections::BTreeSet;
+
+    #[test]
+    fn storage_usage_round_trip_preserves_partial_accounting() {
+        let session_id = SessionId::new();
+        let request = Request::SessionStorageUsage {
+            session_id,
+            entry_budget: 7,
+        };
+        let decoded: Request =
+            serde_json::from_slice(&serde_json::to_vec(&request).expect("encode request"))
+                .expect("decode request");
+        assert!(
+            matches!(decoded, Request::SessionStorageUsage { session_id: id, entry_budget: 7 } if id == session_id)
+        );
+        let usage = bcode_session_models::SessionStorageUsage {
+            visited_entries: 7,
+            skipped_entries: 2,
+            budget_exhausted: true,
+            database: bcode_session_models::SessionStorageBytes {
+                files: 1,
+                file_bytes: 9000,
+                allocated_bytes: Some(4096),
+            },
+            ..Default::default()
+        };
+        let response = ResponsePayload::SessionStorageUsage {
+            usage: usage.clone(),
+        };
+        let decoded: ResponsePayload =
+            serde_json::from_slice(&serde_json::to_vec(&response).expect("encode response"))
+                .expect("decode response");
+        let ResponsePayload::SessionStorageUsage { usage: actual } = decoded else {
+            panic!("unexpected response")
+        };
+        assert_eq!(actual, usage);
+    }
 
     #[test]
     fn model_status_preserves_domain_identity_and_wire_shape() {
