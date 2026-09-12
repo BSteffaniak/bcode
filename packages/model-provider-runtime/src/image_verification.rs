@@ -113,7 +113,8 @@ pub struct ImageWorkloadTransfer {
 /// Image probe report compatibility boundary. Readers must reject unknown schema versions.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ImageVerificationReport {
-    /// Current report representation is version 1.
+    /// Current report representation is version 1. Unknown versions are rejected on decode.
+    #[serde(deserialize_with = "deserialize_report_version")]
     pub schema_version: u32,
     /// Message shape tested. Absent in older version-1 reports means user image.
     #[serde(default)]
@@ -123,6 +124,18 @@ pub struct ImageVerificationReport {
     /// Optional additive workload comparison; older version-1 reports omit it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub workload_transfer: Option<ImageWorkloadTransfer>,
+}
+
+fn deserialize_report_version<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<u32, D::Error> {
+    let version = u32::deserialize(deserializer)?;
+    if version != 1 {
+        return Err(serde::de::Error::custom(
+            "unsupported image verification report version",
+        ));
+    }
+    Ok(version)
 }
 
 impl ImageVerificationReport {
@@ -998,6 +1011,33 @@ mod tests {
         assert_eq!(
             workload_transfer(&seed, &report.cases[2], &report.cases[4], &[]).outcome,
             ImageVerificationOutcome::Inconclusive
+        );
+    }
+
+    #[test]
+    fn report_decoder_rejects_unknown_versions_and_preserves_legacy_defaults() {
+        let legacy = serde_json::json!({"schema_version": 1, "cases": []});
+        let report: ImageVerificationReport =
+            serde_json::from_value(legacy.clone()).expect("legacy report");
+        assert_eq!(report.source, ImageVerificationSource::User);
+        assert!(report.workload_transfer.is_none());
+        for version in [0, 2, u32::MAX] {
+            let mut future = legacy.clone();
+            future["schema_version"] = serde_json::json!(version);
+            let error = serde_json::from_value::<ImageVerificationReport>(future)
+                .expect_err("unknown version");
+            assert!(
+                error
+                    .to_string()
+                    .contains("unsupported image verification report version")
+            );
+        }
+        let mut unknown_source = legacy;
+        unknown_source["source"] = serde_json::json!("future_media");
+        assert!(serde_json::from_value::<ImageVerificationReport>(unknown_source).is_err());
+        assert!(
+            serde_json::from_value::<ImageVerificationReport>(serde_json::json!({"cases": []}))
+                .is_err()
         );
     }
 
