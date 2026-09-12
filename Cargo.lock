@@ -1910,6 +1910,7 @@ dependencies = [
 name = "bcode_fake_provider_plugin"
 version = "0.0.1-alpha.0"
 dependencies = [
+ "base64 0.22.1",
  "bcode_model",
  "bcode_model_provider_runtime",
  "bcode_plugin_sdk",
@@ -1917,6 +1918,7 @@ dependencies = [
  "bcode_provider_auth_models",
  "bcode_session_models",
  "bcode_tool",
+ "image",
  "jsonschema",
  "serde",
  "serde_json",

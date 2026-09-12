@@ -9,6 +9,59 @@ use bcode_plugin_sdk::{
 };
 use std::time::Duration;
 
+#[cfg(feature = "image-fixtures")]
+#[test]
+fn panel_model_reads_real_pngs_through_public_provider_operations() {
+    use bcode_model_provider_runtime::{
+        image_fixtures::generate_image_fixture,
+        image_verification::{
+            ImageVerificationOptions, ImageVerificationOutcome, ImageVerificationSource,
+            run_image_verification,
+        },
+    };
+    for source in [
+        ImageVerificationSource::User,
+        ImageVerificationSource::ToolResult,
+    ] {
+        let mut invoker = FakePluginInvoker::default();
+        let models: bcode_model::ModelList = invoker
+            .invoke_json(
+                None,
+                bcode_model::OP_MODELS,
+                &bcode_model::ModelListRequest::default(),
+            )
+            .expect("models");
+        let model = models
+            .models
+            .into_iter()
+            .find(|model| model.model_id == "fake-vision-panels")
+            .expect("panel model");
+        let fixture = generate_image_fixture(726).expect("fixture");
+        let options = ImageVerificationOptions {
+            provider_plugin_id: None,
+            provider_context: bcode_model::ProviderRequestContext::default(),
+            model,
+            images: fixture.images,
+            source,
+            question: fixture.question,
+            expected_answer: fixture.expected_answer,
+            allow_conversation_storage: false,
+            timeout: Duration::from_secs(5),
+        };
+        let report = run_image_verification(&mut invoker, &options).expect("probe");
+        assert!(!report.has_failures(), "{report:?}");
+        assert_eq!(report.cases[2].context, ImageVerificationOutcome::Passed);
+        assert_eq!(report.cases[4].context, ImageVerificationOutcome::Blocked);
+        let mut reversed = options;
+        reversed.images.reverse();
+        let report = run_image_verification(&mut invoker, &reversed).expect("reversed probe");
+        assert!(
+            report.has_failures(),
+            "reordering pixels must change the answer"
+        );
+    }
+}
+
 #[derive(Debug, Clone, Copy, Default)]
 enum PollBehavior {
     #[default]

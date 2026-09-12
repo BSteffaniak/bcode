@@ -5,6 +5,7 @@
 //! Fake model provider plugin for deterministic tests and smoke flows.
 
 pub mod prompt_cache;
+mod vision;
 
 use bcode_model::{
     AckResponse, CancelTurnRequest, CompactContextRequest, CompactContextResponse, ContentBlock,
@@ -458,6 +459,13 @@ impl FakeProviderPlugin {
             subset_reasoning,
             structured_output_execution,
         );
+        let mut panel_model = list.models[0].clone();
+        panel_model.model_id = vision::MODEL.to_string();
+        panel_model.display_name = "Fake Vision Panels (generated fixtures only)".to_string();
+        panel_model.is_default = false;
+        panel_model.max_image_input_base64_bytes = Some(1024 * 1024);
+        vision::support(&mut panel_model.feature_support);
+        list.models.push(panel_model);
         // The fake provider is catalog-unmapped, so it must honor the selected model itself:
         // the host takes the listing's default as the request target.
         if let Some(selected) = request
@@ -515,7 +523,11 @@ impl FakeProviderPlugin {
             Err(error) => return invalid_request(&error),
         };
         let execution = configured_structured_output_execution(&request.provider_context.settings);
-        json_response(&capabilities(execution))
+        let mut response = capabilities(execution);
+        if request.selected_model_id.as_deref() == Some(vision::MODEL) {
+            vision::support(&mut response.feature_support);
+        }
+        json_response(&response)
     }
 
     /// Serve a cache-model turn through the deterministic prompt-cache simulator.
@@ -1005,6 +1017,10 @@ fn fake_response_text(
     tool_result: Option<&str>,
     user_text: &str,
 ) -> Result<String, ProviderError> {
+    if request.model_id == vision::MODEL {
+        return vision::answer(request, user_text)
+            .map_err(|message| fake_structured_output_error(&message));
+    }
     if let Some(result) = tool_result {
         return Ok(format!("fake tool result: {result}"));
     }
@@ -1471,6 +1487,14 @@ fn carries_prompt_cache_hints(request: &ModelTurnRequest) -> bool {
         })
 }
 
+fn has_direct_images(request: &ModelTurnRequest) -> bool {
+    request
+        .messages
+        .iter()
+        .flat_map(|message| &message.content)
+        .any(|block| matches!(block, ContentBlock::Image { .. }))
+}
+
 fn validate_fake_request(request: &ModelTurnRequest) -> Option<ProviderError> {
     if let Some((code, message)) = unsupported_fake_sampling_parameters(&request.parameters) {
         return Some(unsupported_fake_error(code, message));
@@ -1516,12 +1540,7 @@ fn validate_fake_request(request: &ModelTurnRequest) -> Option<ProviderError> {
             "fake_unknown_required_tool",
             "named tool choice must reference a registered tool",
         ))
-    } else if request.messages.iter().any(|message| {
-        message
-            .content
-            .iter()
-            .any(|block| matches!(block, ContentBlock::Image { .. }))
-    }) {
+    } else if request.model_id != vision::MODEL && has_direct_images(request) {
         Some((
             "fake_image_input_unsupported",
             "fake provider does not implement image input",
@@ -1544,11 +1563,14 @@ fn validate_fake_request(request: &ModelTurnRequest) -> Option<ProviderError> {
         });
     }
     let cache_model = prompt_cache::profile_for(&request.model_id);
-    let feature_support = cache_model
+    let mut feature_support = cache_model
         .as_ref()
         .map_or_else(fake_feature_support, |profile| {
             prompt_cache::feature_support(profile)
         });
+    if request.model_id == vision::MODEL {
+        vision::support(&mut feature_support);
+    }
     request
         .explicitly_unsupported_features(&feature_support)
         .into_iter()

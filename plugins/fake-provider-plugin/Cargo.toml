@@ -14,6 +14,7 @@ version     = { workspace = true }
 crate-type = ["cdylib", "rlib"]
 
 [dependencies]
+base64                       = { workspace = true }
 bcode_model                  = { workspace = true }
 bcode_model_provider_runtime = { workspace = true }
 bcode_plugin_sdk             = { workspace = true }
@@ -21,6 +22,7 @@ bcode_prompt_cache           = { workspace = true, features = ["simulation"] }
 bcode_provider_auth_models   = { workspace = true }
 bcode_session_models         = { workspace = true }
 bcode_tool                   = { workspace = true }
+image                        = { workspace = true }
 jsonschema                   = { workspace = true }
 serde                        = { workspace = true, features = ["derive", "std"] }
 serde_json                   = { workspace = true }

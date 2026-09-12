@@ -19,6 +19,11 @@ Implemented first slice:
 * Responses continuation requires enabled reuse, a nonempty response ID, and an in-range history
   boundary. Otherwise the full inline context is projected.
 * Deterministic provider-operation tests and an actual Responses request-projection test.
+* `fake-vision-panels` is a dedicated fake-provider model for generated 256x128 PNG panel
+  fixtures. It decodes bounded PNG bytes and checks uniform panel pixels in order, rather than
+  returning a configured answer. Public-operation round trips cover user and tool-result images,
+  the no-image control, and failure after image reordering. It does not implement general vision,
+  conversation storage, uploads, or transport measurements. Existing fake models remain unchanged.
 
 Not implemented or verified by this slice: provider uploads/file IDs, authorized hosted URLs,
 request compression, lazy image hydration, durable reference lifecycle,
