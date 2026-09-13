@@ -990,12 +990,49 @@ impl WorkflowStore {
              OR EXISTS(SELECT 1 FROM workflow_graph_edit_edges WHERE run_id = ?1 AND mutation_id = ?2 AND edge_json IS NOT NULL)",
             (run_id, mutation_id), |row| row.get(0),
         )?;
+        self.validate_published_call_targets(&request)?;
         if connected {
             self.validate_connected_publication(&request)?;
         }
         let revision =
             persist_graph_publication(transaction, &request, &retentions, created_at_ms)?;
         Ok(revision)
+    }
+
+    fn validate_published_call_targets(
+        &self,
+        request: &bcode_workflow::WorkflowRunGraphEditBatch,
+    ) -> Result<(), WorkflowStoreError> {
+        for edit in &request.edits {
+            let (bcode_workflow::WorkflowRunGraphEdit::AddNode { node, .. }
+            | bcode_workflow::WorkflowRunGraphEdit::ReplaceNode { node, .. }) = edit
+            else {
+                continue;
+            };
+            if node.kind != bcode_workflow::NodeKind::WorkflowCall {
+                continue;
+            }
+            let call: bcode_workflow::WorkflowCallConfiguration =
+                serde_json::from_value(node.configuration.clone())?;
+            call.validate()
+                .map_err(|error| WorkflowStoreError::InvalidData(error.to_string()))?;
+            let identity = call.target.definition_identity();
+            let target = self
+                .definition(&identity.definition_id, identity.definition_version)?
+                .ok_or_else(|| {
+                    WorkflowStoreError::InvalidData(
+                        "published call target is unavailable".to_owned(),
+                    )
+                })?;
+            let definition: bcode_workflow::WorkflowDefinition =
+                serde_json::from_str(&target.definition_json)?;
+            if node.input != definition.input || node.output != definition.output {
+                return Err(WorkflowStoreError::InvalidData(
+                    "published call target interface mismatch".to_owned(),
+                ));
+            }
+        }
+        Ok(())
     }
 
     // Connected publication admits direct chains with new targets or explicitly
@@ -1059,6 +1096,7 @@ impl WorkflowStore {
                     | bcode_workflow::NodeKind::Input
                     | bcode_workflow::NodeKind::Approval
                     | bcode_workflow::NodeKind::Parallel
+                    | bcode_workflow::NodeKind::WorkflowCall
             )
         }) {
             return Err(invalid());

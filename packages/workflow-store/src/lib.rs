@@ -29023,6 +29023,74 @@ mod tests {
     }
 
     #[test]
+    fn published_call_requires_exact_available_target_interface() {
+        let (_temp, mut store) = initialized_store();
+        store
+            .connection
+            .execute_batch(
+                "UPDATE workflow_runs SET target_artifact_id = 'artifact-a',
+             coordinator_daemon_instance_id = 'daemon-a', coordinator_generation = 1,
+             coordinator_fencing_token = 'token-a' WHERE run_id = 'run-1';",
+            )
+            .expect("owner");
+        let authority = store
+            .execution_authority("run-1")
+            .expect("authority")
+            .expect("owner");
+        let target = definition("child");
+        let mut node = workflow_call_definition(bcode_workflow::WorkflowDefinitionIdentity {
+            kind: "child".to_owned(),
+            definition_id: "child".to_owned(),
+            definition_version: 1,
+        })
+        .nodes
+        .remove("call")
+        .expect("call");
+        node.input = target.input.clone();
+        node.output = target.output.clone();
+        let request = bcode_workflow::WorkflowRunGraphEditBatch {
+            version: bcode_workflow::WORKFLOW_RUN_GRAPH_EDIT_VERSION,
+            run_id: "run-1".to_owned(),
+            expected_revision: 1,
+            mutation_id: "add-call".to_owned(),
+            edits: vec![bcode_workflow::WorkflowRunGraphEdit::AddNode {
+                node,
+                entry: true,
+                exit: true,
+            }],
+            reconciliation: vec![bcode_workflow::WorkflowRunGraphReconciliation::Retain {
+                activation_id: activation_id(),
+            }],
+        };
+        store
+            .stage_run_graph_edit(&request, &authority, 20)
+            .expect("stage");
+        assert!(
+            store
+                .publish_retained_leaf_run_graph_edit("run-1", "add-call", &authority, 21)
+                .is_err()
+        );
+        store
+            .persist_definition("child", 1, &target)
+            .expect("target");
+        assert_eq!(
+            store
+                .publish_retained_leaf_run_graph_edit("run-1", "add-call", &authority, 22)
+                .expect("publish"),
+            2
+        );
+        assert_eq!(
+            store
+                .current_run_graph_node("run-1", "call")
+                .expect("node")
+                .expect("call")
+                .node
+                .kind,
+            bcode_workflow::NodeKind::WorkflowCall
+        );
+    }
+
+    #[test]
     fn quiescent_graph_publication_is_atomic_and_idempotent() {
         let (temp, mut store) = initialized_store();
         store

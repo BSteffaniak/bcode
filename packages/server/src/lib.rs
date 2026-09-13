@@ -52951,6 +52951,99 @@ library = "test"
     }
 
     #[tokio::test]
+    async fn registered_workflow_tool_stages_agent_task_candidate() {
+        let (mut state, child_id, _root) = active_edit_execution_fixture().await;
+        register_workflow_publication_tool(&mut state);
+        let provenance = state
+            .sessions
+            .session_summary(child_id)
+            .await
+            .expect("session")
+            .execution
+            .expect("execution")
+            .provenance;
+        let edit = publication_leaf_edit(provenance.activation_id.expect("activation"));
+        let bcode_workflow::WorkflowRunGraphEdit::AddNode { node, entry, exit } = &edit.edits[0]
+        else {
+            panic!("agent task");
+        };
+        let call = bcode_model::ToolCall {
+            id: "stage-task".to_owned(),
+            name: "workflow.stage_agent_task".to_owned(),
+            arguments: serde_json::json!({"run_id":edit.run_id,"expected_revision":edit.expected_revision,
+                "mutation_id":edit.mutation_id,"node":node,"entry":entry,"exit":exit,
+                "reconciliation":edit.reconciliation}),
+        };
+        let (tool, preparation) = prepare_server_tool(&state, child_id, &call)
+            .await
+            .expect("prepare task");
+        let metadata = tool_policy_authorization_metadata(&preparation.authorization, &call.name)
+            .expect("facts");
+        assert!(metadata.requires_permission);
+        let cancel = TurnCancelState::default();
+        let approve = async {
+            loop {
+                let pending = state
+                    .pending_permissions
+                    .lock()
+                    .await
+                    .values()
+                    .next()
+                    .cloned();
+                if let Some(pending) = pending {
+                    state
+                        .pending_permissions
+                        .lock()
+                        .await
+                        .remove(&pending.summary.permission_id);
+                    *pending.decision.lock().await = Some(true);
+                    pending.notify.notify_waiters();
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        };
+        let (response, ()) = tokio::time::timeout(Duration::from_secs(10), async {
+            tokio::join!(
+                invoke_prepared_tool_for_test(
+                    &state,
+                    child_id,
+                    &call,
+                    tool,
+                    preparation,
+                    &metadata,
+                    &cancel
+                ),
+                approve
+            )
+        })
+        .await
+        .expect("deadline");
+        let response = response.expect("transport");
+        assert!(!response.is_error, "{}", response.output);
+        let result: serde_json::Value =
+            serde_json::from_str(&response.output).expect("task result");
+        assert_eq!(result["published"], false);
+        assert_eq!(
+            serde_json::from_value::<bcode_workflow::WorkflowRunGraphEditBatch>(
+                result["edit"].clone()
+            )
+            .expect("candidate"),
+            edit
+        );
+        let store = state.workflow_store.lock().expect("store");
+        let authority = store
+            .execution_authority("edit-run")
+            .expect("authority")
+            .expect("owner");
+        let staged = store
+            .staged_run_graph_edit("edit-run", &edit.mutation_id, &authority)
+            .expect("staged");
+        drop(store);
+        assert_eq!(staged, Some(edit));
+    }
+
+    #[tokio::test]
     async fn registered_workflow_tool_stages_active_execution() {
         let (mut state, child_id, _root) = active_edit_execution_fixture().await;
         let (sender, mut scheduled) = mpsc::channel(1);

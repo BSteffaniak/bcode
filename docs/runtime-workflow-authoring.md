@@ -1,5 +1,28 @@
 # Runtime workflow authoring architecture
 
+## Published workflow calls
+
+Connected graph publication now permits `WorkflowCall` nodes through the existing
+child dispatcher. Added/replaced call nodes must resolve an available exact target
+and match its input/output interfaces before publication commits; this validation
+also applies to disconnected leaf additions. Non-identical mapped interfaces are
+not supported by this publication proof. Publication does not override child
+admission policy: inherited authorization, workspace restrictions, recursion checks,
+and execution allowances still apply. Active-planner suspend/join and policy-governed
+recursive reuse remain unfinished; permitting call nodes does not establish them.
+
+## Agent task staging
+
+`workflow.stage_agent_task` is plugin-owned shorthand for a single canonical
+`AddNode` edit. Its typed request supplies run/revision/mutation identities, a complete
+Agent `NodeDefinition`, explicit entry/exit flags, and reconciliation. The plugin
+checks the node kind and prompt representation, then uses the existing authenticated
+staging route and mutating-tool permission decision. The response returns the exact
+canonical edit and `published: false`; publication remains a separate authorized
+operation. Entry tasks consume run input. Non-entry tasks need connected graph edges;
+this tool does not invent bindings, change authorization ceilings, or dispatch sessions.
+It does not implement recursive child admission or durable parent waiting.
+
 ## Execution-scoped context
 
 The workflow plugin exposes `workflow.execution_context` through the existing v1

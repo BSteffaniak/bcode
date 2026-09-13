@@ -27,6 +27,68 @@ fn context_definition() -> ToolDefinition {
     }
 }
 
+const TASK_NAME: &str = "workflow.stage_agent_task";
+
+/// Plugin-owned shorthand; canonical graph publication still owns admission.
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct AgentTaskRequest {
+    run_id: String,
+    expected_revision: u64,
+    mutation_id: String,
+    node: bcode_workflow::NodeDefinition,
+    entry: bool,
+    exit: bool,
+    reconciliation: Vec<bcode_workflow::WorkflowRunGraphReconciliation>,
+}
+
+fn task_definition() -> ToolDefinition {
+    ToolDefinition {
+        name: TASK_NAME.to_owned(),
+        description: "Stage one executable agent task in this active run. Supply an exact Agent NodeDefinition with WorkflowPromptConfiguration, explicit entry/exit flags, and active-work reconciliation. Entry tasks receive the run input; non-entry tasks require connected edges before publication. Staging does not dispatch. Publish the exact returned candidate separately with workflow.publish_run_graph_edit; publication and normal execution authorization remain required.".to_owned(),
+        input_schema: json!({"type":"object","additionalProperties":false,
+            "required":["run_id","expected_revision","mutation_id","node","entry","exit","reconciliation"],
+            "properties":{
+                "run_id":{"type":"string"},"expected_revision":{"type":"integer","minimum":1},
+                "mutation_id":{"type":"string"},"node":{"type":"object"},
+                "entry":{"type":"boolean"},"exit":{"type":"boolean"},
+                "reconciliation":{"type":"array"}
+            }}),
+    }
+}
+
+fn parse_tool_edit(
+    name: &str,
+    arguments: &serde_json::Value,
+) -> Result<WorkflowRunGraphEditBatch, String> {
+    if name != TASK_NAME {
+        return parse_edit(arguments);
+    }
+    let task: AgentTaskRequest = serde_json::from_value(arguments.clone())
+        .map_err(|_| "invalid agent task request".to_owned())?;
+    if task.node.kind != bcode_workflow::NodeKind::Agent {
+        return Err("agent task requires an Agent node".to_owned());
+    }
+    let _: bcode_workflow::WorkflowPromptConfiguration =
+        serde_json::from_value(task.node.configuration.clone())
+            .map_err(|_| "invalid agent prompt configuration".to_owned())?;
+    let edit = WorkflowRunGraphEditBatch {
+        version: bcode_workflow::WORKFLOW_RUN_GRAPH_EDIT_VERSION,
+        run_id: task.run_id,
+        expected_revision: task.expected_revision,
+        mutation_id: task.mutation_id,
+        edits: vec![bcode_workflow::WorkflowRunGraphEdit::AddNode {
+            node: task.node,
+            entry: task.entry,
+            exit: task.exit,
+        }],
+        reconciliation: task.reconciliation,
+    };
+    edit.validate()
+        .map_err(|_| "invalid agent task facts".to_owned())?;
+    Ok(edit)
+}
+
 const NAME: &str = "workflow.stage_run_graph_edit";
 const OPERATION: &str = "stage_run_graph_edit";
 const PUBLISH_NAME: &str = "workflow.publish_run_graph_edit";
@@ -52,7 +114,7 @@ fn publication_definition() -> ToolDefinition {
 
 fn operation(name: &str) -> Result<&'static str, String> {
     match name {
-        NAME => Ok(OPERATION),
+        NAME | TASK_NAME => Ok(OPERATION),
         PUBLISH_NAME => Ok(PUBLISH_OPERATION),
         ACCEPT_NAME => Ok(ACCEPT_OPERATION),
         _ => Err("unsupported workflow tool".to_owned()),
@@ -90,6 +152,7 @@ pub fn invoke(context: &NativeServiceContext) -> ServiceResponse {
                 publication_definition(),
                 acceptance_definition(),
                 context_definition(),
+                task_definition(),
             ],
         }),
         bcode_tool::OP_PREPARE_TOOL => prepare_tool_service_response(
@@ -99,6 +162,7 @@ pub fn invoke(context: &NativeServiceContext) -> ServiceResponse {
                 publication_definition(),
                 acceptance_definition(),
                 context_definition(),
+                task_definition(),
             ],
             |request, _| {
                 let is_context = request.invocation.tool_name == CONTEXT_NAME;
@@ -116,8 +180,11 @@ pub fn invoke(context: &NativeServiceContext) -> ServiceResponse {
                     }
                     serde_json::to_value(context).map_err(|error| error.to_string())?
                 } else {
-                    serde_json::to_value(parse_edit(&request.invocation.arguments)?)
-                        .map_err(|error| error.to_string())?
+                    serde_json::to_value(parse_tool_edit(
+                        &request.invocation.tool_name,
+                        &request.invocation.arguments,
+                    )?)
+                    .map_err(|error| error.to_string())?
                 };
                 let route = request
                     .host_context
@@ -246,7 +313,7 @@ fn invoke_edit(context: &NativeServiceContext) -> ServiceResponse {
     let Ok(operation) = operation(&request.name) else {
         return ServiceResponse::error("unsupported_tool", "unsupported workflow tool");
     };
-    let edit = match parse_edit(&request.arguments) {
+    let edit = match parse_tool_edit(&request.name, &request.arguments) {
         Ok(edit) => edit,
         Err(message) => return ServiceResponse::error("invalid_request", message),
     };
@@ -294,7 +361,7 @@ fn invoke_edit(context: &NativeServiceContext) -> ServiceResponse {
             route_id: Some(route_id.to_owned()),
             interface_id: WORKFLOW_APPLICATION_INTERFACE_ID.to_owned(),
             operation: operation.to_owned(),
-            payload: match serde_json::to_value(edit) {
+            payload: match serde_json::to_value(&edit) {
                 Ok(payload) => payload,
                 Err(_) => {
                     return ServiceResponse::error(
@@ -313,6 +380,8 @@ fn invoke_edit(context: &NativeServiceContext) -> ServiceResponse {
                 acceptance_response(payload)
             } else if operation == PUBLISH_OPERATION {
                 publication_response(&payload)
+            } else if request.name == TASK_NAME {
+                task_staging_response(payload, &edit)
             } else {
                 staging_response(payload)
             }
@@ -325,6 +394,24 @@ fn invoke_edit(context: &NativeServiceContext) -> ServiceResponse {
             "workflow edit was not admitted; verify route, policy, and active execution",
         ),
     }
+}
+
+fn task_staging_response(
+    payload: serde_json::Value,
+    edit: &WorkflowRunGraphEditBatch,
+) -> ServiceResponse {
+    let Ok(staged) =
+        serde_json::from_value::<bcode_workflow::WorkflowRunGraphStageResponse>(payload)
+    else {
+        return ServiceResponse::error("invalid_response", "task staging outcome unknown");
+    };
+    super::json_response(&bcode_tool::ToolInvocationResponse {
+        output: json!({"staged":staged.staged,"published":false,"edit":edit}).to_string(),
+        is_error: false,
+        content: Vec::new(),
+        full_output: None,
+        result: None,
+    })
 }
 
 fn acceptance_response(payload: serde_json::Value) -> ServiceResponse {
