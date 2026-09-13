@@ -42,10 +42,11 @@ impl std::fmt::Debug for WorkflowRunGraphEditPolicy {
 
 /// Host-bound authoring execution context. Adapters provide domain requests, not store handles.
 /// The borrow prevents this context from outliving its host; authorization is evaluated per call.
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 pub struct WorkflowAuthoringApplication<'a> {
     state: &'a std::sync::Arc<ServerState>,
     client_id: super::ClientId,
+    request_end: Option<tokio::sync::watch::Receiver<bool>>,
 }
 
 impl<'a> WorkflowAuthoringApplication<'a> {
@@ -54,7 +55,33 @@ impl<'a> WorkflowAuthoringApplication<'a> {
         state: &'a std::sync::Arc<ServerState>,
         client_id: super::ClientId,
     ) -> Self {
-        Self { state, client_id }
+        Self {
+            state,
+            client_id,
+            request_end: None,
+        }
+    }
+
+    pub(crate) fn with_request_end(
+        mut self,
+        request_end: tokio::sync::watch::Receiver<bool>,
+    ) -> Self {
+        self.request_end = Some(request_end);
+        self
+    }
+
+    async fn discovery_read<T>(
+        &self,
+        operation: impl std::future::Future<Output = Result<T, super::ServerError>>,
+    ) -> Result<T, super::ServerError> {
+        let Some(mut end) = self.request_end.clone() else {
+            return operation.await;
+        };
+        tokio::select! {
+            biased;
+            _ = end.wait_for(|ended| *ended) => Err(super::ServerError::WorkflowAuthoring(bcode_workflow::WorkflowAuthoringFailure::Cancelled)),
+            result = operation => result,
+        }
     }
 
     /// Compatibility projection for the legacy transport; never part of the portable trait.
@@ -633,7 +660,7 @@ impl bcode_workflow::WorkflowAuthoringApplication for WorkflowAuthoringApplicati
         self.state
             .require_workflow_store()
             .map_err(authoring_failure)?;
-        launch_catalog(self.state, &request)
+        self.discovery_read(launch_catalog(self.state, &request))
             .await
             .map_err(authoring_failure)
     }
@@ -644,7 +671,7 @@ impl bcode_workflow::WorkflowAuthoringApplication for WorkflowAuthoringApplicati
         self.state
             .require_workflow_store()
             .map_err(authoring_failure)?;
-        launch_detail(self.state, &request)
+        self.discovery_read(launch_detail(self.state, &request))
             .await
             .map_err(authoring_failure)
     }
@@ -3234,7 +3261,7 @@ async fn build_launch_detail(
     let cancelled = std::sync::Arc::clone(&cancellation.0);
     #[cfg(test)]
     let barrier = state.workflow_detail_barrier.lock().await.take();
-    let result = tokio::task::spawn_blocking(move || {
+    let worker = tokio::task::spawn_blocking(move || {
         #[cfg(test)]
         if let Some((started, release)) = barrier {
             let _ = started.send(());
@@ -3247,9 +3274,8 @@ async fn build_launch_detail(
         })?;
         // Ownership travels with blocking work, including when the awaiting request drops.
         Ok((detail, admission))
-    })
-    .await
-    .map_err(super::ServerError::BlockingTask)?;
+    });
+    let result = cancellation.wait_for_worker(worker).await?;
     drop(cancellation);
     result
 }
@@ -3470,11 +3496,42 @@ impl Drop for DiscoveryExpiration {
 /// Signals a blocking batch when its awaiting request is dropped. The worker retains
 /// its admission permit until the current bounded discovery unit has finished.
 #[derive(Debug, Default)]
-struct DiscoveryBatchCancellation(std::sync::Arc<std::sync::atomic::AtomicBool>);
+struct DiscoveryBatchCancellation(
+    std::sync::Arc<std::sync::atomic::AtomicBool>,
+    std::sync::Arc<tokio::sync::Notify>,
+);
+
+impl DiscoveryBatchCancellation {
+    async fn wait_for_worker<T>(
+        &self,
+        worker: tokio::task::JoinHandle<T>,
+    ) -> Result<T, super::ServerError> {
+        tokio::select! {
+            biased;
+            () = self.cancelled() => Err(super::ServerError::WorkflowAuthoring(
+                bcode_workflow::WorkflowAuthoringFailure::Cancelled,
+            )),
+            result = worker => result.map_err(super::ServerError::BlockingTask),
+        }
+    }
+
+    async fn cancelled(&self) {
+        loop {
+            let notified = self.1.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            if self.0.load(std::sync::atomic::Ordering::Acquire) {
+                return;
+            }
+            notified.await;
+        }
+    }
+}
 
 impl Drop for DiscoveryBatchCancellation {
     fn drop(&mut self) {
         self.0.store(true, std::sync::atomic::Ordering::Release);
+        self.1.notify_waiters();
     }
 }
 
@@ -3532,9 +3589,10 @@ impl DiscoveryContinuation<'_> {
             // Registry removal (explicit cancellation, expiry, or shutdown) and request
             // drop independently stop the same worker. Replacing a finished batch's
             // guard only signals that old batch, never its successor.
-            pending.batch_cancellation = Some(DiscoveryBatchCancellation(std::sync::Arc::clone(
-                &cancellation.0,
-            )));
+            pending.batch_cancellation = Some(DiscoveryBatchCancellation(
+                std::sync::Arc::clone(&cancellation.0),
+                std::sync::Arc::clone(&cancellation.1),
+            ));
         }
         Ok(cancellation)
     }
@@ -3588,6 +3646,64 @@ impl Drop for DiscoveryContinuation<'_> {
 #[cfg(test)]
 mod discovery_continuation_tests {
     use super::*;
+
+    #[tokio::test]
+    async fn cancelled_worker_wait_returns_before_admission_is_released() {
+        let owner = DiscoveryBatchCancellation::default();
+        let observer = DiscoveryBatchCancellation(owner.0.clone(), owner.1.clone());
+        let capacity = std::sync::Arc::new(tokio::sync::Semaphore::new(1));
+        let permit = capacity.clone().try_acquire_owned().unwrap();
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let worker = tokio::task::spawn_blocking(move || {
+            let _permit = permit;
+            started_tx.send(()).unwrap();
+            release_rx
+                .recv_timeout(std::time::Duration::from_secs(10))
+                .unwrap();
+        });
+        started_rx.await.unwrap();
+        drop(owner);
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            observer.wait_for_worker(worker),
+        )
+        .await
+        .unwrap();
+        assert!(matches!(
+            result,
+            Err(super::super::ServerError::WorkflowAuthoring(
+                bcode_workflow::WorkflowAuthoringFailure::Cancelled
+            ))
+        ));
+        assert_eq!(capacity.available_permits(), 0);
+        release_tx.send(()).unwrap();
+        let restored = tokio::time::timeout(std::time::Duration::from_secs(10), capacity.acquire())
+            .await
+            .unwrap()
+            .unwrap();
+        drop(restored);
+        assert_eq!(capacity.available_permits(), 1);
+    }
+
+    #[tokio::test]
+    async fn cancellation_notification_is_sticky_and_wakes_active_waiters() {
+        let owner = DiscoveryBatchCancellation::default();
+        let observer = DiscoveryBatchCancellation(owner.0.clone(), owner.1.clone());
+        let mut waiting = Box::pin(observer.cancelled());
+        std::future::poll_fn(|cx| {
+            assert!(waiting.as_mut().poll(cx).is_pending());
+            std::task::Poll::Ready(())
+        })
+        .await;
+        drop(owner);
+        tokio::time::timeout(std::time::Duration::from_secs(1), waiting)
+            .await
+            .unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(1), observer.cancelled())
+            .await
+            .unwrap();
+    }
 
     #[tokio::test]
     async fn active_detail_cancellation_overrides_construction_failure() {
@@ -3903,7 +4019,7 @@ pub async fn launch_catalog(
         let cancelled = std::sync::Arc::clone(&cancellation.0);
         let workspace = workspace.clone();
         let config = config.clone();
-        let (next_scan, result) = tokio::task::spawn_blocking(move || {
+        let worker = tokio::task::spawn_blocking(move || {
             let result = (|| {
                 if scan.scan.is_none() {
                     scan.scan = Some(bcode_workflow_discovery::WorkflowDiscoveryScan::open(
@@ -3915,9 +4031,8 @@ pub async fn launch_catalog(
                 advance_discovery_batch(scan.scan.as_mut().expect("scan was opened"), &cancelled)
             })();
             (scan, result)
-        })
-        .await
-        .map_err(super::ServerError::BlockingTask)?;
+        });
+        let (next_scan, result) = cancellation.wait_for_worker(worker).await?;
         scan = next_scan;
         continuation.checkpoint().await?;
         let discovery = result?;
@@ -3931,32 +4046,51 @@ pub async fn launch_catalog(
                     closure,
                     ..
                 } => {
-                    let plan = bcode_workflow::plan_workflow_package_closure(&closure, &catalog)?;
-                    let entry_index = plan
-                        .packages
-                        .iter()
-                        .position(|entry| entry.package_id == plan.entry_package_id)
-                        .ok_or_else(|| {
-                            bcode_workflow_store::WorkflowStoreError::InvalidData(
-                                "planned workflow package closure has no entry package".to_string(),
-                            )
-                        })?;
+                    let cancellation = continuation.batch_cancellation()?;
+                    let cancelled = std::sync::Arc::clone(&cancellation.0);
+                    let planning_catalog = catalog.clone();
+                    let worker = tokio::task::spawn_blocking(move || {
+                        let result = run_detail_construction(&cancelled, || {
+                            let plan = bcode_workflow::plan_workflow_package_closure(
+                                &closure,
+                                &planning_catalog,
+                            )?;
+                            let entry_index = plan
+                                .packages
+                                .iter()
+                                .position(|entry| entry.package_id == plan.entry_package_id)
+                                .ok_or_else(|| {
+                                    bcode_workflow_store::WorkflowStoreError::InvalidData(
+                                        "planned workflow package closure has no entry package"
+                                            .to_string(),
+                                    )
+                                })?;
+                            let mut preview_catalog = planning_catalog;
+                            for dependency in &plan.packages[..entry_index] {
+                                for member in &dependency.plan.members {
+                                    run_detail_construction(&cancelled, || {
+                                        preview_catalog.workflow_definitions.insert(
+                                            member.definition_identity.definition_id.clone(),
+                                            member.lowering.document.definition.clone(),
+                                        );
+                                        Ok(())
+                                    })?;
+                                }
+                            }
+                            let preview = bcode_workflow::preview_workflow_package(
+                                &plan.packages[entry_index].plan,
+                                &preview_catalog,
+                                &BTreeMap::new(),
+                            )?;
+                            Ok((plan, entry_index, preview))
+                        });
+                        (scan, result)
+                    });
+                    let (returned_scan, result) = cancellation.wait_for_worker(worker).await?;
+                    scan = returned_scan;
+                    continuation.checkpoint().await?;
+                    let (plan, entry_index, preview) = result?;
                     let entry = &plan.packages[entry_index];
-                    let mut preview_catalog = catalog.clone();
-                    for dependency in &plan.packages[..entry_index] {
-                        for member in &dependency.plan.members {
-                            continuation.checkpoint().await?;
-                            preview_catalog.workflow_definitions.insert(
-                                member.definition_identity.definition_id.clone(),
-                                member.lowering.document.definition.clone(),
-                            );
-                        }
-                    }
-                    let preview = bcode_workflow::preview_workflow_package(
-                        &entry.plan,
-                        &preview_catalog,
-                        &BTreeMap::new(),
-                    )?;
                     let receipt = package_publication(state, &entry.package_id)?;
                     let lock_digest = preview.lock.digest_sha256()?;
                     let readiness = receipt.as_ref().map_or(

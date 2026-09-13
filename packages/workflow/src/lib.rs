@@ -10732,7 +10732,10 @@ fn validate_runtime_value_schema(path: &str, schema: &ValueSchema) -> Result<(),
 fn compile_runtime_value_schema(
     path: &str,
     schema: &ValueSchema,
-) -> Result<jsonschema::Validator, WorkflowError> {
+) -> Result<std::sync::Arc<jsonschema::Validator>, WorkflowError> {
+    type ValidatorCache = BTreeMap<Vec<u8>, std::sync::Arc<jsonschema::Validator>>;
+    static CACHE: std::sync::OnceLock<std::sync::Mutex<ValidatorCache>> =
+        std::sync::OnceLock::new();
     if schema.type_name.trim().is_empty()
         || schema.type_name.len() > MAX_WORKFLOW_AUTHORING_ID_BYTES
     {
@@ -10749,6 +10752,19 @@ fn compile_runtime_value_schema(
             format!("schema exceeds {MAX_WORKFLOW_AUTHORING_SCHEMA_BYTES} bytes"),
         ));
     }
+    // Successful validators are immutable and independent of diagnostic paths. Bound
+    // both entry count and retained key size; oversized schemas still compile uncached.
+    let cache = CACHE.get_or_init(|| std::sync::Mutex::new(BTreeMap::new()));
+    let cacheable = bytes.len() <= 16 * 1024;
+    if cacheable
+        && let Some(validator) = cache
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(&bytes)
+            .cloned()
+    {
+        return Ok(validator);
+    }
     if let Some(dialect) = schema.schema.get("$schema")
         && dialect.as_str() != Some(WORKFLOW_AUTHORING_JSON_SCHEMA_DIALECT)
     {
@@ -10762,8 +10778,20 @@ fn compile_runtime_value_schema(
     let mut counts = RuntimeSchemaCounts::default();
     validate_runtime_schema_value(path, &schema.schema, 0, &mut counts)?;
     validate_local_schema_references(path, &schema.schema)?;
-    jsonschema::validator_for(&schema.schema)
-        .map_err(|error| authoring_error(path, format!("invalid JSON Schema: {error}")))
+    let validator = std::sync::Arc::new(
+        jsonschema::validator_for(&schema.schema)
+            .map_err(|error| authoring_error(path, format!("invalid JSON Schema: {error}")))?,
+    );
+    if cacheable {
+        let mut cache = cache
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if cache.len() >= 64 {
+            cache.clear();
+        }
+        cache.insert(bytes, validator.clone());
+    }
+    Ok(validator)
 }
 
 fn validate_runtime_schema_value(

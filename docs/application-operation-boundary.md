@@ -2,6 +2,23 @@
 
 Bcode application behavior is reusable without making a second transport or a generic application framework. The current boundary is a set of focused, server-owned operation modules backed by portable domain contracts.
 
+## Request lifetime and ordered transport
+
+Local IPC uses bounded read-ahead and ordered execution. Queued bytes can delay EOF
+observation; disconnect is not a guaranteed prompt cancellation channel under pipelining.
+The transport does not drain indefinitely or discard queued mutations to reach EOF.
+Explicit cancellation should use an independent control connection.
+
+The transport reports request-lifetime end; the server-owned workflow application adapter
+chooses cancellation for disposable discovery reads. Other operations retain their own
+completion semantics. This host-local signal is not a public reconnect/resume contract.
+Retained-detail deadlines also terminate the awaiting read independently of worker exit;
+worker admission remains held until the blocking work exits. Successful response delivery
+after read EOF does not stop ordered request execution: buffered mutations are processed
+before the queued EOF. A real IPC regression covers two pipelined session creations with
+the peer's write half closed. Full disconnect with undeliverable responses and mixed
+read/mutation pipelines still require broader behavioral validation.
+
 ## Retained workflow launch pages
 
 Launch-catalog version 3 distinguishes pending discovery tokens from result tokens in

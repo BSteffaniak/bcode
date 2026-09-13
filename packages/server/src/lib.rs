@@ -183,6 +183,7 @@ struct ResponseWriter {
     writer: Mutex<WriteHalf<LocalIpcStream>>,
     metrics: MetricsRegistry,
     disconnect: Notify,
+    request_end: tokio::sync::watch::Sender<bool>,
 }
 
 pub(crate) type SharedWriter = Arc<ResponseWriter>;
@@ -507,6 +508,7 @@ impl ClientEventSink {
         if result.is_err() {
             // A timed-out write may have emitted a partial frame. Never keep that
             // connection alive or let the client wait on a dead subscription.
+            self.writer.request_end.send_replace(true);
             self.writer.disconnect.notify_one();
             tracing::warn!(target: "bcode_server::session_stream", client_id = %self.client_id,
                 event_kind, elapsed_ms = elapsed.as_millis(),
@@ -5108,11 +5110,13 @@ async fn read_client_envelopes(
     mut reader: tokio::io::ReadHalf<LocalIpcStream>,
     incoming: tokio::sync::mpsc::Sender<Result<bcode_ipc::Envelope, CodecError>>,
     disconnected: Arc<Notify>,
+    request_end: tokio::sync::watch::Sender<bool>,
 ) {
     loop {
         let envelope = recv_envelope(&mut reader).await;
         let failed = envelope.is_err();
         if failed {
+            request_end.send_replace(true);
             disconnected.notify_one();
         }
         if incoming.send(envelope).await.is_err() || failed {
@@ -5133,15 +5137,24 @@ async fn handle_registered_client(
     let mut readers = JoinSet::new();
     let (incoming_tx, mut incoming) = tokio::sync::mpsc::channel(1);
     let disconnected = Arc::new(Notify::new());
+    let (request_end, _) = tokio::sync::watch::channel(false);
+    let mut stop = shutdown.resubscribe();
+    let stopped = request_end.clone();
+    readers.spawn(async move {
+        let _ = stop.recv().await;
+        stopped.send_replace(true);
+    });
     readers.spawn(read_client_envelopes(
         reader,
         incoming_tx,
         Arc::clone(&disconnected),
+        request_end.clone(),
     ));
     let writer = Arc::new(ResponseWriter {
         writer: Mutex::new(writer),
         metrics: state.metrics.clone(),
         disconnect: Notify::new(),
+        request_end,
     });
     let mut attached_session: Option<SessionId> = None;
 
@@ -5187,12 +5200,6 @@ async fn handle_registered_client(
                 continue;
             }
         };
-        // These requests produce only disposable discovery state. Do not drop mutating
-        // application requests on disconnect: they must reconcile their own outcomes.
-        let cancel_on_disconnect = matches!(
-            request,
-            Request::WorkflowLaunchCatalog(_) | Request::WorkflowLaunchDetail(_)
-        );
         let operation = Box::pin(handle_request(
             request,
             envelope.request_id,
@@ -5201,19 +5208,12 @@ async fn handle_registered_client(
             &writer,
             &mut attached_session,
         ));
-        let result = if cancel_on_disconnect {
-            tokio::select! {
-                biased;
-                () = disconnected.notified() => break,
-                () = writer.disconnect.notified() => break,
-                _ = shutdown.recv() => break,
-                result = operation => result,
-            }
-        } else {
-            operation.await
-        };
+        let result = operation.await;
         if let Err(error) = result {
             if matches!(error, ServerError::Transport(_) | ServerError::Codec(_)) {
+                if *writer.request_end.borrow() {
+                    break;
+                }
                 return Err(error);
             }
             tracing::warn!(
@@ -6763,7 +6763,8 @@ async fn handle_workflow_validation_request(
         }
         WorkflowDefinitionRequest::WorkflowLaunchCatalog(request) => {
             let page = bcode_workflow::WorkflowAuthoringApplication::workflow_launch_catalog(
-                &workflow_operations::WorkflowAuthoringApplication::new(state, client_id),
+                &workflow_operations::WorkflowAuthoringApplication::new(state, client_id)
+                    .with_request_end(writer.request_end.subscribe()),
                 request,
             )
             .await;
@@ -6776,9 +6777,12 @@ async fn handle_workflow_validation_request(
             send_response(writer, request_id, response).await
         }
         WorkflowDefinitionRequest::WorkflowLaunchDetail(request) => {
-            let detail = bcode_workflow::WorkflowAuthoringApplication::workflow_launch_detail(
-                &workflow_operations::WorkflowAuthoringApplication::new(state, client_id),
-                request,
+            let detail = Box::pin(
+                bcode_workflow::WorkflowAuthoringApplication::workflow_launch_detail(
+                    &workflow_operations::WorkflowAuthoringApplication::new(state, client_id)
+                        .with_request_end(writer.request_end.subscribe()),
+                    request,
+                ),
             )
             .await;
             let response = match detail {
@@ -37199,6 +37203,7 @@ mod tests {
         )
         .unwrap();
         let count = 1_004;
+        let started = std::time::Instant::now();
         for index in 0..count {
             std::fs::write(root.join(format!("{index}.workflow-package.yaml")), format!("version: 3\npackage_id: example/package-{index:04}\nexports: {{ main: member }}\nmembers:\n  - member_id: member\n    source_name: member.workflow.yaml\n")).unwrap();
         }
@@ -37256,6 +37261,8 @@ mod tests {
         }
         assert!(complete);
         assert_eq!(identities.len(), count);
+        eprintln!("package catalog setup and paging: {:?}", started.elapsed());
+        let detail_started = std::time::Instant::now();
         let detail = workflow_operations::launch_detail(
             &state,
             &bcode_workflow::WorkflowLaunchDetailRequest {
@@ -37274,6 +37281,7 @@ mod tests {
         )
         .await
         .unwrap();
+        eprintln!("tokenless package detail: {:?}", detail_started.elapsed());
         assert!(
             matches!(detail.item.source, bcode_workflow::WorkflowLaunchSourceIdentity::PackageExport { package_id, .. } if package_id == "example/package-1003")
         );
@@ -37686,16 +37694,21 @@ mod tests {
     #[allow(clippy::significant_drop_tightening)]
     #[tokio::test]
     async fn active_ipc_detail_disconnect_retains_admission_until_worker_exit() {
-        Box::pin(active_ipc_detail_cleanup(false)).await;
+        Box::pin(active_ipc_detail_cleanup(false, false)).await;
     }
 
     #[tokio::test]
     async fn active_ipc_detail_expiry_retains_admission_until_worker_exit() {
-        Box::pin(active_ipc_detail_cleanup(true)).await;
+        Box::pin(active_ipc_detail_cleanup(true, false)).await;
+    }
+
+    #[tokio::test]
+    async fn active_ipc_detail_explicit_cancel_retains_admission_until_worker_exit() {
+        Box::pin(active_ipc_detail_cleanup(false, true)).await;
     }
 
     #[allow(clippy::significant_drop_tightening)]
-    async fn active_ipc_detail_cleanup(expire: bool) {
+    async fn active_ipc_detail_cleanup(expire: bool, cancel: bool) {
         let workspace = tempfile::tempdir().unwrap();
         let sources = workspace.path().join("workflows");
         std::fs::create_dir(&sources).unwrap();
@@ -37756,7 +37769,7 @@ mod tests {
                     version: bcode_workflow::WORKFLOW_LAUNCH_CATALOG_VERSION,
                     workspace: workspace.path().into(),
                     source: page.items[0].source.clone(),
-                    catalog_token: Some(token),
+                    catalog_token: Some(token.clone()),
                 });
             bcode_ipc::send_envelope(
                 &mut peer,
@@ -37768,16 +37781,11 @@ mod tests {
                 .await
                 .unwrap()
                 .unwrap();
-            if expire {
-                let envelope = tokio::time::timeout(
-                    Duration::from_secs(5),
-                    bcode_ipc::recv_envelope(&mut peer),
-                )
-                .await
-                .unwrap()
-                .unwrap();
-                assert_eq!(envelope.request_id, 1);
-                let response = bcode_ipc::decode_response(&envelope.payload).unwrap();
+            if cancel {
+                cancel_detail_over_control_connection(&endpoint, &listener, &state, token).await;
+            }
+            if expire || cancel {
+                let response = receive_correlated_test_response(&mut peer, 1).await;
                 assert!(
                     matches!(response, Response::Err(ref error) if error.code.contains("cancel")),
                     "{response:?}"
@@ -37794,6 +37802,31 @@ mod tests {
         }
         assert_detail_worker_capacity_restored(&state, capacity, release_tx).await;
         drop(state);
+    }
+
+    async fn cancel_detail_over_control_connection(
+        endpoint: &bcode_ipc::IpcEndpoint,
+        listener: &LocalIpcListener,
+        state: &Arc<ServerState>,
+        token: String,
+    ) {
+        let mut peer = LocalIpcStream::connect(endpoint).await.unwrap();
+        let stream = listener.accept().await.unwrap();
+        let state = Arc::clone(state);
+        let handler = tokio::spawn(async move { handle_client(stream, state).await });
+        let response =
+            send_correlated_test_request(&mut peer, 2, &Request::CancelWorkflowDiscovery { token })
+                .await;
+        assert!(matches!(
+            response,
+            Response::Ok(ResponsePayload::WorkflowDiscoveryCancelled { released: true })
+        ));
+        drop(peer);
+        tokio::time::timeout(Duration::from_secs(5), handler)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
     }
 
     async fn assert_detail_worker_capacity_restored(
@@ -78419,6 +78452,51 @@ event_symbol = "bcode_plugin_handle_event_v1"
         .expect("late handler");
         assert!(state.clients.lock().await.is_empty());
         drop(late_peer);
+        drop(state);
+    }
+
+    #[tokio::test]
+    async fn pipelined_mutations_survive_write_half_close() {
+        use tokio::io::AsyncWriteExt as _;
+        let state = Arc::new(test_server_state(SessionManager::default()));
+        let socket_dir = tempfile::tempdir().unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        let endpoint = bcode_ipc::IpcEndpoint::unix_socket(socket_dir.path().join("pipeline.sock"));
+        let listener = LocalIpcListener::bind(&endpoint).unwrap();
+        let mut peer = LocalIpcStream::connect(&endpoint).await.unwrap();
+        let stream = listener.accept().await.unwrap();
+        // Queue both mutations and EOF before starting the handler.
+        for id in 1..=2 {
+            let request = Request::CreateSession {
+                name: Some(format!("pipeline-{id}")),
+                working_directory: workspace.path().to_path_buf(),
+            };
+            bcode_ipc::send_envelope(
+                &mut peer,
+                &bcode_ipc::request_envelope(id, &request).unwrap(),
+            )
+            .await
+            .unwrap();
+        }
+        peer.shutdown().await.unwrap();
+        let server_state = Arc::clone(&state);
+        let handler = tokio::spawn(async move { handle_client(stream, server_state).await });
+        for id in 1..=2 {
+            let envelope =
+                tokio::time::timeout(Duration::from_secs(10), bcode_ipc::recv_envelope(&mut peer))
+                    .await
+                    .unwrap()
+                    .unwrap();
+            assert_eq!(envelope.request_id, id);
+            let response = bcode_ipc::decode_response(&envelope.payload).unwrap();
+            assert!(matches!(response, Response::Ok(_)), "{response:?}");
+        }
+        tokio::time::timeout(Duration::from_secs(5), handler)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert!(state.clients.lock().await.is_empty());
         drop(state);
     }
 
