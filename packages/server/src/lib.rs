@@ -14822,6 +14822,11 @@ async fn submit_session_model_turn_with_admission(
             bcode_session::SessionOwnershipKind::QueuedCommand,
         )
         .await?;
+    let admission_commit = if let Some(cancellation) = &cancel_state {
+        Some(cancellation.marker_commit.lock().await)
+    } else {
+        None
+    };
     if cancel_state
         .as_ref()
         .is_some_and(|state| state.is_cancelled())
@@ -14859,13 +14864,14 @@ async fn submit_session_model_turn_with_admission(
             runtime_context,
             user_event: Box::new(user_event),
             queued_steering: None,
-            cancel_state,
+            cancel_state: cancel_state.clone(),
             completion: Some(sender),
             recovering: false,
             ownership,
         },
     )
     .await?;
+    drop(admission_commit);
     Ok(SubmittedModelTurn::Started {
         receipt,
         completion: receiver,
@@ -67267,6 +67273,36 @@ event_symbol = "bcode_plugin_handle_event_v1"
             assert_eq!((text.as_str(), admission.priority), expected);
         }
         assert_eq!(queued_followups.load(Ordering::Acquire), 0);
+    }
+
+    #[tokio::test]
+    async fn cancelled_submission_cannot_cross_admission_commit_gate() {
+        let sessions = SessionManager::default();
+        let session = sessions
+            .create_session(None, PathBuf::from("."))
+            .await
+            .expect("session");
+        let state = Arc::new(test_server_state_with_fake_provider(sessions));
+        let cancellation = Arc::new(TurnCancelState::default());
+        let commit = cancellation.marker_commit.lock().await;
+        let mut submission = Box::pin(submit_session_model_turn_with_admission(
+            &state,
+            session.id,
+            "must not execute".into(),
+            None,
+            bcode_session_models::TurnAdmissionMetadata::default(),
+            Some(Arc::clone(&cancellation)),
+        ));
+        assert!(futures::poll!(&mut submission).is_pending());
+        cancellation.close();
+        drop(commit);
+        assert!(matches!(
+            submission.await,
+            Err(ServerError::WorkflowStore(
+                WorkflowStoreError::CancellationPreventsControl
+            ))
+        ));
+        drop(state);
     }
 
     #[tokio::test]
