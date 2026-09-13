@@ -4305,23 +4305,25 @@ impl PluginRuntimeHost {
         R: DeserializeOwned,
     {
         let payload = serde_json::to_vec(request).map_err(PluginServiceCallError::RequestEncode)?;
-        let mut invocation = self
-            .invoke_service_with_events_scoped(plugin_id, interface_id, operation, payload, scope)
-            .await?;
-        let cancel = invocation.cancel.clone();
         let response = tokio::select! {
+            biased;
             () = async {
                 while !cancellation.is_cancelled() {
                     tokio::time::sleep(std::time::Duration::from_millis(10)).await;
                 }
             } => {
-                cancel.cancel();
                 return Err(PluginServiceCallError::Service {
                     code: "cancelled".to_owned(),
                     message: "plugin invocation cancelled by caller".to_owned(),
                 });
             }
             timed = tokio::time::timeout(timeout, async {
+                // Admission is part of the invocation deadline and cancellation scope.
+                // Dropping startup or the returned invocation propagates cancellation
+                // through their existing abandonment guards.
+                let mut invocation = self
+                    .invoke_service_with_events_scoped(plugin_id, interface_id, operation, payload, scope)
+                    .await?;
                 loop {
                     if let StreamingServiceInvocationEvent::Response(response) =
                         invocation.next_event().await?
@@ -4330,7 +4332,6 @@ impl PluginRuntimeHost {
                     }
                 }
             }) => timed.unwrap_or_else(|_| {
-                cancel.cancel();
                 Err(PluginLoadError::ServiceInvocationTimeout {
                     plugin_id: plugin_id.to_owned(),
                     timeout_ms: u64::try_from(timeout.as_millis()).unwrap_or(u64::MAX),
@@ -7296,6 +7297,76 @@ library = "libexample_plugin.dylib"
             PluginServiceCallError::Service { code, .. } if code == "cancelled"
         ));
         assert!(started.elapsed() < Duration::from_secs(1));
+    }
+
+    #[tokio::test]
+    async fn typed_cancellation_and_timeout_cover_resource_admission() {
+        let manifest = toml::from_str::<PluginManifest>(include_str!(
+            "../../../examples/hello-plugin/bcode-plugin.toml"
+        ))
+        .expect("hello manifest");
+        let host =
+            PluginHost::load_static_plugins(&[(manifest, bcode_hello_plugin::static_plugin())])
+                .expect("static host");
+        let mut runtime = PluginRuntimeHost::from(host);
+        runtime.resources = Arc::new(PluginResourceLimiter::new(1, 1));
+        let permit = runtime
+            .resources
+            .acquire(&PluginInvocationScope::Global)
+            .await
+            .unwrap();
+        let cancellation = bcode_plugin_sdk::ServiceCancellation::default();
+        let call = runtime.invoke_service_json_scoped_cancellable::<_, serde_json::Value>(
+            "example.hello",
+            "example-hello/v1",
+            "wait-cancelled",
+            &(),
+            PluginInvocationScope::Global,
+            Duration::from_secs(5),
+            &cancellation,
+        );
+        let mut call = Box::pin(call);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), &mut call)
+                .await
+                .is_err()
+        );
+        cancellation.cancel();
+        let error = tokio::time::timeout(Duration::from_secs(1), &mut call)
+            .await
+            .expect("cancellation must interrupt admission")
+            .expect_err("cancelled");
+        assert!(
+            matches!(error, PluginServiceCallError::Service { code, .. } if code == "cancelled")
+        );
+        let uncancelled = bcode_plugin_sdk::ServiceCancellation::default();
+        let result = tokio::time::timeout(
+            Duration::from_secs(1),
+            runtime.invoke_service_json_scoped_cancellable::<_, serde_json::Value>(
+                "example.hello",
+                "example-hello/v1",
+                "wait-cancelled",
+                &(),
+                PluginInvocationScope::Global,
+                Duration::from_millis(20),
+                &uncancelled,
+            ),
+        )
+        .await
+        .expect("deadline must interrupt admission");
+        assert!(result.is_err());
+        assert_eq!(
+            runtime
+                .executors
+                .get("example.hello")
+                .unwrap()
+                .status()
+                .completed,
+            0
+        );
+        drop(permit);
+        drop(call);
+        drop(runtime);
     }
 
     #[tokio::test]
