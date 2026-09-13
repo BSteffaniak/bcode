@@ -1,5 +1,16 @@
 # Runtime workflow authoring architecture
 
+## Cancellation continuation
+
+Periodic keyset discovery now considers paused/repair-required runs with their own
+or direct parent's durable cancellation flag, in addition to running work. The
+child driver inherits intent under child authority before scheduling. Run-wide
+cancellation signalling is paged by dispatch identity alongside publication
+cancellation; missing owners remain unresolved and are retried on later drives.
+No terminal outcome is inferred from signalling failure. This uses existing durable
+flags, not an in-memory traversal as the source of cancellation authority. Full
+multi-level restart and foreign-owner integration acceptance remains unverified.
+
 ## Published workflow calls
 
 Connected graph publication now permits `WorkflowCall` nodes through the existing

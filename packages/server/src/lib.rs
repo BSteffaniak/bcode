@@ -16518,21 +16518,22 @@ async fn drive_workflow_run_exclusive(
     let mut retry_preparations = true;
     let mut publication_cursor = None;
     let mut receipt_cursor = None;
-    let mut cancellation_cursor = None;
+    let (mut cancellation_cursor, mut run_cancellation_cursor) = (None, None);
     let mut cancellation_sweep_complete = false;
     loop {
         if state.shutdown_requested.load(Ordering::SeqCst) {
             return Ok(());
         }
-        bcode_workflow_store::WorkflowStore::open_at_path(&store_path)?
-            .verify_execution_authority(run_id, &authority.authority)?;
         let iteration_started_at = std::time::Instant::now();
         let now_ms = current_unix_millis();
+        bcode_workflow_store::WorkflowStore::open_at_path(&store_path)?
+            .inherit_parent_cancellation_owned(run_id, &authority.authority, now_ms)?;
         cancellation_sweep_complete = continue_workflow_cancellation(
             state,
             run_id,
             &authority.authority,
             &mut cancellation_cursor,
+            &mut run_cancellation_cursor,
             cancellation_sweep_complete,
         )
         .await?;
@@ -16622,12 +16623,18 @@ async fn continue_workflow_cancellation(
     run_id: &str,
     authority: &bcode_workflow_store::WorkflowExecutionAuthority,
     cursor: &mut Option<String>,
+    run_cursor: &mut Option<String>,
     mut sweep_complete: bool,
 ) -> Result<bool, WorkflowStoreError> {
-    retry_owned_workflow_cancellation(state, run_id, authority).await?;
+    retry_owned_workflow_cancellation(state, run_id, authority, run_cursor).await?;
     if !sweep_complete {
-        propagate_publication_cancellation(state, run_id, authority, cursor).await?;
-        sweep_complete = cursor.is_none();
+        if cursor.as_deref() != Some("") {
+            propagate_publication_cancellation(state, run_id, authority, cursor).await?;
+            if cursor.is_none() {
+                *cursor = Some(String::new());
+            }
+        }
+        sweep_complete = cursor.as_deref() == Some("") && run_cursor.is_none();
     }
     retry_owned_sibling_cancellation(state, run_id, authority).await?;
     Ok(sweep_complete)
@@ -33678,7 +33685,7 @@ async fn restore_workflow_runs_with_receipt_limit(
         // Durable stop intent must progress even when receipt observation is unavailable.
         // This path qualifies authority independently and does not admit successor work.
         let cancellation_available = if let Err(error) =
-            retry_owned_workflow_cancellation(state, &run_id, &authority.authority).await
+            retry_owned_workflow_cancellation(state, &run_id, &authority.authority, &mut None).await
         {
             tracing::warn!(run_id, %error, "failed to restore workflow cancellation");
             false
@@ -34038,6 +34045,7 @@ async fn retry_owned_workflow_cancellation(
     state: &ServerState,
     run_id: &str,
     authority: &bcode_workflow_store::WorkflowExecutionAuthority,
+    cursor: &mut Option<String>,
 ) -> Result<(), WorkflowStoreError> {
     let attempts = {
         let store = state
@@ -34051,8 +34059,11 @@ async fn retry_owned_workflow_cancellation(
         if run.cancellation_requested_at_ms.is_none() {
             return Ok(());
         }
-        store.active_attempt_cancellations(run_id, 100)?
+        store.owned_run_cancellations_after(run_id, authority, cursor.as_deref(), 32)?
     };
+    *cursor = attempts
+        .last()
+        .map(|attempt| attempt.dispatch_identity.clone());
     for attempt in attempts {
         if state
             .workflow_store
@@ -72396,9 +72407,14 @@ event_symbol = "bcode_plugin_handle_event_v1"
             .execution_authority("orphaned-cancellation-run")
             .expect("authority")
             .expect("owner");
-        retry_owned_workflow_cancellation(&state, "orphaned-cancellation-run", &authority)
-            .await
-            .expect("missing runtime handle defers periodic cancellation");
+        retry_owned_workflow_cancellation(
+            &state,
+            "orphaned-cancellation-run",
+            &authority,
+            &mut None,
+        )
+        .await
+        .expect("missing runtime handle defers periodic cancellation");
         assert_eq!(
             state
                 .workflow_store

@@ -8907,6 +8907,32 @@ impl WorkflowStore {
             .map_err(WorkflowStoreError::from)
     }
 
+    /// Whether periodic driving is needed, including paused inherited cancellation.
+    ///
+    /// # Errors
+    /// Rejects malformed or missing parent state and database failures.
+    pub fn needs_continuation(&self, run_id: &str) -> Result<bool, WorkflowStoreError> {
+        let Some(run) = self.run_summary(run_id)? else {
+            return Ok(false);
+        };
+        if run.status == RunStatus::Running {
+            return Ok(true);
+        }
+        if !matches!(run.status, RunStatus::Paused | RunStatus::RepairRequired) {
+            return Ok(false);
+        }
+        if run.cancellation_requested_at_ms.is_some() {
+            return Ok(true);
+        }
+        let Some(link) = self.parent_run_link(run_id)? else {
+            return Ok(false);
+        };
+        let parent = self.run_summary(&link.parent_run_id)?.ok_or_else(|| {
+            WorkflowStoreError::InvalidData("continuation parent missing".to_owned())
+        })?;
+        Ok(parent.cancellation_requested_at_ms.is_some())
+    }
+
     /// Return a keyset page of run identities for notification-independent discovery.
     ///
     /// All statuses are included so each query examines at most one page rather than scanning
@@ -11080,6 +11106,36 @@ impl WorkflowStore {
         statement
             .query_map(
                 (run_id, limit, MAX_INLINE_JSON_BYTES, after.unwrap_or("")),
+                active_attempt_cancellation_row,
+            )?
+            .map(|row| active_attempt_cancellation(row?))
+            .collect()
+    }
+
+    /// Read a keyset page of active attempts covered by durable run cancellation.
+    ///
+    /// # Errors
+    /// Rejects stale authority, invalid bounds, malformed receipts, or database failures.
+    pub fn owned_run_cancellations_after(
+        &self,
+        run_id: &str,
+        authority: &WorkflowExecutionAuthority,
+        after: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<ActiveAttemptCancellation>, WorkflowStoreError> {
+        let limit = bounded_limit(limit)?;
+        let transaction = self.connection.unchecked_transaction()?;
+        self.verify_execution_authority(run_id, authority)?;
+        let mut statement = transaction.prepare(
+            "SELECT run_id, node_id, activation_id, attempt, dispatch_identity, receipt_json
+             FROM workflow_attempts WHERE run_id = ?1 AND dispatch_identity > ?2
+             AND status IN ('prepared', 'admitted', 'running', 'cancelling')
+             AND EXISTS (SELECT 1 FROM workflow_runs WHERE run_id = ?1 AND cancellation_requested_at_ms IS NOT NULL)
+             ORDER BY dispatch_identity LIMIT ?3",
+        )?;
+        statement
+            .query_map(
+                (run_id, after.unwrap_or(""), limit),
                 active_attempt_cancellation_row,
             )?
             .map(|row| active_attempt_cancellation(row?))
@@ -35675,6 +35731,43 @@ mod tests {
         );
     }
 
+    fn assert_inherited_child_cancellation(store: &mut WorkflowStore, child_run_id: &str) {
+        let transaction = store
+            .connection
+            .unchecked_transaction()
+            .expect("test snapshot");
+        transaction.execute("UPDATE workflow_runs SET target_artifact_id = 'artifact-a', coordinator_daemon_instance_id = 'daemon-a', coordinator_generation = 1, coordinator_fencing_token = 'token-a' WHERE run_id = ?1", [child_run_id]).expect("owner");
+        let authority = store
+            .execution_authority(child_run_id)
+            .expect("authority")
+            .expect("owner");
+        transaction.execute("UPDATE workflow_runs SET cancellation_requested_at_ms = 3 WHERE run_id = 'parent-run'", []).expect("parent intent");
+        // Release the fixture transaction before the operation's own commit boundary.
+        transaction.commit().expect("fixture commit");
+        store
+            .connection
+            .execute(
+                "UPDATE workflow_runs SET status = 'paused' WHERE run_id = ?1",
+                [child_run_id],
+            )
+            .expect("paused child");
+        assert!(
+            store
+                .needs_continuation(child_run_id)
+                .expect("discover paused cancellation")
+        );
+        assert!(
+            store
+                .inherit_parent_cancellation_owned(child_run_id, &authority, 4)
+                .expect("inherit")
+        );
+        assert!(
+            !store
+                .inherit_parent_cancellation_owned(child_run_id, &authority, 4)
+                .expect("duplicate")
+        );
+    }
+
     #[test]
     #[allow(clippy::too_many_lines)]
     fn exact_child_run_creation_is_atomic_idempotent_bounded_and_restart_safe() {
@@ -35937,11 +36030,12 @@ mod tests {
             "UPDATE workflow_definitions SET definition_json = ?1, checksum_sha256 = ?2 WHERE definition_id = 'parent'",
             rusqlite::params![source_json, sha256_hex(source_json.as_bytes())],
         ).expect("restore source fixture");
+        assert_inherited_child_cancellation(&mut store, &child_run_id);
         let (recorded, cancelled_run_ids) = store
             .request_cancellation_tree("parent-run", 4)
             .expect("cancel parent tree");
-        assert!(recorded);
-        assert_eq!(cancelled_run_ids, ["parent-run", child_run_id.as_str()]);
+        assert!(!recorded, "parent and child intent already inherited");
+        assert_eq!(cancelled_run_ids, ["parent-run"]);
         let running = store
             .observe_child_attempt(&receipt, 5)
             .expect("observe cancelled child");
