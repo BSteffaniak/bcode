@@ -12,9 +12,26 @@ export BCODE_SOCKET="${workdir}/bcode.sock"
 export BCODE_STATE_DIR="${workdir}/state"
 export XDG_CONFIG_HOME="${workdir}/config"
 export BCODE_CONFIG="${workdir}/bcode.toml"
+active_loss="${BCODE_RESTART_ACTIVE_LOSS:-0}"
+if [[ "${active_loss}" == "1" ]]; then
+    export BCODE_FAKE_PROVIDER_DELAY_MS=10000
+fi
 cat >"${BCODE_CONFIG}" <<'TOML'
 [workflows]
 run_publication_local_clients = true
+
+[model]
+profile = "restart-proof"
+
+[model.profiles.restart-proof]
+provider_plugin_id = "bcode.fake-provider"
+model_id = "fake-echo"
+
+[model.profiles.restart-proof.settings]
+fake_structured_output_json = '{"recovered":true}'
+
+[model.prompt_cache]
+mode = "off"
 TOML
 
 server_pid=""
@@ -22,6 +39,14 @@ cleanup() {
     local result=$?
     if [[ "${result}" -ne 0 ]]; then
         cat "${workdir}"/server-*.log >&2 2>/dev/null || true
+        if [[ -f "${workdir}/completed.json" ]]; then
+            python3 - "${workdir}/completed.json" >&2 <<'PY'
+import json
+import sys
+view = json.load(open(sys.argv[1]))
+print(json.dumps({"status": view["run"]["status"], "attempts": view["attempts"]}))
+PY
+        fi
     fi
     if [[ -n "${server_pid}" ]] && kill -0 "${server_pid}" 2>/dev/null; then
         kill "${server_pid}" 2>/dev/null || true
@@ -191,19 +216,53 @@ root = pathlib.Path(sys.argv[1])
 waits = json.loads((root / "before-waits.json").read_text())
 node = json.loads((root / "workflow.json").read_text())["definition"]["nodes"]["approval"]
 node["id"] = "added"
-node["name"] = "Published approval"
+node["name"] = "Published agent"
+node["kind"] = "agent"
+node["output"] = {"type_name": "restart.result/v1", "schema": {"type": "object", "properties": {"recovered": {"type": "boolean"}}, "required": ["recovered"], "additionalProperties": False}}
+node["configuration"] = {"version": 3, "execution_target": "fresh_isolated", "agent_profile": "build",
+    "provider": "bcode.fake-provider", "model": "fake-echo", "read_only": True,
+    "tool_capability": "read_only", "tool_allowlist": [], "timeout_ms": 30000,
+    "prompt_mode": "json_input", "system_prompt": "",
+    "output": {"mode": "structured", "result": {"schema": node["output"], "strict": True}}}
 edit = {"version": 2, "run_id": "release-run", "mutation_id": "release-edit",
         "expected_revision": 1,
-        "edits": [{"operation": "add_node", "node": node, "entry": True, "exit": True}],
-        "reconciliation": [{"disposition": "retain", "activation_id": waits[0]["activation_id"]}]}
+        "edits": [{"operation": "add_node", "node": node, "entry": False, "exit": True},
+                  {"operation": "add_edge", "edge_id": 0, "edge": {"from": "approval", "to": "added", "kind": {"kind": "direct"}, "transform": None}}],
+        "reconciliation": [{"disposition": "retain_with_bindings", "activation_id": waits[0]["activation_id"], "edge_ids": [0]}]}
 (root / "edit.json").write_text(json.dumps(edit))
 PY
 "${bcode}" workflow stage-run-edit --file "${workdir}/edit.json" >"${workdir}/staged.json"
 "${bcode}" workflow publish-run-edit --file "${workdir}/edit.json" >"${workdir}/published.json"
 "${bcode}" workflow inspect-run-graph --run-id release-run --expected-revision 2 --limit 10 >"${workdir}/published-graph.json"
 
-"${bcode}" server stop >/dev/null
-wait "${server_pid}"
+if [[ "${active_loss}" == "1" ]]; then
+    activation_id="$(python3 - "${workdir}/before-waits.json" <<'PY'
+import json
+import sys
+print(json.load(open(sys.argv[1]))[0]["activation_id"])
+PY
+)"
+    "${bcode}" workflow resolve-approval --run-id release-run --node-id approval \
+        --activation-id "${activation_id}" --approve >"${workdir}/resolved.json"
+    admitted=0
+    for _ in {1..50}; do
+        "${bcode}" workflow inspect-run --run-id release-run --limit 10 >"${workdir}/active.json"
+        if python3 - "${workdir}/active.json" <<'PY'
+import json
+import sys
+attempts = json.load(open(sys.argv[1]))["attempts"]
+sys.exit(0 if len(attempts) == 1 and attempts[0]["status"] in ("admitted", "running") else 1)
+PY
+        then admitted=1; break; fi
+        sleep 0.1
+    done
+    [[ "${admitted}" == "1" ]] || { echo "agent admission not observed" >&2; exit 1; }
+    kill -KILL "${server_pid}"
+    wait "${server_pid}" 2>/dev/null || true
+else
+    "${bcode}" server stop >/dev/null
+    wait "${server_pid}"
+fi
 server_pid=""
 if kill -0 "${first_pid}" 2>/dev/null; then
     echo "first release daemon process remained alive after stop" >&2
@@ -301,6 +360,7 @@ for history in (before_runs, after_runs):
     assert f" v{definition['definition_version']}" in compact
 PY
 
+if [[ "${active_loss}" != "1" ]]; then
 "${bcode}" workflow waits --run-id release-run --limit 10 >"${workdir}/after-waits.json"
 activation_id="$(python3 - "${workdir}" <<'PY'
 import json
@@ -309,7 +369,7 @@ import sys
 root = pathlib.Path(sys.argv[1])
 before = json.loads((root / "before-waits.json").read_text())
 after = json.loads((root / "after-waits.json").read_text())
-assert len(before) == 1 and len(after) == 2
+assert len(before) == len(after) == 1
 original = next(wait for wait in after if wait["node_id"] == "approval")
 assert before[0]["activation_id"] == original["activation_id"]
 print(original["activation_id"])
@@ -317,15 +377,18 @@ PY
 )"
 "${bcode}" workflow resolve-approval --run-id release-run --node-id approval \
     --activation-id "${activation_id}" --approve >"${workdir}/resolved.json"
+fi
 "${bcode}" workflow inspect-run-graph --run-id release-run --expected-revision 2 --limit 10 >"${workdir}/recovered-graph.json"
-added_activation="$(python3 - "${workdir}/after-waits.json" <<'PY'
+for _ in {1..100}; do
+    "${bcode}" workflow inspect-run --run-id release-run --limit 10 >"${workdir}/completed.json"
+    if python3 - "${workdir}/completed.json" <<'PY'
 import json
 import sys
-print(next(wait["activation_id"] for wait in json.load(open(sys.argv[1])) if wait["node_id"] == "added"))
+sys.exit(0 if json.load(open(sys.argv[1]))["run"]["status"] == "completed" else 1)
 PY
-)"
-"${bcode}" workflow resolve-approval --run-id release-run --node-id added \
-    --activation-id "${added_activation}" --approve >"${workdir}/added-resolved.json"
+    then break; fi
+    sleep 0.1
+done
 "${bcode}" workflow run-output --run-id release-run --limit 10 >"${workdir}/outputs.json"
 python3 - "${workdir}/outputs.json" "${activation_id}" <<'PY'
 import json
@@ -334,7 +397,7 @@ outputs = json.load(open(sys.argv[1]))
 assert len(outputs) == 2, outputs
 assert {output["node_id"] for output in outputs} == {"approval", "added"}, outputs
 assert any(output["activation_id"] == sys.argv[2] for output in outputs), outputs
-assert all(output["value"] is None for output in outputs), outputs
+assert next(output["value"] for output in outputs if output["node_id"] == "added") == {"recovered": True}, outputs
 PY
 
 "${bcode}" workflow inspect-run --run-id release-run --limit 10 >"${workdir}/completed.json"
@@ -346,6 +409,8 @@ assert inspection["run"]["status"] == "completed", inspection["run"]
 assert inspection["waits"] == [], inspection["waits"]
 assert len(inspection["activations"]) == 2, inspection["activations"]
 assert len(inspection["outputs"]) == 2, inspection["outputs"]
+assert len(inspection["attempts"]) == 1, inspection["attempts"]
+assert inspection["attempts"][0]["status"] == "succeeded", inspection["attempts"]
 PY
 
 "${bcode}" server stop >/dev/null
