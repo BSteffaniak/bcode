@@ -109,7 +109,8 @@ const MAX_CHUNK_DATA_SIZE: usize = MAX_FRAME_PAYLOAD_SIZE / 2;
 /// storage-usage variants. Version 37 peers are rejected rather than misdecoded.
 /// Version 39 adds bounded usage reporting and explicit snapshot collection.
 /// Version 40 adds bounded native usage catalog discovery.
-pub const CURRENT_PROTOCOL_VERSION: u16 = 40;
+/// Version 41 combines session usage and publication acceptance with distinct positional tags.
+pub const CURRENT_PROTOCOL_VERSION: u16 = 41;
 
 /// Durable session-storage writer epoch expected by this IPC build.
 pub const CURRENT_SESSION_STORAGE_WRITER_EPOCH: u32 =
@@ -1217,6 +1218,10 @@ pub enum Request {
     SessionUsage {
         session_id: SessionId,
         query: bcode_session_models::SessionUsageQuery,
+    },
+    /// Accept cancellation intents without claiming a committed graph revision.
+    AcceptWorkflowRunGraphPublication {
+        request: bcode_workflow::WorkflowRunGraphEditBatch,
     },
 }
 
@@ -2390,6 +2395,10 @@ pub enum ResponsePayload {
     },
     SessionUsage {
         page: bcode_session_models::SessionUsagePage,
+    },
+    /// Lifecycle outcome of an accepted graph publication.
+    WorkflowRunGraphPublicationAccepted {
+        status: bcode_workflow::WorkflowRunGraphPublicationStatus,
     },
 }
 
@@ -4839,19 +4848,19 @@ mod tests {
     }
 
     #[test]
-    fn ipc_v1_golden_fixtures_decode_to_expected_payloads() {
-        let message_sent = fixture_bytes("fixtures/ipc/v1/response_message_sent.hex");
+    fn ipc_v40_golden_fixtures_decode_to_expected_payloads() {
+        let message_sent = fixture_bytes("fixtures/ipc/v40/response_message_sent.hex");
         let decoded: Response = decode(&message_sent).expect("message_sent fixture should decode");
         assert_eq!(decoded, Response::Ok(ResponsePayload::MessageSent));
 
-        let cancelled = fixture_bytes("fixtures/ipc/v1/response_turn_cancellation_requested.hex");
+        let cancelled = fixture_bytes("fixtures/ipc/v40/response_turn_cancellation_requested.hex");
         let decoded: Response = decode(&cancelled).expect("cancel fixture should decode");
         assert_eq!(
             decoded,
             Response::Ok(ResponsePayload::TurnCancellationRequested { cancelled: true })
         );
 
-        let accepted = fixture_bytes("fixtures/ipc/v1/response_message_accepted.hex");
+        let accepted = fixture_bytes("fixtures/ipc/v40/response_message_accepted.hex");
         let decoded: Response = decode(&accepted).expect("message_accepted fixture should decode");
         assert_eq!(
             decoded,
@@ -4861,7 +4870,7 @@ mod tests {
             })
         );
 
-        let request = fixture_bytes("fixtures/ipc/v1/request_send_user_message.hex");
+        let request = fixture_bytes("fixtures/ipc/v40/request_send_user_message.hex");
         let decoded: Request = decode(&request).expect("send request fixture should decode");
         assert_eq!(
             decoded,
@@ -4875,22 +4884,22 @@ mod tests {
     }
 
     #[test]
-    fn ipc_v1_golden_fixtures_remain_byte_stable() {
+    fn ipc_v40_golden_fixtures_remain_byte_stable() {
         let cases = [
             (
-                "fixtures/ipc/v1/response_message_sent.hex",
+                "fixtures/ipc/v40/response_message_sent.hex",
                 encode(&Response::Ok(ResponsePayload::MessageSent))
                     .expect("response should encode"),
             ),
             (
-                "fixtures/ipc/v1/response_turn_cancellation_requested.hex",
+                "fixtures/ipc/v40/response_turn_cancellation_requested.hex",
                 encode(&Response::Ok(ResponsePayload::TurnCancellationRequested {
                     cancelled: true,
                 }))
                 .expect("response should encode"),
             ),
             (
-                "fixtures/ipc/v1/response_message_accepted.hex",
+                "fixtures/ipc/v40/response_message_accepted.hex",
                 encode(&Response::Ok(ResponsePayload::MessageAccepted {
                     queued: true,
                     queue_position: Some(2),
@@ -4898,7 +4907,7 @@ mod tests {
                 .expect("response should encode"),
             ),
             (
-                "fixtures/ipc/v1/request_send_user_message.hex",
+                "fixtures/ipc/v40/request_send_user_message.hex",
                 encode(&Request::SendUserMessage {
                     session_id: "00000000-0000-0000-0000-000000000001"
                         .parse()
@@ -4910,6 +4919,37 @@ mod tests {
         ];
         for (path, encoded) in cases {
             assert_eq!(encoded, fixture_bytes(path), "fixture changed: {path}");
+        }
+    }
+
+    #[tokio::test]
+    async fn historical_payloads_are_rejected_before_decoding() {
+        for (version, fixture) in [
+            (37, "fixtures/ipc/v37/response_message_sent.hex"),
+            (40, "fixtures/ipc/v40/response_message_sent.hex"),
+        ] {
+            let envelope = Envelope {
+                version: ProtocolVersion(version),
+                request_id: 1,
+                kind: EnvelopeKind::Response,
+                payload: fixture_bytes(fixture),
+            };
+            let encoded = encode(&envelope).expect("envelope");
+            let mut frame = u32::try_from(encoded.len())
+                .expect("frame length")
+                .to_le_bytes()
+                .to_vec();
+            frame.extend_from_slice(&encoded);
+            let error = read_envelope_frame(&mut std::io::Cursor::new(frame))
+                .await
+                .expect_err("historical protocol rejected");
+            assert!(matches!(
+                error,
+                CodecError::UnsupportedVersion {
+                    actual,
+                    expected: CURRENT_PROTOCOL_VERSION
+                } if actual == version
+            ));
         }
     }
 

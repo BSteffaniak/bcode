@@ -4409,6 +4409,33 @@ pub struct WorkflowRunGraphEditBatch {
     pub reconciliation: Vec<WorkflowRunGraphReconciliation>,
 }
 
+/// Publication lifecycle projection. Variant tags define compatibility; unknown variants reject.
+///
+/// Pending is acceptance, not executable authority. A conflict never revokes cancellation
+/// already requested by acceptance; retry requires a newly authored candidate.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "status", rename_all = "snake_case", deny_unknown_fields)]
+pub enum WorkflowRunGraphPublicationStatus {
+    /// Accepted cancellation remains in progress or awaits finalization.
+    Pending {
+        /// Revision against which the candidate was accepted.
+        expected_revision: u64,
+    },
+    /// Another publication changed the revision, or a cancellation target reached
+    /// an incompatible terminal outcome. Equal revisions indicate the latter.
+    Conflicted {
+        /// Original accepted revision.
+        expected_revision: u64,
+        /// Current committed revision at observation time.
+        current_revision: u64,
+    },
+    /// The exact candidate has already committed, even if later revisions exist.
+    Committed {
+        /// Revision published by this candidate.
+        revision: u64,
+    },
+}
+
 /// Compatibility version for run-edit application authorization facts.
 pub const WORKFLOW_RUN_GRAPH_EDIT_FACTS_VERSION: u32 = 1;
 
@@ -8833,6 +8860,34 @@ fn validate_structured_source_retry(
         ));
     }
     Ok(())
+}
+
+/// Compare a standalone member schema with its nested parallel-tuple schema.
+///
+/// Only top-level titles and the supported default dialect declaration may differ.
+/// Nested keywords and validation constraints are compared exactly; unknown dialects fail closed.
+#[must_use]
+pub fn parallel_member_schema_matches(
+    standalone: &serde_json::Value,
+    nested: &serde_json::Value,
+) -> bool {
+    fn normalized(schema: &serde_json::Value) -> Option<serde_json::Value> {
+        let mut schema = schema.clone();
+        if let Some(object) = schema.as_object_mut() {
+            if let Some(dialect) = object.get("$schema")
+                && dialect.as_str() != Some("https://json-schema.org/draft/2020-12/schema")
+            {
+                return None;
+            }
+            object.remove("$schema");
+            object.remove("title");
+        }
+        Some(schema)
+    }
+    match (normalized(standalone), normalized(nested)) {
+        (Some(left), Some(right)) => left == right,
+        _ => false,
+    }
 }
 
 fn workflow_parallel_join_schema(
@@ -22443,6 +22498,24 @@ steps:
             .validate()
             .is_err()
         );
+    }
+
+    #[test]
+    fn parallel_member_schema_comparison_preserves_constraints_and_dialects() {
+        let nested = serde_json::json!({"type":"integer", "minimum":0});
+        let standalone = serde_json::json!({"$schema":"https://json-schema.org/draft/2020-12/schema", "title":"Count", "type":"integer", "minimum":0});
+        assert!(parallel_member_schema_matches(&standalone, &nested));
+        assert!(!parallel_member_schema_matches(
+            &standalone,
+            &serde_json::json!({"type":"integer", "minimum":1})
+        ));
+        let mut future = standalone;
+        future["$schema"] = serde_json::json!("https://example.test/future");
+        assert!(!parallel_member_schema_matches(&future, &future));
+        assert!(!parallel_member_schema_matches(
+            &serde_json::json!({"properties":{"title":{"type":"string"}}}),
+            &serde_json::json!({"properties":{}})
+        ));
     }
 
     #[test]

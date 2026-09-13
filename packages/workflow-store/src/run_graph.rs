@@ -315,6 +315,75 @@ impl WorkflowStore {
         Ok(revision)
     }
 
+    /// Read the exact candidate's publication outcome without mutating durable state.
+    ///
+    /// Returns `None` for candidates that have not been accepted or committed. A committed
+    /// result takes precedence over later graph revisions. Conflicted acceptance retains
+    /// all cancellation intents; this read never rebases or revokes them.
+    ///
+    /// # Errors
+    /// Rejects stale authority, missing graphs, inconsistent revisions, or database errors.
+    pub fn run_graph_publication_status(
+        &self,
+        run_id: &str,
+        mutation_id: &str,
+        authority: &super::WorkflowExecutionAuthority,
+    ) -> Result<Option<bcode_workflow::WorkflowRunGraphPublicationStatus>, WorkflowStoreError> {
+        use bcode_workflow::WorkflowRunGraphPublicationStatus;
+        let _snapshot = self
+            .connection
+            .is_autocommit()
+            .then(|| self.connection.unchecked_transaction())
+            .transpose()?;
+        let transaction = &self.connection;
+        self.verify_execution_authority(run_id, authority)?;
+        let current_revision = graph_revision(transaction, run_id)?
+            .ok_or_else(|| WorkflowStoreError::InvalidData("publication graph missing".into()))?;
+        let committed: Option<u64> = transaction.query_row(
+            "SELECT revision FROM workflow_graph_edit_publications WHERE run_id = ?1 AND mutation_id = ?2",
+            (run_id, mutation_id), |row| row.get(0)).optional()?;
+        if let Some(revision) = committed {
+            if revision > current_revision {
+                return Err(WorkflowStoreError::InvalidData(
+                    "publication revision exceeds graph".into(),
+                ));
+            }
+            return Ok(Some(WorkflowRunGraphPublicationStatus::Committed {
+                revision,
+            }));
+        }
+        let expected: Option<u64> = transaction.query_row(
+            "SELECT expected_revision FROM workflow_pending_publications WHERE run_id = ?1 AND mutation_id = ?2",
+            (run_id, mutation_id), |row| row.get(0)).optional()?;
+        expected
+            .map(|expected_revision| {
+                if expected_revision > current_revision {
+                    return Err(WorkflowStoreError::InvalidData(
+                        "accepted revision exceeds graph".into(),
+                    ));
+                }
+                let terminal_conflict: bool = transaction.query_row(
+                    "SELECT EXISTS(SELECT 1 FROM workflow_graph_edit_candidates candidate
+                     JOIN json_each(candidate.request_json, '$.reconciliation') disposition
+                     JOIN workflow_activations activation ON activation.run_id = candidate.run_id
+                         AND activation.activation_id = json_extract(disposition.value, '$.activation_id')
+                     WHERE candidate.run_id = ?1 AND candidate.mutation_id = ?2
+                         AND json_extract(disposition.value, '$.disposition') = 'cancel'
+                         AND activation.status IN ('completed', 'failed', 'skipped'))",
+                    (run_id, mutation_id), |row| row.get(0),
+                )?;
+                Ok(if expected_revision == current_revision && !terminal_conflict {
+                    WorkflowRunGraphPublicationStatus::Pending { expected_revision }
+                } else {
+                    WorkflowRunGraphPublicationStatus::Conflicted {
+                        expected_revision,
+                        current_revision,
+                    }
+                })
+            })
+            .transpose()
+    }
+
     /// Accept an exact staged candidate and its receipt-backed cancellation intents atomically.
     ///
     /// This does not publish a revision or signal owners. The caller must authorize the exact
@@ -331,6 +400,89 @@ impl WorkflowStore {
         accepted_at_ms: u64,
     ) -> Result<bool, WorkflowStoreError> {
         let transaction = self.connection.unchecked_transaction()?;
+        let result = self.accept_pending_publication(
+            run_id,
+            mutation_id,
+            authority,
+            accepted_at_ms,
+            &transaction,
+        )?;
+        transaction.commit()?;
+        Ok(result)
+    }
+
+    /// Accept an authorized candidate and return its lifecycle status atomically.
+    ///
+    /// # Errors
+    /// Rejects stale authority, invalid candidates, or persistence failures.
+    pub fn accept_run_graph_publication(
+        &self,
+        run_id: &str,
+        mutation_id: &str,
+        authority: &super::WorkflowExecutionAuthority,
+        accepted_at_ms: u64,
+    ) -> Result<bcode_workflow::WorkflowRunGraphPublicationStatus, WorkflowStoreError> {
+        let transaction = self.connection.unchecked_transaction()?;
+        if let Some(status) = self.run_graph_publication_status(run_id, mutation_id, authority)? {
+            return Ok(status);
+        }
+        self.accept_pending_publication(
+            run_id,
+            mutation_id,
+            authority,
+            accepted_at_ms,
+            &transaction,
+        )?;
+        let status = self
+            .run_graph_publication_status(run_id, mutation_id, authority)?
+            .ok_or_else(|| {
+                WorkflowStoreError::InvalidData("accepted publication missing".into())
+            })?;
+        transaction.commit()?;
+        Ok(status)
+    }
+
+    /// Accept cancellation intents only while the authenticated execution caller remains active.
+    ///
+    /// # Errors
+    /// Rejects inactive callers, stale authority, invalid candidates, or persistence failures.
+    pub fn accept_pending_run_graph_publication_from_execution(
+        &self,
+        mutation_id: &str,
+        authority: &super::WorkflowExecutionAuthority,
+        caller: &super::WorkflowExecutionSessionLink,
+        accepted_at_ms: u64,
+    ) -> Result<bcode_workflow::WorkflowRunGraphPublicationStatus, WorkflowStoreError> {
+        let transaction = self.connection.unchecked_transaction()?;
+        self.verify_active_graph_edit_caller(&caller.run_id, caller)?;
+        let status = self.run_graph_publication_status(&caller.run_id, mutation_id, authority)?;
+        let outcome = if let Some(status) = status {
+            status
+        } else {
+            self.accept_pending_publication(
+                &caller.run_id,
+                mutation_id,
+                authority,
+                accepted_at_ms,
+                &transaction,
+            )?;
+            self.run_graph_publication_status(&caller.run_id, mutation_id, authority)?
+                .ok_or_else(|| {
+                    WorkflowStoreError::InvalidData("accepted publication missing".into())
+                })?
+        };
+        transaction.commit()?;
+        Ok(outcome)
+    }
+
+    fn accept_pending_publication(
+        &self,
+        run_id: &str,
+        mutation_id: &str,
+        authority: &super::WorkflowExecutionAuthority,
+        accepted_at_ms: u64,
+        transaction: &rusqlite::Transaction<'_>,
+    ) -> Result<bool, WorkflowStoreError> {
         let request = self
             .staged_run_graph_edit(run_id, mutation_id, authority)?
             .ok_or_else(|| WorkflowStoreError::InvalidData("candidate not found".into()))?;
@@ -344,7 +496,7 @@ impl WorkflowStore {
             run_id,
             mutation_id,
             authority,
-            &transaction,
+            transaction,
         )? != RunGraphCandidateValidation::Validated
         {
             return Err(WorkflowStoreError::InvalidData(
@@ -367,15 +519,34 @@ impl WorkflowStore {
             else {
                 continue;
             };
+            if publication_local_cancellation(transaction, run_id, activation_id)?
+                || publication_fan_out_local_target(transaction, &request, activation_id)?
+            {
+                continue;
+            }
             let mut statement = transaction.prepare(
                 "SELECT dispatch_identity FROM workflow_attempts attempt
                  WHERE run_id = ?1 AND activation_id = ?2 AND status IN ('admitted', 'running')
                    AND receipt_json IS NOT NULL
                    AND NOT EXISTS (SELECT 1 FROM workflow_run_links WHERE parent_run_id = ?1 AND parent_activation_id = ?2)
-                   AND NOT EXISTS (SELECT 1 FROM workflow_fan_out_members WHERE run_id = ?1 AND member_activation_id = ?2)
+                   AND NOT EXISTS (SELECT 1 FROM workflow_fan_out_members WHERE run_id = ?1 AND member_activation_id = ?2
+                       AND controller_activation_id NOT IN (SELECT value FROM json_each(?3)))
                  LIMIT 2")?;
+            let controllers = request
+                .reconciliation
+                .iter()
+                .filter_map(|item| match item {
+                    bcode_workflow::WorkflowRunGraphReconciliation::Cancel { activation_id } => {
+                        Some(activation_id)
+                    }
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
             let identities = statement
-                .query_map((run_id, activation_id), |row| row.get::<_, String>(0))?
+                .query_map(
+                    (run_id, activation_id, serde_json::to_string(&controllers)?),
+                    |row| row.get::<_, String>(0),
+                )?
                 .collect::<Result<Vec<_>, _>>()?;
             let [identity] = identities.as_slice() else {
                 return Err(WorkflowStoreError::InvalidData("pending publication requires one receipt-backed unlinked attempt per cancellation".into()));
@@ -391,9 +562,8 @@ impl WorkflowStore {
                 "pending publication requires cancellation targets".into(),
             ));
         }
-        super::append_event(&transaction, run_id, "graph_publication_accepted",
+        super::append_event(transaction, run_id, "graph_publication_accepted",
             &serde_json::json!({"mutation_id": mutation_id, "expected_revision": request.expected_revision}).to_string(), accepted_at_ms)?;
-        transaction.commit()?;
         Ok(true)
     }
 
@@ -601,7 +771,9 @@ impl WorkflowStore {
     /// Admission bindings remain historical. Settlement consumes the publication's retained
     /// identities. Direct chains with new or explicitly retained active targets and source
     /// bindings are supported; retained targets require unchanged incoming edges.
-    /// Controllers, joins, and edits to retained nodes remain unsupported.
+    /// Newly added parallel joins require newly added members and exact tuple member schemas.
+    /// Existing controllers and edits to retained nodes remain unsupported. Direct dependency
+    /// joins use existing all-predecessor readiness and consistent-input validation.
     /// The caller must authorize the operation before invoking this method.
     ///
     /// # Errors
@@ -643,6 +815,97 @@ impl WorkflowStore {
         )
     }
 
+    /// Read a bounded page of accepted publication identities for owner reconciliation.
+    ///
+    /// Advance with the last identity returned; an empty page ends the sweep. Includes
+    /// committed and conflicted acceptance so filtering cannot hide unbounded scan work.
+    ///
+    /// # Errors
+    /// Rejects stale authority, invalid page limits or identities, and database failures.
+    pub fn accepted_run_graph_publication_page(
+        &self,
+        run_id: &str,
+        authority: &super::WorkflowExecutionAuthority,
+        after: Option<&str>,
+        limit: u32,
+    ) -> Result<Vec<String>, WorkflowStoreError> {
+        super::validate_id("run_id", run_id)?;
+        if let Some(after) = after {
+            super::validate_id("mutation_id", after)?;
+        }
+        if limit == 0 || limit > 1_000 {
+            return Err(WorkflowStoreError::InvalidData(
+                "publication page limit must be 1..=1000".into(),
+            ));
+        }
+        let transaction = self.connection.unchecked_transaction()?;
+        self.verify_execution_authority(run_id, authority)?;
+        let mut statement = transaction.prepare(
+            "SELECT mutation_id FROM workflow_pending_publications
+             WHERE run_id = ?1 AND mutation_id > ?2 ORDER BY mutation_id LIMIT ?3",
+        )?;
+        Ok(statement
+            .query_map(
+                rusqlite::params![run_id, after.unwrap_or(""), limit],
+                |row| row.get(0),
+            )?
+            .collect::<Result<Vec<_>, _>>()?)
+    }
+
+    /// Finalize an accepted candidate after every exact cancellation target has settled.
+    /// Conflicts and still-active targets return their existing status without publication.
+    ///
+    /// # Errors
+    /// Rejects stale authority, absent acceptance, unsupported reconciliation, or damaged state.
+    pub fn finalize_pending_run_graph_publication(
+        &self,
+        run_id: &str,
+        mutation_id: &str,
+        authority: &super::WorkflowExecutionAuthority,
+        created_at_ms: u64,
+    ) -> Result<bcode_workflow::WorkflowRunGraphPublicationStatus, WorkflowStoreError> {
+        use bcode_workflow::WorkflowRunGraphPublicationStatus as Status;
+        let transaction = self.connection.unchecked_transaction()?;
+        let status = self
+            .run_graph_publication_status(run_id, mutation_id, authority)?
+            .ok_or_else(|| {
+                WorkflowStoreError::InvalidData("publication was not accepted".into())
+            })?;
+        if !matches!(status, Status::Pending { .. }) {
+            return Ok(status);
+        }
+        let request = self
+            .staged_run_graph_edit(run_id, mutation_id, authority)?
+            .ok_or_else(|| WorkflowStoreError::InvalidData("accepted candidate missing".into()))?;
+        for disposition in &request.reconciliation {
+            if let bcode_workflow::WorkflowRunGraphReconciliation::Cancel { activation_id } =
+                disposition
+                && !accepted_cancellation_settled(&transaction, &request, activation_id)?
+                && !publication_local_cancellation(&transaction, run_id, activation_id)?
+                && !publication_fan_out_local_target(&transaction, &request, activation_id)?
+            {
+                let terminal: bool = transaction.query_row(
+                    "SELECT EXISTS(SELECT 1 FROM workflow_activations WHERE run_id = ?1 AND activation_id = ?2 AND status IN ('completed', 'failed', 'skipped'))",
+                    (run_id, activation_id), |row| row.get(0),
+                )?;
+                if terminal {
+                    return Err(WorkflowStoreError::InvalidData("publication cancellation conflicts with a terminal activation; revise dispositions".into()));
+                }
+                return Ok(status);
+            }
+        }
+        let revision = self.publish_leaf_run_graph_edit_in_transaction(
+            run_id,
+            mutation_id,
+            authority,
+            created_at_ms,
+            true,
+            &transaction,
+        )?;
+        transaction.commit()?;
+        Ok(Status::Committed { revision })
+    }
+
     fn publish_leaf_run_graph_edit(
         &self,
         run_id: &str,
@@ -656,6 +919,27 @@ impl WorkflowStore {
         if let Some(caller) = caller {
             self.verify_active_graph_edit_caller(run_id, caller)?;
         }
+        let revision = self.publish_leaf_run_graph_edit_in_transaction(
+            run_id,
+            mutation_id,
+            authority,
+            created_at_ms,
+            retain_active,
+            &transaction,
+        )?;
+        transaction.commit()?;
+        Ok(revision)
+    }
+
+    fn publish_leaf_run_graph_edit_in_transaction(
+        &self,
+        run_id: &str,
+        mutation_id: &str,
+        authority: &super::WorkflowExecutionAuthority,
+        created_at_ms: u64,
+        retain_active: bool,
+        transaction: &Transaction<'_>,
+    ) -> Result<u64, WorkflowStoreError> {
         let request = self
             .staged_run_graph_edit(run_id, mutation_id, authority)?
             .ok_or_else(|| {
@@ -666,10 +950,9 @@ impl WorkflowStore {
             (run_id, mutation_id), |row| row.get(0),
         ).optional()?;
         if let Some(revision) = published {
-            transaction.commit()?;
             return Ok(revision);
         }
-        ensure_run_accepts_graph_edits(&transaction, run_id)?;
+        ensure_run_accepts_graph_edits(transaction, run_id)?;
         let active: bool = transaction.query_row(
             "SELECT EXISTS(SELECT 1 FROM workflow_activations WHERE run_id = ?1
              AND status NOT IN ('completed', 'failed', 'cancelled', 'skipped'))",
@@ -681,7 +964,7 @@ impl WorkflowStore {
             run_id,
             mutation_id,
             authority,
-            &transaction,
+            transaction,
         )? != RunGraphCandidateValidation::Validated
         {
             return Err(WorkflowStoreError::InvalidData(
@@ -689,8 +972,8 @@ impl WorkflowStore {
             ));
         }
         let retentions = if retain_active {
-            cancel_unstarted_leaf_activations(&transaction, &request, created_at_ms)?;
-            validate_leaf_retention(&transaction, &request)?
+            cancel_unstarted_leaf_activations(transaction, &request, created_at_ms)?;
+            validate_leaf_retention(transaction, &request)?
         } else if active || !request.reconciliation.is_empty() {
             return Err(WorkflowStoreError::InvalidData(
                 "publication requires execution reconciliation".to_string(),
@@ -711,14 +994,14 @@ impl WorkflowStore {
             self.validate_connected_publication(&request)?;
         }
         let revision =
-            persist_graph_publication(&transaction, &request, &retentions, created_at_ms)?;
-        transaction.commit()?;
+            persist_graph_publication(transaction, &request, &retentions, created_at_ms)?;
         Ok(revision)
     }
 
     // Connected publication admits direct chains with new targets or explicitly
     // retained active targets behind unchanged incoming edges. Historical inputs and
-    // executables remain immutable; joins and controllers require further reconciliation.
+    // executables remain immutable; parallel controllers require further reconciliation.
+    #[allow(clippy::too_many_lines)]
     fn validate_connected_publication(
         &self,
         request: &bcode_workflow::WorkflowRunGraphEditBatch,
@@ -775,20 +1058,92 @@ impl WorkflowStore {
                     | bcode_workflow::NodeKind::PluginBlock
                     | bcode_workflow::NodeKind::Input
                     | bcode_workflow::NodeKind::Approval
+                    | bcode_workflow::NodeKind::Parallel
             )
         }) {
             return Err(invalid());
         }
-        let mut targets = BTreeSet::new();
+        let added = request
+            .edits
+            .iter()
+            .filter_map(|edit| match edit {
+                bcode_workflow::WorkflowRunGraphEdit::AddNode { node, .. } => {
+                    Some(node.id.as_str())
+                }
+                _ => None,
+            })
+            .collect::<BTreeSet<_>>();
+        for (node, entry) in nodes
+            .values()
+            .filter(|(node, _)| node.kind == bcode_workflow::NodeKind::Parallel)
+        {
+            let members = bcode_workflow::parallel_join_member_ids(node)
+                .map_err(|error| WorkflowStoreError::InvalidData(error.to_string()))?;
+            let member_schemas = members
+                .iter()
+                .map(|member| {
+                    nodes
+                        .get(*member)
+                        .map(|(node, _)| node.output.schema.clone())
+                })
+                .collect::<Option<Vec<_>>>()
+                .ok_or_else(invalid)?;
+            let tuple = node
+                .input
+                .schema
+                .get("prefixItems")
+                .and_then(serde_json::Value::as_array)
+                .ok_or_else(invalid)?;
+            if tuple.len() != member_schemas.len()
+                || !member_schemas.iter().zip(tuple).all(|(member, nested)| {
+                    bcode_workflow::parallel_member_schema_matches(member, nested)
+                })
+            {
+                return Err(invalid());
+            }
+            let admitted: bool = self.connection.query_row(
+                "SELECT EXISTS(SELECT 1 FROM workflow_activations WHERE run_id = ?1 AND node_id = ?2)",
+                (&request.run_id, &node.id), |row| row.get(0),
+            )?;
+            // Planned controllers may change while their members execute. Once admitted,
+            // the controller's executable and tuple inputs belong to that activation.
+            if !added.contains(node.id.as_str()) && admitted {
+                let previous = self
+                    .current_run_graph_node(&request.run_id, &node.id)?
+                    .ok_or_else(invalid)?;
+                if previous.node != *node || previous.entry != *entry {
+                    return Err(invalid());
+                }
+                for (edge_id, edge) in edges.iter().filter(|(_, edge)| edge.to == node.id) {
+                    if self
+                        .current_run_graph_edge(&request.run_id, *edge_id)?
+                        .is_none_or(|old| old.edge != *edge)
+                    {
+                        return Err(invalid());
+                    }
+                }
+            }
+            if *entry
+                || node.input != node.output
+                || edges.values().filter(|edge| edge.to == node.id).count() != members.len()
+                || members.iter().any(|member| {
+                    !edges
+                        .values()
+                        .any(|edge| edge.from == *member && edge.to == node.id)
+                })
+            {
+                return Err(invalid());
+            }
+        }
         let mut sources = BTreeSet::new();
         for (edge_id, edge) in &edges {
             let (source, _) = nodes.get(&edge.from).ok_or_else(invalid)?;
             let (target, entry) = nodes.get(&edge.to).ok_or_else(invalid)?;
             if edge.kind != bcode_workflow::EdgeKind::Direct
                 || edge.transform.is_some()
-                || source.output != target.input
+                || (target.kind != bcode_workflow::NodeKind::Parallel
+                    && source.output != target.input)
                 || *entry
-                || !targets.insert(&edge.to)
                 || !sources.insert(&edge.from)
             {
                 return Err(invalid());
@@ -1366,16 +1721,220 @@ fn admit_added_leaf_entries(
     Ok(())
 }
 
+// Local cancellation remains deferred until publication; recheck after external owners settle.
+fn publication_local_cancellation(
+    connection: &Connection,
+    run_id: &str,
+    activation_id: &str,
+) -> Result<bool, WorkflowStoreError> {
+    Ok(connection.query_row(
+        "SELECT EXISTS(SELECT 1 FROM workflow_activations activation
+         WHERE run_id = ?1 AND activation_id = ?2 AND output_id IS NULL
+         AND status IN ('pending', 'waiting_input', 'waiting_approval')
+         AND NOT EXISTS(SELECT 1 FROM workflow_attempts WHERE run_id = ?1 AND activation_id = ?2)
+         AND NOT EXISTS(SELECT 1 FROM workflow_run_links WHERE parent_run_id = ?1 AND parent_activation_id = ?2)
+         AND NOT EXISTS(SELECT 1 FROM workflow_fan_out_members WHERE run_id = ?1
+             AND (member_activation_id = ?2 OR controller_node_id = activation.node_id)))",
+        (run_id, activation_id), |row| row.get(0),
+    )?)
+}
+
+fn publication_fan_out_local_target(
+    connection: &Connection,
+    request: &bcode_workflow::WorkflowRunGraphEditBatch,
+    activation_id: &str,
+) -> Result<bool, WorkflowStoreError> {
+    let controller: Option<String> = connection.query_row(
+        "SELECT controller_activation_id FROM workflow_fan_out_members WHERE run_id = ?1 AND (member_activation_id = ?2 OR controller_activation_id = ?2) LIMIT 1",
+        (&request.run_id, activation_id), |row| row.get(0),
+    ).optional()?;
+    let Some(controller) = controller else {
+        return Ok(false);
+    };
+    if !request.reconciliation.iter().any(|item| matches!(item, bcode_workflow::WorkflowRunGraphReconciliation::Cancel { activation_id } if *activation_id == controller)) { return Ok(false); }
+    Ok(!fan_out_has_external_work(
+        connection,
+        &request.run_id,
+        activation_id,
+    )?)
+}
+
+fn never_handed_off_preparation(
+    connection: &Connection,
+    run_id: &str,
+    activation_id: &str,
+) -> Result<bool, WorkflowStoreError> {
+    Ok(connection.query_row(
+        "SELECT EXISTS(SELECT 1 FROM workflow_attempts attempt JOIN workflow_dispatch_handoffs handoff USING(dispatch_identity)
+         WHERE run_id = ?1 AND activation_id = ?2 AND status = 'prepared' AND receipt_json IS NULL AND handed_off = 0)",
+        (run_id, activation_id), |row| row.get(0),
+    )?)
+}
+
+fn fan_out_has_external_work(
+    connection: &Connection,
+    run_id: &str,
+    activation_id: &str,
+) -> Result<bool, WorkflowStoreError> {
+    Ok(connection.query_row(
+        "SELECT EXISTS(SELECT 1 FROM workflow_attempts attempt WHERE run_id = ?1 AND activation_id = ?2
+         AND NOT (status = 'prepared' AND receipt_json IS NULL AND EXISTS (
+             SELECT 1 FROM workflow_dispatch_handoffs handoff WHERE handoff.dispatch_identity = attempt.dispatch_identity AND handed_off = 0)))
+         OR EXISTS(SELECT 1 FROM workflow_run_links WHERE parent_run_id = ?1 AND parent_activation_id = ?2)",
+        (run_id, activation_id), |row| row.get(0),
+    )?)
+}
+
+fn record_fan_out_publication_cancellation(
+    transaction: &Transaction<'_>,
+    request: &bcode_workflow::WorkflowRunGraphEditBatch,
+    controller: &str,
+    created_at_ms: u64,
+) -> Result<(), WorkflowStoreError> {
+    super::append_event(
+        transaction,
+        &request.run_id,
+        "fan_out_publication_cancelled",
+        &serde_json::json!({"activation_id": controller, "mutation_id": request.mutation_id})
+            .to_string(),
+        created_at_ms,
+    )
+}
+
+fn validate_fan_out_retirement_members(
+    connection: &Connection,
+    run_id: &str,
+    controller: &str,
+) -> Result<(), WorkflowStoreError> {
+    let invalid: bool = connection.query_row(
+        "SELECT EXISTS(SELECT 1 FROM workflow_fan_out_members member
+         LEFT JOIN workflow_activations activation ON activation.run_id = member.run_id AND activation.activation_id = member.member_activation_id AND activation.node_id = member.member_node_id
+         WHERE member.run_id = ?1 AND controller_activation_id = ?2 AND
+         (member.status NOT IN ('pending', 'waiting', 'running', 'completed', 'failed')
+          OR (member.status IN ('completed', 'failed') AND (activation.status IS NULL OR activation.status != member.status))
+          OR (member.status = 'completed' AND member.output_json IS NULL)
+          OR (member.status != 'completed' AND member.output_json IS NOT NULL)))",
+        (run_id, controller), |row| row.get(0),
+    )?;
+    if invalid {
+        return Err(WorkflowStoreError::InvalidData(
+            "fan-out retirement requires consistent member outcomes".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn cancel_unstarted_fan_outs(
+    transaction: &Transaction<'_>,
+    request: &bcode_workflow::WorkflowRunGraphEditBatch,
+    created_at_ms: u64,
+) -> Result<BTreeSet<String>, WorkflowStoreError> {
+    let cancelled = request
+        .reconciliation
+        .iter()
+        .filter_map(|item| match item {
+            bcode_workflow::WorkflowRunGraphReconciliation::Cancel { activation_id } => {
+                Some(activation_id.as_str())
+            }
+            _ => None,
+        })
+        .collect::<BTreeSet<_>>();
+    let mut handled = BTreeSet::new();
+    for controller in &cancelled {
+        let mut statement = transaction.prepare(
+            "SELECT member_activation_id FROM workflow_fan_out_members
+             WHERE run_id = ?1 AND controller_activation_id = ?2 AND status NOT IN ('completed', 'failed') LIMIT ?3",
+        )?;
+        let members = statement
+            .query_map(
+                rusqlite::params![
+                    request.run_id,
+                    controller,
+                    bcode_workflow::MAX_WORKFLOW_RUN_GRAPH_EDITS + 1
+                ],
+                |row| row.get::<_, String>(0),
+            )?
+            .collect::<Result<Vec<_>, _>>()?;
+        if members.is_empty() && !transaction.query_row(
+            "SELECT EXISTS(SELECT 1 FROM workflow_fan_out_members WHERE run_id = ?1 AND controller_activation_id = ?2)",
+            (&request.run_id, controller), |row| row.get::<_, bool>(0),
+        )? { continue; }
+        validate_fan_out_retirement_members(transaction, &request.run_id, controller)?;
+        if members.len() > bcode_workflow::MAX_WORKFLOW_RUN_GRAPH_EDITS {
+            return Err(WorkflowStoreError::InvalidData(
+                "fan-out cancellation requires bounded member reconciliation".into(),
+            ));
+        }
+        for identity in members
+            .iter()
+            .chain(std::iter::once(&(*controller).to_string()))
+        {
+            if accepted_cancellation_settled(transaction, request, identity)? {
+                continue;
+            }
+            let status: Option<String> = transaction.query_row(
+                "SELECT status FROM workflow_activations WHERE run_id = ?1 AND activation_id = ?2",
+                (&request.run_id, identity), |row| row.get(0),
+            ).optional()?;
+            let unsafe_work = fan_out_has_external_work(transaction, &request.run_id, identity)?;
+            let prepared = never_handed_off_preparation(transaction, &request.run_id, identity)?;
+            if unsafe_work
+                || status.as_deref().is_none_or(|status| {
+                    !(status == "waiting" && identity != controller)
+                        && (!cancelled.contains(identity.as_str())
+                            || if identity == controller {
+                                status != "running"
+                            } else {
+                                !(matches!(
+                                    status,
+                                    "pending" | "waiting_input" | "waiting_approval"
+                                ) || status == "running" && prepared)
+                            })
+                })
+            {
+                return Err(WorkflowStoreError::InvalidData("fan-out cancellation requires explicit unstarted member dispositions without attempts or linked work".into()));
+            }
+        }
+        for identity in members
+            .iter()
+            .chain(std::iter::once(&(*controller).to_string()))
+        {
+            transaction.execute(
+                "UPDATE workflow_attempts SET status = 'cancelled', terminal_at_ms = ?3
+                 WHERE run_id = ?1 AND activation_id = ?2 AND status = 'prepared'
+                 AND receipt_json IS NULL AND EXISTS (SELECT 1 FROM workflow_dispatch_handoffs handoff
+                     WHERE handoff.dispatch_identity = workflow_attempts.dispatch_identity AND handed_off = 0)",
+                rusqlite::params![request.run_id, identity, created_at_ms],
+            )?;
+            transaction.execute(
+                "UPDATE workflow_activations SET status = 'cancelled' WHERE run_id = ?1 AND activation_id = ?2 AND output_id IS NULL",
+                (&request.run_id, identity),
+            )?;
+            transaction.execute("UPDATE workflow_resource_leases SET released_at_ms = ?3 WHERE run_id = ?1 AND activation_id = ?2 AND released_at_ms IS NULL", rusqlite::params![request.run_id, identity, created_at_ms])?;
+            handled.insert(identity.clone());
+        }
+        transaction.execute("UPDATE workflow_fan_out_members SET status = 'cancelled', terminal_at_ms = ?3 WHERE run_id = ?1 AND controller_activation_id = ?2 AND status NOT IN ('completed', 'failed')", rusqlite::params![request.run_id, controller, created_at_ms])?;
+        record_fan_out_publication_cancellation(transaction, request, controller, created_at_ms)?;
+    }
+    Ok(handled)
+}
+
 fn cancel_unstarted_leaf_activations(
     transaction: &Transaction<'_>,
     request: &bcode_workflow::WorkflowRunGraphEditBatch,
     created_at_ms: u64,
 ) -> Result<(), WorkflowStoreError> {
+    let fan_outs = cancel_unstarted_fan_outs(transaction, request, created_at_ms)?;
     for disposition in &request.reconciliation {
         let bcode_workflow::WorkflowRunGraphReconciliation::Cancel { activation_id } = disposition
         else {
             continue;
         };
+        if fan_outs.contains(activation_id)
+            || accepted_cancellation_settled(transaction, request, activation_id)?
+        {
+            continue;
+        }
         transaction.execute(
             "UPDATE workflow_attempts SET status = 'cancelled', terminal_at_ms = ?3
              WHERE run_id = ?1 AND activation_id = ?2 AND status = 'prepared'
@@ -1482,6 +2041,26 @@ fn validate_leaf_retention(
     Ok(retentions)
 }
 
+fn accepted_cancellation_settled(
+    connection: &Connection,
+    request: &bcode_workflow::WorkflowRunGraphEditBatch,
+    activation_id: &str,
+) -> Result<bool, WorkflowStoreError> {
+    Ok(connection.query_row(
+        "SELECT EXISTS(SELECT 1 FROM workflow_publication_cancellations intent
+         JOIN workflow_pending_publications pending USING (run_id, mutation_id)
+         JOIN workflow_attempts attempt ON attempt.dispatch_identity = intent.dispatch_identity
+         JOIN workflow_activations activation ON activation.run_id = attempt.run_id
+             AND activation.node_id = attempt.node_id AND activation.activation_id = attempt.activation_id
+         WHERE intent.run_id = ?1 AND intent.mutation_id = ?2 AND pending.expected_revision = ?3
+             AND attempt.run_id = ?1 AND attempt.activation_id = ?4
+             AND attempt.status = 'cancelled' AND activation.status = 'cancelled'
+             AND activation.output_id IS NULL)",
+        rusqlite::params![request.run_id, request.mutation_id, request.expected_revision, activation_id],
+        |row| row.get(0),
+    )?)
+}
+
 pub fn validate_reconciliation_targets(
     connection: &Connection,
     request: &bcode_workflow::WorkflowRunGraphEditBatch,
@@ -1511,6 +2090,11 @@ pub fn validate_reconciliation_targets(
                     activation_id,
                 )?;
                 true
+            } else if status == "cancelled"
+                && output.is_none()
+                && matches!(disposition, Reconciliation::Cancel { .. })
+            {
+                accepted_cancellation_settled(connection, request, activation_id)?
             } else {
                 output.is_none()
                     && matches!(
@@ -1611,6 +2195,7 @@ fn publish_candidate_edges(
     Ok(())
 }
 
+#[allow(clippy::too_many_lines)]
 fn validate_retained_bindings(
     connection: &Connection,
     request: &bcode_workflow::WorkflowRunGraphEditBatch,
@@ -1680,19 +2265,45 @@ fn validate_retained_bindings(
             })?;
             // Exact schema equality is a conservative proof. Transform-aware compatibility
             // requires a separate proof and must not be inferred from a node identity.
-            if edge.from != source_id || edge.transform.is_some() || source.output != target.input {
+            let target_schema = if target.kind == bcode_workflow::NodeKind::Parallel {
+                let members = bcode_workflow::parallel_join_member_ids(target)
+                    .map_err(|error| WorkflowStoreError::InvalidData(error.to_string()))?;
+                let position = members
+                    .iter()
+                    .position(|member| *member == source_id)
+                    .ok_or_else(|| {
+                        WorkflowStoreError::InvalidData(
+                            "retained source is not a parallel member".into(),
+                        )
+                    })?;
+                target
+                    .input
+                    .schema
+                    .get("prefixItems")
+                    .and_then(serde_json::Value::as_array)
+                    .and_then(|items| items.get(position))
+                    .ok_or_else(|| {
+                        WorkflowStoreError::InvalidData(
+                            "parallel tuple member schema missing".into(),
+                        )
+                    })?
+            } else {
+                &target.input.schema
+            };
+            let compatible = if target.kind == bcode_workflow::NodeKind::Parallel {
+                bcode_workflow::parallel_member_schema_matches(&source.output.schema, target_schema)
+            } else {
+                source.output == target.input
+            };
+            if edge.from != source_id || edge.transform.is_some() || !compatible {
                 return Err(WorkflowStoreError::InvalidData(
                     "retained-result binding lacks compatible source and target schemas"
                         .to_string(),
                 ));
             }
             if let Some(value) = &completed_value {
-                super::validate_json_schema(
-                    "retained-result target input",
-                    &target.input.schema,
-                    value,
-                )
-                .map_err(|error| WorkflowStoreError::InvalidData(error.to_string()))?;
+                super::validate_json_schema("retained-result target input", target_schema, value)
+                    .map_err(|error| WorkflowStoreError::InvalidData(error.to_string()))?;
             }
         }
     }

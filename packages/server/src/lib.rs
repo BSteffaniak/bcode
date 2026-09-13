@@ -389,6 +389,7 @@ pub struct ServerState {
     turn_skills: Mutex<BTreeMap<(SessionId, u64), SkillTurnInvocation>>,
     session_runtimes: Mutex<BTreeMap<SessionId, SessionRuntimeHandle>>,
     turn_admission_locks: Mutex<BTreeMap<SessionId, Arc<Mutex<()>>>>,
+    workflow_prompt_admissions: StdMutex<BTreeMap<String, std::sync::Weak<Mutex<()>>>>,
     workflow_store: Arc<StdMutex<bcode_workflow_store::WorkflowStore>>,
     workflow_store_unavailable: StdMutex<Option<WorkflowInitializationFailure>>,
     workflow_restore_pending: std::sync::atomic::AtomicBool,
@@ -1691,6 +1692,69 @@ impl ServerState {
         request: bcode_workflow::WorkflowRunGraphEditBatch,
         cancellation: &TurnCancelState,
     ) -> Result<u64, ServerError> {
+        match self
+            .run_graph_publication_from_invocation(
+                session_id,
+                plugin_id,
+                request,
+                cancellation,
+                false,
+            )
+            .await?
+        {
+            bcode_workflow::WorkflowRunGraphPublicationStatus::Committed { revision } => {
+                Ok(revision)
+            }
+            _ => unreachable!("committed-only operation never accepts pending publication"),
+        }
+    }
+
+    /// Accept an exact candidate's cancellation intents without claiming graph publication.
+    ///
+    /// # Errors
+    /// Rejects unauthorized or inactive callers, unavailable scheduling, or invalid candidates.
+    pub async fn accept_workflow_run_graph_publication_from_invocation(
+        &self,
+        session_id: SessionId,
+        plugin_id: &str,
+        request: bcode_workflow::WorkflowRunGraphEditBatch,
+        cancellation: &TurnCancelState,
+    ) -> Result<bcode_workflow::WorkflowRunGraphPublicationStatus, ServerError> {
+        self.run_graph_publication_from_invocation(
+            session_id,
+            plugin_id,
+            request,
+            cancellation,
+            true,
+        )
+        .await
+    }
+
+    fn authorize_invocation_publication(
+        &self,
+        facts: &bcode_workflow::WorkflowRunGraphPublicationFacts,
+    ) -> Result<(), ServerError> {
+        let deny = |reason| ServerError::WorkflowApplicationOperationUnauthorized(reason);
+        facts.validate().map_err(|error| deny(error.to_string()))?;
+        let policy = self
+            .workflow_run_graph_publication_policy
+            .as_ref()
+            .ok_or_else(|| deny("publication policy unavailable".into()))?;
+        if let WorkflowApplicationAuthorizationDecision::Deny { reason } = (policy.evaluator)(facts)
+        {
+            return Err(deny(reason));
+        }
+        Ok(())
+    }
+
+    async fn run_graph_publication_from_invocation(
+        &self,
+        session_id: SessionId,
+        plugin_id: &str,
+        request: bcode_workflow::WorkflowRunGraphEditBatch,
+        cancellation: &TurnCancelState,
+        accept_pending: bool,
+    ) -> Result<bcode_workflow::WorkflowRunGraphPublicationStatus, ServerError> {
         let denied = || {
             ServerError::WorkflowApplicationOperationUnauthorized(
                 "publication requires an authorized current workflow execution".to_string(),
@@ -1704,18 +1768,7 @@ impl ServerState {
             },
             request,
         };
-        facts.validate().map_err(|_| denied())?;
-        let policy = self
-            .workflow_run_graph_publication_policy
-            .as_ref()
-            .ok_or_else(denied)?;
-        if let WorkflowApplicationAuthorizationDecision::Deny { reason } =
-            (policy.evaluator)(&facts)
-        {
-            return Err(ServerError::WorkflowApplicationOperationUnauthorized(
-                reason,
-            ));
-        }
+        self.authorize_invocation_publication(&facts)?;
         self.require_workflow_store()?;
         let session = self.sessions.session_summary(session_id).await?;
         let provenance = session.execution.ok_or_else(denied)?.provenance;
@@ -1774,17 +1827,32 @@ impl ServerState {
             .ok_or_else(denied)?
             .try_reserve()
             .map_err(|_| denied())?;
-        let result = store.publish_retained_leaf_run_graph_edit_from_execution(
-            &facts.request.mutation_id,
-            &authority,
-            &link,
-            current_time_ms(),
-        );
+        let result = if accept_pending {
+            store.accept_pending_run_graph_publication_from_execution(
+                &facts.request.mutation_id,
+                &authority,
+                &link,
+                current_time_ms(),
+            )
+        } else {
+            store
+                .publish_retained_leaf_run_graph_edit_from_execution(
+                    &facts.request.mutation_id,
+                    &authority,
+                    &link,
+                    current_time_ms(),
+                )
+                .map(
+                    |revision| bcode_workflow::WorkflowRunGraphPublicationStatus::Committed {
+                        revision,
+                    },
+                )
+        };
         drop(store);
         drop(commit);
-        let revision = result?;
+        let outcome = result?;
         permit.send(facts.request.run_id);
-        Ok(revision)
+        Ok(outcome)
     }
 
     /// Configure run-edit staging policy before sharing the server with clients.
@@ -1825,6 +1893,19 @@ impl ServerState {
             workflow_operations::publish_run_graph_edit(self, client_id, request).await?;
         permit.send(run_id);
         Ok(revision)
+    }
+
+    /// Accept a staged publication with cancellation intents for a local client.
+    ///
+    /// # Errors
+    /// Rejects unavailable scheduling, denied publication policy, or invalid durable state.
+    pub async fn accept_workflow_run_graph_publication(
+        self: &Arc<Self>,
+        client_id: ClientId,
+        request: bcode_workflow::WorkflowRunGraphEditBatch,
+    ) -> Result<bcode_workflow::WorkflowRunGraphPublicationStatus, ServerError> {
+        self.start_workflow_driver().await;
+        workflow_operations::accept_run_graph_publication(self, client_id, request).await
     }
 
     pub fn set_workflow_run_graph_edit_policy(&mut self, policy: WorkflowRunGraphEditPolicy) {
@@ -2074,6 +2155,7 @@ impl ServerState {
             turn_skills: Mutex::default(),
             session_runtimes: Mutex::default(),
             turn_admission_locks: Mutex::default(),
+            workflow_prompt_admissions: StdMutex::default(),
             workflow_store: StdMutex::new(workflow_store).into(),
             workflow_store_unavailable: StdMutex::new(workflow_store_unavailable),
             workflow_restore_pending: std::sync::atomic::AtomicBool::new(false),
@@ -5263,6 +5345,10 @@ fn workflow_store_error_response(error: &WorkflowStoreError) -> ErrorResponse {
             "workflow_store_reset_required",
             "workflow store requires explicit maintenance",
         ),
+        WorkflowStoreError::OwnerDispatch(_) | WorkflowStoreError::OwnerAccessDeferred => (
+            "workflow_owner_unavailable",
+            "workflow execution owner is unavailable",
+        ),
         WorkflowStoreError::Database(_)
         | WorkflowStoreError::Io(_)
         | WorkflowStoreError::Serialization(_)
@@ -5751,6 +5837,9 @@ const fn request_kind(request: &Request) -> &'static str {
         Request::StartWorkflowRun(_) => "start_workflow_run",
         Request::ListWorkflowDefinitions { .. } => "list_workflow_definitions",
         Request::DescribeWorkflowDefinition { .. } => "describe_workflow_definition",
+        Request::AcceptWorkflowRunGraphPublication { .. } => {
+            "accept_workflow_run_graph_publication"
+        }
         Request::PublishWorkflowRunGraphEdit { .. } => "publish_workflow_run_graph_edit",
         Request::StageWorkflowRunGraphEdit { .. } => "stage_workflow_run_graph_edit",
         Request::InspectWorkflowRunGraph { .. } => "inspect_workflow_run_graph",
@@ -7567,10 +7656,19 @@ async fn handle_workflow_run_request(
 ) -> Result<(), ServerError> {
     state.require_workflow_store()?;
     match request {
+        RuntimeAndModelRequest::AcceptWorkflowRunGraphPublication { request } => {
+            let status =
+                Box::pin(state.accept_workflow_run_graph_publication(client_id, request)).await?;
+            send_response(
+                writer,
+                request_id,
+                Response::Ok(ResponsePayload::WorkflowRunGraphPublicationAccepted { status }),
+            )
+            .await
+        }
         RuntimeAndModelRequest::PublishWorkflowRunGraphEdit { request } => {
-            let revision = state
-                .publish_workflow_run_graph_edit(client_id, request)
-                .await?;
+            let revision =
+                Box::pin(state.publish_workflow_run_graph_edit(client_id, request)).await?;
             send_response(
                 writer,
                 request_id,
@@ -7853,12 +7951,14 @@ async fn handle_workflow_run_request(
             activation_id,
             value,
         } => {
-            let result = bcode_workflow::WorkflowRunApplication::provide_workflow_input(
-                &workflow_operations::WorkflowAuthoringApplication::new(state, client_id),
-                run_id,
-                node_id,
-                activation_id,
-                value,
+            let result = Box::pin(
+                bcode_workflow::WorkflowRunApplication::provide_workflow_input(
+                    &workflow_operations::WorkflowAuthoringApplication::new(state, client_id),
+                    run_id,
+                    node_id,
+                    activation_id,
+                    value,
+                ),
             )
             .await;
             let response = match result {
@@ -7873,12 +7973,14 @@ async fn handle_workflow_run_request(
             activation_id,
             approved,
         } => {
-            let result = bcode_workflow::WorkflowRunApplication::resolve_workflow_approval(
-                &workflow_operations::WorkflowAuthoringApplication::new(state, client_id),
-                run_id,
-                node_id,
-                activation_id,
-                approved,
+            let result = Box::pin(
+                bcode_workflow::WorkflowRunApplication::resolve_workflow_approval(
+                    &workflow_operations::WorkflowAuthoringApplication::new(state, client_id),
+                    run_id,
+                    node_id,
+                    activation_id,
+                    approved,
+                ),
             )
             .await;
             let response = match result {
@@ -13840,7 +13942,11 @@ async fn run_session_runtime(
         .await
         .take()
         .expect("session runtime cancel receiver should be present");
+    let mut shutdown = state.subscribe_shutdown();
     loop {
+        if state.shutdown_requested.load(Ordering::SeqCst) {
+            break;
+        }
         service_cancel_commands(
             &state,
             session_id,
@@ -13852,13 +13958,16 @@ async fn run_session_runtime(
         while let Ok(command) = steering_commands.try_recv() {
             process_steering_message_command(&state, permit.session_id(), command).await;
         }
-        let Some(command) = next_runtime_queue_command(
-            &mut cancel_commands,
-            &mut followup_commands,
-            queued_followups.as_ref(),
-        )
-        .await
-        else {
+        let command = tokio::select! {
+            biased;
+            _ = shutdown.recv() => break,
+            command = next_runtime_queue_command(
+                &mut cancel_commands,
+                &mut followup_commands,
+                queued_followups.as_ref(),
+            ) => command,
+        };
+        let Some(command) = command else {
             break;
         };
         let command = match command {
@@ -14695,7 +14804,17 @@ async fn submit_session_model_turn_with_admission(
     let (sender, receiver) = oneshot::channel();
     let client_id = ClientId::new();
     let admission_lock = turn_admission_lock(state, session_id).await;
-    let _admission_guard = admission_lock.lock().await;
+    let _admission_guard = if let Some(cancellation) = &cancel_state {
+        tokio::select! {
+            biased;
+            () = cancellation.cancelled() => {
+                return Err(WorkflowStoreError::CancellationPreventsControl.into());
+            }
+            guard = admission_lock.lock() => guard,
+        }
+    } else {
+        admission_lock.lock().await
+    };
     let ownership = state
         .sessions
         .acquire_session_ownership(
@@ -14703,6 +14822,12 @@ async fn submit_session_model_turn_with_admission(
             bcode_session::SessionOwnershipKind::QueuedCommand,
         )
         .await?;
+    if cancel_state
+        .as_ref()
+        .is_some_and(|state| state.is_cancelled())
+    {
+        return Err(WorkflowStoreError::CancellationPreventsControl.into());
+    }
     let (admission, user_event) =
         admit_turn(state, session_id, client_id, text, admission_metadata).await?;
     let receipt = match admission {
@@ -16252,6 +16377,42 @@ fn workflow_drive_gate(state: &ServerState, run_id: &str) -> Arc<Mutex<()>> {
     gate
 }
 
+// Startup recovery can defer while an execution session is still owned by the prior
+// daemon. Retry only safe read-only preparations on later continuations, preserving
+// dispatch identities and checking authority at handoff and commit.
+async fn retry_prepared_workflow_dispatches(
+    state: &Arc<ServerState>,
+    store_path: &Path,
+    run_id: &str,
+    authority: &bcode_workflow_store::WorkflowExecutionAuthority,
+) -> Result<(), ServerError> {
+    if state.shutdown_requested.load(Ordering::SeqCst) {
+        return Ok(());
+    }
+    let mut store = bcode_workflow_store::WorkflowStore::open_at_path(store_path)?;
+    match store
+        .redispatch_owned_prepared_read_only_for_run(
+            &WorkflowActivationOwner { state },
+            run_id,
+            authority,
+            1_000,
+            current_unix_millis(),
+        )
+        .await
+    {
+        Ok(_) => {}
+        Err(WorkflowStoreError::OwnerDispatch(error))
+            if matches!(*error, WorkflowStoreError::OwnerAccessDeferred) =>
+        {
+            tracing::debug!(run_id, "prepared workflow owner dispatch deferred");
+        }
+        Err(error) => return Err(error.into()),
+    }
+    // A deferred owner must not block unrelated pending work, but lost authority must.
+    store.verify_execution_authority(run_id, authority)?;
+    Ok(())
+}
+
 async fn drive_workflow_run(state: &Arc<ServerState>, run_id: &str) -> Result<(), ServerError> {
     let gate = workflow_drive_gate(state, run_id);
     let Ok(_guard) = gate.try_lock() else {
@@ -16269,12 +16430,11 @@ async fn drive_workflow_run_exclusive(
         return Ok(());
     };
     let started_at = std::time::Instant::now();
-    let store_path = state
-        .workflow_store
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .path()
-        .to_path_buf();
+    let store_path = workflow_store_path(state);
+    let mut retry_preparations = true;
+    let mut publication_cursor = None;
+    let mut cancellation_cursor = None;
+    let mut cancellation_sweep_complete = false;
     loop {
         if state.shutdown_requested.load(Ordering::SeqCst) {
             return Ok(());
@@ -16283,9 +16443,14 @@ async fn drive_workflow_run_exclusive(
             .verify_execution_authority(run_id, &authority.authority)?;
         let iteration_started_at = std::time::Instant::now();
         let now_ms = current_unix_millis();
-        retry_owned_workflow_cancellation(state, run_id, &authority.authority).await?;
-        propagate_publication_cancellation(state, run_id, &authority.authority).await?;
-        retry_owned_sibling_cancellation(state, run_id, &authority.authority).await?;
+        cancellation_sweep_complete = continue_workflow_cancellation(
+            state,
+            run_id,
+            &authority.authority,
+            &mut cancellation_cursor,
+            cancellation_sweep_complete,
+        )
+        .await?;
         if bcode_workflow_store::WorkflowStore::open_at_path(&store_path)?
             .is_recovery_only(run_id)?
         {
@@ -16297,6 +16462,11 @@ async fn drive_workflow_run_exclusive(
             .expire_run_deadline(run_id, now_ms)?
         {
             break;
+        }
+        if retry_preparations && cancellation_sweep_complete {
+            retry_prepared_workflow_dispatches(state, &store_path, run_id, &authority.authority)
+                .await?;
+            retry_preparations = false;
         }
         let settled = bcode_workflow_store::WorkflowStore::open_at_path(&store_path)?
             .settle_pending_control_nodes(run_id, 1_000, now_ms)?;
@@ -16325,20 +16495,21 @@ async fn drive_workflow_run_exclusive(
             )
             .await?;
         }
+        let published = finalize_workflow_publication_page(
+            &store_path,
+            run_id,
+            &authority.authority,
+            &mut publication_cursor,
+            now_ms,
+        )?;
         let retried = bcode_workflow_store::WorkflowStore::open_at_path(&store_path)?
             .consume_next_due_automatic_retry_for_run(run_id, now_ms)?;
-        if !dispatched.unsupported.is_empty() {
-            tracing::debug!(
-                run_id,
-                unsupported = ?dispatched.unsupported,
-                "workflow run has pending activations without a production owner"
-            );
-        }
-        state.metrics.record_histogram(
-            "workflow.scheduler.iteration.duration_ms",
-            u64::try_from(iteration_started_at.elapsed().as_millis()).unwrap_or(u64::MAX),
-        );
-        if settled.settled.is_empty()
+        log_unsupported_workflow_activations(run_id, &dispatched.unsupported);
+        record_workflow_iteration_duration(state, iteration_started_at);
+        if !published
+            && cancellation_sweep_complete
+            && publication_cursor.is_none()
+            && settled.settled.is_empty()
             && dispatched.admitted.is_empty()
             && reconciled.succeeded.is_empty()
             && reconciled.failed.is_empty()
@@ -16351,12 +16522,95 @@ async fn drive_workflow_run_exclusive(
             break;
         }
     }
+    finish_workflow_drive(state, run_id, started_at).await
+}
+
+fn workflow_store_path(state: &ServerState) -> PathBuf {
+    state
+        .workflow_store
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .path()
+        .to_path_buf()
+}
+
+async fn continue_workflow_cancellation(
+    state: &ServerState,
+    run_id: &str,
+    authority: &bcode_workflow_store::WorkflowExecutionAuthority,
+    cursor: &mut Option<String>,
+    mut sweep_complete: bool,
+) -> Result<bool, WorkflowStoreError> {
+    retry_owned_workflow_cancellation(state, run_id, authority).await?;
+    if !sweep_complete {
+        propagate_publication_cancellation(state, run_id, authority, cursor).await?;
+        sweep_complete = cursor.is_none();
+    }
+    retry_owned_sibling_cancellation(state, run_id, authority).await?;
+    Ok(sweep_complete)
+}
+
+async fn finish_workflow_drive(
+    state: &ServerState,
+    run_id: &str,
+    started_at: std::time::Instant,
+) -> Result<(), ServerError> {
     state.metrics.record_histogram(
         "workflow.scheduler.drive.duration_ms",
         u64::try_from(started_at.elapsed().as_millis()).unwrap_or(u64::MAX),
     );
     settle_workflow_runtime_work(state, run_id).await?;
     Ok(())
+}
+
+fn log_unsupported_workflow_activations(run_id: &str, unsupported: &[String]) {
+    if !unsupported.is_empty() {
+        tracing::debug!(
+            run_id,
+            ?unsupported,
+            "workflow run has pending activations without a production owner"
+        );
+    }
+}
+
+fn record_workflow_iteration_duration(state: &ServerState, started: std::time::Instant) {
+    state.metrics.record_histogram(
+        "workflow.scheduler.iteration.duration_ms",
+        u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
+    );
+}
+
+fn finalize_workflow_publication_page(
+    path: &std::path::Path,
+    run_id: &str,
+    authority: &bcode_workflow_store::WorkflowExecutionAuthority,
+    cursor: &mut Option<String>,
+    now_ms: u64,
+) -> Result<bool, WorkflowStoreError> {
+    use bcode_workflow::WorkflowRunGraphPublicationStatus as Status;
+    let store = bcode_workflow_store::WorkflowStore::open_at_path(path)?;
+    let candidates =
+        store.accepted_run_graph_publication_page(run_id, authority, cursor.as_deref(), 32)?;
+    *cursor = candidates.last().cloned();
+    let mut published = false;
+    for mutation_id in candidates {
+        if !matches!(
+            store.run_graph_publication_status(run_id, &mutation_id, authority)?,
+            Some(Status::Pending { .. })
+        ) {
+            continue;
+        }
+        published |= matches!(
+            store.finalize_pending_run_graph_publication(
+                run_id,
+                &mutation_id,
+                authority,
+                now_ms
+            )?,
+            Status::Committed { .. }
+        );
+    }
+    Ok(published)
 }
 
 fn workflow_terminal_failure_message(state: &ServerState, run_id: &str) -> Option<String> {
@@ -25695,6 +25949,7 @@ async fn invocation_service_routes(
     }
     if state.workflow_run_graph_publication_policy.is_some() {
         workflow_operations.push("publish_run_graph_edit".to_owned());
+        workflow_operations.push("accept_run_graph_publication".to_owned());
     }
     if !workflow_operations.is_empty() {
         routes.push(ServerInvocationServiceRoute {
@@ -27576,6 +27831,45 @@ fn workflow_invocation_failure() -> ToolInvocationServiceResolution {
     }
 }
 
+async fn invoke_run_graph_operation(
+    state: &ServerState,
+    session_id: SessionId,
+    plugin_id: &str,
+    operation: &str,
+    edit: bcode_workflow::WorkflowRunGraphEditBatch,
+    cancellation: &TurnCancelState,
+) -> Result<serde_json::Value, ServerError> {
+    match operation {
+        "accept_run_graph_publication" => state
+            .accept_workflow_run_graph_publication_from_invocation(
+                session_id,
+                plugin_id,
+                edit,
+                cancellation,
+            )
+            .await
+            .map(|status| serde_json::json!(status)),
+        "publish_run_graph_edit" => state
+            .publish_workflow_run_graph_edit_from_invocation(
+                session_id,
+                plugin_id,
+                edit,
+                cancellation,
+            )
+            .await
+            .map(|revision| serde_json::json!({"revision": revision})),
+        _ => state
+            .stage_workflow_run_graph_edit_from_invocation(
+                session_id,
+                plugin_id,
+                edit,
+                cancellation,
+            )
+            .await
+            .map(|staged| serde_json::json!({"staged": staged})),
+    }
+}
+
 async fn resolve_server_plugin_bridge_request(
     state: &ServerState,
     session_id: SessionId,
@@ -27618,32 +27912,22 @@ async fn resolve_server_plugin_bridge_request(
                 != Some(bcode_workflow::WORKFLOW_APPLICATION_INTERFACE_ID)
                 || !matches!(
                     request.operation.as_str(),
-                    "stage_run_graph_edit" | "publish_run_graph_edit"
+                    "stage_run_graph_edit"
+                        | "publish_run_graph_edit"
+                        | "accept_run_graph_publication"
                 )
             {
                 ToolInvocationServiceResolution::Unsupported
             } else if let Ok(edit) = serde_json::from_value(request.payload) {
-                let result = if request.operation == "publish_run_graph_edit" {
-                    state
-                        .publish_workflow_run_graph_edit_from_invocation(
-                            session_id,
-                            plugin_id,
-                            edit,
-                            cancel_state,
-                        )
-                        .await
-                        .map(|revision| serde_json::json!({ "revision": revision }))
-                } else {
-                    state
-                        .stage_workflow_run_graph_edit_from_invocation(
-                            session_id,
-                            plugin_id,
-                            edit,
-                            cancel_state,
-                        )
-                        .await
-                        .map(|staged| serde_json::json!({ "staged": staged }))
-                };
+                let result = invoke_run_graph_operation(
+                    state,
+                    session_id,
+                    plugin_id,
+                    &request.operation,
+                    edit,
+                    cancel_state,
+                )
+                .await;
                 match result {
                     Ok(payload) => ToolInvocationServiceResolution::Responded { payload },
                     Err(ServerError::WorkflowComputationCancelled(_)) => {
@@ -30455,7 +30739,15 @@ fn workflow_attempt_observation_from_completion(
                 .ok_or_else(|| {
                     WorkflowStoreError::InvalidData("workflow run not found".to_string())
                 })?;
-            if run.cancellation_requested_at_ms.is_some() {
+            let publication_cancelled = state
+                .workflow_store
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .has_publication_cancellation_intent(
+                    &request.activation.run_id,
+                    &request.dispatch_identity,
+                )?;
+            if run.cancellation_requested_at_ms.is_some() || publication_cancelled {
                 Ok(bcode_workflow_store::AttemptObservation::Cancelled)
             } else {
                 Ok(bcode_workflow_store::AttemptObservation::Paused {
@@ -30812,6 +31104,29 @@ const fn mutating_workflow_attempt(
     request.may_mutate()
 }
 
+fn verify_workflow_observation_session(
+    state: &ServerState,
+    session_id: SessionId,
+    request: &bcode_workflow_store::AttemptReconciliationRequest,
+) -> Result<(), WorkflowStoreError> {
+    let link = state
+        .workflow_store
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .execution_session_link(
+            &request.run_id,
+            &request.node_id,
+            &request.activation_id,
+            request.attempt,
+        )?;
+    if link.is_some_and(|link| link.session_id != session_id.to_string()) {
+        return Err(WorkflowStoreError::InvalidData(
+            "workflow receipt session does not match its durable execution link".into(),
+        ));
+    }
+    Ok(())
+}
+
 #[allow(clippy::too_many_lines)]
 async fn observe_workflow_turn(
     state: &ServerState,
@@ -30820,6 +31135,7 @@ async fn observe_workflow_turn(
     output_schema_id: &str,
     request: &bcode_workflow_store::AttemptReconciliationRequest,
 ) -> Result<bcode_workflow_store::AttemptObservation, WorkflowStoreError> {
+    verify_workflow_observation_session(state, session_id, request)?;
     let Ok(events) = state
         .sessions
         .session_turn_evidence(session_id, turn_id)
@@ -30861,6 +31177,11 @@ async fn observe_workflow_turn(
                     WorkflowStoreError::InvalidData("admitted prompt node is missing".into())
                 })?)?;
             let output_schema = node.output;
+            if output_schema.type_name != output_schema_id {
+                return Err(WorkflowStoreError::InvalidData(
+                    "workflow prompt receipt output schema does not match admission".into(),
+                ));
+            }
             let output = match configuration.output {
                 bcode_workflow::WorkflowPromptOutputPolicy::PreserveInput => intent
                     .get("input")
@@ -30920,7 +31241,12 @@ async fn observe_workflow_turn(
                 .ok_or_else(|| {
                     WorkflowStoreError::InvalidData("workflow run not found".to_string())
                 })?;
-            if run.cancellation_requested_at_ms.is_some() {
+            let publication_cancelled = state
+                .workflow_store
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .has_publication_cancellation_intent(&request.run_id, &request.dispatch_identity)?;
+            if run.cancellation_requested_at_ms.is_some() || publication_cancelled {
                 Ok(bcode_workflow_store::AttemptObservation::Cancelled)
             } else {
                 Ok(bcode_workflow_store::AttemptObservation::Paused {
@@ -31221,6 +31547,14 @@ enum WorkflowPluginBlockPlan {
     AwaitingAuthorization,
 }
 
+struct PreparationMonitor(tokio::task::JoinHandle<()>);
+
+impl Drop for PreparationMonitor {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
 struct WorkflowActivationOwner<'a> {
     state: &'a Arc<ServerState>,
 }
@@ -31309,7 +31643,7 @@ impl WorkflowActivationOwner<'_> {
             let monitor_cancellation = cancellation.clone();
             let state = Arc::clone(self.state);
             let run_id = activation.run_id.clone();
-            let cancellation_monitor = tokio::spawn(async move {
+            let cancellation_monitor = PreparationMonitor(tokio::spawn(async move {
                 loop {
                     let cancelled = state
                         .workflow_store
@@ -31325,7 +31659,7 @@ impl WorkflowActivationOwner<'_> {
                     }
                     tokio::time::sleep(Duration::from_millis(10)).await;
                 }
-            });
+            }));
             let response = self
                 .state
                 .plugins
@@ -31342,7 +31676,7 @@ impl WorkflowActivationOwner<'_> {
                     &cancellation,
                 )
                 .await;
-            cancellation_monitor.abort();
+            drop(cancellation_monitor);
             let response =
                 response.map_err(|error| WorkflowStoreError::InvalidData(error.to_string()))?;
             validate_workflow_preparation_binding(&block, &owner_input, &response)?;
@@ -32170,6 +32504,7 @@ async fn workflow_child_session_for_activation(
 async fn persist_workflow_prompt_completion(
     store_path: &Path,
     dispatch_identity: &str,
+    authority: &bcode_workflow_store::WorkflowExecutionAuthority,
     observation: bcode_workflow_store::AttemptObservation,
 ) -> Result<bcode_workflow_store::ReceiptReconciliationSummary, WorkflowStoreError> {
     const RECEIPT_COMMIT_RETRY_LIMIT: usize = 200;
@@ -32187,8 +32522,9 @@ async fn persist_workflow_prompt_completion(
             tokio::time::sleep(Duration::from_millis(10)).await;
             continue;
         }
-        return store.apply_attempt_observation(
+        return store.apply_owned_attempt_observation(
             dispatch_identity,
+            authority,
             observation,
             current_unix_millis(),
         );
@@ -32199,27 +32535,9 @@ async fn persist_workflow_prompt_completion(
 async fn settle_workflow_prompt_observation(
     state: &Arc<ServerState>,
     request: &bcode_workflow_store::PreparedActivationDispatch,
+    authority: &bcode_workflow_store::WorkflowExecutionAuthority,
     observation: bcode_workflow_store::AttemptObservation,
 ) {
-    let authority =
-        match workflow_operations::execution_authority(state, &request.activation.run_id).await {
-            Ok(Some(authority)) => authority,
-            Ok(None) => {
-                tracing::warn!(
-                    run_id = %request.activation.run_id,
-                    "refusing workflow prompt settlement without durable execution authority"
-                );
-                return;
-            }
-            Err(error) => {
-                tracing::warn!(
-                    run_id = %request.activation.run_id,
-                    %error,
-                    "refusing workflow prompt settlement from a stale or foreign owner"
-                );
-                return;
-            }
-        };
     let store_path = state
         .workflow_store
         .lock()
@@ -32227,9 +32545,7 @@ async fn settle_workflow_prompt_observation(
         .path()
         .to_path_buf();
     if bcode_workflow_store::WorkflowStore::open_at_path(&store_path)
-        .and_then(|store| {
-            store.verify_execution_authority(&request.activation.run_id, &authority.authority)
-        })
+        .and_then(|store| store.verify_execution_authority(&request.activation.run_id, authority))
         .is_err()
     {
         tracing::warn!(
@@ -32238,8 +32554,13 @@ async fn settle_workflow_prompt_observation(
         );
         return;
     }
-    match persist_workflow_prompt_completion(&store_path, &request.dispatch_identity, observation)
-        .await
+    match persist_workflow_prompt_completion(
+        &store_path,
+        &request.dispatch_identity,
+        authority,
+        observation,
+    )
+    .await
     {
         Ok(summary) => {
             if let Err(error) =
@@ -32298,9 +32619,18 @@ async fn observe_existing_workflow_agent_turn(
         return Ok(initial);
     }
 
+    let mut shutdown = state.subscribe_shutdown();
+    if state.shutdown_requested.load(Ordering::SeqCst) {
+        return Err(WorkflowStoreError::OwnerAccessDeferred);
+    }
     let wait = async {
         loop {
-            match events.recv().await {
+            let event = tokio::select! {
+                biased;
+                _ = shutdown.recv() => return Err(WorkflowStoreError::OwnerAccessDeferred),
+                event = events.recv() => event,
+            };
+            match event {
                 Ok(event)
                     if matches!(
                         event.kind,
@@ -32404,11 +32734,94 @@ async fn workflow_prompt_activity(
     serde_json::from_slice(&response.payload).ok()
 }
 
+struct WorkflowPromptAdmission<'a> {
+    state: &'a ServerState,
+    identity: String,
+    lock: Arc<Mutex<()>>,
+}
+
+impl Drop for WorkflowPromptAdmission<'_> {
+    fn drop(&mut self) {
+        let mut admissions = self
+            .state
+            .workflow_prompt_admissions
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if admissions
+            .get(&self.identity)
+            .is_some_and(|entry| entry.strong_count() == 1)
+        {
+            admissions.remove(&self.identity);
+        }
+    }
+}
+
+fn workflow_prompt_admission<'a>(
+    state: &'a ServerState,
+    identity: &str,
+) -> WorkflowPromptAdmission<'a> {
+    let lock = {
+        let mut admissions = state
+            .workflow_prompt_admissions
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        admissions
+            .get(identity)
+            .and_then(std::sync::Weak::upgrade)
+            .unwrap_or_else(|| {
+                let lock = Arc::new(Mutex::new(()));
+                admissions.insert(identity.to_owned(), Arc::downgrade(&lock));
+                lock
+            })
+    };
+    WorkflowPromptAdmission {
+        state,
+        identity: identity.to_owned(),
+        lock,
+    }
+}
+
+fn workflow_prompt_admission_error(error: &ServerError) -> WorkflowStoreError {
+    if matches!(
+        error,
+        ServerError::Session(bcode_session::SessionError::Lease(
+            bcode_session::lease::SessionLeaseError::OwnedByOtherDaemon { .. }
+        ))
+    ) {
+        WorkflowStoreError::OwnerAccessDeferred
+    } else {
+        WorkflowStoreError::InvalidData(error.to_string())
+    }
+}
+
 #[allow(clippy::too_many_lines)]
 async fn dispatch_workflow_prompt_turn(
     state: &Arc<ServerState>,
     request: &bcode_workflow_store::PreparedActivationDispatch,
 ) -> Result<serde_json::Value, WorkflowStoreError> {
+    let admission = workflow_prompt_admission(state, &request.dispatch_identity);
+    let admission_guard = admission.lock.lock().await;
+    if state.shutdown_requested.load(Ordering::SeqCst) {
+        return Err(WorkflowStoreError::OwnerAccessDeferred);
+    }
+    let dispatch_guard =
+        workflow_operations::execution_authority(state, &request.activation.run_id)
+            .await
+            .map_err(|error| WorkflowStoreError::InvalidData(error.to_string()))?
+            .ok_or_else(|| {
+                WorkflowStoreError::InvalidData(
+                    "workflow prompt dispatch requires execution authority".into(),
+                )
+            })?;
+    let dispatch_authority = dispatch_guard.authority.clone();
+    let existing_receipt = state
+        .workflow_store
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .check_owner_admission(request, &dispatch_authority)?;
+    if let Some(receipt) = existing_receipt {
+        return Ok(receipt);
+    }
     let configuration = workflow_prompt_configuration_from_intent(request)?;
     let execution_target = configuration.execution_target;
     let input = request.activation.input.as_ref().ok_or_else(|| {
@@ -32610,7 +33023,9 @@ async fn dispatch_workflow_prompt_turn(
             configuration.timeout_ms
         ))
     })?
-    .map_err(|error| WorkflowStoreError::InvalidData(error.to_string()))?;
+    .map_err(|error| workflow_prompt_admission_error(&error))?;
+    drop(admission_guard);
+    drop(admission);
     let (receipt, completion_receiver, existing_turn) = match submitted {
         SubmittedModelTurn::Started {
             receipt,
@@ -32664,6 +33079,7 @@ async fn dispatch_workflow_prompt_turn(
             settle_workflow_prompt_observation(
                 &state_for_completion,
                 &request_for_completion,
+                &dispatch_authority,
                 observation,
             )
             .await;
@@ -32689,6 +33105,7 @@ async fn dispatch_workflow_prompt_turn(
                     settle_workflow_prompt_observation(
                         &state_for_completion,
                         &request_for_completion,
+                        &dispatch_authority,
                         observation,
                     )
                     .await;
@@ -32817,13 +33234,21 @@ async fn restore_workflow_runs(state: &Arc<ServerState>, run_ids: Vec<String>) {
         } else {
             true
         };
-        let publication_available = if let Err(error) =
-            propagate_publication_cancellation(state, &run_id, &authority.authority).await
+        let mut publication_cancellation_cursor = None;
+        let publication_available = if let Err(error) = propagate_publication_cancellation(
+            state,
+            &run_id,
+            &authority.authority,
+            &mut publication_cancellation_cursor,
+        )
+        .await
         {
             tracing::warn!(run_id, %error, "failed to restore publication cancellation");
             false
         } else {
-            true
+            // The driver continues the paginated sweep; do not restore prepared work
+            // while this bounded recovery pass has not established its completion.
+            publication_cancellation_cursor.is_none()
         };
         let sibling_available = if let Err(error) =
             retry_owned_sibling_cancellation(state, &run_id, &authority.authority).await
@@ -33194,12 +33619,16 @@ async fn propagate_publication_cancellation(
     state: &ServerState,
     run_id: &str,
     authority: &bcode_workflow_store::WorkflowExecutionAuthority,
+    cursor: &mut Option<String>,
 ) -> Result<(), WorkflowStoreError> {
     let attempts = state
         .workflow_store
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .pending_publication_cancellations(run_id, authority, 1_000)?;
+        .pending_publication_cancellations_after(run_id, authority, cursor.as_deref(), 32)?;
+    *cursor = attempts
+        .last()
+        .map(|attempt| attempt.dispatch_identity.clone());
     for attempt in attempts {
         state
             .workflow_store
@@ -51753,21 +52182,83 @@ library = "test"
     }
 
     async fn active_edit_execution_fixture() -> (ServerState, SessionId, tempfile::TempDir) {
-        let sessions = SessionManager::default();
+        active_edit_execution_fixture_with_effect(
+            bcode_workflow_store::DispatchSideEffect::ReadOnly,
+        )
+        .await
+    }
+
+    async fn active_edit_execution_fixture_with_effect(
+        effect: bcode_workflow_store::DispatchSideEffect,
+    ) -> (ServerState, SessionId, tempfile::TempDir) {
+        active_edit_execution_fixture_with_graph(effect, false).await
+    }
+
+    fn persist_connected_edit_definition(
+        store: &mut bcode_workflow_store::WorkflowStore,
+        connected: bool,
+    ) {
+        if connected {
+            let mut definition = store
+                .definition("edit-test", 1)
+                .expect("definition")
+                .expect("present")
+                .definition()
+                .expect("decode");
+            let mut successor = definition.nodes["agent"].clone();
+            successor.id = "waiting-successor".into();
+            definition.nodes.insert(successor.id.clone(), successor);
+            definition.exits = vec!["waiting-successor".into()];
+            definition.edges.push(bcode_workflow::EdgeDefinition {
+                from: "agent".into(),
+                to: "waiting-successor".into(),
+                kind: bcode_workflow::EdgeKind::Direct,
+                transform: None,
+            });
+            store
+                .persist_definition("edit-test", 2, &definition)
+                .expect("connected definition");
+        }
+    }
+
+    fn publication_fixture_sessions(root: &Path, connected: bool) -> SessionManager {
+        if connected {
+            SessionManager::persistent_with_metrics_and_lease_owner(
+                root.join("sessions"),
+                MetricsRegistry::default(),
+                SessionLeaseOwnerContext {
+                    daemon_instance_id: Some(
+                        test_workflow_execution_authority().daemon_instance_id,
+                    ),
+                    ..SessionLeaseOwnerContext::default()
+                },
+            )
+            .expect("sessions")
+        } else {
+            SessionManager::default()
+        }
+    }
+
+    async fn active_edit_execution_fixture_with_graph(
+        effect: bcode_workflow_store::DispatchSideEffect,
+        connected: bool,
+    ) -> (ServerState, SessionId, tempfile::TempDir) {
+        let root = tempfile::tempdir().expect("root");
+        let sessions = publication_fixture_sessions(root.path(), connected);
         let parent = sessions
             .create_session(None, PathBuf::from("."))
             .await
             .expect("parent");
-        let root = tempfile::tempdir().expect("root");
         let mut store =
             bcode_workflow_store::WorkflowStore::open_in_state_dir(root.path()).expect("store");
         persist_active_edit_definition(&mut store);
+        persist_connected_edit_definition(&mut store, connected);
         let authority = test_workflow_execution_authority();
         store
             .create_run(&bcode_workflow_store::NewWorkflowRun {
                 run_id: "edit-run".to_owned(),
                 definition_id: "edit-test".to_owned(),
-                definition_version: 1,
+                definition_version: if connected { 2 } else { 1 },
                 workspace_snapshot: "snapshot".to_owned(),
                 parent_session_id: Some(parent.id.to_string()),
                 parent_session_generation: None,
@@ -51796,8 +52287,8 @@ library = "test"
                 "edit-run",
                 "agent",
                 &pending.activation_id,
-                bcode_workflow_store::DispatchSideEffect::ReadOnly,
-                serde_json::json!({}),
+                effect,
+                serde_json::json!({"configuration": pending.node.configuration, "node": pending.node, "input": pending.input}),
                 2,
             )
             .expect("prepare")
@@ -51834,6 +52325,7 @@ library = "test"
             .expect("link");
         let mut state = test_server_state_with_fake_provider_and_workflow_store(sessions, store);
         state.daemon_status.instance_id = authority.daemon_instance_id.clone();
+        register_test_execution_lifetime(&mut state, root.path());
         state.set_workflow_run_graph_edit_policy(WorkflowRunGraphEditPolicy {
             evaluator: Arc::new(|facts| {
                 workflow_operations::authorize_configured_run_graph_edit(
@@ -51843,6 +52335,28 @@ library = "test"
             }),
         });
         (state, child.id, root)
+    }
+
+    fn register_test_execution_lifetime(state: &mut ServerState, root: &std::path::Path) {
+        let record = bcode_daemon_lifecycle::DaemonRecord::current(
+            &bcode_ipc::default_endpoint(),
+            root.join("daemon.log"),
+            None,
+            state.daemon_status.instance_id.clone(),
+        )
+        .expect("daemon record");
+        state.state_root = root.to_path_buf();
+        state
+            .daemon_status
+            .state_location_id
+            .clone_from(&record.state_location_id);
+        state
+            .execution_lifetime
+            .set(
+                bcode_daemon_lifecycle::ExecutionLifetime::begin(root, &record)
+                    .expect("execution lifetime"),
+            )
+            .expect("new lifetime");
     }
 
     fn register_workflow_publication_tool(state: &mut ServerState) {
@@ -52228,6 +52742,1262 @@ library = "test"
     }
 
     #[tokio::test]
+    #[allow(clippy::too_many_lines)]
+    async fn publication_cancels_live_prompt_and_executes_revised_result() {
+        Box::pin(assert_live_publication_result(false)).await;
+    }
+
+    #[tokio::test]
+    async fn publication_resumes_after_server_replacement() {
+        Box::pin(assert_live_publication_result(true)).await;
+    }
+
+    #[allow(clippy::too_many_lines)]
+    async fn assert_live_publication_result(replace_server: bool) {
+        let _guard = WORKFLOW_RUNTIME_TEST_LOCK.lock().await;
+        let session_root = tempfile::tempdir().expect("sessions");
+        let sessions = SessionManager::persistent(session_root.path()).expect("sessions");
+        let parent = sessions
+            .create_session(None, PathBuf::from("."))
+            .await
+            .expect("parent");
+        let root = tempfile::tempdir().expect("root");
+        let mut store =
+            bcode_workflow_store::WorkflowStore::open_in_state_dir(root.path()).expect("store");
+        persist_active_edit_definition(&mut store);
+        let authority = test_workflow_execution_authority();
+        store
+            .create_run(&bcode_workflow_store::NewWorkflowRun {
+                run_id: "edit-run".into(),
+                definition_id: "edit-test".into(),
+                definition_version: 1,
+                workspace_snapshot: "snapshot".into(),
+                parent_session_id: Some(parent.id.to_string()),
+                parent_session_generation: None,
+                binding: None,
+                authored_provenance: None,
+                input: Some(serde_json::json!(true)),
+                execution_authority: Some(authority.clone()),
+                created_at_ms: 1,
+                authorization_profile: bcode_workflow::WorkflowAuthorizationProfileIdentity {
+                    version: 1,
+                    provider_id: "test-policy".into(),
+                    profile_id: "build".into(),
+                    policy_digest_sha256: "a".repeat(64),
+                },
+                authorization_ceiling: bcode_workflow::WorkflowToolCapability::Mutating,
+                limits: bcode_workflow_store::WorkflowRunLimits::default(),
+            })
+            .expect("run");
+        let path = store.path().to_path_buf();
+        let (mut state,) = (test_server_state_with_fake_provider_and_workflow_store(
+            sessions, store,
+        ),);
+        state.daemon_status.instance_id = authority.daemon_instance_id.clone();
+        register_test_execution_lifetime(&mut state, root.path());
+        state
+            .selected_provider_context
+            .settings
+            .insert("fake_turn_delay_ms".into(), "750".into());
+        state.set_workflow_run_graph_edit_policy(WorkflowRunGraphEditPolicy {
+            evaluator: Arc::new(|_| WorkflowApplicationAuthorizationDecision::Allow),
+        });
+        state.set_workflow_run_graph_publication_policy(WorkflowRunGraphPublicationPolicy {
+            evaluator: Arc::new(|_| WorkflowApplicationAuthorizationDecision::Allow),
+        });
+        let (sender, mut queued) = mpsc::channel(2);
+        state.workflow_driver_sender.set(sender).expect("queue");
+        let (state,) = (Arc::new(state),);
+        register_workflow_runtime_work(&state, parent.id, "edit-run", "publication".into()).await;
+        let dispatch = bcode_workflow_store::WorkflowStore::open_at_path(&path)
+            .expect("scheduler")
+            .dispatch_owned_pending_activations_for_run(
+                &WorkflowPromptTurnOwner { state: &state },
+                "edit-run",
+                &authority,
+                1,
+                current_unix_millis(),
+            )
+            .await
+            .expect("dispatch live prompt");
+        assert_eq!(dispatch.admitted.len(), 1);
+        let attempt = state
+            .workflow_store
+            .lock()
+            .expect("store")
+            .attempt_history("edit-run", None, 10)
+            .expect("attempts")
+            .pop()
+            .expect("attempt");
+        let child = state
+            .sessions
+            .all_session_summaries()
+            .await
+            .into_iter()
+            .find(|session| session.execution.is_some())
+            .expect("child");
+        let mut edit = publication_leaf_edit(attempt.activation_id.clone());
+        let bcode_workflow::WorkflowRunGraphEdit::AddNode { node, .. } = &mut edit.edits[0] else {
+            panic!("added node");
+        };
+        node.output.type_name = "revised-boolean/v1".into();
+        node.configuration = test_workflow_prompt_configuration(
+            node.output.clone(),
+            bcode_workflow::PromptContextTarget::FreshIsolated,
+        );
+        edit.reconciliation = vec![bcode_workflow::WorkflowRunGraphReconciliation::Cancel {
+            activation_id: attempt.activation_id,
+        }];
+        state
+            .stage_workflow_run_graph_edit_from_invocation(
+                child.id,
+                "bcode.workflow",
+                edit.clone(),
+                &TurnCancelState::default(),
+            )
+            .await
+            .expect("stage");
+        assert!(matches!(
+            state
+                .accept_workflow_run_graph_publication_from_invocation(
+                    child.id,
+                    "bcode.workflow",
+                    edit,
+                    &TurnCancelState::default()
+                )
+                .await
+                .expect("accept"),
+            bcode_workflow::WorkflowRunGraphPublicationStatus::Pending { .. }
+        ));
+        assert_eq!(queued.try_recv().expect("wake"), "edit-run");
+        let state = if replace_server {
+            // Stop the original scheduler before its turn-completion callback can publish.
+            state.shutdown_requested.store(true, Ordering::SeqCst);
+            propagate_publication_cancellation(&state, "edit-run", &authority, &mut None)
+                .await
+                .expect("signal original owner");
+            tokio::time::timeout(Duration::from_secs(10), async {
+                loop {
+                    let history = state
+                        .sessions
+                        .session_history_page(
+                            child.id,
+                            bcode_session_models::SessionHistoryQuery {
+                                cursor: None,
+                                limit: 256,
+                                direction: bcode_session_models::SessionHistoryDirection::Backward,
+                            },
+                        )
+                        .await
+                        .expect("terminal history");
+                    if history.events.iter().any(|event| {
+                        matches!(
+                            event.kind,
+                            SessionEventKind::ModelTurnFinished {
+                                outcome: ModelTurnOutcome::Cancelled,
+                                ..
+                            }
+                        )
+                    }) {
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .expect("original turn cancelled");
+            assert_eq!(
+                state
+                    .workflow_store
+                    .lock()
+                    .expect("store")
+                    .run_graph_revision("edit-run")
+                    .expect("revision"),
+                Some(1)
+            );
+            shutdown_publication_owner(&state).await;
+            drop(state);
+            let sessions =
+                SessionManager::persistent(session_root.path()).expect("replacement sessions");
+            let store = bcode_workflow_store::WorkflowStore::open_at_path(&path)
+                .expect("replacement store");
+            let mut replacement =
+                test_server_state_with_fake_provider_and_workflow_store(sessions, store);
+            replacement.daemon_status.instance_id = "replacement-publication-daemon".into();
+            replacement.state_root = root.path().to_path_buf();
+            Arc::new(replacement)
+        } else {
+            state
+        };
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                drive_workflow_run(&state, "edit-run")
+                    .await
+                    .expect("drive cancellation and revision");
+                let outputs = state
+                    .workflow_store
+                    .lock()
+                    .expect("store")
+                    .validated_outputs("edit-run", 10)
+                    .expect("outputs");
+                if outputs.iter().any(|output| {
+                    output.node_id == "next" && output.value == serde_json::json!(true)
+                }) {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("revised result");
+        let store = state.workflow_store.lock().expect("store");
+        assert_eq!(
+            store.run_graph_revision("edit-run").expect("revision"),
+            Some(2)
+        );
+        if replace_server {
+            let recovered_authority = store
+                .execution_authority("edit-run")
+                .expect("authority")
+                .expect("owner");
+            assert_eq!(
+                recovered_authority.daemon_instance_id,
+                "replacement-publication-daemon"
+            );
+            assert_eq!(recovered_authority.generation, authority.generation + 1);
+        }
+        let attempts = store
+            .attempt_history("edit-run", None, 10)
+            .expect("history");
+        assert_eq!(attempts.len(), 2, "one original and one revised admission");
+        drop(store);
+        drop(state);
+        assert!(
+            attempts
+                .iter()
+                .any(|attempt| attempt.node_id == "agent" && attempt.status == "cancelled")
+        );
+        assert!(
+            attempts
+                .iter()
+                .any(|attempt| attempt.node_id == "next" && attempt.status == "succeeded")
+        );
+    }
+
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)]
+    async fn application_cancellation_repair_executes_pending_publication() {
+        let (mut state, child_id, _root) = active_edit_execution_fixture_with_effect(
+            bcode_workflow_store::DispatchSideEffect::Mutating,
+        )
+        .await;
+        state.daemon_status.artifact_id = Some(bcode_ipc::ArtifactId::current());
+        let (sender, _queued) = mpsc::channel(2);
+        state.workflow_driver_sender.set(sender).expect("queue");
+        state.set_workflow_run_graph_publication_policy(WorkflowRunGraphPublicationPolicy {
+            evaluator: Arc::new(|_| WorkflowApplicationAuthorizationDecision::Allow),
+        });
+        let (attempt, path, authority) = {
+            let mut store = state.workflow_store.lock().expect("store");
+            let attempt = store
+                .attempt_history("edit-run", None, 10)
+                .expect("attempts")
+                .pop()
+                .expect("attempt");
+            store.persist_dispatch_receipt(&bcode_workflow_store::DispatchReceipt {
+                run_id: "edit-run".into(), node_id: "agent".into(), activation_id: attempt.activation_id.clone(), attempt: attempt.attempt,
+                dispatch_identity: attempt.dispatch_identity.clone(),
+                receipt: serde_json::json!({"owner": "bcode.server.agent-turn/v1", "session_id": SessionId::new(), "turn_id": "lost-turn", "output_schema_id": "boolean"}), admitted_at_ms: 4,
+            }).expect("receipt");
+            (
+                attempt,
+                store.path().to_path_buf(),
+                store
+                    .execution_authority("edit-run")
+                    .expect("authority")
+                    .expect("owner"),
+            )
+        };
+        let mut edit = publication_leaf_edit(attempt.activation_id.clone());
+        edit.reconciliation = vec![bcode_workflow::WorkflowRunGraphReconciliation::Cancel {
+            activation_id: attempt.activation_id,
+        }];
+        state
+            .stage_workflow_run_graph_edit_from_invocation(
+                child_id,
+                "bcode.workflow",
+                edit.clone(),
+                &TurnCancelState::default(),
+            )
+            .await
+            .expect("stage");
+        state
+            .accept_workflow_run_graph_publication_from_invocation(
+                child_id,
+                "bcode.workflow",
+                edit,
+                &TurnCancelState::default(),
+            )
+            .await
+            .expect("accept");
+        let state = Arc::new(state);
+        let reconciled = bcode_workflow_store::WorkflowStore::open_at_path(&path)
+            .expect("store")
+            .reconcile_owned_receipts_for_run_async(
+                &WorkflowTurnReceiptObserver { state: &state },
+                "edit-run",
+                &authority,
+                10,
+                5,
+            )
+            .await
+            .expect("ambiguous reconciliation");
+        assert_eq!(reconciled.repair_required.len(), 1, "{reconciled:?}");
+        let result = bcode_workflow::WorkflowRunApplication::repair_workflow_attempt(
+            &workflow_operations::WorkflowAuthoringApplication::new(&state, ClientId::new()),
+            attempt.dispatch_identity,
+            bcode_workflow::RepairResolution::ConfirmCancelled {
+                message: "operator verified cancelled work".into(),
+            },
+        )
+        .await
+        .expect("application repair");
+        assert_eq!(result.attempt_status, "cancelled");
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                drive_workflow_run(&state, "edit-run")
+                    .await
+                    .expect("continue");
+                let outputs = state
+                    .workflow_store
+                    .lock()
+                    .expect("store")
+                    .validated_outputs("edit-run", 10)
+                    .expect("outputs");
+                if outputs.iter().any(|output| {
+                    output.node_id == "next" && output.value == serde_json::json!(true)
+                }) {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("revised result");
+        let attempts = state
+            .workflow_store
+            .lock()
+            .expect("store")
+            .attempt_history("edit-run", None, 10)
+            .expect("history");
+        drop(state);
+        assert_eq!(attempts.len(), 2);
+        assert!(
+            attempts
+                .iter()
+                .any(|attempt| attempt.node_id == "agent" && attempt.status == "cancelled")
+        );
+    }
+
+    #[tokio::test]
+    async fn pending_invocation_publication_survives_reopen_and_finalizes() {
+        Box::pin(assert_invocation_publication_recovery(false)).await;
+    }
+
+    #[tokio::test]
+    async fn terminal_publication_conflict_preserves_result_over_ipc() {
+        Box::pin(assert_invocation_publication_recovery(true)).await;
+    }
+
+    async fn assert_invocation_publication_recovery(conflict: bool) {
+        use bcode_workflow::WorkflowRunGraphPublicationStatus as Status;
+        let (mut state, child_id, _root) = active_edit_execution_fixture_with_graph(
+            bcode_workflow_store::DispatchSideEffect::ReadOnly,
+            conflict,
+        )
+        .await;
+        let (sender, mut scheduled) = mpsc::channel(2);
+        state.workflow_driver_sender.set(sender).expect("scheduler");
+        register_workflow_publication_tool(&mut state);
+        state.set_workflow_run_graph_publication_policy(WorkflowRunGraphPublicationPolicy {
+            evaluator: Arc::new(|_| WorkflowApplicationAuthorizationDecision::Allow),
+        });
+        let (activation_id, identity, path, authority) = {
+            let mut store = state.workflow_store.lock().expect("store");
+            let attempt = store
+                .attempt_history("edit-run", None, 10)
+                .expect("attempts")
+                .pop()
+                .expect("attempt");
+            store
+                .persist_dispatch_receipt(&bcode_workflow_store::DispatchReceipt {
+                    run_id: "edit-run".into(),
+                    node_id: "agent".into(),
+                    activation_id: attempt.activation_id.clone(),
+                    attempt: attempt.attempt,
+                    dispatch_identity: attempt.dispatch_identity.clone(),
+                    receipt: serde_json::json!({"accepted": true}),
+                    admitted_at_ms: 4,
+                })
+                .expect("admit");
+            (
+                attempt.activation_id,
+                attempt.dispatch_identity,
+                store.path().to_path_buf(),
+                store
+                    .execution_authority("edit-run")
+                    .expect("authority")
+                    .expect("owner"),
+            )
+        };
+        let mut edit = publication_leaf_edit(activation_id.clone());
+        edit.reconciliation =
+            vec![bcode_workflow::WorkflowRunGraphReconciliation::Cancel { activation_id }];
+        let cancel = TurnCancelState::default();
+        state
+            .stage_workflow_run_graph_edit_from_invocation(
+                child_id,
+                "bcode.workflow",
+                edit.clone(),
+                &cancel,
+            )
+            .await
+            .expect("stage");
+        assert_eq!(
+            state
+                .accept_workflow_run_graph_publication_from_invocation(
+                    child_id,
+                    "bcode.workflow",
+                    edit.clone(),
+                    &cancel
+                )
+                .await
+                .expect("accept"),
+            Status::Pending {
+                expected_revision: 1
+            }
+        );
+        if conflict {
+            state.daemon_status.instance_id = "replacement-publication-owner".into();
+        }
+        let mut state = Arc::new(state);
+        if conflict {
+            release_publication_owner(&mut state).await;
+        }
+        assert_publication_observation_with_full_queue(&state, edit.clone()).await;
+        assert_eq!(scheduled.try_recv().expect("wake"), "edit-run");
+        if conflict {
+            assert_publication_authority_transferred(&state, &authority);
+            assert_stale_prompt_completion_rejected(&path, &identity, &authority).await;
+            recover_terminal_publication_over_ipc(&state, edit, &identity).await;
+            drop(state);
+            return;
+        }
+        let mut cursor = None;
+        assert!(
+            !finalize_workflow_publication_page(&path, "edit-run", &authority, &mut cursor, 5)
+                .expect("not settled")
+        );
+        settle_reopened_publication_attempt(&path, &identity);
+        cursor = None;
+        assert!(
+            finalize_workflow_publication_page(&path, "edit-run", &authority, &mut cursor, 7)
+                .expect("finalize")
+        );
+        assert_reopened_publication_work(&path);
+        drive_workflow_run(&state, "edit-run")
+            .await
+            .expect("execute revised graph");
+    }
+
+    async fn release_publication_owner(state: &mut Arc<ServerState>) {
+        let parent_id = state
+            .workflow_store
+            .lock()
+            .expect("store")
+            .run_summary("edit-run")
+            .expect("run")
+            .expect("present")
+            .parent_session_id
+            .expect("parent");
+        let parent_id = SessionId::from_str(&parent_id).expect("session id");
+        let ownership = state
+            .sessions
+            .acquire_session_ownership(parent_id, bcode_session::SessionOwnershipKind::RuntimeWork)
+            .await
+            .expect("prior ownership");
+        assert!(matches!(
+            workflow_operations::execution_authority(state, "edit-run").await,
+            Err(ServerError::WorkflowOwnedByLiveDaemon { .. })
+        ));
+        drop(ownership);
+        state
+            .sessions
+            .release_session_ownership(parent_id)
+            .await
+            .expect("release");
+        assert!(!state.sessions.session_is_owned(parent_id).await);
+        // No background owner may remain when this fixture simulates daemon exit.
+        drop(
+            Arc::get_mut(state)
+                .expect("exclusive old owner")
+                .execution_lifetime
+                .take(),
+        );
+    }
+
+    fn assert_publication_authority_transferred(
+        state: &ServerState,
+        prior: &bcode_workflow_store::WorkflowExecutionAuthority,
+    ) {
+        let replacement = state
+            .workflow_store
+            .lock()
+            .expect("store")
+            .execution_authority("edit-run")
+            .expect("authority")
+            .expect("replacement");
+        assert!(replacement.generation > prior.generation);
+        assert_ne!(replacement.fencing_token, prior.fencing_token);
+        assert_eq!(
+            replacement.daemon_instance_id,
+            state.daemon_status.instance_id
+        );
+    }
+
+    fn assert_reopened_publication_work(path: &std::path::Path) {
+        let reopened =
+            bcode_workflow_store::WorkflowStore::open_at_path(path).expect("reopen committed");
+        assert_eq!(
+            reopened.run_graph_revision("edit-run").expect("revision"),
+            Some(2)
+        );
+        assert!(
+            reopened
+                .pending_activations(10)
+                .expect("work")
+                .iter()
+                .any(|activation| activation.node_id == "next")
+        );
+    }
+
+    async fn assert_stale_prompt_completion_rejected(
+        path: &Path,
+        identity: &str,
+        authority: &bcode_workflow_store::WorkflowExecutionAuthority,
+    ) {
+        assert!(
+            persist_workflow_prompt_completion(
+                path,
+                identity,
+                authority,
+                bcode_workflow_store::AttemptObservation::Cancelled
+            )
+            .await
+            .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn shutdown_defers_prepared_workflow_redispatch() {
+        let (state, _, _root) = active_edit_execution_fixture_with_graph(
+            bcode_workflow_store::DispatchSideEffect::ReadOnly,
+            true,
+        )
+        .await;
+        let state = Arc::new(state);
+        state.shutdown_requested.store(true, Ordering::SeqCst);
+        drive_workflow_run(&state, "edit-run").await.expect("defer");
+        let store = state.workflow_store.lock().expect("store");
+        let attempts = store
+            .attempt_history("edit-run", None, 10)
+            .expect("attempts");
+        assert_eq!(attempts.len(), 1);
+        assert_eq!(attempts[0].status, "prepared");
+        assert!(!attempts[0].has_receipt);
+        drop(store);
+        drop(state);
+    }
+
+    #[tokio::test]
+    async fn waiting_workflow_admission_observes_durable_cancellation() {
+        let (state, _, _root) = active_edit_execution_fixture_with_graph(
+            bcode_workflow_store::DispatchSideEffect::ReadOnly,
+            true,
+        )
+        .await;
+        let state = Arc::new(state);
+        let request = receipt_owned_publication_request(&state);
+        let admission = workflow_prompt_admission(&state, &request.dispatch_identity);
+        let guard = admission.lock.lock().await;
+        let mut dispatch = Box::pin(dispatch_workflow_prompt_turn(&state, &request));
+        assert!(futures::poll!(&mut dispatch).is_pending());
+        {
+            let mut store = state.workflow_store.lock().expect("store");
+            let authority = store
+                .execution_authority("edit-run")
+                .expect("authority")
+                .expect("owner");
+            store
+                .request_cancellation_owned("edit-run", current_unix_millis(), &authority)
+                .expect("cancel");
+        }
+        drop(guard);
+        assert!(dispatch.await.is_err());
+        drop(admission);
+        assert!(
+            !state
+                .workflow_store
+                .lock()
+                .expect("store")
+                .dispatch_receipt_committed(&request.dispatch_identity)
+                .expect("receipt")
+        );
+        drop(state);
+    }
+
+    #[tokio::test]
+    async fn waiting_workflow_admission_observes_shutdown() {
+        let (state, _, _root) = active_edit_execution_fixture_with_graph(
+            bcode_workflow_store::DispatchSideEffect::ReadOnly,
+            true,
+        )
+        .await;
+        let state = Arc::new(state);
+        let request = receipt_owned_publication_request(&state);
+        let admission = workflow_prompt_admission(&state, &request.dispatch_identity);
+        let guard = admission.lock.lock().await;
+        let mut dispatch = Box::pin(dispatch_workflow_prompt_turn(&state, &request));
+        assert!(futures::poll!(&mut dispatch).is_pending());
+        state.shutdown_requested.store(true, Ordering::SeqCst);
+        drop(guard);
+        assert!(matches!(
+            dispatch.await,
+            Err(WorkflowStoreError::OwnerAccessDeferred)
+        ));
+        drop(admission);
+        assert!(
+            state
+                .workflow_prompt_admissions
+                .lock()
+                .expect("admissions")
+                .is_empty()
+        );
+        drop(state);
+    }
+
+    #[tokio::test]
+    async fn duplicate_workflow_prompt_admission_reuses_receipt() {
+        let (state, _, _root) = active_edit_execution_fixture_with_graph(
+            bcode_workflow_store::DispatchSideEffect::ReadOnly,
+            true,
+        )
+        .await;
+        let state = Arc::new(state);
+        let request = receipt_owned_publication_request(&state);
+        let (first, duplicate) = tokio::join!(
+            dispatch_workflow_prompt_turn(&state, &request),
+            dispatch_workflow_prompt_turn(&state, &request),
+        );
+        assert_eq!(first.expect("dispatch"), duplicate.expect("duplicate"));
+        assert!(
+            state
+                .workflow_prompt_admissions
+                .lock()
+                .expect("admissions")
+                .is_empty()
+        );
+        drop(state);
+    }
+
+    #[tokio::test]
+    async fn publication_fixture_dispatches_receipt_owned_turn() {
+        let (state, request, edit, _root) = Box::pin(prepare_restarted_publication_fixture()).await;
+        state.start_workflow_driver().await;
+        restore_workflow_runtime_work(&state).await;
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                let succeeded = state
+                    .workflow_store
+                    .lock()
+                    .expect("store")
+                    .attempt_history("edit-run", None, 10)
+                    .expect("attempts")
+                    .iter()
+                    .any(|attempt| {
+                        attempt.dispatch_identity == request.dispatch_identity
+                            && attempt.status == "cancelled"
+                    });
+                if succeeded {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .unwrap_or_else(|error| {
+            panic!(
+                "owner settlement: {error}; attempts: {:?}",
+                state
+                    .workflow_store
+                    .lock()
+                    .expect("store")
+                    .attempt_history("edit-run", None, 10)
+            );
+        });
+        finish_recovered_receipt_publication(&state, edit).await;
+        drop(state);
+    }
+
+    async fn prepare_restarted_publication_fixture() -> (
+        Arc<ServerState>,
+        bcode_workflow_store::PreparedActivationDispatch,
+        bcode_workflow::WorkflowRunGraphEditBatch,
+        tempfile::TempDir,
+    ) {
+        let (mut server, _, root) = active_edit_execution_fixture_with_graph(
+            bcode_workflow_store::DispatchSideEffect::ReadOnly,
+            true,
+        )
+        .await;
+        register_workflow_publication_tool(&mut server);
+        server.set_workflow_run_graph_publication_policy(WorkflowRunGraphPublicationPolicy {
+            evaluator: Arc::new(|_| WorkflowApplicationAuthorizationDecision::Allow),
+        });
+        let original = Arc::new(server);
+        let request = receipt_owned_publication_request(&original);
+        let receipt = dispatch_workflow_prompt_turn(&original, &request)
+            .await
+            .expect("dispatch");
+        original
+            .workflow_store
+            .lock()
+            .expect("store")
+            .persist_dispatch_receipt(&bcode_workflow_store::DispatchReceipt {
+                run_id: "edit-run".into(),
+                node_id: "agent".into(),
+                activation_id: request.activation.activation_id.clone(),
+                attempt: request.attempt,
+                dispatch_identity: request.dispatch_identity.clone(),
+                receipt,
+                admitted_at_ms: current_unix_millis(),
+            })
+            .expect("receipt");
+        // Retain the publication wake without starting successor scheduling in the old
+        // owner: the replacement below must be the one to execute revised work.
+        let (sender, receiver) = mpsc::channel(2);
+        original
+            .workflow_driver_sender
+            .set(sender)
+            .expect("publication queue");
+        let edit = accept_receipt_publication_candidate(&original, &request).await;
+        let authority = original
+            .workflow_store
+            .lock()
+            .expect("store")
+            .execution_authority("edit-run")
+            .expect("authority")
+            .expect("owned");
+        propagate_publication_cancellation(&original, "edit-run", &authority, &mut None)
+            .await
+            .expect("signal cancellation");
+        let session_id = original
+            .workflow_store
+            .lock()
+            .expect("store")
+            .execution_session_link(
+                "edit-run",
+                "agent",
+                &request.activation.activation_id,
+                request.attempt,
+            )
+            .expect("link")
+            .expect("session")
+            .session_id
+            .parse::<SessionId>()
+            .expect("id");
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                if original.session_current_turn(session_id).await.is_none() {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("turn cancellation settled");
+        original.shutdown_requested.store(true, Ordering::SeqCst);
+        drop(receiver);
+        let mut replacement = reopen_publication_receipt_owner(&original).await;
+        shutdown_publication_owner(&original).await;
+        drop(original);
+        // Load the replacement's static plugin host after old-host deactivation.
+        {
+            let replacement_state = Arc::get_mut(&mut replacement).expect("new owner");
+            register_workflow_publication_tool(replacement_state);
+            replacement_state.set_workflow_run_graph_publication_policy(
+                WorkflowRunGraphPublicationPolicy {
+                    evaluator: Arc::new(|_| WorkflowApplicationAuthorizationDecision::Allow),
+                },
+            );
+        }
+        (replacement, request, edit, root)
+    }
+
+    async fn accept_receipt_publication_candidate(
+        state: &Arc<ServerState>,
+        request: &bcode_workflow_store::PreparedActivationDispatch,
+    ) -> bcode_workflow::WorkflowRunGraphEditBatch {
+        let mut edit = publication_leaf_edit(request.activation.activation_id.clone());
+        edit.reconciliation = vec![bcode_workflow::WorkflowRunGraphReconciliation::Cancel {
+            activation_id: request.activation.activation_id.clone(),
+        }];
+        state.start_workflow_driver().await;
+        state
+            .stage_workflow_run_graph_edit(ClientId::new(), edit.clone())
+            .await
+            .expect("stage");
+        publication_operation_over_ipc(state, edit.clone(), false).await;
+        edit
+    }
+
+    async fn finish_recovered_receipt_publication(
+        state: &Arc<ServerState>,
+        edit: bcode_workflow::WorkflowRunGraphEditBatch,
+    ) {
+        assert_eq!(
+            publication_status_over_ipc(state, edit).await,
+            bcode_workflow::WorkflowRunGraphPublicationStatus::Committed { revision: 2 }
+        );
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                let outputs = state
+                    .workflow_store
+                    .lock()
+                    .expect("store")
+                    .validated_outputs("edit-run", 10)
+                    .expect("outputs");
+                if outputs.iter().any(|output| output.node_id == "next") {
+                    assert!(!outputs.iter().any(|output| output.node_id == "agent"));
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .unwrap_or_else(|error| {
+            let receipts = state
+                .workflow_store
+                .lock()
+                .expect("store")
+                .active_attempts_for_run("edit-run", 10);
+            panic!(
+                "revised output: {error}; receipts: {receipts:?}; {:?}",
+                state
+                    .workflow_store
+                    .lock()
+                    .expect("store")
+                    .attempt_history("edit-run", None, 10)
+            )
+        });
+        let task = state.workflow_driver_task.lock().await.take();
+        if let Some(task) = task {
+            task.abort();
+            let _ = task.await;
+        }
+    }
+
+    async fn shutdown_publication_owner(state: &Arc<ServerState>) {
+        state.request_shutdown();
+        // These fixtures have already settled their turns. Close idle command senders
+        // so their receiver tasks can exit and release the daemon lifetime.
+        {
+            let mut runtimes = state.session_runtimes.lock().await;
+            for runtime in runtimes.values() {
+                assert!(
+                    !runtime.phase.lock().await.has_active_work(),
+                    "old turn still active"
+                );
+                assert_eq!(runtime.queued_followups.load(Ordering::SeqCst), 0);
+            }
+            runtimes.clear();
+        }
+        shutdown_constructed_server(Arc::clone(state), Ok(()))
+            .await
+            .expect("shutdown");
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while Arc::strong_count(state) != 1 {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| {
+            panic!(
+                "old-owner references remaining: {}",
+                Arc::strong_count(state)
+            )
+        });
+    }
+
+    async fn reopen_publication_receipt_owner(state: &Arc<ServerState>) -> Arc<ServerState> {
+        let root = state
+            .sessions
+            .session_store_root()
+            .expect("persistent sessions");
+        let (path, links, parent) = {
+            let store = state.workflow_store.lock().expect("store");
+            (
+                store.path().to_path_buf(),
+                store
+                    .execution_session_links_for_run("edit-run", 10)
+                    .expect("links"),
+                store
+                    .run_summary("edit-run")
+                    .expect("run")
+                    .expect("present")
+                    .parent_session_id
+                    .expect("parent"),
+            )
+        };
+        for session in links
+            .into_iter()
+            .map(|link| link.session_id)
+            .chain(std::iter::once(parent))
+        {
+            let session = SessionId::from_str(&session).expect("session id");
+            tokio::time::timeout(Duration::from_secs(10), async {
+                loop {
+                    state
+                        .sessions
+                        .release_session_ownership(session)
+                        .await
+                        .expect("release");
+                    if !state.sessions.session_is_owned(session).await {
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+            })
+            .await
+            .expect("owner quiesced");
+        }
+        let sessions = SessionManager::persistent_with_metrics_and_lease_owner(
+            root,
+            MetricsRegistry::default(),
+            SessionLeaseOwnerContext {
+                daemon_instance_id: Some("receipt-replacement".into()),
+                ..SessionLeaseOwnerContext::default()
+            },
+        )
+        .expect("replacement sessions");
+        let store =
+            bcode_workflow_store::WorkflowStore::open_at_path(&path).expect("replacement store");
+        let mut replacement =
+            test_server_state_with_fake_provider_and_workflow_store(sessions, store);
+        register_workflow_publication_tool(&mut replacement);
+        replacement.set_workflow_run_graph_publication_policy(WorkflowRunGraphPublicationPolicy {
+            evaluator: Arc::new(|_| WorkflowApplicationAuthorizationDecision::Allow),
+        });
+        replacement.set_workflow_run_graph_edit_policy(WorkflowRunGraphEditPolicy {
+            evaluator: Arc::new(|_| WorkflowApplicationAuthorizationDecision::Allow),
+        });
+        replacement.daemon_status.instance_id = "receipt-replacement".into();
+        replacement.state_root.clone_from(&state.state_root);
+        replacement
+            .daemon_status
+            .state_location_id
+            .clone_from(&state.daemon_status.state_location_id);
+        Arc::new(replacement)
+    }
+
+    fn receipt_owned_publication_request(
+        state: &ServerState,
+    ) -> bcode_workflow_store::PreparedActivationDispatch {
+        let store = state.workflow_store.lock().expect("store");
+        let attempt = store
+            .attempt_history("edit-run", None, 10)
+            .expect("attempts")
+            .pop()
+            .expect("attempt");
+        let node = store
+            .definition("edit-test", 2)
+            .expect("definition")
+            .expect("stored")
+            .definition()
+            .expect("decode")
+            .nodes["agent"]
+            .clone();
+        drop(store);
+        bcode_workflow_store::PreparedActivationDispatch {
+            activation: bcode_workflow_store::PendingActivation {
+                run_id: "edit-run".into(),
+                node_id: "agent".into(),
+                activation_id: attempt.activation_id,
+                dependency_generation: 0,
+                input: Some(serde_json::json!(true)),
+                created_at_ms: 1,
+                node: node.clone(),
+            },
+            attempt: attempt.attempt,
+            dispatch_identity: attempt.dispatch_identity,
+            intent: serde_json::json!({"configuration": node.configuration, "node": node, "input": true}),
+        }
+    }
+
+    async fn execute_publication_owner_turn(
+        state: &Arc<ServerState>,
+        identity: &str,
+        activation_id: String,
+    ) -> bcode_workflow_store::AttemptObservation {
+        let session_id = SessionId::from_str(
+            &state
+                .workflow_store
+                .lock()
+                .expect("store")
+                .execution_session_link("edit-run", "agent", &activation_id, 1)
+                .expect("link")
+                .expect("linked session")
+                .session_id,
+        )
+        .expect("session id");
+        let owner_state = Arc::new(test_server_state_with_fake_provider(state.sessions.clone()));
+        let SubmittedModelTurn::Started {
+            receipt,
+            completion,
+        } = submit_session_model_turn_with_admission(
+            &owner_state,
+            session_id,
+            "Return exactly true".into(),
+            None,
+            bcode_session_models::TurnAdmissionMetadata {
+                execution: TurnExecutionOptions {
+                    provider_plugin_id: Some("bcode.fake-provider".into()),
+                    model_id: Some("fake-echo".into()),
+                    structured_output: Some(bcode_session_models::TurnStructuredOutputRequest {
+                        name: "publication".into(),
+                        schema: serde_json::json!({"type":"boolean"}),
+                        strict: true,
+                        max_corrections: 0,
+                    }),
+                    ..TurnExecutionOptions::default()
+                },
+                ..bcode_session_models::TurnAdmissionMetadata::default()
+            },
+            None,
+        )
+        .await
+        .expect("submit")
+        else {
+            panic!("new turn")
+        };
+        tokio::time::timeout(Duration::from_secs(10), completion)
+            .await
+            .expect("completion timeout")
+            .expect("completed");
+        let request = bcode_workflow_store::AttemptReconciliationRequest {
+            run_id: "edit-run".into(),
+            node_id: "agent".into(),
+            activation_id,
+            attempt: 1,
+            dispatch_identity: identity.into(),
+            side_effect: bcode_workflow_store::DispatchSideEffect::ReadOnly,
+            receipt: serde_json::Value::Null,
+        };
+        assert!(
+            observe_workflow_turn(
+                state,
+                SessionId::new(),
+                &receipt.turn_id.to_string(),
+                "boolean",
+                &request
+            )
+            .await
+            .is_err()
+        );
+        observe_workflow_turn(
+            state,
+            session_id,
+            &receipt.turn_id.to_string(),
+            "boolean",
+            &request,
+        )
+        .await
+        .expect("observe owner")
+    }
+
+    async fn recover_terminal_publication_over_ipc(
+        state: &Arc<ServerState>,
+        mut edit: bcode_workflow::WorkflowRunGraphEditBatch,
+        identity: &str,
+    ) {
+        let activation_id = match &edit.reconciliation[0] {
+            bcode_workflow::WorkflowRunGraphReconciliation::Cancel { activation_id } => {
+                activation_id.clone()
+            }
+            _ => panic!("cancel disposition"),
+        };
+        let (path, authority) = {
+            let store = state.workflow_store.lock().expect("store");
+            (
+                store.path().to_path_buf(),
+                store
+                    .execution_authority("edit-run")
+                    .expect("authority")
+                    .expect("owner"),
+            )
+        };
+        let observation = execute_publication_owner_turn(state, identity, activation_id).await;
+        assert!(
+            matches!(
+                &observation,
+                bcode_workflow_store::AttemptObservation::Succeeded { .. }
+            ),
+            "{observation:?}"
+        );
+        persist_workflow_prompt_completion(&path, identity, &authority, observation)
+            .await
+            .expect("terminal success");
+        assert_eq!(
+            publication_status_over_ipc(state, edit.clone()).await,
+            bcode_workflow::WorkflowRunGraphPublicationStatus::Conflicted {
+                expected_revision: 1,
+                current_revision: 1
+            }
+        );
+        edit.mutation_id = "recover-terminal-conflict".into();
+        edit.reconciliation = state
+            .workflow_store
+            .lock()
+            .expect("store")
+            .pending_activations_for_run("edit-run", 10)
+            .expect("pending")
+            .into_iter()
+            .map(
+                |activation| bcode_workflow::WorkflowRunGraphReconciliation::Retain {
+                    activation_id: activation.activation_id,
+                },
+            )
+            .collect();
+        state
+            .stage_workflow_run_graph_edit(ClientId::new(), edit.clone())
+            .await
+            .expect("revised candidate");
+        assert_eq!(
+            publication_operation_over_ipc(state, edit, true).await,
+            bcode_workflow::WorkflowRunGraphPublicationStatus::Committed { revision: 2 }
+        );
+        for _ in 0..10 {
+            drive_workflow_run(state, "edit-run")
+                .await
+                .expect("execute revised graph");
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        let store = state.workflow_store.lock().expect("store");
+        let attempts = store
+            .attempt_history("edit-run", None, 10)
+            .expect("history");
+        let outputs = store.validated_outputs("edit-run", 10).expect("results");
+        drop(store);
+        assert_eq!(
+            attempts
+                .iter()
+                .find(|attempt| attempt.dispatch_identity == identity)
+                .expect("original attempt")
+                .status,
+            "succeeded"
+        );
+        assert!(
+            outputs
+                .iter()
+                .any(|output| output.node_id == "agent" && output.value == serde_json::json!(true))
+        );
+        assert!(outputs.iter().any(|output| output.node_id == "next"));
+    }
+
+    async fn assert_publication_observation_with_full_queue(
+        state: &Arc<ServerState>,
+        edit: bcode_workflow::WorkflowRunGraphEditBatch,
+    ) {
+        state
+            .workflow_driver_sender
+            .get()
+            .expect("queue")
+            .try_send("queue-full".into())
+            .expect("fill queue");
+        let result = publication_status_over_ipc(state, edit).await;
+        assert_eq!(
+            result,
+            bcode_workflow::WorkflowRunGraphPublicationStatus::Pending {
+                expected_revision: 1
+            }
+        );
+    }
+
+    async fn publication_status_over_ipc(
+        state: &Arc<ServerState>,
+        request: bcode_workflow::WorkflowRunGraphEditBatch,
+    ) -> bcode_workflow::WorkflowRunGraphPublicationStatus {
+        publication_operation_over_ipc(state, request, false).await
+    }
+
+    async fn publication_operation_over_ipc(
+        state: &Arc<ServerState>,
+        request: bcode_workflow::WorkflowRunGraphEditBatch,
+        publish: bool,
+    ) -> bcode_workflow::WorkflowRunGraphPublicationStatus {
+        let socket_dir = tempfile::tempdir().expect("socket directory");
+        let endpoint =
+            bcode_ipc::IpcEndpoint::unix_socket(socket_dir.path().join("publication.sock"));
+        let listener = LocalIpcListener::bind(&endpoint).expect("listener");
+        let server_state = Arc::clone(state);
+        let server = tokio::spawn(async move {
+            handle_client(listener.accept().await.expect("connection"), server_state)
+                .await
+                .expect("client");
+        });
+        let mut stream = LocalIpcStream::connect(&endpoint).await.expect("connect");
+        let operation = if publish {
+            Request::PublishWorkflowRunGraphEdit { request }
+        } else {
+            Request::AcceptWorkflowRunGraphPublication { request }
+        };
+        let envelope = bcode_ipc::request_envelope(1, &operation).expect("request");
+        bcode_ipc::send_envelope(&mut stream, &envelope)
+            .await
+            .expect("send");
+        let response = bcode_ipc::recv_envelope(&mut stream)
+            .await
+            .expect("receive");
+        let status = match bcode_ipc::decode_response(&response.payload).expect("decode") {
+            Response::Ok(ResponsePayload::WorkflowRunGraphPublicationAccepted { status }) => status,
+            Response::Ok(ResponsePayload::WorkflowRunGraphEditPublished { revision }) => {
+                bcode_workflow::WorkflowRunGraphPublicationStatus::Committed { revision }
+            }
+            other => panic!("publication rejected: {other:?}"),
+        };
+        drop(stream);
+        server.await.expect("server");
+        status
+    }
+
+    fn settle_reopened_publication_attempt(path: &std::path::Path, identity: &str) {
+        let mut reopened = bcode_workflow_store::WorkflowStore::open_at_path(path).expect("reopen");
+        assert!(
+            reopened
+                .continuation_run_ids_after("", 16)
+                .expect("rediscover")
+                .contains(&"edit-run".to_owned())
+        );
+        reopened
+            .apply_attempt_observation(
+                identity,
+                bcode_workflow_store::AttemptObservation::Cancelled,
+                6,
+            )
+            .expect("owner settled");
+    }
+
+    #[tokio::test]
     async fn execution_publication_requires_distinct_policy_and_exact_candidate() {
         assert_execution_publication_authorization(false).await;
     }
@@ -52336,12 +54106,25 @@ library = "test"
                 .expect("duplicate"),
             2
         );
-        assert_publication_queue_full(&state, child_id, edit, &cancel).await;
+        assert_publication_queue_full(&state, child_id, edit.clone(), &cancel).await;
         assert_eq!(
             scheduled.try_recv().expect("publication scheduled"),
             "edit-run"
         );
         assert_eq!(scheduled.try_recv().expect("duplicate wake"), "edit-run");
+        assert_eq!(
+            state
+                .accept_workflow_run_graph_publication_from_invocation(
+                    child_id,
+                    "bcode.workflow",
+                    edit,
+                    &cancel
+                )
+                .await
+                .expect("observe committed via acceptance"),
+            bcode_workflow::WorkflowRunGraphPublicationStatus::Committed { revision: 2 }
+        );
+        assert_eq!(scheduled.try_recv().expect("acceptance wake"), "edit-run");
         assert_eq!(
             state
                 .workflow_store
@@ -58916,7 +60699,10 @@ event_symbol = "bcode_plugin_handle_event_v1"
             .expect("session route")
             .expect("session content");
         let selected = format!("{selected:?}");
-        assert!(selected.contains("route prompt 69"));
+        assert!(
+            selected.contains("route prompt 69"),
+            "selected route: {selected}"
+        );
         assert!(selected.contains("selected-session-draft"));
         assert!(!selected.contains("other-session-draft"));
 
@@ -65484,6 +67270,37 @@ event_symbol = "bcode_plugin_handle_event_v1"
     }
 
     #[tokio::test]
+    async fn cancelled_submission_does_not_wait_for_session_admission_lock() {
+        let sessions = SessionManager::default();
+        let session = sessions
+            .create_session(None, PathBuf::from("."))
+            .await
+            .expect("session");
+        let state = Arc::new(test_server_state_with_fake_provider(sessions));
+        let lock = turn_admission_lock(&state, session.id).await;
+        let guard = lock.lock().await;
+        let cancellation = Arc::new(TurnCancelState::default());
+        let mut submission = Box::pin(submit_session_model_turn_with_admission(
+            &state,
+            session.id,
+            "must not execute".into(),
+            None,
+            bcode_session_models::TurnAdmissionMetadata::default(),
+            Some(Arc::clone(&cancellation)),
+        ));
+        assert!(futures::poll!(&mut submission).is_pending());
+        cancellation.cancel().await;
+        assert!(matches!(
+            submission.await,
+            Err(ServerError::WorkflowStore(
+                WorkflowStoreError::CancellationPreventsControl
+            ))
+        ));
+        drop(guard);
+        drop(state);
+    }
+
+    #[tokio::test]
     async fn existing_admission_does_not_enqueue_duplicate_turn() {
         let sessions = SessionManager::default();
         let session = sessions
@@ -66784,6 +68601,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
             .expect("plugins"),
         );
         let (mut state,) = (test_server_state(sessions),);
+        state.daemon_status.instance_id = test_workflow_execution_authority().daemon_instance_id;
         state.plugins = plugins;
         state.workflow_store = StdMutex::new(store).into();
         let state = Arc::new(state);
@@ -68304,6 +70122,72 @@ event_symbol = "bcode_plugin_handle_event_v1"
         ));
     }
 
+    #[tokio::test]
+    async fn prompt_owner_without_terminal_evidence_is_deferred() {
+        let root = tempfile::tempdir().expect("sessions");
+        let sessions = SessionManager::persistent(root.path()).expect("sessions");
+        let session = sessions
+            .create_session(None, PathBuf::from("."))
+            .await
+            .expect("session");
+        let state = test_server_state(sessions);
+        let mut request = bcode_workflow_store::AttemptReconciliationRequest {
+            run_id: "run-1".into(),
+            node_id: "agent".into(),
+            activation_id: "activation-1".into(),
+            attempt: 1,
+            dispatch_identity: "dispatch-1".into(),
+            side_effect: bcode_workflow::DispatchSideEffect::Mutating,
+            receipt: serde_json::json!({"owner": "bcode.server.agent-turn/v1", "owner_daemon_instance_id": "ended-daemon", "session_id": session.id}),
+        };
+        let observation =
+            observe_workflow_turn(&state, session.id, "interrupted-turn", "boolean", &request)
+                .await
+                .expect("observation");
+        assert!(matches!(
+            observation,
+            bcode_workflow_store::AttemptObservation::Deferred { .. }
+        ));
+        request.receipt["owner_daemon_instance_id"] =
+            serde_json::json!(state.daemon_status.instance_id);
+        let current = observe_workflow_turn(&state, session.id, "active-turn", "boolean", &request)
+            .await
+            .expect("current observation");
+        drop(state);
+        assert!(matches!(
+            current,
+            bcode_workflow_store::AttemptObservation::Deferred { .. }
+        ));
+    }
+
+    #[tokio::test]
+    async fn missing_prompt_session_is_deferred_not_running_or_cancelled() {
+        let state = test_server_state(SessionManager::default());
+        let request = bcode_workflow_store::AttemptReconciliationRequest {
+            run_id: "run-1".into(),
+            node_id: "agent".into(),
+            activation_id: "activation-1".into(),
+            attempt: 1,
+            dispatch_identity: "dispatch-1".into(),
+            side_effect: bcode_workflow::DispatchSideEffect::Mutating,
+            receipt: serde_json::json!({}),
+        };
+        let observation = observe_workflow_turn(
+            &state,
+            SessionId::new(),
+            "missing-turn",
+            "boolean",
+            &request,
+        )
+        .await
+        .expect("observation");
+        drop(state);
+        assert!(matches!(
+            observation,
+            bcode_workflow_store::AttemptObservation::Deferred { .. }
+        ));
+    }
+
     #[test]
     fn foreign_artifact_workflow_receipt_is_deferred_before_observation() {
         let mut state = test_server_state(SessionManager::default());
@@ -69115,7 +70999,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
                     binding: None,
                     authored_provenance: None,
                     input: Some(serde_json::json!(1)),
-                    execution_authority: None,
+                    execution_authority: Some(test_workflow_execution_authority()),
                     created_at_ms: 1,
                     authorization_profile: bcode_workflow::WorkflowAuthorizationProfileIdentity {
                         version: 1,
@@ -69142,9 +71026,16 @@ event_symbol = "bcode_plugin_handle_event_v1"
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .path()
             .to_path_buf();
+        let authority = state
+            .workflow_store
+            .lock()
+            .expect("store")
+            .execution_authority("agent-run")
+            .expect("authority")
+            .expect("owned run");
         let summary = bcode_workflow_store::WorkflowStore::open_at_path(&store_path)
             .expect("scheduler store")
-            .dispatch_pending_activations(&owner, 10, 2)
+            .dispatch_owned_pending_activations_for_run(&owner, "agent-run", &authority, 10, 2)
             .await
             .expect("dispatch");
         assert_eq!(summary.admitted.len(), 1);

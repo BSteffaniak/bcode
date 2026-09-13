@@ -12,6 +12,16 @@ const NAME: &str = "workflow.stage_run_graph_edit";
 const OPERATION: &str = "stage_run_graph_edit";
 const PUBLISH_NAME: &str = "workflow.publish_run_graph_edit";
 const PUBLISH_OPERATION: &str = "publish_run_graph_edit";
+const ACCEPT_NAME: &str = "workflow.accept_run_graph_publication";
+const ACCEPT_OPERATION: &str = "accept_run_graph_publication";
+
+fn acceptance_definition() -> ToolDefinition {
+    ToolDefinition {
+        name: ACCEPT_NAME.to_owned(),
+        description: "Accept an exact staged workflow edit requiring cancellation of receipt-backed work. Requires publication authorization. Acceptance durably requests cancellation; it does not mean the graph is published. Retry the identical candidate to observe its status while this execution remains active. A conflict preserves cancellation already requested and requires an explicitly revised candidate, never a silent rebase.".to_owned(),
+        input_schema: definition().input_schema,
+    }
+}
 
 fn publication_definition() -> ToolDefinition {
     ToolDefinition {
@@ -25,6 +35,7 @@ fn operation(name: &str) -> Result<&'static str, String> {
     match name {
         NAME => Ok(OPERATION),
         PUBLISH_NAME => Ok(PUBLISH_OPERATION),
+        ACCEPT_NAME => Ok(ACCEPT_OPERATION),
         _ => Err("unsupported workflow tool".to_owned()),
     }
 }
@@ -55,11 +66,19 @@ fn parse_edit(arguments: &serde_json::Value) -> Result<WorkflowRunGraphEditBatch
 pub fn invoke(context: &NativeServiceContext) -> ServiceResponse {
     match context.request.operation.as_str() {
         bcode_tool::OP_LIST_TOOLS => super::json_response(&ToolList {
-            tools: vec![definition(), publication_definition()],
+            tools: vec![
+                definition(),
+                publication_definition(),
+                acceptance_definition(),
+            ],
         }),
         bcode_tool::OP_PREPARE_TOOL => prepare_tool_service_response(
             &context.request,
-            [definition(), publication_definition()],
+            [
+                definition(),
+                publication_definition(),
+                acceptance_definition(),
+            ],
             |request, _| {
                 let operation = operation(&request.invocation.tool_name)?;
                 let edit = parse_edit(&request.invocation.arguments)?;
@@ -186,7 +205,9 @@ fn invoke_edit(context: &NativeServiceContext) -> ServiceResponse {
         Ok(ServiceBridgeResponse::Service(ToolInvocationServiceResolution::Responded {
             payload,
         })) => {
-            if operation == PUBLISH_OPERATION {
+            if operation == ACCEPT_OPERATION {
+                acceptance_response(payload)
+            } else if operation == PUBLISH_OPERATION {
                 publication_response(&payload)
             } else {
                 staging_response(payload)
@@ -200,6 +221,43 @@ fn invoke_edit(context: &NativeServiceContext) -> ServiceResponse {
             "workflow edit was not admitted; verify route, policy, and active execution",
         ),
     }
+}
+
+fn acceptance_response(payload: serde_json::Value) -> ServiceResponse {
+    use bcode_workflow::WorkflowRunGraphPublicationStatus as Status;
+    let Ok(status) = serde_json::from_value::<Status>(payload) else {
+        return ServiceResponse::error(
+            "invalid_response",
+            "unsupported acceptance response; outcome is unknown",
+        );
+    };
+    let output = match status {
+        Status::Pending { expected_revision } if expected_revision > 0 => format!(
+            "Workflow publication pending against revision {expected_revision}. Cancellation has been requested; topology has not been published."
+        ),
+        Status::Conflicted {
+            expected_revision,
+            current_revision,
+        } if expected_revision > 0 && current_revision >= expected_revision => format!(
+            "Workflow publication conflicted: expected revision {expected_revision}, current revision {current_revision}. Equal revisions indicate a conflicting terminal outcome. Already-requested cancellation remains durable. Author and stage a revised candidate explicitly."
+        ),
+        Status::Committed { revision } if revision > 1 => {
+            format!("Workflow edit published at revision {revision}.")
+        }
+        _ => {
+            return ServiceResponse::error(
+                "invalid_response",
+                "inconsistent acceptance response; outcome is unknown",
+            );
+        }
+    };
+    super::json_response(&bcode_tool::ToolInvocationResponse {
+        output,
+        is_error: false,
+        content: Vec::new(),
+        full_output: None,
+        result: None,
+    })
 }
 
 fn publication_response(payload: &serde_json::Value) -> ServiceResponse {
@@ -250,6 +308,39 @@ fn staging_response(payload: serde_json::Value) -> ServiceResponse {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn acceptance_response_preserves_lifecycle_semantics() {
+        for (payload, expected) in [
+            (
+                json!({"status":"pending", "expected_revision":1}),
+                "topology has not been published",
+            ),
+            (
+                json!({"status":"conflicted", "expected_revision":1, "current_revision":2}),
+                "cancellation remains durable",
+            ),
+            (
+                json!({"status":"committed", "revision":2}),
+                "published at revision 2",
+            ),
+        ] {
+            let response = acceptance_response(payload);
+            assert!(response.error.is_none());
+            let tool: bcode_tool::ToolInvocationResponse =
+                serde_json::from_slice(&response.payload).expect("response");
+            assert!(!tool.is_error);
+            assert!(tool.output.contains(expected));
+        }
+        for payload in [
+            json!({"revision":2}),
+            json!({"status":"future"}),
+            json!({"status":"pending", "expected_revision":0}),
+            json!({"status":"conflicted", "expected_revision":2, "current_revision":1}),
+        ] {
+            assert!(acceptance_response(payload).error.is_some());
+        }
+    }
 
     #[test]
     fn staging_response_rejects_ambiguous_success() {

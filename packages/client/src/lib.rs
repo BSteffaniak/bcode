@@ -5189,14 +5189,27 @@ impl BcodeClient {
         }
     }
 
-    /// Publish an exact staged run-owned graph candidate.
-    ///
-    /// Publication requires separate authorization; staging approval does not grant it.
-    /// Returns the committed graph revision, including for identical duplicate publication.
+    /// Accept a staged publication; pending acceptance is not a committed revision.
     ///
     /// # Errors
-    /// Returns an error for transport failure, publication policy denial, candidate mismatch,
-    /// stale authority or revision, unsupported reconciliation/topology, or an unexpected response.
+    /// Returns transport, authorization, candidate, or unexpected-response errors.
+    pub async fn accept_workflow_run_graph_publication(
+        &self,
+        request: bcode_workflow::WorkflowRunGraphEditBatch,
+    ) -> Result<bcode_workflow::WorkflowRunGraphPublicationStatus, ClientError> {
+        match self
+            .send_request(Request::AcceptWorkflowRunGraphPublication { request })
+            .await?
+        {
+            ResponsePayload::WorkflowRunGraphPublicationAccepted { status } => Ok(status),
+            _ => Err(ClientError::UnexpectedResponse),
+        }
+    }
+
+    /// Publish an exact staged run-owned graph candidate with separate publication authorization.
+    ///
+    /// # Errors
+    /// Returns transport, policy, candidate, reconciliation, or unexpected-response errors.
     pub async fn publish_workflow_run_graph_edit(
         &self,
         request: bcode_workflow::WorkflowRunGraphEditBatch,

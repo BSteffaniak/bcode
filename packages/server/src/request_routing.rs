@@ -550,6 +550,10 @@ pub enum WorkflowDefinitionRequest {
 /// Requests owned by the `RuntimeAndModel` dispatcher (31 variants).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RuntimeAndModelRequest {
+    /// Accept exact cancellation intents using publication-specific authorization.
+    AcceptWorkflowRunGraphPublication {
+        request: bcode_workflow::WorkflowRunGraphEditBatch,
+    },
     /// Publish an exact staged edit using publication-specific authorization.
     PublishWorkflowRunGraphEdit {
         request: bcode_workflow::WorkflowRunGraphEditBatch,
@@ -1274,6 +1278,9 @@ impl RoutedRequest {
                     version,
                 },
             )),
+            Request::AcceptWorkflowRunGraphPublication { request } => Self::RuntimeAndModel(
+                Box::new(RuntimeAndModelRequest::AcceptWorkflowRunGraphPublication { request }),
+            ),
             Request::PublishWorkflowRunGraphEdit { request } => Self::RuntimeAndModel(Box::new(
                 RuntimeAndModelRequest::PublishWorkflowRunGraphEdit { request },
             )),

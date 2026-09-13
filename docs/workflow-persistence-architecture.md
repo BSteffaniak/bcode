@@ -94,15 +94,54 @@ operation validates the staged candidate under current authority and commits acc
 with receipt-backed, unlinked cancellation targets atomically. Duplicate acceptance keeps
 the original attempt set; failed target validation rolls back all acceptance writes.
 Schema-30 initialization upgrades preserve existing runs without inventing intents.
-This store capability is not wired to public publication. The normal daemon driver now
+The invocation application boundary now advertises `accept_run_graph_publication`, using
+publication grants, exact candidate matching, authenticated execution provenance, and
+transactional active-caller verification. It reserves a driver wake before acceptance and
+returns the typed lifecycle status; the existing publication operation stays committed-only.
+Local-client acceptance is now exposed through appended IPC request/response variants and
+a client method, sharing publication policy checks and exact-candidate authorization.
+Scheduler capacity is reserved before acceptance; the store returns duplicate lifecycle
+status atomically. Full local-client acceptance integration coverage, pending-path execution,
+and recovery remain unfinished. The normal daemon driver now
 signals discovered publication cancellations using its held authority and transactionally
-marks successful signalling. Missing runtime owners leave the intent pending for receipt
+marks successful signalling. Cancellation discovery now advances by dispatch-identity
+keyset pages within each drive, so unresolved first-page owners do not hide later targets.
+A completed cancellation sweep waits for a subsequent drive before retrying missing owners.
+Missing runtime owners leave the intent pending for receipt
 reconciliation rather than manufacturing terminal evidence. Accepted
 attempt intents now participate in owner-observation settlement and authority-qualified,
-bounded cancellation discovery. Running observations remain pending; confirmed cancellation
+bounded cancellation discovery. Prompt completion and receipt observation now classify a
+confirmed cancelled model turn as Cancelled when its exact dispatch has an accepted
+publication cancellation intent, rather than incorrectly pausing it for steering. Ordinary
+steering without such intent still pauses. Running observations remain pending; confirmed cancellation
 removes the attempt from discovery without requesting cancellation of the whole run.
-Conflict projection, finalization, and recovery remain unimplemented;
-existing committed-only publication operations are unchanged.
+The authority-qualified status read now projects pending, conflicted, or committed outcomes
+from a bounded snapshot. Prompt receipt reconciliation resolves output schemas from the
+activation's admitted graph node rather than its authored definition, so added/replaced
+executables retain their own result contract. Receipt schema identity must match admission.
+Missing execution sessions and history pages with compatibility issues produce an unknown
+observation, not a fabricated running or cancelled state. Authority-qualified reconciliation
+therefore retains unresolved work or requires repair without using missing history to
+finalize pending publication. Later publications conflict accepted candidates without deleting
+cancellation intents; prior committed results remain stable. The invocation acceptance
+operation returns this projection on duplicate requests. Store finalization now requires
+exact accepted cancellation targets to have confirmed cancelled attempts and activations,
+then revalidates and publishes atomically under current authority. Pending and conflicted
+results do not publish; committed duplicate results are stable. The daemon driver now
+sweeps accepted identities in keyset pages after receipt reconciliation and finalizes pending
+candidates under its held authority. A new commit keeps scheduling active for the revised
+graph. An integration test now accepts a fresh candidate through the authenticated server
+invocation method, reopens the store, rediscovers the run, supplies confirmed cancellation,
+and invokes daemon finalization to create pending revised work. This is not a complete
+restart or owner-signalling exercise: cancellation evidence is injected by the test and
+successful revised execution is not asserted. Existing committed-only publication
+operations are unchanged.
+
+The bundled workflow plugin exposes `workflow.accept_run_graph_publication` through its
+normal mutating-tool preparation and invocation bridge. Its prepared facts bind the exact
+operation and candidate. Pending responses explicitly deny publication, conflict responses
+preserve cancellation and require a revised candidate, and malformed/future results report
+unknown outcome. Existing staging and committed-only publication tools remain unchanged.
 
 ## Pending publication decision (approved; not yet implemented)
 
@@ -144,7 +183,11 @@ rechecks it transactionally. Resource acquisition now shares preparation's autho
 transaction and uses the exact pending activation resolved there. Failed admission rolls back
 new leases and their events; the scheduler does not commit a separate resource-acquisition phase.
 Startup recovery uses caller-qualified redispatch with expected-authority checks at discovery,
-handoff, and receipt commit. Startup preparation recovery also checks held authority within
+handoff, and receipt commit. Normal continuation retries the same bounded read-only
+redispatch path when startup owner access was deferred; dispatch identities are retained.
+A deferred owner does not block unrelated pending work, and authority is verified again
+before continuation. Mutating receipt-less work is not redispatched by this retry.
+Startup preparation recovery also checks held authority within
 its classification/mutation transaction. Historical orphan lease reconciliation and handed-off
 owner cancellation remain outside this new-admission guarantee.
 

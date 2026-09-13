@@ -1518,6 +1518,30 @@ pub async fn publish_run_graph_edit(
     client_id: super::ClientId,
     request: bcode_workflow::WorkflowRunGraphEditBatch,
 ) -> Result<u64, super::ServerError> {
+    match local_run_graph_publication(state, client_id, request, false).await? {
+        bcode_workflow::WorkflowRunGraphPublicationStatus::Committed { revision } => Ok(revision),
+        _ => unreachable!("committed-only publication"),
+    }
+}
+
+/// Authorize local-client acceptance separately from staging.
+///
+/// # Errors
+/// Rejects policy denial, candidate mismatch, stale authority, or store failure.
+pub async fn accept_run_graph_publication(
+    state: &std::sync::Arc<ServerState>,
+    client_id: super::ClientId,
+    request: bcode_workflow::WorkflowRunGraphEditBatch,
+) -> Result<bcode_workflow::WorkflowRunGraphPublicationStatus, super::ServerError> {
+    local_run_graph_publication(state, client_id, request, true).await
+}
+
+async fn local_run_graph_publication(
+    state: &std::sync::Arc<ServerState>,
+    client_id: super::ClientId,
+    request: bcode_workflow::WorkflowRunGraphEditBatch,
+    accept: bool,
+) -> Result<bcode_workflow::WorkflowRunGraphPublicationStatus, super::ServerError> {
     let facts = bcode_workflow::WorkflowRunGraphPublicationFacts {
         version: 1,
         actor: bcode_workflow::WorkflowApplicationActor {
@@ -1565,6 +1589,37 @@ pub async fn publish_run_graph_edit(
             ),
         );
     }
+    if accept {
+        if let Some(status) = store.run_graph_publication_status(
+            &facts.request.run_id,
+            &facts.request.mutation_id,
+            &guard.authority,
+        )? {
+            return Ok(status);
+        }
+        let permit = state
+            .workflow_driver_sender
+            .get()
+            .ok_or_else(|| {
+                super::ServerError::WorkflowApplicationOperationUnauthorized(
+                    "workflow scheduler unavailable".into(),
+                )
+            })?
+            .try_reserve()
+            .map_err(|_| {
+                super::ServerError::WorkflowApplicationOperationUnauthorized(
+                    "workflow scheduler unavailable or full".into(),
+                )
+            })?;
+        let status = store.accept_run_graph_publication(
+            &facts.request.run_id,
+            &facts.request.mutation_id,
+            &guard.authority,
+            super::current_time_ms(),
+        )?;
+        permit.send(facts.request.run_id);
+        return Ok(status);
+    }
     store
         .publish_retained_leaf_run_graph_edit(
             &facts.request.run_id,
@@ -1572,6 +1627,7 @@ pub async fn publish_run_graph_edit(
             &guard.authority,
             super::current_time_ms(),
         )
+        .map(|revision| bcode_workflow::WorkflowRunGraphPublicationStatus::Committed { revision })
         .map_err(Into::into)
 }
 
@@ -7454,15 +7510,21 @@ pub async fn retry_node(
     failed_attempt: u32,
 ) -> Result<bcode_workflow_store::WorkflowNodeRetryResult, super::ServerError> {
     let started_at = std::time::Instant::now();
+    let authority = execution_authority(state, run_id).await?.ok_or_else(|| {
+        super::ServerError::WorkflowApplicationOperationUnauthorized(
+            "retry requires durable execution authority".into(),
+        )
+    })?;
     let result = state
         .workflow_store
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .retry_failed_node(
+        .retry_failed_node_owned(
             run_id,
             node_id,
             activation_id,
             failed_attempt,
+            &authority.authority,
             super::current_unix_millis(),
         )?;
     state.metrics.record_histogram(
@@ -9450,6 +9512,7 @@ pub async fn repair_attempt(
             super::current_unix_millis(),
             &authority.authority,
         )?;
+    super::drive_workflow_run(state, &attempt.run_id).await?;
     let resolution_label = match resolution {
         bcode_workflow_store::RepairResolution::ConfirmSucceeded { .. } => "confirm_succeeded",
         bcode_workflow_store::RepairResolution::ConfirmFailed { .. } => "confirm_failed",

@@ -899,6 +899,12 @@ pub enum WorkflowStoreError {
         "workflow storage upgrade is blocked by another owner; retry after that owner releases the store"
     )]
     UpgradeOwnershipUnavailable,
+    /// Owner access is temporarily blocked by an existing execution owner.
+    #[error("workflow execution owner access is deferred")]
+    OwnerAccessDeferred,
+    /// External owner dispatch failed; durable preparation remains available for recovery.
+    #[error("workflow owner dispatch failed: {0}")]
+    OwnerDispatch(Box<Self>),
     /// Persisted data violated the storage contract.
     #[error("invalid workflow store data: {0}")]
     InvalidData(String),
@@ -7339,6 +7345,8 @@ impl WorkflowStore {
             .await
     }
 
+    // Exclusive borrowing keeps this async dispatch future Send: WorkflowStore is not Sync.
+    #[allow(clippy::needless_pass_by_ref_mut)]
     async fn dispatch_activations_with_fault<O, F>(
         &mut self,
         owner: &O,
@@ -7388,15 +7396,18 @@ impl WorkflowStore {
             self.record_dispatch_handoff(&prepared, authority.as_ref())?;
             let receipt = owner.dispatch(&prepared).await?;
             fault.after_boundary(WorkflowDispatchBoundary::OwnerAccepted, &prepared)?;
-            self.persist_dispatch_receipt(&DispatchReceipt {
-                run_id: prepared.activation.run_id.clone(),
-                node_id: prepared.activation.node_id.clone(),
-                activation_id: prepared.activation.activation_id.clone(),
-                attempt: prepared.attempt,
-                dispatch_identity: prepared.dispatch_identity.clone(),
-                receipt,
-                admitted_at_ms: dispatched_at_ms,
-            })?;
+            self.persist_dispatch_receipt_with_authority(
+                &DispatchReceipt {
+                    run_id: prepared.activation.run_id.clone(),
+                    node_id: prepared.activation.node_id.clone(),
+                    activation_id: prepared.activation.activation_id.clone(),
+                    attempt: prepared.attempt,
+                    dispatch_identity: prepared.dispatch_identity.clone(),
+                    receipt,
+                    admitted_at_ms: dispatched_at_ms,
+                },
+                authority.as_ref(),
+            )?;
             fault.after_boundary(WorkflowDispatchBoundary::ReceiptCommitted, &prepared)?;
             summary.admitted.push(prepared.dispatch_identity);
         }
@@ -7455,6 +7466,9 @@ impl WorkflowStore {
             return Err(WorkflowStoreError::InvalidData(
                 "preparation execution authority changed".into(),
             ));
+        }
+        if fan_out_retirement_pending(&transaction, run_id, activation_id)? {
+            return Ok(None);
         }
         let activation =
             match pending_activation_by_identity(&transaction, run_id, node_id, activation_id)? {
@@ -7530,6 +7544,74 @@ impl WorkflowStore {
         }))
     }
 
+    /// Check an exact owner admission against current durable state, or recover its receipt.
+    ///
+    /// Receipt recovery does not authorize new execution. Receipt-less admission requires
+    /// a running, uncancelled run and activation with a prepared attempt.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for stale authority, conflicting request identity or intent,
+    /// ineligible work, oversized receipt data, or database/serialization failure.
+    pub fn check_owner_admission(
+        &self,
+        request: &PreparedActivationDispatch,
+        authority: &WorkflowExecutionAuthority,
+    ) -> Result<Option<serde_json::Value>, WorkflowStoreError> {
+        let transaction = self.connection.unchecked_transaction()?;
+        self.verify_execution_authority(&request.activation.run_id, authority)?;
+        let (intent, receipt, receipt_length, eligible): (Option<String>, Option<String>, usize, bool) = transaction.query_row(
+            "SELECT CASE WHEN length(CAST(attempt.intent_json AS BLOB)) <= ?6 THEN attempt.intent_json END,
+             CASE WHEN length(CAST(attempt.receipt_json AS BLOB)) <= ?6 THEN attempt.receipt_json END,
+             coalesce(length(CAST(attempt.receipt_json AS BLOB)), 0),
+             attempt.status = 'prepared' AND activation.status = 'running'
+             AND run.status = 'running' AND run.cancellation_requested_at_ms IS NULL
+             FROM workflow_attempts attempt
+             JOIN workflow_activations activation USING (run_id, node_id, activation_id)
+             JOIN workflow_runs run USING (run_id)
+             WHERE attempt.run_id = ?1 AND attempt.node_id = ?2 AND attempt.activation_id = ?3
+             AND attempt.attempt = ?4 AND attempt.dispatch_identity = ?5",
+            rusqlite::params![request.activation.run_id, request.activation.node_id,
+                request.activation.activation_id, request.attempt, request.dispatch_identity,
+                MAX_INLINE_JSON_BYTES],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )?;
+        let intent = intent.ok_or_else(|| {
+            WorkflowStoreError::InvalidData("owner admission intent exceeds inline limit".into())
+        })?;
+        if serde_json::from_str::<serde_json::Value>(&intent)? != request.intent {
+            return Err(WorkflowStoreError::InvalidData(
+                "owner admission intent conflicts".into(),
+            ));
+        }
+        if receipt_length > MAX_INLINE_JSON_BYTES {
+            return Err(WorkflowStoreError::InvalidData(
+                "owner admission receipt exceeds inline limit".into(),
+            ));
+        }
+        if let Some(receipt) = receipt {
+            return Ok(Some(serde_json::from_str(&receipt)?));
+        }
+        if !eligible
+            || fan_out_retirement_pending(
+                &transaction,
+                &request.activation.run_id,
+                &request.activation.activation_id,
+            )?
+        {
+            return Err(WorkflowStoreError::InvalidData(
+                "owner admission is no longer eligible".into(),
+            ));
+        }
+        run_graph::reconciled_activation_exit(
+            &transaction,
+            &request.activation.run_id,
+            &request.activation.node_id,
+            &request.activation.activation_id,
+        )?;
+        Ok(None)
+    }
+
     fn record_dispatch_handoff(
         &self,
         request: &PreparedActivationDispatch,
@@ -7556,7 +7638,13 @@ impl WorkflowStore {
             [&request.dispatch_identity],
             |row| row.get(0),
         )?;
-        if !eligible {
+        if !eligible
+            || fan_out_retirement_pending(
+                &transaction,
+                &request.activation.run_id,
+                &request.activation.activation_id,
+            )?
+        {
             return Err(WorkflowStoreError::InvalidData(
                 "dispatch handoff is no longer eligible".to_string(),
             ));
@@ -7910,6 +7998,7 @@ impl WorkflowStore {
             schedule.failed_attempt,
             now_ms,
             Some(&schedule),
+            None,
         )
     }
 
@@ -8343,7 +8432,10 @@ impl WorkflowStore {
         let mut admitted = Vec::with_capacity(prepared.len());
         for request in prepared {
             self.record_dispatch_handoff(&request, Some(authority))?;
-            let receipt = owner.dispatch(&request).await?;
+            let receipt = owner
+                .dispatch(&request)
+                .await
+                .map_err(|error| WorkflowStoreError::OwnerDispatch(Box::new(error)))?;
             self.persist_dispatch_receipt_with_authority(
                 &DispatchReceipt {
                     run_id: request.activation.run_id,
@@ -8657,6 +8749,38 @@ impl WorkflowStore {
                 ))
             })?;
         let transaction = self.connection.transaction()?;
+        let mut summary = ReceiptReconciliationSummary::default();
+        apply_attempt_observation(
+            &transaction,
+            &request,
+            observation,
+            observed_at_ms,
+            &mut summary,
+        )?;
+        transaction.commit()?;
+        Ok(summary)
+    }
+
+    /// Apply an owner observation only under the current durable execution authority.
+    ///
+    /// # Errors
+    /// Rejects missing receipts, stale authority, invalid observations, or persistence failures.
+    pub fn apply_owned_attempt_observation(
+        &mut self,
+        dispatch_identity: &str,
+        authority: &WorkflowExecutionAuthority,
+        observation: AttemptObservation,
+        observed_at_ms: u64,
+    ) -> Result<ReceiptReconciliationSummary, WorkflowStoreError> {
+        validate_id("dispatch_identity", dispatch_identity)?;
+        let transaction = self.connection.unchecked_transaction()?;
+        let request =
+            receipt_backed_attempt(&transaction, dispatch_identity)?.ok_or_else(|| {
+                WorkflowStoreError::InvalidData(format!(
+                    "receipt-backed workflow attempt not found: {dispatch_identity}"
+                ))
+            })?;
+        self.verify_execution_authority(&request.run_id, authority)?;
         let mut summary = ReceiptReconciliationSummary::default();
         apply_attempt_observation(
             &transaction,
@@ -9001,11 +9125,17 @@ impl WorkflowStore {
             .optional()?
             .unwrap_or_default();
         validate_receipt_recovery_cursor(&cursor)?;
+        let revision = run_graph::graph_revision(&self.connection, run_id)?;
         let (summary, next) = self
             .reconcile_owned_receipt_page(observer, run_id, authority, &cursor, limit, now_ms)
             .await?;
         let tx = self.connection.unchecked_transaction()?;
         self.verify_execution_authority(run_id, authority)?;
+        if run_graph::graph_revision(&tx, run_id)? != revision {
+            // Settlement discarded a page observed against an obsolete graph. Keep its
+            // cursor unchanged so the next pass observes those attempts again.
+            return Ok(summary);
+        }
         tx.execute("INSERT INTO workflow_receipt_cursors VALUES (?1, ?2)
             ON CONFLICT(run_id) DO UPDATE SET after_dispatch_identity = excluded.after_dispatch_identity
             WHERE workflow_receipt_cursors.after_dispatch_identity = ?3",
@@ -9059,11 +9189,8 @@ impl WorkflowStore {
         }
         let transaction = self.connection.transaction()?;
         if let Some((run_id, authority, revision)) = authority {
-            if run_graph::graph_revision(&transaction, run_id)? != Some(revision) {
-                return Err(WorkflowStoreError::InvalidData(
-                    "receipt settlement graph revision conflict".to_string(),
-                ));
-            }
+            let revision_matches =
+                run_graph::graph_revision(&transaction, run_id)? == Some(revision);
             let owned: bool = transaction.query_row(
                 "SELECT EXISTS(SELECT 1 FROM workflow_runs WHERE run_id = ?1
                  AND target_artifact_id = ?2 AND coordinator_daemon_instance_id = ?3
@@ -9081,6 +9208,11 @@ impl WorkflowStore {
                 return Err(WorkflowStoreError::InvalidData(
                     "receipt settlement lost execution authority".to_string(),
                 ));
+            }
+            if !revision_matches {
+                // Publication raced the asynchronous observations. Discard this bounded page;
+                // the durable attempts remain discoverable for observation against the new graph.
+                return Ok(ReceiptReconciliationSummary::default());
             }
         }
         let mut summary = ReceiptReconciliationSummary::default();
@@ -9345,6 +9477,8 @@ impl WorkflowStore {
         )
     }
 
+    // Keep validation, disposition, and run state in one atomic repair transaction.
+    #[allow(clippy::too_many_lines)]
     fn repair_attempt_with_authority(
         &self,
         dispatch_identity: &str,
@@ -9412,6 +9546,22 @@ impl WorkflowStore {
             .to_string(),
             repaired_at_ms,
         )?;
+        let publication_cancelled = matches!(resolution, RepairResolution::ConfirmCancelled { .. })
+            && transaction.query_row(
+                "SELECT EXISTS(SELECT 1 FROM workflow_publication_cancellations WHERE run_id = ?1 AND dispatch_identity = ?2)",
+                (&run_id, dispatch_identity), |row| row.get::<_, bool>(0),
+            )?;
+        if publication_cancelled {
+            let changed = transaction.execute(
+                "UPDATE workflow_activations SET status = 'cancelled' WHERE run_id = ?1 AND node_id = ?2 AND activation_id = ?3 AND output_id IS NULL AND status IN ('running', 'repair_required')",
+                (&run_id, &node_id, &activation_id),
+            )?;
+            if changed != 1 {
+                return Err(WorkflowStoreError::InvalidData(
+                    "publication repair activation is inconsistent".into(),
+                ));
+            }
+        }
         let remaining: bool = transaction.query_row(
             "SELECT EXISTS(SELECT 1 FROM workflow_attempts WHERE run_id = ?1 \
              AND status = 'repair_required')",
@@ -9420,7 +9570,8 @@ impl WorkflowStore {
         )?;
         let mut run_status = if remaining {
             RunStatus::RepairRequired
-        } else if matches!(resolution, RepairResolution::AbandonForExplicitRetry { .. })
+        } else if (publication_cancelled
+            || matches!(resolution, RepairResolution::AbandonForExplicitRetry { .. }))
             && !self.is_recovery_only(&run_id)?
         {
             RunStatus::Running
@@ -9550,7 +9701,7 @@ impl WorkflowStore {
     /// budget, cancellation, or database failure.
     #[allow(clippy::too_many_lines)]
     pub fn retry_failed_node(
-        &mut self,
+        &self,
         run_id: &str,
         node_id: &str,
         activation_id: &str,
@@ -9564,18 +9715,44 @@ impl WorkflowStore {
             failed_attempt,
             retried_at_ms,
             None,
+            None,
         )
     }
 
-    #[allow(clippy::too_many_lines)]
+    /// Retry a failed activation while holding the expected durable execution authority.
+    ///
+    /// # Errors
+    /// Rejects stale authority, invalid retry state, exhausted budget, or database failure.
+    pub fn retry_failed_node_owned(
+        &self,
+        run_id: &str,
+        node_id: &str,
+        activation_id: &str,
+        failed_attempt: u32,
+        authority: &WorkflowExecutionAuthority,
+        retried_at_ms: u64,
+    ) -> Result<WorkflowNodeRetryResult, WorkflowStoreError> {
+        self.retry_failed_node_with_schedule(
+            run_id,
+            node_id,
+            activation_id,
+            failed_attempt,
+            retried_at_ms,
+            None,
+            Some(authority),
+        )
+    }
+
+    #[allow(clippy::too_many_lines, clippy::too_many_arguments)]
     fn retry_failed_node_with_schedule(
-        &mut self,
+        &self,
         run_id: &str,
         node_id: &str,
         activation_id: &str,
         failed_attempt: u32,
         retried_at_ms: u64,
         retry_schedule: Option<&AutomaticRetrySchedule>,
+        authority: Option<&WorkflowExecutionAuthority>,
     ) -> Result<WorkflowNodeRetryResult, WorkflowStoreError> {
         validate_id("run_id", run_id)?;
         validate_id("node_id", node_id)?;
@@ -9585,9 +9762,13 @@ impl WorkflowStore {
                 "failed attempt must be positive".to_string(),
             ));
         }
-        let transaction = self
-            .connection
-            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let transaction = rusqlite::Transaction::new_unchecked(
+            &self.connection,
+            rusqlite::TransactionBehavior::Immediate,
+        )?;
+        if let Some(authority) = authority {
+            self.verify_execution_authority(run_id, authority)?;
+        }
         let (run_status, cancellation_requested, retry_cap): (String, bool, u32) = transaction
             .query_row(
                 "SELECT status, cancellation_requested_at_ms IS NOT NULL, retry_cap \
@@ -10464,6 +10645,26 @@ impl WorkflowStore {
             .collect()
     }
 
+    /// Whether an exact attempt has a durable publication cancellation intent.
+    ///
+    /// # Errors
+    /// Rejects invalid identities or database failures. This read never changes intent.
+    pub fn has_publication_cancellation_intent(
+        &self,
+        run_id: &str,
+        dispatch_identity: &str,
+    ) -> Result<bool, WorkflowStoreError> {
+        validate_id("run_id", run_id)?;
+        validate_id("dispatch_identity", dispatch_identity)?;
+        Ok(self.connection.query_row(
+            "SELECT EXISTS(SELECT 1 FROM workflow_publication_cancellations intent
+             JOIN workflow_attempts attempt ON attempt.dispatch_identity = intent.dispatch_identity
+             WHERE intent.run_id = ?1 AND attempt.run_id = ?1 AND intent.dispatch_identity = ?2)",
+            (run_id, dispatch_identity),
+            |row| row.get(0),
+        )?)
+    }
+
     /// Discover exact accepted publication cancellations under held execution authority.
     ///
     /// A changed graph revision does not revoke previously accepted cancellation. Results
@@ -10477,6 +10678,20 @@ impl WorkflowStore {
         authority: &WorkflowExecutionAuthority,
         limit: usize,
     ) -> Result<Vec<ActiveAttemptCancellation>, WorkflowStoreError> {
+        self.pending_publication_cancellations_after(run_id, authority, None, limit)
+    }
+
+    /// Discover a keyset page of accepted cancellations after a dispatch identity.
+    ///
+    /// # Errors
+    /// Rejects stale authority, invalid cursors/limits, malformed receipts, or database failure.
+    pub fn pending_publication_cancellations_after(
+        &self,
+        run_id: &str,
+        authority: &WorkflowExecutionAuthority,
+        after: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<ActiveAttemptCancellation>, WorkflowStoreError> {
         let limit = bounded_limit(limit)?;
         let transaction = self.connection.unchecked_transaction()?;
         self.verify_execution_authority(run_id, authority)?;
@@ -10486,14 +10701,15 @@ impl WorkflowStore {
                   WHEN typeof(receipt_json) = 'text' AND length(CAST(receipt_json AS BLOB)) <= ?3
                   THEN receipt_json ELSE 'invalid oversized or non-text cancellation receipt' END
              FROM workflow_attempts attempt WHERE run_id = ?1
+             AND dispatch_identity > ?4
              AND status IN ('prepared', 'admitted', 'running', 'cancelling')
              AND EXISTS (SELECT 1 FROM workflow_publication_cancellations intent
                  WHERE intent.dispatch_identity = attempt.dispatch_identity)
-             ORDER BY prepared_at_ms, dispatch_identity LIMIT ?2",
+             ORDER BY dispatch_identity LIMIT ?2",
         )?;
         statement
             .query_map(
-                (run_id, limit, MAX_INLINE_JSON_BYTES),
+                (run_id, limit, MAX_INLINE_JSON_BYTES, after.unwrap_or("")),
                 active_attempt_cancellation_row,
             )?
             .map(|row| active_attempt_cancellation(row?))
@@ -14014,7 +14230,17 @@ fn settle_parallel_failure(
                     .ok_or_else(|| {
                         WorkflowStoreError::InvalidData("parallel join is missing".to_string())
                     })?;
-                    if admitted.is_none_or(|revision| join_record.revision > revision)
+                    let incompatible_join: bool = transaction.query_row(
+                        "SELECT EXISTS(SELECT 1 FROM workflow_activations activation
+                         LEFT JOIN workflow_activation_graph_bindings binding
+                         ON binding.run_id = activation.run_id AND binding.activation_id = activation.activation_id
+                         AND binding.node_id = activation.node_id
+                         WHERE activation.run_id = ?1 AND activation.node_id = ?2
+                         AND (binding.graph_revision IS NULL OR binding.graph_revision < ?3))",
+                        rusqlite::params![run_id, join.id, join_record.revision], |row| row.get(0),
+                    )?;
+                    if admitted.is_none()
+                        || incompatible_join
                         || run_graph::retained_edge_activation(
                             transaction,
                             run_id,
@@ -14359,16 +14585,44 @@ fn apply_attempt_observation(
         summary.running.push(request.dispatch_identity.clone());
         return Ok(());
     }
-    if cancellation_requested
-        && matches!(
-            observation,
-            AttemptObservation::Deferred { .. } | AttemptObservation::Unknown
-        )
-    {
+    if cancellation_requested && matches!(observation, AttemptObservation::Unknown) {
+        if request.side_effect == DispatchSideEffect::Mutating {
+            transition_attempt(
+                transaction,
+                request,
+                "repair_required",
+                Some(reconciled_at_ms),
+            )?;
+            transaction.execute(
+                "UPDATE workflow_runs SET status = 'repair_required', updated_at_ms = ?2 WHERE run_id = ?1",
+                (&request.run_id, reconciled_at_ms),
+            )?;
+            summary
+                .repair_required
+                .push(request.dispatch_identity.clone());
+        } else {
+            summary
+                .unresolved_read_only
+                .push(request.dispatch_identity.clone());
+        }
+        return Ok(());
+    }
+    if cancellation_requested && matches!(observation, AttemptObservation::Deferred { .. }) {
         summary.deferred.push(request.dispatch_identity.clone());
         return Ok(());
     }
-    if cancellation_requested {
+    let publication_cancellation: bool = transaction.query_row(
+        "SELECT EXISTS(SELECT 1 FROM workflow_publication_cancellations WHERE run_id = ?1 AND dispatch_identity = ?2)",
+        (&request.run_id, &request.dispatch_identity), |row| row.get(0),
+    )?;
+    let preserve_terminal = matches!(
+        observation,
+        AttemptObservation::Succeeded { .. }
+            | AttemptObservation::Failed { .. }
+            | AttemptObservation::RetryableFailure { .. }
+    ) && (publication_cancellation
+        || fan_out_retirement_pending(transaction, &request.run_id, &request.activation_id)?);
+    if cancellation_requested && !preserve_terminal {
         observation = AttemptObservation::Cancelled;
     }
     let retryable_observation = matches!(&observation, AttemptObservation::RetryableFailure { .. });
@@ -14590,6 +14844,24 @@ fn apply_paused_attempt_observation(
     Ok(())
 }
 
+fn fan_out_retirement_pending(
+    connection: &Connection,
+    run_id: &str,
+    activation_id: &str,
+) -> Result<bool, WorkflowStoreError> {
+    Ok(connection.query_row(
+        "SELECT EXISTS(SELECT 1 FROM workflow_fan_out_members member
+         JOIN workflow_pending_publications pending ON pending.run_id = member.run_id
+         JOIN workflow_run_graphs graph ON graph.run_id = pending.run_id AND graph.revision = pending.expected_revision
+         JOIN workflow_graph_edit_candidates candidate ON candidate.run_id = pending.run_id AND candidate.mutation_id = pending.mutation_id
+         JOIN json_each(candidate.request_json, '$.reconciliation') disposition
+         WHERE member.run_id = ?1 AND member.member_activation_id = ?2
+         AND json_extract(disposition.value, '$.activation_id') = member.controller_activation_id
+         AND json_extract(disposition.value, '$.disposition') = 'cancel')",
+        (run_id, activation_id), |row| row.get(0),
+    )?)
+}
+
 fn fan_out_member_controller(
     transaction: &Transaction<'_>,
     request: &AttemptReconciliationRequest,
@@ -14653,6 +14925,11 @@ fn settle_fan_out_member_failure(
         return Err(WorkflowStoreError::InvalidData(
             "fan-out member activation is not running".to_string(),
         ));
+    }
+    if fan_out_retirement_pending(transaction, &request.run_id, &request.activation_id)? {
+        append_event(transaction, &request.run_id, "fan_out_member_failed",
+            &serde_json::json!({"controller_activation_id": controller_activation_id, "member_activation_id": request.activation_id, "message": message}).to_string(), settled_at_ms)?;
+        return Ok(Vec::new());
     }
     let mut sibling_cancellations = Vec::new();
     if configuration.failure_policy == bcode_workflow::ParallelFailurePolicy::FailFast {
@@ -14844,6 +15121,11 @@ fn settle_fan_out_member_success(
         .to_string(),
         settled_at_ms,
     )?;
+    if fan_out_retirement_pending(transaction, &request.run_id, &request.activation_id)? {
+        // Preserve the owner's result, but leave graph reconciliation to the publisher.
+        // Do not admit queued members or aggregate a controller being retired.
+        return Ok(());
+    }
     let running: u32 = transaction.query_row(
         "SELECT COUNT(*) FROM workflow_fan_out_members WHERE run_id = ?1 \
          AND controller_activation_id = ?2 AND status IN ('pending', 'running')",
@@ -24333,6 +24615,7 @@ mod tests {
     async fn receipt_settlement_rechecks_authority_after_observation() {
         verify_receipt_observation_fence(
             "UPDATE workflow_runs SET coordinator_generation = 2 WHERE run_id = 'run-1'",
+            true,
         )
         .await;
     }
@@ -24341,11 +24624,12 @@ mod tests {
     async fn receipt_settlement_rechecks_graph_after_observation() {
         verify_receipt_observation_fence(
             "UPDATE workflow_run_graphs SET revision = 2 WHERE run_id = 'run-1'",
+            false,
         )
         .await;
     }
 
-    async fn verify_receipt_observation_fence(change: &'static str) {
+    async fn verify_receipt_observation_fence(change: &'static str, rejects: bool) {
         struct Observer(std::path::PathBuf, &'static str);
         impl AsyncAttemptStatusObserver for Observer {
             fn observe_async<'a>(
@@ -24372,11 +24656,12 @@ mod tests {
             .expect("owner");
         let observer = Observer(store.path().to_path_buf(), change);
         let before = store.connection.total_changes();
-        assert!(
+        assert_eq!(
             store
                 .advance_receipt_recovery(&observer, "run-1", &authority, 10, 30)
                 .await
-                .is_err()
+                .is_err(),
+            rejects,
         );
         let cursor_count: u64 = store
             .connection
@@ -24492,6 +24777,49 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn unknown_cancellation_outcome_requires_repair_not_success() {
+        struct Observer;
+        impl AsyncAttemptStatusObserver for Observer {
+            fn observe_async<'a>(
+                &'a self,
+                _: &'a AttemptReconciliationRequest,
+            ) -> Pin<
+                Box<
+                    dyn Future<Output = Result<AttemptObservation, WorkflowStoreError>> + Send + 'a,
+                >,
+            > {
+                Box::pin(async { Ok(AttemptObservation::Unknown) })
+            }
+        }
+        let (temp, mut store) = initialized_store();
+        let identity = prepare_receipt_backed_attempt(&mut store, DispatchSideEffect::Mutating);
+        store.request_cancellation("run-1", 20).expect("intent");
+        store
+            .mark_cancellation_signalled(&identity, 21)
+            .expect("signal");
+        drop(store);
+        let mut store = WorkflowStore::open_in_state_dir(temp.path()).expect("restart");
+        let summary = store
+            .reconcile_receipt_backed_attempts_async(&Observer, 10, 22)
+            .await
+            .expect("observe");
+        assert!(summary.cancelled.is_empty());
+        assert_eq!(summary.repair_required, vec![identity]);
+        assert_eq!(
+            store.attempt_history("run-1", None, 10).expect("history")[0].status,
+            "repair_required"
+        );
+        assert_eq!(
+            store
+                .run_summary("run-1")
+                .expect("summary")
+                .expect("run")
+                .status,
+            RunStatus::RepairRequired
+        );
+    }
+
+    #[tokio::test]
     async fn cancellation_recovery_requires_terminal_owner_evidence_after_restart() {
         struct Observer(AttemptObservation);
         impl AsyncAttemptStatusObserver for Observer {
@@ -24518,7 +24846,6 @@ mod tests {
 
         for observation in [
             AttemptObservation::Running,
-            AttemptObservation::Unknown,
             AttemptObservation::Deferred {
                 reason: "owner temporarily unavailable".to_string(),
             },
@@ -25274,6 +25601,352 @@ mod tests {
     }
 
     #[test]
+    fn publication_cancels_running_fan_out_with_unstarted_members() {
+        exercise_fan_out_retirement(None);
+    }
+
+    #[test]
+    fn publication_preserves_competing_fan_out_success() {
+        exercise_fan_out_retirement(Some(false));
+    }
+
+    #[test]
+    fn publication_preserves_competing_fan_out_failure() {
+        exercise_fan_out_retirement(Some(true));
+    }
+
+    fn fan_out_retirement_fixture() -> (tempfile::TempDir, WorkflowStore, NewWorkflowRun) {
+        let temp = tempfile::tempdir().expect("temp");
+        let mut store = WorkflowStore::open_in_state_dir(temp.path()).expect("store");
+        store
+            .persist_definition("fan-out", 1, &fan_out_definition())
+            .expect("definition");
+        let mut run = new_run();
+        run.definition_id = "fan-out".into();
+        run.input = Some(serde_json::json!([3, 1, 2]));
+        store.create_run(&run).expect("run");
+        (temp, store, run)
+    }
+
+    fn exercise_fan_out_retirement(succeeds: Option<bool>) {
+        let (temp, mut store, run) = fan_out_retirement_fixture();
+        store.connection.execute_batch("UPDATE workflow_runs SET target_artifact_id = 'artifact-a', coordinator_daemon_instance_id = 'daemon-a', coordinator_generation = 1, coordinator_fencing_token = 'token-a'").expect("owner");
+        let authority = store
+            .execution_authority(&run.run_id)
+            .expect("authority")
+            .expect("owner");
+        let summary = store
+            .settle_pending_control_nodes(&run.run_id, 10, 20)
+            .expect("materialize");
+        let member = &summary.activated[0];
+        let prepared = store
+            .prepare_pending_activation(
+                &run.run_id,
+                &member.node_id,
+                &member.activation_id,
+                DispatchSideEffect::Mutating,
+                serde_json::json!({}),
+                20,
+            )
+            .expect("prepare child")
+            .expect("child");
+        let mut request = bcode_workflow::WorkflowRunGraphEditBatch {
+            version: bcode_workflow::WORKFLOW_RUN_GRAPH_EDIT_VERSION,
+            run_id: run.run_id.clone(),
+            mutation_id: "cancel-fan-out".into(),
+            expected_revision: 1,
+            edits: vec![bcode_workflow::WorkflowRunGraphEdit::RemoveNode {
+                node_id: "fan-out".into(),
+            }],
+            reconciliation: vec![bcode_workflow::WorkflowRunGraphReconciliation::Cancel {
+                activation_id: activation_identity(&run.run_id, "fan-out", 0),
+            }],
+        };
+        let mut replacement = sequential_definition().nodes["first"].clone();
+        replacement.id = "replacement".into();
+        replacement.input = fan_out_definition().nodes["fan-out"].input.clone();
+        request
+            .edits
+            .push(bcode_workflow::WorkflowRunGraphEdit::AddNode {
+                node: replacement,
+                entry: true,
+                exit: true,
+            });
+        request
+            .reconciliation
+            .extend(summary.activated.iter().map(|member| {
+                bcode_workflow::WorkflowRunGraphReconciliation::Cancel {
+                    activation_id: member.activation_id.clone(),
+                }
+            }));
+        let mut uncovered = request.clone();
+        uncovered.mutation_id = "uncovered-fan-out".into();
+        uncovered.reconciliation.pop();
+        store
+            .stage_run_graph_edit(&uncovered, &authority, 21)
+            .expect("stage uncovered");
+        assert!(
+            store
+                .publish_retained_leaf_run_graph_edit(
+                    &run.run_id,
+                    &uncovered.mutation_id,
+                    &authority,
+                    22
+                )
+                .is_err()
+        );
+        assert_eq!(
+            store.run_graph_revision(&run.run_id).expect("revision"),
+            Some(1)
+        );
+        store
+            .stage_run_graph_edit(&request, &authority, 21)
+            .expect("stage");
+        complete_fan_out_publication_cancellation(
+            &mut store, &run, &request, &authority, &prepared, succeeds,
+        );
+        if succeeds.is_some() {
+            return;
+        }
+        assert!(
+            store
+                .persist_dispatch_receipt(&DispatchReceipt {
+                    run_id: run.run_id.clone(),
+                    node_id: member.node_id.clone(),
+                    activation_id: member.activation_id.clone(),
+                    attempt: prepared.attempt,
+                    dispatch_identity: prepared.dispatch_identity,
+                    receipt: serde_json::json!({"accepted":true}),
+                    admitted_at_ms: 23,
+                })
+                .is_err()
+        );
+        drop(store);
+        assert_retired_fan_out_after_reopen(temp.path(), &run.run_id);
+    }
+
+    struct CancelledFanOut;
+    impl AttemptStatusObserver for CancelledFanOut {
+        fn observe(
+            &self,
+            _: &AttemptReconciliationRequest,
+        ) -> Result<AttemptObservation, WorkflowStoreError> {
+            Ok(AttemptObservation::Cancelled)
+        }
+    }
+
+    fn complete_fan_out_publication_cancellation(
+        store: &mut WorkflowStore,
+        run: &NewWorkflowRun,
+        request: &bcode_workflow::WorkflowRunGraphEditBatch,
+        authority: &WorkflowExecutionAuthority,
+        prepared: &PreparedActivationDispatch,
+        succeeds: Option<bool>,
+    ) {
+        store
+            .persist_dispatch_receipt(&DispatchReceipt {
+                run_id: run.run_id.clone(),
+                node_id: prepared.activation.node_id.clone(),
+                activation_id: prepared.activation.activation_id.clone(),
+                attempt: prepared.attempt,
+                dispatch_identity: prepared.dispatch_identity.clone(),
+                receipt: serde_json::json!({"accepted":true}),
+                admitted_at_ms: 22,
+            })
+            .expect("receipt");
+        let sibling = store
+            .pending_activations_for_run(&run.run_id, 10)
+            .expect("sibling")
+            .remove(0);
+        let sibling = store
+            .prepare_pending_activation(
+                &run.run_id,
+                &sibling.node_id,
+                &sibling.activation_id,
+                DispatchSideEffect::Mutating,
+                serde_json::json!({}),
+                22,
+            )
+            .expect("prepare sibling")
+            .expect("prepared");
+        store
+            .accept_pending_run_graph_publication(&run.run_id, &request.mutation_id, authority, 23)
+            .expect("accept");
+        assert!(
+            store
+                .record_dispatch_handoff(&sibling, Some(authority))
+                .is_err()
+        );
+        let handed_off: bool = store
+            .connection
+            .query_row(
+                "SELECT handed_off FROM workflow_dispatch_handoffs WHERE dispatch_identity = ?1",
+                [&sibling.dispatch_identity],
+                |row| row.get(0),
+            )
+            .expect("handoff");
+        assert!(!handed_off);
+        assert_eq!(
+            store
+                .pending_publication_cancellations(&run.run_id, authority, 10)
+                .expect("intents")
+                .len(),
+            1
+        );
+        let pending = store
+            .pending_activations_for_run(&run.run_id, 10)
+            .expect("pending sibling");
+        for sibling in pending {
+            assert!(
+                store
+                    .prepare_pending_activation(
+                        &run.run_id,
+                        &sibling.node_id,
+                        &sibling.activation_id,
+                        DispatchSideEffect::Mutating,
+                        serde_json::json!({}),
+                        24
+                    )
+                    .expect("fenced sibling")
+                    .is_none()
+            );
+        }
+        store
+            .mark_publication_cancellation_signalled(
+                &run.run_id,
+                &prepared.dispatch_identity,
+                authority,
+                24,
+            )
+            .expect("signal");
+        if let Some(failed) = succeeds {
+            assert_competing_fan_out_success(store, run, request, authority, failed);
+            return;
+        }
+        store
+            .reconcile_receipt_backed_attempts(&CancelledFanOut, 10, 25)
+            .expect("owner cancelled");
+        assert_eq!(
+            store
+                .finalize_pending_run_graph_publication(
+                    &run.run_id,
+                    &request.mutation_id,
+                    authority,
+                    26
+                )
+                .expect("finalize"),
+            bcode_workflow::WorkflowRunGraphPublicationStatus::Committed { revision: 2 }
+        );
+    }
+
+    fn assert_competing_fan_out_success(
+        store: &mut WorkflowStore,
+        run: &NewWorkflowRun,
+        request: &bcode_workflow::WorkflowRunGraphEditBatch,
+        authority: &WorkflowExecutionAuthority,
+        failed: bool,
+    ) {
+        struct Succeeded(bool);
+        impl AttemptStatusObserver for Succeeded {
+            fn observe(
+                &self,
+                request: &AttemptReconciliationRequest,
+            ) -> Result<AttemptObservation, WorkflowStoreError> {
+                if self.0 {
+                    return Ok(AttemptObservation::Failed {
+                        message: "competing failure".into(),
+                    });
+                }
+                Ok(AttemptObservation::Succeeded {
+                    output: ValidatedOutput {
+                        output_id: "competing-success".into(),
+                        run_id: request.run_id.clone(),
+                        node_id: request.node_id.clone(),
+                        activation_id: request.activation_id.clone(),
+                        schema_id: "u32".into(),
+                        schema_version: 1,
+                        value: serde_json::json!(7),
+                        artifact_reference: None,
+                        created_at_ms: 25,
+                    },
+                })
+            }
+        }
+        store
+            .reconcile_receipt_backed_attempts(&Succeeded(failed), 10, 25)
+            .expect("success");
+        let state: (String, Option<String>) = store.connection.query_row("SELECT status, output_json FROM workflow_fan_out_members WHERE run_id = ?1 AND member_index = 0", [&run.run_id], |row| Ok((row.get(0)?, row.get(1)?))).expect("member result");
+        let expected = if failed { "failed" } else { "completed" };
+        assert_eq!(state, (expected.into(), (!failed).then(|| "7".into())));
+        let statuses: Vec<String> = store.connection.prepare("SELECT status FROM workflow_fan_out_members WHERE run_id = ?1 ORDER BY member_index").expect("query").query_map([&run.run_id], |row| row.get(0)).expect("rows").collect::<Result<_, _>>().expect("statuses");
+        assert_eq!(statuses, [expected, "running", "waiting"]);
+        assert_eq!(
+            store
+                .finalize_pending_run_graph_publication(
+                    &run.run_id,
+                    &request.mutation_id,
+                    authority,
+                    26
+                )
+                .expect("terminal conflict"),
+            bcode_workflow::WorkflowRunGraphPublicationStatus::Conflicted {
+                expected_revision: 1,
+                current_revision: 1
+            }
+        );
+        assert_eq!(
+            store.run_graph_revision(&run.run_id).expect("revision"),
+            Some(1)
+        );
+        recover_conflicted_fan_out(store, run, request, authority, expected);
+    }
+
+    fn recover_conflicted_fan_out(
+        store: &mut WorkflowStore,
+        run: &NewWorkflowRun,
+        request: &bcode_workflow::WorkflowRunGraphEditBatch,
+        authority: &WorkflowExecutionAuthority,
+        expected: &str,
+    ) {
+        let terminal: String = store.connection.query_row("SELECT member_activation_id FROM workflow_fan_out_members WHERE run_id = ?1 AND member_index = 0", [&run.run_id], |row| row.get(0)).expect("terminal");
+        let mut revised = request.clone();
+        revised.mutation_id = "reconcile-terminal-member".into();
+        revised.reconciliation.retain(|item| !matches!(item, bcode_workflow::WorkflowRunGraphReconciliation::Cancel { activation_id } if *activation_id == terminal));
+        store
+            .stage_run_graph_edit(&revised, authority, 27)
+            .expect("revised dispositions");
+        store
+            .publish_retained_leaf_run_graph_edit(&run.run_id, &revised.mutation_id, authority, 28)
+            .expect("recover retirement");
+        let statuses: Vec<String> = store.connection.prepare("SELECT status FROM workflow_fan_out_members WHERE run_id = ?1 ORDER BY member_index").expect("query").query_map([&run.run_id], |row| row.get(0)).expect("rows").collect::<Result<_, _>>().expect("statuses");
+        assert_eq!(statuses, [expected, "cancelled", "cancelled"]);
+        assert_eq!(
+            store.run_graph_revision(&run.run_id).expect("revision"),
+            Some(2)
+        );
+    }
+
+    fn assert_retired_fan_out_after_reopen(path: &std::path::Path, run_id: &str) {
+        let mut store = WorkflowStore::open_in_state_dir(path).expect("reopen");
+        assert!(
+            store
+                .pending_activations_for_run(run_id, 10)
+                .expect("pending")
+                .iter()
+                .all(|activation| activation.node_id == "replacement")
+        );
+        assert!(
+            store
+                .settle_pending_control_nodes(run_id, 10, 23)
+                .expect("settle")
+                .activated
+                .is_empty()
+        );
+        let count: u64 = store.connection.query_row("SELECT count(*) FROM workflow_fan_out_members WHERE run_id = ?1 AND status = 'cancelled'", [run_id], |row| row.get(0)).expect("members");
+        assert_eq!(count, 3);
+    }
+
+    #[test]
     fn durable_fan_out_materialization_is_bounded_ordered_and_restart_safe() {
         let temp = tempfile::tempdir().expect("temp");
         let mut store = WorkflowStore::open_in_state_dir(temp.path()).expect("store");
@@ -25759,7 +26432,7 @@ mod tests {
             .expect("terminal failure");
         drop(reopened);
 
-        let mut reopened = WorkflowStore::open_in_state_dir(temp.path()).expect("terminal restart");
+        let reopened = WorkflowStore::open_in_state_dir(temp.path()).expect("terminal restart");
         assert!(
             reopened
                 .pending_activations(10)
@@ -35375,6 +36048,16 @@ mod tests {
 
     #[test]
     fn pending_publication_acceptance_is_atomic_and_idempotent() {
+        exercise_pending_publication(true);
+    }
+
+    #[test]
+    fn pending_publication_finalizes_only_after_exact_settlement() {
+        exercise_pending_publication(false);
+    }
+
+    #[test]
+    fn explicit_cancellation_repair_unblocks_accepted_publication() {
         let (_temp, mut store, run, authority, _) = connected_publication_fixture();
         let id = activation_identity(&run.run_id, "first", 0);
         let prepared = store
@@ -35388,16 +36071,118 @@ mod tests {
             )
             .expect("prepare")
             .expect("pending");
+        store
+            .persist_dispatch_receipt(&DispatchReceipt {
+                run_id: run.run_id.clone(),
+                node_id: "first".into(),
+                activation_id: id.clone(),
+                attempt: prepared.attempt,
+                dispatch_identity: prepared.dispatch_identity.clone(),
+                receipt: serde_json::json!({"accepted": true}),
+                admitted_at_ms: 26,
+            })
+            .expect("receipt");
         let request = bcode_workflow::WorkflowRunGraphEditBatch {
+            version: bcode_workflow::WORKFLOW_RUN_GRAPH_EDIT_VERSION,
+            run_id: run.run_id.clone(),
+            mutation_id: "repair-publication".into(),
+            expected_revision: 2,
+            edits: vec![bcode_workflow::WorkflowRunGraphEdit::RemoveEdge { edge_id: 0 }],
+            reconciliation: vec![bcode_workflow::WorkflowRunGraphReconciliation::Cancel {
+                activation_id: id,
+            }],
+        };
+        store
+            .stage_run_graph_edit(&request, &authority, 27)
+            .expect("stage");
+        store
+            .accept_pending_run_graph_publication(&run.run_id, &request.mutation_id, &authority, 28)
+            .expect("accept");
+        store.connection.execute("UPDATE workflow_attempts SET status = 'repair_required' WHERE dispatch_identity = ?1", [&prepared.dispatch_identity]).expect("ambiguous attempt");
+        let resolution = RepairResolution::ConfirmCancelled {
+            message: "operator verified cancellation".into(),
+        };
+        let mut stale = authority.clone();
+        stale.generation += 1;
+        assert!(
+            store
+                .repair_attempt_owned(&prepared.dispatch_identity, &resolution, 29, &stale)
+                .is_err()
+        );
+        store
+            .repair_attempt_owned(&prepared.dispatch_identity, &resolution, 30, &authority)
+            .expect("explicit repair");
+        let result = store
+            .finalize_pending_run_graph_publication(
+                &run.run_id,
+                &request.mutation_id,
+                &authority,
+                31,
+            )
+            .expect("finalize");
+        assert!(matches!(
+            result,
+            bcode_workflow::WorkflowRunGraphPublicationStatus::Committed { revision: 3 }
+        ));
+    }
+
+    fn create_local_publication_target(
+        store: &mut WorkflowStore,
+        run_id: &str,
+        authority: &WorkflowExecutionAuthority,
+    ) {
+        store
+            .create_activation_at_graph_revision(
+                &NewActivation {
+                    run_id: run_id.into(),
+                    node_id: "second".into(),
+                    activation_id: activation_identity(run_id, "second", 0),
+                    dependency_generation: 0,
+                    input: Some(serde_json::json!(1)),
+                    created_at_ms: 25,
+                },
+                2,
+                authority,
+            )
+            .expect("local pending work");
+    }
+
+    fn exercise_pending_publication(conflict: bool) {
+        let (_temp, mut store, run, authority, _) = connected_publication_fixture();
+        let id = activation_identity(&run.run_id, "first", 0);
+        let prepared = store
+            .prepare_pending_activation(
+                &run.run_id,
+                "first",
+                &id,
+                DispatchSideEffect::Mutating,
+                serde_json::json!({}),
+                25,
+            )
+            .expect("prepare")
+            .expect("pending");
+        let local_id = activation_identity(&run.run_id, "second", 0);
+        if !conflict {
+            create_local_publication_target(&mut store, &run.run_id, &authority);
+        }
+        let mut request = bcode_workflow::WorkflowRunGraphEditBatch {
             version: bcode_workflow::WORKFLOW_RUN_GRAPH_EDIT_VERSION,
             run_id: run.run_id.clone(),
             mutation_id: "pending-cancel".into(),
             expected_revision: 2,
             edits: vec![bcode_workflow::WorkflowRunGraphEdit::RemoveEdge { edge_id: 0 }],
-            reconciliation: vec![bcode_workflow::WorkflowRunGraphReconciliation::Cancel {
-                activation_id: id.clone(),
-            }],
+            reconciliation: vec![
+                bcode_workflow::WorkflowRunGraphReconciliation::Cancel {
+                    activation_id: id.clone(),
+                },
+                bcode_workflow::WorkflowRunGraphReconciliation::Cancel {
+                    activation_id: local_id,
+                },
+            ],
         };
+        if conflict {
+            request.reconciliation.pop();
+        }
         store
             .stage_run_graph_edit(&request, &authority, 26)
             .expect("stage");
@@ -35455,16 +36240,165 @@ mod tests {
             store.run_graph_revision(&run.run_id).expect("revision"),
             Some(2)
         );
-        let identity: String = store
-            .connection
-            .query_row(
-                "SELECT dispatch_identity FROM workflow_publication_cancellations",
-                [],
-                |row| row.get(0),
-            )
-            .expect("exact intent");
-        assert_eq!(identity, prepared.dispatch_identity);
-        assert_publication_cancellation_settlement(&mut store, &run.run_id, &authority, identity);
+        assert_pending_publication_finalization(
+            &mut store,
+            &run,
+            &request,
+            &authority,
+            prepared.dispatch_identity,
+            conflict,
+        );
+    }
+
+    fn assert_pending_publication_finalization(
+        store: &mut WorkflowStore,
+        run: &NewWorkflowRun,
+        request: &bcode_workflow::WorkflowRunGraphEditBatch,
+        authority: &WorkflowExecutionAuthority,
+        identity: String,
+        conflict: bool,
+    ) {
+        use bcode_workflow::WorkflowRunGraphPublicationStatus as Status;
+        let page = store
+            .accepted_run_graph_publication_page(&run.run_id, authority, None, 1)
+            .expect("discover accepted publication");
+        assert_eq!(page, std::slice::from_ref(&request.mutation_id));
+        assert!(
+            store
+                .accepted_run_graph_publication_page(
+                    &run.run_id,
+                    authority,
+                    Some(&request.mutation_id),
+                    1
+                )
+                .expect("end of page")
+                .is_empty()
+        );
+        let mut stale = authority.clone();
+        stale.generation += 1;
+        assert!(
+            store
+                .accepted_run_graph_publication_page(&run.run_id, &stale, None, 1)
+                .is_err()
+        );
+        assert_eq!(
+            store
+                .finalize_pending_run_graph_publication(
+                    &run.run_id,
+                    &request.mutation_id,
+                    authority,
+                    30
+                )
+                .expect("not settled"),
+            Status::Pending {
+                expected_revision: 2
+            }
+        );
+        if conflict {
+            assert_publication_status_conflict(store, &run.run_id, authority);
+        }
+        assert_publication_cancellation_settlement(store, &run.run_id, authority, identity);
+        let expected = if conflict {
+            Status::Conflicted {
+                expected_revision: 2,
+                current_revision: 3,
+            }
+        } else {
+            Status::Committed { revision: 3 }
+        };
+        for _ in 0..2 {
+            assert_eq!(
+                store
+                    .finalize_pending_run_graph_publication(
+                        &run.run_id,
+                        &request.mutation_id,
+                        authority,
+                        33
+                    )
+                    .expect("finalize"),
+                expected
+            );
+        }
+    }
+
+    fn assert_publication_status_conflict(
+        store: &mut WorkflowStore,
+        run_id: &str,
+        authority: &WorkflowExecutionAuthority,
+    ) {
+        use bcode_workflow::WorkflowRunGraphPublicationStatus as Status;
+        assert_eq!(
+            store
+                .run_graph_publication_status(run_id, "unknown", authority)
+                .expect("absent"),
+            None
+        );
+        assert_eq!(
+            store
+                .run_graph_publication_status(run_id, "pending-cancel", authority)
+                .expect("pending"),
+            Some(Status::Pending {
+                expected_revision: 2
+            })
+        );
+        let mut stale = authority.clone();
+        stale.generation += 1;
+        assert!(
+            store
+                .run_graph_publication_status(run_id, "pending-cancel", &stale)
+                .is_err()
+        );
+        let mut node = store
+            .current_run_graph_node(run_id, "second")
+            .expect("node")
+            .expect("second")
+            .node;
+        node.name = "later revision".into();
+        let edit = bcode_workflow::WorkflowRunGraphEditBatch {
+            version: bcode_workflow::WORKFLOW_RUN_GRAPH_EDIT_VERSION,
+            run_id: run_id.into(),
+            mutation_id: "later-edit".into(),
+            expected_revision: 2,
+            edits: vec![bcode_workflow::WorkflowRunGraphEdit::ReplaceNode {
+                node,
+                entry: false,
+                exit: true,
+            }],
+            reconciliation: vec![
+                bcode_workflow::WorkflowRunGraphReconciliation::RetainWithBindings {
+                    activation_id: activation_identity(run_id, "first", 0),
+                    edge_ids: vec![0],
+                },
+            ],
+        };
+        store
+            .stage_run_graph_edit(&edit, authority, 30)
+            .expect("stage later edit");
+        store
+            .publish_retained_leaf_run_graph_edit(run_id, &edit.mutation_id, authority, 30)
+            .expect("publish later edit");
+        assert_eq!(
+            store
+                .run_graph_publication_status(run_id, "pending-cancel", authority)
+                .expect("conflict"),
+            Some(Status::Conflicted {
+                expected_revision: 2,
+                current_revision: 3
+            })
+        );
+        assert_eq!(
+            store
+                .run_graph_publication_status(run_id, "bound-connected", authority)
+                .expect("stable commit"),
+            Some(Status::Committed { revision: 2 })
+        );
+        assert_eq!(
+            store
+                .pending_publication_cancellations(run_id, authority, 10)
+                .expect("durable cancellation")
+                .len(),
+            1
+        );
     }
 
     fn assert_publication_cancellation_settlement(
@@ -35488,6 +36422,22 @@ mod tests {
             .expect("discover accepted intent");
         assert_eq!(pending.len(), 1);
         assert_eq!(pending[0].dispatch_identity, identity);
+        assert!(
+            store
+                .has_publication_cancellation_intent(run_id, &identity)
+                .expect("accepted intent")
+        );
+        assert!(
+            !store
+                .has_publication_cancellation_intent(run_id, "unrelated-dispatch")
+                .expect("unrelated attempt")
+        );
+        assert!(
+            store
+                .pending_publication_cancellations_after(run_id, authority, Some(&identity), 1)
+                .expect("end of cancellation sweep")
+                .is_empty()
+        );
         assert!(
             store
                 .mark_publication_cancellation_signalled(run_id, &identity, &stale, 30)
@@ -35570,10 +36520,23 @@ mod tests {
             let (_temp, mut store) = initialized_store();
             let identity = prepare_receipt_backed_attempt(&mut store, DispatchSideEffect::Mutating);
             store.request_cancellation("run-1", 20).expect("intent");
+            let unknown = matches!(observation, AttemptObservation::Unknown);
             let summary = store
                 .apply_attempt_observation(&identity, observation, 21)
                 .expect("nonterminal owner");
             assert!(summary.cancelled.is_empty());
+            if unknown {
+                assert_eq!(summary.repair_required, [identity]);
+                assert_eq!(
+                    store
+                        .run_summary("run-1")
+                        .expect("summary")
+                        .expect("run")
+                        .status,
+                    RunStatus::RepairRequired
+                );
+                continue;
+            }
             assert_eq!(
                 store
                     .run_summary("run-1")
@@ -41280,6 +42243,275 @@ mod tests {
         assert_eq!(admitted, 1);
     }
 
+    fn parallel_publication_edits(
+        parallel: &WorkflowDefinition,
+    ) -> Vec<bcode_workflow::WorkflowRunGraphEdit> {
+        let mut edits = parallel
+            .nodes
+            .values()
+            .map(|node| bcode_workflow::WorkflowRunGraphEdit::AddNode {
+                node: node.clone(),
+                entry: parallel.entries.contains(&node.id),
+                exit: parallel.exits.contains(&node.id),
+            })
+            .collect::<Vec<_>>();
+        edits.extend(parallel.edges.iter().enumerate().map(|(index, edge)| {
+            bcode_workflow::WorkflowRunGraphEdit::AddEdge {
+                edge_id: u64::try_from(index).expect("edge") + 1,
+                edge: edge.clone(),
+            }
+        }));
+        edits
+    }
+
+    #[test]
+    fn publication_adds_parallel_controller_and_settles_tuple() {
+        let (_temp, mut store, run, authority, _) = connected_publication_fixture();
+        let parallel = parallel_join_definition();
+        let request = bcode_workflow::WorkflowRunGraphEditBatch {
+            version: bcode_workflow::WORKFLOW_RUN_GRAPH_EDIT_VERSION,
+            run_id: run.run_id.clone(),
+            mutation_id: "parallel-added".into(),
+            expected_revision: 2,
+            edits: parallel_publication_edits(&parallel),
+            reconciliation: vec![
+                bcode_workflow::WorkflowRunGraphReconciliation::RetainWithBindings {
+                    activation_id: activation_identity(&run.run_id, "first", 0),
+                    edge_ids: vec![0],
+                },
+            ],
+        };
+        store
+            .stage_run_graph_edit(&request, &authority, 25)
+            .expect("stage");
+        store
+            .publish_retained_leaf_run_graph_edit(&run.run_id, &request.mutation_id, &authority, 26)
+            .expect("publish");
+        let mut extension = request.clone();
+        extension.mutation_id = "preserve-parallel".into();
+        extension.expected_revision = 3;
+        let mut extra = parallel.nodes["left"].clone();
+        extra.id = "extra".into();
+        extension.edits = vec![bcode_workflow::WorkflowRunGraphEdit::AddNode {
+            node: extra,
+            entry: true,
+            exit: true,
+        }];
+        extension
+            .reconciliation
+            .extend([("left", 1), ("right", 2)].map(|(node, edge)| {
+                bcode_workflow::WorkflowRunGraphReconciliation::RetainWithBindings {
+                    activation_id: activation_identity(&run.run_id, node, 0),
+                    edge_ids: vec![edge],
+                }
+            }));
+        store
+            .stage_run_graph_edit(&extension, &authority, 27)
+            .expect("stage preserving controller");
+        store
+            .publish_retained_leaf_run_graph_edit(
+                &run.run_id,
+                &extension.mutation_id,
+                &authority,
+                28,
+            )
+            .expect("preserve controller");
+        let mut revised = extension.clone();
+        revised.mutation_id = "reorder-planned-parallel".into();
+        revised.expected_revision = 4;
+        let mut join = parallel.nodes["join"].clone();
+        join.configuration["left_exits"] = serde_json::json!(["right"]);
+        join.configuration["right_exits"] = serde_json::json!(["left"]);
+        revised.edits = vec![bcode_workflow::WorkflowRunGraphEdit::ReplaceNode {
+            node: join,
+            entry: false,
+            exit: true,
+        }];
+        revised
+            .reconciliation
+            .push(bcode_workflow::WorkflowRunGraphReconciliation::Retain {
+                activation_id: activation_identity(&run.run_id, "extra", 0),
+            });
+        store
+            .stage_run_graph_edit(&revised, &authority, 29)
+            .expect("stage reordered tuple");
+        store
+            .publish_retained_leaf_run_graph_edit(&run.run_id, &revised.mutation_id, &authority, 29)
+            .expect("publish reordered tuple");
+        for (node, value) in [("left", 2), ("right", 3)] {
+            store
+                .persist_validated_output(&ValidatedOutput {
+                    output_id: format!("{node}-out"),
+                    run_id: run.run_id.clone(),
+                    node_id: node.into(),
+                    activation_id: activation_identity(&run.run_id, node, 0),
+                    schema_id: "u32".into(),
+                    schema_version: 1,
+                    value: serde_json::json!(value),
+                    artifact_reference: None,
+                    created_at_ms: 30,
+                })
+                .expect("member");
+        }
+        replace_admitted_parallel_join(&mut store, &run, &authority, &parallel);
+        store
+            .settle_pending_control_nodes(&run.run_id, 10, 35)
+            .expect("join");
+        assert_replaced_parallel_history(&store, &run.run_id);
+    }
+
+    fn assert_replaced_parallel_history(store: &WorkflowStore, run_id: &str) {
+        let historical: (String, String) = store.connection.query_row(
+            "SELECT status, input_json FROM workflow_activations WHERE run_id = ?1 AND node_id = 'join'",
+            [run_id], |row| Ok((row.get(0)?, row.get(1)?)),
+        ).expect("historical join");
+        assert_eq!(historical.0, "cancelled");
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&historical.1).expect("input"),
+            serde_json::json!([3, 2])
+        );
+        let outputs = store.validated_outputs(run_id, 10).expect("outputs");
+        assert!(!outputs.iter().any(|output| output.node_id == "join"));
+        assert!(
+            outputs
+                .iter()
+                .any(|output| output.node_id == "replacement-join"
+                    && output.value == serde_json::json!([2, 3]))
+        );
+    }
+
+    fn replace_admitted_parallel_join(
+        store: &mut WorkflowStore,
+        run: &NewWorkflowRun,
+        authority: &WorkflowExecutionAuthority,
+        parallel: &WorkflowDefinition,
+    ) {
+        use bcode_workflow::{
+            WorkflowRunGraphEdit as Edit, WorkflowRunGraphReconciliation as Reconcile,
+        };
+        let mut join = parallel.nodes["join"].clone();
+        join.id = "replacement-join".into();
+        let request = bcode_workflow::WorkflowRunGraphEditBatch {
+            version: bcode_workflow::WORKFLOW_RUN_GRAPH_EDIT_VERSION,
+            run_id: run.run_id.clone(),
+            mutation_id: "replace-admitted-join".into(),
+            expected_revision: 5,
+            edits: vec![
+                Edit::RemoveEdge { edge_id: 1 },
+                Edit::RemoveEdge { edge_id: 2 },
+                Edit::RemoveNode {
+                    node_id: "join".into(),
+                },
+                Edit::AddNode {
+                    node: join,
+                    entry: false,
+                    exit: true,
+                },
+            ],
+            reconciliation: vec![
+                Reconcile::Cancel {
+                    activation_id: activation_identity(&run.run_id, "join", 0),
+                },
+                Reconcile::Retain {
+                    activation_id: activation_identity(&run.run_id, "extra", 0),
+                },
+                Reconcile::RetainWithBindings {
+                    activation_id: activation_identity(&run.run_id, "first", 0),
+                    edge_ids: vec![0],
+                },
+                Reconcile::RetainWithBindings {
+                    activation_id: activation_identity(&run.run_id, "left", 0),
+                    edge_ids: vec![3],
+                },
+                Reconcile::RetainWithBindings {
+                    activation_id: activation_identity(&run.run_id, "right", 0),
+                    edge_ids: vec![4],
+                },
+            ],
+        };
+        let mut request = request;
+        request
+            .edits
+            .extend(parallel.edges.iter().enumerate().map(|(index, edge)| {
+                let mut edge = edge.clone();
+                edge.to = "replacement-join".into();
+                Edit::AddEdge {
+                    edge_id: u64::try_from(index).expect("edge") + 3,
+                    edge,
+                }
+            }));
+        store
+            .stage_run_graph_edit(&request, authority, 32)
+            .expect("stage replacement");
+        store
+            .publish_retained_leaf_run_graph_edit(&run.run_id, &request.mutation_id, authority, 33)
+            .expect("replace admitted join");
+    }
+
+    #[test]
+    fn published_direct_dependency_join_waits_for_both_sources() {
+        let (_temp, mut store, run, authority, _) = connected_publication_fixture();
+        let mut peer = store
+            .current_run_graph_node(&run.run_id, "second")
+            .expect("node")
+            .expect("second")
+            .node;
+        peer.id = "peer".into();
+        let request = bcode_workflow::WorkflowRunGraphEditBatch {
+            version: bcode_workflow::WORKFLOW_RUN_GRAPH_EDIT_VERSION,
+            run_id: run.run_id.clone(),
+            mutation_id: "join-peer".into(),
+            expected_revision: 2,
+            edits: vec![
+                bcode_workflow::WorkflowRunGraphEdit::AddNode {
+                    node: peer,
+                    entry: true,
+                    exit: false,
+                },
+                bcode_workflow::WorkflowRunGraphEdit::AddEdge {
+                    edge_id: 1,
+                    edge: bcode_workflow::EdgeDefinition {
+                        from: "peer".into(),
+                        to: "second".into(),
+                        kind: bcode_workflow::EdgeKind::Direct,
+                        transform: None,
+                    },
+                },
+            ],
+            reconciliation: vec![
+                bcode_workflow::WorkflowRunGraphReconciliation::RetainWithBindings {
+                    activation_id: activation_identity(&run.run_id, "first", 0),
+                    edge_ids: vec![0],
+                },
+            ],
+        };
+        store
+            .stage_run_graph_edit(&request, &authority, 25)
+            .expect("stage join");
+        store
+            .publish_retained_leaf_run_graph_edit(&run.run_id, &request.mutation_id, &authority, 26)
+            .expect("publish join");
+        for node in ["first", "peer"] {
+            let result = store
+                .persist_validated_output(&ValidatedOutput {
+                    output_id: format!("{node}-joined"),
+                    run_id: run.run_id.clone(),
+                    node_id: node.into(),
+                    activation_id: activation_identity(&run.run_id, node, 0),
+                    schema_id: "u32".into(),
+                    schema_version: 1,
+                    value: serde_json::json!(2),
+                    artifact_reference: None,
+                    created_at_ms: 30,
+                })
+                .expect("settle source");
+            assert_eq!(result.activated.len(), usize::from(node == "peer"));
+            if node == "peer" {
+                assert_eq!(result.activated[0].node_id, "second");
+            }
+        }
+    }
+
     fn connected_publication_fixture() -> (
         tempfile::TempDir,
         WorkflowStore,
@@ -41555,6 +42787,69 @@ mod tests {
                 .repair_required
                 .len(),
             1
+        );
+    }
+
+    #[tokio::test]
+    async fn dispatch_receipt_is_fenced_when_authority_transfers_after_owner_acceptance() {
+        struct Transfer {
+            path: PathBuf,
+            prior: WorkflowExecutionAuthority,
+            replacement: WorkflowExecutionAuthority,
+        }
+        impl WorkflowDispatchFault for Transfer {
+            fn after_boundary(
+                &self,
+                boundary: WorkflowDispatchBoundary,
+                request: &PreparedActivationDispatch,
+            ) -> Result<(), WorkflowStoreError> {
+                if boundary == WorkflowDispatchBoundary::OwnerAccepted {
+                    WorkflowStore::open_at_path(&self.path)?.transfer_execution_authority(
+                        &request.activation.run_id,
+                        &self.prior,
+                        &self.replacement,
+                        26,
+                    )?;
+                }
+                Ok(())
+            }
+        }
+        let (_temp, mut store, run, authority, _) = connected_publication_fixture();
+        let mut replacement = authority.clone();
+        replacement.generation += 1;
+        replacement.daemon_instance_id = "replacement".into();
+        replacement.fencing_token = "replacement-token".into();
+        let fault = Transfer {
+            path: store.path().to_path_buf(),
+            prior: authority.clone(),
+            replacement: replacement.clone(),
+        };
+        let owner = MutationDispatchOwner(std::sync::atomic::AtomicUsize::new(0));
+        let pending = store
+            .pending_activations_for_run(&run.run_id, 1)
+            .expect("pending");
+        assert!(
+            store
+                .dispatch_activations_with_fault(&owner, &fault, pending, 25, Some(&authority))
+                .await
+                .is_err()
+        );
+        assert_eq!(owner.0.load(std::sync::atomic::Ordering::SeqCst), 1);
+        let attempts = store
+            .attempt_history(&run.run_id, None, 10)
+            .expect("attempts");
+        assert_eq!(attempts.len(), 1);
+        assert_eq!(attempts[0].status, "prepared");
+        assert!(!attempts[0].has_receipt);
+        let recovered = store
+            .reconcile_owned_prepared_attempts_for_run(&run.run_id, &replacement, 10, 27)
+            .expect("replacement recovery");
+        assert_eq!(recovered.repair_required.len(), 1);
+        assert!(
+            store
+                .pending_activations_for_run(&run.run_id, 10)
+                .expect("pending")
+                .is_empty()
         );
     }
 
