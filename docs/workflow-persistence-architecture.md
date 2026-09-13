@@ -7,8 +7,14 @@ operation validates the staged candidate under current authority and commits acc
 with receipt-backed, unlinked cancellation targets atomically. Duplicate acceptance keeps
 the original attempt set; failed target validation rolls back all acceptance writes.
 Schema-30 initialization upgrades preserve existing runs without inventing intents.
-This store capability is not wired to public publication or owner signalling. Conflict
-projection, settlement consumption, finalization, and recovery remain unimplemented;
+This store capability is not wired to public publication. The normal daemon driver now
+signals discovered publication cancellations using its held authority and transactionally
+marks successful signalling. Missing runtime owners leave the intent pending for receipt
+reconciliation rather than manufacturing terminal evidence. Accepted
+attempt intents now participate in owner-observation settlement and authority-qualified,
+bounded cancellation discovery. Running observations remain pending; confirmed cancellation
+removes the attempt from discovery without requesting cancellation of the whole run.
+Conflict projection, finalization, and recovery remain unimplemented;
 existing committed-only publication operations are unchanged.
 
 ## Pending publication decision (approved; not yet implemented)

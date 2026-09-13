@@ -15707,6 +15707,7 @@ async fn drive_workflow_run(state: &Arc<ServerState>, run_id: &str) -> Result<()
             .verify_execution_authority(run_id, &authority.authority)?;
         let iteration_started_at = std::time::Instant::now();
         let now_ms = current_unix_millis();
+        propagate_publication_cancellation(state, run_id, &authority.authority).await?;
         if bcode_workflow_store::WorkflowStore::open_at_path(&store_path)?
             .expire_run_deadline(run_id, now_ms)?
         {
@@ -32160,6 +32161,51 @@ async fn signal_workflow_attempt_cancellation(
             None,
         )
         .await;
+    }
+    Ok(())
+}
+
+async fn propagate_publication_cancellation(
+    state: &ServerState,
+    run_id: &str,
+    authority: &bcode_workflow_store::WorkflowExecutionAuthority,
+) -> Result<(), WorkflowStoreError> {
+    let attempts = state
+        .workflow_store
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .pending_publication_cancellations(run_id, authority, 1_000)?;
+    for attempt in attempts {
+        state
+            .workflow_store
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .verify_execution_authority(run_id, authority)?;
+        match signal_workflow_attempt_cancellation(state, &attempt).await {
+            Ok(()) => {
+                state
+                    .workflow_store
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .mark_publication_cancellation_signalled(
+                        run_id,
+                        &attempt.dispatch_identity,
+                        authority,
+                        current_unix_millis(),
+                    )?;
+            }
+            Err(WorkflowStoreError::InvalidData(message))
+                if message.starts_with("active runtime work not found for workflow dispatch:") =>
+            {
+                // Absence from this daemon is not terminal owner evidence. The durable
+                // intent stays discoverable and receipt reconciliation can observe completion.
+                tracing::debug!(
+                    dispatch_identity = attempt.dispatch_identity,
+                    "publication cancellation awaits owner evidence"
+                );
+            }
+            Err(error) => return Err(error),
+        }
     }
     Ok(())
 }

@@ -9047,6 +9047,77 @@ impl WorkflowStore {
             .collect()
     }
 
+    /// Discover exact accepted publication cancellations under held execution authority.
+    ///
+    /// A changed graph revision does not revoke previously accepted cancellation. Results
+    /// exclude terminal attempts and remain bounded; receipt identities route owner signalling.
+    ///
+    /// # Errors
+    /// Rejects stale authority, invalid limits, malformed receipts, or database failures.
+    pub fn pending_publication_cancellations(
+        &self,
+        run_id: &str,
+        authority: &WorkflowExecutionAuthority,
+        limit: usize,
+    ) -> Result<Vec<ActiveAttemptCancellation>, WorkflowStoreError> {
+        let limit = bounded_limit(limit)?;
+        let transaction = self.connection.unchecked_transaction()?;
+        self.verify_execution_authority(run_id, authority)?;
+        let mut statement = transaction.prepare(
+            "SELECT run_id, node_id, activation_id, attempt, dispatch_identity, receipt_json
+             FROM workflow_attempts attempt WHERE run_id = ?1
+             AND status IN ('prepared', 'admitted', 'running', 'cancelling')
+             AND EXISTS (SELECT 1 FROM workflow_publication_cancellations intent
+                 WHERE intent.dispatch_identity = attempt.dispatch_identity)
+             ORDER BY prepared_at_ms, dispatch_identity LIMIT ?2",
+        )?;
+        statement
+            .query_map((run_id, limit), active_attempt_cancellation_row)?
+            .map(|row| active_attempt_cancellation(row?))
+            .collect()
+    }
+
+    /// Mark signalling of an accepted publication cancellation under held authority.
+    ///
+    /// # Errors
+    /// Rejects stale authority, absent intent, malformed identity, or database failure.
+    pub fn mark_publication_cancellation_signalled(
+        &self,
+        run_id: &str,
+        dispatch_identity: &str,
+        authority: &WorkflowExecutionAuthority,
+        signalled_at_ms: u64,
+    ) -> Result<bool, WorkflowStoreError> {
+        let transaction = self.connection.unchecked_transaction()?;
+        self.verify_execution_authority(run_id, authority)?;
+        let accepted: bool = transaction.query_row(
+            "SELECT EXISTS(SELECT 1 FROM workflow_publication_cancellations
+             WHERE run_id = ?1 AND dispatch_identity = ?2)",
+            (run_id, dispatch_identity),
+            |row| row.get(0),
+        )?;
+        if !accepted {
+            return Err(WorkflowStoreError::InvalidData(
+                "publication cancellation intent missing".into(),
+            ));
+        }
+        let changed = transaction.execute(
+            "UPDATE workflow_attempts SET status = 'cancelling'
+             WHERE run_id = ?1 AND dispatch_identity = ?2 AND status IN ('prepared', 'admitted', 'running')",
+            (run_id, dispatch_identity))?;
+        if changed == 1 {
+            append_event(
+                &transaction,
+                run_id,
+                "attempt_cancellation_signalled",
+                &serde_json::json!({"dispatch_identity": dispatch_identity}).to_string(),
+                signalled_at_ms,
+            )?;
+        }
+        transaction.commit()?;
+        Ok(changed == 1)
+    }
+
     /// Return bounded fail-fast sibling cancellation intents that still need owner signaling.
     ///
     /// # Errors
@@ -12115,6 +12186,8 @@ fn sibling_cancellation_requested_for_attempt(
     connection
         .query_row(
             "SELECT attempt.status = 'sibling_cancelling' \
+                    OR EXISTS (SELECT 1 FROM workflow_publication_cancellations intent \
+                        WHERE intent.dispatch_identity = attempt.dispatch_identity) \
                     OR (attempt.status = 'cancelling' \
                         AND run.cancellation_requested_at_ms IS NULL) \
              FROM workflow_attempts attempt \
@@ -30651,6 +30724,67 @@ mod tests {
             )
             .expect("exact intent");
         assert_eq!(identity, prepared.dispatch_identity);
+        assert_publication_cancellation_settlement(&mut store, &run.run_id, &authority, identity);
+    }
+
+    fn assert_publication_cancellation_settlement(
+        store: &mut WorkflowStore,
+        run_id: &str,
+        authority: &WorkflowExecutionAuthority,
+        identity: String,
+    ) {
+        let mut stale = authority.clone();
+        stale.generation += 1;
+        assert!(
+            store
+                .pending_publication_cancellations(run_id, &stale, 10)
+                .is_err()
+        );
+        let pending = store
+            .pending_publication_cancellations(run_id, authority, 10)
+            .expect("discover accepted intent");
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].dispatch_identity, identity);
+        assert!(
+            store
+                .mark_publication_cancellation_signalled(run_id, &identity, &stale, 30)
+                .is_err()
+        );
+        assert!(
+            store
+                .mark_publication_cancellation_signalled(run_id, &identity, authority, 30)
+                .expect("signal")
+        );
+        assert!(
+            !store
+                .mark_publication_cancellation_signalled(run_id, &identity, authority, 30)
+                .expect("duplicate signal")
+        );
+        let running = store
+            .apply_attempt_observation(&identity, AttemptObservation::Running, 31)
+            .expect("still running");
+        assert!(running.cancelled.is_empty());
+        assert_eq!(
+            store
+                .pending_publication_cancellations(run_id, authority, 10)
+                .expect("still pending")
+                .len(),
+            1
+        );
+        let settled = store
+            .apply_attempt_observation(&identity, AttemptObservation::Cancelled, 32)
+            .expect("owner stopped");
+        assert_eq!(settled.cancelled, [identity]);
+        assert!(
+            store
+                .pending_publication_cancellations(run_id, authority, 10)
+                .expect("settled")
+                .is_empty()
+        );
+        assert!(
+            !cancellation_requested_for_run(&store.connection, run_id)
+                .expect("not run cancellation")
+        );
     }
 
     #[test]
