@@ -49,6 +49,9 @@ pub struct AuthPoolProfileState {
     /// Last priming success timestamp.
     #[serde(default)]
     pub primed_unix: Option<u64>,
+    /// Provider-selected applicable priming windows; absent means discovery is unknown.
+    #[serde(default)]
+    pub priming_windows: Option<BTreeMap<String, Vec<String>>>,
     /// Provider-confirmed usage windows keyed by meter id, then window id.
     #[serde(default)]
     pub usage_windows: BTreeMap<String, BTreeMap<String, AuthPoolUsageWindowState>>,
@@ -220,6 +223,20 @@ pub fn profile_needs_priming(
         return false;
     };
     with_state(|state| profile_needs_priming_in_state(state, &key, reprime_after, now_unix()))
+}
+
+/// Record provider-selected applicable priming windows after successful discovery.
+pub fn record_profile_priming_windows(
+    pool: Option<&str>,
+    profile: Option<&str>,
+    windows: Option<&BTreeMap<String, Vec<String>>>,
+) {
+    let Some(key) = state_key(pool, profile) else {
+        return;
+    };
+    mutate_state(|state| {
+        state.entries.entry(key).or_default().priming_windows = windows.cloned();
+    });
 }
 
 /// Record provider-confirmed usage windows for a profile.
@@ -459,6 +476,14 @@ fn usage_window_targets(
     if !targets.is_empty() {
         return targets;
     }
+    if let Some(windows) = &entry.priming_windows {
+        for (meter_id, windows) in windows {
+            for window_id in windows {
+                targets.insert((meter_id.clone(), window_id.clone()));
+            }
+        }
+        return targets;
+    }
     for (meter_id, windows) in &entry.usage_windows {
         for window_id in windows.keys() {
             targets.insert((meter_id.clone(), window_id.clone()));
@@ -493,6 +518,42 @@ pub(crate) fn reset_cooldowns_in_state(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn provider_targets_exclude_missing_secondary_and_unrelated_cached_meters() {
+        let mut state = AuthPoolState::default();
+        let entry = state.entries.entry("pool/account".into()).or_default();
+        entry.priming_windows = Some(BTreeMap::from([("weekly".into(), vec!["main".into()])]));
+        entry.usage_windows.insert(
+            "weekly".into(),
+            BTreeMap::from([(
+                "main".into(),
+                AuthPoolUsageWindowState {
+                    used_percent: Some(10),
+                    resets_at_unix: Some(200),
+                    ..Default::default()
+                },
+            )]),
+        );
+        entry.usage_windows.insert(
+            "unrelated".into(),
+            BTreeMap::from([("other".into(), AuthPoolUsageWindowState::default())]),
+        );
+        assert!(!profile_needs_priming_with_windows_in_state(
+            &state,
+            "pool/account",
+            &BTreeMap::new(),
+            None,
+            100
+        ));
+        assert!(profile_needs_priming_with_windows_in_state(
+            &state,
+            "pool/account",
+            &BTreeMap::from([("weekly".into(), vec!["missing".into()])]),
+            None,
+            100
+        ));
+    }
 
     #[test]
     fn provider_window_with_zero_usage_still_needs_priming_even_when_locally_marked() {

@@ -1322,9 +1322,7 @@ fn selected_auth_pool_routing(
     let Some(pool) = config.auth.pools.get(auth_pool) else {
         return bcode_model::ProviderAuthPoolRouting::default();
     };
-    let provider_plugin_id = pool.provider_plugin_id.as_deref();
-    let mut required_windows = pool.priming.required_windows.clone();
-    apply_default_priming_required_windows(auth_pool, provider_plugin_id, &mut required_windows);
+    let required_windows = pool.priming.required_windows.clone();
     bcode_model::ProviderAuthPoolRouting {
         strategy: Some(match pool.strategy {
             bcode_config::AuthPoolStrategy::Failover => "failover".to_string(),
@@ -1336,22 +1334,6 @@ fn selected_auth_pool_routing(
         priming_provider_windows: pool.priming.provider_windows,
         priming_fallback_reprime_after: pool.priming.fallback_reprime_after.clone(),
         priming_required_windows: required_windows,
-    }
-}
-
-fn apply_default_priming_required_windows(
-    pool: &str,
-    provider_plugin_id: Option<&str>,
-    required_windows: &mut BTreeMap<String, Vec<String>>,
-) {
-    if !required_windows.is_empty() {
-        return;
-    }
-    if pool == "openai" || provider_plugin_id == Some("bcode.openai-compatible") {
-        required_windows.insert(
-            "codex".to_string(),
-            vec!["primary".to_string(), "secondary".to_string()],
-        );
     }
 }
 
@@ -2562,7 +2544,7 @@ mod tests {
     }
 
     #[test]
-    fn openai_pool_priming_uses_codex_window_defaults() {
+    fn openai_pool_priming_defers_window_defaults_to_provider() {
         let config = bcode_config::BcodeConfig {
             auth: bcode_config::AuthConfig {
                 pools: BTreeMap::from([(
@@ -2584,10 +2566,7 @@ mod tests {
         let routing = selected_auth_pool_routing(&config, Some("openai"));
 
         assert!(routing.priming_enabled);
-        assert_eq!(
-            routing.priming_required_windows.get("codex"),
-            Some(&vec!["primary".to_string(), "secondary".to_string()])
-        );
+        assert!(routing.priming_required_windows.is_empty());
     }
 
     #[test]

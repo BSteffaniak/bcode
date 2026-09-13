@@ -83,6 +83,11 @@ pub fn record_auth_pool_usage(
     response: &bcode_model::AuthUsageResponse,
 ) {
     if response.supported {
+        auth_pool_state::record_profile_priming_windows(
+            request.provider_context.auth_pool.as_deref(),
+            request.provider_context.auth_profile.as_deref(),
+            response.priming_windows.as_ref(),
+        );
         auth_pool_state::record_profile_usage_windows(
             request.provider_context.auth_pool.as_deref(),
             request.provider_context.auth_profile.as_deref(),

@@ -2493,6 +2493,7 @@ async fn auth_usage_inner(
     if !settings.dialect.uses_codex_request_shape() {
         return Ok(bcode_model::AuthUsageResponse {
             supported: false,
+            priming_windows: None,
             degraded_reason: Some(
                 "provider usage windows are currently implemented for ChatGPT Codex auth only"
                     .to_string(),
@@ -2509,6 +2510,7 @@ async fn auth_usage_inner(
     let AuthSettings::ChatGpt { access_token, .. } = &settings.auth else {
         return Ok(bcode_model::AuthUsageResponse {
             supported: false,
+            priming_windows: None,
             degraded_reason: Some("ChatGPT auth is required for Codex usage windows".to_string()),
             debug: BTreeMap::from([(
                 "auth_mode".to_string(),
@@ -2570,12 +2572,32 @@ async fn auth_usage_inner(
                 bcode_model::AuthUsageCapability::ResetCredits,
             ]),
         },
+        priming_windows: Some(codex_priming_windows(&meters)),
         meters,
         reset_credits: payload
             .rate_limit_reset_credits
             .as_ref()
             .and_then(codex_reset_credits_summary),
     })
+}
+
+fn codex_priming_windows(
+    meters: &[bcode_model::AuthUsageMeterSnapshot],
+) -> BTreeMap<String, Vec<String>> {
+    meters
+        .iter()
+        .filter(|meter| meter.meter_id == "codex")
+        .map(|meter| {
+            (
+                meter.meter_id.clone(),
+                meter
+                    .windows
+                    .iter()
+                    .map(|window| window.window_id.clone())
+                    .collect(),
+            )
+        })
+        .collect()
 }
 
 async fn send_codex_usage_request(
@@ -3114,6 +3136,14 @@ fn usage_window_refs(
     required_windows: &BTreeMap<String, Vec<String>>,
     response: &bcode_model::AuthUsageResponse,
 ) -> Vec<bcode_model::AuthUsageWindowRef> {
+    let required_windows = if required_windows.is_empty() {
+        response
+            .priming_windows
+            .as_ref()
+            .unwrap_or(required_windows)
+    } else {
+        required_windows
+    };
     if !required_windows.is_empty() {
         return required_windows
             .iter()
@@ -3126,6 +3156,9 @@ fn usage_window_refs(
                     })
             })
             .collect();
+    }
+    if required_windows.is_empty() && response.priming_windows.is_some() {
+        return Vec::new();
     }
     response
         .meters
@@ -3320,6 +3353,11 @@ async fn refresh_priming_auth_profile_usage(request: &ModelTurnRequest, turn: &T
     let Ok(usage) = usage_result else {
         return;
     };
+    auth_pool_state::record_profile_priming_windows(
+        request.provider_context.auth_pool.as_deref(),
+        Some(profile),
+        usage.priming_windows.as_ref(),
+    );
     auth_pool_state::record_profile_usage_windows(
         request.provider_context.auth_pool.as_deref(),
         Some(profile),
@@ -3884,7 +3922,7 @@ async fn verify_model_inner(
     })?;
     let turn_request = verification_turn_request(&request);
     let start = Instant::now();
-    match (&settings.auth, settings.dialect) {
+    let response = match (&settings.auth, settings.dialect) {
         (AuthSettings::ApiKey(api_key), OpenAiCompatibleDialect::ChatCompletions) => {
             send_chat_completion_request(
                 &client,
@@ -3894,7 +3932,7 @@ async fn verify_model_inner(
                 &request.model_id,
                 None,
             )
-            .await?;
+            .await?
         }
         (AuthSettings::ApiKey(api_key), OpenAiCompatibleDialect::ResponsesApi) => {
             send_responses_request(
@@ -3905,7 +3943,7 @@ async fn verify_model_inner(
                 &request.model_id,
                 None,
             )
-            .await?;
+            .await?
         }
         (AuthSettings::ChatGpt { access_token, .. }, OpenAiCompatibleDialect::ChatGptCodex) => {
             send_responses_request(
@@ -3916,7 +3954,7 @@ async fn verify_model_inner(
                 &request.model_id,
                 None,
             )
-            .await?;
+            .await?
         }
         (AuthSettings::ChatGpt { .. }, _) => {
             return Err(provider_error(
@@ -3933,13 +3971,36 @@ async fn verify_model_inner(
             ));
         }
         (AuthSettings::Missing, _) => unreachable!("missing auth handled above"),
-    }
+    };
+    verify_stream_completion(response, &turn_request, settings.dialect).await?;
     Ok(bcode_model::VerifyModelResponse {
         status: bcode_model::VerifyModelStatus::Working,
         latency_ms: Some(start.elapsed().as_millis()),
         error_code: None,
         message: None,
     })
+}
+
+async fn verify_stream_completion(
+    response: reqwest::Response,
+    request: &ModelTurnRequest,
+    dialect: OpenAiCompatibleDialect,
+) -> Result<(), ProviderError> {
+    let turn = TurnState::default();
+    let outcome = match dialect {
+        OpenAiCompatibleDialect::ChatCompletions => {
+            read_stream_events(response, &turn, request).await?
+        }
+        dialect => read_responses_stream_events(response, &turn, request, dialect).await?,
+    };
+    if outcome != StreamOutcome::Finished {
+        return Err(provider_error(
+            "verification_incomplete",
+            ProviderErrorCategory::InvalidRequest,
+            "Model verification did not finish successfully",
+        ));
+    }
+    Ok(())
 }
 
 fn verification_turn_request(request: &bcode_model::VerifyModelRequest) -> ModelTurnRequest {
@@ -10164,6 +10225,98 @@ mod tests {
             output
         });
         write_http_response(&mut stream, "text/event-stream", &response_body);
+    }
+
+    #[test]
+    fn provider_priming_targets_allow_weekly_only_accounts() {
+        let response = bcode_model::AuthUsageResponse {
+            supported: true,
+            priming_windows: Some(BTreeMap::from([("codex".into(), vec!["primary".into()])])),
+            meters: vec![bcode_model::AuthUsageMeterSnapshot {
+                meter_id: "codex".into(),
+                windows: vec![bcode_model::AuthUsageWindowSnapshot {
+                    window_id: "primary".into(),
+                    used_percent: Some(10),
+                    resets_at_unix: Some(unix_timestamp() + 604_800),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        assert!(usage_response_satisfies_required_windows(
+            &response,
+            &BTreeMap::new()
+        ));
+        assert!(!usage_response_satisfies_required_windows(
+            &response,
+            &BTreeMap::from([("codex".into(), vec!["primary".into(), "secondary".into()])])
+        ));
+    }
+
+    #[tokio::test]
+    async fn verification_requires_terminal_stream_completion() {
+        for (dialect, body, working) in [
+            (
+                "responses_api",
+                "data: {\"type\":\"response.output_text.delta\",\"delta\":\"ok\"}\n\ndata: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\"}}\n\n",
+                true,
+            ),
+            (
+                "responses_api",
+                "data: {\"type\":\"response.output_text.delta\",\"delta\":\"partial\"}\n\n",
+                false,
+            ),
+            (
+                "responses_api",
+                "data: {\"type\":\"response.failed\",\"response\":{\"error\":{\"message\":\"failed\",\"code\":\"server_error\"}}}\n\n",
+                false,
+            ),
+            (
+                "chat_completions",
+                "data: {\"choices\":[{\"delta\":{\"content\":\"ok\"},\"finish_reason\":null}]}\n\ndata: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n",
+                true,
+            ),
+            (
+                "chat_completions",
+                "data: {\"choices\":[{\"delta\":{\"content\":\"partial\"},\"finish_reason\":null}]}\n\n",
+                false,
+            ),
+            (
+                "chat_completions",
+                "data: {\"error\":{\"message\":\"failed\",\"type\":\"server_error\"}}\n\n",
+                false,
+            ),
+        ] {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let address = listener.local_addr().unwrap();
+            let worker = thread::spawn(move || {
+                let (mut stream, _) = listener.accept().unwrap();
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(5)))
+                    .unwrap();
+                read_http_request_body(&mut stream);
+                write_http_response(&mut stream, "text/event-stream", body);
+            });
+            let mut context = ProviderRequestContext::default();
+            context
+                .settings
+                .insert("base_url".into(), format!("http://{address}/v1"));
+            context.settings.insert("dialect".into(), dialect.into());
+            context
+                .env
+                .insert("BCODE_OPENAI_API_KEY".into(), "test-key".into());
+            let result = verify_model_inner(bcode_model::VerifyModelRequest {
+                model_id: "test-model".into(),
+                prompt: "say ok".into(),
+                timeout_seconds: Some(5),
+                provider_context: context,
+                metadata: BTreeMap::new(),
+            })
+            .await;
+            assert_eq!(result.is_ok(), working, "{result:?}");
+            worker.join().unwrap();
+        }
     }
 
     fn write_http_response(stream: &mut TcpStream, content_type: &str, body: &str) {

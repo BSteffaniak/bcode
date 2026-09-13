@@ -2162,6 +2162,9 @@ pub struct AuthUsageResponse {
     /// Usage meters returned by the provider.
     #[serde(default)]
     pub meters: Vec<AuthUsageMeterSnapshot>,
+    /// Provider-selected windows applicable to automatic priming. Absent means unknown.
+    #[serde(default)]
+    pub priming_windows: Option<BTreeMap<String, Vec<String>>>,
     /// Summary of banked rate-limit reset credits returned with usage, when available.
     #[serde(default)]
     pub reset_credits: Option<AuthResetCreditsSummary>,

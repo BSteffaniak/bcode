@@ -28,6 +28,11 @@ Response type: `bcode_model::AuthUsageResponse`
 * `capabilities.features` lists capability flags such as `refresh`, `window_reset`, `used_percent`, `absolute_amounts`, `priming`, and `reset_credits`.
 * `reset_credits` optionally contains a summary of banked provider reset credits when the usage endpoint returns one.
 * `meters` contains normalized provider usage data.
+* `priming_windows` optionally identifies the provider-selected applicable windows for automatic priming. Explicit configured requirements take precedence. `None` means no recommendation; an empty map must not expand to unrelated usage meters.
+
+OpenAI recommends only the windows returned for the account's main Codex meter, not additional model-specific quotas. Weekly-only accounts do not require a secondary window. Refresh status after upgrading to replace older cached assumptions. Zero rounded usage remains unconfirmed; local request success does not fabricate provider usage.
+
+Explicit OpenAI priming consumes the model stream through successful terminal completion before refreshing usage. HTTP acceptance alone, stream errors, premature EOF, and truncated generation do not establish successful verification. Priming does not automatically change the pool's `include_primary` policy or saved preference.
 
 ## Meter and window semantics
 
