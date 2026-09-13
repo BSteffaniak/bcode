@@ -1552,7 +1552,7 @@ pub async fn start_package_export(
             "published workflow package export has no exact revision".to_string(),
         )
     })?;
-    let started = start_authored(
+    let started = start_authored_with_package(
         client_id,
         state,
         bcode_workflow::StartAuthoredWorkflowRequest {
@@ -1568,6 +1568,7 @@ pub async fn start_package_export(
             input: request.input,
         },
         true,
+        Some((&receipt.package_id, &receipt.package_lock_digest_sha256)),
     )
     .await?;
     Ok(bcode_workflow::WorkflowPackageExportRunStartResponse {
@@ -2037,12 +2038,25 @@ pub fn resolve_authored_run(
     Ok((workflow_id, revision_number, revision, preset))
 }
 
-#[allow(clippy::too_many_lines, clippy::significant_drop_tightening)]
 pub async fn start_authored(
     client_id: super::ClientId,
     state: &std::sync::Arc<ServerState>,
     request: bcode_workflow::StartAuthoredWorkflowRequest,
     authorize: bool,
+) -> Result<bcode_workflow::AuthoredWorkflowRunStartResponse, super::ServerError> {
+    Box::pin(start_authored_with_package(
+        client_id, state, request, authorize, None,
+    ))
+    .await
+}
+
+#[allow(clippy::too_many_lines, clippy::significant_drop_tightening)]
+async fn start_authored_with_package(
+    client_id: super::ClientId,
+    state: &std::sync::Arc<ServerState>,
+    request: bcode_workflow::StartAuthoredWorkflowRequest,
+    authorize: bool,
+    package: Option<(&str, &str)>,
 ) -> Result<bcode_workflow::AuthoredWorkflowRunStartResponse, super::ServerError> {
     let resolution_started_at = std::time::Instant::now();
     let (workflow_id, revision_number, revision, preset) =
@@ -2134,7 +2148,7 @@ pub async fn start_authored(
                 "workflow run input does not match published interface: {error}"
             ))
         })?;
-    let started = start_run(
+    let started = start_run_with_package(
         state,
         bcode_workflow::WorkflowRunStartRequest {
             definition_id: revision.definition_identity.definition_id.clone(),
@@ -2160,6 +2174,7 @@ pub async fn start_authored(
             },
         },
         Some(provenance),
+        package,
     )
     .await?;
     Ok(bcode_workflow::AuthoredWorkflowRunStartResponse {
@@ -6024,11 +6039,26 @@ fn persist_exact_template_call_dependencies(
     Ok(())
 }
 
-#[allow(clippy::too_many_lines)]
 pub async fn start_run(
     state: &std::sync::Arc<ServerState>,
     request: bcode_workflow::WorkflowRunStartRequest,
     authored_provenance: Option<bcode_workflow_store::AuthoredWorkflowRunProvenance>,
+) -> Result<bcode_workflow::WorkflowRunStartResponse, super::ServerError> {
+    Box::pin(start_run_with_package(
+        state,
+        request,
+        authored_provenance,
+        None,
+    ))
+    .await
+}
+
+#[allow(clippy::too_many_lines)]
+async fn start_run_with_package(
+    state: &std::sync::Arc<ServerState>,
+    request: bcode_workflow::WorkflowRunStartRequest,
+    authored_provenance: Option<bcode_workflow_store::AuthoredWorkflowRunProvenance>,
+    package: Option<(&str, &str)>,
 ) -> Result<bcode_workflow::WorkflowRunStartResponse, super::ServerError> {
     let stored_definition = state
         .workflow_store
@@ -6158,7 +6188,7 @@ pub async fn start_run(
             .workflow_store
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let _created = store.create_run_idempotent(&new_run)?;
+        let _created = store.create_run_with_package(&new_run, package)?;
         store
             .run_summary(&run_id)?
             .expect("created or existing workflow run must be readable")

@@ -6352,8 +6352,9 @@ fn resolve_package_calls(
                     "package_call target has not compiled successfully",
                 )
             })?;
-            WorkflowCallTarget::Definition {
-                identity: identity.clone(),
+            WorkflowCallTarget::PackageMember {
+                member_id: target.to_string(),
+                definition_identity: identity.clone(),
             }
         } else if let Some(target) = call.get("external").and_then(serde_json::Value::as_str) {
             if !member
@@ -12043,6 +12044,13 @@ pub struct WorkflowCallPreset {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum WorkflowCallTarget {
+    /// An exact member of the calling run's immutable package publication.
+    PackageMember {
+        /// Package-local member identity, resolved against the parent's lock.
+        member_id: String,
+        /// Expected compiled identity; admission verifies it against the lock.
+        definition_identity: WorkflowDefinitionIdentity,
+    },
     /// One exact registered compiled definition.
     Definition {
         /// Product identity plus content-derived compiled definition identity.
@@ -12068,7 +12076,11 @@ impl WorkflowCallTarget {
     pub const fn definition_identity(&self) -> &WorkflowDefinitionIdentity {
         match self {
             Self::Definition { identity } => identity,
-            Self::AuthoredRevision {
+            Self::PackageMember {
+                definition_identity,
+                ..
+            }
+            | Self::AuthoredRevision {
                 definition_identity,
                 ..
             } => definition_identity,
@@ -12082,6 +12094,9 @@ impl WorkflowCallTarget {
     /// Returns an error for unsupported versions, malformed identities, zero revisions or preset
     /// generations, or authored/compiled logical identity mismatch.
     pub fn validate(&self) -> Result<(), WorkflowError> {
+        if let Self::PackageMember { member_id, .. } = self {
+            validate_workflow_call_id("workflow_call.target.member_id", member_id)?;
+        }
         let identity = self.definition_identity();
         validate_workflow_call_id("workflow_call.target.kind", &identity.kind)?;
         validate_workflow_call_id(
@@ -17430,8 +17445,11 @@ mod tests {
         let configuration: WorkflowCallConfiguration =
             serde_json::from_value(call.configuration.clone()).expect("call");
         assert_eq!(
-            configuration.target.definition_identity(),
-            &plan.members[0].definition_identity
+            configuration.target,
+            WorkflowCallTarget::PackageMember {
+                member_id: "child".to_string(),
+                definition_identity: plan.members[0].definition_identity.clone(),
+            }
         );
         assert_eq!(plan.lock.members.len(), 2);
         assert_eq!(plan.lock.members[1].dependency_closure, ["child"]);

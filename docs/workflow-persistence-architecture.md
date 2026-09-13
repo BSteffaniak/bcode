@@ -1,6 +1,18 @@
 # Workflow Persistence Architecture
 
-## Package-local execution binding (approved; not yet implemented)
+## Package-local execution binding (partial implementation)
+
+Schema 32 adds `workflow_run_packages`. Package export startup supplies an exact
+package binding to atomic run admission, which checks membership and rejects changed
+duplicate bindings. Existing runs remain unbound through the existing exclusive upgrade
+coordinator. Explicit `PackageMember` call targets now verify member and compiled identity
+against the parent's exact lock, require matching durable authority, and inherit the binding
+in the child-admission transaction. Duplicate child admission verifies the binding; other
+exact call kinds do not inherit it. Authored package-local calls now lower to
+`PackageMember`, preserving the declared member ID and expected compiled identity through
+publication and dispatch. Recursive resolution and demand-driven compilation
+are not implemented; this storage path alone does not establish recursive execution. Dedicated bound-run
+reopen, duplicate-conflict, and schema-31 upgrade acceptance still needs to be added.
 
 Package-local calls resolve against an immutable run-owned `(package_id, lock_digest)`
 binding, using the existing exact published package lock. No separate procedure-bundle

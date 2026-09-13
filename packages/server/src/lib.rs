@@ -30759,7 +30759,28 @@ async fn dispatch_workflow_child(
         .validate()
         .map_err(|error| WorkflowStoreError::InvalidData(error.to_string()))?;
     let target = configuration.target;
-    let target_identity = target.definition_identity().clone();
+    let authority = workflow_operations::execution_authority(state, &request.activation.run_id)
+        .await
+        .map_err(|error| WorkflowStoreError::InvalidData(error.to_string()))?;
+    let target_identity = if let bcode_workflow::WorkflowCallTarget::PackageMember {
+        member_id,
+        definition_identity,
+    } = &target
+    {
+        let store = state
+            .workflow_store
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let resolved = store.resolve_run_package_member(&request.activation.run_id, member_id)?;
+        if resolved != *definition_identity {
+            return Err(WorkflowStoreError::InvalidData(
+                "package call differs from bound member".into(),
+            ));
+        }
+        resolved
+    } else {
+        target.definition_identity().clone()
+    };
     let now = current_unix_millis();
     let (parent, parent_link, authored_provenance, child_limits) = {
         let store = state
@@ -30785,7 +30806,8 @@ async fn dispatch_workflow_child(
         let _definition: bcode_workflow::WorkflowDefinition =
             serde_json::from_str(&stored.definition_json)?;
         let (provenance, limits) = match &target {
-            bcode_workflow::WorkflowCallTarget::Definition { .. } => (None, None),
+            bcode_workflow::WorkflowCallTarget::Definition { .. }
+            | bcode_workflow::WorkflowCallTarget::PackageMember { .. } => (None, None),
             bcode_workflow::WorkflowCallTarget::AuthoredRevision {
                 workflow_id,
                 revision,
@@ -30911,11 +30933,7 @@ async fn dispatch_workflow_child(
             binding: None,
             authored_provenance,
             input: request.activation.input.clone(),
-            execution_authority: state
-                .workflow_store
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .execution_authority(&request.activation.run_id)?,
+            execution_authority: authority.as_ref().map(|guard| guard.authority.clone()),
             created_at_ms: now,
             authorization_profile: parent.authorization_profile,
             authorization_ceiling: parent.authorization_ceiling,

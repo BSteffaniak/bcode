@@ -38,7 +38,7 @@ const RESET_BACKUP_DIRECTORY: &str = "reset-backups";
 /// Stable destructive confirmation required by public workflow-store reset surfaces.
 pub const WORKFLOW_STORE_RESET_CONFIRMATION: &str = "DELETE-INCOMPATIBLE-WORKFLOW-STATE";
 /// Current clean-break workflow store schema version.
-pub const WORKFLOW_STORE_SCHEMA_VERSION: u32 = 31;
+pub const WORKFLOW_STORE_SCHEMA_VERSION: u32 = 32;
 /// Current bounded workflow-store reset receipt version.
 pub const WORKFLOW_STORE_RESET_RECEIPT_VERSION: u32 = 1;
 /// Current explicit workflow-store migration receipt contract.
@@ -1154,7 +1154,7 @@ impl WorkflowStore {
                         match Self::open_with_ownership(&path, ownership) {
                             Ok(store) => return Ok(store),
                             Err(WorkflowStoreError::UnsupportedStore {
-                                actual: Some(14..=30),
+                                actual: Some(14..=31),
                                 ..
                             }) => {}
                             Err(error) => return Err(error),
@@ -1184,7 +1184,7 @@ impl WorkflowStore {
                         match Self::open_with_ownership(&path, probe) {
                             Ok(store) => return Ok(store),
                             Err(WorkflowStoreError::UnsupportedStore {
-                                actual: Some(14..=30),
+                                actual: Some(14..=31),
                                 ..
                             }) => {}
                             Err(error) => return Err(error),
@@ -1334,7 +1334,7 @@ impl WorkflowStore {
                 "workflow store migration cannot read the source schema".to_string(),
             )
         })?;
-        if !matches!(previous_schema_version, 14..=30) {
+        if !matches!(previous_schema_version, 14..=31) {
             return Err(WorkflowStoreError::UnsupportedStore {
                 actual: Some(previous_schema_version),
                 expected: WORKFLOW_STORE_SCHEMA_VERSION,
@@ -2345,9 +2345,56 @@ impl WorkflowStore {
         package_id: &str,
         digest: &str,
     ) -> Result<Option<WorkflowPackageLock>, WorkflowStoreError> {
+        Self::package_lock_on(&self.connection, package_id, digest)
+    }
+
+    /// Resolve a package-local member only through a run's immutable publication binding.
+    ///
+    /// # Errors
+    /// Rejects unbound runs, missing members/publications, corrupt or unsupported locks,
+    /// malformed identities, and storage failures. Never selects a newer publication.
+    pub fn resolve_run_package_member(
+        &self,
+        run_id: &str,
+        member_id: &str,
+    ) -> Result<bcode_workflow::WorkflowDefinitionIdentity, WorkflowStoreError> {
+        validate_id("run_id", run_id)?;
+        validate_id("member_id", member_id)?;
+        let binding: (String, String) = self
+            .connection
+            .query_row(
+                "SELECT package_id, lock_digest FROM workflow_run_packages WHERE run_id = ?1",
+                [run_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?
+            .ok_or_else(|| {
+                WorkflowStoreError::InvalidData(
+                    "package member resolution requires a bound run".into(),
+                )
+            })?;
+        let lock = self
+            .workflow_package_lock(&binding.0, &binding.1)?
+            .ok_or_else(|| {
+                WorkflowStoreError::InvalidData("bound package publication is unavailable".into())
+            })?;
+        lock.members
+            .into_iter()
+            .find(|member| member.member_id == member_id)
+            .map(|member| member.definition_identity)
+            .ok_or_else(|| {
+                WorkflowStoreError::InvalidData("bound package member is unavailable".into())
+            })
+    }
+
+    fn package_lock_on(
+        connection: &Connection,
+        package_id: &str,
+        digest: &str,
+    ) -> Result<Option<WorkflowPackageLock>, WorkflowStoreError> {
         validate_id("package_id", package_id)?;
         validate_id("package_lock_digest_sha256", digest)?;
-        let encoded = self.connection.query_row(
+        let encoded = connection.query_row(
             "SELECT length(CAST(lock_json AS BLOB)), CASE WHEN length(CAST(lock_json AS BLOB)) <= ?3 THEN lock_json END \
              FROM workflow_package_publications WHERE package_id = ?1 AND package_lock_digest_sha256 = ?2",
             rusqlite::params![package_id, digest, MAX_INLINE_JSON_BYTES],
@@ -4023,11 +4070,60 @@ impl WorkflowStore {
         &mut self,
         run: &NewWorkflowRun,
     ) -> Result<bool, WorkflowStoreError> {
+        self.create_run_with_package(run, None)
+    }
+
+    /// Atomically admit a run with an optional exact package execution binding.
+    ///
+    /// # Errors
+    /// Rejects absent publications, nonmember definitions, changed duplicate bindings,
+    /// invalid run facts, and storage failures. Existing unbound runs cannot be rebound.
+    pub fn create_run_with_package(
+        &mut self,
+        run: &NewWorkflowRun,
+        package: Option<(&str, &str)>,
+    ) -> Result<bool, WorkflowStoreError> {
         validate_run(run)?;
         let transaction = self
             .connection
             .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        if let Some((id, digest)) = package {
+            let lock = Self::package_lock_on(&transaction, id, digest)?.ok_or_else(|| {
+                WorkflowStoreError::InvalidData("exact run package is unavailable".into())
+            })?;
+            if !lock.members.iter().any(|member| {
+                member.definition_identity.definition_id == run.definition_id
+                    && member.definition_identity.definition_version == run.definition_version
+            }) {
+                return Err(WorkflowStoreError::InvalidData(
+                    "run definition is not a package member".into(),
+                ));
+            }
+        }
         let created = Self::create_or_verify_run(&transaction, run, true)?;
+        let existing: Option<(String, String)> = transaction
+            .query_row(
+                "SELECT package_id, lock_digest FROM workflow_run_packages WHERE run_id = ?1",
+                [&run.run_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?;
+        if created {
+            if let Some((id, digest)) = package {
+                transaction.execute(
+                    "INSERT INTO workflow_run_packages VALUES (?1, ?2, ?3)",
+                    rusqlite::params![run.run_id, id, digest],
+                )?;
+            }
+        } else if existing
+            .as_ref()
+            .map(|(id, digest)| (id.as_str(), digest.as_str()))
+            != package
+        {
+            return Err(WorkflowStoreError::InvalidData(
+                "duplicate run package binding differs".into(),
+            ));
+        }
         transaction.commit()?;
         Ok(created)
     }
@@ -4301,8 +4397,65 @@ impl WorkflowStore {
                 "workflow child exact target differs from the parent call node".to_string(),
             ));
         }
+        let inherited_package = if let bcode_workflow::WorkflowCallTarget::PackageMember {
+            member_id,
+            definition_identity,
+        } = &configuration.target
+        {
+            let authority = request.run.execution_authority.as_ref().ok_or_else(|| {
+                WorkflowStoreError::InvalidData("package child requires execution authority".into())
+            })?;
+            let owned: bool = transaction.query_row(
+                "SELECT EXISTS(SELECT 1 FROM workflow_runs WHERE run_id = ?1 AND target_artifact_id = ?2
+                 AND coordinator_daemon_instance_id = ?3 AND coordinator_generation = ?4
+                 AND coordinator_fencing_token = ?5)",
+                rusqlite::params![request.link.parent_run_id, authority.target_artifact_id,
+                    authority.daemon_instance_id, authority.generation, authority.fencing_token],
+                |row| row.get(0),
+            )?;
+            if !owned {
+                return Err(WorkflowStoreError::InvalidData(
+                    "package child authority is stale or foreign".into(),
+                ));
+            }
+            let binding: (String, String) = transaction
+                .query_row(
+                    "SELECT package_id, lock_digest FROM workflow_run_packages WHERE run_id = ?1",
+                    [&request.link.parent_run_id],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .optional()?
+                .ok_or_else(|| {
+                    WorkflowStoreError::InvalidData(
+                        "package member call requires a bound parent run".into(),
+                    )
+                })?;
+            let lock =
+                Self::package_lock_on(&transaction, &binding.0, &binding.1)?.ok_or_else(|| {
+                    WorkflowStoreError::InvalidData("parent package is unavailable".into())
+                })?;
+            if !lock.members.iter().any(|member| {
+                member.member_id == *member_id && member.definition_identity == *definition_identity
+            }) {
+                return Err(WorkflowStoreError::InvalidData(
+                    "package member target differs from parent lock".into(),
+                ));
+            }
+            Some(binding)
+        } else {
+            None
+        };
         if let Some(existing) = child_link_for_parent_attempt(&transaction, &request.link)? {
             if existing == request.link {
+                let child_binding: Option<(String, String)> = transaction.query_row(
+                    "SELECT package_id, lock_digest FROM workflow_run_packages WHERE run_id = ?1",
+                    [&request.run.run_id], |row| Ok((row.get(0)?, row.get(1)?)),
+                ).optional()?;
+                if child_binding != inherited_package {
+                    return Err(WorkflowStoreError::InvalidData(
+                        "duplicate child package binding differs".into(),
+                    ));
+                }
                 return Self::create_or_verify_run(&transaction, &request.run, false);
             }
             return Err(WorkflowStoreError::InvalidData(
@@ -4418,6 +4571,12 @@ impl WorkflowStore {
             ));
         }
         create_run_in_transaction(&transaction, &request.run)?;
+        if let Some((id, digest)) = inherited_package {
+            transaction.execute(
+                "INSERT INTO workflow_run_packages VALUES (?1, ?2, ?3)",
+                rusqlite::params![request.run.run_id, id, digest],
+            )?;
+        }
         let child_receipt = serde_json::json!({
             "owner": "bcode.server.workflow-child/v1",
             "child_run_id": request.link.child_run_id,
@@ -16199,6 +16358,12 @@ fn initialize_schema(connection: &mut Connection) -> Result<(), WorkflowStoreErr
              contract_id INTEGER PRIMARY KEY CHECK (contract_id = 1),\
              schema_version INTEGER NOT NULL\
          );\
+         CREATE TABLE IF NOT EXISTS workflow_run_packages (\
+             run_id TEXT PRIMARY KEY NOT NULL REFERENCES workflow_runs(run_id),\
+             package_id TEXT NOT NULL,\
+             lock_digest TEXT NOT NULL,\
+             FOREIGN KEY(package_id, lock_digest) REFERENCES workflow_package_publications(package_id, package_lock_digest_sha256)\
+         );\
          CREATE TABLE IF NOT EXISTS workflow_definitions (\
              definition_id TEXT NOT NULL,\
              version INTEGER NOT NULL CHECK (version > 0),\
@@ -16907,6 +17072,33 @@ mod tests {
         );
         assert_eq!(receipt.published_at_ms, 20);
         let mut store = reopened;
+        let mut run = new_run();
+        run.definition_id
+            .clone_from(&receipt.exports[0].definition_identity.definition_id);
+        run.input = Some(serde_json::json!({"message": "test"}));
+        run.definition_version = receipt.exports[0].definition_identity.definition_version;
+        let binding = Some((
+            receipt.package_id.as_str(),
+            receipt.package_lock_digest_sha256.as_str(),
+        ));
+        assert!(store.create_run_with_package(&run, binding).unwrap());
+        assert!(!store.create_run_with_package(&run, binding).unwrap());
+        assert!(store.create_run_with_package(&run, None).is_err());
+        let retained: (String, String) = store
+            .connection
+            .query_row(
+                "SELECT package_id, lock_digest FROM workflow_run_packages WHERE run_id = ?1",
+                [&run.run_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            retained,
+            (
+                receipt.package_id.clone(),
+                receipt.package_lock_digest_sha256.clone()
+            )
+        );
         let mut stale = request;
         stale.expected_generations[0].expected_generation = 2;
         assert!(store.publish_workflow_package(&stale, 21).is_err());
@@ -30123,22 +30315,8 @@ mod tests {
                 link: link.clone(),
                 run: NewWorkflowRun {
                     run_id: child_run_id.clone(),
-                    definition_id: match &link.target {
-                        bcode_workflow::WorkflowCallTarget::Definition { identity } => {
-                            identity.definition_id.clone()
-                        }
-                        bcode_workflow::WorkflowCallTarget::AuthoredRevision { .. } => {
-                            unreachable!("definition target")
-                        }
-                    },
-                    definition_version: match &link.target {
-                        bcode_workflow::WorkflowCallTarget::Definition { identity } => {
-                            identity.definition_version
-                        }
-                        bcode_workflow::WorkflowCallTarget::AuthoredRevision { .. } => {
-                            unreachable!("definition target")
-                        }
-                    },
+                    definition_id: link.target.definition_identity().definition_id.clone(),
+                    definition_version: link.target.definition_identity().definition_version,
                     workspace_snapshot: "snapshot".to_string(),
                     parent_session_id: None,
                     parent_session_generation: None,
