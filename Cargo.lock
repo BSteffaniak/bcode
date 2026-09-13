@@ -492,9 +492,9 @@ checksum = "683d7910e743518b0e34f1186f92494becacb047c7b6bf616c96772180fef923"
 
 [[package]]
 name = "android_system_properties"
-version = "0.1.6"
+version = "0.1.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ae221649c9976a6f6c56ae1facf410f3ddb33cc661c4b7b61020a912d4237fbc"
+checksum = "819e7219dbd41043ac279b19830f2efc897156490d7fd6ea916720117ee66311"
 dependencies = [
  "libc",
 ]
@@ -3411,7 +3411,7 @@ dependencies = [
 [[package]]
 name = "bmux_attach_image_protocol"
 version = "0.0.1-alpha.1"
-source = "git+https://github.com/BSteffaniak/bmux.git?branch=master#efa9a80836ef7179ef543dbe45d60ac40d53e7dc"
+source = "git+https://github.com/BSteffaniak/bmux.git?branch=master#a596e1bf566f70ddd7f15cb3a72598daf8ffa5d9"
 dependencies = [
  "bmux_codec",
  "serde",
@@ -3421,7 +3421,7 @@ dependencies = [
 [[package]]
 name = "bmux_codec"
 version = "0.0.1-alpha.1"
-source = "git+https://github.com/BSteffaniak/bmux.git?branch=master#efa9a80836ef7179ef543dbe45d60ac40d53e7dc"
+source = "git+https://github.com/BSteffaniak/bmux.git?branch=master#a596e1bf566f70ddd7f15cb3a72598daf8ffa5d9"
 dependencies = [
  "lz4_flex",
  "serde",
@@ -3431,7 +3431,7 @@ dependencies = [
 [[package]]
 name = "bmux_image"
 version = "0.0.1-alpha.1"
-source = "git+https://github.com/BSteffaniak/bmux.git?branch=master#efa9a80836ef7179ef543dbe45d60ac40d53e7dc"
+source = "git+https://github.com/BSteffaniak/bmux.git?branch=master#a596e1bf566f70ddd7f15cb3a72598daf8ffa5d9"
 dependencies = [
  "bmux_attach_image_protocol",
  "bmux_ipc",
@@ -3445,7 +3445,7 @@ dependencies = [
 [[package]]
 name = "bmux_ipc"
 version = "0.0.1-alpha.1"
-source = "git+https://github.com/BSteffaniak/bmux.git?branch=master#efa9a80836ef7179ef543dbe45d60ac40d53e7dc"
+source = "git+https://github.com/BSteffaniak/bmux.git?branch=master#a596e1bf566f70ddd7f15cb3a72598daf8ffa5d9"
 dependencies = [
  "bmux_attach_image_protocol",
  "bmux_codec",
@@ -3459,7 +3459,7 @@ dependencies = [
 [[package]]
 name = "bmux_keyboard"
 version = "0.0.1-alpha.1"
-source = "git+https://github.com/BSteffaniak/bmux.git?branch=master#efa9a80836ef7179ef543dbe45d60ac40d53e7dc"
+source = "git+https://github.com/BSteffaniak/bmux.git?branch=master#a596e1bf566f70ddd7f15cb3a72598daf8ffa5d9"
 dependencies = [
  "crossterm",
 ]
@@ -3467,7 +3467,7 @@ dependencies = [
 [[package]]
 name = "bmux_perf_telemetry"
 version = "0.0.1-alpha.1"
-source = "git+https://github.com/BSteffaniak/bmux.git?branch=master#efa9a80836ef7179ef543dbe45d60ac40d53e7dc"
+source = "git+https://github.com/BSteffaniak/bmux.git?branch=master#a596e1bf566f70ddd7f15cb3a72598daf8ffa5d9"
 dependencies = [
  "serde",
  "serde_json",
@@ -3476,7 +3476,7 @@ dependencies = [
 [[package]]
 name = "bmux_plugin"
 version = "0.0.1-alpha.1"
-source = "git+https://github.com/BSteffaniak/bmux.git?branch=master#efa9a80836ef7179ef543dbe45d60ac40d53e7dc"
+source = "git+https://github.com/BSteffaniak/bmux.git?branch=master#a596e1bf566f70ddd7f15cb3a72598daf8ffa5d9"
 dependencies = [
  "bmux_ipc",
  "bmux_keyboard",
@@ -3499,7 +3499,7 @@ dependencies = [
 [[package]]
 name = "bmux_plugin_runtime"
 version = "0.0.1-alpha.1"
-source = "git+https://github.com/BSteffaniak/bmux.git?branch=master#efa9a80836ef7179ef543dbe45d60ac40d53e7dc"
+source = "git+https://github.com/BSteffaniak/bmux.git?branch=master#a596e1bf566f70ddd7f15cb3a72598daf8ffa5d9"
 dependencies = [
  "serde",
  "serde_json",
@@ -3510,7 +3510,7 @@ dependencies = [
 [[package]]
 name = "bmux_plugin_schema"
 version = "0.0.1-alpha.1"
-source = "git+https://github.com/BSteffaniak/bmux.git?branch=master#efa9a80836ef7179ef543dbe45d60ac40d53e7dc"
+source = "git+https://github.com/BSteffaniak/bmux.git?branch=master#a596e1bf566f70ddd7f15cb3a72598daf8ffa5d9"
 dependencies = [
  "serde",
  "thiserror 2.0.20",
@@ -3519,7 +3519,7 @@ dependencies = [
 [[package]]
 name = "bmux_plugin_sdk"
 version = "0.0.1-alpha.1"
-source = "git+https://github.com/BSteffaniak/bmux.git?branch=master#efa9a80836ef7179ef543dbe45d60ac40d53e7dc"
+source = "git+https://github.com/BSteffaniak/bmux.git?branch=master#a596e1bf566f70ddd7f15cb3a72598daf8ffa5d9"
 dependencies = [
  "bmux_codec",
  "bmux_ipc",
@@ -3537,7 +3537,7 @@ dependencies = [
 [[package]]
 name = "bmux_terminal_grid"
 version = "0.0.1-alpha.1"
-source = "git+https://github.com/BSteffaniak/bmux.git?branch=master#efa9a80836ef7179ef543dbe45d60ac40d53e7dc"
+source = "git+https://github.com/BSteffaniak/bmux.git?branch=master#a596e1bf566f70ddd7f15cb3a72598daf8ffa5d9"
 dependencies = [
  "serde",
  "thiserror 2.0.20",
@@ -3549,7 +3549,7 @@ dependencies = [
 [[package]]
 name = "bmux_text_edit"
 version = "0.0.1-alpha.1"
-source = "git+https://github.com/BSteffaniak/bmux.git?branch=master#efa9a80836ef7179ef543dbe45d60ac40d53e7dc"
+source = "git+https://github.com/BSteffaniak/bmux.git?branch=master#a596e1bf566f70ddd7f15cb3a72598daf8ffa5d9"
 dependencies = [
  "bmux_keyboard",
  "unicode-segmentation",
@@ -3559,7 +3559,7 @@ dependencies = [
 [[package]]
 name = "bmux_tui"
 version = "0.0.1-alpha.1"
-source = "git+https://github.com/BSteffaniak/bmux.git?branch=master#efa9a80836ef7179ef543dbe45d60ac40d53e7dc"
+source = "git+https://github.com/BSteffaniak/bmux.git?branch=master#a596e1bf566f70ddd7f15cb3a72598daf8ffa5d9"
 dependencies = [
  "bmux_keyboard",
  "bmux_text_edit",
@@ -3572,7 +3572,7 @@ dependencies = [
 [[package]]
 name = "bmux_tui_components"
 version = "0.0.1-alpha.1"
-source = "git+https://github.com/BSteffaniak/bmux.git?branch=master#efa9a80836ef7179ef543dbe45d60ac40d53e7dc"
+source = "git+https://github.com/BSteffaniak/bmux.git?branch=master#a596e1bf566f70ddd7f15cb3a72598daf8ffa5d9"
 dependencies = [
  "bmux_keyboard",
  "bmux_terminal_grid",
@@ -3585,7 +3585,7 @@ dependencies = [
 [[package]]
 name = "bmux_tui_runtime"
 version = "0.0.1-alpha.1"
-source = "git+https://github.com/BSteffaniak/bmux.git?branch=master#efa9a80836ef7179ef543dbe45d60ac40d53e7dc"
+source = "git+https://github.com/BSteffaniak/bmux.git?branch=master#a596e1bf566f70ddd7f15cb3a72598daf8ffa5d9"
 dependencies = [
  "bmux_tui",
  "futures-util",
@@ -7093,9 +7093,9 @@ dependencies = [
 
 [[package]]
 name = "io-uring"
-version = "0.7.14"
+version = "0.7.13"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d64d8ca234d152948ceaede1f419b6a83983a5ecccaac05fb337a809c96d3aa6"
+checksum = "9080b15e63775b9a2ac7dca720f7050a8b955e092ea0f6020a4a80f69998cdc0"
 dependencies = [
  "bitflags 2.13.1",
  "cfg-if",

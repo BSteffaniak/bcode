@@ -2551,7 +2551,7 @@ pub fn filesystem_tui_registry() -> bcode_plugin_sdk::tui::PluginTuiRegistry {
             "filesystem-artifact-read-card",
             "filesystem-artifact-grep-card",
         ],
-        Box::new(filesystem_tui::FilesystemTuiVisualAdapter),
+        Box::<filesystem_tui::FilesystemTuiVisualAdapter>::default(),
     );
     registry
 }

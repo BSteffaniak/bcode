@@ -333,7 +333,7 @@ async fn run_onboarding_runtime<W: io::Write>(
         handle,
         onboarding_program::OnboardingMessage::InputFailed,
     );
-    let result = runtime.run().await;
+    let result = Box::pin(runtime.run()).await;
     input.request_shutdown();
     match result {
         Ok(output) => Ok(output.program.continuation()),

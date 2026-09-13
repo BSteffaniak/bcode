@@ -47,6 +47,19 @@ pub fn source_viewer_rows_with_style(
     width: u16,
     style: SourceViewerStyle,
 ) -> Vec<Line> {
+    source_viewer_projection(input, width).render_rows(
+        input.start_line,
+        input.truncated_message,
+        style,
+    )
+}
+
+/// Retain canonical source geometry alongside paint rows for selection and anchors.
+#[must_use]
+pub fn source_viewer_projection(
+    input: SourceViewerInput<'_>,
+    width: u16,
+) -> bmux_tui_components::source_viewer::SourceProjection {
     let ansi_lines = super::source_text::ansi_source(input.contents);
     let plain = ansi_lines.as_ref().map(|lines| {
         lines
@@ -56,7 +69,7 @@ pub fn source_viewer_rows_with_style(
             .join("\n")
     });
     let styled_lines = ansi_lines.unwrap_or_else(|| highlighted_lines(input));
-    bmux_tui_components::source_viewer::source_viewer_rows_with_style(
+    bmux_tui_components::source_viewer::source_projection(
         bmux_tui_components::source_viewer::SourceViewerInput {
             label: input.label,
             styled_lines: Some(&styled_lines),
@@ -67,7 +80,6 @@ pub fn source_viewer_rows_with_style(
             line_numbers: input.line_numbers,
         },
         width,
-        style,
     )
 }
 
@@ -288,14 +300,13 @@ mod tests {
         assert!(
             spans
                 .iter()
-                .any(|span| span.content == "H" && span.style.modifiers.contains(Modifier::BOLD)),
+                .any(|span| span.content.contains('H')
+                    && span.style.modifiers.contains(Modifier::BOLD)),
             "expected bold markdown heading spans: {spans:?}"
         );
         assert!(
-            spans
-                .iter()
-                .any(|span| span.content == "h"
-                    && span.style.modifiers.contains(Modifier::UNDERLINE)),
+            spans.iter().any(|span| span.content.contains('h')
+                && span.style.modifiers.contains(Modifier::UNDERLINE)),
             "expected underlined markdown link spans: {spans:?}"
         );
     }

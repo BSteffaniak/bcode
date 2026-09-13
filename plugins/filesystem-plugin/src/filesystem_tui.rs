@@ -3,7 +3,7 @@
 use crate::file_change_tui::file_change_layout;
 use bcode_tui_components::source_preview::{SourcePreviewOptions, source_preview_lines};
 use bcode_tui_components::source_viewer::{
-    SourceViewerInput, SourceViewerStyle, source_viewer_rows_with_style,
+    SourceViewerInput, SourceViewerStyle, source_viewer_projection,
 };
 use bcode_tui_components::tool_card::{push_tool_card_detail, tool_card_header};
 use bmux_tui::prelude::{Color, Line, Span, Style};
@@ -18,9 +18,25 @@ thread_local! {
 }
 
 /// Filesystem request/result TUI visual adapter.
-pub struct FilesystemTuiVisualAdapter;
+#[derive(Default)]
+pub struct FilesystemTuiVisualAdapter {
+    selection: std::sync::Mutex<Vec<bcode_plugin_sdk::tui::PluginTuiSelectionRow>>,
+}
 
 impl bcode_plugin_sdk::tui::PluginTuiVisualAdapter for FilesystemTuiVisualAdapter {
+    fn selection_row(
+        &self,
+        identity: &str,
+        offset: usize,
+    ) -> Option<bcode_plugin_sdk::tui::PluginTuiSelectionRow> {
+        self.selection
+            .lock()
+            .ok()?
+            .iter()
+            .find(|row| row.identity == identity && row.byte_start == offset)
+            .cloned()
+    }
+
     fn supports(&self, kind: &str) -> bool {
         matches!(
             kind,
@@ -71,6 +87,22 @@ impl bcode_plugin_sdk::tui::PluginTuiVisualAdapter for FilesystemTuiVisualAdapte
             "bcode.filesystem.request" => request_layout(payload, context),
             "bcode.filesystem.request-draft.write" | "bcode.filesystem.request-draft.edit" => {
                 request_draft_layout(kind, payload, context)
+            }
+            "bcode.filesystem.read" | "bcode.filesystem.artifact.read" => {
+                let (rows, anchors, selection) =
+                    read_layout(kind, payload, context.width(), context);
+                if let Ok(mut retained) = self.selection.lock() {
+                    // Bounded derived metadata; eviction makes old content unselectable.
+                    for row in selection {
+                        retained.retain(|old| {
+                            old.identity != row.identity || old.byte_start != row.byte_start
+                        });
+                        retained.push(row);
+                    }
+                    let excess = retained.len().saturating_sub(4096);
+                    retained.drain(..excess);
+                }
+                (rows, anchors)
             }
             _ => (self.rows(kind, payload, context), Vec::new()),
         };
@@ -421,6 +453,22 @@ fn read_rows(
     width: u16,
     context: &bcode_plugin_sdk::tui::PluginTuiVisualRenderContext,
 ) -> Vec<Line> {
+    read_layout(kind, payload, width, context).0
+}
+
+fn read_layout(
+    kind: &str,
+    payload: &Value,
+    width: u16,
+    context: &bcode_plugin_sdk::tui::PluginTuiVisualRenderContext,
+) -> (
+    Vec<Line>,
+    Vec<bcode_plugin_sdk::tui_visual::TuiVisualAnchor>,
+    Vec<bcode_plugin_sdk::tui::PluginTuiSelectionRow>,
+) {
+    use std::hash::{Hash, Hasher};
+    let mut anchors = Vec::new();
+    let mut selection = Vec::new();
     let mut rows = card_header(if kind.contains("artifact") {
         "Artifact bytes"
     } else {
@@ -440,21 +488,70 @@ fn read_rows(
         rows.push(Line::raw(""));
         let numbered = !kind.contains("artifact");
         let theme = context.theme();
-        rows.extend(source_viewer_rows_with_style(
-            SourceViewerInput {
-                syntax_palette: theme.map(|theme| syntax_palette(theme.syntax)),
-                label: text(payload, "path").unwrap_or_default(),
-                contents,
-                start_line: payload
-                    .get("start_line")
-                    .and_then(Value::as_u64)
-                    .and_then(|line| usize::try_from(line).ok())
-                    .unwrap_or(1),
-                max_lines: 30,
-                truncated_message: "preview truncated",
-                line_numbers: numbered,
-            },
-            width,
+        let input = SourceViewerInput {
+            syntax_palette: theme.map(|theme| syntax_palette(theme.syntax)),
+            label: text(payload, "path").unwrap_or_default(),
+            contents,
+            start_line: payload
+                .get("start_line")
+                .and_then(Value::as_u64)
+                .and_then(|line| usize::try_from(line).ok())
+                .unwrap_or(1),
+            max_lines: 30,
+            truncated_message: "preview truncated",
+            line_numbers: numbered,
+        };
+        let projection = source_viewer_projection(input, width);
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        contents.hash(&mut hasher);
+        text(payload, "path").hash(&mut hasher);
+        input.start_line.hash(&mut hasher);
+        let revision = hasher.finish();
+        let identity = format!("filesystem-source:{revision:016x}");
+        for (index, row) in projection.rows.iter().enumerate() {
+            let source = Line::from_spans(row.spans.clone()).plain_text();
+            let start = row.source_offset;
+            anchors.push(bcode_plugin_sdk::tui_visual::TuiVisualAnchor {
+                key: format!("{identity}:{start}"),
+                row: rows.len() + 1 + index,
+                source: Some(bcode_plugin_sdk::tui_visual::TuiVisualSourceRange {
+                    identity: identity.clone(),
+                    start,
+                    end: start + source.len(),
+                }),
+            });
+            let cells = bmux_tui::selection::plain_text_fragments(
+                "filesystem",
+                identity.clone(),
+                bmux_tui::geometry::Rect::new(
+                    projection.source_column(),
+                    0,
+                    u16::try_from(projection.body_width).unwrap_or(u16::MAX),
+                    1,
+                ),
+                0,
+                &source,
+                start,
+                revision,
+            )
+            .into_iter()
+            .map(|fragment| bcode_plugin_sdk::tui::PluginTuiSelectionCell {
+                column: fragment.area.x,
+                width: fragment.area.width,
+                bytes: fragment.source_range,
+            })
+            .collect();
+            selection.push(bcode_plugin_sdk::tui::PluginTuiSelectionRow {
+                identity: identity.clone(),
+                byte_start: start,
+                text: source,
+                cells,
+                revision,
+            });
+        }
+        rows.extend(projection.render_rows(
+            input.start_line,
+            input.truncated_message,
             theme.map_or_else(SourceViewerStyle::default, |theme| SourceViewerStyle {
                 source: theme.source.source,
                 border: theme.source.border,
@@ -463,7 +560,7 @@ fn read_rows(
             }),
         ));
     }
-    rows
+    (rows, anchors, selection)
 }
 
 fn image_rows(
@@ -870,7 +967,7 @@ mod tests {
         };
         let context = PluginTuiVisualRenderContext::new(80, PluginTuiDiffLayout::SideBySide, None);
         let payload = serde_json::json!({"preview": "{\"path\":\"test.rs\",\"old_text\":\"old alpha\\nold beta\",\"new_text\":\"new alpha\\nnew beta\"}", "argument_bytes": 90});
-        let (rows, anchors) = FilesystemTuiVisualAdapter.layout(
+        let (rows, anchors) = FilesystemTuiVisualAdapter::default().layout(
             "bcode.filesystem.request-draft.edit",
             &payload,
             &context,
@@ -1180,6 +1277,47 @@ mod tests {
     }
 
     #[test]
+    fn source_selection_tracks_projection_across_resize_and_revision() {
+        use bcode_plugin_sdk::tui::PluginTuiVisualAdapter;
+        let adapter = FilesystemTuiVisualAdapter::default();
+        let payload = serde_json::json!({"path":"test.rs", "contents":"a界e\u{301}long source text\r\nsecond", "start_line":9});
+        let context = bcode_plugin_sdk::tui::PluginTuiVisualRenderContext::new(
+            24,
+            bcode_plugin_sdk::tui::PluginTuiDiffLayout::Unified,
+            None,
+        );
+        let (paint, anchors) = adapter.layout("bcode.filesystem.read", &payload, &context);
+        assert!(!anchors.is_empty());
+        for anchor in &anchors {
+            let range = anchor.source.as_ref().unwrap();
+            let row = adapter.selection_row(&range.identity, range.start).unwrap();
+            assert!(paint[anchor.row].plain_text().contains(&row.text));
+            assert!(
+                row.cells
+                    .iter()
+                    .all(|cell| row.text.is_char_boundary(cell.bytes.start - row.byte_start))
+            );
+        }
+        let wider = bcode_plugin_sdk::tui::PluginTuiVisualRenderContext::new(
+            60,
+            bcode_plugin_sdk::tui::PluginTuiDiffLayout::Unified,
+            None,
+        );
+        let (_, wide) = adapter.layout("bcode.filesystem.read", &payload, &wider);
+        assert_eq!(
+            anchors[0].source.as_ref().unwrap().identity,
+            wide[0].source.as_ref().unwrap().identity
+        );
+        let mut changed = payload;
+        changed["contents"] = serde_json::json!("replacement");
+        let (_, changed) = adapter.layout("bcode.filesystem.read", &changed, &context);
+        assert_ne!(
+            anchors[0].source.as_ref().unwrap().identity,
+            changed[0].source.as_ref().unwrap().identity
+        );
+    }
+
+    #[test]
     fn renders_file_type_icons_for_path_results() {
         let rust_icon = icon_for_file("src/lib.rs", &Some(Theme::Dark));
         let payload = serde_json::json!({
@@ -1188,7 +1326,7 @@ mod tests {
             "partial": false
         });
         let rows = bcode_plugin_sdk::tui::PluginTuiVisualAdapter::rows(
-            &FilesystemTuiVisualAdapter,
+            &FilesystemTuiVisualAdapter::default(),
             "bcode.filesystem.find",
             &payload,
             &bcode_plugin_sdk::tui::PluginTuiVisualRenderContext::new(
@@ -1224,7 +1362,7 @@ mod tests {
             "partial": false
         });
         let rows = bcode_plugin_sdk::tui::PluginTuiVisualAdapter::rows(
-            &FilesystemTuiVisualAdapter,
+            &FilesystemTuiVisualAdapter::default(),
             "bcode.filesystem.list",
             &payload,
             &bcode_plugin_sdk::tui::PluginTuiVisualRenderContext::new(
@@ -1261,7 +1399,7 @@ mod tests {
             ),
         ] {
             let rows = bcode_plugin_sdk::tui::PluginTuiVisualAdapter::rows(
-                &FilesystemTuiVisualAdapter,
+                &FilesystemTuiVisualAdapter::default(),
                 kind,
                 &payload,
                 &bcode_plugin_sdk::tui::PluginTuiVisualRenderContext::new(
@@ -1288,7 +1426,7 @@ mod tests {
         )
         .with_theme(theme);
         let rows = bcode_plugin_sdk::tui::PluginTuiVisualAdapter::rows(
-            &FilesystemTuiVisualAdapter,
+            &FilesystemTuiVisualAdapter::default(),
             "bcode.filesystem.exists",
             &serde_json::json!({"path": "src/lib.rs", "exists": true}),
             &context,
@@ -1313,7 +1451,7 @@ mod tests {
             "partial": false
         });
         let rows = bcode_plugin_sdk::tui::PluginTuiVisualAdapter::rows(
-            &FilesystemTuiVisualAdapter,
+            &FilesystemTuiVisualAdapter::default(),
             "bcode.filesystem.grep",
             &payload,
             &bcode_plugin_sdk::tui::PluginTuiVisualRenderContext::new(
@@ -1343,7 +1481,7 @@ mod tests {
         )
         .with_theme(terminal_native_syntax_theme());
         let rows = bcode_plugin_sdk::tui::PluginTuiVisualAdapter::rows(
-            &FilesystemTuiVisualAdapter,
+            &FilesystemTuiVisualAdapter::default(),
             "bcode.filesystem.read",
             &payload,
             &context,
@@ -1392,7 +1530,7 @@ mod tests {
         )
         .with_theme(terminal_native_syntax_theme());
         let rows = bcode_plugin_sdk::tui::PluginTuiVisualAdapter::rows(
-            &FilesystemTuiVisualAdapter,
+            &FilesystemTuiVisualAdapter::default(),
             "bcode.filesystem.read",
             &payload,
             &context,
@@ -1421,7 +1559,7 @@ mod tests {
             "truncated": true
         });
         let rows = bcode_plugin_sdk::tui::PluginTuiVisualAdapter::rows(
-            &FilesystemTuiVisualAdapter,
+            &FilesystemTuiVisualAdapter::default(),
             "bcode.filesystem.artifact.read",
             &payload,
             &bcode_plugin_sdk::tui::PluginTuiVisualRenderContext::new(
@@ -1447,7 +1585,7 @@ mod tests {
             "partial": false
         });
         let rows = bcode_plugin_sdk::tui::PluginTuiVisualAdapter::rows(
-            &FilesystemTuiVisualAdapter,
+            &FilesystemTuiVisualAdapter::default(),
             "bcode.filesystem.grep",
             &payload,
             &bcode_plugin_sdk::tui::PluginTuiVisualRenderContext::new(
@@ -1477,7 +1615,7 @@ mod tests {
             "partial": false
         });
         let rows = bcode_plugin_sdk::tui::PluginTuiVisualAdapter::rows(
-            &FilesystemTuiVisualAdapter,
+            &FilesystemTuiVisualAdapter::default(),
             "bcode.filesystem.grep",
             &payload,
             &bcode_plugin_sdk::tui::PluginTuiVisualRenderContext::new(
@@ -1507,7 +1645,7 @@ mod tests {
             "truncated": false
         });
         let rows = bcode_plugin_sdk::tui::PluginTuiVisualAdapter::rows(
-            &FilesystemTuiVisualAdapter,
+            &FilesystemTuiVisualAdapter::default(),
             "bcode.filesystem.read",
             &payload,
             &bcode_plugin_sdk::tui::PluginTuiVisualRenderContext::new(
