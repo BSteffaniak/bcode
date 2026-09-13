@@ -249,6 +249,20 @@ real-storage test verifies initialization, unchanged next-day metadata, and comp
 days. Maintenance lock acquisition now runs on a blocking task rather than blocking an async runtime
 thread. The acquired guard is transferred through verification and conversion.
 
+## Operation-scoped multi-participant admission
+
+A new operation-scoped admission primitive allows independently opened readers to hold a shared
+maintenance gate concurrently while each holds its own participant record. Dirty state is synced
+before content access; only successful tracking completion cleans the participant. Maintenance
+requires an exclusive gate and a complete clean registry snapshot. Dirty/unknown participants block
+maintenance but do not prevent other registered readers. Process-crash tests verify OS locks release
+while dirty participant evidence persists. This avoids the earlier whole-daemon exclusive fence as
+a prerequisite for concurrent readers.
+
+The primitive remains handle-based: durable confined registry creation, complete bounded participant
+enumeration, daemon registration, and coverage of older clients are not implemented. It therefore
+is not wired to automatic startup yet and must not be treated as proof that every reader participates.
+
 ## Remaining implementation
 
 ### Access policy and scheduling

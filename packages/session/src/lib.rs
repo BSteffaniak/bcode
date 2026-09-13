@@ -48,6 +48,7 @@ pub mod repair;
 mod runtime_work;
 pub(crate) mod state;
 pub mod storage_access;
+pub mod storage_admission;
 pub mod storage_tiering;
 pub mod storage_tracking_fence;
 pub mod storage_usage;
