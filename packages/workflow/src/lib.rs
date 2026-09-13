@@ -8219,46 +8219,13 @@ impl WorkflowStructuredSourceDocument {
                     }
                 }
                 WorkflowStructuredSourceOperation::WorkflowCall(call) => {
-                    call.validate()?;
-                    let identity = call.target.definition_identity();
-                    let child = catalog
-                        .workflow_definitions
-                        .get(&identity.definition_id)
-                        .ok_or_else(|| {
-                            authoring_error(
-                                format!("steps[{index}].workflow_call.target"),
-                                format!(
-                                    "exact child definition '{}' is unavailable",
-                                    identity.definition_id
-                                ),
-                            )
-                        })?;
-                    let actual =
-                        WorkflowDefinitionIdentity::for_definition(identity.kind.clone(), child)?;
-                    if &actual != identity {
-                        return Err(authoring_error(
-                            format!("steps[{index}].workflow_call.target"),
-                            "exact child definition identity does not match catalog content",
-                        ));
-                    }
-                    if let Some(input) = &call.input
-                        && input.output != child.input
-                    {
-                        return Err(authoring_error(
-                            format!("steps[{index}].workflow_call.input.output"),
-                            "child-call input mapping must produce the exact child input interface",
-                        ));
-                    }
-                    let output = call
-                        .output
-                        .as_ref()
-                        .map_or_else(|| child.output.clone(), |mapping| mapping.output.clone());
+                    let (input, output) = resolve_workflow_call_interface(call, catalog)?;
                     NodeDefinition {
                         id: step.id.clone(),
                         name: step.name.clone().unwrap_or_else(|| step.id.clone()),
                         kind: NodeKind::WorkflowCall,
                         dataflow: WorkflowNodeDataflowPolicy::Direct,
-                        input: child.input.clone(),
+                        input,
                         output,
                         resources: Vec::new(),
                         configuration: serde_json::to_value(call).map_err(|error| {
@@ -8608,23 +8575,14 @@ fn lower_structured_fan_out_member(
             })?,
         },
         WorkflowStructuredSourceOperation::WorkflowCall(call) => {
-            let identity = call.target.definition_identity();
-            let child = catalog
-                .workflow_definitions
-                .get(&identity.definition_id)
-                .ok_or_else(|| {
-                    authoring_error(
-                        format!("steps[{index}].fan_out.operation.workflow_call"),
-                        "fan-out child workflow is unavailable",
-                    )
-                })?;
+            let (input, output) = resolve_workflow_call_interface(call, catalog)?;
             NodeDefinition {
                 id: member_id,
                 name: member_name,
                 kind: NodeKind::WorkflowCall,
                 dataflow: WorkflowNodeDataflowPolicy::Direct,
-                input: child.input.clone(),
-                output: child.output.clone(),
+                input,
+                output,
                 resources: Vec::new(),
                 configuration: serde_json::to_value(call).map_err(|error| {
                     authoring_error(
@@ -12191,6 +12149,44 @@ impl WorkflowCallConfiguration {
         }
         Ok(())
     }
+}
+
+fn resolve_workflow_call_interface(
+    call: &WorkflowCallConfiguration,
+    catalog: &WorkflowAuthoringCatalogSnapshot,
+) -> Result<(ValueSchema, ValueSchema), WorkflowError> {
+    call.validate()?;
+    let identity = call.target.definition_identity();
+    let child = catalog
+        .workflow_definitions
+        .get(&identity.definition_id)
+        .ok_or_else(|| {
+            authoring_error(
+                "workflow_call.target",
+                "exact child definition is unavailable",
+            )
+        })?;
+    let actual = WorkflowDefinitionIdentity::for_definition(identity.kind.clone(), child)?;
+    if &actual != identity {
+        return Err(authoring_error(
+            "workflow_call.target",
+            "exact child definition identity does not match catalog content",
+        ));
+    }
+    if let Some(input) = &call.input
+        && input.output != child.input
+    {
+        return Err(authoring_error(
+            "workflow_call.input.output",
+            "child-call input mapping must produce the exact child input interface",
+        ));
+    }
+    Ok((
+        child.input.clone(),
+        call.output
+            .as_ref()
+            .map_or_else(|| child.output.clone(), |mapping| mapping.output.clone()),
+    ))
 }
 
 fn validate_workflow_call_id(path: &str, value: &str) -> Result<(), WorkflowError> {

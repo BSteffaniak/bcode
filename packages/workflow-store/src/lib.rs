@@ -4397,25 +4397,31 @@ impl WorkflowStore {
                 "workflow child exact target differs from the parent call node".to_string(),
             ));
         }
+        let authority = request.run.execution_authority.as_ref();
+        let owned: bool = transaction.query_row(
+            "SELECT EXISTS(SELECT 1 FROM workflow_runs WHERE run_id = ?1 AND target_artifact_id IS ?2
+             AND coordinator_daemon_instance_id IS ?3 AND coordinator_generation IS ?4
+             AND coordinator_fencing_token IS ?5)",
+            rusqlite::params![request.link.parent_run_id,
+                authority.map(|value| &value.target_artifact_id),
+                authority.map(|value| &value.daemon_instance_id),
+                authority.map(|value| value.generation),
+                authority.map(|value| &value.fencing_token)],
+            |row| row.get(0),
+        )?;
+        if !owned {
+            return Err(WorkflowStoreError::InvalidData(
+                "workflow child authority is stale or foreign".into(),
+            ));
+        }
         let inherited_package = if let bcode_workflow::WorkflowCallTarget::PackageMember {
             member_id,
             definition_identity,
         } = &configuration.target
         {
-            let authority = request.run.execution_authority.as_ref().ok_or_else(|| {
-                WorkflowStoreError::InvalidData("package child requires execution authority".into())
-            })?;
-            let owned: bool = transaction.query_row(
-                "SELECT EXISTS(SELECT 1 FROM workflow_runs WHERE run_id = ?1 AND target_artifact_id = ?2
-                 AND coordinator_daemon_instance_id = ?3 AND coordinator_generation = ?4
-                 AND coordinator_fencing_token = ?5)",
-                rusqlite::params![request.link.parent_run_id, authority.target_artifact_id,
-                    authority.daemon_instance_id, authority.generation, authority.fencing_token],
-                |row| row.get(0),
-            )?;
-            if !owned {
+            if authority.is_none() {
                 return Err(WorkflowStoreError::InvalidData(
-                    "package child authority is stale or foreign".into(),
+                    "package child requires execution authority".into(),
                 ));
             }
             let binding: (String, String) = transaction
@@ -17098,6 +17104,21 @@ mod tests {
                 receipt.package_id.clone(),
                 receipt.package_lock_digest_sha256.clone()
             )
+        );
+        drop(store);
+        let mut store = WorkflowStore::open_in_state_dir(temp.path()).expect("bound run restart");
+        assert_eq!(
+            store
+                .resolve_run_package_member(&run.run_id, &receipt.exports[0].member_id)
+                .unwrap(),
+            receipt.exports[0].definition_identity,
+        );
+        assert!(!store.create_run_with_package(&run, binding).unwrap());
+        assert!(store.create_run_with_package(&run, None).is_err());
+        assert!(
+            store
+                .resolve_run_package_member(&run.run_id, "missing-member")
+                .is_err()
         );
         let mut stale = request;
         stale.expected_generations[0].expected_generation = 2;
@@ -29923,6 +29944,15 @@ mod tests {
                 limits: WorkflowRunLimits::default(),
             },
         };
+        let mut foreign_owner = request.clone();
+        foreign_owner.run.execution_authority = Some(WorkflowExecutionAuthority {
+            target_artifact_id: "foreign-artifact".into(),
+            daemon_instance_id: "foreign-daemon".into(),
+            generation: 1,
+            fencing_token: "foreign-token".into(),
+        });
+        assert!(store.create_child_run_idempotent(&foreign_owner).is_err());
+        assert!(store.run_summary(&request.run.run_id).unwrap().is_none());
         let mut mismatched_profile = request.clone();
         mismatched_profile.run.run_id = workflow_child_run_id(
             "parent-run",
