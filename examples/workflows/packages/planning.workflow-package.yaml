@@ -3,7 +3,10 @@ package_id: bcode/examples-planning
 exports:
   plan-or-refocus: plan-or-refocus
   evaluate-completion: evaluate-completion
+  plan-objective: plan-objective
 members:
+  - member_id: plan-objective
+    source_name: planning/plan-objective.workflow.yaml
   - member_id: plan-or-refocus
     source_name: planning/plan-or-refocus.workflow.yaml
   - member_id: evaluate-completion

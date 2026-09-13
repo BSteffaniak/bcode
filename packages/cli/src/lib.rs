@@ -23079,7 +23079,29 @@ mod workflow_source_tests {
         };
         let plan = bcode_workflow::plan_workflow_package(&loaded, &catalog)
             .expect("planning package plans");
-        assert_eq!(plan.members.len(), 2);
+        assert_eq!(plan.members.len(), 3);
+        let objective = plan
+            .members
+            .iter()
+            .find(|member| member.member_id == "plan-objective")
+            .expect("objective planning member");
+        let objective_definition = &objective.lowering.document.definition;
+        assert_eq!(
+            objective_definition.input.type_name,
+            "bcode.objective-planning.request/v1"
+        );
+        assert_eq!(
+            objective_definition.output.type_name,
+            "bcode.objective-planning.result/v1"
+        );
+        let objective_prompt: bcode_workflow::WorkflowPromptConfiguration =
+            serde_json::from_value(objective_definition.nodes["plan"].configuration.clone())
+                .expect("objective planning prompt");
+        assert!(objective_prompt.read_only);
+        assert_eq!(
+            objective_prompt.execution_target,
+            bcode_workflow::PromptContextTarget::FixedGenerationFork
+        );
         let planning = plan
             .members
             .iter()

@@ -2,6 +2,43 @@
 
 These product-facing examples are ordinary workflow package manifests and source-v3 workflows. They are not loaded from Rust fixtures or interpreted by specialized host code.
 
+## Objective planning
+
+The existing `planning.workflow-package.yaml` also exports `plan-objective`. Supply
+`{"objective":"Describe the requested outcome", "constraints":[]}` as typed input.
+It runs a read-only `plan` session forked from the selected parent generation and returns
+`bcode.objective-planning.result/v1`: a `planned` or `blocked` status, summary, proposed
+tasks with dependencies and acceptance criteria, and blockers. The bounded task list is
+one planning response, not a workflow graph-size or lifetime limit. Model-generated task
+identities and dependencies remain untrusted proposals; they confer no execution authority.
+
+Use the ordinary package lifecycle:
+
+```text
+bcode workflow package validate examples/workflows/packages/planning.workflow-package.yaml
+bcode workflow package preview examples/workflows/packages/planning.workflow-package.yaml
+bcode workflow package apply examples/workflows/packages/planning.workflow-package.yaml
+```
+
+Review the returned lock and member generations and publish through
+`bcode workflow package publish --lock LOCK_JSON --expected-generation MEMBER=GENERATION`
+(with each required member generation from apply). Then launch:
+
+```text
+bcode workflow start package-export --package-id bcode/examples-planning --export plan-objective --parent-session-id SESSION --input INPUT.json
+bcode workflow inspect-run --run-id RUN
+```
+
+For `/workflow` discovery, explicitly add `examples/workflows/packages` to the configured
+`workflows.paths`; examples are not silently installed or enabled. Discovery and launch use
+the same canonical package export. Existing consumers must explicitly apply and publish
+the updated package; existing published runs are unchanged. The parent session, agent profile,
+model, tool availability, and permissions remain normal launch prerequisites.
+
+This export produces a plan only. It does not admit its proposed tasks, delegate sessions,
+revise execution, or deliver a coordinated implementation result. Those require the unfinished
+execution-scoped collaboration operations; a successful planning result is not swarm completion.
+
 ## Typed command execution
 
 `command/package.workflow-package.yaml` exports `run-and-assert`. Its public input is the shell owner's versioned `bcode.shell.exec/v1` command-plan schema, including argv arrays, accepted exit codes, environment policy, sequencing, timeouts, and output retention. Its public output is `bcode.shell.exec-result/v1`; callers can use the typed `passed` and per-command facts in deterministic conditions.
