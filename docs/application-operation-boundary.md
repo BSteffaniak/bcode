@@ -2,6 +2,23 @@
 
 Bcode application behavior is reusable without making a second transport or a generic application framework. The current boundary is a set of focused, server-owned operation modules backed by portable domain contracts.
 
+## Retained workflow launch pages
+
+Launch-catalog version 3 distinguishes pending discovery tokens from result tokens in
+`next_cursor`. A result token owns a temporary indexed preview spool and one admission
+permit. Subsequent pages use indexed keyset reads, not source rediscovery or compilation.
+The query, limit, and exact last cursor position are bound to each single-use token.
+Successful continuation rotates the token; completion, cancellation, expiration, or an
+admitted failure releases retained state. Tokens expire after 60 seconds and do not survive
+daemon replacement. Lost responses do not confer retry safety; restart discovery.
+
+Source content and compilation inputs reflect the admitted discovery, not a live filesystem
+view. Refresh starts a new scan. Publication changes invalidate retained pages through the
+workflow-store read fence. Cancellation uses the existing discovery cancellation operation
+with the result token. SQLite's bounded page cache and bounded result windows do not imply
+a total disk quota or a total process-memory guarantee. No durable workflow/session state is
+written by this disposable spool. Version 2 requests are rejected rather than guessed.
+
 ## Canonical call path
 
 ```text

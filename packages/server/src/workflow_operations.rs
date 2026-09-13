@@ -2989,94 +2989,309 @@ pub async fn launch_detail(
     request: &bcode_workflow::WorkflowLaunchDetailRequest,
 ) -> Result<bcode_workflow::WorkflowLaunchDetail, super::ServerError> {
     request.validate()?;
+    if let Some(token) = request.catalog_token.as_deref() {
+        return retained_launch_detail(state, request, token).await;
+    }
     match &request.source {
         bcode_workflow::WorkflowLaunchSourceIdentity::ExplicitSource {
             source_path,
             source_format,
         } => {
-            let source = bcode_workflow_discovery::inspect_explicit_source(source_path)?;
-            let bcode_workflow_discovery::DiscoveredWorkflowSource::Standalone {
-                source,
-                source_format: actual_format,
-                source_path,
-                ..
-            } = source
-            else {
-                return Err(bcode_workflow_store::WorkflowStoreError::InvalidData(
-                    "explicit launch detail identity expected a standalone source".to_string(),
-                )
-                .into());
-            };
-            if actual_format != *source_format {
-                return Err(bcode_workflow_store::WorkflowStoreError::InvalidData(
-                    "explicit launch source format changed".to_string(),
-                )
-                .into());
-            }
-            let catalog = authoring_catalog(state).await?;
-            let lowering =
-                bcode_workflow::lower_workflow_authoring_source(&source, actual_format, &catalog)?;
-            let preview = lowering.document.compilation_preview(&catalog, None);
-            let item = standalone_launch_item(
-                "explicit".to_string(),
-                0,
-                source_path.clone(),
-                actual_format,
-                &lowering,
-                &preview,
-                true,
-            );
-            Ok(bcode_workflow::WorkflowLaunchDetail {
-                version: bcode_workflow::WORKFLOW_LAUNCH_CATALOG_VERSION,
-                item,
-                document: lowering.document,
-                package_plan: None,
-            })
-        }
-        source => {
-            let page = launch_catalog(
-                state,
-                &bcode_workflow::WorkflowLaunchCatalogRequest {
-                    version: bcode_workflow::WORKFLOW_LAUNCH_CATALOG_VERSION,
-                    incremental: false,
-                    discovery_token: None,
-                    workspace: request.workspace.clone(),
-                    limit: bcode_workflow::MAX_WORKFLOW_LAUNCH_CATALOG_PAGE_SIZE,
-                    cursor: None,
-                    search: None,
-                    source_kind: None,
-                    readiness: None,
-                },
-            )
-            .await?;
-            let item = page
-                .items
-                .into_iter()
-                .find(|item| &item.source == source)
-                .ok_or_else(|| {
-                    bcode_workflow_store::WorkflowStoreError::InvalidData(
-                        "workflow launch target is no longer discoverable".to_string(),
+            let permit = std::sync::Arc::clone(&state.workflow_discovery_capacity)
+                .try_acquire_owned()
+                .map_err(|_| {
+                    super::ServerError::WorkflowAuthoring(
+                        bcode_workflow::WorkflowAuthoringFailure::DiscoveryCapacity,
                     )
                 })?;
-            launch_detail_for_catalog_item(state, &request.workspace, item).await
+            let catalog = authoring_catalog(state).await?;
+            let source_path = source_path.clone();
+            let source_format = *source_format;
+            tokio::task::spawn_blocking(move || {
+                let _permit = permit;
+                explicit_launch_detail(&source_path, source_format, &catalog)
+            })
+            .await
+            .map_err(super::ServerError::BlockingTask)?
+        }
+        source => {
+            let mut query = bcode_workflow::WorkflowLaunchCatalogRequest {
+                retain_for_detail: false,
+                version: bcode_workflow::WORKFLOW_LAUNCH_CATALOG_VERSION,
+                incremental: true,
+                discovery_token: None,
+                workspace: request.workspace.clone(),
+                limit: bcode_workflow::MAX_WORKFLOW_LAUNCH_CATALOG_PAGE_SIZE,
+                cursor: None,
+                search: None,
+                source_kind: None,
+                readiness: None,
+            };
+            let mut page = launch_catalog(state, &query).await?;
+            loop {
+                let token = page.discovery_token.clone().or_else(|| {
+                    page.next_cursor
+                        .as_ref()
+                        .and_then(|cursor| cursor.result_token.clone())
+                });
+                // Detail consumes the catalog internally. Never leave an unreturned cursor
+                // alive on a match, failure, or dropped continuation request.
+                let lease = DiscoveryContinuation {
+                    scans: &state.workflow_discovery_scans,
+                    token: token.as_deref(),
+                };
+                if let Some(discovery_token) = page.discovery_token {
+                    query.discovery_token = Some(discovery_token);
+                    page = launch_catalog(state, &query).await?;
+                    drop(lease);
+                    continue;
+                }
+                query.discovery_token = None;
+                if let Some(item) = page.items.into_iter().find(|item| &item.source == source) {
+                    drop(lease);
+                    return launch_detail_for_catalog_item(state, &request.workspace, item).await;
+                }
+                let Some(cursor) = page.next_cursor else {
+                    return Err(bcode_workflow_store::WorkflowStoreError::InvalidData(
+                        "workflow launch target is no longer discoverable".to_string(),
+                    )
+                    .into());
+                };
+                query.cursor = Some(cursor);
+                page = launch_catalog(state, &query).await?;
+                drop(lease);
+            }
         }
     }
 }
 
-#[allow(clippy::too_many_lines)]
+fn explicit_launch_detail(
+    source_path: &std::path::Path,
+    source_format: bcode_workflow::WorkflowSourceFormat,
+    catalog: &bcode_workflow::WorkflowAuthoringCatalogSnapshot,
+) -> Result<bcode_workflow::WorkflowLaunchDetail, super::ServerError> {
+    let source = bcode_workflow_discovery::inspect_explicit_source(source_path)?;
+    let bcode_workflow_discovery::DiscoveredWorkflowSource::Standalone {
+        source,
+        source_format: actual_format,
+        source_path,
+        ..
+    } = source
+    else {
+        return Err(bcode_workflow_store::WorkflowStoreError::InvalidData(
+            "explicit launch detail identity expected a standalone source".into(),
+        )
+        .into());
+    };
+    if actual_format != source_format {
+        return Err(bcode_workflow_store::WorkflowStoreError::InvalidData(
+            "explicit launch source format changed".into(),
+        )
+        .into());
+    }
+    let lowering =
+        bcode_workflow::lower_workflow_authoring_source(&source, actual_format, catalog)?;
+    let preview = lowering.document.compilation_preview(catalog, None);
+    let item = standalone_launch_item(
+        "explicit".into(),
+        0,
+        source_path,
+        actual_format,
+        &lowering,
+        &preview,
+        true,
+    );
+    Ok(bcode_workflow::WorkflowLaunchDetail {
+        version: bcode_workflow::WORKFLOW_LAUNCH_CATALOG_VERSION,
+        item,
+        document: lowering.document,
+        package_plan: None,
+    })
+}
+
+async fn retained_launch_detail(
+    state: &ServerState,
+    request: &bcode_workflow::WorkflowLaunchDetailRequest,
+    token: &str,
+) -> Result<bcode_workflow::WorkflowLaunchDetail, super::ServerError> {
+    let invalid = || {
+        super::ServerError::WorkflowAuthoring(
+            bcode_workflow::WorkflowAuthoringFailure::DiscoveryContinuationInvalid,
+        )
+    };
+    let (mut scan, expires) = {
+        let mut scans = state
+            .workflow_discovery_scans
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let scan = scans
+            .get_mut(token)
+            .filter(|pending| {
+                pending.expires > std::time::Instant::now()
+                    && pending.request.workspace == request.workspace
+            })
+            .and_then(|pending| pending.scan.take().map(|scan| (scan, pending.expires)))
+            .ok_or_else(invalid)?;
+        drop(scans);
+        scan
+    };
+    // Retain the registry tombstone for cancellation and expiry while this request
+    // exclusively owns the scan. A conflicting request must not remove its authority.
+    let continuation = DiscoveryContinuation {
+        scans: &state.workflow_discovery_scans,
+        token: Some(token),
+    };
+    continuation.checkpoint().await?;
+    if scan.completed.is_none() {
+        return Err(invalid());
+    }
+    let fence = scan.publication_fence.take().ok_or_else(invalid)?;
+    state
+        .workflow_store
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .validate_publication_read_fence(&fence)?;
+    let item = scan
+        .previews
+        .as_ref()
+        .ok_or_else(invalid)?
+        .find(&launch_source_key(&request.source))?
+        .ok_or_else(invalid)?;
+    if item.source != request.source {
+        return Err(invalid());
+    }
+    let cancellation = continuation.batch_cancellation()?;
+    let result = tokio::select! {
+        biased;
+        () = tokio::time::sleep_until(tokio::time::Instant::from_std(expires)) => {
+            return Err(super::ServerError::WorkflowAuthoring(
+                bcode_workflow::WorkflowAuthoringFailure::Cancelled,
+            ));
+        }
+        result = build_launch_detail(state, &request.workspace, item, Some(scan), cancellation) => result,
+    };
+    continuation.checkpoint().await?;
+    let (detail, returned_scan) = result?;
+    scan = returned_scan.ok_or_else(invalid)?;
+    state
+        .workflow_store
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .validate_publication_read_fence(&fence)?;
+    continuation.finish(
+        &mut state
+            .workflow_discovery_scans
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner),
+    )?;
+    drop(continuation);
+    drop(scan);
+    Ok(detail)
+}
+
 async fn launch_detail_for_catalog_item(
     state: &ServerState,
     workspace: &std::path::Path,
     item: bcode_workflow::WorkflowLaunchCatalogItem,
 ) -> Result<bcode_workflow::WorkflowLaunchDetail, super::ServerError> {
+    build_launch_detail(
+        state,
+        workspace,
+        item,
+        None,
+        DiscoveryBatchCancellation::default(),
+    )
+    .await
+    .map(|(detail, _)| detail)
+}
+
+async fn build_launch_detail(
+    state: &ServerState,
+    workspace: &std::path::Path,
+    item: bcode_workflow::WorkflowLaunchCatalogItem,
+    admission: Option<AdmittedDiscovery>,
+    cancellation: DiscoveryBatchCancellation,
+) -> Result<
+    (
+        bcode_workflow::WorkflowLaunchDetail,
+        Option<AdmittedDiscovery>,
+    ),
+    super::ServerError,
+> {
     let catalog = authoring_catalog(state).await?;
+    let template_document = if let bcode_workflow::WorkflowLaunchSourceIdentity::Template {
+        owner_plugin_id,
+        template_id,
+        template_version,
+    } = &item.source
+    {
+        describe_template(state, owner_plugin_id, template_id, *template_version)?
+            .and_then(|template| template.authoring_document)
+    } else {
+        None
+    };
+    let workspace = workspace.to_path_buf();
+    let cancelled = std::sync::Arc::clone(&cancellation.0);
+    #[cfg(test)]
+    let barrier = state.workflow_detail_barrier.lock().await.take();
+    let result = tokio::task::spawn_blocking(move || {
+        #[cfg(test)]
+        if let Some((started, release)) = barrier {
+            let _ = started.send(());
+            release
+                .recv_timeout(std::time::Duration::from_secs(10))
+                .unwrap();
+        }
+        let detail = run_detail_construction(&cancelled, || {
+            construct_launch_detail(&workspace, item, &catalog, template_document, &cancelled)
+        })?;
+        // Ownership travels with blocking work, including when the awaiting request drops.
+        Ok((detail, admission))
+    })
+    .await
+    .map_err(super::ServerError::BlockingTask)?;
+    drop(cancellation);
+    result
+}
+
+fn run_detail_construction<T>(
+    cancelled: &std::sync::atomic::AtomicBool,
+    construct: impl FnOnce() -> Result<T, super::ServerError>,
+) -> Result<T, super::ServerError> {
+    let check = || {
+        if cancelled.load(std::sync::atomic::Ordering::Acquire) {
+            Err(super::ServerError::WorkflowAuthoring(
+                bcode_workflow::WorkflowAuthoringFailure::Cancelled,
+            ))
+        } else {
+            Ok(())
+        }
+    };
+    check()?;
+    let result = construct();
+    check()?;
+    result
+}
+
+#[allow(clippy::too_many_lines)]
+fn construct_launch_detail(
+    workspace: &std::path::Path,
+    mut item: bcode_workflow::WorkflowLaunchCatalogItem,
+    catalog: &bcode_workflow::WorkflowAuthoringCatalogSnapshot,
+    template_document: Option<bcode_workflow::WorkflowAuthoringDocument>,
+    cancelled: &std::sync::atomic::AtomicBool,
+) -> Result<bcode_workflow::WorkflowLaunchDetail, super::ServerError> {
     let (document, package_plan) = match &item.source {
         bcode_workflow::WorkflowLaunchSourceIdentity::PackageExport {
+            package_id,
             export,
             manifest_path,
             ..
         } => {
-            let source = bcode_workflow_discovery::inspect_explicit_source(manifest_path)?;
+            let source = bcode_workflow_discovery::inspect_explicit_source_with_cancellation(
+                manifest_path,
+                &|| cancelled.load(std::sync::atomic::Ordering::Acquire),
+            )?;
             let bcode_workflow_discovery::DiscoveredWorkflowSource::Package { closure, .. } =
                 source
             else {
@@ -3085,7 +3300,13 @@ async fn launch_detail_for_catalog_item(
                 )
                 .into());
             };
-            let plan = bcode_workflow::plan_workflow_package_closure(&closure, &catalog)?;
+            let plan = bcode_workflow::plan_workflow_package_closure(&closure, catalog)?;
+            if plan.entry_package_id != *package_id {
+                return Err(bcode_workflow_store::WorkflowStoreError::InvalidData(
+                    "package launch source identity changed".to_string(),
+                )
+                .into());
+            }
             let entry = plan
                 .packages
                 .iter()
@@ -3095,6 +3316,15 @@ async fn launch_detail_for_catalog_item(
                         "package plan has no entry package".to_string(),
                     )
                 })?;
+            if item.package_lock_digest_sha256.as_deref()
+                != Some(entry.plan.lock.digest_sha256()?.as_str())
+            {
+                return Err(bcode_workflow_store::WorkflowStoreError::InvalidData(
+                    "package launch source content changed; rediscover before requesting detail"
+                        .to_string(),
+                )
+                .into());
+            }
             let member_id = entry
                 .plan
                 .lock
@@ -3121,11 +3351,15 @@ async fn launch_detail_for_catalog_item(
             (document, Some(plan))
         }
         bcode_workflow::WorkflowLaunchSourceIdentity::StandaloneSource {
+            workflow_id,
             source_path,
             source_format,
             ..
         } => {
-            let source = bcode_workflow_discovery::inspect_explicit_source(source_path)?;
+            let source = bcode_workflow_discovery::inspect_explicit_source_with_cancellation(
+                source_path,
+                &|| cancelled.load(std::sync::atomic::Ordering::Acquire),
+            )?;
             let bcode_workflow_discovery::DiscoveredWorkflowSource::Standalone {
                 source,
                 source_format: actual_format,
@@ -3143,25 +3377,28 @@ async fn launch_detail_for_catalog_item(
                 )
                 .into());
             }
-            (
-                bcode_workflow::lower_workflow_authoring_source(&source, actual_format, &catalog)?
-                    .document,
-                None,
-            )
+            let lowering =
+                bcode_workflow::lower_workflow_authoring_source(&source, actual_format, catalog)?;
+            if lowering.document.workflow_id != *workflow_id {
+                return Err(bcode_workflow_store::WorkflowStoreError::InvalidData(
+                    "standalone launch source identity changed".to_string(),
+                )
+                .into());
+            }
+            let preview = lowering.document.compilation_preview(catalog, None);
+            item = standalone_launch_item(
+                item.source_label.clone(),
+                item.precedence,
+                source_path.clone(),
+                actual_format,
+                &lowering,
+                &preview,
+                false,
+            );
+            (lowering.document, None)
         }
-        bcode_workflow::WorkflowLaunchSourceIdentity::Template {
-            owner_plugin_id,
-            template_id,
-            template_version,
-        } => {
-            let template =
-                describe_template(state, owner_plugin_id, template_id, *template_version)?
-                    .ok_or_else(|| {
-                        bcode_workflow_store::WorkflowStoreError::InvalidData(
-                            "workflow template is no longer available".to_string(),
-                        )
-                    })?;
-            let document = template.authoring_document.ok_or_else(|| {
+        bcode_workflow::WorkflowLaunchSourceIdentity::Template { .. } => {
+            let document = template_document.ok_or_else(|| {
                 bcode_workflow_store::WorkflowStoreError::InvalidData(
                     "workflow template has no maintainable authoring document".to_string(),
                 )
@@ -3192,12 +3429,21 @@ pub struct PendingDiscovery {
     scan: Option<AdmittedDiscovery>,
     expires: std::time::Instant,
     _expiration: DiscoveryExpiration,
+    batch_cancellation: Option<DiscoveryBatchCancellation>,
 }
 
 impl PendingDiscovery {
     #[cfg(test)]
+    pub(super) fn expire_after(&mut self, duration: std::time::Duration) {
+        self.expires = std::time::Instant::now() + duration;
+    }
+
+    #[cfg(test)]
     pub(super) fn retained_preview_count(&self) -> usize {
-        self.scan.as_ref().map_or(0, |scan| scan.previews.len())
+        self.scan
+            .as_ref()
+            .and_then(|scan| scan.previews.as_ref())
+            .map_or(0, |spool| spool.first(1).map_or(0, |items| items.len()))
     }
 }
 
@@ -3205,9 +3451,10 @@ impl PendingDiscovery {
 #[derive(Debug)]
 struct AdmittedDiscovery {
     scan: Option<bcode_workflow_discovery::WorkflowDiscoveryScan>,
-    previews: Vec<bcode_workflow::WorkflowLaunchCatalogItem>,
+    previews: Option<bcode_workflow_discovery::LaunchPreviewSpool>,
     catalog: Option<bcode_workflow::WorkflowAuthoringCatalogSnapshot>,
     publication_fence: Option<bcode_workflow_store::WorkflowPublicationReadFence>,
+    completed: Option<Vec<bcode_workflow::WorkflowLaunchDiagnostic>>,
     _permit: tokio::sync::OwnedSemaphorePermit,
 }
 
@@ -3220,6 +3467,48 @@ impl Drop for DiscoveryExpiration {
     }
 }
 
+/// Signals a blocking batch when its awaiting request is dropped. The worker retains
+/// its admission permit until the current bounded discovery unit has finished.
+#[derive(Debug, Default)]
+struct DiscoveryBatchCancellation(std::sync::Arc<std::sync::atomic::AtomicBool>);
+
+impl Drop for DiscoveryBatchCancellation {
+    fn drop(&mut self) {
+        self.0.store(true, std::sync::atomic::Ordering::Release);
+    }
+}
+
+fn advance_discovery_batch(
+    scan: &mut bcode_workflow_discovery::WorkflowDiscoveryScan,
+    cancelled: &std::sync::atomic::AtomicBool,
+) -> Result<
+    bcode_workflow_discovery::WorkflowDiscoveryBatch,
+    bcode_workflow_discovery::WorkflowDiscoveryError,
+> {
+    let mut batch = bcode_workflow_discovery::WorkflowDiscoveryBatch {
+        sources: Vec::new(),
+        diagnostics: Vec::new(),
+        complete: false,
+    };
+    for _ in 0..16.min(bcode_workflow_discovery::MAX_DISCOVERY_RESULTS) {
+        if cancelled.load(std::sync::atomic::Ordering::Acquire) {
+            return Err(bcode_workflow_discovery::WorkflowDiscoveryError::Invalid(
+                "discovery request dropped".into(),
+            ));
+        }
+        let next = scan.advance_sources_with_cancellation(1, &|| {
+            cancelled.load(std::sync::atomic::Ordering::Acquire)
+        })?;
+        batch.sources.extend(next.sources);
+        batch.diagnostics.extend(next.diagnostics);
+        batch.complete = next.complete;
+        if batch.complete {
+            break;
+        }
+    }
+    Ok(batch)
+}
+
 /// Removes an in-flight continuation on completion, error, or dropped request.
 struct DiscoveryContinuation<'a> {
     scans: &'a std::sync::Mutex<BTreeMap<String, PendingDiscovery>>,
@@ -3227,6 +3516,29 @@ struct DiscoveryContinuation<'a> {
 }
 
 impl DiscoveryContinuation<'_> {
+    fn batch_cancellation(&self) -> Result<DiscoveryBatchCancellation, super::ServerError> {
+        let cancellation = DiscoveryBatchCancellation::default();
+        if let Some(token) = self.token {
+            let mut scans = self
+                .scans
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let pending = scans
+                .get_mut(token)
+                .filter(|pending| pending.expires > std::time::Instant::now())
+                .ok_or(super::ServerError::WorkflowAuthoring(
+                    bcode_workflow::WorkflowAuthoringFailure::Cancelled,
+                ))?;
+            // Registry removal (explicit cancellation, expiry, or shutdown) and request
+            // drop independently stop the same worker. Replacing a finished batch's
+            // guard only signals that old batch, never its successor.
+            pending.batch_cancellation = Some(DiscoveryBatchCancellation(std::sync::Arc::clone(
+                &cancellation.0,
+            )));
+        }
+        Ok(cancellation)
+    }
+
     async fn checkpoint(&self) -> Result<(), super::ServerError> {
         tokio::task::yield_now().await;
         if let Some(token) = self.token {
@@ -3278,14 +3590,78 @@ mod discovery_continuation_tests {
     use super::*;
 
     #[tokio::test]
+    async fn active_detail_cancellation_overrides_construction_failure() {
+        let owner = DiscoveryBatchCancellation::default();
+        let cancelled = std::sync::Arc::clone(&owner.0);
+        let capacity = std::sync::Arc::new(tokio::sync::Semaphore::new(1));
+        let permit = capacity.clone().acquire_owned().await.unwrap();
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let worker = tokio::task::spawn_blocking(move || {
+            let _permit = permit;
+            run_detail_construction(&cancelled, || {
+                started_tx.send(()).unwrap();
+                release_rx
+                    .recv_timeout(std::time::Duration::from_secs(10))
+                    .unwrap();
+                Err::<(), _>(super::super::ServerError::WorkflowAuthoring(
+                    bcode_workflow::WorkflowAuthoringFailure::DiscoveryContinuationInvalid,
+                ))
+            })
+        });
+        started_rx.await.unwrap();
+        drop(owner);
+        assert_eq!(capacity.available_permits(), 0);
+        release_tx.send(()).unwrap();
+        assert!(matches!(
+            worker.await.unwrap(),
+            Err(super::super::ServerError::WorkflowAuthoring(
+                bcode_workflow::WorkflowAuthoringFailure::Cancelled
+            ))
+        ));
+        assert_eq!(capacity.available_permits(), 1);
+    }
+
+    #[tokio::test]
+    async fn dropped_batch_owner_stops_blocking_discovery_before_next_unit() {
+        let root = tempfile::tempdir().unwrap();
+        let config = bcode_config::WorkflowsConfig {
+            include_repo_workflows: true,
+            include_user_workflows: false,
+            ..Default::default()
+        };
+        let mut scan =
+            bcode_workflow_discovery::WorkflowDiscoveryScan::open(root.path(), &config, 1).unwrap();
+        let owner = DiscoveryBatchCancellation::default();
+        let cancelled = std::sync::Arc::clone(&owner.0);
+        let capacity = std::sync::Arc::new(tokio::sync::Semaphore::new(1));
+        let permit = capacity.clone().acquire_owned().await.unwrap();
+        let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+        let (resume_tx, resume_rx) = std::sync::mpsc::channel();
+        let worker = tokio::task::spawn_blocking(move || {
+            let _permit = permit;
+            ready_tx.send(()).unwrap();
+            resume_rx.recv().unwrap();
+            advance_discovery_batch(&mut scan, &cancelled)
+        });
+        ready_rx.await.unwrap();
+        drop(owner);
+        assert_eq!(capacity.available_permits(), 0);
+        resume_tx.send(()).unwrap();
+        assert!(worker.await.unwrap().is_err());
+        assert_eq!(capacity.available_permits(), 1);
+    }
+
+    #[tokio::test]
     async fn cancelled_inflight_continuation_cannot_publish() {
         let token = "inflight";
         let capacity = std::sync::Arc::new(tokio::sync::Semaphore::new(1));
         let scan = AdmittedDiscovery {
             scan: None,
-            previews: Vec::new(),
+            previews: None,
             catalog: None,
             publication_fence: None,
+            completed: None,
             _permit: capacity.clone().try_acquire_owned().unwrap(),
         };
         let request = serde_json::from_value(serde_json::json!({
@@ -3300,6 +3676,7 @@ mod discovery_continuation_tests {
                 scan: Some(scan),
                 expires: std::time::Instant::now() + std::time::Duration::from_mins(1),
                 _expiration: DiscoveryExpiration(tokio::spawn(std::future::pending())),
+                batch_cancellation: None,
             },
         )]));
         // Match resume: transfer the scan/permit to a worker but retain cancellation authority.
@@ -3311,6 +3688,16 @@ mod discovery_continuation_tests {
             .scan
             .take()
             .unwrap();
+        let continuation = DiscoveryContinuation {
+            scans: &scans,
+            token: Some(token),
+        };
+        let previous = continuation.batch_cancellation().unwrap();
+        let cancellation = continuation.batch_cancellation().unwrap();
+        assert!(previous.0.load(std::sync::atomic::Ordering::Acquire));
+        drop(previous);
+        assert!(!cancellation.0.load(std::sync::atomic::Ordering::Acquire));
+        let cancelled = std::sync::Arc::clone(&cancellation.0);
         let (started_tx, started_rx) = tokio::sync::oneshot::channel();
         let (release_tx, release_rx) = std::sync::mpsc::channel();
         let worker = tokio::task::spawn_blocking(move || {
@@ -3318,13 +3705,10 @@ mod discovery_continuation_tests {
             release_rx
                 .recv_timeout(std::time::Duration::from_secs(10))
                 .unwrap();
+            assert!(cancelled.load(std::sync::atomic::Ordering::Acquire));
             scan
         });
         started_rx.await.unwrap();
-        let continuation = DiscoveryContinuation {
-            scans: &scans,
-            token: Some(token),
-        };
         assert!(continuation.checkpoint().await.is_ok());
         // Match cancellation while the worker is held at the deterministic barrier.
         assert!(scans.lock().unwrap().remove(token).is_some());
@@ -3361,10 +3745,11 @@ fn retain_discovery(
 ) -> Result<bcode_workflow::WorkflowLaunchCatalogPage, super::ServerError> {
     let token = uuid::Uuid::new_v4().to_string();
     let lifetime = std::time::Duration::from_mins(1);
+    let expires = std::time::Instant::now() + lifetime;
     let scans = std::sync::Arc::downgrade(&state.workflow_discovery_scans);
     let expired_token = token.clone();
     let expiration = DiscoveryExpiration(tokio::spawn(async move {
-        tokio::time::sleep(lifetime).await;
+        tokio::time::sleep_until(tokio::time::Instant::from_std(expires)).await;
         if let Some(scans) = scans.upgrade() {
             scans
                 .lock()
@@ -3383,12 +3768,14 @@ fn retain_discovery(
             PendingDiscovery {
                 request,
                 scan: Some(scan),
-                expires: std::time::Instant::now() + lifetime,
+                expires,
                 _expiration: expiration,
+                batch_cancellation: None,
             },
         );
     }
     Ok(bcode_workflow::WorkflowLaunchCatalogPage {
+        detail_token: None,
         version: bcode_workflow::WORKFLOW_LAUNCH_CATALOG_VERSION,
         discovery_token: Some(token),
         items: Vec::new(),
@@ -3409,9 +3796,17 @@ pub async fn launch_catalog(
     request.validate()?;
     let mut binding = request.clone();
     binding.discovery_token = None;
+    let result_token = request
+        .cursor
+        .as_ref()
+        .and_then(|cursor| cursor.result_token.as_deref());
+    if let Some(cursor) = &mut binding.cursor {
+        cursor.result_token = None;
+    }
+    let token = result_token.or(request.discovery_token.as_deref());
     // Batch delivery does not change query identity or cancellation authority.
     binding.incremental = true;
-    let mut resumed = if let Some(token) = &request.discovery_token {
+    let mut resumed = if let Some(token) = token {
         let mut scans = state
             .workflow_discovery_scans
             .lock()
@@ -3435,7 +3830,7 @@ pub async fn launch_catalog(
     };
     let continuation = DiscoveryContinuation {
         scans: &state.workflow_discovery_scans,
-        token: request.discovery_token.as_deref(),
+        token,
     };
     let workspace = request.workspace.clone();
     let config = state.startup_config.workflows.clone();
@@ -3451,14 +3846,15 @@ pub async fn launch_catalog(
             })?;
         AdmittedDiscovery {
             scan: None,
-            previews: Vec::new(),
+            previews: None,
             catalog: None,
             publication_fence: None,
+            completed: None,
             _permit: permit,
         }
     };
     drop(resumed);
-    if request.incremental && request.discovery_token.is_none() {
+    if request.incremental && token.is_none() {
         return retain_discovery(state, binding, scan, &continuation);
     }
     let publication_fence = {
@@ -3474,17 +3870,37 @@ pub async fn launch_catalog(
             None => store.publication_read_fence()?,
         }
     };
+    if scan.completed.is_some() {
+        if result_token.is_none() {
+            return Err(super::ServerError::WorkflowAuthoring(
+                bcode_workflow::WorkflowAuthoringFailure::DiscoveryContinuationInvalid,
+            ));
+        }
+        scan.publication_fence = Some(publication_fence);
+        return deliver_retained_page(state, binding, scan, &continuation);
+    }
+    if result_token.is_some() {
+        return Err(super::ServerError::WorkflowAuthoring(
+            bcode_workflow::WorkflowAuthoringFailure::DiscoveryContinuationInvalid,
+        ));
+    }
     // Pin compilation inputs for the entire process-local discovery, including resumes.
     let catalog = match scan.catalog.take() {
         Some(catalog) => catalog,
         None => authoring_catalog(state).await?,
     };
-    let mut items = LaunchCatalogWindow::new(request);
-    items.items = std::mem::take(&mut scan.previews);
+    let items = LaunchCatalogWindow {
+        request,
+        spool: match scan.previews.take() {
+            Some(spool) => spool,
+            None => bcode_workflow_discovery::LaunchPreviewSpool::new()?,
+        },
+    };
     let discovery = loop {
         continuation.checkpoint().await?;
-        // Transfer ownership into just one bounded batch. Dropping this request can leave that
-        // batch running, but cannot schedule another; its output then releases the scan handles.
+        // Retain capacity in the worker, but stop between discovery units on request drop.
+        let cancellation = continuation.batch_cancellation()?;
+        let cancelled = std::sync::Arc::clone(&cancellation.0);
         let workspace = workspace.clone();
         let config = config.clone();
         let (next_scan, result) = tokio::task::spawn_blocking(move || {
@@ -3496,10 +3912,7 @@ pub async fn launch_catalog(
                         bcode_workflow_discovery::MAX_DISCOVERY_RESULTS,
                     )?);
                 }
-                scan.scan
-                    .as_mut()
-                    .expect("scan was opened")
-                    .advance_sources(16.min(bcode_workflow_discovery::MAX_DISCOVERY_RESULTS))
+                advance_discovery_batch(scan.scan.as_mut().expect("scan was opened"), &cancelled)
             })();
             (scan, result)
         })
@@ -3639,7 +4052,7 @@ pub async fn launch_catalog(
                                 .configuration_schema
                                 .clone(),
                             diagnostics: member.compilation.validation.diagnostics.clone(),
-                        });
+                        })?;
                     }
                 }
                 bcode_workflow_discovery::DiscoveredWorkflowSource::Standalone {
@@ -3663,16 +4076,16 @@ pub async fn launch_catalog(
                         &lowering,
                         &preview,
                         false,
-                    ));
+                    ))?;
                 }
             }
         }
         if discovery.complete {
-            drop(scan);
+            scan.scan = None;
             break discovery.diagnostics;
         }
         if request.incremental {
-            scan.previews = items.items;
+            scan.previews = Some(items.spool);
             scan.catalog = Some(catalog);
             state
                 .workflow_store
@@ -3737,22 +4150,16 @@ pub async fn launch_catalog(
             input_schema: document.definition.input.clone(),
             configuration_schema: document.configuration_schema.clone(),
             diagnostics: preview.validation.diagnostics,
-        });
+        })?;
     }
-    continuation.finish(
-        &mut state
-            .workflow_discovery_scans
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner),
-    )?;
-    drop(continuation);
     state
         .workflow_store
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
         .validate_publication_read_fence(&publication_fence)?;
-    Ok(project_launch_catalog_page(
-        items.items,
+    scan.previews = Some(items.spool);
+    scan.publication_fence = Some(publication_fence);
+    scan.completed = Some(
         discovery
             .into_iter()
             .map(|diagnostic| bcode_workflow::WorkflowLaunchDiagnostic {
@@ -3762,34 +4169,86 @@ pub async fn launch_catalog(
                 message: diagnostic.message,
             })
             .collect(),
-        request,
-    ))
+    );
+    deliver_retained_page(state, binding, scan, &continuation)
+}
+
+fn deliver_retained_page(
+    state: &ServerState,
+    mut binding: bcode_workflow::WorkflowLaunchCatalogRequest,
+    mut scan: AdmittedDiscovery,
+    continuation: &DiscoveryContinuation<'_>,
+) -> Result<bcode_workflow::WorkflowLaunchCatalogPage, super::ServerError> {
+    let spool = scan.previews.as_ref().ok_or_else(|| {
+        super::ServerError::WorkflowAuthoring(
+            bcode_workflow::WorkflowAuthoringFailure::DiscoveryContinuationInvalid,
+        )
+    })?;
+    let rows = spool.page(
+        binding
+            .cursor
+            .as_ref()
+            .map(|cursor| (cursor.title.as_str(), cursor.source_key.as_str())),
+        binding.limit.saturating_add(1),
+    )?;
+    let diagnostics = scan.completed.take().ok_or_else(|| {
+        super::ServerError::WorkflowAuthoring(
+            bcode_workflow::WorkflowAuthoringFailure::DiscoveryContinuationInvalid,
+        )
+    })?;
+    let mut page = project_launch_catalog_page(rows, diagnostics, &binding);
+    // Fence the publication point as well as admission: decoding/projecting the spool
+    // must not publish readiness from a catalog changed during that work.
+    let store = state
+        .workflow_store
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let fence = scan.publication_fence.as_ref().ok_or_else(|| {
+        super::ServerError::WorkflowAuthoring(
+            bcode_workflow::WorkflowAuthoringFailure::DiscoveryContinuationInvalid,
+        )
+    })?;
+    store.validate_publication_read_fence(fence)?;
+    if page.next_cursor.is_some() || binding.retain_for_detail {
+        binding.cursor.clone_from(&page.next_cursor);
+        scan.completed = Some(page.diagnostics.clone());
+        let retain_for_detail = binding.retain_for_detail;
+        let retained = retain_discovery(state, binding, scan, continuation)?;
+        if retain_for_detail {
+            page.detail_token.clone_from(&retained.discovery_token);
+        }
+        if let Some(cursor) = &mut page.next_cursor {
+            cursor.result_token = retained.discovery_token;
+        }
+    } else {
+        continuation.finish(
+            &mut state
+                .workflow_discovery_scans
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+        )?;
+    }
+    drop(store);
+    Ok(page)
 }
 
 struct LaunchCatalogWindow<'a> {
     request: &'a bcode_workflow::WorkflowLaunchCatalogRequest,
-    items: Vec<bcode_workflow::WorkflowLaunchCatalogItem>,
+    spool: bcode_workflow_discovery::LaunchPreviewSpool,
 }
 
-impl<'a> LaunchCatalogWindow<'a> {
-    const fn new(request: &'a bcode_workflow::WorkflowLaunchCatalogRequest) -> Self {
-        Self {
-            request,
-            items: Vec::new(),
+impl LaunchCatalogWindow<'_> {
+    fn push(
+        &self,
+        item: bcode_workflow::WorkflowLaunchCatalogItem,
+    ) -> Result<(), super::ServerError> {
+        // Apply the existing semantic query before indexing. Unlike the old lookahead
+        // window, this retains every matching preview without retaining it in memory.
+        let page = project_launch_catalog_page(vec![item], Vec::new(), self.request);
+        for item in page.items {
+            self.spool.insert(&launch_source_key(&item.source), &item)?;
         }
-    }
-
-    fn push(&mut self, item: bcode_workflow::WorkflowLaunchCatalogItem) {
-        // Keep one lookahead item, preserving the ordinary page cursor semantics.
-        let mut window_request = self.request.clone();
-        window_request.limit = self.request.limit.saturating_add(1);
-        self.items.push(item);
-        self.items = project_launch_catalog_page(
-            std::mem::take(&mut self.items),
-            Vec::new(),
-            &window_request,
-        )
-        .items;
+        Ok(())
     }
 }
 
@@ -3846,11 +4305,13 @@ fn project_launch_catalog_page(
     items.sort_by(compare);
     let next_cursor = has_more.then(|| items.last()).flatten().map(|item| {
         bcode_workflow::WorkflowLaunchCatalogCursor {
+            result_token: None,
             title: item.title.clone(),
             source_key: launch_source_key(&item.source),
         }
     });
     bcode_workflow::WorkflowLaunchCatalogPage {
+        detail_token: None,
         version: bcode_workflow::WORKFLOW_LAUNCH_CATALOG_VERSION,
         discovery_token: None,
         items,

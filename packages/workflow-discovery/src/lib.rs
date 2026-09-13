@@ -10,6 +10,9 @@
 //! cache. It is never reopened or treated as canonical; normal drop removes its directory.
 //! Abrupt process death may leave temporary files for operating-system cleanup.
 
+mod launch_previews;
+pub use launch_previews::LaunchPreviewSpool;
+
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Component, Path, PathBuf};
@@ -405,7 +408,7 @@ impl WorkflowDiscoveryScan {
         budget: usize,
     ) -> Result<Option<WorkflowDiscoveryResult>, WorkflowDiscoveryError> {
         self.select_delivery(false)?;
-        self.advance_checked(budget)
+        self.advance_checked(budget, &|| false)
     }
 
     fn select_delivery(&mut self, streaming: bool) -> Result<(), WorkflowDiscoveryError> {
@@ -421,6 +424,7 @@ impl WorkflowDiscoveryScan {
     fn advance_checked(
         &mut self,
         budget: usize,
+        cancelled: &dyn Fn() -> bool,
     ) -> Result<Option<WorkflowDiscoveryResult>, WorkflowDiscoveryError> {
         if budget == 0 || budget > MAX_DISCOVERY_RESULTS || self.terminal {
             return Err(WorkflowDiscoveryError::Invalid(
@@ -428,7 +432,7 @@ impl WorkflowDiscoveryScan {
             ));
         }
         self.terminal = true;
-        let outcome = self.advance_inner(budget);
+        let outcome = self.advance_inner(budget, cancelled);
         if matches!(&outcome, Ok(None)) {
             self.terminal = false;
         } else {
@@ -454,8 +458,25 @@ impl WorkflowDiscoveryScan {
         &mut self,
         budget: usize,
     ) -> Result<WorkflowDiscoveryBatch, WorkflowDiscoveryError> {
+        self.advance_sources_with_cancellation(budget, &|| false)
+    }
+
+    /// Deliver a source batch with cooperative cancellation between source units.
+    ///
+    /// Cancellation terminalizes the scan and releases its temporary storage.
+    /// In-progress filesystem operations are not interrupted.
+    ///
+    /// # Errors
+    ///
+    /// Returns the errors of [`Self::advance_sources`], or an interrupted I/O error
+    /// when cancellation is observed. A failed scan cannot be advanced again.
+    pub fn advance_sources_with_cancellation(
+        &mut self,
+        budget: usize,
+        cancelled: &dyn Fn() -> bool,
+    ) -> Result<WorkflowDiscoveryBatch, WorkflowDiscoveryError> {
         self.select_delivery(true)?;
-        let result = self.advance_checked(budget)?;
+        let result = self.advance_checked(budget, cancelled)?;
         Ok(match result {
             Some(result) => WorkflowDiscoveryBatch {
                 sources: result.sources,
@@ -473,8 +494,10 @@ impl WorkflowDiscoveryScan {
     fn advance_inner(
         &mut self,
         budget: usize,
+        cancelled: &dyn Fn() -> bool,
     ) -> Result<Option<WorkflowDiscoveryResult>, WorkflowDiscoveryError> {
         for _ in 0..budget {
+            check_source_cancellation(cancelled)?;
             let Some(root) = self.roots.get(self.root_index).cloned() else {
                 match self.kind {
                     WorkflowCandidateKind::Package => {
@@ -537,7 +560,7 @@ impl WorkflowDiscoveryScan {
                     ));
                 }
                 match self.kind {
-                    WorkflowCandidateKind::Package => self.package(&root, path)?,
+                    WorkflowCandidateKind::Package => self.package(&root, path, cancelled)?,
                     WorkflowCandidateKind::Standalone => self.standalone(&root, path)?,
                 }
                 self.trim_diagnostics();
@@ -554,8 +577,16 @@ impl WorkflowDiscoveryScan {
         &mut self,
         root: &DiscoveryRoot,
         manifest_path: PathBuf,
+        cancelled: &dyn Fn() -> bool,
     ) -> Result<(), WorkflowDiscoveryError> {
-        match read_package_closure(&manifest_path, &root.path) {
+        let result = read_package_closure(&manifest_path, &root.path, cancelled);
+        check_source_cancellation(cancelled)?;
+        match result {
+            Err(WorkflowDiscoveryError::Io(error))
+                if error.kind() == std::io::ErrorKind::Interrupted =>
+            {
+                return Err(error.into());
+            }
             Ok((closure, members)) => {
                 self.package_members
                     .as_mut()
@@ -711,6 +742,22 @@ impl WorkflowDiscoveryScan {
 pub fn inspect_explicit_source(
     path: &Path,
 ) -> Result<DiscoveredWorkflowSource, WorkflowDiscoveryError> {
+    inspect_explicit_source_with_cancellation(path, &|| false)
+}
+
+/// Inspect an explicit source, checking cancellation before each package source unit.
+///
+/// An in-progress filesystem operation is not interrupted.
+///
+/// # Errors
+///
+/// Returns the same errors as [`inspect_explicit_source`], or an interrupted I/O error
+/// when `cancelled` returns true.
+pub fn inspect_explicit_source_with_cancellation(
+    path: &Path,
+    cancelled: &dyn Fn() -> bool,
+) -> Result<DiscoveredWorkflowSource, WorkflowDiscoveryError> {
+    check_source_cancellation(cancelled)?;
     let path = fs::canonicalize(path)?;
     if !path.is_file() {
         return Err(WorkflowDiscoveryError::Invalid(
@@ -725,7 +772,7 @@ pub fn inspect_explicit_source(
         let root = path.parent().ok_or_else(|| {
             WorkflowDiscoveryError::Invalid("package manifest has no parent".to_string())
         })?;
-        let (closure, _) = read_package_closure(&path, root)?;
+        let (closure, _) = read_package_closure(&path, root, cancelled)?;
         return Ok(DiscoveredWorkflowSource::Package {
             package_id: closure.entry_package_id.clone(),
             source_label: "explicit".to_string(),
@@ -970,9 +1017,21 @@ fn is_standalone_source(name: &str) -> bool {
         .any(|suffix| name.ends_with(suffix))
 }
 
+fn check_source_cancellation(cancelled: &dyn Fn() -> bool) -> Result<(), std::io::Error> {
+    if cancelled() {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Interrupted,
+            "workflow source inspection cancelled",
+        ))
+    } else {
+        Ok(())
+    }
+}
+
 fn read_package_closure(
     entry: &Path,
     authorized_root: &Path,
+    cancelled: &dyn Fn() -> bool,
 ) -> Result<(bcode_workflow::WorkflowPackageClosure, BTreeSet<PathBuf>), WorkflowDiscoveryError> {
     let entry = fs::canonicalize(entry)?;
     let authorized_root = fs::canonicalize(authorized_root)?;
@@ -986,6 +1045,7 @@ fn read_package_closure(
     let mut packages = Vec::new();
     let mut members = BTreeSet::new();
     while let Some((manifest_path, depth)) = pending.pop() {
+        check_source_cancellation(cancelled)?;
         if depth > bcode_workflow::MAX_WORKFLOW_PACKAGE_DEPTH {
             return Err(WorkflowDiscoveryError::Invalid(
                 "workflow package import depth exceeds the package bound".to_string(),
@@ -1000,7 +1060,7 @@ fn read_package_closure(
             ));
         }
         let (manifest, manifest_members, imports) =
-            read_package_manifest(&manifest_path, &authorized_root)?;
+            read_package_manifest(&manifest_path, &authorized_root, cancelled)?;
         members.extend(manifest_members);
         pending.extend(imports.into_iter().rev().map(|path| (path, depth + 1)));
         packages.push(bcode_workflow::WorkflowPackageClosureSource {
@@ -1027,6 +1087,7 @@ fn read_package_closure(
 fn read_package_manifest(
     path: &Path,
     authorized_root: &Path,
+    cancelled: &dyn Fn() -> bool,
 ) -> Result<
     (
         bcode_workflow::WorkflowPackageManifest,
@@ -1091,6 +1152,7 @@ fn read_package_manifest(
             .collect(),
     };
     for member in &mut manifest.members {
+        check_source_cancellation(cancelled)?;
         let relative = confined_relative_path(&member.source_name)?;
         let path = fs::canonicalize(package_root.join(relative))?;
         if !path.starts_with(package_root) || !path.is_file() {
@@ -1099,7 +1161,9 @@ fn read_package_manifest(
                 member.source_name
             )));
         }
-        let source = fs::read_to_string(&path)?;
+        let remaining =
+            bcode_workflow::MAX_WORKFLOW_PACKAGE_SOURCE_BYTES.saturating_sub(total_bytes);
+        let source = read_source_window(&path, remaining)?;
         total_bytes = total_bytes.checked_add(source.len()).ok_or_else(|| {
             WorkflowDiscoveryError::Invalid("workflow package byte count overflow".to_string())
         })?;
@@ -1115,6 +1179,7 @@ fn read_package_manifest(
     manifest.validate()?;
     let mut imports = Vec::new();
     for import in &decoded.imports {
+        check_source_cancellation(cancelled)?;
         if let Some(relative) = &import.manifest {
             let path = fs::canonicalize(package_root.join(confined_relative_path(relative)?))?;
             if !path.starts_with(authorized_root) || !path.is_file() {
@@ -1331,6 +1396,44 @@ mod tests {
     }
 
     #[test]
+    fn package_cancellation_stops_before_missing_member_access() {
+        let root = tempfile::tempdir().unwrap();
+        let manifest = root.path().join("example.workflow-package.yaml");
+        std::fs::write(&manifest, "version: 3\npackage_id: example/package\nexports: { main: member }\nmembers:\n  - member_id: member\n    source_name: missing.workflow.yaml\n").unwrap();
+        let checks = std::cell::Cell::new(0);
+        let result = super::inspect_explicit_source_with_cancellation(&manifest, &|| {
+            checks.set(checks.get() + 1);
+            // Entry and manifest begin normally; cancel before member access.
+            checks.get() >= 3
+        });
+        assert!(
+            matches!(result, Err(super::WorkflowDiscoveryError::Io(error))
+            if error.kind() == std::io::ErrorKind::Interrupted)
+        );
+    }
+
+    #[test]
+    fn oversized_package_member_is_rejected_before_reading_its_tail() {
+        use std::io::{Seek as _, Write as _};
+
+        let root = tempfile::tempdir().unwrap();
+        let manifest = root.path().join("example.workflow-package.yaml");
+        std::fs::write(&manifest, "version: 3\npackage_id: example/package\nexports: { main: member }\nmembers:\n  - member_id: member\n    source_name: member.workflow.yaml\n").unwrap();
+        let mut member = std::fs::File::create(root.path().join("member.workflow.yaml")).unwrap();
+        let size = u64::try_from(bcode_workflow::MAX_WORKFLOW_PACKAGE_SOURCE_BYTES).unwrap() * 4;
+        member.set_len(size).unwrap();
+        member.seek(std::io::SeekFrom::End(-1)).unwrap();
+        // Reading the entire file would report invalid UTF-8 rather than the byte bound.
+        member.write_all(&[0xff]).unwrap();
+        drop(member);
+        assert!(matches!(
+            super::inspect_explicit_source(&manifest),
+            Err(super::WorkflowDiscoveryError::Invalid(message))
+                if message == "workflow package sources exceed the package byte bound"
+        ));
+    }
+
+    #[test]
     fn source_window_reads_only_limit_plus_one_bytes() {
         let root = tempfile::tempdir().unwrap();
         let path = root.path().join("source.json");
@@ -1537,6 +1640,40 @@ members:
         assert!(!scan.advance_sources(1).unwrap().complete);
         drop(scan);
         assert!(!temporary.exists());
+    }
+
+    #[test]
+    fn automatic_package_cancellation_terminalizes_and_releases_storage() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("workflows");
+        fs::create_dir(&root).unwrap();
+        fs::write(root.join("example.workflow-package.yaml"), "version: 3\npackage_id: example/package\nexports: { main: member }\nmembers:\n  - member_id: member\n    source_name: missing.workflow.yaml\n").unwrap();
+        let config = bcode_config::WorkflowsConfig {
+            include_repo_workflows: true,
+            include_user_workflows: false,
+            ..Default::default()
+        };
+        let mut scan = WorkflowDiscoveryScan::open(temp.path(), &config, 20).unwrap();
+        let temporary = scan
+            .package_members
+            .as_ref()
+            .unwrap()
+            .directory
+            .path()
+            .to_path_buf();
+        let checks = std::cell::Cell::new(0);
+        let result = scan.advance_sources_with_cancellation(16, &|| {
+            checks.set(checks.get() + 1);
+            checks.get() >= 3
+        });
+        assert!(
+            matches!(result, Err(super::WorkflowDiscoveryError::Io(error))
+            if error.kind() == std::io::ErrorKind::Interrupted)
+        );
+        assert!(!temporary.exists());
+        assert!(scan.result.sources.is_empty());
+        assert!(scan.result.diagnostics.is_empty());
+        assert!(scan.advance_sources(1).is_err());
     }
 
     #[test]

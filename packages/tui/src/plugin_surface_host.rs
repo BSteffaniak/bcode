@@ -239,10 +239,21 @@ impl PluginTuiHost for BcodePluginTuiHost {
     ) -> PluginWorkflowLaunchDetailFuture {
         let client = self.client.clone();
         Box::pin(async move {
-            client
-                .workflow_launch_detail(request)
+            let (cancel, interrupted) = tokio::sync::oneshot::channel::<()>();
+            let task = tokio::spawn(async move {
+                Box::pin(client.workflow_launch_detail_until(request, async {
+                    let _ = interrupted.await;
+                }))
                 .await
-                .map_err(|error| PluginTuiHostError::Internal(error.to_string()))
+            });
+            // Keep cancellation alive until delivery. Dropping the host future closes
+            // the channel; the detached worker then performs client-owned cleanup.
+            let result = task.await;
+            drop(cancel);
+            result
+                .map_err(|error| PluginTuiHostError::Internal(error.to_string()))?
+                .map_err(|error| PluginTuiHostError::Internal(error.to_string()))?
+                .ok_or_else(|| PluginTuiHostError::Internal("workflow detail interrupted".into()))
         })
     }
 

@@ -4249,6 +4249,42 @@ impl BcodeClient {
     {
         use bcode_workflow::WorkflowAuthoringApplication;
         tokio::pin!(interrupted);
+        if let Some(token) = request
+            .cursor
+            .as_ref()
+            .and_then(|cursor| cursor.result_token.clone())
+        {
+            let started = std::sync::atomic::AtomicBool::new(false);
+            let page_request = async {
+                started.store(true, std::sync::atomic::Ordering::Relaxed);
+                self.workflow_launch_catalog(request).await
+            };
+            tokio::pin!(page_request);
+            let result = tokio::select! {
+                biased;
+                () = &mut interrupted => {
+                    if !started.load(std::sync::atomic::Ordering::Relaxed) {
+                        self.cancel_workflow_discovery(token).await?;
+                        return Ok(None);
+                    }
+                    // A completed page can rotate authority before cancellation reaches the
+                    // server. Drain this bounded read and release its successor as well.
+                    let cancellation = self.cancel_workflow_discovery(token).await;
+                    let page = page_request.await;
+                    if let Ok(page) = &page
+                        && let Some(successor) = page.detail_token.clone().or_else(|| page.next_cursor.as_ref().and_then(|cursor| cursor.result_token.clone()))
+                    {
+                        self.cancel_workflow_discovery(successor).await?;
+                    }
+                    if !cancellation? {
+                        page?;
+                    }
+                    return Ok(None);
+                }
+                result = &mut page_request => result?,
+            };
+            return Ok(Some(result));
+        }
         if request.discovery_token.is_none() {
             let mut admission = request.clone();
             admission.incremental = true;
@@ -4276,13 +4312,33 @@ impl BcodeClient {
             .discovery_token
             .clone()
             .ok_or(ClientError::UnexpectedResponse)?;
+        let started = std::sync::atomic::AtomicBool::new(false);
+        let page_request = async {
+            started.store(true, std::sync::atomic::Ordering::Relaxed);
+            self.workflow_launch_catalog(request).await
+        };
+        tokio::pin!(page_request);
         tokio::select! {
             biased;
             () = &mut interrupted => {
-                self.cancel_workflow_discovery(token).await?;
+                if !started.load(std::sync::atomic::Ordering::Relaxed) {
+                    self.cancel_workflow_discovery(token).await?;
+                    return Ok(None);
+                }
+                let cancellation = self.cancel_workflow_discovery(token).await;
+                let page = page_request.await;
+                if let Ok(page) = &page {
+                    let successor = page.discovery_token.clone().or_else(|| page.detail_token.clone()).or_else(|| page.next_cursor.as_ref().and_then(|cursor| cursor.result_token.clone()));
+                    if let Some(successor) = successor {
+                        self.cancel_workflow_discovery(successor).await?;
+                    }
+                }
+                if !cancellation? {
+                    page?;
+                }
                 Ok(None)
             }
-            result = self.workflow_launch_catalog(request) => result.map(Some),
+            result = &mut page_request => result.map(Some),
         }
     }
 
@@ -4301,6 +4357,75 @@ impl BcodeClient {
         {
             ResponsePayload::WorkflowLaunchDetail { detail } => Ok(*detail),
             _ => Err(ClientError::UnexpectedResponse),
+        }
+    }
+
+    /// Resolve detail with caller-owned interruption and bounded discovery requests.
+    ///
+    /// Tokenless discovered identities first reconcile a retained catalog. Only one page
+    /// is received; exact detail lookup uses its retained index, not a second scan.
+    /// Explicit source reads bypass discovery. `None` means interrupted, not confirmed
+    /// termination of blocking work. Dropping the future is not explicit cancellation;
+    /// response loss can retain resources until expiry. No durable resume is promised.
+    ///
+    /// # Errors
+    /// Returns transport, protocol, discovery, detail, or cancellation-request errors.
+    pub async fn workflow_launch_detail_until<F>(
+        &self,
+        mut request: bcode_workflow::WorkflowLaunchDetailRequest,
+        interrupted: F,
+    ) -> Result<Option<bcode_workflow::WorkflowLaunchDetail>, ClientError>
+    where
+        F: std::future::Future<Output = ()> + Send,
+    {
+        use bcode_workflow::WorkflowAuthoringApplication as _;
+        tokio::pin!(interrupted);
+        if request.catalog_token.is_none()
+            && !matches!(
+                request.source,
+                bcode_workflow::WorkflowLaunchSourceIdentity::ExplicitSource { .. }
+            )
+        {
+            let mut query = bcode_workflow::WorkflowLaunchCatalogRequest {
+                version: request.version,
+                workspace: request.workspace.clone(),
+                incremental: true,
+                retain_for_detail: true,
+                discovery_token: None,
+                limit: 1,
+                cursor: None,
+                search: None,
+                source_kind: None,
+                readiness: None,
+            };
+            loop {
+                let Some(page) =
+                    Box::pin(self.workflow_launch_catalog_until(query.clone(), &mut interrupted))
+                        .await?
+                else {
+                    return Ok(None);
+                };
+                if let Some(token) = page.discovery_token {
+                    query.discovery_token = Some(token);
+                } else {
+                    request.catalog_token =
+                        Some(page.detail_token.ok_or(ClientError::UnexpectedResponse)?);
+                    break;
+                }
+            }
+        }
+        let token = request.catalog_token.clone();
+        let detail = self.workflow_launch_detail(request);
+        tokio::pin!(detail);
+        tokio::select! {
+            biased;
+            () = &mut interrupted => {
+                if let Some(token) = token {
+                    self.cancel_workflow_discovery(token).await?;
+                }
+                Ok(None)
+            }
+            result = &mut detail => result.map(Some),
         }
     }
 
@@ -7353,6 +7478,172 @@ mod client_timeout_tests {
 
     #[cfg(unix)]
     #[tokio::test]
+    async fn interrupted_dispatched_page_cancels_successor_before_returning() {
+        for final_page in [false, true] {
+            interrupted_page_successor(final_page).await;
+        }
+    }
+
+    #[cfg(unix)]
+    async fn interrupted_page_successor(final_page: bool) {
+        let dir = std::path::PathBuf::from(format!("/tmp/bcc-{}", SessionOpenOperationId::new()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let endpoint = bcode_ipc::IpcEndpoint::unix_socket(dir.join("catalog.sock"));
+        let listener = bcode_ipc::LocalIpcListener::bind(&endpoint).unwrap();
+        let (dispatched, interrupted) = tokio::sync::oneshot::channel();
+        let server = tokio::spawn(async move {
+            let mut signal = Some(dispatched);
+            let mut held_page = None;
+            for step in 0..3 {
+                let mut stream = listener.accept().await.unwrap();
+                let hello = bcode_ipc::recv_envelope(&mut stream).await.unwrap();
+                let response = bcode_ipc::Response::Ok(bcode_ipc::ResponsePayload::Hello {
+                    protocol_version: bcode_ipc::ProtocolVersion::current(),
+                    client_id: bcode_session_models::ClientId::new(),
+                    daemon: matching_daemon_status(),
+                });
+                bcode_ipc::send_envelope(
+                    &mut stream,
+                    &bcode_ipc::response_envelope(hello.request_id, &response).unwrap(),
+                )
+                .await
+                .unwrap();
+                let request = bcode_ipc::recv_envelope(&mut stream).await.unwrap();
+                let operation = bcode_ipc::decode_request(&request.payload).unwrap();
+                if step == 0 {
+                    assert!(matches!(
+                        operation,
+                        bcode_ipc::Request::WorkflowLaunchCatalog(_)
+                    ));
+                    held_page = Some((stream, request.request_id));
+                    signal.take().unwrap().send(()).unwrap();
+                    continue;
+                }
+                let expected = if step == 1 { "previous" } else { "successor" };
+                assert!(
+                    matches!(operation, bcode_ipc::Request::CancelWorkflowDiscovery { token } if token == expected)
+                );
+                let response = bcode_ipc::Response::Ok(
+                    bcode_ipc::ResponsePayload::WorkflowDiscoveryCancelled {
+                        released: step == 2,
+                    },
+                );
+                bcode_ipc::send_envelope(
+                    &mut stream,
+                    &bcode_ipc::response_envelope(request.request_id, &response).unwrap(),
+                )
+                .await
+                .unwrap();
+                if step == 1 {
+                    let (mut page_stream, id) = held_page.take().unwrap();
+                    let response = bcode_ipc::Response::Ok(
+                        bcode_ipc::ResponsePayload::WorkflowLaunchCatalog {
+                            page: bcode_workflow::WorkflowLaunchCatalogPage {
+                                detail_token: final_page.then(|| "successor".into()),
+                                version: bcode_workflow::WORKFLOW_LAUNCH_CATALOG_VERSION,
+                                items: vec![],
+                                diagnostics: vec![],
+                                discovery_token: None,
+                                next_cursor: (!final_page).then(|| {
+                                    bcode_workflow::WorkflowLaunchCatalogCursor {
+                                        title: "next".into(),
+                                        source_key: "next".into(),
+                                        result_token: Some("successor".into()),
+                                    }
+                                }),
+                            },
+                        },
+                    );
+                    bcode_ipc::send_envelope(
+                        &mut page_stream,
+                        &bcode_ipc::response_envelope(id, &response).unwrap(),
+                    )
+                    .await
+                    .unwrap();
+                }
+            }
+        });
+        let client = BcodeClient::new(endpoint);
+        let request = serde_json::from_value(serde_json::json!({
+            "version": bcode_workflow::WORKFLOW_LAUNCH_CATALOG_VERSION, "workspace": ".", "limit": 1,
+            "cursor": {"title": "previous", "source_key": "previous", "result_token": "previous"}
+        })).unwrap();
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            Box::pin(client.workflow_launch_catalog_until(request, async {
+                interrupted.await.unwrap();
+            })),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert!(result.is_none());
+        server.await.unwrap();
+        std::fs::remove_file(dir.join("catalog.sock")).unwrap();
+        std::fs::remove_dir(dir).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn interrupted_retained_page_does_not_dispatch_after_cancellation() {
+        let dir = std::path::PathBuf::from(format!("/tmp/bcc-{}", SessionOpenOperationId::new()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let endpoint = bcode_ipc::IpcEndpoint::unix_socket(dir.join("catalog.sock"));
+        let listener = bcode_ipc::LocalIpcListener::bind(&endpoint).unwrap();
+        let server = tokio::spawn(async move {
+            {
+                let mut stream = listener.accept().await.unwrap();
+                let hello = bcode_ipc::recv_envelope(&mut stream).await.unwrap();
+                let response = bcode_ipc::Response::Ok(bcode_ipc::ResponsePayload::Hello {
+                    protocol_version: bcode_ipc::ProtocolVersion::current(),
+                    client_id: bcode_session_models::ClientId::new(),
+                    daemon: matching_daemon_status(),
+                });
+                bcode_ipc::send_envelope(
+                    &mut stream,
+                    &bcode_ipc::response_envelope(hello.request_id, &response).unwrap(),
+                )
+                .await
+                .unwrap();
+                let request = bcode_ipc::recv_envelope(&mut stream).await.unwrap();
+                let operation = bcode_ipc::decode_request(&request.payload).unwrap();
+                assert!(
+                    matches!(operation, bcode_ipc::Request::CancelWorkflowDiscovery { token } if token == "previous")
+                );
+                let payload =
+                    bcode_ipc::ResponsePayload::WorkflowDiscoveryCancelled { released: true };
+                bcode_ipc::send_envelope(
+                    &mut stream,
+                    &bcode_ipc::response_envelope(
+                        request.request_id,
+                        &bcode_ipc::Response::Ok(payload),
+                    )
+                    .unwrap(),
+                )
+                .await
+                .unwrap();
+            }
+        });
+        let client = BcodeClient::new(endpoint);
+        let request = serde_json::from_value(serde_json::json!({
+            "version": bcode_workflow::WORKFLOW_LAUNCH_CATALOG_VERSION, "workspace": ".", "limit": 1,
+            "cursor": {"title": "previous", "source_key": "previous", "result_token": "previous"}
+        })).unwrap();
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            Box::pin(client.workflow_launch_catalog_until(request, std::future::ready(()))),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert!(result.is_none());
+        server.await.unwrap();
+        std::fs::remove_file(dir.join("catalog.sock")).unwrap();
+        std::fs::remove_dir(dir).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
     async fn interrupted_catalog_admission_releases_token_without_discovery() {
         let dir = std::path::PathBuf::from(format!("/tmp/bcc-{}", SessionOpenOperationId::new()));
         std::fs::create_dir_all(&dir).unwrap();
@@ -7382,6 +7673,7 @@ mod client_timeout_tests {
                     );
                     bcode_ipc::ResponsePayload::WorkflowLaunchCatalog {
                         page: bcode_workflow::WorkflowLaunchCatalogPage {
+                            detail_token: None,
                             version: bcode_workflow::WORKFLOW_LAUNCH_CATALOG_VERSION,
                             discovery_token: Some("admitted".to_string()),
                             items: vec![],

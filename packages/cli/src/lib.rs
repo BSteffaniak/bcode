@@ -716,9 +716,25 @@ async fn handle_workflow_launch_detail(client: &BcodeClient, path: &Path) -> Res
             "unsupported or invalid workflow launch detail request".to_string(),
         )
     })?;
+    #[cfg(unix)]
+    let mut interrupt = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())?;
+    let mut signal_error: Option<std::io::Error> = None;
+    let interrupted = async {
+        #[cfg(unix)]
+        {
+            interrupt.recv().await;
+        }
+        #[cfg(not(unix))]
+        {
+            signal_error = tokio::signal::ctrl_c().await.err();
+        }
+    };
+    let detail = Box::pin(client.workflow_launch_detail_until(request, interrupted)).await?;
+    if let Some(error) = signal_error.take() {
+        return Err(error.into());
+    }
     print_json(
-        &bcode_workflow::WorkflowAuthoringApplication::workflow_launch_detail(client, request)
-            .await?,
+        &detail.ok_or_else(|| CliError::InvalidArguments("workflow detail interrupted".into()))?,
     )
 }
 
@@ -2199,6 +2215,7 @@ async fn handle_workflow_package_command(
         let page = bcode_workflow::WorkflowAuthoringApplication::workflow_launch_catalog(
             client,
             bcode_workflow::WorkflowLaunchCatalogRequest {
+                retain_for_detail: false,
                 version: bcode_workflow::WORKFLOW_LAUNCH_CATALOG_VERSION,
                 incremental: false,
                 discovery_token: None,

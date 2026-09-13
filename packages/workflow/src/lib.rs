@@ -162,7 +162,7 @@ pub const WORKFLOW_DEFINITION_SCHEMA_VERSION: u32 = 2;
 ///
 /// Version 2 adds opt-in pending discovery responses. Version 1 and unknown versions are rejected
 /// before discovery; no persisted workflow representation is changed by this contract revision.
-pub const WORKFLOW_LAUNCH_CATALOG_VERSION: u32 = 2;
+pub const WORKFLOW_LAUNCH_CATALOG_VERSION: u32 = 3;
 /// Maximum entries returned by one launch-catalog request.
 pub const MAX_WORKFLOW_LAUNCH_CATALOG_PAGE_SIZE: usize = 1_000;
 /// Maximum bytes accepted in launch-catalog search text.
@@ -261,6 +261,11 @@ pub enum WorkflowLaunchSourceIdentity {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct WorkflowLaunchCatalogCursor {
+    /// Single-use process-local result token. Missing tokens denote stateless cursors.
+    /// Retained results expire after 60 seconds and are invalidated by publication changes.
+    /// Source files are a discovery-time snapshot; refresh starts a new scan.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub result_token: Option<String>,
     pub title: String,
     pub source_key: String,
 }
@@ -269,6 +274,10 @@ pub struct WorkflowLaunchCatalogCursor {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct WorkflowLaunchCatalogRequest {
+    /// Retain completed results for detail lookup even on the final page. Opt-in;
+    /// omission releases final-page resources as before. Keep unchanged on continuation.
+    #[serde(default)]
+    pub retain_for_detail: bool,
     pub version: u32,
     pub workspace: PathBuf,
     /// Opt into bounded discovery advances. The initial response admits a cancellable token
@@ -327,6 +336,22 @@ impl WorkflowLaunchCatalogRequest {
                 "invalid discovery continuation",
             ));
         }
+        if self
+            .cursor
+            .as_ref()
+            .and_then(|cursor| cursor.result_token.as_ref())
+            .is_some_and(|token| token.is_empty() || token.len() > 128)
+            || (self.discovery_token.is_some()
+                && self
+                    .cursor
+                    .as_ref()
+                    .is_some_and(|cursor| cursor.result_token.is_some()))
+        {
+            return Err(authoring_error(
+                "launch_catalog.cursor",
+                "invalid retained result continuation",
+            ));
+        }
         if self.limit == 0 || self.limit > MAX_WORKFLOW_LAUNCH_CATALOG_PAGE_SIZE {
             return Err(authoring_error(
                 "launch_catalog.limit",
@@ -379,6 +404,11 @@ pub struct WorkflowLaunchCatalogItem {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct WorkflowLaunchCatalogPage {
+    /// Completed catalog token when retention was requested. Shares ownership with
+    /// `next_cursor.result_token`, if present: consuming either consumes both. Use for
+    /// detail or cancel via discovery cancellation. Expires after one minute; not durable.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub detail_token: Option<String>,
     pub version: u32,
     /// Pending scan token, not an item cursor or durable resume capability. Retry with the
     /// unchanged request within 60 seconds; expiration or daemon loss requires a fresh scan.
@@ -386,6 +416,10 @@ pub struct WorkflowLaunchCatalogPage {
     pub discovery_token: Option<String>,
     pub items: Vec<WorkflowLaunchCatalogItem>,
     pub diagnostics: Vec<WorkflowLaunchDiagnostic>,
+    /// Version 3 retains ordered results while this cursor is outstanding. Pass it unchanged
+    /// with the same query and limit; each successful page consumes its token. Cancellation
+    /// uses the discovery cancellation operation with `result_token`. Expiry, publication
+    /// changes, daemon loss, or response loss require a fresh scan; no durable resume is promised.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub next_cursor: Option<WorkflowLaunchCatalogCursor>,
 }
@@ -397,6 +431,14 @@ pub struct WorkflowLaunchDetailRequest {
     pub version: u32,
     pub workspace: PathBuf,
     pub source: WorkflowLaunchSourceIdentity,
+    /// Optional retained result token from a launch-catalog cursor. Detail consumes it
+    /// on completion or failure after admission and resolves only within that completed
+    /// catalog, without rescanning. Rejected admission leaves the token unchanged.
+    /// During construction the token remains cancellable; expiry, cancellation, or daemon
+    /// loss requires fresh discovery.
+    /// Omission preserves standalone detail discovery. Older servers reject this field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub catalog_token: Option<String>,
 }
 
 impl WorkflowLaunchDetailRequest {
@@ -442,6 +484,7 @@ mod launch_catalog_contract_tests {
 
     fn request(version: u32) -> WorkflowLaunchCatalogRequest {
         WorkflowLaunchCatalogRequest {
+            retain_for_detail: false,
             incremental: false,
             discovery_token: None,
             version,
@@ -493,6 +536,7 @@ mod launch_catalog_contract_tests {
     #[test]
     fn launch_detail_request_rejects_future_versions() {
         let current = WorkflowLaunchDetailRequest {
+            catalog_token: None,
             version: WORKFLOW_LAUNCH_CATALOG_VERSION,
             workspace: PathBuf::from("/workspace"),
             source: WorkflowLaunchSourceIdentity::ExplicitSource {

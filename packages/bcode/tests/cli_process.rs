@@ -326,6 +326,7 @@ fn workflow_repair_cli_resolves_persistent_attempt_without_retry() {
     std::fs::write(
         root.path().join("catalog.json"),
         serde_json::to_vec(&bcode_workflow::WorkflowLaunchCatalogRequest {
+            retain_for_detail: false,
             version: bcode_workflow::WORKFLOW_LAUNCH_CATALOG_VERSION,
             incremental: false,
             discovery_token: None,
@@ -1456,7 +1457,7 @@ fn workflow_launch_detail_reads_source_through_daemon() {
     )
     .unwrap();
     let request = serde_json::json!({
-        "version": 1, "workspace": root.path(),
+        "version": bcode_workflow::WORKFLOW_LAUNCH_CATALOG_VERSION, "workspace": root.path(),
         "source": {"source_kind":"explicit_source", "source_path": source, "source_format":"json"}
     });
     std::fs::write(
@@ -1468,8 +1469,77 @@ fn workflow_launch_detail_reads_source_through_daemon() {
         root.path(),
         &["workflow", "launch-detail", "--request", "request.json"],
     );
-    assert_eq!(detail["version"], 1);
-    assert!(detail.is_object());
+    assert_eq!(
+        detail["version"],
+        bcode_workflow::WORKFLOW_LAUNCH_CATALOG_VERSION
+    );
+    assert_eq!(
+        detail["document"]["workflow_id"],
+        "example/source-defined-input"
+    );
+    let sources = root.path().join("workflows");
+    std::fs::create_dir_all(&sources).unwrap();
+    std::fs::copy(&source, sources.join("source.workflow.json")).unwrap();
+    let mut second: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&source).unwrap()).unwrap();
+    second["workflow_id"] = serde_json::json!("zzz/second");
+    std::fs::write(
+        sources.join("second.workflow.json"),
+        serde_json::to_vec(&second).unwrap(),
+    )
+    .unwrap();
+    let catalog_request = serde_json::json!({
+        "version": bcode_workflow::WORKFLOW_LAUNCH_CATALOG_VERSION,
+        "workspace": root.path(), "limit": 10, "retain_for_detail": true,
+        "source_kind": "standalone_source", "search": "Source-defined input"
+    });
+    std::fs::write(
+        root.path().join("catalog.json"),
+        serde_json::to_vec(&catalog_request).unwrap(),
+    )
+    .unwrap();
+    let catalog = graph_cli_json(
+        root.path(),
+        &["workflow", "launch-catalog", "--request", "catalog.json"],
+    );
+    let mut discovered_request = request;
+    discovered_request["source"] = catalog["items"][0]["source"].clone();
+    assert!(catalog["next_cursor"].is_null());
+    discovered_request["catalog_token"] = catalog["detail_token"].clone();
+    assert!(discovered_request["catalog_token"].is_string());
+    assert!(discovered_request["source"].is_object());
+    std::fs::write(
+        root.path().join("request.json"),
+        serde_json::to_vec(&discovered_request).unwrap(),
+    )
+    .unwrap();
+    let discovered = graph_cli_json(
+        root.path(),
+        &["workflow", "launch-detail", "--request", "request.json"],
+    );
+    assert_eq!(discovered["document"], detail["document"]);
+    assert_eq!(discovered["item"]["source"], discovered_request["source"]);
+    let replay = run_cli_at_root(
+        root.path(),
+        &["workflow", "launch-detail", "--request", "request.json"],
+        Stdio::piped(),
+        Stdio::null(),
+    );
+    assert!(!replay.status.success(), "detail token must be consumed");
+    discovered_request
+        .as_object_mut()
+        .unwrap()
+        .remove("catalog_token");
+    std::fs::write(
+        root.path().join("request.json"),
+        serde_json::to_vec(&discovered_request).unwrap(),
+    )
+    .unwrap();
+    let fresh = graph_cli_json(
+        root.path(),
+        &["workflow", "launch-detail", "--request", "request.json"],
+    );
+    assert_eq!(fresh["document"], discovered["document"]);
     drop(daemon);
 }
 

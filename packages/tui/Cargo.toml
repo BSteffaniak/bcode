@@ -42,6 +42,7 @@ bcode_tool = { workspace = true }
 bcode_tui_components = { workspace = true, features = [
     "activity",
     "chrome",
+    "compact",
     "composer",
     "diff-viewer",
     "permission",

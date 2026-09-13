@@ -2859,6 +2859,7 @@ impl WorkflowStatusSurface {
             self.launch_detail = None;
         }
         let request = bcode_workflow::WorkflowLaunchCatalogRequest {
+            retain_for_detail: false,
             incremental: false,
             discovery_token: None,
             version: bcode_workflow::WORKFLOW_LAUNCH_CATALOG_VERSION,
@@ -2888,12 +2889,17 @@ impl WorkflowStatusSurface {
         self.launch_detail_loading = true;
         self.launch_detail_error = None;
         let future = host.workflow_launch_detail(bcode_workflow::WorkflowLaunchDetailRequest {
+            catalog_token: None,
             version: bcode_workflow::WORKFLOW_LAUNCH_CATALOG_VERSION,
             workspace,
             source,
         });
         host.spawn(Box::pin(async move {
-            let _ = sender.send(future.await).await;
+            tokio::select! {
+                biased;
+                () = sender.closed() => {}
+                result = future => { let _ = sender.send(result).await; }
+            }
         }));
         PluginTuiAction::Redraw
     }
@@ -9426,6 +9432,7 @@ mod tests {
         surface.live_status = "live updates unavailable: offline".to_string();
         assert!(render_workspace_text(&mut surface, 100, 24).contains("Disconnected"));
         surface.launch_catalog = Some(bcode_workflow::WorkflowLaunchCatalogPage {
+            detail_token: None,
             discovery_token: None,
             version: bcode_workflow::WORKFLOW_LAUNCH_CATALOG_VERSION,
             items: Vec::new(),
@@ -9737,6 +9744,7 @@ mod tests {
         };
         surface.selected_launch_source = Some(item.source.clone());
         surface.launch_catalog = Some(bcode_workflow::WorkflowLaunchCatalogPage {
+            detail_token: None,
             discovery_token: None,
             version: bcode_workflow::WORKFLOW_LAUNCH_CATALOG_VERSION,
             items: vec![item.clone()],
