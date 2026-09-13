@@ -239,6 +239,16 @@ fail closed. The timeout is not a hard syscall deadline: blocking filesystem wor
 chunk must return before cancellation can be observed. These controls do not activate startup by
 themselves or substitute for multi-daemon tracking-health registration.
 
+## Existing-session eligibility and lock scheduling
+
+Missing access tracking is now initialized to the maintenance observation time, only after acquiring
+idle-session ownership and validating current finalized-reference projection state. Existing valid
+records are never refreshed by initialization; corrupt records remain errors. The first scan does
+not compress anything with unknown age, but a later scan can do so after the configured delay. A
+real-storage test verifies initialization, unchanged next-day metadata, and compression after six
+days. Maintenance lock acquisition now runs on a blocking task rather than blocking an async runtime
+thread. The acquired guard is transferred through verification and conversion.
+
 ## Remaining implementation
 
 ### Access policy and scheduling

@@ -80,6 +80,26 @@ pub fn record_session_access(
     Ok(result)
 }
 
+pub(crate) fn initialize_session_access(
+    root: &Path,
+    session_id: SessionId,
+    now_ms: u64,
+) -> io::Result<()> {
+    let root = root.canonicalize()?;
+    let (mut file, directory) = open_session_access_file(&root, session_id)?;
+    file.try_lock().map_err(io::Error::from)?;
+    let result = match read_locked(&mut file) {
+        Ok(StorageAccessObservation::Unknown) => {
+            update_locked(&mut file, conservative_access_time(now_ms)).map(|_| ())
+        }
+        Ok(StorageAccessObservation::Recorded(_)) => Ok(()),
+        Err(error) => Err(error),
+    };
+    file.unlock()?;
+    result?;
+    directory.sync_all()
+}
+
 #[cfg(unix)]
 fn open_session_access_file(root: &Path, session_id: SessionId) -> io::Result<(File, File)> {
     use std::ffi::CString;

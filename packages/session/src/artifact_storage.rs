@@ -133,6 +133,52 @@ pub enum ArtifactStorageOutcome {
     },
 }
 
+async fn acquire_maintenance(
+    root: &Path,
+    session_id: SessionId,
+) -> io::Result<crate::lease::SessionMaintenanceGuard> {
+    let root = root.to_path_buf();
+    tokio::task::spawn_blocking(move || {
+        let root = root.canonicalize()?;
+        let session = confined(&root.join(session_id.to_string()), &root)?;
+        if !fs::symlink_metadata(session.join("session.db"))?.is_file() {
+            return Err(invalid());
+        }
+        crate::lease::acquire_session_maintenance_guard(&root, session_id).map_err(io::Error::other)
+    })
+    .await
+    .map_err(|_| io::Error::other("artifact maintenance acquisition failed"))?
+}
+
+/// Initialize unknown access age conservatively for an otherwise valid idle session.
+///
+/// This is explicit maintenance metadata, not canonical history repair. Existing access records
+/// are never reset or refreshed by discovery, so routine scanning cannot keep sessions hot.
+///
+/// # Errors
+/// Refuses active ownership, unsupported/damaged session storage or access state, and IO failures.
+pub async fn initialize_maintenance_access(
+    root: &Path,
+    session_id: SessionId,
+    now_ms: u64,
+) -> io::Result<()> {
+    let maintenance = acquire_maintenance(root, session_id).await?;
+    let db = crate::db::SessionDb::open_existing_turso_in_root(session_id, root)
+        .await
+        .map_err(io::Error::other)?;
+    let valid = db.artifact_maintenance_page(None).await;
+    db.database().close().await.map_err(io::Error::other)?;
+    valid.map_err(io::Error::other)?;
+    let root = root.to_path_buf();
+    tokio::task::spawn_blocking(move || {
+        let result = crate::storage_access::initialize_session_access(&root, session_id, now_ms);
+        drop(maintenance);
+        result
+    })
+    .await
+    .map_err(|_| io::Error::other("access initialization failed"))?
+}
+
 /// Return a bounded page of finalized artifact identities for offline maintenance.
 ///
 /// # Errors
@@ -142,8 +188,7 @@ pub async fn maintenance_candidates(
     session_id: SessionId,
     after: Option<(&str, &str)>,
 ) -> io::Result<Vec<(String, String)>> {
-    let _maintenance = crate::lease::acquire_session_maintenance_guard(root, session_id)
-        .map_err(io::Error::other)?;
+    let _maintenance = acquire_maintenance(root, session_id).await?;
     let db = crate::db::SessionDb::open_existing_turso_in_root(session_id, root)
         .await
         .map_err(io::Error::other)?;
@@ -254,8 +299,8 @@ pub async fn compress_finalized_artifact_cancellable(
     if !fs::symlink_metadata(session.join("session.db"))?.is_file() {
         return Err(invalid());
     }
-    let maintenance = crate::lease::acquire_session_maintenance_guard(&root, session_id)
-        .map_err(io::Error::other)?;
+    let maintenance = acquire_maintenance(&root, session_id).await?;
+    cancellation.check()?;
     if let Some((now_ms, minimum_age_ms)) = age {
         let mut access = File::open(session.join("storage-access.bin"))?;
         let crate::storage_access::StorageAccessObservation::Recorded(record) =

@@ -218,6 +218,37 @@ async fn worker_waiting_between_ticks_stops_on_shutdown() {
 }
 
 #[tokio::test]
+async fn missing_tracking_initializes_once_without_compressing_or_refreshing_age() {
+    let (root, state, id, artifacts, _) = fixture(1).await;
+    let access = root.path().join(id.to_string()).join("storage-access.bin");
+    std::fs::remove_file(&access).expect("remove fixture tracking");
+    let now = super::super::current_time_ms();
+    assert_eq!(
+        maintain_session_at(&state, root.path(), id, None, now)
+            .await
+            .expect("initialize"),
+        None
+    );
+    let initial = std::fs::read(&access).expect("initialized");
+    assert!(artifacts.join("recording-000").is_file());
+    assert_eq!(
+        maintain_session_at(&state, root.path(), id, None, now + 86_400_000)
+            .await
+            .expect("young"),
+        None
+    );
+    assert_eq!(std::fs::read(&access).expect("unchanged"), initial);
+    assert_eq!(
+        maintain_session_at(&state, root.path(), id, None, now + 6 * 86_400_000)
+            .await
+            .expect("eligible"),
+        None
+    );
+    drop(state);
+    assert!(artifacts.join("recording-000").is_dir());
+}
+
+#[tokio::test]
 async fn scheduler_respects_disable_and_live_ownership() {
     let (root, state, id, artifacts, _) = fixture(1).await;
     let mut config = bcode_config::BcodeConfig::default();

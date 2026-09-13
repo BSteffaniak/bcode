@@ -126,14 +126,20 @@ async fn maintain_session_at(
         return Ok(None);
     }
     let path = root.join(id.to_string()).join("storage-access.bin");
-    let observation = tokio::task::spawn_blocking(move || {
-        let mut file = std::fs::File::open(path)?;
-        observe_access(&mut file)
+    let observation = tokio::task::spawn_blocking(move || match std::fs::File::open(path) {
+        Ok(mut file) => observe_access(&mut file),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            Ok(StorageAccessObservation::Unknown)
+        }
+        Err(error) => Err(error),
     })
     .await
     .map_err(|_| "access task failed")?
     .map_err(|_| "access unavailable")?;
     let StorageAccessObservation::Recorded(record) = observation else {
+        bcode_session::artifact_storage::initialize_maintenance_access(root, id, now)
+            .await
+            .map_err(|_| "access initialization deferred")?;
         return Ok(None);
     };
     let Some(age) = now.checked_sub(record.observed_at_ms) else {
