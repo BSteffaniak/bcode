@@ -3680,6 +3680,7 @@ impl PluginEventDispatcher {
 pub struct PluginRuntimeHost {
     registry: Arc<PluginRegistry>,
     executors: Arc<BTreeMap<String, Arc<PluginExecutorHandle>>>,
+    cleanup_executors: Arc<Vec<PluginExecutorHandle>>,
     event_dispatchers: Arc<BTreeMap<String, Arc<PluginEventDispatcher>>>,
     configs: Arc<BTreeMap<String, ResolvedPluginConfig>>,
     selection: Arc<PluginSelection>,
@@ -4528,6 +4529,11 @@ impl PluginRuntimeHost {
                 first_error.get_or_insert(error);
             }
         }
+        for executor in self.cleanup_executors.iter().rev() {
+            if let Err(error) = executor.deactivate().await {
+                first_error.get_or_insert(error);
+            }
+        }
         first_error.map_or(Ok(()), Err)
     }
 }
@@ -4535,6 +4541,18 @@ impl PluginRuntimeHost {
 impl From<PluginHost> for PluginRuntimeHost {
     fn from(mut host: PluginHost) -> Self {
         let loaded = std::mem::take(&mut host.loaded);
+        // Cleanup-only executors retain callback ownership without entering discovery.
+        let cleanup_executors = std::mem::take(&mut host.cleanup_pending)
+            .into_iter()
+            .map(|plugin| {
+                PluginExecutorHandle::new(
+                    plugin.manifest().clone(),
+                    PluginConcurrency::from(&plugin.manifest().concurrency),
+                    PluginExecutorKind::Concurrent(Arc::new(plugin), None),
+                    Arc::new(PluginExecutorMetrics::default()),
+                )
+            })
+            .collect();
         let configs = std::mem::take(&mut host.configs);
         let command_registry = std::mem::take(&mut host.command_registry);
         let auth_provider_registry = std::mem::take(&mut host.auth_provider_registry);
@@ -4580,6 +4598,7 @@ impl From<PluginHost> for PluginRuntimeHost {
         Self {
             registry: Arc::new(PluginRegistry::from_manifests(manifests)),
             executors: Arc::new(executors),
+            cleanup_executors: Arc::new(cleanup_executors),
             event_dispatchers: Arc::new(event_dispatchers),
             configs: Arc::new(configs),
             selection: Arc::new(PluginSelection::default()),
@@ -4949,6 +4968,7 @@ fn manifest_event_subscriptions<'a>(
 #[derive(Debug)]
 pub struct PluginHost {
     loaded: Vec<LoadedPlugin>,
+    cleanup_pending: Vec<LoadedPlugin>,
     configs: BTreeMap<String, ResolvedPluginConfig>,
     command_registry: bcode_command::CommandRegistry,
     auth_provider_registry: AuthProviderRegistry,
@@ -4963,6 +4983,7 @@ impl Default for PluginHost {
             configs: BTreeMap::new(),
             command_registry,
             auth_provider_registry: AuthProviderRegistry::new(),
+            cleanup_pending: Vec::new(),
         }
     }
 }
@@ -5124,6 +5145,7 @@ impl PluginHost {
                 registry
             },
             auth_provider_registry: AuthProviderRegistry::new(),
+            cleanup_pending: Vec::new(),
         };
         host.load_static_plugins_into(&static_plugins)?;
         host.load_registered_plugins_into(&plugins)?;
@@ -5191,6 +5213,32 @@ impl PluginHost {
         host
     }
 
+    fn activate_plugin(&mut self, loaded: LoadedPlugin) -> Result<(), PluginLoadError> {
+        let result = loaded
+            .activate()
+            .and_then(|()| self.register_activated_plugin(&loaded));
+        if let Err(error) = result {
+            if loaded.deactivate().is_err() {
+                self.cleanup_pending.push(loaded);
+            }
+            return Err(error);
+        }
+        self.loaded.push(loaded);
+        Ok(())
+    }
+
+    fn register_activated_plugin(&mut self, loaded: &LoadedPlugin) -> Result<(), PluginLoadError> {
+        // Publish contributions together only after both registration hooks succeed.
+        // Best-effort loading must not expose contributions from a rejected plugin.
+        let mut commands = self.command_registry.clone();
+        let mut auth = self.auth_provider_registry.clone();
+        loaded.register_commands(&mut commands)?;
+        loaded.register_auth_providers(&mut auth)?;
+        self.command_registry = commands;
+        self.auth_provider_registry = auth;
+        Ok(())
+    }
+
     fn load_static_plugins_into(
         &mut self,
         plugins: &[(PluginManifest, StaticPluginVtable)],
@@ -5202,11 +5250,7 @@ impl PluginHost {
                 loaded.set_config(config);
             }
             tracing::debug!(target: "bcode_plugin::startup", plugin_id = %loaded.manifest().id, "activating plugin");
-            loaded.activate()?;
-            loaded.register_commands(&mut self.command_registry)?;
-            loaded.register_auth_providers(&mut self.auth_provider_registry)?;
-            tracing::debug!(target: "bcode_plugin::startup", plugin_id = %loaded.manifest().id, "plugin activated");
-            self.loaded.push(loaded);
+            self.activate_plugin(loaded)?;
         }
         Ok(())
     }
@@ -5222,11 +5266,7 @@ impl PluginHost {
                 loaded.set_config(config);
             }
             tracing::debug!(target: "bcode_plugin::startup", plugin_id = %loaded.manifest().id, "activating plugin");
-            loaded.activate()?;
-            loaded.register_commands(&mut self.command_registry)?;
-            loaded.register_auth_providers(&mut self.auth_provider_registry)?;
-            tracing::debug!(target: "bcode_plugin::startup", plugin_id = %loaded.manifest().id, "plugin activated");
-            self.loaded.push(loaded);
+            self.activate_plugin(loaded)?;
         }
         Ok(())
     }
@@ -5432,7 +5472,7 @@ impl PluginHost {
         Ok(delivered)
     }
 
-    /// Deactivate all loaded plugins in reverse load order.
+    /// Deactivate all loaded plugins in reverse load order, then retry failed-start cleanup.
     ///
     /// # Errors
     ///
@@ -5449,6 +5489,15 @@ impl PluginHost {
         }
         failed.reverse();
         self.loaded = failed;
+        let mut pending = Vec::new();
+        while let Some(plugin) = self.cleanup_pending.pop() {
+            if let Err(error) = plugin.deactivate() {
+                first_error.get_or_insert(error);
+                pending.push(plugin);
+            }
+        }
+        pending.reverse();
+        self.cleanup_pending = pending;
         first_error.map_or(Ok(()), Err)
     }
 }
@@ -5457,7 +5506,7 @@ impl Drop for PluginHost {
     fn drop(&mut self) {
         if self.deactivate_all().is_err() {
             tracing::warn!(
-                remaining_plugins = self.loaded.len(),
+                remaining_plugins = self.loaded.len() + self.cleanup_pending.len(),
                 "plugin host dropped with incomplete deactivation"
             );
         }
@@ -6842,6 +6891,7 @@ library = "libexample_plugin.dylib"
             configs: BTreeMap::new(),
             command_registry: bcode_command::CommandRegistry::new(),
             auth_provider_registry: AuthProviderRegistry::new(),
+            cleanup_pending: Vec::new(),
         };
 
         let error = host
@@ -7086,6 +7136,62 @@ library = "libexample_plugin.dylib"
             response.error.as_ref().map(|error| error.code.as_str()),
             Some("bridge_failed")
         );
+    }
+
+    #[tokio::test]
+    async fn failed_start_cleanup_survives_runtime_transfer() {
+        let mut host = PluginHost::default();
+        let mut plugin = load_static_hello_plugin();
+        let LoadedPluginBackend::Static { vtable } = &mut plugin.backend else {
+            unreachable!();
+        };
+        vtable.activate = test_activate_failed;
+        vtable.deactivate = test_activate_failed;
+        assert!(host.activate_plugin(plugin).is_err());
+        let runtime = PluginRuntimeHost::from(host);
+        assert!(runtime.registry.manifests.is_empty());
+        assert!(runtime.executors.is_empty());
+        assert_eq!(runtime.cleanup_executors.len(), 1);
+        assert!(runtime.deactivate_all().await.is_err());
+        assert!(runtime.clone().deactivate_all().await.is_err());
+        drop(runtime);
+    }
+
+    #[test]
+    fn failed_start_retains_cleanup_without_publishing_plugin() {
+        let mut host = PluginHost::default();
+        let mut plugin = load_static_hello_plugin();
+        let LoadedPluginBackend::Static { vtable } = &mut plugin.backend else {
+            unreachable!();
+        };
+        vtable.activate = test_activate_failed;
+        vtable.deactivate = test_activate_failed;
+        assert!(host.activate_plugin(plugin).is_err());
+        assert!(host.loaded.is_empty());
+        assert_eq!(host.cleanup_pending.len(), 1);
+        assert!(host.deactivate_all().is_err());
+        assert_eq!(host.cleanup_pending.len(), 1);
+        let LoadedPluginBackend::Static { vtable } = &mut host.cleanup_pending[0].backend else {
+            unreachable!();
+        };
+        vtable.deactivate = test_deactivate;
+        host.deactivate_all().unwrap();
+        assert!(host.cleanup_pending.is_empty());
+    }
+
+    #[test]
+    fn failed_auth_registration_does_not_publish_commands() {
+        let mut host = PluginHost::default();
+        let mut plugin = load_static_hello_plugin();
+        let LoadedPluginBackend::Static { vtable } = &mut plugin.backend else {
+            unreachable!();
+        };
+        vtable.register_auth_providers = Some(test_register_auth_failed);
+        let commands = host.command_registry.clone();
+        let auth = host.auth_provider_registry.clone();
+        assert!(host.register_activated_plugin(&plugin).is_err());
+        assert_eq!(host.command_registry, commands);
+        assert_eq!(host.auth_provider_registry, auth);
     }
 
     #[test]
@@ -8348,6 +8454,7 @@ library = "libexample_plugin.dylib"
             configs: BTreeMap::new(),
             command_registry: bcode_command::CommandRegistry::new(),
             auth_provider_registry: AuthProviderRegistry::new(),
+            cleanup_pending: Vec::new(),
             loaded: vec![LoadedPlugin {
                 config: ResolvedPluginConfig::default(),
                 manifest,
@@ -8508,6 +8615,7 @@ library = "libexample_plugin.dylib"
             configs: BTreeMap::new(),
             command_registry: bcode_command::CommandRegistry::new(),
             auth_provider_registry: AuthProviderRegistry::new(),
+            cleanup_pending: Vec::new(),
             loaded,
         };
         assert!(host.deactivate_all().is_err());
@@ -8540,6 +8648,7 @@ library = "libexample_plugin.dylib"
                 configs: BTreeMap::new(),
                 command_registry: bcode_command::CommandRegistry::new(),
                 auth_provider_registry: AuthProviderRegistry::new(),
+                cleanup_pending: Vec::new(),
                 loaded: vec![LoadedPlugin {
                     config: ResolvedPluginConfig::default(),
                     manifest,
@@ -8779,6 +8888,7 @@ library = "libexample_plugin.dylib"
             configs: BTreeMap::new(),
             command_registry: bcode_command::CommandRegistry::new(),
             auth_provider_registry: AuthProviderRegistry::new(),
+            cleanup_pending: Vec::new(),
             loaded: ["z-failed", "a-healthy"]
                 .into_iter()
                 .map(|id| LoadedPlugin {
@@ -9660,6 +9770,7 @@ library = "libexample_plugin.dylib"
             configs: BTreeMap::new(),
             command_registry: bcode_command::CommandRegistry::new(),
             auth_provider_registry: AuthProviderRegistry::new(),
+            cleanup_pending: Vec::new(),
             loaded: ["a-healthy", "z-unknown"]
                 .into_iter()
                 .map(|id| LoadedPlugin {
@@ -9705,6 +9816,7 @@ library = "libexample_plugin.dylib"
             configs: BTreeMap::new(),
             command_registry: bcode_command::CommandRegistry::new(),
             auth_provider_registry: AuthProviderRegistry::new(),
+            cleanup_pending: Vec::new(),
             loaded: vec![LoadedPlugin {
                 config: ResolvedPluginConfig::default(),
                 manifest: test_manifest("unpolled-cleanup"),
@@ -9763,6 +9875,7 @@ library = "libexample_plugin.dylib"
                     configs: BTreeMap::new(),
                     command_registry: bcode_command::CommandRegistry::new(),
                     auth_provider_registry: AuthProviderRegistry::new(),
+                    cleanup_pending: Vec::new(),
                     loaded: vec![LoadedPlugin {
                         config: ResolvedPluginConfig::default(),
                         manifest,
@@ -9818,6 +9931,7 @@ library = "libexample_plugin.dylib"
                     configs: BTreeMap::new(),
                     command_registry: bcode_command::CommandRegistry::new(),
                     auth_provider_registry: AuthProviderRegistry::new(),
+                    cleanup_pending: Vec::new(),
                     loaded: vec![
                         LoadedPlugin {
                             config: ResolvedPluginConfig::default(),
@@ -9914,6 +10028,7 @@ library = "libexample_plugin.dylib"
                 configs: BTreeMap::new(),
                 command_registry: bcode_command::CommandRegistry::new(),
                 auth_provider_registry: AuthProviderRegistry::new(),
+                cleanup_pending: Vec::new(),
                 loaded: vec![LoadedPlugin {
                     config: ResolvedPluginConfig::default(),
                     manifest,
@@ -9978,6 +10093,7 @@ library = "libexample_plugin.dylib"
                     configs: BTreeMap::new(),
                     command_registry: bcode_command::CommandRegistry::new(),
                     auth_provider_registry: AuthProviderRegistry::new(),
+                    cleanup_pending: Vec::new(),
                     loaded,
                 });
                 let result = runtime.deactivate_all().await;
@@ -10171,6 +10287,7 @@ library = "libexample_plugin.dylib"
                 configs: BTreeMap::new(),
                 command_registry: bcode_command::CommandRegistry::new(),
                 auth_provider_registry: AuthProviderRegistry::new(),
+                cleanup_pending: Vec::new(),
                 loaded: vec![
                     LoadedPlugin {
                         config: ResolvedPluginConfig::default(),
@@ -10384,6 +10501,7 @@ library = "libexample_plugin.dylib"
                 configs: BTreeMap::new(),
                 command_registry: bcode_command::CommandRegistry::new(),
                 auth_provider_registry: AuthProviderRegistry::new(),
+                cleanup_pending: Vec::new(),
                 loaded: vec![LoadedPlugin {
                     config: ResolvedPluginConfig::default(),
                     manifest: manifest(),
@@ -10521,6 +10639,7 @@ library = "libexample_plugin.dylib"
                 configs: BTreeMap::new(),
                 command_registry: bcode_command::CommandRegistry::new(),
                 auth_provider_registry: AuthProviderRegistry::new(),
+                cleanup_pending: Vec::new(),
                 loaded: vec![LoadedPlugin {
                     config: ResolvedPluginConfig::default(),
                     manifest: manifest(),
