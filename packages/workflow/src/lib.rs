@@ -10729,11 +10729,51 @@ fn validate_runtime_value_schema(path: &str, schema: &ValueSchema) -> Result<(),
 
 // Keep safety validation and compilation together so value checks reuse the validator
 // produced by schema admission rather than compiling the same schema a second time.
+#[test]
+fn runtime_schema_cache_preserves_validation_and_concurrent_reuse() {
+    let schema = ValueSchema {
+        type_name: "cache_concurrency_test".to_owned(),
+        schema: serde_json::json!({"type": "integer", "minimum": 430_043}),
+    };
+    let barrier = std::sync::Barrier::new(8);
+    let validators = std::thread::scope(|scope| {
+        let workers = (0..8)
+            .map(|_| {
+                scope.spawn(|| {
+                    barrier.wait();
+                    compile_runtime_value_schema("concurrent", &schema).expect("valid schema")
+                })
+            })
+            .collect::<Vec<_>>();
+        workers
+            .into_iter()
+            .map(|worker| worker.join().expect("worker"))
+            .collect::<Vec<_>>()
+    });
+    for validator in &validators {
+        assert!(std::sync::Arc::ptr_eq(&validators[0], validator));
+        assert!(validator.is_valid(&serde_json::json!(430_043)));
+        assert!(!validator.is_valid(&serde_json::json!(430_042)));
+    }
+    let mut invalid_name = schema;
+    invalid_name.type_name.clear();
+    assert!(compile_runtime_value_schema("invalid_name", &invalid_name).is_err());
+    let invalid = ValueSchema {
+        type_name: "invalid".to_owned(),
+        schema: serde_json::json!({"type": "not-a-type"}),
+    };
+    for path in ["first_path", "second_path"] {
+        let error = compile_runtime_value_schema(path, &invalid).expect_err("invalid schema");
+        assert!(error.to_string().contains(path));
+    }
+}
+
 fn compile_runtime_value_schema(
     path: &str,
     schema: &ValueSchema,
 ) -> Result<std::sync::Arc<jsonschema::Validator>, WorkflowError> {
-    type ValidatorCache = BTreeMap<Vec<u8>, std::sync::Arc<jsonschema::Validator>>;
+    type ValidatorCache =
+        std::collections::VecDeque<(Vec<u8>, std::sync::Arc<jsonschema::Validator>)>;
     static CACHE: std::sync::OnceLock<std::sync::Mutex<ValidatorCache>> =
         std::sync::OnceLock::new();
     if schema.type_name.trim().is_empty()
@@ -10754,15 +10794,20 @@ fn compile_runtime_value_schema(
     }
     // Successful validators are immutable and independent of diagnostic paths. Bound
     // both entry count and retained key size; oversized schemas still compile uncached.
-    let cache = CACHE.get_or_init(|| std::sync::Mutex::new(BTreeMap::new()));
-    let cacheable = bytes.len() <= 16 * 1024;
-    if cacheable
-        && let Some(validator) = cache
+    let cache = CACHE.get_or_init(|| std::sync::Mutex::new(std::collections::VecDeque::new()));
+    // Keep the guard through compilation so simultaneous misses cannot duplicate
+    // cached compilation work. Uncacheable inputs do not hold this lock.
+    let mut cache = (bytes.len() <= 16 * 1024).then(|| {
+        cache
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .get(&bytes)
-            .cloned()
+    });
+    if let Some(cache) = cache.as_mut()
+        && let Some(position) = cache.iter().position(|(key, _)| key == &bytes)
+        && let Some(entry) = cache.remove(position)
     {
+        let validator = entry.1.clone();
+        cache.push_back(entry);
         return Ok(validator);
     }
     if let Some(dialect) = schema.schema.get("$schema")
@@ -10782,14 +10827,11 @@ fn compile_runtime_value_schema(
         jsonschema::validator_for(&schema.schema)
             .map_err(|error| authoring_error(path, format!("invalid JSON Schema: {error}")))?,
     );
-    if cacheable {
-        let mut cache = cache
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if let Some(cache) = cache.as_mut() {
         if cache.len() >= 64 {
-            cache.clear();
+            cache.pop_front();
         }
-        cache.insert(bytes, validator.clone());
+        cache.push_back((bytes, validator.clone()));
     }
     Ok(validator)
 }
