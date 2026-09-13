@@ -5263,9 +5263,19 @@ struct ProviderSetupCandidateInput<'a> {
     auth_pool: Option<&'a str>,
 }
 
+#[derive(Clone)]
+struct SdkProviderFactory(Arc<dyn Fn() -> Box<dyn ModelProviderInvoker> + Send + Sync>);
+
+impl std::fmt::Debug for SdkProviderFactory {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("SdkProviderFactory")
+    }
+}
+
 /// Top-level SDK handle.
 #[derive(Debug, Clone)]
 pub struct Bcode {
+    provider_factory: Option<SdkProviderFactory>,
     tool_artifact_root: Option<PathBuf>,
     mode: BcodeMode,
     runtime: AgentRuntime,
@@ -5405,7 +5415,10 @@ impl Bcode {
         self.configure_agent(AgentBuilder::from_context(session_id, cwd))
     }
 
-    fn configure_agent(&self, builder: AgentBuilder) -> AgentBuilder {
+    fn configure_agent(&self, mut builder: AgentBuilder) -> AgentBuilder {
+        if let Some(factory) = &self.provider_factory {
+            builder.provider_factory = Some(Arc::clone(&factory.0));
+        }
         let builder = if let Some(root) = &self.tool_artifact_root {
             builder.tool_artifact_root(root)
         } else {
@@ -5847,6 +5860,7 @@ impl Bcode {
 /// Builder for [`Bcode`].
 #[derive(Debug, Clone)]
 pub struct BcodeBuilder {
+    provider_factory: Option<SdkProviderFactory>,
     tool_artifact_root: Option<PathBuf>,
     mode: BcodeMode,
     runtime: AgentRuntime,
@@ -5863,6 +5877,7 @@ pub struct BcodeBuilder {
 impl Default for BcodeBuilder {
     fn default() -> Self {
         Self {
+            provider_factory: None,
             tool_artifact_root: None,
             mode: BcodeMode::Embedded,
             runtime: AgentRuntime::new(),
@@ -5879,6 +5894,22 @@ impl Default for BcodeBuilder {
 }
 
 impl BcodeBuilder {
+    /// Configure provider acquisition inherited by this handle's agents.
+    ///
+    /// Each generation or stream acquires its own invoker through the existing agent
+    /// factory boundary. Building or cloning the SDK does not invoke the factory.
+    /// This takes precedence over plugin-backed provider execution without changing
+    /// plugin tool discovery or model selection. An agent can override the factory.
+    /// The caller owns acquisition effects; no plugin runtime is required.
+    #[must_use]
+    pub fn provider_factory<F>(mut self, factory: F) -> Self
+    where
+        F: Fn() -> Box<dyn ModelProviderInvoker> + Send + Sync + 'static,
+    {
+        self.provider_factory = Some(SdkProviderFactory(Arc::new(factory)));
+        self
+    }
+
     /// Supply the caller-owned absolute tool-artifact root inherited by this handle's agents.
     ///
     /// This setter performs no filesystem access. Tool execution rejects relative roots;
@@ -6164,6 +6195,7 @@ impl BcodeBuilder {
     #[must_use]
     pub fn build(self) -> Bcode {
         Bcode {
+            provider_factory: self.provider_factory,
             tool_artifact_root: self.tool_artifact_root,
             mode: self.mode,
             runtime: self.runtime,
@@ -6185,6 +6217,7 @@ impl BcodeBuilder {
             runtime: self.runtime,
             provider_registry: self.provider_registry,
             provider_context: self.provider_context,
+            provider_factory: self.provider_factory,
             daemon_client,
         }
     }
@@ -6194,6 +6227,7 @@ impl BcodeBuilder {
     #[must_use]
     pub fn build(self) -> Bcode {
         Bcode {
+            provider_factory: self.provider_factory,
             tool_artifact_root: self.tool_artifact_root,
             mode: self.mode,
             runtime: self.runtime,
@@ -6217,6 +6251,7 @@ impl BcodeBuilder {
             runtime: self.runtime,
             provider_registry: self.provider_registry,
             provider_context: self.provider_context,
+            provider_factory: self.provider_factory,
             daemon_client,
             provider: self.provider,
             plugins: self.plugins,

@@ -13,6 +13,67 @@ use bcode::{
 use std::sync::Arc;
 use std::time::Duration;
 
+#[tokio::test]
+async fn sdk_provider_factory_is_lazy_inherited_and_agent_overridable() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let acquisitions = Arc::new(AtomicUsize::new(0));
+    let observed = Arc::clone(&acquisitions);
+    let sdk = bcode::Bcode::builder()
+        .provider_factory(move || {
+            observed.fetch_add(1, Ordering::SeqCst);
+            Box::new(ScriptedProvider::new([
+                ScriptedProviderTurn::complete_text("selected provider"),
+            ]))
+        })
+        .build();
+    let cloned = sdk.clone();
+    let session_id = "00000000-0000-4000-8000-000000000127".parse().unwrap();
+    let agents = [
+        sdk.agent().build(),
+        cloned
+            .agent_from_context(session_id, "/fixture".into())
+            .build(),
+    ];
+    assert_eq!(acquisitions.load(Ordering::SeqCst), 0);
+    for agent in agents {
+        for _ in 0..2 {
+            assert_eq!(
+                agent.generate_text("hello").await.unwrap().text,
+                "selected provider"
+            );
+        }
+    }
+    assert_eq!(acquisitions.load(Ordering::SeqCst), 4);
+    let mut stream = sdk.agent().build().stream_text("hello").unwrap();
+    let mut finished = false;
+    while let Some(item) = stream.next().await {
+        match item {
+            bcode::TextStreamItem::Finished(response) => {
+                assert_eq!(response.text, "selected provider");
+                finished = true;
+            }
+            bcode::TextStreamItem::Error(error) => panic!("stream failed: {error}"),
+            _ => {}
+        }
+    }
+    assert!(finished);
+    assert_eq!(acquisitions.load(Ordering::SeqCst), 5);
+    let overridden = sdk
+        .agent()
+        .provider_factory(|| {
+            Box::new(ScriptedProvider::new([
+                ScriptedProviderTurn::complete_text("agent override"),
+            ]))
+        })
+        .build();
+    assert_eq!(
+        overridden.generate_text("hello").await.unwrap().text,
+        "agent override"
+    );
+    assert_eq!(acquisitions.load(Ordering::SeqCst), 5);
+}
+
 fn tool_definition() -> ToolDefinition {
     ToolDefinition {
         name: "scripted".to_string(),

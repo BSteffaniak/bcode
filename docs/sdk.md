@@ -38,6 +38,13 @@ Executable examples:
 
 ## Streaming and structured output
 
+`Bcode::builder().provider_factory(...)` supplies caller-owned provider acquisition to all
+agents created by the SDK, including `agent_from_context`. It needs no plugin-host feature.
+Each generation or stream acquires a fresh invoker; building and cloning the SDK do not
+invoke the factory. Agent-level factories override the inherited factory. Factories take
+precedence over plugin-backed providers without replacing tool discovery or model selection.
+Acquisition effects and captured state remain the caller's responsibility.
+
 Applications that own provider request correlation IDs can configure
 `AgentRuntime::with_provider_request_identity_source(Arc<dyn ProviderRequestIdentitySource>)`
 and pass that runtime to `AgentBuilder::runtime`. The source supplies a `ProviderRequestIdentity`
