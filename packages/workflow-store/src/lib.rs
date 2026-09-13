@@ -38,7 +38,7 @@ const RESET_BACKUP_DIRECTORY: &str = "reset-backups";
 /// Stable destructive confirmation required by public workflow-store reset surfaces.
 pub const WORKFLOW_STORE_RESET_CONFIRMATION: &str = "DELETE-INCOMPATIBLE-WORKFLOW-STATE";
 /// Current clean-break workflow store schema version.
-pub const WORKFLOW_STORE_SCHEMA_VERSION: u32 = 30;
+pub const WORKFLOW_STORE_SCHEMA_VERSION: u32 = 31;
 /// Current bounded workflow-store reset receipt version.
 pub const WORKFLOW_STORE_RESET_RECEIPT_VERSION: u32 = 1;
 /// Current explicit workflow-store migration receipt contract.
@@ -1154,7 +1154,7 @@ impl WorkflowStore {
                         match Self::open_with_ownership(&path, ownership) {
                             Ok(store) => return Ok(store),
                             Err(WorkflowStoreError::UnsupportedStore {
-                                actual: Some(14..=29),
+                                actual: Some(14..=30),
                                 ..
                             }) => {}
                             Err(error) => return Err(error),
@@ -1184,7 +1184,7 @@ impl WorkflowStore {
                         match Self::open_with_ownership(&path, probe) {
                             Ok(store) => return Ok(store),
                             Err(WorkflowStoreError::UnsupportedStore {
-                                actual: Some(14..=29),
+                                actual: Some(14..=30),
                                 ..
                             }) => {}
                             Err(error) => return Err(error),
@@ -1334,7 +1334,7 @@ impl WorkflowStore {
                 "workflow store migration cannot read the source schema".to_string(),
             )
         })?;
-        if !matches!(previous_schema_version, 14..=29) {
+        if !matches!(previous_schema_version, 14..=30) {
             return Err(WorkflowStoreError::UnsupportedStore {
                 actual: Some(previous_schema_version),
                 expected: WORKFLOW_STORE_SCHEMA_VERSION,
@@ -30533,6 +30533,124 @@ mod tests {
                 .status,
             RunStatus::Cancelled
         );
+    }
+
+    #[test]
+    fn schema_30_upgrade_preserves_runs_without_inventing_publication_intents() {
+        let (temp, store, run, _, _) = connected_publication_fixture();
+        store
+            .connection
+            .execute_batch(
+                "DROP TABLE workflow_publication_cancellations;
+             DROP TABLE workflow_pending_publications;
+             UPDATE workflow_store_contract SET schema_version = 30;",
+            )
+            .expect("old schema");
+        drop(store);
+        let store = WorkflowStore::initialize_in_state_dir(temp.path(), 40).expect("upgrade");
+        assert!(store.run_summary(&run.run_id).expect("summary").is_some());
+        let count: u64 = store
+            .connection
+            .query_row(
+                "SELECT count(*) FROM workflow_publication_cancellations",
+                [],
+                |row| row.get(0),
+            )
+            .expect("intents");
+        assert_eq!(count, 0);
+    }
+
+    #[test]
+    fn pending_publication_acceptance_is_atomic_and_idempotent() {
+        let (_temp, mut store, run, authority, _) = connected_publication_fixture();
+        let id = activation_identity(&run.run_id, "first", 0);
+        let prepared = store
+            .prepare_pending_activation(
+                &run.run_id,
+                "first",
+                &id,
+                DispatchSideEffect::Mutating,
+                serde_json::json!({}),
+                25,
+            )
+            .expect("prepare")
+            .expect("pending");
+        let request = bcode_workflow::WorkflowRunGraphEditBatch {
+            version: bcode_workflow::WORKFLOW_RUN_GRAPH_EDIT_VERSION,
+            run_id: run.run_id.clone(),
+            mutation_id: "pending-cancel".into(),
+            expected_revision: 2,
+            edits: vec![bcode_workflow::WorkflowRunGraphEdit::RemoveEdge { edge_id: 0 }],
+            reconciliation: vec![bcode_workflow::WorkflowRunGraphReconciliation::Cancel {
+                activation_id: id.clone(),
+            }],
+        };
+        store
+            .stage_run_graph_edit(&request, &authority, 26)
+            .expect("stage");
+        assert!(
+            store
+                .accept_pending_run_graph_publication(
+                    &run.run_id,
+                    &request.mutation_id,
+                    &authority,
+                    27
+                )
+                .is_err()
+        );
+        let count: u64 = store
+            .connection
+            .query_row(
+                "SELECT count(*) FROM workflow_pending_publications",
+                [],
+                |row| row.get(0),
+            )
+            .expect("count");
+        assert_eq!(count, 0);
+        store
+            .persist_dispatch_receipt(&DispatchReceipt {
+                run_id: run.run_id.clone(),
+                node_id: "first".into(),
+                activation_id: id,
+                attempt: prepared.attempt,
+                dispatch_identity: prepared.dispatch_identity.clone(),
+                receipt: serde_json::json!({"accepted": true}),
+                admitted_at_ms: 28,
+            })
+            .expect("receipt");
+        assert!(
+            store
+                .accept_pending_run_graph_publication(
+                    &run.run_id,
+                    &request.mutation_id,
+                    &authority,
+                    29
+                )
+                .expect("accept")
+        );
+        assert!(
+            !store
+                .accept_pending_run_graph_publication(
+                    &run.run_id,
+                    &request.mutation_id,
+                    &authority,
+                    30
+                )
+                .expect("duplicate")
+        );
+        assert_eq!(
+            store.run_graph_revision(&run.run_id).expect("revision"),
+            Some(2)
+        );
+        let identity: String = store
+            .connection
+            .query_row(
+                "SELECT dispatch_identity FROM workflow_publication_cancellations",
+                [],
+                |row| row.get(0),
+            )
+            .expect("exact intent");
+        assert_eq!(identity, prepared.dispatch_identity);
     }
 
     #[test]

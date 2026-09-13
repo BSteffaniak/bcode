@@ -1,5 +1,41 @@
 # Workflow Persistence Architecture
 
+## Pending publication storage (partial implementation)
+
+Schema 31 adds pending acceptance and exact attempt-intent records. The store acceptance
+operation validates the staged candidate under current authority and commits acceptance
+with receipt-backed, unlinked cancellation targets atomically. Duplicate acceptance keeps
+the original attempt set; failed target validation rolls back all acceptance writes.
+Schema-30 initialization upgrades preserve existing runs without inventing intents.
+This store capability is not wired to public publication or owner signalling. Conflict
+projection, settlement consumption, finalization, and recovery remain unimplemented;
+existing committed-only publication operations are unchanged.
+
+## Pending publication decision (approved; not yet implemented)
+
+An accepted publication that requires owner cancellation must expose a durable pending
+outcome rather than pretending that a graph revision has committed. It identifies the
+exact authorized candidate, expected graph revision, and affected attempts. Acceptance
+and the corresponding cancellation intents must commit together before owner signalling.
+
+Later authorized graph edits remain permitted. If the expected graph revision changes
+before final publication, the pending publication becomes conflicted; it must not silently
+rebase or publish against the new revision. Cancellation already requested remains durable,
+visible history and is not undone. Retrying after conflict requires an explicitly revised
+candidate with a new mutation identity. Repeating the original identity reports its existing
+outcome, and conflicting duplicate payloads reject without additional effects.
+
+Final publication must verify current execution authority and exact owner settlement,
+revalidate the candidate's execution bindings, and commit the revision with its terminal
+publication outcome. A missing runtime entry or unknown owner observation is not settlement
+proof. Lost-admission recovery remains ownership-qualified and must preserve ambiguity.
+Pending, conflicted, and committed outcomes must be represented consistently through the
+application, invocation, and client boundaries. Existing committed-only operations must
+not begin returning errors after secretly accepting durable cancellation side effects.
+
+These are the approved semantics for the outstanding implementation, not capabilities
+provided by the current committed-only publication path.
+
 ## Durable dispatch handoff
 
 Schema 30 adds attempt-keyed handoff evidence through the exclusive upgrade coordinator.

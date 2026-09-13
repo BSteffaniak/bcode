@@ -134,7 +134,31 @@ pub fn initialize_retirement(connection: &Connection) -> Result<(), WorkflowStor
     Ok(())
 }
 
+fn initialize_pending_publications(connection: &Connection) -> Result<(), WorkflowStoreError> {
+    connection.execute_batch(
+        "CREATE TABLE IF NOT EXISTS workflow_pending_publications (
+            run_id TEXT NOT NULL,
+            mutation_id TEXT NOT NULL,
+            expected_revision INTEGER NOT NULL,
+            accepted_at_ms INTEGER NOT NULL,
+            PRIMARY KEY (run_id, mutation_id),
+            FOREIGN KEY (run_id, mutation_id) REFERENCES workflow_graph_edit_candidates(run_id, mutation_id)
+        );
+        CREATE TABLE IF NOT EXISTS workflow_publication_cancellations (
+            run_id TEXT NOT NULL,
+            mutation_id TEXT NOT NULL,
+            dispatch_identity TEXT NOT NULL REFERENCES workflow_attempts(dispatch_identity),
+            PRIMARY KEY (run_id, mutation_id, dispatch_identity),
+            FOREIGN KEY (run_id, mutation_id) REFERENCES workflow_pending_publications(run_id, mutation_id)
+        );
+        CREATE INDEX IF NOT EXISTS workflow_publication_cancellation_attempt
+            ON workflow_publication_cancellations(dispatch_identity);",
+    )?;
+    Ok(())
+}
+
 pub fn initialize_edit_candidates(connection: &Connection) -> Result<(), WorkflowStoreError> {
+    initialize_pending_publications(connection)?;
     connection.execute_batch(
         "CREATE TABLE IF NOT EXISTS workflow_dispatch_handoffs (
             dispatch_identity TEXT PRIMARY KEY REFERENCES workflow_attempts(dispatch_identity),
@@ -289,6 +313,88 @@ impl WorkflowStore {
             transaction.commit()?;
         }
         Ok(revision)
+    }
+
+    /// Accept an exact staged candidate and its receipt-backed cancellation intents atomically.
+    ///
+    /// This does not publish a revision or signal owners. The caller must authorize the exact
+    /// candidate before acceptance. Duplicate acceptance preserves the original attempt set.
+    ///
+    /// # Errors
+    /// Rejects stale authority/revision, invalid candidates, non-receipt-backed or linked targets,
+    /// and persistence failures. Rejection rolls back acceptance and all intents.
+    pub fn accept_pending_run_graph_publication(
+        &self,
+        run_id: &str,
+        mutation_id: &str,
+        authority: &super::WorkflowExecutionAuthority,
+        accepted_at_ms: u64,
+    ) -> Result<bool, WorkflowStoreError> {
+        let transaction = self.connection.unchecked_transaction()?;
+        let request = self
+            .staged_run_graph_edit(run_id, mutation_id, authority)?
+            .ok_or_else(|| WorkflowStoreError::InvalidData("candidate not found".into()))?;
+        let exists: bool = transaction.query_row(
+            "SELECT EXISTS(SELECT 1 FROM workflow_pending_publications WHERE run_id = ?1 AND mutation_id = ?2)",
+            (run_id, mutation_id), |row| row.get(0))?;
+        if exists {
+            return Ok(false);
+        }
+        if self.validate_run_graph_edit_in_transaction(
+            run_id,
+            mutation_id,
+            authority,
+            &transaction,
+        )? != RunGraphCandidateValidation::Validated
+        {
+            return Err(WorkflowStoreError::InvalidData(
+                "candidate requires incremental validation".into(),
+            ));
+        }
+        transaction.execute(
+            "INSERT INTO workflow_pending_publications VALUES (?1, ?2, ?3, ?4)",
+            rusqlite::params![
+                run_id,
+                mutation_id,
+                request.expected_revision,
+                accepted_at_ms
+            ],
+        )?;
+        let mut count = 0;
+        for disposition in &request.reconciliation {
+            let bcode_workflow::WorkflowRunGraphReconciliation::Cancel { activation_id } =
+                disposition
+            else {
+                continue;
+            };
+            let mut statement = transaction.prepare(
+                "SELECT dispatch_identity FROM workflow_attempts attempt
+                 WHERE run_id = ?1 AND activation_id = ?2 AND status IN ('admitted', 'running')
+                   AND receipt_json IS NOT NULL
+                   AND NOT EXISTS (SELECT 1 FROM workflow_run_links WHERE parent_run_id = ?1 AND parent_activation_id = ?2)
+                   AND NOT EXISTS (SELECT 1 FROM workflow_fan_out_members WHERE run_id = ?1 AND member_activation_id = ?2)
+                 LIMIT 2")?;
+            let identities = statement
+                .query_map((run_id, activation_id), |row| row.get::<_, String>(0))?
+                .collect::<Result<Vec<_>, _>>()?;
+            let [identity] = identities.as_slice() else {
+                return Err(WorkflowStoreError::InvalidData("pending publication requires one receipt-backed unlinked attempt per cancellation".into()));
+            };
+            transaction.execute(
+                "INSERT INTO workflow_publication_cancellations VALUES (?1, ?2, ?3)",
+                (run_id, mutation_id, identity),
+            )?;
+            count += 1;
+        }
+        if count == 0 {
+            return Err(WorkflowStoreError::InvalidData(
+                "pending publication requires cancellation targets".into(),
+            ));
+        }
+        super::append_event(&transaction, run_id, "graph_publication_accepted",
+            &serde_json::json!({"mutation_id": mutation_id, "expected_revision": request.expected_revision}).to_string(), accepted_at_ms)?;
+        transaction.commit()?;
+        Ok(true)
     }
 
     /// Validate a persisted edit against one bounded snapshot of the committed graph.
