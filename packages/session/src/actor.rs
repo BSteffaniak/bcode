@@ -424,6 +424,19 @@ impl SessionHandle {
         .await?
     }
 
+    pub async fn turn_receipt(
+        &self,
+        producer: String,
+        idempotency_key: String,
+    ) -> Result<Option<bcode_session_models::TurnReceipt>, SessionError> {
+        self.send(|reply| SessionCommand::TurnReceipt {
+            producer,
+            idempotency_key,
+            reply,
+        })
+        .await?
+    }
+
     pub async fn append_user_message(
         &self,
         client_id: ClientId,
@@ -758,6 +771,11 @@ enum SessionCommand {
         query: bcode_session_models::SessionUsageQuery,
         reply: oneshot::Sender<Result<bcode_session_models::SessionUsagePage, SessionError>>,
     },
+    TurnReceipt {
+        producer: String,
+        idempotency_key: String,
+        reply: oneshot::Sender<Result<Option<bcode_session_models::TurnReceipt>, SessionError>>,
+    },
     RenormalizeUsage {
         range: bcode_session_models::SessionCostRange,
         normalize: UsageNormalizer,
@@ -1082,6 +1100,26 @@ impl SessionActor {
             | SessionCommand::Attach { .. }
             | SessionCommand::SetComposerDraft { .. } => {
                 unreachable!("write commands are handled before read commands")
+            }
+            SessionCommand::TurnReceipt {
+                producer,
+                idempotency_key,
+                reply,
+            } => {
+                let result = async {
+                    if let Some(db) = self.existing_session_db().await? {
+                        return Ok::<_, SessionError>(
+                            db.turn_receipt(&producer, &idempotency_key).await?,
+                        );
+                    }
+                    Ok(self
+                        .state
+                        .turn_receipts
+                        .get(&(producer, idempotency_key))
+                        .cloned())
+                }
+                .await;
+                let _ = reply.send(result);
             }
             SessionCommand::SubscribeEvents(reply) => {
                 let _ = reply.send(Ok(self.subscribe_events()));

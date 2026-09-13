@@ -1292,6 +1292,12 @@ async fn print_workflow_definition(
 async fn dispatch_workflow_command(command: Box<WorkflowCommand>) -> Result<(), CliError> {
     let client = BcodeClient::default_endpoint();
     match *command {
+        WorkflowCommand::PublishRunEdit { file } => {
+            let request: bcode_workflow::WorkflowRunGraphEditBatch =
+                serde_json::from_value(read_bounded_json(&file)?)?;
+            let revision = Box::pin(client.publish_workflow_run_graph_edit(request)).await?;
+            print_json(&serde_json::json!({"published": true, "revision": revision}))?;
+        }
         WorkflowCommand::StageRunEdit { file } => {
             let request: bcode_workflow::WorkflowRunGraphEditBatch =
                 serde_json::from_value(read_bounded_json(&file)?)?;
@@ -4241,6 +4247,12 @@ enum ThemeCommand {
 
 #[derive(Debug, Subcommand)]
 enum WorkflowCommand {
+    /// Commit an exact staged edit through publication policy; pending cancellation is rejected.
+    PublishRunEdit {
+        /// Bounded JSON `WorkflowRunGraphEditBatch` identical to the staged candidate.
+        #[arg(long)]
+        file: PathBuf,
+    },
     /// Persist a live run edit candidate; does not publish topology or execute the edit.
     StageRunEdit {
         /// Bounded JSON `WorkflowRunGraphEditBatch`, including run, revision, and mutation identity.
@@ -21443,6 +21455,22 @@ mod web_command_tests {
             invalid_arguments[10] = invalid;
             assert!(Cli::try_parse_from(invalid_arguments).is_err());
         }
+    }
+
+    #[test]
+    fn workflow_publish_run_edit_requires_candidate_file() {
+        assert!(Cli::try_parse_from(["bcode", "workflow", "publish-run-edit"]).is_err());
+        let cli = Cli::try_parse_from([
+            "bcode",
+            "workflow",
+            "publish-run-edit",
+            "--file",
+            "edit.json",
+        ])
+        .expect("publish edit command");
+        assert!(matches!(cli.command,
+            Some(Commands::Workflow { command: WorkflowCommand::PublishRunEdit { file } })
+            if file == Path::new("edit.json")));
     }
 
     #[test]

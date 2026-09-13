@@ -99,7 +99,7 @@ Pending mutation grants are checked against exact scope immediately before dispa
 
 Prepared/admitted/running attempts are identified by stable dispatch identity. Cancellation and restart reconciliation use persisted intent and optional owner receipt.
 
-A read-only attempt without a receipt may be eligible for the owner's explicit replay policy. A mutating prepared attempt, or an accepted mutating attempt whose terminal outcome cannot be proven, becomes `repair_required`. Generic runtime never guesses success and never automatically replays it.
+A read-only attempt without a receipt may be eligible for the owner's explicit replay policy. A mutating prepared attempt, or any accepted attempt whose terminal outcome cannot be proven, becomes `repair_required`. A read-only classification does not prove safe replay of an admitted turn. Explicit abandonment preserves the old attempt and returns its output-free active activation to pending for a higher-numbered attempt. Generic runtime never guesses success and never automatically replays an ambiguous admission.
 
 For shell command plans, inspect persisted normalized command-plan identity, receipt, process/owner evidence, and typed artifacts. If no trustworthy receipt or owner status proves an outcome, preserve repair-required state. Arbitrary commands are not replayed merely because the process disappeared.
 

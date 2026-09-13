@@ -1707,12 +1707,33 @@ impl bcode_workflow::WorkflowRunSubscription for WorkflowRunWatcher {
 impl WorkflowRunWatcher {
     /// Wait for the next workflow canonical-state notification.
     ///
+    /// Transport loss reconnects through the configured daemon acquisition path and returns
+    /// `ResyncRequired`, even when the replacement daemon has no new events. Callers must
+    /// refetch bounded canonical state; reconnecting does not replay missed notifications.
+    ///
     /// # Errors
     ///
-    /// Returns an error when the daemon connection closes or the event cannot be decoded.
+    /// Returns an error when reconnection or subscription fails, or an event cannot be decoded.
     pub async fn next_event(&mut self) -> Result<WorkflowRunWatchEvent, ClientError> {
         loop {
-            let event = match self.connection.recv_event().await? {
+            let received = match self.connection.recv_event_without_reconnect().await {
+                Ok(event) => event,
+                Err(error)
+                    if error.is_daemon_unavailable()
+                        && self.connection.reconnect_client.is_some() =>
+                {
+                    self.connection.restore_state.workflow_runs = false;
+                    self.connection.reconnect_and_restore().await?;
+                    let after_sequence = self.connection.subscribe_workflow_runs().await?;
+                    self.sequence =
+                        bcode_workflow_view_models::WorkflowLiveSequence::from_last_observed(
+                            after_sequence,
+                        );
+                    return Ok(WorkflowRunWatchEvent::ResyncRequired);
+                }
+                Err(error) => return Err(error),
+            };
+            let event = match received {
                 Event::Workflow(event) => event,
                 Event::Session(_)
                 | Event::SessionLive(_)
@@ -8676,6 +8697,65 @@ mod client_timeout_tests {
             server.await.expect("server task");
             std::fs::remove_dir_all(socket_dir).expect("socket cleanup");
         }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn workflow_watcher_requests_resync_after_quiet_reconnect() {
+        let socket_dir = std::path::PathBuf::from(format!("/tmp/bcw-{}", SessionId::new()));
+        std::fs::create_dir_all(&socket_dir).expect("socket directory");
+        let endpoint = bcode_ipc::IpcEndpoint::unix_socket(socket_dir.join("watch.sock"));
+        let listener = bcode_ipc::LocalIpcListener::bind(&endpoint).expect("listener");
+        let daemon = matching_daemon_status();
+        let (stop, stopped) = tokio::sync::oneshot::channel();
+        let server = tokio::spawn(async move {
+            for sequence in [10, 0] {
+                let mut stream = listener.accept().await.expect("connection");
+                let hello = bcode_ipc::recv_envelope(&mut stream).await.expect("hello");
+                let response = bcode_ipc::Response::Ok(bcode_ipc::ResponsePayload::Hello {
+                    protocol_version: bcode_ipc::ProtocolVersion(
+                        bcode_ipc::CURRENT_PROTOCOL_VERSION,
+                    ),
+                    client_id: bcode_session_models::ClientId::new(),
+                    daemon: daemon.clone(),
+                });
+                let envelope = bcode_ipc::response_envelope(hello.request_id, &response)
+                    .expect("hello response");
+                bcode_ipc::send_envelope(&mut stream, &envelope)
+                    .await
+                    .expect("send hello");
+                let request = bcode_ipc::recv_envelope(&mut stream)
+                    .await
+                    .expect("subscription");
+                let response = bcode_ipc::response_envelope(
+                    request.request_id,
+                    &bcode_ipc::Response::Ok(bcode_ipc::ResponsePayload::WorkflowRunsSubscribed {
+                        after_sequence: sequence,
+                    }),
+                )
+                .expect("response");
+                bcode_ipc::send_envelope(&mut stream, &response)
+                    .await
+                    .expect("subscribe");
+                if sequence == 0 {
+                    stopped.await.expect("client observed resync");
+                    break;
+                }
+            }
+        });
+        let client = BcodeClient::new(endpoint);
+        let mut watcher = client.watch_workflow_runs().await.expect("watcher");
+        assert!(matches!(
+            tokio::time::timeout(Duration::from_secs(5), watcher.next_event())
+                .await
+                .expect("deadline")
+                .expect("reconnect"),
+            super::WorkflowRunWatchEvent::ResyncRequired
+        ));
+        assert_eq!(watcher.sequence.last_observed(), Some(0));
+        stop.send(()).expect("stop");
+        server.await.expect("server");
+        std::fs::remove_dir_all(socket_dir).expect("cleanup");
     }
 
     #[cfg(unix)]

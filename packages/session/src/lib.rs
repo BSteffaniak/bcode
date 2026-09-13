@@ -8030,6 +8030,23 @@ mod tests {
         }
 
         let restored = SessionManager::persistent(&root).expect("restored manager");
+        let bcode_session_models::TurnAdmission::Accepted(expected_receipt) = &expected else {
+            panic!("accepted admission");
+        };
+        assert_eq!(
+            restored
+                .turn_receipt(session_id, "test.producer", "operation-1")
+                .await
+                .expect("lookup"),
+            Some(expected_receipt.clone())
+        );
+        assert_eq!(
+            restored
+                .turn_receipt(session_id, "test.producer", "missing")
+                .await
+                .expect("missing lookup"),
+            None
+        );
         let duplicate = restored
             .admit_turn(
                 session_id,

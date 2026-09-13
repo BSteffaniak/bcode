@@ -2599,6 +2599,22 @@ impl WorkflowApplicationActor {
     }
 }
 
+/// Canonical facts for explicit repair authorization. Hosts emit version 1; policy consumers
+/// must reject unsupported versions. Repair never bypasses later dispatch policy.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WorkflowAttemptRepairFacts {
+    /// Compatibility version of this fact envelope.
+    pub version: u32,
+    /// Caller identity supplied by the application host.
+    pub actor: WorkflowApplicationActor,
+    /// Canonical owning run.
+    pub run_id: String,
+    /// Exact admitted execution identity.
+    pub dispatch_identity: String,
+    /// Explicit requested resolution.
+    pub resolution: RepairResolution,
+}
+
 /// Side-effecting authored-workflow operation evaluated by application policy.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]

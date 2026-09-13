@@ -8244,8 +8244,62 @@ impl WorkflowStore {
         self.persist_dispatch_receipt_with_authority(receipt, authority.as_ref())
     }
 
+    /// Persist an owner admission receipt using the authority captured before dispatch.
+    ///
+    /// # Errors
+    ///
+    /// Rejects stale authority, malformed or conflicting receipts, terminal attempts,
+    /// oversized data, and persistence failures.
+    pub fn persist_owned_dispatch_receipt(
+        &self,
+        receipt: &DispatchReceipt,
+        authority: &WorkflowExecutionAuthority,
+    ) -> Result<(), WorkflowStoreError> {
+        self.persist_dispatch_receipt_with_authority(receipt, Some(authority))
+    }
+
     fn persist_dispatch_receipt_with_authority(
         &self,
+        receipt: &DispatchReceipt,
+        authority: Option<&WorkflowExecutionAuthority>,
+    ) -> Result<(), WorkflowStoreError> {
+        let transaction = self.connection.unchecked_transaction()?;
+        self.persist_dispatch_receipt_transaction(&transaction, receipt, authority)?;
+        transaction.commit()?;
+        Ok(())
+    }
+
+    /// Atomically recover an admitted dispatch and apply its bounded owner observation.
+    ///
+    /// # Errors
+    /// Rejects stale authority, conflicting receipts, invalid observations, or persistence failures.
+    /// Neither the receipt nor the observation is committed on failure.
+    pub fn recover_owned_dispatch_observation(
+        &self,
+        receipt: &DispatchReceipt,
+        authority: &WorkflowExecutionAuthority,
+        observation: AttemptObservation,
+        observed_at_ms: u64,
+    ) -> Result<ReceiptReconciliationSummary, WorkflowStoreError> {
+        let transaction = self.connection.unchecked_transaction()?;
+        self.persist_dispatch_receipt_transaction(&transaction, receipt, Some(authority))?;
+        let request = receipt_backed_attempt(&transaction, &receipt.dispatch_identity)?
+            .ok_or_else(|| WorkflowStoreError::InvalidData("recovered receipt missing".into()))?;
+        let mut summary = ReceiptReconciliationSummary::default();
+        apply_attempt_observation(
+            &transaction,
+            &request,
+            observation,
+            observed_at_ms,
+            &mut summary,
+        )?;
+        transaction.commit()?;
+        Ok(summary)
+    }
+
+    fn persist_dispatch_receipt_transaction(
+        &self,
+        transaction: &Transaction<'_>,
         receipt: &DispatchReceipt,
         authority: Option<&WorkflowExecutionAuthority>,
     ) -> Result<(), WorkflowStoreError> {
@@ -8267,7 +8321,6 @@ impl WorkflowStore {
                 "dispatch receipt identity does not match durable attempt identity".to_string(),
             ));
         }
-        let transaction = self.connection.unchecked_transaction()?;
         if self.execution_authority(&receipt.run_id)?.as_ref() != authority {
             return Err(WorkflowStoreError::InvalidData(
                 "receipt execution authority changed".into(),
@@ -8306,7 +8359,6 @@ impl WorkflowStore {
                 )
                 .optional()?;
             if existing.as_deref() == Some(receipt_json.as_str()) {
-                transaction.commit()?;
                 return Ok(());
             }
             return Err(WorkflowStoreError::InvalidData(format!(
@@ -8320,7 +8372,7 @@ impl WorkflowStore {
             |row| row.get(0),
         )?;
         append_event(
-            &transaction,
+            transaction,
             &receipt.run_id,
             if status == "admitted" {
                 "attempt_admitted"
@@ -8330,7 +8382,6 @@ impl WorkflowStore {
             &serde_json::to_string(receipt)?,
             receipt.admitted_at_ms,
         )?;
-        transaction.commit()?;
         Ok(())
     }
 
@@ -8426,9 +8477,67 @@ impl WorkflowStore {
     where
         O: ActivationDispatchOwner + ?Sized,
     {
+        self.redispatch_owned_prepared_read_only_scoped(
+            owner,
+            run_id,
+            authority,
+            limit,
+            admitted_at_ms,
+            None,
+        )
+        .await
+    }
+
+    /// Redispatch only read-only preparations included in an examined recovery batch.
+    ///
+    /// # Errors
+    ///
+    /// Rejects stale authority, invalid bounds, conflicting handoffs, owner failures,
+    /// and receipt persistence failures.
+    pub async fn redispatch_examined_preparations<O>(
+        &mut self,
+        owner: &O,
+        run_id: &str,
+        authority: &WorkflowExecutionAuthority,
+        identities: &[String],
+        admitted_at_ms: u64,
+    ) -> Result<Vec<String>, WorkflowStoreError>
+    where
+        O: ActivationDispatchOwner + ?Sized,
+    {
+        self.redispatch_owned_prepared_read_only_scoped(
+            owner,
+            run_id,
+            authority,
+            identities.len().max(1),
+            admitted_at_ms,
+            Some(identities),
+        )
+        .await
+    }
+
+    // Exclusive access keeps this future Send: SQLite connections are Send but not Sync.
+    #[allow(clippy::needless_pass_by_ref_mut)]
+    async fn redispatch_owned_prepared_read_only_scoped<O>(
+        &mut self,
+        owner: &O,
+        run_id: &str,
+        authority: &WorkflowExecutionAuthority,
+        limit: usize,
+        admitted_at_ms: u64,
+        identities: Option<&[String]>,
+    ) -> Result<Vec<String>, WorkflowStoreError>
+    where
+        O: ActivationDispatchOwner + ?Sized,
+    {
         self.verify_execution_authority(run_id, authority)?;
-        let prepared =
-            prepared_read_only_dispatches_for_run(&self.connection, run_id, bounded_limit(limit)?)?;
+        let prepared = prepared_dispatches_scoped(
+            &self.connection,
+            Some(run_id),
+            bounded_limit(limit)?,
+            true,
+            identities,
+        )?;
         let mut admitted = Vec::with_capacity(prepared.len());
         for request in prepared {
             self.record_dispatch_handoff(&request, Some(authority))?;
@@ -8451,6 +8560,66 @@ impl WorkflowStore {
             admitted.push(request.dispatch_identity);
         }
         Ok(admitted)
+    }
+
+    /// Read a bounded batch of receipt-less preparations for owner-evidence recovery.
+    ///
+    /// # Errors
+    ///
+    /// Rejects invalid limits, malformed stored preparations, or stale execution authority.
+    pub fn prepared_admission_recovery_for_run(
+        &self,
+        run_id: &str,
+        authority: &WorkflowExecutionAuthority,
+        limit: usize,
+    ) -> Result<Vec<PreparedActivationDispatch>, WorkflowStoreError> {
+        self.prepared_admission_recovery_after(run_id, authority, "", limit)
+    }
+
+    /// Read the next bounded preparation page without changing admission or execution state.
+    ///
+    /// The cursor is the last returned dispatch identity, independent of mutable timestamps.
+    ///
+    /// # Errors
+    ///
+    /// Rejects invalid bounds, stale authority, malformed preparations, or database failures.
+    pub fn prepared_admission_recovery_after(
+        &self,
+        run_id: &str,
+        authority: &WorkflowExecutionAuthority,
+        after_dispatch_identity: &str,
+        limit: usize,
+    ) -> Result<Vec<PreparedActivationDispatch>, WorkflowStoreError> {
+        self.verify_execution_authority(run_id, authority)?;
+        let limit = bounded_limit(limit)?;
+        let identities = {
+            let mut statement = self.connection.prepare(
+                "SELECT dispatch_identity FROM workflow_attempts WHERE run_id = ?1 \
+                 AND status IN ('prepared', 'cancelling', 'sibling_cancelling') AND receipt_json IS NULL AND dispatch_identity > ?2 \
+                 ORDER BY dispatch_identity LIMIT ?3",
+            )?;
+            statement
+                .query_map(
+                    rusqlite::params![run_id, after_dispatch_identity, limit],
+                    |row| row.get::<_, String>(0),
+                )?
+                .collect::<Result<Vec<_>, _>>()?
+        };
+        let mut preparations = prepared_dispatches_scoped(
+            &self.connection,
+            Some(run_id),
+            limit,
+            false,
+            Some(&identities),
+        )?;
+        // Eligibility changes must not silently turn a nonempty keyset page into end-of-stream.
+        if preparations.len() != identities.len() {
+            return Err(WorkflowStoreError::InvalidData(
+                "preparation recovery page changed eligibility".into(),
+            ));
+        }
+        preparations.sort_by(|left, right| left.dispatch_identity.cmp(&right.dispatch_identity));
+        Ok(preparations)
     }
 
     /// Reconcile receipt-less prepared attempts after restart without external dispatch.
@@ -8502,6 +8671,53 @@ impl WorkflowStore {
             reconciled_at_ms,
             Some(authority),
         )
+    }
+
+    /// Classify only preparations whose owner evidence was examined by the caller.
+    ///
+    /// # Errors
+    ///
+    /// Rejects stale authority, oversized batches, or persistence failures.
+    pub fn reconcile_examined_preparations(
+        &self,
+        run_id: &str,
+        authority: &WorkflowExecutionAuthority,
+        identities: &[String],
+        reconciled_at_ms: u64,
+    ) -> Result<ReconciliationSummary, WorkflowStoreError> {
+        bounded_limit(identities.len().max(1))?;
+        let transaction = self.connection.unchecked_transaction()?;
+        self.verify_execution_authority(run_id, authority)?;
+        let mut summary = ReconciliationSummary::default();
+        for identity in identities {
+            let effect: Option<String> = transaction.query_row(
+                "SELECT side_effect FROM workflow_attempts WHERE run_id = ?1 AND dispatch_identity = ?2 AND status = 'prepared' AND receipt_json IS NULL",
+                (run_id, identity), |row| row.get(0),
+            ).optional()?;
+            match effect.as_deref() {
+                Some("mutating") => {
+                    transaction.execute("UPDATE workflow_attempts SET status = 'repair_required', terminal_at_ms = ?2 WHERE dispatch_identity = ?1", (identity, reconciled_at_ms))?;
+                    transaction.execute("UPDATE workflow_runs SET status = 'repair_required', updated_at_ms = ?2 WHERE run_id = ?1", (run_id, reconciled_at_ms))?;
+                    append_event(
+                        &transaction,
+                        run_id,
+                        "attempt_repair_required",
+                        &serde_json::json!({"dispatch_identity": identity}).to_string(),
+                        reconciled_at_ms,
+                    )?;
+                    summary.repair_required.push(identity.clone());
+                }
+                Some("read_only") => summary.safe_prepared.push(identity.clone()),
+                None => {}
+                Some(_) => {
+                    return Err(WorkflowStoreError::InvalidData(
+                        "unknown preparation side effect".into(),
+                    ));
+                }
+            }
+        }
+        transaction.commit()?;
+        Ok(summary)
     }
 
     fn reconcile_prepared_attempts_scoped(
@@ -8581,14 +8797,27 @@ impl WorkflowStore {
         &self,
         limit: usize,
     ) -> Result<Vec<String>, WorkflowStoreError> {
+        self.recovery_candidate_run_ids_after("", limit)
+    }
+
+    /// Read a keyset page of recoverable runs, ordered by stable run identity.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for invalid bounds or database failures.
+    pub fn recovery_candidate_run_ids_after(
+        &self,
+        after_run_id: &str,
+        limit: usize,
+    ) -> Result<Vec<String>, WorkflowStoreError> {
         let limit = bounded_limit(limit)?;
         let mut statement = self.connection.prepare(
-            "SELECT run_id FROM workflow_runs WHERE status IN ('running', 'paused') \
-             OR (status = 'repair_required' AND EXISTS(SELECT 1 FROM workflow_recovery_barriers b WHERE b.run_id = workflow_runs.run_id)) \
-             ORDER BY updated_at_ms, run_id LIMIT ?1",
+            "SELECT run_id FROM workflow_runs WHERE (status IN ('running', 'paused') \
+             OR (status = 'repair_required' AND EXISTS(SELECT 1 FROM workflow_recovery_barriers b WHERE b.run_id = workflow_runs.run_id))) \
+             AND run_id > ?2 ORDER BY run_id LIMIT ?1",
         )?;
         statement
-            .query_map([limit], |row| row.get(0))?
+            .query_map(rusqlite::params![limit, after_run_id], |row| row.get(0))?
             .collect::<Result<Vec<_>, _>>()
             .map_err(WorkflowStoreError::from)
     }
@@ -9005,6 +9234,36 @@ impl WorkflowStore {
     where
         O: AsyncAttemptStatusObserver + ?Sized,
     {
+        self.reconcile_owned_receipts_page_async(
+            observer,
+            run_id,
+            authority,
+            (None, limit),
+            reconciled_at_ms,
+        )
+        .await
+        .map(|(summary, _)| summary)
+    }
+
+    /// Reconcile a bounded receipt page ordered by immutable dispatch identity.
+    ///
+    /// The returned cursor advances past observed attempts even when they remain active.
+    /// Pass it to the next call; `None` indicates the end of this sweep. Each page independently
+    /// captures and rechecks authority and graph revision before committing settlement.
+    ///
+    /// # Errors
+    /// Returns an error for invalid bounds, stale authority, observation failure, or invalid state.
+    pub async fn reconcile_owned_receipts_page_async<O>(
+        &mut self,
+        observer: &O,
+        run_id: &str,
+        authority: &WorkflowExecutionAuthority,
+        page: (Option<&str>, usize),
+        reconciled_at_ms: u64,
+    ) -> Result<(ReceiptReconciliationSummary, Option<String>), WorkflowStoreError>
+    where
+        O: AsyncAttemptStatusObserver + ?Sized,
+    {
         let (revision, requests) = {
             let transaction = self.connection.unchecked_transaction()?;
             self.verify_execution_authority(run_id, authority)?;
@@ -9013,18 +9272,31 @@ impl WorkflowStore {
                     "receipt reconciliation graph is missing".to_string(),
                 )
             })?;
-            let requests =
-                receipt_backed_attempts(&transaction, Some(run_id), bounded_limit(limit)?)?;
+            let requests = receipt_backed_attempts_after(
+                &transaction,
+                run_id,
+                page.0,
+                bounded_limit(page.1)?,
+            )?;
             transaction.commit()?;
             (revision, requests)
         };
-        self.reconcile_attempt_requests_with_authority_async(
-            observer,
-            requests,
-            reconciled_at_ms,
-            Some((run_id, authority, revision)),
-        )
-        .await
+        let cursor = (requests.len() == page.1)
+            .then(|| {
+                requests
+                    .last()
+                    .map(|request| request.dispatch_identity.clone())
+            })
+            .flatten();
+        let summary = self
+            .reconcile_attempt_requests_with_authority_async(
+                observer,
+                requests,
+                reconciled_at_ms,
+                Some((run_id, authority, revision)),
+            )
+            .await?;
+        Ok((summary, cursor))
     }
 
     /// Reconcile one keyset page without repeatedly observing only the oldest attempts.
@@ -9494,11 +9766,7 @@ impl WorkflowStore {
         if let Some(authority) = authority {
             self.verify_execution_authority(&run_id, authority)?;
         }
-        if parse_side_effect(&side_effect)? != DispatchSideEffect::Mutating {
-            return Err(WorkflowStoreError::InvalidData(
-                "only ambiguous mutating attempts require explicit repair".to_string(),
-            ));
-        }
+        parse_side_effect(&side_effect)?;
         let expected = crate::dispatch_identity(&run_id, &node_id, &activation_id, attempt_number);
         if expected != dispatch_identity {
             return Err(WorkflowStoreError::InvalidData(
@@ -9506,6 +9774,17 @@ impl WorkflowStore {
             ));
         }
 
+        if matches!(resolution, RepairResolution::AbandonForExplicitRetry { .. }) {
+            let retry_blocked: bool = transaction.query_row(
+                "SELECT cancellation_requested_at_ms IS NOT NULL OR EXISTS(SELECT 1 FROM workflow_publication_cancellations WHERE run_id = ?1 AND dispatch_identity = ?2) FROM workflow_runs WHERE run_id = ?1",
+                (&run_id, dispatch_identity), |row| row.get(0),
+            )?;
+            if retry_blocked {
+                return Err(WorkflowStoreError::InvalidData(
+                    "cancelled work cannot be abandoned for retry; resolve its cancellation explicitly".into(),
+                ));
+            }
+        }
         let (attempt_status, event_type) = match resolution {
             RepairResolution::ConfirmSucceeded { output } => {
                 if output.run_id != run_id
@@ -9546,6 +9825,12 @@ impl WorkflowStore {
             .to_string(),
             repaired_at_ms,
         )?;
+        if matches!(resolution, RepairResolution::AbandonForExplicitRetry { .. }) {
+            transaction.execute(
+                "UPDATE workflow_activations SET status = 'pending' WHERE run_id = ?1 AND node_id = ?2 AND activation_id = ?3 AND output_id IS NULL AND status IN ('running', 'repair_required')",
+                (&run_id, &node_id, &activation_id),
+            )?;
+        }
         let publication_cancelled = matches!(resolution, RepairResolution::ConfirmCancelled { .. })
             && transaction.query_row(
                 "SELECT EXISTS(SELECT 1 FROM workflow_publication_cancellations WHERE run_id = ?1 AND dispatch_identity = ?2)",
@@ -12241,13 +12526,15 @@ impl WorkflowStore {
                 kind.as_str()
             )));
         }
-        let node =
-            run_graph::initial_activation_node(&transaction, run_id, node_id, activation_id)?
-                .ok_or_else(|| {
-                    WorkflowStoreError::InvalidData(format!(
-                        "workflow waiting run-graph node not found: {node_id}"
-                    ))
-                })?;
+        // Resolve the admitted executable, not the initial graph: an explicitly retained
+        // gate and a gate added by publication may both settle at a later graph revision.
+        run_graph::reconciled_activation_exit(&transaction, run_id, node_id, activation_id)?;
+        let node = run_graph::bound_activation_node(&transaction, run_id, node_id, activation_id)?
+            .ok_or_else(|| {
+                WorkflowStoreError::InvalidData(format!(
+                    "workflow waiting run-graph node not found: {node_id}"
+                ))
+            })?;
         let expected_kind = match kind {
             WorkflowWaitKind::Input => bcode_workflow::NodeKind::Input,
             WorkflowWaitKind::Approval => bcode_workflow::NodeKind::Approval,
@@ -13750,6 +14037,17 @@ fn prepared_read_only_dispatches_scoped(
     run_id: Option<&str>,
     limit: i64,
 ) -> Result<Vec<PreparedActivationDispatch>, WorkflowStoreError> {
+    prepared_dispatches_scoped(connection, run_id, limit, true, None)
+}
+
+fn prepared_dispatches_scoped(
+    connection: &Connection,
+    run_id: Option<&str>,
+    limit: i64,
+    read_only: bool,
+    identities: Option<&[String]>,
+) -> Result<Vec<PreparedActivationDispatch>, WorkflowStoreError> {
+    let identities_json = identities.map(serde_json::to_string).transpose()?;
     let mut statement = connection.prepare(
         "SELECT attempt.run_id, attempt.node_id, attempt.activation_id, attempt.attempt, \
          attempt.dispatch_identity, activation.dependency_generation, \
@@ -13765,16 +14063,25 @@ fn prepared_read_only_dispatches_scoped(
            AND activation.node_id = attempt.node_id \
            AND activation.activation_id = attempt.activation_id \
          JOIN workflow_runs run ON run.run_id = attempt.run_id \
-         WHERE attempt.status = 'prepared' AND attempt.side_effect = 'read_only' \
-           AND activation.status = 'running' \
-           AND attempt.receipt_json IS NULL AND run.status = 'running' \
-           AND run.cancellation_requested_at_ms IS NULL \
+         WHERE (attempt.status = 'prepared' OR (?4 = 0 AND attempt.status IN ('cancelling', 'sibling_cancelling'))) \
+           AND (?4 = 0 OR attempt.side_effect = 'read_only') \
+           AND (?5 IS NULL OR attempt.dispatch_identity IN (SELECT value FROM json_each(?5))) \
+           AND (?4 = 0 OR activation.status = 'running') \
+           AND attempt.receipt_json IS NULL \
+           AND (?4 = 0 OR run.status = 'running') \
+           AND (?4 = 0 OR run.cancellation_requested_at_ms IS NULL) \
            AND (?1 IS NULL OR attempt.run_id = ?1) \
          ORDER BY attempt.prepared_at_ms, attempt.dispatch_identity LIMIT ?2",
     )?;
     statement
         .query_map(
-            rusqlite::params![run_id, limit, MAX_INLINE_JSON_BYTES],
+            rusqlite::params![
+                run_id,
+                limit,
+                MAX_INLINE_JSON_BYTES,
+                read_only,
+                identities_json
+            ],
             |row| {
                 Ok((
                     row.get::<_, String>(0)?,
@@ -13889,6 +14196,25 @@ fn receipt_backed_attempt(
         .optional()?
         .map(attempt_reconciliation_request)
         .transpose()
+}
+
+fn receipt_backed_attempts_after(
+    connection: &Connection,
+    run_id: &str,
+    after: Option<&str>,
+    limit: i64,
+) -> Result<Vec<AttemptReconciliationRequest>, WorkflowStoreError> {
+    let mut statement = connection.prepare(
+        "SELECT run_id, node_id, activation_id, attempt, dispatch_identity, side_effect, \
+         receipt_json FROM workflow_attempts WHERE run_id = ?1 \
+         AND status IN ('admitted', 'running', 'cancelling', 'sibling_cancelling') \
+         AND receipt_json IS NOT NULL AND (?2 IS NULL OR dispatch_identity > ?2) \
+         ORDER BY dispatch_identity LIMIT ?3",
+    )?;
+    statement
+        .query_map((run_id, after, limit), attempt_reconciliation_row)?
+        .map(|row| attempt_reconciliation_request(row?))
+        .collect()
 }
 
 fn receipt_backed_attempts(
@@ -14758,40 +15084,31 @@ fn apply_attempt_observation(
             summary.cancelled.push(request.dispatch_identity.clone());
         }
         AttemptObservation::Unknown => {
-            if request.side_effect == DispatchSideEffect::Mutating {
-                transition_attempt(
-                    transaction,
-                    request,
-                    "repair_required",
-                    Some(reconciled_at_ms),
-                )?;
-                transaction.execute(
-                    "UPDATE workflow_runs SET status = ?2, updated_at_ms = ?3 WHERE run_id = ?1",
-                    (
-                        &request.run_id,
-                        RunStatus::RepairRequired.as_str(),
-                        reconciled_at_ms,
-                    ),
-                )?;
-                append_event(
-                    transaction,
+            // Admission is not proof of safe replay, even for read-only work.
+            transition_attempt(
+                transaction,
+                request,
+                "repair_required",
+                Some(reconciled_at_ms),
+            )?;
+            transaction.execute(
+                "UPDATE workflow_runs SET status = ?2, updated_at_ms = ?3 WHERE run_id = ?1",
+                (
                     &request.run_id,
-                    "attempt_repair_required",
-                    &serde_json::json!({
-                        "dispatch_identity": request.dispatch_identity,
-                        "reason": "operation_outcome_unproven",
-                    })
-                    .to_string(),
+                    RunStatus::RepairRequired.as_str(),
                     reconciled_at_ms,
-                )?;
-                summary
-                    .repair_required
-                    .push(request.dispatch_identity.clone());
-            } else {
-                summary
-                    .unresolved_read_only
-                    .push(request.dispatch_identity.clone());
-            }
+                ),
+            )?;
+            append_event(
+                transaction,
+                &request.run_id,
+                "attempt_repair_required",
+                &serde_json::json!({"dispatch_identity": request.dispatch_identity, "reason": "operation_outcome_unproven"}).to_string(),
+                reconciled_at_ms,
+            )?;
+            summary
+                .repair_required
+                .push(request.dispatch_identity.clone());
         }
     }
     Ok(())
@@ -16779,7 +17096,7 @@ fn request_run_cancellation_in_transaction(
     let changed = transaction.execute(
         "UPDATE workflow_runs SET cancellation_requested_at_ms = ?2, updated_at_ms = ?2 \
              WHERE run_id = ?1 AND cancellation_requested_at_ms IS NULL \
-               AND status IN ('running', 'paused')",
+               AND status IN ('running', 'paused', 'repair_required')",
         (run_id, requested_at_ms),
     )?;
     if changed == 1 {
@@ -22932,6 +23249,176 @@ mod tests {
     }
 
     #[test]
+    fn recovered_admission_observation_rolls_back_on_invalid_output() {
+        let (_temp, mut store) = initialized_store();
+        let prepared = store
+            .prepare_pending_activation(
+                "run-1",
+                "review",
+                &activation_id(),
+                DispatchSideEffect::ReadOnly,
+                serde_json::json!({"operation": "review"}),
+                12,
+            )
+            .expect("prepare")
+            .expect("activation");
+        let authority = WorkflowExecutionAuthority {
+            target_artifact_id: "artifact-a".into(),
+            daemon_instance_id: "daemon-a".into(),
+            generation: 1,
+            fencing_token: "token-a".into(),
+        };
+        store.connection.execute(
+            "UPDATE workflow_runs SET target_artifact_id = 'artifact-a', coordinator_daemon_instance_id = 'daemon-a', coordinator_generation = 1, coordinator_fencing_token = 'token-a' WHERE run_id = 'run-1'", [],
+        ).expect("authority");
+        let receipt = DispatchReceipt {
+            run_id: "run-1".into(),
+            node_id: "review".into(),
+            activation_id: activation_id(),
+            attempt: prepared.attempt,
+            dispatch_identity: prepared.dispatch_identity,
+            receipt: serde_json::json!({"owner": "test"}),
+            admitted_at_ms: 13,
+        };
+        let output = ValidatedOutput {
+            output_id: "recovered-output".into(),
+            run_id: "run-1".into(),
+            node_id: "review".into(),
+            activation_id: activation_id(),
+            schema_id: "u32".into(),
+            schema_version: 1,
+            value: serde_json::json!("invalid"),
+            artifact_reference: None,
+            created_at_ms: 14,
+        };
+        assert!(
+            store
+                .recover_owned_dispatch_observation(
+                    &receipt,
+                    &authority,
+                    AttemptObservation::Succeeded {
+                        output: output.clone()
+                    },
+                    14
+                )
+                .is_err()
+        );
+        let attempts = store.attempt_history("run-1", None, 10).expect("attempts");
+        assert_eq!(attempts[0].status, "prepared");
+        assert!(!attempts[0].has_receipt);
+        let mut stale = authority.clone();
+        stale.generation += 1;
+        assert!(
+            store
+                .recover_owned_dispatch_observation(
+                    &receipt,
+                    &stale,
+                    AttemptObservation::Unknown,
+                    14
+                )
+                .is_err()
+        );
+        let summary = store
+            .recover_owned_dispatch_observation(
+                &receipt,
+                &authority,
+                AttemptObservation::Succeeded {
+                    output: ValidatedOutput {
+                        value: serde_json::json!(7),
+                        ..output
+                    },
+                },
+                14,
+            )
+            .expect("recover atomically");
+        assert_eq!(summary.succeeded, vec![receipt.dispatch_identity]);
+        let attempts = store.attempt_history("run-1", None, 10).expect("attempts");
+        assert_eq!(attempts[0].status, "succeeded");
+        assert!(attempts[0].has_receipt);
+    }
+
+    #[test]
+    fn cancellation_admission_recovery_never_enables_redispatch() {
+        let (_temp, mut store) = initialized_store();
+        store
+            .prepare_pending_activation(
+                "run-1",
+                "review",
+                &activation_id(),
+                DispatchSideEffect::ReadOnly,
+                serde_json::json!({"operation": "review"}),
+                12,
+            )
+            .expect("prepare")
+            .expect("activation");
+        for (status, activation_status) in [
+            ("cancelling", "running"),
+            ("sibling_cancelling", "running"),
+            ("cancelling", "cancelled"),
+            ("sibling_cancelling", "repair_required"),
+            ("prepared", "cancelled"),
+        ] {
+            store
+                .connection
+                .execute(
+                    "UPDATE workflow_activations SET status = ?1 WHERE run_id = 'run-1'",
+                    [activation_status],
+                )
+                .expect("activation state");
+            store
+                .connection
+                .execute(
+                    "UPDATE workflow_attempts SET status = ?1 WHERE run_id = 'run-1'",
+                    [status],
+                )
+                .expect("cancellation fixture");
+            let before = store.connection.total_changes();
+            let evidence =
+                prepared_dispatches_scoped(&store.connection, Some("run-1"), 10, false, None)
+                    .expect("evidence");
+            assert_eq!(evidence.len(), 1);
+            assert!(
+                prepared_read_only_dispatches_for_run(&store.connection, "run-1", 10)
+                    .expect("redispatch")
+                    .is_empty()
+            );
+            assert_eq!(store.connection.total_changes(), before);
+        }
+    }
+
+    #[test]
+    fn prepared_recovery_filters_identities_before_limit() {
+        let (_temp, mut store) = initialized_store();
+        store
+            .prepare_pending_activation(
+                "run-1",
+                "review",
+                &activation_id(),
+                DispatchSideEffect::ReadOnly,
+                serde_json::json!({"operation": "review"}),
+                12,
+            )
+            .expect("prepare")
+            .expect("activation");
+        // Two durable attempts make the selected identity fall beyond a one-row prefix.
+        store.connection.execute(
+            "INSERT INTO workflow_attempts (run_id, node_id, activation_id, attempt, dispatch_identity, status, side_effect, intent_json, receipt_json, prepared_at_ms, admitted_at_ms, terminal_at_ms, intent_checksum) SELECT run_id, node_id, activation_id, attempt + 1, 'later-identity', status, side_effect, intent_json, receipt_json, prepared_at_ms + 1, admitted_at_ms, terminal_at_ms, intent_checksum FROM workflow_attempts WHERE run_id = 'run-1'",
+            [],
+        ).expect("second attempt");
+        let selected = vec!["later-identity".to_owned()];
+        let recovered =
+            prepared_dispatches_scoped(&store.connection, Some("run-1"), 1, true, Some(&selected))
+                .expect("selected recovery");
+        assert_eq!(recovered.len(), 1);
+        assert_eq!(recovered[0].dispatch_identity, "later-identity");
+        assert!(
+            prepared_dispatches_scoped(&store.connection, Some("run-1"), 1, true, Some(&[]))
+                .expect("empty selection")
+                .is_empty()
+        );
+    }
+
+    #[test]
     fn prepared_recovery_preserves_absent_and_null_inputs() {
         let (_temp, mut store) = initialized_store();
         store
@@ -24273,6 +24760,32 @@ mod tests {
     }
 
     #[test]
+    fn cancelled_ambiguous_attempt_cannot_be_abandoned_for_retry() {
+        let (_temp, mut store) = initialized_store();
+        let identity = prepare_receipt_backed_attempt(&mut store, DispatchSideEffect::ReadOnly);
+        store
+            .apply_attempt_observation(&identity, AttemptObservation::Unknown, 20)
+            .expect("ambiguous");
+        store.request_cancellation("run-1", 21).expect("cancel");
+        let before = store.attempt_history("run-1", None, 10).expect("before");
+        assert!(
+            store
+                .repair_attempt(
+                    &identity,
+                    &RepairResolution::AbandonForExplicitRetry {
+                        reason: "attempt to retry cancelled work".into(),
+                    },
+                    22
+                )
+                .is_err()
+        );
+        let after = store.attempt_history("run-1", None, 10).expect("after");
+        assert_eq!(after[0].status, before[0].status);
+        assert_eq!(after[0].attempt, before[0].attempt);
+        assert!(store.pending_activations(10).expect("pending").is_empty());
+    }
+
+    #[test]
     fn explicit_operator_retry_remains_distinct_from_ambiguity_repair() {
         let temp = tempfile::tempdir().expect("temp");
         let mut store = initialized_store_at(temp.path());
@@ -24609,6 +25122,74 @@ mod tests {
         );
         assert_eq!(observer.1.load(std::sync::atomic::Ordering::SeqCst), 1);
         assert_eq!(store.connection.total_changes(), before);
+    }
+
+    #[tokio::test]
+    async fn receipt_pages_advance_past_unresolved_attempts() {
+        struct Observer;
+        impl AsyncAttemptStatusObserver for Observer {
+            fn observe_async<'a>(
+                &'a self,
+                _: &'a AttemptReconciliationRequest,
+            ) -> Pin<
+                Box<
+                    dyn Future<Output = Result<AttemptObservation, WorkflowStoreError>> + Send + 'a,
+                >,
+            > {
+                Box::pin(async { Ok(AttemptObservation::Running) })
+            }
+        }
+        let (_temp, mut store) = initialized_store();
+        let identity = prepare_receipt_backed_attempt(&mut store, DispatchSideEffect::Mutating);
+        store.connection.execute_batch("UPDATE workflow_runs SET target_artifact_id = 'artifact-a', coordinator_daemon_instance_id = 'daemon-a', coordinator_generation = 1, coordinator_fencing_token = 'token-a' WHERE run_id = 'run-1';").expect("authority");
+        let authority = store
+            .execution_authority("run-1")
+            .expect("authority")
+            .expect("owner");
+        let (_, cursor) = store
+            .reconcile_owned_receipts_page_async(&Observer, "run-1", &authority, (None, 1), 30)
+            .await
+            .expect("first page");
+        assert_eq!(cursor.as_deref(), Some(identity.as_str()));
+        let mut reopened = WorkflowStore::open_at_path(store.path()).expect("reopen");
+        let (summary, next) = reopened
+            .reconcile_owned_receipts_page_async(
+                &Observer,
+                "run-1",
+                &authority,
+                (cursor.as_deref(), 1),
+                31,
+            )
+            .await
+            .expect("next page");
+        assert!(next.is_none());
+        assert!(summary.succeeded.is_empty());
+        assert_eq!(
+            reopened
+                .attempt_history("run-1", None, 10)
+                .expect("history")[0]
+                .status,
+            "running"
+        );
+        reopened
+            .connection
+            .execute(
+                "UPDATE workflow_runs SET coordinator_generation = 2 WHERE run_id = 'run-1'",
+                [],
+            )
+            .expect("transfer");
+        assert!(
+            reopened
+                .reconcile_owned_receipts_page_async(
+                    &Observer,
+                    "run-1",
+                    &authority,
+                    (cursor.as_deref(), 1),
+                    32
+                )
+                .await
+                .is_err()
+        );
     }
 
     #[tokio::test]

@@ -54,6 +54,24 @@ impl SessionManager {
         .map(|result| result.events)
     }
 
+    /// Look up one admission identity without admitting or starting work.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the session cannot be loaded or its receipt cannot be read.
+    pub async fn turn_receipt(
+        &self,
+        session_id: SessionId,
+        producer: &str,
+        idempotency_key: &str,
+    ) -> Result<Option<bcode_session_models::TurnReceipt>, SessionError> {
+        self.ensure_session_loaded(session_id).await?;
+        self.session_handle(session_id)
+            .await?
+            .turn_receipt(producer.to_owned(), idempotency_key.to_owned())
+            .await
+    }
+
     /// Atomically admit an ordinary turn and return its durable receipt.
     ///
     /// # Errors

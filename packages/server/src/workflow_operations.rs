@@ -1,5 +1,26 @@
 use bcode_workflow_store::WorkflowStoreError;
 
+/// Host policy for explicit attempt repair; evaluated before authority acquisition.
+#[derive(Clone)]
+pub struct WorkflowAttemptRepairPolicy {
+    /// Evaluate canonical repair facts from the application host.
+    pub evaluator: std::sync::Arc<
+        dyn Fn(
+                &bcode_workflow::WorkflowAttemptRepairFacts,
+            ) -> WorkflowApplicationAuthorizationDecision
+            + Send
+            + Sync,
+    >,
+}
+
+impl std::fmt::Debug for WorkflowAttemptRepairPolicy {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("WorkflowAttemptRepairPolicy")
+            .finish_non_exhaustive()
+    }
+}
+
 /// Host policy for executable run graph publication, distinct from staging approval.
 #[derive(Clone)]
 pub struct WorkflowRunGraphPublicationPolicy {
@@ -256,6 +277,42 @@ impl bcode_workflow::WorkflowRunApplication for WorkflowAuthoringApplication<'_>
         self.state
             .require_workflow_store()
             .map_err(run_operation_failure)?;
+        let attempt = self
+            .state
+            .workflow_store
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .attempt_by_dispatch_identity(&dispatch_identity)
+            .map_err(|error| run_operation_failure(error.into()))?
+            .ok_or_else(|| {
+                run_operation_failure(
+                    super::ServerError::WorkflowApplicationOperationUnauthorized(
+                        "repair attempt missing".into(),
+                    ),
+                )
+            })?;
+        let facts = bcode_workflow::WorkflowAttemptRepairFacts {
+            version: 1,
+            actor: bcode_workflow::WorkflowApplicationActor {
+                kind: bcode_workflow::WorkflowApplicationActorKind::LocalClient,
+                actor_id: self.client_id.to_string(),
+            },
+            run_id: attempt.run_id,
+            dispatch_identity: dispatch_identity.clone(),
+            resolution: resolution.clone(),
+        };
+        let decision = self
+            .state
+            .workflow_attempt_repair_policy
+            .as_ref()
+            .map_or(WorkflowApplicationAuthorizationDecision::Allow, |policy| {
+                (policy.evaluator)(&facts)
+            });
+        if let WorkflowApplicationAuthorizationDecision::Deny { reason } = decision {
+            return Err(run_operation_failure(
+                super::ServerError::WorkflowApplicationOperationUnauthorized(reason),
+            ));
+        }
         repair_attempt(self.state, &dispatch_identity, &resolution)
             .await
             .map_err(run_operation_failure)
@@ -6102,28 +6159,14 @@ pub async fn execution_authority(
     };
     if current.daemon_instance_id == state.daemon_status.instance_id {
         verify_current_coordinator_artifact(state, &current)?;
-        let recovering = state
-            .workflow_store
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .is_recovery_only(run_id)?;
-        let session_ownership = if recovering {
-            let session_id = run_parent_session_id(state, run_id)?;
-            Some(
-                state
-                    .sessions
-                    .acquire_session_ownership(
-                        session_id,
-                        bcode_session::SessionOwnershipKind::RuntimeWork,
-                    )
-                    .await
-                    .map_err(|error| {
-                        bcode_workflow_store::WorkflowStoreError::InvalidData(error.to_string())
-                    })?,
-            )
-        } else {
-            None
-        };
+        let session_id = run_parent_session_id(state, run_id)?;
+        let ownership = state
+            .sessions
+            .acquire_session_ownership(session_id, bcode_session::SessionOwnershipKind::RuntimeWork)
+            .await
+            .map_err(|error| {
+                bcode_workflow_store::WorkflowStoreError::InvalidData(error.to_string())
+            })?;
         state
             .workflow_store
             .lock()
@@ -6131,7 +6174,7 @@ pub async fn execution_authority(
             .verify_execution_authority(run_id, &current)?;
         return Ok(Some(AuthorityGuard {
             authority: current,
-            _session_ownership: session_ownership,
+            _session_ownership: Some(ownership),
         }));
     }
     let artifact_id = current_artifact_id(state);
@@ -6159,13 +6202,31 @@ pub async fn execution_authority(
         .map_err(|error| {
             bcode_workflow_store::WorkflowStoreError::InvalidData(error.to_string())
         })?;
+    // Another caller in this daemon may have transferred while we acquired the
+    // session lease. Reuse only verified authority for this exact daemon/artifact.
+    let latest = state
+        .workflow_store
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .execution_authority(run_id)?;
+    if let Some(latest) = latest.filter(|owner| authority_targets_current_daemon(state, owner)) {
+        state
+            .workflow_store
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .verify_execution_authority(run_id, &latest)?;
+        return Ok(Some(AuthorityGuard {
+            authority: latest,
+            _session_ownership: Some(session_ownership),
+        }));
+    }
     let replacement = bcode_workflow_store::WorkflowExecutionAuthority {
         target_artifact_id: artifact_id.clone(),
         daemon_instance_id: state.daemon_status.instance_id.clone(),
         generation: current.generation.saturating_add(1),
         fencing_token: uuid::Uuid::new_v4().to_string(),
     };
-    transfer_ended_workflow_owner(state, run_id, &current, &replacement)?;
+    let replacement = transfer_ended_workflow_owner(state, run_id, &current, &replacement)?;
     Ok(Some(AuthorityGuard {
         authority: replacement,
         _session_ownership: Some(session_ownership),
@@ -6177,12 +6238,18 @@ fn transfer_ended_workflow_owner(
     run_id: &str,
     current: &bcode_workflow_store::WorkflowExecutionAuthority,
     replacement: &bcode_workflow_store::WorkflowExecutionAuthority,
-) -> Result<(), super::ServerError> {
+) -> Result<bcode_workflow_store::WorkflowExecutionAuthority, super::ServerError> {
     let now_ms = super::current_unix_millis();
     let mut store = state
         .workflow_store
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if let Some(latest) = store.execution_authority(run_id)?
+        && authority_targets_current_daemon(state, &latest)
+    {
+        store.verify_execution_authority(run_id, &latest)?;
+        return Ok(latest);
+    }
     let terminal_descendant = store.run_summary(run_id)?.is_some_and(|run| {
         matches!(
             run.status,
@@ -6225,7 +6292,7 @@ fn transfer_ended_workflow_owner(
         );
     }
     drop(store);
-    Ok(())
+    Ok(replacement.clone())
 }
 
 pub fn validate_workflow_definition_for_production(
@@ -7220,7 +7287,9 @@ pub async fn cancel_run(
         let mut targets = Vec::new();
         if matches!(
             root.status,
-            bcode_workflow_store::RunStatus::Running | bcode_workflow_store::RunStatus::Paused
+            bcode_workflow_store::RunStatus::Running
+                | bcode_workflow_store::RunStatus::Paused
+                | bcode_workflow_store::RunStatus::RepairRequired
         ) {
             targets.push(run_id.to_string());
         }
@@ -7232,6 +7301,7 @@ pub async fn cancel_run(
                         descendant.run.status,
                         bcode_workflow_store::RunStatus::Running
                             | bcode_workflow_store::RunStatus::Paused
+                            | bcode_workflow_store::RunStatus::RepairRequired
                     )
                 })
                 .map(|descendant| descendant.run.run_id),
@@ -9501,6 +9571,17 @@ pub async fn repair_attempt(
                 "workflow repair requires durable execution authority".to_string(),
             )
         })?;
+    state.start_workflow_driver().await;
+    let sender = state.workflow_driver_sender.get().ok_or_else(|| {
+        super::ServerError::WorkflowApplicationOperationUnauthorized(
+            "workflow scheduler is unavailable".to_string(),
+        )
+    })?;
+    let permit = sender.try_reserve().map_err(|_| {
+        super::ServerError::WorkflowApplicationOperationUnauthorized(
+            "workflow scheduler is unavailable or full".to_string(),
+        )
+    })?;
     let started_at = std::time::Instant::now();
     let result = state
         .workflow_store
@@ -9512,7 +9593,9 @@ pub async fn repair_attempt(
             super::current_unix_millis(),
             &authority.authority,
         )?;
-    super::drive_workflow_run(state, &attempt.run_id).await?;
+    // A committed repair returns independently of execution. Reserve before mutation so
+    // unavailable scheduling rejects without committing; durable discovery recovers lost wakes.
+    permit.send(attempt.run_id.clone());
     let resolution_label = match resolution {
         bcode_workflow_store::RepairResolution::ConfirmSucceeded { .. } => "confirm_succeeded",
         bcode_workflow_store::RepairResolution::ConfirmFailed { .. } => "confirm_failed",
