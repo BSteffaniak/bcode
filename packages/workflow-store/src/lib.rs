@@ -2332,6 +2332,54 @@ impl WorkflowStore {
         Ok(())
     }
 
+    /// Read an exact immutable published package lock, verifying its stored digest.
+    ///
+    /// No latest-publication fallback is permitted. The encoded lock is bounded
+    /// before allocation; it remains package-owned binding data, not run authority.
+    ///
+    /// # Errors
+    /// Returns an error for malformed input, oversized/corrupt lock data, unsupported
+    /// lock versions, or storage failures.
+    pub fn workflow_package_lock(
+        &self,
+        package_id: &str,
+        digest: &str,
+    ) -> Result<Option<WorkflowPackageLock>, WorkflowStoreError> {
+        validate_id("package_id", package_id)?;
+        validate_id("package_lock_digest_sha256", digest)?;
+        let encoded = self.connection.query_row(
+            "SELECT length(CAST(lock_json AS BLOB)), CASE WHEN length(CAST(lock_json AS BLOB)) <= ?3 THEN lock_json END \
+             FROM workflow_package_publications WHERE package_id = ?1 AND package_lock_digest_sha256 = ?2",
+            rusqlite::params![package_id, digest, MAX_INLINE_JSON_BYTES],
+            |row| Ok((row.get::<_, usize>(0)?, row.get::<_, Option<String>>(1)?)),
+        ).optional()?;
+        let Some((bytes, json)) = encoded else {
+            return Ok(None);
+        };
+        if bytes > MAX_INLINE_JSON_BYTES {
+            return Err(WorkflowStoreError::InvalidData(
+                "published package lock exceeds byte budget".into(),
+            ));
+        }
+        let json = json.ok_or_else(|| {
+            WorkflowStoreError::InvalidData("published package lock is missing".into())
+        })?;
+        if sha256_hex(json.as_bytes()) != digest {
+            return Err(WorkflowStoreError::InvalidData(
+                "published package lock checksum mismatch".into(),
+            ));
+        }
+        let lock: WorkflowPackageLock = serde_json::from_str(&json)?;
+        lock.validate()
+            .map_err(|error| WorkflowStoreError::InvalidData(error.to_string()))?;
+        if lock.package_id != package_id {
+            return Err(WorkflowStoreError::InvalidData(
+                "published package lock identity mismatch".into(),
+            ));
+        }
+        Ok(Some(lock))
+    }
+
     /// Read one exact or latest bounded package publication receipt.
     ///
     /// # Errors
@@ -16845,6 +16893,18 @@ mod tests {
             .expect("receipt after restart")
             .expect("receipt");
         assert_eq!(receipt.exports, published_lock.exports);
+        assert_eq!(
+            reopened
+                .workflow_package_lock("example/package", &receipt.package_lock_digest_sha256)
+                .unwrap(),
+            Some(published_lock)
+        );
+        assert!(
+            reopened
+                .workflow_package_lock("example/package", &"0".repeat(64))
+                .unwrap()
+                .is_none()
+        );
         assert_eq!(receipt.published_at_ms, 20);
         let mut store = reopened;
         let mut stale = request;

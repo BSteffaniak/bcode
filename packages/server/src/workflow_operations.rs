@@ -1504,21 +1504,39 @@ pub async fn start_package_export(
     request: bcode_workflow::StartWorkflowPackageExportRequest,
 ) -> Result<bcode_workflow::WorkflowPackageExportRunStartResponse, super::ServerError> {
     request.package_export.validate()?;
-    let receipt = state
-        .workflow_store
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .workflow_package_publication(
-            &request.package_export.package_id,
-            request.package_export.package_lock_digest_sha256.as_deref(),
-        )?
-        .ok_or_else(|| {
-            bcode_workflow_store::WorkflowStoreError::InvalidData(format!(
-                "published workflow package not found: {}",
-                request.package_export.package_id
-            ))
-        })?;
-    let exported = receipt
+    let (receipt, lock) = {
+        let store = state
+            .workflow_store
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let receipt = store
+            .workflow_package_publication(
+                &request.package_export.package_id,
+                request.package_export.package_lock_digest_sha256.as_deref(),
+            )?
+            .ok_or_else(|| {
+                bcode_workflow_store::WorkflowStoreError::InvalidData(format!(
+                    "published workflow package not found: {}",
+                    request.package_export.package_id
+                ))
+            })?;
+        let lock = store
+            .workflow_package_lock(&receipt.package_id, &receipt.package_lock_digest_sha256)?
+            .ok_or_else(|| {
+                bcode_workflow_store::WorkflowStoreError::InvalidData(
+                    "published workflow package lock is missing".into(),
+                )
+            })?;
+        drop(store);
+        if lock.exports != receipt.exports {
+            return Err(bcode_workflow_store::WorkflowStoreError::InvalidData(
+                "published workflow package receipt disagrees with exact lock".into(),
+            )
+            .into());
+        }
+        (receipt, lock)
+    };
+    let exported = lock
         .exports
         .iter()
         .find(|export| export.export == request.package_export.export)

@@ -1,5 +1,29 @@
 # Workflow Persistence Architecture
 
+## Package-local execution binding (approved; not yet implemented)
+
+Package-local calls resolve against an immutable run-owned `(package_id, lock_digest)`
+binding, using the existing exact published package lock. No separate procedure-bundle
+store is needed. The binding is execution data, never diagnostic authored provenance or
+presentation metadata. Definitions retain local member references rather than embedding
+their containing lock digest in their own content hashes.
+
+Package export admission must validate the selected export against the exact lock and
+persist the binding in the same transaction as run creation. A duplicate admission must
+match the original binding; it cannot change a running execution's resolution context.
+Package-local child admission resolves the member against that pinned lock and atomically
+inherits the binding with child creation and parent linkage, under current execution
+authority. Other exact-definition calls do not implicitly inherit package context.
+Missing bindings, unsupported locks, and inconsistent member identities fail closed;
+resolution must never substitute the latest package publication.
+
+The durable schema upgrade must preserve existing runs as unbound, without inferring
+bindings from authored provenance or current publications. Public and persisted contract
+compatibility must be updated with the implementation. Recursive procedure reuse must
+remain distinct from cyclic run ownership: each invocation creates a fresh child run,
+subject to explicit configurable execution/resource policy. Compiler analysis must resolve
+recursive references without recursively expanding unbounded preview paths.
+
 ## Pending publication storage (partial implementation)
 
 Schema 31 adds pending acceptance and exact attempt-intent records. The store acceptance
