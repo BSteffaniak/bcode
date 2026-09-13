@@ -1319,6 +1319,16 @@ mod bridge_size_tests {
     }
 }
 
+struct AbandonedAsyncBridgeRequest(Option<ServiceCancellation>);
+
+impl Drop for AbandonedAsyncBridgeRequest {
+    fn drop(&mut self) {
+        if let Some(cancellation) = &self.0 {
+            cancellation.cancel();
+        }
+    }
+}
+
 impl AsyncServiceBridge {
     /// Create a bridge from an owned asynchronous handler.
     #[must_use]
@@ -1339,7 +1349,9 @@ impl AsyncServiceBridge {
     /// Await a bounded, correlated reply without a synchronous fallback.
     ///
     /// Cancellation is checked before handler admission and after completion; the handler
-    /// receives the same cancellation signal to wake its own pending work.
+    /// receives the same cancellation signal to wake its own pending work. Dropping an admitted
+    /// request before its handler returns cancels that signal, including other work sharing it.
+    /// This requests cleanup; it does not acknowledge release of separately spawned work.
     /// Size validation stops at the limit without allocating encoded payloads; oversized
     /// error sizes are lower bounds rather than exact encoded lengths.
     ///
@@ -1362,7 +1374,9 @@ impl AsyncServiceBridge {
                 maximum: SERVICE_BRIDGE_MAX_REQUEST_BYTES,
             });
         }
+        let mut abandonment = AbandonedAsyncBridgeRequest(Some(cancellation.clone()));
         let response = (self.handler)(request.clone(), cancellation.clone()).await;
+        abandonment.0 = None;
         if cancellation.is_cancelled() {
             return Err(ServiceBridgeError::Cancelled);
         }
@@ -3690,6 +3704,33 @@ mod tests {
             std::ptr::copy_nonoverlapping(encoded.as_ptr(), output_ptr, encoded.len());
         }
         SERVICE_BRIDGE_STATUS_OK
+    }
+
+    #[test]
+    fn async_bridge_abandonment_cancels_only_admitted_pending_requests() {
+        use std::future::Future as _;
+        let bridge = super::AsyncServiceBridge::new(|_, _| std::future::pending());
+        let request = || ServiceBridgeRequest::ReceiveInput {
+            invocation_id: "invocation".into(),
+            timeout_ms: None,
+        };
+        let cancellation = ServiceCancellation::default();
+        drop(bridge.request(request(), cancellation.clone()));
+        assert!(!cancellation.is_cancelled());
+        let mut pending = Box::pin(bridge.request(request(), cancellation.clone()));
+        let mut context = std::task::Context::from_waker(std::task::Waker::noop());
+        assert!(pending.as_mut().poll(&mut context).is_pending());
+        drop(pending);
+        assert!(cancellation.is_cancelled());
+
+        let completed = super::AsyncServiceBridge::new(|_, _| async {
+            Err(super::ServiceBridgeError::Cancelled)
+        });
+        let cancellation = ServiceCancellation::default();
+        let mut ready = Box::pin(completed.request(request(), cancellation.clone()));
+        assert!(ready.as_mut().poll(&mut context).is_ready());
+        drop(ready);
+        assert!(!cancellation.is_cancelled());
     }
 
     #[test]

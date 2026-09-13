@@ -2319,6 +2319,18 @@ impl PluginResourceLimiter {
         }
     }
 
+    fn close(&self) {
+        self.global.close();
+        for semaphore in self
+            .per_session
+            .lock()
+            .expect("plugin resource limiter session map locks")
+            .values()
+        {
+            semaphore.close();
+        }
+    }
+
     async fn acquire(
         &self,
         scope: &PluginInvocationScope,
@@ -2368,7 +2380,13 @@ impl PluginResourceLimiter {
             .lock()
             .expect("plugin resource limiter session map locks")
             .entry(session_id.to_string())
-            .or_insert_with(|| Arc::new(Semaphore::new(self.max_per_session)))
+            .or_insert_with(|| {
+                let semaphore = Arc::new(Semaphore::new(self.max_per_session));
+                if self.global.is_closed() {
+                    semaphore.close();
+                }
+                semaphore
+            })
             .clone()
     }
 }
@@ -4471,8 +4489,10 @@ impl PluginRuntimeHost {
 
     /// Deactivate all loaded plugins through their plugin-local executors.
     ///
-    /// Permanently closes asynchronous event admission when called, even if the returned
-    /// future is never polled. Closure applies across this host and its clones. The future
+    /// Permanently closes service resource admission and asynchronous event admission when
+    /// called, even if the returned future is never polled. Pending resource waiters are
+    /// rejected; already admitted work retains its permits until completion. Closure applies
+    /// across this host and its clones. The future
     /// drains admitted events, then deactivates plugin executors. Retain
     /// the host after a failed or abandoned wait to preserve cleanup ownership.
     ///
@@ -4484,6 +4504,7 @@ impl PluginRuntimeHost {
     pub fn deactivate_all(
         &self,
     ) -> impl std::future::Future<Output = Result<(), PluginLoadError>> + Send + '_ {
+        self.resources.close();
         for dispatcher in self.event_dispatchers.values() {
             dispatcher.shutdown.send_replace(true);
         }
@@ -8609,6 +8630,55 @@ library = "libexample_plugin.dylib"
         }
         drop(executor);
         assert!(messages.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn abandoned_host_shutdown_closes_resource_waiters() {
+        let host = PluginRuntimeHost::from(PluginHost::default());
+        let clone = host.clone();
+        let scope = PluginInvocationScope::Session {
+            session_id: "shutdown-session".to_owned(),
+            client_id: None,
+            turn_id: None,
+            work_id: None,
+        };
+        let limiter = &host.resources;
+        let mut permits = Vec::new();
+        for _ in 0..limiter.max_per_session {
+            permits.push(limiter.acquire(&scope).await.unwrap());
+        }
+        let mut waiting = Box::pin(clone.resources.acquire(&scope));
+        std::future::poll_fn(|cx| {
+            assert!(std::future::Future::poll(waiting.as_mut(), cx).is_pending());
+            std::task::Poll::Ready(())
+        })
+        .await;
+        drop(host.deactivate_all());
+        assert!(waiting.await.is_err());
+        assert!(
+            clone
+                .resources
+                .acquire(&PluginInvocationScope::Global)
+                .await
+                .is_err()
+        );
+        assert!(
+            clone
+                .resources
+                .acquire(&PluginInvocationScope::Session {
+                    session_id: "new-session".to_owned(),
+                    client_id: None,
+                    turn_id: None,
+                    work_id: None,
+                })
+                .await
+                .is_err()
+        );
+        assert_eq!(limiter.active_session_count(&scope), Some(permits.len()));
+        drop(permits);
+        drop(clone);
+        host.deactivate_all().await.unwrap();
+        drop(host);
     }
 
     #[tokio::test]

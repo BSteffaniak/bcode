@@ -1508,6 +1508,7 @@ async fn run_controlled_provider_context() -> bcode::Result<()> {
                     storage_profile: "stored-profile".into(),
                     vault: "/fixture/not-a-real-vault".into(),
                     provider: "openai".into(),
+                    owner_plugin_id: Some("context-provider".into()),
                     scheme: "api_key".into(),
                     ..Default::default()
                 }],
@@ -1533,8 +1534,7 @@ async fn run_controlled_provider_context() -> bcode::Result<()> {
             }
         },
     );
-    let sdk = sdk.build();
-    let context = sdk.provider_context().clone();
+    let context = sdk.clone().build().provider_context().clone();
     assert_eq!(acquisitions, ["context-profile"]);
     assert_eq!(context.auth_pool.as_deref(), Some("context-pool"));
     assert_eq!(context.auth_profile.as_deref(), Some("context-profile"));
@@ -1553,32 +1553,63 @@ async fn run_controlled_provider_context() -> bcode::Result<()> {
         session_id,
         turn_id: "controlled-context".into(),
     }])?;
-    let agent = sdk
-        .agent_from_context(session_id, "/fixture".into())
-        .runtime(AgentRuntime::new().with_provider_request_identity_source(Arc::new(identities)))
-        .build();
-    struct ContextProvider(bcode::ProviderRequestContext);
+    struct ContextProvider {
+        context: bcode::ProviderRequestContext,
+        released: bcode::CancellationToken,
+    }
+    impl Drop for ContextProvider {
+        fn drop(&mut self) {
+            self.released.cancel();
+        }
+    }
     impl bcode::InProcessModelProvider for ContextProvider {
         fn run_turn(
             &self,
             request: bcode_model::ModelTurnRequest,
             _context: bcode::InProcessProviderContext,
         ) -> bcode::InProcessProviderFuture<'_> {
-            assert_eq!(request.provider_context, self.0);
+            assert_eq!(request.provider_context, self.context);
             assert_eq!(request.model_id, "context-model");
             Box::pin(async { Ok(bcode::InProcessProviderOutcome::EndTurn) })
         }
     }
-    let mut provider = bcode::InProcessModelProviderAdapter::new(ContextProvider(context));
-    let response = agent
-        .generate_text_with_provider(&mut provider, "controlled context")
-        .await;
-    provider.shutdown_wait().await?;
+    let released = bcode::CancellationToken::new();
+    let provider_released = released.clone();
+    let acquisitions = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let observed_acquisitions = acquisitions.clone();
+    let sdk = sdk
+        .runtime(AgentRuntime::new().with_provider_request_identity_source(Arc::new(identities)))
+        .provider_factory(move || {
+            observed_acquisitions.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Box::new(bcode::InProcessModelProviderAdapter::new(ContextProvider {
+                context: context.clone(),
+                released: provider_released.clone(),
+            }))
+        })
+        .build();
+    let agent = sdk
+        .agent_from_context(session_id, "/fixture".into())
+        .build();
+    assert_eq!(acquisitions.load(std::sync::atomic::Ordering::SeqCst), 0);
+    let response = agent.generate_text("controlled context").await?;
+    assert_eq!(acquisitions.load(std::sync::atomic::Ordering::SeqCst), 1);
+    switchy::unsync::select! {
+        () = released.cancelled() => {},
+        () = switchy::unsync::time::sleep(Duration::from_secs(2)) => {
+            panic!("SDK-owned provider was not released")
+        },
+    }
     assert_eq!(
-        response?.runtime.stop_reason,
+        response.runtime.stop_reason,
         Some(bcode::StopReason::EndTurn)
     );
     Ok(())
+}
+
+#[cfg(all(test, feature = "config", not(feature = "simulation-example")))]
+#[test]
+fn controlled_context_uses_sdk_provider_acquisition() {
+    run_native(run_controlled_provider_context()).unwrap();
 }
 
 async fn run() -> bcode::Result<()> {
