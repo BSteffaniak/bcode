@@ -5839,8 +5839,12 @@ pub fn plan_workflow_package(
         let identity = compiled.definition_identity;
         lowering.document.definition = compiled.definition.clone();
         let closure = workflow_package_member_closure(member, &members)?;
-        let source_digest = lowering.document.source_digest_sha256()?;
-        let executable_digest = lowering.document.executable_source_digest_sha256()?;
+        let normalized_document = lowering.document.normalized()?;
+        let source_digest = canonical_sha256(&normalized_document, "workflow")?;
+        let executable_digest = canonical_sha256(
+            &normalized_document.executable_semantics(),
+            "workflow.executable_source",
+        )?;
         identities.insert(member.member_id.clone(), identity.clone());
         resolved_catalog
             .workflow_definitions
@@ -17005,6 +17009,22 @@ mod tests {
         };
         let plan = plan_workflow_package(&manifest, &authoring_catalog()).expect("plan");
         let member = &plan.members[0];
+        assert_eq!(
+            plan.lock.members[0].source_digest_sha256,
+            member
+                .lowering
+                .document
+                .source_digest_sha256()
+                .expect("source digest")
+        );
+        assert_eq!(
+            plan.lock.members[0].executable_digest_sha256,
+            member
+                .lowering
+                .document
+                .executable_source_digest_sha256()
+                .expect("executable digest")
+        );
         assert_eq!(
             member.definition_identity,
             WorkflowDefinitionIdentity::for_definition(
