@@ -14,7 +14,7 @@ version     = { workspace = true }
 bcode_agent_policy_models    = { workspace = true }
 bcode_command                = { workspace = true }
 bcode_model                  = { workspace = true }
-bcode_plugin                 = { workspace = true }
+bcode_plugin_models          = { workspace = true }
 bcode_plugin_sdk             = { workspace = true }
 bcode_session_view_models    = { workspace = true }
 bcode_skill_models           = { workspace = true }

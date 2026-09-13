@@ -1588,6 +1588,80 @@ impl WorkflowStore {
             .collect()
     }
 
+    /// Read a complete definition snapshot or reject it before payload loading.
+    ///
+    /// Unlike a listing window, this must not be used as a partial compilation catalog.
+    /// The row check visits at most `limit + 1` index entries; no full count is needed.
+    ///
+    /// # Errors
+    /// Returns an error for invalid limits, row/byte budget overflow, checksum damage,
+    /// or storage failure. Larger stores remain intact and accessible by exact lookup.
+    pub fn definition_snapshot_with_budget(
+        &self,
+        limit: usize,
+        byte_budget: usize,
+    ) -> Result<Vec<StoredWorkflowDefinition>, WorkflowStoreError> {
+        let row_limit = bounded_limit(limit)?;
+        // Pin the same SQLite read snapshot for lookahead and payload reads.
+        let transaction = self.connection.unchecked_transaction()?;
+        let count: i64 = transaction.query_row(
+            "SELECT count(*) FROM (SELECT definition_id FROM workflow_definitions LIMIT ?1)",
+            [row_limit + 1],
+            |row| row.get(0),
+        )?;
+        if count > row_limit {
+            return Err(WorkflowStoreError::InvalidData(
+                "complete definition snapshot exceeds row budget; use exact definition resolution"
+                    .into(),
+            ));
+        }
+        let definitions = self.list_definitions_with_byte_budget(limit, byte_budget)?;
+        transaction.commit()?;
+        Ok(definitions)
+    }
+
+    /// Read a row-limited definition window within an aggregate encoded-JSON budget.
+    ///
+    /// Payload lengths are checked before loading JSON. An oversized window is an
+    /// error, never a partial success. This bounds encoded input, not decoded heap.
+    ///
+    /// # Errors
+    /// Returns an error for invalid limits, exceeded budget, checksum damage, or storage failure.
+    pub fn list_definitions_with_byte_budget(
+        &self,
+        limit: usize,
+        byte_budget: usize,
+    ) -> Result<Vec<StoredWorkflowDefinition>, WorkflowStoreError> {
+        let limit = bounded_limit(limit)?;
+        if byte_budget == 0 {
+            return Err(WorkflowStoreError::InvalidData(
+                "definition byte budget must be positive".into(),
+            ));
+        }
+        let mut statement = self.connection.prepare(
+            "SELECT definition_id, version, length(CAST(definition_json AS BLOB)) \
+             FROM workflow_definitions ORDER BY definition_id, version DESC LIMIT ?1",
+        )?;
+        let mut rows = statement.query([limit])?;
+        let mut remaining = byte_budget;
+        let mut definitions = Vec::new();
+        while let Some(row) = rows.next()? {
+            let bytes: usize = row.get(2)?;
+            remaining = remaining.checked_sub(bytes).ok_or_else(|| {
+                WorkflowStoreError::InvalidData(
+                    "definition window exceeds encoded byte budget".into(),
+                )
+            })?;
+            let id: String = row.get(0)?;
+            let version = row.get(1)?;
+            let stored = self.definition(&id, version)?.ok_or_else(|| {
+                WorkflowStoreError::InvalidData("definition disappeared during bounded read".into())
+            })?;
+            definitions.push(stored);
+        }
+        Ok(definitions)
+    }
+
     /// Create a logical authored workflow and its initial draft atomically.
     ///
     /// # Errors
@@ -39316,6 +39390,37 @@ mod tests {
             workflow_database_path(Path::new("/state")),
             Path::new("/state/workflows/workflow.db")
         );
+    }
+
+    #[test]
+    fn definition_window_enforces_aggregate_budget_without_partial_success() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut store = WorkflowStore::open_in_state_dir(temp.path()).unwrap();
+        let first = store.persist_definition("a", 1, &definition("a")).unwrap();
+        let second = store.persist_definition("b", 1, &definition("b")).unwrap();
+        let bytes = first.definition_json.len() + second.definition_json.len();
+        assert!(store.definition_snapshot_with_budget(1, bytes).is_err());
+        assert_eq!(
+            store.definition_snapshot_with_budget(2, bytes).unwrap(),
+            vec![first.clone(), second.clone()]
+        );
+        assert!(store.definition_snapshot_with_budget(2, bytes - 1).is_err());
+        assert_eq!(
+            store.list_definitions_with_byte_budget(2, bytes).unwrap(),
+            vec![first.clone(), second]
+        );
+        assert!(
+            store
+                .list_definitions_with_byte_budget(2, bytes - 1)
+                .is_err()
+        );
+        assert_eq!(
+            store
+                .list_definitions_with_byte_budget(1, first.definition_json.len())
+                .unwrap(),
+            vec![first]
+        );
+        assert!(store.list_definitions_with_byte_budget(1, 0).is_err());
     }
 
     #[test]

@@ -33,16 +33,14 @@ Rules are ordinary Rust predicates, not a rule language or an exhaustive permitt
 Tests exercise graph traversal with renamed, transitive, build-only, dev-only, and cyclic edges.
 The graph cannot detect business logic hidden inside an otherwise permitted crate.
 
-## Existing blocker surfaced by the checker
+## Portable plugin contracts
 
-Isolated default-feature profiles currently expose:
-
-* `bcode_session_view -> bcode_ipc -> bcode_plugin -> bmux_plugin -> bmux_tui`
-* `bcode_hyperchad -> bcode_ipc -> bcode_plugin -> bmux_plugin -> bmux_tui`
-
-These are reported failures, not allowed exceptions. Restoring portable boundaries requires a
-separate IPC/plugin dependency refactor; source-scanner removal does not authorize weakening the
-renderer-neutrality invariant. The new CI job therefore remains blocking until those paths are fixed.
+IPC and configuration consume plugin-owned metadata from `bcode_plugin_models`, not the
+concrete plugin runtime. Template descriptors parameterize workflow schema/definition types;
+runtime loading and validation remain in `bcode_plugin`. Selection and visual-route metadata
+retain their existing representation while rendering and route selection remain outside models.
+This removes the former IPC/config paths through `bcode_plugin -> bmux_plugin -> bmux_tui`.
+The resolved dependency check enforces portable frontend boundaries; no exception was added.
 
 The minimal app already uses the bundled-plugin registry and `zstd` through `bmux_codec`.
 Registry plumbing and codec compression are not evidence that optional search providers are enabled;

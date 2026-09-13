@@ -4,7 +4,7 @@
 
 //! Configuration loading for Bcode.
 
-use bcode_plugin::PluginSelection;
+use bcode_plugin_models::PluginSelection;
 use bcode_plugin_sdk::path::display_from_current_dir;
 use bcode_skill_models::SkillId;
 pub use hyperchad_docs_config::{ConfigDocSchema, FieldDoc, NestedFieldDoc};
@@ -2401,8 +2401,8 @@ impl TuiVisualAdapterConfig {
     #[must_use]
     pub fn order_routes(
         &self,
-        routes: Vec<bcode_plugin::PluginVisualAdapterRoute>,
-    ) -> Vec<bcode_plugin::PluginVisualAdapterRoute> {
+        routes: Vec<bcode_plugin_models::PluginVisualAdapterRoute>,
+    ) -> Vec<bcode_plugin_models::PluginVisualAdapterRoute> {
         let preferred = self
             .preferred
             .iter()
@@ -4258,9 +4258,9 @@ impl From<&PluginConfig> for PluginSelection {
     fn from(value: &PluginConfig) -> Self {
         Self {
             mode: match value.default {
-                PluginDefaultMode::All => bcode_plugin::PluginSelectionMode::All,
+                PluginDefaultMode::All => bcode_plugin_models::PluginSelectionMode::All,
                 PluginDefaultMode::Bundled | PluginDefaultMode::None => {
-                    bcode_plugin::PluginSelectionMode::Explicit
+                    bcode_plugin_models::PluginSelectionMode::Explicit
                 }
             },
             enabled: value.enabled.clone(),
@@ -8977,7 +8977,7 @@ mod tests {
         upsert_agent_permission_rule, validate_config,
     };
     use bcode_agent_policy_models::Action;
-    use bcode_plugin::{PluginSelection, PluginSelectionMode};
+    use bcode_plugin_models::{PluginSelection, PluginSelectionMode};
     use std::collections::{BTreeMap, BTreeSet};
     use std::path::PathBuf;
     use std::sync::Mutex;
@@ -12740,16 +12740,17 @@ extends = ["a"]
 
     #[test]
     fn visual_adapter_preferences_override_defaults_and_disabled_routes_are_removed() {
-        let route = |plugin_id: &str, adapter_id: &str| bcode_plugin::PluginVisualAdapterRoute {
-            plugin_id: plugin_id.to_owned(),
-            adapter_id: adapter_id.to_owned(),
-            schema: "test.visual".to_owned(),
-            service_interface_id: bcode_tool::TOOL_SERVICE_INTERFACE_ID.to_owned(),
-            surfaces: vec!["tui".to_owned()],
-            priority: 0,
-            producer_default: false,
-            render_mode: bcode_plugin::PluginVisualAdapterRenderMode::TranscriptBlock,
-        };
+        let route =
+            |plugin_id: &str, adapter_id: &str| bcode_plugin_models::PluginVisualAdapterRoute {
+                plugin_id: plugin_id.to_owned(),
+                adapter_id: adapter_id.to_owned(),
+                schema: "test.visual".to_owned(),
+                service_interface_id: bcode_tool::TOOL_SERVICE_INTERFACE_ID.to_owned(),
+                surfaces: vec!["tui".to_owned()],
+                priority: 0,
+                producer_default: false,
+                render_mode: bcode_plugin_models::PluginVisualAdapterRenderMode::TranscriptBlock,
+            };
         let config = TuiVisualAdapterConfig {
             preferred: vec!["user/custom".to_owned()],
             disabled: BTreeSet::from(["bcode/disabled".to_owned()]),

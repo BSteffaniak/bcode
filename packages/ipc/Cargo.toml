@@ -17,7 +17,7 @@ bcode_config               = { workspace = true }
 bcode_metrics              = { workspace = true }
 bcode_model                = { workspace = true }
 bcode_model_catalog_models = { workspace = true }
-bcode_plugin               = { workspace = true }
+bcode_plugin_models        = { workspace = true }
 bcode_plugin_sdk           = { workspace = true }
 bcode_provider_auth_models = { workspace = true }
 bcode_ralph_models         = { workspace = true }

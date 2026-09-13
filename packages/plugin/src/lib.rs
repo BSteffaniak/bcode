@@ -396,6 +396,34 @@ pub struct WorkflowTemplateContribution {
 }
 
 impl WorkflowTemplateContribution {
+    /// Project serialized metadata without retaining runtime-loaded authoring state.
+    #[must_use]
+    pub fn descriptor(
+        &self,
+    ) -> bcode_plugin_models::WorkflowTemplateDescriptor<
+        bcode_workflow::ValueSchema,
+        bcode_workflow::WorkflowDefinition,
+    > {
+        bcode_plugin_models::WorkflowTemplateDescriptor {
+            contribution_version: self.contribution_version,
+            template_id: self.template_id.clone(),
+            template_version: self.template_version,
+            title: self.title.clone(),
+            description: self.description.clone(),
+            configuration_schema: self.configuration_schema.clone(),
+            definition: self.definition.clone(),
+            document_source: self.document_source.as_ref().map(|source| {
+                bcode_plugin_models::WorkflowTemplateDocumentSource {
+                    path: source.path.clone(),
+                    sha256: source.sha256.clone(),
+                }
+            }),
+            required_plugins: self.required_plugins.clone(),
+            required_capabilities: self.required_capabilities.clone(),
+            presentation: self.presentation.clone(),
+        }
+    }
+
     /// Return the normalized standard authoring document for an external template.
     #[must_use]
     pub const fn authoring_document(&self) -> Option<&bcode_workflow::WorkflowAuthoringDocument> {
@@ -614,16 +642,6 @@ fn default_tool_service_interface_id() -> String {
     bcode_tool::TOOL_SERVICE_INTERFACE_ID.to_owned()
 }
 
-/// How a visual adapter's rows should be composed into host transcript chrome.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum PluginVisualAdapterRenderMode {
-    #[default]
-    Inline,
-    TranscriptBlock,
-    FullBlock,
-}
-
 /// Visual adapter capability declared by a plugin manifest.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PluginVisualAdapterDeclaration {
@@ -798,8 +816,9 @@ pub struct PluginTuiSurfaceDeclaration {
 }
 
 pub use bcode_plugin_models::{
-    PluginCommandContribution, PluginConfigAlias, PluginConfigExtension,
-    PluginOwnedCommandContribution,
+    PluginCommandContribution, PluginConcurrency, PluginConfigAlias, PluginConfigExtension,
+    PluginExecutorStatus, PluginOwnedCommandContribution, PluginSelection, PluginSelectionMode,
+    PluginVisualAdapterRenderMode, PluginVisualAdapterRoute,
 };
 
 /// Service interface declared by a plugin manifest.
@@ -939,57 +958,6 @@ impl NativePluginRuntime {
     #[must_use]
     pub const fn is_current_abi(&self) -> bool {
         self.abi_version == CURRENT_PLUGIN_ABI_VERSION
-    }
-}
-
-/// Plugin default selection mode.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub enum PluginSelectionMode {
-    /// Enable all candidates unless disabled.
-    All,
-    /// Enable only explicitly selected plugin IDs.
-    #[default]
-    Explicit,
-}
-
-/// Plugin enable/disable selection policy.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct PluginSelection {
-    pub mode: PluginSelectionMode,
-    pub enabled: BTreeSet<String>,
-    pub disabled: BTreeSet<String>,
-}
-
-impl Default for PluginSelection {
-    fn default() -> Self {
-        Self {
-            mode: PluginSelectionMode::Explicit,
-            enabled: BTreeSet::new(),
-            disabled: BTreeSet::new(),
-        }
-    }
-}
-
-impl PluginSelection {
-    /// Return a policy where all discovered plugins are enabled unless disabled.
-    #[must_use]
-    pub fn all_enabled() -> Self {
-        Self {
-            mode: PluginSelectionMode::All,
-            ..Self::default()
-        }
-    }
-
-    /// Return true when the plugin ID is enabled by this selection policy.
-    #[must_use]
-    pub fn is_enabled(&self, plugin_id: &str) -> bool {
-        if self.disabled.contains(plugin_id) {
-            return false;
-        }
-        match self.mode {
-            PluginSelectionMode::All => true,
-            PluginSelectionMode::Explicit => self.enabled.contains(plugin_id),
-        }
     }
 }
 
@@ -2125,18 +2093,6 @@ impl From<&PluginConcurrencyConfig> for PluginConcurrency {
     }
 }
 
-/// Plugin service execution concurrency policy.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub enum PluginConcurrency {
-    /// Allow unconstrained concurrent plugin execution.
-    #[default]
-    Concurrent,
-    /// Serialize invocations for this plugin on a dedicated worker.
-    Exclusive,
-    /// Reserve support for bounded concurrent plugin execution.
-    Limited(usize),
-}
-
 const fn plugin_serialization_reason(concurrency: PluginConcurrency) -> Option<&'static str> {
     match concurrency {
         PluginConcurrency::Exclusive => Some("plugin_host_reentrancy"),
@@ -2272,23 +2228,6 @@ impl Drop for CancelAbandonedInvocation {
             cancel.cancel();
         }
     }
-}
-
-/// Plugin executor status snapshot.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct PluginExecutorStatus {
-    pub plugin_id: String,
-    pub concurrency: PluginConcurrency,
-    pub running: usize,
-    pub queued: usize,
-    pub queued_control: usize,
-    pub queued_query: usize,
-    pub queued_tool_execution: usize,
-    pub queued_model_provider: usize,
-    pub queued_event_delivery: usize,
-    pub queued_service: usize,
-    pub completed: u64,
-    pub failed: u64,
 }
 
 #[derive(Debug)]
@@ -3250,6 +3189,8 @@ impl PluginExecutorHandle {
 #[derive(Debug, Clone)]
 pub struct PluginRegistry {
     manifests: BTreeMap<String, PluginManifest>,
+    template_order: Vec<(String, usize)>,
+    template_lookup: BTreeMap<String, BTreeMap<String, BTreeMap<u32, usize>>>,
     service_registry: PluginServiceRegistry,
     service_policies: BTreeMap<(String, String), ServiceRuntimePolicy>,
 }
@@ -3337,8 +3278,23 @@ impl PluginRegistry {
                 );
             }
         }
+        let mut template_order = Vec::new();
+        let mut template_lookup = BTreeMap::<String, BTreeMap<String, BTreeMap<u32, usize>>>::new();
+        for (owner, manifest) in &manifests {
+            for (index, template) in manifest.workflow_templates.iter().enumerate() {
+                template_order.push((owner.clone(), index));
+                template_lookup
+                    .entry(owner.clone())
+                    .or_default()
+                    .entry(template.template_id.clone())
+                    .or_default()
+                    .insert(template.template_version, index);
+            }
+        }
         Self {
             manifests,
+            template_order,
+            template_lookup,
             service_registry,
             service_policies,
         }
@@ -3393,6 +3349,43 @@ impl PluginRegistry {
             .flat_map(|service| &service.workflow_authoring_actions)
             .cloned()
             .collect()
+    }
+
+    /// Iterate a bounded window in owner/declaration order without scanning empty manifests.
+    ///
+    /// Offsets are valid only for this immutable registry instance, not durable cursors.
+    pub fn workflow_template_window(
+        &self,
+        offset: usize,
+        limit: usize,
+    ) -> impl Iterator<Item = (&str, &WorkflowTemplateContribution)> {
+        self.template_order
+            .get(offset..)
+            .unwrap_or_default()
+            .iter()
+            .take(limit)
+            .map(|(owner, index)| {
+                (
+                    owner.as_str(),
+                    &self.manifests[owner].workflow_templates[*index],
+                )
+            })
+    }
+
+    /// Look up an exact template identity using the immutable registration index.
+    #[must_use]
+    pub fn workflow_template(
+        &self,
+        owner: &str,
+        template_id: &str,
+        version: u32,
+    ) -> Option<&WorkflowTemplateContribution> {
+        let index = self
+            .template_lookup
+            .get(owner)?
+            .get(template_id)?
+            .get(&version)?;
+        self.manifests.get(owner)?.workflow_templates.get(*index)
     }
 
     /// Return all loaded, validated workflow template declarations in deterministic order.
@@ -3472,27 +3465,6 @@ impl PluginRegistry {
     ) -> Option<&ServiceRuntimePolicy> {
         self.service_policies
             .get(&(plugin_id.to_string(), interface_id.to_string()))
-    }
-}
-
-/// Loaded route for a manifest-declared visual adapter.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct PluginVisualAdapterRoute {
-    pub plugin_id: String,
-    pub adapter_id: String,
-    pub schema: String,
-    pub service_interface_id: String,
-    pub surfaces: Vec<String>,
-    pub priority: i32,
-    pub producer_default: bool,
-    pub render_mode: PluginVisualAdapterRenderMode,
-}
-
-impl PluginVisualAdapterRoute {
-    /// Return this route's stable user-facing adapter reference.
-    #[must_use]
-    pub fn adapter_reference(&self) -> String {
-        format!("{}/{}", self.plugin_id, self.adapter_id)
     }
 }
 
@@ -11014,6 +10986,46 @@ library = "libexample_plugin.dylib"
                 .definition_identity("bcode.example")
                 .expect("changed identity")
                 .definition_id
+        );
+    }
+
+    #[test]
+    fn template_index_preserves_declaration_order_and_exact_versions() {
+        let mut owner = test_manifest("bcode.owner");
+        let mut first = workflow_template();
+        first.template_version = 2;
+        let second = workflow_template();
+        owner.workflow_templates = vec![first.clone(), second.clone()];
+        let empty = test_manifest("bcode.empty");
+        let registry = PluginRegistry::from_manifests(BTreeMap::from([
+            (owner.id.clone(), owner),
+            (empty.id.clone(), empty),
+        ]));
+        let page = registry.workflow_template_window(0, 1).collect::<Vec<_>>();
+        assert_eq!(page, vec![("bcode.owner", &first)]);
+        assert_eq!(
+            registry.workflow_template_window(1, 1).collect::<Vec<_>>(),
+            vec![("bcode.owner", &second)]
+        );
+        assert_eq!(registry.workflow_template_window(0, 0).count(), 0);
+        assert_eq!(registry.workflow_template_window(usize::MAX, 1).count(), 0);
+        assert_eq!(
+            registry.workflow_template("bcode.owner", "example", 2),
+            Some(&first)
+        );
+        assert_eq!(
+            registry.workflow_template("bcode.owner", "example", 1),
+            Some(&second)
+        );
+        assert!(
+            registry
+                .workflow_template("bcode.owner", "example", 3)
+                .is_none()
+        );
+        assert!(
+            registry
+                .workflow_template("bcode.empty", "example", 1)
+                .is_none()
         );
     }
 

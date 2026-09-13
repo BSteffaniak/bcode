@@ -101,7 +101,9 @@ const MAX_CHUNK_DATA_SIZE: usize = MAX_FRAME_PAYLOAD_SIZE / 2;
 /// a daemon across config directories.
 /// Version 35 includes the selected edge revision in workflow graph inspection.
 /// Older positional payloads are rejected rather than assigned a guessed revision.
-pub const CURRENT_PROTOCOL_VERSION: u16 = 37;
+/// Version 38 restores pre-storage-usage positional request/response tags by appending
+/// storage-usage variants. Version 37 peers are rejected rather than misdecoded.
+pub const CURRENT_PROTOCOL_VERSION: u16 = 38;
 
 /// Durable session-storage writer epoch expected by this IPC build.
 pub const CURRENT_SESSION_STORAGE_WRITER_EPOCH: u32 =
@@ -454,11 +456,6 @@ pub enum Request {
     /// typed read-model endpoints instead.
     SessionHistory {
         session_id: SessionId,
-    },
-    /// Explicit bounded physical storage measurement; never loads session history.
-    SessionStorageUsage {
-        session_id: SessionId,
-        entry_budget: u32,
     },
     SessionHistoryPage {
         session_id: SessionId,
@@ -1155,6 +1152,11 @@ pub enum Request {
         range: bcode_session_models::SessionCostRange,
         catalog: Box<bcode_model_catalog_models::CatalogDocument>,
     },
+    /// Explicit bounded physical storage measurement; never loads session history.
+    SessionStorageUsage {
+        session_id: SessionId,
+        entry_budget: u32,
+    },
 }
 
 /// Server stop request policy.
@@ -1337,7 +1339,7 @@ pub struct ServerStatus {
     #[serde(default)]
     pub selected_model_id: Option<String>,
     #[serde(default)]
-    pub plugin_runtime: Vec<bcode_plugin::PluginExecutorStatus>,
+    pub plugin_runtime: Vec<bcode_plugin_models::PluginExecutorStatus>,
     /// Server process identity and lifecycle metadata.
     #[serde(default)]
     pub daemon: DaemonStatus,
@@ -1480,7 +1482,10 @@ pub struct WorkflowTemplateDiagnostic {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WorkflowTemplateDescription {
     pub owner_plugin_id: String,
-    pub template: bcode_plugin::WorkflowTemplateContribution,
+    pub template: bcode_plugin_models::WorkflowTemplateDescriptor<
+        bcode_workflow::ValueSchema,
+        bcode_workflow::WorkflowDefinition,
+    >,
     /// Normalized standard authoring document when the template uses the maintainable source form.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub authoring_document: Option<bcode_workflow::WorkflowAuthoringDocument>,
@@ -1497,7 +1502,7 @@ impl WorkflowTemplateDescription {
     pub fn into_inspection(
         self,
     ) -> Result<bcode_workflow::WorkflowTemplateInspection, &'static str> {
-        let document = self.authoring_document.or(self.template.authoring_document);
+        let document = self.authoring_document;
         let (definition, configuration_schema) = if let Some(document) = document {
             (document.definition, document.configuration_schema)
         } else {
@@ -1803,9 +1808,6 @@ pub enum ResponsePayload {
     SessionHistory {
         session_id: SessionId,
         history: Vec<SessionEvent>,
-    },
-    SessionStorageUsage {
-        usage: bcode_session_models::SessionStorageUsage,
     },
     SessionHistoryPage {
         page: SessionHistoryPage,
@@ -2292,6 +2294,9 @@ pub enum ResponsePayload {
     SessionCompactionAccepted,
     SessionRepriced {
         report: Box<bcode_session_models::SessionRepriceReport>,
+    },
+    SessionStorageUsage {
+        usage: bcode_session_models::SessionStorageUsage,
     },
 }
 
@@ -3582,8 +3587,8 @@ mod tests {
         };
         let template_description = WorkflowTemplateDescription {
             owner_plugin_id: "owner".to_string(),
-            template: bcode_plugin::WorkflowTemplateContribution {
-                contribution_version: bcode_plugin::WORKFLOW_TEMPLATE_CONTRIBUTION_VERSION,
+            template: bcode_plugin_models::WorkflowTemplateDescriptor {
+                contribution_version: 1,
                 template_id: "review".to_string(),
                 template_version: 1,
                 title: "Review".to_string(),
@@ -3591,7 +3596,6 @@ mod tests {
                 configuration_schema: Some(authoring_document.configuration_schema.clone()),
                 definition: Some(definition.clone()),
                 document_source: None,
-                authoring_document: None,
                 required_plugins: Vec::new(),
                 required_capabilities: Vec::new(),
                 presentation: std::collections::BTreeMap::new(),

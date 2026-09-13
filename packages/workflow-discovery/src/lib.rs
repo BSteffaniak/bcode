@@ -11,7 +11,7 @@
 //! Abrupt process death may leave temporary files for operating-system cleanup.
 
 mod launch_previews;
-pub use launch_previews::LaunchPreviewSpool;
+pub use launch_previews::{LaunchPreviewPage, LaunchPreviewSpool, MAX_PREVIEW_PAGE_BYTES};
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;

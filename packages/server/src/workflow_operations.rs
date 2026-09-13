@@ -660,7 +660,7 @@ impl bcode_workflow::WorkflowAuthoringApplication for WorkflowAuthoringApplicati
         self.state
             .require_workflow_store()
             .map_err(authoring_failure)?;
-        self.discovery_read(launch_catalog(self.state, &request))
+        self.discovery_read(Box::pin(launch_catalog(self.state, &request)))
             .await
             .map_err(authoring_failure)
     }
@@ -671,7 +671,7 @@ impl bcode_workflow::WorkflowAuthoringApplication for WorkflowAuthoringApplicati
         self.state
             .require_workflow_store()
             .map_err(authoring_failure)?;
-        self.discovery_read(launch_detail(self.state, &request))
+        self.discovery_read(Box::pin(launch_detail(self.state, &request)))
             .await
             .map_err(authoring_failure)
     }
@@ -3151,16 +3151,14 @@ async fn retained_launch_detail(
             .workflow_discovery_scans
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let scan = scans
+        scans
             .get_mut(token)
             .filter(|pending| {
                 pending.expires > std::time::Instant::now()
                     && pending.request.workspace == request.workspace
             })
             .and_then(|pending| pending.scan.take().map(|scan| (scan, pending.expires)))
-            .ok_or_else(invalid)?;
-        drop(scans);
-        scan
+            .ok_or_else(invalid)?
     };
     // Retain the registry tombstone for cancellation and expiry while this request
     // exclusively owns the scan. A conflicting request must not remove its authority.
@@ -3173,21 +3171,38 @@ async fn retained_launch_detail(
         return Err(invalid());
     }
     let fence = scan.publication_fence.take().ok_or_else(invalid)?;
-    state
-        .workflow_store
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .validate_publication_read_fence(&fence)?;
-    let item = scan
-        .previews
-        .as_ref()
-        .ok_or_else(invalid)?
-        .find(&launch_source_key(&request.source))?
-        .ok_or_else(invalid)?;
+    let store = std::sync::Arc::clone(&state.workflow_store);
+    let cancellation = continuation.batch_cancellation()?;
+    let cancelled = std::sync::Arc::clone(&cancellation.0);
+    let source_key = launch_source_key(&request.source);
+    // The admitted scan travels with the worker so cancellation cannot release its
+    // capacity while SQLite or the decoder is still using the retained preview.
+    let worker = tokio::task::spawn_blocking(move || {
+        let result = run_detail_construction(&cancelled, || {
+            let store = store
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            run_detail_construction(&cancelled, || {
+                store.validate_publication_read_fence(&fence)?;
+                Ok(())
+            })?;
+            drop(store);
+            scan.previews
+                .as_ref()
+                .ok_or_else(invalid)?
+                .find_with_cancellation(&source_key, &|| {
+                    cancelled.load(std::sync::atomic::Ordering::Acquire)
+                })?
+                .ok_or_else(invalid)
+        });
+        (scan, fence, result)
+    });
+    let (mut scan, fence, result) = cancellation.wait_for_worker(worker).await?;
+    continuation.checkpoint().await?;
+    let item = result?;
     if item.source != request.source {
         return Err(invalid());
     }
-    let cancellation = continuation.batch_cancellation()?;
     let result = tokio::select! {
         biased;
         () = tokio::time::sleep_until(tokio::time::Instant::from_std(expires)) => {
@@ -3200,11 +3215,24 @@ async fn retained_launch_detail(
     continuation.checkpoint().await?;
     let (detail, returned_scan) = result?;
     scan = returned_scan.ok_or_else(invalid)?;
-    state
-        .workflow_store
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .validate_publication_read_fence(&fence)?;
+    let cancellation = continuation.batch_cancellation()?;
+    let cancelled = std::sync::Arc::clone(&cancellation.0);
+    let store = std::sync::Arc::clone(&state.workflow_store);
+    let worker = tokio::task::spawn_blocking(move || {
+        let result = run_detail_construction(&cancelled, || {
+            let store = store
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            run_detail_construction(&cancelled, || {
+                store.validate_publication_read_fence(&fence)?;
+                Ok(())
+            })
+        });
+        (scan, detail, result)
+    });
+    let (scan, detail, result) = cancellation.wait_for_worker(worker).await?;
+    continuation.checkpoint().await?;
+    result?;
     continuation.finish(
         &mut state
             .workflow_discovery_scans
@@ -3473,13 +3501,22 @@ impl PendingDiscovery {
     }
 }
 
+/// Process-local cursor into the immutable loaded manifest registry.
+#[derive(Debug, Default)]
+struct TemplateTraversal {
+    owner: Option<String>,
+    index: usize,
+    discovery: Option<Vec<bcode_workflow_discovery::WorkflowDiscoveryDiagnostic>>,
+}
+
 /// Keeps capacity occupied until both retained state and any active blocking work are dropped.
 #[derive(Debug)]
 struct AdmittedDiscovery {
     scan: Option<bcode_workflow_discovery::WorkflowDiscoveryScan>,
     previews: Option<bcode_workflow_discovery::LaunchPreviewSpool>,
-    catalog: Option<bcode_workflow::WorkflowAuthoringCatalogSnapshot>,
+    catalog: Option<std::sync::Arc<bcode_workflow::WorkflowAuthoringCatalogSnapshot>>,
     publication_fence: Option<bcode_workflow_store::WorkflowPublicationReadFence>,
+    templates: TemplateTraversal,
     completed: Option<Vec<bcode_workflow::WorkflowLaunchDiagnostic>>,
     _permit: tokio::sync::OwnedSemaphorePermit,
 }
@@ -3499,6 +3536,7 @@ impl Drop for DiscoveryExpiration {
 struct DiscoveryBatchCancellation(
     std::sync::Arc<std::sync::atomic::AtomicBool>,
     std::sync::Arc<tokio::sync::Notify>,
+    Option<std::time::Instant>,
 );
 
 impl DiscoveryBatchCancellation {
@@ -3523,7 +3561,18 @@ impl DiscoveryBatchCancellation {
             if self.0.load(std::sync::atomic::Ordering::Acquire) {
                 return;
             }
-            notified.await;
+            if let Some(deadline) = self.2 {
+                tokio::select! {
+                    () = &mut notified => {},
+                    () = tokio::time::sleep_until(deadline.into()) => {
+                        self.0.store(true, std::sync::atomic::Ordering::Release);
+                        self.1.notify_waiters();
+                        return;
+                    }
+                }
+            } else {
+                notified.await;
+            }
         }
     }
 }
@@ -3574,7 +3623,7 @@ struct DiscoveryContinuation<'a> {
 
 impl DiscoveryContinuation<'_> {
     fn batch_cancellation(&self) -> Result<DiscoveryBatchCancellation, super::ServerError> {
-        let cancellation = DiscoveryBatchCancellation::default();
+        let mut cancellation = DiscoveryBatchCancellation::default();
         if let Some(token) = self.token {
             let mut scans = self
                 .scans
@@ -3589,9 +3638,11 @@ impl DiscoveryContinuation<'_> {
             // Registry removal (explicit cancellation, expiry, or shutdown) and request
             // drop independently stop the same worker. Replacing a finished batch's
             // guard only signals that old batch, never its successor.
+            cancellation.2 = Some(pending.expires);
             pending.batch_cancellation = Some(DiscoveryBatchCancellation(
                 std::sync::Arc::clone(&cancellation.0),
                 std::sync::Arc::clone(&cancellation.1),
+                cancellation.2,
             ));
         }
         Ok(cancellation)
@@ -3648,9 +3699,297 @@ mod discovery_continuation_tests {
     use super::*;
 
     #[tokio::test]
+    #[allow(clippy::significant_drop_tightening)] // Scan ownership moves into the retained registry.
+    async fn unsent_catalog_response_releases_retained_scan_but_sent_response_keeps_it() {
+        let state = crate::tests::test_server_state(bcode_session::SessionManager::default());
+        let capacity = state.workflow_discovery_capacity.available_permits();
+        for delivered in [false, true] {
+            let continuation = DiscoveryContinuation {
+                scans: &state.workflow_discovery_scans,
+                token: None,
+            };
+            let request = serde_json::from_value(
+                serde_json::json!({"version": 1, "workspace": ".", "limit": 1}),
+            )
+            .unwrap();
+            let scan = AdmittedDiscovery {
+                scan: None,
+                previews: None,
+                catalog: None,
+                publication_fence: None,
+                templates: TemplateTraversal::default(),
+                completed: None,
+                _permit: state
+                    .workflow_discovery_capacity
+                    .clone()
+                    .try_acquire_owned()
+                    .unwrap(),
+            };
+            let page = retain_discovery(&state, request, scan, &continuation).unwrap();
+            drop(continuation);
+            let mut guard = PendingCatalogDelivery::for_response(&state, &page);
+            if delivered {
+                guard.delivered();
+            }
+            drop(guard);
+            assert_eq!(
+                state.workflow_discovery_scans.lock().unwrap().len(),
+                usize::from(delivered)
+            );
+            assert_eq!(
+                state.workflow_discovery_capacity.available_permits(),
+                capacity - usize::from(delivered)
+            );
+            state.workflow_discovery_scans.lock().unwrap().clear();
+        }
+        drop(state);
+    }
+
+    #[tokio::test]
+    async fn dropped_publication_worker_result_releases_replacement_and_admission() {
+        let state = crate::tests::test_server_state(bcode_session::SessionManager::default());
+        let registry = std::sync::Arc::clone(&state.workflow_discovery_scans);
+        let capacity = state.workflow_discovery_capacity.available_permits();
+        let scan = AdmittedDiscovery {
+            scan: None,
+            previews: None,
+            catalog: None,
+            publication_fence: None,
+            templates: TemplateTraversal::default(),
+            completed: Some(Vec::new()),
+            _permit: state
+                .workflow_discovery_capacity
+                .clone()
+                .try_acquire_owned()
+                .unwrap(),
+        };
+        let (published_tx, published_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let worker_registry = registry.clone();
+        let worker = tokio::task::spawn_blocking(move || {
+            let continuation = DiscoveryContinuation {
+                scans: &worker_registry,
+                token: None,
+            };
+            let request = serde_json::from_value(
+                serde_json::json!({"version": 1, "workspace": ".", "limit": 1}),
+            )
+            .unwrap();
+            let page = retain_discovery_in(&worker_registry, request, scan, &continuation).unwrap();
+            drop(continuation);
+            let pending = PendingCatalogDelivery {
+                registry: worker_registry,
+                token: page.discovery_token,
+            };
+            published_tx.send(()).unwrap();
+            release_rx
+                .recv_timeout(std::time::Duration::from_secs(5))
+                .unwrap();
+            pending
+        });
+        published_rx.await.unwrap();
+        assert_eq!(registry.lock().unwrap().len(), 1);
+        assert_eq!(
+            state.workflow_discovery_capacity.available_permits(),
+            capacity - 1
+        );
+        drop(worker);
+        release_tx.send(()).unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while state.workflow_discovery_capacity.available_permits() != capacity {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(registry.lock().unwrap().is_empty());
+        drop(registry);
+        drop(state);
+    }
+
+    #[tokio::test]
+    async fn cancelled_retained_page_worker_keeps_admission_until_exit() {
+        let state = std::sync::Arc::new(crate::tests::test_server_state(
+            bcode_session::SessionManager::default(),
+        ));
+        let request: bcode_workflow::WorkflowLaunchCatalogRequest =
+            serde_json::from_value(serde_json::json!({"version": 1, "workspace": ".", "limit": 1}))
+                .unwrap();
+        let capacity = state.workflow_discovery_capacity.available_permits();
+        let scan = AdmittedDiscovery {
+            scan: None,
+            previews: Some(bcode_workflow_discovery::LaunchPreviewSpool::new().unwrap()),
+            catalog: None,
+            publication_fence: None,
+            templates: TemplateTraversal::default(),
+            completed: Some(Vec::new()),
+            _permit: state
+                .workflow_discovery_capacity
+                .clone()
+                .try_acquire_owned()
+                .unwrap(),
+        };
+        state.workflow_discovery_scans.lock().unwrap().insert(
+            "page".into(),
+            PendingDiscovery {
+                request: request.clone(),
+                scan: None,
+                expires: std::time::Instant::now() + std::time::Duration::from_mins(1),
+                _expiration: DiscoveryExpiration(tokio::spawn(std::future::pending())),
+                batch_cancellation: None,
+            },
+        );
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        *state.workflow_page_barrier.lock().await = Some((started_tx, release_rx));
+        let reader = state.clone();
+        let delivery = tokio::spawn(async move {
+            let continuation = DiscoveryContinuation {
+                scans: &reader.workflow_discovery_scans,
+                token: Some("page"),
+            };
+            deliver_retained_page(&reader, request, scan, &continuation).await
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(5), started_rx)
+            .await
+            .unwrap()
+            .unwrap();
+        state
+            .workflow_discovery_scans
+            .lock()
+            .unwrap()
+            .remove("page");
+        let result = tokio::time::timeout(std::time::Duration::from_secs(5), delivery)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(matches!(
+            result,
+            Err(crate::ServerError::WorkflowAuthoring(
+                bcode_workflow::WorkflowAuthoringFailure::Cancelled
+            ))
+        ));
+        assert!(state.workflow_discovery_scans.lock().unwrap().is_empty());
+        assert_eq!(
+            state.workflow_discovery_capacity.available_permits(),
+            capacity - 1
+        );
+        let free = state
+            .workflow_discovery_capacity
+            .clone()
+            .try_acquire_many_owned(u32::try_from(capacity - 1).unwrap())
+            .unwrap();
+        release_tx.send(()).unwrap();
+        let released = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            state.workflow_discovery_capacity.acquire(),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        drop(released);
+        drop(free);
+        assert_eq!(
+            state.workflow_discovery_capacity.available_permits(),
+            capacity
+        );
+        drop(state);
+    }
+
+    #[tokio::test]
+    async fn retained_page_publication_lock_wait_cancels_and_expires() {
+        for expire in [false, true] {
+            let state = std::sync::Arc::new(crate::tests::test_server_state(
+                bcode_session::SessionManager::default(),
+            ));
+            let request: bcode_workflow::WorkflowLaunchCatalogRequest = serde_json::from_value(
+                serde_json::json!({"version": 1, "workspace": ".", "limit": 1}),
+            )
+            .unwrap();
+            let capacity = state.workflow_discovery_capacity.available_permits();
+            let scan = AdmittedDiscovery {
+                scan: None,
+                previews: Some(bcode_workflow_discovery::LaunchPreviewSpool::new().unwrap()),
+                catalog: None,
+                publication_fence: None,
+                templates: TemplateTraversal::default(),
+                completed: Some(Vec::new()),
+                _permit: state
+                    .workflow_discovery_capacity
+                    .clone()
+                    .try_acquire_owned()
+                    .unwrap(),
+            };
+            state.workflow_discovery_scans.lock().unwrap().insert(
+                "locked".into(),
+                PendingDiscovery {
+                    request: request.clone(),
+                    scan: None,
+                    expires: std::time::Instant::now() + std::time::Duration::from_mins(1),
+                    _expiration: DiscoveryExpiration(tokio::spawn(std::future::pending())),
+                    batch_cancellation: None,
+                },
+            );
+            let (locked_tx, locked_rx) = tokio::sync::oneshot::channel();
+            let (release_tx, release_rx) = std::sync::mpsc::channel();
+            let owner = state.clone();
+            let holder = tokio::task::spawn_blocking(move || {
+                let guard = owner.workflow_store.lock().unwrap();
+                locked_tx.send(()).unwrap();
+                release_rx
+                    .recv_timeout(std::time::Duration::from_secs(10))
+                    .unwrap();
+                drop(guard);
+            });
+            locked_rx.await.unwrap();
+            let (waiting_tx, waiting_rx) = tokio::sync::oneshot::channel();
+            let (_, unused_rx) = std::sync::mpsc::channel();
+            *state.workflow_detail_barrier.lock().await = Some((waiting_tx, unused_rx));
+            let reader = state.clone();
+            let delivery = tokio::spawn(async move {
+                let continuation = DiscoveryContinuation {
+                    scans: &reader.workflow_discovery_scans,
+                    token: Some("locked"),
+                };
+                deliver_retained_page(&reader, request, scan, &continuation).await
+            });
+            tokio::time::timeout(std::time::Duration::from_secs(5), waiting_rx)
+                .await
+                .unwrap()
+                .unwrap();
+            {
+                let mut scans = state.workflow_discovery_scans.lock().unwrap();
+                if expire {
+                    scans.get_mut("locked").unwrap().expires = std::time::Instant::now();
+                } else {
+                    scans.remove("locked");
+                }
+            }
+            let result = tokio::time::timeout(std::time::Duration::from_secs(5), delivery)
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(matches!(
+                result,
+                Err(super::super::ServerError::WorkflowAuthoring(
+                    bcode_workflow::WorkflowAuthoringFailure::Cancelled
+                ))
+            ));
+            assert!(state.workflow_discovery_scans.lock().unwrap().is_empty());
+            assert_eq!(
+                state.workflow_discovery_capacity.available_permits(),
+                capacity
+            );
+            release_tx.send(()).unwrap();
+            holder.await.unwrap();
+            drop(state);
+        }
+    }
+
+    #[tokio::test]
     async fn cancelled_worker_wait_returns_before_admission_is_released() {
         let owner = DiscoveryBatchCancellation::default();
-        let observer = DiscoveryBatchCancellation(owner.0.clone(), owner.1.clone());
+        let observer = DiscoveryBatchCancellation(owner.0.clone(), owner.1.clone(), None);
         let capacity = std::sync::Arc::new(tokio::sync::Semaphore::new(1));
         let permit = capacity.clone().try_acquire_owned().unwrap();
         let (started_tx, started_rx) = tokio::sync::oneshot::channel();
@@ -3689,7 +4028,7 @@ mod discovery_continuation_tests {
     #[tokio::test]
     async fn cancellation_notification_is_sticky_and_wakes_active_waiters() {
         let owner = DiscoveryBatchCancellation::default();
-        let observer = DiscoveryBatchCancellation(owner.0.clone(), owner.1.clone());
+        let observer = DiscoveryBatchCancellation(owner.0.clone(), owner.1.clone(), None);
         let mut waiting = Box::pin(observer.cancelled());
         std::future::poll_fn(|cx| {
             assert!(waiting.as_mut().poll(cx).is_pending());
@@ -3777,6 +4116,7 @@ mod discovery_continuation_tests {
             previews: None,
             catalog: None,
             publication_fence: None,
+            templates: TemplateTraversal::default(),
             completed: None,
             _permit: capacity.clone().try_acquire_owned().unwrap(),
         };
@@ -3859,10 +4199,21 @@ fn retain_discovery(
     scan: AdmittedDiscovery,
     continuation: &DiscoveryContinuation<'_>,
 ) -> Result<bcode_workflow::WorkflowLaunchCatalogPage, super::ServerError> {
+    retain_discovery_in(&state.workflow_discovery_scans, request, scan, continuation)
+}
+
+fn retain_discovery_in(
+    registry: &std::sync::Arc<
+        std::sync::Mutex<std::collections::BTreeMap<String, PendingDiscovery>>,
+    >,
+    request: bcode_workflow::WorkflowLaunchCatalogRequest,
+    scan: AdmittedDiscovery,
+    continuation: &DiscoveryContinuation<'_>,
+) -> Result<bcode_workflow::WorkflowLaunchCatalogPage, super::ServerError> {
     let token = uuid::Uuid::new_v4().to_string();
     let lifetime = std::time::Duration::from_mins(1);
     let expires = std::time::Instant::now() + lifetime;
-    let scans = std::sync::Arc::downgrade(&state.workflow_discovery_scans);
+    let scans = std::sync::Arc::downgrade(registry);
     let expired_token = token.clone();
     let expiration = DiscoveryExpiration(tokio::spawn(async move {
         tokio::time::sleep_until(tokio::time::Instant::from_std(expires)).await;
@@ -3874,8 +4225,7 @@ fn retain_discovery(
         }
     }));
     {
-        let mut scans = state
-            .workflow_discovery_scans
+        let mut scans = registry
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         continuation.finish(&mut scans)?;
@@ -3965,6 +4315,7 @@ pub async fn launch_catalog(
             previews: None,
             catalog: None,
             publication_fence: None,
+            templates: TemplateTraversal::default(),
             completed: None,
             _permit: permit,
         }
@@ -3973,19 +4324,10 @@ pub async fn launch_catalog(
     if request.incremental && token.is_none() {
         return retain_discovery(state, binding, scan, &continuation);
     }
-    let publication_fence = {
-        let store = state
-            .workflow_store
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        match scan.publication_fence.take() {
-            Some(fence) => {
-                store.validate_publication_read_fence(&fence)?;
-                fence
-            }
-            None => store.publication_read_fence()?,
-        }
-    };
+    let fence = scan.publication_fence.take();
+    let (returned_scan, publication_fence) =
+        catalog_publication_fence(state, scan, fence, &continuation).await?;
+    scan = returned_scan;
     if scan.completed.is_some() {
         if result_token.is_none() {
             return Err(super::ServerError::WorkflowAuthoring(
@@ -3993,7 +4335,7 @@ pub async fn launch_catalog(
             ));
         }
         scan.publication_fence = Some(publication_fence);
-        return deliver_retained_page(state, binding, scan, &continuation);
+        return deliver_retained_page(state, binding, scan, &continuation).await;
     }
     if result_token.is_some() {
         return Err(super::ServerError::WorkflowAuthoring(
@@ -4003,7 +4345,7 @@ pub async fn launch_catalog(
     // Pin compilation inputs for the entire process-local discovery, including resumes.
     let catalog = match scan.catalog.take() {
         Some(catalog) => catalog,
-        None => authoring_catalog(state).await?,
+        None => std::sync::Arc::new(authoring_catalog(state).await?),
     };
     let items = LaunchCatalogWindow {
         request,
@@ -4013,6 +4355,9 @@ pub async fn launch_catalog(
         },
     };
     let discovery = loop {
+        if let Some(diagnostics) = scan.templates.discovery.take() {
+            break diagnostics;
+        }
         continuation.checkpoint().await?;
         // Retain capacity in the worker, but stop between discovery units on request drop.
         let cancellation = continuation.batch_cancellation()?;
@@ -4065,11 +4410,14 @@ pub async fn launch_catalog(
                                             .to_string(),
                                     )
                                 })?;
-                            let mut preview_catalog = planning_catalog;
+                            // Only package previews add dependency definitions. Keep that
+                            // private copy inside the admitted worker, after cancellation.
+                            let mut preview_catalog =
+                                std::borrow::Cow::Borrowed(planning_catalog.as_ref());
                             for dependency in &plan.packages[..entry_index] {
                                 for member in &dependency.plan.members {
                                     run_detail_construction(&cancelled, || {
-                                        preview_catalog.workflow_definitions.insert(
+                                        preview_catalog.to_mut().workflow_definitions.insert(
                                             member.definition_identity.definition_id.clone(),
                                             member.lowering.document.definition.clone(),
                                         );
@@ -4196,12 +4544,38 @@ pub async fn launch_catalog(
                     source_format,
                     source,
                 } => {
-                    let lowering = bcode_workflow::lower_workflow_authoring_source(
-                        &source,
-                        source_format,
-                        &catalog,
-                    )?;
-                    let preview = lowering.document.compilation_preview(&catalog, None);
+                    let cancellation = continuation.batch_cancellation()?;
+                    let cancelled = std::sync::Arc::clone(&cancellation.0);
+                    let planning_catalog = catalog.clone();
+                    #[cfg(test)]
+                    let barrier = state.workflow_detail_barrier.lock().await.take();
+                    let worker = tokio::task::spawn_blocking(move || {
+                        #[cfg(test)]
+                        if let Some((started, release)) = barrier {
+                            let _ = started.send(());
+                            release
+                                .recv_timeout(std::time::Duration::from_secs(10))
+                                .unwrap();
+                        }
+                        let result = run_detail_construction(&cancelled, || {
+                            let lowering = bcode_workflow::lower_workflow_authoring_source(
+                                &source,
+                                source_format,
+                                &planning_catalog,
+                            )?;
+                            let preview = run_detail_construction(&cancelled, || {
+                                Ok(lowering
+                                    .document
+                                    .compilation_preview(&planning_catalog, None))
+                            })?;
+                            Ok((lowering, preview))
+                        });
+                        (scan, result)
+                    });
+                    let (returned_scan, result) = cancellation.wait_for_worker(worker).await?;
+                    scan = returned_scan;
+                    continuation.checkpoint().await?;
+                    let (lowering, preview) = result?;
                     items.push(standalone_launch_item(
                         source_label,
                         precedence,
@@ -4221,28 +4595,99 @@ pub async fn launch_catalog(
         if request.incremental {
             scan.previews = Some(items.spool);
             scan.catalog = Some(catalog);
-            state
-                .workflow_store
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .validate_publication_read_fence(&publication_fence)?;
-            scan.publication_fence = Some(publication_fence);
+            let (mut scan, fence) =
+                catalog_publication_fence(state, scan, Some(publication_fence), &continuation)
+                    .await?;
+            scan.publication_fence = Some(fence);
             return retain_discovery(state, binding, scan, &continuation);
         }
         tokio::task::yield_now().await;
     };
-    for template in list_templates(
-        state,
-        request
-            .limit
-            .saturating_add(1)
-            .min(bcode_workflow::MAX_WORKFLOW_LAUNCH_CATALOG_PAGE_SIZE),
-    )? {
+    // Traverse manifests by key and templates by index without collecting the registry.
+    // Count empty manifests too so every incremental request has bounded traversal work.
+    let mut units = 0;
+    loop {
         continuation.checkpoint().await?;
-        let Some(document) = template.authoring_document else {
+        if units == 16 {
+            if request.incremental {
+                scan.templates.discovery = Some(discovery);
+                scan.previews = Some(items.spool);
+                scan.catalog = Some(catalog);
+                let (mut scan, fence) =
+                    catalog_publication_fence(state, scan, Some(publication_fence), &continuation)
+                        .await?;
+                scan.publication_fence = Some(fence);
+                return retain_discovery(state, binding, scan, &continuation);
+            }
+            tokio::task::yield_now().await;
+            units = 0;
+        }
+        let manifests = state.plugins.registry().manifests();
+        let entry = scan.templates.owner.as_ref().map_or_else(
+            || manifests.first_key_value(),
+            |owner| manifests.get_key_value(owner),
+        );
+        let Some((owner, manifest)) = entry else {
+            break;
+        };
+        units += 1;
+        scan.templates.owner = Some(owner.clone());
+        let Some(contribution) = manifest.workflow_templates.get(scan.templates.index) else {
+            let next = manifests
+                .range((
+                    std::ops::Bound::Excluded(owner.clone()),
+                    std::ops::Bound::Unbounded,
+                ))
+                .next();
+            let Some((next, _)) = next else { break };
+            scan.templates.owner = Some(next.clone());
+            scan.templates.index = 0;
             continue;
         };
-        let preview = document.compilation_preview(&catalog, None);
+        scan.templates.index += 1;
+        let owner = owner.clone();
+        let contribution = contribution.clone();
+        let loaded_plugins = contribution
+            .required_plugins
+            .iter()
+            .filter(|id| manifests.contains_key(*id))
+            .cloned()
+            .collect::<std::collections::BTreeSet<_>>();
+        let cancellation = continuation.batch_cancellation()?;
+        let cancelled = std::sync::Arc::clone(&cancellation.0);
+        let planning_catalog = catalog.clone();
+        #[cfg(test)]
+        let barrier = state.workflow_detail_barrier.lock().await.take();
+        let worker = tokio::task::spawn_blocking(move || {
+            #[cfg(test)]
+            if let Some((started, release)) = barrier {
+                let _ = started.send(());
+                release
+                    .recv_timeout(std::time::Duration::from_secs(10))
+                    .unwrap();
+            }
+            let result = run_detail_construction(&cancelled, || {
+                let mut template = template_description_with_plugins(
+                    &|id| loaded_plugins.contains(id),
+                    &owner,
+                    &contribution,
+                )?;
+                let Some(document) = template.authoring_document.take() else {
+                    return Ok(None);
+                };
+                let preview = run_detail_construction(&cancelled, || {
+                    Ok(document.compilation_preview(&planning_catalog, None))
+                })?;
+                Ok(Some((template, Box::new(document), preview)))
+            });
+            (scan, result)
+        });
+        let (returned_scan, result) = cancellation.wait_for_worker(worker).await?;
+        scan = returned_scan;
+        continuation.checkpoint().await?;
+        let Some((template, document, preview)) = result? else {
+            continue;
+        };
         let compiled = preview.compiled.as_ref();
         let readiness = if template.diagnostics.is_empty() && preview.is_compiled() {
             bcode_workflow::WorkflowLaunchReadiness::Ready
@@ -4286,12 +4731,9 @@ pub async fn launch_catalog(
             diagnostics: preview.validation.diagnostics,
         })?;
     }
-    state
-        .workflow_store
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .validate_publication_read_fence(&publication_fence)?;
     scan.previews = Some(items.spool);
+    let (mut scan, publication_fence) =
+        catalog_publication_fence(state, scan, Some(publication_fence), &continuation).await?;
     scan.publication_fence = Some(publication_fence);
     scan.completed = Some(
         discovery
@@ -4304,65 +4746,240 @@ pub async fn launch_catalog(
             })
             .collect(),
     );
-    deliver_retained_page(state, binding, scan, &continuation)
+    deliver_retained_page(state, binding, scan, &continuation).await
 }
 
-fn deliver_retained_page(
+// Keep scan admission owned while waiting for storage, including after caller cancellation.
+async fn catalog_publication_fence(
     state: &ServerState,
-    mut binding: bcode_workflow::WorkflowLaunchCatalogRequest,
+    scan: AdmittedDiscovery,
+    fence: Option<bcode_workflow_store::WorkflowPublicationReadFence>,
+    continuation: &DiscoveryContinuation<'_>,
+) -> Result<
+    (
+        AdmittedDiscovery,
+        bcode_workflow_store::WorkflowPublicationReadFence,
+    ),
+    super::ServerError,
+> {
+    let cancellation = continuation.batch_cancellation()?;
+    let cancelled = std::sync::Arc::clone(&cancellation.0);
+    let store = std::sync::Arc::clone(&state.workflow_store);
+    let worker = tokio::task::spawn_blocking(move || {
+        let result = run_detail_construction(&cancelled, || {
+            let store = store
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            run_detail_construction(&cancelled, || {
+                Ok(match fence {
+                    Some(fence) => {
+                        store.validate_publication_read_fence(&fence)?;
+                        fence
+                    }
+                    None => store.publication_read_fence()?,
+                })
+            })
+        });
+        (scan, result)
+    });
+    let (scan, result) = cancellation.wait_for_worker(worker).await?;
+    continuation.checkpoint().await?;
+    Ok((scan, result?))
+}
+
+// A worker may publish a replacement token just as its receiver is cancelled.
+// Keep cleanup attached to the result until the async caller accepts delivery.
+pub struct PendingCatalogDelivery {
+    registry:
+        std::sync::Arc<std::sync::Mutex<std::collections::BTreeMap<String, PendingDiscovery>>>,
+    token: Option<String>,
+}
+
+impl PendingCatalogDelivery {
+    pub(super) fn for_response(
+        state: &ServerState,
+        page: &bcode_workflow::WorkflowLaunchCatalogPage,
+    ) -> Self {
+        Self {
+            registry: std::sync::Arc::clone(&state.workflow_discovery_scans),
+            token: page
+                .discovery_token
+                .clone()
+                .or_else(|| page.detail_token.clone())
+                .or_else(|| {
+                    page.next_cursor
+                        .as_ref()
+                        .and_then(|cursor| cursor.result_token.clone())
+                }),
+        }
+    }
+
+    pub(super) fn delivered(&mut self) {
+        self.token = None;
+    }
+}
+
+impl Drop for PendingCatalogDelivery {
+    fn drop(&mut self) {
+        if let Some(token) = &self.token {
+            self.registry
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .remove(token);
+        }
+    }
+}
+
+async fn deliver_retained_page(
+    state: &ServerState,
+    binding: bcode_workflow::WorkflowLaunchCatalogRequest,
     mut scan: AdmittedDiscovery,
     continuation: &DiscoveryContinuation<'_>,
 ) -> Result<bcode_workflow::WorkflowLaunchCatalogPage, super::ServerError> {
-    let spool = scan.previews.as_ref().ok_or_else(|| {
-        super::ServerError::WorkflowAuthoring(
-            bcode_workflow::WorkflowAuthoringFailure::DiscoveryContinuationInvalid,
-        )
-    })?;
-    let rows = spool.page(
-        binding
-            .cursor
-            .as_ref()
-            .map(|cursor| (cursor.title.as_str(), cursor.source_key.as_str())),
-        binding.limit.saturating_add(1),
-    )?;
-    let diagnostics = scan.completed.take().ok_or_else(|| {
-        super::ServerError::WorkflowAuthoring(
-            bcode_workflow::WorkflowAuthoringFailure::DiscoveryContinuationInvalid,
-        )
-    })?;
-    let mut page = project_launch_catalog_page(rows, diagnostics, &binding);
-    // Fence the publication point as well as admission: decoding/projecting the spool
-    // must not publish readiness from a catalog changed during that work.
-    let store = state
-        .workflow_store
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    let fence = scan.publication_fence.as_ref().ok_or_else(|| {
-        super::ServerError::WorkflowAuthoring(
-            bcode_workflow::WorkflowAuthoringFailure::DiscoveryContinuationInvalid,
-        )
-    })?;
-    store.validate_publication_read_fence(fence)?;
-    if page.next_cursor.is_some() || binding.retain_for_detail {
-        binding.cursor.clone_from(&page.next_cursor);
-        scan.completed = Some(page.diagnostics.clone());
-        let retain_for_detail = binding.retain_for_detail;
-        let retained = retain_discovery(state, binding, scan, continuation)?;
-        if retain_for_detail {
-            page.detail_token.clone_from(&retained.discovery_token);
+    let cancellation = continuation.batch_cancellation()?;
+    let cancelled = std::sync::Arc::clone(&cancellation.0);
+    #[cfg(test)]
+    let barrier = state.workflow_page_barrier.lock().await.take();
+    let worker = tokio::task::spawn_blocking(move || {
+        #[cfg(test)]
+        if let Some((started, release)) = barrier {
+            let _ = started.send(());
+            let _ = release.recv_timeout(std::time::Duration::from_secs(10));
         }
-        if let Some(cursor) = &mut page.next_cursor {
-            cursor.result_token = retained.discovery_token;
+        let result = run_detail_construction(&cancelled, || {
+            let spool = scan.previews.as_ref().ok_or_else(|| {
+                super::ServerError::WorkflowAuthoring(
+                    bcode_workflow::WorkflowAuthoringFailure::DiscoveryContinuationInvalid,
+                )
+            })?;
+            let rows = spool.bounded_page(
+                binding
+                    .cursor
+                    .as_ref()
+                    .map(|cursor| (cursor.title.as_str(), cursor.source_key.as_str())),
+                binding.limit,
+                bcode_workflow_discovery::MAX_PREVIEW_PAGE_BYTES,
+                &|| cancelled.load(std::sync::atomic::Ordering::Acquire),
+            )?;
+            let diagnostics = scan.completed.take().ok_or_else(|| {
+                super::ServerError::WorkflowAuthoring(
+                    bcode_workflow::WorkflowAuthoringFailure::DiscoveryContinuationInvalid,
+                )
+            })?;
+            let mut page = project_launch_catalog_page(rows.items, diagnostics, &binding);
+            if rows.has_more {
+                page.next_cursor =
+                    page.items
+                        .last()
+                        .map(|item| bcode_workflow::WorkflowLaunchCatalogCursor {
+                            result_token: None,
+                            title: item.title.clone(),
+                            source_key: launch_source_key(&item.source),
+                        });
+            }
+            Ok(page)
+        });
+        (scan, binding, result)
+    });
+    let (scan, binding, result) = cancellation.wait_for_worker(worker).await?;
+    continuation.checkpoint().await?;
+    publish_retained_page(state, binding, scan, result?, continuation).await
+}
+
+async fn publish_retained_page(
+    state: &ServerState,
+    mut binding: bcode_workflow::WorkflowLaunchCatalogRequest,
+    mut scan: AdmittedDiscovery,
+    mut page: bcode_workflow::WorkflowLaunchCatalogPage,
+    continuation: &DiscoveryContinuation<'_>,
+) -> Result<bcode_workflow::WorkflowLaunchCatalogPage, super::ServerError> {
+    let cancellation = continuation.batch_cancellation()?;
+    let registry = std::sync::Arc::clone(&state.workflow_discovery_scans);
+    let store = std::sync::Arc::clone(&state.workflow_store);
+    let deadline = cancellation.2;
+    let token = continuation.token.map(str::to_owned);
+    let cancelled = std::sync::Arc::clone(&cancellation.0);
+    #[cfg(test)]
+    let mut barrier = state.workflow_detail_barrier.lock().await.take();
+    let worker = tokio::task::spawn_blocking(move || {
+        let publication = DiscoveryContinuation {
+            scans: &registry,
+            token: token.as_deref(),
+        };
+        let store = loop {
+            match store.try_lock() {
+                Ok(store) => break store,
+                Err(std::sync::TryLockError::Poisoned(error)) => break error.into_inner(),
+                Err(std::sync::TryLockError::WouldBlock) => {}
+            }
+            if deadline.is_some_and(|deadline| deadline <= std::time::Instant::now()) {
+                return Err(super::ServerError::WorkflowAuthoring(
+                    bcode_workflow::WorkflowAuthoringFailure::Cancelled,
+                ));
+            }
+            if let Some(token) = publication.token {
+                let scans = registry
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                if scans
+                    .get(token)
+                    .is_none_or(|pending| pending.expires <= std::time::Instant::now())
+                {
+                    return Err(super::ServerError::WorkflowAuthoring(
+                        bcode_workflow::WorkflowAuthoringFailure::Cancelled,
+                    ));
+                }
+            }
+            run_detail_construction(&cancelled, || Ok(()))?;
+            #[cfg(test)]
+            if let Some((started, _)) = barrier.take() {
+                let _ = started.send(());
+            }
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        };
+        run_detail_construction(&cancelled, || Ok(()))?;
+        let fence = scan.publication_fence.as_ref().ok_or_else(|| {
+            super::ServerError::WorkflowAuthoring(
+                bcode_workflow::WorkflowAuthoringFailure::DiscoveryContinuationInvalid,
+            )
+        })?;
+        store.validate_publication_read_fence(fence)?;
+        if page.next_cursor.is_some() || binding.retain_for_detail {
+            binding.cursor.clone_from(&page.next_cursor);
+            scan.completed = Some(page.diagnostics.clone());
+            let retain_for_detail = binding.retain_for_detail;
+            let retained = retain_discovery_in(&registry, binding, scan, &publication)?;
+            if retain_for_detail {
+                page.detail_token.clone_from(&retained.discovery_token);
+            }
+            if let Some(cursor) = &mut page.next_cursor {
+                cursor.result_token = retained.discovery_token;
+            }
+        } else {
+            publication.finish(
+                &mut registry
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner),
+            )?;
         }
-    } else {
-        continuation.finish(
-            &mut state
-                .workflow_discovery_scans
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner),
-        )?;
-    }
-    drop(store);
+        drop(publication);
+        drop(store);
+        let pending = PendingCatalogDelivery {
+            registry: std::sync::Arc::clone(&registry),
+            token: page.detail_token.clone().or_else(|| {
+                page.next_cursor
+                    .as_ref()
+                    .and_then(|cursor| cursor.result_token.clone())
+            }),
+        };
+        Ok::<_, super::ServerError>((page, pending))
+    });
+    // Successful finish removes the old token and signals its batch cancellation.
+    // Await the commit result rather than racing that self-generated signal. Caller
+    // drop still signals the worker, and undelivered replacements clean themselves up.
+    let (delivered, mut pending) = worker.await.map_err(super::ServerError::BlockingTask)??;
+    pending.token = None;
+    page = delivered;
     Ok(page)
 }
 
@@ -7997,7 +8614,7 @@ pub async fn authoring_catalog(
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         store
-            .list_definitions(1_000)?
+            .definition_snapshot_with_budget(1_000, 16 * 1024 * 1024)?
             .into_iter()
             .map(|stored| {
                 let definition: bcode_workflow::WorkflowDefinition =
@@ -8074,17 +8691,22 @@ pub fn template_description(
     owner_plugin_id: &str,
     template: &bcode_plugin::WorkflowTemplateContribution,
 ) -> Result<TemplateCatalogEntry, super::ServerError> {
-    let loaded_plugins = state
-        .plugins
-        .registry()
-        .manifests()
-        .keys()
-        .cloned()
-        .collect::<std::collections::BTreeSet<_>>();
+    template_description_with_plugins(
+        &|id| state.plugins.registry().manifests().contains_key(id),
+        owner_plugin_id,
+        template,
+    )
+}
+
+fn template_description_with_plugins(
+    plugin_is_loaded: &impl Fn(&str) -> bool,
+    owner_plugin_id: &str,
+    template: &bcode_plugin::WorkflowTemplateContribution,
+) -> Result<TemplateCatalogEntry, super::ServerError> {
     let capabilities = bcode_workflow::WorkflowProductionCapabilities::current();
     let mut diagnostics = Vec::new();
     for requirement in &template.required_plugins {
-        if !loaded_plugins.contains(requirement) {
+        if !plugin_is_loaded(requirement) {
             diagnostics.push(bcode_workflow::WorkflowTemplateAvailabilityDiagnostic {
                 code: "missing_plugin".to_string(),
                 requirement: requirement.clone(),
@@ -8135,9 +8757,7 @@ pub fn list_templates(
     state
         .plugins
         .registry()
-        .workflow_templates()
-        .into_iter()
-        .take(limit)
+        .workflow_template_window(0, limit)
         .map(|(owner, template)| template_description(state, owner, template))
         .collect()
 }
@@ -8152,14 +8772,8 @@ pub fn describe_template(
     state
         .plugins
         .registry()
-        .workflow_templates()
-        .into_iter()
-        .find(|(owner, template)| {
-            *owner == owner_plugin_id
-                && template.template_id == template_id
-                && template.template_version == template_version
-        })
-        .map(|(_, template)| template_description(state, owner_plugin_id, template))
+        .workflow_template(owner_plugin_id, template_id, template_version)
+        .map(|template| template_description(state, owner_plugin_id, template))
         .transpose()
         .map(|template| template.map(Box::new))
 }

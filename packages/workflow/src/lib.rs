@@ -5817,25 +5817,23 @@ pub fn plan_workflow_package(
                 format!("normalized member source cannot be serialized: {error}"),
             )
         })?;
-        let mut lowering = lower_workflow_authoring_source(
+        let validated = lower_workflow_authoring_source_for_compilation(
             &normalized,
             WorkflowSourceFormat::Json,
             &resolved_catalog,
         )
         .map_err(|error| qualify_workflow_package_member_error(member, error))?;
-        let compilation = lowering
+        let compiled = validated
+            .result
             .document
-            .compilation_preview(&resolved_catalog, None);
-        let compiled = compilation.compiled.ok_or_else(|| {
-            let message = compilation
-                .validation
-                .diagnostics
-                .first()
-                .map_or("package member did not compile", |diagnostic| {
-                    diagnostic.message.as_str()
-                });
-            qualify_workflow_package_member_error(member, authoring_error("compilation", message))
-        })?;
+            .compile_normalized_for_preview(validated.normalized, &resolved_catalog, None)
+            .map_err(|error| {
+                qualify_workflow_package_member_error(
+                    member,
+                    authoring_error("compilation", validation_diagnostic(error).message),
+                )
+            })?;
+        let mut lowering = validated.result;
         let identity = compiled.definition_identity;
         lowering.document.definition = compiled.definition.clone();
         let closure = workflow_package_member_closure(member, &members)?;
@@ -7434,6 +7432,22 @@ pub fn lower_workflow_authoring_source(
     format: WorkflowSourceFormat,
     catalog: &WorkflowAuthoringCatalogSnapshot,
 ) -> Result<WorkflowSourceLoweringResult, WorkflowError> {
+    lower_workflow_authoring_source_for_compilation(source, format, catalog)
+        .map(|lowered| lowered.result)
+}
+
+// Operation-local proof produced only by lowering. Never reconstruct this from a
+// public lowering result, whose document and validation report are caller-mutable.
+struct ValidatedWorkflowLowering {
+    result: WorkflowSourceLoweringResult,
+    normalized: WorkflowAuthoringDocument,
+}
+
+fn lower_workflow_authoring_source_for_compilation(
+    source: &str,
+    format: WorkflowSourceFormat,
+    catalog: &WorkflowAuthoringCatalogSnapshot,
+) -> Result<ValidatedWorkflowLowering, WorkflowError> {
     let value = decode_workflow_source_value(source, format)?;
     let object = value
         .as_object()
@@ -7491,24 +7505,31 @@ pub fn lower_workflow_authoring_source(
             },
         )
     };
-    let validation = document.validation_report().remap_diagnostics(&source_map);
-    if !validation.is_valid() {
-        return Err(authoring_error(
-            "source.lowered",
-            validation
-                .diagnostics
-                .first()
-                .map_or("lowered workflow is invalid", |diagnostic| {
-                    diagnostic.message.as_str()
-                }),
-        ));
+    let normalized = document.normalized().map_err(|error| {
+        let diagnostic = validation_diagnostic(error);
+        authoring_error("source.lowered", diagnostic.message)
+    })?;
+    let validation = WorkflowValidationReport {
+        authoring_version: document.schema_version,
+        valid: true,
+        source_digest_sha256: canonical_sha256(&normalized, "workflow").ok(),
+        executable_source_digest_sha256: canonical_sha256(
+            &normalized.executable_semantics(),
+            "workflow.executable_source",
+        )
+        .ok(),
+        diagnostics: Vec::new(),
     }
-    Ok(WorkflowSourceLoweringResult {
-        version: WORKFLOW_SOURCE_LOWERING_VERSION,
-        profile,
-        document,
-        source_map,
-        validation,
+    .remap_diagnostics(&source_map);
+    Ok(ValidatedWorkflowLowering {
+        normalized,
+        result: WorkflowSourceLoweringResult {
+            version: WORKFLOW_SOURCE_LOWERING_VERSION,
+            profile,
+            document,
+            source_map,
+            validation,
+        },
     })
 }
 
@@ -9476,15 +9497,33 @@ impl WorkflowAuthoringDocument {
         catalog: &WorkflowAuthoringCatalogSnapshot,
         configuration: Option<&serde_json::Value>,
     ) -> WorkflowCompilationPreview {
-        let mut validation = self.validation_report();
-        if !validation.is_valid() {
-            return WorkflowCompilationPreview {
-                version: WORKFLOW_COMPILATION_PREVIEW_VERSION,
-                validation,
-                compiled: None,
-            };
-        }
-        match self.compile_for_preview(catalog, configuration) {
+        let normalized = match self.normalized() {
+            Ok(document) => document,
+            Err(error) => {
+                let mut validation = self.validation_report();
+                if validation.is_valid() {
+                    validation.valid = false;
+                    validation.diagnostics.push(validation_diagnostic(error));
+                }
+                return WorkflowCompilationPreview {
+                    version: WORKFLOW_COMPILATION_PREVIEW_VERSION,
+                    validation,
+                    compiled: None,
+                };
+            }
+        };
+        let mut validation = WorkflowValidationReport {
+            authoring_version: self.schema_version,
+            valid: true,
+            source_digest_sha256: canonical_sha256(&normalized, "workflow").ok(),
+            executable_source_digest_sha256: canonical_sha256(
+                &normalized.executable_semantics(),
+                "workflow.executable_source",
+            )
+            .ok(),
+            diagnostics: Vec::new(),
+        };
+        match self.compile_normalized_for_preview(normalized, catalog, configuration) {
             Ok(compiled) => WorkflowCompilationPreview {
                 version: WORKFLOW_COMPILATION_PREVIEW_VERSION,
                 validation,
@@ -9509,12 +9548,21 @@ impl WorkflowAuthoringDocument {
         catalog: &WorkflowAuthoringCatalogSnapshot,
         configuration: Option<&serde_json::Value>,
     ) -> Result<WorkflowCompiledAuthoringPreview, WorkflowError> {
-        self.validate()?;
+        self.compile_normalized_for_preview(self.normalized()?, catalog, configuration)
+    }
+
+    // The owned document must come from this immutable source's validated normalization.
+    // Keep reuse operation-local; callers cannot supply unchecked normalized documents.
+    fn compile_normalized_for_preview(
+        &self,
+        normalized: Self,
+        catalog: &WorkflowAuthoringCatalogSnapshot,
+        configuration: Option<&serde_json::Value>,
+    ) -> Result<WorkflowCompiledAuthoringPreview, WorkflowError> {
         catalog.validate()?;
         let configuration =
             merge_authoring_configuration(self.configuration_defaults.as_ref(), configuration)?;
         validate_value_against_schema("configuration", &configuration, &self.configuration_schema)?;
-        let normalized = self.normalize_validated()?;
         let mut definition = normalized.definition;
         let mut run_limits = normalized.run_limits;
         let mut plugin_input_defaults = normalized.plugin_input_defaults.clone();
@@ -17009,6 +17057,23 @@ mod tests {
         };
         let plan = plan_workflow_package(&manifest, &authoring_catalog()).expect("plan");
         let member = &plan.members[0];
+        let independently_lowered = lower_workflow_authoring_source(
+            &manifest.members[0].source,
+            manifest.members[0].format,
+            &authoring_catalog(),
+        )
+        .expect("public lowering");
+        assert_eq!(member.lowering.validation, independently_lowered.validation);
+        let independent = independently_lowered
+            .document
+            .compilation_preview(&authoring_catalog(), None);
+        assert_eq!(
+            member.definition_identity,
+            independent
+                .compiled
+                .expect("public compilation")
+                .definition_identity
+        );
         assert_eq!(
             plan.lock.members[0].source_digest_sha256,
             member
@@ -20172,6 +20237,16 @@ steps:
             preview.validation.diagnostics
         );
         let compiled = preview.compiled.as_ref().expect("compiled preview");
+        assert_eq!(preview.validation, document.validation_report());
+        assert_eq!(
+            *compiled,
+            document
+                .compile_for_preview(
+                    &catalog,
+                    Some(&serde_json::json!({"message": "build", "duration_ms": 45000})),
+                )
+                .expect("independent compilation")
+        );
         let prompt: WorkflowPromptConfiguration = serde_json::from_value(
             compiled
                 .definition
