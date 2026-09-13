@@ -1253,6 +1253,60 @@ impl WorkflowStore {
         self.stage_run_graph_edit_for_caller(request, authority, created_at_ms, Some(caller))
     }
 
+    /// Read an active execution's graph and verify its durable link in one snapshot.
+    ///
+    /// # Errors
+    /// Rejects stale callers, foreign authority, unqualified continuation cursors,
+    /// invalid bounds, revision conflicts, and unavailable or damaged graph state.
+    pub fn execution_context_graph_page(
+        &self,
+        caller: &super::WorkflowExecutionSessionLink,
+        authority: &super::WorkflowExecutionAuthority,
+        request: &bcode_workflow::WorkflowExecutionContextRequest,
+    ) -> Result<
+        (
+            RunGraphPage,
+            Option<bcode_workflow::WorkflowOutputInspection>,
+            Vec<super::WorkflowOutputSummary>,
+        ),
+        WorkflowStoreError,
+    > {
+        if !(1..=100).contains(&request.limit) {
+            return Err(WorkflowStoreError::InvalidData(
+                "execution context limit must be between 1 and 100".to_owned(),
+            ));
+        }
+        if request.expected_revision.is_none()
+            && (request.after_node_id.is_some() || request.after_edge_id.is_some())
+        {
+            return Err(WorkflowStoreError::InvalidData(
+                "execution context continuation requires a revision".to_owned(),
+            ));
+        }
+        let transaction = self.connection.unchecked_transaction()?;
+        self.verify_execution_authority(&caller.run_id, authority)?;
+        self.verify_active_graph_edit_caller(&caller.run_id, caller)?;
+        let page = self.current_run_graph_page(
+            &caller.run_id,
+            request.expected_revision,
+            request.after_node_id.as_deref(),
+            request.after_edge_id,
+            request.limit,
+        )?;
+        let output = request
+            .output_id
+            .as_deref()
+            .map(|id| self.inspect_exact_output(&caller.run_id, id))
+            .transpose()?;
+        let outputs = self.output_summaries_after(
+            &caller.run_id,
+            request.after_output_id.as_deref(),
+            request.limit,
+        )?;
+        transaction.commit()?;
+        Ok((page, output, outputs))
+    }
+
     // Both callers hold a transaction on this connection through their eventual commit.
     fn verify_active_graph_edit_caller(
         &self,

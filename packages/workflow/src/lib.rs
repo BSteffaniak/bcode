@@ -95,6 +95,40 @@ use thiserror::Error;
 use tokio::sync::{Notify, OwnedSemaphorePermit, Semaphore, mpsc};
 use tokio::task::JoinHandle;
 
+/// Execution-scoped graph inspection request. Identity is supplied by the host.
+///
+/// The initial request omits revision and cursors. Subsequent pages must name
+/// the returned revision; conflicts require restarting pagination. Unknown fields
+/// are rejected under the v1 workflow application interface.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WorkflowExecutionContextRequest {
+    /// Optional exact canonical output to consume from this execution's run.
+    pub output_id: Option<String>,
+    /// Exclusive output identity cursor; outputs are immutable and ordered by identity.
+    pub after_output_id: Option<String>,
+    pub expected_revision: Option<u64>,
+    pub after_node_id: Option<String>,
+    pub after_edge_id: Option<u64>,
+    pub limit: usize,
+}
+
+/// Authenticated execution identity and a bounded revision-qualified graph page.
+/// This read grants no authority to publish or execute work.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WorkflowExecutionContext {
+    pub run_id: String,
+    pub node_id: String,
+    pub activation_id: String,
+    pub attempt: u32,
+    pub graph: WorkflowRunGraphInspection,
+    /// Requested checksum-verified canonical result; absent when no output was requested.
+    pub output: Option<WorkflowOutputInspection>,
+    /// Bounded output metadata page. A full page may have successors; continue by ID.
+    pub outputs: Vec<WorkflowOutputSummary>,
+}
+
 /// Read independent node and edge pages from one expected graph revision.
 ///
 /// A revision mismatch is rejected; callers must restart pagination. Cursors are

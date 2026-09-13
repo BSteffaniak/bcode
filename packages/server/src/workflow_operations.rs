@@ -10997,12 +10997,18 @@ fn inspect_run_graph(
         after_edge_id,
         limit,
     )?;
+    Ok(graph_page_inspection(page))
+}
+
+pub fn graph_page_inspection(
+    page: bcode_workflow_store::RunGraphPage,
+) -> bcode_workflow::WorkflowRunGraphInspection {
     let revision = page.revision;
     let nodes = page.nodes;
     let edges = page.edges;
     let nodes_complete = page.nodes_complete;
     let edges_complete = page.edges_complete;
-    Ok(bcode_workflow::WorkflowRunGraphInspection {
+    bcode_workflow::WorkflowRunGraphInspection {
         revision,
         nodes: nodes
             .into_iter()
@@ -11023,7 +11029,7 @@ fn inspect_run_graph(
             .collect(),
         nodes_complete,
         edges_complete,
-    })
+    }
 }
 
 #[allow(clippy::too_many_lines)]

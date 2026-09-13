@@ -8,6 +8,25 @@ use bcode_tool::{
 use bcode_workflow::{WORKFLOW_APPLICATION_INTERFACE_ID, WorkflowRunGraphEditBatch};
 use serde_json::json;
 
+const CONTEXT_NAME: &str = "workflow.execution_context";
+const CONTEXT_OPERATION: &str = "execution_context";
+
+fn context_definition() -> ToolDefinition {
+    ToolDefinition {
+        name: CONTEXT_NAME.to_owned(),
+        description: "Read this active workflow execution's authenticated identity and bounded graph page. Omit revision and cursors initially; continue with the returned revision and last node/edge identities. Restart on revision conflict. This grants no mutation authority.".to_owned(),
+        input_schema: json!({"type":"object", "additionalProperties":false,
+            "required":["limit"], "properties": {
+                "after_output_id":{"type":["string","null"], "description":"Exclusive last output ID. Outputs arriving behind the cursor require a fresh scan; this is not a durable event stream."},
+                "output_id":{"type":["string","null"], "description":"Exact canonical output identity from this run; returns checksum-verified value without opening artifacts."},
+                "limit":{"type":"integer", "minimum":1, "maximum":100},
+                "expected_revision":{"type":["integer","null"], "minimum":1},
+                "after_node_id":{"type":["string","null"]},
+                "after_edge_id":{"type":["integer","null"]}
+            }}),
+    }
+}
+
 const NAME: &str = "workflow.stage_run_graph_edit";
 const OPERATION: &str = "stage_run_graph_edit";
 const PUBLISH_NAME: &str = "workflow.publish_run_graph_edit";
@@ -70,6 +89,7 @@ pub fn invoke(context: &NativeServiceContext) -> ServiceResponse {
                 definition(),
                 publication_definition(),
                 acceptance_definition(),
+                context_definition(),
             ],
         }),
         bcode_tool::OP_PREPARE_TOOL => prepare_tool_service_response(
@@ -78,10 +98,27 @@ pub fn invoke(context: &NativeServiceContext) -> ServiceResponse {
                 definition(),
                 publication_definition(),
                 acceptance_definition(),
+                context_definition(),
             ],
             |request, _| {
-                let operation = operation(&request.invocation.tool_name)?;
-                let edit = parse_edit(&request.invocation.arguments)?;
+                let is_context = request.invocation.tool_name == CONTEXT_NAME;
+                let operation = if is_context {
+                    CONTEXT_OPERATION
+                } else {
+                    operation(&request.invocation.tool_name)?
+                };
+                let payload = if is_context {
+                    let context: bcode_workflow::WorkflowExecutionContextRequest =
+                        serde_json::from_value(request.invocation.arguments.clone())
+                            .map_err(|_| "invalid execution context request".to_owned())?;
+                    if !(1..=100).contains(&context.limit) {
+                        return Err("invalid execution context limit".to_owned());
+                    }
+                    serde_json::to_value(context).map_err(|error| error.to_string())?
+                } else {
+                    serde_json::to_value(parse_edit(&request.invocation.arguments)?)
+                        .map_err(|error| error.to_string())?
+                };
                 let route = request
                     .host_context
                     .iter()
@@ -102,11 +139,15 @@ pub fn invoke(context: &NativeServiceContext) -> ServiceResponse {
                     })
                     .ok_or_else(|| "workflow staging route is unavailable".to_owned())?;
                 Ok(bcode_plugin_sdk::ToolPolicyPreparation::new(
-                    true,
-                    bcode_plugin_sdk::ToolPolicyOperation::Mutating,
+                    !is_context,
+                    if is_context {
+                        bcode_plugin_sdk::ToolPolicyOperation::ReadOnly
+                    } else {
+                        bcode_plugin_sdk::ToolPolicyOperation::Mutating
+                    },
                 )
                 .with_descriptor(
-                    json!({"route_id":route.route_id, "operation": operation, "edit": edit}),
+                    json!({"route_id":route.route_id, "operation": operation, "edit": payload}),
                 ))
             },
         ),
@@ -135,10 +176,73 @@ fn prepared_edit_matches(
             == Some(edit)
 }
 
+fn invoke_context(
+    context: &NativeServiceContext,
+    request: ToolInvocationRequest,
+) -> ServiceResponse {
+    let Ok(query) = serde_json::from_value::<bcode_workflow::WorkflowExecutionContextRequest>(
+        request.arguments,
+    ) else {
+        return ServiceResponse::error("invalid_request", "invalid execution context request");
+    };
+    let Ok(payload) = serde_json::to_value(query) else {
+        return ServiceResponse::error("invalid_request", "invalid execution context request");
+    };
+    let descriptor = &request.preparation_descriptor;
+    if descriptor
+        .get("operation")
+        .and_then(serde_json::Value::as_str)
+        != Some(CONTEXT_OPERATION)
+        || descriptor.get("edit") != Some(&payload)
+        || context.cancellation.is_cancelled()
+    {
+        return ServiceResponse::error(
+            "invalid_request",
+            "execution context preparation is not current",
+        );
+    }
+    let Some(route_id) = descriptor
+        .get("route_id")
+        .and_then(serde_json::Value::as_str)
+    else {
+        return ServiceResponse::error("invalid_request", "execution context route missing");
+    };
+    match context.bridge.request(&ServiceBridgeRequest::InvokeService(
+        ToolInvocationServiceRequest {
+            invocation_id: request.tool_call_id.clone(),
+            request_id: request.tool_call_id,
+            route_id: Some(route_id.to_owned()),
+            interface_id: WORKFLOW_APPLICATION_INTERFACE_ID.to_owned(),
+            operation: CONTEXT_OPERATION.to_owned(),
+            payload,
+        },
+    )) {
+        Ok(ServiceBridgeResponse::Service(ToolInvocationServiceResolution::Responded {
+            payload,
+        })) => serde_json::from_value::<bcode_workflow::WorkflowExecutionContext>(payload)
+            .map_or_else(
+                |_| ServiceResponse::error("invalid_response", "invalid workflow context"),
+                |context| {
+                    super::json_response(&bcode_tool::ToolInvocationResponse {
+                        output: serde_json::to_string(&context).unwrap_or_default(),
+                        is_error: false,
+                        content: Vec::new(),
+                        full_output: None,
+                        result: None,
+                    })
+                },
+            ),
+        _ => ServiceResponse::error("context_unavailable", "active workflow context unavailable"),
+    }
+}
+
 fn invoke_edit(context: &NativeServiceContext) -> ServiceResponse {
     let Ok(request) = context.request.payload_json::<ToolInvocationRequest>() else {
         return ServiceResponse::error("invalid_request", "invalid workflow tool invocation");
     };
+    if request.name == CONTEXT_NAME {
+        return invoke_context(context, request);
+    }
     let Ok(operation) = operation(&request.name) else {
         return ServiceResponse::error("unsupported_tool", "unsupported workflow tool");
     };

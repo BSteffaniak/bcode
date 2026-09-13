@@ -1678,6 +1678,72 @@ impl ServerState {
         result.map_err(Into::into)
     }
 
+    /// Read bounded graph context for the authenticated active execution session.
+    ///
+    /// # Errors
+    /// Rejects missing or stale execution provenance, foreign authority, cancellation,
+    /// invalid pagination, and unavailable or damaged durable state.
+    pub async fn workflow_execution_context_from_invocation(
+        &self,
+        session_id: SessionId,
+        request: bcode_workflow::WorkflowExecutionContextRequest,
+        cancellation: &TurnCancelState,
+    ) -> Result<bcode_workflow::WorkflowExecutionContext, ServerError> {
+        let denied = || {
+            ServerError::WorkflowApplicationOperationUnauthorized(
+                "context requires a current workflow execution".to_owned(),
+            )
+        };
+        self.require_workflow_store()?;
+        let session = self.sessions.session_summary(session_id).await?;
+        let provenance = session.execution.ok_or_else(denied)?.provenance;
+        if provenance.version != bcode_session_models::EXECUTION_SESSION_PROVENANCE_VERSION
+            || provenance.owner != "bcode.workflow"
+        {
+            return Err(denied());
+        }
+        let activation_id = provenance.activation_id.as_deref().ok_or_else(denied)?;
+        let commit = cancellation.marker_commit.lock().await;
+        let store = self
+            .workflow_store
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let link = store
+            .execution_session_link(
+                &provenance.run_id,
+                &provenance.node_id,
+                activation_id,
+                provenance.attempt,
+            )?
+            .ok_or_else(denied)?;
+        if link.session_id != session_id.to_string()
+            || Some(link.workspace_snapshot.as_str()) != provenance.workspace_snapshot.as_deref()
+            || cancellation.is_cancelled()
+        {
+            return Err(denied());
+        }
+        let authority = store
+            .execution_authority(&provenance.run_id)?
+            .ok_or_else(denied)?;
+        if authority.daemon_instance_id != self.daemon_status.instance_id {
+            return Err(denied());
+        }
+        let (page, output, outputs) =
+            store.execution_context_graph_page(&link, &authority, &request)?;
+        let context = bcode_workflow::WorkflowExecutionContext {
+            run_id: link.run_id,
+            node_id: link.node_id,
+            activation_id: link.activation_id,
+            attempt: link.attempt,
+            graph: workflow_operations::graph_page_inspection(page),
+            output,
+            outputs,
+        };
+        drop(store);
+        drop(commit);
+        Ok(context)
+    }
+
     /// Publish an exact staged candidate for an authenticated plugin invocation.
     ///
     /// The dispatcher supplies the plugin identity, session, and turn cancellation state.
@@ -25960,7 +26026,7 @@ async fn invocation_service_routes(
     session_id: SessionId,
 ) -> Vec<ServerInvocationServiceRoute> {
     let mut routes = provider_invocation_service_routes(state, session_id).await;
-    let mut workflow_operations = Vec::new();
+    let mut workflow_operations = vec!["execution_context".to_owned()];
     if state.workflow_run_graph_edit_policy.is_some() {
         workflow_operations.push("stage_run_graph_edit".to_owned());
     }
@@ -27887,6 +27953,29 @@ async fn invoke_run_graph_operation(
     }
 }
 
+async fn resolve_execution_context(
+    state: &ServerState,
+    session_id: SessionId,
+    payload: serde_json::Value,
+    cancellation: &TurnCancelState,
+) -> ToolInvocationServiceResolution {
+    let Ok(request) = serde_json::from_value(payload) else {
+        return workflow_invocation_failure();
+    };
+    state
+        .workflow_execution_context_from_invocation(session_id, request, cancellation)
+        .await
+        .map_or_else(
+            |_| workflow_invocation_failure(),
+            |context| {
+                serde_json::to_value(context).map_or_else(
+                    |_| workflow_invocation_failure(),
+                    |payload| ToolInvocationServiceResolution::Responded { payload },
+                )
+            },
+        )
+}
+
 async fn resolve_server_plugin_bridge_request(
     state: &ServerState,
     session_id: SessionId,
@@ -27929,12 +28018,15 @@ async fn resolve_server_plugin_bridge_request(
                 != Some(bcode_workflow::WORKFLOW_APPLICATION_INTERFACE_ID)
                 || !matches!(
                     request.operation.as_str(),
-                    "stage_run_graph_edit"
+                    "execution_context"
+                        | "stage_run_graph_edit"
                         | "publish_run_graph_edit"
                         | "accept_run_graph_publication"
                 )
             {
                 ToolInvocationServiceResolution::Unsupported
+            } else if request.operation == "execution_context" {
+                resolve_execution_context(state, session_id, request.payload, cancel_state).await
             } else if let Ok(edit) = serde_json::from_value(request.payload) {
                 let result = invoke_run_graph_operation(
                     state,
@@ -52811,6 +52903,51 @@ library = "test"
             ),
             WorkflowApplicationAuthorizationDecision::Deny { .. }
         ));
+    }
+
+    #[tokio::test]
+    async fn registered_workflow_tool_reads_authenticated_execution_context() {
+        let (mut state, child_id, _root) = active_edit_execution_fixture().await;
+        register_workflow_publication_tool(&mut state);
+        let call = bcode_model::ToolCall {
+            id: "context-read".to_owned(),
+            name: "workflow.execution_context".to_owned(),
+            arguments: serde_json::json!({"limit":1}),
+        };
+        let (tool, preparation) = prepare_server_tool(&state, child_id, &call)
+            .await
+            .expect("prepare context");
+        let metadata = tool_policy_authorization_metadata(&preparation.authorization, &call.name)
+            .expect("read facts");
+        assert!(!metadata.requires_permission);
+        let cancellation = TurnCancelState::default();
+        let response = tokio::time::timeout(
+            Duration::from_secs(10),
+            invoke_prepared_tool_for_test(
+                &state,
+                child_id,
+                &call,
+                tool,
+                preparation,
+                &metadata,
+                &cancellation,
+            ),
+        )
+        .await
+        .expect("context deadline")
+        .expect("context transport");
+        assert!(!response.is_error, "{}", response.output);
+        let context: bcode_workflow::WorkflowExecutionContext =
+            serde_json::from_str(&response.output).expect("typed context");
+        assert_eq!(context.run_id, "edit-run");
+        assert_eq!(context.graph.revision, 1);
+        assert!(context.graph.nodes.len() <= 1);
+        assert!(
+            serde_json::from_value::<bcode_workflow::WorkflowExecutionContextRequest>(
+                serde_json::json!({"limit":1,"run_id":"foreign-run"})
+            )
+            .is_err()
+        );
     }
 
     #[tokio::test]

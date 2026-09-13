@@ -1,5 +1,30 @@
 # Runtime workflow authoring architecture
 
+## Execution-scoped context
+
+The workflow plugin exposes `workflow.execution_context` through the existing v1
+workflow application invocation bridge. Its request contains only a page limit
+(1–100), optional expected graph revision, and node/edge continuation cursors.
+The host derives run, node, activation, and attempt identity from versioned session
+provenance and verifies the exact stored execution link, active attempt, workspace,
+and current daemon authority. Verification and graph reads share one non-mutating
+store snapshot. Continuation without an expected revision fails closed; conflicts
+require restarting pagination. Unknown request fields are rejected.
+
+The response uses portable workflow contracts and contains authenticated execution
+identity plus the existing bounded graph projection, a bounded canonical output
+metadata page, and optionally one exact checksum-verified output. `after_output_id`
+is an exclusive lexicographic cursor; continue until an empty page. This is a
+snapshot query, not a durable stream: concurrently created outputs behind a cursor
+require a fresh scan. `output_id` selects a value only within the authenticated run;
+missing, oversized, or checksum-inconsistent values fail closed. Reads never open
+artifact references or infer overall run completion from an individual output.
+These fields extend the still-unreleased context operation, not a durable format.
+This read-only operation does
+not grant edit/publication authority or expose other runs. The optional objective
+planning procedure allows this tool for inspecting its current execution. Output
+inspection supplies existing results, not delegated task admission or durable waits.
+
 ## Purpose
 
 Runtime workflow authoring lets a human, CLI, SDK, frontend, plugin, or generated producer describe a

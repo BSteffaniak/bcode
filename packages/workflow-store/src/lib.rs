@@ -29,7 +29,7 @@ mod continuation;
 mod offline_recovery;
 mod recovery;
 mod run_graph;
-pub use run_graph::{RunGraphCandidateValidation, RunGraphEdge, RunGraphNode};
+pub use run_graph::{RunGraphCandidateValidation, RunGraphEdge, RunGraphNode, RunGraphPage};
 
 const DATABASE_FILE: &str = "workflow.db";
 const LOCK_FILE: &str = "workflow.lock";
@@ -5691,6 +5691,91 @@ impl WorkflowStore {
             })?
             .collect::<Result<Vec<_>, _>>()
             .map_err(WorkflowStoreError::from)
+    }
+
+    /// Read canonical output metadata using an exclusive identity cursor.
+    ///
+    /// # Errors
+    /// Rejects invalid identities or limits and database failures. Does not load values.
+    pub fn output_summaries_after(
+        &self,
+        run_id: &str,
+        after_output_id: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<WorkflowOutputSummary>, WorkflowStoreError> {
+        validate_id("run_id", run_id)?;
+        if let Some(cursor) = after_output_id {
+            validate_id("output_id", cursor)?;
+        }
+        let limit = bounded_limit(limit)?;
+        let mut statement = self.connection.prepare(
+            "SELECT output_id, run_id, node_id, activation_id, schema_id, schema_version,
+             artifact_reference, checksum_sha256, created_at_ms FROM workflow_outputs
+             WHERE run_id = ?1 AND output_id > ?2 ORDER BY output_id LIMIT ?3",
+        )?;
+        statement
+            .query_map((run_id, after_output_id.unwrap_or(""), limit), |row| {
+                Ok(WorkflowOutputSummary {
+                    output_id: row.get(0)?,
+                    run_id: row.get(1)?,
+                    node_id: row.get(2)?,
+                    activation_id: row.get(3)?,
+                    schema_id: row.get(4)?,
+                    schema_version: row.get(5)?,
+                    artifact_reference: row.get(6)?,
+                    checksum_sha256: row.get(7)?,
+                    created_at_ms: row.get(8)?,
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(Into::into)
+    }
+
+    /// Read one exact checksum-verified output without scanning prior outputs.
+    ///
+    /// # Errors
+    /// Rejects invalid identities, missing outputs, oversized payloads, corrupt JSON,
+    /// checksum disagreement, or database failures. No artifact is opened implicitly.
+    pub fn inspect_exact_output(
+        &self,
+        run_id: &str,
+        output_id: &str,
+    ) -> Result<bcode_workflow::WorkflowOutputInspection, WorkflowStoreError> {
+        validate_id("run_id", run_id)?;
+        validate_id("output_id", output_id)?;
+        let (mut output, value): (bcode_workflow::WorkflowOutputInspection, String) =
+            self.connection.query_row(
+                "SELECT node_id, activation_id, schema_id, schema_version,
+                 CASE WHEN length(CAST(value_json AS BLOB)) <= ?3 THEN value_json END,
+                 artifact_reference, checksum_sha256, created_at_ms
+                 FROM workflow_outputs WHERE run_id = ?1 AND output_id = ?2",
+                rusqlite::params![run_id, output_id, MAX_INLINE_JSON_BYTES],
+                |row| {
+                    Ok((
+                        bcode_workflow::WorkflowOutputInspection {
+                            version: bcode_workflow::WORKFLOW_OUTPUT_INSPECTION_VERSION,
+                            output_id: output_id.to_owned(),
+                            run_id: run_id.to_owned(),
+                            node_id: row.get(0)?,
+                            activation_id: row.get(1)?,
+                            schema_id: row.get(2)?,
+                            schema_version: row.get(3)?,
+                            value: serde_json::Value::Null,
+                            artifact_reference: row.get(5)?,
+                            checksum_sha256: row.get(6)?,
+                            created_at_ms: row.get(7)?,
+                        },
+                        row.get(4)?,
+                    ))
+                },
+            )?;
+        if sha256_hex(value.as_bytes()) != output.checksum_sha256 {
+            return Err(WorkflowStoreError::InvalidData(
+                "workflow output checksum mismatch".to_owned(),
+            ));
+        }
+        output.value = serde_json::from_str(&value)?;
+        Ok(output)
     }
 
     /// Return bounded validated output values without replaying workflow history.
@@ -24557,6 +24642,26 @@ mod tests {
         );
     }
 
+    fn assert_context_pagination(
+        store: &WorkflowStore,
+        link: &WorkflowExecutionSessionLink,
+        authority: &WorkflowExecutionAuthority,
+        request: &bcode_workflow::WorkflowExecutionContextRequest,
+    ) {
+        for expected_revision in [None, Some(999)] {
+            let continuation = bcode_workflow::WorkflowExecutionContextRequest {
+                expected_revision,
+                after_node_id: Some("review".to_owned()),
+                ..request.clone()
+            };
+            assert!(
+                store
+                    .execution_context_graph_page(link, authority, &continuation)
+                    .is_err()
+            );
+        }
+    }
+
     #[test]
     fn run_edit_staging_checks_exact_active_execution() {
         let temp = tempfile::tempdir().expect("temp");
@@ -24604,6 +24709,28 @@ mod tests {
         };
         let mut wrong = link.clone();
         wrong.session_id = "other-session".to_string();
+        let context_request = bcode_workflow::WorkflowExecutionContextRequest {
+            output_id: None,
+            after_output_id: None,
+            expected_revision: None,
+            after_node_id: None,
+            after_edge_id: None,
+            limit: 1,
+        };
+        let before_read = store.connection.total_changes();
+        let (page, output, _) = store
+            .execution_context_graph_page(&link, &authority, &context_request)
+            .expect("active execution context");
+        assert!(output.is_none());
+        assert_eq!(page.revision, 1);
+        assert!(page.nodes.len() <= 1);
+        assert_eq!(store.connection.total_changes(), before_read);
+        assert!(
+            store
+                .execution_context_graph_page(&wrong, &authority, &context_request)
+                .is_err()
+        );
+        assert_context_pagination(&store, &link, &authority, &context_request);
         assert!(
             store
                 .stage_run_graph_edit_from_execution(&request, &authority, &wrong, 14)
@@ -24621,6 +24748,11 @@ mod tests {
                 [],
             )
             .expect("settle fixture");
+        assert!(
+            store
+                .execution_context_graph_page(&link, &authority, &context_request)
+                .is_err()
+        );
         let before = store.connection.total_changes();
         assert!(
             store
@@ -47074,6 +47206,36 @@ mod tests {
         let outputs = store.output_summaries("run-1", 10).expect("outputs");
         assert_eq!(outputs.len(), 1);
         assert_eq!(outputs[0].artifact_reference.as_deref(), Some("artifact-1"));
+        let before = store.connection.total_changes();
+        let page = store
+            .output_summaries_after("run-1", None, 1)
+            .expect("page");
+        assert_eq!(page[0].output_id, "output-1");
+        assert!(
+            store
+                .output_summaries_after("run-1", Some("output-1"), 1)
+                .expect("end")
+                .is_empty()
+        );
+        let exact = store
+            .inspect_exact_output("run-1", "output-1")
+            .expect("exact output");
+        assert_eq!(exact.value, serde_json::json!(7));
+        assert_eq!(
+            exact.activation_id,
+            activation_identity("run-1", "review", 0)
+        );
+        assert!(store.inspect_exact_output("other-run", "output-1").is_err());
+        assert!(store.inspect_exact_output("run-1", "absent").is_err());
+        assert_eq!(store.connection.total_changes(), before);
+        store
+            .connection
+            .execute(
+                "UPDATE workflow_outputs SET value_json = '8' WHERE output_id = 'output-1'",
+                [],
+            )
+            .expect("damage fixture");
+        assert!(store.inspect_exact_output("run-1", "output-1").is_err());
         assert!(
             store
                 .grants_for_run("run-1", 10)
