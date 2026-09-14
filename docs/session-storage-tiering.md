@@ -361,6 +361,14 @@ No migration, history recompression writer, or database-space reclamation is act
 writes requires the storage epoch upgrade and completion of every remaining direct payload consumer;
 this codec foundation alone is not history compression functionality.
 
+## Compressed-history read integration
+
+Canonical row pages and migration-target row pages now decode the storage envelope to exact logical
+JSON before returning their typed contract; historical policy does not receive a compressed string
+as event JSON. A database integration test stores a compressed fixture payload and verifies bounded
+history, around-sequence navigation, and canonical-row JSON equivalence while the stored payload
+remains compressed. Production history compression writes and epoch migration are still not enabled.
+
 ## Remaining implementation
 
 ### Access policy and scheduling

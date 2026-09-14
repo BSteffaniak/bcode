@@ -1941,7 +1941,9 @@ impl SessionDb {
         ))
     }
 
-    /// Return a bounded canonical page without decoding payloads.
+    /// Return a bounded canonical page with logical payload JSON, without interpreting event kinds.
+    /// Storage compression is decoded at this boundary so migration policy never receives codec
+    /// envelopes as historical event JSON.
     ///
     /// # Errors
     ///
@@ -1971,7 +1973,10 @@ impl SessionDb {
                     .map_err(|_| SessionDbError::InvalidRow {
                         column: "schema_version".to_owned(),
                     })?,
-                    payload: required_string(row, "payload")?,
+                    payload: crate::event_compression::decode_event_payload(&required_string(
+                        row, "payload",
+                    )?)?
+                    .into_owned(),
                 })
             })
             .collect()
@@ -4050,7 +4055,10 @@ impl bcode_session_migration_target::MigrationTarget for SessionMigrationTarget<
                     .map_err(|_| SessionDbError::InvalidRow {
                         column: "events.schema_version".to_owned(),
                     })?,
-                    payload: required_string(&row, "payload")?,
+                    payload: crate::event_compression::decode_event_payload(&required_string(
+                        &row, "payload",
+                    )?)?
+                    .into_owned(),
                 })
             })
             .collect()
@@ -11081,6 +11089,83 @@ mod tests {
                 .expect("read")
                 .1,
             bytes[262_140..262_220]
+        );
+    }
+
+    #[tokio::test]
+    async fn compressed_canonical_payloads_preserve_bounded_history_and_migration_json() {
+        let root = tempfile::tempdir().expect("root");
+        let id = SessionId::new();
+        let db = SessionDb::open_turso_in_root(id, root.path())
+            .await
+            .expect("database");
+        let created = event(
+            id,
+            0,
+            SessionEventKind::SessionCreated {
+                name: None,
+                working_directory: root.path().to_path_buf(),
+            },
+        );
+        db.append_event(&created).await.expect("created");
+        let message = event(
+            id,
+            1,
+            SessionEventKind::UserMessage {
+                text: "history payload 世界 ".repeat(10_000),
+                client_id: ClientId::new(),
+                admission: bcode_session_models::TurnAdmissionMetadata::default(),
+            },
+        );
+        db.append_event(&message).await.expect("message");
+        let logical = encode_session_event(&message).expect("logical JSON");
+        let compressed =
+            crate::event_compression::compress_event_payload(&logical, 12).expect("compressed");
+        assert!(compressed.len() < logical.len());
+        // Explicit test fixture transformation: production writes remain migration-fenced.
+        db.database()
+            .update("events")
+            .value("payload", compressed.clone())
+            .where_eq("event_seq", 1)
+            .execute(db.database())
+            .await
+            .expect("fixture payload");
+        let page = db
+            .history_page(SessionHistoryQuery {
+                cursor: None,
+                limit: 1,
+                direction: SessionHistoryDirection::Backward,
+            })
+            .await
+            .expect("history");
+        assert_eq!(page.events, vec![message.clone()]);
+        let window = db
+            .history_around(bcode_session_models::SessionHistoryAroundQuery {
+                sequence: 1,
+                before: 1,
+                after: 0,
+            })
+            .await
+            .expect("around");
+        assert!(window.events.contains(&message));
+        let rows = db
+            .canonical_rows_page(1, 1)
+            .await
+            .expect("logical canonical page");
+        assert_eq!(rows[0].payload, logical);
+        assert_eq!(rows[0].sequence, 1);
+        let stored = db
+            .database()
+            .select("events")
+            .columns(&["payload"])
+            .where_eq("event_seq", 1)
+            .execute_first(db.database())
+            .await
+            .expect("query")
+            .expect("row");
+        assert_eq!(
+            required_string(&stored, "payload").expect("physical payload"),
+            compressed
         );
     }
 
