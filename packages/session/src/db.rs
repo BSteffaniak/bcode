@@ -11598,6 +11598,101 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn epoch_nine_upgrade_then_compression_preserves_history_and_reclaims_space() {
+        let root = tempfile::tempdir().expect("root");
+        let id = SessionId::new();
+        let db = SessionDb::open_turso_in_root(id, root.path())
+            .await
+            .expect("db");
+        let created = event(
+            id,
+            0,
+            SessionEventKind::SessionCreated {
+                name: None,
+                working_directory: root.path().to_path_buf(),
+            },
+        );
+        db.append_event(&created).await.expect("created");
+        let message = event(
+            id,
+            1,
+            SessionEventKind::SystemMessage {
+                text: "migrated canonical history 世界 ".repeat(150_000),
+            },
+        );
+        db.append_event(&message).await.expect("message");
+        let expected = db.all_events_strict().await.expect("history");
+        let json = db.canonical_rows_page(0, 16).await.expect("logical rows");
+        db.database()
+            .update("session_storage_contract")
+            .value("writer_epoch", 9)
+            .execute(db.database())
+            .await
+            .expect("epoch nine fixture");
+        db.database().close().await.expect("close source");
+        drop(db);
+        let maintenance =
+            crate::lease::acquire_session_maintenance_guard(root.path(), id).expect("maintenance");
+        let write =
+            crate::lease::acquire_maintenance_session_write_lock(&maintenance, root.path(), id)
+                .expect("write");
+        let migrated = SessionDb::migrate_turso_in_root(id, root.path(), &maintenance, &write)
+            .await
+            .expect("upgrade");
+        assert_eq!(migrated.storage_writer_epoch().await.expect("writer"), 10);
+        assert_eq!(
+            migrated
+                .all_events_strict()
+                .await
+                .expect("migrated history"),
+            expected
+        );
+        assert_eq!(
+            migrated
+                .canonical_rows_page(0, 16)
+                .await
+                .expect("migrated JSON")
+                .iter()
+                .map(|row| &row.payload)
+                .collect::<Vec<_>>(),
+            json.iter().map(|row| &row.payload).collect::<Vec<_>>()
+        );
+        migrated.database().close().await.expect("close migrated");
+        drop(migrated);
+        drop(write);
+        drop(maintenance);
+        let compressed = crate::history_compression::compress_history_page(root.path(), id, 0, 12)
+            .await
+            .expect("compress");
+        assert!(compressed.saved_bytes > 1024 * 1024);
+        let reclaimed = crate::storage_reclamation::reclaim_session_storage(root.path(), id)
+            .await
+            .expect("reclaim");
+        assert!(reclaimed.reclaimed_bytes() > 1024 * 1024);
+        let db = SessionDb::open_existing_turso_in_root(id, root.path())
+            .await
+            .expect("reopen");
+        assert_eq!(
+            db.all_events_strict().await.expect("final history"),
+            expected
+        );
+        let next = event(
+            id,
+            2,
+            SessionEventKind::SystemMessage {
+                text: "continued".into(),
+            },
+        );
+        db.append_event(&next)
+            .await
+            .expect("append after upgrade and reclaim");
+        assert_eq!(
+            db.all_events_strict().await.expect("continued").last(),
+            Some(&next)
+        );
+    }
+
+    #[tokio::test]
     async fn future_compressed_payload_is_rejected_without_rewriting_history() {
         let root = tempfile::tempdir().expect("root");
         let id = SessionId::new();

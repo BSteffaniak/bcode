@@ -595,6 +595,15 @@ ACTIVE evidence and invalidates those tokens. Tests verify token health rejectio
 until the last token drops, and preserved dirty evidence. Normal clean completion without tokens
 continues to work. Automatic dispatch is still disabled pending startup-failure/older-reader proof.
 
+## Epoch-9 migration through reclamation integration
+
+A database integration test now starts with an epoch-9 fixture, runs the existing exclusively owned
+migration coordinator to epoch 10, verifies exact logical JSON/history preservation, compresses the
+migrated history, reclaims more than one MiB, reopens the database, and appends another canonical
+event. This exercises migration, compression, reclamation and continued writes together rather than
+only testing each helper separately. It does not authorize unregistered historical readers or remove
+the disabled automatic-dispatch gate.
+
 ## Remaining implementation
 
 ### Access policy and scheduling
