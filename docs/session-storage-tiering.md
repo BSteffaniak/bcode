@@ -564,6 +564,28 @@ owned registry gate plus acknowledgement, whose health can be rechecked before p
 verifies failure propagation and lock retention after the original registration handle is dropped.
 The storage operations and worker still need to consume this owned admission; dispatch remains gated.
 
+## Owned acknowledgement in conversion operations
+
+Artifact and history cancellation contexts now optionally retain an owned live-daemon token. Their
+age-based operations acquire owned registry admission with that token instead of rejecting their
+own active registration. Every cancellation checkpoint also rechecks token health, including the
+history pre-commit and artifact pre-publication checkpoints. Scheduler passes obtain the token from
+the installed registration and reject the local failure latch. A real-artifact test confirms foreign
+live daemons prevent compression, foreign clean completion permits local acknowledged compression,
+and subsequent tracking failure refuses another operation context. Reclamation still uses offline
+admission; the global readiness gate remains false pending startup-failure/older-reader coordination.
+
+## Live-admitted reclamation
+
+Completed scheduler passes now supply the local live acknowledgement to age-fenced database
+reclamation, matching artifact and history conversion. Admission and liveness remain held through
+engine completion; cancellation/failed health is checked before opening storage and before VACUUM.
+The backend VACUUM itself is drained rather than abandoned. The reclamation integration test now
+installs a local registration, verifies a foreign active daemon prevents any file shrinkage, then
+verifies successful compaction after that foreign registration finishes cleanly. This closes the
+self-registration blocker for reclamation; startup dispatch and older/unregistered reader proof
+remain unresolved.
+
 ## Remaining implementation
 
 ### Access policy and scheduling

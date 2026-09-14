@@ -109,7 +109,7 @@ pub async fn compress_history_page_cancellable(
             .into());
         }
         let _admission = if age.is_some() {
-            Some(crate::artifact_storage::acquire_tracking_admission(&root).await?)
+            Some(cancellation.admit_tracking(&root).await?)
         } else {
             None
         };

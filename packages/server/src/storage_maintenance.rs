@@ -137,6 +137,28 @@ fn tracking_coverage_ready(state: &ServerState) -> bool {
     false
 }
 
+fn operation_cancellation(state: &ServerState) -> Result<ArtifactMaintenanceCancellation, String> {
+    if state
+        .storage_tracking_failed
+        .load(std::sync::atomic::Ordering::SeqCst)
+    {
+        return Err("storage tracking failed".into());
+    }
+    let registration = state
+        .storage_daemon_registration
+        .lock()
+        .map_err(|_| "registration lock unavailable")?;
+    let cancellation = ArtifactMaintenanceCancellation::default();
+    registration
+        .as_ref()
+        .map_or(Ok(cancellation.clone()), |registration| {
+            registration
+                .acknowledgement()
+                .map(|ack| cancellation.with_acknowledgement(ack))
+                .map_err(|_| "unhealthy storage registration".into())
+        })
+}
+
 async fn maintain_history(
     state: &ServerState,
     root: &std::path::Path,
@@ -179,7 +201,7 @@ async fn maintain_history(
     } else {
         return Ok(None);
     };
-    let cancellation = ArtifactMaintenanceCancellation::default();
+    let cancellation = operation_cancellation(state)?;
     let mut shutdown = state.subscribe_shutdown();
     let work = bcode_session::history_compression::compress_history_page_cancellable(
         root,
@@ -221,8 +243,16 @@ async fn reclaim_completed_pass(
     {
         return;
     }
-    match bcode_session::storage_reclamation::reclaim_idle_session_storage(
-        root, id, now, age, minimum,
+    let Ok(cancellation) = operation_cancellation(state) else {
+        return;
+    };
+    match bcode_session::storage_reclamation::reclaim_idle_session_storage_admitted(
+        root,
+        id,
+        now,
+        age,
+        minimum,
+        cancellation,
     )
     .await
     {
@@ -306,7 +336,7 @@ async fn maintain_session_at(
                 return Ok(None);
             }
             cursor = Some((artifact.clone(), reference.clone()));
-            let cancellation = ArtifactMaintenanceCancellation::default();
+            let cancellation = operation_cancellation(state)?;
             let mut shutdown = state.subscribe_shutdown();
             let conversion = compress_finalized_artifact_cancellable(
                 root,

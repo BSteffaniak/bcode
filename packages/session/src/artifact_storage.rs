@@ -230,22 +230,75 @@ pub async fn compress_finalized_artifact(
 
 /// Cancellation shared between an async maintenance caller and its blocking codec work.
 #[derive(Debug, Clone, Default)]
-pub struct ArtifactMaintenanceCancellation(std::sync::Arc<std::sync::atomic::AtomicBool>);
+pub struct ArtifactMaintenanceCancellation {
+    cancelled: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    acknowledgement: Option<crate::storage_daemon_registration::StorageDaemonAcknowledgement>,
+}
 
 impl ArtifactMaintenanceCancellation {
+    /// Attach exact live-daemon health to the operation; all cancellation checkpoints recheck it.
+    #[must_use]
+    pub fn with_acknowledgement(
+        mut self,
+        acknowledgement: crate::storage_daemon_registration::StorageDaemonAcknowledgement,
+    ) -> Self {
+        self.acknowledgement = Some(acknowledgement);
+        self
+    }
+
     /// Request cancellation before publication. Committed publication is never rolled back.
     pub fn cancel(&self) {
-        self.0.store(true, std::sync::atomic::Ordering::SeqCst);
+        self.cancelled
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    pub(crate) async fn admit_tracking(&self, root: &Path) -> io::Result<TrackingAdmission> {
+        #[cfg(any(target_os = "macos", target_os = "linux"))]
+        if let Some(acknowledgement) = self.acknowledgement.clone() {
+            let root = root.to_path_buf();
+            return tokio::task::spawn_blocking(move || {
+                crate::storage_admission::StorageAdmissionRegistry::open(&root)?
+                    .admit_owned(4096, acknowledgement)
+                    .map(TrackingAdmission::Live)
+            })
+            .await
+            .map_err(|_| io::Error::other("owned tracking admission failed"))?;
+        }
+        acquire_tracking_admission(root)
+            .await
+            .map(TrackingAdmission::Offline)
     }
 
     pub(crate) fn check(&self) -> io::Result<()> {
-        if self.0.load(std::sync::atomic::Ordering::SeqCst) {
+        if let Some(acknowledgement) = &self.acknowledgement {
+            acknowledgement.check()?;
+        }
+        if self.cancelled.load(std::sync::atomic::Ordering::SeqCst) {
             Err(io::Error::new(
                 io::ErrorKind::Interrupted,
                 "artifact maintenance cancelled",
             ))
         } else {
             Ok(())
+        }
+    }
+}
+
+pub(crate) enum TrackingAdmission {
+    Offline(crate::storage_admission::StorageMaintenanceAdmission),
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    Live(crate::storage_admission::OwnedStorageMaintenance),
+}
+
+impl TrackingAdmission {
+    pub(crate) fn check(&self) -> io::Result<()> {
+        match self {
+            Self::Offline(guard) => {
+                let _ = guard;
+                Ok(())
+            }
+            #[cfg(any(target_os = "macos", target_os = "linux"))]
+            Self::Live(guard) => guard.check(),
         }
     }
 }
@@ -388,7 +441,7 @@ pub async fn compress_finalized_artifact_cancellable(
     // Age-based calls are automatic policy work. Admission is enforced here so a scheduler cannot
     // bypass failed tracking by calling the storage operation directly.
     let admission = if age.is_some() {
-        Some(acquire_tracking_admission(&root).await?)
+        Some(cancellation.admit_tracking(&root).await?)
     } else {
         None
     };
@@ -454,6 +507,9 @@ pub async fn compress_finalized_artifact_cancellable(
     let expected_bytes = reference.byte_len.ok_or_else(invalid)?;
     let expected_checksum = reference.checksum_sha256;
     run_cancellable_artifact_work(cancellation.clone(), move || {
+        if let Some(admission) = &admission {
+            admission.check()?;
+        }
         cancellation.check()?;
         let artifacts = confined(
             &root.join("session-artifacts").join(session_id.to_string()),

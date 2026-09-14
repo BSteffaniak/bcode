@@ -3,6 +3,7 @@
 //! This operation never runs from history/catalog reads. Canonical events stay in the same
 //! database; database-engine VACUUM performs physical compaction without replay or reindexing.
 
+use crate::artifact_storage::ArtifactMaintenanceCancellation;
 use crate::db::{SessionDb, SessionDbError};
 use bcode_session_models::SessionId;
 use std::path::Path;
@@ -81,7 +82,11 @@ pub async fn try_reclaim_session_storage(
     id: SessionId,
 ) -> Result<SessionReclamationOutcome, SessionDbError> {
     let root = root.to_path_buf();
-    run_owned_reclamation(async move { reclaim_session_storage_owned(&root, id, None).await }).await
+    run_owned_reclamation(async move {
+        reclaim_session_storage_owned(&root, id, None, ArtifactMaintenanceCancellation::default())
+            .await
+    })
+    .await
 }
 
 /// Reclaim only when tracking remains old enough and the registry grants automatic admission.
@@ -96,12 +101,41 @@ pub async fn reclaim_idle_session_storage(
     minimum_age_ms: u64,
     minimum_free_bytes: u64,
 ) -> Result<SessionReclamationOutcome, SessionDbError> {
+    reclaim_idle_session_storage_admitted(
+        root,
+        id,
+        now_ms,
+        minimum_age_ms,
+        minimum_free_bytes,
+        ArtifactMaintenanceCancellation::default(),
+    )
+    .await
+}
+
+/// Reclaim eligible storage using the live-daemon acknowledgement carried by the operation context.
+///
+/// Cancellation and health are checked before starting VACUUM. Once the engine operation starts,
+/// it is drained to completion while admission and ownership remain held; it is not rolled back by
+/// dropping a waiter. This prevents cancellation from releasing a live compaction's authority.
+///
+/// # Errors
+/// Returns age, registry, ownership, compatibility, cancellation or backend failures.
+pub async fn reclaim_idle_session_storage_admitted(
+    root: &Path,
+    id: SessionId,
+    now_ms: u64,
+    minimum_age_ms: u64,
+    minimum_free_bytes: u64,
+    cancellation: ArtifactMaintenanceCancellation,
+) -> Result<SessionReclamationOutcome, SessionDbError> {
+    cancellation.check()?;
     let root = root.to_path_buf();
     run_owned_reclamation(async move {
         reclaim_session_storage_owned(
             &root,
             id,
             Some((now_ms, minimum_age_ms, minimum_free_bytes)),
+            cancellation,
         )
         .await
     })
@@ -122,7 +156,9 @@ async fn reclaim_session_storage_owned(
     root: &Path,
     id: SessionId,
     eligibility: Option<(u64, u64, u64)>,
+    cancellation: ArtifactMaintenanceCancellation,
 ) -> Result<SessionReclamationOutcome, SessionDbError> {
+    cancellation.check()?;
     let root = root.canonicalize()?;
     let directory = root.join(id.to_string());
     if !std::fs::symlink_metadata(&directory)?.is_dir()
@@ -143,7 +179,7 @@ async fn reclaim_session_storage_owned(
         .into());
     }
     let _admission = if eligibility.is_some() {
-        Some(crate::artifact_storage::acquire_tracking_admission(&root).await?)
+        Some(cancellation.admit_tracking(&root).await?)
     } else {
         None
     };
@@ -179,6 +215,7 @@ async fn reclaim_session_storage_owned(
     }
     // Same locked engine as normal sessions; only this exclusively owned maintenance connection
     // opts into VACUUM. The engine owns atomicity, temporary files, and WAL recovery.
+    cancellation.check()?;
     let result = vacuum_with_maintenance_engine(&path).await;
     let after_bytes = std::fs::metadata(&path).map(|metadata| metadata.len());
     drop(maintenance);
@@ -211,6 +248,26 @@ async fn vacuum_with_maintenance_engine(path: &Path) -> Result<(), SessionDbErro
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn cancelled_admitted_reclamation_does_not_create_storage() {
+        let root = tempfile::tempdir().expect("root");
+        let cancellation = ArtifactMaintenanceCancellation::default();
+        cancellation.cancel();
+        assert!(
+            reclaim_idle_session_storage_admitted(
+                root.path(),
+                SessionId::new(),
+                100,
+                10,
+                1,
+                cancellation
+            )
+            .await
+            .is_err()
+        );
+        assert_eq!(std::fs::read_dir(root.path()).expect("entries").count(), 0);
+    }
 
     #[tokio::test]
     async fn cancelled_waiter_does_not_release_running_maintenance() {

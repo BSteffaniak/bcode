@@ -8,6 +8,30 @@ use bcode_session_models::{
 use std::path::PathBuf;
 
 #[tokio::test]
+async fn maintenance_pass_uses_local_live_acknowledgement_but_refuses_foreign_daemon() {
+    let (root, state, id, artifacts, _) = fixture(2).await;
+    let registry = bcode_session::storage_admission::StorageAdmissionRegistry::open(root.path())
+        .expect("registry");
+    let local = registry.register_daemon(SessionId::new()).expect("local");
+    *state.storage_daemon_registration.lock().expect("lock") = Some(local);
+    let foreign = registry.register_daemon(SessionId::new()).expect("foreign");
+    let future = super::super::current_time_ms() + 31 * 86_400_000;
+    maintain_session_at(&state, root.path(), id, None, future)
+        .await
+        .expect("foreign deferred");
+    assert!(artifacts.join("recording-000").is_file());
+    foreign.finish().expect("foreign drained");
+    maintain_session_at(&state, root.path(), id, None, future)
+        .await
+        .expect("local admitted");
+    assert!(artifacts.join("recording-000").is_dir());
+    assert!(artifacts.join("recording-001").is_dir());
+    state.fail_storage_tracking();
+    assert!(operation_cancellation(&state).is_err());
+    drop(state);
+}
+
+#[tokio::test]
 async fn automatic_publication_is_blocked_by_registered_readers_and_dirty_records() {
     let (root, state, id, artifacts, _) = fixture(1).await;
     let registry = bcode_session::storage_admission::StorageAdmissionRegistry::open(root.path())
@@ -48,6 +72,16 @@ async fn automatic_publication_resumes_after_successful_reader_completion() {
 #[tokio::test]
 async fn completed_scheduler_pass_reclaims_free_database_pages() {
     let (root, state, id, _artifacts, _) = fixture(0).await;
+    let registry = bcode_session::storage_admission::StorageAdmissionRegistry::open(root.path())
+        .expect("registry");
+    *state
+        .storage_daemon_registration
+        .lock()
+        .expect("registration") = Some(
+        registry
+            .register_daemon(SessionId::new())
+            .expect("local daemon"),
+    );
     let db = bcode_session::db::SessionDb::open_existing_turso_in_root(id, root.path())
         .await
         .expect("db");
@@ -69,6 +103,12 @@ async fn completed_scheduler_pass_reclaims_free_database_pages() {
     let path = root.path().join(id.to_string()).join("session.db");
     let before = std::fs::metadata(&path).expect("before").len();
     let future = super::super::current_time_ms() + 31 * 86_400_000;
+    let foreign = registry.register_daemon(SessionId::new()).expect("foreign");
+    maintain_session_at(&state, root.path(), id, None, future)
+        .await
+        .expect("foreign defers compaction");
+    assert_eq!(std::fs::metadata(&path).expect("unchanged").len(), before);
+    foreign.finish().expect("foreign released");
     maintain_session_at(&state, root.path(), id, None, future)
         .await
         .expect("scheduled reclamation");
