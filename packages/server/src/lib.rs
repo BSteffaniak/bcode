@@ -37404,6 +37404,19 @@ mod tests {
             );
         }
         assert!(state.workflow_discovery_scans.lock().unwrap().is_empty());
+        // Dropping the request removes retained discovery immediately, but an active
+        // blocking batch keeps its permit until it observes cancellation and exits.
+        // Await the actual capacity release rather than racing that worker's drop.
+        let permits = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            state
+                .workflow_discovery_capacity
+                .acquire_many(u32::try_from(capacity).expect("discovery capacity fits u32")),
+        )
+        .await
+        .expect("cancelled discovery worker must release admission")
+        .expect("discovery admission remains open");
+        drop(permits);
         assert_eq!(
             state.workflow_discovery_capacity.available_permits(),
             capacity
