@@ -278,6 +278,20 @@ lifetime growth, full read-path admission, and older-client exclusion remain nec
 registry can safely authorize the automatic worker. Existing participant records must not be deleted
 merely to make an incomplete scan fit its budget.
 
+## Participant retirement and application adapter
+
+Completed clean participants can now be retired under exclusive registry admission. Dirty, active,
+unknown, or missing participants are not silently removed. Repeated successful register/retire cycles
+leave only the coordinator instead of growing the registry with every operation. The server has an
+async registration/completion adapter that performs blocking lock/sync work off executor threads and
+preserves dirty evidence on abandonment. Its lifecycle test covers exclusion, clean retirement, and
+abandoned-operation refusal. Retirement contention remains an explicit error with a retained clean
+record, not unsafe deletion.
+
+The adapter is not yet invoked by production content reads and the worker is still unstarted.
+Read-failure fallback, complete admission coverage, safe clean-record cleanup, and old-client
+participation remain unresolved. These APIs must not be mistaken for enabled automatic compression.
+
 ## Remaining implementation
 
 ### Access policy and scheduling

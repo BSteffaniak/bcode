@@ -84,6 +84,32 @@ impl StorageAdmissionRegistry {
         StorageMaintenanceAdmission::begin(gate, files)
     }
 
+    /// Retire a completed participant without leaving registry growth proportional to read count.
+    ///
+    /// Retirement holds exclusive admission so enumeration cannot race removal. Dirty or active
+    /// participants are never removed. Callers must stop reusing this identity before retirement.
+    ///
+    /// # Errors
+    /// Returns contention, dirty/unknown state, missing participants or IO failures. Failed
+    /// retirement preserves the participant and does not grant maintenance admission.
+    pub fn retire(&self, participant: SessionId) -> io::Result<()> {
+        let gate = self.gate()?;
+        gate.try_lock().map_err(io::Error::from)?;
+        let name =
+            std::ffi::CString::new(format!("{participant}.participant")).map_err(|_| invalid())?;
+        let mut file = open_child(&self.directory, &name, libc::O_RDONLY)?;
+        file.try_lock_shared().map_err(io::Error::from)?;
+        super::read_state(&mut file, false)?;
+        // SAFETY: the fixed typed identity is one component in the pinned registry directory.
+        // Exclusive admission excludes registered readers and other retirement operations.
+        if unsafe { libc::unlinkat(raw(&self.directory), name.as_ptr(), 0) } != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        self.directory.sync_all()?;
+        file.unlock()?;
+        gate.unlock()
+    }
+
     fn gate(&self) -> io::Result<File> {
         let file = open_child(&self.directory, c"gate", libc::O_RDWR | libc::O_CREAT)?;
         self.directory.sync_all()?;
@@ -189,6 +215,32 @@ unsafe fn errno() -> *mut libc::c_int {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn retiring_clean_participants_bounds_registry_growth_without_clearing_damage() {
+        let root = tempfile::tempdir().expect("root");
+        let registry = StorageAdmissionRegistry::open(root.path()).expect("registry");
+        for _ in 0..20 {
+            let id = SessionId::new();
+            registry
+                .admit_read(id)
+                .expect("read")
+                .complete()
+                .expect("complete");
+            registry.retire(id).expect("retire");
+        }
+        drop(
+            registry
+                .admit_maintenance(1)
+                .expect("only coordinator remains"),
+        );
+        let dirty = SessionId::new();
+        let active = registry.admit_read(dirty).expect("active");
+        assert!(registry.retire(dirty).is_err());
+        drop(active);
+        assert!(registry.retire(dirty).is_err());
+        assert!(registry.admit_maintenance(16).is_err());
+    }
 
     #[test]
     fn registry_tracks_multiple_readers_and_dirty_restart() {
