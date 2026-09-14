@@ -72580,33 +72580,36 @@ event_symbol = "bcode_plugin_handle_event_v1"
                 output: None,
             })
             .expect("call configuration");
-            let intermediate = run_definition.clone();
-            let identity = bcode_workflow::WorkflowDefinitionIdentity::for_definition(
-                "intermediate-call",
-                &intermediate,
-            )
-            .expect("intermediate identity");
-            state
-                .workflow_store
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .persist_definition(
-                    &identity.definition_id,
-                    identity.definition_version,
+            for level in 0..10 {
+                let intermediate = run_definition.clone();
+                let identity = bcode_workflow::WorkflowDefinitionIdentity::for_definition(
+                    format!("intermediate-call-{level}"),
                     &intermediate,
                 )
-                .expect("intermediate definition");
-            run_definition
-                .nodes
-                .get_mut("agent")
-                .expect("node")
-                .configuration = serde_json::to_value(bcode_workflow::WorkflowCallConfiguration {
-                version: bcode_workflow::WORKFLOW_CALL_VERSION,
-                target: bcode_workflow::WorkflowCallTarget::Definition { identity },
-                input: None,
-                output: None,
-            })
-            .expect("root call");
+                .expect("intermediate identity");
+                state
+                    .workflow_store
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .persist_definition(
+                        &identity.definition_id,
+                        identity.definition_version,
+                        &intermediate,
+                    )
+                    .expect("intermediate definition");
+                run_definition
+                    .nodes
+                    .get_mut("agent")
+                    .expect("node")
+                    .configuration =
+                    serde_json::to_value(bcode_workflow::WorkflowCallConfiguration {
+                        version: bcode_workflow::WORKFLOW_CALL_VERSION,
+                        target: bcode_workflow::WorkflowCallTarget::Definition { identity },
+                        input: None,
+                        output: None,
+                    })
+                    .expect("root call");
+            }
         }
         {
             let mut store = state
@@ -72639,7 +72642,11 @@ event_symbol = "bcode_plugin_handle_event_v1"
                         policy_digest_sha256: "a".repeat(64),
                     },
                     authorization_ceiling: bcode_workflow::WorkflowToolCapability::Mutating,
-                    limits: bcode_workflow_store::WorkflowRunLimits::default(),
+                    limits: bcode_workflow_store::WorkflowRunLimits {
+                        recursion_depth_cap: 16,
+                        descendant_cap: 128,
+                        ..bcode_workflow_store::WorkflowRunLimits::default()
+                    },
                 })
                 .expect("run");
         }
@@ -72715,7 +72722,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
                 "child admission must not execute descendants"
             );
             // Exercise the same bounded discovery contract as the background driver.
-            for _ in 0..3 {
+            for _ in 0..12 {
                 let run_ids = state
                     .workflow_store
                     .lock()
@@ -72804,17 +72811,24 @@ event_symbol = "bcode_plugin_handle_event_v1"
                 .provenance
                 .run_id
                 .clone();
-            let intermediate_run_id = state
-                .workflow_store
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .parent_run_link(&child_run_id)
-                .expect("link")
-                .expect("intermediate")
-                .parent_run_id;
-            drive_workflow_run(&state, &intermediate_run_id)
-                .await
-                .expect("inherit root intent");
+            let mut ancestors = Vec::new();
+            let mut current = child_run_id.clone();
+            let reopened = bcode_workflow_store::WorkflowStore::open_at_path(&store_path)
+                .expect("reopen policy");
+            while let Some(link) = reopened.parent_run_link(&current).expect("link") {
+                let limits = reopened.run_limits(&current).expect("limits").expect("run");
+                assert_eq!(limits.recursion_depth_cap, 16);
+                assert_eq!(limits.descendant_cap, 128);
+                current = link.parent_run_id;
+                ancestors.push(current.clone());
+            }
+            assert!(ancestors.len() > 8);
+            drop(reopened);
+            for ancestor in ancestors.into_iter().rev() {
+                drive_workflow_run(&state, &ancestor)
+                    .await
+                    .expect("inherit root intent");
+            }
             drive_workflow_run_and_parents(&state, &child_run_id)
                 .await
                 .expect("inherit and drive");
