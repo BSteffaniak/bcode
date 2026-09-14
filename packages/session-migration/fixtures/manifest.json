@@ -566,7 +566,8 @@
           5,
           6,
           7,
-          8
+          8,
+          9
         ],
         "owns_writer_schema": false,
         "owns_writer_schema_event": true,
@@ -787,7 +788,8 @@
           5,
           6,
           7,
-          8
+          8,
+          9
         ],
         "owns_writer_schema": false,
         "owns_writer_schema_event": true,
@@ -1010,7 +1012,8 @@
           5,
           6,
           7,
-          8
+          8,
+          9
         ],
         "owns_writer_schema": true,
         "owns_writer_schema_event": false,
@@ -5472,7 +5475,8 @@
           5,
           6,
           7,
-          8
+          8,
+          9
         ],
         "owns_writer_schema": false,
         "owns_writer_schema_event": true,
@@ -5754,7 +5758,8 @@
           5,
           6,
           7,
-          8
+          8,
+          9
         ],
         "owns_writer_schema": true,
         "owns_writer_schema_event": true,
@@ -6041,7 +6046,8 @@
           5,
           6,
           7,
-          8
+          8,
+          9
         ],
         "owns_writer_schema": true,
         "owns_writer_schema_event": true,
@@ -6343,7 +6349,8 @@
           5,
           6,
           7,
-          8
+          8,
+          9
         ],
         "owns_writer_schema": true,
         "owns_writer_schema_event": true,
@@ -6645,7 +6652,8 @@
           5,
           6,
           7,
-          8
+          8,
+          9
         ],
         "owns_writer_schema": true,
         "owns_writer_schema_event": true,
@@ -6947,7 +6955,8 @@
           5,
           6,
           7,
-          8
+          8,
+          9
         ],
         "owns_writer_schema": true,
         "owns_writer_schema_event": true,
@@ -7254,7 +7263,8 @@
           5,
           6,
           7,
-          8
+          8,
+          9
         ],
         "owns_writer_schema": true,
         "owns_writer_schema_event": true,
@@ -7566,7 +7576,8 @@
           5,
           6,
           7,
-          8
+          8,
+          9
         ],
         "owns_writer_schema": true,
         "owns_writer_schema_event": true,

@@ -427,6 +427,40 @@ failures remain errors. The existing strict operation converts unsupported capab
 unsupported error. Tests verify positive capacity accompanies the refusal and database bytes remain
 unchanged. This does not enable experimental VACUUM or complete actual space reclamation.
 
+## Confined eligibility reads
+
+The scheduler's discovery observation and the session-domain final age check now share a
+non-mutating descriptor-relative access-record reader. Missing tracking returns unknown without
+creating a file; missing canonical authority, symlinks, hard links, damaged/future records, and
+contention fail closed. A regression verifies valid external tracking bytes cannot confer eligibility
+through either a symlink or hardlink. This closes an eligibility-path substitution gap, not the
+separate cross-daemon unregistered-read fallback gap; dispatch remains gated off.
+
+## Maintenance-engine reclamation activation
+
+Explicit reclamation now uses the same exact Turso 0.6.1 already locked by Switchy, through a
+session-private maintenance connection. After current-contract validation and closing the ordinary
+connection, that maintenance connection alone enables `experimental_vacuum(true)`. The engine owns
+temporary database creation, source transaction/WAL publication, and recovery; Bcode does not copy
+canonical rows or edit sidecars. Normal connection configuration is unchanged. Both engine handles
+are dropped before releasing the existing maintenance lease. This intentionally uses the engine's
+experimental compaction capability only for explicit, exclusively owned maintenance.
+
+Tests now verify real main-file reduction of at least four MiB, canonical history and writer-contract
+preservation, reopening through the normal backend, and ownership release. This supersedes the earlier
+unsupported-only reclamation status. Automatic scheduling of reclamation and process-crash injection
+during the engine's internal VACUUM phases still need integration/validation.
+
+## Writer epoch 10 compatibility boundary
+
+The current session writer epoch is now 10. Migration-owned inventory includes the released epoch-9,
+schema-47 combination and the 9-to-10 edge; existing fixture lifecycle matrices exercise the added
+source epoch. Older writer-contract validators reject epoch 10 instead of assuming epoch-9 storage
+semantics. The event schema remains 47: storage representation compatibility is separate from event
+semantics. The existing verified migration coordinator still owns conversion and writer finalization.
+No compressed-history writes are enabled by this bump alone; dispatch/fallback coordination and the
+history maintenance writer remain incomplete.
+
 ## Remaining implementation
 
 ### Access policy and scheduling

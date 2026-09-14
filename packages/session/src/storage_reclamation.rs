@@ -40,8 +40,9 @@ impl SessionReclamation {
 
 /// Compact one current-format, idle canonical session database explicitly.
 ///
-/// The backend owns journaling and interruption recovery. Unsupported compaction is an error,
-/// never a fallback to copying history, rebuilding projections, or manipulating WAL files. This
+/// The exact locked Turso engine owns journaling and interruption recovery. Only this offline
+/// maintenance connection enables its experimental VACUUM option; normal connections do not.
+/// There is no fallback to copying history, rebuilding projections, or manipulating WAL files. This
 /// can perform work proportional to database size and is not an interactive read operation.
 /// Dropping the async waiter does not release maintenance ownership: the owned operation finishes
 /// database close first. This backend operation has no supported mid-VACUUM cancellation primitive.
@@ -80,7 +81,31 @@ pub async fn try_reclaim_session_storage(
     id: SessionId,
 ) -> Result<SessionReclamationOutcome, SessionDbError> {
     let root = root.to_path_buf();
-    run_owned_reclamation(async move { reclaim_session_storage_owned(&root, id).await }).await
+    run_owned_reclamation(async move { reclaim_session_storage_owned(&root, id, None).await }).await
+}
+
+/// Reclaim only when tracking remains old enough and the registry grants automatic admission.
+///
+/// # Errors
+/// Returns errors for unknown/dirty tracking, unavailable ownership, incompatible storage, or IO.
+/// The final age check and compaction retain one maintenance lease; no canonical replay occurs.
+pub async fn reclaim_idle_session_storage(
+    root: &Path,
+    id: SessionId,
+    now_ms: u64,
+    minimum_age_ms: u64,
+    minimum_free_bytes: u64,
+) -> Result<SessionReclamationOutcome, SessionDbError> {
+    let root = root.to_path_buf();
+    run_owned_reclamation(async move {
+        reclaim_session_storage_owned(
+            &root,
+            id,
+            Some((now_ms, minimum_age_ms, minimum_free_bytes)),
+        )
+        .await
+    })
+    .await
 }
 
 // Dropping a JoinHandle does not abort the task. The task, not its optional waiter, owns the lease
@@ -96,6 +121,7 @@ async fn run_owned_reclamation<T: Send + 'static>(
 async fn reclaim_session_storage_owned(
     root: &Path,
     id: SessionId,
+    eligibility: Option<(u64, u64, u64)>,
 ) -> Result<SessionReclamationOutcome, SessionDbError> {
     let root = root.canonicalize()?;
     let directory = root.join(id.to_string());
@@ -116,6 +142,11 @@ async fn reclaim_session_storage_owned(
         )
         .into());
     }
+    let _admission = if eligibility.is_some() {
+        Some(crate::artifact_storage::acquire_tracking_admission(&root).await?)
+    } else {
+        None
+    };
     let lock_root = root.clone();
     let maintenance = tokio::task::spawn_blocking(move || {
         crate::lease::acquire_session_maintenance_guard(&lock_root, id)
@@ -123,39 +154,58 @@ async fn reclaim_session_storage_owned(
     .await
     .map_err(|_| std::io::Error::other("maintenance acquisition failed"))?
     .map_err(std::io::Error::other)?;
+    if let Some((now_ms, minimum_age_ms, _)) = eligibility {
+        let crate::storage_access::StorageAccessObservation::Recorded(record) =
+            crate::storage_access::observe_session_access(&root, id)?
+        else {
+            return Err(std::io::Error::other("unknown session access age").into());
+        };
+        if now_ms
+            .checked_sub(record.observed_at_ms)
+            .is_none_or(|age| age < minimum_age_ms)
+        {
+            return Ok(SessionReclamationOutcome::NotNeeded);
+        }
+    }
     let db = SessionDb::open_existing_turso_in_root(id, &root).await?;
     let before_bytes = std::fs::metadata(&path)?.len();
     let capacity = db.reclaimable_bytes().await;
-    let result = match capacity {
-        Ok(0) => Ok(SessionReclamationOutcome::NotNeeded),
-        Ok(reclaimable_bytes) => match db.reclaim_free_pages().await {
-            Ok(()) => Ok(SessionReclamationOutcome::Reclaimed(SessionReclamation {
-                before_bytes,
-                after_bytes: 0,
-            })),
-            Err(error)
-                if error
-                    .to_string()
-                    .contains("VACUUM is an experimental feature") =>
-            {
-                Ok(SessionReclamationOutcome::BackendUnsupported { reclaimable_bytes })
-            }
-            Err(error) => Err(error),
-        },
-        Err(error) => Err(error),
-    };
     let closed = db.database().close().await;
     drop(db);
-    // Both success and failure close the maintenance connection before releasing its lease.
-    let after_bytes = std::fs::metadata(path).map(|metadata| metadata.len());
-    drop(maintenance);
-    let mut outcome = result?;
     closed?;
-    let after_bytes = after_bytes?;
-    if let SessionReclamationOutcome::Reclaimed(report) = &mut outcome {
-        report.after_bytes = after_bytes;
+    let capacity = capacity?;
+    if capacity == 0 || eligibility.is_some_and(|(_, _, minimum)| capacity < minimum) {
+        return Ok(SessionReclamationOutcome::NotNeeded);
     }
-    Ok(outcome)
+    // Same locked engine as normal sessions; only this exclusively owned maintenance connection
+    // opts into VACUUM. The engine owns atomicity, temporary files, and WAL recovery.
+    let result = vacuum_with_maintenance_engine(&path).await;
+    let after_bytes = std::fs::metadata(&path).map(|metadata| metadata.len());
+    drop(maintenance);
+    result?;
+    Ok(SessionReclamationOutcome::Reclaimed(SessionReclamation {
+        before_bytes,
+        after_bytes: after_bytes?,
+    }))
+}
+
+async fn vacuum_with_maintenance_engine(path: &Path) -> Result<(), SessionDbError> {
+    let path = path.to_str().ok_or_else(|| {
+        std::io::Error::new(std::io::ErrorKind::InvalidInput, "non-UTF8 database path")
+    })?;
+    let database = turso::Builder::new_local(path)
+        .experimental_vacuum(true)
+        .experimental_multiprocess_wal(false)
+        .build()
+        .await
+        .map_err(std::io::Error::other)?;
+    let connection = database.connect().map_err(std::io::Error::other)?;
+    let result = connection.execute("VACUUM", ()).await;
+    drop(connection);
+    drop(database);
+    result
+        .map(|_| ())
+        .map_err(|error| std::io::Error::other(error).into())
 }
 
 #[cfg(test)]
@@ -252,7 +302,54 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn unsupported_reclamation_preserves_storage_and_releases_ownership() {
+    async fn vacuum_preserves_nonempty_history_and_current_writer_contract() {
+        let root = tempfile::tempdir().expect("root");
+        let manager = crate::SessionManager::persistent(root.path()).expect("manager");
+        let session = manager
+            .create_session(Some("reclamation".into()), root.path().to_path_buf())
+            .await
+            .expect("session");
+        let id = session.id;
+        let history = manager.session_history(id).await.expect("history");
+        manager
+            .release_session_ownership(id)
+            .await
+            .expect("release");
+        drop(manager);
+        let db = SessionDb::open_existing_turso_in_root(id, root.path())
+            .await
+            .expect("db");
+        let epoch = db.storage_writer_epoch().await.expect("epoch");
+        db.database()
+            .exec_raw("CREATE TABLE free_fixture (content BLOB)")
+            .await
+            .expect("fixture");
+        db.database()
+            .exec_raw("INSERT INTO free_fixture VALUES (zeroblob(2097152))")
+            .await
+            .expect("grow");
+        db.database()
+            .exec_raw("DROP TABLE free_fixture")
+            .await
+            .expect("free");
+        db.database().close().await.expect("close");
+        drop(db);
+        let report = reclaim_session_storage(root.path(), id)
+            .await
+            .expect("vacuum");
+        assert!(report.reclaimed_bytes() > 0);
+        let db = SessionDb::open_existing_turso_in_root(id, root.path())
+            .await
+            .expect("reopen");
+        assert_eq!(db.all_events_strict().await.expect("same history"), history);
+        assert_eq!(db.storage_writer_epoch().await.expect("same epoch"), epoch);
+        db.storage_compatibility()
+            .await
+            .expect("current compatibility");
+    }
+
+    #[tokio::test]
+    async fn reclamation_reduces_file_size_and_releases_ownership() {
         let root = tempfile::tempdir().expect("root");
         let id = SessionId::new();
         let db = SessionDb::open_turso_in_root(id, root.path())
@@ -277,17 +374,19 @@ mod tests {
         db.database().close().await.expect("close");
         drop(db);
         let path = root.path().join(id.to_string()).join("session.db");
-        let before = std::fs::read(&path).expect("before");
-        // The locked backend disables experimental VACUUM. Preserve this refusal instead of
-        // enabling an experimental storage feature implicitly or rewriting with another engine.
+        let before = std::fs::metadata(&path).expect("before").len();
         let outcome = try_reclaim_session_storage(root.path(), id)
             .await
-            .expect("typed unsupported outcome");
-        assert!(
-            matches!(outcome, SessionReclamationOutcome::BackendUnsupported { reclaimable_bytes } if reclaimable_bytes >= 4 * 1024 * 1024)
+            .expect("reclaimed");
+        let SessionReclamationOutcome::Reclaimed(report) = outcome else {
+            panic!("expected reclamation: {outcome:?}");
+        };
+        assert_eq!(report.before_bytes, before);
+        assert!(report.reclaimed_bytes() >= 4 * 1024 * 1024);
+        assert_eq!(
+            std::fs::metadata(&path).expect("after").len(),
+            report.after_bytes
         );
-        assert!(reclaim_session_storage(root.path(), id).await.is_err());
-        assert_eq!(std::fs::read(&path).expect("after"), before);
         drop(crate::lease::acquire_session_maintenance_guard(root.path(), id).expect("released"));
         let db = SessionDb::open_existing_turso_in_root(id, root.path())
             .await

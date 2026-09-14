@@ -1771,14 +1771,6 @@ impl SessionDb {
             }))
     }
 
-    pub(crate) async fn reclaim_free_pages(&self) -> SessionDbResult<()> {
-        if self.reclaimable_bytes().await? == 0 {
-            return Ok(());
-        }
-        self.db.exec_raw("VACUUM").await?;
-        Ok(())
-    }
-
     /// Return free database-page bytes available for explicit physical reclamation.
     ///
     /// This does not include slack inside live pages or external artifacts. It is not a promise

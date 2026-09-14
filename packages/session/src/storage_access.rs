@@ -74,10 +74,36 @@ pub fn record_session_access(
     now_ms: u64,
 ) -> io::Result<StorageAccessRecord> {
     let root = root.canonicalize()?;
-    let (mut file, directory_handle) = open_session_access_file(&root, session_id)?;
+    let (mut file, directory_handle) = open_session_access_file(&root, session_id, true)?;
     let result = record_access(&mut file, kind, conservative_access_time(now_ms))?;
     directory_handle.sync_all()?;
     Ok(result)
+}
+
+/// Observe one session's tracking state without creating files or following symlinks.
+///
+/// # Errors
+/// Rejects missing canonical storage, unsafe tracking paths, hard links, corruption, contention,
+/// unsupported platforms or IO. Only a missing tracking file yields `Unknown`.
+pub fn observe_session_access(
+    root: &Path,
+    session_id: SessionId,
+) -> io::Result<StorageAccessObservation> {
+    let root = root.canonicalize()?;
+    let (mut file, _) = match open_session_access_file(&root, session_id, false) {
+        Ok(handles) => handles,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            // Distinguish absent tracking from absent canonical authority. No alternate location.
+            if !std::fs::symlink_metadata(root.join(session_id.to_string()).join("session.db"))?
+                .is_file()
+            {
+                return Err(invalid());
+            }
+            return Ok(StorageAccessObservation::Unknown);
+        }
+        Err(error) => return Err(error),
+    };
+    observe_access(&mut file)
 }
 
 pub(crate) fn initialize_session_access(
@@ -86,7 +112,7 @@ pub(crate) fn initialize_session_access(
     now_ms: u64,
 ) -> io::Result<()> {
     let root = root.canonicalize()?;
-    let (mut file, directory) = open_session_access_file(&root, session_id)?;
+    let (mut file, directory) = open_session_access_file(&root, session_id, true)?;
     file.try_lock().map_err(io::Error::from)?;
     let result = match read_locked(&mut file) {
         Ok(StorageAccessObservation::Unknown) => {
@@ -101,7 +127,11 @@ pub(crate) fn initialize_session_access(
 }
 
 #[cfg(unix)]
-fn open_session_access_file(root: &Path, session_id: SessionId) -> io::Result<(File, File)> {
+fn open_session_access_file(
+    root: &Path,
+    session_id: SessionId,
+    create: bool,
+) -> io::Result<(File, File)> {
     use std::ffi::CString;
     use std::os::fd::{AsRawFd as _, FromRawFd as _};
     use std::os::unix::fs::MetadataExt as _;
@@ -132,7 +162,11 @@ fn open_session_access_file(root: &Path, session_id: SessionId) -> io::Result<(F
     let file = child(
         &directory,
         c"storage-access.bin",
-        libc::O_RDWR | libc::O_CREAT,
+        if create {
+            libc::O_RDWR | libc::O_CREAT
+        } else {
+            libc::O_RDONLY
+        },
     )?;
     if !file.metadata()?.is_file() || file.metadata()?.nlink() != 1 {
         return Err(invalid());
@@ -141,7 +175,11 @@ fn open_session_access_file(root: &Path, session_id: SessionId) -> io::Result<(F
 }
 
 #[cfg(not(unix))]
-fn open_session_access_file(_root: &Path, _session_id: SessionId) -> io::Result<(File, File)> {
+fn open_session_access_file(
+    _root: &Path,
+    _session_id: SessionId,
+    _create: bool,
+) -> io::Result<(File, File)> {
     Err(io::Error::new(
         io::ErrorKind::Unsupported,
         "confined storage access tracking is unavailable on this platform",
@@ -333,6 +371,44 @@ mod tests {
             .expect("next");
         assert_eq!(next.generation, first.generation + 1);
         assert_eq!(next.observed_at_ms, 120_000);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn observation_is_nonmutating_and_rejects_substituted_tracking() {
+        use std::os::unix::fs::symlink;
+        let root = tempfile::tempdir().expect("root");
+        let id = SessionId::new();
+        let session = root.path().join(id.to_string());
+        std::fs::create_dir(&session).expect("session");
+        std::fs::write(session.join("session.db"), b"fixture").expect("canonical");
+        let tracking = session.join("storage-access.bin");
+        assert_eq!(
+            observe_session_access(root.path(), id).expect("unknown"),
+            StorageAccessObservation::Unknown
+        );
+        assert!(!tracking.exists());
+        let record =
+            record_session_access(root.path(), id, StorageAccessKind::History, 1).expect("record");
+        let original = std::fs::read(&tracking).expect("bytes");
+        assert_eq!(
+            observe_session_access(root.path(), id).expect("read"),
+            StorageAccessObservation::Recorded(record)
+        );
+        assert_eq!(std::fs::read(&tracking).expect("unchanged"), original);
+        let outside = tempfile::NamedTempFile::new().expect("outside");
+        std::fs::write(outside.path(), &original).expect("valid outside record");
+        std::fs::remove_file(&tracking).expect("remove fixture");
+        symlink(outside.path(), &tracking).expect("symlink");
+        assert!(observe_session_access(root.path(), id).is_err());
+        std::fs::remove_file(&tracking).expect("remove fixture link");
+        std::fs::hard_link(outside.path(), &tracking).expect("hardlink");
+        assert!(observe_session_access(root.path(), id).is_err());
+        assert_eq!(
+            std::fs::read(outside.path()).expect("outside preserved"),
+            original
+        );
+        assert!(observe_session_access(root.path(), SessionId::new()).is_err());
     }
 
     #[test]

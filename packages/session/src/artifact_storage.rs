@@ -299,7 +299,7 @@ pub async fn compress_finalized_artifact_with_age(
     .await
 }
 
-async fn acquire_tracking_admission(
+pub(crate) async fn acquire_tracking_admission(
     root: &Path,
 ) -> io::Result<crate::storage_admission::StorageMaintenanceAdmission> {
     #[cfg(any(target_os = "macos", target_os = "linux"))]
@@ -321,10 +321,14 @@ async fn acquire_tracking_admission(
     }
 }
 
-fn access_age_allows(session: &Path, now_ms: u64, minimum_age_ms: u64) -> io::Result<bool> {
-    let mut access = File::open(session.join("storage-access.bin"))?;
+fn access_age_allows(
+    root: &Path,
+    session_id: SessionId,
+    now_ms: u64,
+    minimum_age_ms: u64,
+) -> io::Result<bool> {
     let crate::storage_access::StorageAccessObservation::Recorded(record) =
-        crate::storage_access::observe_access(&mut access)?
+        crate::storage_access::observe_session_access(root, session_id)?
     else {
         return Err(invalid());
     };
@@ -395,7 +399,7 @@ pub async fn compress_finalized_artifact_cancellable(
     let maintenance = acquire_maintenance(&root, session_id).await?;
     cancellation.check()?;
     if let Some((now_ms, minimum_age_ms)) = age
-        && !access_age_allows(&session, now_ms, minimum_age_ms)?
+        && !access_age_allows(&root, session_id, now_ms, minimum_age_ms)?
     {
         return Ok(ArtifactStorageOutcome::Unchanged);
     }

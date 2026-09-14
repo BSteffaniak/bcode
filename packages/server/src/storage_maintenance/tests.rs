@@ -45,6 +45,41 @@ async fn automatic_publication_resumes_after_successful_reader_completion() {
     assert!(artifacts.join("recording-000").is_dir());
 }
 
+#[tokio::test]
+async fn completed_scheduler_pass_reclaims_free_database_pages() {
+    let (root, state, id, _artifacts, _) = fixture(0).await;
+    let db = bcode_session::db::SessionDb::open_existing_turso_in_root(id, root.path())
+        .await
+        .expect("db");
+    let history = db.all_events_strict().await.expect("history");
+    db.database()
+        .exec_raw("CREATE TABLE reclamation_fixture (content BLOB)")
+        .await
+        .expect("fixture");
+    db.database()
+        .exec_raw("INSERT INTO reclamation_fixture VALUES (zeroblob(4194304))")
+        .await
+        .expect("grow");
+    db.database()
+        .exec_raw("DROP TABLE reclamation_fixture")
+        .await
+        .expect("free pages");
+    db.database().close().await.expect("close");
+    drop(db);
+    let path = root.path().join(id.to_string()).join("session.db");
+    let before = std::fs::metadata(&path).expect("before").len();
+    let future = super::super::current_time_ms() + 31 * 86_400_000;
+    maintain_session_at(&state, root.path(), id, None, future)
+        .await
+        .expect("scheduled reclamation");
+    drop(state);
+    assert!(std::fs::metadata(&path).expect("after").len() < before);
+    let db = bcode_session::db::SessionDb::open_existing_turso_in_root(id, root.path())
+        .await
+        .expect("reopen");
+    assert_eq!(db.all_events_strict().await.expect("preserved"), history);
+}
+
 async fn fixture(count: usize) -> (tempfile::TempDir, ServerState, SessionId, PathBuf, Vec<u8>) {
     let root = tempfile::tempdir().expect("root");
     let sessions = bcode_session::SessionManager::persistent(root.path()).expect("manager");

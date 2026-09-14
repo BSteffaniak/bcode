@@ -12,7 +12,7 @@ use bcode_session::artifact_compression::ArtifactCompression;
 use bcode_session::artifact_storage::{
     ArtifactMaintenanceCancellation, compress_finalized_artifact_cancellable,
 };
-use bcode_session::storage_access::{StorageAccessObservation, observe_access};
+use bcode_session::storage_access::{StorageAccessObservation, observe_session_access};
 use bcode_session_models::SessionId;
 use std::sync::Arc;
 use std::time::Duration;
@@ -116,6 +116,36 @@ fn tracking_coverage_ready(state: &ServerState) -> bool {
     false
 }
 
+async fn reclaim_completed_pass(
+    state: &ServerState,
+    root: &std::path::Path,
+    id: SessionId,
+    now: u64,
+    age: u64,
+    minimum: u64,
+) {
+    if state
+        .shutdown_requested
+        .load(std::sync::atomic::Ordering::SeqCst)
+    {
+        return;
+    }
+    match bcode_session::storage_reclamation::reclaim_idle_session_storage(
+        root, id, now, age, minimum,
+    )
+    .await
+    {
+        Ok(bcode_session::storage_reclamation::SessionReclamationOutcome::Reclaimed(report)) => {
+            state.metrics.add_counter(
+                "storage.maintenance.reclaimed_bytes",
+                report.reclaimed_bytes(),
+            );
+        }
+        Ok(_) => {}
+        Err(_) => tracing::debug!("automatic session reclamation deferred"),
+    }
+}
+
 async fn maintain_session(
     state: &ServerState,
     root: &std::path::Path,
@@ -144,17 +174,11 @@ async fn maintain_session_at(
     if !config.enabled {
         return Ok(None);
     }
-    let path = root.join(id.to_string()).join("storage-access.bin");
-    let observation = tokio::task::spawn_blocking(move || match std::fs::File::open(path) {
-        Ok(mut file) => observe_access(&mut file),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            Ok(StorageAccessObservation::Unknown)
-        }
-        Err(error) => Err(error),
-    })
-    .await
-    .map_err(|_| "access task failed")?
-    .map_err(|_| "access unavailable")?;
+    let access_root = root.to_path_buf();
+    let observation = tokio::task::spawn_blocking(move || observe_session_access(&access_root, id))
+        .await
+        .map_err(|_| "access task failed")?
+        .map_err(|_| "access unavailable")?;
     let StorageAccessObservation::Recorded(record) = observation else {
         bcode_session::artifact_storage::initialize_maintenance_access(root, id, now)
             .await
@@ -182,9 +206,6 @@ async fn maintain_session_at(
         )
         .await
         .map_err(|_| "references unavailable")?;
-        if rows.is_empty() {
-            return Ok(None);
-        }
         let has_more = rows.len() == 16;
         for (artifact, reference) in rows {
             if state
@@ -224,6 +245,17 @@ async fn maintain_session_at(
             if outcome.is_err() {
                 tracing::debug!("automatic artifact candidate deferred");
             }
+        }
+        if !has_more {
+            reclaim_completed_pass(
+                state,
+                root,
+                id,
+                now,
+                minimum_age,
+                config.minimum_saved_bytes,
+            )
+            .await;
         }
         Ok(if has_more { cursor } else { None })
     }

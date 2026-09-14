@@ -11,7 +11,7 @@
 //! required fallback for every other surface.
 
 /// Durable session-storage writer epoch shared by runtime and daemon compatibility handshakes.
-pub const CURRENT_SESSION_STORAGE_WRITER_EPOCH: u32 = 9;
+pub const CURRENT_SESSION_STORAGE_WRITER_EPOCH: u32 = 10;
 
 use bcode_skill_models::{SkillActivationMode, SkillContextResponse, SkillId, SkillSource};
 pub use bcode_tool_models::{
