@@ -228,11 +228,21 @@ fn validate_auth_selection_metadata(
     request: &ProviderRequestContextResolution<'_>,
     registry: &bcode_config::RuntimeAuthSubscriptions,
 ) -> Result<(), bcode_config::ConfigError> {
+    bcode_config::contexts::validate_effective(request.config)?;
+    let empty = bcode_config::RuntimeAuthSubscriptions::default();
+    let registry = if request.config.active_context.is_some() {
+        &empty
+    } else {
+        registry
+    };
     validate_runtime_account_selection(request, registry)?;
     validate_runtime_pool_selection(request, registry)
 }
 
 fn request_needs_runtime_registry(request: &ProviderRequestContextResolution<'_>) -> bool {
+    if request.config.active_context.is_some() {
+        return false;
+    }
     request.selection.auth_pool.is_some()
         || request
             .selection
@@ -409,6 +419,20 @@ pub fn resolve_provider_request_context_with_subscriptions(
 /// custody of the supplied resolver remain the caller's responsibility.
 #[must_use]
 pub fn resolve_provider_request_context_with_resolver(
+    request: ProviderRequestContextResolution<'_>,
+    registry: &bcode_config::RuntimeAuthSubscriptions,
+    mut resolve: impl FnMut(&str, &bcode_config::AuthProfileConfig) -> ResolvedProviderAuth,
+) -> bcode_model::ProviderRequestContext {
+    let isolated = bcode_config::RuntimeAuthSubscriptions::default();
+    let registry = if request.config.active_context.is_some() {
+        &isolated
+    } else {
+        registry
+    };
+    resolve_request_context_from_registry(request, registry, &mut resolve)
+}
+
+fn resolve_request_context_from_registry(
     request: ProviderRequestContextResolution<'_>,
     registry: &bcode_config::RuntimeAuthSubscriptions,
     mut resolve: impl FnMut(&str, &bcode_config::AuthProfileConfig) -> ResolvedProviderAuth,
@@ -1733,6 +1757,69 @@ mod tests {
             assert_eq!(calls, usize::from(owner == Some("example.plugin")));
             assert_eq!(context.auth.is_some(), owner == Some("example.plugin"));
         }
+    }
+
+    #[test]
+    fn context_pool_ignores_ambient_runtime_members_and_preferences() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("bcode.toml");
+        std::fs::write(
+            &path,
+            r#"
+[contexts]
+active = "custom"
+[contexts.entries.custom.model]
+provider_plugin_id = "example.plugin"
+auth_pool = "pool"
+[contexts.entries.custom.auth.profiles.account]
+backend = "env"
+provider_id = "example"
+owner_plugin_id = "example.plugin"
+[contexts.entries.custom.auth.pools.pool]
+profiles = ["account"]
+"#,
+        )
+        .unwrap();
+        let config = bcode_config::load_config_from_paths(&[path]).unwrap();
+        let pool = bcode_config::contexts::qualify("custom", "pool").unwrap();
+        let registry = bcode_config::RuntimeAuthSubscriptions {
+            pools: BTreeMap::from([(
+                pool,
+                bcode_config::RuntimeAuthSubscriptionPool {
+                    preferred_profile: Some("foreign-account".to_owned()),
+                    profiles: vec![bcode_config::RuntimeAuthSubscriptionProfile {
+                        auth_profile: "foreign-account".to_owned(),
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                },
+            )]),
+            ..Default::default()
+        };
+        let mut names = Vec::new();
+        let context = resolve_provider_request_context_with_resolver(
+            ProviderRequestContextResolution {
+                config: &config,
+                selection: config.resolved_model_selection(),
+            },
+            &registry,
+            |name, _| {
+                names.push(name.to_owned());
+                ResolvedProviderAuth::default()
+            },
+        );
+        assert_eq!(names, vec!["ctx-6-custom-account"]);
+        assert_eq!(context.auth_candidates.len(), 1);
+        assert_eq!(
+            context.auth_profile.as_deref(),
+            Some("ctx-6-custom-account")
+        );
+        assert!(!request_needs_runtime_registry(
+            &ProviderRequestContextResolution {
+                config: &config,
+                selection: config.resolved_model_selection()
+            }
+        ));
     }
 
     #[test]

@@ -168,7 +168,11 @@ fn qualify_option(context: &str, value: &mut Option<String>) -> Result<(), Confi
     Ok(())
 }
 
-pub(crate) fn validate_effective(config: &crate::BcodeConfig) -> Result<(), ConfigError> {
+/// Validate that an effective snapshot agrees with its selected context definition.
+///
+/// # Errors
+/// Rejects inconsistent context identity or resolved model/auth configuration.
+pub fn validate_effective(config: &crate::BcodeConfig) -> Result<(), ConfigError> {
     let declared = config
         .contexts
         .as_ref()
