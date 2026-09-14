@@ -35756,10 +35756,26 @@ mod tests {
                 .needs_continuation(child_run_id)
                 .expect("discover paused cancellation")
         );
+        let mut restarted = WorkflowStore::open_at_path(store.path()).expect("reopen child store");
+        let mut foreign_authority = authority.clone();
+        foreign_authority.daemon_instance_id = "foreign-daemon".to_string();
         assert!(
-            store
+            restarted
+                .inherit_parent_cancellation_owned(child_run_id, &foreign_authority, 4)
+                .is_err()
+        );
+        assert!(
+            restarted
+                .run_summary(child_run_id)
+                .expect("summary")
+                .expect("child")
+                .cancellation_requested_at_ms
+                .is_none()
+        );
+        assert!(
+            restarted
                 .inherit_parent_cancellation_owned(child_run_id, &authority, 4)
-                .expect("inherit")
+                .expect("inherit after reopen")
         );
         assert!(
             !store

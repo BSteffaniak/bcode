@@ -16526,12 +16526,11 @@ async fn drive_workflow_run_exclusive(
         }
         let iteration_started_at = std::time::Instant::now();
         let now_ms = current_unix_millis();
-        bcode_workflow_store::WorkflowStore::open_at_path(&store_path)?
-            .inherit_parent_cancellation_owned(run_id, &authority.authority, now_ms)?;
-        cancellation_sweep_complete = continue_workflow_cancellation(
+        cancellation_sweep_complete = refresh_cancellation_sweep(
             state,
             run_id,
             &authority.authority,
+            &store_path,
             &mut cancellation_cursor,
             &mut run_cancellation_cursor,
             cancellation_sweep_complete,
@@ -16616,6 +16615,35 @@ fn workflow_store_path(state: &ServerState) -> PathBuf {
         .unwrap_or_else(std::sync::PoisonError::into_inner)
         .path()
         .to_path_buf()
+}
+
+async fn refresh_cancellation_sweep(
+    state: &ServerState,
+    run_id: &str,
+    authority: &bcode_workflow_store::WorkflowExecutionAuthority,
+    store_path: &Path,
+    publication_cursor: &mut Option<String>,
+    run_cursor: &mut Option<String>,
+    complete: bool,
+) -> Result<bool, WorkflowStoreError> {
+    let inherited = bcode_workflow_store::WorkflowStore::open_at_path(store_path)?
+        .inherit_parent_cancellation_owned(run_id, authority, current_unix_millis())?;
+    // A completed sweep must not hide later cancellation or prevent signal retries.
+    if complete {
+        *publication_cursor = None;
+        *run_cursor = None;
+    } else if inherited {
+        *run_cursor = None;
+    }
+    continue_workflow_cancellation(
+        state,
+        run_id,
+        authority,
+        publication_cursor,
+        run_cursor,
+        false,
+    )
+    .await
 }
 
 async fn continue_workflow_cancellation(
@@ -33958,63 +33986,35 @@ async fn signal_workflow_attempt_cancellation(
                     "workflow child cancellation receipt has no child_run_id".to_string(),
                 )
             })?;
-        let child_status = {
-            let mut store = state
-                .workflow_store
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            let child = store.run_summary(child_run_id)?.ok_or_else(|| {
-                WorkflowStoreError::InvalidData(
-                    "workflow child cancellation target is missing".into(),
-                )
-            })?;
-            if matches!(
-                child.status,
-                bcode_workflow_store::RunStatus::Completed
-                    | bcode_workflow_store::RunStatus::Failed
-                    | bcode_workflow_store::RunStatus::Cancelled
-            ) {
-                return Ok(());
-            }
-            let authority = store.execution_authority(child_run_id)?.ok_or_else(|| {
-                WorkflowStoreError::InvalidData(
-                    "child cancellation requires durable execution authority".into(),
-                )
-            })?;
-            if !workflow_operations::authority_targets_current_daemon(state, &authority) {
-                return Err(WorkflowStoreError::InvalidData(
-                    "child cancellation belongs to a foreign daemon".into(),
-                ));
-            }
-            let _ = store.request_cancellation_owned(
-                child_run_id,
-                current_unix_millis(),
-                &authority,
-            )?;
-            store
-                .run_summary(child_run_id)?
-                .ok_or_else(|| {
-                    WorkflowStoreError::InvalidData(
-                        "workflow child cancellation target is missing".to_string(),
-                    )
-                })?
-                .status
-        };
+        let mut store = state
+            .workflow_store
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let child = store.run_summary(child_run_id)?.ok_or_else(|| {
+            WorkflowStoreError::InvalidData("workflow child cancellation target is missing".into())
+        })?;
         if matches!(
-            child_status,
-            bcode_workflow_store::RunStatus::Running | bcode_workflow_store::RunStatus::Paused
+            child.status,
+            bcode_workflow_store::RunStatus::Completed
+                | bcode_workflow_store::RunStatus::Failed
+                | bcode_workflow_store::RunStatus::Cancelled
         ) {
-            let child_attempts = state
-                .workflow_store
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .active_attempt_cancellations(child_run_id, 1_000)?;
-            Box::pin(propagate_persisted_workflow_cancellation(
-                state,
-                child_attempts,
-            ))
-            .await?;
+            return Ok(());
         }
+        let authority = store.execution_authority(child_run_id)?.ok_or_else(|| {
+            WorkflowStoreError::InvalidData(
+                "child cancellation requires execution authority".into(),
+            )
+        })?;
+        if !workflow_operations::authority_targets_current_daemon(state, &authority) {
+            return Err(WorkflowStoreError::InvalidData(
+                "child cancellation belongs to a foreign daemon".into(),
+            ));
+        }
+        store.request_cancellation_owned(child_run_id, current_unix_millis(), &authority)?;
+        drop(store);
+        // The child's bounded driver signals its attempts under its own authority.
+        // Never recursively traverse or signal descendants using the parent's fence.
         return Ok(());
     }
     let work_id = WorkId::new(attempt.dispatch_identity.clone());
@@ -34217,6 +34217,7 @@ async fn propagate_fail_fast_sibling_cancellation(
     Ok(signalled)
 }
 
+#[cfg(test)]
 async fn propagate_persisted_workflow_cancellation(
     state: &ServerState,
     attempts: Vec<bcode_workflow_store::ActiveAttemptCancellation>,
@@ -72476,6 +72477,16 @@ event_symbol = "bcode_plugin_handle_event_v1"
     #[tokio::test]
     #[allow(clippy::too_many_lines)]
     async fn active_workflow_prompt_cancellation_reaches_turn_and_durable_attempt() {
+        Box::pin(assert_active_workflow_cancellation(false)).await;
+    }
+
+    #[tokio::test]
+    async fn inherited_workflow_cancellation_reaches_active_turn_and_parent() {
+        Box::pin(assert_active_workflow_cancellation(true)).await;
+    }
+
+    #[allow(clippy::too_many_lines)]
+    async fn assert_active_workflow_cancellation(inherited: bool) {
         let _workflow_runtime_guard = WORKFLOW_RUNTIME_TEST_LOCK.lock().await;
         let sessions = SessionManager::default();
         let parent = sessions
@@ -72537,13 +72548,67 @@ event_symbol = "bcode_plugin_handle_event_v1"
             exits: vec!["agent".to_string()],
             edges: Vec::new(),
         };
+        let mut run_definition = definition.clone();
+        if inherited {
+            let target = bcode_workflow::WorkflowDefinitionIdentity::for_definition(
+                "delegated-agent",
+                &definition,
+            )
+            .expect("target identity");
+            state
+                .workflow_store
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .persist_definition(
+                    &target.definition_id,
+                    target.definition_version,
+                    &definition,
+                )
+                .expect("delegated definition");
+            let node = run_definition.nodes.get_mut("agent").expect("node");
+            node.kind = bcode_workflow::NodeKind::WorkflowCall;
+            node.configuration = serde_json::to_value(bcode_workflow::WorkflowCallConfiguration {
+                version: bcode_workflow::WORKFLOW_CALL_VERSION,
+                target: bcode_workflow::WorkflowCallTarget::Definition { identity: target },
+                input: None,
+                output: None,
+            })
+            .expect("call configuration");
+            let intermediate = run_definition.clone();
+            let identity = bcode_workflow::WorkflowDefinitionIdentity::for_definition(
+                "intermediate-call",
+                &intermediate,
+            )
+            .expect("intermediate identity");
+            state
+                .workflow_store
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .persist_definition(
+                    &identity.definition_id,
+                    identity.definition_version,
+                    &intermediate,
+                )
+                .expect("intermediate definition");
+            run_definition
+                .nodes
+                .get_mut("agent")
+                .expect("node")
+                .configuration = serde_json::to_value(bcode_workflow::WorkflowCallConfiguration {
+                version: bcode_workflow::WORKFLOW_CALL_VERSION,
+                target: bcode_workflow::WorkflowCallTarget::Definition { identity },
+                input: None,
+                output: None,
+            })
+            .expect("root call");
+        }
         {
             let mut store = state
                 .workflow_store
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             store
-                .persist_definition("agent-cancellation", 1, &definition)
+                .persist_definition("agent-cancellation", 1, &run_definition)
                 .expect("definition");
             store
                 .create_run(&bcode_workflow_store::NewWorkflowRun {
@@ -72572,6 +72637,46 @@ event_symbol = "bcode_plugin_handle_event_v1"
                 })
                 .expect("run");
         }
+        let mut foreign_state = test_server_state_with_fake_provider(SessionManager::default());
+        foreign_state.workflow_store = Arc::new(std::sync::Mutex::new(
+            bcode_workflow_store::WorkflowStore::open_at_path(
+                state
+                    .workflow_store
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .path(),
+            )
+            .expect("second daemon store"),
+        ));
+        foreign_state.daemon_status.instance_id = "foreign-cancellation-daemon".to_string();
+        let child_cancellation = bcode_workflow_store::ActiveAttemptCancellation {
+            run_id: "parent-run".to_string(),
+            node_id: "call".to_string(),
+            activation_id: "call-1".to_string(),
+            attempt: 1,
+            dispatch_identity: "parent-call-dispatch".to_string(),
+            receipt: Some(serde_json::json!({
+                "owner": "bcode.server.workflow-child/v1",
+                "child_run_id": "agent-cancel-run",
+            })),
+        };
+        assert!(
+            signal_workflow_attempt_cancellation(&foreign_state, &child_cancellation)
+                .await
+                .is_err()
+        );
+        drop(foreign_state);
+        assert!(
+            state
+                .workflow_store
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .run_summary("agent-cancel-run")
+                .expect("summary")
+                .expect("run")
+                .cancellation_requested_at_ms
+                .is_none()
+        );
         register_workflow_runtime_work(
             &state,
             parent.id,
@@ -72585,7 +72690,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .path()
             .to_path_buf();
-        let (owner,) = (WorkflowPromptTurnOwner { state: &state },);
+        let (owner,) = (WorkflowActivationOwner { state: &state },);
         let summary = bcode_workflow_store::WorkflowStore::open_at_path(&store_path)
             .expect("scheduler")
             .dispatch_pending_activations(&owner, 10, 2)
@@ -72593,6 +72698,31 @@ event_symbol = "bcode_plugin_handle_event_v1"
             .expect("dispatch");
         assert_eq!(summary.admitted.len(), 1);
         let dispatch_identity = summary.admitted[0].clone();
+        if inherited {
+            assert!(
+                state
+                    .sessions
+                    .all_session_summaries()
+                    .await
+                    .into_iter()
+                    .all(|session| session.execution.is_none()),
+                "child admission must not execute descendants"
+            );
+            // Exercise the same bounded discovery contract as the background driver.
+            for _ in 0..3 {
+                let run_ids = state
+                    .workflow_store
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .continuation_run_ids_after("", 16)
+                    .expect("discovery page");
+                for run_id in run_ids {
+                    drive_workflow_run(&state, &run_id)
+                        .await
+                        .expect("discovered run");
+                }
+            }
+        }
         let child = state
             .sessions
             .all_session_summaries()
@@ -72610,6 +72740,25 @@ event_symbol = "bcode_plugin_handle_event_v1"
         })
         .await
         .expect("turn became active");
+        let authority = bcode_workflow_store::WorkflowStore::open_at_path(&store_path)
+            .expect("store")
+            .execution_authority("agent-cancel-run")
+            .expect("authority query")
+            .expect("authority");
+        let (mut publication_cursor, mut run_cursor) = (None, None);
+        assert!(
+            refresh_cancellation_sweep(
+                &state,
+                "agent-cancel-run",
+                &authority,
+                &store_path,
+                &mut publication_cursor,
+                &mut run_cursor,
+                false,
+            )
+            .await
+            .expect("initial empty sweep")
+        );
         let attempts = {
             let mut store = state
                 .workflow_store
@@ -72626,12 +72775,44 @@ event_symbol = "bcode_plugin_handle_event_v1"
         };
         assert_eq!(attempts.len(), 1);
         assert_eq!(attempts[0].dispatch_identity, dispatch_identity);
-        assert_eq!(
-            propagate_persisted_workflow_cancellation(&state, attempts)
+        if !inherited {
+            assert!(
+                !refresh_cancellation_sweep(
+                    &state,
+                    "agent-cancel-run",
+                    &authority,
+                    &store_path,
+                    &mut publication_cursor,
+                    &mut run_cursor,
+                    true,
+                )
                 .await
-                .expect("propagate"),
-            [dispatch_identity]
-        );
+                .expect("late cancellation restarts completed sweep")
+            );
+        }
+        if inherited {
+            let child_run_id = child
+                .execution
+                .as_ref()
+                .expect("execution")
+                .provenance
+                .run_id
+                .clone();
+            let intermediate_run_id = state
+                .workflow_store
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .parent_run_link(&child_run_id)
+                .expect("link")
+                .expect("intermediate")
+                .parent_run_id;
+            drive_workflow_run(&state, &intermediate_run_id)
+                .await
+                .expect("inherit root intent");
+            drive_workflow_run_and_parents(&state, &child_run_id)
+                .await
+                .expect("inherit and drive");
+        }
         tokio::time::timeout(Duration::from_secs(3), async {
             loop {
                 let events = state
@@ -72655,6 +72836,40 @@ event_symbol = "bcode_plugin_handle_event_v1"
         })
         .await
         .expect("turn cancellation completed");
+        if inherited {
+            let child_run_id = &child
+                .execution
+                .as_ref()
+                .expect("execution")
+                .provenance
+                .run_id;
+            tokio::time::timeout(Duration::from_secs(3), async {
+                loop {
+                    drive_workflow_run_and_parents(&state, child_run_id)
+                        .await
+                        .expect("reconcile subtree");
+                    let done = {
+                        let store = state
+                            .workflow_store
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner);
+                        [child_run_id.as_str(), "agent-cancel-run"]
+                            .into_iter()
+                            .all(|run_id| {
+                                let run = store.run_summary(run_id).expect("summary").expect("run");
+                                run.cancellation_requested_at_ms.is_some()
+                                    && run.status == bcode_workflow_store::RunStatus::Cancelled
+                            })
+                    };
+                    if done {
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+            })
+            .await
+            .expect("child and parent terminal cancellation");
+        }
         let attempt = state
             .workflow_store
             .lock()
