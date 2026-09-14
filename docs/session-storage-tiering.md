@@ -351,6 +351,16 @@ still rely on byte-for-byte candidate verification and established finalization/
 untrusted replacement between this check and the later source open remains part of publication
 identity hardening, not something a checksum alone resolves.
 
+## Event-payload codec foundation
+
+A versioned, checksummed Zstd/base64 event-payload envelope now preserves exact logical JSON bytes,
+including private usage evidence and unknown JSON fields. Expansion, decoder-window, encoded-size,
+UTF-8 and checksum checks bound decoding. Incompressible/tiny values remain raw JSON. Current event
+and private-usage decoding accept the envelope, but canonical writes still emit plain JSON.
+No migration, history recompression writer, or database-space reclamation is activated. Enabling
+writes requires the storage epoch upgrade and completion of every remaining direct payload consumer;
+this codec foundation alone is not history compression functionality.
+
 ## Remaining implementation
 
 ### Access policy and scheduling

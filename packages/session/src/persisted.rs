@@ -24,7 +24,8 @@ use thiserror::Error;
 /// Returns an error when the event is not a supported persisted session-event
 /// shape or cannot be converted into the current domain model.
 pub fn decode_session_event(payload: &str) -> Result<SessionEvent, PersistedSessionEventError> {
-    let value = serde_json::from_str::<serde_json::Value>(payload)?;
+    let payload = crate::event_compression::decode_event_payload(payload)?;
+    let value = serde_json::from_str::<serde_json::Value>(&payload)?;
     if let Some(raw) = value.get("original_usage") {
         let original: bcode_session_models::OriginalUsage = serde_json::from_value(raw.clone())
             .map_err(|_| PersistedSessionEventError::InvalidOriginalUsage)?;
@@ -85,8 +86,10 @@ pub fn encode_session_event_with_original(
 pub fn original_usage(
     payload: &str,
 ) -> Result<Option<bcode_session_models::OriginalUsage>, String> {
+    let payload = crate::event_compression::decode_event_payload(payload)
+        .map_err(|_| "invalid compressed canonical payload")?;
     let value: serde_json::Value =
-        serde_json::from_str(payload).map_err(|_| "invalid canonical payload")?;
+        serde_json::from_str(&payload).map_err(|_| "invalid canonical payload")?;
     let Some(raw) = value.get("original_usage") else {
         return Ok(None);
     };
@@ -138,6 +141,9 @@ fn first_persisted_event_kind_name(kind: &serde_json::Value) -> String {
 /// Errors returned when decoding persisted session events.
 #[derive(Debug, Error)]
 pub enum PersistedSessionEventError {
+    /// Compressed storage envelope is corrupt, oversized or unsupported.
+    #[error("invalid or unsupported compressed session payload")]
+    Compression(#[from] std::io::Error),
     /// Private original usage is malformed; ordinary reads must not conceal damaged evidence.
     #[error("invalid original billing usage in canonical event")]
     InvalidOriginalUsage,
