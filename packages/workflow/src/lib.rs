@@ -5773,6 +5773,16 @@ pub fn plan_workflow_package(
         .iter()
         .map(|member| (member.member_id.as_str(), member))
         .collect::<BTreeMap<_, _>>();
+    let mut sources = BTreeMap::new();
+    let mut interfaces = BTreeMap::new();
+    for (member_id, member) in &members {
+        let value = decode_workflow_source_value(&member.source, member.format)
+            .map_err(|error| qualify_workflow_package_member_error(member, error))?;
+        let interface = WorkflowPackageSourceInterface::from_source(&value)
+            .map_err(|error| qualify_workflow_package_member_error(member, error))?;
+        interfaces.insert(*member_id, interface);
+        sources.insert(*member_id, value);
+    }
     let order = workflow_package_topological_order(&members)?;
     let external_targets = manifest
         .external_dependencies
@@ -5808,8 +5818,12 @@ pub fn plan_workflow_package(
         let member = members[member_id];
         let member_source_path =
             |path: &str| format!("package.members.{}.source.{path}", member.member_id);
-        let mut value = decode_workflow_source_value(&member.source, member.format)
-            .map_err(|error| qualify_workflow_package_member_error(member, error))?;
+        let mut value = sources.remove(member_id).ok_or_else(|| {
+            authoring_error(
+                member_source_path("source"),
+                "member source was not collected",
+            )
+        })?;
         resolve_package_calls(&mut value, member, &identities, &external_targets)?;
         let normalized = serde_json::to_string(&value).map_err(|error| {
             authoring_error(
@@ -5823,6 +5837,9 @@ pub fn plan_workflow_package(
             &resolved_catalog,
         )
         .map_err(|error| qualify_workflow_package_member_error(member, error))?;
+        interfaces[member_id]
+            .validate_definition(&validated.result.document.definition)
+            .map_err(|error| qualify_workflow_package_member_error(member, error))?;
         let compiled = validated
             .result
             .document
@@ -6225,6 +6242,54 @@ fn digest_serializable(value: &impl Serialize) -> Result<String, WorkflowError> 
     Ok(output)
 }
 
+/// Source-declared boundaries collected independently of compiled member identities.
+/// Missing boundaries retain source-v3 inference semantics.
+#[derive(Debug, Default)]
+struct WorkflowPackageSourceInterface {
+    input: Option<ValueSchema>,
+    output: Option<ValueSchema>,
+}
+
+impl WorkflowPackageSourceInterface {
+    fn from_source(value: &serde_json::Value) -> Result<Self, WorkflowError> {
+        // Other source formats own their boundary representation and validation.
+        if value.get("workflow_source_version")
+            != Some(&serde_json::json!(WORKFLOW_SOURCE_DOCUMENT_VERSION))
+        {
+            return Ok(Self::default());
+        }
+        let schema = |name: &str| -> Result<Option<ValueSchema>, WorkflowError> {
+            let Some(value) = value.get(name).filter(|value| !value.is_null()) else {
+                return Ok(None);
+            };
+            let schema: ValueSchema = serde_json::from_value(value.clone()).map_err(|error| {
+                authoring_error(name, format!("invalid member interface: {error}"))
+            })?;
+            validate_runtime_value_schema(name, &schema)?;
+            Ok(Some(schema))
+        };
+        Ok(Self {
+            input: schema("input")?,
+            output: schema("output")?,
+        })
+    }
+
+    fn validate_definition(&self, definition: &WorkflowDefinition) -> Result<(), WorkflowError> {
+        for (name, declared, actual) in [
+            ("input", &self.input, &definition.input),
+            ("output", &self.output, &definition.output),
+        ] {
+            if declared.as_ref().is_some_and(|schema| schema != actual) {
+                return Err(authoring_error(
+                    name,
+                    "compiled member boundary differs from its source-declared interface",
+                ));
+            }
+        }
+        Ok(())
+    }
+}
+
 fn workflow_package_topological_order<'a>(
     members: &BTreeMap<&'a str, &'a WorkflowPackageMember>,
 ) -> Result<Vec<&'a str>, WorkflowError> {
@@ -6291,6 +6356,14 @@ fn workflow_package_member_closure(
     Ok(closure.into_iter().collect())
 }
 
+/// A package source reference before publication resolves executable identities.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "snake_case")]
+enum WorkflowPackageSourceCall {
+    Member(String),
+    External(String),
+}
+
 #[allow(clippy::too_many_lines)]
 fn resolve_package_calls(
     value: &mut serde_json::Value,
@@ -6311,82 +6384,79 @@ fn resolve_package_calls(
         let Some(call) = object.remove("package_call") else {
             continue;
         };
-        let call = call.as_object().ok_or_else(|| {
+        let call: WorkflowPackageSourceCall = serde_json::from_value(call).map_err(|error| {
             authoring_error(
                 format!(
                     "package.members.{}.steps[{index}].package_call",
                     member.member_id
                 ),
-                "package_call must be an object",
+                format!(
+                    "package_call requires exactly one string member or external field: {error}"
+                ),
             )
         })?;
-        if call.len() != 1 {
+        if object.contains_key("workflow_call") {
             return Err(authoring_error(
                 format!(
                     "package.members.{}.steps[{index}].package_call",
                     member.member_id
                 ),
-                "package_call accepts exactly one of member or external",
+                "package_call cannot replace an explicit workflow_call",
             ));
         }
-        let target = if let Some(target) = call.get("member").and_then(serde_json::Value::as_str) {
-            if !member
-                .dependencies
-                .iter()
-                .any(|dependency| dependency == target)
-            {
-                return Err(authoring_error(
-                    format!(
-                        "package.members.{}.steps[{index}].package_call.member",
-                        member.member_id
-                    ),
-                    "package_call target must be a declared direct dependency",
-                ));
+        let target = match &call {
+            WorkflowPackageSourceCall::Member(target) => {
+                if !member
+                    .dependencies
+                    .iter()
+                    .any(|dependency| dependency == target)
+                {
+                    return Err(authoring_error(
+                        format!(
+                            "package.members.{}.steps[{index}].package_call.member",
+                            member.member_id
+                        ),
+                        "package_call target must be a declared direct dependency",
+                    ));
+                }
+                let identity = identities.get(target).ok_or_else(|| {
+                    authoring_error(
+                        format!(
+                            "package.members.{}.steps[{index}].package_call.member",
+                            member.member_id
+                        ),
+                        "package_call target has not compiled successfully",
+                    )
+                })?;
+                WorkflowCallTarget::PackageMember {
+                    member_id: target.clone(),
+                    definition_identity: identity.clone(),
+                }
             }
-            let identity = identities.get(target).ok_or_else(|| {
-                authoring_error(
-                    format!(
-                        "package.members.{}.steps[{index}].package_call.member",
-                        member.member_id
-                    ),
-                    "package_call target has not compiled successfully",
-                )
-            })?;
-            WorkflowCallTarget::PackageMember {
-                member_id: target.to_string(),
-                definition_identity: identity.clone(),
+            WorkflowPackageSourceCall::External(target) => {
+                if !member
+                    .external_dependencies
+                    .iter()
+                    .any(|dependency| dependency == target)
+                {
+                    return Err(authoring_error(
+                        format!(
+                            "package.members.{}.steps[{index}].package_call.external",
+                            member.member_id
+                        ),
+                        "package_call external target must be a declared direct dependency",
+                    ));
+                }
+                external_targets.get(target).cloned().ok_or_else(|| {
+                    authoring_error(
+                        format!(
+                            "package.members.{}.steps[{index}].package_call.external",
+                            member.member_id
+                        ),
+                        "package_call external target is unavailable",
+                    )
+                })?
             }
-        } else if let Some(target) = call.get("external").and_then(serde_json::Value::as_str) {
-            if !member
-                .external_dependencies
-                .iter()
-                .any(|dependency| dependency == target)
-            {
-                return Err(authoring_error(
-                    format!(
-                        "package.members.{}.steps[{index}].package_call.external",
-                        member.member_id
-                    ),
-                    "package_call external target must be a declared direct dependency",
-                ));
-            }
-            external_targets.get(target).cloned().ok_or_else(|| {
-                authoring_error(
-                    format!(
-                        "package.members.{}.steps[{index}].package_call.external",
-                        member.member_id
-                    ),
-                    "package_call external target is unavailable",
-                )
-            })?
-        } else {
-            return Err(authoring_error(
-                format!(
-                    "package.members.{}.steps[{index}].package_call",
-                    member.member_id
-                ),
-                "package_call requires a string member or external field",
-            ));
         };
         object.insert(
             "workflow_call".to_string(),
@@ -10351,14 +10421,60 @@ fn resolve_authoring_catalog(
     ),
     WorkflowError,
 > {
-    resolve_authoring_catalog_inner(
-        definition,
-        declared,
-        plugin_input_defaults,
-        catalog,
-        &mut BTreeSet::new(),
-        1,
-    )
+    let (mut requirements, mut effects, mut permissions) =
+        resolve_authoring_catalog_inner(definition, declared, plugin_input_defaults, catalog)?;
+    // Each frame retains its iterator and path, rather than using the Rust call stack.
+    let mut stack = vec![(definition.nodes.iter(), String::new(), None)];
+    let mut active = BTreeSet::new();
+    let empty_defaults = BTreeMap::new();
+    while let Some((nodes, prefix, _)) = stack.last_mut() {
+        let Some((node_id, node)) = nodes.next() else {
+            if let Some((_, _, Some(identity))) = stack.pop() {
+                active.remove(&identity);
+            }
+            continue;
+        };
+        if node.kind != NodeKind::WorkflowCall {
+            continue;
+        }
+        let path = if prefix.is_empty() {
+            node_id.clone()
+        } else {
+            format!("{prefix}/{node_id}")
+        };
+        let (identity, child) = resolve_authoring_workflow_call(node_id, node, catalog)?;
+        if !active.insert(identity.clone()) {
+            return Err(authoring_error(
+                format!("definition.nodes.{path}.configuration"),
+                "workflow call dependency graph is recursive",
+            ));
+        }
+        let (child_requirements, child_effects, child_permissions) =
+            resolve_authoring_catalog_inner(
+                child,
+                &WorkflowRequirementSummary::default(),
+                &empty_defaults,
+                catalog,
+            )?;
+        merge_child_preview(
+            &path,
+            child_requirements,
+            child_effects,
+            child_permissions,
+            &mut requirements,
+            &mut effects,
+            &mut permissions,
+        );
+        stack.push((child.nodes.iter(), path, Some(identity)));
+    }
+    let effects = effects.normalized();
+    effects.validate()?;
+    requirements.validate()?;
+    permissions.explicit_grant_nodes.sort();
+    permissions.explicit_grant_nodes.dedup();
+    permissions.mutation_approval_nodes.sort();
+    permissions.mutation_approval_nodes.dedup();
+    Ok((requirements, effects, permissions))
 }
 
 fn resolve_authoring_catalog_inner(
@@ -10366,8 +10482,6 @@ fn resolve_authoring_catalog_inner(
     declared: &WorkflowRequirementSummary,
     plugin_input_defaults: &BTreeMap<String, serde_json::Value>,
     catalog: &WorkflowAuthoringCatalogSnapshot,
-    visited: &mut BTreeSet<String>,
-    depth: u32,
 ) -> Result<
     (
         WorkflowRequirementSummary,
@@ -10413,17 +10527,8 @@ fn resolve_authoring_catalog_inner(
                 &mut effects,
                 &mut permissions,
             )?,
-            NodeKind::WorkflowCall => resolve_authoring_workflow_call(
-                node_id,
-                node,
-                catalog,
-                &mut requirements,
-                &mut effects,
-                &mut permissions,
-                visited,
-                depth,
-            )?,
-            NodeKind::Task
+            NodeKind::WorkflowCall
+            | NodeKind::Task
             | NodeKind::Branch
             | NodeKind::Repeat
             | NodeKind::Retry
@@ -10492,23 +10597,11 @@ fn merge_child_preview(
     );
 }
 
-#[allow(clippy::too_many_arguments)]
-fn resolve_authoring_workflow_call(
+fn resolve_authoring_workflow_call<'a>(
     node_id: &str,
     node: &NodeDefinition,
-    catalog: &WorkflowAuthoringCatalogSnapshot,
-    requirements: &mut WorkflowRequirementSummary,
-    effects: &mut WorkflowEffectSummary,
-    permissions: &mut WorkflowPermissionPreview,
-    visited: &mut BTreeSet<String>,
-    depth: u32,
-) -> Result<(), WorkflowError> {
-    if depth >= MAX_WORKFLOW_CALL_DEPTH {
-        return Err(authoring_error(
-            format!("definition.nodes.{node_id}.configuration"),
-            "workflow call dependency depth exceeds the supported bound",
-        ));
-    }
+    catalog: &'a WorkflowAuthoringCatalogSnapshot,
+) -> Result<(String, &'a WorkflowDefinition), WorkflowError> {
     let call: WorkflowCallConfiguration = serde_json::from_value(node.configuration.clone())
         .map_err(|error| {
             authoring_error(
@@ -10518,12 +10611,6 @@ fn resolve_authoring_workflow_call(
         })?;
     call.validate()?;
     let identity = call.target.definition_identity();
-    if !visited.insert(identity.definition_id.clone()) {
-        return Err(authoring_error(
-            format!("definition.nodes.{node_id}.configuration"),
-            "workflow call dependency graph is recursive",
-        ));
-    }
     let child = catalog
         .workflow_definitions
         .get(&identity.definition_id)
@@ -10543,26 +10630,7 @@ fn resolve_authoring_workflow_call(
             "exact child definition identity does not match catalog content",
         ));
     }
-    let empty_defaults = BTreeMap::new();
-    let (child_requirements, child_effects, child_permissions) = resolve_authoring_catalog_inner(
-        child,
-        &WorkflowRequirementSummary::default(),
-        &empty_defaults,
-        catalog,
-        visited,
-        depth + 1,
-    )?;
-    merge_child_preview(
-        node_id,
-        child_requirements,
-        child_effects,
-        child_permissions,
-        requirements,
-        effects,
-        permissions,
-    );
-    visited.remove(&identity.definition_id);
-    Ok(())
+    Ok((identity.definition_id.clone(), child))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -16727,6 +16795,45 @@ mod tests {
         }
     }
 
+    #[test]
+    fn package_source_calls_reject_ambiguous_or_unknown_references() {
+        assert_eq!(
+            serde_json::from_value::<WorkflowPackageSourceCall>(
+                serde_json::json!({"member": "self"})
+            )
+            .expect("local reference needs no compiled identity"),
+            WorkflowPackageSourceCall::Member("self".to_string())
+        );
+        for value in [
+            serde_json::json!({"member": "self", "external": "other"}),
+            serde_json::json!({"member": 1}),
+            serde_json::json!({"future": "self"}),
+            serde_json::json!({}),
+        ] {
+            assert!(serde_json::from_value::<WorkflowPackageSourceCall>(value).is_err());
+        }
+    }
+
+    #[test]
+    fn package_interfaces_are_available_before_local_calls_are_resolved() {
+        let input = source_interface_schema("example.input/v1");
+        let output = source_interface_schema("example.output/v1");
+        let source = serde_json::json!({
+            "workflow_source_version": WORKFLOW_SOURCE_DOCUMENT_VERSION,
+            "input": input,
+            "output": output,
+            "steps": [{"id": "recurse", "package_call": {"member": "self"}}]
+        });
+        let interface = WorkflowPackageSourceInterface::from_source(&source)
+            .expect("unresolved local calls do not require compiled identities");
+        assert_eq!(interface.input, Some(input));
+        assert_eq!(interface.output, Some(output));
+        let inferred = WorkflowPackageSourceInterface::from_source(&single_gate_source(None, None))
+            .expect("legacy inferred boundaries remain supported");
+        assert!(inferred.input.is_none());
+        assert!(inferred.output.is_none());
+    }
+
     fn single_gate_source(
         input: Option<&ValueSchema>,
         output: Option<&ValueSchema>,
@@ -18926,6 +19033,53 @@ steps:
         assert_eq!(call.input.type_name, "example.child-input/v1");
         assert_eq!(call.output.type_name, "example.projected/v1");
         assert!(lowered.document.definition.edges[0].transform.is_some());
+    }
+
+    #[test]
+    fn capability_analysis_is_not_limited_by_runtime_call_depth() {
+        let mut catalog = authoring_catalog();
+        let mut child = lower_workflow_authoring_source(
+            &single_gate_source(None, None).to_string(),
+            WorkflowSourceFormat::Json,
+            &catalog,
+        )
+        .expect("leaf")
+        .document
+        .definition;
+        for index in 0..MAX_WORKFLOW_CALL_DEPTH + 4 {
+            let identity = WorkflowDefinitionIdentity::for_definition(
+                format!("example/child-{index}"),
+                &child,
+            )
+            .expect("identity");
+            catalog
+                .workflow_definitions
+                .insert(identity.definition_id.clone(), child);
+            let source = serde_json::json!({
+                "workflow_source_version": WORKFLOW_SOURCE_DOCUMENT_VERSION,
+                "workflow_id": format!("example/parent-{index}"),
+                "title": "Parent",
+                "steps": [{"id": "call", "workflow_call": {
+                    "version": WORKFLOW_CALL_VERSION,
+                    "target": {"kind": "definition", "identity": identity}
+                }}]
+            });
+            child = lower_workflow_authoring_source(
+                &source.to_string(),
+                WorkflowSourceFormat::Json,
+                &catalog,
+            )
+            .expect("parent")
+            .document
+            .definition;
+        }
+        resolve_authoring_catalog(
+            &child,
+            &WorkflowRequirementSummary::default(),
+            &BTreeMap::new(),
+            &catalog,
+        )
+        .expect("analysis traverses beyond the runtime default depth");
     }
 
     #[test]
