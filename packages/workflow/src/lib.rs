@@ -10427,6 +10427,7 @@ fn resolve_authoring_catalog(
     let mut stack = vec![(definition.nodes.iter(), String::new(), None)];
     let mut active = BTreeSet::new();
     let empty_defaults = BTreeMap::new();
+    let mut remaining_expansions = MAX_WORKFLOW_AUTHORING_REQUIREMENTS;
     while let Some((nodes, prefix, _)) = stack.last_mut() {
         let Some((node_id, node)) = nodes.next() else {
             if let Some((_, _, Some(identity))) = stack.pop() {
@@ -10437,6 +10438,12 @@ fn resolve_authoring_catalog(
         if node.kind != NodeKind::WorkflowCall {
             continue;
         }
+        remaining_expansions = remaining_expansions.checked_sub(1).ok_or_else(|| {
+            authoring_error(
+                "definition.workflow_calls",
+                "workflow call preview expansion exceeds the bounded analysis budget",
+            )
+        })?;
         let path = if prefix.is_empty() {
             node_id.clone()
         } else {
@@ -19080,6 +19087,54 @@ steps:
             &catalog,
         )
         .expect("analysis traverses beyond the runtime default depth");
+    }
+
+    #[test]
+    fn capability_analysis_bounds_shared_child_expansion() {
+        let mut catalog = authoring_catalog();
+        let mut child = lower_workflow_authoring_source(
+            &single_gate_source(None, None).to_string(),
+            WorkflowSourceFormat::Json,
+            &catalog,
+        )
+        .expect("leaf")
+        .document
+        .definition;
+        // A small catalog represents exponentially many invocation paths.
+        for index in 0..16 {
+            let identity = WorkflowDefinitionIdentity::for_definition(
+                format!("example/branch-{index}"),
+                &child,
+            )
+            .expect("identity");
+            catalog
+                .workflow_definitions
+                .insert(identity.definition_id.clone(), child.clone());
+            let mut call = child.nodes.values().next().expect("node").clone();
+            call.kind = NodeKind::WorkflowCall;
+            call.configuration = serde_json::to_value(WorkflowCallConfiguration {
+                version: WORKFLOW_CALL_VERSION,
+                target: WorkflowCallTarget::Definition { identity },
+                input: None,
+                output: None,
+            })
+            .expect("call");
+            child.nodes.clear();
+            for id in ["left", "right"] {
+                call.id = id.to_string();
+                child.nodes.insert(id.to_string(), call.clone());
+            }
+            child.entries = vec!["left".into(), "right".into()];
+            child.exits = child.entries.clone();
+        }
+        let error = resolve_authoring_catalog(
+            &child,
+            &WorkflowRequirementSummary::default(),
+            &BTreeMap::new(),
+            &catalog,
+        )
+        .expect_err("shared invocation expansion must be bounded");
+        assert!(error.to_string().contains("bounded analysis budget"));
     }
 
     #[test]
