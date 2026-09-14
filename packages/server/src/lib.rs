@@ -26,6 +26,7 @@ mod session_bulk_migration;
 mod session_operations;
 mod session_search_operations;
 pub mod storage_maintenance;
+pub mod storage_maintenance_worker;
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 pub mod storage_read_admission;
 mod workflow_operations;

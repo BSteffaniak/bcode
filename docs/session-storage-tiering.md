@@ -292,6 +292,15 @@ The adapter is not yet invoked by production content reads and the worker is sti
 Read-failure fallback, complete admission coverage, safe clean-record cleanup, and old-client
 participation remain unresolved. These APIs must not be mistaken for enabled automatic compression.
 
+## Worker lifecycle ownership
+
+The server now has an owned worker lifecycle wrapper with idempotent start, disabled/shutdown
+refusal, and cancellation-safe join ownership. Cancelling a shutdown waiter no longer requires
+abandoning its task handle; another waiter can finish draining the same worker. Tests cover repeated
+start, no restart after shutdown, and a cancelled stop retaining its worker until actual completion.
+The wrapper is not invoked by production startup yet: caller-established tracking-health coverage
+remains a precondition and has not been integrated.
+
 ## Remaining implementation
 
 ### Access policy and scheduling
