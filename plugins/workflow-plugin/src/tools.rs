@@ -39,7 +39,16 @@ struct AgentTaskRequest {
     node: bcode_workflow::NodeDefinition,
     entry: bool,
     exit: bool,
+    #[serde(default)]
+    edges: Vec<AgentTaskEdge>,
     reconciliation: Vec<bcode_workflow::WorkflowRunGraphReconciliation>,
+}
+
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct AgentTaskEdge {
+    edge_id: u64,
+    edge: bcode_workflow::EdgeDefinition,
 }
 
 fn task_definition() -> ToolDefinition {
@@ -51,6 +60,7 @@ fn task_definition() -> ToolDefinition {
             "properties":{
                 "run_id":{"type":"string"},"expected_revision":{"type":"integer","minimum":1},
                 "mutation_id":{"type":"string"},"node":{"type":"object"},
+                "edges":{"type":"array","description":"Edges staged atomically with the task; canonical graph validation checks endpoints and identities.","items":{"type":"object","additionalProperties":false,"required":["edge_id","edge"],"properties":{"edge_id":{"type":"integer","minimum":1},"edge":{"type":"object"}}}},
                 "entry":{"type":"boolean"},"exit":{"type":"boolean"},
                 "reconciliation":{"type":"array"}
             }}),
@@ -72,16 +82,23 @@ fn parse_tool_edit(
     let _: bcode_workflow::WorkflowPromptConfiguration =
         serde_json::from_value(task.node.configuration.clone())
             .map_err(|_| "invalid agent prompt configuration".to_owned())?;
+    let mut edits = vec![bcode_workflow::WorkflowRunGraphEdit::AddNode {
+        node: task.node,
+        entry: task.entry,
+        exit: task.exit,
+    }];
+    edits.extend(task.edges.into_iter().map(|edge| {
+        bcode_workflow::WorkflowRunGraphEdit::AddEdge {
+            edge_id: edge.edge_id,
+            edge: edge.edge,
+        }
+    }));
     let edit = WorkflowRunGraphEditBatch {
         version: bcode_workflow::WORKFLOW_RUN_GRAPH_EDIT_VERSION,
         run_id: task.run_id,
         expected_revision: task.expected_revision,
         mutation_id: task.mutation_id,
-        edits: vec![bcode_workflow::WorkflowRunGraphEdit::AddNode {
-            node: task.node,
-            entry: task.entry,
-            exit: task.exit,
-        }],
+        edits,
         reconciliation: task.reconciliation,
     };
     edit.validate()
