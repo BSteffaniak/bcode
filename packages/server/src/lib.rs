@@ -32217,6 +32217,8 @@ async fn dispatch_workflow_child(
                         concurrency_cap: limits.concurrency_cap,
                         cycle_cap: limits.cycle_cap,
                         retry_cap: limits.retry_cap,
+                        recursion_depth_cap: limits.recursion_depth_cap,
+                        descendant_cap: limits.descendant_cap,
                     }),
                 )
             }
@@ -32259,6 +32261,10 @@ async fn dispatch_workflow_child(
             concurrency_cap: parent_limits.concurrency_cap.min(child.concurrency_cap),
             cycle_cap: parent_limits.cycle_cap.min(child.cycle_cap),
             retry_cap: parent_limits.retry_cap.min(child.retry_cap),
+            recursion_depth_cap: parent_limits
+                .recursion_depth_cap
+                .min(child.recursion_depth_cap),
+            descendant_cap: parent_limits.descendant_cap.min(child.descendant_cap),
         },
     );
     let child = bcode_workflow_store::NewChildWorkflowRun {

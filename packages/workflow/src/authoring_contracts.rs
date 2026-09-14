@@ -1104,7 +1104,7 @@ pub struct DeleteWorkflowPresetRequest {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum WorkflowPresetUpdateResult {
-    Updated(WorkflowPresetSnapshot),
+    Updated(Box<WorkflowPresetSnapshot>),
     Conflict(WorkflowAuthoringConflict),
 }
 

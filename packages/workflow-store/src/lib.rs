@@ -41,9 +41,9 @@ const RESET_BACKUP_DIRECTORY: &str = "reset-backups";
 /// Stable destructive confirmation required by public workflow-store reset surfaces.
 pub const WORKFLOW_STORE_RESET_CONFIRMATION: &str = "DELETE-INCOMPATIBLE-WORKFLOW-STATE";
 /// Current clean-break workflow store schema version.
-pub const WORKFLOW_STORE_SCHEMA_VERSION: u32 = 41;
+pub const WORKFLOW_STORE_SCHEMA_VERSION: u32 = 42;
 // Changes only when existing readers/writers would become unsafe, not for additive DDL.
-const WORKFLOW_STORE_COMPATIBILITY: u32 = 1;
+const WORKFLOW_STORE_COMPATIBILITY: u32 = 2;
 /// Current bounded workflow-store reset receipt version.
 pub const WORKFLOW_STORE_RESET_RECEIPT_VERSION: u32 = 1;
 /// Current explicit workflow-store migration receipt contract.
@@ -1192,7 +1192,7 @@ impl WorkflowStore {
                         match Self::open_with_ownership(&path, ownership) {
                             Ok(store) => return Ok(store),
                             Err(WorkflowStoreError::UnsupportedStore {
-                                actual: Some(14..=40),
+                                actual: Some(14..=41),
                                 ..
                             }) => {}
                             Err(error) => return Err(error),
@@ -1227,7 +1227,7 @@ impl WorkflowStore {
                         match Self::open_with_ownership(&path, probe) {
                             Ok(store) => return Ok(store),
                             Err(WorkflowStoreError::UnsupportedStore {
-                                actual: Some(14..=40),
+                                actual: Some(14..=41),
                                 ..
                             }) => {}
                             Err(error) => return Err(error),
@@ -1402,13 +1402,24 @@ impl WorkflowStore {
                 "workflow store migration cannot read the source schema".to_string(),
             )
         })?;
-        if !matches!(previous_schema_version, 14..=40) {
+        if !matches!(previous_schema_version, 14..=41) {
             return Err(WorkflowStoreError::UnsupportedStore {
                 actual: Some(previous_schema_version),
                 expected: WORKFLOW_STORE_SCHEMA_VERSION,
             });
         }
         verify_upgrade_recovery_source(&transaction, previous_schema_version)?;
+        if previous_schema_version == 41
+            && read_storage_contract_value(
+                &transaction,
+                "SELECT compatibility FROM workflow_storage_compatibility WHERE contract_id = 1",
+            )? != Some(1)
+        {
+            return Err(WorkflowStoreError::UnsupportedStore {
+                actual: Some(previous_schema_version),
+                expected: WORKFLOW_STORE_SCHEMA_VERSION,
+            });
+        }
         let backup_directory = root.join(MIGRATION_BACKUP_DIRECTORY);
         std::fs::create_dir_all(&backup_directory)?;
         let mut backup_path = backup_directory.join(format!("workflow-{migrated_at_ms}.db"));
@@ -1456,6 +1467,7 @@ impl WorkflowStore {
         continuation::initialize(&transaction)?;
         recovery::initialize(&transaction)?;
         initialize_compatibility_contract(&transaction)?;
+        migrate_recursion_policy(&transaction)?;
         transaction.execute(
             "UPDATE workflow_store_contract SET schema_version = ?1 WHERE contract_id = 1",
             [WORKFLOW_STORE_SCHEMA_VERSION],
@@ -4708,6 +4720,16 @@ impl WorkflowStore {
             concurrency_cap,
             cycle_cap,
             retry_cap,
+            recursion_depth_cap: transaction.query_row(
+                "SELECT recursion_depth_cap FROM workflow_runs WHERE run_id = ?1",
+                [&run.run_id],
+                |row| row.get(0),
+            )?,
+            descendant_cap: transaction.query_row(
+                "SELECT descendant_cap FROM workflow_runs WHERE run_id = ?1",
+                [&run.run_id],
+                |row| row.get(0),
+            )?,
         };
         let existing_binding = parse_run_binding(
             owner_plugin_id,
@@ -5354,7 +5376,7 @@ impl WorkflowStore {
             ));
         }
         let parent_limits: WorkflowRunLimits = transaction.query_row(
-            "SELECT deadline_at_ms, node_execution_cap, concurrency_cap, cycle_cap, retry_cap \
+            "SELECT deadline_at_ms, node_execution_cap, concurrency_cap, cycle_cap, retry_cap, recursion_depth_cap, descendant_cap \
              FROM workflow_runs WHERE run_id = ?1",
             [&request.link.parent_run_id],
             |row| {
@@ -5364,6 +5386,8 @@ impl WorkflowStore {
                     concurrency_cap: row.get(2)?,
                     cycle_cap: row.get(3)?,
                     retry_cap: row.get(4)?,
+                    recursion_depth_cap: row.get(5)?,
+                    descendant_cap: row.get(6)?,
                 })
             },
         )?;
@@ -5380,6 +5404,9 @@ impl WorkflowStore {
             || request.run.limits.concurrency_cap > parent_limits.concurrency_cap
             || request.run.limits.cycle_cap > parent_limits.cycle_cap
             || request.run.limits.retry_cap > parent_limits.retry_cap
+            || request.run.limits.recursion_depth_cap > parent_limits.recursion_depth_cap
+            || request.run.limits.descendant_cap > parent_limits.descendant_cap
+            || request.link.depth > parent_limits.recursion_depth_cap
         {
             return Err(WorkflowStoreError::InvalidData(
                 "workflow child execution limits exceed the inherited parent limits".to_string(),
@@ -5404,9 +5431,9 @@ impl WorkflowStore {
         let descendant_count = bounded_descendant_count(
             &transaction,
             &request.link.root_run_id,
-            MAX_WORKFLOW_RUN_DESCENDANTS,
+            parent_limits.descendant_cap,
         )?;
-        if descendant_count >= MAX_WORKFLOW_RUN_DESCENDANTS {
+        if descendant_count >= parent_limits.descendant_cap {
             return Err(WorkflowStoreError::InvalidData(
                 "workflow child descendant limit reached".to_string(),
             ));
@@ -5637,7 +5664,7 @@ impl WorkflowStore {
         validate_id("run_id", run_id)?;
         self.connection
             .query_row(
-                "SELECT deadline_at_ms, node_execution_cap, concurrency_cap, cycle_cap, retry_cap \
+                "SELECT deadline_at_ms, node_execution_cap, concurrency_cap, cycle_cap, retry_cap, recursion_depth_cap, descendant_cap \
                  FROM workflow_runs WHERE run_id = ?1",
                 [run_id],
                 |row| {
@@ -5647,6 +5674,8 @@ impl WorkflowStore {
                         concurrency_cap: row.get(2)?,
                         cycle_cap: row.get(3)?,
                         retry_cap: row.get(4)?,
+                        recursion_depth_cap: row.get(5)?,
+                        descendant_cap: row.get(6)?,
                     })
                 },
             )
@@ -16008,6 +16037,7 @@ fn enforce_attempt_limits(
             "workflow node-execution cap exceeded".to_string(),
         ));
     }
+    enforce_root_attempt_limit(connection, &attempt.run_id)?;
     let active_count: u32 = connection.query_row(
         "SELECT COUNT(*) FROM (
             SELECT 1 FROM workflow_attempts WHERE run_id = ?1
@@ -16020,6 +16050,35 @@ fn enforce_attempt_limits(
     if active_count >= concurrency_cap {
         return Err(WorkflowStoreError::InvalidData(
             "workflow concurrency cap reached".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+fn enforce_root_attempt_limit(
+    connection: &Connection,
+    run_id: &str,
+) -> Result<(), WorkflowStoreError> {
+    let root_run_id: String = connection.query_row(
+        "SELECT COALESCE((SELECT root_run_id FROM workflow_run_links WHERE child_run_id = ?1), ?1)",
+        [run_id],
+        |row| row.get(0),
+    )?;
+    let cap: u64 = connection.query_row(
+        "SELECT node_execution_cap FROM workflow_runs WHERE run_id = ?1",
+        [&root_run_id],
+        |row| row.get(0),
+    )?;
+    let used: u64 = connection.query_row(
+        "SELECT COUNT(*) FROM (SELECT attempt.dispatch_identity FROM workflow_attempts attempt \
+         WHERE attempt.run_id = ?1 OR attempt.run_id IN \
+         (SELECT child_run_id FROM workflow_run_links WHERE root_run_id = ?1) LIMIT ?2)",
+        rusqlite::params![root_run_id, cap],
+        |row| row.get(0),
+    )?;
+    if used >= cap {
+        return Err(WorkflowStoreError::InvalidData(
+            "workflow root node-execution cap exceeded".to_string(),
         ));
     }
     Ok(())
@@ -17517,6 +17576,14 @@ fn create_run_in_transaction_diagnosed(
             run.created_at_ms,
         ],
     )?;
+    transaction.execute(
+        "UPDATE workflow_runs SET recursion_depth_cap = ?2, descendant_cap = ?3 WHERE run_id = ?1",
+        rusqlite::params![
+            run.run_id,
+            run.limits.recursion_depth_cap,
+            run.limits.descendant_cap
+        ],
+    )?;
     *operation = "materialize_run_graph";
     run_graph::materialize(transaction, &run.run_id, &definition)?;
     *operation = "append_run_created_event";
@@ -17682,7 +17749,8 @@ fn validate_run_link(
         .map_err(|error| WorkflowStoreError::InvalidData(error.to_string()))?;
     if link.version != WORKFLOW_RUN_LINK_VERSION
         || link.parent_attempt == 0
-        || !(2..=MAX_WORKFLOW_RUN_DEPTH).contains(&link.depth)
+        || link.depth < 2
+        || link.depth > child.limits.recursion_depth_cap
         || link.child_run_id != child.run_id
         || link.child_run_id
             != workflow_child_run_id(
@@ -18017,6 +18085,7 @@ fn validate_run_limits(limits: &WorkflowRunLimits) -> Result<(), WorkflowStoreEr
         ("node_execution_cap", limits.node_execution_cap),
         ("concurrency_cap", u64::from(limits.concurrency_cap)),
         ("cycle_cap", u64::from(limits.cycle_cap)),
+        ("recursion_depth_cap", u64::from(limits.recursion_depth_cap)),
     ] {
         if value == 0 {
             return Err(WorkflowStoreError::InvalidData(format!(
@@ -18674,6 +18743,8 @@ fn initialize_schema(connection: &mut Connection) -> Result<(), WorkflowStoreErr
              concurrency_cap INTEGER NOT NULL,\
              cycle_cap INTEGER NOT NULL,\
              retry_cap INTEGER NOT NULL,\
+             recursion_depth_cap INTEGER NOT NULL DEFAULT 8,\
+             descendant_cap INTEGER NOT NULL DEFAULT 64,\
              created_at_ms INTEGER NOT NULL,\
              updated_at_ms INTEGER NOT NULL,\
              FOREIGN KEY (definition_id, definition_version)\
@@ -18960,6 +19031,24 @@ fn initialize_schema(connection: &mut Connection) -> Result<(), WorkflowStoreErr
         [WORKFLOW_STORE_SCHEMA_VERSION],
     )?;
     transaction.commit()?;
+    Ok(())
+}
+
+fn migrate_recursion_policy(transaction: &Connection) -> Result<(), WorkflowStoreError> {
+    let columns = transaction
+        .prepare("PRAGMA table_info(workflow_runs)")?
+        .query_map([], |row| row.get::<_, String>(1))?
+        .collect::<Result<BTreeSet<_>, _>>()?;
+    if !columns.contains("recursion_depth_cap") {
+        transaction.execute_batch(
+            "ALTER TABLE workflow_runs ADD COLUMN recursion_depth_cap INTEGER NOT NULL DEFAULT 8;
+             ALTER TABLE workflow_runs ADD COLUMN descendant_cap INTEGER NOT NULL DEFAULT 64;",
+        )?;
+    }
+    transaction.execute(
+        "UPDATE workflow_storage_compatibility SET compatibility = ?1 WHERE contract_id = 1",
+        [WORKFLOW_STORE_COMPATIBILITY],
+    )?;
     Ok(())
 }
 
@@ -28379,6 +28468,7 @@ mod tests {
     #[test]
     fn unknown_compatibility_preserves_current_and_future_revisions() {
         for revision in [
+            41,
             WORKFLOW_STORE_SCHEMA_VERSION,
             WORKFLOW_STORE_SCHEMA_VERSION + 1,
         ] {
@@ -35731,6 +35821,64 @@ mod tests {
         );
     }
 
+    #[test]
+    fn recursion_policy_survives_schema_41_upgrade_and_reopen() {
+        let (temp, mut store) = initialized_store();
+        let mut run = new_run();
+        run.run_id = "policy-run".to_string();
+        run.limits.recursion_depth_cap = 24;
+        run.limits.descendant_cap = 256;
+        store.create_run(&run).expect("run");
+        assert_eq!(
+            store.run_limits(&run.run_id).expect("limits"),
+            Some(run.limits.clone())
+        );
+        store
+            .connection
+            .execute_batch(
+                "ALTER TABLE workflow_runs DROP COLUMN recursion_depth_cap;
+            ALTER TABLE workflow_runs DROP COLUMN descendant_cap;
+            UPDATE workflow_store_contract SET schema_version = 41;
+            UPDATE workflow_storage_compatibility SET compatibility = 1;",
+            )
+            .expect("historical schema");
+        drop(store);
+        WorkflowStore::migrate_to_current_in_state_dir(temp.path(), 42).expect("upgrade");
+        let reopened = WorkflowStore::open_in_state_dir(temp.path()).expect("reopen");
+        let limits = reopened
+            .run_limits(&run.run_id)
+            .expect("limits")
+            .expect("run");
+        assert_eq!(limits.recursion_depth_cap, 8);
+        assert_eq!(limits.descendant_cap, 64);
+        assert_eq!(limits.node_execution_cap, run.limits.node_execution_cap);
+    }
+
+    fn assert_root_attempt_budget_survives_reopen(store: &WorkflowStore, child_run_id: &str) {
+        let reopened = WorkflowStore::open_at_path(store.path()).expect("reopen");
+        let transaction = reopened
+            .connection
+            .unchecked_transaction()
+            .expect("budget snapshot");
+        transaction
+            .execute(
+                "UPDATE workflow_runs SET node_execution_cap = 1 WHERE run_id = 'parent-run'",
+                [],
+            )
+            .expect("budget");
+        assert!(enforce_root_attempt_limit(&transaction, child_run_id).is_err());
+        assert!(enforce_root_attempt_limit(&transaction, "parent-run").is_err());
+        transaction
+            .execute(
+                "UPDATE workflow_runs SET node_execution_cap = 2 WHERE run_id = 'parent-run'",
+                [],
+            )
+            .expect("budget");
+        enforce_root_attempt_limit(&transaction, child_run_id)
+            .expect("remaining attempt allowance");
+        transaction.rollback().expect("restore fixture limits");
+    }
+
     fn assert_inherited_child_cancellation(store: &mut WorkflowStore, child_run_id: &str) {
         let transaction = store
             .connection
@@ -35918,6 +36066,7 @@ mod tests {
                 .create_child_run_idempotent(&request)
                 .expect("created")
         );
+        assert_root_attempt_budget_survives_reopen(&store, &child_run_id);
         let attempts = store
             .active_attempts_for_run("parent-run", 10)
             .expect("attempts");
@@ -37809,6 +37958,7 @@ mod tests {
             concurrency_cap: 1,
             cycle_cap: 1,
             retry_cap: 0,
+            ..WorkflowRunLimits::default()
         };
         store.create_run(&run).expect("run");
         let attempt = PreparedAttempt {

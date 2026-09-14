@@ -3313,6 +3313,12 @@ pub struct WorkflowRunLimitPolicy {
     pub cycle_cap: u32,
     /// Maximum attempts per activation.
     pub retry_cap: u32,
+    /// Maximum run depth, including the root at depth one.
+    #[serde(default = "run_contracts::default_recursion_depth_cap")]
+    pub recursion_depth_cap: u32,
+    /// Maximum descendants of the root; zero disables delegation.
+    #[serde(default = "run_contracts::default_descendant_cap")]
+    pub descendant_cap: u32,
 }
 
 impl Default for WorkflowRunLimitPolicy {
@@ -3323,6 +3329,8 @@ impl Default for WorkflowRunLimitPolicy {
             concurrency_cap: 8,
             cycle_cap: 100,
             retry_cap: 3,
+            recursion_depth_cap: run_contracts::default_recursion_depth_cap(),
+            descendant_cap: run_contracts::default_descendant_cap(),
         }
     }
 }
@@ -3335,6 +3343,7 @@ impl WorkflowRunLimitPolicy {
             || self.concurrency_cap == 0
             || self.cycle_cap == 0
             || self.retry_cap == 0
+            || self.recursion_depth_cap == 0
             || u64::from(self.concurrency_cap) > self.node_execution_cap
         {
             return Err(authoring_error(
@@ -3344,6 +3353,29 @@ impl WorkflowRunLimitPolicy {
         }
         Ok(())
     }
+}
+
+#[test]
+fn authored_recursion_policy_preserves_explicit_values_and_historical_defaults() {
+    let old = serde_json::json!({"node_execution_cap":1000,"concurrency_cap":8,"cycle_cap":100,"retry_cap":3});
+    let mut policy: WorkflowRunLimitPolicy =
+        serde_json::from_value(old).expect("historical policy");
+    assert_eq!(policy.recursion_depth_cap, 8);
+    assert_eq!(policy.descendant_cap, 64);
+    policy.recursion_depth_cap = 24;
+    policy.descendant_cap = 256;
+    policy.validate().expect("larger policy");
+    assert_eq!(
+        serde_json::from_value::<WorkflowRunLimitPolicy>(
+            serde_json::to_value(&policy).expect("encode")
+        )
+        .expect("decode"),
+        policy
+    );
+    policy.descendant_cap = 0;
+    policy.validate().expect("delegation disabled");
+    policy.recursion_depth_cap = 0;
+    assert!(policy.validate().is_err());
 }
 
 fn workflow_dynamic_binding_path_allowed(schema: &ValueSchema, path: &str) -> bool {
@@ -3491,6 +3523,8 @@ impl WorkflowConfigurationBinding {
                         | "concurrency_cap"
                         | "cycle_cap"
                         | "retry_cap"
+                        | "recursion_depth_cap"
+                        | "descendant_cap"
                 ) {
                     return Err(authoring_error(
                         "bindings.target.field",
@@ -10345,6 +10379,10 @@ fn apply_authoring_binding(
                 "concurrency_cap" => run_limits.concurrency_cap = bounded_u32(field, value)?,
                 "cycle_cap" => run_limits.cycle_cap = bounded_u32(field, value)?,
                 "retry_cap" => run_limits.retry_cap = bounded_u32(field, value)?,
+                "recursion_depth_cap" => {
+                    run_limits.recursion_depth_cap = bounded_u32(field, value)?;
+                }
+                "descendant_cap" => run_limits.descendant_cap = bounded_u32(field, value)?,
                 _ => {
                     return Err(authoring_error(
                         "bindings.target.field",

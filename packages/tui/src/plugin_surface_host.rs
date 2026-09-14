@@ -219,6 +219,8 @@ fn workflow_run_limits(
         concurrency_cap: policy.concurrency_cap,
         cycle_cap: policy.cycle_cap,
         retry_cap: policy.retry_cap,
+        recursion_depth_cap: policy.recursion_depth_cap,
+        descendant_cap: policy.descendant_cap,
     }
 }
 

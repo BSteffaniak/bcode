@@ -846,6 +846,19 @@ pub struct WorkflowRunLimits {
     pub cycle_cap: u32,
     /// Maximum attempts per activation.
     pub retry_cap: u32,
+    /// Maximum run depth, counting the root as depth one.
+    #[serde(default = "default_recursion_depth_cap")]
+    pub recursion_depth_cap: u32,
+    /// Maximum descendants of the root run.
+    #[serde(default = "default_descendant_cap")]
+    pub descendant_cap: u32,
+}
+
+pub const fn default_recursion_depth_cap() -> u32 {
+    8
+}
+pub const fn default_descendant_cap() -> u32 {
+    64
 }
 
 impl Default for WorkflowRunLimits {
@@ -856,6 +869,8 @@ impl Default for WorkflowRunLimits {
             concurrency_cap: 8,
             cycle_cap: 100,
             retry_cap: 3,
+            recursion_depth_cap: default_recursion_depth_cap(),
+            descendant_cap: default_descendant_cap(),
         }
     }
 }

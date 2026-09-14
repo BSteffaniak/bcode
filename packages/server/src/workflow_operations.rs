@@ -2361,7 +2361,7 @@ async fn start_authored_with_package(
                 "workflow run input does not match published interface: {error}"
             ))
         })?;
-    let started = start_run_with_package(
+    let started = Box::pin(start_run_with_package(
         state,
         bcode_workflow::WorkflowRunStartRequest {
             definition_id: revision.definition_identity.definition_id.clone(),
@@ -2384,11 +2384,13 @@ async fn start_authored_with_package(
                 concurrency_cap: limits.concurrency_cap,
                 cycle_cap: limits.cycle_cap,
                 retry_cap: limits.retry_cap,
+                recursion_depth_cap: limits.recursion_depth_cap,
+                descendant_cap: limits.descendant_cap,
             },
         },
         Some(provenance),
         package,
-    )
+    ))
     .await?;
     Ok(bcode_workflow::AuthoredWorkflowRunStartResponse {
         started,
@@ -10212,7 +10214,7 @@ pub fn update_preset(
         );
     match update {
         Ok(preset) => Ok(bcode_workflow::WorkflowPresetUpdateResult::Updated(
-            workflow_preset_snapshot(preset),
+            Box::new(workflow_preset_snapshot(preset)),
         )),
         Err(error) => {
             record_authoring_conflict(&state.metrics, "update_preset");

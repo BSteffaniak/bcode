@@ -164,8 +164,8 @@ impl WorkflowStore {
             return Err(invalid("exhausted repeat predicate has cleared"));
         }
         let limits = self.connection.query_row(
-            "SELECT deadline_at_ms,node_execution_cap,concurrency_cap,cycle_cap,retry_cap FROM workflow_runs WHERE run_id=?1",
-            [run_id], |row| Ok(WorkflowRunLimits { deadline_at_ms: row.get(0)?, node_execution_cap: row.get(1)?, concurrency_cap: row.get(2)?, cycle_cap: row.get(3)?, retry_cap: row.get(4)? }),
+            "SELECT deadline_at_ms,node_execution_cap,concurrency_cap,cycle_cap,retry_cap,recursion_depth_cap,descendant_cap FROM workflow_runs WHERE run_id=?1",
+            [run_id], |row| Ok(WorkflowRunLimits { deadline_at_ms: row.get(0)?, node_execution_cap: row.get(1)?, concurrency_cap: row.get(2)?, cycle_cap: row.get(3)?, retry_cap: row.get(4)?, recursion_depth_cap: row.get(5)?, descendant_cap: row.get(6)? }),
         )?;
         let bound = repeat.configuration["max_iterations"]
             .as_u64()
