@@ -111,7 +111,21 @@ fn transcript_item_rows(
             body_start,
         }
     } else {
-        TranscriptLayoutRows::Anchored { rows, anchors }
+        let selection = anchors
+            .iter()
+            .filter_map(|anchor| {
+                let source = anchor.source.as_ref()?;
+                let row = app
+                    .plugin_presentation()?
+                    .selection_row(&source.identity, source.start)?;
+                Some((anchor.row, row))
+            })
+            .collect();
+        TranscriptLayoutRows::Selected {
+            rows,
+            anchors,
+            selection,
+        }
     }
 }
 

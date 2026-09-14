@@ -1403,7 +1403,7 @@ pub struct PluginTuiDiagnostic {
 /// One native visual selection cell.
 ///
 /// Byte ranges must come from the producer's source model, never inferred by the host.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PluginTuiSelectionCell {
     pub column: u16,
     pub width: u16,
@@ -1411,7 +1411,7 @@ pub struct PluginTuiSelectionCell {
 }
 
 /// Bounded source text and geometry for a visual row.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PluginTuiSelectionRow {
     pub identity: String,
     pub byte_start: usize,

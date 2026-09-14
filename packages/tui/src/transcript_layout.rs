@@ -34,6 +34,12 @@ pub enum TranscriptLayoutRows {
         rows: Vec<Line>,
         anchors: Vec<bcode_plugin_sdk::tui_visual::TuiVisualAnchor>,
     },
+    /// Source geometry captured with this exact native visual projection.
+    Selected {
+        rows: Vec<Line>,
+        anchors: Vec<bcode_plugin_sdk::tui_visual::TuiVisualAnchor>,
+        selection: std::collections::BTreeMap<usize, bcode_plugin_sdk::tui::PluginTuiSelectionRow>,
+    },
     /// Accepted Markdown projection retained for source-aware reflow correspondence.
     Markdown {
         rows: Vec<Line>,
@@ -56,9 +62,10 @@ impl TranscriptLayoutRows {
     #[must_use]
     pub const fn len(&self) -> usize {
         match self {
-            Self::Rendered(rows) | Self::Anchored { rows, .. } | Self::Markdown { rows, .. } => {
-                rows.len()
-            }
+            Self::Rendered(rows)
+            | Self::Anchored { rows, .. }
+            | Self::Selected { rows, .. }
+            | Self::Markdown { rows, .. } => rows.len(),
             Self::BlankSpan(len) => *len,
         }
     }
@@ -203,6 +210,15 @@ impl TranscriptLayoutCache {
     }
 
     /// Find the nearest accepted content key at or before an item row.
+    /// Source geometry retained with the exact painted entry projection.
+    pub fn selection_row(
+        &self,
+        index: usize,
+        row: usize,
+    ) -> Option<&bcode_plugin_sdk::tui::PluginTuiSelectionRow> {
+        self.entries.selection_row(index, row)
+    }
+
     pub fn content_anchor(&self, index: usize, row: usize) -> Option<(&str, usize)> {
         self.entries.content_anchor(index, row)
     }

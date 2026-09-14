@@ -4953,7 +4953,15 @@ pub(crate) mod tests {
         drop(state);
 
         assert!(SLOW_APPLY_STARTED.load(Ordering::SeqCst));
-        assert!(SLOW_APPLY_CANCELLED.load(Ordering::SeqCst));
+        // Timeout requests cancellation; the native worker observes it asynchronously.
+        // Do not race its acknowledgement against the host's terminal response.
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !SLOW_APPLY_CANCELLED.load(Ordering::SeqCst) {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("native provider must acknowledge deadline cancellation");
         assert_eq!(response.failed_sessions, 0);
         assert_eq!(response.incomplete_sessions, 1);
         assert!(response.deadline_reached);

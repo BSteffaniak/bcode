@@ -1880,24 +1880,19 @@ impl<W: std::io::Write> bmux_tui_runtime::Presenter<BcodeRuntimeModel>
         program.committed_hits = self.terminal.hits().clone();
         program.committed_selection = self.terminal.selection().clone();
         program.committed_visual_text.clear();
-        if let Some(layout) = program.committed_layout {
+        if let Some(layout) = layout {
             let body = layout.body();
             for line in program.chat.app.transcript_layout().visible_lines_from_top(
                 program.chat.app.transcript_top_row(body.height),
                 body.height,
             ) {
-                if let Some((identity, offset)) = program
+                if let Some(row) = program
                     .chat
                     .app
                     .transcript_layout()
-                    .content_anchor(line.entry_index, line.row_in_entry)
-                    && let Some(row) = program
-                        .chat
-                        .app
-                        .plugin_presentation()
-                        .and_then(|host| host.selection_row(identity, offset))
+                    .selection_row(line.entry_index, line.row_in_entry)
                 {
-                    program.committed_visual_text.push(row);
+                    program.committed_visual_text.push(row.clone());
                 }
             }
         }
@@ -2059,14 +2054,11 @@ fn register_transcript_selection_scene(
                 .revision(item.revision()),
             );
         }
-        if let Some((identity, offset)) = app
+        if let Some(selection) = app
             .transcript_layout()
-            .content_anchor(visible.entry_index, visible.row_in_entry)
-            && let Some(selection) = app
-                .plugin_presentation()
-                .and_then(|host| host.selection_row(identity, offset))
+            .selection_row(visible.entry_index, visible.row_in_entry)
         {
-            for cell in selection.cells {
+            for cell in &selection.cells {
                 let x = body.x.saturating_add(cell.column);
                 if x.saturating_add(cell.width) > body.right() {
                     continue;
@@ -2077,7 +2069,7 @@ fn register_transcript_selection_scene(
                         format!("bcode.visual:{}", selection.identity),
                         bmux_tui::geometry::Rect::new(x, y, cell.width, 1),
                         u64::try_from(visible.row_in_entry).unwrap_or(u64::MAX),
-                        cell.bytes,
+                        cell.bytes.clone(),
                     )
                     .revision(selection.revision),
                 );
@@ -3187,6 +3179,114 @@ mod tests {
                 cursor: newer_cursor,
             }
         ));
+        drop(model);
+    }
+
+    struct FailingSelectionOutput {
+        fail: std::rc::Rc<std::cell::Cell<bool>>,
+    }
+
+    impl std::io::Write for FailingSelectionOutput {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            if self.fail.get() {
+                Err(std::io::Error::other("injected presentation failure"))
+            } else {
+                Ok(bytes.len())
+            }
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn visual_selection_text_commits_on_first_frame_and_survives_failed_resize() {
+        use bmux_tui_runtime::Presenter;
+
+        let session_id = bcode_session_models::SessionId::new();
+        let mut model = root_test_model_with_history(session_id, &[]);
+        let bundled = [bcode_plugin::StaticBundledPlugin::new(
+            include_str!("../../../plugins/filesystem-plugin/bcode-plugin.toml"),
+            bcode_filesystem_plugin::static_plugin(),
+        )];
+        let selected = bcode_plugin::filter_selected_static_plugins(
+            &bundled,
+            &bcode_plugin::PluginSelection::all_enabled(),
+        )
+        .unwrap();
+        model.chat.app.set_plugin_host(std::sync::Arc::new(
+            bcode_plugin::PluginHost::load_static_plugins(&selected).unwrap(),
+        ));
+        model
+            .chat
+            .app
+            .absorb_session_event(&bcode_session_models::SessionEvent {
+                schema_version: bcode_session_models::CURRENT_SESSION_EVENT_SCHEMA_VERSION,
+                sequence: 1,
+                timestamp_ms: 1,
+                session_id,
+                provenance: None,
+                kind: bcode_session_models::SessionEventKind::ToolInvocationResultRecorded {
+                    record: bcode_session_models::ToolInvocationResultRecord {
+                        invocation_id: "source-selection".to_owned(),
+                        model_output: "fallback".to_owned(),
+                        is_error: false,
+                        presentation: None,
+                        result: Some(bcode_session_models::ToolInvocationResult::Artifact {
+                            artifact: Box::new(bcode_session_models::ToolArtifact {
+                                artifact_id: "source-selection".to_owned(),
+                                producer_plugin_id: "bcode.filesystem".to_owned(),
+                                schema: "bcode.filesystem.read".to_owned(),
+                                schema_version: 1,
+                                tool_call_id: Some("source-selection".to_owned()),
+                                title: Some("File contents".to_owned()),
+                                metadata: serde_json::json!({
+                                    "path": "test.rs",
+                                    "contents": "pub fn alpha() {}\npub fn beta() {}",
+                                    "start_line": 1,
+                                }),
+                                refs: Vec::new(),
+                            }),
+                        }),
+                        content: Vec::new(),
+                    },
+                },
+            });
+        let fail = std::rc::Rc::new(std::cell::Cell::new(false));
+        let mut output = FailingSelectionOutput { fail: fail.clone() };
+        let mut terminal = bmux_tui::terminal::Terminal::new(
+            &mut output,
+            bmux_tui::geometry::Rect::new(0, 0, 80, 24),
+        );
+        super::BcodeRuntimePresenter::new(&mut terminal)
+            .present(&mut model)
+            .unwrap();
+        assert!(!model.committed_visual_text.is_empty());
+        let before: Vec<_> = model
+            .committed_visual_text
+            .iter()
+            .map(|row| (row.identity.clone(), row.byte_start, row.text.clone()))
+            .collect();
+        fail.set(true);
+        terminal.resize(bmux_tui::geometry::Rect::new(0, 0, 30, 12));
+        model.presentation_damage = bmux_tui::damage::Damage::Full;
+        assert!(
+            super::BcodeRuntimePresenter::new(&mut terminal)
+                .present(&mut model)
+                .is_err()
+        );
+        let after: Vec<_> = model
+            .committed_visual_text
+            .iter()
+            .map(|row| (row.identity.clone(), row.byte_start, row.text.clone()))
+            .collect();
+        assert_eq!(before, after);
+        fail.set(false);
+        model.presentation_damage = bmux_tui::damage::Damage::Full;
+        super::BcodeRuntimePresenter::new(&mut terminal)
+            .present(&mut model)
+            .unwrap();
+        assert!(!model.committed_visual_text.is_empty());
         drop(model);
     }
 

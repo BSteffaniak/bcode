@@ -17,6 +17,7 @@ struct IndexedEntry {
         std::sync::Arc<bcode_markdown_render::MarkdownRenderResult>,
         usize,
     )>,
+    selection: BTreeMap<usize, bcode_plugin_sdk::tui::PluginTuiSelectionRow>,
     anchors: Vec<bcode_plugin_sdk::tui_visual::TuiVisualAnchor>,
 }
 
@@ -24,6 +25,7 @@ impl IndexedEntry {
     fn new(signature: TranscriptLayoutSignature, rows: TranscriptLayoutRows) -> Self {
         let row_count = rows.len();
         let mut markdown = None;
+        let mut selection = BTreeMap::new();
         let (rows, anchors) = match rows {
             TranscriptLayoutRows::Markdown {
                 rows,
@@ -32,6 +34,14 @@ impl IndexedEntry {
                 body_start,
             } => {
                 markdown = Some((projection, body_start));
+                (rows, anchors)
+            }
+            TranscriptLayoutRows::Selected {
+                rows,
+                anchors,
+                selection: retained,
+            } => {
+                selection = retained;
                 (rows, anchors)
             }
             TranscriptLayoutRows::Rendered(rows) => (rows, Vec::new()),
@@ -44,6 +54,7 @@ impl IndexedEntry {
             rows,
             row_count,
             markdown,
+            selection,
             anchors,
         }
     }
@@ -303,6 +314,14 @@ impl IndexedTranscriptLayout {
             .flat_map(|unit| unit.rects.iter())
             .map(|rect| body_start.saturating_add(usize::from(rect.y)))
             .min()
+    }
+
+    pub fn selection_row(
+        &self,
+        index: usize,
+        row: usize,
+    ) -> Option<&bcode_plugin_sdk::tui::PluginTuiSelectionRow> {
+        self.transcript.entries.get(index)?.selection.get(&row)
     }
 
     pub fn content_anchor(&self, index: usize, row: usize) -> Option<(&str, usize)> {
@@ -573,6 +592,50 @@ impl IndexedTranscriptLayout {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn selection_geometry_belongs_to_each_retained_projection() {
+        let mut narrow = IndexedTranscriptLayout::default();
+        let mut wide = IndexedTranscriptLayout::default();
+        let projection = |text: &str| TranscriptLayoutRows::Selected {
+            rows: vec![Line::from(text)],
+            anchors: Vec::new(),
+            selection: std::collections::BTreeMap::from([(
+                0,
+                bcode_plugin_sdk::tui::PluginTuiSelectionRow {
+                    identity: "same-source".to_owned(),
+                    byte_start: 0,
+                    text: text.to_owned(),
+                    cells: Vec::new(),
+                    revision: 1,
+                },
+            )]),
+        };
+        narrow.sync_transcript(
+            1,
+            |_| TranscriptLayoutSignature::new("narrow".to_owned()),
+            |_| projection("abc"),
+            |_| None,
+        );
+        wide.sync_transcript(
+            1,
+            |_| TranscriptLayoutSignature::new("wide".to_owned()),
+            |_| projection("abcdef"),
+            |_| None,
+        );
+        assert_eq!(narrow.selection_row(0, 0).unwrap().text, "abc");
+        assert_eq!(wide.selection_row(0, 0).unwrap().text, "abcdef");
+        assert!(narrow.selection_row(0, 1).is_none());
+        // Replacement releases geometry along with its old painted rows.
+        narrow.sync_transcript(
+            1,
+            |_| TranscriptLayoutSignature::new("replacement".to_owned()),
+            |_| TranscriptLayoutRows::Rendered(vec![Line::from("new")]),
+            |_| None,
+        );
+        assert!(narrow.selection_row(0, 0).is_none());
+        assert_eq!(wide.selection_row(0, 0).unwrap().text, "abcdef");
+    }
+
     #[test]
     fn shrinking_region_anchor_cannot_escape_into_following_region() {
         use bcode_plugin_sdk::tui_visual::TuiVisualAnchor;

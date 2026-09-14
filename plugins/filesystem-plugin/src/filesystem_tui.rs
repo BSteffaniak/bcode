@@ -92,13 +92,13 @@ impl bcode_plugin_sdk::tui::PluginTuiVisualAdapter for FilesystemTuiVisualAdapte
                 let (rows, anchors, selection) =
                     read_layout(kind, payload, context.width(), context);
                 if let Ok(mut retained) = self.selection.lock() {
+                    // Replace complete source projections, including offsets that
+                    // disappeared during reflow. Other source cards remain cached.
+                    let identities: std::collections::BTreeSet<_> =
+                        selection.iter().map(|row| row.identity.as_str()).collect();
+                    retained.retain(|row| !identities.contains(row.identity.as_str()));
+                    retained.extend(selection);
                     // Bounded derived metadata; eviction makes old content unselectable.
-                    for row in selection {
-                        retained.retain(|old| {
-                            old.identity != row.identity || old.byte_start != row.byte_start
-                        });
-                        retained.push(row);
-                    }
                     let excess = retained.len().saturating_sub(4096);
                     retained.drain(..excess);
                 }
@@ -1304,6 +1304,35 @@ mod tests {
             None,
         );
         let (_, wide) = adapter.layout("bcode.filesystem.read", &payload, &wider);
+        let obsolete: Vec<_> = anchors
+            .iter()
+            .filter_map(|anchor| anchor.source.as_ref())
+            .filter(|range| {
+                !wide.iter().any(|anchor| {
+                    anchor.source.as_ref().is_some_and(|current| {
+                        current.identity == range.identity && current.start == range.start
+                    })
+                })
+            })
+            .collect();
+        assert!(
+            !obsolete.is_empty(),
+            "resize must remove wrapped row starts"
+        );
+        for range in obsolete {
+            assert!(
+                adapter
+                    .selection_row(&range.identity, range.start)
+                    .is_none()
+            );
+        }
+        for range in wide.iter().filter_map(|anchor| anchor.source.as_ref()) {
+            assert!(
+                adapter
+                    .selection_row(&range.identity, range.start)
+                    .is_some()
+            );
+        }
         assert_eq!(
             anchors[0].source.as_ref().unwrap().identity,
             wide[0].source.as_ref().unwrap().identity
