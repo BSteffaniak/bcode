@@ -331,6 +331,16 @@ file identity, keeps the participant dirty until unlink plus directory sync comp
 admission throughout. Wrong-identity completion is rejected. A regression exercises one long read
 alongside one hundred shorter completed reads and verifies only the long participant remains.
 
+## Startup wiring status
+
+Daemon startup now owns/starts the enabled storage worker and shutdown awaits its completion.
+Read-admission and timestamp failures set a process-local failure latch. However, the worker's
+compatibility-readiness check currently fails closed unconditionally: the task waits for shutdown
+and does not dispatch compression. The `storage.maintenance.compatibility_ready` gauge is zero.
+This is lifecycle wiring, **not automatic compression activation**, and the failure latch is not a
+replacement for durable cross-daemon fallback registration. Older-client coordination and canonical
+history compression are still unimplemented.
+
 ## Remaining implementation
 
 ### Access policy and scheduling

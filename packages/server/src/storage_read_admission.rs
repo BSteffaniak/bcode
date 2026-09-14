@@ -31,6 +31,9 @@ impl RegisteredStorageRead {
         }
         Self::begin(root).await.map_or_else(
             |_| {
+                state
+                    .storage_tracking_failed
+                    .store(true, std::sync::atomic::Ordering::SeqCst);
                 tracing::warn!(
                     "storage read admission unavailable; automatic scheduling remains disabled"
                 );
@@ -55,6 +58,9 @@ impl RegisteredStorageRead {
                 tracing::warn!("storage read participant retirement deferred");
             }
         } else {
+            state
+                .storage_tracking_failed
+                .store(true, std::sync::atomic::Ordering::SeqCst);
             tracing::warn!("storage access tracking failed; participant remains dirty");
         }
     }

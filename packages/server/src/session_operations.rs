@@ -930,6 +930,9 @@ pub async fn record_consumption(
         .await
         .is_err()
     {
+        state
+            .storage_tracking_failed
+            .store(true, std::sync::atomic::Ordering::SeqCst);
         // Optional tracking must not make otherwise healthy canonical reads unavailable. Automatic
         // tiering remains disabled until durable degraded-state/maintenance coordination exists.
         tracing::warn!(

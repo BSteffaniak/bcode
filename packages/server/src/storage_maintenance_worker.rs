@@ -8,7 +8,7 @@ use std::sync::Arc;
 use tokio::sync::Mutex;
 
 /// Owns one worker across repeated start/stop calls, including cancelled shutdown waiters.
-#[derive(Default)]
+#[derive(Debug, Default)]
 pub struct StorageMaintenanceWorker {
     task: Mutex<Option<tokio::task::JoinHandle<()>>>,
 }

@@ -20,6 +20,16 @@ use std::time::Duration;
 /// Run the experimental maintenance worker until daemon shutdown.
 /// Not activated by normal startup pending complete safety coordination.
 pub async fn run(state: Arc<ServerState>) {
+    // Startup owns and drains this worker, but dispatch must remain closed until compatibility
+    // and fallback registration cover every reader, including independently running old daemons.
+    state
+        .metrics
+        .set_gauge("storage.maintenance.compatibility_ready", 0);
+    let mut readiness_shutdown = state.subscribe_shutdown();
+    if !tracking_coverage_ready(&state) {
+        let _ = readiness_shutdown.recv().await;
+        return;
+    }
     let Some(root) = state.sessions.session_store_root() else {
         return;
     };
@@ -95,6 +105,15 @@ pub async fn run(state: Arc<ServerState>) {
             }
         }
     }
+}
+
+fn tracking_coverage_ready(state: &ServerState) -> bool {
+    // No compatibility proof is currently installed. Do not infer it from clean registry files:
+    // old clients and unregistered fallbacks are not represented by those files.
+    let _failed = state
+        .storage_tracking_failed
+        .load(std::sync::atomic::Ordering::SeqCst);
+    false
 }
 
 async fn maintain_session(

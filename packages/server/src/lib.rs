@@ -326,6 +326,8 @@ pub struct ServerState {
     locations: Option<bcode_config::StateLocationSet>,
     state_root: PathBuf,
     pub sessions: SessionManager,
+    storage_worker: storage_maintenance_worker::StorageMaintenanceWorker,
+    storage_tracking_failed: std::sync::atomic::AtomicBool,
     session_migrations: bcode_session_migration::SessionMigrationService,
     pub session_catalog: Arc<session_catalog::SessionCatalog>,
     pub plugins: bcode_plugin::PluginRuntimeHost,
@@ -1901,6 +1903,8 @@ impl ServerState {
             locations: None,
             state_root,
             sessions,
+            storage_worker: storage_maintenance_worker::StorageMaintenanceWorker::default(),
+            storage_tracking_failed: std::sync::atomic::AtomicBool::new(false),
             session_migrations,
             session_catalog: Arc::new(session_catalog::SessionCatalog::default()),
             plugins,
@@ -4748,6 +4752,7 @@ async fn run_constructed_server(
         total_elapsed_ms = startup_started_at.elapsed().as_millis(),
         "server ready; accepting clients"
     );
+    state.storage_worker.start(Arc::clone(&state)).await;
     bcode_daemon_lifecycle::notify_launcher_ready();
     let mut clients = JoinSet::new();
     let accept_result = loop {
@@ -4826,6 +4831,9 @@ async fn shutdown_constructed_server(
     accept_result: Result<(), ServerError>,
 ) -> Result<(), ServerError> {
     state.request_shutdown();
+    if state.storage_worker.stop().await.is_err() {
+        tracing::warn!("storage maintenance worker failed during shutdown");
+    }
     let ingestion = state.stop_session_search_ingestion().await;
     let driver_task = state.workflow_driver_task.lock().await.take();
     if let Some(task) = driver_task {
