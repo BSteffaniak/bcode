@@ -1801,22 +1801,25 @@ impl SessionDb {
         start: u64,
         level: i32,
     ) -> SessionDbResult<crate::history_compression::HistoryCompressionPage> {
-        self.compress_history_payload_page_before(start, level, None)
+        self.compress_history_payload_page_checked(start, level, None, || Ok(()))
             .await
     }
 
-    pub(crate) async fn compress_history_payload_page_before(
+    pub(crate) async fn compress_history_payload_page_checked(
         &self,
         start: u64,
         level: i32,
         cutoff_ms: Option<u64>,
+        mut check_cancelled: impl FnMut() -> std::io::Result<()> + Send,
     ) -> SessionDbResult<crate::history_compression::HistoryCompressionPage> {
+        check_cancelled()?;
         let tx = self.db.begin_transaction().await?;
         configure_turso_connection(&*tx).await?;
         validate_storage_writer_contract(&*tx).await?;
         let rows = read_canonical_payload_page(&*tx, start, 16).await?;
         let mut report = crate::history_compression::HistoryCompressionPage::default();
         for row in rows {
+            check_cancelled()?;
             let event = decode_session_event(&row.payload)?;
             validate_canonical_event_identity(&event, row.sequence, self.session_id)?;
             report.inspected += 1;
@@ -1857,6 +1860,7 @@ impl SessionDb {
                 }
             }
         }
+        check_cancelled()?;
         tx.commit().await?;
         Ok(report)
     }
@@ -11230,6 +11234,62 @@ mod tests {
                 .expect("read")
                 .1,
             bytes[262_140..262_220]
+        );
+    }
+
+    #[tokio::test]
+    async fn cancellation_before_history_commit_rolls_back_compressed_payloads() {
+        let root = tempfile::tempdir().expect("root");
+        let id = SessionId::new();
+        let db = SessionDb::open_turso_in_root(id, root.path())
+            .await
+            .expect("db");
+        let original = event(
+            id,
+            0,
+            SessionEventKind::SessionCreated {
+                name: Some("cancel".repeat(20_000)),
+                working_directory: root.path().to_path_buf(),
+            },
+        );
+        db.append_event(&original).await.expect("event");
+        let before = db.canonical_rows_page(0, 1).await.expect("before")[0]
+            .payload
+            .clone();
+        let mut checks = 0;
+        let error = db
+            .compress_history_payload_page_checked(0, 1, None, || {
+                checks += 1;
+                if checks == 3 {
+                    Err(std::io::Error::new(
+                        std::io::ErrorKind::Interrupted,
+                        "cancel before commit",
+                    ))
+                } else {
+                    Ok(())
+                }
+            })
+            .await
+            .expect_err("cancelled");
+        assert!(
+            matches!(error, SessionDbError::Io(ref error) if error.kind() == std::io::ErrorKind::Interrupted)
+        );
+        let row = db
+            .database()
+            .select("events")
+            .columns(&["payload"])
+            .where_eq("event_seq", 0)
+            .execute_first(db.database())
+            .await
+            .expect("row")
+            .expect("exists");
+        assert_eq!(
+            required_string(&row, "payload").expect("unchanged physical bytes"),
+            before
+        );
+        assert_eq!(
+            db.all_events_strict().await.expect("history"),
+            vec![original]
         );
     }
 

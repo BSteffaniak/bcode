@@ -179,15 +179,23 @@ async fn maintain_history(
     } else {
         return Ok(None);
     };
-    let page = bcode_session::history_compression::compress_history_page_with_age(
+    let cancellation = ArtifactMaintenanceCancellation::default();
+    let mut shutdown = state.subscribe_shutdown();
+    let work = bcode_session::history_compression::compress_history_page_cancellable(
         root,
         id,
         start,
         level,
         Some((now, age)),
-    )
-    .await
-    .map_err(|_| "history compression deferred")?;
+        cancellation.clone(),
+    );
+    tokio::pin!(work);
+    let page = tokio::select! {
+        biased;
+        _ = shutdown.recv() => { cancellation.cancel(); work.await }
+        () = tokio::time::sleep(Duration::from_secs(u64::from(policy.artifact_timeout_secs))) => { cancellation.cancel(); work.await }
+        result = &mut work => result,
+    }.map_err(|_| "history compression deferred")?;
     state.metrics.add_counter(
         "storage.maintenance.history_payload_bytes_saved",
         page.saved_bytes,

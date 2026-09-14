@@ -238,7 +238,7 @@ impl ArtifactMaintenanceCancellation {
         self.0.store(true, std::sync::atomic::Ordering::SeqCst);
     }
 
-    fn check(&self) -> io::Result<()> {
+    pub(crate) fn check(&self) -> io::Result<()> {
         if self.0.load(std::sync::atomic::Ordering::SeqCst) {
             Err(io::Error::new(
                 io::ErrorKind::Interrupted,

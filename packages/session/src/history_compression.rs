@@ -4,6 +4,15 @@ use crate::db::{SessionDb, SessionDbError};
 use bcode_session_models::SessionId;
 use std::path::Path;
 
+struct CancelOnAbandon(Option<crate::artifact_storage::ArtifactMaintenanceCancellation>);
+impl Drop for CancelOnAbandon {
+    fn drop(&mut self) {
+        if let Some(token) = &self.0 {
+            token.cancel();
+        }
+    }
+}
+
 /// Result of one atomic history-maintenance page.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct HistoryCompressionPage {
@@ -49,6 +58,31 @@ pub async fn compress_history_page_with_age(
     level: i32,
     age: Option<(u64, u64)>,
 ) -> Result<HistoryCompressionPage, SessionDbError> {
+    compress_history_page_cancellable(
+        root,
+        id,
+        start_sequence,
+        level,
+        age,
+        crate::artifact_storage::ArtifactMaintenanceCancellation::default(),
+    )
+    .await
+}
+
+/// Compress an atomic history page with cooperative cancellation through commit.
+///
+/// # Errors
+/// Returns age-checked compression failures or Interrupted on cancellation before commit. The
+/// caller should await completion after cancellation; dropping the waiter also requests cancellation.
+pub async fn compress_history_page_cancellable(
+    root: &Path,
+    id: SessionId,
+    start_sequence: u64,
+    level: i32,
+    age: Option<(u64, u64)>,
+    cancellation: crate::artifact_storage::ArtifactMaintenanceCancellation,
+) -> Result<HistoryCompressionPage, SessionDbError> {
+    cancellation.check()?;
     if !(1..=22).contains(&level) {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
@@ -57,7 +91,9 @@ pub async fn compress_history_page_with_age(
         .into());
     }
     let root = root.to_path_buf();
-    tokio::spawn(async move {
+    let mut waiter = CancelOnAbandon(Some(cancellation.clone()));
+    let task = tokio::spawn(async move {
+        cancellation.check()?;
         let root = root.canonicalize()?;
         let directory = root.join(id.to_string());
         if !std::fs::symlink_metadata(&directory)?.is_dir()
@@ -102,14 +138,17 @@ pub async fn compress_history_page_with_age(
         };
         let db = SessionDb::open_existing_turso_in_root(id, &root).await?;
         let result = db
-            .compress_history_payload_page_before(start_sequence, level, cutoff)
+            .compress_history_payload_page_checked(start_sequence, level, cutoff, || {
+                cancellation.check()
+            })
             .await;
         let closed = db.database().close().await;
         drop(db);
         drop(maintenance);
         closed?;
         result
-    })
-    .await
-    .map_err(|_| std::io::Error::other("history compression task failed"))?
+    });
+    let result = task.await;
+    waiter.0 = None;
+    result.map_err(|_| std::io::Error::other("history compression task failed"))?
 }

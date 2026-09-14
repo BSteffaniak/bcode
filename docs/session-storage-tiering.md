@@ -483,6 +483,16 @@ A test verifies old and recent events coexist without compressing the recent eve
 access timestamp prevents later recompression. The global dispatch-readiness gate still returns false;
 this connects the internal scheduling phases, not completed production activation or fallback safety.
 
+## Atomic history cancellation
+
+History pages now accept cooperative cancellation checked before the transaction, between events,
+and immediately before commit. A cancelled page rolls back all compressed payload changes. The
+worker uses the configured per-artifact allowance for each history page and cancels/drains it on
+shutdown or timeout. Dropping a waiter requests cancellation while the owned task retains registry
+admission and session ownership through transaction completion and database close. A regression
+cancels after a payload update but before commit and verifies physical payload bytes are unchanged.
+The dispatch gate remains disabled pending durable fallback and older-client coordination.
+
 ## Remaining implementation
 
 ### Access policy and scheduling
