@@ -586,6 +586,15 @@ verifies successful compaction after that foreign registration finishes cleanly.
 self-registration blocker for reclamation; startup dispatch and older/unregistered reader proof
 remain unresolved.
 
+## Registration abandonment invalidates owned tokens
+
+Dropping the daemon registration now invalidates all outstanding live acknowledgements. Their
+shared file handles retain the OS lock only to drain work; they no longer remain healthy proof after
+the registration owner disappears. Attempting clean completion with outstanding tokens also leaves
+ACTIVE evidence and invalidates those tokens. Tests verify token health rejection, lock retention
+until the last token drops, and preserved dirty evidence. Normal clean completion without tokens
+continues to work. Automatic dispatch is still disabled pending startup-failure/older-reader proof.
+
 ## Remaining implementation
 
 ### Access policy and scheduling

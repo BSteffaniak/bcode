@@ -18,8 +18,14 @@ const CLEAN: &[u8] = b"BCSTDAEMON1:DONE!";
 /// A registered daemon. This guard must be installed before accepting content reads.
 #[derive(Debug)]
 pub struct StorageDaemonRegistration {
-    file: Arc<File>,
+    file: Option<Arc<File>>,
     failed: Arc<AtomicBool>,
+}
+
+impl Drop for StorageDaemonRegistration {
+    fn drop(&mut self) {
+        self.failed.store(true, Ordering::SeqCst);
+    }
 }
 
 impl StorageDaemonRegistration {
@@ -35,7 +41,7 @@ impl StorageDaemonRegistration {
         file.write_all(ACTIVE)?;
         file.sync_all()?;
         Ok(Self {
-            file: Arc::new(file),
+            file: Some(Arc::new(file)),
             failed: Arc::new(AtomicBool::new(false)),
         })
     }
@@ -60,7 +66,7 @@ impl StorageDaemonRegistration {
             return Err(invalid());
         }
         Ok(StorageDaemonAcknowledgement {
-            file: Arc::clone(&self.file),
+            file: Arc::clone(self.file.as_ref().ok_or_else(invalid)?),
             failed: Arc::clone(&self.failed),
         })
     }
@@ -69,11 +75,12 @@ impl StorageDaemonRegistration {
     ///
     /// # Errors
     /// Returns an error for failed tracking or IO. Failed/crashed epochs retain ACTIVE permanently.
-    pub fn finish(self) -> io::Result<()> {
+    pub fn finish(mut self) -> io::Result<()> {
         if !self.healthy() {
             return Err(invalid());
         }
-        let mut file = Arc::try_unwrap(self.file).map_err(|_| invalid())?;
+        let mut file =
+            Arc::try_unwrap(self.file.take().ok_or_else(invalid)?).map_err(|_| invalid())?;
         file.rewind()?;
         file.write_all(CLEAN)?;
         file.sync_all()?;
@@ -151,6 +158,35 @@ fn invalid() -> io::Error {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn abandoned_registration_invalidates_tokens_but_retains_lock_until_they_drain() {
+        let file = tempfile::NamedTempFile::new().expect("file");
+        let daemon =
+            StorageDaemonRegistration::begin(file.reopen().expect("open")).expect("register");
+        let token = daemon.acknowledgement().expect("token");
+        token.check().expect("live");
+        drop(daemon);
+        assert!(token.check().is_err());
+        let probe = file.reopen().expect("probe");
+        assert!(probe.try_lock().is_err());
+        drop(token);
+        probe.try_lock().expect("released after drain");
+        probe.unlock().expect("unlock");
+        assert!(!daemon_registration_is_complete(probe).expect("dirty evidence"));
+    }
+
+    #[test]
+    fn refused_finish_invalidates_outstanding_acknowledgement() {
+        let file = tempfile::NamedTempFile::new().expect("file");
+        let daemon =
+            StorageDaemonRegistration::begin(file.reopen().expect("open")).expect("register");
+        let token = daemon.acknowledgement().expect("token");
+        assert!(daemon.finish().is_err());
+        assert!(token.check().is_err());
+        drop(token);
+        assert!(!daemon_registration_is_complete(file.reopen().expect("inspect")).expect("dirty"));
+    }
 
     #[test]
     fn only_clean_shutdown_can_clear_registration() {
