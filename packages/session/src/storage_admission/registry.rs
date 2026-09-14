@@ -84,6 +84,42 @@ impl StorageAdmissionRegistry {
         StorageMaintenanceAdmission::begin(gate, files)
     }
 
+    /// Finish a uniquely owned operation and retire its participant while still excluding maintenance.
+    ///
+    /// Unlike separate completion/retirement, this does not require upgrading a shared gate while
+    /// unrelated readers are active. The participant identity must never be reused concurrently.
+    ///
+    /// # Errors
+    /// Rejects preexisting dirty state, identity substitution, or IO failure. Unknown participants
+    /// are not removed. Both the gate and participant remain held until directory sync completes.
+    pub fn complete_read(
+        &self,
+        participant: SessionId,
+        mut admission: StorageReadAdmission,
+    ) -> io::Result<()> {
+        use std::os::unix::fs::MetadataExt as _;
+        if !admission.may_clean {
+            return Err(invalid());
+        }
+        let name =
+            std::ffi::CString::new(format!("{participant}.participant")).map_err(|_| invalid())?;
+        let current = open_child(&self.directory, &name, libc::O_RDONLY)?;
+        let current = current.metadata()?;
+        let held = admission.participant.metadata()?;
+        if current.dev() != held.dev() || current.ino() != held.ino() {
+            return Err(invalid());
+        }
+        // Leave dirty until retirement is durable: interruption cannot expose stale clean evidence.
+        // SAFETY: name is a typed single component and the held shared gate excludes maintenance.
+        if unsafe { libc::unlinkat(raw(&self.directory), name.as_ptr(), 0) } != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        self.directory.sync_all()?;
+        admission.may_clean = false;
+        admission.participant.unlock()?;
+        admission.gate.unlock()
+    }
+
     /// Register a degraded reader without treating damaged participant state as clean.
     ///
     /// This marker is durable before content is exposed and is never automatically repaired.
@@ -261,6 +297,54 @@ mod tests {
         drop(active);
         assert!(registry.retire(dirty).is_err());
         assert!(registry.admit_maintenance(16).is_err());
+    }
+
+    #[test]
+    fn completed_reads_retire_while_other_readers_remain_active() {
+        let root = tempfile::tempdir().expect("root");
+        let registry = StorageAdmissionRegistry::open(root.path()).expect("registry");
+        let long_id = SessionId::new();
+        let long = registry.admit_read(long_id).expect("long read");
+        for _ in 0..100 {
+            let id = SessionId::new();
+            let short = registry.admit_read(id).expect("short read");
+            registry
+                .complete_read(id, short)
+                .expect("retire without exclusive upgrade");
+        }
+        assert_eq!(
+            std::fs::read_dir(root.path().join("storage-admission-v1"))
+                .expect("registry")
+                .count(),
+            2
+        );
+        registry
+            .complete_read(long_id, long)
+            .expect("long complete");
+        drop(
+            registry
+                .admit_maintenance(1)
+                .expect("no leaked participants"),
+        );
+    }
+
+    #[test]
+    fn completion_rejects_wrong_participant_identity() {
+        let root = tempfile::tempdir().expect("root");
+        let registry = StorageAdmissionRegistry::open(root.path()).expect("registry");
+        let a = SessionId::new();
+        let b = SessionId::new();
+        let first = registry.admit_read(a).expect("a");
+        let second = registry.admit_read(b).expect("b");
+        assert!(registry.complete_read(b, first).is_err());
+        drop(second);
+        assert!(registry.admit_maintenance(8).is_err());
+        assert_eq!(
+            std::fs::read_dir(root.path().join("storage-admission-v1"))
+                .expect("registry")
+                .count(),
+            3
+        );
     }
 
     #[test]

@@ -79,17 +79,17 @@ impl RegisteredStorageRead {
         .map_err(|_| io::Error::other("storage read registration task failed"))?
     }
 
-    /// Finish after durable access tracking succeeds; release and retire the clean participant.
+    /// Finish after durable access tracking succeeds; retire while shared admission is still held.
     ///
     /// A failed/cancelled content operation should drop this guard, retaining dirty evidence.
-    /// Retirement contention preserves a clean record and is reported instead of ignored.
+    /// Other active readers do not prevent completion or cause clean participant accumulation.
     ///
     /// # Errors
     /// Returns tracking-state, sync, lock contention, or retirement failures.
     pub async fn complete(self) -> io::Result<()> {
         tokio::task::spawn_blocking(move || {
-            self.admission.complete()?;
-            self.registry.retire(self.participant)
+            self.registry
+                .complete_read(self.participant, self.admission)
         })
         .await
         .map_err(|_| io::Error::other("storage read completion task failed"))?

@@ -322,6 +322,15 @@ and successful reader completion permits a later real compression pass. This clo
 unenforced-registry gap, but does not establish coverage for unregistered fallbacks or older clients.
 Startup activation remains disabled until those read paths are safely coordinated.
 
+## Completion without registry accumulation
+
+Successful registered reads now retire their exact participant while still holding shared admission,
+instead of releasing admission and then attempting an exclusive upgrade. Unrelated concurrent reads
+therefore no longer cause normal completion to leak clean participant records. Retirement checks
+file identity, keeps the participant dirty until unlink plus directory sync completes, and retains
+admission throughout. Wrong-identity completion is rejected. A regression exercises one long read
+alongside one hundred shorter completed reads and verifies only the long participant remains.
+
 ## Remaining implementation
 
 ### Access policy and scheduling
