@@ -263,6 +263,21 @@ The primitive remains handle-based: durable confined registry creation, complete
 enumeration, daemon registration, and coverage of older clients are not implemented. It therefore
 is not wired to automatic startup yet and must not be treated as proof that every reader participates.
 
+## Confined admission registry
+
+The operation-scoped admission primitive now has a filesystem adapter on macOS/Linux. It creates
+and syncs a versioned registry beneath an existing authorized root, creates participant files while
+holding the shared registration gate, and scans participants only under exclusive maintenance
+admission. Scans have an explicit entry budget; incomplete scans and unknown names refuse admission.
+Descriptor-relative no-follow opens reject symlinks and multiply linked participant files. Tests
+cover multiple registry instances, concurrent readers, dirty restart, scan exhaustion, unknown state,
+and symlink/hardlink refusal.
+
+The adapter is not registered by daemon startup yet. Participant identity reuse/retirement, bounded
+lifetime growth, full read-path admission, and older-client exclusion remain necessary before this
+registry can safely authorize the automatic worker. Existing participant records must not be deleted
+merely to make an incomplete scan fit its budget.
+
 ## Remaining implementation
 
 ### Access policy and scheduling

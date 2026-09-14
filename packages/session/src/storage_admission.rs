@@ -6,6 +6,11 @@
 //! maintenance without preventing unrelated reads. All handles are caller-confined, non-append
 //! regular files; participant discovery and ownership of the complete registry remain caller-owned.
 
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+mod registry;
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+pub use registry::StorageAdmissionRegistry;
+
 use std::fs::File;
 use std::io::{self, Read as _, Seek as _, Write as _};
 
