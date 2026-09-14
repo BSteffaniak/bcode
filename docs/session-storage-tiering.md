@@ -493,6 +493,15 @@ admission and session ownership through transaction completion and database clos
 cancels after a payload update but before commit and verifies physical payload bytes are unchanged.
 The dispatch gate remains disabled pending durable fallback and older-client coordination.
 
+## Integrated history/reclamation proof
+
+A real-file test now creates forty large canonical messages through SessionManager, compresses them
+across bounded maintenance pages, reclaims more than four MiB, reopens through normal session APIs,
+verifies exact event history and bounded backward pages, and appends successfully afterward. A
+separate test downgrades a fixture's writer contract to epoch 9 and verifies compression refuses it
+without altering the logical payload or epoch. These prove the offline history/reclamation path;
+they do not bypass the still-disabled dispatch gate or establish durable fallback coordination.
+
 ## Remaining implementation
 
 ### Access policy and scheduling

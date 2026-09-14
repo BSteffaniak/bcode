@@ -1,5 +1,8 @@
 //! Bounded current-format canonical history recompression under offline ownership.
 
+#[cfg(test)]
+mod tests;
+
 use crate::db::{SessionDb, SessionDbError};
 use bcode_session_models::SessionId;
 use std::path::Path;
