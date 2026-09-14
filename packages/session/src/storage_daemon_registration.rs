@@ -36,6 +36,23 @@ impl StorageDaemonRegistration {
         })
     }
 
+    /// Check whether a registry handle is this exact live, healthy registration.
+    /// The mutable borrow held by maintenance admission prevents health changes during its scope.
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    pub(crate) fn acknowledges(&self, candidate: &File) -> io::Result<bool> {
+        use std::os::unix::fs::MetadataExt as _;
+        if self.failed {
+            return Ok(false);
+        }
+        let held = self.file.metadata()?;
+        let observed = candidate.metadata()?;
+        Ok(held.is_file()
+            && observed.is_file()
+            && held.nlink() == 1
+            && held.dev() == observed.dev()
+            && held.ino() == observed.ino())
+    }
+
     /// Mark this daemon unsafe for maintenance. No extra disk write is required: ACTIVE is durable.
     pub const fn fail(&mut self) {
         self.failed = true;

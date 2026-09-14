@@ -9,7 +9,7 @@
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 mod registry;
 #[cfg(any(target_os = "macos", target_os = "linux"))]
-pub use registry::StorageAdmissionRegistry;
+pub use registry::{AcknowledgedStorageMaintenance, StorageAdmissionRegistry};
 
 use std::fs::File;
 use std::io::{self, Read as _, Seek as _, Write as _};

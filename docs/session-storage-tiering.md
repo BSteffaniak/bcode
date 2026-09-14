@@ -534,6 +534,16 @@ is still disabled rather than incorrectly trusting a clean shutdown. Startup reg
 still needs an externally established fallback fence. Tests verify clean explicit completion admits
 maintenance and failed completion survives registry reopening as a blocker.
 
+## Exact live-daemon acknowledgement
+
+Registry admission now accepts an exact healthy live registration by device/inode identity, retaining
+a mutable borrow of that registration for the entire maintenance guard. The registration cannot be
+failed, finished or dropped while that guard exists. Missing/substituted registration, another
+registry's registration, foreign active/abandoned daemons, dirty readers and incomplete scans still
+refuse admission. Tests cover local acknowledgement, foreign refusal, post-clean-shutdown admission,
+failed health, and cross-root rejection. This capability is not yet wired into async worker dispatch;
+its registration-health synchronization and unregistered startup failure path remain unresolved.
+
 ## Remaining implementation
 
 ### Access policy and scheduling

@@ -11,6 +11,13 @@ use std::io;
 use std::os::unix::ffi::OsStrExt as _;
 use std::path::Path;
 
+/// Maintenance admission borrowing a live daemon's health registration for its entire lifetime.
+/// Foreign live or abandoned daemon records still block admission; this is not registry-wide trust.
+pub struct AcknowledgedStorageMaintenance<'a> {
+    _admission: StorageMaintenanceAdmission,
+    _registration: &'a mut crate::storage_daemon_registration::StorageDaemonRegistration,
+}
+
 /// Confined admission registry, opened from an already authorized state location.
 pub struct StorageAdmissionRegistry {
     directory: File,
@@ -90,6 +97,34 @@ impl StorageAdmissionRegistry {
         &self,
         entry_budget: usize,
     ) -> io::Result<StorageMaintenanceAdmission> {
+        self.admit_checked(entry_budget, None)
+    }
+
+    /// Admit maintenance with an exact healthy live-daemon acknowledgement.
+    ///
+    /// The guard borrows registration mutably so it cannot be failed, finished or dropped until
+    /// maintenance ends. Acknowledgement is tied to the held file's device/inode, not a supplied ID.
+    ///
+    /// # Errors
+    /// Rejects missing/substituted registration, failed health, other active/abandoned daemons,
+    /// dirty readers, unknown files, incomplete scans, contention and IO errors.
+    pub fn admit_acknowledged<'a>(
+        &self,
+        entry_budget: usize,
+        registration: &'a mut crate::storage_daemon_registration::StorageDaemonRegistration,
+    ) -> io::Result<AcknowledgedStorageMaintenance<'a>> {
+        let admission = self.admit_checked(entry_budget, Some(&*registration))?;
+        Ok(AcknowledgedStorageMaintenance {
+            _admission: admission,
+            _registration: registration,
+        })
+    }
+
+    fn admit_checked(
+        &self,
+        entry_budget: usize,
+        registration: Option<&crate::storage_daemon_registration::StorageDaemonRegistration>,
+    ) -> io::Result<StorageMaintenanceAdmission> {
         if entry_budget == 0 || entry_budget > 65_536 {
             return Err(invalid());
         }
@@ -97,6 +132,7 @@ impl StorageAdmissionRegistry {
         gate.try_lock().map_err(io::Error::from)?;
         let names = names(&self.directory, entry_budget)?;
         let mut files = Vec::new();
+        let mut acknowledged = false;
         for name in names {
             if name == "gate" {
                 continue;
@@ -105,9 +141,17 @@ impl StorageAdmissionRegistry {
             if let Some(id) = text.strip_suffix(".daemon") {
                 id.parse::<SessionId>().map_err(|_| invalid())?;
                 let name = std::ffi::CString::new(name.as_bytes()).map_err(|_| invalid())?;
-                if !crate::storage_daemon_registration::daemon_registration_is_complete(
-                    open_child(&self.directory, &name, libc::O_RDONLY)?,
-                )? {
+                let file = open_child(&self.directory, &name, libc::O_RDONLY)?;
+                if let Some(registration) = registration
+                    && registration.acknowledges(&file)?
+                {
+                    if acknowledged {
+                        return Err(invalid());
+                    }
+                    acknowledged = true;
+                    continue;
+                }
+                if !crate::storage_daemon_registration::daemon_registration_is_complete(file)? {
                     return Err(invalid());
                 }
                 continue;
@@ -116,6 +160,9 @@ impl StorageAdmissionRegistry {
             id.parse::<SessionId>().map_err(|_| invalid())?;
             let name = std::ffi::CString::new(name.as_bytes()).map_err(|_| invalid())?;
             files.push(Ok(open_child(&self.directory, &name, libc::O_RDONLY)?));
+        }
+        if registration.is_some() && !acknowledged {
+            return Err(invalid());
         }
         StorageMaintenanceAdmission::begin(gate, files)
     }
@@ -458,6 +505,43 @@ mod tests {
         drop(registry);
         let registry = StorageAdmissionRegistry::open(root.path()).expect("restart");
         assert!(registry.admit_maintenance(16).is_err());
+    }
+
+    #[test]
+    fn live_acknowledgement_is_exact_and_never_covers_foreign_or_failed_daemons() {
+        let root = tempfile::tempdir().expect("root");
+        let registry = StorageAdmissionRegistry::open(root.path()).expect("registry");
+        let mut local = registry.register_daemon(SessionId::new()).expect("local");
+        assert!(registry.admit_maintenance(16).is_err());
+        {
+            let admission = registry
+                .admit_acknowledged(16, &mut local)
+                .expect("live healthy acknowledgement");
+            assert!(registry.admit_read(SessionId::new()).is_err());
+            drop(admission);
+        }
+        let foreign = registry.register_daemon(SessionId::new()).expect("foreign");
+        assert!(registry.admit_acknowledged(16, &mut local).is_err());
+        foreign.finish().expect("foreign completed");
+        drop(
+            registry
+                .admit_acknowledged(16, &mut local)
+                .expect("foreign clean"),
+        );
+        local.fail();
+        assert!(registry.admit_acknowledged(16, &mut local).is_err());
+    }
+
+    #[test]
+    fn live_acknowledgement_from_another_registry_is_rejected() {
+        let root = tempfile::tempdir().expect("root");
+        let other = tempfile::tempdir().expect("other");
+        let registry = StorageAdmissionRegistry::open(root.path()).expect("registry");
+        let other_registry = StorageAdmissionRegistry::open(other.path()).expect("other registry");
+        let mut other_daemon = other_registry
+            .register_daemon(SessionId::new())
+            .expect("other daemon");
+        assert!(registry.admit_acknowledged(16, &mut other_daemon).is_err());
     }
 
     #[test]
