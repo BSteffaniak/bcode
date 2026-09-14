@@ -5181,7 +5181,7 @@ impl WorkflowStore {
     ///
     /// # Errors
     ///
-    /// Returns an error for malformed links, missing/invalid parent attempts, recursion, workspace
+    /// Returns an error for malformed ownership links, missing/invalid parent attempts, workspace
     /// mismatch, depth/descendant overflow, exact-target mismatch, identity conflict, or database
     /// failure. No child or link is retained on error.
     #[allow(clippy::too_many_lines)]
@@ -5247,13 +5247,6 @@ impl WorkflowStore {
                 "workflow child authorization profile differs from its parent".to_string(),
             ));
         }
-        let parent_definition: WorkflowDefinition = serde_json::from_str(&parent.2)?;
-        let parent_definition_identity =
-            bcode_workflow::WorkflowDefinitionIdentity::for_definition(
-                parent_definition.name.clone(),
-                &parent_definition,
-            )
-            .map_err(|error| WorkflowStoreError::InvalidData(error.to_string()))?;
         if request.run.authorization_ceiling > parent_authorization_ceiling {
             return Err(WorkflowStoreError::InvalidData(
                 "workflow child authorization ceiling exceeds its parent".to_string(),
@@ -5459,12 +5452,7 @@ impl WorkflowStore {
                     .to_string(),
             ));
         }
-        reject_recursive_child_target(
-            &transaction,
-            &request.link.parent_run_id,
-            target,
-            &parent_definition_identity,
-        )?;
+        validate_child_ancestry(&transaction, &request.link)?;
         if request.run.definition_id != target.definition_id
             || request.run.definition_version != target.definition_version
         {
@@ -17634,58 +17622,38 @@ fn create_run_in_transaction_diagnosed(
     Ok(())
 }
 
-fn reject_recursive_child_target(
+fn validate_child_ancestry(
     transaction: &Transaction<'_>,
-    parent_run_id: &str,
-    target: &bcode_workflow::WorkflowDefinitionIdentity,
-    parent_definition_identity: &bcode_workflow::WorkflowDefinitionIdentity,
+    link: &WorkflowRunLink,
 ) -> Result<(), WorkflowStoreError> {
-    if target == parent_definition_identity {
-        return Err(WorkflowStoreError::InvalidData(
-            "recursive workflow child target is forbidden".to_string(),
-        ));
-    }
-    let mut current: Option<String> = transaction
-        .query_row(
-            "SELECT parent_run_id FROM workflow_run_links WHERE child_run_id = ?1",
-            [parent_run_id],
-            |row| row.get(0),
-        )
-        .optional()?;
-    let mut visited = std::collections::BTreeSet::new();
-    for _ in 0..MAX_WORKFLOW_RUN_DEPTH {
-        let Some(run_id) = current else {
+    let mut current = link.parent_run_id.clone();
+    let mut expected_depth = link.depth - 1;
+    loop {
+        if current == link.child_run_id || expected_depth == 0 {
+            return Err(WorkflowStoreError::InvalidData(
+                "workflow run ownership cycle or invalid depth".into(),
+            ));
+        }
+        let parent: Option<(String, String, u32)> = transaction.query_row(
+            "SELECT parent_run_id, root_run_id, depth FROM workflow_run_links WHERE child_run_id = ?1",
+            [&current], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        ).optional()?;
+        let Some((parent, root, depth)) = parent else {
+            if current != link.root_run_id || expected_depth != 1 {
+                return Err(WorkflowStoreError::InvalidData(
+                    "workflow ancestry root or depth mismatch".into(),
+                ));
+            }
             return Ok(());
         };
-        if !visited.insert(run_id.clone()) {
+        if root != link.root_run_id || depth != expected_depth {
             return Err(WorkflowStoreError::InvalidData(
-                "workflow run link ancestry contains a cycle".to_string(),
+                "workflow ancestry root or depth mismatch".into(),
             ));
         }
-        let definition: (String, u32) = transaction.query_row(
-            "SELECT definition_id, definition_version FROM workflow_runs WHERE run_id = ?1",
-            [&run_id],
-            |row| Ok((row.get(0)?, row.get(1)?)),
-        )?;
-        if definition == (target.definition_id.clone(), target.definition_version) {
-            return Err(WorkflowStoreError::InvalidData(
-                "recursive workflow child target is forbidden".to_string(),
-            ));
-        }
-        current = transaction
-            .query_row(
-                "SELECT parent_run_id FROM workflow_run_links WHERE child_run_id = ?1",
-                [&run_id],
-                |row| row.get(0),
-            )
-            .optional()?;
+        current = parent;
+        expected_depth -= 1;
     }
-    if current.is_some() {
-        return Err(WorkflowStoreError::InvalidData(
-            "workflow child ancestry exceeds the supported depth".to_string(),
-        ));
-    }
-    Ok(())
 }
 
 fn required_definition_capability(
@@ -36044,6 +36012,20 @@ mod tests {
         });
         assert!(store.create_child_run_idempotent(&foreign_owner).is_err());
         assert!(store.run_summary(&request.run.run_id).unwrap().is_none());
+        {
+            let transaction = store.connection.transaction().expect("ancestry snapshot");
+            validate_child_ancestry(&transaction, &request.link).expect("valid ownership chain");
+            let mut invalid = request.link.clone();
+            invalid.root_run_id = "unrelated-root".to_string();
+            assert!(validate_child_ancestry(&transaction, &invalid).is_err());
+            invalid = request.link.clone();
+            invalid.depth += 1;
+            assert!(validate_child_ancestry(&transaction, &invalid).is_err());
+            invalid = request.link.clone();
+            invalid.child_run_id.clone_from(&invalid.parent_run_id);
+            assert!(validate_child_ancestry(&transaction, &invalid).is_err());
+            transaction.rollback().expect("snapshot end");
+        }
         let mut mismatched_profile = request.clone();
         mismatched_profile.run.run_id = workflow_child_run_id(
             "parent-run",
@@ -36796,24 +36778,6 @@ mod tests {
             1,
             &target,
         );
-        let parent_call_identity = bcode_workflow::WorkflowDefinitionIdentity::for_definition(
-            call_definition.name.clone(),
-            &call_definition,
-        )
-        .expect("parent call identity");
-        {
-            let transaction = store.connection.transaction().expect("transaction");
-            assert!(
-                reject_recursive_child_target(
-                    &transaction,
-                    "recursive-parent",
-                    &parent_call_identity,
-                    &parent_call_identity,
-                )
-                .is_err()
-            );
-            transaction.rollback().expect("rollback");
-        }
         let mut request = NewChildWorkflowRun {
             link: WorkflowRunLink {
                 version: WORKFLOW_RUN_LINK_VERSION,
