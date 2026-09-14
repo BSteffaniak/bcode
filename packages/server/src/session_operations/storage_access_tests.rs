@@ -98,6 +98,16 @@ async fn explicit_history_tracks_but_background_history_does_not() {
         .expect("background page");
     assert!(!path.exists());
     let state = crate::tests::test_server_state(sessions);
+    let registry = bcode_session::storage_admission::StorageAdmissionRegistry::open(root.path())
+        .expect("registry");
+    *state
+        .storage_daemon_registration
+        .lock()
+        .expect("registration lock") = Some(
+        registry
+            .register_daemon(bcode_session_models::SessionId::new())
+            .expect("register"),
+    );
     let client = bcode_session_models::ClientId::new();
     let page = history_page(
         &state,
@@ -131,7 +141,22 @@ async fn explicit_history_tracks_but_background_history_does_not() {
     )
     .await
     .expect("healthy read");
+    assert!(
+        !state
+            .storage_daemon_registration
+            .lock()
+            .expect("registration lock")
+            .as_ref()
+            .expect("registered")
+            .healthy()
+    );
+    assert!(
+        state
+            .storage_tracking_failed
+            .load(std::sync::atomic::Ordering::SeqCst)
+    );
     drop(state);
+    assert!(registry.admit_maintenance(32).is_err());
     assert_eq!(repeated.events.len(), page.events.len());
     assert_eq!(std::fs::read(&path).expect("preserved"), b"damaged");
 }

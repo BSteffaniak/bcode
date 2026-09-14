@@ -3001,6 +3001,17 @@ impl ServerState {
         }
     }
 
+    fn fail_storage_tracking(&self) {
+        self.storage_tracking_failed.store(true, Ordering::SeqCst);
+        // ACTIVE is already durable. A health failure must invalidate both the dispatch latch and
+        // any subsequent exact-registration acknowledgement without requiring another disk write.
+        if let Ok(mut registration) = self.storage_daemon_registration.lock()
+            && let Some(registration) = registration.as_mut()
+        {
+            registration.fail();
+        }
+    }
+
     fn request_shutdown(&self) {
         if self.shutdown_requested.swap(true, Ordering::SeqCst) {
             return;

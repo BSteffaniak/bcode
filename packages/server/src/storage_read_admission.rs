@@ -33,9 +33,7 @@ impl RegisteredStorageRead {
         if let Ok(admission) = Self::begin(root).await {
             return Some(admission);
         }
-        state
-            .storage_tracking_failed
-            .store(true, std::sync::atomic::Ordering::SeqCst);
+        state.fail_storage_tracking();
         let blocked = tokio::task::spawn_blocking(move || {
             StorageAdmissionRegistry::open(&fallback_root)?.block_maintenance_for_fallback()
         })
@@ -74,12 +72,11 @@ impl RegisteredStorageRead {
             .is_ok()
         {
             if self.complete().await.is_err() {
+                state.fail_storage_tracking();
                 tracing::warn!("storage read participant retirement deferred");
             }
         } else {
-            state
-                .storage_tracking_failed
-                .store(true, std::sync::atomic::Ordering::SeqCst);
+            state.fail_storage_tracking();
             tracing::warn!("storage access tracking failed; participant remains dirty");
         }
     }
@@ -124,6 +121,45 @@ impl RegisteredStorageRead {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn tracking_failure_invalidates_live_acknowledgement_and_survives_restart() {
+        let root = tempfile::tempdir().expect("root");
+        let registry = StorageAdmissionRegistry::open(root.path()).expect("registry");
+        let registration = registry
+            .register_daemon(SessionId::new())
+            .expect("registration");
+        let state = crate::tests::test_server_state(bcode_session::SessionManager::default());
+        *state.storage_daemon_registration.lock().expect("lock") = Some(registration);
+        {
+            let mut held = state.storage_daemon_registration.lock().expect("lock");
+            drop(
+                registry
+                    .admit_acknowledged(16, held.as_mut().expect("registered"))
+                    .expect("healthy acknowledgement"),
+            );
+        }
+        state.fail_storage_tracking();
+        assert!(
+            state
+                .storage_tracking_failed
+                .load(std::sync::atomic::Ordering::SeqCst)
+        );
+        {
+            let mut held = state.storage_daemon_registration.lock().expect("lock");
+            assert!(!held.as_ref().expect("registered").healthy());
+            assert!(
+                registry
+                    .admit_acknowledged(16, held.as_mut().expect("registered"))
+                    .is_err()
+            );
+            drop(held);
+        }
+        drop(state);
+        drop(registry);
+        let reopened = StorageAdmissionRegistry::open(root.path()).expect("restart");
+        assert!(reopened.admit_maintenance(16).is_err());
+    }
 
     #[tokio::test]
     async fn registered_read_lifecycle_retires_success_but_preserves_abandonment() {

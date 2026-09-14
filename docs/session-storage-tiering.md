@@ -544,6 +544,16 @@ refuse admission. Tests cover local acknowledgement, foreign refusal, post-clean
 failed health, and cross-root rejection. This capability is not yet wired into async worker dispatch;
 its registration-health synchronization and unregistered startup failure path remain unresolved.
 
+## Synchronized tracking failure and live acknowledgement
+
+Server tracking failures now invalidate both the dispatch failure latch and any installed daemon
+registration's health. This includes admission failure, timestamp persistence failure, and participant
+retirement failure. The registration's ACTIVE evidence is already durable, so invalidating live
+acknowledgement requires no successful follow-up disk write. Tests verify a real corrupted tracking
+record still permits canonical reads but marks its daemon unhealthy, refuses later live admission,
+and remains a maintenance blocker after registry reopening. Startup registration failure and
+older-client participation are still unresolved, so production dispatch remains disabled.
+
 ## Remaining implementation
 
 ### Access policy and scheduling
