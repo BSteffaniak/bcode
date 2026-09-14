@@ -341,6 +341,16 @@ This is lifecycle wiring, **not automatic compression activation**, and the fail
 replacement for durable cross-daemon fallback registration. Older-client coordination and canonical
 history compression are still unimplemented.
 
+## Original artifact checksum validation
+
+Verified-reference compression now validates any projected SHA-256 checksum against the original
+logical byte stream before candidate preparation. Malformed checksums or differing bytes reject the
+operation; compressed-container self-checks alone no longer substitute for supplied original evidence.
+Validation is streaming and checks cancellation between bounded reads. Missing optional checksums
+still rely on byte-for-byte candidate verification and established finalization/ownership. Concurrent
+untrusted replacement between this check and the later source open remains part of publication
+identity hardening, not something a checksum alone resolves.
+
 ## Remaining implementation
 
 ### Access policy and scheduling

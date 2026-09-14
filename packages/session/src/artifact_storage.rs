@@ -311,6 +311,34 @@ fn access_age_allows(session: &Path, now_ms: u64, minimum_age_ms: u64) -> io::Re
         .is_some_and(|elapsed| elapsed >= minimum_age_ms))
 }
 
+fn verify_reference_checksum(
+    reader: &mut impl std::io::Read,
+    expected: Option<&str>,
+    cancellation: &ArtifactMaintenanceCancellation,
+) -> io::Result<()> {
+    use sha2::{Digest as _, Sha256};
+    let Some(expected) = expected else {
+        return Ok(());
+    };
+    if expected.len() != 64 || !expected.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return Err(invalid());
+    }
+    let mut digest = Sha256::new();
+    let mut buffer = vec![0; 256 * 1024];
+    loop {
+        cancellation.check()?;
+        let count = reader.read(&mut buffer)?;
+        if count == 0 {
+            break;
+        }
+        digest.update(&buffer[..count]);
+    }
+    if !format!("{:x}", digest.finalize()).eq_ignore_ascii_case(expected) {
+        return Err(invalid());
+    }
+    Ok(())
+}
+
 /// Run verified maintenance with end-to-end cooperative cancellation.
 ///
 /// # Errors
@@ -398,6 +426,7 @@ pub async fn compress_finalized_artifact_cancellable(
         .map_err(|_| invalid())?
         .to_path_buf();
     let expected_bytes = reference.byte_len.ok_or_else(invalid)?;
+    let expected_checksum = reference.checksum_sha256;
     tokio::task::spawn_blocking(move || {
         cancellation.check()?;
         let artifacts = confined(
@@ -405,10 +434,11 @@ pub async fn compress_finalized_artifact_cancellable(
             &root,
         )?;
         let (file, encoding) = open_content(&artifacts.join(&relative), &artifacts)?;
-        let reader = ArtifactReader::new(file, encoding)?;
+        let mut reader = ArtifactReader::new(file, encoding)?;
         if reader.logical_bytes() != expected_bytes {
             return Err(invalid());
         }
+        verify_reference_checksum(&mut reader, expected_checksum.as_deref(), &cancellation)?;
         drop(reader);
         let result = compress_artifact_with_maintenance(
             &root,
@@ -673,6 +703,42 @@ fn exchange(_parent: &File, _parent_path: &Path, _left: &Path, _right: &Path) ->
 #[cfg(all(test, any(target_os = "macos", target_os = "linux")))]
 mod tests {
     use super::*;
+
+    #[test]
+    fn reference_checksum_rejects_damaged_or_malformed_original_evidence() {
+        use sha2::{Digest as _, Sha256};
+        let bytes = b"original terminal output";
+        let expected = format!("{:x}", Sha256::digest(bytes));
+        let cancellation = ArtifactMaintenanceCancellation::default();
+        verify_reference_checksum(&mut bytes.as_slice(), Some(&expected), &cancellation)
+            .expect("checksum");
+        verify_reference_checksum(
+            &mut bytes.as_slice(),
+            Some(&expected.to_uppercase()),
+            &cancellation,
+        )
+        .expect("uppercase");
+        assert!(
+            verify_reference_checksum(
+                &mut b"damaged terminal output".as_slice(),
+                Some(&expected),
+                &cancellation
+            )
+            .is_err()
+        );
+        for bad in ["", "abc123", &"g".repeat(64)] {
+            assert!(
+                verify_reference_checksum(&mut bytes.as_slice(), Some(bad), &cancellation).is_err()
+            );
+        }
+        cancellation.cancel();
+        assert_eq!(
+            verify_reference_checksum(&mut bytes.as_slice(), Some(&expected), &cancellation)
+                .expect_err("cancelled")
+                .kind(),
+            io::ErrorKind::Interrupted
+        );
+    }
 
     #[tokio::test]
     async fn cancelled_verified_maintenance_does_not_touch_missing_storage() {
