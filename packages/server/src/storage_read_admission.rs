@@ -16,6 +16,49 @@ pub struct RegisteredStorageRead {
 }
 
 impl RegisteredStorageRead {
+    /// Attempt admission without making optional tracking a prerequisite for canonical reads.
+    ///
+    /// A failure is reported as `None`; automatic scheduling must remain disabled unless a caller
+    /// has independently fenced unregistered reads. This adapter does not grant such a fence.
+    pub async fn for_session(state: &super::ServerState, session_id: SessionId) -> Option<Self> {
+        let root = state.sessions.session_store_root()?;
+        if !root
+            .join(session_id.to_string())
+            .join("session.db")
+            .is_file()
+        {
+            return None;
+        }
+        Self::begin(root).await.map_or_else(
+            |_| {
+                tracing::warn!(
+                    "storage read admission unavailable; automatic scheduling remains disabled"
+                );
+                None
+            },
+            Some,
+        )
+    }
+
+    /// Persist access before completing admission. Failure leaves a durable dirty participant.
+    pub async fn finish_history(self, state: &super::ServerState, session_id: SessionId) {
+        if state
+            .sessions
+            .record_storage_access(
+                session_id,
+                bcode_session::storage_access::StorageAccessKind::History,
+            )
+            .await
+            .is_ok()
+        {
+            if self.complete().await.is_err() {
+                tracing::warn!("storage read participant retirement deferred");
+            }
+        } else {
+            tracing::warn!("storage access tracking failed; participant remains dirty");
+        }
+    }
+
     /// Register one operation without running blocking lock/sync calls on the async executor.
     ///
     /// # Errors

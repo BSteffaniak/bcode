@@ -769,7 +769,17 @@ pub async fn complete_history(
     {
         return Err(ReadHistoryError::IncompatibleActiveNamespace(namespace));
     }
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    let admission =
+        super::storage_read_admission::RegisteredStorageRead::for_session(state, session_id).await;
     let history = state.sessions.session_history(session_id).await?;
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    if let Some(admission) = admission {
+        admission.finish_history(state, session_id).await;
+    } else {
+        record_history_access(state, session_id).await;
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
     record_history_access(state, session_id).await;
     Ok(history)
 }
@@ -787,10 +797,20 @@ pub async fn inspect(
     {
         return Err(ReadHistoryError::IncompatibleActiveNamespace(namespace));
     }
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    let admission =
+        super::storage_read_admission::RegisteredStorageRead::for_session(state, session_id).await;
     let page = state
         .sessions
         .session_inspection_page(session_id, query)
         .await?;
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    if let Some(admission) = admission {
+        admission.finish_history(state, session_id).await;
+    } else {
+        record_history_access(state, session_id).await;
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
     record_history_access(state, session_id).await;
     Ok(page)
 }
@@ -834,10 +854,20 @@ pub async fn history_page(
     {
         return Err(ReadHistoryError::IncompatibleActiveNamespace(namespace));
     }
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    let admission =
+        super::storage_read_admission::RegisteredStorageRead::for_session(state, session_id).await;
     let page = state
         .sessions
         .session_history_page(session_id, query)
         .await?;
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    if let Some(admission) = admission {
+        admission.finish_history(state, session_id).await;
+    } else {
+        record_history_access(state, session_id).await;
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
     record_history_access(state, session_id).await;
     Ok(page)
 }
@@ -855,10 +885,20 @@ pub async fn history_around(
     {
         return Err(ReadHistoryError::IncompatibleActiveNamespace(namespace));
     }
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    let admission =
+        super::storage_read_admission::RegisteredStorageRead::for_session(state, session_id).await;
     let window = state
         .sessions
         .session_history_around(session_id, query)
         .await?;
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    if let Some(admission) = admission {
+        admission.finish_history(state, session_id).await;
+    } else {
+        record_history_access(state, session_id).await;
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
     record_history_access(state, session_id).await;
     Ok(window)
 }

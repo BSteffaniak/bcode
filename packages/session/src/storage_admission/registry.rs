@@ -84,6 +84,27 @@ impl StorageAdmissionRegistry {
         StorageMaintenanceAdmission::begin(gate, files)
     }
 
+    /// Register a degraded reader without treating damaged participant state as clean.
+    ///
+    /// This marker is durable before content is exposed and is never automatically repaired.
+    /// It is useful when a previously admitted read cannot commit its access timestamp.
+    ///
+    /// # Errors
+    /// Returns contention or IO failure; no health claim is made on failure.
+    pub fn mark_degraded(&self, participant: SessionId) -> io::Result<()> {
+        drop(self.admit_read(participant)?);
+        Ok(())
+    }
+
+    /// Check registry health without acquiring mutation authority.
+    ///
+    /// # Errors
+    /// Returns errors for active readers, dirty state, incomplete enumeration or IO.
+    pub fn check_health(&self, entry_budget: usize) -> io::Result<()> {
+        drop(self.admit_maintenance(entry_budget)?);
+        Ok(())
+    }
+
     /// Retire a completed participant without leaving registry growth proportional to read count.
     ///
     /// Retirement holds exclusive admission so enumeration cannot race removal. Dirty or active

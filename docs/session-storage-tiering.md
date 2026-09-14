@@ -301,6 +301,16 @@ start, no restart after shutdown, and a cancelled stop retaining its worker unti
 The wrapper is not invoked by production startup yet: caller-established tracking-health coverage
 remains a precondition and has not been integrated.
 
+## Initial production admission wiring
+
+Explicit history export, history pages, around-sequence windows, and inspection now attempt
+registered admission before reading and clean their participant only after access persistence
+succeeds. Cancellation or failed tracking leaves dirty evidence. Registry failure does not break
+canonical reads; the unregistered fallback is explicitly unsafe for automatic scheduling, so startup
+activation remains disabled. Artifact, attach, and model-context admission plus a durable fallback
+fence still need integration before enabling the worker. This partial wiring is not completed
+tracking-health coverage.
+
 ## Remaining implementation
 
 ### Access policy and scheduling
