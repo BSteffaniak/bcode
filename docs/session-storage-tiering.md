@@ -311,6 +311,17 @@ activation remains disabled. Artifact, attach, and model-context admission plus 
 fence still need integration before enabling the worker. This partial wiring is not completed
 tracking-health coverage.
 
+## Enforced automatic publication admission
+
+Age-based compression now acquires complete clean registry admission inside the session-domain
+mutation operation, not merely in the scheduler. The registry gate remains held through validation
+and transfers into the blocking conversion task until publication/cleanup completes. Dirty records,
+active registered readers, unknown entries, and over-budget registry scans therefore prevent actual
+automatic replacement. Integration tests prove active/abandoned readers leave a raw artifact intact
+and successful reader completion permits a later real compression pass. This closes the previously
+unenforced-registry gap, but does not establish coverage for unregistered fallbacks or older clients.
+Startup activation remains disabled until those read paths are safely coordinated.
+
 ## Remaining implementation
 
 ### Access policy and scheduling

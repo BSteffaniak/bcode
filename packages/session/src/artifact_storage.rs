@@ -277,11 +277,47 @@ pub async fn compress_finalized_artifact_with_age(
     .await
 }
 
+async fn acquire_tracking_admission(
+    root: &Path,
+) -> io::Result<crate::storage_admission::StorageMaintenanceAdmission> {
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    {
+        let root = root.to_path_buf();
+        tokio::task::spawn_blocking(move || {
+            crate::storage_admission::StorageAdmissionRegistry::open(&root)?.admit_maintenance(4096)
+        })
+        .await
+        .map_err(|_| io::Error::other("storage tracking admission task failed"))?
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    {
+        let _ = root;
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "automatic artifact maintenance unavailable",
+        ))
+    }
+}
+
+fn access_age_allows(session: &Path, now_ms: u64, minimum_age_ms: u64) -> io::Result<bool> {
+    let mut access = File::open(session.join("storage-access.bin"))?;
+    let crate::storage_access::StorageAccessObservation::Recorded(record) =
+        crate::storage_access::observe_access(&mut access)?
+    else {
+        return Err(invalid());
+    };
+    Ok(now_ms
+        .checked_sub(record.observed_at_ms)
+        .is_some_and(|elapsed| elapsed >= minimum_age_ms))
+}
+
 /// Run verified maintenance with end-to-end cooperative cancellation.
 ///
 /// # Errors
 /// Returns the same safety/IO failures as age-checked maintenance, or `Interrupted` if cancelled
-/// before publication. The caller must await completion after requesting cancellation.
+/// before publication. Age-based calls additionally require a complete clean admission registry;
+/// active, dirty, unknown, or over-budget registries block publication. The registry guard is moved
+/// into blocking work and held until physical completion. The caller must await cancellation.
 #[allow(clippy::too_many_arguments)]
 pub async fn compress_finalized_artifact_cancellable(
     sessions_root: &Path,
@@ -295,25 +331,23 @@ pub async fn compress_finalized_artifact_cancellable(
 ) -> io::Result<ArtifactStorageOutcome> {
     cancellation.check()?;
     let root = sessions_root.canonicalize()?;
+    // Age-based calls are automatic policy work. Admission is enforced here so a scheduler cannot
+    // bypass failed tracking by calling the storage operation directly.
+    let admission = if age.is_some() {
+        Some(acquire_tracking_admission(&root).await?)
+    } else {
+        None
+    };
     let session = confined(&root.join(session_id.to_string()), &root)?;
     if !fs::symlink_metadata(session.join("session.db"))?.is_file() {
         return Err(invalid());
     }
     let maintenance = acquire_maintenance(&root, session_id).await?;
     cancellation.check()?;
-    if let Some((now_ms, minimum_age_ms)) = age {
-        let mut access = File::open(session.join("storage-access.bin"))?;
-        let crate::storage_access::StorageAccessObservation::Recorded(record) =
-            crate::storage_access::observe_access(&mut access)?
-        else {
-            return Err(invalid());
-        };
-        if now_ms
-            .checked_sub(record.observed_at_ms)
-            .is_none_or(|elapsed| elapsed < minimum_age_ms)
-        {
-            return Ok(ArtifactStorageOutcome::Unchanged);
-        }
+    if let Some((now_ms, minimum_age_ms)) = age
+        && !access_age_allows(&session, now_ms, minimum_age_ms)?
+    {
+        return Ok(ArtifactStorageOutcome::Unchanged);
     }
     let db = crate::db::SessionDb::open_existing_turso_in_root(session_id, &root)
         .await
@@ -376,7 +410,7 @@ pub async fn compress_finalized_artifact_cancellable(
             return Err(invalid());
         }
         drop(reader);
-        compress_artifact_with_maintenance(
+        let result = compress_artifact_with_maintenance(
             &root,
             session_id,
             &relative,
@@ -384,7 +418,9 @@ pub async fn compress_finalized_artifact_cancellable(
             minimum_saved_bytes,
             || cancellation.check(),
             maintenance,
-        )
+        );
+        drop(admission);
+        result
     })
     .await
     .map_err(|_| io::Error::other("artifact maintenance task failed"))?

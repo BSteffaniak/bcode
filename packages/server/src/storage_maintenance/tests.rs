@@ -7,6 +7,44 @@ use bcode_session_models::{
 };
 use std::path::PathBuf;
 
+#[tokio::test]
+async fn automatic_publication_is_blocked_by_registered_readers_and_dirty_records() {
+    let (root, state, id, artifacts, _) = fixture(1).await;
+    let registry = bcode_session::storage_admission::StorageAdmissionRegistry::open(root.path())
+        .expect("registry");
+    let participant = SessionId::new();
+    let read = registry.admit_read(participant).expect("reader");
+    let future = super::super::current_time_ms() + 31 * 86_400_000;
+    maintain_session_at(&state, root.path(), id, None, future)
+        .await
+        .expect("deferred active candidate");
+    assert!(artifacts.join("recording-000").is_file());
+    drop(read);
+    maintain_session_at(&state, root.path(), id, None, future)
+        .await
+        .expect("deferred dirty candidate");
+    assert!(artifacts.join("recording-000").is_file());
+    drop(state);
+    assert!(registry.check_health(4096).is_err());
+}
+
+#[tokio::test]
+async fn automatic_publication_resumes_after_successful_reader_completion() {
+    let (root, state, id, artifacts, _) = fixture(1).await;
+    let registry = bcode_session::storage_admission::StorageAdmissionRegistry::open(root.path())
+        .expect("registry");
+    let participant = SessionId::new();
+    let read = registry.admit_read(participant).expect("reader");
+    read.complete().expect("tracked reader");
+    registry.retire(participant).expect("retire");
+    let future = super::super::current_time_ms() + 31 * 86_400_000;
+    maintain_session_at(&state, root.path(), id, None, future)
+        .await
+        .expect("eligible");
+    drop(state);
+    assert!(artifacts.join("recording-000").is_dir());
+}
+
 async fn fixture(count: usize) -> (tempfile::TempDir, ServerState, SessionId, PathBuf, Vec<u8>) {
     let root = tempfile::tempdir().expect("root");
     let sessions = bcode_session::SessionManager::persistent(root.path()).expect("manager");
