@@ -17,7 +17,6 @@ crate-type = ["cdylib", "rlib"]
 base64 = { workspace = true }
 bcode_config = { workspace = true }
 bcode_model = { workspace = true }
-bcode_model_discovery = { workspace = true }
 bcode_model_provider_runtime = { workspace = true }
 bcode_model_schema = { workspace = true }
 bcode_openai_responses = { workspace = true }
@@ -26,7 +25,6 @@ bcode_provider_auth = { workspace = true }
 bcode_provider_auth_models = { workspace = true }
 bcode_session_models = { workspace = true }
 bcode_tool = { workspace = true }
-httpdate = { workspace = true }
 rand = { workspace = true }
 reqwest = { workspace = true }
 rustls = { workspace = true }
@@ -40,7 +38,6 @@ tokio = { workspace = true, features = [
     "sync",
     "time",
 ] }
-zeroize = { workspace = true }
 
 [features]
 default          = []

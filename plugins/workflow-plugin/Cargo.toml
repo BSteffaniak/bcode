@@ -44,8 +44,6 @@ serde_json = { workspace = true }
 tokio = { workspace = true }
 
 [dev-dependencies]
-bcode_plugin = { workspace = true }
-toml         = { workspace = true }
 
 [features]
 default          = []

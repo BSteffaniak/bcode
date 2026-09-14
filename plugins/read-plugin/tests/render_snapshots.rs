@@ -5,6 +5,10 @@ fn render(markdown: &str, width: u16) -> String {
         .iter()
         .enumerate()
         .map(|(index, line)| {
+            assert!(
+                line.width() <= usize::from(width),
+                "row {index} exceeds {width} cells"
+            );
             let content = line
                 .spans
                 .iter()

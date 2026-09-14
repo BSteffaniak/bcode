@@ -30,7 +30,6 @@ hyperchad = { workspace = true, features = [
     "renderer",
     "router",
 ] }
-serde_json = { workspace = true }
 switchy = { workspace = true, features = ["async", "async-tokio"] }
 [features]
 actix            = ["hyperchad/renderer-html-actix"]

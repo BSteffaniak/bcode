@@ -15,7 +15,6 @@ bcode_cli           = { workspace = true }
 bcode_config        = { workspace = true }
 hyperchad_docs_site = { workspace = true }
 
-clap = { workspace = true, features = ["derive", "help", "std", "usage"] }
 
 hyperchad = { workspace = true, features = [
     "actions",
@@ -47,7 +46,6 @@ fail-on-warnings = [
 ]
 
 [dev-dependencies]
-toml = { workspace = true, features = ["parse"] }
 
 [package.metadata.cargo-machete]
 ignored = [

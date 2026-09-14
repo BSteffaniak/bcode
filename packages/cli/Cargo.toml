@@ -45,18 +45,14 @@ bcode_workflow = { workspace = true }
 bcode_workflow_discovery = { workspace = true }
 bcode_workflow_store = { workspace = true }
 bcode_worktree_models = { workspace = true }
-bmux_keyboard = { workspace = true }
-bmux_tui = { workspace = true, features = ["crossterm"] }
 chrono = { workspace = true }
 clap = { workspace = true, features = ["derive", "help", "std", "usage"] }
 crossterm = { workspace = true, features = ["events"] }
 open = { workspace = true, optional = true }
 rand = { workspace = true }
-reqwest = { workspace = true }
 rpassword = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
-sha2 = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true, features = ["process", "signal", "time"] }
 toml = { workspace = true, features = ["parse", "serde"] }

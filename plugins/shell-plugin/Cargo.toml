@@ -14,7 +14,6 @@ version     = { workspace = true }
 crate-type = ["cdylib", "rlib"]
 
 [dependencies]
-base64 = { workspace = true }
 bcode_agent_profile = { workspace = true }
 bcode_config = { workspace = true }
 bcode_plugin_sdk = { workspace = true, features = ["tui"] }

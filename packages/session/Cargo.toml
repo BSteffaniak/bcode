@@ -19,7 +19,6 @@ bcode_session_migration_target = { workspace = true }
 bcode_session_models = { workspace = true }
 bcode_skill_models = { workspace = true }
 bmux_codec = { workspace = true, features = ["stable"] }
-rusqlite = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
 sha2 = { workspace = true }

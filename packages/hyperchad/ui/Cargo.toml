@@ -27,9 +27,6 @@ hyperchad = { workspace = true, features = [
     "transformer",
     "transformer-models",
 ] }
-hyperchad_color = { workspace = true }
-hyperchad_renderer = { workspace = true }
-hyperchad_template = { workspace = true }
 hyperchad_transformer = { workspace = true }
 hyperchad_transformer_models = { workspace = true }
 serde = { workspace = true, features = ["derive"] }

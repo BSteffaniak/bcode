@@ -481,6 +481,12 @@ zeroize = { version = "1.8.2", default-features = false, features = ["std"] }
 zip = { version = "5.1.1", default-features = false, features = ["deflate"] }
 zstd = { version = "0.13.3", default-features = false }
 
+# Clap's generated builders retain megabytes of temporaries without stack-slot
+# reuse at opt-level 0. Optimize the CLI in dev/test as well as release so the
+# complete command tree works on ordinary thread stacks, including docs callers.
+[profile.dev.package.bcode_cli]
+opt-level = 1
+
 [profile.dev.package.sha2]
 opt-level = 3
 

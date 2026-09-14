@@ -1,0 +1,5 @@
+# These tests measure wall-clock throughput/latency. Reserve runner capacity so
+# unrelated workspace tests do not consume their CPU budget during measurement.
+[[profile.default.overrides]]
+filter = '(package(bcode_hyperchad) & test(representative_long_snapshot_render_measurement_stays_bounded)) | (package(bcode_server) & test(slow_client_progress_flood_converges_to_latest_checkpoint_after_reconnect))'
+threads-required = "num-test-threads"

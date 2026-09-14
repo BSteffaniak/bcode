@@ -1727,7 +1727,7 @@ library = "libdynamic_visual_test.dylib"
         )
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn discovered_dynamic_user_adapter_renders_shell_request_and_result() {
         let presentation = discovered_hello_presentation();
         for (schema, adapter_id) in [
@@ -1750,6 +1750,24 @@ library = "libdynamic_visual_test.dylib"
             );
             assert!(initial.is_none(), "dynamic work must be off-frame");
             wait_for_dynamic_completion(&presentation);
+            assert!(
+                presentation
+                    .dynamic_visuals
+                    .lock()
+                    .expect("visual coordinator")
+                    .cache
+                    .values()
+                    .all(Result::is_ok),
+                "dynamic adapter errors: {:?}",
+                presentation
+                    .dynamic_visuals
+                    .lock()
+                    .expect("visual coordinator")
+                    .cache
+                    .values()
+                    .filter_map(|result| result.as_ref().err())
+                    .collect::<Vec<_>>()
+            );
             let routed = presentation
                 .routed_visual(
                     &invocation_id,

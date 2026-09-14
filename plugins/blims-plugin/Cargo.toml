@@ -15,7 +15,6 @@ crate-type = ["cdylib", "rlib"]
 
 [dependencies]
 bcode_client = { workspace = true }
-bcode_daemon_lifecycle = { workspace = true }
 bcode_ipc = { workspace = true }
 bcode_plugin_sdk = { workspace = true }
 bcode_session_models = { workspace = true }
@@ -39,7 +38,6 @@ thiserror = { workspace = true }
 tokio = { workspace = true, features = ["rt", "time"] }
 
 [dev-dependencies]
-tempfile = { workspace = true }
 
 [features]
 default          = []

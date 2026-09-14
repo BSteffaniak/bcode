@@ -30,7 +30,6 @@ bcode_provider_auth = { workspace = true }
 bcode_provider_auth_models = { workspace = true }
 bcode_ralph = { workspace = true }
 bcode_ralph_models = { workspace = true }
-bcode_server = { workspace = true }
 bcode_session_models = { workspace = true }
 bcode_session_search = { workspace = true }
 bcode_session_view = { workspace = true }
@@ -58,7 +57,6 @@ bcode_workflow_view_models = { workspace = true }
 bcode_worktree_models = { workspace = true }
 bmux_image = { workspace = true, features = ["iterm2", "kitty", "sixel"] }
 bmux_keyboard = { workspace = true }
-bmux_terminal_grid = { workspace = true }
 bmux_text_edit = { workspace = true }
 bmux_tui = { workspace = true, features = ["crossterm"] }
 bmux_tui_components = { workspace = true, features = [
@@ -95,19 +93,14 @@ webbrowser = { workspace = true }
 zeroize = { workspace = true }
 
 [dev-dependencies]
-bcode_default_agents_plugin = { workspace = true, features = [
-    "static-bundled",
-] }
 bcode_filesystem_plugin = { workspace = true, features = ["static-bundled"] }
-bcode_git_plugin = { workspace = true, features = ["static-bundled"] }
-bcode_hello_plugin = { workspace = true }
-bcode_loop_plugin = { workspace = true, features = ["static-bundled"] }
-bcode_question_plugin = { workspace = true, features = ["static-bundled"] }
-bcode_shell_plugin = { workspace = true, features = ["static-bundled"] }
-bcode_vim_edit_plugin = { workspace = true, features = ["static-bundled"] }
-bcode_workflow_plugin = { workspace = true, features = ["static-bundled"] }
-insta = { workspace = true }
-tempfile = { workspace = true }
+bcode_git_plugin        = { workspace = true, features = ["static-bundled"] }
+bcode_hello_plugin      = { workspace = true }
+bcode_question_plugin   = { workspace = true, features = ["static-bundled"] }
+bcode_shell_plugin      = { workspace = true, features = ["static-bundled"] }
+bcode_vim_edit_plugin   = { workspace = true, features = ["static-bundled"] }
+insta                   = { workspace = true }
+tempfile                = { workspace = true }
 
 [features]
 default = []
@@ -128,3 +121,7 @@ static-bundled-shell-plugin = [
 static-bundled-workflow-plugin = [
     "bcode_bundled_plugins/static-bundled-workflow-plugin",
 ]
+
+[package.metadata.cargo-machete]
+# Tests discover and load this dev-dependency as a dynamic library, not a Rust import.
+ignored = ["bcode_hello_plugin"]

@@ -16,8 +16,9 @@ expression: "render(r#\"# Narrow\n\nA paragraph with **strong text**, *emphasis*
 11 │ •  ☐ pending
 12 │
 13 │ Column one: a long value
-14 │ Column two: another long value
-15 │
-16 │ ┌─ rust
-17 │ │ let answer = 42;
-18 │ └─
+14 │ Column two: another long
+15 │ value
+16 │
+17 │ ┌─ rust
+18 │ │ let answer = 42;
+19 │ └─

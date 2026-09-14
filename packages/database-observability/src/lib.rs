@@ -8,12 +8,12 @@ use async_trait::async_trait;
 use bcode_metrics::{DatabaseMetrics, DatabaseOperation};
 use std::sync::Arc;
 use std::time::Instant;
-use switchy::database::query::{
+use switchy_database::query::{
     DeleteStatement, InsertStatement, SelectQuery, UpdateStatement, UpsertMultiStatement,
     UpsertStatement,
 };
-use switchy::database::schema;
-use switchy::database::{
+use switchy_database::schema;
+use switchy_database::{
     Database, DatabaseError, DatabaseTransaction, DatabaseValue, Row, Savepoint,
 };
 

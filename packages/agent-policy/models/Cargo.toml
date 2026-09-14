@@ -19,3 +19,7 @@ toml                         = { workspace = true, features = ["display"] }
 [features]
 default          = []
 fail-on-warnings = []
+
+[package.metadata.cargo-machete]
+# ConfigDocSchema derives generate hyperchad_docs_config and toml references.
+ignored = ["hyperchad_docs_config", "toml"]

@@ -1518,7 +1518,6 @@ name = "bcode_blims_plugin"
 version = "0.0.1-alpha.0"
 dependencies = [
  "bcode_client",
- "bcode_daemon_lifecycle",
  "bcode_ipc",
  "bcode_plugin_sdk",
  "bcode_session_models",
@@ -1533,7 +1532,6 @@ dependencies = [
  "serde_json",
  "switchy_database",
  "switchy_database_connection",
- "tempfile",
  "thiserror 2.0.20",
  "tokio",
 ]
@@ -1624,18 +1622,14 @@ dependencies = [
  "bcode_workflow_discovery",
  "bcode_workflow_store",
  "bcode_worktree_models",
- "bmux_keyboard",
- "bmux_tui",
  "chrono",
  "clap",
  "crossterm",
  "open",
  "rand 0.9.5",
- "reqwest",
  "rpassword",
  "serde",
  "serde_json",
- "sha2 0.10.9",
  "sshenv_vault",
  "switchy",
  "tempfile",
@@ -1673,7 +1667,6 @@ dependencies = [
  "bcode_workflow",
  "bcode_workflow_store",
  "bcode_workflow_view_models",
- "serde",
  "serde_json",
  "thiserror 2.0.20",
  "tokio",
@@ -1749,7 +1742,6 @@ name = "bcode_config"
 version = "0.0.1-alpha.0"
 dependencies = [
  "bcode_agent_policy_models",
- "bcode_command",
  "bcode_model",
  "bcode_plugin_models",
  "bcode_plugin_sdk",
@@ -1833,7 +1825,6 @@ version = "0.0.1-alpha.0"
 dependencies = [
  "bcode_cli",
  "bcode_config",
- "clap",
  "hyperchad",
  "hyperchad_color",
  "hyperchad_docs_site",
@@ -1841,7 +1832,6 @@ dependencies = [
  "hyperchad_template",
  "hyperchad_transformer",
  "hyperchad_transformer_models",
- "toml 1.1.4+spec-1.1.0",
 ]
 
 [[package]]
@@ -1899,7 +1889,6 @@ dependencies = [
  "bcode_eval",
  "bcode_eval_models",
  "bcode_plugin_sdk",
- "bcode_session_models",
  "bcode_workflow",
  "bmux_keyboard",
  "bmux_text_edit",
@@ -1937,7 +1926,6 @@ dependencies = [
 name = "bcode_filesystem_plugin"
 version = "0.0.1-alpha.0"
 dependencies = [
- "base64 0.22.1",
  "bcode_plugin_sdk",
  "bcode_syntax_render",
  "bcode_tool",
@@ -1955,7 +1943,6 @@ name = "bcode_git_plugin"
 version = "0.0.1-alpha.0"
 dependencies = [
  "bcode_config",
- "bcode_plugin",
  "bcode_plugin_sdk",
  "bcode_tool",
  "bcode_tui_components",
@@ -1964,7 +1951,6 @@ dependencies = [
  "serde_json",
  "tempfile",
  "thiserror 2.0.20",
- "toml 1.1.4+spec-1.1.0",
 ]
 
 [[package]]
@@ -2004,7 +1990,6 @@ dependencies = [
  "bcode_session_view_models",
  "bcode_tool",
  "hyperchad",
- "hyperchad_renderer_html",
  "serde",
  "serde_json",
  "switchy",
@@ -2022,9 +2007,6 @@ dependencies = [
  "bcode_session_models",
  "bcode_session_view_models",
  "hyperchad",
- "hyperchad_color",
- "hyperchad_renderer",
- "hyperchad_template",
  "hyperchad_transformer",
  "hyperchad_transformer_models",
  "serde",
@@ -2104,7 +2086,6 @@ dependencies = [
  "insta",
  "pulldown-cmark",
  "smallvec",
- "test-log",
  "unicode-segmentation",
  "unicode-width 0.2.2",
  "url 2.5.8",
@@ -2202,27 +2183,19 @@ dependencies = [
 name = "bcode_model_plugin"
 version = "0.0.1-alpha.0"
 dependencies = [
- "bcode_client",
  "bcode_command",
  "bcode_config",
- "bcode_ipc",
- "bcode_model",
  "bcode_plugin",
  "bcode_plugin_sdk",
  "bcode_provider_auth_models",
- "bcode_session_models",
  "bcode_tool",
  "bcode_workflow",
  "bmux_keyboard",
  "bmux_tui",
  "bmux_tui_components",
- "clap",
  "serde",
  "serde_json",
- "thiserror 2.0.20",
- "tokio",
  "toml 1.1.4+spec-1.1.0",
- "uuid",
 ]
 
 [[package]]
@@ -2257,7 +2230,6 @@ dependencies = [
  "bcode_model_catalog_models",
  "bcode_models_site_ui",
  "hyperchad",
- "serde_json",
  "switchy",
 ]
 
@@ -2267,11 +2239,6 @@ version = "0.0.1-alpha.0"
 dependencies = [
  "bcode_model_catalog_models",
  "hyperchad",
- "hyperchad_color",
- "hyperchad_renderer",
- "hyperchad_template",
- "hyperchad_transformer",
- "hyperchad_transformer_models",
 ]
 
 [[package]]
@@ -2300,7 +2267,6 @@ dependencies = [
  "base64 0.22.1",
  "bcode_config",
  "bcode_model",
- "bcode_model_discovery",
  "bcode_model_provider_runtime",
  "bcode_model_schema",
  "bcode_openai_responses",
@@ -2309,7 +2275,6 @@ dependencies = [
  "bcode_provider_auth_models",
  "bcode_session_models",
  "bcode_tool",
- "httpdate",
  "rand 0.9.5",
  "reqwest",
  "rustls 0.23.43",
@@ -2317,7 +2282,6 @@ dependencies = [
  "serde_json",
  "sha2 0.10.9",
  "tokio",
- "zeroize",
 ]
 
 [[package]]
@@ -2369,7 +2333,6 @@ dependencies = [
  "bcode_workflow",
  "bmux_plugin",
  "bmux_plugin_sdk",
- "clap",
  "libloading 0.9.0",
  "semver",
  "serde",
@@ -2590,8 +2553,6 @@ dependencies = [
  "bcode_agent_runtime",
  "bcode_bundled_plugins",
  "bcode_client",
- "bcode_code_review_models",
- "bcode_code_review_plugin",
  "bcode_command",
  "bcode_compressed_session_search_plugin",
  "bcode_config",
@@ -2599,7 +2560,6 @@ dependencies = [
  "bcode_default_agents_plugin",
  "bcode_fake_provider_plugin",
  "bcode_filesystem_plugin",
- "bcode_git_plugin",
  "bcode_hyperchad",
  "bcode_hyperchad_ui",
  "bcode_ipc",
@@ -2677,7 +2637,6 @@ dependencies = [
  "bcode_skill_models",
  "bmux_codec",
  "libc",
- "rusqlite",
  "serde",
  "serde_json",
  "sha2 0.10.9",
@@ -2708,7 +2667,6 @@ name = "bcode_session_import"
 version = "0.0.1-alpha.0"
 dependencies = [
  "serde",
- "serde_json",
 ]
 
 [[package]]
@@ -2763,7 +2721,6 @@ name = "bcode_session_view"
 version = "0.0.1-alpha.0"
 dependencies = [
  "bcode_client",
- "bcode_ipc",
  "bcode_plugin_sdk",
  "bcode_session",
  "bcode_session_models",
@@ -2779,7 +2736,6 @@ name = "bcode_session_view_models"
 version = "0.0.1-alpha.0"
 dependencies = [
  "bcode_session_models",
- "bcode_tool",
  "proptest",
  "serde",
  "serde_json",
@@ -2823,7 +2779,6 @@ dependencies = [
 name = "bcode_shell_plugin"
 version = "0.0.1-alpha.0"
 dependencies = [
- "base64 0.22.1",
  "bcode_agent_profile",
  "bcode_config",
  "bcode_plugin_sdk",
@@ -2856,7 +2811,6 @@ dependencies = [
  "bcode_tool",
  "proptest",
  "serde",
- "serde_json",
  "thiserror 2.0.20",
  "toml 1.1.4+spec-1.1.0",
 ]
@@ -2978,12 +2932,10 @@ dependencies = [
  "bcode_code_review_models",
  "bcode_command",
  "bcode_config",
- "bcode_default_agents_plugin",
  "bcode_filesystem_plugin",
  "bcode_git_plugin",
  "bcode_hello_plugin",
  "bcode_ipc",
- "bcode_loop_plugin",
  "bcode_markdown_render",
  "bcode_mermaid_render",
  "bcode_metrics",
@@ -2995,7 +2947,6 @@ dependencies = [
  "bcode_question_plugin",
  "bcode_ralph",
  "bcode_ralph_models",
- "bcode_server",
  "bcode_session_models",
  "bcode_session_search",
  "bcode_session_view",
@@ -3008,13 +2959,11 @@ dependencies = [
  "bcode_tui_components",
  "bcode_vim_edit_plugin",
  "bcode_workflow",
- "bcode_workflow_plugin",
  "bcode_workflow_store",
  "bcode_workflow_view_models",
  "bcode_worktree_models",
  "bmux_image",
  "bmux_keyboard",
- "bmux_terminal_grid",
  "bmux_text_edit",
  "bmux_tui",
  "bmux_tui_components",
@@ -3136,7 +3085,6 @@ dependencies = [
  "bcode_client",
  "bcode_command",
  "bcode_ipc",
- "bcode_plugin",
  "bcode_plugin_sdk",
  "bcode_session_models",
  "bcode_session_view_models",
@@ -3153,7 +3101,6 @@ dependencies = [
  "serde",
  "serde_json",
  "tokio",
- "toml 1.1.4+spec-1.1.0",
 ]
 
 [[package]]
@@ -3196,7 +3143,6 @@ dependencies = [
  "bcode_config",
  "bcode_plugin_sdk",
  "bcode_worktree_models",
- "serde",
  "tempfile",
  "thiserror 2.0.20",
  "worktree_setup_config",
@@ -12326,36 +12272,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "06794f8f6c5c898b3275aebefa6b8a1cb24cd2c6c79397ab15774837a0bc5755"
 dependencies = [
  "winapi-util",
-]
-
-[[package]]
-name = "test-log"
-version = "0.2.21"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9b9c218384242b5c89b68303ab6f6fc53a312d923f0c14dc6bb860c6aeee40f1"
-dependencies = [
- "test-log-macros",
-]
-
-[[package]]
-name = "test-log-core"
-version = "0.2.21"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c26ef8b00e4d382e59f6a8ddb3cd790b3a5bb29f21a358a9a69ea2f29f13f27b"
-dependencies = [
- "proc-macro2",
- "quote",
- "syn 2.0.119",
-]
-
-[[package]]
-name = "test-log-macros"
-version = "0.2.21"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "944ad38adcbb71eaa682c56bceeb079e4ca82b4b3edc2a0fde5cb297b77dac8d"
-dependencies = [
- "syn 2.0.119",
- "test-log-core",
 ]
 
 [[package]]

@@ -3713,7 +3713,9 @@ mod tests {
                 .await
                 .expect("event appends");
         }
-        assert_eq!(manager.pending_catalog_updates().await, 1);
+        // The worker may flush during the append loop; the invariant is at most
+        // one pending summary per session, not that the worker has not run yet.
+        assert!(manager.pending_catalog_updates().await <= 1);
         manager.flush_catalog_updates().await;
         let snapshot = metrics.snapshot();
         assert_eq!(

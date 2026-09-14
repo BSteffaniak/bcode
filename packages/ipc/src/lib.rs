@@ -1153,6 +1153,7 @@ pub enum Request {
         catalog: Box<bcode_model_catalog_models::CatalogDocument>,
     },
     /// Explicit bounded physical storage measurement; never loads session history.
+    // Keep existing positional wire tags stable.
     SessionStorageUsage {
         session_id: SessionId,
         entry_budget: u32,
@@ -2295,6 +2296,7 @@ pub enum ResponsePayload {
     SessionRepriced {
         report: Box<bcode_session_models::SessionRepriceReport>,
     },
+    // Binary enum tags are positional: append new responses to preserve v1 tags.
     SessionStorageUsage {
         usage: bcode_session_models::SessionStorageUsage,
     },

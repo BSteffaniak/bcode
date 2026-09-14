@@ -35,3 +35,7 @@ bundled-tesseract-v5-5-2 = ["bundled-tesseract-build"]
 default = []
 fail-on-warnings = []
 system-tesseract = []
+
+[package.metadata.cargo-machete]
+# The build script uses these dependencies; cargo-machete does not trace this build script.
+ignored = ["cmake", "pkg-config", "reqwest", "sha2", "toml", "zip"]

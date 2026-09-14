@@ -31,7 +31,6 @@ switchy = { workspace = true, features = [
     "async-tokio",
     "database-sqlite-rusqlite",
 ] }
-switchy_database = { workspace = true, features = ["cascade", "schema"] }
 tokio = { workspace = true, features = ["macros", "rt"] }
 
 [features]

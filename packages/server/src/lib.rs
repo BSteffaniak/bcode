@@ -64379,7 +64379,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
                 binding: None,
                 authored_provenance: None,
                 input: Some(serde_json::json!({"delay_ms": 5_000})),
-                execution_authority: None,
+                execution_authority: Some(test_workflow_execution_authority()),
                 created_at_ms: 1,
                 authorization_profile: bcode_workflow::WorkflowAuthorizationProfileIdentity {
                     version: 1,
@@ -66999,7 +66999,11 @@ event_symbol = "bcode_plugin_handle_event_v1"
         let root = tempfile::tempdir().expect("workflow root");
         let state = Arc::new(test_server_state_with_fake_provider_and_workflow_store(
             SessionManager::default(),
-            mutation_resolution_store(root.path(), None),
+            mutation_resolution_store_with_authority(
+                root.path(),
+                None,
+                Some(test_workflow_execution_authority()),
+            ),
         ));
         let socket_dir = tempfile::tempdir().expect("socket directory");
         let endpoint = bcode_ipc::IpcEndpoint::unix_socket(socket_dir.path().join("server.sock"));

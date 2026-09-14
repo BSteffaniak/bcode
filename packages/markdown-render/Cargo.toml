@@ -25,7 +25,6 @@ url                          = { workspace = true }
 
 [dev-dependencies]
 insta         = { workspace = true }
-test-log      = { workspace = true }
 unicode-width = { workspace = true }
 
 [features]
