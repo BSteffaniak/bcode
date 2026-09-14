@@ -7,6 +7,10 @@
 
 use std::fs::File;
 use std::io::{self, Read as _, Seek as _, Write as _};
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, Ordering},
+};
 
 const ACTIVE: &[u8] = b"BCSTDAEMON1:LIVE!";
 const CLEAN: &[u8] = b"BCSTDAEMON1:DONE!";
@@ -14,8 +18,8 @@ const CLEAN: &[u8] = b"BCSTDAEMON1:DONE!";
 /// A registered daemon. This guard must be installed before accepting content reads.
 #[derive(Debug)]
 pub struct StorageDaemonRegistration {
-    file: File,
-    failed: bool,
+    file: Arc<File>,
+    failed: Arc<AtomicBool>,
 }
 
 impl StorageDaemonRegistration {
@@ -31,51 +35,83 @@ impl StorageDaemonRegistration {
         file.write_all(ACTIVE)?;
         file.sync_all()?;
         Ok(Self {
-            file,
-            failed: false,
+            file: Arc::new(file),
+            failed: Arc::new(AtomicBool::new(false)),
         })
     }
 
-    /// Check whether a registry handle is this exact live, healthy registration.
-    /// The mutable borrow held by maintenance admission prevents health changes during its scope.
-    #[cfg(any(target_os = "macos", target_os = "linux"))]
-    pub(crate) fn acknowledges(&self, candidate: &File) -> io::Result<bool> {
-        use std::os::unix::fs::MetadataExt as _;
-        if self.failed {
-            return Ok(false);
-        }
-        let held = self.file.metadata()?;
-        let observed = candidate.metadata()?;
-        Ok(held.is_file()
-            && observed.is_file()
-            && held.nlink() == 1
-            && held.dev() == observed.dev()
-            && held.ino() == observed.ino())
-    }
-
     /// Mark this daemon unsafe for maintenance. No extra disk write is required: ACTIVE is durable.
-    pub const fn fail(&mut self) {
-        self.failed = true;
+    pub fn fail(&mut self) {
+        self.failed.store(true, Ordering::SeqCst);
     }
 
     /// Whether this daemon can acknowledge a coordinated health request.
     #[must_use]
-    pub const fn healthy(&self) -> bool {
-        !self.failed
+    pub fn healthy(&self) -> bool {
+        !self.failed.load(Ordering::SeqCst)
+    }
+
+    /// Obtain an owned liveness token for async maintenance; health is checked again by consumers.
+    ///
+    /// # Errors
+    /// Refuses a daemon that has observed tracking failure.
+    pub fn acknowledgement(&self) -> io::Result<StorageDaemonAcknowledgement> {
+        if !self.healthy() {
+            return Err(invalid());
+        }
+        Ok(StorageDaemonAcknowledgement {
+            file: Arc::clone(&self.file),
+            failed: Arc::clone(&self.failed),
+        })
     }
 
     /// Complete a healthy epoch only after all reads, access updates, and maintenance have drained.
     ///
     /// # Errors
     /// Returns an error for failed tracking or IO. Failed/crashed epochs retain ACTIVE permanently.
-    pub fn finish(mut self) -> io::Result<()> {
-        if self.failed {
+    pub fn finish(self) -> io::Result<()> {
+        if !self.healthy() {
             return Err(invalid());
         }
-        self.file.rewind()?;
-        self.file.write_all(CLEAN)?;
-        self.file.sync_all()?;
-        self.file.unlock()
+        let mut file = Arc::try_unwrap(self.file).map_err(|_| invalid())?;
+        file.rewind()?;
+        file.write_all(CLEAN)?;
+        file.sync_all()?;
+        file.unlock()
+    }
+}
+
+/// Owned live registration proof. Retaining it keeps the OS liveness lock held.
+/// Health failure invalidates every outstanding token; callers must recheck before publication.
+#[derive(Clone, Debug)]
+pub struct StorageDaemonAcknowledgement {
+    file: Arc<File>,
+    failed: Arc<AtomicBool>,
+}
+
+impl StorageDaemonAcknowledgement {
+    /// Validate that tracking has not failed since the token was obtained.
+    ///
+    /// # Errors
+    /// Returns an error after any tracking failure for this daemon.
+    pub fn check(&self) -> io::Result<()> {
+        if self.failed.load(Ordering::SeqCst) {
+            Err(invalid())
+        } else {
+            Ok(())
+        }
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    pub(crate) fn acknowledges(&self, candidate: &File) -> io::Result<bool> {
+        use std::os::unix::fs::MetadataExt as _;
+        self.check()?;
+        let held = self.file.metadata()?;
+        let observed = candidate.metadata()?;
+        Ok(held.nlink() == 1
+            && observed.is_file()
+            && held.dev() == observed.dev()
+            && held.ino() == observed.ino())
     }
 }
 

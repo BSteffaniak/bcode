@@ -18,6 +18,21 @@ pub struct AcknowledgedStorageMaintenance<'a> {
     _registration: &'a mut crate::storage_daemon_registration::StorageDaemonRegistration,
 }
 
+/// Transferable maintenance admission retaining both registry exclusion and daemon liveness.
+pub struct OwnedStorageMaintenance {
+    _admission: StorageMaintenanceAdmission,
+    acknowledgement: crate::storage_daemon_registration::StorageDaemonAcknowledgement,
+}
+impl OwnedStorageMaintenance {
+    /// Recheck live tracking health before a committed side effect.
+    ///
+    /// # Errors
+    /// Refuses tracking failures observed since admission.
+    pub fn check(&self) -> io::Result<()> {
+        self.acknowledgement.check()
+    }
+}
+
 /// Confined admission registry, opened from an already authorized state location.
 pub struct StorageAdmissionRegistry {
     directory: File,
@@ -120,10 +135,37 @@ impl StorageAdmissionRegistry {
         })
     }
 
+    /// Acquire transferable maintenance admission using an exact live registration token.
+    ///
+    /// # Errors
+    /// Rejects stale health, missing identity, foreign live daemons, dirty readers, or incomplete scans.
+    pub fn admit_owned(
+        &self,
+        entry_budget: usize,
+        acknowledgement: crate::storage_daemon_registration::StorageDaemonAcknowledgement,
+    ) -> io::Result<OwnedStorageMaintenance> {
+        let admission = self.admit_owned_checked(entry_budget, Some(&acknowledgement))?;
+        Ok(OwnedStorageMaintenance {
+            _admission: admission,
+            acknowledgement,
+        })
+    }
+
     fn admit_checked(
         &self,
         entry_budget: usize,
         registration: Option<&crate::storage_daemon_registration::StorageDaemonRegistration>,
+    ) -> io::Result<StorageMaintenanceAdmission> {
+        let acknowledgement = registration
+            .map(crate::storage_daemon_registration::StorageDaemonRegistration::acknowledgement)
+            .transpose()?;
+        self.admit_owned_checked(entry_budget, acknowledgement.as_ref())
+    }
+
+    fn admit_owned_checked(
+        &self,
+        entry_budget: usize,
+        registration: Option<&crate::storage_daemon_registration::StorageDaemonAcknowledgement>,
     ) -> io::Result<StorageMaintenanceAdmission> {
         if entry_budget == 0 || entry_budget > 65_536 {
             return Err(invalid());
@@ -504,6 +546,23 @@ mod tests {
         assert!(failed.finish().is_err());
         drop(registry);
         let registry = StorageAdmissionRegistry::open(root.path()).expect("restart");
+        assert!(registry.admit_maintenance(16).is_err());
+    }
+
+    #[test]
+    fn owned_acknowledgement_keeps_liveness_and_observes_health_failure() {
+        let root = tempfile::tempdir().expect("root");
+        let registry = StorageAdmissionRegistry::open(root.path()).expect("registry");
+        let mut daemon = registry.register_daemon(SessionId::new()).expect("daemon");
+        let admission = registry
+            .admit_owned(16, daemon.acknowledgement().expect("token"))
+            .expect("owned admission");
+        admission.check().expect("healthy");
+        daemon.fail();
+        assert!(admission.check().is_err());
+        drop(daemon);
+        assert!(registry.admit_read(SessionId::new()).is_err());
+        drop(admission);
         assert!(registry.admit_maintenance(16).is_err());
     }
 

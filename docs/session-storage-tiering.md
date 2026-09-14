@@ -554,6 +554,16 @@ record still permits canonical reads but marks its daemon unhealthy, refuses lat
 and remains a maintenance blocker after registry reopening. Startup registration failure and
 older-client participation are still unresolved, so production dispatch remains disabled.
 
+## Owned live acknowledgement
+
+Live daemon acknowledgement can now be transferred into owned asynchronous maintenance work. The
+token retains the liveness file lock and shares an atomic failure latch with its registration; a
+later failure invalidates every token. Clean shutdown refuses outstanding tokens rather than
+releasing liveness prematurely. Registry `admit_owned` validates exact file identity and returns an
+owned registry gate plus acknowledgement, whose health can be rechecked before publication. A test
+verifies failure propagation and lock retention after the original registration handle is dropped.
+The storage operations and worker still need to consume this owned admission; dispatch remains gated.
+
 ## Remaining implementation
 
 ### Access policy and scheduling
