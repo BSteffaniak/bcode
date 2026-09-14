@@ -418,6 +418,15 @@ waiter while its task holds session maintenance, verify a competing lease remain
 verify terminal cancellation releases ownership. This closes waiter-abandonment cancellation but
 does not enable dispatch or replace missing older-client/fallback compatibility coordination.
 
+## Typed reclamation capability outcomes
+
+Explicit reclamation now distinguishes no free pages, completed engine compaction, and the locked
+backend's known disabled-VACUUM refusal. The unsupported outcome includes measured reclaimable
+capacity rather than claiming it was reclaimed. Other backend, compatibility, ownership, and IO
+failures remain errors. The existing strict operation converts unsupported capability to an explicit
+unsupported error. Tests verify positive capacity accompanies the refusal and database bytes remain
+unchanged. This does not enable experimental VACUUM or complete actual space reclamation.
+
 ## Remaining implementation
 
 ### Access policy and scheduling

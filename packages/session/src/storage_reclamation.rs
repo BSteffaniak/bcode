@@ -7,6 +7,20 @@ use crate::db::{SessionDb, SessionDbError};
 use bcode_session_models::SessionId;
 use std::path::Path;
 
+/// Outcome of an explicit reclamation attempt. No outcome implies history repair or migration.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SessionReclamationOutcome {
+    /// The database has no whole free pages; no compaction was attempted.
+    NotNeeded,
+    /// The engine completed physical compaction.
+    Reclaimed(SessionReclamation),
+    /// The configured engine refuses compaction without an unsupported/experimental option.
+    BackendUnsupported {
+        /// Measured free-page capacity, not bytes already reclaimed.
+        reclaimable_bytes: u64,
+    },
+}
+
 /// Physical database lengths observed before and after explicit reclamation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SessionReclamation {
@@ -39,6 +53,32 @@ pub async fn reclaim_session_storage(
     root: &Path,
     id: SessionId,
 ) -> Result<SessionReclamation, SessionDbError> {
+    match try_reclaim_session_storage(root, id).await? {
+        SessionReclamationOutcome::Reclaimed(report) => Ok(report),
+        SessionReclamationOutcome::NotNeeded => {
+            let length = std::fs::metadata(root.join(id.to_string()).join("session.db"))?.len();
+            Ok(SessionReclamation {
+                before_bytes: length,
+                after_bytes: length,
+            })
+        }
+        SessionReclamationOutcome::BackendUnsupported { .. } => Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "configured session backend does not support space reclamation",
+        )
+        .into()),
+    }
+}
+
+/// Attempt reclamation while preserving a typed backend-capability result.
+///
+/// # Errors
+/// Returns ownership, compatibility, IO, or unexpected backend errors. Known disabled VACUUM
+/// capability is reported as `BackendUnsupported`, never as reclaimed space or a repair attempt.
+pub async fn try_reclaim_session_storage(
+    root: &Path,
+    id: SessionId,
+) -> Result<SessionReclamationOutcome, SessionDbError> {
     let root = root.to_path_buf();
     run_owned_reclamation(async move { reclaim_session_storage_owned(&root, id).await }).await
 }
@@ -56,7 +96,7 @@ async fn run_owned_reclamation<T: Send + 'static>(
 async fn reclaim_session_storage_owned(
     root: &Path,
     id: SessionId,
-) -> Result<SessionReclamation, SessionDbError> {
+) -> Result<SessionReclamationOutcome, SessionDbError> {
     let root = root.canonicalize()?;
     let directory = root.join(id.to_string());
     if !std::fs::symlink_metadata(&directory)?.is_dir()
@@ -85,18 +125,37 @@ async fn reclaim_session_storage_owned(
     .map_err(std::io::Error::other)?;
     let db = SessionDb::open_existing_turso_in_root(id, &root).await?;
     let before_bytes = std::fs::metadata(&path)?.len();
-    let result = db.reclaim_free_pages().await;
+    let capacity = db.reclaimable_bytes().await;
+    let result = match capacity {
+        Ok(0) => Ok(SessionReclamationOutcome::NotNeeded),
+        Ok(reclaimable_bytes) => match db.reclaim_free_pages().await {
+            Ok(()) => Ok(SessionReclamationOutcome::Reclaimed(SessionReclamation {
+                before_bytes,
+                after_bytes: 0,
+            })),
+            Err(error)
+                if error
+                    .to_string()
+                    .contains("VACUUM is an experimental feature") =>
+            {
+                Ok(SessionReclamationOutcome::BackendUnsupported { reclaimable_bytes })
+            }
+            Err(error) => Err(error),
+        },
+        Err(error) => Err(error),
+    };
     let closed = db.database().close().await;
     drop(db);
     // Both success and failure close the maintenance connection before releasing its lease.
     let after_bytes = std::fs::metadata(path).map(|metadata| metadata.len());
     drop(maintenance);
-    result?;
+    let mut outcome = result?;
     closed?;
-    Ok(SessionReclamation {
-        before_bytes,
-        after_bytes: after_bytes?,
-    })
+    let after_bytes = after_bytes?;
+    if let SessionReclamationOutcome::Reclaimed(report) = &mut outcome {
+        report.after_bytes = after_bytes;
+    }
+    Ok(outcome)
 }
 
 #[cfg(test)]
@@ -221,6 +280,12 @@ mod tests {
         let before = std::fs::read(&path).expect("before");
         // The locked backend disables experimental VACUUM. Preserve this refusal instead of
         // enabling an experimental storage feature implicitly or rewriting with another engine.
+        let outcome = try_reclaim_session_storage(root.path(), id)
+            .await
+            .expect("typed unsupported outcome");
+        assert!(
+            matches!(outcome, SessionReclamationOutcome::BackendUnsupported { reclaimable_bytes } if reclaimable_bytes >= 4 * 1024 * 1024)
+        );
         assert!(reclaim_session_storage(root.path(), id).await.is_err());
         assert_eq!(std::fs::read(&path).expect("after"), before);
         drop(crate::lease::acquire_session_maintenance_guard(root.path(), id).expect("released"));
