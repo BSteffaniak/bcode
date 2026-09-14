@@ -502,6 +502,27 @@ separate test downgrades a fixture's writer contract to epoch 9 and verifies com
 without altering the logical payload or epoch. These prove the offline history/reclamation path;
 they do not bypass the still-disabled dispatch gate or establish durable fallback coordination.
 
+## Reader compatibility differs from writer compatibility
+
+The full session suite confirms that bounded and complete history investigation intentionally remain
+available without writer-epoch compatibility or runtime leases. Do not impose writer equality on
+these read paths: a readable event representation is sufficient for investigation even when mutation
+is refused. A new regression verifies unsupported compressed-envelope versions reject history and
+canonical-page reads without rewriting bytes. The epoch-10 writer upgrade therefore cannot by
+itself prove that older binaries participate in access tracking; older-reader coordination remains
+an explicit unresolved activation requirement, not permission to weaken read availability.
+
+## Durable fallback blocker
+
+Admission failure now attempts an idempotent durable `unregistered-read.blocked` marker under the
+shared registry gate before returning the ordinary-read fallback. Complete maintenance registry
+scans reject this marker after restart; successful subsequent reads never clear it. Tests verify
+persistence, idempotency, ordinary-reader availability, and refusal while maintenance holds the gate.
+If even this marker cannot be persisted, the implementation still returns the ordinary-read fallback
+with a local failure latch; dispatch must therefore remain disabled until that last fallback case
+has a pre-established durable fence. This marker improves one path but does not complete fallback
+safety or older-client coordination.
+
 ## Remaining implementation
 
 ### Access policy and scheduling

@@ -11598,6 +11598,57 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn future_compressed_payload_is_rejected_without_rewriting_history() {
+        let root = tempfile::tempdir().expect("root");
+        let id = SessionId::new();
+        let db = SessionDb::open_turso_in_root(id, root.path())
+            .await
+            .expect("database");
+        let created = event(
+            id,
+            0,
+            SessionEventKind::SessionCreated {
+                name: Some("future representation".repeat(1000)),
+                working_directory: root.path().to_path_buf(),
+            },
+        );
+        db.append_event(&created).await.expect("event");
+        let logical = encode_session_event(&created).expect("json");
+        let compressed =
+            crate::event_compression::compress_event_payload(&logical, 1).expect("compressed");
+        let future = compressed.replacen("bcode-event-zstd:1:", "bcode-event-zstd:2:", 1);
+        assert_ne!(future, compressed);
+        db.database()
+            .update("events")
+            .value("payload", future.clone())
+            .where_eq("event_seq", 0)
+            .execute(db.database())
+            .await
+            .expect("fixture");
+        assert!(
+            db.history_page(SessionHistoryQuery {
+                cursor: None,
+                limit: 1,
+                direction: SessionHistoryDirection::Backward
+            })
+            .await
+            .is_err()
+        );
+        assert!(db.all_events().await.is_err());
+        assert!(db.canonical_rows_page(0, 1).await.is_err());
+        let row = db
+            .database()
+            .select("events")
+            .columns(&["payload"])
+            .where_eq("event_seq", 0)
+            .execute_first(db.database())
+            .await
+            .expect("query")
+            .expect("row");
+        assert_eq!(required_string(&row, "payload").expect("preserved"), future);
+    }
+
+    #[tokio::test]
     async fn compressed_canonical_payloads_preserve_bounded_history_and_migration_json() {
         let root = tempfile::tempdir().expect("root");
         let id = SessionId::new();

@@ -29,18 +29,25 @@ impl RegisteredStorageRead {
         {
             return None;
         }
-        Self::begin(root).await.map_or_else(
-            |_| {
-                state
-                    .storage_tracking_failed
-                    .store(true, std::sync::atomic::Ordering::SeqCst);
-                tracing::warn!(
-                    "storage read admission unavailable; automatic scheduling remains disabled"
-                );
-                None
-            },
-            Some,
-        )
+        let fallback_root = root.clone();
+        if let Ok(admission) = Self::begin(root).await {
+            return Some(admission);
+        }
+        state
+            .storage_tracking_failed
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let blocked = tokio::task::spawn_blocking(move || {
+            StorageAdmissionRegistry::open(&fallback_root)?.block_maintenance_for_fallback()
+        })
+        .await;
+        if matches!(blocked, Ok(Ok(()))) {
+            tracing::warn!("unregistered storage read durably disabled maintenance");
+        } else {
+            tracing::warn!(
+                "storage fallback fence unavailable; automatic scheduling remains disabled"
+            );
+        }
+        None
     }
 
     /// Persist access before completing admission. Failure leaves a durable dirty participant.

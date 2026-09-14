@@ -120,6 +120,27 @@ impl StorageAdmissionRegistry {
         admission.gate.unlock()
     }
 
+    /// Persist an idempotent state-location blocker for an unregistered read fallback.
+    ///
+    /// The shared gate refuses an active maintenance operation before the caller exposes content.
+    /// Subsequent exclusive scans reject this unknown participant name, including after restart.
+    /// The blocker is never automatically removed by successful reads or participant retirement.
+    ///
+    /// # Errors
+    /// Returns contention or IO errors. On failure the caller has no durable fallback proof.
+    pub fn block_maintenance_for_fallback(&self) -> io::Result<()> {
+        let gate = self.gate()?;
+        gate.try_lock_shared().map_err(io::Error::from)?;
+        let marker = open_child(
+            &self.directory,
+            c"unregistered-read.blocked",
+            libc::O_RDWR | libc::O_CREAT,
+        )?;
+        marker.sync_all()?;
+        self.directory.sync_all()?;
+        gate.unlock()
+    }
+
     /// Register a degraded reader without treating damaged participant state as clean.
     ///
     /// This marker is durable before content is exposed and is never automatically repaired.
@@ -345,6 +366,39 @@ mod tests {
                 .count(),
             3
         );
+    }
+
+    #[test]
+    fn durable_fallback_blocker_survives_restart_and_is_idempotent() {
+        let root = tempfile::tempdir().expect("root");
+        let registry = StorageAdmissionRegistry::open(root.path()).expect("registry");
+        registry.block_maintenance_for_fallback().expect("block");
+        registry.block_maintenance_for_fallback().expect("repeat");
+        assert!(registry.admit_maintenance(4096).is_err());
+        let id = SessionId::new();
+        let read = registry.admit_read(id).expect("read remains available");
+        registry.complete_read(id, read).expect("complete");
+        drop(registry);
+        let registry = StorageAdmissionRegistry::open(root.path()).expect("restart");
+        assert!(registry.admit_maintenance(4096).is_err());
+        assert!(
+            root.path()
+                .join("storage-admission-v1/unregistered-read.blocked")
+                .is_file()
+        );
+    }
+
+    #[test]
+    fn fallback_cannot_authorize_read_while_maintenance_is_active() {
+        let root = tempfile::tempdir().expect("root");
+        let registry = StorageAdmissionRegistry::open(root.path()).expect("registry");
+        let maintenance = registry.admit_maintenance(4096).expect("maintenance");
+        assert!(registry.block_maintenance_for_fallback().is_err());
+        drop(maintenance);
+        registry
+            .block_maintenance_for_fallback()
+            .expect("after maintenance");
+        assert!(registry.admit_maintenance(4096).is_err());
     }
 
     #[test]
