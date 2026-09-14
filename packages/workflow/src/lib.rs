@@ -21527,6 +21527,39 @@ steps:
     }
 
     #[test]
+    fn workflow_call_preview_resolves_deep_dependencies_without_stack_recursion() {
+        let mut document = authored_document();
+        document.bindings.clear();
+        let mut catalog = authoring_catalog();
+        let mut child = document.definition.clone();
+        for depth in 0..24 {
+            let identity =
+                WorkflowDefinitionIdentity::for_definition(format!("nested/{depth}"), &child)
+                    .expect("identity");
+            catalog
+                .workflow_definitions
+                .insert(identity.definition_id.clone(), child);
+            child = document.definition.clone();
+            let node = child.nodes.get_mut("agent").expect("agent");
+            node.kind = NodeKind::WorkflowCall;
+            node.resources.clear();
+            node.configuration = serde_json::to_value(WorkflowCallConfiguration {
+                version: WORKFLOW_CALL_VERSION,
+                target: WorkflowCallTarget::Definition { identity },
+                input: None,
+                output: None,
+            })
+            .expect("call");
+        }
+        document.definition = child;
+        let compiled = document
+            .compilation_preview(&catalog, None)
+            .compiled
+            .expect("deep preview");
+        assert!(!compiled.requirements.agents.is_empty());
+    }
+
+    #[test]
     fn workflow_call_preview_aggregates_child_requirements_effects_and_permissions() {
         let mut document = authored_document();
         document.bindings.clear();
