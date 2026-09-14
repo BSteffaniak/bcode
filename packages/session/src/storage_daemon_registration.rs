@@ -12,6 +12,7 @@ const ACTIVE: &[u8] = b"BCSTDAEMON1:LIVE!";
 const CLEAN: &[u8] = b"BCSTDAEMON1:DONE!";
 
 /// A registered daemon. This guard must be installed before accepting content reads.
+#[derive(Debug)]
 pub struct StorageDaemonRegistration {
     file: File,
     failed: bool,

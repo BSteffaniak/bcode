@@ -523,6 +523,17 @@ with a local failure latch; dispatch must therefore remain disabled until that l
 has a pre-established durable fence. This marker improves one path but does not complete fallback
 safety or older-client coordination.
 
+## Startup daemon fallback registration
+
+Startup now durably registers a daemon-specific ACTIVE record in the admission registry before
+launcher readiness/content requests. Registry enumeration recognizes daemon records and refuses
+active/abandoned registrations, while ordinary registered reads can coexist. A tracking failure
+cannot erase this already-durable evidence. The server conservatively leaves ACTIVE on shutdown
+until full runtime drain and live-health acknowledgement are integrated; consequently maintenance
+is still disabled rather than incorrectly trusting a clean shutdown. Startup registration failure
+still needs an externally established fallback fence. Tests verify clean explicit completion admits
+maintenance and failed completion survives registry reopening as a blocker.
+
 ## Remaining implementation
 
 ### Access policy and scheduling

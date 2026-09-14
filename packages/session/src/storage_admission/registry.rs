@@ -37,6 +37,32 @@ impl StorageAdmissionRegistry {
         Ok(Self { directory })
     }
 
+    /// Register daemon-lifetime liveness before serving content reads.
+    ///
+    /// Registration is serialized with maintenance admission. Active or abandoned daemon records
+    /// remain an explicit blocker until coordinated live acknowledgement or clean completion.
+    ///
+    /// # Errors
+    /// Returns lock contention, duplicate identity, unsafe paths or durability failures.
+    pub fn register_daemon(
+        &self,
+        identity: SessionId,
+    ) -> io::Result<crate::storage_daemon_registration::StorageDaemonRegistration> {
+        let gate = self.gate()?;
+        gate.try_lock_shared().map_err(io::Error::from)?;
+        let name = std::ffi::CString::new(format!("{identity}.daemon")).map_err(|_| invalid())?;
+        let file = open_child(
+            &self.directory,
+            &name,
+            libc::O_RDWR | libc::O_CREAT | libc::O_EXCL,
+        )?;
+        let registration =
+            crate::storage_daemon_registration::StorageDaemonRegistration::begin(file)?;
+        self.directory.sync_all()?;
+        gate.unlock()?;
+        Ok(registration)
+    }
+
     /// Admit one read using a caller-owned stable participant identity.
     ///
     /// Reuse a participant only after its prior operation finishes. Independent participants may
@@ -76,6 +102,16 @@ impl StorageAdmissionRegistry {
                 continue;
             }
             let text = name.to_str().ok_or_else(invalid)?;
+            if let Some(id) = text.strip_suffix(".daemon") {
+                id.parse::<SessionId>().map_err(|_| invalid())?;
+                let name = std::ffi::CString::new(name.as_bytes()).map_err(|_| invalid())?;
+                if !crate::storage_daemon_registration::daemon_registration_is_complete(
+                    open_child(&self.directory, &name, libc::O_RDONLY)?,
+                )? {
+                    return Err(invalid());
+                }
+                continue;
+            }
             let id = text.strip_suffix(".participant").ok_or_else(invalid)?;
             id.parse::<SessionId>().map_err(|_| invalid())?;
             let name = std::ffi::CString::new(name.as_bytes()).map_err(|_| invalid())?;
@@ -399,6 +435,29 @@ mod tests {
             .block_maintenance_for_fallback()
             .expect("after maintenance");
         assert!(registry.admit_maintenance(4096).is_err());
+    }
+
+    #[test]
+    fn daemon_registration_blocks_scan_until_clean_completion_and_survives_failure() {
+        let root = tempfile::tempdir().expect("root");
+        let registry = StorageAdmissionRegistry::open(root.path()).expect("registry");
+        let daemon = registry.register_daemon(SessionId::new()).expect("daemon");
+        assert!(registry.admit_maintenance(16).is_err());
+        let read_id = SessionId::new();
+        let read = registry.admit_read(read_id).expect("reads coexist");
+        registry
+            .complete_read(read_id, read)
+            .expect("complete read");
+        daemon.finish().expect("healthy drained daemon");
+        drop(registry.admit_maintenance(16).expect("clean scan"));
+        let mut failed = registry
+            .register_daemon(SessionId::new())
+            .expect("second daemon");
+        failed.fail();
+        assert!(failed.finish().is_err());
+        drop(registry);
+        let registry = StorageAdmissionRegistry::open(root.path()).expect("restart");
+        assert!(registry.admit_maintenance(16).is_err());
     }
 
     #[test]

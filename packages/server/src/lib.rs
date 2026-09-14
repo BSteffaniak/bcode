@@ -328,6 +328,8 @@ pub struct ServerState {
     pub sessions: SessionManager,
     storage_worker: storage_maintenance_worker::StorageMaintenanceWorker,
     storage_tracking_failed: std::sync::atomic::AtomicBool,
+    storage_daemon_registration:
+        StdMutex<Option<bcode_session::storage_daemon_registration::StorageDaemonRegistration>>,
     session_migrations: bcode_session_migration::SessionMigrationService,
     pub session_catalog: Arc<session_catalog::SessionCatalog>,
     pub plugins: bcode_plugin::PluginRuntimeHost,
@@ -1905,6 +1907,7 @@ impl ServerState {
             sessions,
             storage_worker: storage_maintenance_worker::StorageMaintenanceWorker::default(),
             storage_tracking_failed: std::sync::atomic::AtomicBool::new(false),
+            storage_daemon_registration: StdMutex::new(None),
             session_migrations,
             session_catalog: Arc::new(session_catalog::SessionCatalog::default()),
             plugins,
@@ -4752,6 +4755,23 @@ async fn run_constructed_server(
         total_elapsed_ms = startup_started_at.elapsed().as_millis(),
         "server ready; accepting clients"
     );
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    if let Some(root) = state.sessions.session_store_root() {
+        let registered = tokio::task::spawn_blocking(move || {
+            bcode_session::storage_admission::StorageAdmissionRegistry::open(&root)?
+                .register_daemon(SessionId::new())
+        })
+        .await;
+        if let Ok(Ok(registration)) = registered {
+            *state
+                .storage_daemon_registration
+                .lock()
+                .expect("storage registration lock") = Some(registration);
+        } else {
+            state.storage_tracking_failed.store(true, Ordering::SeqCst);
+            tracing::warn!("storage daemon registration unavailable; maintenance is disabled");
+        }
+    }
     state.storage_worker.start(Arc::clone(&state)).await;
     bcode_daemon_lifecycle::notify_launcher_ready();
     let mut clients = JoinSet::new();
@@ -4855,6 +4875,11 @@ async fn shutdown_constructed_server(
             writer_failed = metrics_status.writer_failed,
             "metrics persistence stopped with degraded telemetry"
         );
+    }
+    // Conservatively retain ACTIVE at shutdown until every runtime/provider task has a proved
+    // drain contract. Dropping the registration releases liveness but never cleans failure evidence.
+    if let Ok(mut registration) = state.storage_daemon_registration.lock() {
+        registration.take();
     }
     let record_removal = state.daemon_record_path.as_ref().map_or(Ok(()), |path| {
         bcode_daemon_lifecycle::remove_record_if_instance(path, &state.daemon_status.instance_id)
