@@ -1771,6 +1771,38 @@ impl SessionDb {
             }))
     }
 
+    pub(crate) async fn reclaim_free_pages(&self) -> SessionDbResult<()> {
+        if self.reclaimable_bytes().await? == 0 {
+            return Ok(());
+        }
+        self.db.exec_raw("VACUUM").await?;
+        Ok(())
+    }
+
+    /// Return free database-page bytes available for explicit physical reclamation.
+    ///
+    /// This does not include slack inside live pages or external artifacts. It is not a promise
+    /// that the configured backend supports compaction, nor a mutation or canonical validity check.
+    ///
+    /// # Errors
+    /// Rejects incompatible storage, malformed engine statistics, overflow and database failures.
+    pub async fn reclaimable_bytes(&self) -> SessionDbResult<u64> {
+        validate_storage_writer_contract(&**self.db).await?;
+        let free = self.db.query_raw("PRAGMA freelist_count").await?;
+        let size = self.db.query_raw("PRAGMA page_size").await?;
+        let free = free.first().ok_or_else(|| SessionDbError::InvalidRow {
+            column: "freelist_count".into(),
+        })?;
+        let size = size.first().ok_or_else(|| SessionDbError::InvalidRow {
+            column: "page_size".into(),
+        })?;
+        required_non_negative_u64(free, "freelist_count")?
+            .checked_mul(required_non_negative_u64(size, "page_size")?)
+            .ok_or_else(|| SessionDbError::InvalidRow {
+                column: "reclaimable_bytes".into(),
+            })
+    }
+
     /// Return the session id owned by this database.
     #[must_use]
     pub const fn session_id(&self) -> SessionId {
@@ -1947,39 +1979,14 @@ impl SessionDb {
     ///
     /// # Errors
     ///
-    /// Returns an error when the query fails or a row is malformed.
+    /// Returns an error when the query fails or a row is malformed. Pages may contain fewer than
+    /// `limit` rows to respect the decoded-byte allowance; continue from the last sequence.
     pub async fn canonical_rows_page(
         &self,
         start_sequence: u64,
         limit: usize,
     ) -> SessionDbResult<Vec<bcode_session_migration_target::CanonicalRow>> {
-        self.db
-            .select("events")
-            .columns(&["event_seq", "event_type", "schema_version", "payload"])
-            .where_gte("event_seq", seq_to_value(start_sequence))
-            .sort("event_seq", SortDirection::Asc)
-            .limit(limit)
-            .execute(&**self.db)
-            .await?
-            .iter()
-            .map(|row| {
-                Ok(bcode_session_migration_target::CanonicalRow {
-                    sequence: required_non_negative_u64(row, "event_seq")?,
-                    event_kind: required_string(row, "event_type")?,
-                    schema_version: u16::try_from(required_non_negative_u64(
-                        row,
-                        "schema_version",
-                    )?)
-                    .map_err(|_| SessionDbError::InvalidRow {
-                        column: "schema_version".to_owned(),
-                    })?,
-                    payload: crate::event_compression::decode_event_payload(&required_string(
-                        row, "payload",
-                    )?)?
-                    .into_owned(),
-                })
-            })
-            .collect()
+        read_canonical_payload_page(&**self.db, start_sequence, limit).await
     }
 
     /// Inspect this database's durable storage compatibility without mutating it.
@@ -3541,6 +3548,84 @@ async fn run_session_migrations(db: &dyn Database) -> Result<(), MigrationError>
     runner.run(db).await
 }
 
+const CANONICAL_PAGE_DECODED_BYTES: usize = 32 * 1024 * 1024;
+
+async fn canonical_payload_fetch_limit(
+    db: &dyn Database,
+    start: u64,
+    limit: usize,
+) -> SessionDbResult<usize> {
+    // Numeric inputs only. A bounded metadata query avoids materializing every selected payload
+    // just to discover that its aggregate physical size exceeds the page allowance.
+    let rows = db.query_raw(&format!("SELECT length(CAST(payload AS BLOB)) AS payload_bytes FROM events WHERE event_seq >= {start} ORDER BY event_seq ASC LIMIT {}", limit.min(MIGRATION_EVENT_PAGE_SIZE))).await?;
+    let mut remaining = CANONICAL_PAGE_DECODED_BYTES as u64;
+    let mut count = 0;
+    for row in rows {
+        let bytes = required_non_negative_u64(&row, "payload_bytes")?;
+        if bytes > remaining {
+            if count == 0 {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::OutOfMemory,
+                    "canonical row exceeds physical page budget",
+                )
+                .into());
+            }
+            break;
+        }
+        remaining -= bytes;
+        count += 1;
+    }
+    Ok(count)
+}
+
+async fn read_canonical_payload_page(
+    db: &dyn Database,
+    start_sequence: u64,
+    limit: usize,
+) -> SessionDbResult<Vec<bcode_session_migration_target::CanonicalRow>> {
+    if limit == 0 || start_sequence > i64::MAX as u64 {
+        return Ok(Vec::new());
+    }
+    let mut remaining = CANONICAL_PAGE_DECODED_BYTES;
+    let mut result = Vec::new();
+    let fetch_limit = canonical_payload_fetch_limit(db, start_sequence, limit).await?;
+    if fetch_limit == 0 {
+        return Ok(Vec::new());
+    }
+    let rows = db
+        .select("events")
+        .columns(&["event_seq", "event_type", "schema_version", "payload"])
+        .where_gte("event_seq", seq_to_value(start_sequence))
+        .sort("event_seq", SortDirection::Asc)
+        .limit(fetch_limit)
+        .execute(db)
+        .await?;
+    for row in rows {
+        let stored = required_string(&row, "payload")?;
+        let payload =
+            match crate::event_compression::decode_event_payload_with_limit(&stored, remaining) {
+                Ok(payload) => payload.into_owned(),
+                Err(error)
+                    if error.kind() == std::io::ErrorKind::OutOfMemory && !result.is_empty() =>
+                {
+                    break;
+                }
+                Err(error) => return Err(error.into()),
+            };
+        remaining -= payload.len();
+        result.push(bcode_session_migration_target::CanonicalRow {
+            sequence: required_non_negative_u64(&row, "event_seq")?,
+            event_kind: required_string(&row, "event_type")?,
+            schema_version: u16::try_from(required_non_negative_u64(&row, "schema_version")?)
+                .map_err(|_| SessionDbError::InvalidRow {
+                    column: "events.schema_version".to_owned(),
+                })?,
+            payload,
+        });
+    }
+    Ok(result)
+}
+
 async fn build_target_migration_receipt(
     db: &dyn Database,
     session_id: SessionId,
@@ -3549,38 +3634,63 @@ async fn build_target_migration_receipt(
     migration_outcome: &MigrationReplayOutcome,
     builder: &bcode_session_migration_target::MigrationReceiptBuilder,
 ) -> SessionDbResult<bcode_session_migration_target::MigrationReceipt> {
-    let rows = db
-        .select("events")
-        .columns(&["event_seq", "payload"])
-        .sort("event_seq", SortDirection::Asc)
-        .execute(db)
-        .await?;
-    let event_count = u64::try_from(rows.len()).unwrap_or(u64::MAX);
-    let event_tail = rows
-        .last()
-        .map(|row| required_non_negative_u64(row, "event_seq"))
-        .transpose()?;
-    let mut digest = Sha256::new();
-    for row in &rows {
-        let payload = required_string(row, "payload")?;
-        digest.update(
-            u64::try_from(payload.len())
-                .unwrap_or(u64::MAX)
-                .to_le_bytes(),
-        );
-        digest.update(payload.as_bytes());
-    }
+    let (event_count, event_tail, target_payload_digest_sha256) =
+        migration_payload_digest(db).await?;
     builder(bcode_session_migration_target::MigrationReceiptFacts {
         operation_id: operation_id.map(|id| id.to_string()),
         session_id,
         source_writer_epoch,
         event_count,
         event_tail,
-        target_payload_digest_sha256: format!("{:x}", digest.finalize()),
+        target_payload_digest_sha256,
         replay: migration_outcome.evidence.clone(),
         completed_at_ms: bcode_session_models::current_unix_timestamp_ms(),
     })
     .map_err(|reason| SessionDbError::MigrationHistoryIncompatible { reason })
+}
+
+// Receipt identity covers logical JSON, not its physical compression envelope. Page the explicit
+// maintenance traversal so receipt construction does not materialize the full canonical history.
+async fn migration_payload_digest(
+    db: &dyn Database,
+) -> SessionDbResult<(u64, Option<u64>, String)> {
+    let mut event_count = 0_u64;
+    let mut event_tail = None;
+    let mut digest = Sha256::new();
+    loop {
+        let mut query = db
+            .select("events")
+            .columns(&["event_seq", "payload"])
+            .sort("event_seq", SortDirection::Asc)
+            .limit(MIGRATION_EVENT_PAGE_SIZE);
+        if let Some(tail) = event_tail {
+            query = query.where_gt("event_seq", seq_to_value(tail));
+        }
+        let rows = query.execute(db).await?;
+        if rows.is_empty() {
+            break;
+        }
+        for row in rows {
+            let sequence = required_non_negative_u64(&row, "event_seq")?;
+            if sequence != event_count {
+                return Err(SessionDbError::InvalidCanonicalSequence {
+                    expected: event_count,
+                    actual: sequence,
+                });
+            }
+            let stored = required_string(&row, "payload")?;
+            let payload = crate::event_compression::decode_event_payload(&stored)?;
+            digest.update(
+                u64::try_from(payload.len())
+                    .unwrap_or(u64::MAX)
+                    .to_le_bytes(),
+            );
+            digest.update(payload.as_bytes());
+            event_count += 1;
+            event_tail = Some(sequence);
+        }
+    }
+    Ok((event_count, event_tail, format!("{:x}", digest.finalize())))
 }
 
 async fn set_storage_writer_contract(db: &dyn Database, writer_epoch: u32) -> SessionDbResult<()> {
@@ -4034,34 +4144,7 @@ impl bcode_session_migration_target::MigrationTarget for SessionMigrationTarget<
         start_sequence: u64,
         limit: usize,
     ) -> Result<Vec<bcode_session_migration_target::CanonicalRow>, Self::Error> {
-        let rows = self
-            .db
-            .select("events")
-            .columns(&["event_seq", "event_type", "schema_version", "payload"])
-            .where_gte("event_seq", seq_to_value(start_sequence))
-            .sort("event_seq", SortDirection::Asc)
-            .limit(limit.min(MIGRATION_EVENT_PAGE_SIZE))
-            .execute(self.db)
-            .await?;
-        rows.into_iter()
-            .map(|row| {
-                Ok(bcode_session_migration_target::CanonicalRow {
-                    sequence: required_non_negative_u64(&row, "event_seq")?,
-                    event_kind: required_string(&row, "event_type")?,
-                    schema_version: u16::try_from(required_non_negative_u64(
-                        &row,
-                        "schema_version",
-                    )?)
-                    .map_err(|_| SessionDbError::InvalidRow {
-                        column: "events.schema_version".to_owned(),
-                    })?,
-                    payload: crate::event_compression::decode_event_payload(&required_string(
-                        &row, "payload",
-                    )?)?
-                    .into_owned(),
-                })
-            })
-            .collect()
+        read_canonical_payload_page(self.db, start_sequence, limit).await
     }
 
     async fn replace_canonical_row(
@@ -11090,6 +11173,125 @@ mod tests {
                 .1,
             bytes[262_140..262_220]
         );
+    }
+
+    #[tokio::test]
+    async fn canonical_page_cursor_past_sql_integer_range_does_not_repeat_tail() {
+        let root = tempfile::tempdir().expect("root");
+        let id = SessionId::new();
+        let db = SessionDb::open_turso_in_root(id, root.path())
+            .await
+            .expect("db");
+        db.database()
+            .insert("events")
+            .value("event_seq", i64::MAX)
+            .value("event_type", "fixture")
+            .value("schema_version", 1)
+            .value("payload", "{}")
+            .execute(db.database())
+            .await
+            .expect("fixture");
+        let page = db
+            .canonical_rows_page(i64::MAX as u64, 3)
+            .await
+            .expect("tail");
+        assert_eq!(page.len(), 1);
+        assert!(
+            db.canonical_rows_page(i64::MAX as u64 + 1, 3)
+                .await
+                .expect("past tail")
+                .is_empty()
+        );
+        assert!(
+            db.canonical_rows_page(0, 0)
+                .await
+                .expect("zero page")
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn canonical_pages_stop_before_exceeding_decoded_budget_and_resume() {
+        let root = tempfile::tempdir().expect("root");
+        let id = SessionId::new();
+        let db = SessionDb::open_turso_in_root(id, root.path())
+            .await
+            .expect("database");
+        let logical = serde_json::json!({"text": "x".repeat(12 * 1024 * 1024)}).to_string();
+        let compressed =
+            crate::event_compression::compress_event_payload(&logical, 1).expect("compress");
+        for sequence in 0..3 {
+            db.database()
+                .insert("events")
+                .value("event_seq", sequence)
+                .value("event_type", "fixture")
+                .value("schema_version", 1)
+                .value("payload", compressed.clone())
+                .execute(db.database())
+                .await
+                .expect("fixture");
+        }
+        let first = db.canonical_rows_page(0, 3).await.expect("first page");
+        assert_eq!(first.len(), 2);
+        assert!(
+            first.iter().map(|row| row.payload.len()).sum::<usize>()
+                <= CANONICAL_PAGE_DECODED_BYTES
+        );
+        let next = first.last().expect("last").sequence + 1;
+        drop(first);
+        let second = db.canonical_rows_page(next, 3).await.expect("second page");
+        assert_eq!(second.len(), 1);
+        assert_eq!(second[0].sequence, 2);
+        assert_eq!(second[0].payload, logical);
+        assert!(db.canonical_rows_page(3, 3).await.expect("end").is_empty());
+    }
+
+    #[tokio::test]
+    async fn migration_digest_is_storage_neutral_and_rejects_sequence_damage() {
+        let root = tempfile::tempdir().expect("root");
+        let id = SessionId::new();
+        let db = SessionDb::open_turso_in_root(id, root.path())
+            .await
+            .expect("db");
+        let mut expected = Sha256::new();
+        for sequence in 0..u64::try_from(MIGRATION_EVENT_PAGE_SIZE + 3).expect("bound") {
+            let logical = serde_json::json!({"sequence": sequence, "private_evidence": "preserve all fields ".repeat(100)}).to_string();
+            expected.update((logical.len() as u64).to_le_bytes());
+            expected.update(logical.as_bytes());
+            let payload = if sequence % 2 == 0 {
+                crate::event_compression::compress_event_payload(&logical, 1).expect("compress")
+            } else {
+                logical
+            };
+            db.database()
+                .insert("events")
+                .value("event_seq", seq_to_value(sequence))
+                .value("event_type", "fixture")
+                .value("schema_version", 1)
+                .value("payload", payload)
+                .execute(db.database())
+                .await
+                .expect("fixture");
+        }
+        let (count, tail, actual) = migration_payload_digest(db.database())
+            .await
+            .expect("digest");
+        assert_eq!(count, (MIGRATION_EVENT_PAGE_SIZE + 3) as u64);
+        assert_eq!(tail, Some(count - 1));
+        assert_eq!(actual, format!("{:x}", expected.finalize()));
+        db.database()
+            .delete("events")
+            .where_eq("event_seq", 1)
+            .execute(db.database())
+            .await
+            .expect("damage");
+        assert!(matches!(
+            migration_payload_digest(db.database()).await,
+            Err(SessionDbError::InvalidCanonicalSequence {
+                expected: 1,
+                actual: 2
+            })
+        ));
     }
 
     #[tokio::test]

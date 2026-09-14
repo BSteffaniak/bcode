@@ -369,6 +369,55 @@ as event JSON. A database integration test stores a compressed fixture payload a
 history, around-sequence navigation, and canonical-row JSON equivalence while the stored payload
 remains compressed. Production history compression writes and epoch migration are still not enabled.
 
+## Database reclamation backend blocker
+
+An explicit session-owned reclamation operation acquires maintenance ownership, validates the
+current writer contract, asks the database backend to VACUUM, closes its connection, and reports main
+file lengths. It never copies canonical history or edits engine sidecars. The currently locked Turso
+backend rejects this operation with `VACUUM is an experimental feature. Enable with
+--experimental-vacuum flag`. Bcode does not implicitly enable that experimental feature.
+Tests verify this refusal preserves database bytes and releases maintenance ownership. Therefore
+actual database-space reclamation is **not available** through the current backend configuration;
+a supported backend capability or explicitly reviewed persistence change is still required.
+
+## Reclaimable capacity accounting
+
+The session database now measures free-page capacity through backend `freelist_count` and
+`page_size` statistics, validating the writer contract and checked byte arithmetic. Explicit
+reclamation skips VACUUM when no free pages exist. Before/after main-file measurements are taken
+while maintenance ownership is still held, avoiding a new writer racing the reported result.
+A test creates and frees a MiB of fixture storage and verifies positive reclaimable capacity.
+Inspection of the locked dependency confirmed Turso exposes only `experimental_vacuum`, and
+Switchy's current database builder does not expose it. Actual compaction remains unsupported by
+the configured backend; capacity measurement is not reported as space already reclaimed.
+
+## Reclamation waiter cancellation
+
+Reclamation now runs in an owned task that retains its maintenance guard and database connection
+through close even when the caller drops/cancels its waiter. A regression aborts the waiter while
+maintenance is held, proves another lease is refused, then permits completion and verifies a new
+owner can acquire the session. This is completion safety, not durable resumability or mid-VACUUM
+cancellation; the configured backend still refuses experimental VACUUM when free pages exist.
+
+## Expanded production admission coverage
+
+Artifact range reads, full/recent/projection-window attachment, and model request context construction
+now attempt registered admission before consuming content, and retire only after the corresponding
+access timestamp is persisted. Attachment tracking was moved into the application operation rather
+than duplicated in response-formatting helpers. Artifact blocking tasks continue holding session
+ownership on cancellation; abandoned admission remains dirty, preventing age-based publication.
+Admission failure still falls back to ordinary reads with only a local failure latch, so durable
+fallback registration and older-client compatibility remain blockers to enabling dispatch.
+
+## Abandoned artifact-conversion waiters
+
+Dropping the async waiter now requests cancellation of blocking artifact conversion automatically.
+The blocking task retains maintenance and registry admission until it returns; completion disarms the
+waiter guard so successful work does not poison a caller's shared cancellation token. Tests abort a
+waiter while its task holds session maintenance, verify a competing lease remains refused, and then
+verify terminal cancellation releases ownership. This closes waiter-abandonment cancellation but
+does not enable dispatch or replace missing older-client/fallback compatibility coordination.
+
 ## Remaining implementation
 
 ### Access policy and scheduling

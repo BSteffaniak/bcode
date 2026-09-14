@@ -45,12 +45,24 @@ impl RegisteredStorageRead {
 
     /// Persist access before completing admission. Failure leaves a durable dirty participant.
     pub async fn finish_history(self, state: &super::ServerState, session_id: SessionId) {
+        self.finish_consumption(
+            state,
+            session_id,
+            bcode_session::storage_access::StorageAccessKind::History,
+        )
+        .await;
+    }
+
+    /// Persist the category's access timestamp before retiring a successful read participant.
+    pub async fn finish_consumption(
+        self,
+        state: &super::ServerState,
+        session_id: SessionId,
+        kind: bcode_session::storage_access::StorageAccessKind,
+    ) {
         if state
             .sessions
-            .record_storage_access(
-                session_id,
-                bcode_session::storage_access::StorageAccessKind::History,
-            )
+            .record_storage_access(session_id, kind)
             .await
             .is_ok()
         {

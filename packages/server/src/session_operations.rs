@@ -40,10 +40,21 @@ pub async fn attach_recent(
     client_id: bcode_session_models::ClientId,
     limit: usize,
 ) -> Result<bcode_session::SessionAttachment, bcode_session::SessionError> {
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    let admission =
+        super::storage_read_admission::RegisteredStorageRead::for_session(state, session_id).await;
     let attachment = state
         .sessions
         .attach_session_recent(session_id, client_id, limit)
         .await?;
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    if let Some(admission) = admission {
+        admission.finish_history(state, session_id).await;
+    } else {
+        record_history_access(state, session_id).await;
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    record_history_access(state, session_id).await;
     state.complete_session_namespace_attach(session_id).await;
     Ok(attachment)
 }
@@ -58,10 +69,21 @@ pub async fn attach_projection_window(
     client_id: bcode_session_models::ClientId,
     request: bcode_session_models::ProjectionWindowRequest,
 ) -> Result<bcode_session::SessionProjectionWindowAttachment, bcode_session::SessionError> {
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    let admission =
+        super::storage_read_admission::RegisteredStorageRead::for_session(state, session_id).await;
     let attachment = state
         .sessions
         .attach_session_projection_window(session_id, client_id, request)
         .await?;
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    if let Some(admission) = admission {
+        admission.finish_history(state, session_id).await;
+    } else {
+        record_history_access(state, session_id).await;
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    record_history_access(state, session_id).await;
     state.complete_session_namespace_attach(session_id).await;
     Ok(attachment)
 }
@@ -90,11 +112,21 @@ pub async fn attach(
         .await
         .1
         .map_err(AttachError::Namespace)?;
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    let admission =
+        super::storage_read_admission::RegisteredStorageRead::for_session(state, session_id).await;
     let attachment = state
         .sessions
         .attach_session(session_id, client_id)
         .await
         .map_err(AttachError::Session)?;
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    if let Some(admission) = admission {
+        admission.finish_history(state, session_id).await;
+    } else {
+        record_history_access(state, session_id).await;
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
     record_history_access(state, session_id).await;
     state.complete_session_namespace_attach(session_id).await;
     super::restore_active_skills_from_history(&attachment.history, state, session_id).await;

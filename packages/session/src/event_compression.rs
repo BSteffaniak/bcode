@@ -14,6 +14,13 @@ const VERSION: &str = "1";
 /// Maximum expanded payload accepted by this envelope, independent of untrusted advertised sizes.
 pub const MAX_COMPRESSED_EVENT_BYTES: usize = 16 * 1024 * 1024;
 
+fn payload_budget_exceeded() -> io::Error {
+    io::Error::new(
+        io::ErrorKind::OutOfMemory,
+        "session payload exceeds decoded byte budget",
+    )
+}
+
 fn invalid() -> io::Error {
     io::Error::new(
         io::ErrorKind::InvalidData,
@@ -54,7 +61,26 @@ pub fn compress_event_payload(payload: &str, level: i32) -> io::Result<String> {
 /// Returns an error for malformed/future envelopes, oversized content, checksum, UTF-8, or codec
 /// failures. Never repairs or substitutes an older interpretation.
 pub fn decode_event_payload(payload: &str) -> io::Result<Cow<'_, str>> {
+    decode_event_payload_with_limit(payload, usize::MAX)
+}
+
+/// Decode a payload with a caller-supplied logical-byte allowance.
+///
+/// This applies the allowance to raw JSON as well as compressed representations. Compressed
+/// lengths are checked before allocating or decoding, so aggregate page budgets can constrain
+/// expansion rather than checking memory usage only after it has occurred.
+///
+/// # Errors
+/// Returns `OutOfMemory` when the logical length exceeds the allowance; otherwise returns the
+/// same corruption, compatibility, and codec errors as [`decode_event_payload`].
+pub fn decode_event_payload_with_limit(
+    payload: &str,
+    max_bytes: usize,
+) -> io::Result<Cow<'_, str>> {
     let Some(envelope) = payload.strip_prefix(PREFIX) else {
+        if payload.len() > max_bytes {
+            return Err(payload_budget_exceeded());
+        }
         return Ok(Cow::Borrowed(payload));
     };
     let mut fields = envelope.splitn(4, ':');
@@ -69,6 +95,9 @@ pub fn decode_event_payload(payload: &str) -> io::Result<Cow<'_, str>> {
         .ok_or_else(invalid)?
         .parse::<usize>()
         .map_err(|_| invalid())?;
+    if length > max_bytes {
+        return Err(payload_budget_exceeded());
+    }
     let checksum = fields.next().ok_or_else(invalid)?;
     let encoded = fields.next().ok_or_else(invalid)?;
     if length > MAX_COMPRESSED_EVENT_BYTES
@@ -98,6 +127,25 @@ pub fn decode_event_payload(payload: &str) -> io::Result<Cow<'_, str>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn caller_budget_limits_raw_and_compressed_expansion_before_decoding() {
+        let raw = serde_json::json!({"text": "repeat".repeat(10_000)}).to_string();
+        let compressed = compress_event_payload(&raw, 1).expect("compress");
+        for payload in [&raw, &compressed] {
+            assert_eq!(
+                decode_event_payload_with_limit(payload, raw.len()).expect("exact budget"),
+                raw
+            );
+            assert_eq!(
+                decode_event_payload_with_limit(payload, raw.len() - 1)
+                    .expect_err("over budget")
+                    .kind(),
+                io::ErrorKind::OutOfMemory
+            );
+        }
+        assert_eq!(decode_event_payload_with_limit("", 0).expect("empty"), "");
+    }
 
     #[test]
     fn preserves_exact_json_and_private_fields_at_both_levels() {

@@ -11217,6 +11217,9 @@ async fn read_session_artifact_range(
         .acquire_session_ownership(session_id, bcode_session::SessionOwnershipKind::RuntimeWork)
         .await
         .map_err(|error| error.to_string())?;
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    let admission =
+        storage_read_admission::RegisteredStorageRead::for_session(state, session_id).await;
     let range = read_session_artifact_range_untracked(
         state,
         session_id,
@@ -11227,6 +11230,24 @@ async fn read_session_artifact_range(
         ownership.clone(),
     )
     .await?;
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    if let Some(admission) = admission {
+        admission
+            .finish_consumption(
+                state,
+                session_id,
+                bcode_session::storage_access::StorageAccessKind::Artifact,
+            )
+            .await;
+    } else {
+        session_operations::record_consumption(
+            state,
+            session_id,
+            bcode_session::storage_access::StorageAccessKind::Artifact,
+        )
+        .await;
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
     session_operations::record_consumption(
         state,
         session_id,
@@ -12705,7 +12726,6 @@ async fn finish_attach_session_projection_window_success(
 ) -> Result<(), ServerError> {
     let projection_window = window_attachment.projection_window;
     let attachment = window_attachment.attachment;
-    session_operations::record_history_access(state, session_id).await;
     state.metrics.record_histogram(
         "server.attach_projection_window.session_attach_duration_ms",
         elapsed_ms(timings.attach_started_at),
@@ -12809,7 +12829,6 @@ async fn finish_attach_session_recent_success(
     attachment: bcode_session::SessionAttachment,
     timings: AttachRecentTimings,
 ) -> Result<(), ServerError> {
-    session_operations::record_history_access(state, session_id).await;
     state.metrics.record_histogram(
         "server.attach_recent.session_attach_duration_ms",
         elapsed_ms(timings.attach_started_at),
@@ -22780,7 +22799,28 @@ async fn build_model_turn_request(
         model_request_metric_labels(session_id, provider_plugin_id, selected_model_id, round);
     let build_timer = state.metrics.timer();
     let history_timer = state.metrics.timer();
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    let admission =
+        storage_read_admission::RegisteredStorageRead::for_session(state, session_id).await;
     let history = state.sessions.model_context_events(session_id).await?;
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    if let Some(admission) = admission {
+        admission
+            .finish_consumption(
+                state,
+                session_id,
+                bcode_session::storage_access::StorageAccessKind::ModelContext,
+            )
+            .await;
+    } else {
+        session_operations::record_consumption(
+            state,
+            session_id,
+            bcode_session::storage_access::StorageAccessKind::ModelContext,
+        )
+        .await;
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
     session_operations::record_consumption(
         state,
         session_id,

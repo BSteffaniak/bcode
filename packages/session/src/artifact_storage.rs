@@ -250,6 +250,28 @@ impl ArtifactMaintenanceCancellation {
     }
 }
 
+struct CancelAbandonedWaiter(Option<ArtifactMaintenanceCancellation>);
+
+impl Drop for CancelAbandonedWaiter {
+    fn drop(&mut self) {
+        if let Some(cancellation) = &self.0 {
+            cancellation.cancel();
+        }
+    }
+}
+
+async fn run_cancellable_artifact_work<T: Send + 'static>(
+    cancellation: ArtifactMaintenanceCancellation,
+    work: impl FnOnce() -> io::Result<T> + Send + 'static,
+) -> io::Result<T> {
+    let mut waiter = CancelAbandonedWaiter(Some(cancellation));
+    let result = tokio::task::spawn_blocking(work).await;
+    // A completed operation must not poison a token reused by its caller. An abandoned waiter
+    // instead drops the armed guard; the task retains its authority until it observes cancellation.
+    waiter.0 = None;
+    result.map_err(|_| io::Error::other("artifact maintenance task failed"))?
+}
+
 /// Compress a finalized reference only if its durable access age still meets the supplied policy.
 ///
 /// # Errors
@@ -427,7 +449,7 @@ pub async fn compress_finalized_artifact_cancellable(
         .to_path_buf();
     let expected_bytes = reference.byte_len.ok_or_else(invalid)?;
     let expected_checksum = reference.checksum_sha256;
-    tokio::task::spawn_blocking(move || {
+    run_cancellable_artifact_work(cancellation.clone(), move || {
         cancellation.check()?;
         let artifacts = confined(
             &root.join("session-artifacts").join(session_id.to_string()),
@@ -453,7 +475,6 @@ pub async fn compress_finalized_artifact_cancellable(
         result
     })
     .await
-    .map_err(|_| io::Error::other("artifact maintenance task failed"))?
 }
 
 /// Compress one finalized artifact during explicit offline maintenance.
@@ -738,6 +759,73 @@ mod tests {
                 .kind(),
             io::ErrorKind::Interrupted
         );
+    }
+
+    #[tokio::test]
+    async fn abandoned_conversion_waiter_signals_cancellation_without_releasing_task_ownership() {
+        let root = tempfile::tempdir().expect("root");
+        let id = SessionId::new();
+        let owned_root = root.path().to_path_buf();
+        let cancellation = ArtifactMaintenanceCancellation::default();
+        let work_cancellation = cancellation.clone();
+        let (started, ready) = tokio::sync::oneshot::channel();
+        let (release, finish) = std::sync::mpsc::channel();
+        let (done, completed) = tokio::sync::oneshot::channel();
+        let waiter = tokio::spawn(run_cancellable_artifact_work(
+            cancellation.clone(),
+            move || {
+                let maintenance = crate::lease::acquire_session_maintenance_guard(&owned_root, id)
+                    .map_err(io::Error::other)?;
+                started.send(()).expect("started");
+                finish
+                    .recv_timeout(std::time::Duration::from_secs(20))
+                    .expect("finish");
+                let result = work_cancellation.check();
+                drop(maintenance);
+                done.send(result.as_ref().err().map(io::Error::kind))
+                    .expect("done");
+                result
+            },
+        ));
+        ready.await.expect("ready");
+        waiter.abort();
+        assert!(waiter.await.expect_err("aborted").is_cancelled());
+        assert_eq!(
+            cancellation.check().expect_err("cancel requested").kind(),
+            io::ErrorKind::Interrupted
+        );
+        let probe_root = root.path().to_path_buf();
+        assert!(
+            tokio::task::spawn_blocking(move || crate::lease::acquire_session_lease(
+                &probe_root,
+                id,
+                &crate::lease::SessionLeaseOwnerContext::default()
+            )
+            .is_err())
+            .await
+            .expect("ownership probe")
+        );
+        release.send(()).expect("release task");
+        assert_eq!(
+            completed.await.expect("completed"),
+            Some(io::ErrorKind::Interrupted)
+        );
+        drop(
+            crate::lease::acquire_session_maintenance_guard(root.path(), id)
+                .expect("ownership released"),
+        );
+    }
+
+    #[tokio::test]
+    async fn completed_conversion_does_not_cancel_shared_token() {
+        let cancellation = ArtifactMaintenanceCancellation::default();
+        assert_eq!(
+            run_cancellable_artifact_work(cancellation.clone(), || Ok(42))
+                .await
+                .expect("complete"),
+            42
+        );
+        cancellation.check().expect("not cancelled");
     }
 
     #[tokio::test]
