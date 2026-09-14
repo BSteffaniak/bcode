@@ -461,6 +461,28 @@ semantics. The existing verified migration coordinator still owns conversion and
 No compressed-history writes are enabled by this bump alone; dispatch/fallback coordination and the
 history maintenance writer remain incomplete.
 
+## Epoch-10 history maintenance writer
+
+`compress_history_page` now recompresses at most sixteen current canonical events per transaction,
+under idle-session maintenance ownership and writer-contract validation. It validates event identity,
+compares candidate bytes against exact logical JSON, preserves private fields, updates only smaller
+physical payloads, and leaves projections and event sequences unchanged. A continuation cursor allows
+bounded subsequent pages; repetition is idempotent. Normal appends remain plain JSON. Tests verify
+real compressed writes, logical history/JSON equality, continued appends, and transaction rollback
+when a later row in the page is corrupt. Reclamation remains a separate maintenance operation.
+This entry point is not yet connected to age-based automatic dispatch; cancellation budgets and
+full historical migration round-trip coverage remain necessary for that integration.
+
+## Age-fenced history scheduling phase
+
+The worker now carries typed artifact/history cursors. After artifact pagination, it advances bounded
+history pages across later ticks, selects the configured light/deep level, and reclaims database
+space after reaching history EOF. The history operation acquires registry admission and maintenance
+ownership, rechecks access age, and skips events newer than the cutoff while advancing the cursor.
+A test verifies old and recent events coexist without compressing the recent event and that a new
+access timestamp prevents later recompression. The global dispatch-readiness gate still returns false;
+this connects the internal scheduling phases, not completed production activation or fallback safety.
+
 ## Remaining implementation
 
 ### Access policy and scheduling

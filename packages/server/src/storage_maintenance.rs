@@ -17,6 +17,12 @@ use bcode_session_models::SessionId;
 use std::sync::Arc;
 use std::time::Duration;
 
+#[derive(Clone)]
+enum MaintenanceCursor {
+    Artifacts(Option<(String, String)>),
+    History(u64),
+}
+
 /// Run the experimental maintenance worker until daemon shutdown.
 /// Not activated by normal startup pending complete safety coordination.
 pub async fn run(state: Arc<ServerState>) {
@@ -45,7 +51,7 @@ pub async fn run(state: Arc<ServerState>) {
     let mut interval = tokio::time::interval(Duration::from_secs(u64::from(cadence)));
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut directories = None;
-    let mut pending: std::collections::VecDeque<(SessionId, Option<(String, String)>)> =
+    let mut pending: std::collections::VecDeque<(SessionId, MaintenanceCursor)> =
         std::collections::VecDeque::new();
     loop {
         tokio::select! {
@@ -93,11 +99,26 @@ pub async fn run(state: Arc<ServerState>) {
                 continue;
             };
             directories = next;
-            pending.extend(ids.into_iter().map(|id| (id, None)));
+            pending.extend(
+                ids.into_iter()
+                    .map(|id| (id, MaintenanceCursor::Artifacts(None))),
+            );
         }
         if let Some((id, cursor)) = pending.pop_front() {
-            match maintain_session(&state, &root, id, cursor).await {
-                Ok(Some(next)) => pending.push_back((id, Some(next))),
+            let outcome = match cursor {
+                MaintenanceCursor::Artifacts(after) => maintain_session(&state, &root, id, after)
+                    .await
+                    .map(|next| {
+                        Some(next.map_or(MaintenanceCursor::History(0), |key| {
+                            MaintenanceCursor::Artifacts(Some(key))
+                        }))
+                    }),
+                MaintenanceCursor::History(start) => {
+                    maintain_history(&state, &root, id, start).await
+                }
+            };
+            match outcome {
+                Ok(Some(next)) => pending.push_back((id, next)),
                 Ok(None) => {}
                 Err(_) => tracing::debug!(
                     "automatic artifact maintenance deferred: ownership or storage evidence unavailable"
@@ -114,6 +135,68 @@ fn tracking_coverage_ready(state: &ServerState) -> bool {
         .storage_tracking_failed
         .load(std::sync::atomic::Ordering::SeqCst);
     false
+}
+
+async fn maintain_history(
+    state: &ServerState,
+    root: &std::path::Path,
+    id: SessionId,
+    start: u64,
+) -> Result<Option<MaintenanceCursor>, String> {
+    if state
+        .shutdown_requested
+        .load(std::sync::atomic::Ordering::SeqCst)
+        || !state
+            .session_catalog
+            .ambiguous_location_ids(id)
+            .await
+            .is_empty()
+    {
+        return Ok(None);
+    }
+    let policy = state.session_config(id).await.session_storage;
+    if !policy.enabled {
+        return Ok(None);
+    }
+    let now = super::current_time_ms();
+    let access_root = root.to_path_buf();
+    let observation = tokio::task::spawn_blocking(move || observe_session_access(&access_root, id))
+        .await
+        .map_err(|_| "history access task")?
+        .map_err(|_| "history access unavailable")?;
+    let StorageAccessObservation::Recorded(access) = observation else {
+        return Ok(None);
+    };
+    let Some(elapsed) = now.checked_sub(access.observed_at_ms) else {
+        return Ok(None);
+    };
+    let light = u64::from(policy.light_after_days) * 86_400_000;
+    let deep = u64::from(policy.deep_after_days) * 86_400_000;
+    let (level, age) = if elapsed >= deep {
+        (12, deep)
+    } else if elapsed >= light {
+        (1, light)
+    } else {
+        return Ok(None);
+    };
+    let page = bcode_session::history_compression::compress_history_page_with_age(
+        root,
+        id,
+        start,
+        level,
+        Some((now, age)),
+    )
+    .await
+    .map_err(|_| "history compression deferred")?;
+    state.metrics.add_counter(
+        "storage.maintenance.history_payload_bytes_saved",
+        page.saved_bytes,
+    );
+    if let Some(next) = page.next_sequence {
+        return Ok(Some(MaintenanceCursor::History(next)));
+    }
+    reclaim_completed_pass(state, root, id, now, age, policy.minimum_saved_bytes).await;
+    Ok(None)
 }
 
 async fn reclaim_completed_pass(

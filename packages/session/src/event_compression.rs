@@ -1,8 +1,8 @@
 //! Lossless current-format event payload envelope.
 //!
-//! This codec is independent of the event schema. It is not enabled for canonical writes until a
-//! storage-epoch migration fences incompatible readers. JSON remains the logical source content;
-//! decoding preserves every byte, including private evidence and unknown JSON fields.
+//! This codec is independent of the event schema. Epoch-10 offline maintenance may write it after
+//! validating the current storage contract; normal appends remain plain JSON. JSON is logical source
+//! content, preserved byte-for-byte including private evidence and unknown JSON fields.
 
 use base64::Engine as _;
 use sha2::{Digest as _, Sha256};

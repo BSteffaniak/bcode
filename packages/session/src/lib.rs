@@ -39,6 +39,7 @@ pub(crate) mod db_runtime_work;
 pub(crate) mod db_validation;
 mod derivation;
 pub mod event_compression;
+pub mod history_compression;
 pub mod lease;
 mod manifest;
 mod mutation;

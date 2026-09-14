@@ -1795,6 +1795,72 @@ impl SessionDb {
             })
     }
 
+    #[cfg(test)]
+    pub(crate) async fn compress_history_payload_page(
+        &self,
+        start: u64,
+        level: i32,
+    ) -> SessionDbResult<crate::history_compression::HistoryCompressionPage> {
+        self.compress_history_payload_page_before(start, level, None)
+            .await
+    }
+
+    pub(crate) async fn compress_history_payload_page_before(
+        &self,
+        start: u64,
+        level: i32,
+        cutoff_ms: Option<u64>,
+    ) -> SessionDbResult<crate::history_compression::HistoryCompressionPage> {
+        let tx = self.db.begin_transaction().await?;
+        configure_turso_connection(&*tx).await?;
+        validate_storage_writer_contract(&*tx).await?;
+        let rows = read_canonical_payload_page(&*tx, start, 16).await?;
+        let mut report = crate::history_compression::HistoryCompressionPage::default();
+        for row in rows {
+            let event = decode_session_event(&row.payload)?;
+            validate_canonical_event_identity(&event, row.sequence, self.session_id)?;
+            report.inspected += 1;
+            report.next_sequence = row.sequence.checked_add(1);
+            if cutoff_ms.is_some_and(|cutoff| event.timestamp_ms > cutoff) {
+                continue;
+            }
+            let stored = tx
+                .select("events")
+                .columns(&["payload"])
+                .where_eq("event_seq", seq_to_value(row.sequence))
+                .execute_first(&*tx)
+                .await?
+                .ok_or_else(|| SessionDbError::InvalidRow {
+                    column: "events.payload".into(),
+                })?;
+            let stored = required_string(&stored, "payload")?;
+            // Oversized historical raw rows remain readable and are skipped, not truncated.
+            if row.payload.len() <= crate::event_compression::MAX_COMPRESSED_EVENT_BYTES {
+                let candidate =
+                    crate::event_compression::compress_event_payload(&row.payload, level)?;
+                if candidate.len() < stored.len() {
+                    if crate::event_compression::decode_event_payload(&candidate)?.as_ref()
+                        != row.payload
+                    {
+                        return Err(std::io::Error::other(
+                            "history compression verification failed",
+                        )
+                        .into());
+                    }
+                    tx.update("events")
+                        .value("payload", candidate.clone())
+                        .where_eq("event_seq", seq_to_value(row.sequence))
+                        .execute(&*tx)
+                        .await?;
+                    report.compressed += 1;
+                    report.saved_bytes += (stored.len() - candidate.len()) as u64;
+                }
+            }
+        }
+        tx.commit().await?;
+        Ok(report)
+    }
+
     /// Return the session id owned by this database.
     #[must_use]
     pub const fn session_id(&self) -> SessionId {
@@ -11165,6 +11231,191 @@ mod tests {
                 .1,
             bytes[262_140..262_220]
         );
+    }
+
+    #[tokio::test]
+    async fn history_maintenance_rolls_back_page_on_corrupt_event() {
+        let root = tempfile::tempdir().expect("root");
+        let id = SessionId::new();
+        let db = SessionDb::open_turso_in_root(id, root.path())
+            .await
+            .expect("db");
+        db.append_event(&event(
+            id,
+            0,
+            SessionEventKind::SessionCreated {
+                name: Some("rollback".repeat(10_000)),
+                working_directory: root.path().to_path_buf(),
+            },
+        ))
+        .await
+        .expect("created");
+        let before = db
+            .database()
+            .select("events")
+            .columns(&["payload"])
+            .where_eq("event_seq", 0)
+            .execute_first(db.database())
+            .await
+            .expect("row")
+            .expect("exists");
+        let before = required_string(&before, "payload").expect("payload");
+        db.database()
+            .insert("events")
+            .value("event_seq", 1)
+            .value("event_type", "session_created")
+            .value("schema_version", 47)
+            .value("payload", "{}")
+            .execute(db.database())
+            .await
+            .expect("corrupt fixture");
+        assert!(db.compress_history_payload_page(0, 1).await.is_err());
+        let after = db
+            .database()
+            .select("events")
+            .columns(&["payload"])
+            .where_eq("event_seq", 0)
+            .execute_first(db.database())
+            .await
+            .expect("row")
+            .expect("exists");
+        assert_eq!(required_string(&after, "payload").expect("payload"), before);
+    }
+
+    #[tokio::test]
+    async fn age_checked_history_preserves_recent_events_and_rechecks_access() {
+        let root = tempfile::tempdir().expect("root");
+        let id = SessionId::new();
+        let db = SessionDb::open_turso_in_root(id, root.path())
+            .await
+            .expect("db");
+        let mut old = event(
+            id,
+            0,
+            SessionEventKind::SessionCreated {
+                name: Some("old".repeat(20_000)),
+                working_directory: root.path().to_path_buf(),
+            },
+        );
+        old.timestamp_ms = 1;
+        db.append_event(&old).await.expect("old");
+        let mut recent = event(
+            id,
+            1,
+            SessionEventKind::SessionRenamed {
+                name: Some("recent".repeat(20_000)),
+            },
+        );
+        recent.timestamp_ms = 950;
+        db.append_event(&recent).await.expect("recent");
+        db.database().close().await.expect("close");
+        drop(db);
+        let path = root.path().join(id.to_string()).join("storage-access.bin");
+        let mut file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .open(path)
+            .expect("tracking");
+        crate::storage_access::record_access(
+            &mut file,
+            crate::storage_access::StorageAccessKind::History,
+            1,
+        )
+        .expect("old access");
+        let page = crate::history_compression::compress_history_page_with_age(
+            root.path(),
+            id,
+            0,
+            1,
+            Some((1000, 100)),
+        )
+        .await
+        .expect("compress");
+        assert_eq!(
+            (page.inspected, page.compressed, page.next_sequence),
+            (2, 1, Some(2))
+        );
+        crate::storage_access::record_access(
+            &mut file,
+            crate::storage_access::StorageAccessKind::History,
+            2000,
+        )
+        .expect("new access");
+        let page = crate::history_compression::compress_history_page_with_age(
+            root.path(),
+            id,
+            0,
+            12,
+            Some((2050, 100)),
+        )
+        .await
+        .expect("defer");
+        assert_eq!(page.inspected, 0);
+        let db = SessionDb::open_existing_turso_in_root(id, root.path())
+            .await
+            .expect("reopen");
+        assert_eq!(
+            db.all_events_strict().await.expect("unchanged history"),
+            vec![old, recent]
+        );
+    }
+
+    #[tokio::test]
+    async fn history_maintenance_writes_lossless_compression_and_is_idempotent() {
+        let root = tempfile::tempdir().expect("root");
+        let id = SessionId::new();
+        let db = SessionDb::open_turso_in_root(id, root.path())
+            .await
+            .expect("db");
+        let created = event(
+            id,
+            0,
+            SessionEventKind::SessionCreated {
+                name: Some("history".repeat(10_000)),
+                working_directory: root.path().to_path_buf(),
+            },
+        );
+        db.append_event(&created).await.expect("created");
+        let logical = db.canonical_rows_page(0, 1).await.expect("logical")[0]
+            .payload
+            .clone();
+        db.database().close().await.expect("close");
+        drop(db);
+        let report = crate::history_compression::compress_history_page(root.path(), id, 0, 1)
+            .await
+            .expect("compress");
+        assert_eq!(report.compressed, 1);
+        assert!(report.saved_bytes > 1000);
+        assert_eq!(report.next_sequence, Some(1));
+        let repeated = crate::history_compression::compress_history_page(root.path(), id, 0, 1)
+            .await
+            .expect("repeat");
+        assert_eq!(repeated.compressed, 0);
+        let end = crate::history_compression::compress_history_page(root.path(), id, 1, 1)
+            .await
+            .expect("end");
+        assert_eq!(end.next_sequence, None);
+        let db = SessionDb::open_existing_turso_in_root(id, root.path())
+            .await
+            .expect("reopen");
+        assert_eq!(
+            db.all_events_strict().await.expect("history"),
+            vec![created]
+        );
+        assert_eq!(
+            db.canonical_rows_page(0, 1).await.expect("json")[0].payload,
+            logical
+        );
+        let next = event(
+            id,
+            1,
+            SessionEventKind::SessionRenamed {
+                name: Some("continued".into()),
+            },
+        );
+        db.append_event(&next).await.expect("continue writing");
+        assert_eq!(db.all_events_strict().await.expect("continued")[1], next);
     }
 
     #[tokio::test]
