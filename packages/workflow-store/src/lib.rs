@@ -38,7 +38,7 @@ const RESET_BACKUP_DIRECTORY: &str = "reset-backups";
 /// Stable destructive confirmation required by public workflow-store reset surfaces.
 pub const WORKFLOW_STORE_RESET_CONFIRMATION: &str = "DELETE-INCOMPATIBLE-WORKFLOW-STATE";
 /// Current clean-break workflow store schema version.
-pub const WORKFLOW_STORE_SCHEMA_VERSION: u32 = 32;
+pub const WORKFLOW_STORE_SCHEMA_VERSION: u32 = 33;
 /// Current bounded workflow-store reset receipt version.
 pub const WORKFLOW_STORE_RESET_RECEIPT_VERSION: u32 = 1;
 /// Current explicit workflow-store migration receipt contract.
@@ -1154,7 +1154,7 @@ impl WorkflowStore {
                         match Self::open_with_ownership(&path, ownership) {
                             Ok(store) => return Ok(store),
                             Err(WorkflowStoreError::UnsupportedStore {
-                                actual: Some(14..=31),
+                                actual: Some(14..=32),
                                 ..
                             }) => {}
                             Err(error) => return Err(error),
@@ -1184,7 +1184,7 @@ impl WorkflowStore {
                         match Self::open_with_ownership(&path, probe) {
                             Ok(store) => return Ok(store),
                             Err(WorkflowStoreError::UnsupportedStore {
-                                actual: Some(14..=31),
+                                actual: Some(14..=32),
                                 ..
                             }) => {}
                             Err(error) => return Err(error),
@@ -1334,7 +1334,7 @@ impl WorkflowStore {
                 "workflow store migration cannot read the source schema".to_string(),
             )
         })?;
-        if !matches!(previous_schema_version, 14..=31) {
+        if !matches!(previous_schema_version, 14..=32) {
             return Err(WorkflowStoreError::UnsupportedStore {
                 actual: Some(previous_schema_version),
                 expected: WORKFLOW_STORE_SCHEMA_VERSION,
@@ -1383,6 +1383,7 @@ impl WorkflowStore {
             run_graph::initialize_retirement(&transaction)?;
         }
         run_graph::initialize_edit_candidates(&transaction)?;
+        migrate_run_package_bindings(&transaction)?;
         transaction.execute(
             "UPDATE workflow_store_contract SET schema_version = ?1 WHERE contract_id = 1",
             [WORKFLOW_STORE_SCHEMA_VERSION],
@@ -4083,10 +4084,22 @@ impl WorkflowStore {
         run: &NewWorkflowRun,
         package: Option<(&str, &str)>,
     ) -> Result<bool, WorkflowStoreError> {
+        let mut operation = "begin_transaction";
+        self.create_run_with_package_diagnosed(run, package, &mut operation)
+            .inspect_err(|error| diagnose_run_creation_database_error(operation, error))
+    }
+
+    fn create_run_with_package_diagnosed(
+        &mut self,
+        run: &NewWorkflowRun,
+        package: Option<(&str, &str)>,
+        operation: &mut &'static str,
+    ) -> Result<bool, WorkflowStoreError> {
         validate_run(run)?;
         let transaction = self
             .connection
             .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        *operation = "verify_package";
         if let Some((id, digest)) = package {
             let lock = Self::package_lock_on(&transaction, id, digest)?.ok_or_else(|| {
                 WorkflowStoreError::InvalidData("exact run package is unavailable".into())
@@ -4100,7 +4113,9 @@ impl WorkflowStore {
                 ));
             }
         }
+        *operation = "create_or_verify_run";
         let created = Self::create_or_verify_run(&transaction, run, true)?;
+        *operation = "read_run_package";
         let existing: Option<(String, String)> = transaction
             .query_row(
                 "SELECT package_id, lock_digest FROM workflow_run_packages WHERE run_id = ?1",
@@ -4110,6 +4125,7 @@ impl WorkflowStore {
             .optional()?;
         if created {
             if let Some((id, digest)) = package {
+                *operation = "insert_run_package";
                 transaction.execute(
                     "INSERT INTO workflow_run_packages VALUES (?1, ?2, ?3)",
                     rusqlite::params![run.run_id, id, digest],
@@ -4124,6 +4140,7 @@ impl WorkflowStore {
                 "duplicate run package binding differs".into(),
             ));
         }
+        *operation = "commit_run";
         transaction.commit()?;
         Ok(created)
     }
@@ -15146,10 +15163,49 @@ fn validate_run_input(
     Ok(input_json)
 }
 
-#[allow(clippy::too_many_lines)]
+fn diagnose_run_creation_database_error(operation: &'static str, error: &WorkflowStoreError) {
+    if let WorkflowStoreError::Database(error) = error {
+        let reason = run_creation_database_reason(error);
+        let sqlite_extended_code = error.sqlite_error().map(|error| error.extended_code);
+        tracing::warn!(target: "bcode_workflow_store::run_creation", operation, reason, sqlite_extended_code, "workflow run creation database failure");
+    }
+}
+
+fn run_creation_database_reason(error: &rusqlite::Error) -> &'static str {
+    let (rusqlite::Error::SqliteFailure(_, Some(message))
+    | rusqlite::Error::SqlInputError { msg: message, .. }) = error
+    else {
+        return "database_api_error";
+    };
+    // Classify only fixed SQLite prefixes; never emit the suffix (names, SQL, or values).
+    if message.starts_with("no such table:") {
+        "missing_table"
+    } else if message.starts_with("no such column:") {
+        "missing_column"
+    } else if message.starts_with("table ") && message.contains(" has no column named ") {
+        "missing_insert_column"
+    } else if message.starts_with("foreign key mismatch") {
+        "foreign_key_mismatch"
+    } else {
+        "sqlite_error"
+    }
+}
+
 fn create_run_in_transaction(
     transaction: &Transaction<'_>,
     run: &NewWorkflowRun,
+) -> Result<(), WorkflowStoreError> {
+    let mut operation = "validate_provenance";
+    create_run_in_transaction_diagnosed(transaction, run, &mut operation).inspect_err(|error| {
+        diagnose_run_creation_database_error(operation, error);
+    })
+}
+
+#[allow(clippy::too_many_lines)]
+fn create_run_in_transaction_diagnosed(
+    transaction: &Transaction<'_>,
+    run: &NewWorkflowRun,
+    operation: &mut &'static str,
 ) -> Result<(), WorkflowStoreError> {
     if let Some(provenance) = &run.authored_provenance {
         validate_persisted_authored_run_provenance(transaction, run, provenance)?;
@@ -15157,6 +15213,7 @@ fn create_run_in_transaction(
     if let Some(binding) = &run.binding
         && binding.single_active
     {
+        *operation = "check_single_active_binding";
         let active: Option<String> = transaction
             .query_row(
                 "SELECT run_id FROM workflow_runs WHERE owner_plugin_id = ?1 \
@@ -15177,6 +15234,7 @@ fn create_run_in_transaction(
             )));
         }
     }
+    *operation = "read_definition";
     let definition_json = transaction
         .query_row(
             "SELECT CASE WHEN typeof(definition_json) = 'text' \
@@ -15249,6 +15307,7 @@ fn create_run_in_transaction(
                 Some(authority.fencing_token.as_str()),
             )
         });
+    *operation = "insert_run";
     transaction.execute(
         "INSERT INTO workflow_runs \
              (run_id, definition_id, definition_version, workspace_snapshot, parent_session_id, \
@@ -15287,7 +15346,9 @@ fn create_run_in_transaction(
             run.created_at_ms,
         ],
     )?;
+    *operation = "materialize_run_graph";
     run_graph::materialize(transaction, &run.run_id, &definition)?;
+    *operation = "append_run_created_event";
     append_event(
         transaction,
         &run.run_id,
@@ -15307,6 +15368,7 @@ fn create_run_in_transaction(
         ));
     }
     for node_id in &definition.entries {
+        *operation = "read_entry_node";
         let node =
             run_graph::initial_node(transaction, &run.run_id, node_id)?.ok_or_else(|| {
                 WorkflowStoreError::InvalidData(format!(
@@ -15328,6 +15390,7 @@ fn create_run_in_transaction(
             created_at_ms: run.created_at_ms,
         };
         validate_activation(&activation)?;
+        *operation = "insert_entry_activation";
         insert_activation_with_status(transaction, &activation, activation_status_for_node(&node))?;
     }
     Ok(())
@@ -16356,6 +16419,40 @@ fn verify_migration_integrity(connection: &Connection) -> Result<(), WorkflowSto
     Ok(())
 }
 
+fn migrate_run_package_bindings(transaction: &Transaction<'_>) -> Result<(), WorkflowStoreError> {
+    let exists: bool = transaction.query_row(
+        "SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE type = 'table' AND name = 'workflow_run_packages')",
+        [],
+        |row| row.get(0),
+    )?;
+    if !exists {
+        // Without publications there cannot have been valid package bindings to recover.
+        // Otherwise an absent table is ambiguous damage, not permission to invent empty state.
+        let publications: bool = transaction.query_row(
+            "SELECT EXISTS(SELECT 1 FROM workflow_package_publications)",
+            [],
+            |row| row.get(0),
+        )?;
+        if publications {
+            return Err(WorkflowStoreError::InvalidData(
+                "missing workflow run package bindings with existing publications require explicit maintenance".to_string(),
+            ));
+        }
+        transaction.execute_batch(
+            "CREATE TABLE workflow_run_packages (
+                run_id TEXT PRIMARY KEY NOT NULL REFERENCES workflow_runs(run_id),
+                package_id TEXT NOT NULL,
+                lock_digest TEXT NOT NULL,
+                FOREIGN KEY(package_id, lock_digest) REFERENCES workflow_package_publications(package_id, package_lock_digest_sha256)
+            );",
+        )?;
+    }
+    // Verify the required shape even if the table already existed. No rows are replayed.
+    transaction
+        .prepare("SELECT run_id, package_id, lock_digest FROM workflow_run_packages LIMIT 0")?;
+    Ok(())
+}
+
 #[allow(clippy::too_many_lines)]
 fn initialize_schema(connection: &mut Connection) -> Result<(), WorkflowStoreError> {
     let transaction = connection.transaction()?;
@@ -16708,6 +16805,8 @@ fn verify_store_schema(connection: &Connection) -> Result<(), WorkflowStoreError
             expected: WORKFLOW_STORE_SCHEMA_VERSION,
         });
     }
+    connection
+        .prepare("SELECT run_id, package_id, lock_digest FROM workflow_run_packages LIMIT 0")?;
     Ok(())
 }
 
@@ -22555,6 +22654,87 @@ mod tests {
     }
 
     #[test]
+    fn schema_32_missing_package_bindings_upgrade_preserves_runs_and_allows_admission() {
+        let (temp, store) = initialized_store();
+        store.connection.execute_batch(
+            "DROP TABLE workflow_run_packages; UPDATE workflow_store_contract SET schema_version = 32;"
+        ).expect("historical upgrade gap");
+        drop(store);
+        assert!(matches!(
+            WorkflowStore::open_in_state_dir(temp.path()),
+            Err(WorkflowStoreError::UnsupportedStore { .. })
+        ));
+        let mut store =
+            WorkflowStore::initialize_in_state_dir(temp.path(), 990).expect("safe upgrade");
+        assert!(store.run_summary("run-1").expect("preserved run").is_some());
+        let mut run = new_run();
+        run.run_id = "after-upgrade".into();
+        assert!(
+            store
+                .create_run_with_package(&run, None)
+                .expect("admission")
+        );
+        let backup = Connection::open(
+            temp.path()
+                .join("workflows")
+                .join(MIGRATION_BACKUP_DIRECTORY)
+                .join("workflow-990.db"),
+        )
+        .expect("backup");
+        assert_eq!(detected_store_schema(&backup), Some(32));
+        assert!(
+            backup
+                .prepare("SELECT * FROM workflow_run_packages")
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn schema_32_missing_bindings_with_publications_preserves_ambiguous_state() {
+        let (temp, store) = initialized_store();
+        store
+            .connection
+            .execute_batch(
+                "DROP TABLE workflow_run_packages;
+             INSERT INTO workflow_package_publications VALUES ('package', 'digest', '{}', '{}', 1);
+             UPDATE workflow_store_contract SET schema_version = 32;",
+            )
+            .expect("ambiguous fixture");
+        drop(store);
+        assert!(WorkflowStore::initialize_in_state_dir(temp.path(), 992).is_err());
+        let connection =
+            Connection::open(workflow_database_path(temp.path())).expect("inspect fixture");
+        assert_eq!(detected_store_schema(&connection), Some(32));
+        assert!(
+            connection
+                .prepare("SELECT * FROM workflow_run_packages")
+                .is_err()
+        );
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT count(*) FROM workflow_package_publications",
+                    [],
+                    |row| row.get::<_, u64>(0)
+                )
+                .expect("publications"),
+            1
+        );
+    }
+
+    #[test]
+    fn current_schema_missing_package_bindings_is_not_repaired_on_open() {
+        let (temp, store) = initialized_store();
+        store
+            .connection
+            .execute_batch("DROP TABLE workflow_run_packages;")
+            .expect("damage");
+        drop(store);
+        assert!(WorkflowStore::open_in_state_dir(temp.path()).is_err());
+        assert!(WorkflowStore::initialize_in_state_dir(temp.path(), 991).is_err());
+    }
+
+    #[test]
     fn startup_upgrade_supports_schema_14_and_16() {
         for schema in [14, 16] {
             let (temp, store) = initialized_store();
@@ -22590,9 +22770,16 @@ mod tests {
                 )
                 .expect("historical contract");
             drop(store);
-            let store = WorkflowStore::initialize_in_state_dir(temp.path(), 900)
+            let mut store = WorkflowStore::initialize_in_state_dir(temp.path(), 900)
                 .expect("supported upgrade");
             assert!(store.run_graph_revision("run-1").expect("graph").is_some());
+            let mut run = new_run();
+            run.run_id = "post-upgrade-run".to_string();
+            assert!(
+                store
+                    .create_run_with_package(&run, None)
+                    .expect("post-upgrade admission")
+            );
         }
     }
 
@@ -39554,6 +39741,25 @@ mod tests {
         assert_eq!(store.pending_activations(10).expect("resumed").len(), 1);
         store.request_cancellation("run-1", 22).expect("cancel");
         assert!(store.pending_activations(10).expect("cancelled").is_empty());
+    }
+
+    #[test]
+    fn run_creation_database_diagnostics_classify_without_payloads() {
+        for (sql, expected) in [
+            ("SELECT * FROM secret_table", "missing_table"),
+            ("SELECT secret_column FROM example", "missing_column"),
+            (
+                "INSERT INTO example(secret_column) VALUES (1)",
+                "missing_insert_column",
+            ),
+        ] {
+            let connection = Connection::open_in_memory().expect("database");
+            connection
+                .execute_batch("CREATE TABLE example (id INTEGER);")
+                .expect("schema");
+            let error = connection.execute_batch(sql).expect_err("invalid query");
+            assert_eq!(run_creation_database_reason(&error), expected);
+        }
     }
 
     #[test]

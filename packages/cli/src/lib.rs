@@ -3655,9 +3655,9 @@ fn init_tracing() {
             } else if foreground_server {
                 "info".to_string()
             } else {
-                // Background daemons are otherwise silent; lifecycle transitions that explain why
-                // a daemon is still alive are low-volume and always worth a log line.
-                "off,bcode_server::idle_shutdown=info,bcode_server::session_stream=info,bcode_tui::session_stream=info".to_string()
+                // Background daemons are otherwise silent. Keep lifecycle diagnostics and
+                // secret-safe workflow start failures available without enabling broad logging.
+                "off,bcode_server::idle_shutdown=info,bcode_server::session_stream=info,bcode_tui::session_stream=info,bcode_server::workflow_start=warn,bcode_workflow_store::run_creation=warn".to_string()
             }
         });
     let (env_filter, invalid_filter) = match tracing_subscriber::EnvFilter::try_new(filter) {

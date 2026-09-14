@@ -1958,6 +1958,56 @@ mod tests {
     }
 
     #[test]
+    fn actual_loop_definition_can_create_a_durable_run() {
+        let temp = tempfile::tempdir().expect("temp");
+        let mut store =
+            bcode_workflow_store::WorkflowStore::open_in_state_dir(temp.path()).expect("store");
+        let input = LoopWorkflowInput::new("implement".into(), "done".into(), 3).expect("input");
+        let spec = loop_workflow_spec(&input).expect("spec");
+        let identity = spec.identity();
+        store
+            .persist_definition(
+                &identity.definition_id,
+                identity.definition_version,
+                spec.definition(),
+            )
+            .expect("definition");
+        let run = bcode_workflow_store::NewWorkflowRun {
+            run_id: "loop-test".into(),
+            definition_id: identity.definition_id.clone(),
+            definition_version: identity.definition_version,
+            workspace_snapshot: temp.path().to_string_lossy().into_owned(),
+            parent_session_id: Some(SessionId::new().to_string()),
+            parent_session_generation: None,
+            binding: Some(bcode_workflow::WorkflowRunBinding {
+                owner_plugin_id: PLUGIN_ID.to_string(),
+                workflow_kind: WORKFLOW_KIND.to_string(),
+                scope_key: "loop-test-session".to_string(),
+                display_label: Some("Loop".to_string()),
+                single_active: true,
+            }),
+            authored_provenance: None,
+            input: Some(serde_json::to_value(loop_workflow_initial_value(&input)).expect("input")),
+            execution_authority: None,
+            created_at_ms: 10,
+            authorization_profile: bcode_workflow::WorkflowAuthorizationProfileIdentity {
+                version: 1,
+                provider_id: "test-policy".into(),
+                profile_id: "build".into(),
+                policy_digest_sha256: "a".repeat(64),
+            },
+            authorization_ceiling: bcode_workflow::WorkflowToolCapability::Mutating,
+            limits: bcode_workflow::WorkflowRunLimits::default(),
+        };
+        assert!(
+            store
+                .create_run_with_package(&run, None)
+                .expect("create loop run")
+        );
+        assert!(store.run_summary(&run.run_id).expect("summary").is_some());
+    }
+
+    #[test]
     #[allow(clippy::too_many_lines)]
     fn workflow_definition_is_typed_read_only_and_bounded() {
         let input =

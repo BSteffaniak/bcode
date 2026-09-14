@@ -650,8 +650,12 @@ damaged or stale.
 ## Schema upgrades and explicit reset
 
 The workflow database has one current schema version. A missing database is initialized directly
-at that version. Domain-owned startup coordination automatically upgrades supported schemas 14–16
-under the migration safety contract in `INVARIANTS.md`. Ordinary store opens and status/history
+at that version. Domain-owned startup coordination automatically upgrades supported schemas 14–32
+under the migration safety contract in `INVARIANTS.md`. Schema 33 supplies the run-package binding
+table omitted by earlier upgrades. If that table is absent, automatic creation requires an empty
+publication catalog; existing publications make the missing bindings ambiguous and require explicit
+maintenance. Existing binding rows are preserved. Current-schema opens validate the required table
+without creating it. Ordinary store opens and status/history
 reads never migrate. Unsupported, malformed, or future contracts fail closed without reset.
 
 Startup waits at most five seconds for verified exclusive workflow-store ownership, rechecks the

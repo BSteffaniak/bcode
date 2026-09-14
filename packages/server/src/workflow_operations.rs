@@ -1,3 +1,5 @@
+use bcode_workflow_store::WorkflowStoreError;
+
 /// Host policy for executable run graph publication, distinct from staging approval.
 #[derive(Clone)]
 pub struct WorkflowRunGraphPublicationPolicy {
@@ -189,6 +191,45 @@ fn run_operation_failure(error: super::ServerError) -> bcode_workflow::WorkflowR
     }
 }
 
+fn diagnosed_start_failure(
+    stage: &str,
+    error: super::ServerError,
+) -> bcode_workflow::WorkflowRunOperationFailure {
+    // Never format the underlying error: it can contain SQL, paths, or workflow inputs.
+    let category = match &error {
+        super::ServerError::WorkflowStore(WorkflowStoreError::Database(_)) => "database",
+        super::ServerError::WorkflowStore(WorkflowStoreError::Io(_)) => "io",
+        super::ServerError::WorkflowStore(WorkflowStoreError::Serialization(_)) => "serialization",
+        super::ServerError::WorkflowStore(WorkflowStoreError::InvalidData(_)) => "invalid_data",
+        _ => return run_operation_failure(error),
+    };
+    let sqlite_extended_code = match &error {
+        super::ServerError::WorkflowStore(WorkflowStoreError::Database(error)) => {
+            error.sqlite_error().map(|error| error.extended_code)
+        }
+        _ => None,
+    };
+    tracing::warn!(target: "bcode_server::workflow_start", stage, category, sqlite_extended_code, "workflow start failed");
+    let mut failure = run_operation_failure(error);
+    failure.message =
+        format!("workflow state is unavailable (start stage: {stage}; category: {category})");
+    failure
+}
+
+#[cfg(test)]
+#[test]
+fn workflow_start_diagnostics_do_not_expose_error_payloads() {
+    let failure = diagnosed_start_failure(
+        "persist_definition",
+        WorkflowStoreError::InvalidData("secret workflow input".to_string()).into(),
+    );
+    assert_eq!(failure.code, "workflow_unavailable");
+    assert_eq!(
+        failure.message,
+        "workflow state is unavailable (start stage: persist_definition; category: invalid_data)"
+    );
+}
+
 impl bcode_workflow::WorkflowRunApplication for WorkflowAuthoringApplication<'_> {
     async fn start_workflow_template(
         &self,
@@ -370,9 +411,10 @@ impl bcode_workflow::WorkflowRunApplication for WorkflowAuthoringApplication<'_>
         self.state
             .require_workflow_store()
             .map_err(run_operation_failure)?;
-        start(self.state, request)
+        let mut stage = "validate_definition";
+        start_with_stage(self.state, request, &mut stage)
             .await
-            .map_err(run_operation_failure)
+            .map_err(|error| diagnosed_start_failure(stage, error))
     }
     async fn workflow_live_event_catch_up(
         &self,
@@ -6053,13 +6095,31 @@ pub async fn start_run(
     .await
 }
 
-#[allow(clippy::too_many_lines)]
 async fn start_run_with_package(
     state: &std::sync::Arc<ServerState>,
     request: bcode_workflow::WorkflowRunStartRequest,
     authored_provenance: Option<bcode_workflow_store::AuthoredWorkflowRunProvenance>,
     package: Option<(&str, &str)>,
 ) -> Result<bcode_workflow::WorkflowRunStartResponse, super::ServerError> {
+    Box::pin(start_run_with_stage(
+        state,
+        request,
+        authored_provenance,
+        package,
+        &mut "read_definition",
+    ))
+    .await
+}
+
+#[allow(clippy::too_many_lines)]
+async fn start_run_with_stage(
+    state: &std::sync::Arc<ServerState>,
+    request: bcode_workflow::WorkflowRunStartRequest,
+    authored_provenance: Option<bcode_workflow_store::AuthoredWorkflowRunProvenance>,
+    package: Option<(&str, &str)>,
+    phase: &mut &'static str,
+) -> Result<bcode_workflow::WorkflowRunStartResponse, super::ServerError> {
+    *phase = "read_definition";
     let stored_definition = state
         .workflow_store
         .lock()
@@ -6071,6 +6131,7 @@ async fn start_run_with_package(
                 request.definition_id, request.definition_version
             ))
         })?;
+    *phase = "validate_stored_definition";
     let definition: bcode_workflow::WorkflowDefinition =
         serde_json::from_str(&stored_definition.definition_json)?;
     validate_workflow_definition_for_production(state, &definition)?;
@@ -6091,6 +6152,7 @@ async fn start_run_with_package(
         )
         .into());
     }
+    *phase = "resolve_parent_session";
     let parent_session = state
         .sessions
         .session_summary(request.parent_session_id)
@@ -6188,7 +6250,9 @@ async fn start_run_with_package(
             .workflow_store
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        *phase = "create_run";
         let _created = store.create_run_with_package(&new_run, package)?;
+        *phase = "read_created_run_summary";
         store
             .run_summary(&run_id)?
             .expect("created or existing workflow run must be readable")
@@ -6203,6 +6267,7 @@ async fn start_run_with_package(
         ),
     )
     .await;
+    *phase = "initial_execution";
     super::drive_workflow_run(state, &run_id).await?;
     drop(workflow_session_ownership);
     Ok(bcode_workflow::WorkflowRunStartResponse {
@@ -6216,8 +6281,18 @@ pub async fn start(
     state: &std::sync::Arc<ServerState>,
     request: bcode_workflow::WorkflowStartRequest,
 ) -> Result<bcode_workflow::WorkflowRunStartResponse, super::ServerError> {
+    start_with_stage(state, request, &mut "validate_definition").await
+}
+
+async fn start_with_stage(
+    state: &std::sync::Arc<ServerState>,
+    request: bcode_workflow::WorkflowStartRequest,
+    phase: &mut &'static str,
+) -> Result<bcode_workflow::WorkflowRunStartResponse, super::ServerError> {
     let started_at = std::time::Instant::now();
+    *phase = "validate_definition";
     validate_workflow_definition_for_production(state, &request.definition)?;
+    *phase = "validate_identity";
     if request.identity.kind != request.binding.workflow_kind {
         return Err(bcode_workflow_store::WorkflowStoreError::InvalidData(
             "workflow logical identity does not match its binding kind".to_string(),
@@ -6235,6 +6310,7 @@ pub async fn start(
         )
         .into());
     }
+    *phase = "persist_definition";
     let stored = state
         .workflow_store
         .lock()
@@ -6252,7 +6328,8 @@ pub async fn start(
         )
         .into());
     }
-    let result = start_run(
+    *phase = "start_run";
+    let result = start_run_with_stage(
         state,
         bcode_workflow::WorkflowRunStartRequest {
             definition_id: request.identity.definition_id,
@@ -6266,6 +6343,8 @@ pub async fn start(
             limits: request.limits,
         },
         None,
+        None,
+        phase,
     )
     .await;
     state.metrics.record_histogram_with_labels(
