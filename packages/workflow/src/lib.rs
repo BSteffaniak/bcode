@@ -21550,6 +21550,12 @@ steps:
                 output: None,
             })
             .expect("call");
+            let mut sibling = node.clone();
+            sibling.id = "sibling".to_string();
+            sibling.name = "sibling".to_string();
+            child.nodes.insert("sibling".to_string(), sibling);
+            child.entries.push("sibling".to_string());
+            child.exits.push("sibling".to_string());
         }
         document.definition = child;
         let compiled = document
