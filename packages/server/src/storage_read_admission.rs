@@ -165,6 +165,50 @@ mod tests {
     use super::*;
 
     #[tokio::test]
+    async fn maintenance_contention_rejects_read_until_authority_is_released() {
+        let root = tempfile::tempdir().expect("root");
+        let sessions = bcode_session::SessionManager::persistent(root.path()).expect("manager");
+        let session = sessions
+            .create_session(None, root.path().to_path_buf())
+            .await
+            .expect("create");
+        let expected = sessions.session_history(session.id).await.expect("history");
+        sessions
+            .release_session_ownership(session.id)
+            .await
+            .expect("release");
+        let before = bcode_session::storage_access::observe_session_access(root.path(), session.id)
+            .expect("access");
+        let registry = StorageAdmissionRegistry::open(root.path()).expect("registry");
+        let maintenance = registry.admit_maintenance(16).expect("maintenance");
+        let state = crate::tests::test_server_state(sessions);
+        let client = bcode_session_models::ClientId::new();
+        assert!(
+            crate::session_operations::complete_history(&state, client, session.id)
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            bcode_session::storage_access::observe_session_access(root.path(), session.id)
+                .expect("access unchanged"),
+            before
+        );
+        drop(maintenance);
+        assert_eq!(
+            crate::session_operations::complete_history(&state, client, session.id)
+                .await
+                .expect("retry after release"),
+            expected
+        );
+        assert!(
+            state
+                .storage_tracking_failed
+                .load(std::sync::atomic::Ordering::SeqCst)
+        );
+        drop(state);
+    }
+
+    #[tokio::test]
     async fn double_failure_rejects_history_and_retry_preserves_content() {
         let root = tempfile::tempdir().expect("root");
         let sessions = bcode_session::SessionManager::persistent(root.path()).expect("manager");
