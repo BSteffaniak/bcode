@@ -46,7 +46,11 @@ impl StorageAdmissionRegistry {
     /// # Errors
     /// Rejects symlinks, non-directories, unavailable roots, or IO failure. Does not create the root.
     pub fn open(root: &Path) -> io::Result<Self> {
-        let root = File::open(root)?;
+        use std::os::unix::fs::OpenOptionsExt as _;
+        let root = std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_DIRECTORY | libc::O_CLOEXEC)
+            .open(root)?;
         if !root.metadata()?.is_dir() {
             return Err(invalid());
         }
@@ -486,6 +490,19 @@ unsafe fn errno() -> *mut libc::c_int {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn symlinked_root_is_rejected_without_initializing_target() {
+        let root = tempfile::tempdir().expect("root");
+        let target = root.path().join("target");
+        std::fs::create_dir(&target).expect("target");
+        let alias = root.path().join("alias");
+        std::os::unix::fs::symlink(&target, &alias).expect("alias");
+        assert!(StorageAdmissionRegistry::open(&alias).is_err());
+        assert_eq!(std::fs::read_dir(&target).expect("untouched").count(), 0);
+        let registry = StorageAdmissionRegistry::open(&target).expect("direct root");
+        drop(registry.admit_maintenance(16).expect("healthy direct root"));
+    }
 
     #[test]
     fn retiring_clean_participants_bounds_registry_growth_without_clearing_damage() {
