@@ -35,7 +35,7 @@ pub struct HistoryCompressionPage {
 ///
 /// The current writer contract fences older writers. Each page is atomic and retry-safe: already
 /// smaller representations remain unchanged. Private JSON fields are preserved byte-for-byte.
-/// Separate explicit reclamation releases free database pages after this operation completes.
+/// Freed database pages may be reused by subsequent writes; no physical reclamation is performed.
 ///
 /// # Errors
 /// Rejects invalid compression levels, missing/unsafe storage, active ownership, incompatible

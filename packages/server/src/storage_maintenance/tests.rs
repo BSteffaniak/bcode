@@ -88,49 +88,6 @@ async fn automatic_publication_resumes_after_successful_reader_completion() {
     assert!(artifacts.join("recording-000").is_dir());
 }
 
-#[tokio::test]
-async fn completed_scheduler_pass_reclaims_free_database_pages() {
-    let (root, state, id, _artifacts, _) = fixture(0).await;
-    let registry = bcode_session::storage_admission::StorageAdmissionRegistry::open(root.path())
-        .expect("registry");
-    let db = bcode_session::db::SessionDb::open_existing_turso_in_root(id, root.path())
-        .await
-        .expect("db");
-    let history = db.all_events_strict().await.expect("history");
-    db.database()
-        .exec_raw("CREATE TABLE reclamation_fixture (content BLOB)")
-        .await
-        .expect("fixture");
-    db.database()
-        .exec_raw("INSERT INTO reclamation_fixture VALUES (zeroblob(4194304))")
-        .await
-        .expect("grow");
-    db.database()
-        .exec_raw("DROP TABLE reclamation_fixture")
-        .await
-        .expect("free pages");
-    db.database().close().await.expect("close");
-    drop(db);
-    let path = root.path().join(id.to_string()).join("session.db");
-    let before = std::fs::metadata(&path).expect("before").len();
-    let future = super::super::current_time_ms() + 31 * 86_400_000;
-    let foreign = registry.register_daemon(SessionId::new()).expect("foreign");
-    maintain_session_at(&state, root.path(), id, None, future)
-        .await
-        .expect("foreign defers compaction");
-    assert_eq!(std::fs::metadata(&path).expect("unchanged").len(), before);
-    foreign.finish().expect("foreign released");
-    maintain_session_at(&state, root.path(), id, None, future)
-        .await
-        .expect("scheduled reclamation");
-    drop(state);
-    assert!(std::fs::metadata(&path).expect("after").len() < before);
-    let db = bcode_session::db::SessionDb::open_existing_turso_in_root(id, root.path())
-        .await
-        .expect("reopen");
-    assert_eq!(db.all_events_strict().await.expect("preserved"), history);
-}
-
 async fn fixture(count: usize) -> (tempfile::TempDir, ServerState, SessionId, PathBuf, Vec<u8>) {
     let root = tempfile::tempdir().expect("root");
     let sessions = bcode_session::SessionManager::persistent(root.path()).expect("manager");
@@ -327,7 +284,7 @@ async fn scheduler_recent_access_and_damage_defer_but_cold_content_reaches_deep_
 }
 
 #[tokio::test]
-async fn worker_compresses_reclaims_and_preserves_continued_writes() {
+async fn worker_compresses_and_preserves_continued_writes() {
     verify_worker_history(false).await;
 }
 
@@ -401,8 +358,6 @@ async fn verify_worker_history(upgrade: bool) {
         .release_session_ownership(id)
         .await
         .expect("release");
-    let path = root.path().join(id.to_string()).join("session.db");
-    let before = std::fs::metadata(&path).expect("before").len();
     let state = Arc::new(state);
     if upgrade {
         upgrade_worker_fixture(&state, root.path(), id).await;
@@ -416,7 +371,7 @@ async fn verify_worker_history(upgrade: bool) {
                 .metrics
                 .snapshot()
                 .counters
-                .get("storage.maintenance.reclaimed_bytes")
+                .get("storage.maintenance.history_payload_bytes_saved")
                 .copied()
                 .unwrap_or_default()
                 > 1_048_576
@@ -433,8 +388,7 @@ async fn verify_worker_history(upgrade: bool) {
         .expect("shutdown")
         .expect("worker");
     drop(state);
-    completed.expect("worker compressed history and reclaimed pages");
-    assert!(std::fs::metadata(&path).expect("after").len() < before);
+    completed.expect("worker compressed history");
     assert!(artifacts.join("recording-000").is_dir());
     assert_eq!(
         bcode_session::artifact_storage::read_artifact_range(
@@ -456,7 +410,7 @@ async fn verify_worker_history(upgrade: bool) {
         .append_event(
             id,
             SessionEventKind::SystemMessage {
-                text: "continued after automatic reclamation".into(),
+                text: "continued after automatic compression".into(),
             },
         )
         .await

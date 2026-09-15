@@ -12,25 +12,20 @@ requires durable admission and verified maintenance ownership. The worker initia
 access ages conservatively rather than immediately compressing existing sessions. Historical
 entries below describing an unconditional disabled gate are superseded by this status.
 
-The real-file worker integration test now exercises age-based artifact and canonical-history
-compression, more than one MiB of actual database reclamation, transparent artifact reads, exact
-history preservation after reopening, and continued canonical writes. It runs the production
-scheduling loop with a supplied clock; production uses wall-clock time. This supplements the
-component migration, fallback-admission, compression, and reclamation tests. Subprocess tests now
-verify admission-lock release with preserved dirty evidence, artifact publication crash boundaries,
-and history transaction rollback after process exit between payload update and commit. The history
-crash test reopens exact logical history and successfully retries compression. The epoch-nine
-upgrade/compression/reclamation integration test also passes. An application-level integration now
-starts with epoch nine, runs `prepare_open` through the migration coordinator, verifies epoch ten,
-releases ownership, and runs the automatic worker through compression, reclamation, reopen, and
-continued writes. A constructed-server integration separately verifies normal startup launches
-the storage worker, conservatively initializes missing tracking, and clean shutdown releases
-registration so maintenance can be admitted again. The migration and lifecycle proofs are separate
-tests, not a single historical-session daemon-startup scenario.
-Engine VACUUM process-loss coverage now observes source-WAL growth during reclamation, kills the
-child process, reopens exact canonical history, and appends successfully. The regression passed
-both alone and in the reclamation suite. This is a real process-loss test at an observed publication
-window, not deterministic injection at every engine I/O boundary or a power-loss simulation.
+Database VACUUM/reclamation has been removed by explicit product decision: Bcode must not enable
+experimental engine compaction for session storage. Automatic artifact and history compression
+remain enabled. Artifact compression reduces artifact file sizes; history compression reduces
+stored payload bytes and can leave database pages available for reuse, but does not promise a
+smaller database file. No replacement database-compaction mechanism is introduced.
+
+Worker tests cover compression, transparent artifact reads, exact history after reopen, and
+continued writes, including an epoch-nine application upgrade. Constructed-server tests cover
+startup dispatch and clean registration release. Crash regressions for artifact publication,
+admission, and history transactions remain; VACUUM-only tests and the maintenance connection
+have been removed along with the direct Turso dependency.
+
+Historical implementation notes below about enabling VACUUM, reclamation APIs, free-page
+measurement, and reclamation validation are superseded by this removal decision.
 
 The first implemented slice was explicit bounded
 physical measurement through `bcode session storage-usage <session-id> [--entry-budget 10000]`.

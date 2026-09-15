@@ -33,7 +33,6 @@ switchy = { workspace = true, features = [
 thiserror = { workspace = true }
 tokio = { workspace = true, features = ["macros", "rt", "sync"] }
 tracing = { workspace = true }
-turso = { workspace = true }
 url = { workspace = true }
 zstd = { workspace = true }
 

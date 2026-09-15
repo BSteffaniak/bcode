@@ -51,13 +51,13 @@ async fn compressed_history_rejects_legacy_json_decoder_without_changing_logical
 }
 
 #[tokio::test]
-async fn paged_history_compression_reclaims_real_space_and_preserves_reopen_and_append() {
-    verify_history_reclamation(false).await;
+async fn paged_history_compression_preserves_reopen_and_append() {
+    verify_history_compression(false).await;
 }
 
 #[tokio::test]
-async fn directory_history_compression_reclaims_space_and_preserves_reopen_and_append() {
-    verify_history_reclamation(true).await;
+async fn directory_history_compression_preserves_reopen_and_append() {
+    verify_history_compression(true).await;
 }
 
 #[tokio::test]
@@ -110,7 +110,7 @@ fn directory_fixture(path: &Path) {
     std::fs::write(path.join("format"), b"BCODE_SESSION_DB 1\n").expect("format");
 }
 
-async fn verify_history_reclamation(directory_format: bool) {
+async fn verify_history_compression(directory_format: bool) {
     let root = tempfile::tempdir().expect("root");
     let manager = crate::SessionManager::persistent(root.path()).expect("manager");
     let session = manager
@@ -139,8 +139,6 @@ async fn verify_history_reclamation(directory_format: bool) {
     if directory_format {
         directory_fixture(&path);
     }
-    let path = crate::db_path::resolve_existing_session_db(&path).expect("resolve fixture");
-    let before = std::fs::metadata(&path).expect("before").len();
     let mut cursor = 0;
     let mut pages = 0;
     let mut saved = 0;
@@ -162,11 +160,6 @@ async fn verify_history_reclamation(directory_format: bool) {
     assert!(pages >= 4);
     assert_eq!(inspected, expected.len());
     assert!(saved > 4 * 1024 * 1024);
-    let report = crate::storage_reclamation::reclaim_session_storage(root.path(), id)
-        .await
-        .expect("reclaim");
-    assert!(report.reclaimed_bytes() > 4 * 1024 * 1024, "{report:?}");
-    assert!(std::fs::metadata(&path).expect("after").len() < before);
     let reopened = crate::SessionManager::persistent(root.path()).expect("reopen");
     assert_eq!(
         reopened.session_history(id).await.expect("same history"),
@@ -188,7 +181,7 @@ async fn verify_history_reclamation(directory_format: bool) {
         .append_event(
             id,
             SessionEventKind::SystemMessage {
-                text: "continued after reclamation".into(),
+                text: "continued after compression".into(),
             },
         )
         .await

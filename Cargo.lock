@@ -2646,7 +2646,6 @@ dependencies = [
  "thiserror 2.0.20",
  "tokio",
  "tracing",
- "turso",
  "url 2.5.8",
  "zstd",
 ]

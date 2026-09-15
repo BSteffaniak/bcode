@@ -1772,30 +1772,6 @@ impl SessionDb {
             }))
     }
 
-    /// Return free database-page bytes available for explicit physical reclamation.
-    ///
-    /// This does not include slack inside live pages or external artifacts. It is not a promise
-    /// that the configured backend supports compaction, nor a mutation or canonical validity check.
-    ///
-    /// # Errors
-    /// Rejects incompatible storage, malformed engine statistics, overflow and database failures.
-    pub async fn reclaimable_bytes(&self) -> SessionDbResult<u64> {
-        validate_storage_writer_contract(&**self.db).await?;
-        let free = self.db.query_raw("PRAGMA freelist_count").await?;
-        let size = self.db.query_raw("PRAGMA page_size").await?;
-        let free = free.first().ok_or_else(|| SessionDbError::InvalidRow {
-            column: "freelist_count".into(),
-        })?;
-        let size = size.first().ok_or_else(|| SessionDbError::InvalidRow {
-            column: "page_size".into(),
-        })?;
-        required_non_negative_u64(free, "freelist_count")?
-            .checked_mul(required_non_negative_u64(size, "page_size")?)
-            .ok_or_else(|| SessionDbError::InvalidRow {
-                column: "reclaimable_bytes".into(),
-            })
-    }
-
     #[cfg(test)]
     pub(crate) async fn compress_history_payload_page(
         &self,
@@ -11890,7 +11866,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn epoch_nine_upgrade_then_compression_preserves_history_and_reclaims_space() {
+    async fn epoch_nine_upgrade_then_compression_preserves_history() {
         let root = tempfile::tempdir().expect("root");
         let id = SessionId::new();
         let db = SessionDb::open_turso_in_root(id, root.path())
@@ -11957,10 +11933,6 @@ mod tests {
             .await
             .expect("compress");
         assert!(compressed.saved_bytes > 1024 * 1024);
-        let reclaimed = crate::storage_reclamation::reclaim_session_storage(root.path(), id)
-            .await
-            .expect("reclaim");
-        assert!(reclaimed.reclaimed_bytes() > 1024 * 1024);
         let db = SessionDb::open_existing_turso_in_root(id, root.path())
             .await
             .expect("reopen");
@@ -11977,7 +11949,7 @@ mod tests {
         );
         db.append_event(&next)
             .await
-            .expect("append after upgrade and reclaim");
+            .expect("append after upgrade and compression");
         assert_eq!(
             db.all_events_strict().await.expect("continued").last(),
             Some(&next)

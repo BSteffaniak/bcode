@@ -256,46 +256,7 @@ async fn maintain_history(
             through: page.through_sequence,
         }));
     }
-    reclaim_completed_pass(state, root, id, now, age, policy.minimum_saved_bytes).await;
     Ok(None)
-}
-
-async fn reclaim_completed_pass(
-    state: &ServerState,
-    root: &std::path::Path,
-    id: SessionId,
-    now: u64,
-    age: u64,
-    minimum: u64,
-) {
-    if state
-        .shutdown_requested
-        .load(std::sync::atomic::Ordering::SeqCst)
-    {
-        return;
-    }
-    let Ok(cancellation) = operation_cancellation(state) else {
-        return;
-    };
-    match bcode_session::storage_reclamation::reclaim_idle_session_storage_admitted(
-        root,
-        id,
-        now,
-        age,
-        minimum,
-        cancellation,
-    )
-    .await
-    {
-        Ok(bcode_session::storage_reclamation::SessionReclamationOutcome::Reclaimed(report)) => {
-            state.metrics.add_counter(
-                "storage.maintenance.reclaimed_bytes",
-                report.reclaimed_bytes(),
-            );
-        }
-        Ok(_) => {}
-        Err(_) => tracing::debug!("automatic session reclamation deferred"),
-    }
 }
 
 async fn observe_access_for_sweep(
@@ -396,17 +357,6 @@ async fn maintain_session_at(
             if outcome.is_err() {
                 tracing::debug!("automatic artifact candidate deferred");
             }
-        }
-        if !has_more {
-            reclaim_completed_pass(
-                state,
-                root,
-                id,
-                now,
-                minimum_age,
-                config.minimum_saved_bytes,
-            )
-            .await;
         }
         Ok(ArtifactSweepCursor::continuation(
             cursor,
