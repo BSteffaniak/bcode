@@ -89,7 +89,7 @@ fn rows(models: BTreeMap<UsageModel, UsageTotals>) -> Vec<UsageModelRow> {
         .map(|(model, totals)| UsageModelRow { model, totals })
         .collect()
 }
-fn merge(target: &mut UsageTotals, source: &UsageTotals) -> Result<(), String> {
+pub(crate) fn merge(target: &mut UsageTotals, source: &UsageTotals) -> Result<(), String> {
     for (target, source) in [
         (&mut target.requests, source.requests),
         (&mut target.priced_requests, source.priced_requests),

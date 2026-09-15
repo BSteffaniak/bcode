@@ -10,6 +10,7 @@ use bcode_usage_models::{
 };
 pub mod index;
 pub mod summary;
+mod time_index;
 
 use std::collections::BTreeMap;
 

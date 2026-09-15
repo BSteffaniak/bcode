@@ -898,6 +898,13 @@ pub async fn collect_usage(
         admission.finish_history(state, session_id).await;
     }
     if query.after.is_none() {
+        state
+            .usage_index
+            .lock()
+            .await
+            .prepare_collection()
+            .await
+            .map_err(|_| "usage index upgrade unavailable; maintenance required")?;
         let progress = state
             .usage_index
             .lock()

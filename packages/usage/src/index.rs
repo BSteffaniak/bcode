@@ -8,7 +8,9 @@ use switchy::database::{
     query::{FilterableQuery, SortDirection},
 };
 
-const SCHEMA: i64 = 1;
+mod upgrade;
+
+const SCHEMA: i64 = 2;
 
 /// State-location-local reporting storage. Opening a dashboard never initializes or repairs it.
 #[derive(Debug)]
@@ -16,10 +18,10 @@ pub struct UsageIndex {
     path: PathBuf,
 }
 
-fn error(_: impl std::fmt::Display) -> String {
+pub(super) fn error(_: impl std::fmt::Display) -> String {
     "usage index unavailable or incompatible; explicit collection/maintenance required".into()
 }
-fn text(row: &Row, name: &str) -> Result<String, String> {
+pub(super) fn text(row: &Row, name: &str) -> Result<String, String> {
     row.get(name)
         .and_then(|value| value.as_str().map(str::to_owned))
         .ok_or_else(|| error(name))
@@ -44,6 +46,14 @@ pub enum CollectionProgress {
 }
 
 impl UsageIndex {
+    /// Prepare a known reporting schema upgrade during explicit collection only.
+    /// # Errors
+    /// Rejects unknown versions or unverifiable exclusive access; preserves existing data.
+    pub async fn prepare_collection(&self) -> Result<(), String> {
+        let (_lock, _db) = self.open(true).await?;
+        Ok(())
+    }
+
     /// Inspect one source checkpoint without creating storage or reading request contributions.
     /// # Errors
     /// Rejects corrupt checkpoints or incompatible storage; a missing index is reported separately.
@@ -137,7 +147,9 @@ impl UsageIndex {
         if tables.is_empty() && initialize {
             for statement in [
                 "CREATE TABLE usage_meta (id INTEGER PRIMARY KEY CHECK(id=1), version INTEGER NOT NULL, revision INTEGER NOT NULL, ordinal INTEGER NOT NULL)",
-                "INSERT INTO usage_meta VALUES (1,1,0,0)",
+                "INSERT INTO usage_meta VALUES (1,2,0,0)",
+                "CREATE TABLE usage_time_nodes (node_key TEXT PRIMARY KEY, tree TEXT NOT NULL, totals_json TEXT NOT NULL)",
+                "CREATE INDEX usage_time_tree ON usage_time_nodes(tree)",
                 "CREATE TABLE usage_sessions (session_id TEXT PRIMARY KEY, generation TEXT NOT NULL, next_key TEXT, collecting INTEGER NOT NULL)",
                 "CREATE TABLE usage_rows (ordinal INTEGER PRIMARY KEY, session_id TEXT NOT NULL, request_key TEXT NOT NULL, entry_json TEXT NOT NULL, staged INTEGER NOT NULL, UNIQUE(session_id,request_key,staged))",
                 "CREATE INDEX usage_session_rows ON usage_rows(session_id,staged,ordinal)",
@@ -153,8 +165,10 @@ impl UsageIndex {
             .await
             .map_err(error)?
             .ok_or_else(|| error("missing schema"))?;
-        if integer(&meta, "version")? != SCHEMA {
-            return Err(error("future schema"));
+        match integer(&meta, "version")? {
+            1 if initialize => upgrade::upgrade_v1(&*tx).await?,
+            SCHEMA => {}
+            _ => return Err(error("unsupported schema")),
         }
         tx.commit().await.map_err(error)?;
         Ok((lock, db))
@@ -191,6 +205,11 @@ impl UsageIndex {
             }
         } else {
             validate_restart(current.as_ref(), &generation)?;
+            tx.delete("usage_time_nodes")
+                .where_eq("tree", format!("{id}/{generation}"))
+                .execute(&*tx)
+                .await
+                .map_err(error)?;
             tx.delete("usage_rows")
                 .where_eq("session_id", id.clone())
                 .where_eq("staged", 1)
@@ -207,6 +226,7 @@ impl UsageIndex {
             .ok_or_else(|| error("meta"))?;
         let mut ordinal = integer(&meta, "ordinal")?;
         for entry in &page.entries {
+            index_contribution(&*tx, &id, &generation, entry).await?;
             ordinal = ordinal
                 .checked_add(1)
                 .ok_or_else(|| error("ordinal overflow"))?;
@@ -262,6 +282,35 @@ impl UsageIndex {
             .map_err(error)?;
         tx.commit().await.map_err(error)?;
         Ok(complete)
+    }
+
+    /// Read exact whole-range totals for one completely published session snapshot.
+    /// # Errors
+    /// Rejects missing, collecting, incompatible, or corrupt state. Source freshness is not implied.
+    pub async fn session_range_totals(
+        &self,
+        session_id: SessionId,
+        range: bcode_session_models::SessionCostRange,
+    ) -> Result<bcode_usage_models::UsageTotals, String> {
+        range.validate()?;
+        let (_lock, db) = self.open(false).await?;
+        let row = db
+            .select("usage_sessions")
+            .where_eq("session_id", session_id.to_string())
+            .execute_first(&*db)
+            .await
+            .map_err(error)?
+            .ok_or_else(|| error("missing source"))?;
+        if integer(&row, "collecting")? != 0 {
+            return Err(error("source collecting"));
+        }
+        crate::time_index::range(
+            &*db,
+            &format!("{session_id}/{}", text(&row, "generation")?),
+            range.from_timestamp_ms,
+            range.to_timestamp_ms,
+        )
+        .await
     }
 
     /// Read a bounded generation-fenced report page without initializing missing storage.
@@ -348,6 +397,23 @@ impl UsageIndex {
         tx.commit().await.map_err(error)?;
         Ok(())
     }
+}
+
+async fn index_contribution(
+    db: &dyn Database,
+    id: &str,
+    generation: &str,
+    entry: &bcode_session_models::SessionUsageEntry,
+) -> Result<(), String> {
+    let mut contribution = bcode_usage_models::UsageTotals::default();
+    crate::contribute(&mut contribution, &entry.usage)?;
+    crate::time_index::add(
+        db,
+        &format!("{id}/{generation}"),
+        entry.first_observed_at_ms,
+        &contribution,
+    )
+    .await
 }
 
 fn validate_restart(current: Option<&Row>, generation: &str) -> Result<(), String> {
@@ -524,6 +590,61 @@ mod tests {
         final_page.generation.cost_revision = 1;
         assert!(index.collect(session, Some("a"), final_page).await.unwrap());
         assert_eq!(index.query(&query()).await.unwrap().totals.requests, 2);
+    }
+
+    #[tokio::test]
+    async fn time_range_totals_are_exact_across_restart() {
+        let root = tempfile::tempdir().unwrap();
+        let root = root.path().canonicalize().unwrap();
+        let index = UsageIndex::in_state_root(&root);
+        let id = SessionId::new();
+        let mut first = page("a", Some("a"));
+        first.entries[0].first_observed_at_ms = 10;
+        index.collect(id, None, first).await.unwrap();
+        let mut second = page("b", None);
+        second.entries[0].first_observed_at_ms = 20;
+        index.collect(id, Some("a"), second).await.unwrap();
+        let index = UsageIndex::in_state_root(&root);
+        for (from, to, count) in [(0, 10, 0), (10, 20, 1), (10, 21, 2), (21, 100, 0)] {
+            let totals = index
+                .session_range_totals(
+                    id,
+                    SessionCostRange {
+                        from_timestamp_ms: from,
+                        to_timestamp_ms: to,
+                    },
+                )
+                .await
+                .unwrap();
+            assert_eq!(totals.requests, count);
+        }
+    }
+
+    #[tokio::test]
+    async fn v1_upgrade_is_explicit_and_preserves_contributions() {
+        let root = tempfile::tempdir().unwrap();
+        let root = root.path().canonicalize().unwrap();
+        let index = UsageIndex::in_state_root(&root);
+        let id = SessionId::new();
+        index.collect(id, None, page("a", None)).await.unwrap();
+        let (lock, db) = index.open(false).await.unwrap();
+        db.query_raw("DROP TABLE usage_time_nodes").await.unwrap();
+        db.query_raw("UPDATE usage_meta SET version=1 WHERE id=1")
+            .await
+            .unwrap();
+        drop(db);
+        drop(lock);
+        assert!(index.query(&query()).await.is_err());
+        index.prepare_collection().await.unwrap();
+        assert_eq!(index.query(&query()).await.unwrap().totals.requests, 1);
+        assert_eq!(
+            index
+                .session_range_totals(id, query().range)
+                .await
+                .unwrap()
+                .requests,
+            1
+        );
     }
 
     #[tokio::test]
