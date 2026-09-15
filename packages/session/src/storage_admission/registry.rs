@@ -75,6 +75,23 @@ impl StorageAdmissionRegistry {
         Ok(Self { directory })
     }
 
+    /// Open a session-scoped registry without creating canonical session storage.
+    /// All participating clients must use this scope (coordinated clean-break rollout).
+    ///
+    /// # Errors
+    /// Rejects unsafe roots, symlinks, malformed paths, or I/O failures.
+    pub fn open_session(root: &Path, session_id: SessionId) -> io::Result<Self> {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        let root = std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_DIRECTORY | libc::O_CLOEXEC)
+            .open(root)?;
+        let parent = create_directory(&root, c"storage-admission-sessions-v1")?;
+        let name = std::ffi::CString::new(session_id.to_string()).map_err(|_| invalid())?;
+        let directory = create_directory(&parent, &name)?;
+        Ok(Self { directory })
+    }
+
     /// Remove only verified clean, completed daemon records under exclusive registry admission.
     ///
     /// The complete directory scan must fit the budget before any record is removed. Live,
@@ -415,6 +432,17 @@ impl StorageAdmissionRegistry {
         self.directory.sync_all()?;
         Ok(file)
     }
+}
+
+fn create_directory(parent: &File, name: &std::ffi::CStr) -> io::Result<File> {
+    // SAFETY: name is a fixed or typed UUID component under an owned directory descriptor.
+    let created = unsafe { libc::mkdirat(raw(parent), name.as_ptr(), 0o700) };
+    if created != 0 && io::Error::last_os_error().kind() != io::ErrorKind::AlreadyExists {
+        return Err(io::Error::last_os_error());
+    }
+    let directory = open_child(parent, name, libc::O_RDONLY | libc::O_DIRECTORY)?;
+    parent.sync_all()?;
+    Ok(directory)
 }
 
 fn raw(file: &File) -> std::os::fd::RawFd {

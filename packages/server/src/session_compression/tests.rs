@@ -98,8 +98,9 @@ async fn explicit_id_does_not_bypass_registered_reader() {
         .expect("release");
     let state = crate::tests::test_server_state(sessions);
     crate::storage_read_admission::register_startup(&state, root.path().to_path_buf()).await;
-    let registry = bcode_session::storage_admission::StorageAdmissionRegistry::open(root.path())
-        .expect("registry");
+    let registry =
+        bcode_session::storage_admission::StorageAdmissionRegistry::open_session(root.path(), id)
+            .expect("registry");
     let reader = registry
         .admit_read(bcode_session_models::SessionId::new())
         .expect("reader");

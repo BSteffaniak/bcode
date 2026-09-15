@@ -29,7 +29,7 @@ async fn daemon_maintenance_never_falls_back_to_offline_authority() {
 }
 
 #[tokio::test]
-async fn maintenance_pass_uses_local_live_acknowledgement_but_refuses_foreign_daemon() {
+async fn maintenance_pass_ignores_unrelated_daemon() {
     let (root, state, id, artifacts, _) = fixture(2).await;
     let registry = bcode_session::storage_admission::StorageAdmissionRegistry::open(root.path())
         .expect("registry");
@@ -37,8 +37,8 @@ async fn maintenance_pass_uses_local_live_acknowledgement_but_refuses_foreign_da
     let future = super::super::current_time_ms() + 31 * 86_400_000;
     maintain_session_at(&state, root.path(), id, None, future)
         .await
-        .expect("foreign deferred");
-    assert!(artifacts.join("recording-000").is_file());
+        .expect("unrelated daemon allowed");
+    assert!(artifacts.join("recording-000").is_dir());
     foreign.finish().expect("foreign drained");
     maintain_session_at(&state, root.path(), id, None, future)
         .await
@@ -53,8 +53,9 @@ async fn maintenance_pass_uses_local_live_acknowledgement_but_refuses_foreign_da
 #[tokio::test]
 async fn automatic_publication_is_blocked_by_registered_readers_and_dirty_records() {
     let (root, state, id, artifacts, _) = fixture(1).await;
-    let registry = bcode_session::storage_admission::StorageAdmissionRegistry::open(root.path())
-        .expect("registry");
+    let registry =
+        bcode_session::storage_admission::StorageAdmissionRegistry::open_session(root.path(), id)
+            .expect("registry");
     let participant = SessionId::new();
     let read = registry.admit_read(participant).expect("reader");
     let future = super::super::current_time_ms() + 31 * 86_400_000;
@@ -74,8 +75,9 @@ async fn automatic_publication_is_blocked_by_registered_readers_and_dirty_record
 #[tokio::test]
 async fn automatic_publication_resumes_after_successful_reader_completion() {
     let (root, state, id, artifacts, _) = fixture(1).await;
-    let registry = bcode_session::storage_admission::StorageAdmissionRegistry::open(root.path())
-        .expect("registry");
+    let registry =
+        bcode_session::storage_admission::StorageAdmissionRegistry::open_session(root.path(), id)
+            .expect("registry");
     let participant = SessionId::new();
     let read = registry.admit_read(participant).expect("reader");
     read.complete().expect("tracked reader");

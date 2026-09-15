@@ -1,5 +1,22 @@
 # Session storage tiering
 
+## Session-scoped coordination
+
+Reads and compression now coordinate through
+`storage-admission-sessions-v1/<session-id>` beneath the owning sessions root. The directory is
+coordination metadata, not canonical session storage. Every persistent application read registers
+before lookup and retains admission through access persistence. Registration failure rejects the
+read: no unregistered fallback is permitted. Active or abandoned read evidence blocks only that
+session; unrelated daemon registrations and unrelated session reads do not block its maintenance.
+Compression retains exclusive admission and existing session maintenance ownership through writes.
+The initiating daemon must still have healthy registration and tracking state.
+
+This is a coordinated clean-break protocol change: rebuild and cleanly stop/restart **all** clients
+and daemons sharing the state location before using it. Earlier binaries use a different admission
+gate and must not coexist during compression. Legacy global registry evidence is preserved, not
+removed or treated as session-specific evidence. Earlier notes describing global admission as the
+compression gate are superseded by this section.
+
 ## Manual compression
 
 ```sh

@@ -301,26 +301,18 @@ impl ArtifactMaintenanceCancellation {
     ///
     /// # Errors
     /// Reports busy admission, unacknowledged daemons, or invalid/unavailable evidence.
-    pub async fn check_tracking_admission(&self, root: &Path) -> io::Result<()> {
-        let admission = self.admit_tracking(root).await?;
-        admission.check()
+    pub async fn check_tracking_admission(&self, root: &Path, id: SessionId) -> io::Result<()> {
+        let _admission = self.admit_tracking(root, id).await?;
+        self.check()
     }
 
-    pub(crate) async fn admit_tracking(&self, root: &Path) -> io::Result<TrackingAdmission> {
-        #[cfg(any(target_os = "macos", target_os = "linux"))]
-        if let Some(acknowledgement) = self.acknowledgement.clone() {
-            let root = root.to_path_buf();
-            return tokio::task::spawn_blocking(move || {
-                crate::storage_admission::StorageAdmissionRegistry::open(&root)?
-                    .admit_owned(4096, acknowledgement)
-                    .map(TrackingAdmission::Live)
-            })
-            .await
-            .map_err(|_| io::Error::other("owned tracking admission failed"))?;
-        }
-        acquire_tracking_admission(root)
-            .await
-            .map(TrackingAdmission::Offline)
+    pub(crate) async fn admit_tracking(
+        &self,
+        root: &Path,
+        id: SessionId,
+    ) -> io::Result<TrackingAdmission> {
+        self.check()?;
+        acquire_tracking_admission(root, id).await
     }
 
     pub(crate) fn check(&self) -> io::Result<()> {
@@ -338,24 +330,7 @@ impl ArtifactMaintenanceCancellation {
     }
 }
 
-pub(crate) enum TrackingAdmission {
-    Offline(crate::storage_admission::StorageMaintenanceAdmission),
-    #[cfg(any(target_os = "macos", target_os = "linux"))]
-    Live(crate::storage_admission::OwnedStorageMaintenance),
-}
-
-impl TrackingAdmission {
-    pub(crate) fn check(&self) -> io::Result<()> {
-        match self {
-            Self::Offline(guard) => {
-                let _ = guard;
-                Ok(())
-            }
-            #[cfg(any(target_os = "macos", target_os = "linux"))]
-            Self::Live(guard) => guard.check(),
-        }
-    }
-}
+type TrackingAdmission = crate::storage_admission::StorageMaintenanceAdmission;
 
 struct CancelAbandonedWaiter(Option<ArtifactMaintenanceCancellation>);
 
@@ -408,12 +383,14 @@ pub async fn compress_finalized_artifact_with_age(
 
 pub(crate) async fn acquire_tracking_admission(
     root: &Path,
+    id: SessionId,
 ) -> io::Result<crate::storage_admission::StorageMaintenanceAdmission> {
     #[cfg(any(target_os = "macos", target_os = "linux"))]
     {
         let root = root.to_path_buf();
         tokio::task::spawn_blocking(move || {
-            crate::storage_admission::StorageAdmissionRegistry::open(&root)?.admit_maintenance(4096)
+            crate::storage_admission::StorageAdmissionRegistry::open_session(&root, id)?
+                .admit_maintenance(4096)
         })
         .await
         .map_err(|_| io::Error::other("storage tracking admission task failed"))?
@@ -495,7 +472,7 @@ pub async fn compress_finalized_artifact_cancellable(
     // Age-based calls are automatic policy work. Admission is enforced here so a scheduler cannot
     // bypass failed tracking by calling the storage operation directly.
     let admission = if age.is_some() || cancellation.requires_tracking_admission() {
-        Some(cancellation.admit_tracking(&root).await?)
+        Some(cancellation.admit_tracking(&root, session_id).await?)
     } else {
         None
     };
@@ -557,9 +534,7 @@ pub async fn compress_finalized_artifact_cancellable(
     let expected_bytes = reference.byte_len.ok_or_else(invalid)?;
     let expected_checksum = reference.checksum_sha256;
     run_cancellable_artifact_work(cancellation.clone(), move || {
-        if let Some(admission) = &admission {
-            admission.check()?;
-        }
+        cancellation.check()?;
         cancellation.check()?;
         let artifacts = confined(
             &root.join("session-artifacts").join(session_id.to_string()),

@@ -128,7 +128,7 @@ pub async fn compress_history_page_through(
             .into());
         }
         let _admission = if age.is_some() || cancellation.requires_tracking_admission() {
-            Some(cancellation.admit_tracking(&root).await?)
+            Some(cancellation.admit_tracking(&root, id).await?)
         } else {
             None
         };

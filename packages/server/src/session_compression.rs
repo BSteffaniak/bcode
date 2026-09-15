@@ -102,7 +102,10 @@ async fn execute_page(
     let Ok(cancellation) = super::storage_maintenance::operation_cancellation(state) else {
         return Ok(failed(result, Failure::TrackingUnavailable));
     };
-    if let Err(error) = cancellation.check_tracking_admission(root).await {
+    if let Err(error) = cancellation
+        .check_tracking_admission(root, request.session_id)
+        .await
+    {
         return Ok(failed(result, admission_failure(&error)));
     }
     let age = request.minimum_age_ms.map(|age| (request.as_of_ms, age));

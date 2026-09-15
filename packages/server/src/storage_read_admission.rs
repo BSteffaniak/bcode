@@ -1,7 +1,7 @@
 //! Application-owned lifecycle for registered storage reads.
 //!
-//! This adapter is deliberately not enabled until all relevant read entry points can acquire it
-//! before exposing content. Errors must not be interpreted as permission to schedule from stale age.
+//! Persistent reads register against the target session before consuming content. Registration
+//! failures reject the read; they never authorize an unregistered fallback.
 
 use bcode_session::storage_admission::{StorageAdmissionRegistry, StorageReadAdmission};
 use bcode_session_models::SessionId;
@@ -16,34 +16,29 @@ pub struct RegisteredStorageRead {
 }
 
 impl RegisteredStorageRead {
-    /// Attempt admission, permitting fallback only after a durable maintenance blocker is saved.
+    /// Acquire session-scoped admission before content access.
     ///
-    /// In-memory sessions require no persistent admission. Failed admission and failed blocker
-    /// persistence return an error before the caller may consume content.
+    /// In-memory sessions require no persistent admission. Persistent registration failures return
+    /// an error before content can be consumed, without poisoning unrelated sessions.
     ///
     /// # Errors
-    /// Returns a retryable storage error when neither admission nor fallback fencing succeeds.
+    /// Returns a retryable storage error when registration cannot be acquired.
     pub async fn for_session(
         state: &super::ServerState,
-        _session_id: SessionId,
+        session_id: SessionId,
     ) -> Result<Option<Self>, bcode_session::SessionError> {
         let Some(root) = state.sessions.session_store_root() else {
             return Ok(None);
         };
         // Register before lookup: existence can change, and metadata failure is not proof that
         // this operation cannot consume persistent content.
-        let fallback_root = root.clone();
-        if let Ok(admission) = Self::begin(root).await {
-            return Ok(Some(admission));
-        }
-        if !block_unregistered_reads(state, fallback_root).await {
-            return Err(bcode_session::db::SessionDbError::Io(io::Error::new(
+        Self::begin(root, session_id).await.map(Some).map_err(|_| {
+            bcode_session::db::SessionDbError::Io(io::Error::new(
                 io::ErrorKind::WouldBlock,
-                "storage read admission unavailable; retry after storage coordination recovers",
+                "session storage admission unavailable; retry after coordination recovers",
             ))
-            .into());
-        }
-        Ok(None)
+            .into()
+        })
     }
 
     /// Persist access before completing admission. Failure leaves a durable dirty participant.
@@ -84,9 +79,9 @@ impl RegisteredStorageRead {
     /// # Errors
     /// Returns contention or registry IO/compatibility failures. No content may have been exposed
     /// under this admission if it fails; the caller decides whether to defer optional maintenance.
-    pub async fn begin(root: PathBuf) -> io::Result<Self> {
+    pub async fn begin(root: PathBuf, session_id: SessionId) -> io::Result<Self> {
         tokio::task::spawn_blocking(move || {
-            let registry = StorageAdmissionRegistry::open(&root)?;
+            let registry = StorageAdmissionRegistry::open_session(&root, session_id)?;
             let participant = SessionId::new();
             let admission = registry.admit_read(participant)?;
             Ok(Self {
@@ -179,7 +174,8 @@ mod tests {
             .expect("release");
         let before = bcode_session::storage_access::observe_session_access(root.path(), session.id)
             .expect("access");
-        let registry = StorageAdmissionRegistry::open(root.path()).expect("registry");
+        let registry =
+            StorageAdmissionRegistry::open_session(root.path(), session.id).expect("registry");
         let maintenance = registry.admit_maintenance(16).expect("maintenance");
         let state = crate::tests::test_server_state(sessions);
         let client = bcode_session_models::ClientId::new();
@@ -201,7 +197,7 @@ mod tests {
             expected
         );
         assert!(
-            state
+            !state
                 .storage_tracking_failed
                 .load(std::sync::atomic::Ordering::SeqCst)
         );
@@ -232,7 +228,7 @@ mod tests {
             .expect("release");
         let before = bcode_session::storage_access::observe_session_access(root.path(), session.id)
             .expect("access");
-        let obstruction = root.path().join("storage-admission-v1");
+        let obstruction = root.path().join("storage-admission-sessions-v1");
         std::fs::write(&obstruction, b"unavailable registry").expect("obstruct");
         let state = crate::tests::test_server_state(sessions);
         let client = bcode_session_models::ClientId::new();
@@ -258,7 +254,7 @@ mod tests {
             expected
         );
         assert!(
-            state
+            !state
                 .storage_tracking_failed
                 .load(std::sync::atomic::Ordering::SeqCst)
         );
@@ -275,7 +271,7 @@ mod tests {
             .await
             .expect("admission available")
             .expect("admitted");
-        let registry = StorageAdmissionRegistry::open(root.path()).expect("registry");
+        let registry = StorageAdmissionRegistry::open_session(root.path(), id).expect("registry");
         assert!(registry.admit_maintenance(16).is_err());
         read.complete().await.expect("complete empty lookup");
         drop(state);
@@ -409,15 +405,16 @@ mod tests {
     #[tokio::test]
     async fn registered_read_lifecycle_retires_success_but_preserves_abandonment() {
         let root = tempfile::tempdir().expect("root");
-        let read = RegisteredStorageRead::begin(root.path().to_path_buf())
+        let id = SessionId::new();
+        let read = RegisteredStorageRead::begin(root.path().to_path_buf(), id)
             .await
             .expect("registered");
-        let registry = StorageAdmissionRegistry::open(root.path()).expect("registry");
+        let registry = StorageAdmissionRegistry::open_session(root.path(), id).expect("registry");
         assert!(registry.admit_maintenance(10).is_err());
         read.complete().await.expect("complete");
         drop(registry.admit_maintenance(1).expect("empty clean registry"));
         drop(
-            RegisteredStorageRead::begin(root.path().to_path_buf())
+            RegisteredStorageRead::begin(root.path().to_path_buf(), id)
                 .await
                 .expect("abandoned"),
         );

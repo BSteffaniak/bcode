@@ -1,7 +1,7 @@
 use super::*;
 
 #[tokio::test]
-async fn unacknowledged_daemon_stops_sweep_before_artifact_attempts() {
+async fn unrelated_daemon_does_not_block_session_sweep() {
     let root = tempfile::tempdir().expect("root");
     let sessions = bcode_session::SessionManager::persistent(root.path()).expect("sessions");
     let id = sessions
@@ -20,6 +20,14 @@ async fn unacknowledged_daemon_stops_sweep_before_artifact_attempts() {
     let foreign = registry
         .register_daemon(bcode_session_models::SessionId::new())
         .expect("foreign");
+    let unrelated = bcode_session::storage_admission::StorageAdmissionRegistry::open_session(
+        root.path(),
+        bcode_session_models::SessionId::new(),
+    )
+    .expect("unrelated registry");
+    let unrelated_reader = unrelated
+        .admit_read(bcode_session_models::SessionId::new())
+        .expect("unrelated read");
     let request = StorageCompressionRequest {
         session_id: id,
         as_of_ms: crate::current_time_ms(),
@@ -31,10 +39,11 @@ async fn unacknowledged_daemon_stops_sweep_before_artifact_attempts() {
     let blocked = compress_page(&state, request.clone())
         .await
         .expect("blocked");
-    assert_eq!(blocked.failure, Some(Failure::UnacknowledgedDaemon));
-    assert_eq!(blocked.disposition, Disposition::Unavailable);
-    assert_eq!(blocked.failures, 1);
-    assert!(blocked.next.is_none());
+    assert_eq!(blocked.failure, None);
+    assert_eq!(blocked.disposition, Disposition::Processed);
+    assert_eq!(blocked.failures, 0);
+    assert!(blocked.next.is_some());
+    drop(unrelated_reader);
     foreign.finish().expect("clean foreign shutdown");
     let retry = compress_page(&state, request).await.expect("retry");
     drop(state);
