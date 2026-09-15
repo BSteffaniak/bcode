@@ -1,4 +1,5 @@
 //! BMUX-native usage surface. All source access goes through typed host capabilities.
+mod filters;
 mod timeline;
 
 use bcode_plugin_sdk::tui::{
@@ -48,6 +49,7 @@ enum Update {
     Collection(Result<bcode_session_models::SessionUsagePage, String>),
 }
 struct Dashboard {
+    filters: Option<filters::Filters>,
     session: Option<SessionId>,
     query: UsageQuery,
     report: Option<UsageReport>,
@@ -67,6 +69,7 @@ impl Dashboard {
                 u64::try_from(duration.as_millis()).unwrap_or(1)
             });
         Self {
+            filters: None,
             session,
             query: UsageQuery {
                 version: USAGE_VERSION,
@@ -181,6 +184,34 @@ impl Dashboard {
                 .collect()
         }
     }
+    fn filter_event(&mut self, event: &Event, host: &dyn PluginTuiHost) -> bool {
+        let Some(filters) = &mut self.filters else {
+            return false;
+        };
+        if let Event::Key(stroke) = event {
+            match stroke.key {
+                KeyCode::Escape => {
+                    self.filters = None;
+                    return true;
+                }
+                KeyCode::Enter => {
+                    match filters.apply(&self.query) {
+                        Ok(query) => {
+                            self.query = query;
+                            self.filters = None;
+                            self.refresh(host);
+                        }
+                        Err(error) => filters.error = error,
+                    }
+                    return true;
+                }
+                _ => {}
+            }
+        }
+        filters.event(event);
+        true
+    }
+
     fn filter_key(&mut self, key: KeyCode, host: &dyn PluginTuiHost) -> bool {
         if self.busy {
             return false;
@@ -269,6 +300,10 @@ impl PluginTuiSurface for Dashboard {
     }
     fn render(&mut self, area: Rect, frame: &mut PaintCx<'_, '_>) {
         self.receive();
+        if let Some(filters) = &self.filters {
+            filters.paint(area, frame);
+            return;
+        }
         self.area = Rect::new(
             area.x,
             area.y.saturating_add(area.height.min(3)),
@@ -357,6 +392,9 @@ impl PluginTuiSurface for Dashboard {
     }
     fn handle_event(&mut self, event: &Event, host: &dyn PluginTuiHost) -> PluginTuiAction {
         self.receive();
+        if self.filter_event(event, host) {
+            return PluginTuiAction::Redraw;
+        }
         if let Event::Key(stroke) = event {
             if self.filter_key(stroke.key, host) {
                 return PluginTuiAction::Redraw;
@@ -364,6 +402,9 @@ impl PluginTuiSurface for Dashboard {
             match stroke.key {
                 KeyCode::Escape | KeyCode::Char('q') => {
                     return PluginTuiAction::Close { outcome: None };
+                }
+                KeyCode::Char('f') if !self.busy => {
+                    self.filters = Some(filters::Filters::new(&self.query));
                 }
                 KeyCode::Char('r') if !self.busy => {
                     self.query.after = None;
