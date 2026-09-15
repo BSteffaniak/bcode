@@ -1,5 +1,6 @@
 //! BMUX-native usage surface. All source access goes through typed host capabilities.
 mod filters;
+mod model_picker;
 mod timeline;
 
 use bcode_plugin_sdk::tui::{
@@ -49,6 +50,9 @@ enum Update {
     Collection(Result<bcode_session_models::SessionUsagePage, String>),
 }
 struct Dashboard {
+    summary: Option<bcode_usage::summary::UsageSummaryAccumulator>,
+    report_scope: &'static str,
+    model_picker: Option<model_picker::ModelPicker>,
     filters: Option<filters::Filters>,
     session: Option<SessionId>,
     query: UsageQuery,
@@ -69,6 +73,9 @@ impl Dashboard {
                 u64::try_from(duration.as_millis()).unwrap_or(1)
             });
         Self {
+            summary: None,
+            report_scope: "PAGE SUBTOTALS",
+            model_picker: None,
             filters: None,
             session,
             query: UsageQuery {
@@ -108,10 +115,7 @@ impl Dashboard {
         if let Some(update) = update {
             self.busy = false;
             match update {
-                Update::Report(Ok(report)) => {
-                    self.status.clone_from(&report.coverage);
-                    self.report = Some(report);
-                }
+                Update::Report(Ok(report)) => self.receive_report(report),
                 Update::Collection(Ok(page)) => {
                     self.collection.after = page.next_after;
                     self.collection.generation = Some(page.generation);
@@ -123,6 +127,7 @@ impl Dashboard {
                     .into();
                 }
                 Update::Report(Err(error)) | Update::Collection(Err(error)) => {
+                    self.summary = None;
                     self.status = error;
                     self.collection.after = None;
                     self.collection.generation = None;
@@ -130,6 +135,47 @@ impl Dashboard {
             }
         }
     }
+    fn receive_report(&mut self, report: UsageReport) {
+        if let Some(summary) = &mut self.summary {
+            if let Err(error) = summary.accept(self.query.after, &report) {
+                self.status = error;
+                self.summary = None;
+                return;
+            }
+            if report.next_after.is_some() {
+                self.query.after = report.next_after;
+                self.query.revision = Some(report.revision);
+                self.status = "Summary incomplete: s next bounded page; r cancel".into();
+                return;
+            }
+            let Some(summary) = self.summary.take() else {
+                return;
+            };
+            match summary.finish() {
+                Ok(report) => {
+                    self.status.clone_from(&report.coverage);
+                    self.report = Some(report);
+                    self.report_scope = "WHOLE RANGE: INDEXED SNAPSHOTS";
+                }
+                Err(error) => self.status = error,
+            }
+        } else {
+            self.report_scope = "PAGE SUBTOTALS";
+            self.status.clone_from(&report.coverage);
+            self.report = Some(report);
+        }
+    }
+
+    fn start_summary_page(&mut self, host: &dyn PluginTuiHost) {
+        if self.summary.is_none() {
+            self.summary = Some(bcode_usage::summary::UsageSummaryAccumulator::default());
+            self.query.after = None;
+            self.query.revision = None;
+            self.details = false;
+        }
+        self.refresh(host);
+    }
+
     fn refresh(&mut self, host: &dyn PluginTuiHost) {
         if self.busy {
             return;
@@ -184,6 +230,31 @@ impl Dashboard {
                 .collect()
         }
     }
+    fn picker_event(&mut self, event: &Event, host: &dyn PluginTuiHost) -> bool {
+        let Some(picker) = &mut self.model_picker else {
+            return false;
+        };
+        if let Event::Key(stroke) = event {
+            match stroke.key {
+                KeyCode::Escape => {
+                    self.model_picker = None;
+                    return true;
+                }
+                KeyCode::Enter => {
+                    self.query.models = picker.selection();
+                    self.query.after = None;
+                    self.query.revision = None;
+                    self.model_picker = None;
+                    self.refresh(host);
+                    return true;
+                }
+                _ => {}
+            }
+        }
+        picker.event(event);
+        true
+    }
+
     fn filter_event(&mut self, event: &Event, host: &dyn PluginTuiHost) -> bool {
         let Some(filters) = &mut self.filters else {
             return false;
@@ -268,6 +339,7 @@ impl Dashboard {
             }
             _ => return false,
         }
+        self.summary = None;
         self.query.after = None;
         self.query.revision = None;
         self.table = TableState::default();
@@ -300,6 +372,10 @@ impl PluginTuiSurface for Dashboard {
     }
     fn render(&mut self, area: Rect, frame: &mut PaintCx<'_, '_>) {
         self.receive();
+        if let Some(picker) = &mut self.model_picker {
+            picker.paint(area, frame);
+            return;
+        }
         if let Some(filters) = &self.filters {
             filters.paint(area, frame);
             return;
@@ -311,8 +387,8 @@ impl PluginTuiSurface for Dashboard {
             area.height.saturating_sub(3),
         );
         let heading = format!(
-            "Usage | UTC {}..{} | PAGE SUBTOTALS",
-            self.query.range.from_timestamp_ms, self.query.range.to_timestamp_ms
+            "Usage | UTC {}..{} | {}",
+            self.query.range.from_timestamp_ms, self.query.range.to_timestamp_ms, self.report_scope
         );
         for (index, text) in [heading.as_str(), self.status.as_str(), "r refresh c collect n next Enter drill-down p provider a all 1/7/3 days d requests j JSON x CSV q close"].into_iter().enumerate() {
             let row = u16::try_from(index).unwrap_or_default();
@@ -392,7 +468,13 @@ impl PluginTuiSurface for Dashboard {
     }
     fn handle_event(&mut self, event: &Event, host: &dyn PluginTuiHost) -> PluginTuiAction {
         self.receive();
-        if self.filter_event(event, host) {
+        if self.summary.is_some()
+            && matches!(event, Event::Key(stroke) if !matches!(stroke.key, KeyCode::Char('s' | 'r' | 'q') | KeyCode::Escape))
+        {
+            self.status = "Summary in progress: s next page; r cancel".into();
+            return PluginTuiAction::Redraw;
+        }
+        if self.picker_event(event, host) || self.filter_event(event, host) {
             return PluginTuiAction::Redraw;
         }
         if let Event::Key(stroke) = event {
@@ -403,10 +485,20 @@ impl PluginTuiSurface for Dashboard {
                 KeyCode::Escape | KeyCode::Char('q') => {
                     return PluginTuiAction::Close { outcome: None };
                 }
+                KeyCode::Char('m') if !self.busy => {
+                    self.model_picker = Some(model_picker::ModelPicker::new(
+                        self.report
+                            .iter()
+                            .flat_map(|report| report.models.iter().map(|row| row.model.clone())),
+                        self.query.models.clone(),
+                    ));
+                }
                 KeyCode::Char('f') if !self.busy => {
                     self.filters = Some(filters::Filters::new(&self.query));
                 }
+                KeyCode::Char('s') if !self.busy => self.start_summary_page(host),
                 KeyCode::Char('r') if !self.busy => {
+                    self.summary = None;
                     self.query.after = None;
                     self.query.revision = None;
                     self.refresh(host);
