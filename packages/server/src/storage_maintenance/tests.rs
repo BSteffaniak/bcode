@@ -203,11 +203,33 @@ async fn scheduler_compresses_eligible_artifacts_and_continues_past_first_page()
     assert!(cursor.is_some());
     assert!(artifacts.join("recording-015").is_dir());
     assert!(artifacts.join("recording-016").is_file());
+    let later_path = artifacts.join("later-recording");
+    std::fs::write(&later_path, &bytes).expect("later artifact");
+    let later = state.sessions.append_event(id, SessionEventKind::ToolInvocationResultRecorded {
+        record: ToolInvocationResultRecord {
+            invocation_id: "later".into(), model_output: "done".into(), is_error: false, presentation: None, content: vec![],
+            result: Some(ToolInvocationResult::Artifact { artifact: Box::new(ToolArtifact {
+                artifact_id: "z-later".into(), producer_plugin_id: "fixture".into(), schema: "fixture".into(), schema_version: 1,
+                tool_call_id: None, title: None, metadata: serde_json::Value::Null,
+                refs: vec![ToolArtifactRef { key: "recording".into(), content_type: None, storage_uri: Some("later-recording".into()), byte_len: Some(bytes.len() as u64), metadata: Some(serde_json::json!({"complete": true, "availability": "complete"})) }],
+            }) }),
+        },
+    }).await.expect("new finalization");
+    assert!(later.sequence > cursor.as_ref().expect("cursor").through_sequence);
+    state
+        .sessions
+        .release_session_ownership(id)
+        .await
+        .expect("release");
     assert_eq!(
         maintain_session_at(&state, root.path(), id, cursor, future)
             .await
             .expect("second page"),
         None
+    );
+    assert!(
+        later_path.is_file(),
+        "current sweep excludes later finalization"
     );
     drop(state);
     for index in 0..18 {

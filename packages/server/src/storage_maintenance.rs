@@ -17,9 +17,32 @@ use bcode_session_models::SessionId;
 use std::sync::Arc;
 use std::time::Duration;
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ArtifactSweepCursor {
+    after: (String, String),
+    through_sequence: u64,
+}
+
+impl ArtifactSweepCursor {
+    fn continuation(
+        after: Option<(String, String)>,
+        through_sequence: u64,
+        has_more: bool,
+    ) -> Option<Self> {
+        if has_more {
+            after.map(|after| Self {
+                after,
+                through_sequence,
+            })
+        } else {
+            None
+        }
+    }
+}
+
 #[derive(Clone)]
 enum MaintenanceCursor {
-    Artifacts(Option<(String, String)>),
+    Artifacts(Option<ArtifactSweepCursor>),
     History(u64),
 }
 
@@ -271,18 +294,28 @@ async fn maintain_session(
     state: &ServerState,
     root: &std::path::Path,
     id: SessionId,
-    after: Option<(String, String)>,
-) -> Result<Option<(String, String)>, String> {
+    after: Option<ArtifactSweepCursor>,
+) -> Result<Option<ArtifactSweepCursor>, String> {
     maintain_session_at(state, root, id, after, super::current_time_ms()).await
+}
+
+async fn observe_access_for_sweep(
+    root: std::path::PathBuf,
+    id: SessionId,
+) -> Result<StorageAccessObservation, String> {
+    tokio::task::spawn_blocking(move || observe_session_access(&root, id))
+        .await
+        .map_err(|_| "access task failed")?
+        .map_err(|_| "access unavailable".into())
 }
 
 async fn maintain_session_at(
     state: &ServerState,
     root: &std::path::Path,
     id: SessionId,
-    after: Option<(String, String)>,
+    after: Option<ArtifactSweepCursor>,
     now: u64,
-) -> Result<Option<(String, String)>, String> {
+) -> Result<Option<ArtifactSweepCursor>, String> {
     if !state
         .session_catalog
         .ambiguous_location_ids(id)
@@ -296,10 +329,7 @@ async fn maintain_session_at(
         return Ok(None);
     }
     let access_root = root.to_path_buf();
-    let observation = tokio::task::spawn_blocking(move || observe_session_access(&access_root, id))
-        .await
-        .map_err(|_| "access task failed")?
-        .map_err(|_| "access unavailable")?;
+    let observation = observe_access_for_sweep(access_root, id).await?;
     let StorageAccessObservation::Recorded(record) = observation else {
         bcode_session::artifact_storage::initialize_maintenance_access(root, id, now)
             .await
@@ -318,17 +348,18 @@ async fn maintain_session_at(
     } else {
         return Ok(None);
     };
-    let mut cursor = after;
+    let mut cursor = after.as_ref().map(|cursor| cursor.after.clone());
     {
-        let rows = bcode_session::artifact_storage::maintenance_candidates(
+        let page = bcode_session::artifact_storage::maintenance_candidates_through(
             root,
             id,
             cursor.as_ref().map(|(a, r)| (a.as_str(), r.as_str())),
+            after.as_ref().map(|cursor| cursor.through_sequence),
         )
         .await
         .map_err(|_| "references unavailable")?;
-        let has_more = rows.len() == 16;
-        for (artifact, reference) in rows {
+        let has_more = page.references.len() == 16;
+        for (artifact, reference) in page.references {
             if state
                 .shutdown_requested
                 .load(std::sync::atomic::Ordering::SeqCst)
@@ -378,6 +409,10 @@ async fn maintain_session_at(
             )
             .await;
         }
-        Ok(if has_more { cursor } else { None })
+        Ok(ArtifactSweepCursor::continuation(
+            cursor,
+            page.through_sequence,
+            has_more,
+        ))
     }
 }

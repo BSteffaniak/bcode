@@ -613,6 +613,15 @@ finalized artifact. The default caller still captures a new tail each call; sche
 and the equivalent history high-water bound remain incomplete, so this does not yet resolve queue
 fairness for continuously growing sessions or enable automatic dispatch.
 
+## Artifact cursor high-water integration
+
+The worker now retains the captured canonical tail alongside the artifact key cursor and passes it
+to every continuation page. A real-session scheduler test appends a new finalized artifact between
+pages, verifies the ongoing sweep finishes without touching it, and verifies existing artifacts still
+compress and read correctly. This integrates the earlier domain high-water API into actual artifact
+pagination. History still needs the same finite sweep boundary; dispatch and startup-failure/older
+reader coordination remain incomplete.
+
 ## Remaining implementation
 
 ### Access policy and scheduling
