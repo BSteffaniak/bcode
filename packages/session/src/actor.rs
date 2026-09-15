@@ -524,6 +524,14 @@ impl SessionHandle {
             .await?
     }
 
+    pub async fn usage_page(
+        &self,
+        query: bcode_session_models::SessionUsageQuery,
+    ) -> Result<bcode_session_models::SessionUsagePage, SessionError> {
+        self.send(|reply| SessionCommand::UsagePage { query, reply })
+            .await?
+    }
+
     pub async fn inspection_page(
         &self,
         query: SessionInspectionQuery,
@@ -727,6 +735,10 @@ pub type UsageNormalizer = Arc<
 >;
 
 enum SessionCommand {
+    UsagePage {
+        query: bcode_session_models::SessionUsageQuery,
+        reply: oneshot::Sender<Result<bcode_session_models::SessionUsagePage, SessionError>>,
+    },
     RenormalizeUsage {
         range: bcode_session_models::SessionCostRange,
         normalize: UsageNormalizer,
@@ -1076,6 +1088,16 @@ impl SessionActor {
             }
             SessionCommand::HistoryAround { query, reply } => {
                 let _ = reply.send(self.history_around(query).await);
+            }
+            SessionCommand::UsagePage { query, reply } => {
+                let result = match self.existing_session_db().await {
+                    Ok(Some(db)) => db.usage_page(&query).await.map_err(SessionError::from),
+                    Ok(None) => Err(SessionError::EventSerialization(
+                        "usage reporting requires a persisted accounting projection".into(),
+                    )),
+                    Err(error) => Err(error),
+                };
+                let _ = reply.send(result);
             }
             SessionCommand::InspectionPage { query, reply } => {
                 let _ = reply.send(self.inspection_page(query).await);

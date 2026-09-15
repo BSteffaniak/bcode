@@ -622,6 +622,16 @@ stores upgrade through exclusive migration coordination, retaining canonical eve
 attach never scans history or reprices. Explicit reindex discards range-specific valuations; rerun
 repricing with the desired supplied snapshot afterward.
 
+Bounded accounting reads are available through `SessionManager::session_usage_page`. They return
+normalized request contributions and separately stored valuations, never private billing evidence
+or historical embedded-cost fallbacks. Reads use the existing primary-key index with a maximum of
+256 examined contributions per call, then apply the first-observed timestamp range. An empty page
+can therefore have a continuation; consumers must inspect `next_after`, not entry count. Page
+continuations require the accounting checkpoint and cost revision from the first page. Changes
+invalidate continuation rather than mixing valuations across generations. Missing or stale
+projections fail without repair. In-memory-only sessions currently report this capability as
+unavailable. This is a bounded source API, not yet a cross-session dashboard or reporting index.
+
 ## Normal bounded reads
 
 Normal attach and history paths use database projections and bounded range queries. They do not full

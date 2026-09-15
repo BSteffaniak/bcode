@@ -2466,6 +2466,93 @@ impl SessionDb {
             .transpose()
     }
 
+    /// Read a bounded page of normalized request contributions without replay or repricing.
+    ///
+    /// The primary-key scan is bounded before applying the time filter. Callers must follow
+    /// continuation keys even for empty pages and restart if the accounting generation changes.
+    ///
+    /// # Errors
+    /// Returns an error for invalid queries, stale projections, changed generations, or corrupt rows.
+    pub async fn usage_page(
+        &self,
+        query: &bcode_session_models::SessionUsageQuery,
+    ) -> SessionDbResult<bcode_session_models::SessionUsagePage> {
+        use bcode_session_models::{SessionUsageEntry, SessionUsageGeneration, SessionUsagePage};
+
+        let invalid = |column| SessionDbError::InvalidRow { column };
+        query.validate().map_err(invalid)?;
+        let before = self.session_usage_summary().await?;
+        let generation = SessionUsageGeneration {
+            through_sequence: before.through_sequence,
+            cost_revision: before.cost_revision,
+        };
+        if query
+            .generation
+            .is_some_and(|expected| expected != generation)
+        {
+            return Err(invalid(
+                "usage accounting generation changed; restart query".into(),
+            ));
+        }
+        let rows = self
+            .db
+            .select("session_usage_requests")
+            .columns(&[
+                "request_key",
+                "first_observed_at_ms",
+                "usage_json",
+                "cost_json",
+            ])
+            .where_gt("request_key", query.after.clone().unwrap_or_default())
+            .sort("request_key", SortDirection::Asc)
+            .limit(query.limit as usize)
+            .execute(&**self.db)
+            .await?;
+        let scanned =
+            u32::try_from(rows.len()).map_err(|_| invalid("usage page overflow".into()))?;
+        let mut entries = Vec::new();
+        let mut last_key = None;
+        for row in rows {
+            let key = required_string(&row, "request_key")?;
+            let first_observed_at_ms = u64::try_from(required_i64(&row, "first_observed_at_ms")?)
+                .map_err(|_| invalid("negative request timestamp".into()))?;
+            last_key = Some(key.clone());
+            if !query.range.contains(first_observed_at_ms) {
+                continue;
+            }
+            let mut usage: SessionTokenUsage =
+                serde_json::from_str(&required_string(&row, "usage_json")?)?;
+            // Never fall back to a historical estimate embedded in normalized facts.
+            usage.cost = optional_string(&row, "cost_json")
+                .map(|json| serde_json::from_str(&json))
+                .transpose()?;
+            usage.validate().map_err(invalid)?;
+            entries.push(SessionUsageEntry {
+                key,
+                first_observed_at_ms,
+                usage,
+            });
+        }
+        let after = self.session_usage_summary().await?;
+        if before.through_sequence != after.through_sequence
+            || before.cost_revision != after.cost_revision
+        {
+            return Err(invalid(
+                "usage accounting generation changed; restart query".into(),
+            ));
+        }
+        Ok(SessionUsagePage {
+            generation,
+            entries,
+            scanned,
+            next_after: if scanned == query.limit {
+                last_key
+            } else {
+                None
+            },
+        })
+    }
+
     /// Return compact cumulative usage from the checkpointed accounting projection.
     ///
     /// # Errors
@@ -9359,6 +9446,141 @@ mod tests {
                 .cast_unsigned(),
             legacy.timestamp_ms
         );
+    }
+
+    #[tokio::test]
+    async fn usage_pages_reject_stale_projection_without_repairing_it() {
+        use bcode_session_models::{SessionCostRange, SessionUsageQuery};
+        let dir = tempfile::tempdir().unwrap();
+        let id = SessionId::new();
+        let db = SessionDb::open_turso_in_root(id, dir.path()).await.unwrap();
+        db.append_event(&event(
+            id,
+            0,
+            SessionEventKind::SessionCreated {
+                name: None,
+                working_directory: dir.path().into(),
+            },
+        ))
+        .await
+        .unwrap();
+        db.db
+            .delete("projection_checkpoints")
+            .where_eq(
+                "projection_name",
+                MaterializedProjection::SessionUsage.as_str(),
+            )
+            .execute(&**db.db)
+            .await
+            .unwrap();
+        let query = SessionUsageQuery {
+            range: SessionCostRange {
+                from_timestamp_ms: 0,
+                to_timestamp_ms: 100,
+            },
+            after: None,
+            limit: 1,
+            generation: None,
+        };
+        assert!(matches!(
+            db.usage_page(&query).await,
+            Err(SessionDbError::ProjectionStale { .. })
+        ));
+        assert_eq!(
+            db.materialized_projection_checkpoint(MaterializedProjection::SessionUsage)
+                .await
+                .unwrap(),
+            None
+        );
+        assert_eq!(db.last_event_sequence().await.unwrap(), Some(0));
+    }
+
+    #[tokio::test]
+    async fn usage_pages_are_bounded_filtered_and_generation_fenced() {
+        use bcode_session_models::{SessionCostRange, SessionUsageQuery};
+        let dir = tempfile::tempdir().unwrap();
+        let id = SessionId::new();
+        let db = SessionDb::open_turso_in_root(id, dir.path()).await.unwrap();
+        db.append_event(&event(
+            id,
+            0,
+            SessionEventKind::SessionCreated {
+                name: None,
+                working_directory: dir.path().into(),
+            },
+        ))
+        .await
+        .unwrap();
+        for sequence in 1..=3 {
+            let mut observation = event(
+                id,
+                sequence,
+                SessionEventKind::ModelUsage {
+                    turn_id: "turn".into(),
+                    usage: SessionTokenUsage {
+                        request_id: Some(format!("r{sequence}")),
+                        observation_id: Some(format!("r{sequence}:usage")),
+                        terminal: true,
+                        input_tokens: Some(10),
+                        ..Default::default()
+                    },
+                },
+            );
+            observation.timestamp_ms = sequence * 100;
+            db.append_event(&observation).await.unwrap();
+        }
+        let history = db.events_range(0, 3, 4).await.unwrap();
+        let summary = db.session_usage_summary().await.unwrap();
+        let mut query = SessionUsageQuery {
+            range: SessionCostRange {
+                from_timestamp_ms: 200,
+                to_timestamp_ms: 300,
+            },
+            after: None,
+            limit: 1,
+            generation: None,
+        };
+        let first = db.usage_page(&query).await.unwrap();
+        assert!(first.entries.is_empty());
+        assert_eq!(first.scanned, 1);
+        assert_eq!(first.next_after.as_deref(), Some("r1"));
+        query.after = first.next_after;
+        assert!(db.usage_page(&query).await.is_err());
+        query.generation = Some(first.generation);
+        let second = db.usage_page(&query).await.unwrap();
+        assert_eq!(second.entries.len(), 1);
+        assert_eq!(second.entries[0].first_observed_at_ms, 200);
+        assert_eq!(second.entries[0].usage.input_tokens, Some(10));
+        assert!(matches!(
+            second.entries[0].usage.cost,
+            Some(bcode_session_models::SessionCostEstimate::Unavailable { .. })
+        ));
+        query.after = second.next_after;
+        let third = db.usage_page(&query).await.unwrap();
+        assert!(third.entries.is_empty());
+        query.after = third.next_after;
+        let end = db.usage_page(&query).await.unwrap();
+        assert_eq!(end.scanned, 0);
+        assert!(end.next_after.is_none());
+        assert_eq!(db.session_usage_summary().await.unwrap(), summary);
+        assert_eq!(db.events_range(0, 3, 4).await.unwrap(), history);
+        db.reprice_usage(query.range, &|_| {
+            bcode_session_models::SessionCostEstimate::Unavailable {
+                reason: bcode_session_models::SessionCostUnavailableReason::ProviderUsageIncomplete,
+            }
+        })
+        .await
+        .unwrap();
+        assert!(db.usage_page(&query).await.is_err());
+        query.after = None;
+        query.generation = None;
+        let updated = db.usage_page(&query).await.unwrap();
+        assert_eq!(
+            updated.generation.cost_revision,
+            first.generation.cost_revision + 1
+        );
+        query.limit = 257;
+        assert!(db.usage_page(&query).await.is_err());
     }
 
     #[tokio::test]

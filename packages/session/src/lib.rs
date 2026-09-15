@@ -2271,6 +2271,34 @@ impl SessionManager {
         Ok(db.history_around(query).await?)
     }
 
+    /// Read one bounded persisted accounting page through the session owner.
+    ///
+    /// This does not acquire runtime write ownership, replay events, or reprice requests.
+    ///
+    /// # Errors
+    /// Returns an error for invalid queries, missing storage, stale accounting, or changed generations.
+    pub async fn session_usage_page(
+        &self,
+        session_id: SessionId,
+        query: bcode_session_models::SessionUsageQuery,
+    ) -> Result<bcode_session_models::SessionUsagePage, SessionError> {
+        query.validate().map_err(SessionError::EventSerialization)?;
+        let gate = self.session_load_gate(session_id).await;
+        let _guard = gate.lock().await;
+        let cached_handle = self.inner.lock().await.sessions.get(&session_id).cloned();
+        if let Some(handle) = cached_handle {
+            return handle.usage_page(query).await;
+        }
+        let Some(store) = &self.store else {
+            return Err(SessionError::NotFound(session_id));
+        };
+        if !db::session_db_path(&store.root_path(), session_id).exists() {
+            return Err(SessionError::NotFound(session_id));
+        }
+        let db = db::SessionDb::open_existing_turso_in_root(session_id, &store.root_path()).await?;
+        Ok(db.usage_page(&query).await?)
+    }
+
     /// Return one bounded structured session investigation page.
     ///
     /// # Errors
