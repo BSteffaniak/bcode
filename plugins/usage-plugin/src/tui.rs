@@ -1,4 +1,6 @@
 //! BMUX-native usage surface. All source access goes through typed host capabilities.
+mod timeline;
+
 use bcode_plugin_sdk::tui::{
     BoxedPluginTuiSurface, PluginTuiAction, PluginTuiHost, PluginTuiRegistry, PluginTuiSurface,
     PluginTuiSurfaceFactory, PluginTuiSurfaceFuture, PluginTuiSurfaceOpenRequest, PluginTuiTheme,
@@ -330,6 +332,15 @@ impl PluginTuiSurface for Dashboard {
                 self.area.y = self.area.y.saturating_add(5);
                 self.area.height = self.area.height.saturating_sub(5);
             }
+        }
+        if !self.details
+            && self.area.height >= 12
+            && let Some(report) = &self.report
+        {
+            let chart_area = Rect::new(self.area.x, self.area.y, self.area.width, 6);
+            timeline::paint(report, chart_area, frame);
+            self.area.y = self.area.y.saturating_add(6);
+            self.area.height = self.area.height.saturating_sub(6);
         }
         Table::new(&self.columns(), &self.rows()).paint(self.area, &self.table, frame);
     }

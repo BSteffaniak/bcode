@@ -1912,6 +1912,29 @@ impl SessionManager {
         sorted_session_summaries(handles, &working_directory)
     }
 
+    /// Read at most 128 native catalog identities after an exclusive ID cursor.
+    /// Discovery must already be complete; no storage loading or repair is triggered.
+    /// # Errors
+    /// Returns an error while catalog discovery is incomplete or degraded.
+    pub async fn usage_catalog_page(
+        &self,
+        after: Option<SessionId>,
+    ) -> Result<Vec<SessionId>, SessionError> {
+        use std::ops::Bound::{Excluded, Unbounded};
+        if !self.catalog_loaded() {
+            return Err(SessionError::EventSerialization(
+                "session catalog is not completely loaded".into(),
+            ));
+        }
+        let inner = self.inner.lock().await;
+        Ok(inner
+            .sessions
+            .range((after.map_or(Unbounded, Excluded), Unbounded))
+            .take(128)
+            .map(|(id, _)| *id)
+            .collect())
+    }
+
     /// Return one stable bounded page of native session summaries ordered by update time and ID.
     ///
     /// An empty `session_ids` set selects from the complete native catalog. The cursor is exclusive.
@@ -2962,6 +2985,38 @@ mod tests {
     use std::collections::BTreeSet;
     use std::time::Duration;
     use switchy::database::query::FilterableQuery;
+
+    #[tokio::test]
+    async fn usage_catalog_identity_pages_are_exclusive_and_complete() {
+        let manager = SessionManager::default();
+        let mut expected = std::collections::BTreeSet::new();
+        for _ in 0..130 {
+            expected.insert(
+                manager
+                    .create_session(None, test_working_directory())
+                    .await
+                    .unwrap()
+                    .id,
+            );
+        }
+        let first = manager.usage_catalog_page(None).await.unwrap();
+        assert_eq!(first.len(), 128);
+        assert!(first.windows(2).all(|pair| pair[0] < pair[1]));
+        let second = manager
+            .usage_catalog_page(first.last().copied())
+            .await
+            .unwrap();
+        assert_eq!(second.len(), 2);
+        assert!(
+            manager
+                .usage_catalog_page(second.last().copied())
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        let actual: std::collections::BTreeSet<_> = first.into_iter().chain(second).collect();
+        assert_eq!(actual, expected);
+    }
 
     #[tokio::test]
     async fn repricing_memory_session_changes_valuation_not_usage() {

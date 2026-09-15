@@ -13,6 +13,10 @@ struct UsageCli {
     /// Explicitly collect all bounded accounting pages for this session.
     #[arg(long)]
     collect: Option<SessionId>,
+    /// Explicitly collect every discovered native session, in bounded ID pages.
+    /// Concurrent catalog additions behind the cursor require another pass.
+    #[arg(long, conflicts_with_all = ["collect", "after", "revision"])]
+    collect_all: bool,
     /// Inclusive UTC timestamp in milliseconds.
     #[arg(long, default_value_t = 0)]
     from_ms: u64,
@@ -35,7 +39,7 @@ struct UsageCli {
     /// Export CSV rather than JSON to stdout.
     #[arg(long)]
     csv: bool,
-    /// Continue a report page using its next_after ordinal.
+    /// Continue a report page using its `next_after` ordinal.
     #[arg(long, requires = "revision")]
     after: Option<u64>,
     /// Index revision required for continuation.
@@ -96,6 +100,66 @@ fn write_page(
         .map_err(|_| "usage export output failed; export is incomplete".into())
 }
 
+async fn collect_session(
+    client: &bcode_client::BcodeClient,
+    session_id: SessionId,
+) -> Result<(), String> {
+    let mut source = SessionUsageQuery {
+        range: SessionCostRange {
+            from_timestamp_ms: 0,
+            to_timestamp_ms: i64::MAX.cast_unsigned(),
+        },
+        after: None,
+        generation: None,
+        limit: 256,
+    };
+    loop {
+        let page = client
+            .collect_usage(session_id, source.clone())
+            .await
+            .map_err(|_| {
+                format!(
+                    "collection unavailable or changed for {session_id}; collection is incomplete"
+                )
+            })?;
+        if page
+            .next_after
+            .as_ref()
+            .is_some_and(|next| source.after.as_ref().is_some_and(|after| next <= after))
+        {
+            return Err("nonadvancing usage collection cursor".into());
+        }
+        source.generation = Some(page.generation);
+        source.after = page.next_after;
+        if source.after.is_none() {
+            return Ok(());
+        }
+    }
+}
+
+async fn collect_catalog(client: &bcode_client::BcodeClient) -> Result<(), String> {
+    let mut after = None;
+    loop {
+        let ids = client
+            .usage_catalog(after)
+            .await
+            .map_err(|_| "native catalog discovery unavailable; collection is incomplete")?;
+        if ids.is_empty() {
+            return Ok(());
+        }
+        if ids.len() > 128 {
+            return Err("oversized usage catalog page".into());
+        }
+        for id in ids {
+            if after.is_some_and(|previous| id <= previous) {
+                return Err("nonadvancing usage catalog cursor".into());
+            }
+            collect_session(client, id).await?;
+            after = Some(id);
+        }
+    }
+}
+
 fn invoke(matches: clap::ArgMatches) -> StaticCliFuture {
     Box::pin(async move {
         let args = UsageCli::from_arg_matches(&matches).map_err(|error| error.to_string())?;
@@ -116,26 +180,9 @@ fn invoke(matches: clap::ArgMatches) -> StaticCliFuture {
         };
         query.validate()?;
         if let Some(session_id) = args.collect {
-            let mut source = SessionUsageQuery {
-                range: SessionCostRange {
-                    from_timestamp_ms: 0,
-                    to_timestamp_ms: i64::MAX.cast_unsigned(),
-                },
-                after: None,
-                generation: None,
-                limit: 256,
-            };
-            loop {
-                let page = client
-                    .collect_usage(session_id, source.clone())
-                    .await
-                    .map_err(|_| "collection unavailable or changed; retry explicitly")?;
-                source.generation = Some(page.generation);
-                source.after = page.next_after;
-                if source.after.is_none() {
-                    break;
-                }
-            }
+            collect_session(&client, session_id).await?;
+        } else if args.collect_all {
+            collect_catalog(&client).await?;
         }
         let mut first_page = true;
         loop {
@@ -163,6 +210,27 @@ fn invoke(matches: clap::ArgMatches) -> StaticCliFuture {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn catalog_collection_is_explicit_and_excludes_conflicting_scope() {
+        let matches = UsageCli::command()
+            .try_get_matches_from(["usage", "--collect-all", "--to-ms", "100"])
+            .unwrap();
+        assert!(UsageCli::from_arg_matches(&matches).unwrap().collect_all);
+        let id = SessionId::new().to_string();
+        assert!(
+            UsageCli::command()
+                .try_get_matches_from([
+                    "usage",
+                    "--collect-all",
+                    "--collect",
+                    &id,
+                    "--to-ms",
+                    "100"
+                ])
+                .is_err()
+        );
+    }
+
     #[test]
     fn model_filters_preserve_exact_identity() {
         let model = parse_model("provider/family/model:revision").unwrap();

@@ -2977,6 +2977,20 @@ impl BcodeClient {
         }
     }
 
+    /// Discover one bounded native session-ID page for explicit usage collection.
+    /// An empty page ends traversal; concurrent catalog changes require another collection pass.
+    /// # Errors
+    /// Returns an error when discovery is incomplete or transport fails.
+    pub async fn usage_catalog(
+        &self,
+        after: Option<SessionId>,
+    ) -> Result<Vec<SessionId>, ClientError> {
+        match self.send_request(Request::UsageCatalog { after }).await? {
+            ResponsePayload::UsageCatalog { session_ids } => Ok(session_ids),
+            _ => Err(ClientError::UnexpectedResponse),
+        }
+    }
+
     /// Query a bounded usage reporting snapshot page.
     /// # Errors
     /// Returns an error for invalid queries, changed generations, or transport failure.

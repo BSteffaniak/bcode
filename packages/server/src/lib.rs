@@ -5571,6 +5571,7 @@ const fn request_kind(request: &Request) -> &'static str {
         Request::DeactivateSkill { .. } => "deactivate_skill",
         Request::ActiveSkills { .. } => "active_skills",
         Request::AgentPolicyStatus => "agent_policy_status",
+        Request::UsageCatalog { .. } => "usage_catalog",
         Request::UsageReport { .. } => "usage_report",
         Request::UsageCollect { .. } => "usage_collect",
         Request::SetSessionAgent { .. } => "set_session_agent",
@@ -5936,6 +5937,19 @@ async fn handle_request_inner(
             range,
             catalog,
         } => handle_reprice_session(state, writer, request_id, session_id, range, *catalog).await,
+        SessionLifecycleRequest::UsageCatalog { after } => {
+            let result = state.sessions.usage_catalog_page(after).await;
+            let response = result.map_or_else(
+                |_| {
+                    Response::Err(ErrorResponse::new(
+                        "usage_catalog_unavailable",
+                        "Native catalog is incomplete; retry after discovery finishes.",
+                    ))
+                },
+                |session_ids| Response::Ok(ResponsePayload::UsageCatalog { session_ids }),
+            );
+            send_response(writer, request_id, response).await
+        }
         SessionLifecycleRequest::UsageReport { query } => {
             let result = state.usage_index.lock().await.query(&query).await;
             let response = result.map_or_else(

@@ -104,7 +104,8 @@ const MAX_CHUNK_DATA_SIZE: usize = MAX_FRAME_PAYLOAD_SIZE / 2;
 /// Version 38 restores pre-storage-usage positional request/response tags by appending
 /// storage-usage variants. Version 37 peers are rejected rather than misdecoded.
 /// Version 39 adds bounded usage reporting and explicit snapshot collection.
-pub const CURRENT_PROTOCOL_VERSION: u16 = 39;
+/// Version 40 adds bounded native usage catalog discovery.
+pub const CURRENT_PROTOCOL_VERSION: u16 = 40;
 
 /// Durable session-storage writer epoch expected by this IPC build.
 pub const CURRENT_SESSION_STORAGE_WRITER_EPOCH: u32 =
@@ -1167,6 +1168,10 @@ pub enum Request {
     UsageCollect {
         session_id: SessionId,
         query: bcode_session_models::SessionUsageQuery,
+    },
+    /// Discover up to 128 native session identities for explicit collection.
+    UsageCatalog {
+        after: Option<SessionId>,
     },
 }
 
@@ -2316,6 +2321,9 @@ pub enum ResponsePayload {
     UsageCollected {
         page: bcode_session_models::SessionUsagePage,
     },
+    UsageCatalog {
+        session_ids: Vec<SessionId>,
+    },
 }
 
 /// Stable reasons runtime ownership cannot currently be released.
@@ -3253,6 +3261,23 @@ mod tests {
     };
     use bcode_skill_models::SkillActivationMode;
     use std::collections::BTreeSet;
+
+    #[test]
+    fn usage_catalog_round_trip_preserves_cursor_and_id_order() {
+        let id = SessionId::new();
+        let request = Request::UsageCatalog { after: Some(id) };
+        let decoded: Request =
+            serde_json::from_slice(&serde_json::to_vec(&request).unwrap()).unwrap();
+        assert!(matches!(decoded, Request::UsageCatalog { after: Some(actual) } if actual == id));
+        let response = ResponsePayload::UsageCatalog {
+            session_ids: vec![id],
+        };
+        let decoded: ResponsePayload =
+            serde_json::from_slice(&serde_json::to_vec(&response).unwrap()).unwrap();
+        assert!(
+            matches!(decoded, ResponsePayload::UsageCatalog { session_ids } if session_ids == vec![id])
+        );
+    }
 
     #[test]
     fn storage_usage_round_trip_preserves_partial_accounting() {
