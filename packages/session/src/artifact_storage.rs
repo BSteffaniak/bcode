@@ -275,6 +275,12 @@ pub struct ArtifactMaintenanceCancellation {
 }
 
 impl ArtifactMaintenanceCancellation {
+    /// Whether daemon-owned work requires admission independently of its age filter.
+    #[must_use]
+    pub const fn requires_tracking_admission(&self) -> bool {
+        self.acknowledgement.is_some()
+    }
+
     /// Attach exact live-daemon health to the operation; all cancellation checkpoints recheck it.
     #[must_use]
     pub fn with_acknowledgement(
@@ -479,7 +485,7 @@ pub async fn compress_finalized_artifact_cancellable(
     let root = sessions_root.canonicalize()?;
     // Age-based calls are automatic policy work. Admission is enforced here so a scheduler cannot
     // bypass failed tracking by calling the storage operation directly.
-    let admission = if age.is_some() {
+    let admission = if age.is_some() || cancellation.requires_tracking_admission() {
         Some(cancellation.admit_tracking(&root).await?)
     } else {
         None

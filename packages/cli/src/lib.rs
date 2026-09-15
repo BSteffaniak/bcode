@@ -70,6 +70,9 @@ pub enum CliError {
     #[error("workflow draft edit was not applied; inspect the returned outcome")]
     WorkflowDraftEditNotApplied,
 
+    /// Manual compression was cancelled or had unavailable/failed candidates.
+    #[error("session compression incomplete; see reported outcomes")]
+    SessionCompressionIncomplete,
     /// Derivation returned a non-success terminal outcome already printed as JSON.
     #[error("session derivation did not succeed; see JSON outcome")]
     SessionDerivationNotSucceeded,
@@ -234,6 +237,7 @@ impl CliError {
             | Self::WorkflowDraftEditNotApplied
             | Self::SessionDerivationNotSucceeded
             | Self::WorkflowApprovalContinuationFailed
+            | Self::SessionCompressionIncomplete
             | Self::WorkflowApprovalDecisionNotApplied => 1,
             #[cfg(feature = "web-renderer")]
             Self::HyperChadRender(_) => 1,
@@ -4900,6 +4904,20 @@ struct ArtifactRangeArgs {
 
 #[derive(Debug, Subcommand)]
 enum SessionCommand {
+    /// Losslessly compress finalized artifacts and history; never runs VACUUM.
+    Compress {
+        #[arg(required_unless_present = "older_than")]
+        session_id: Option<SessionId>,
+        #[arg(long, value_parser = bcode_session_models::parse_storage_compression_age)]
+        older_than: Option<u64>,
+        #[arg(long, default_value = "light", value_parser = ["light", "deep"])]
+        tier: String,
+        #[arg(long)]
+        dry_run: bool,
+        /// Emit one JSON result per bounded page (JSON Lines).
+        #[arg(long)]
+        json: bool,
+    },
     /// Measure session database, artifact, and other file bytes without replaying history (JSON).
     StorageUsage {
         session_id: SessionId,
@@ -6656,9 +6674,163 @@ async fn handle_session_command(command: Box<SessionCommand>) -> Result<(), CliE
     }
 }
 
+#[cfg(test)]
+mod compression_cli_tests {
+    use clap::Parser as _;
+
+    #[test]
+    fn compression_selection_and_duration_validation() {
+        assert!(super::Cli::try_parse_from(["bcode", "session", "compress"]).is_err());
+        for age in ["12h", "7d", "2w"] {
+            assert!(
+                super::Cli::try_parse_from([
+                    "bcode",
+                    "session",
+                    "compress",
+                    "--older-than",
+                    age,
+                    "--dry-run",
+                    "--json"
+                ])
+                .is_ok()
+            );
+        }
+        for age in ["0d", "-1h", "1.5d", "14", "18446744073709551615w"] {
+            assert!(
+                super::Cli::try_parse_from(["bcode", "session", "compress", "--older-than", age])
+                    .is_err()
+            );
+        }
+        let id = bcode_session_models::SessionId::new().to_string();
+        assert!(
+            super::Cli::try_parse_from(["bcode", "session", "compress", &id, "--tier", "deep"])
+                .is_ok()
+        );
+        assert!(
+            super::Cli::try_parse_from(["bcode", "session", "compress", &id, "--older-than", "7d"])
+                .is_ok()
+        );
+    }
+}
+
+async fn run_session_compression(
+    session_id: Option<SessionId>,
+    older_than: Option<u64>,
+    tier: &str,
+    dry_run: bool,
+    json: bool,
+) -> Result<(), CliError> {
+    use bcode_session_models::{
+        StorageCompressionDisposition as Disposition, StorageCompressionRequest,
+        StorageCompressionTier,
+    };
+    ensure_server_running().await?;
+    let client = BcodeClient::default_endpoint();
+    let as_of_ms = u64::try_from(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis(),
+    )
+    .unwrap_or(u64::MAX);
+    let tier = if tier == "deep" {
+        StorageCompressionTier::Deep
+    } else {
+        StorageCompressionTier::Light
+    };
+    let mut after = None;
+    let mut failed = false;
+    let interrupt = tokio::signal::ctrl_c();
+    tokio::pin!(interrupt);
+    loop {
+        let ids = if let Some(id) = session_id {
+            vec![id]
+        } else {
+            client.usage_catalog(after).await?
+        };
+        if ids.is_empty() {
+            break;
+        }
+        after = ids.last().copied();
+        for id in ids {
+            let mut cursor = None;
+            loop {
+                let work = client.compress_session_page(StorageCompressionRequest {
+                    session_id: id,
+                    as_of_ms,
+                    minimum_age_ms: older_than,
+                    tier,
+                    dry_run,
+                    cursor,
+                });
+                tokio::pin!(work);
+                let (outcome, cancelled) = tokio::select! {
+                    biased;
+                    _ = &mut interrupt => (work.await, true),
+                    outcome = &mut work => (outcome, false),
+                };
+                let result = match outcome {
+                    Ok(result) => result,
+                    Err(error) => {
+                        failed = true;
+                        if json {
+                            println!(
+                                "{}",
+                                serde_json::json!({"session_id": id, "error": "compression request failed"})
+                            );
+                        } else {
+                            eprintln!("{id}: compression request failed: {error}");
+                        }
+                        if cancelled {
+                            return Err(CliError::SessionCompressionIncomplete);
+                        }
+                        break;
+                    }
+                };
+                failed |= result.failures > 0 || result.disposition == Disposition::Unavailable;
+                if json {
+                    println!("{}", serde_json::to_string(&result)?);
+                } else {
+                    println!(
+                        "{}: {:?}; artifact bytes saved: {}; history payload bytes saved: {}; failures: {}",
+                        id,
+                        result.disposition,
+                        result.artifact_bytes_saved,
+                        result.history_payload_bytes_saved,
+                        result.failures
+                    );
+                }
+                if cancelled {
+                    return Err(CliError::SessionCompressionIncomplete);
+                }
+                cursor = result.next;
+                if cursor.is_none() {
+                    break;
+                }
+            }
+        }
+        if session_id.is_some() {
+            break;
+        }
+    }
+    if failed {
+        return Err(CliError::SessionCompressionIncomplete);
+    }
+    Ok(())
+}
+
 #[allow(clippy::too_many_lines)]
 async fn dispatch_session_command(command: Box<SessionCommand>) -> Result<(), CliError> {
     match *command {
+        SessionCommand::Compress {
+            session_id,
+            older_than,
+            tier,
+            dry_run,
+            json,
+        } => {
+            run_session_compression(session_id, older_than, &tier, dry_run, json).await?;
+        }
         SessionCommand::StorageUsage {
             session_id,
             entry_budget,

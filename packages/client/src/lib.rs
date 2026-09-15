@@ -3023,6 +3023,23 @@ impl BcodeClient {
         }
     }
 
+    /// Execute one bounded compression page. Continuations are not durable operation handles.
+    ///
+    /// # Errors
+    /// Returns transport, admission or invalid-policy errors.
+    pub async fn compress_session_page(
+        &self,
+        request: bcode_session_models::StorageCompressionRequest,
+    ) -> Result<bcode_session_models::StorageCompressionResult, ClientError> {
+        match self
+            .send_request(Request::SessionCompress { request })
+            .await?
+        {
+            ResponsePayload::SessionCompressed { result } => Ok(result),
+            _ => Err(ClientError::UnexpectedResponse),
+        }
+    }
+
     /// Measure physical session files with an explicit directory-entry budget.
     ///
     /// # Errors

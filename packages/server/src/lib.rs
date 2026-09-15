@@ -23,6 +23,7 @@ mod runtime_work;
 mod runtime_work_operations;
 mod server_operations;
 mod session_bulk_migration;
+mod session_compression;
 mod session_operations;
 mod session_search_operations;
 pub mod storage_maintenance;
@@ -5332,6 +5333,7 @@ fn request_metrics_context(
 #[allow(clippy::too_many_lines)]
 const fn request_session_id(request: &Request) -> Option<SessionId> {
     match request {
+        Request::SessionCompress { request } => Some(request.session_id),
         Request::RenameSession { session_id, .. }
         | Request::DeleteSession { session_id }
         | Request::ReadSessionArtifact { session_id, .. }
@@ -5572,6 +5574,7 @@ const fn request_kind(request: &Request) -> &'static str {
         Request::ActiveSkills { .. } => "active_skills",
         Request::AgentPolicyStatus => "agent_policy_status",
         Request::UsageCatalog { .. } => "usage_catalog",
+        Request::SessionCompress { .. } => "session_compress",
         Request::UsageReport { .. } => "usage_report",
         Request::UsageCollect { .. } => "usage_collect",
         Request::SetSessionAgent { .. } => "set_session_agent",
@@ -5967,6 +5970,16 @@ async fn handle_request_inner(
             let response = match session_operations::collect_usage(state, session_id, query).await {
                 Ok(page) => Response::Ok(ResponsePayload::UsageCollected { page }),
                 Err(message) => Response::Err(ErrorResponse::new("usage_unavailable", message)),
+            };
+            send_response(writer, request_id, response).await
+        }
+        SessionLifecycleRequest::SessionCompress { request } => {
+            let response = match session_compression::compress_page(state, request).await {
+                Ok(result) => Response::Ok(ResponsePayload::SessionCompressed { result }),
+                Err(message) => Response::Err(ErrorResponse::new(
+                    "session_compression_unavailable",
+                    message,
+                )),
             };
             send_response(writer, request_id, response).await
         }
@@ -34217,6 +34230,7 @@ const fn response_payload_kind(response: &Response) -> &'static str {
         Response::Ok(payload) => match payload {
             ResponsePayload::Attached { .. } => "attached",
             ResponsePayload::SessionHistory { .. } => "session_history",
+            ResponsePayload::SessionCompressed { .. } => "session_compressed",
             ResponsePayload::SessionStorageUsage { .. } => "session_storage_usage",
             ResponsePayload::SessionHistoryPage { .. } => "session_history_page",
             ResponsePayload::SessionHistoryAround { .. } => "session_history_around",

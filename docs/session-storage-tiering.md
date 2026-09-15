@@ -1,5 +1,34 @@
 # Session storage tiering
 
+## Manual compression
+
+```sh
+bcode session compress --older-than 14d --dry-run
+bcode session compress --older-than 14d
+bcode session compress <session-id> --tier deep
+bcode session compress <session-id> --older-than 12h --json
+```
+
+A session ID or a positive duration with `h`, `d`, or `w` is required. Age means inactivity
+since meaningful access, not file age. Unknown access ages are skipped without initializing
+tracking. Explicit ID selection without an age filter bypasses only age, never ownership or
+registered-reader admission. Manual requests are independent of the automatic scheduling switch.
+The default tier is light. No VACUUM, repair, migration, or configuration writes are performed.
+
+The CLI discovers bounded native session-ID pages in the resolved state location and submits
+one finalized artifact or one bounded history page per request. Per-session canonical tails are
+retained across pages. Concurrent catalog changes may require another invocation. Ctrl-C stops
+scheduling after the in-flight bounded request drains; daemon shutdown and a ten-second work
+allowance request cooperative cancellation inside each executing page. There is no durable job
+or reconnect-resume promise. Dry-run eligibility is an observation, not authorization or a savings
+estimate; execution rechecks safety. Unavailable outcomes currently combine ownership,
+compatibility, integrity, and storage failures rather than guessing their causes.
+
+Human output and JSON Lines (`--json`) report per-page outcomes. Artifact representation bytes
+and history payload bytes saved are separate; neither means allocated disk reclaimed. A page with
+`changed = false` performed no size-reducing rewrite. Partial failures produce a nonzero exit after
+independent sessions are attempted. Cancellation also exits nonzero; already completed work stays.
+
 ## Outcome and implementation status
 
 The intended outcome is transparent, lossless, default-enabled storage tiering: light compression

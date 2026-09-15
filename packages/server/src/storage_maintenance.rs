@@ -166,7 +166,9 @@ fn tracking_readiness(state: &ServerState) -> bool {
     ready
 }
 
-fn operation_cancellation(state: &ServerState) -> Result<ArtifactMaintenanceCancellation, String> {
+pub(super) fn operation_cancellation(
+    state: &ServerState,
+) -> Result<ArtifactMaintenanceCancellation, String> {
     if state
         .storage_tracking_failed
         .load(std::sync::atomic::Ordering::SeqCst)

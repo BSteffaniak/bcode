@@ -1175,6 +1175,10 @@ pub enum Request {
     UsageCatalog {
         after: Option<SessionId>,
     },
+    /// Explicit bounded manual compression; compatibility follows this protocol.
+    SessionCompress {
+        request: bcode_session_models::StorageCompressionRequest,
+    },
 }
 
 /// Server stop request policy.
@@ -2326,6 +2330,9 @@ pub enum ResponsePayload {
     UsageCatalog {
         session_ids: Vec<SessionId>,
     },
+    SessionCompressed {
+        result: bcode_session_models::StorageCompressionResult,
+    },
 }
 
 /// Stable reasons runtime ownership cannot currently be released.
@@ -3263,6 +3270,28 @@ mod tests {
     };
     use bcode_skill_models::SkillActivationMode;
     use std::collections::BTreeSet;
+
+    #[test]
+    fn compression_wire_round_trip() {
+        let request = Request::SessionCompress {
+            request: bcode_session_models::StorageCompressionRequest {
+                session_id: SessionId::new(),
+                as_of_ms: 123,
+                minimum_age_ms: None,
+                tier: bcode_session_models::StorageCompressionTier::Deep,
+                dry_run: false,
+                cursor: Some(bcode_session_models::StorageCompressionCursor::History {
+                    start: 5,
+                    through: 9,
+                }),
+            },
+        };
+        let bytes = serde_json::to_vec(&request).expect("encode");
+        assert_eq!(
+            serde_json::from_slice::<Request>(&bytes).expect("decode"),
+            request
+        );
+    }
 
     #[test]
     fn usage_catalog_round_trip_preserves_cursor_and_id_order() {
