@@ -444,9 +444,70 @@ fn verify_reference_checksum(
         digest.update(&buffer[..count]);
     }
     if !format!("{:x}", digest.finalize()).eq_ignore_ascii_case(expected) {
-        return Err(invalid());
+        return Err(artifact_failure(
+            bcode_session_models::ArtifactCompressionFailureReason::ChecksumMismatch,
+        ));
     }
     Ok(())
+}
+
+/// Typed safe error marker carried internally by artifact maintenance I/O errors.
+#[derive(Debug)]
+struct ArtifactFailure(bcode_session_models::ArtifactCompressionFailureReason);
+impl std::fmt::Display for ArtifactFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{:?}", self.0)
+    }
+}
+impl std::error::Error for ArtifactFailure {}
+
+fn artifact_failure(reason: bcode_session_models::ArtifactCompressionFailureReason) -> io::Error {
+    io::Error::new(io::ErrorKind::InvalidData, ArtifactFailure(reason))
+}
+
+/// Classify an artifact error without exposing paths, provider content, or engine messages.
+#[must_use]
+pub fn artifact_failure_reason(
+    error: &io::Error,
+) -> bcode_session_models::ArtifactCompressionFailureReason {
+    use bcode_session_models::ArtifactCompressionFailureReason as Reason;
+    if let Some(marker) = error
+        .get_ref()
+        .and_then(|e| e.downcast_ref::<ArtifactFailure>())
+    {
+        return marker.0;
+    }
+    match error.kind() {
+        io::ErrorKind::NotFound => Reason::NotFound,
+        io::ErrorKind::PermissionDenied => Reason::PermissionDenied,
+        io::ErrorKind::WouldBlock => Reason::Busy,
+        io::ErrorKind::InvalidData | io::ErrorKind::InvalidInput => Reason::InvalidData,
+        io::ErrorKind::Interrupted => Reason::Cancelled,
+        io::ErrorKind::TimedOut => Reason::Timeout,
+        io::ErrorKind::Unsupported => Reason::Unsupported,
+        _ => Reason::Io,
+    }
+}
+
+async fn maintenance_admission(
+    cancellation: &ArtifactMaintenanceCancellation,
+    root: &Path,
+    id: SessionId,
+    age_filtered: bool,
+) -> io::Result<Option<TrackingAdmission>> {
+    if age_filtered || cancellation.requires_tracking_admission() {
+        cancellation
+            .admit_tracking(root, id)
+            .await
+            .map(Some)
+            .map_err(|_| {
+                artifact_failure(
+                    bcode_session_models::ArtifactCompressionFailureReason::AdmissionUnavailable,
+                )
+            })
+    } else {
+        Ok(None)
+    }
 }
 
 /// Run verified maintenance with end-to-end cooperative cancellation.
@@ -467,16 +528,15 @@ pub async fn compress_finalized_artifact_cancellable(
     age: Option<(u64, u64)>,
     cancellation: ArtifactMaintenanceCancellation,
 ) -> io::Result<ArtifactStorageOutcome> {
+    use bcode_session_models::ArtifactCompressionFailureReason as Reason;
     cancellation.check()?;
     let root = sessions_root.canonicalize()?;
     // Age-based calls are automatic policy work. Admission is enforced here so a scheduler cannot
     // bypass failed tracking by calling the storage operation directly.
-    let admission = if age.is_some() || cancellation.requires_tracking_admission() {
-        Some(cancellation.admit_tracking(&root, session_id).await?)
-    } else {
-        None
-    };
-    let maintenance = acquire_maintenance(&root, session_id).await?;
+    let admission = maintenance_admission(&cancellation, &root, session_id, age.is_some()).await?;
+    let maintenance = acquire_maintenance(&root, session_id)
+        .await
+        .map_err(|_| artifact_failure(Reason::OwnershipUnavailable))?;
     cancellation.check()?;
     if let Some((now_ms, minimum_age_ms)) = age
         && !access_age_allows(&root, session_id, now_ms, minimum_age_ms)?
@@ -512,26 +572,30 @@ pub async fn compress_finalized_artifact_cancellable(
         }
     }
     let reference = reference_result
-        .map_err(io::Error::other)?
-        .ok_or_else(invalid)?;
+        .map_err(|_| artifact_failure(Reason::ReferenceInspection))?
+        .ok_or_else(|| artifact_failure(Reason::ReferenceMissing))?;
     if reference.complete != Some(true) || reference.availability.as_deref() != Some("complete") {
-        return Err(invalid());
+        return Err(artifact_failure(Reason::NotFinalized));
     }
     let artifacts = confined(
         &root.join("session-artifacts").join(session_id.to_string()),
         &root,
     )?;
     let resolved = crate::artifact_reference::resolve_artifact_reference(
-        &reference.storage_uri.ok_or_else(invalid)?,
+        &reference
+            .storage_uri
+            .ok_or_else(|| artifact_failure(Reason::InvalidReference))?,
         &artifacts,
     )
-    .map_err(|_| invalid())?;
+    .map_err(|_| artifact_failure(Reason::InvalidReference))?;
     let resolved = confined(&resolved, &artifacts)?;
     let relative = resolved
         .strip_prefix(&artifacts)
         .map_err(|_| invalid())?
         .to_path_buf();
-    let expected_bytes = reference.byte_len.ok_or_else(invalid)?;
+    let expected_bytes = reference
+        .byte_len
+        .ok_or_else(|| artifact_failure(Reason::MissingLength))?;
     let expected_checksum = reference.checksum_sha256;
     run_cancellable_artifact_work(cancellation.clone(), move || {
         cancellation.check()?;
@@ -543,7 +607,7 @@ pub async fn compress_finalized_artifact_cancellable(
         let (file, encoding) = open_content(&artifacts.join(&relative), &artifacts)?;
         let mut reader = ArtifactReader::new(file, encoding)?;
         if reader.logical_bytes() != expected_bytes {
-            return Err(invalid());
+            return Err(artifact_failure(Reason::LengthMismatch));
         }
         verify_reference_checksum(&mut reader, expected_checksum.as_deref(), &cancellation)?;
         drop(reader);
@@ -807,6 +871,29 @@ fn exchange(_parent: &File, _parent_path: &Path, _left: &Path, _right: &Path) ->
 #[cfg(all(test, any(target_os = "macos", target_os = "linux")))]
 mod tests {
     use super::*;
+
+    #[test]
+    fn artifact_diagnostics_are_typed_and_secret_safe() {
+        use bcode_session_models::ArtifactCompressionFailureReason as Reason;
+        for (kind, reason) in [
+            (io::ErrorKind::NotFound, Reason::NotFound),
+            (io::ErrorKind::PermissionDenied, Reason::PermissionDenied),
+            (io::ErrorKind::WouldBlock, Reason::Busy),
+            (io::ErrorKind::Interrupted, Reason::Cancelled),
+        ] {
+            let error = io::Error::new(kind, "secret path and credentials");
+            assert_eq!(artifact_failure_reason(&error), reason);
+        }
+        let error = artifact_failure(Reason::MissingLength);
+        assert_eq!(artifact_failure_reason(&error), Reason::MissingLength);
+        let error = verify_reference_checksum(
+            &mut b"actual".as_slice(),
+            Some(&"0".repeat(64)),
+            &ArtifactMaintenanceCancellation::default(),
+        )
+        .expect_err("mismatch");
+        assert_eq!(artifact_failure_reason(&error), Reason::ChecksumMismatch);
+    }
 
     #[test]
     fn reference_checksum_rejects_damaged_or_malformed_original_evidence() {

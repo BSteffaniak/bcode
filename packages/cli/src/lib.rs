@@ -6729,6 +6729,12 @@ fn print_compression_result(
             result.history_payload_bytes_saved,
             result.failures
         );
+        if let Some(context) = &result.artifact_failure {
+            eprintln!(
+                "{id}: artifact {:?}, reference {:?}: {:?}",
+                context.artifact_id, context.reference_key, context.reason
+            );
+        }
         if let Some(reason) = result.failure {
             eprintln!("{id}: {}", reason.message());
         }

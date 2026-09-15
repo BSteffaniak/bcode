@@ -120,6 +120,57 @@ impl StorageCompressionFailure {
     }
 }
 
+/// Bounded artifact failure context. Identity strings are rendered escaped by frontends.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StorageArtifactFailure {
+    /// Logical artifact ID, never a resolved path.
+    pub artifact_id: String,
+    /// Logical reference key.
+    pub reference_key: String,
+    /// Normalized stage or cause; no raw engine error text.
+    pub reason: ArtifactCompressionFailureReason,
+}
+
+/// Secret-safe artifact compression failure reasons.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ArtifactCompressionFailureReason {
+    /// Reference is missing from the finalized projection.
+    ReferenceMissing,
+    /// Finalization/completeness metadata is not sufficient for compression.
+    NotFinalized,
+    /// No logical byte length was recorded.
+    MissingLength,
+    /// Storage URI is missing or cannot be safely resolved.
+    InvalidReference,
+    /// Content length disagrees with the reference.
+    LengthMismatch,
+    /// Content checksum disagrees with the reference.
+    ChecksumMismatch,
+    /// Reading the current reference failed compatibility or projection validation.
+    ReferenceInspection,
+    /// Session maintenance ownership could not be acquired.
+    OwnershipUnavailable,
+    /// Durable read admission could not be acquired.
+    AdmissionUnavailable,
+    /// Referenced storage does not exist.
+    NotFound,
+    /// Filesystem access was denied.
+    PermissionDenied,
+    /// A required resource is busy.
+    Busy,
+    /// Stored content or representation is invalid.
+    InvalidData,
+    /// Work exceeded the configured request allowance.
+    Timeout,
+    /// Work was cancelled.
+    Cancelled,
+    /// The platform or representation is unsupported.
+    Unsupported,
+    /// Other I/O or publication failure; prior committed publication may be retained.
+    Io,
+}
+
 /// Bounded result, versioned by the enclosing application protocol.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StorageCompressionResult {
@@ -137,6 +188,8 @@ pub struct StorageCompressionResult {
     pub changed: bool,
     /// Structured reason for a failed page; omitted for successful or age-filtered pages.
     pub failure: Option<StorageCompressionFailure>,
+    /// Specific artifact failure context when available.
+    pub artifact_failure: Option<StorageArtifactFailure>,
     /// Next page, if any. No durable resume is promised.
     pub next: Option<StorageCompressionCursor>,
 }

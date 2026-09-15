@@ -33,6 +33,7 @@ pub async fn compress_page(
         failures: 0,
         changed: false,
         failure: Some(Failure::StorageUnavailable),
+        artifact_failure: None,
         next: None,
     };
     let Some(root) = state.sessions.session_store_root() else {
@@ -93,21 +94,30 @@ const fn compression_level(tier: StorageCompressionTier) -> i32 {
     }
 }
 
+async fn preflight(
+    state: &ServerState,
+    root: &std::path::Path,
+    id: bcode_session_models::SessionId,
+) -> Result<bcode_session::artifact_storage::ArtifactMaintenanceCancellation, Failure> {
+    let cancellation = super::storage_maintenance::operation_cancellation(state)
+        .map_err(|_| Failure::TrackingUnavailable)?;
+    cancellation
+        .check_tracking_admission(root, id)
+        .await
+        .map_err(|e| admission_failure(&e))?;
+    Ok(cancellation)
+}
+
 async fn execute_page(
     state: &ServerState,
     root: &std::path::Path,
     request: StorageCompressionRequest,
     mut result: StorageCompressionResult,
 ) -> Result<StorageCompressionResult, &'static str> {
-    let Ok(cancellation) = super::storage_maintenance::operation_cancellation(state) else {
-        return Ok(failed(result, Failure::TrackingUnavailable));
+    let cancellation = match preflight(state, root, request.session_id).await {
+        Ok(cancellation) => cancellation,
+        Err(reason) => return Ok(failed(result, reason)),
     };
-    if let Err(error) = cancellation
-        .check_tracking_admission(root, request.session_id)
-        .await
-    {
-        return Ok(failed(result, admission_failure(&error)));
-    }
     let age = request.minimum_age_ms.map(|age| (request.as_of_ms, age));
     let tier = artifact_tier(request.tier);
     let cursor = request.cursor.unwrap_or(Cursor::Artifacts {
@@ -140,10 +150,11 @@ async fn execute_page(
                 );
                 tokio::pin!(work);
                 let mut shutdown = state.subscribe_shutdown();
+                let mut timed_out = false;
                 let outcome = tokio::select! {
                     biased;
                     _ = shutdown.recv() => { cancellation.cancel(); work.await }
-                    () = tokio::time::sleep(std::time::Duration::from_secs(10)) => { cancellation.cancel(); work.await }
+                    () = tokio::time::sleep(std::time::Duration::from_secs(10)) => { timed_out = true; cancellation.cancel(); work.await }
                     outcome = &mut work => outcome,
                 };
                 match outcome {
@@ -151,7 +162,12 @@ async fn execute_page(
                         result.artifact_bytes_saved = saved_bytes;
                     }
                     Ok(ArtifactStorageOutcome::Unchanged) => {}
-                    Err(_) => return Ok(failed(result, Failure::ArtifactFailed)),
+                    Err(error) => {
+                        result.artifact_failure = Some(artifact_failure_context(
+                            artifact, reference, &error, timed_out,
+                        ));
+                        return Ok(failed(result, Failure::ArtifactFailed));
+                    }
                 }
                 result.next = Some(Cursor::Artifacts {
                     after: Some((artifact.clone(), reference.clone())),
@@ -231,5 +247,22 @@ const fn artifact_tier(
         StorageCompressionTier::Deep => {
             bcode_session::artifact_compression::ArtifactCompression::Deep
         }
+    }
+}
+
+fn artifact_failure_context(
+    artifact: &str,
+    reference: &str,
+    error: &std::io::Error,
+    timed_out: bool,
+) -> bcode_session_models::StorageArtifactFailure {
+    bcode_session_models::StorageArtifactFailure {
+        artifact_id: artifact.chars().take(256).collect(),
+        reference_key: reference.chars().take(256).collect(),
+        reason: if timed_out {
+            bcode_session_models::ArtifactCompressionFailureReason::Timeout
+        } else {
+            bcode_session::artifact_storage::artifact_failure_reason(error)
+        },
     }
 }
