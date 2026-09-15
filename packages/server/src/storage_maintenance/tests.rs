@@ -8,12 +8,31 @@ use bcode_session_models::{
 use std::path::PathBuf;
 
 #[tokio::test]
+async fn daemon_maintenance_never_falls_back_to_offline_authority() {
+    let (root, state, id, artifacts, _) = fixture(1).await;
+    let registration = state
+        .storage_daemon_registration
+        .lock()
+        .expect("lock")
+        .take()
+        .expect("registration");
+    registration.finish().expect("clean empty registry");
+    let future = super::super::current_time_ms() + 31 * 86_400_000;
+    assert!(operation_cancellation(&state).is_err());
+    assert!(
+        maintain_session_at(&state, root.path(), id, None, future)
+            .await
+            .is_err()
+    );
+    drop(state);
+    assert!(artifacts.join("recording-000").is_file());
+}
+
+#[tokio::test]
 async fn maintenance_pass_uses_local_live_acknowledgement_but_refuses_foreign_daemon() {
     let (root, state, id, artifacts, _) = fixture(2).await;
     let registry = bcode_session::storage_admission::StorageAdmissionRegistry::open(root.path())
         .expect("registry");
-    let local = registry.register_daemon(SessionId::new()).expect("local");
-    *state.storage_daemon_registration.lock().expect("lock") = Some(local);
     let foreign = registry.register_daemon(SessionId::new()).expect("foreign");
     let future = super::super::current_time_ms() + 31 * 86_400_000;
     maintain_session_at(&state, root.path(), id, None, future)
@@ -74,14 +93,6 @@ async fn completed_scheduler_pass_reclaims_free_database_pages() {
     let (root, state, id, _artifacts, _) = fixture(0).await;
     let registry = bcode_session::storage_admission::StorageAdmissionRegistry::open(root.path())
         .expect("registry");
-    *state
-        .storage_daemon_registration
-        .lock()
-        .expect("registration") = Some(
-        registry
-            .register_daemon(SessionId::new())
-            .expect("local daemon"),
-    );
     let db = bcode_session::db::SessionDb::open_existing_turso_in_root(id, root.path())
         .await
         .expect("db");
@@ -182,6 +193,7 @@ async fn fixture(count: usize) -> (tempfile::TempDir, ServerState, SessionId, Pa
         .await
         .expect("release");
     let state = crate::tests::test_server_state(sessions);
+    crate::storage_read_admission::register_startup(&state, root.path().to_path_buf()).await;
     (root, state, id, artifacts, bytes)
 }
 

@@ -686,6 +686,45 @@ completion. A regression covers each altered representation and proves lock rele
 replacement. Production clean-shutdown drain and cross-process coordination remain incomplete; the
 automatic dispatch gate is unchanged.
 
+## Final-state shutdown registration completion
+
+Registration is now retained until final ServerState destruction. A requested healthy shutdown
+attempts CLEAN only after the last state owner releases; outstanding acknowledgement tokens cause
+completion to refuse and preserve ACTIVE. Abnormal drop and failed tracking also preserve ACTIVE.
+Tests retain another state owner across shutdown and prove maintenance stays blocked until final
+release, then verify clean retirement; another test retains a token and proves dirty evidence stays.
+This closes normal registration cleanup without claiming that older/unregistered daemons participate.
+The global automatic-dispatch gate remains disabled.
+
+## Startup registration fallback
+
+Startup registration failure now uses the same durable maintenance blocker as failed read
+admission, before the client accept loop starts. Both paths latch local tracking failure even
+when blocker persistence fails. Tests cover blocker survival after healthy shutdown/restart and
+an unavailable registry without modifying the obstructing file. Registration now runs before
+background services, workflow recovery, and ready callbacks in `run_constructed_server`, rather
+than immediately before the accept loop. A startup lifecycle test verifies that foreign maintenance
+is blocked until clean shutdown; the unavailable-registry test exercises registration failure itself.
+This does not establish an older-reader fence or make double-failure fallback safe for automatic
+dispatch; the compatibility gate remains closed.
+
+Validation: `cargo fmt`, `cargo check --workspace --quiet`,
+`cargo clippy --workspace --all-targets --quiet -- -D warnings`, and
+`cargo test -p bcode_server storage_read_admission::tests --quiet` passed (7 tests).
+
+## Daemon maintenance authority
+
+Daemon maintenance now requires a live registration acknowledgement; missing registration no
+longer falls back to offline maintenance admission, even when the registry is otherwise clean.
+Scheduler fixtures use the production startup registration boundary. A regression removes a
+clean registration and verifies that an eligible artifact remains raw and scheduling fails closed.
+Explicit offline session maintenance APIs are unchanged. This closes a local authority fallback,
+not the independent older-reader or durable fallback-failure compatibility gaps.
+
+Validation: `cargo fmt`, `cargo check --workspace --quiet`,
+`cargo clippy --workspace --all-targets --quiet -- -D warnings`, and
+`cargo test -p bcode_server storage_maintenance::tests --quiet` passed (11 tests).
+
 ## Remaining implementation
 
 ### Access policy and scheduling

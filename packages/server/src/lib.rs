@@ -1431,6 +1431,28 @@ fn workflow_store_or_degraded(
     }
 }
 
+impl Drop for ServerState {
+    fn drop(&mut self) {
+        let Ok(slot) = self.storage_daemon_registration.get_mut() else {
+            return;
+        };
+        let Some(registration) = slot.take() else {
+            return;
+        };
+        // Final Arc release proves no request/provider task can still borrow this ServerState.
+        // Independent maintenance acknowledgements retain their own liveness references and make
+        // finish refuse completion, so detached blocking work cannot be hidden by this cleanup.
+        if self.shutdown_requested.load(Ordering::SeqCst)
+            && !self.storage_tracking_failed.load(Ordering::SeqCst)
+            && registration.finish().is_err()
+        {
+            tracing::warn!(
+                "storage registration could not finish cleanly; preserving maintenance blocker"
+            );
+        }
+    }
+}
+
 impl ServerState {
     fn require_workflow_store(&self) -> Result<(), ServerError> {
         self.workflow_store_unavailable
@@ -4669,6 +4691,11 @@ async fn run_constructed_server(
         drop(listener);
         return shutdown_constructed_server(state, Ok(())).await;
     }
+    // Register before recovery, callbacks, or background services can consume session content.
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    if let Some(root) = state.sessions.session_store_root() {
+        storage_read_admission::register_startup(&state, root).await;
+    }
     let startup_started_at = state.startup_started_at;
     let stage_started_at = Instant::now();
     state.start_catalog_event_forwarder().await;
@@ -4766,28 +4793,6 @@ async fn run_constructed_server(
         total_elapsed_ms = startup_started_at.elapsed().as_millis(),
         "server ready; accepting clients"
     );
-    #[cfg(any(target_os = "macos", target_os = "linux"))]
-    if let Some(root) = state.sessions.session_store_root() {
-        let registered = tokio::task::spawn_blocking(move || {
-            let registry = bcode_session::storage_admission::StorageAdmissionRegistry::open(&root)?;
-            if registry.retire_completed_daemons(4096).is_err() {
-                tracing::debug!(
-                    "completed storage registrations could not be retired; preserving registry"
-                );
-            }
-            registry.register_daemon(SessionId::new())
-        })
-        .await;
-        if let Ok(Ok(registration)) = registered {
-            *state
-                .storage_daemon_registration
-                .lock()
-                .expect("storage registration lock") = Some(registration);
-        } else {
-            state.storage_tracking_failed.store(true, Ordering::SeqCst);
-            tracing::warn!("storage daemon registration unavailable; maintenance is disabled");
-        }
-    }
     state.storage_worker.start(Arc::clone(&state)).await;
     bcode_daemon_lifecycle::notify_launcher_ready();
     let mut clients = JoinSet::new();
@@ -4892,11 +4897,8 @@ async fn shutdown_constructed_server(
             "metrics persistence stopped with degraded telemetry"
         );
     }
-    // Conservatively retain ACTIVE at shutdown until every runtime/provider task has a proved
-    // drain contract. Dropping the registration releases liveness but never cleans failure evidence.
-    if let Ok(mut registration) = state.storage_daemon_registration.lock() {
-        registration.take();
-    }
+    // Registration is finalized only on the final ServerState release, not while other tasks may
+    // still retain state and perform access tracking.
     let record_removal = state.daemon_record_path.as_ref().map_or(Ok(()), |path| {
         bcode_daemon_lifecycle::remove_record_if_instance(path, &state.daemon_status.instance_id)
     });
@@ -65504,10 +65506,10 @@ event_symbol = "bcode_plugin_handle_event_v1"
 
     #[tokio::test]
     async fn unavailable_workflow_subscription_leaves_no_registration_and_connection_usable() {
-        let state = Arc::new(ServerState {
-            workflow_store_unavailable: Some("workflow maintenance required".into()),
-            ..test_server_state(SessionManager::default())
-        });
+        let mut state = Arc::new(test_server_state(SessionManager::default()));
+        Arc::get_mut(&mut state)
+            .expect("unique state")
+            .workflow_store_unavailable = Some("workflow maintenance required".into());
         let socket_dir = tempfile::tempdir().expect("socket directory");
         let endpoint = bcode_ipc::IpcEndpoint::unix_socket(socket_dir.path().join("server.sock"));
         let listener = LocalIpcListener::bind(&endpoint).expect("listener");
@@ -69023,10 +69025,9 @@ event_symbol = "bcode_plugin_handle_event_v1"
     }
 
     fn unavailable_workflow_state() -> Arc<ServerState> {
-        let state = Arc::new(ServerState {
-            workflow_store_unavailable: Some("private storage diagnostic".into()),
-            ..test_server_state(SessionManager::default())
-        });
+        let mut state = test_server_state(SessionManager::default());
+        state.workflow_store_unavailable = Some("private storage diagnostic".into());
+        let state = Arc::new(state);
         let (workflow, draft) = unavailable_workflow_sentinel();
         state
             .workflow_store

@@ -33,18 +33,7 @@ impl RegisteredStorageRead {
         if let Ok(admission) = Self::begin(root).await {
             return Some(admission);
         }
-        state.fail_storage_tracking();
-        let blocked = tokio::task::spawn_blocking(move || {
-            StorageAdmissionRegistry::open(&fallback_root)?.block_maintenance_for_fallback()
-        })
-        .await;
-        if matches!(blocked, Ok(Ok(()))) {
-            tracing::warn!("unregistered storage read durably disabled maintenance");
-        } else {
-            tracing::warn!(
-                "storage fallback fence unavailable; automatic scheduling remains disabled"
-            );
-        }
+        block_unregistered_reads(state, fallback_root).await;
         None
     }
 
@@ -118,9 +107,135 @@ impl RegisteredStorageRead {
     }
 }
 
+/// Register before startup services can consume session content.
+/// Registration failure disables optional maintenance without preventing unrelated startup.
+pub(super) async fn register_startup(state: &super::ServerState, root: PathBuf) {
+    let fallback_root = root.clone();
+    let registered = tokio::task::spawn_blocking(move || {
+        let registry = StorageAdmissionRegistry::open(&root)?;
+        if registry.retire_completed_daemons(4096).is_err() {
+            tracing::debug!(
+                "completed storage registrations could not be retired; preserving registry"
+            );
+        }
+        registry.register_daemon(SessionId::new())
+    })
+    .await;
+    if let Ok(Ok(registration)) = registered {
+        *state
+            .storage_daemon_registration
+            .lock()
+            .expect("storage registration lock") = Some(registration);
+    } else {
+        block_unregistered_reads(state, fallback_root).await;
+        tracing::warn!("storage daemon registration unavailable; maintenance is disabled");
+    }
+}
+
+/// Disable maintenance before allowing reads without daemon or operation registration.
+///
+/// Failure to persist the blocker is not a compatibility proof: the global dispatch gate must
+/// remain closed until an independent fence covers these readers.
+pub(super) async fn block_unregistered_reads(state: &super::ServerState, root: PathBuf) {
+    state.fail_storage_tracking();
+    let blocked = tokio::task::spawn_blocking(move || {
+        StorageAdmissionRegistry::open(&root)?.block_maintenance_for_fallback()
+    })
+    .await;
+    if matches!(blocked, Ok(Ok(()))) {
+        tracing::warn!("unregistered storage reads durably disabled maintenance");
+    } else {
+        tracing::warn!("storage fallback fence unavailable; automatic scheduling remains disabled");
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn startup_registration_blocks_foreign_maintenance_until_shutdown() {
+        let root = tempfile::tempdir().expect("root");
+        let state = crate::tests::test_server_state(bcode_session::SessionManager::default());
+        register_startup(&state, root.path().to_path_buf()).await;
+        let registry = StorageAdmissionRegistry::open(root.path()).expect("registry");
+        assert!(registry.admit_maintenance(16).is_err());
+        assert!(
+            !state
+                .storage_tracking_failed
+                .load(std::sync::atomic::Ordering::SeqCst)
+        );
+        state.request_shutdown();
+        drop(state);
+        drop(registry.admit_maintenance(16).expect("clean shutdown"));
+    }
+
+    #[tokio::test]
+    async fn unregistered_startup_persists_blocker_across_restart() {
+        let root = tempfile::tempdir().expect("root");
+        let state = crate::tests::test_server_state(bcode_session::SessionManager::default());
+        block_unregistered_reads(&state, root.path().to_path_buf()).await;
+        assert!(
+            state
+                .storage_tracking_failed
+                .load(std::sync::atomic::Ordering::SeqCst)
+        );
+        state.request_shutdown();
+        drop(state);
+        let registry = StorageAdmissionRegistry::open(root.path()).expect("restart");
+        assert!(registry.admit_maintenance(16).is_err());
+    }
+
+    #[tokio::test]
+    async fn unavailable_fallback_keeps_local_tracking_failed() {
+        let root = tempfile::NamedTempFile::new().expect("not a directory");
+        let state = crate::tests::test_server_state(bcode_session::SessionManager::default());
+        register_startup(&state, root.path().to_path_buf()).await;
+        assert!(
+            state
+                .storage_tracking_failed
+                .load(std::sync::atomic::Ordering::SeqCst)
+        );
+        drop(state);
+        assert_eq!(std::fs::metadata(root.path()).expect("preserved").len(), 0);
+    }
+
+    #[tokio::test]
+    async fn healthy_shutdown_cleans_only_after_last_state_owner_releases() {
+        let root = tempfile::tempdir().expect("root");
+        let registry = StorageAdmissionRegistry::open(root.path()).expect("registry");
+        let state = std::sync::Arc::new(crate::tests::test_server_state(
+            bcode_session::SessionManager::default(),
+        ));
+        *state.storage_daemon_registration.lock().expect("lock") =
+            Some(registry.register_daemon(SessionId::new()).expect("daemon"));
+        let outstanding = std::sync::Arc::clone(&state);
+        state.request_shutdown();
+        drop(state);
+        assert!(registry.admit_maintenance(16).is_err());
+        drop(outstanding);
+        drop(
+            registry
+                .admit_maintenance(16)
+                .expect("clean after final release"),
+        );
+        assert_eq!(registry.retire_completed_daemons(16).expect("retire"), 1);
+    }
+
+    #[tokio::test]
+    async fn shutdown_with_outstanding_operation_token_leaves_dirty_record() {
+        let root = tempfile::tempdir().expect("root");
+        let registry = StorageAdmissionRegistry::open(root.path()).expect("registry");
+        let state = crate::tests::test_server_state(bcode_session::SessionManager::default());
+        let daemon = registry.register_daemon(SessionId::new()).expect("daemon");
+        let token = daemon.acknowledgement().expect("token");
+        *state.storage_daemon_registration.lock().expect("lock") = Some(daemon);
+        state.request_shutdown();
+        drop(state);
+        assert!(token.check().is_err());
+        drop(token);
+        assert!(registry.admit_maintenance(16).is_err());
+    }
 
     #[tokio::test]
     async fn tracking_failure_invalidates_live_acknowledgement_and_survives_restart() {

@@ -180,15 +180,12 @@ fn operation_cancellation(state: &ServerState) -> Result<ArtifactMaintenanceCanc
         .storage_daemon_registration
         .lock()
         .map_err(|_| "registration lock unavailable")?;
-    let cancellation = ArtifactMaintenanceCancellation::default();
     registration
         .as_ref()
-        .map_or(Ok(cancellation.clone()), |registration| {
-            registration
-                .acknowledgement()
-                .map(|ack| cancellation.with_acknowledgement(ack))
-                .map_err(|_| "unhealthy storage registration".into())
-        })
+        .ok_or_else(|| "storage daemon registration unavailable".to_owned())?
+        .acknowledgement()
+        .map(|ack| ArtifactMaintenanceCancellation::default().with_acknowledgement(ack))
+        .map_err(|_| "unhealthy storage registration".into())
 }
 
 async fn maintain_history(
