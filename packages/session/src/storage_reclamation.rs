@@ -450,6 +450,119 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn vacuum_crash_child() {
+        let Ok(root) = std::env::var("BCODE_VACUUM_CRASH_ROOT") else {
+            return;
+        };
+        let id = std::env::var("BCODE_VACUUM_CRASH_ID")
+            .expect("id")
+            .parse()
+            .expect("session id");
+        reclaim_session_storage(Path::new(&root), id)
+            .await
+            .expect("vacuum");
+        panic!("VACUUM completed before interruption");
+    }
+
+    #[tokio::test]
+    async fn process_loss_during_vacuum_wal_publication_preserves_history() {
+        let root = tempfile::tempdir().expect("root");
+        let manager = crate::SessionManager::persistent(root.path()).expect("manager");
+        let session = manager
+            .create_session(None, root.path().to_path_buf())
+            .await
+            .expect("create");
+        let id = session.id;
+        manager
+            .append_event(
+                id,
+                bcode_session_models::SessionEventKind::SystemMessage {
+                    text: "history survives VACUUM process loss 世界".repeat(1000),
+                },
+            )
+            .await
+            .expect("append");
+        let expected = manager.session_history(id).await.expect("history");
+        manager
+            .release_session_ownership(id)
+            .await
+            .expect("release");
+        drop(manager);
+        let db = SessionDb::open_existing_turso_in_root(id, root.path())
+            .await
+            .expect("db");
+        // Retained data keeps source-WAL publication observable; free pages make VACUUM eligible.
+        db.database()
+            .exec_raw("CREATE TABLE vacuum_retained (content BLOB)")
+            .await
+            .expect("table");
+        db.database()
+            .exec_raw("INSERT INTO vacuum_retained VALUES (zeroblob(33554432))")
+            .await
+            .expect("retained");
+        db.database()
+            .exec_raw("CREATE TABLE vacuum_free (content BLOB)")
+            .await
+            .expect("table");
+        db.database()
+            .exec_raw("INSERT INTO vacuum_free VALUES (zeroblob(4194304))")
+            .await
+            .expect("free fixture");
+        db.database()
+            .exec_raw("DROP TABLE vacuum_free")
+            .await
+            .expect("free pages");
+        db.database().close().await.expect("close");
+        drop(db);
+        let wal = root.path().join(id.to_string()).join("session.db-wal");
+        assert!(std::fs::metadata(&wal).map_or(true, |m| m.len() == 0));
+        let mut child = std::process::Command::new(std::env::current_exe().expect("executable"))
+            .args(["--exact", "storage_reclamation::tests::vacuum_crash_child"])
+            .env("BCODE_VACUUM_CRASH_ROOT", root.path())
+            .env("BCODE_VACUUM_CRASH_ID", id.to_string())
+            .spawn()
+            .expect("child");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        let observed = loop {
+            if std::fs::metadata(&wal).is_ok_and(|m| m.len() > 4096) {
+                break true;
+            }
+            if child.try_wait().expect("child status").is_some()
+                || std::time::Instant::now() >= deadline
+            {
+                break false;
+            }
+            std::thread::sleep(std::time::Duration::from_micros(100));
+        };
+        let killed = child.kill();
+        let status = child.wait().expect("reap child");
+        assert!(observed, "source WAL publication not observed");
+        killed.expect("kill during publication");
+        assert!(!status.success());
+        let manager = crate::SessionManager::persistent(root.path()).expect("reopen");
+        assert_eq!(
+            manager
+                .session_history(id)
+                .await
+                .expect("recovered history"),
+            expected
+        );
+        manager
+            .append_event(
+                id,
+                bcode_session_models::SessionEventKind::SystemMessage {
+                    text: "continued after interrupted vacuum".into(),
+                },
+            )
+            .await
+            .expect("continued write");
+        manager
+            .release_session_ownership(id)
+            .await
+            .expect("release");
+    }
+
+    #[tokio::test]
     async fn reclamation_reduces_file_size_and_releases_ownership() {
         let root = tempfile::tempdir().expect("root");
         let id = SessionId::new();

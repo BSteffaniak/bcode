@@ -27,8 +27,10 @@ continued writes. A constructed-server integration separately verifies normal st
 the storage worker, conservatively initializes missing tracking, and clean shutdown releases
 registration so maintenance can be admitted again. The migration and lifecycle proofs are separate
 tests, not a single historical-session daemon-startup scenario.
-Engine VACUUM interruption remains unverified; successful reclamation and cancellation tests do
-not establish recovery after process loss during engine publication.
+Engine VACUUM process-loss coverage now observes source-WAL growth during reclamation, kills the
+child process, reopens exact canonical history, and appends successfully. The regression passed
+both alone and in the reclamation suite. This is a real process-loss test at an observed publication
+window, not deterministic injection at every engine I/O boundary or a power-loss simulation.
 
 The first implemented slice was explicit bounded
 physical measurement through `bcode session storage-usage <session-id> [--entry-budget 10000]`.
