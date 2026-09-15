@@ -42,7 +42,8 @@ pub async fn attach_recent(
 ) -> Result<bcode_session::SessionAttachment, bcode_session::SessionError> {
     #[cfg(any(target_os = "macos", target_os = "linux"))]
     let admission =
-        super::storage_read_admission::RegisteredStorageRead::for_session(state, session_id).await;
+        super::storage_read_admission::RegisteredStorageRead::for_session(state, session_id)
+            .await?;
     let attachment = state
         .sessions
         .attach_session_recent(session_id, client_id, limit)
@@ -71,7 +72,8 @@ pub async fn attach_projection_window(
 ) -> Result<bcode_session::SessionProjectionWindowAttachment, bcode_session::SessionError> {
     #[cfg(any(target_os = "macos", target_os = "linux"))]
     let admission =
-        super::storage_read_admission::RegisteredStorageRead::for_session(state, session_id).await;
+        super::storage_read_admission::RegisteredStorageRead::for_session(state, session_id)
+            .await?;
     let attachment = state
         .sessions
         .attach_session_projection_window(session_id, client_id, request)
@@ -114,7 +116,9 @@ pub async fn attach(
         .map_err(AttachError::Namespace)?;
     #[cfg(any(target_os = "macos", target_os = "linux"))]
     let admission =
-        super::storage_read_admission::RegisteredStorageRead::for_session(state, session_id).await;
+        super::storage_read_admission::RegisteredStorageRead::for_session(state, session_id)
+            .await
+            .map_err(AttachError::Session)?;
     let attachment = state
         .sessions
         .attach_session(session_id, client_id)
@@ -803,7 +807,8 @@ pub async fn complete_history(
     }
     #[cfg(any(target_os = "macos", target_os = "linux"))]
     let admission =
-        super::storage_read_admission::RegisteredStorageRead::for_session(state, session_id).await;
+        super::storage_read_admission::RegisteredStorageRead::for_session(state, session_id)
+            .await?;
     let history = state.sessions.session_history(session_id).await?;
     #[cfg(any(target_os = "macos", target_os = "linux"))]
     if let Some(admission) = admission {
@@ -831,7 +836,8 @@ pub async fn inspect(
     }
     #[cfg(any(target_os = "macos", target_os = "linux"))]
     let admission =
-        super::storage_read_admission::RegisteredStorageRead::for_session(state, session_id).await;
+        super::storage_read_admission::RegisteredStorageRead::for_session(state, session_id)
+            .await?;
     let page = state
         .sessions
         .session_inspection_page(session_id, query)
@@ -888,7 +894,8 @@ pub async fn history_page(
     }
     #[cfg(any(target_os = "macos", target_os = "linux"))]
     let admission =
-        super::storage_read_admission::RegisteredStorageRead::for_session(state, session_id).await;
+        super::storage_read_admission::RegisteredStorageRead::for_session(state, session_id)
+            .await?;
     let page = state
         .sessions
         .session_history_page(session_id, query)
@@ -919,7 +926,8 @@ pub async fn history_around(
     }
     #[cfg(any(target_os = "macos", target_os = "linux"))]
     let admission =
-        super::storage_read_admission::RegisteredStorageRead::for_session(state, session_id).await;
+        super::storage_read_admission::RegisteredStorageRead::for_session(state, session_id)
+            .await?;
     let window = state
         .sessions
         .session_history_around(session_id, query)

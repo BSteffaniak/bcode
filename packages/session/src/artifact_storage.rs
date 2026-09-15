@@ -1102,6 +1102,9 @@ mod tests {
         let bytes = "terminal 世界\n".repeat(100_000).into_bytes();
         let path = artifacts.join("recording.bin");
         fs::write(&path, &bytes).expect("original");
+        // An older daemon may already have opened the raw inode before maintenance starts.
+        // Atomic publication must neither invalidate that descriptor nor expose compressed bytes.
+        let mut old_reader = File::open(&path).expect("pre-transition raw reader");
         let outcome = compress_session_artifact(
             root.path(),
             id,
@@ -1142,6 +1145,17 @@ mod tests {
                 .1,
             bytes[..32]
         );
+        // A cached path used after either transition must fail as a raw-file read. A descriptor
+        // opened before publication still addresses the original inode, even after backup cleanup.
+        assert!(fs::read(&path).is_err());
+        for offset in [0, 262_140, bytes.len() as u64 - 7] {
+            old_reader.seek(SeekFrom::Start(offset)).expect("old seek");
+            let mut actual = [0; 7];
+            old_reader.read_exact(&mut actual).expect("old raw read");
+            let start = usize::try_from(offset).expect("offset");
+            assert_eq!(actual, bytes[start..start + 7]);
+        }
+        drop(old_reader);
         assert_eq!(
             fs::read(session.join("session.db")).expect("canonical"),
             b"fixture"

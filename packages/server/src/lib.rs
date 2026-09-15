@@ -11261,8 +11261,9 @@ async fn read_session_artifact_range(
         .await
         .map_err(|error| error.to_string())?;
     #[cfg(any(target_os = "macos", target_os = "linux"))]
-    let admission =
-        storage_read_admission::RegisteredStorageRead::for_session(state, session_id).await;
+    let admission = storage_read_admission::RegisteredStorageRead::for_session(state, session_id)
+        .await
+        .map_err(|error| error.to_string())?;
     let range = read_session_artifact_range_untracked(
         state,
         session_id,
@@ -22844,7 +22845,7 @@ async fn build_model_turn_request(
     let history_timer = state.metrics.timer();
     #[cfg(any(target_os = "macos", target_os = "linux"))]
     let admission =
-        storage_read_admission::RegisteredStorageRead::for_session(state, session_id).await;
+        storage_read_admission::RegisteredStorageRead::for_session(state, session_id).await?;
     let history = state.sessions.model_context_events(session_id).await?;
     #[cfg(any(target_os = "macos", target_os = "linux"))]
     if let Some(admission) = admission {

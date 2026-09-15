@@ -193,7 +193,7 @@ async fn reclaim_session_storage_owned(
         )
         .into());
     }
-    let _admission = if eligibility.is_some() {
+    let admission = if eligibility.is_some() {
         Some(cancellation.admit_tracking(&root).await?)
     } else {
         None
@@ -231,6 +231,9 @@ async fn reclaim_session_storage_owned(
     // Same locked engine as normal sessions; only this exclusively owned maintenance connection
     // opts into VACUUM. The engine owns atomicity, temporary files, and WAL recovery.
     cancellation.check()?;
+    if let Some(admission) = &admission {
+        admission.check()?;
+    }
     let result = vacuum_with_maintenance_engine(&path).await;
     let after_bytes = std::fs::metadata(&path).map(|metadata| metadata.len());
     drop(maintenance);

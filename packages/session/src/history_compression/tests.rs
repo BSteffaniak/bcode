@@ -4,6 +4,53 @@ use super::*;
 use bcode_session_models::{SessionEventKind, SessionHistoryDirection, SessionHistoryQuery};
 
 #[tokio::test]
+async fn compressed_history_rejects_legacy_json_decoder_without_changing_logical_event() {
+    let root = tempfile::tempdir().expect("root");
+    let manager = crate::SessionManager::persistent(root.path()).expect("manager");
+    let session = manager
+        .create_session(None, root.path().to_path_buf())
+        .await
+        .expect("create");
+    let event = manager
+        .append_event(
+            session.id,
+            SessionEventKind::SystemMessage {
+                text: "lossless history 世界 ".repeat(8000),
+            },
+        )
+        .await
+        .expect("append");
+    manager
+        .release_session_ownership(session.id)
+        .await
+        .expect("release");
+    drop(manager);
+    let page = compress_history_page(root.path(), session.id, 0, 1)
+        .await
+        .expect("compress");
+    assert!(page.compressed > 0);
+    let db = SessionDb::open_existing_turso_in_root(session.id, root.path())
+        .await
+        .expect("open");
+    let rows = db
+        .database()
+        .query_raw(&format!(
+            "SELECT payload FROM events WHERE event_seq = {}",
+            event.sequence
+        ))
+        .await
+        .expect("stored payload");
+    let value = rows[0].get("payload").expect("payload column");
+    let stored = value.as_str().expect("payload");
+    // Historical readers deserialize the stored column directly, without envelope decoding.
+    assert!(serde_json::from_str::<serde_json::Value>(stored).is_err());
+    let decoded = crate::event_compression::decode_event_payload(stored).expect("current decoder");
+    let actual: bcode_session_models::SessionEvent = serde_json::from_str(&decoded).expect("event");
+    assert_eq!(actual, event);
+    db.database().close().await.expect("close");
+}
+
+#[tokio::test]
 async fn paged_history_compression_reclaims_real_space_and_preserves_reopen_and_append() {
     let root = tempfile::tempdir().expect("root");
     let manager = crate::SessionManager::persistent(root.path()).expect("manager");

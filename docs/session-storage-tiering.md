@@ -761,6 +761,21 @@ Validation: `cargo fmt`, `cargo check --workspace --quiet`,
 `cargo clippy --workspace --all-targets --quiet -- -D warnings`, and
 `cargo test -p bcode_server storage_read_admission::tests --quiet` passed (8 tests).
 
+## Raw-reader compatibility evidence
+
+The artifact publication regression now retains a raw file descriptor across light and deep
+conversion, including backup cleanup. Reads at the start, a chunk boundary, and the tail still
+return original bytes through that descriptor; reopening the logical path as a raw file fails
+because the authoritative representation is a directory. Updated range reads return identical
+logical bytes. This tests actual filesystem behavior, not just version markers. It does not prove
+access-age tracking for old readers or canonical-history compatibility, and is not a complete
+historical-binary integration test. Automatic dispatch remains disabled.
+
+Validation: `cargo fmt`, `cargo check --workspace --quiet`,
+`cargo clippy --workspace --all-targets --quiet -- -D warnings`, and
+`cargo test -p bcode_session artifact_storage::tests::publishes_at_same_path_and_reads_original_bytes --quiet`
+passed (1 test).
+
 ## Remaining implementation
 
 ### Access policy and scheduling

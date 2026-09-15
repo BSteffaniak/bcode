@@ -16,20 +16,34 @@ pub struct RegisteredStorageRead {
 }
 
 impl RegisteredStorageRead {
-    /// Attempt admission without making optional tracking a prerequisite for canonical reads.
+    /// Attempt admission, permitting fallback only after a durable maintenance blocker is saved.
     ///
-    /// A failure is reported as `None`; automatic scheduling must remain disabled unless a caller
-    /// has independently fenced unregistered reads. This adapter does not grant such a fence.
-    pub async fn for_session(state: &super::ServerState, _session_id: SessionId) -> Option<Self> {
-        let root = state.sessions.session_store_root()?;
+    /// In-memory sessions require no persistent admission. Failed admission and failed blocker
+    /// persistence return an error before the caller may consume content.
+    ///
+    /// # Errors
+    /// Returns a retryable storage error when neither admission nor fallback fencing succeeds.
+    pub async fn for_session(
+        state: &super::ServerState,
+        _session_id: SessionId,
+    ) -> Result<Option<Self>, bcode_session::SessionError> {
+        let Some(root) = state.sessions.session_store_root() else {
+            return Ok(None);
+        };
         // Register before lookup: existence can change, and metadata failure is not proof that
         // this operation cannot consume persistent content.
         let fallback_root = root.clone();
         if let Ok(admission) = Self::begin(root).await {
-            return Some(admission);
+            return Ok(Some(admission));
         }
-        block_unregistered_reads(state, fallback_root).await;
-        None
+        if !block_unregistered_reads(state, fallback_root).await {
+            return Err(bcode_session::db::SessionDbError::Io(io::Error::new(
+                io::ErrorKind::WouldBlock,
+                "storage read admission unavailable; retry after storage coordination recovers",
+            ))
+            .into());
+        }
+        Ok(None)
     }
 
     /// Persist access before completing admission. Failure leaves a durable dirty participant.
@@ -131,7 +145,7 @@ pub(super) async fn register_startup(state: &super::ServerState, root: PathBuf) 
 ///
 /// Failure to persist the blocker is not a compatibility proof: the global dispatch gate must
 /// remain closed until an independent fence covers these readers.
-pub(super) async fn block_unregistered_reads(state: &super::ServerState, root: PathBuf) {
+pub(super) async fn block_unregistered_reads(state: &super::ServerState, root: PathBuf) -> bool {
     state.fail_storage_tracking();
     let blocked = tokio::task::spawn_blocking(move || {
         StorageAdmissionRegistry::open(&root)?.block_maintenance_for_fallback()
@@ -139,8 +153,10 @@ pub(super) async fn block_unregistered_reads(state: &super::ServerState, root: P
     .await;
     if matches!(blocked, Ok(Ok(()))) {
         tracing::warn!("unregistered storage reads durably disabled maintenance");
+        true
     } else {
         tracing::warn!("storage fallback fence unavailable; automatic scheduling remains disabled");
+        false
     }
 }
 
@@ -156,6 +172,7 @@ mod tests {
         let id = SessionId::new();
         let read = RegisteredStorageRead::for_session(&state, id)
             .await
+            .expect("admission available")
             .expect("admitted");
         let registry = StorageAdmissionRegistry::open(root.path()).expect("registry");
         assert!(registry.admit_maintenance(16).is_err());
