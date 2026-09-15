@@ -1805,20 +1805,71 @@ impl SessionDb {
             .await
     }
 
+    #[cfg(test)]
     pub(crate) async fn compress_history_payload_page_checked(
         &self,
         start: u64,
         level: i32,
         cutoff_ms: Option<u64>,
+        check_cancelled: impl FnMut() -> std::io::Result<()> + Send,
+    ) -> SessionDbResult<crate::history_compression::HistoryCompressionPage> {
+        self.compress_history_payload_page_through(start, level, cutoff_ms, None, check_cancelled)
+            .await
+    }
+
+    pub(crate) async fn compress_history_payload_page_through(
+        &self,
+        start: u64,
+        level: i32,
+        cutoff_ms: Option<u64>,
+        through_sequence: Option<u64>,
         mut check_cancelled: impl FnMut() -> std::io::Result<()> + Send,
     ) -> SessionDbResult<crate::history_compression::HistoryCompressionPage> {
         check_cancelled()?;
         let tx = self.db.begin_transaction().await?;
         configure_turso_connection(&*tx).await?;
         validate_storage_writer_contract(&*tx).await?;
-        let rows = read_canonical_payload_page(&*tx, start, 16).await?;
-        let mut report = crate::history_compression::HistoryCompressionPage::default();
+        let current_tail = last_sequence(&*tx).await?;
+        if let Some(requested) = through_sequence
+            && current_tail.is_none_or(|current| current < requested)
+        {
+            return Err(SessionDbError::InvalidRow {
+                column: "history_compression.through_sequence".into(),
+            });
+        }
+        let through_sequence = through_sequence.or(current_tail);
+        let mut report = crate::history_compression::HistoryCompressionPage {
+            through_sequence,
+            ..Default::default()
+        };
+        let Some(tail) = through_sequence.filter(|tail| start <= *tail) else {
+            return Ok(report);
+        };
+        let limit =
+            usize::try_from(tail.saturating_sub(start).saturating_add(1).min(16)).unwrap_or(16);
+        let rows = read_canonical_payload_page(&*tx, start, limit).await?;
+        if rows.is_empty() {
+            return Err(SessionDbError::InvalidRow {
+                column: "history_compression.missing_page".into(),
+            });
+        }
+        let mut expected_sequence = start;
         for row in rows {
+            if row.sequence != expected_sequence {
+                return Err(SessionDbError::InvalidCanonicalSequence {
+                    expected: expected_sequence,
+                    actual: row.sequence,
+                });
+            }
+            expected_sequence =
+                expected_sequence
+                    .checked_add(1)
+                    .ok_or_else(|| SessionDbError::InvalidRow {
+                        column: "event_seq".into(),
+                    })?;
+            if row.sequence > tail {
+                break;
+            }
             check_cancelled()?;
             let event = decode_session_event(&row.payload)?;
             validate_canonical_event_identity(&event, row.sequence, self.session_id)?;
@@ -11368,6 +11419,89 @@ mod tests {
         assert_eq!(
             db.all_events_strict().await.expect("history"),
             vec![original]
+        );
+    }
+
+    #[tokio::test]
+    async fn history_sweep_rejects_sequence_gaps_and_missing_captured_tail() {
+        let root = tempfile::tempdir().expect("root");
+        let id = SessionId::new();
+        let db = SessionDb::open_turso_in_root(id, root.path())
+            .await
+            .expect("db");
+        db.append_event(&event(
+            id,
+            0,
+            SessionEventKind::SessionCreated {
+                name: Some("compressible".repeat(2000)),
+                working_directory: root.path().to_path_buf(),
+            },
+        ))
+        .await
+        .expect("create");
+        for sequence in 1..=2 {
+            db.append_event(&event(
+                id,
+                sequence,
+                SessionEventKind::SystemMessage {
+                    text: "history".repeat(2000),
+                },
+            ))
+            .await
+            .expect("append");
+        }
+        let row = db
+            .database()
+            .select("events")
+            .columns(&["payload"])
+            .where_eq("event_seq", 0)
+            .execute_first(db.database())
+            .await
+            .expect("query")
+            .expect("row");
+        let original = required_string(&row, "payload").expect("payload");
+        db.database()
+            .delete("events")
+            .where_eq("event_seq", 1)
+            .execute(db.database())
+            .await
+            .expect("fixture gap");
+        assert!(matches!(
+            db.compress_history_payload_page_through(0, 1, None, Some(2), || Ok(()))
+                .await,
+            Err(SessionDbError::InvalidCanonicalSequence {
+                expected: 1,
+                actual: 2
+            })
+        ));
+        let row = db
+            .database()
+            .select("events")
+            .columns(&["payload"])
+            .where_eq("event_seq", 0)
+            .execute_first(db.database())
+            .await
+            .expect("query")
+            .expect("row");
+        assert_eq!(
+            required_string(&row, "payload").expect("rollback"),
+            original
+        );
+        assert!(
+            db.compress_history_payload_page_through(0, 1, None, Some(3), || Ok(()))
+                .await
+                .is_err()
+        );
+        db.database()
+            .delete("events")
+            .where_eq("event_seq", 2)
+            .execute(db.database())
+            .await
+            .expect("fixture lost tail");
+        assert!(
+            db.compress_history_payload_page_through(1, 1, None, Some(2), || Ok(()))
+                .await
+                .is_err()
         );
     }
 

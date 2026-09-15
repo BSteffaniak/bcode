@@ -622,6 +622,52 @@ compress and read correctly. This integrates the earlier domain high-water API i
 pagination. History still needs the same finite sweep boundary; dispatch and startup-failure/older
 reader coordination remain incomplete.
 
+## Finite history sweep integration
+
+History maintenance pages now capture and report a canonical tail; the worker retains it across
+history continuation ticks and stops at that tail even if later events are appended. Newer events
+remain for a subsequent sweep. A real-session regression appends between pages, proves the captured
+sweep terminates, and confirms a later sweep still finds the new payload uncompressed. This removes
+unbounded tail chasing in history sweeps but does not change the disabled compatibility gate.
+
+## Bounded completed-daemon retirement
+
+Startup now attempts bounded cleanup of cleanly completed daemon records under exclusive registry
+admission before registering the new daemon. The complete scan must fit its budget before deletion;
+active, abandoned, malformed and unknown records remain untouched. A regression verifies budget
+exhaustion makes no cleanup progress, three clean records retire, repeat cleanup is idempotent, and
+active/abandoned/unknown evidence survives. This prevents accumulation of explicitly completed
+registrations, but production shutdown still needs a proved drain before marking its record clean;
+startup-failure and older-reader coordination remain blockers to automatic dispatch.
+
+## History sweep damage handling
+
+History compression now verifies the captured tail still exists and each returned row matches the
+expected contiguous sequence. A missing or regressed tail, an empty page before the captured end,
+or a gap rejects the transaction instead of resembling normal completion. A regression removes a
+middle row, verifies earlier compression rolls back, and checks a missing captured tail is rejected.
+This preserves damage visibility during finite sweeps; it does not alter the disabled dispatch gate.
+
+## Strict daemon inventory for coordination
+
+Daemon lifecycle now exposes a bounded strict inventory distinct from best-effort cleanup discovery.
+Missing/unreadable registries, malformed/future records, unexpected entries, oversized records,
+filename identity mismatches, duplicate namespaces/instances and exhausted scan budgets return errors
+rather than an empty/partial list. Tests confirm best-effort cleanup remains separate. This inventory
+is only an observation: registration locking, endpoint/process identity verification and descriptor
+confinement against concurrent path mutation are still required before it can authorize absence of
+older readers. The automatic dispatch gate is unchanged.
+
+## Complete live acknowledgement sets
+
+Owned registry admission now accepts an explicit set of live daemon tokens, requiring each token to
+match exactly one record and every other live daemon to be absent or cleanly completed. Missing,
+duplicate, cross-root and failed tokens reject admission. The returned guard retains all liveness
+handles and its health check fails if any participant fails. A regression covers two live daemons,
+incomplete/duplicate sets, successful complete admission, and later participant failure. Collecting
+such proofs across independent daemon processes is still unimplemented; this API alone does not
+resolve older-reader coordination or open the dispatch gate.
+
 ## Remaining implementation
 
 ### Access policy and scheduling

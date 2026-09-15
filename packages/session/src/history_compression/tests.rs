@@ -96,6 +96,75 @@ async fn paged_history_compression_reclaims_real_space_and_preserves_reopen_and_
 }
 
 #[tokio::test]
+async fn captured_history_tail_excludes_later_appends() {
+    let root = tempfile::tempdir().expect("root");
+    let manager = crate::SessionManager::persistent(root.path()).expect("manager");
+    let id = manager
+        .create_session(None, root.path().to_path_buf())
+        .await
+        .expect("create")
+        .id;
+    for _ in 0..18 {
+        manager
+            .append_event(
+                id,
+                SessionEventKind::SystemMessage {
+                    text: "old".repeat(3000),
+                },
+            )
+            .await
+            .expect("old event");
+    }
+    manager
+        .release_session_ownership(id)
+        .await
+        .expect("release");
+    let first = compress_history_page(root.path(), id, 0, 1)
+        .await
+        .expect("first page");
+    assert_eq!(first.through_sequence, Some(18));
+    let later = manager
+        .append_event(
+            id,
+            SessionEventKind::SystemMessage {
+                text: "later".repeat(3000),
+            },
+        )
+        .await
+        .expect("later event");
+    manager
+        .release_session_ownership(id)
+        .await
+        .expect("release again");
+    drop(manager);
+    let mut cursor = first.next_sequence.expect("continuation");
+    loop {
+        let page = compress_history_page_through(
+            root.path(),
+            id,
+            cursor,
+            1,
+            None,
+            crate::artifact_storage::ArtifactMaintenanceCancellation::default(),
+            first.through_sequence,
+        )
+        .await
+        .expect("continue");
+        assert_eq!(page.through_sequence, first.through_sequence);
+        let Some(next) = page.next_sequence else {
+            break;
+        };
+        assert!(next <= later.sequence);
+        cursor = next;
+    }
+    let fresh = compress_history_page(root.path(), id, later.sequence, 1)
+        .await
+        .expect("new sweep");
+    assert_eq!(fresh.compressed, 1, "old sweep left later payload raw");
+    assert_eq!(fresh.through_sequence, Some(later.sequence));
+}
+
+#[tokio::test]
 async fn incompatible_writer_cannot_recompress_canonical_payloads() {
     let root = tempfile::tempdir().expect("root");
     let manager = crate::SessionManager::persistent(root.path()).expect("manager");

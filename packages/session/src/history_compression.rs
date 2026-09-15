@@ -27,6 +27,8 @@ pub struct HistoryCompressionPage {
     pub saved_bytes: u64,
     /// Exclusive continuation position. None means no more canonical rows were found.
     pub next_sequence: Option<u64>,
+    /// Captured canonical tail for a finite sweep; retain it on subsequent page requests.
+    pub through_sequence: Option<u64>,
 }
 
 /// Recompress one bounded page without changing logical events or derived projections.
@@ -85,6 +87,25 @@ pub async fn compress_history_page_cancellable(
     age: Option<(u64, u64)>,
     cancellation: crate::artifact_storage::ArtifactMaintenanceCancellation,
 ) -> Result<HistoryCompressionPage, SessionDbError> {
+    compress_history_page_through(root, id, start_sequence, level, age, cancellation, None).await
+}
+
+/// Recompress a page within a captured finite history sweep.
+///
+/// Pass the returned `through_sequence` on subsequent pages. Newer canonical events are left
+/// for the next sweep, so ongoing sessions do not monopolize background maintenance.
+///
+/// # Errors
+/// Returns the same validation, ownership, cancellation and storage errors as cancellable pages.
+pub async fn compress_history_page_through(
+    root: &Path,
+    id: SessionId,
+    start_sequence: u64,
+    level: i32,
+    age: Option<(u64, u64)>,
+    cancellation: crate::artifact_storage::ArtifactMaintenanceCancellation,
+    through_sequence: Option<u64>,
+) -> Result<HistoryCompressionPage, SessionDbError> {
     cancellation.check()?;
     if !(1..=22).contains(&level) {
         return Err(std::io::Error::new(
@@ -141,9 +162,13 @@ pub async fn compress_history_page_cancellable(
         };
         let db = SessionDb::open_existing_turso_in_root(id, &root).await?;
         let result = db
-            .compress_history_payload_page_checked(start_sequence, level, cutoff, || {
-                cancellation.check()
-            })
+            .compress_history_payload_page_through(
+                start_sequence,
+                level,
+                cutoff,
+                through_sequence,
+                || cancellation.check(),
+            )
             .await;
         let closed = db.database().close().await;
         drop(db);

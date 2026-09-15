@@ -279,6 +279,74 @@ pub fn read_records(state_dir: &Path) -> Vec<(PathBuf, DaemonRecord)> {
         .collect()
 }
 
+/// Read a complete bounded daemon inventory for safety-sensitive coordination.
+///
+/// Unlike [`read_records`], this never treats unreadable, malformed, oversized, unsupported or
+/// duplicate records as absent. This is an observation, not a lock against concurrent registration;
+/// callers must separately coordinate registration before relying on absence as authority.
+///
+/// # Errors
+/// Returns a secret-safe IO error for missing/unsafe registry roots, unknown entry types, invalid
+/// records, duplicate namespaces/instances, or exhausted entry/record-byte budgets.
+pub fn read_records_strict(
+    state_dir: &Path,
+    entry_budget: usize,
+) -> std::io::Result<Vec<DaemonRecord>> {
+    const MAX_RECORD_BYTES: u64 = 64 * 1024;
+    fn invalid() -> std::io::Error {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "daemon inventory is incomplete or unverifiable",
+        )
+    }
+    if entry_budget == 0 || entry_budget > 4096 {
+        return Err(invalid());
+    }
+    let root = state_dir.canonicalize()?;
+    let directory = root.join("daemons");
+    if !fs::symlink_metadata(&directory)?.is_dir() || !directory.canonicalize()?.starts_with(&root)
+    {
+        return Err(invalid());
+    }
+    let mut records = Vec::new();
+    let mut namespaces = std::collections::BTreeSet::new();
+    let mut instances = std::collections::BTreeSet::new();
+    for (index, entry) in fs::read_dir(&directory)?.enumerate() {
+        if index == entry_budget {
+            return Err(invalid());
+        }
+        let entry = entry?;
+        let path = entry.path();
+        let metadata = fs::symlink_metadata(&path)?;
+        if !metadata.is_file()
+            || metadata.len() > MAX_RECORD_BYTES
+            || path.extension().and_then(|value| value.to_str()) != Some("json")
+        {
+            return Err(invalid());
+        }
+        let mut bytes = Vec::new();
+        fs::File::open(&path)?
+            .take(MAX_RECORD_BYTES + 1)
+            .read_to_end(&mut bytes)?;
+        if bytes.len() as u64 > MAX_RECORD_BYTES {
+            return Err(invalid());
+        }
+        let record: DaemonRecord = serde_json::from_slice(&bytes).map_err(|_| invalid())?;
+        if record.schema_version != DAEMON_RECORD_SCHEMA_VERSION
+            || record.namespace.is_empty()
+            || record.instance_id.is_empty()
+            || path.file_stem().and_then(|value| value.to_str()) != Some(record.namespace.as_str())
+            || !namespaces.insert(record.namespace.clone())
+            || !instances.insert(record.instance_id.clone())
+        {
+            return Err(invalid());
+        }
+        records.push(record);
+    }
+    records.sort_by(|left, right| left.namespace.cmp(&right.namespace));
+    Ok(records)
+}
+
 /// Remove a daemon registry record.
 ///
 /// # Errors
@@ -1463,6 +1531,70 @@ fn endpoint_record(endpoint: &IpcEndpoint) -> DaemonEndpointRecord {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn strict_inventory_never_converts_damage_or_partial_scans_to_absence() {
+        let root = tempfile::tempdir().expect("root");
+        assert!(read_records_strict(root.path(), 16).is_err());
+        let directory = registry_dir(root.path());
+        fs::create_dir(&directory).expect("registry");
+        assert!(
+            read_records_strict(root.path(), 16)
+                .expect("empty")
+                .is_empty()
+        );
+        let record = record_with_writer_epoch(Some(10));
+        fs::write(
+            directory.join("test.json"),
+            serde_json::to_vec(&record).expect("json"),
+        )
+        .expect("record");
+        assert_eq!(
+            read_records_strict(root.path(), 1).expect("record"),
+            vec![record]
+        );
+        fs::write(directory.join("broken.json"), b"broken").expect("broken");
+        assert!(read_records_strict(root.path(), 16).is_err());
+        assert!(read_records_strict(root.path(), 1).is_err());
+        assert_eq!(
+            read_records(root.path()).len(),
+            1,
+            "best-effort cleanup remains separate"
+        );
+        fs::remove_file(directory.join("broken.json")).expect("fixture cleanup");
+        let mut future = record_with_writer_epoch(Some(10));
+        future.schema_version += 1;
+        fs::write(
+            directory.join("test.json"),
+            serde_json::to_vec(&future).expect("json"),
+        )
+        .expect("future");
+        assert!(read_records_strict(root.path(), 16).is_err());
+    }
+
+    #[test]
+    fn strict_inventory_rejects_duplicate_instances_and_oversized_records() {
+        let root = tempfile::tempdir().expect("root");
+        let directory = registry_dir(root.path());
+        fs::create_dir(&directory).expect("registry");
+        let first = record_with_writer_epoch(Some(10));
+        let mut second = first.clone();
+        second.namespace = "other".into();
+        fs::write(
+            directory.join("test.json"),
+            serde_json::to_vec(&first).expect("json"),
+        )
+        .expect("first");
+        fs::write(
+            directory.join("other.json"),
+            serde_json::to_vec(&second).expect("json"),
+        )
+        .expect("duplicate");
+        assert!(read_records_strict(root.path(), 16).is_err());
+        fs::remove_file(directory.join("other.json")).expect("fixture cleanup");
+        fs::write(directory.join("test.json"), vec![b' '; 65537]).expect("oversized");
+        assert!(read_records_strict(root.path(), 16).is_err());
+    }
 
     fn record_with_writer_epoch(storage_writer_epoch: Option<u32>) -> DaemonRecord {
         DaemonRecord {

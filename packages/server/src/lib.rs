@@ -4769,8 +4769,13 @@ async fn run_constructed_server(
     #[cfg(any(target_os = "macos", target_os = "linux"))]
     if let Some(root) = state.sessions.session_store_root() {
         let registered = tokio::task::spawn_blocking(move || {
-            bcode_session::storage_admission::StorageAdmissionRegistry::open(&root)?
-                .register_daemon(SessionId::new())
+            let registry = bcode_session::storage_admission::StorageAdmissionRegistry::open(&root)?;
+            if registry.retire_completed_daemons(4096).is_err() {
+                tracing::debug!(
+                    "completed storage registrations could not be retired; preserving registry"
+                );
+            }
+            registry.register_daemon(SessionId::new())
         })
         .await;
         if let Ok(Ok(registration)) = registered {

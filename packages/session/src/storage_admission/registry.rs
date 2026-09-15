@@ -21,7 +21,7 @@ pub struct AcknowledgedStorageMaintenance<'a> {
 /// Transferable maintenance admission retaining both registry exclusion and daemon liveness.
 pub struct OwnedStorageMaintenance {
     _admission: StorageMaintenanceAdmission,
-    acknowledgement: crate::storage_daemon_registration::StorageDaemonAcknowledgement,
+    acknowledgements: Vec<crate::storage_daemon_registration::StorageDaemonAcknowledgement>,
 }
 impl OwnedStorageMaintenance {
     /// Recheck live tracking health before a committed side effect.
@@ -29,7 +29,9 @@ impl OwnedStorageMaintenance {
     /// # Errors
     /// Refuses tracking failures observed since admission.
     pub fn check(&self) -> io::Result<()> {
-        self.acknowledgement.check()
+        self.acknowledgements
+            .iter()
+            .try_for_each(crate::storage_daemon_registration::StorageDaemonAcknowledgement::check)
     }
 }
 
@@ -57,6 +59,50 @@ impl StorageAdmissionRegistry {
         let directory = open_child(&root, name, libc::O_RDONLY | libc::O_DIRECTORY)?;
         root.sync_all()?;
         Ok(Self { directory })
+    }
+
+    /// Remove only verified clean, completed daemon records under exclusive registry admission.
+    ///
+    /// The complete directory scan must fit the budget before any record is removed. Live,
+    /// abandoned, malformed and unknown records remain untouched. This never repairs failed
+    /// tracking evidence or treats an incomplete scan as proof of safety.
+    ///
+    /// # Errors
+    /// Returns contention, incomplete enumeration, unsafe paths or filesystem errors. Cleanup can
+    /// be partially completed on an IO failure; every removed record was independently clean.
+    pub fn retire_completed_daemons(&self, entry_budget: usize) -> io::Result<usize> {
+        if entry_budget == 0 || entry_budget > 65_536 {
+            return Err(invalid());
+        }
+        let gate = self.gate()?;
+        gate.try_lock().map_err(io::Error::from)?;
+        let entries = names(&self.directory, entry_budget)?;
+        let mut retired = 0;
+        for name in entries {
+            let Some(id) = name.to_str().and_then(|name| name.strip_suffix(".daemon")) else {
+                continue;
+            };
+            if id.parse::<SessionId>().is_err() {
+                continue;
+            }
+            let name = std::ffi::CString::new(name.as_bytes()).map_err(|_| invalid())?;
+            let file = open_child(&self.directory, &name, libc::O_RDONLY)?;
+            if !matches!(
+                crate::storage_daemon_registration::daemon_registration_is_complete(file),
+                Ok(true)
+            ) {
+                continue;
+            }
+            // SAFETY: name is a typed single component, and exclusive registration admission
+            // prevents a cooperating daemon from replacing or reopening this completed identity.
+            if unsafe { libc::unlinkat(raw(&self.directory), name.as_ptr(), 0) } != 0 {
+                return Err(io::Error::last_os_error());
+            }
+            self.directory.sync_all()?;
+            retired += 1;
+        }
+        gate.unlock()?;
+        Ok(retired)
     }
 
     /// Register daemon-lifetime liveness before serving content reads.
@@ -144,10 +190,29 @@ impl StorageAdmissionRegistry {
         entry_budget: usize,
         acknowledgement: crate::storage_daemon_registration::StorageDaemonAcknowledgement,
     ) -> io::Result<OwnedStorageMaintenance> {
-        let admission = self.admit_owned_checked(entry_budget, Some(&acknowledgement))?;
+        self.admit_owned_set(entry_budget, vec![acknowledgement])
+    }
+
+    /// Admit a complete set of live-daemon acknowledgements, retaining every liveness handle.
+    ///
+    /// Each token must match exactly one registry record. Every other daemon must be cleanly
+    /// completed; missing participants are never inferred healthy from a process or file name.
+    ///
+    /// # Errors
+    /// Rejects duplicate, foreign, missing or failed acknowledgements, unacknowledged live daemons,
+    /// dirty readers, incomplete enumeration, or IO failure.
+    pub fn admit_owned_set(
+        &self,
+        entry_budget: usize,
+        acknowledgements: Vec<crate::storage_daemon_registration::StorageDaemonAcknowledgement>,
+    ) -> io::Result<OwnedStorageMaintenance> {
+        if acknowledgements.len() > entry_budget {
+            return Err(invalid());
+        }
+        let admission = self.admit_owned_checked(entry_budget, &acknowledgements)?;
         Ok(OwnedStorageMaintenance {
             _admission: admission,
-            acknowledgement,
+            acknowledgements,
         })
     }
 
@@ -159,13 +224,13 @@ impl StorageAdmissionRegistry {
         let acknowledgement = registration
             .map(crate::storage_daemon_registration::StorageDaemonRegistration::acknowledgement)
             .transpose()?;
-        self.admit_owned_checked(entry_budget, acknowledgement.as_ref())
+        self.admit_owned_checked(entry_budget, acknowledgement.as_slice())
     }
 
     fn admit_owned_checked(
         &self,
         entry_budget: usize,
-        registration: Option<&crate::storage_daemon_registration::StorageDaemonAcknowledgement>,
+        registrations: &[crate::storage_daemon_registration::StorageDaemonAcknowledgement],
     ) -> io::Result<StorageMaintenanceAdmission> {
         if entry_budget == 0 || entry_budget > 65_536 {
             return Err(invalid());
@@ -174,7 +239,7 @@ impl StorageAdmissionRegistry {
         gate.try_lock().map_err(io::Error::from)?;
         let names = names(&self.directory, entry_budget)?;
         let mut files = Vec::new();
-        let mut acknowledged = false;
+        let mut acknowledged = std::collections::BTreeSet::new();
         for name in names {
             if name == "gate" {
                 continue;
@@ -184,13 +249,16 @@ impl StorageAdmissionRegistry {
                 id.parse::<SessionId>().map_err(|_| invalid())?;
                 let name = std::ffi::CString::new(name.as_bytes()).map_err(|_| invalid())?;
                 let file = open_child(&self.directory, &name, libc::O_RDONLY)?;
-                if let Some(registration) = registration
-                    && registration.acknowledges(&file)?
-                {
-                    if acknowledged {
-                        return Err(invalid());
+                let mut matched = false;
+                for (index, registration) in registrations.iter().enumerate() {
+                    if registration.acknowledges(&file)? {
+                        if matched || !acknowledged.insert(index) {
+                            return Err(invalid());
+                        }
+                        matched = true;
                     }
-                    acknowledged = true;
+                }
+                if matched {
                     continue;
                 }
                 if !crate::storage_daemon_registration::daemon_registration_is_complete(file)? {
@@ -203,7 +271,7 @@ impl StorageAdmissionRegistry {
             let name = std::ffi::CString::new(name.as_bytes()).map_err(|_| invalid())?;
             files.push(Ok(open_child(&self.directory, &name, libc::O_RDONLY)?));
         }
-        if registration.is_some() && !acknowledged {
+        if acknowledged.len() != registrations.len() {
             return Err(invalid());
         }
         StorageMaintenanceAdmission::begin(gate, files)
@@ -601,6 +669,69 @@ mod tests {
             .register_daemon(SessionId::new())
             .expect("other daemon");
         assert!(registry.admit_acknowledged(16, &mut other_daemon).is_err());
+    }
+
+    #[test]
+    fn completed_daemon_cleanup_preserves_active_abandoned_and_unknown_evidence() {
+        let root = tempfile::tempdir().expect("root");
+        let registry = StorageAdmissionRegistry::open(root.path()).expect("registry");
+        for _ in 0..3 {
+            registry
+                .register_daemon(SessionId::new())
+                .expect("register")
+                .finish()
+                .expect("clean");
+        }
+        let active_id = SessionId::new();
+        let active = registry.register_daemon(active_id).expect("active");
+        let abandoned_id = SessionId::new();
+        drop(registry.register_daemon(abandoned_id).expect("abandoned"));
+        let unknown = root.path().join("storage-admission-v1/future-format");
+        std::fs::write(&unknown, b"preserve").expect("unknown");
+        assert!(registry.retire_completed_daemons(2).is_err());
+        assert_eq!(registry.retire_completed_daemons(16).expect("cleanup"), 3);
+        assert_eq!(registry.retire_completed_daemons(16).expect("repeat"), 0);
+        assert!(
+            root.path()
+                .join("storage-admission-v1")
+                .join(format!("{active_id}.daemon"))
+                .exists()
+        );
+        assert!(
+            root.path()
+                .join("storage-admission-v1")
+                .join(format!("{abandoned_id}.daemon"))
+                .exists()
+        );
+        assert_eq!(std::fs::read(unknown).expect("preserved"), b"preserve");
+        drop(active);
+        assert!(registry.admit_maintenance(16).is_err());
+    }
+
+    #[test]
+    fn complete_live_set_admits_maintenance_and_any_failure_invalidates_it() {
+        let root = tempfile::tempdir().expect("root");
+        let registry = StorageAdmissionRegistry::open(root.path()).expect("registry");
+        let first = registry.register_daemon(SessionId::new()).expect("first");
+        let mut second = registry.register_daemon(SessionId::new()).expect("second");
+        let a = first.acknowledgement().expect("a");
+        let b = second.acknowledgement().expect("b");
+        assert!(registry.admit_owned_set(16, vec![a.clone()]).is_err());
+        assert!(
+            registry
+                .admit_owned_set(16, vec![a.clone(), a.clone(), b.clone()])
+                .is_err()
+        );
+        let admission = registry
+            .admit_owned_set(16, vec![a, b])
+            .expect("complete live set");
+        admission.check().expect("healthy");
+        second.fail();
+        assert!(admission.check().is_err());
+        drop(admission);
+        drop(first);
+        drop(second);
+        assert!(registry.admit_maintenance(16).is_err());
     }
 
     #[test]

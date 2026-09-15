@@ -43,20 +43,13 @@ impl ArtifactSweepCursor {
 #[derive(Clone)]
 enum MaintenanceCursor {
     Artifacts(Option<ArtifactSweepCursor>),
-    History(u64),
+    History { start: u64, through: Option<u64> },
 }
 
 /// Run the experimental maintenance worker until daemon shutdown.
 /// Not activated by normal startup pending complete safety coordination.
 pub async fn run(state: Arc<ServerState>) {
-    // Startup owns and drains this worker, but dispatch must remain closed until compatibility
-    // and fallback registration cover every reader, including independently running old daemons.
-    state
-        .metrics
-        .set_gauge("storage.maintenance.compatibility_ready", 0);
-    let mut readiness_shutdown = state.subscribe_shutdown();
-    if !tracking_coverage_ready(&state) {
-        let _ = readiness_shutdown.recv().await;
+    if !wait_for_tracking_readiness(&state).await {
         return;
     }
     let Some(root) = state.sessions.session_store_root() else {
@@ -132,12 +125,16 @@ pub async fn run(state: Arc<ServerState>) {
                 MaintenanceCursor::Artifacts(after) => maintain_session(&state, &root, id, after)
                     .await
                     .map(|next| {
-                        Some(next.map_or(MaintenanceCursor::History(0), |key| {
-                            MaintenanceCursor::Artifacts(Some(key))
-                        }))
+                        Some(next.map_or(
+                            MaintenanceCursor::History {
+                                start: 0,
+                                through: None,
+                            },
+                            |key| MaintenanceCursor::Artifacts(Some(key)),
+                        ))
                     }),
-                MaintenanceCursor::History(start) => {
-                    maintain_history(&state, &root, id, start).await
+                MaintenanceCursor::History { start, through } => {
+                    maintain_history(&state, &root, id, start, through).await
                 }
             };
             match outcome {
@@ -149,6 +146,18 @@ pub async fn run(state: Arc<ServerState>) {
             }
         }
     }
+}
+
+async fn wait_for_tracking_readiness(state: &ServerState) -> bool {
+    state
+        .metrics
+        .set_gauge("storage.maintenance.compatibility_ready", 0);
+    let mut shutdown = state.subscribe_shutdown();
+    if tracking_coverage_ready(state) {
+        return true;
+    }
+    let _ = shutdown.recv().await;
+    false
 }
 
 fn tracking_coverage_ready(state: &ServerState) -> bool {
@@ -187,6 +196,7 @@ async fn maintain_history(
     root: &std::path::Path,
     id: SessionId,
     start: u64,
+    through: Option<u64>,
 ) -> Result<Option<MaintenanceCursor>, String> {
     if state
         .shutdown_requested
@@ -226,13 +236,14 @@ async fn maintain_history(
     };
     let cancellation = operation_cancellation(state)?;
     let mut shutdown = state.subscribe_shutdown();
-    let work = bcode_session::history_compression::compress_history_page_cancellable(
+    let work = bcode_session::history_compression::compress_history_page_through(
         root,
         id,
         start,
         level,
         Some((now, age)),
         cancellation.clone(),
+        through,
     );
     tokio::pin!(work);
     let page = tokio::select! {
@@ -246,7 +257,10 @@ async fn maintain_history(
         page.saved_bytes,
     );
     if let Some(next) = page.next_sequence {
-        return Ok(Some(MaintenanceCursor::History(next)));
+        return Ok(Some(MaintenanceCursor::History {
+            start: next,
+            through: page.through_sequence,
+        }));
     }
     reclaim_completed_pass(state, root, id, now, age, policy.minimum_saved_bytes).await;
     Ok(None)
