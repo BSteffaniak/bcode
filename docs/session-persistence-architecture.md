@@ -11,12 +11,7 @@ A Bcode session id maps to exactly one canonical database within the state locat
 <sessions-root>/<session-id>/session.db
 ```
 
-This is the current regular-file layout. The approved, not-yet-implemented
-[database-directory compatibility transition](session-storage-tiering.md#approved-database-directory-transition-not-implemented)
-may convert this path to a versioned directory containing the canonical database, automatically
-when migration safety can be verified. The transition preserves the owning state location and
-session-ID-derived root; it must not introduce concurrent canonical alternatives or migrate during
-normal bounded reads.
+This is the current regular-file layout. The [approved clean-break compression rollout](session-storage-tiering.md#approved-clean-break-rollout) retains this layout; a directory-format transition is not required solely to exclude older readers. Any future layout migration must preserve canonical authority, verify exclusive ownership, and provide interruption-safe recovery outside normal bounded reads.
 
 `<sessions-root>` is the canonical session store root of one resolved state location. See
 [State Locations](state-locations.md) for selection precedence. Exactly one state location owns a

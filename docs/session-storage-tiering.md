@@ -20,57 +20,17 @@ must not be presented as a complete total. Database totals include projections a
 interpreted as canonical event payload size. Global catalog and provider-owned search indexes are
 excluded, not treated as zero. No compression ratio or space saving is inferred from file lengths.
 
-## Approved compatibility rollout
+## Approved clean-break rollout
 
-Automatic compression at an existing state location requires an enforced minimum-reader
-compatibility transition (approved during implementation). This is a prerequisite, not an
-operator assertion that a clean admission registry proves older readers are absent.
+Automatic session-storage compression targets a coordinated clean-break deployment. Before activation at a state location, the operator stops all older Bcode clients and daemons accessing that location and upgrades every participant. Mixed-version access to that location after activation is unsupported. This deployment prerequisite is not inferred from clean registry files.
 
-The transition must:
+Legacy-reader coexistence and historical-client exclusion tests are no longer activation prerequisites for this rollout. The previously proposed `session.db` directory transition is not required solely to fence older readers; the current regular-file layout remains authoritative.
 
-* Remain owned by session migration/upgrade coordination, preserving each session's canonical
-  ID-derived path and existing canonical history.
-* Verify exclusive transition ownership and exclude incompatible readers, including readers that
-  resolve artifact references before releasing their session lease and later open the artifact.
-* Enforce the minimum reader on every subsequent content entry point. Updating writer epochs or
-  introducing a marker that old readers ignore is not sufficient evidence of exclusion.
-* Preserve existing state and defer compression when exclusion cannot be verified. Do not stop
-  unrelated daemon versions or prevent unrelated capabilities from starting.
-* Persist interruption-safe transition evidence before scheduling becomes eligible. A failed read
-  registration and failed durable blocker must not permit another daemon to schedule from stale
-  access evidence.
+Current-version safety requirements remain: verified exclusive maintenance ownership, active-session exclusion, durable read/access coordination, failure handling that cannot authorize compression from stale evidence, bounded scheduling, cancellation, and interruption-safe publication and recovery. Existing canonical data must remain losslessly readable; unknown or inconsistent state must be preserved and surfaced rather than guessed.
 
-The existing registry and writer-contract checks do not implement this transition. Automatic
-compression remains disabled until an enforceable protocol and compatibility tests establish these
-conditions. Explicit maintenance APIs are not evidence that the automatic rollout is complete.
+Automatic dispatch remains disabled until these requirements and the complete scheduling path are validated. A deployment upgrade does not justify bypassing runtime safety checks or merely replacing the readiness gate with `true`.
 
-## Approved database-directory transition (not implemented)
-
-The approved compatibility boundary may replace the regular `session.db` file with a versioned
-`session.db` directory containing the canonical database. The user requires automatic migration
-where safe. This is a storage-format transition, not an alternate canonical location: the owning
-state location and session-ID-derived root remain unchanged. Build or writer identity must never
-select a different database. The current implementation still uses the regular database file.
-
-Historical evidence: `SessionDb::history_page` at `00a3a555^` selects `events` without validating
-the writer contract. Raw rows remain readable even if other rows use compressed envelopes.
-Consequently, neither a writer-epoch bump nor legacy JSON decode rejection proves minimum-reader
-exclusion. A directory at the old database path can reject new legacy database opens, but does not
-revoke already-open handles or cached artifact references; those require separate ownership and
-read-lifetime verification before publication is eligible.
-
-Implementation must be migration-owned and automatic only for known supported input with verified
-exclusive ownership. It must preserve all database sidecars, provide interruption-safe recovery,
-and make exactly one representation authoritative throughout the transition. Updated bounded
-readers must resolve the current representation without repairing or migrating on reads. Unknown,
-ambiguous, damaged, or unverifiably owned representations remain untouched and report actionable
-maintenance-required status. Catalog discovery must not hide directory-format sessions. Migration,
-backup, restore, usage measurement, reclamation, and database opening must share the domain-owned
-layout contract. Historical-client and interrupted-transition tests must pass before this design
-can establish eligibility for automatic compression.
-
-See [Session persistence architecture](session-persistence-architecture.md) for the current file
-layout; this approval does not claim that the transition or automatic dispatch is implemented.
+Earlier implementation notes and the remaining-work discussion below describe historical compatibility blockers. Their requirements for legacy-reader fencing and a database-directory transition are superseded by this decision; their current-version safety requirements still apply.
 
 ## Implemented codec foundation (not activated)
 
