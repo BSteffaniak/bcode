@@ -36,6 +36,8 @@ struct UsageCli {
     /// Output is partial on error; only exit status zero means export completed.
     #[arg(long, conflicts_with = "collect")]
     all_pages: bool,
+    #[command(flatten)]
+    reporting: SummaryOptions,
     /// Export CSV rather than JSON to stdout.
     #[arg(long)]
     csv: bool,
@@ -45,6 +47,13 @@ struct UsageCli {
     /// Index revision required for continuation.
     #[arg(long)]
     revision: Option<u64>,
+}
+
+#[derive(Debug, clap::Args)]
+struct SummaryOptions {
+    /// Explicitly traverse indexed pages for whole-range totals and timeline buckets (JSON).
+    #[arg(long, conflicts_with_all = ["all_pages", "csv", "after", "revision"])]
+    summary: bool,
 }
 
 fn parse_model(value: &str) -> Result<UsageModel, String> {
@@ -184,13 +193,18 @@ fn invoke(matches: clap::ArgMatches) -> StaticCliFuture {
         } else if args.collect_all {
             collect_catalog(&client).await?;
         }
+        let mut aggregate = bcode_usage::summary::UsageSummaryAccumulator::default();
         let mut first_page = true;
         loop {
             let report = client.usage_report(query.clone()).await.map_err(
                 |_| "usage query unavailable or changed; export is incomplete; restart query",
             )?;
-            write_page(&report, args.csv, args.all_pages, first_page)?;
-            if !args.all_pages {
+            if args.reporting.summary {
+                aggregate.accept(query.after, &report)?;
+            } else {
+                write_page(&report, args.csv, args.all_pages, first_page)?;
+            }
+            if !args.all_pages && !args.reporting.summary {
                 break;
             }
             let Some(after) = report.next_after else {
@@ -203,6 +217,9 @@ fn invoke(matches: clap::ArgMatches) -> StaticCliFuture {
             query.revision = Some(report.revision);
             first_page = false;
         }
+        if args.reporting.summary {
+            write_page(&aggregate.finish()?, false, false, true)?;
+        }
         Ok(StaticCliOutcome::default())
     })
 }
@@ -210,6 +227,26 @@ fn invoke(matches: clap::ArgMatches) -> StaticCliFuture {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn summary_requires_a_complete_traversal_and_json_output() {
+        let matches = UsageCli::command()
+            .try_get_matches_from(["usage", "--summary", "--to-ms", "100"])
+            .unwrap();
+        assert!(
+            UsageCli::from_arg_matches(&matches)
+                .unwrap()
+                .reporting
+                .summary
+        );
+        for conflicting in ["--csv", "--all-pages"] {
+            assert!(
+                UsageCli::command()
+                    .try_get_matches_from(["usage", "--summary", "--to-ms", "100", conflicting])
+                    .is_err()
+            );
+        }
+    }
+
     #[test]
     fn catalog_collection_is_explicit_and_excludes_conflicting_scope() {
         let matches = UsageCli::command()

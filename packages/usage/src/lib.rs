@@ -9,6 +9,7 @@ use bcode_usage_models::{
     UsageRequestRow, UsageTotals,
 };
 pub mod index;
+pub mod summary;
 
 use std::collections::BTreeMap;
 
