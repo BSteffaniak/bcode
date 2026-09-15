@@ -668,6 +668,15 @@ incomplete/duplicate sets, successful complete admission, and later participant 
 such proofs across independent daemon processes is still unimplemented; this API alone does not
 resolve older-reader coordination or open the dispatch gate.
 
+## Durable live-acknowledgement validation
+
+Exact live acknowledgement now validates the durable registration length and ACTIVE bytes using
+positional IO, in addition to device/inode identity and shared health. A live in-memory token cannot
+silently authorize a truncated, future-version, or unexpectedly completed registration file. Tests
+mutate those bytes while the registration remains live and verify admission refuses without repair.
+This strengthens the existing admission mechanism; dispatch remains gated pending startup-failure
+and older-reader coordination.
+
 ## Remaining implementation
 
 ### Access policy and scheduling

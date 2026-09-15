@@ -618,6 +618,32 @@ mod tests {
     }
 
     #[test]
+    fn live_token_rejects_corrupted_durable_registration_without_repair() {
+        let root = tempfile::tempdir().expect("root");
+        let registry = StorageAdmissionRegistry::open(root.path()).expect("registry");
+        let id = SessionId::new();
+        let daemon = registry.register_daemon(id).expect("daemon");
+        let path = root
+            .path()
+            .join("storage-admission-v1")
+            .join(format!("{id}.daemon"));
+        for content in [
+            b"BCSTDAEMON2:LIVE!".as_slice(),
+            b"BCSTDAEMON1:DONE!",
+            b"truncated",
+        ] {
+            std::fs::write(&path, content).expect("corrupt fixture");
+            let token = daemon
+                .acknowledgement()
+                .expect("local health alone is insufficient");
+            assert!(registry.admit_owned(16, token).is_err());
+            assert_eq!(std::fs::read(&path).expect("preserved"), content);
+        }
+        drop(daemon);
+        assert!(registry.admit_maintenance(16).is_err());
+    }
+
+    #[test]
     fn owned_acknowledgement_keeps_liveness_and_observes_health_failure() {
         let root = tempfile::tempdir().expect("root");
         let registry = StorageAdmissionRegistry::open(root.path()).expect("registry");

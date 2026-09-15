@@ -111,14 +111,29 @@ impl StorageDaemonAcknowledgement {
 
     #[cfg(any(target_os = "macos", target_os = "linux"))]
     pub(crate) fn acknowledges(&self, candidate: &File) -> io::Result<bool> {
-        use std::os::unix::fs::MetadataExt as _;
+        use std::os::unix::fs::{FileExt as _, MetadataExt as _};
         self.check()?;
         let held = self.file.metadata()?;
         let observed = candidate.metadata()?;
-        Ok(held.nlink() == 1
-            && observed.is_file()
-            && held.dev() == observed.dev()
-            && held.ino() == observed.ino())
+        if held.nlink() != 1
+            || !observed.is_file()
+            || held.dev() != observed.dev()
+            || held.ino() != observed.ino()
+        {
+            return Ok(false);
+        }
+        // Positional IO does not disturb the shared liveness descriptor's cursor. The owned lock
+        // excludes cooperating writers; hostile mutation still must never be accepted as ACTIVE.
+        if observed.len() != ACTIVE.len() as u64 {
+            return Err(invalid());
+        }
+        let mut bytes = [0; ACTIVE.len()];
+        candidate.read_exact_at(&mut bytes, 0)?;
+        if bytes != ACTIVE {
+            return Err(invalid());
+        }
+        self.check()?;
+        Ok(true)
     }
 }
 
