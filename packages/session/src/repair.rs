@@ -168,6 +168,16 @@ pub async fn repair_session(
         })
         .transpose()?;
 
+    let db_path = match crate::db_path::resolve_existing_session_db(&db_path) {
+        Ok(path) => path,
+        Err(error) => {
+            report.status = RepairStatus::ManualRequired;
+            report.final_error = Some(error.to_string());
+            report.notes.push("session database representation requires supported migration or manual maintenance".to_string());
+            return Ok(report);
+        }
+    };
+    report.db_path.clone_from(&db_path);
     let initial_error = match validate_session_db(root, session_id).await {
         Ok(()) => {
             report.status = RepairStatus::Ok;
@@ -593,6 +603,37 @@ fn unix_time_millis() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn unsupported_directory_layout_requires_manual_maintenance_without_repair() {
+        let root = tempfile::tempdir().expect("root");
+        let id = SessionId::new();
+        let directory = db::session_db_path(root.path(), id);
+        std::fs::create_dir_all(&directory).expect("directory");
+        std::fs::write(directory.join("format"), b"BCODE_SESSION_DB 2\n").unwrap();
+        std::fs::write(directory.join("data.db"), b"preserve database").unwrap();
+        std::fs::write(directory.join("data.db-wal"), b"preserve wal").unwrap();
+        for dry_run in [true, false] {
+            let report = repair_session(root.path(), id, RepairOptions { dry_run })
+                .await
+                .unwrap();
+            assert_eq!(report.status, RepairStatus::ManualRequired);
+            assert!(report.actions.is_empty());
+            assert!(report.backup_path.is_none());
+            assert_eq!(
+                std::fs::read(directory.join("format")).unwrap(),
+                b"BCODE_SESSION_DB 2\n"
+            );
+            assert_eq!(
+                std::fs::read(directory.join("data.db")).unwrap(),
+                b"preserve database"
+            );
+            assert_eq!(
+                std::fs::read(directory.join("data.db-wal")).unwrap(),
+                b"preserve wal"
+            );
+        }
+    }
 
     fn session_storage_files(root: &Path, session_id: SessionId) -> Vec<(String, Vec<u8>)> {
         let session_dir = root.join(session_id.to_string());
