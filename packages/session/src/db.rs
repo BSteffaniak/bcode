@@ -3446,6 +3446,19 @@ impl SessionDb {
         &self,
         after: Option<(&str, &str)>,
     ) -> SessionDbResult<Vec<(String, String)>> {
+        self.artifact_maintenance_page_through(after, i64::MAX as u64)
+            .await
+    }
+
+    /// Read candidates finalized no later than a captured sweep tail.
+    ///
+    /// # Errors
+    /// Returns compatibility, projection, query or row-validation failures.
+    pub async fn artifact_maintenance_page_through(
+        &self,
+        after: Option<(&str, &str)>,
+        through_sequence: u64,
+    ) -> SessionDbResult<Vec<(String, String)>> {
         validate_storage_writer_contract(&**self.db).await?;
         let expected = self.last_event_sequence().await?.unwrap_or_default();
         if self
@@ -3467,6 +3480,7 @@ impl SessionDb {
                 .columns(&["artifact_id", "reference_key"])
                 .where_eq("artifact_id", artifact)
                 .where_gt("reference_key", reference)
+                .where_lte("finalized_event_seq", seq_to_value(through_sequence))
                 .where_eq("complete", true)
                 .where_eq("availability", "complete")
                 .sort("reference_key", SortDirection::Asc)
@@ -3485,6 +3499,7 @@ impl SessionDb {
                 .db
                 .select("artifact_references")
                 .columns(&["artifact_id", "reference_key"])
+                .where_lte("finalized_event_seq", seq_to_value(through_sequence))
                 .where_eq("complete", true)
                 .where_eq("availability", "complete")
                 .sort("artifact_id", SortDirection::Asc)
@@ -11035,6 +11050,69 @@ mod tests {
             .await
             .expect("rows");
         assert_eq!(rows.len(), 3);
+    }
+
+    #[tokio::test]
+    async fn artifact_sweep_high_water_excludes_new_finalizations() {
+        let root = tempfile::tempdir().expect("root");
+        let id = SessionId::new();
+        let db = SessionDb::open_turso_in_root(id, root.path())
+            .await
+            .expect("db");
+        db.append_event(&event(
+            id,
+            0,
+            SessionEventKind::SessionCreated {
+                name: None,
+                working_directory: root.path().to_path_buf(),
+            },
+        ))
+        .await
+        .expect("created");
+        for sequence in 0..2 {
+            if sequence == 1 {
+                db.append_event(&event(
+                    id,
+                    1,
+                    SessionEventKind::SystemMessage {
+                        text: "later".into(),
+                    },
+                ))
+                .await
+                .expect("later");
+            }
+            db.database()
+                .insert("artifact_references")
+                .value("artifact_id", format!("artifact-{sequence}"))
+                .value("reference_key", "recording")
+                .value("producer_plugin_id", "fixture")
+                .value("schema", "fixture")
+                .value("schema_version", 1)
+                .value("complete", true)
+                .value("availability", "complete")
+                .value("finalized_event_seq", sequence)
+                .execute(db.database())
+                .await
+                .expect("reference");
+        }
+        let first = db
+            .artifact_maintenance_page_through(None, 0)
+            .await
+            .expect("captured sweep");
+        assert_eq!(first, vec![("artifact-0".into(), "recording".into())]);
+        assert!(
+            db.artifact_maintenance_page_through(Some(("artifact-0", "recording")), 0)
+                .await
+                .expect("sweep done")
+                .is_empty()
+        );
+        assert_eq!(
+            db.artifact_maintenance_page_through(None, 1)
+                .await
+                .expect("next sweep")
+                .len(),
+            2
+        );
     }
 
     #[tokio::test]

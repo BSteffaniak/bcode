@@ -604,6 +604,15 @@ event. This exercises migration, compression, reclamation and continued writes t
 only testing each helper separately. It does not authorize unregistered historical readers or remove
 the disabled automatic-dispatch gate.
 
+## Finite artifact sweep boundary
+
+The session domain now exposes candidate pages with an explicit canonical high-water mark. Later
+finalizations are excluded from that sweep even if the projection advances; the next sweep can
+include them. A regression verifies that continuing a completed old sweep does not chase a newly
+finalized artifact. The default caller still captures a new tail each call; scheduler cursor wiring
+and the equivalent history high-water bound remain incomplete, so this does not yet resolve queue
+fairness for continuously growing sessions or enable automatic dispatch.
+
 ## Remaining implementation
 
 ### Access policy and scheduling

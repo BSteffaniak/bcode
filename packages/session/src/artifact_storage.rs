@@ -179,6 +179,47 @@ pub async fn initialize_maintenance_access(
     .map_err(|_| io::Error::other("access initialization failed"))?
 }
 
+/// One finite artifact sweep page; subsequent pages retain `through_sequence`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ArtifactMaintenancePage {
+    /// Captured canonical high-water mark, unchanged while a sweep advances.
+    pub through_sequence: u64,
+    /// Bounded candidate identities.
+    pub references: Vec<(String, String)>,
+}
+
+/// Discover candidates under a stable canonical high-water mark.
+///
+/// # Errors
+/// Rejects foreign ownership, unsupported storage, stale projections and IO failures.
+pub async fn maintenance_candidates_through(
+    root: &Path,
+    session_id: SessionId,
+    after: Option<(&str, &str)>,
+    through: Option<u64>,
+) -> io::Result<ArtifactMaintenancePage> {
+    let _maintenance = acquire_maintenance(root, session_id).await?;
+    let db = crate::db::SessionDb::open_existing_turso_in_root(session_id, root)
+        .await
+        .map_err(io::Error::other)?;
+    let result = async {
+        let through_sequence = match through {
+            Some(tail) => tail,
+            None => db.last_event_sequence().await?.unwrap_or_default(),
+        };
+        let references = db
+            .artifact_maintenance_page_through(after, through_sequence)
+            .await?;
+        Ok::<_, crate::db::SessionDbError>(ArtifactMaintenancePage {
+            through_sequence,
+            references,
+        })
+    }
+    .await;
+    db.database().close().await.map_err(io::Error::other)?;
+    result.map_err(io::Error::other)
+}
+
 /// Return a bounded page of finalized artifact identities for offline maintenance.
 ///
 /// # Errors
@@ -188,13 +229,11 @@ pub async fn maintenance_candidates(
     session_id: SessionId,
     after: Option<(&str, &str)>,
 ) -> io::Result<Vec<(String, String)>> {
-    let _maintenance = acquire_maintenance(root, session_id).await?;
-    let db = crate::db::SessionDb::open_existing_turso_in_root(session_id, root)
-        .await
-        .map_err(io::Error::other)?;
-    let result = db.artifact_maintenance_page(after).await;
-    db.database().close().await.map_err(io::Error::other)?;
-    result.map_err(io::Error::other)
+    Ok(
+        maintenance_candidates_through(root, session_id, after, None)
+            .await?
+            .references,
+    )
 }
 
 /// Verify a finalized artifact reference and compress it under one maintenance fence.
