@@ -879,6 +879,7 @@ pub async fn collect_usage(
             .lock()
             .await
             .invalidate(session_id)
+            .await
             .map_err(|_| "usage index revision exhausted")?;
         return Err("session storage location is ambiguous");
     }
@@ -901,6 +902,7 @@ pub async fn collect_usage(
         .lock()
         .await
         .collect(session_id, query.after.as_deref(), page.clone())
+        .await
         .map_err(|_| "usage collection conflict; restart collection")?;
     Ok(page)
 }

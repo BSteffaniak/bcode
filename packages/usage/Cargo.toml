@@ -12,8 +12,17 @@ version     = { workspace = true }
 
 [dependencies]
 bcode_session_models = { workspace = true }
-bcode_usage_models   = { workspace = true }
-serde_json           = { workspace = true }
+bcode_usage_models = { workspace = true }
+serde_json = { workspace = true }
+switchy = { workspace = true, features = [
+    "database",
+    "database-connection",
+    "database-connection-turso",
+] }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+tokio    = { workspace = true, features = ["macros", "rt"] }
 
 [features]
 default          = []

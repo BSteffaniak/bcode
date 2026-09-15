@@ -3016,6 +3016,9 @@ dependencies = [
  "bcode_session_models",
  "bcode_usage_models",
  "serde_json",
+ "switchy",
+ "tempfile",
+ "tokio",
 ]
 
 [[package]]

@@ -1925,7 +1925,7 @@ impl ServerState {
             .clone();
         let run_edit_plugins = init.startup_config.workflows.run_edit_plugins.clone();
         Self {
-            usage_index: Mutex::default(),
+            usage_index: Mutex::new(bcode_usage::index::UsageIndex::in_state_root(&state_root)),
             locations: None,
             state_root,
             sessions,
@@ -5937,7 +5937,7 @@ async fn handle_request_inner(
             catalog,
         } => handle_reprice_session(state, writer, request_id, session_id, range, *catalog).await,
         SessionLifecycleRequest::UsageReport { query } => {
-            let result = state.usage_index.lock().await.query(&query);
+            let result = state.usage_index.lock().await.query(&query).await;
             let response = result.map_or_else(
                 |_| {
                     Response::Err(ErrorResponse::new(
