@@ -60,6 +60,39 @@ async fn directory_history_compression_reclaims_space_and_preserves_reopen_and_a
     verify_history_reclamation(true).await;
 }
 
+#[tokio::test]
+async fn directory_layout_rejects_direct_engine_open_and_preserves_current_history() {
+    let root = tempfile::tempdir().unwrap();
+    let manager = crate::SessionManager::persistent(root.path()).unwrap();
+    let session = manager
+        .create_session(None, root.path().to_path_buf())
+        .await
+        .unwrap();
+    let expected = manager.session_history(session.id).await.unwrap();
+    manager.release_session_ownership(session.id).await.unwrap();
+    drop(manager);
+    let path = crate::db_path::session_db_path(root.path(), session.id);
+    directory_fixture(&path);
+    let before = std::fs::read(path.join("data.db")).unwrap();
+    // Exercise the same backend initializer without the new layout resolver. This models new
+    // legacy-style opens, not an already-open historical daemon or its cached artifact references.
+    assert!(
+        crate::db_connection::init_turso_local_with_retry(&path)
+            .await
+            .is_err()
+    );
+    assert_eq!(std::fs::read(path.join("data.db")).unwrap(), before);
+    let reopened = crate::SessionManager::persistent(root.path()).unwrap();
+    assert_eq!(
+        reopened.session_history(session.id).await.unwrap(),
+        expected
+    );
+    reopened
+        .release_session_ownership(session.id)
+        .await
+        .unwrap();
+}
+
 fn directory_fixture(path: &Path) {
     // Offline fixture construction, not a production migration protocol. Production publication
     // requires interruption-safe ownership and verification of all engine sidecars.
