@@ -328,6 +328,56 @@ async fn scheduler_recent_access_and_damage_defer_but_cold_content_reaches_deep_
 
 #[tokio::test]
 async fn worker_compresses_reclaims_and_preserves_continued_writes() {
+    verify_worker_history(false).await;
+}
+
+#[tokio::test]
+async fn application_upgrade_then_worker_preserves_history_and_writes() {
+    verify_worker_history(true).await;
+}
+
+async fn upgrade_worker_fixture(state: &Arc<ServerState>, root: &std::path::Path, id: SessionId) {
+    let db = bcode_session::db::SessionDb::open_existing_turso_in_root(id, root)
+        .await
+        .expect("fixture db");
+    db.database()
+        .update("session_storage_contract")
+        .value("writer_epoch", 9)
+        .execute(db.database())
+        .await
+        .expect("epoch nine fixture");
+    db.database().close().await.expect("close fixture");
+    drop(db);
+    tokio::time::timeout(Duration::from_secs(15), async {
+        loop {
+            let snapshot = crate::session_operations::prepare_open(state, id)
+                .await
+                .unwrap_or_else(|_| panic!("application upgrade rejected"));
+            if let Some(outcome) = snapshot.outcome {
+                assert!(matches!(
+                    outcome,
+                    bcode_session_models::SessionOpenTerminalOutcome::Ready
+                ));
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("upgrade completes");
+    state
+        .sessions
+        .release_session_ownership(id)
+        .await
+        .expect("release upgraded session");
+    let db = bcode_session::db::SessionDb::open_existing_turso_in_root(id, root)
+        .await
+        .expect("upgraded db");
+    assert_eq!(db.storage_writer_epoch().await.expect("writer epoch"), 10);
+    db.database().close().await.expect("close upgraded db");
+}
+
+async fn verify_worker_history(upgrade: bool) {
     let (root, mut state, id, artifacts, bytes) = fixture(1).await;
     state
         .startup_config
@@ -354,6 +404,9 @@ async fn worker_compresses_reclaims_and_preserves_continued_writes() {
     let path = root.path().join(id.to_string()).join("session.db");
     let before = std::fs::metadata(&path).expect("before").len();
     let state = Arc::new(state);
+    if upgrade {
+        upgrade_worker_fixture(&state, root.path(), id).await;
+    }
     let worker = tokio::spawn(run_with_clock(Arc::clone(&state), || {
         super::super::current_time_ms() + 31 * 86_400_000
     }));
@@ -416,6 +469,60 @@ async fn worker_compresses_reclaims_and_preserves_continued_writes() {
         .release_session_ownership(id)
         .await
         .expect("release");
+}
+
+#[tokio::test]
+async fn constructed_server_starts_storage_worker_and_releases_registration() {
+    let (root, state, id, artifacts, _) = fixture(1).await;
+    state
+        .storage_daemon_registration
+        .lock()
+        .expect("registration lock")
+        .take()
+        .expect("fixture registration")
+        .finish()
+        .expect("retire fixture");
+    let access = root.path().join(id.to_string()).join("storage-access.bin");
+    std::fs::remove_file(&access).expect("remove tracking");
+    let socket_dir = tempfile::tempdir().expect("socket directory");
+    let endpoint = bcode_ipc::IpcEndpoint::unix_socket(socket_dir.path().join("storage.sock"));
+    let listener = crate::LocalIpcListener::bind(&endpoint).expect("listener");
+    let state = Arc::new(state);
+    let server_state = Arc::clone(&state);
+    let shutdown = bcode_agent_runtime::CancellationToken::new();
+    let signal = shutdown.clone();
+    let server = tokio::spawn(async move {
+        crate::run_constructed_server(
+            server_state,
+            listener,
+            &bcode_config::DaemonConfig::default(),
+            false,
+            &[],
+            shutdown,
+            None,
+        )
+        .await
+    });
+    let dispatched = tokio::time::timeout(Duration::from_secs(15), async {
+        while !access.exists() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await;
+    signal.cancel();
+    tokio::time::timeout(Duration::from_secs(15), server)
+        .await
+        .expect("bounded shutdown")
+        .expect("server task")
+        .expect("server");
+    drop(state);
+    dispatched.expect("startup launched storage worker");
+    assert!(artifacts.join("recording-000").is_file());
+    let registry = bcode_session::storage_admission::StorageAdmissionRegistry::open(root.path())
+        .expect("registry");
+    let _maintenance = registry
+        .admit_maintenance(4096)
+        .expect("clean shutdown registration");
 }
 
 #[tokio::test]

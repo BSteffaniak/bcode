@@ -11368,6 +11368,85 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn history_compression_crash_child() {
+        let Ok(root) = std::env::var("BCODE_HISTORY_CRASH_ROOT") else {
+            return;
+        };
+        let id = std::env::var("BCODE_HISTORY_CRASH_ID")
+            .expect("id")
+            .parse()
+            .expect("session id");
+        let db = SessionDb::open_existing_turso_in_root(id, std::path::Path::new(&root))
+            .await
+            .expect("open");
+        let mut checks = 0;
+        db.compress_history_payload_page_checked(0, 1, None, || {
+            checks += 1;
+            if checks == 3 {
+                // Exit without unwinding after the payload update, before transaction commit.
+                std::process::exit(94);
+            }
+            Ok(())
+        })
+        .await
+        .expect("compression");
+        panic!("crash boundary not reached");
+    }
+
+    #[tokio::test]
+    async fn process_crash_before_history_commit_preserves_history_and_retry() {
+        let root = tempfile::tempdir().expect("root");
+        let id = SessionId::new();
+        let db = SessionDb::open_turso_in_root(id, root.path())
+            .await
+            .expect("db");
+        let original = event(
+            id,
+            0,
+            SessionEventKind::SessionCreated {
+                name: Some("crash history 世界".repeat(20_000)),
+                working_directory: root.path().to_path_buf(),
+            },
+        );
+        db.append_event(&original).await.expect("append");
+        let before = db.canonical_rows_page(0, 1).await.expect("before")[0]
+            .payload
+            .clone();
+        db.database().close().await.expect("close");
+        drop(db);
+        let status = std::process::Command::new(std::env::current_exe().expect("executable"))
+            .args(["--exact", "db::tests::history_compression_crash_child"])
+            .env("BCODE_HISTORY_CRASH_ROOT", root.path())
+            .env("BCODE_HISTORY_CRASH_ID", id.to_string())
+            .status()
+            .expect("child");
+        assert_eq!(status.code(), Some(94));
+        let db = SessionDb::open_existing_turso_in_root(id, root.path())
+            .await
+            .expect("recover");
+        assert_eq!(
+            db.canonical_rows_page(0, 1).await.expect("recovered")[0].payload,
+            before
+        );
+        assert_eq!(
+            db.all_events_strict().await.expect("history"),
+            vec![original.clone()]
+        );
+        assert!(
+            db.compress_history_payload_page(0, 1)
+                .await
+                .expect("retry")
+                .compressed
+                > 0
+        );
+        assert_eq!(
+            db.all_events_strict().await.expect("compressed history"),
+            vec![original]
+        );
+        db.database().close().await.expect("close");
+    }
+
+    #[tokio::test]
     async fn cancellation_before_history_commit_rolls_back_compressed_payloads() {
         let root = tempfile::tempdir().expect("root");
         let id = SessionId::new();

@@ -16,8 +16,19 @@ The real-file worker integration test now exercises age-based artifact and canon
 compression, more than one MiB of actual database reclamation, transparent artifact reads, exact
 history preservation after reopening, and continued canonical writes. It runs the production
 scheduling loop with a supplied clock; production uses wall-clock time. This supplements the
-component migration, fallback-admission, compression, and reclamation tests. Process-crash recovery
-and complete rollout-path migration coverage still require separate verification.
+component migration, fallback-admission, compression, and reclamation tests. Subprocess tests now
+verify admission-lock release with preserved dirty evidence, artifact publication crash boundaries,
+and history transaction rollback after process exit between payload update and commit. The history
+crash test reopens exact logical history and successfully retries compression. The epoch-nine
+upgrade/compression/reclamation integration test also passes. An application-level integration now
+starts with epoch nine, runs `prepare_open` through the migration coordinator, verifies epoch ten,
+releases ownership, and runs the automatic worker through compression, reclamation, reopen, and
+continued writes. A constructed-server integration separately verifies normal startup launches
+the storage worker, conservatively initializes missing tracking, and clean shutdown releases
+registration so maintenance can be admitted again. The migration and lifecycle proofs are separate
+tests, not a single historical-session daemon-startup scenario.
+Engine VACUUM interruption remains unverified; successful reclamation and cancellation tests do
+not establish recovery after process loss during engine publication.
 
 The first implemented slice was explicit bounded
 physical measurement through `bcode session storage-usage <session-id> [--entry-budget 10000]`.
