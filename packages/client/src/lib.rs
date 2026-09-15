@@ -2977,6 +2977,36 @@ impl BcodeClient {
         }
     }
 
+    /// Query a bounded usage reporting snapshot page.
+    /// # Errors
+    /// Returns an error for invalid queries, changed generations, or transport failure.
+    pub async fn usage_report(
+        &self,
+        query: bcode_usage_models::UsageQuery,
+    ) -> Result<bcode_usage_models::UsageReport, ClientError> {
+        match self.send_request(Request::UsageReport { query }).await? {
+            ResponsePayload::UsageReport { report } => Ok(report),
+            _ => Err(ClientError::UnexpectedResponse),
+        }
+    }
+
+    /// Explicitly collect one source accounting page into the disposable reporting index.
+    /// # Errors
+    /// Returns an error for unsafe source state, generation conflicts, or transport failure.
+    pub async fn collect_usage(
+        &self,
+        session_id: SessionId,
+        query: bcode_session_models::SessionUsageQuery,
+    ) -> Result<bcode_session_models::SessionUsagePage, ClientError> {
+        match self
+            .send_request(Request::UsageCollect { session_id, query })
+            .await?
+        {
+            ResponsePayload::UsageCollected { page } => Ok(page),
+            _ => Err(ClientError::UnexpectedResponse),
+        }
+    }
+
     /// Measure physical session files with an explicit directory-entry budget.
     ///
     /// # Errors

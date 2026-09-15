@@ -103,7 +103,8 @@ const MAX_CHUNK_DATA_SIZE: usize = MAX_FRAME_PAYLOAD_SIZE / 2;
 /// Older positional payloads are rejected rather than assigned a guessed revision.
 /// Version 38 restores pre-storage-usage positional request/response tags by appending
 /// storage-usage variants. Version 37 peers are rejected rather than misdecoded.
-pub const CURRENT_PROTOCOL_VERSION: u16 = 38;
+/// Version 39 adds bounded usage reporting and explicit snapshot collection.
+pub const CURRENT_PROTOCOL_VERSION: u16 = 39;
 
 /// Durable session-storage writer epoch expected by this IPC build.
 pub const CURRENT_SESSION_STORAGE_WRITER_EPOCH: u32 =
@@ -1157,6 +1158,15 @@ pub enum Request {
     SessionStorageUsage {
         session_id: SessionId,
         entry_budget: u32,
+    },
+    /// Bounded query of explicitly collected reporting snapshots.
+    UsageReport {
+        query: bcode_usage_models::UsageQuery,
+    },
+    /// Explicitly collect one session accounting page into the disposable reporting index.
+    UsageCollect {
+        session_id: SessionId,
+        query: bcode_session_models::SessionUsageQuery,
     },
 }
 
@@ -2299,6 +2309,12 @@ pub enum ResponsePayload {
     // Binary enum tags are positional: append new responses to preserve v1 tags.
     SessionStorageUsage {
         usage: bcode_session_models::SessionStorageUsage,
+    },
+    UsageReport {
+        report: bcode_usage_models::UsageReport,
+    },
+    UsageCollected {
+        page: bcode_session_models::SessionUsagePage,
     },
 }
 

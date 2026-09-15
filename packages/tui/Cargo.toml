@@ -51,6 +51,7 @@ bcode_tui_components = { workspace = true, features = [
     "terminal-viewer",
     "transcript",
 ] }
+bcode_usage_models = { workspace = true }
 bcode_workflow = { workspace = true }
 bcode_workflow_store = { workspace = true }
 bcode_workflow_view_models = { workspace = true }

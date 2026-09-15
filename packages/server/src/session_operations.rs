@@ -853,6 +853,58 @@ pub async fn inspect(
     Ok(page)
 }
 
+/// Explicitly collect one bounded usage projection page for reporting.
+/// # Errors
+/// Rejects ambiguous locations, partial collection ranges, unsafe reads, and changed generations.
+pub async fn collect_usage(
+    state: &ServerState,
+    session_id: bcode_session_models::SessionId,
+    query: bcode_session_models::SessionUsageQuery,
+) -> Result<bcode_session_models::SessionUsagePage, &'static str> {
+    query
+        .validate()
+        .map_err(|_| "invalid usage collection query")?;
+    if query.range.from_timestamp_ms != 0 || query.range.to_timestamp_ms != i64::MAX.cast_unsigned()
+    {
+        return Err("usage collection requires the complete request timestamp range");
+    }
+    if !state
+        .session_catalog
+        .ambiguous_location_ids(session_id)
+        .await
+        .is_empty()
+    {
+        state
+            .usage_index
+            .lock()
+            .await
+            .invalidate(session_id)
+            .map_err(|_| "usage index revision exhausted")?;
+        return Err("session storage location is ambiguous");
+    }
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    let admission =
+        super::storage_read_admission::RegisteredStorageRead::for_session(state, session_id)
+            .await
+            .map_err(|_| "usage storage read admission unavailable")?;
+    let page = state
+        .sessions
+        .session_usage_page(session_id, query.clone())
+        .await
+        .map_err(|_| "usage projection unavailable or changed; restart collection")?;
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    if let Some(admission) = admission {
+        admission.finish_history(state, session_id).await;
+    }
+    state
+        .usage_index
+        .lock()
+        .await
+        .collect(session_id, query.after.as_deref(), page.clone())
+        .map_err(|_| "usage collection conflict; restart collection")?;
+    Ok(page)
+}
+
 /// Measure one session's physical files without reading canonical history.
 ///
 /// # Errors

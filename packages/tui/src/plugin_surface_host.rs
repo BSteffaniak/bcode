@@ -105,6 +105,29 @@ fn workflow_run_limits(
 }
 
 impl PluginTuiHost for BcodePluginTuiHost {
+    fn usage_report(
+        &self,
+        query: bcode_usage_models::UsageQuery,
+    ) -> bcode_plugin_sdk::tui::PluginUsageReportFuture {
+        let client = self.client.clone();
+        Box::pin(async move {
+            client.usage_report(query).await.map_err(|_| {
+                PluginTuiHostError::Internal("usage query failed; refresh or recollect".into())
+            })
+        })
+    }
+    fn collect_usage(
+        &self,
+        session_id: SessionId,
+        query: bcode_session_models::SessionUsageQuery,
+    ) -> bcode_plugin_sdk::tui::PluginUsageCollectFuture {
+        let client = self.client.clone();
+        Box::pin(async move {
+            client.collect_usage(session_id, query).await.map_err(|_| {
+                PluginTuiHostError::Internal("usage collection failed; restart collection".into())
+            })
+        })
+    }
     fn spawn(&self, task: PluginTask) {
         let redraw = self.redraw.clone();
         let active_tasks = Arc::clone(&self.active_tasks);

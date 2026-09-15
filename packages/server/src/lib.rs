@@ -323,6 +323,7 @@ struct WorktreeCreateOperation {
 
 #[derive(Debug)]
 pub struct ServerState {
+    usage_index: Mutex<bcode_usage::index::UsageIndex>,
     locations: Option<bcode_config::StateLocationSet>,
     state_root: PathBuf,
     pub sessions: SessionManager,
@@ -1924,6 +1925,7 @@ impl ServerState {
             .clone();
         let run_edit_plugins = init.startup_config.workflows.run_edit_plugins.clone();
         Self {
+            usage_index: Mutex::default(),
             locations: None,
             state_root,
             sessions,
@@ -5569,6 +5571,8 @@ const fn request_kind(request: &Request) -> &'static str {
         Request::DeactivateSkill { .. } => "deactivate_skill",
         Request::ActiveSkills { .. } => "active_skills",
         Request::AgentPolicyStatus => "agent_policy_status",
+        Request::UsageReport { .. } => "usage_report",
+        Request::UsageCollect { .. } => "usage_collect",
         Request::SetSessionAgent { .. } => "set_session_agent",
     }
 }
@@ -5932,6 +5936,26 @@ async fn handle_request_inner(
             range,
             catalog,
         } => handle_reprice_session(state, writer, request_id, session_id, range, *catalog).await,
+        SessionLifecycleRequest::UsageReport { query } => {
+            let result = state.usage_index.lock().await.query(&query);
+            let response = result.map_or_else(
+                |_| {
+                    Response::Err(ErrorResponse::new(
+                        "usage_unavailable",
+                        "Usage query invalid or snapshot changed; restart reporting.",
+                    ))
+                },
+                |report| Response::Ok(ResponsePayload::UsageReport { report }),
+            );
+            send_response(writer, request_id, response).await
+        }
+        SessionLifecycleRequest::UsageCollect { session_id, query } => {
+            let response = match session_operations::collect_usage(state, session_id, query).await {
+                Ok(page) => Response::Ok(ResponsePayload::UsageCollected { page }),
+                Err(message) => Response::Err(ErrorResponse::new("usage_unavailable", message)),
+            };
+            send_response(writer, request_id, response).await
+        }
         SessionLifecycleRequest::SessionStorageUsage {
             session_id,
             entry_budget,

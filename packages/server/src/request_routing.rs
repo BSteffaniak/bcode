@@ -169,6 +169,13 @@ pub enum SessionLifecycleRequest {
         range: bcode_session_models::SessionCostRange,
         catalog: Box<bcode_model_catalog_models::CatalogDocument>,
     },
+    UsageReport {
+        query: bcode_usage_models::UsageQuery,
+    },
+    UsageCollect {
+        session_id: SessionId,
+        query: bcode_session_models::SessionUsageQuery,
+    },
     SessionStorageUsage {
         session_id: SessionId,
         entry_budget: u32,
@@ -863,6 +870,15 @@ impl RoutedRequest {
                 range,
                 catalog,
             })),
+            Request::UsageReport { query } => {
+                Self::SessionLifecycle(Box::new(SessionLifecycleRequest::UsageReport { query }))
+            }
+            Request::UsageCollect { session_id, query } => {
+                Self::SessionLifecycle(Box::new(SessionLifecycleRequest::UsageCollect {
+                    session_id,
+                    query,
+                }))
+            }
             Request::SessionStorageUsage {
                 session_id,
                 entry_budget,

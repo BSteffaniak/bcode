@@ -1578,6 +1578,7 @@ dependencies = [
  "bcode_shell_plugin",
  "bcode_skills_plugin",
  "bcode_tantivy_session_search_plugin",
+ "bcode_usage_plugin",
  "bcode_vim_edit_plugin",
  "bcode_web_search_plugin",
  "bcode_workflow_plugin",
@@ -1664,6 +1665,7 @@ dependencies = [
  "bcode_session_search",
  "bcode_skill_models",
  "bcode_tool",
+ "bcode_usage_models",
  "bcode_workflow",
  "bcode_workflow_store",
  "bcode_workflow_view_models",
@@ -2032,6 +2034,7 @@ dependencies = [
  "bcode_session_search",
  "bcode_skill_models",
  "bcode_tool",
+ "bcode_usage_models",
  "bcode_workflow",
  "bcode_workflow_store",
  "bcode_workflow_view_models",
@@ -2363,6 +2366,7 @@ dependencies = [
  "bcode_session_models",
  "bcode_session_view_models",
  "bcode_tool",
+ "bcode_usage_models",
  "bcode_workflow",
  "bcode_workflow_view_models",
  "bmux_keyboard",
@@ -2593,6 +2597,8 @@ dependencies = [
  "bcode_skill_models",
  "bcode_tantivy_session_search_plugin",
  "bcode_tool",
+ "bcode_usage",
+ "bcode_usage_models",
  "bcode_vim_edit_plugin",
  "bcode_web_search_plugin",
  "bcode_workflow",
@@ -2959,6 +2965,7 @@ dependencies = [
  "bcode_syntax_render",
  "bcode_tool",
  "bcode_tui_components",
+ "bcode_usage_models",
  "bcode_vim_edit_plugin",
  "bcode_workflow",
  "bcode_workflow_store",
@@ -3000,6 +3007,40 @@ dependencies = [
  "bmux_tui",
  "bmux_tui_components",
  "unicode-width 0.2.2",
+]
+
+[[package]]
+name = "bcode_usage"
+version = "0.0.1-alpha.0"
+dependencies = [
+ "bcode_session_models",
+ "bcode_usage_models",
+ "serde_json",
+]
+
+[[package]]
+name = "bcode_usage_models"
+version = "0.0.1-alpha.0"
+dependencies = [
+ "bcode_session_models",
+ "serde",
+]
+
+[[package]]
+name = "bcode_usage_plugin"
+version = "0.0.1-alpha.0"
+dependencies = [
+ "bcode_client",
+ "bcode_command",
+ "bcode_plugin_sdk",
+ "bcode_session_models",
+ "bcode_usage",
+ "bcode_usage_models",
+ "bmux_keyboard",
+ "bmux_tui",
+ "bmux_tui_components",
+ "clap",
+ "serde_json",
 ]
 
 [[package]]

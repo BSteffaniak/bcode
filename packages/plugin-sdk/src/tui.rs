@@ -554,8 +554,45 @@ pub struct PluginSessionViewSubscription {
     pub receiver: mpsc::Receiver<PluginSessionViewUpdate>,
 }
 
+/// Async bounded usage query result.
+pub type PluginUsageReportFuture = Pin<
+    Box<
+        dyn Future<Output = Result<bcode_usage_models::UsageReport, PluginTuiHostError>>
+            + Send
+            + 'static,
+    >,
+>;
+/// Async explicit usage collection result.
+pub type PluginUsageCollectFuture = Pin<
+    Box<
+        dyn Future<Output = Result<bcode_session_models::SessionUsagePage, PluginTuiHostError>>
+            + Send
+            + 'static,
+    >,
+>;
+
 /// Host services available to native TUI plugin surfaces.
 pub trait PluginTuiHost: Send + Sync {
+    /// Query a bounded, normalized reporting snapshot.
+    fn usage_report(&self, _query: bcode_usage_models::UsageQuery) -> PluginUsageReportFuture {
+        Box::pin(async {
+            Err(PluginTuiHostError::Unsupported(
+                "usage reporting unavailable".into(),
+            ))
+        })
+    }
+    /// Explicitly collect a bounded page of one session's accounting projection.
+    fn collect_usage(
+        &self,
+        _session_id: SessionId,
+        _query: bcode_session_models::SessionUsageQuery,
+    ) -> PluginUsageCollectFuture {
+        Box::pin(async {
+            Err(PluginTuiHostError::Unsupported(
+                "usage collection unavailable".into(),
+            ))
+        })
+    }
     /// Spawn an async task on Bcode's native Tokio runtime.
     fn spawn(&self, task: PluginTask);
 

@@ -7,6 +7,7 @@ members = [
     "plugins/git-plugin",
     "plugins/code-review-plugin",
     "plugins/eval-plugin",
+    "plugins/usage-plugin",
     "plugins/metrics-plugin",
     "plugins/ralph-plugin",
     "plugins/read-plugin",
@@ -69,6 +70,8 @@ members = [
     "packages/models-site/ui",
     "packages/markdown-render",
     "packages/mermaid-render",
+    "packages/usage",
+    "packages/usage/models",
     "packages/metrics",
     "packages/syntax-render",
     "packages/plugin",
@@ -250,6 +253,9 @@ bcode_tool_models                       = { version = "0.0.1-alpha.0", default-f
 bcode_tool_runtime                      = { version = "0.0.1-alpha.0", default-features = false, path = "packages/tool-runtime" }
 bcode_tui                               = { version = "0.0.1-alpha.0", default-features = false, path = "packages/tui" }
 bcode_tui_components                    = { version = "0.0.1-alpha.0", default-features = false, path = "packages/tui-components" }
+bcode_usage                             = { version = "0.0.1-alpha.0", default-features = false, path = "packages/usage" }
+bcode_usage_models                      = { version = "0.0.1-alpha.0", default-features = false, path = "packages/usage/models" }
+bcode_usage_plugin                      = { version = "0.0.1-alpha.0", default-features = false, path = "plugins/usage-plugin" }
 bcode_vim_edit                          = { version = "0.0.1-alpha.0", default-features = false, path = "packages/vim-edit" }
 bcode_vim_edit_plugin                   = { version = "0.0.1-alpha.0", default-features = false, path = "plugins/vim-edit-plugin" }
 bcode_web_search_plugin                 = { version = "0.0.1-alpha.0", default-features = false, path = "plugins/web-search-plugin" }

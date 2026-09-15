@@ -40,6 +40,11 @@ pub fn static_tui_extensions() -> Vec<bcode_plugin_sdk::tui::StaticPluginTuiExte
         "bcode.loop",
         bcode_loop_plugin::tui_registry,
     ));
+    #[cfg(feature = "static-bundled-usage-plugin")]
+    extensions.push(bcode_plugin_sdk::tui::StaticPluginTuiExtension::new(
+        "bcode.usage",
+        bcode_usage_plugin::tui::tui_registry,
+    ));
     #[cfg(feature = "static-bundled-metrics-plugin")]
     extensions.push(bcode_plugin_sdk::tui::StaticPluginTuiExtension::new(
         "bcode.metrics",
@@ -120,6 +125,8 @@ pub fn tui_registry(plugin_id: &str) -> Option<bcode_plugin_sdk::tui::PluginTuiR
         "bcode.git" => Some(bcode_git_plugin::git_tui_registry()),
         #[cfg(feature = "static-bundled-loop-plugin")]
         "bcode.loop" => Some(bcode_loop_plugin::tui_registry()),
+        #[cfg(feature = "static-bundled-usage-plugin")]
+        "bcode.usage" => Some(bcode_usage_plugin::tui::tui_registry()),
         #[cfg(feature = "static-bundled-metrics-plugin")]
         "bcode.metrics" => Some(bcode_metrics_plugin::tui::tui_registry()),
         #[cfg(feature = "static-bundled-model-plugin")]
@@ -225,6 +232,11 @@ fn append_static_bundled_plugins(plugins: &mut Vec<bcode_plugin::StaticBundledPl
     plugins.push(document_plugin());
     #[cfg(feature = "static-bundled-eval-plugin")]
     plugins.push(eval_plugin());
+    #[cfg(feature = "static-bundled-usage-plugin")]
+    plugins.push(bcode_plugin::StaticBundledPlugin::new(
+        include_str!("../../../plugins/usage-plugin/bcode-plugin.toml"),
+        bcode_usage_plugin::static_plugin(),
+    ));
     #[cfg(feature = "static-bundled-metrics-plugin")]
     plugins.push(metrics_plugin());
     #[cfg(feature = "static-bundled-ocr-plugin")]

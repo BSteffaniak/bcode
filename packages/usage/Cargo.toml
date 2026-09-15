@@ -1,0 +1,20 @@
+[package]
+authors     = { workspace = true }
+categories  = ["development-tools"]
+description = "Checked usage aggregation and export for Bcode"
+edition     = { workspace = true }
+keywords    = ["bcode", "usage"]
+license     = { workspace = true }
+name        = "bcode_usage"
+readme      = { workspace = true }
+repository  = { workspace = true }
+version     = { workspace = true }
+
+[dependencies]
+bcode_session_models = { workspace = true }
+bcode_usage_models   = { workspace = true }
+serde_json           = { workspace = true }
+
+[features]
+default          = []
+fail-on-warnings = []
