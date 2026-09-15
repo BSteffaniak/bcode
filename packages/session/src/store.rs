@@ -411,6 +411,44 @@ mod tests {
     }
 
     #[test]
+    fn discovery_retains_directory_formats_without_interpreting_or_repairing_them() {
+        let temp = tempfile::tempdir().expect("root");
+        let root = temp.path();
+        let store = SessionStore::new(root);
+        let mut expected = std::collections::BTreeSet::new();
+        for marker in [
+            b"BCODE_SESSION_DB 1\n".as_slice(),
+            b"BCODE_SESSION_DB 2\n",
+            b"broken",
+        ] {
+            let id = SessionId::new();
+            expected.insert(id);
+            let directory = root.join(id.to_string()).join("session.db");
+            std::fs::create_dir_all(&directory).expect("directory");
+            std::fs::write(directory.join("format"), marker).expect("marker");
+            // Missing inner databases must remain discoverable, not disappear as empty sessions.
+        }
+        let summaries = store
+            .discover_readable_session_summaries()
+            .expect("discover");
+        assert_eq!(
+            summaries
+                .into_iter()
+                .map(|summary| summary.id)
+                .collect::<std::collections::BTreeSet<_>>(),
+            expected
+        );
+        for id in expected {
+            let directory = root.join(id.to_string()).join("session.db");
+            assert!(!directory.join("data.db").exists());
+            assert_eq!(std::fs::read_dir(directory).unwrap().count(), 1);
+        }
+        assert!(!root.join("catalog.db").exists());
+        assert!(!root.join("leases").exists());
+        assert!(!root.join("locks").exists());
+    }
+
+    #[test]
     fn readable_discovery_ignores_directories_that_are_not_session_ids() {
         let temp = tempfile::tempdir().expect("temporary directory");
         let root = temp.path().join("sessions");
