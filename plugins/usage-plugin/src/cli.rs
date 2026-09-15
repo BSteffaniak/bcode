@@ -1,9 +1,8 @@
 //! Structured fallback and explicit maintenance/export CLI.
 use bcode_plugin_sdk::{StaticCliFuture, StaticCliOutcome, StaticCliRegistration};
 use bcode_session_models::{SessionCostRange, SessionId, SessionUsageQuery};
-use bcode_usage_models::{USAGE_VERSION, UsageQuery};
+use bcode_usage_models::{USAGE_VERSION, UsageModel, UsageQuery};
 use clap::{CommandFactory, FromArgMatches, Parser};
-use std::collections::BTreeSet;
 
 #[derive(Debug, Parser)]
 #[command(
@@ -26,7 +25,14 @@ struct UsageCli {
     /// Filter provider IDs (repeatable).
     #[arg(long)]
     provider: Vec<String>,
-    /// Export CSV rather than JSON to stdout; one explicitly requested page.
+    /// Exact provider/model identity (repeatable; split at the first slash).
+    #[arg(long, value_parser = parse_model)]
+    model: Vec<UsageModel>,
+    /// Stream every report page as JSON Lines, or CSV with one header.
+    /// Output is partial on error; only exit status zero means export completed.
+    #[arg(long, conflicts_with = "collect")]
+    all_pages: bool,
+    /// Export CSV rather than JSON to stdout.
     #[arg(long)]
     csv: bool,
     /// Continue a report page using its next_after ordinal.
@@ -37,6 +43,19 @@ struct UsageCli {
     revision: Option<u64>,
 }
 
+fn parse_model(value: &str) -> Result<UsageModel, String> {
+    let (provider, model) = value
+        .split_once('/')
+        .ok_or("model must be provider/model")?;
+    if provider.is_empty() || model.is_empty() || provider.len() > 4096 || model.len() > 4096 {
+        return Err("model must contain nonempty bounded provider and model IDs".into());
+    }
+    Ok(UsageModel {
+        provider: Some(provider.into()),
+        model: Some(model.into()),
+    })
+}
+
 pub fn registration() -> StaticCliRegistration {
     StaticCliRegistration {
         requires_daemon: true,
@@ -44,17 +63,50 @@ pub fn registration() -> StaticCliRegistration {
         invoke,
     }
 }
+fn write_page(
+    report: &bcode_usage_models::UsageReport,
+    csv: bool,
+    stream: bool,
+    first: bool,
+) -> Result<(), String> {
+    use std::io::Write;
+    let output = if csv {
+        let csv = bcode_usage::export_csv(report);
+        if first {
+            csv
+        } else {
+            csv.split_once("\r\n")
+                .map_or(String::new(), |(_, rows)| rows.to_owned())
+        }
+    } else if stream {
+        format!(
+            "{}\n",
+            serde_json::to_string(report).map_err(|_| "usage encoding failed")?
+        )
+    } else {
+        format!(
+            "{}\n",
+            bcode_usage::export_json(report).map_err(|_| "usage encoding failed")?
+        )
+    };
+    let mut stdout = std::io::stdout().lock();
+    stdout
+        .write_all(output.as_bytes())
+        .and_then(|()| stdout.flush())
+        .map_err(|_| "usage export output failed; export is incomplete".into())
+}
+
 fn invoke(matches: clap::ArgMatches) -> StaticCliFuture {
     Box::pin(async move {
         let args = UsageCli::from_arg_matches(&matches).map_err(|error| error.to_string())?;
         let client = bcode_client::BcodeClient::default_endpoint();
-        let query = UsageQuery {
+        let mut query = UsageQuery {
             version: USAGE_VERSION,
             range: SessionCostRange {
                 from_timestamp_ms: args.from_ms,
                 to_timestamp_ms: args.to_ms,
             },
-            models: BTreeSet::new(),
+            models: args.model.into_iter().collect(),
             providers: args.provider.into_iter().collect(),
             session_id: args.session,
             bucket_ms: args.to_ms.saturating_sub(args.from_ms).div_ceil(365).max(1),
@@ -85,18 +137,63 @@ fn invoke(matches: clap::ArgMatches) -> StaticCliFuture {
                 }
             }
         }
-        let report = client
-            .usage_report(query)
-            .await
-            .map_err(|_| "usage query unavailable or changed; restart query")?;
-        if args.csv {
-            print!("{}", bcode_usage::export_csv(&report));
-        } else {
-            println!(
-                "{}",
-                bcode_usage::export_json(&report).map_err(|_| "usage encoding failed")?
-            );
+        let mut first_page = true;
+        loop {
+            let report = client.usage_report(query.clone()).await.map_err(
+                |_| "usage query unavailable or changed; export is incomplete; restart query",
+            )?;
+            write_page(&report, args.csv, args.all_pages, first_page)?;
+            if !args.all_pages {
+                break;
+            }
+            let Some(after) = report.next_after else {
+                break;
+            };
+            if after <= query.after.unwrap_or_default() {
+                return Err("nonadvancing usage cursor; export is incomplete".into());
+            }
+            query.after = Some(after);
+            query.revision = Some(report.revision);
+            first_page = false;
         }
         Ok(StaticCliOutcome::default())
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn model_filters_preserve_exact_identity() {
+        let model = parse_model("provider/family/model:revision").unwrap();
+        assert_eq!(model.provider.as_deref(), Some("provider"));
+        assert_eq!(model.model.as_deref(), Some("family/model:revision"));
+        for value in ["model", "/model", "provider/"] {
+            assert!(parse_model(value).is_err());
+        }
+    }
+    #[test]
+    fn streaming_export_is_explicit_and_generation_fenced() {
+        let matches = UsageCli::command()
+            .try_get_matches_from([
+                "usage",
+                "--to-ms",
+                "100",
+                "--all-pages",
+                "--csv",
+                "--model",
+                "p/a",
+                "--model",
+                "p/b",
+            ])
+            .unwrap();
+        let args = UsageCli::from_arg_matches(&matches).unwrap();
+        assert!(args.all_pages && args.csv);
+        assert_eq!(args.model.len(), 2);
+        assert!(
+            UsageCli::command()
+                .try_get_matches_from(["usage", "--to-ms", "100", "--after", "1"])
+                .is_err()
+        );
+    }
 }

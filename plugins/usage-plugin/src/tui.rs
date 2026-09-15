@@ -179,6 +179,69 @@ impl Dashboard {
                 .collect()
         }
     }
+    fn filter_key(&mut self, key: KeyCode, host: &dyn PluginTuiHost) -> bool {
+        if self.busy {
+            return false;
+        }
+        let selected = self.table.selected().unwrap_or(0);
+        match key {
+            KeyCode::Enter if self.details => {
+                let Some(row) = self
+                    .report
+                    .as_ref()
+                    .and_then(|report| report.requests.get(selected))
+                else {
+                    return false;
+                };
+                self.query.session_id = Some(row.session_id);
+            }
+            KeyCode::Enter => {
+                let Some(row) = self
+                    .report
+                    .as_ref()
+                    .and_then(|report| report.models.get(selected))
+                else {
+                    return false;
+                };
+                self.query.models = BTreeSet::from([row.model.clone()]);
+            }
+            KeyCode::Char('p') if !self.details => {
+                let Some(provider) = self
+                    .report
+                    .as_ref()
+                    .and_then(|report| report.models.get(selected))
+                    .and_then(|row| row.model.provider.clone())
+                else {
+                    return false;
+                };
+                self.query.providers = BTreeSet::from([provider]);
+            }
+            KeyCode::Char('1' | '7' | '3') => {
+                let days = match key {
+                    KeyCode::Char('1') => 1,
+                    KeyCode::Char('7') => 7,
+                    _ => 30,
+                };
+                self.query.range.from_timestamp_ms = self
+                    .query
+                    .range
+                    .to_timestamp_ms
+                    .saturating_sub(days * 86_400_000);
+            }
+            KeyCode::Char('a') => {
+                self.query.models.clear();
+                self.query.providers.clear();
+                self.query.session_id = None;
+            }
+            _ => return false,
+        }
+        self.query.after = None;
+        self.query.revision = None;
+        self.table = TableState::default();
+        self.refresh(host);
+        true
+    }
+
     const fn columns(&self) -> [TableColumn<'static>; 3] {
         if self.details {
             [
@@ -210,7 +273,11 @@ impl PluginTuiSurface for Dashboard {
             area.width,
             area.height.saturating_sub(3),
         );
-        for (index, text) in ["Usage | UTC last 30 days | PAGE SUBTOTALS, not all-time totals", self.status.as_str(), "r refresh  c collect  n next  Enter filter model  a all  d requests  j JSON  x CSV  q close"].into_iter().enumerate() {
+        let heading = format!(
+            "Usage | UTC {}..{} | PAGE SUBTOTALS",
+            self.query.range.from_timestamp_ms, self.query.range.to_timestamp_ms
+        );
+        for (index, text) in [heading.as_str(), self.status.as_str(), "r refresh c collect n next Enter drill-down p provider a all 1/7/3 days d requests j JSON x CSV q close"].into_iter().enumerate() {
             let row = u16::try_from(index).unwrap_or_default();
             if row < area.height { frame.write_line_with_fallback_style(LocalRect::terminal(Rect::new(area.x, area.y + row, area.width, 1)), &Line::from(text), Style::new()); }
         }
@@ -280,6 +347,9 @@ impl PluginTuiSurface for Dashboard {
     fn handle_event(&mut self, event: &Event, host: &dyn PluginTuiHost) -> PluginTuiAction {
         self.receive();
         if let Event::Key(stroke) = event {
+            if self.filter_key(stroke.key, host) {
+                return PluginTuiAction::Redraw;
+            }
             match stroke.key {
                 KeyCode::Escape | KeyCode::Char('q') => {
                     return PluginTuiAction::Close { outcome: None };
@@ -314,24 +384,6 @@ impl PluginTuiSurface for Dashboard {
                     } else {
                         self.status = "Open /usage from a session to collect it".into();
                     }
-                }
-                KeyCode::Enter if !self.details && !self.busy => {
-                    if let Some(model) = self
-                        .report
-                        .as_ref()
-                        .and_then(|report| report.models.get(self.table.selected().unwrap_or(0)))
-                    {
-                        self.query.models = BTreeSet::from([model.model.clone()]);
-                        self.query.after = None;
-                        self.query.revision = None;
-                        self.refresh(host);
-                    }
-                }
-                KeyCode::Char('a') if !self.busy => {
-                    self.query.models.clear();
-                    self.query.after = None;
-                    self.query.revision = None;
-                    self.refresh(host);
                 }
                 KeyCode::Char('d') => {
                     self.details = !self.details;
