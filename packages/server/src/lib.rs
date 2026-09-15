@@ -5063,6 +5063,14 @@ fn workflow_store_error_response(error: &WorkflowStoreError) -> ErrorResponse {
         WorkflowStoreError::InvalidRunTransition { .. } => {
             return ErrorResponse::new("workflow_invalid_transition", error.to_string());
         }
+        WorkflowStoreError::ActiveBindingConflict { status, .. } => {
+            return ErrorResponse::new(
+                "workflow_active_binding_conflict",
+                format!(
+                    "cannot start another workflow: the existing workflow is {status}; inspect it and explicitly resolve it first"
+                ),
+            );
+        }
         WorkflowStoreError::CancellationPreventsControl => (
             "workflow_cancellation_prevents_control",
             "workflow cancellation prevents the requested state change",
@@ -30109,7 +30117,11 @@ async fn observe_workflow_turn(
             next_cursor: None,
             has_more: false,
         },
-        Err(error) => return Err(WorkflowStoreError::InvalidData(error.to_string())),
+        Err(_) => {
+            return Ok(bcode_workflow_store::AttemptObservation::Deferred {
+                reason: "session history unavailable for bounded outcome observation".into(),
+            });
+        }
     };
     let terminal = page
         .events
@@ -30124,56 +30136,56 @@ async fn observe_workflow_turn(
             _ => None,
         });
     let Some((outcome, message, terminal_at_ms)) = terminal else {
-        return Ok(bcode_workflow_store::AttemptObservation::Running);
+        return Ok(bcode_workflow_store::AttemptObservation::Deferred {
+            reason: "terminal outcome not established by bounded session observation".into(),
+        });
     };
     match outcome {
         ModelTurnOutcome::Completed => {
-            let output = workflow_turn_output(&page.events, turn_id);
-            let output = output.ok_or_else(|| {
-                WorkflowStoreError::InvalidData(
-                    "completed workflow prompt turn has no assistant output".to_string(),
-                )
-            })?;
-            // Each store access takes and releases the lock in its own scope. Chaining the lookups
-            // through combinators would keep the first guard alive while the closure locks the same
-            // non-reentrant mutex again, which self-deadlocks.
-            let run = {
-                let store = state
-                    .workflow_store
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner);
-                store.run_summary(&request.run_id)?
-            }
-            .ok_or_else(|| WorkflowStoreError::InvalidData("workflow run not found".to_string()))?;
-            let stored_definition = {
-                let store = state
-                    .workflow_store
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner);
-                store.definition(&run.definition_id, run.definition_version)?
-            };
-            let output_schema = stored_definition
-                .map(|stored| {
-                    serde_json::from_str::<bcode_workflow::WorkflowDefinition>(
-                        &stored.definition_json,
-                    )
-                })
-                .transpose()?
-                .and_then(|definition| definition.node(&request.node_id).cloned())
-                .map(|node| node.output)
-                .ok_or_else(|| {
+            let intent = state
+                .workflow_store
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .dispatch_intent(&request.dispatch_identity)?;
+            let configuration =
+                workflow_prompt_configuration(intent.get("configuration").ok_or_else(|| {
                     WorkflowStoreError::InvalidData(
-                        "workflow prompt output schema not found".to_string(),
+                        "admitted prompt configuration is missing".into(),
                     )
-                })?;
-            let validator = jsonschema::validator_for(&output_schema.schema)
-                .map_err(|error| WorkflowStoreError::InvalidData(error.to_string()))?;
-            let output =
-                bcode_model_provider_runtime::extract_structured_json_candidate(&output, |value| {
-                    validator.is_valid(value)
-                        && validate_workflow_output_semantics(&output_schema, value).is_ok()
-                })
-                .map_err(WorkflowStoreError::InvalidData)?;
+                })?)?;
+            let node: bcode_workflow::NodeDefinition =
+                serde_json::from_value(intent.get("node").cloned().ok_or_else(|| {
+                    WorkflowStoreError::InvalidData("admitted prompt node is missing".into())
+                })?)?;
+            let output_schema = node.output;
+            let output = match configuration.output {
+                bcode_workflow::WorkflowPromptOutputPolicy::PreserveInput => intent
+                    .get("input")
+                    .filter(|value| !value.is_null())
+                    .cloned()
+                    .ok_or_else(|| {
+                        WorkflowStoreError::InvalidData(
+                            "input-preserving workflow prompt has no activation input".into(),
+                        )
+                    })?,
+                bcode_workflow::WorkflowPromptOutputPolicy::Structured { .. } => {
+                    let output = workflow_turn_output(&page.events, turn_id).ok_or_else(|| {
+                        WorkflowStoreError::InvalidData(
+                            "completed workflow prompt turn has no assistant output".into(),
+                        )
+                    })?;
+                    let validator = jsonschema::validator_for(&output_schema.schema)
+                        .map_err(|error| WorkflowStoreError::InvalidData(error.to_string()))?;
+                    bcode_model_provider_runtime::extract_structured_json_candidate(
+                        &output,
+                        |value| {
+                            validator.is_valid(value)
+                                && validate_workflow_output_semantics(&output_schema, value).is_ok()
+                        },
+                    )
+                    .map_err(WorkflowStoreError::InvalidData)?
+                }
+            };
             if let Err(error) = output_schema.validate_value("workflow prompt output", &output) {
                 return Ok(bcode_workflow_store::AttemptObservation::Failed {
                     message: format!("workflow prompt output failed schema validation: {error}"),
@@ -31562,7 +31574,11 @@ async fn observe_existing_workflow_agent_turn(
         &reconciliation,
     )
     .await?;
-    if initial != bcode_workflow_store::AttemptObservation::Running {
+    if !matches!(
+        initial,
+        bcode_workflow_store::AttemptObservation::Running
+            | bcode_workflow_store::AttemptObservation::Deferred { .. }
+    ) {
         return Ok(initial);
     }
 
@@ -62520,7 +62536,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
                     &pending.node_id,
                     &pending.activation_id,
                     bcode_workflow::DispatchSideEffect::ReadOnly,
-                    serde_json::json!({"owner": "test"}),
+                    serde_json::json!({"owner": "test", "node": pending.node, "input": pending.input, "configuration": pending.node.configuration}),
                     2,
                 )
                 .expect("prepare")
@@ -62834,7 +62850,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
                     &pending.node_id,
                     &pending.activation_id,
                     bcode_workflow::DispatchSideEffect::ReadOnly,
-                    serde_json::json!({"owner": "test"}),
+                    serde_json::json!({"owner": "test", "node": pending.node, "input": pending.input, "configuration": pending.node.configuration}),
                     2,
                 )
                 .expect("prepare")
@@ -63432,7 +63448,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
                     &pending.node_id,
                     &pending.activation_id,
                     bcode_workflow::DispatchSideEffect::ReadOnly,
-                    serde_json::json!({"owner": "test"}),
+                    serde_json::json!({"owner": "test", "node": pending.node, "input": pending.input, "configuration": pending.node.configuration}),
                     2,
                 )
                 .expect("prepare")
@@ -63811,7 +63827,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
             },
         ];
 
-        for (index, scenario) in scenarios.into_iter().enumerate() {
+        for (index, scenario) in scenarios.iter().chain(scenarios.first()).enumerate() {
             let sessions = SessionManager::default();
             let parent = sessions
                 .create_session(Some("loop parent".to_string()), PathBuf::from("."))
@@ -63845,12 +63861,20 @@ event_symbol = "bcode_plugin_handle_event_v1"
                         input: schema.clone(),
                         output: schema.clone(),
                         resources: Vec::new(),
-                        // Reconciliation parses this as a versioned `WorkflowPromptConfiguration`,
-                        // so it must be the real contract rather than an ad-hoc object.
-                        configuration: test_workflow_prompt_configuration(
-                            schema,
-                            bcode_workflow::PromptContextTarget::FreshIsolated,
-                        ),
+                        // Exercise the same admitted output policy used by the loop plugin.
+                        configuration: {
+                            let mut configuration = test_workflow_prompt_configuration(
+                                schema,
+                                bcode_workflow::PromptContextTarget::FreshIsolated,
+                            );
+                            if index == scenarios.len() {
+                                configuration["output"] = serde_json::to_value(
+                                    bcode_workflow::WorkflowPromptOutputPolicy::PreserveInput,
+                                )
+                                .unwrap();
+                            }
+                            configuration
+                        },
                     },
                 )]),
                 entries: vec!["loop.implementation".to_string()],
@@ -63894,7 +63918,8 @@ event_symbol = "bcode_plugin_handle_event_v1"
                     &pending.node_id,
                     &pending.activation_id,
                     bcode_workflow::DispatchSideEffect::ReadOnly,
-                    serde_json::json!({"owner": "test"}),
+                    serde_json::json!({"owner": "test", "node": pending.node,
+                        "input": pending.input, "configuration": pending.node.configuration}),
                     2,
                 )
                 .expect("prepare")
@@ -63924,7 +63949,11 @@ event_symbol = "bcode_plugin_handle_event_v1"
                 sessions
                     .append_assistant_message(
                         child.id,
-                        serde_json::json!({"condition_met": true}).to_string(),
+                        if index == scenarios.len() {
+                            "Implementation completed; this is prose, not workflow JSON.".into()
+                        } else {
+                            serde_json::json!({"condition_met": true}).to_string()
+                        },
                     )
                     .await
                     .expect("output");

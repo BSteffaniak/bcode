@@ -857,6 +857,11 @@ pub enum WorkflowStoreError {
         current: RunStatus,
         target: RunStatus,
     },
+    /// A single-active binding is occupied by a nonterminal run.
+    #[error(
+        "workflow binding is occupied by run {run_id} ({status}); inspect and explicitly resolve that run before starting another"
+    )]
+    ActiveBindingConflict { run_id: String, status: RunStatus },
     /// A durable cancellation request prevents further lifecycle changes.
     #[error("workflow cancellation prevents run state changes")]
     CancellationPreventsControl,
@@ -10947,6 +10952,30 @@ impl WorkflowStore {
             .collect()
     }
 
+    /// Read one exact admitted dispatch intent, verifying its bounded representation and checksum.
+    ///
+    /// # Errors
+    /// Returns an error for missing, oversized, corrupt, or invalid intent data.
+    pub fn dispatch_intent(&self, identity: &str) -> Result<serde_json::Value, WorkflowStoreError> {
+        validate_id("dispatch_identity", identity)?;
+        let (json, checksum): (Option<String>, String) = self.connection.query_row(
+            "SELECT CASE WHEN typeof(intent_json) = 'text' \
+             AND length(CAST(intent_json AS BLOB)) <= ?2 THEN intent_json END, intent_checksum \
+             FROM workflow_attempts WHERE dispatch_identity = ?1",
+            (identity, MAX_INLINE_JSON_BYTES),
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+        let json = json.ok_or_else(|| {
+            WorkflowStoreError::InvalidData("invalid dispatch intent size or type".into())
+        })?;
+        if sha256_hex(json.as_bytes()) != checksum {
+            return Err(WorkflowStoreError::InvalidData(
+                "dispatch intent checksum mismatch".into(),
+            ));
+        }
+        Ok(serde_json::from_str(&json)?)
+    }
+
     /// Look up one attempt by its indexed dispatch identity and verify its coordinates.
     ///
     /// # Errors
@@ -11146,13 +11175,21 @@ fn settle_output_successors<F: WorkflowOutputFault + ?Sized>(
     .is_some_and(|settlement| settlement.run_failed);
     fault.after_boundary(WorkflowOutputBoundary::SuccessorsMaterialized, output)?;
     let has_unfinished = run_has_unfinished_activations(transaction, &output.run_id)?;
+    let current_status = transaction.query_row(
+        "SELECT status FROM workflow_runs WHERE run_id = ?1",
+        [&output.run_id],
+        |row| decode_run_status(row, 0),
+    )?;
     let run_status = if parallel_failure {
         RunStatus::Failed
-    } else if !has_unfinished && completed_is_exit {
+    } else if !has_unfinished
+        && completed_is_exit
+        && matches!(current_status, RunStatus::Running | RunStatus::Paused)
+    {
         transaction.execute(
             "UPDATE workflow_runs SET status = 'completed', terminal_output_id = ?3, \
              terminal_output_checksum_sha256 = ?4, updated_at_ms = ?2 \
-             WHERE run_id = ?1 AND status = 'running'",
+             WHERE run_id = ?1 AND status IN ('running', 'paused')",
             (
                 &output.run_id,
                 output.created_at_ms,
@@ -11169,7 +11206,7 @@ fn settle_output_successors<F: WorkflowOutputFault + ?Sized>(
         )?;
         RunStatus::Completed
     } else {
-        RunStatus::Running
+        current_status
     };
     Ok(OutputPersistenceResult {
         completed_activation_id: output.activation_id.clone(),
@@ -12187,7 +12224,8 @@ fn materialize_selected_successors(
             input: Some(input),
             created_at_ms: output.created_at_ms,
         };
-        enforce_activation_limits(transaction, &activation)?;
+        // Completion may materialize pending work while paused; attempt admission remains fenced.
+        enforce_activation_materialization_limits(transaction, &activation, true)?;
         let status = activation_status_for_node(target);
         let changed = transaction.execute(
             "INSERT INTO workflow_activations \
@@ -13263,6 +13301,17 @@ fn apply_attempt_observation(
                         reconciled_at_ms,
                     ),
                 )?;
+                append_event(
+                    transaction,
+                    &request.run_id,
+                    "attempt_repair_required",
+                    &serde_json::json!({
+                        "dispatch_identity": request.dispatch_identity,
+                        "reason": "operation_outcome_unproven",
+                    })
+                    .to_string(),
+                    reconciled_at_ms,
+                )?;
                 summary
                     .repair_required
                     .push(request.dispatch_identity.clone());
@@ -13890,6 +13939,14 @@ fn enforce_activation_limits(
     connection: &Connection,
     activation: &NewActivation,
 ) -> Result<(), WorkflowStoreError> {
+    enforce_activation_materialization_limits(connection, activation, false)
+}
+
+fn enforce_activation_materialization_limits(
+    connection: &Connection,
+    activation: &NewActivation,
+    settling_admitted_work: bool,
+) -> Result<(), WorkflowStoreError> {
     let (cycle_cap, status, cancellation_requested, deadline_at_ms): (
         u32,
         RunStatus,
@@ -13909,7 +13966,9 @@ fn enforce_activation_limits(
         },
     )?;
     let status = status.as_str();
-    if status != RunStatus::Running.as_str() {
+    if status != RunStatus::Running.as_str()
+        && !(settling_admitted_work && status == RunStatus::Paused.as_str())
+    {
         return Err(WorkflowStoreError::InvalidData(format!(
             "workflow run does not accept activations while {status}"
         )));
@@ -15214,9 +15273,9 @@ fn create_run_in_transaction_diagnosed(
         && binding.single_active
     {
         *operation = "check_single_active_binding";
-        let active: Option<String> = transaction
+        let active: Option<(String, RunStatus)> = transaction
             .query_row(
-                "SELECT run_id FROM workflow_runs WHERE owner_plugin_id = ?1 \
+                "SELECT run_id, status FROM workflow_runs WHERE owner_plugin_id = ?1 \
                      AND workflow_kind = ?2 AND scope_key = ?3 \
                      AND status IN ('running', 'paused', 'repair_required') \
                      ORDER BY updated_at_ms DESC, run_id LIMIT 1",
@@ -15225,13 +15284,11 @@ fn create_run_in_transaction_diagnosed(
                     &binding.workflow_kind,
                     &binding.scope_key,
                 ),
-                |row| row.get(0),
+                |row| Ok((row.get(0)?, decode_run_status(row, 1)?)),
             )
             .optional()?;
-        if let Some(active) = active {
-            return Err(WorkflowStoreError::InvalidData(format!(
-                "workflow binding already has an active run: {active}"
-            )));
+        if let Some((run_id, status)) = active {
+            return Err(WorkflowStoreError::ActiveBindingConflict { run_id, status });
         }
     }
     *operation = "read_definition";
@@ -18533,7 +18590,10 @@ mod tests {
             ..run.clone()
         };
         let error = store.create_run(&conflict).expect_err("single active");
-        assert!(error.to_string().contains("already has an active run"));
+        assert!(matches!(
+            error,
+            WorkflowStoreError::ActiveBindingConflict { .. }
+        ));
 
         assert!(store.pause_run(&run.run_id, 12).expect("pause"));
         assert!(store.resume_run(&run.run_id, 13).expect("resume"));
@@ -38237,6 +38297,64 @@ mod tests {
                 .expect("summary")
                 .expect("run")
                 .status,
+            RunStatus::Completed
+        );
+    }
+
+    #[test]
+    fn paused_completion_materializes_successor_without_admitting_execution() {
+        let temp = tempfile::tempdir().expect("temp");
+        let mut store = WorkflowStore::open_in_state_dir(temp.path()).expect("store");
+        store
+            .persist_definition("sequential", 1, &sequential_definition())
+            .unwrap();
+        let mut run = new_run();
+        run.definition_id = "sequential".into();
+        store.create_run(&run).unwrap();
+        store.pause_run(&run.run_id, 15).unwrap();
+        let result = store
+            .persist_validated_output(&ValidatedOutput {
+                output_id: "paused-first".into(),
+                run_id: run.run_id.clone(),
+                node_id: "first".into(),
+                activation_id: activation_identity(&run.run_id, "first", 0),
+                schema_id: "u32".into(),
+                schema_version: 1,
+                value: serde_json::json!(2),
+                artifact_reference: None,
+                created_at_ms: 20,
+            })
+            .unwrap();
+        assert_eq!(result.run_status, RunStatus::Paused);
+        assert_eq!(result.activated.len(), 1);
+        assert!(store.pending_activations(10).unwrap().is_empty());
+        drop(store);
+        let mut store = WorkflowStore::open_in_state_dir(temp.path()).unwrap();
+        assert_eq!(
+            store.run_summary(&run.run_id).unwrap().unwrap().status,
+            RunStatus::Paused
+        );
+        store.resume_run(&run.run_id, 21).unwrap();
+        let pending = store.pending_activations(10).unwrap();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].node_id, "second");
+        store.pause_run(&run.run_id, 22).unwrap();
+        let result = store
+            .persist_validated_output(&ValidatedOutput {
+                output_id: "paused-second".into(),
+                run_id: run.run_id.clone(),
+                node_id: "second".into(),
+                activation_id: activation_identity(&run.run_id, "second", 0),
+                schema_id: "u32".into(),
+                schema_version: 1,
+                value: serde_json::json!(3),
+                artifact_reference: None,
+                created_at_ms: 23,
+            })
+            .unwrap();
+        assert_eq!(result.run_status, RunStatus::Completed);
+        assert_eq!(
+            store.run_summary(&run.run_id).unwrap().unwrap().status,
             RunStatus::Completed
         );
     }

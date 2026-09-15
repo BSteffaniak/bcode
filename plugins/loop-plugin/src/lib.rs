@@ -313,18 +313,32 @@ fn status_for_session(session_id: SessionId) -> InvokeCommandResponse {
     }
 }
 
+fn format_control_outcome(
+    run: &bcode_workflow_store::WorkflowRunSummary,
+    action: bcode_ipc::WorkflowRunControlAction,
+    changed: bool,
+) -> String {
+    use bcode_ipc::WorkflowRunControlAction as Action;
+    use bcode_workflow_store::RunStatus as Status;
+    let verb = match (action, run.status) {
+        (Action::Resume, Status::Running) => Some("resumed"),
+        (Action::Pause, Status::Paused) => Some("paused"),
+        (Action::Cancel, Status::Running | Status::Paused) => Some("cancellation requested"),
+        _ => None,
+    };
+    if changed && let Some(verb) = verb {
+        format!("loop workflow {} {verb}", run.run_id)
+    } else {
+        format_workflow_status(run)
+    }
+}
+
 fn control_loop(
     session_id: SessionId,
     action: bcode_ipc::WorkflowRunControlAction,
 ) -> InvokeCommandResponse {
-    let verb = match action {
-        bcode_ipc::WorkflowRunControlAction::Pause => "paused",
-        bcode_ipc::WorkflowRunControlAction::Resume => "resumed",
-        bcode_ipc::WorkflowRunControlAction::Cancel => "cancellation requested",
-    };
     match control_associated_workflow_run(session_id, action) {
-        Ok((Some(run), true)) => status_response(&format!("loop workflow {} {verb}", run.run_id)),
-        Ok((Some(run), false)) => status_response(&format_workflow_status(&run)),
+        Ok((Some(run), changed)) => status_response(&format_control_outcome(&run, action, changed)),
         Ok((None, _)) if legacy_state_exists(session_id) => {
             status_response(unsupported_legacy_message())
         }
@@ -1862,6 +1876,10 @@ mod tests {
             format_workflow_status(&run)
                 .contains("repair required because recovery could not prove")
         );
+        let message =
+            format_control_outcome(&run, bcode_ipc::WorkflowRunControlAction::Resume, true);
+        assert!(message.contains("repair required"));
+        assert!(!message.contains("resumed"));
     }
 
     #[test]

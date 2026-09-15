@@ -14,6 +14,25 @@ candidate against all execution state, publish topology, cancel activations, or 
 A staged candidate is not permission to execute it. General live-edit publication remains incomplete;
 do not expect this command alone to change the running plan. Draft authoring remains separate.
 
+## Pause, resume, and binding conflicts
+
+Pause blocks new attempt admission, not settlement of already-admitted work. Completion may
+persist output and pending successors while paused; those successors cannot execute until resume.
+A final admitted operation may complete the run while paused. Control responses describe the
+post-operation run status, including immediate repair-required or terminal outcomes.
+
+Agent-turn recovery reads the checksummed admitted dispatch intent. Input-preserving operations
+recover their input after proven turn completion; prose is not interpreted as structured output.
+Missing terminal evidence in the bounded history window defers observation rather than proving
+running or failed state. Exact lookup of older outcomes remains incomplete.
+
+A single-active binding includes repair-required runs. Starting a replacement returns
+`workflow_active_binding_conflict`, not a storage-unavailable error. Existing ambiguous attempts
+still require explicit ownership-verified maintenance; installing these fixes does not repair them.
+Receipt reconciliation records `attempt_repair_required` with normalized reason
+`operation_outcome_unproven`. Doctor checks structural consistency: an empty issues list alone
+does not establish executability; inspect the run and attempt statuses too.
+
 ## Bounded status and history
 
 Normal workflow list, status, inspect, and history operations are read-only and bounded. They query normalized projections and never replay the complete workflow event log, contact external owners, or perform repair.
