@@ -3695,9 +3695,27 @@ impl SessionDb {
             .where_eq("reference_key", reference_key)
             .execute_first(&**self.db)
             .await?;
-        row.as_ref()
+        let mut reference = row
+            .as_ref()
             .map(finalized_artifact_reference_from_row)
-            .transpose()
+            .transpose()?;
+        if let Some(reference) = &mut reference {
+            // Old projections stored plugin-defined checksums without scope. Resolve the explicit
+            // whole-content contract from exactly one canonical event, without repairing indexes.
+            let events = self
+                .events_range(
+                    reference.finalized_event_seq,
+                    reference.finalized_event_seq,
+                    1,
+                )
+                .await?;
+            reference.checksum_sha256 = crate::db_artifact::whole_content_checksum(
+                events.first(),
+                artifact_id,
+                reference_key,
+            )?;
+        }
+        Ok(reference)
     }
 
     /// Return the latest transcript projection rows as generic database rows for callers that
@@ -11468,16 +11486,6 @@ mod tests {
         let db = SessionDb::open_turso_in_root(id, root.path())
             .await
             .expect("database");
-        db.append_event(&event(
-            id,
-            0,
-            SessionEventKind::SessionCreated {
-                name: None,
-                working_directory: root.path().to_path_buf(),
-            },
-        ))
-        .await
-        .expect("created");
         let invocation = "a".repeat(64);
         let artifact = "b".repeat(64);
         let artifact_root = root.path().join("session-artifacts").join(id.to_string());
@@ -11486,24 +11494,30 @@ mod tests {
         let path = parent.join(format!("{artifact}.bin"));
         let bytes = b"terminal output\n".repeat(100_000);
         std::fs::write(&path, &bytes).expect("raw");
+        db.append_event(&event(id, 0, SessionEventKind::ToolInvocationResultRecorded {
+            record: bcode_session_models::ToolInvocationResultRecord {
+                invocation_id: "fixture".into(), model_output: "done".into(), is_error: false,
+                presentation: None, content: vec![], result: Some(bcode_session_models::ToolInvocationResult::Artifact {
+                    artifact: Box::new(bcode_session_models::ToolArtifact {
+                        artifact_id: "artifact".into(), producer_plugin_id: "fixture".into(), schema: "fixture".into(),
+                        schema_version: 1, tool_call_id: None, title: None, metadata: serde_json::Value::Null,
+                        refs: vec![bcode_session_models::ToolArtifactRef {
+                            key: "recording".into(), content_type: None,
+                            storage_uri: Some(format!("bcode-artifact://invocation/{invocation}/{artifact}")),
+                            byte_len: Some(bytes.len() as u64),
+                            metadata: Some(serde_json::json!({"complete": true, "availability": "complete", "checksum_sha256": "0".repeat(64)})),
+                        }],
+                    }),
+                }),
+            },
+        })).await.expect("canonical artifact");
+        // Simulate an existing projection produced before checksum scope was distinguished.
         db.database()
-            .insert("artifact_references")
-            .value("artifact_id", "artifact")
-            .value("reference_key", "recording")
-            .value("producer_plugin_id", "fixture")
-            .value("schema", "fixture")
-            .value("schema_version", 1)
-            .value("complete", true)
-            .value("availability", "complete")
-            .value("byte_len", i64::try_from(bytes.len()).expect("length"))
-            .value(
-                "storage_uri",
-                format!("bcode-artifact://invocation/{invocation}/{artifact}"),
-            )
-            .value("finalized_event_seq", 0)
+            .update("artifact_references")
+            .value("checksum_sha256", "0".repeat(64))
             .execute(db.database())
             .await
-            .expect("reference");
+            .expect("old projection");
         db.database()
             .update("events")
             .value("created_at_ms", 1_000_000_i64)
@@ -12374,7 +12388,7 @@ mod tests {
         assert_eq!(reference.finalized_event_seq, 1);
         assert_eq!(reference.availability.as_deref(), Some("complete"));
         assert_eq!(reference.complete, Some(true));
-        assert_eq!(reference.checksum_sha256.as_deref(), Some("abc123"));
+        assert_eq!(reference.checksum_sha256, None);
         assert!(
             db.finalized_artifact_reference("artifact-1", "missing")
                 .await

@@ -1,5 +1,20 @@
 # Session storage tiering
 
+## Artifact checksum scope
+
+Reference metadata `content_checksum_sha256` is an optional SHA-256 digest of the entire logical
+artifact byte stream, before storage compression. When present it must be a 64-digit hexadecimal
+string; malformed or mismatching values fail closed. Plugin metadata `checksum_sha256` has no
+generic whole-content meaning. In shell recordings it remains the digest of output frames only;
+new shell references also publish `content_checksum_sha256` for the finalized recording file.
+
+Existing projection checksum columns may contain ambiguous plugin digests. Bounded reference
+lookup resolves the explicit checksum from the single canonical finalization event, rejecting
+missing or inconsistent references; it does not rewrite history, repair indexes, or replay logs.
+Older references without the explicit whole-content field have no producer-provided full-file
+digest. Compression still verifies original/candidate byte equivalence and container integrity
+before publication; it does not claim to validate the producer's internal recording semantics.
+
 ## Session-scoped coordination
 
 Reads and compression now coordinate through

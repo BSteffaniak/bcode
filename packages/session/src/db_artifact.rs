@@ -55,10 +55,56 @@ pub fn generic_artifact_reference_metadata(
         .and_then(|metadata| metadata.get("complete"))
         .and_then(serde_json::Value::as_bool);
     let checksum_sha256 = metadata
-        .and_then(|metadata| metadata.get("checksum_sha256"))
+        .and_then(|metadata| metadata.get("content_checksum_sha256"))
         .and_then(serde_json::Value::as_str)
         .map(ToOwned::to_owned);
     (availability, complete, checksum_sha256)
+}
+
+/// Resolve an explicitly scoped full logical-content checksum from canonical finalization.
+/// Plugin-defined `checksum_sha256` metadata never implies whole-file semantics.
+pub fn whole_content_checksum(
+    event: Option<&bcode_session_models::SessionEvent>,
+    artifact_id: &str,
+    reference_key: &str,
+) -> SessionDbResult<Option<String>> {
+    let invalid = || SessionDbError::InvalidRow {
+        column: "artifact.content_checksum_sha256".into(),
+    };
+    let Some(bcode_session_models::SessionEvent {
+        kind: bcode_session_models::SessionEventKind::ToolInvocationResultRecorded { record },
+        ..
+    }) = event
+    else {
+        return Err(invalid());
+    };
+    let Some(bcode_session_models::ToolInvocationResult::Artifact { artifact }) = &record.result
+    else {
+        return Err(invalid());
+    };
+    if artifact.artifact_id != artifact_id {
+        return Err(invalid());
+    }
+    let mut references = artifact
+        .refs
+        .iter()
+        .filter(|reference| reference.key == reference_key);
+    let reference = references.next().ok_or_else(invalid)?;
+    if references.next().is_some() {
+        return Err(invalid());
+    }
+    let Some(value) = reference
+        .metadata
+        .as_ref()
+        .and_then(|m| m.get("content_checksum_sha256"))
+    else {
+        return Ok(None);
+    };
+    let checksum = value.as_str().ok_or_else(invalid)?;
+    if checksum.len() != 64 || !checksum.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return Err(invalid());
+    }
+    Ok(Some(checksum.to_owned()))
 }
 
 pub fn finalized_artifact_reference_from_row(
@@ -82,4 +128,61 @@ pub fn finalized_artifact_reference_from_row(
         checksum_sha256: optional_string(row, "checksum_sha256"),
         finalized_event_seq: required_i64(row, "finalized_event_seq").map(i64_to_u64)?,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn only_explicit_whole_content_digest_is_enforced() {
+        use bcode_session_models::*;
+        let mut artifact = ToolArtifact {
+            artifact_id: "a".into(),
+            producer_plugin_id: "any-plugin".into(),
+            schema: "any".into(),
+            schema_version: 1,
+            tool_call_id: None,
+            title: None,
+            metadata: serde_json::Value::Null,
+            refs: vec![ToolArtifactRef {
+                key: "r".into(),
+                content_type: None,
+                storage_uri: None,
+                byte_len: None,
+                metadata: Some(serde_json::json!({"checksum_sha256": "plugin-specific"})),
+            }],
+        };
+        let make_event = |artifact| SessionEvent {
+            schema_version: CURRENT_SESSION_EVENT_SCHEMA_VERSION,
+            provenance: None,
+            session_id: SessionId::new(),
+            sequence: 0,
+            timestamp_ms: 0,
+            kind: SessionEventKind::ToolInvocationResultRecorded {
+                record: ToolInvocationResultRecord {
+                    invocation_id: "i".into(),
+                    model_output: String::new(),
+                    is_error: false,
+                    presentation: None,
+                    content: vec![],
+                    result: Some(ToolInvocationResult::Artifact {
+                        artifact: Box::new(artifact),
+                    }),
+                },
+            },
+        };
+        assert_eq!(
+            whole_content_checksum(Some(&make_event(artifact.clone())), "a", "r").unwrap(),
+            None
+        );
+        artifact.refs[0].metadata =
+            Some(serde_json::json!({"content_checksum_sha256": "a".repeat(64)}));
+        assert_eq!(
+            whole_content_checksum(Some(&make_event(artifact.clone())), "a", "r").unwrap(),
+            Some("a".repeat(64))
+        );
+        artifact.refs[0].metadata = Some(serde_json::json!({"content_checksum_sha256": 123}));
+        assert!(whole_content_checksum(Some(&make_event(artifact)), "a", "r").is_err());
+    }
 }

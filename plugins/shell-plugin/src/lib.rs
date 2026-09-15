@@ -2448,6 +2448,7 @@ fn finalize_recording(
         .recording_path
         .as_deref()
         .ok_or_else(|| "recording writer had no final path".to_owned())?;
+    let content_checksum = recording_content_checksum(path).map_err(|error| error.to_string())?;
     Ok(Some(ToolArtifactRef {
         key: SHELL_RECORDING_REF_KEY.to_owned(),
         content_type: Some(SHELL_RECORDING_CONTENT_TYPE.to_owned()),
@@ -2462,12 +2463,29 @@ fn finalize_recording(
             "frame_count": summary.frame_count,
             "output_bytes": summary.output_bytes,
             "checksum_sha256": summary.checksum_sha256,
+            "content_checksum_sha256": content_checksum,
             "availability": "complete",
             "complete": true,
             "retention": "session_lifetime",
             "eviction": "none",
         })),
     }))
+}
+
+fn recording_content_checksum(path: &Path) -> std::io::Result<String> {
+    use sha2::{Digest as _, Sha256};
+    use std::io::Read as _;
+    let mut file = std::fs::File::open(path)?;
+    let mut checksum = Sha256::new();
+    let mut buffer = [0_u8; 16 * 1024];
+    loop {
+        let count = file.read(&mut buffer)?;
+        if count == 0 {
+            break;
+        }
+        checksum.update(&buffer[..count]);
+    }
+    Ok(format!("{:x}", checksum.finalize()))
 }
 
 fn clean_artifact_ref(path: &Path, output: &LimitedOutput) -> ToolArtifactRef {
