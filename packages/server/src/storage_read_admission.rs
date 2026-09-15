@@ -20,15 +20,10 @@ impl RegisteredStorageRead {
     ///
     /// A failure is reported as `None`; automatic scheduling must remain disabled unless a caller
     /// has independently fenced unregistered reads. This adapter does not grant such a fence.
-    pub async fn for_session(state: &super::ServerState, session_id: SessionId) -> Option<Self> {
+    pub async fn for_session(state: &super::ServerState, _session_id: SessionId) -> Option<Self> {
         let root = state.sessions.session_store_root()?;
-        if !root
-            .join(session_id.to_string())
-            .join("session.db")
-            .is_file()
-        {
-            return None;
-        }
+        // Register before lookup: existence can change, and metadata failure is not proof that
+        // this operation cannot consume persistent content.
         let fallback_root = root.clone();
         if let Ok(admission) = Self::begin(root).await {
             return Some(admission);
@@ -152,6 +147,23 @@ pub(super) async fn block_unregistered_reads(state: &super::ServerState, root: P
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn missing_session_still_registers_before_storage_lookup() {
+        let root = tempfile::tempdir().expect("root");
+        let sessions = bcode_session::SessionManager::persistent(root.path()).expect("manager");
+        let state = crate::tests::test_server_state(sessions);
+        let id = SessionId::new();
+        let read = RegisteredStorageRead::for_session(&state, id)
+            .await
+            .expect("admitted");
+        let registry = StorageAdmissionRegistry::open(root.path()).expect("registry");
+        assert!(registry.admit_maintenance(16).is_err());
+        read.complete().await.expect("complete empty lookup");
+        drop(state);
+        drop(registry.admit_maintenance(16).expect("released"));
+        assert!(!root.path().join(id.to_string()).exists());
+    }
 
     #[tokio::test]
     async fn startup_registration_blocks_foreign_maintenance_until_shutdown() {

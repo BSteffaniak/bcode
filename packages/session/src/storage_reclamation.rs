@@ -45,8 +45,9 @@ impl SessionReclamation {
 /// maintenance connection enables its experimental VACUUM option; normal connections do not.
 /// There is no fallback to copying history, rebuilding projections, or manipulating WAL files. This
 /// can perform work proportional to database size and is not an interactive read operation.
-/// Dropping the async waiter does not release maintenance ownership: the owned operation finishes
-/// database close first. This backend operation has no supported mid-VACUUM cancellation primitive.
+/// Dropping the async waiter requests cancellation before VACUUM starts, but does not release
+/// maintenance ownership: the owned operation finishes database close first. This backend operation
+/// has no supported mid-VACUUM cancellation primitive.
 ///
 /// # Errors
 /// Refuses missing/unconfined canonical storage, active/unverifiable ownership, incompatible
@@ -82,9 +83,9 @@ pub async fn try_reclaim_session_storage(
     id: SessionId,
 ) -> Result<SessionReclamationOutcome, SessionDbError> {
     let root = root.to_path_buf();
-    run_owned_reclamation(async move {
-        reclaim_session_storage_owned(&root, id, None, ArtifactMaintenanceCancellation::default())
-            .await
+    let cancellation = ArtifactMaintenanceCancellation::default();
+    run_owned_reclamation(cancellation.clone(), async move {
+        reclaim_session_storage_owned(&root, id, None, cancellation).await
     })
     .await
 }
@@ -130,7 +131,7 @@ pub async fn reclaim_idle_session_storage_admitted(
 ) -> Result<SessionReclamationOutcome, SessionDbError> {
     cancellation.check()?;
     let root = root.to_path_buf();
-    run_owned_reclamation(async move {
+    run_owned_reclamation(cancellation.clone(), async move {
         reclaim_session_storage_owned(
             &root,
             id,
@@ -142,14 +143,28 @@ pub async fn reclaim_idle_session_storage_admitted(
     .await
 }
 
-// Dropping a JoinHandle does not abort the task. The task, not its optional waiter, owns the lease
-// and database connection through terminal close. This is not a durable resumable operation.
+struct CancelOnAbandon(Option<ArtifactMaintenanceCancellation>);
+
+impl Drop for CancelOnAbandon {
+    fn drop(&mut self) {
+        if let Some(cancellation) = &self.0 {
+            cancellation.cancel();
+        }
+    }
+}
+
+// Dropping a JoinHandle does not abort the task. Request cancellation, but retain ownership in
+// the task until it observes cancellation or finishes an already-started engine operation.
 async fn run_owned_reclamation<T: Send + 'static>(
+    cancellation: ArtifactMaintenanceCancellation,
     operation: impl std::future::Future<Output = Result<T, SessionDbError>> + Send + 'static,
 ) -> Result<T, SessionDbError> {
-    tokio::spawn(operation)
-        .await
-        .map_err(|_| SessionDbError::Io(std::io::Error::other("session reclamation task failed")))?
+    let mut abandoned = CancelOnAbandon(Some(cancellation));
+    let result = tokio::spawn(operation).await.map_err(|_| {
+        SessionDbError::Io(std::io::Error::other("session reclamation task failed"))
+    })?;
+    abandoned.0 = None;
+    result
 }
 
 async fn reclaim_session_storage_owned(
@@ -250,6 +265,36 @@ mod tests {
     use super::*;
 
     #[tokio::test]
+    async fn abandoning_waiter_cancels_but_drains_owned_operation() {
+        let cancellation = ArtifactMaintenanceCancellation::default();
+        let observed = cancellation.clone();
+        let (started, ready) = tokio::sync::oneshot::channel();
+        let (release, released) = tokio::sync::oneshot::channel();
+        let (finished, drained) = tokio::sync::oneshot::channel();
+        let waiter = tokio::spawn(run_owned_reclamation(cancellation, async move {
+            started.send(()).expect("started");
+            released.await.expect("release");
+            assert!(observed.check().is_err());
+            finished.send(()).expect("drained");
+            Ok(())
+        }));
+        ready.await.expect("running");
+        waiter.abort();
+        assert!(waiter.await.expect_err("aborted").is_cancelled());
+        release.send(()).expect("operation still alive");
+        drained.await.expect("operation drained after cancellation");
+    }
+
+    #[tokio::test]
+    async fn completed_waiter_does_not_cancel_shared_token() {
+        let cancellation = ArtifactMaintenanceCancellation::default();
+        run_owned_reclamation(cancellation.clone(), async { Ok(()) })
+            .await
+            .expect("complete");
+        cancellation.check().expect("still healthy");
+    }
+
+    #[tokio::test]
     async fn cancelled_admitted_reclamation_does_not_create_storage() {
         let root = tempfile::tempdir().expect("root");
         let cancellation = ArtifactMaintenanceCancellation::default();
@@ -282,15 +327,18 @@ mod tests {
         let (started, ready) = tokio::sync::oneshot::channel();
         let (finish, finished) = tokio::sync::oneshot::channel();
         let (released, release_done) = tokio::sync::oneshot::channel();
-        let waiter = tokio::spawn(run_owned_reclamation(async move {
-            let guard = crate::lease::acquire_session_maintenance_guard(&owned_root, id)
-                .map_err(std::io::Error::other)?;
-            started.send(()).expect("ready");
-            finished.await.expect("finish signal");
-            drop(guard);
-            released.send(()).expect("released");
-            Ok(())
-        }));
+        let waiter = tokio::spawn(run_owned_reclamation(
+            ArtifactMaintenanceCancellation::default(),
+            async move {
+                let guard = crate::lease::acquire_session_maintenance_guard(&owned_root, id)
+                    .map_err(std::io::Error::other)?;
+                started.send(()).expect("ready");
+                finished.await.expect("finish signal");
+                drop(guard);
+                released.send(()).expect("released");
+                Ok(())
+            },
+        ));
         ready.await.expect("started");
         waiter.abort();
         assert!(waiter.await.expect_err("cancelled").is_cancelled());

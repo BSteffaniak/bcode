@@ -20,6 +20,30 @@ must not be presented as a complete total. Database totals include projections a
 interpreted as canonical event payload size. Global catalog and provider-owned search indexes are
 excluded, not treated as zero. No compression ratio or space saving is inferred from file lengths.
 
+## Approved compatibility rollout
+
+Automatic compression at an existing state location requires an enforced minimum-reader
+compatibility transition (approved during implementation). This is a prerequisite, not an
+operator assertion that a clean admission registry proves older readers are absent.
+
+The transition must:
+
+* Remain owned by session migration/upgrade coordination, preserving each session's canonical
+  ID-derived path and existing canonical history.
+* Verify exclusive transition ownership and exclude incompatible readers, including readers that
+  resolve artifact references before releasing their session lease and later open the artifact.
+* Enforce the minimum reader on every subsequent content entry point. Updating writer epochs or
+  introducing a marker that old readers ignore is not sufficient evidence of exclusion.
+* Preserve existing state and defer compression when exclusion cannot be verified. Do not stop
+  unrelated daemon versions or prevent unrelated capabilities from starting.
+* Persist interruption-safe transition evidence before scheduling becomes eligible. A failed read
+  registration and failed durable blocker must not permit another daemon to schedule from stale
+  access evidence.
+
+The existing registry and writer-contract checks do not implement this transition. Automatic
+compression remains disabled until an enforceable protocol and compatibility tests establish these
+conditions. Explicit maintenance APIs are not evidence that the automatic rollout is complete.
+
 ## Implemented codec foundation (not activated)
 
 The session domain now contains an explicit compressed-artifact codec. Version 1 uses 256 KiB
@@ -724,6 +748,18 @@ not the independent older-reader or durable fallback-failure compatibility gaps.
 Validation: `cargo fmt`, `cargo check --workspace --quiet`,
 `cargo clippy --workspace --all-targets --quiet -- -D warnings`, and
 `cargo test -p bcode_server storage_maintenance::tests --quiet` passed (11 tests).
+
+## Read admission before existence lookup
+
+Persistent read admission no longer skips registration based on `session.db` existence. An absent
+file or failed metadata lookup cannot prove that a later lookup will not consume content. A
+regression verifies that a missing-session read blocks maintenance until completion without
+creating canonical session storage. This closes an admission bypass, not the older-reader
+compatibility gap; automatic dispatch remains disabled.
+
+Validation: `cargo fmt`, `cargo check --workspace --quiet`,
+`cargo clippy --workspace --all-targets --quiet -- -D warnings`, and
+`cargo test -p bcode_server storage_read_admission::tests --quiet` passed (8 tests).
 
 ## Remaining implementation
 
