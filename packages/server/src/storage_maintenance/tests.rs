@@ -327,6 +327,49 @@ async fn scheduler_recent_access_and_damage_defer_but_cold_content_reaches_deep_
 }
 
 #[tokio::test]
+async fn worker_dispatches_tracking_initialization_and_stops() {
+    let (root, state, id, artifacts, _) = fixture(1).await;
+    let access = root.path().join(id.to_string()).join("storage-access.bin");
+    std::fs::remove_file(&access).expect("remove tracking");
+    let state = Arc::new(state);
+    let worker = tokio::spawn(run(Arc::clone(&state)));
+    let dispatched = tokio::time::timeout(Duration::from_secs(10), async {
+        while !access.exists() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await;
+    state.request_shutdown();
+    tokio::time::timeout(Duration::from_secs(2), worker)
+        .await
+        .expect("bounded shutdown")
+        .expect("worker");
+    drop(state);
+    dispatched.expect("worker dispatched without bypassing readiness");
+    assert!(artifacts.join("recording-000").is_file());
+}
+
+#[tokio::test]
+async fn readiness_requires_registration_and_healthy_tracking() {
+    let (_root, state, _id, _artifacts, _) = fixture(1).await;
+    assert!(tracking_readiness(&state));
+    state
+        .storage_tracking_failed
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    assert!(!tracking_readiness(&state));
+    state
+        .storage_tracking_failed
+        .store(false, std::sync::atomic::Ordering::SeqCst);
+    let registration = state
+        .storage_daemon_registration
+        .lock()
+        .expect("lock")
+        .take();
+    assert!(!tracking_readiness(&state));
+    drop(registration);
+}
+
+#[tokio::test]
 async fn worker_shutdown_before_first_poll_starts_no_compression() {
     let (root, state, id, artifacts, _) = fixture(1).await;
     let state = Arc::new(state);

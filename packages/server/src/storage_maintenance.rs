@@ -46,10 +46,10 @@ enum MaintenanceCursor {
     History { start: u64, through: Option<u64> },
 }
 
-/// Run the experimental maintenance worker until daemon shutdown.
-/// Not activated by normal startup pending complete safety coordination.
+/// Run bounded maintenance until daemon shutdown.
+/// Requires healthy current-version registration under the coordinated clean-break rollout.
 pub async fn run(state: Arc<ServerState>) {
-    if !wait_for_tracking_readiness(&state).await {
+    if !tracking_readiness(&state) {
         return;
     }
     let Some(root) = state.sessions.session_store_root() else {
@@ -148,25 +148,18 @@ pub async fn run(state: Arc<ServerState>) {
     }
 }
 
-async fn wait_for_tracking_readiness(state: &ServerState) -> bool {
+fn tracking_readiness(state: &ServerState) -> bool {
+    let ready = !state
+        .shutdown_requested
+        .load(std::sync::atomic::Ordering::SeqCst)
+        && operation_cancellation(state).is_ok();
     state
         .metrics
-        .set_gauge("storage.maintenance.compatibility_ready", 0);
-    let mut shutdown = state.subscribe_shutdown();
-    if tracking_coverage_ready(state) {
-        return true;
-    }
-    let _ = shutdown.recv().await;
-    false
-}
-
-fn tracking_coverage_ready(state: &ServerState) -> bool {
-    // No compatibility proof is currently installed. Do not infer it from clean registry files:
-    // old clients and unregistered fallbacks are not represented by those files.
-    let _failed = state
-        .storage_tracking_failed
-        .load(std::sync::atomic::Ordering::SeqCst);
-    false
+        .set_gauge("storage.maintenance.compatibility_ready", i64::from(ready));
+    // The clean-break rollout excludes legacy participants operationally. Current-version
+    // registration is still mandatory, and each operation rechecks tracking health and obtains
+    // durable maintenance admission. A failed startup registration never gains offline authority.
+    ready
 }
 
 fn operation_cancellation(state: &ServerState) -> Result<ArtifactMaintenanceCancellation, String> {

@@ -6,7 +6,16 @@ The intended outcome is transparent, lossless, default-enabled storage tiering: 
 at five days without meaningful access, deep compression at thirty days, configurable thresholds
 and an opt-out. It is not model-context compaction, retention, summarization, or deletion.
 
-**Automatic compression is not implemented yet.** The first implemented slice is explicit bounded
+**Automatic dispatch is implemented for the coordinated clean-break rollout.** Startup requires a
+healthy current-daemon registration and no local tracking-failure latch; every operation still
+requires durable admission and verified maintenance ownership. The worker initializes unknown
+access ages conservatively rather than immediately compressing existing sessions. Historical
+entries below describing an unconditional disabled gate are superseded by this status.
+
+Full migration/compression/reclamation validation remains in progress; dispatch activation alone
+is not evidence that every rollout acceptance criterion is complete.
+
+The first implemented slice was explicit bounded
 physical measurement through `bcode session storage-usage <session-id> [--entry-budget 10000]`.
 The command returns JSON through the client/application/session boundaries. It measures database
 files and engine sidecars, session artifacts, and other session-local files separately. It reports
