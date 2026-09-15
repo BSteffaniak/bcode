@@ -141,10 +141,10 @@ async fn acquire_maintenance(
     tokio::task::spawn_blocking(move || {
         let root = root.canonicalize()?;
         let session = confined(&root.join(session_id.to_string()), &root)?;
-        if !fs::symlink_metadata(session.join("session.db"))?.is_file() {
-            return Err(invalid());
-        }
-        crate::lease::acquire_session_maintenance_guard(&root, session_id).map_err(io::Error::other)
+        let maintenance = crate::lease::acquire_session_maintenance_guard(&root, session_id)
+            .map_err(io::Error::other)?;
+        crate::db_path::resolve_existing_session_db(&session.join("session.db"))?;
+        Ok(maintenance)
     })
     .await
     .map_err(|_| io::Error::other("artifact maintenance acquisition failed"))?
@@ -484,10 +484,6 @@ pub async fn compress_finalized_artifact_cancellable(
     } else {
         None
     };
-    let session = confined(&root.join(session_id.to_string()), &root)?;
-    if !fs::symlink_metadata(session.join("session.db"))?.is_file() {
-        return Err(invalid());
-    }
     let maintenance = acquire_maintenance(&root, session_id).await?;
     cancellation.check()?;
     if let Some((now_ms, minimum_age_ms)) = age
@@ -615,11 +611,9 @@ pub fn compress_session_artifact(
     }
     let sessions_root = sessions_root.canonicalize()?;
     let session = confined(&sessions_root.join(session_id.to_string()), &sessions_root)?;
-    if !fs::symlink_metadata(session.join("session.db"))?.is_file() {
-        return Err(invalid());
-    }
     let maintenance = crate::lease::acquire_session_maintenance_guard(&sessions_root, session_id)
         .map_err(io::Error::other)?;
+    crate::db_path::resolve_existing_session_db(&session.join("session.db"))?;
     compress_artifact_with_maintenance(
         &sessions_root,
         session_id,
@@ -978,6 +972,28 @@ mod tests {
             fs::read(root.path().join("moved/raw")).expect("untouched original"),
             b"original"
         );
+    }
+
+    #[tokio::test]
+    async fn directory_layout_admits_maintenance_and_rejects_unknown_format() {
+        let root = tempfile::tempdir().expect("root");
+        let id = SessionId::new();
+        let directory = root.path().join(id.to_string()).join("session.db");
+        fs::create_dir_all(&directory).expect("directory");
+        fs::write(directory.join("data.db"), b"fixture").expect("database");
+        fs::write(directory.join("format"), b"BCODE_SESSION_DB 1\n").expect("format");
+        let maintenance = acquire_maintenance(root.path(), id).await.expect("admit");
+        assert!(crate::lease::acquire_session_maintenance_guard(root.path(), id).is_err());
+        drop(maintenance);
+        fs::write(directory.join("format"), b"BCODE_SESSION_DB 2\n").expect("future");
+        assert!(acquire_maintenance(root.path(), id).await.is_err());
+        assert_eq!(fs::read(directory.join("data.db")).unwrap(), b"fixture");
+        assert_eq!(
+            fs::read(directory.join("format")).unwrap(),
+            b"BCODE_SESSION_DB 2\n"
+        );
+        // Failed representation validation must release the maintenance lease.
+        assert!(crate::lease::acquire_session_maintenance_guard(root.path(), id).is_ok());
     }
 
     #[tokio::test]

@@ -94,11 +94,9 @@ pub fn observe_session_access(
         Ok(handles) => handles,
         Err(error) if error.kind() == io::ErrorKind::NotFound => {
             // Distinguish absent tracking from absent canonical authority. No alternate location.
-            if !std::fs::symlink_metadata(root.join(session_id.to_string()).join("session.db"))?
-                .is_file()
-            {
-                return Err(invalid());
-            }
+            crate::db_path::resolve_existing_session_db(
+                &root.join(session_id.to_string()).join("session.db"),
+            )?;
             return Ok(StorageAccessObservation::Unknown);
         }
         Err(error) => return Err(error),
@@ -156,7 +154,23 @@ fn open_session_access_file(
     let name = CString::new(session_id.to_string()).map_err(|_| invalid())?;
     let directory = child(&root, &name, libc::O_RDONLY | libc::O_DIRECTORY)?;
     let canonical = child(&directory, c"session.db", libc::O_RDONLY)?;
-    if !canonical.metadata()?.is_file() {
+    if canonical.metadata()?.is_dir() {
+        let marker = child(&canonical, c"format", libc::O_RDONLY)?;
+        if !marker.metadata()?.is_file() {
+            return Err(invalid());
+        }
+        let mut bytes = Vec::new();
+        std::io::Read::take(marker, 20).read_to_end(&mut bytes)?;
+        if bytes != b"BCODE_SESSION_DB 1\n" {
+            return Err(invalid());
+        }
+        if !child(&canonical, c"data.db", libc::O_RDONLY)?
+            .metadata()?
+            .is_file()
+        {
+            return Err(invalid());
+        }
+    } else if !canonical.metadata()?.is_file() {
         return Err(invalid());
     }
     let file = child(
@@ -299,6 +313,38 @@ fn update_locked(file: &mut File, now_ms: u64) -> io::Result<StorageAccessRecord
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn directory_tracking_preserves_unknown_formats_and_missing_storage() {
+        let root = tempfile::tempdir().unwrap();
+        let id = SessionId::new();
+        let session = root.path().join(id.to_string());
+        let database = session.join("session.db");
+        std::fs::create_dir_all(&database).unwrap();
+        std::fs::write(database.join("format"), b"BCODE_SESSION_DB 1\n").unwrap();
+        assert!(observe_session_access(root.path(), id).is_err());
+        assert!(record_session_access(root.path(), id, StorageAccessKind::History, 1).is_err());
+        assert!(!session.join("storage-access.bin").exists());
+        std::fs::write(database.join("data.db"), b"fixture").unwrap();
+        assert_eq!(
+            observe_session_access(root.path(), id).unwrap(),
+            StorageAccessObservation::Unknown
+        );
+        let record = record_session_access(root.path(), id, StorageAccessKind::History, 1).unwrap();
+        assert_eq!(
+            observe_session_access(root.path(), id).unwrap(),
+            StorageAccessObservation::Recorded(record)
+        );
+        let before = std::fs::read(session.join("storage-access.bin")).unwrap();
+        std::fs::write(database.join("format"), b"BCODE_SESSION_DB 2\n").unwrap();
+        assert!(record_session_access(root.path(), id, StorageAccessKind::History, 2).is_err());
+        assert!(observe_session_access(root.path(), id).is_err());
+        assert_eq!(
+            std::fs::read(session.join("storage-access.bin")).unwrap(),
+            before
+        );
+    }
 
     #[cfg(unix)]
     #[test]
