@@ -165,6 +165,63 @@ mod tests {
     use super::*;
 
     #[tokio::test]
+    async fn double_failure_rejects_history_and_retry_preserves_content() {
+        let root = tempfile::tempdir().expect("root");
+        let sessions = bcode_session::SessionManager::persistent(root.path()).expect("manager");
+        let session = sessions
+            .create_session(None, root.path().to_path_buf())
+            .await
+            .expect("create");
+        sessions
+            .append_event(
+                session.id,
+                bcode_session_models::SessionEventKind::SystemMessage {
+                    text: "history must remain readable after coordination recovers".into(),
+                },
+            )
+            .await
+            .expect("append");
+        let expected = sessions.session_history(session.id).await.expect("history");
+        sessions
+            .release_session_ownership(session.id)
+            .await
+            .expect("release");
+        let before = bcode_session::storage_access::observe_session_access(root.path(), session.id)
+            .expect("access");
+        let obstruction = root.path().join("storage-admission-v1");
+        std::fs::write(&obstruction, b"unavailable registry").expect("obstruct");
+        let state = crate::tests::test_server_state(sessions);
+        let client = bcode_session_models::ClientId::new();
+        assert!(
+            crate::session_operations::complete_history(&state, client, session.id)
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            bcode_session::storage_access::observe_session_access(root.path(), session.id)
+                .expect("unchanged access"),
+            before
+        );
+        assert_eq!(
+            std::fs::read(&obstruction).expect("preserved"),
+            b"unavailable registry"
+        );
+        std::fs::remove_file(&obstruction).expect("remove test obstruction");
+        assert_eq!(
+            crate::session_operations::complete_history(&state, client, session.id)
+                .await
+                .expect("retry"),
+            expected
+        );
+        assert!(
+            state
+                .storage_tracking_failed
+                .load(std::sync::atomic::Ordering::SeqCst)
+        );
+        drop(state);
+    }
+
+    #[tokio::test]
     async fn missing_session_still_registers_before_storage_lookup() {
         let root = tempfile::tempdir().expect("root");
         let sessions = bcode_session::SessionManager::persistent(root.path()).expect("manager");
