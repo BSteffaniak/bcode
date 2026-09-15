@@ -185,14 +185,6 @@ async fn reclaim_session_storage_owned(
         )
         .into());
     }
-    let path = directory.join("session.db");
-    if !std::fs::symlink_metadata(&path)?.is_file() {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidInput,
-            "unsafe canonical database",
-        )
-        .into());
-    }
     let admission = if eligibility.is_some() {
         Some(cancellation.admit_tracking(&root).await?)
     } else {
@@ -218,6 +210,7 @@ async fn reclaim_session_storage_owned(
             return Ok(SessionReclamationOutcome::NotNeeded);
         }
     }
+    let path = crate::db_path::resolve_existing_session_db(&directory.join("session.db"))?;
     let db = SessionDb::open_existing_turso_in_root(id, &root).await?;
     let before_bytes = std::fs::metadata(&path)?.len();
     let capacity = db.reclaimable_bytes().await;

@@ -1370,7 +1370,8 @@ impl SessionDb {
                 format!("session database does not exist at {}", path.display()),
             )));
         }
-        Self::connect_turso_observed(session_id, path, metrics).await
+        let path = crate::db_path::resolve_existing_session_db(path)?;
+        Self::connect_turso_observed(session_id, &path, metrics).await
     }
 
     async fn initialize_turso_observed(

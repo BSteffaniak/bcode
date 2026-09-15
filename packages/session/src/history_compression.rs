@@ -120,9 +120,7 @@ pub async fn compress_history_page_through(
         cancellation.check()?;
         let root = root.canonicalize()?;
         let directory = root.join(id.to_string());
-        if !std::fs::symlink_metadata(&directory)?.is_dir()
-            || !std::fs::symlink_metadata(directory.join("session.db"))?.is_file()
-        {
+        if !std::fs::symlink_metadata(&directory)?.is_dir() {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
                 "unsafe canonical history path",

@@ -12,6 +12,7 @@ const MAX_DEPTH: usize = 32;
 #[derive(Clone, Copy)]
 enum Category {
     Session,
+    Database,
     Artifact,
 }
 
@@ -41,13 +42,7 @@ pub fn measure_session_storage(
     let session = root.join(session_id.to_string());
     require_directory(&session)?;
     require_confined(&session, &root)?;
-    let database = fs::symlink_metadata(session.join("session.db"))?;
-    if !database.is_file() {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "canonical database is not a regular file",
-        ));
-    }
+    crate::db_path::resolve_existing_session_db(&session.join("session.db"))?;
     let mut usage = SessionStorageUsage::default();
     visit(
         &session,
@@ -131,8 +126,24 @@ fn visit(
             continue;
         };
         if metadata.is_dir() {
+            let child_category = if matches!(category, Category::Session)
+                && depth == 0
+                && entry.file_name() == "session.db"
+            {
+                Category::Database
+            } else {
+                category
+            };
             if depth == MAX_DEPTH
-                || visit(&entry.path(), root, category, budget, depth + 1, usage).is_err()
+                || visit(
+                    &entry.path(),
+                    root,
+                    child_category,
+                    budget,
+                    depth + 1,
+                    usage,
+                )
+                .is_err()
             {
                 usage.skipped_entries += 1;
             }
@@ -142,6 +153,7 @@ fn visit(
         } else if metadata.is_file() {
             let bucket = match category {
                 Category::Artifact => &mut usage.artifacts,
+                Category::Database => &mut usage.database,
                 Category::Session
                     if depth == 0
                         && matches!(
@@ -205,6 +217,33 @@ mod tests {
             fs::read(root.path().join(id.to_string()).join("session.db")).expect("database"),
             b"not a database"
         );
+    }
+
+    #[test]
+    fn measures_directory_database_and_sidecars_with_shared_budget() {
+        let root = tempfile::tempdir().expect("root");
+        let id = SessionId::new();
+        let session = root.path().join(id.to_string());
+        let database = session.join("session.db");
+        fs::create_dir_all(&database).expect("directory");
+        let marker = b"BCODE_SESSION_DB 1\n";
+        fs::write(database.join("format"), marker).expect("marker");
+        fs::write(database.join("data.db"), b"uninterpreted database").expect("database");
+        fs::write(database.join("data.db-wal"), b"wal").expect("wal");
+        fs::write(session.join("note"), b"note").expect("other");
+        let usage = measure_session_storage(root.path(), id, 100).expect("measure");
+        assert_eq!(usage.database.files, 3);
+        assert_eq!(usage.database.file_bytes, 44);
+        assert_eq!(usage.other.file_bytes, 4);
+        assert_eq!(usage.skipped_entries, 0);
+        assert_eq!(fs::read(database.join("format")).unwrap(), marker);
+        assert_eq!(
+            fs::read(database.join("data.db")).unwrap(),
+            b"uninterpreted database"
+        );
+        let bounded = measure_session_storage(root.path(), id, 1).expect("bounded");
+        assert_eq!(bounded.visited_entries, 1);
+        assert!(bounded.budget_exhausted);
     }
 
     #[test]

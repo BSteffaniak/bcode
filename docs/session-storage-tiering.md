@@ -44,6 +44,34 @@ The existing registry and writer-contract checks do not implement this transitio
 compression remains disabled until an enforceable protocol and compatibility tests establish these
 conditions. Explicit maintenance APIs are not evidence that the automatic rollout is complete.
 
+## Approved database-directory transition (not implemented)
+
+The approved compatibility boundary may replace the regular `session.db` file with a versioned
+`session.db` directory containing the canonical database. The user requires automatic migration
+where safe. This is a storage-format transition, not an alternate canonical location: the owning
+state location and session-ID-derived root remain unchanged. Build or writer identity must never
+select a different database. The current implementation still uses the regular database file.
+
+Historical evidence: `SessionDb::history_page` at `00a3a555^` selects `events` without validating
+the writer contract. Raw rows remain readable even if other rows use compressed envelopes.
+Consequently, neither a writer-epoch bump nor legacy JSON decode rejection proves minimum-reader
+exclusion. A directory at the old database path can reject new legacy database opens, but does not
+revoke already-open handles or cached artifact references; those require separate ownership and
+read-lifetime verification before publication is eligible.
+
+Implementation must be migration-owned and automatic only for known supported input with verified
+exclusive ownership. It must preserve all database sidecars, provide interruption-safe recovery,
+and make exactly one representation authoritative throughout the transition. Updated bounded
+readers must resolve the current representation without repairing or migrating on reads. Unknown,
+ambiguous, damaged, or unverifiably owned representations remain untouched and report actionable
+maintenance-required status. Catalog discovery must not hide directory-format sessions. Migration,
+backup, restore, usage measurement, reclamation, and database opening must share the domain-owned
+layout contract. Historical-client and interrupted-transition tests must pass before this design
+can establish eligibility for automatic compression.
+
+See [Session persistence architecture](session-persistence-architecture.md) for the current file
+layout; this approval does not claim that the transition or automatic dispatch is implemented.
+
 ## Implemented codec foundation (not activated)
 
 The session domain now contains an explicit compressed-artifact codec. Version 1 uses 256 KiB
@@ -825,10 +853,16 @@ not justify the conversion.
 
 Keep the canonical `session.db` at its existing path, with queryable sequence and metadata indexes.
 Do not archive whole databases or shift authority into external event packs or search indexes.
-Current event rows contain JSON text; migration readers also interpret JSON directly. A compressed
-payload format therefore requires a compatibility-defined storage change, a narrowly scoped
-current-format target, and migration-owned historical conversion. Audit every payload consumer,
-including original usage, export, repair, and bounded search projection ingestion.
+Current event payloads support a versioned compressed envelope as well as raw JSON. Bounded
+history recompression and explicit database reclamation are implemented. The
+`history_compression::tests` suite verifies legacy JSON decoding rejects a compressed payload,
+current reads preserve the logical event, a multi-page sweep reclaims database space, reopening
+and appending preserve history, captured tails exclude later appends, and incompatible writers
+cannot recompress canonical payloads. All four tests passed in the latest focused validation.
+These tests do not establish exclusion of historical readers: rejecting a compressed event alone
+does not prevent an old client from consuming uncompressed events or derived projections.
+Migration-owned minimum-reader enforcement and the audit of original usage, export, repair, and
+bounded search projection ingestion remain prerequisites to automatic rollout.
 
 Maintain append-only logical history exactly. Automatic known lossless upgrades require exclusive
 verified ownership, incompatible-reader fencing, interruption-safe recovery, and preservation of

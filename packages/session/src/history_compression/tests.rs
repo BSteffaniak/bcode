@@ -52,6 +52,32 @@ async fn compressed_history_rejects_legacy_json_decoder_without_changing_logical
 
 #[tokio::test]
 async fn paged_history_compression_reclaims_real_space_and_preserves_reopen_and_append() {
+    verify_history_reclamation(false).await;
+}
+
+#[tokio::test]
+async fn directory_history_compression_reclaims_space_and_preserves_reopen_and_append() {
+    verify_history_reclamation(true).await;
+}
+
+fn directory_fixture(path: &Path) {
+    // Offline fixture construction, not a production migration protocol. Production publication
+    // requires interruption-safe ownership and verification of all engine sidecars.
+    let temporary = path.with_extension("fixture");
+    std::fs::rename(path, &temporary).expect("move closed fixture");
+    std::fs::create_dir(path).expect("directory layout");
+    std::fs::rename(&temporary, path.join("data.db")).expect("inner database");
+    for suffix in ["-wal", "-shm"] {
+        let sidecar = path.with_file_name(format!("session.db{suffix}"));
+        if sidecar.exists() {
+            std::fs::rename(sidecar, path.join(format!("data.db{suffix}")))
+                .expect("move fixture sidecar");
+        }
+    }
+    std::fs::write(path.join("format"), b"BCODE_SESSION_DB 1\n").expect("format");
+}
+
+async fn verify_history_reclamation(directory_format: bool) {
     let root = tempfile::tempdir().expect("root");
     let manager = crate::SessionManager::persistent(root.path()).expect("manager");
     let session = manager
@@ -77,6 +103,10 @@ async fn paged_history_compression_reclaims_real_space_and_preserves_reopen_and_
         .expect("release");
     drop(manager);
     let path = root.path().join(id.to_string()).join("session.db");
+    if directory_format {
+        directory_fixture(&path);
+    }
+    let path = crate::db_path::resolve_existing_session_db(&path).expect("resolve fixture");
     let before = std::fs::metadata(&path).expect("before").len();
     let mut cursor = 0;
     let mut pages = 0;
