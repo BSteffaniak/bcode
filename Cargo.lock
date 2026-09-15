@@ -2790,6 +2790,8 @@ dependencies = [
  "bcode_agent_profile",
  "bcode_config",
  "bcode_plugin_sdk",
+ "bcode_session",
+ "bcode_session_models",
  "bcode_shell_command_analysis",
  "bcode_shell_command_analysis_models",
  "bcode_tool",

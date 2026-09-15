@@ -38,7 +38,9 @@ url = { workspace = true }
 vte = { workspace = true }
 
 [dev-dependencies]
-tempfile = { workspace = true }
+bcode_session        = { workspace = true }
+bcode_session_models = { workspace = true }
+tempfile             = { workspace = true }
 
 [features]
 default = []

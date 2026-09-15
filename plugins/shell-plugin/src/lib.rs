@@ -2448,8 +2448,17 @@ fn finalize_recording(
         .recording_path
         .as_deref()
         .ok_or_else(|| "recording writer had no final path".to_owned())?;
+    recording_artifact_ref(path, &summary, columns, rows).map(Some)
+}
+
+fn recording_artifact_ref(
+    path: &Path,
+    summary: &recording::ShellRecordingSummary,
+    columns: u16,
+    rows: u16,
+) -> Result<ToolArtifactRef, String> {
     let content_checksum = recording_content_checksum(path).map_err(|error| error.to_string())?;
-    Ok(Some(ToolArtifactRef {
+    Ok(ToolArtifactRef {
         key: SHELL_RECORDING_REF_KEY.to_owned(),
         content_type: Some(SHELL_RECORDING_CONTENT_TYPE.to_owned()),
         storage_uri: file_storage_uri(path),
@@ -2469,8 +2478,11 @@ fn finalize_recording(
             "retention": "session_lifetime",
             "eviction": "none",
         })),
-    }))
+    })
 }
+
+#[cfg(all(test, any(target_os = "macos", target_os = "linux")))]
+mod compression_tests;
 
 fn recording_content_checksum(path: &Path) -> std::io::Result<String> {
     use sha2::{Digest as _, Sha256};
