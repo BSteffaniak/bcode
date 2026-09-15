@@ -3005,6 +3005,8 @@ impl BcodeClient {
     }
 
     /// Explicitly collect one source accounting page into the disposable reporting index.
+    /// Empty initial acknowledgements either confirm an unchanged published generation or
+    /// provide a cursor for matching durable staging. Always follow a returned cursor.
     /// # Errors
     /// Returns an error for unsafe source state, generation conflicts, or transport failure.
     pub async fn collect_usage(

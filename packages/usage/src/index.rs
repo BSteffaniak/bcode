@@ -1,6 +1,6 @@
 //! Transactional, disposable usage snapshots stored through Switchy/Turso.
 
-use bcode_session_models::{SessionId, SessionUsagePage};
+use bcode_session_models::{SessionId, SessionUsageGeneration, SessionUsagePage};
 use bcode_usage_models::{UsageQuery, UsageReport, UsageRequestRow};
 use std::path::{Path, PathBuf};
 use switchy::database::{
@@ -30,7 +30,62 @@ fn integer(row: &Row, name: &str) -> Result<i64, String> {
         .ok_or_else(|| error(name))
 }
 
+/// Bounded decision for a source whose current accounting generation was verified by its owner.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CollectionProgress {
+    /// No published or staged collection exists.
+    Missing,
+    /// Published contributions already represent the verified generation.
+    Current,
+    /// Continue durable staging at this exclusive source key.
+    Continue(String),
+    /// Recorded source generation differs; explicit restart is required.
+    Changed,
+}
+
 impl UsageIndex {
+    /// Inspect one source checkpoint without creating storage or reading request contributions.
+    /// # Errors
+    /// Rejects corrupt checkpoints or incompatible storage; a missing index is reported separately.
+    pub async fn collection_progress(
+        &self,
+        session_id: SessionId,
+        generation: SessionUsageGeneration,
+    ) -> Result<CollectionProgress, String> {
+        match std::fs::symlink_metadata(&self.path) {
+            Err(cause) if cause.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(CollectionProgress::Missing);
+            }
+            Err(cause) => return Err(error(cause)),
+            Ok(_) => {}
+        }
+        let (_lock, db) = self.open(false).await?;
+        let Some(row) = db
+            .select("usage_sessions")
+            .where_eq("session_id", session_id.to_string())
+            .execute_first(&*db)
+            .await
+            .map_err(error)?
+        else {
+            return Ok(CollectionProgress::Missing);
+        };
+        let recorded: SessionUsageGeneration =
+            serde_json::from_str(&text(&row, "generation")?).map_err(error)?;
+        if recorded != generation {
+            return Ok(CollectionProgress::Changed);
+        }
+        match integer(&row, "collecting")? {
+            0 => Ok(CollectionProgress::Current),
+            1 => {
+                let next = text(&row, "next_key")?;
+                if next.is_empty() || next.len() > 4096 {
+                    return Err(error("invalid collection cursor"));
+                }
+                Ok(CollectionProgress::Continue(next))
+            }
+            _ => Err(error("invalid collection status")),
+        }
+    }
     /// Resolve reporting storage beneath an already resolved state location.
     #[must_use]
     pub fn in_state_root(root: &Path) -> Self {
@@ -135,12 +190,7 @@ impl UsageIndex {
                 return Err(error("collection changed"));
             }
         } else {
-            if current
-                .as_ref()
-                .is_some_and(|row| integer(row, "collecting").ok() == Some(1))
-            {
-                return Err(error("collection already active; continue its cursor"));
-            }
+            validate_restart(current.as_ref(), &generation)?;
             tx.delete("usage_rows")
                 .where_eq("session_id", id.clone())
                 .where_eq("staged", 1)
@@ -300,6 +350,19 @@ impl UsageIndex {
     }
 }
 
+fn validate_restart(current: Option<&Row>, generation: &str) -> Result<(), String> {
+    if let Some(current) = current {
+        match integer(current, "collecting")? {
+            1 if text(current, "generation")? == generation => {
+                return Err(error("collection already active; continue its cursor"));
+            }
+            0 | 1 => {}
+            _ => return Err(error("invalid collection status")),
+        }
+    }
+    Ok(())
+}
+
 fn validate_page(after: Option<&str>, page: &SessionUsagePage) -> Result<(), String> {
     if page.scanned > 256 || page.entries.len() != page.scanned as usize {
         return Err(error("incomplete range"));
@@ -393,6 +456,76 @@ mod tests {
         index.invalidate(session).await.unwrap();
         assert_eq!(index.query(&query()).await.unwrap().totals.requests, 0);
     }
+    #[tokio::test]
+    async fn progress_distinguishes_missing_staged_current_and_repriced() {
+        let root = tempfile::tempdir().unwrap();
+        let root = root.path().canonicalize().unwrap();
+        let index = UsageIndex::in_state_root(&root);
+        let session = SessionId::new();
+        let generation = page("a", None).generation;
+        assert_eq!(
+            index
+                .collection_progress(session, generation)
+                .await
+                .unwrap(),
+            CollectionProgress::Missing
+        );
+        assert!(!root.join("usage.db").exists());
+        index
+            .collect(session, None, page("a", Some("a")))
+            .await
+            .unwrap();
+        assert_eq!(
+            index
+                .collection_progress(session, generation)
+                .await
+                .unwrap(),
+            CollectionProgress::Continue("a".into())
+        );
+        index
+            .collect(session, Some("a"), page("b", None))
+            .await
+            .unwrap();
+        assert_eq!(
+            index
+                .collection_progress(session, generation)
+                .await
+                .unwrap(),
+            CollectionProgress::Current
+        );
+        let mut repriced = generation;
+        repriced.cost_revision += 1;
+        assert_eq!(
+            index.collection_progress(session, repriced).await.unwrap(),
+            CollectionProgress::Changed
+        );
+    }
+
+    #[tokio::test]
+    async fn changed_source_restarts_staging_and_rejects_old_continuation() {
+        let root = tempfile::tempdir().unwrap();
+        let root = root.path().canonicalize().unwrap();
+        let index = UsageIndex::in_state_root(&root);
+        let session = SessionId::new();
+        index
+            .collect(session, None, page("a", Some("a")))
+            .await
+            .unwrap();
+        let mut changed = page("a", Some("a"));
+        changed.generation.cost_revision = 1;
+        index.collect(session, None, changed).await.unwrap();
+        assert!(
+            index
+                .collect(session, Some("a"), page("b", None))
+                .await
+                .is_err()
+        );
+        let mut final_page = page("b", None);
+        final_page.generation.cost_revision = 1;
+        assert!(index.collect(session, Some("a"), final_page).await.unwrap());
+        assert_eq!(index.query(&query()).await.unwrap().totals.requests, 2);
+    }
+
     #[tokio::test]
     async fn future_schema_is_preserved_and_rejected() {
         let root = tempfile::tempdir().unwrap();

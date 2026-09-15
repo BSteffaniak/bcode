@@ -888,7 +888,7 @@ pub async fn collect_usage(
         super::storage_read_admission::RegisteredStorageRead::for_session(state, session_id)
             .await
             .map_err(|_| "usage storage read admission unavailable")?;
-    let page = state
+    let mut page = state
         .sessions
         .session_usage_page(session_id, query.clone())
         .await
@@ -896,6 +896,33 @@ pub async fn collect_usage(
     #[cfg(any(target_os = "macos", target_os = "linux"))]
     if let Some(admission) = admission {
         admission.finish_history(state, session_id).await;
+    }
+    if query.after.is_none() {
+        let progress = state
+            .usage_index
+            .lock()
+            .await
+            .collection_progress(session_id, page.generation)
+            .await
+            .map_err(|_| "usage checkpoint unavailable")?;
+        match progress {
+            bcode_usage::index::CollectionProgress::Current => {
+                // Collection acknowledgement: no contributions needed for an unchanged source.
+                page.entries.clear();
+                page.scanned = 0;
+                page.next_after = None;
+                return Ok(page);
+            }
+            bcode_usage::index::CollectionProgress::Continue(after) => {
+                // Resume durable staging, rather than restarting or duplicating its first page.
+                page.entries.clear();
+                page.scanned = 0;
+                page.next_after = Some(after);
+                return Ok(page);
+            }
+            bcode_usage::index::CollectionProgress::Missing
+            | bcode_usage::index::CollectionProgress::Changed => {}
+        }
     }
     state
         .usage_index

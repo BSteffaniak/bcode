@@ -1165,6 +1165,8 @@ pub enum Request {
         query: bcode_usage_models::UsageQuery,
     },
     /// Explicitly collect one session accounting page into the disposable reporting index.
+    /// An initial request may return an empty acknowledgement: no cursor means its verified
+    /// generation is already published; a cursor resumes matching durable staging.
     UsageCollect {
         session_id: SessionId,
         query: bcode_session_models::SessionUsageQuery,
