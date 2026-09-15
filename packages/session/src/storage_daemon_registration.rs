@@ -74,18 +74,33 @@ impl StorageDaemonRegistration {
     /// Complete a healthy epoch only after all reads, access updates, and maintenance have drained.
     ///
     /// # Errors
-    /// Returns an error for failed tracking or IO. Failed/crashed epochs retain ACTIVE permanently.
+    /// Returns an error for failed tracking, altered durable registration, outstanding tokens or IO.
+    /// Failed/crashed/corrupt epochs are preserved rather than rewritten as CLEAN.
     pub fn finish(mut self) -> io::Result<()> {
         if !self.healthy() {
             return Err(invalid());
         }
         let mut file =
             Arc::try_unwrap(self.file.take().ok_or_else(invalid)?).map_err(|_| invalid())?;
+        validate_active_record(&mut file)?;
         file.rewind()?;
         file.write_all(CLEAN)?;
         file.sync_all()?;
         file.unlock()
     }
+}
+
+fn validate_active_record(file: &mut File) -> io::Result<()> {
+    if file.metadata()?.len() != ACTIVE.len() as u64 {
+        return Err(invalid());
+    }
+    file.rewind()?;
+    let mut bytes = [0; ACTIVE.len()];
+    file.read_exact(&mut bytes)?;
+    if bytes != ACTIVE {
+        return Err(invalid());
+    }
+    Ok(())
 }
 
 /// Owned live registration proof. Retaining it keeps the OS liveness lock held.
@@ -201,6 +216,26 @@ mod tests {
         assert!(token.check().is_err());
         drop(token);
         assert!(!daemon_registration_is_complete(file.reopen().expect("inspect")).expect("dirty"));
+    }
+
+    #[test]
+    fn clean_completion_never_overwrites_corrupt_or_future_registration() {
+        for bytes in [
+            b"".as_slice(),
+            b"truncated",
+            b"BCSTDAEMON2:LIVE!",
+            b"BCSTDAEMON1:DONE!",
+        ] {
+            let file = tempfile::NamedTempFile::new().expect("file");
+            let daemon =
+                StorageDaemonRegistration::begin(file.reopen().expect("open")).expect("begin");
+            std::fs::write(file.path(), bytes).expect("damage fixture");
+            assert!(daemon.finish().is_err());
+            assert_eq!(std::fs::read(file.path()).expect("preserved"), bytes);
+            let probe = file.reopen().expect("probe");
+            probe.try_lock().expect("failed finish relinquishes lock");
+            probe.unlock().expect("unlock");
+        }
     }
 
     #[test]

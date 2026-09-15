@@ -677,6 +677,15 @@ mutate those bytes while the registration remains live and verify admission refu
 This strengthens the existing admission mechanism; dispatch remains gated pending startup-failure
 and older-reader coordination.
 
+## Clean completion preserves damaged registration
+
+Daemon registration `finish` now verifies the exact durable ACTIVE representation before writing
+CLEAN. Truncated, future-version, or unexpectedly completed bytes are preserved and rejected instead
+of being silently repaired by shutdown. Outstanding tokens and tracking failures continue to refuse
+completion. A regression covers each altered representation and proves lock release without data
+replacement. Production clean-shutdown drain and cross-process coordination remain incomplete; the
+automatic dispatch gate is unchanged.
+
 ## Remaining implementation
 
 ### Access policy and scheduling
