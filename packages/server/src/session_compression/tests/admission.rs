@@ -1,0 +1,43 @@
+use super::*;
+
+#[tokio::test]
+async fn unacknowledged_daemon_stops_sweep_before_artifact_attempts() {
+    let root = tempfile::tempdir().expect("root");
+    let sessions = bcode_session::SessionManager::persistent(root.path()).expect("sessions");
+    let id = sessions
+        .create_session(None, root.path().to_path_buf())
+        .await
+        .expect("create")
+        .id;
+    sessions
+        .release_session_ownership(id)
+        .await
+        .expect("release");
+    let state = crate::tests::test_server_state(sessions);
+    crate::storage_read_admission::register_startup(&state, root.path().to_path_buf()).await;
+    let registry = bcode_session::storage_admission::StorageAdmissionRegistry::open(root.path())
+        .expect("registry");
+    let foreign = registry
+        .register_daemon(bcode_session_models::SessionId::new())
+        .expect("foreign");
+    let request = StorageCompressionRequest {
+        session_id: id,
+        as_of_ms: crate::current_time_ms(),
+        minimum_age_ms: None,
+        tier: StorageCompressionTier::Light,
+        dry_run: false,
+        cursor: None,
+    };
+    let blocked = compress_page(&state, request.clone())
+        .await
+        .expect("blocked");
+    assert_eq!(blocked.failure, Some(Failure::UnacknowledgedDaemon));
+    assert_eq!(blocked.disposition, Disposition::Unavailable);
+    assert_eq!(blocked.failures, 1);
+    assert!(blocked.next.is_none());
+    foreign.finish().expect("clean foreign shutdown");
+    let retry = compress_page(&state, request).await.expect("retry");
+    drop(state);
+    assert_eq!(retry.failure, None);
+    assert_eq!(retry.disposition, Disposition::Processed);
+}

@@ -35,6 +35,16 @@ impl OwnedStorageMaintenance {
     }
 }
 
+/// Structured rejection when a daemon has not acknowledged maintenance.
+#[derive(Debug)]
+pub struct UnacknowledgedStorageDaemon;
+impl std::fmt::Display for UnacknowledgedStorageDaemon {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("unacknowledged storage daemon")
+    }
+}
+impl std::error::Error for UnacknowledgedStorageDaemon {}
+
 /// Confined admission registry, opened from an already authorized state location.
 pub struct StorageAdmissionRegistry {
     directory: File,
@@ -265,8 +275,23 @@ impl StorageAdmissionRegistry {
                 if matched {
                     continue;
                 }
-                if !crate::storage_daemon_registration::daemon_registration_is_complete(file)? {
-                    return Err(invalid());
+                let complete =
+                    crate::storage_daemon_registration::daemon_registration_is_complete(file)
+                        .map_err(|error| {
+                            if error.kind() == io::ErrorKind::WouldBlock {
+                                io::Error::new(
+                                    io::ErrorKind::PermissionDenied,
+                                    UnacknowledgedStorageDaemon,
+                                )
+                            } else {
+                                error
+                            }
+                        })?;
+                if !complete {
+                    return Err(io::Error::new(
+                        io::ErrorKind::PermissionDenied,
+                        UnacknowledgedStorageDaemon,
+                    ));
                 }
                 continue;
             }

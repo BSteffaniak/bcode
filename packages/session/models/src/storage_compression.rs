@@ -65,6 +65,61 @@ pub enum StorageCompressionDisposition {
     Unavailable,
 }
 
+/// Secret-safe failure categories for explicit compression. No paths or raw engine errors.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum StorageCompressionFailure {
+    /// Another operation holds the shared admission gate.
+    AdmissionBusy,
+    /// Another live or uncleanly stopped daemon has not acknowledged maintenance.
+    UnacknowledgedDaemon,
+    /// Admission evidence is damaged, dirty, incomplete, or unavailable.
+    AdmissionUnavailable,
+    /// Current daemon registration or tracking health is unavailable.
+    TrackingUnavailable,
+    /// Canonical storage is unavailable or ambiguous.
+    StorageUnavailable,
+    /// Candidate discovery failed ownership, compatibility, or projection validation.
+    CandidateInspectionFailed,
+    /// An artifact rewrite failed validation, I/O, or its work allowance.
+    ArtifactFailed,
+    /// A history rewrite failed validation, I/O, or its work allowance.
+    HistoryFailed,
+}
+
+impl StorageCompressionFailure {
+    /// Stable, secret-safe explanation and next action.
+    #[must_use]
+    pub const fn message(self) -> &'static str {
+        match self {
+            Self::AdmissionBusy => {
+                "storage admission is busy; wait for active reads or maintenance to finish and retry"
+            }
+            Self::UnacknowledgedDaemon => {
+                "another live or unclean daemon registration blocks maintenance; cleanly stop other daemons sharing this state location; do not delete registry files"
+            }
+            Self::AdmissionUnavailable => {
+                "storage admission evidence is unavailable, dirty, or invalid; inspect storage coordination health; do not delete registry files"
+            }
+            Self::TrackingUnavailable => {
+                "this daemon's storage tracking or registration is unhealthy; inspect daemon diagnostics before retrying"
+            }
+            Self::StorageUnavailable => {
+                "canonical storage is unavailable or its location is ambiguous; inspect session ownership and location"
+            }
+            Self::CandidateInspectionFailed => {
+                "candidate inspection failed; inspect session ownership, compatibility, and derived-state health before retrying"
+            }
+            Self::ArtifactFailed => {
+                "artifact compression failed validation, I/O, or its work allowance; this session sweep stopped; inspect artifact storage before retrying"
+            }
+            Self::HistoryFailed => {
+                "history compression failed validation, I/O, or its work allowance; this session sweep stopped; inspect session storage before retrying"
+            }
+        }
+    }
+}
+
 /// Bounded result, versioned by the enclosing application protocol.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StorageCompressionResult {
@@ -80,6 +135,8 @@ pub struct StorageCompressionResult {
     pub failures: u32,
     /// True when the current page changed a representation.
     pub changed: bool,
+    /// Structured reason for a failed page; omitted for successful or age-filtered pages.
+    pub failure: Option<StorageCompressionFailure>,
     /// Next page, if any. No durable resume is promised.
     pub next: Option<StorageCompressionCursor>,
 }

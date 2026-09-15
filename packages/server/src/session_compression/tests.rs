@@ -1,4 +1,5 @@
 use super::*;
+mod admission;
 
 #[tokio::test]
 async fn manual_compression_ignores_scheduling_but_preserves_history_and_age_safety() {
@@ -119,6 +120,8 @@ async fn explicit_id_does_not_bypass_registered_reader() {
     .await
     .expect("result");
     drop(state);
+    assert_eq!(result.failure, Some(Failure::AdmissionBusy));
+    assert!(result.next.is_none());
     assert_eq!(result.disposition, Disposition::Unavailable);
     assert_eq!(result.failures, 1);
     drop(reader);

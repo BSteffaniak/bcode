@@ -6713,6 +6713,29 @@ mod compression_cli_tests {
     }
 }
 
+fn print_compression_result(
+    result: &bcode_session_models::StorageCompressionResult,
+    json: bool,
+) -> Result<(), CliError> {
+    let id = result.session_id;
+    if json {
+        println!("{}", serde_json::to_string(&result)?);
+    } else {
+        println!(
+            "{}: {:?}; artifact bytes saved: {}; history payload bytes saved: {}; failures: {}",
+            id,
+            result.disposition,
+            result.artifact_bytes_saved,
+            result.history_payload_bytes_saved,
+            result.failures
+        );
+        if let Some(reason) = result.failure {
+            eprintln!("{id}: {}", reason.message());
+        }
+    }
+    Ok(())
+}
+
 async fn run_session_compression(
     session_id: Option<SessionId>,
     older_than: Option<u64>,
@@ -6788,18 +6811,7 @@ async fn run_session_compression(
                     }
                 };
                 failed |= result.failures > 0 || result.disposition == Disposition::Unavailable;
-                if json {
-                    println!("{}", serde_json::to_string(&result)?);
-                } else {
-                    println!(
-                        "{}: {:?}; artifact bytes saved: {}; history payload bytes saved: {}; failures: {}",
-                        id,
-                        result.disposition,
-                        result.artifact_bytes_saved,
-                        result.history_payload_bytes_saved,
-                        result.failures
-                    );
-                }
+                print_compression_result(&result, json)?;
                 if cancelled {
                     return Err(CliError::SessionCompressionIncomplete);
                 }

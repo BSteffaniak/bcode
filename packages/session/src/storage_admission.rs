@@ -11,6 +11,7 @@ mod registry;
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 pub use registry::{
     AcknowledgedStorageMaintenance, OwnedStorageMaintenance, StorageAdmissionRegistry,
+    UnacknowledgedStorageDaemon,
 };
 
 use std::fs::File;

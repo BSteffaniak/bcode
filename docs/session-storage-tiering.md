@@ -21,8 +21,13 @@ retained across pages. Concurrent catalog changes may require another invocation
 scheduling after the in-flight bounded request drains; daemon shutdown and a ten-second work
 allowance request cooperative cancellation inside each executing page. There is no durable job
 or reconnect-resume promise. Dry-run eligibility is an observation, not authorization or a savings
-estimate; execution rechecks safety. Unavailable outcomes currently combine ownership,
-compatibility, integrity, and storage failures rather than guessing their causes.
+estimate; execution rechecks safety. Execution now preflights durable admission before inspecting
+or attempting candidates. Structured failure codes distinguish busy admission, unacknowledged
+daemons, unavailable admission evidence, unhealthy tracking, candidate inspection, and rewrite
+failures. CLI text includes secret-safe next steps; JSON includes the failure code. No raw engine
+errors, paths, or secrets are exposed. A failed rewrite stops this session's sweep with no
+continuation rather than repeatedly reporting failed candidates as processed. Other sessions in
+a batch can still proceed. Actual writes reacquire admission; preflight is not authorization.
 
 Human output and JSON Lines (`--json`) report per-page outcomes. Artifact representation bytes
 and history payload bytes saved are separate; neither means allocated disk reclaimed. A page with

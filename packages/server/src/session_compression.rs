@@ -8,7 +8,8 @@ use bcode_session::artifact_storage::{
 use bcode_session::storage_access::{StorageAccessObservation, observe_session_access};
 use bcode_session_models::{
     StorageCompressionCursor as Cursor, StorageCompressionDisposition as Disposition,
-    StorageCompressionRequest, StorageCompressionResult, StorageCompressionTier,
+    StorageCompressionFailure as Failure, StorageCompressionRequest, StorageCompressionResult,
+    StorageCompressionTier,
 };
 
 pub async fn compress_page(
@@ -31,6 +32,7 @@ pub async fn compress_page(
         history_payload_bytes_saved: 0,
         failures: 0,
         changed: false,
+        failure: Some(Failure::StorageUnavailable),
         next: None,
     };
     let Some(root) = state.sessions.session_store_root() else {
@@ -56,23 +58,27 @@ pub async fn compress_page(
                     .checked_sub(record.observed_at_ms)
                     .is_none_or(|elapsed| elapsed < age)
                 {
+                    result.failure = None;
                     result.disposition = Disposition::Recent;
                     return Ok(result);
                 }
             }
             Ok(Ok(StorageAccessObservation::Unknown)) => {
+                result.failure = None;
                 result.disposition = Disposition::UnknownAge;
                 return Ok(result);
             }
             _ => return Ok(result),
         }
     }
+    result.failure = Some(Failure::CandidateInspectionFailed);
     if request.dry_run {
         // Candidate inspection takes exclusive session ownership but never initializes tracking.
         if maintenance_candidates_through(&root, request.session_id, None, None)
             .await
             .is_ok()
         {
+            result.failure = None;
             result.disposition = Disposition::Eligible;
         }
         return Ok(result);
@@ -93,17 +99,14 @@ async fn execute_page(
     request: StorageCompressionRequest,
     mut result: StorageCompressionResult,
 ) -> Result<StorageCompressionResult, &'static str> {
-    let cancellation = super::storage_maintenance::operation_cancellation(state)
-        .map_err(|_| "compression admission unavailable")?;
-    let age = request.minimum_age_ms.map(|age| (request.as_of_ms, age));
-    let tier = match request.tier {
-        StorageCompressionTier::Light => {
-            bcode_session::artifact_compression::ArtifactCompression::Light
-        }
-        StorageCompressionTier::Deep => {
-            bcode_session::artifact_compression::ArtifactCompression::Deep
-        }
+    let Ok(cancellation) = super::storage_maintenance::operation_cancellation(state) else {
+        return Ok(failed(result, Failure::TrackingUnavailable));
     };
+    if let Err(error) = cancellation.check_tracking_admission(root).await {
+        return Ok(failed(result, admission_failure(&error)));
+    }
+    let age = request.minimum_age_ms.map(|age| (request.as_of_ms, age));
+    let tier = artifact_tier(request.tier);
     let cursor = request.cursor.unwrap_or(Cursor::Artifacts {
         after: None,
         through: None,
@@ -145,7 +148,7 @@ async fn execute_page(
                         result.artifact_bytes_saved = saved_bytes;
                     }
                     Ok(ArtifactStorageOutcome::Unchanged) => {}
-                    Err(_) => result.failures += 1,
+                    Err(_) => return Ok(failed(result, Failure::ArtifactFailed)),
                 }
                 result.next = Some(Cursor::Artifacts {
                     after: Some((artifact.clone(), reference.clone())),
@@ -183,12 +186,47 @@ async fn execute_page(
                     .next_sequence
                     .map(|start| Cursor::History { start, through });
             } else {
-                result.failures += 1;
-                return Ok(result);
+                return Ok(failed(result, Failure::HistoryFailed));
             }
         }
     }
     result.changed = result.artifact_bytes_saved > 0 || result.history_payload_bytes_saved > 0;
+    result.failure = None;
     result.disposition = Disposition::Processed;
     Ok(result)
+}
+
+fn failed(mut result: StorageCompressionResult, reason: Failure) -> StorageCompressionResult {
+    result.disposition = Disposition::Unavailable;
+    result.failures += 1;
+    result.failure = Some(reason);
+    result.next = None;
+    result
+}
+
+fn admission_failure(error: &std::io::Error) -> Failure {
+    match error.kind() {
+        std::io::ErrorKind::WouldBlock => Failure::AdmissionBusy,
+        std::io::ErrorKind::PermissionDenied
+            if error.get_ref().is_some_and(|e| {
+                e.is::<bcode_session::storage_admission::UnacknowledgedStorageDaemon>()
+            }) =>
+        {
+            Failure::UnacknowledgedDaemon
+        }
+        _ => Failure::AdmissionUnavailable,
+    }
+}
+
+const fn artifact_tier(
+    tier: StorageCompressionTier,
+) -> bcode_session::artifact_compression::ArtifactCompression {
+    match tier {
+        StorageCompressionTier::Light => {
+            bcode_session::artifact_compression::ArtifactCompression::Light
+        }
+        StorageCompressionTier::Deep => {
+            bcode_session::artifact_compression::ArtifactCompression::Deep
+        }
+    }
 }

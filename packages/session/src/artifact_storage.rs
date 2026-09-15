@@ -297,6 +297,15 @@ impl ArtifactMaintenanceCancellation {
             .store(true, std::sync::atomic::Ordering::SeqCst);
     }
 
+    /// Check daemon admission without modifying participant records. Execution must reacquire it.
+    ///
+    /// # Errors
+    /// Reports busy admission, unacknowledged daemons, or invalid/unavailable evidence.
+    pub async fn check_tracking_admission(&self, root: &Path) -> io::Result<()> {
+        let admission = self.admit_tracking(root).await?;
+        admission.check()
+    }
+
     pub(crate) async fn admit_tracking(&self, root: &Path) -> io::Result<TrackingAdmission> {
         #[cfg(any(target_os = "macos", target_os = "linux"))]
         if let Some(acknowledgement) = self.acknowledgement.clone() {
