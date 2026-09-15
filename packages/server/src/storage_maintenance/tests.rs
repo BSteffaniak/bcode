@@ -327,6 +327,98 @@ async fn scheduler_recent_access_and_damage_defer_but_cold_content_reaches_deep_
 }
 
 #[tokio::test]
+async fn worker_compresses_reclaims_and_preserves_continued_writes() {
+    let (root, mut state, id, artifacts, bytes) = fixture(1).await;
+    state
+        .startup_config
+        .session_storage
+        .maintenance_interval_secs = 1;
+    for _ in 0..20 {
+        state
+            .sessions
+            .append_event(
+                id,
+                SessionEventKind::SystemMessage {
+                    text: "worker history 世界 ".repeat(20_000),
+                },
+            )
+            .await
+            .expect("append");
+    }
+    let expected = state.sessions.session_history(id).await.expect("history");
+    state
+        .sessions
+        .release_session_ownership(id)
+        .await
+        .expect("release");
+    let path = root.path().join(id.to_string()).join("session.db");
+    let before = std::fs::metadata(&path).expect("before").len();
+    let state = Arc::new(state);
+    let worker = tokio::spawn(run_with_clock(Arc::clone(&state), || {
+        super::super::current_time_ms() + 31 * 86_400_000
+    }));
+    let completed = tokio::time::timeout(Duration::from_secs(45), async {
+        loop {
+            if state
+                .metrics
+                .snapshot()
+                .counters
+                .get("storage.maintenance.reclaimed_bytes")
+                .copied()
+                .unwrap_or_default()
+                > 1_048_576
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await;
+    state.request_shutdown();
+    tokio::time::timeout(Duration::from_secs(10), worker)
+        .await
+        .expect("shutdown")
+        .expect("worker");
+    drop(state);
+    completed.expect("worker compressed history and reclaimed pages");
+    assert!(std::fs::metadata(&path).expect("after").len() < before);
+    assert!(artifacts.join("recording-000").is_dir());
+    assert_eq!(
+        bcode_session::artifact_storage::read_artifact_range(
+            &artifacts,
+            &artifacts.join("recording-000"),
+            0,
+            u32::try_from(bytes.len()).expect("fixture length"),
+        )
+        .expect("transparent artifact read")
+        .1,
+        bytes,
+    );
+    let sessions = bcode_session::SessionManager::persistent(root.path()).expect("reopen");
+    assert_eq!(
+        sessions.session_history(id).await.expect("preserved"),
+        expected
+    );
+    sessions
+        .append_event(
+            id,
+            SessionEventKind::SystemMessage {
+                text: "continued after automatic reclamation".into(),
+            },
+        )
+        .await
+        .expect("continued write");
+    assert_eq!(
+        sessions.session_history(id).await.expect("history").len(),
+        expected.len() + 1
+    );
+    sessions
+        .release_session_ownership(id)
+        .await
+        .expect("release");
+}
+
+#[tokio::test]
 async fn worker_dispatches_tracking_initialization_and_stops() {
     let (root, state, id, artifacts, _) = fixture(1).await;
     let access = root.path().join(id.to_string()).join("storage-access.bin");

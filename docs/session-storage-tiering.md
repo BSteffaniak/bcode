@@ -12,8 +12,12 @@ requires durable admission and verified maintenance ownership. The worker initia
 access ages conservatively rather than immediately compressing existing sessions. Historical
 entries below describing an unconditional disabled gate are superseded by this status.
 
-Full migration/compression/reclamation validation remains in progress; dispatch activation alone
-is not evidence that every rollout acceptance criterion is complete.
+The real-file worker integration test now exercises age-based artifact and canonical-history
+compression, more than one MiB of actual database reclamation, transparent artifact reads, exact
+history preservation after reopening, and continued canonical writes. It runs the production
+scheduling loop with a supplied clock; production uses wall-clock time. This supplements the
+component migration, fallback-admission, compression, and reclamation tests. Process-crash recovery
+and complete rollout-path migration coverage still require separate verification.
 
 The first implemented slice was explicit bounded
 physical measurement through `bcode session storage-usage <session-id> [--entry-budget 10000]`.

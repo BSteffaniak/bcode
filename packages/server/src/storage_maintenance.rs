@@ -49,6 +49,10 @@ enum MaintenanceCursor {
 /// Run bounded maintenance until daemon shutdown.
 /// Requires healthy current-version registration under the coordinated clean-break rollout.
 pub async fn run(state: Arc<ServerState>) {
+    run_with_clock(state, super::current_time_ms).await;
+}
+
+async fn run_with_clock(state: Arc<ServerState>, now_ms: fn() -> u64) {
     if !tracking_readiness(&state) {
         return;
     }
@@ -56,11 +60,9 @@ pub async fn run(state: Arc<ServerState>) {
         return;
     };
     let mut shutdown = state.subscribe_shutdown();
-    let cadence = state
-        .startup_config
-        .session_storage
-        .maintenance_interval_secs;
-    if cadence == 0 || state.startup_config.session_storage.artifact_timeout_secs == 0 {
+    let policy = &state.startup_config.session_storage;
+    let cadence = policy.maintenance_interval_secs;
+    if cadence == 0 || policy.artifact_timeout_secs == 0 {
         tracing::warn!("automatic artifact maintenance disabled: invalid timing configuration");
         return;
     }
@@ -122,19 +124,21 @@ pub async fn run(state: Arc<ServerState>) {
         }
         if let Some((id, cursor)) = pending.pop_front() {
             let outcome = match cursor {
-                MaintenanceCursor::Artifacts(after) => maintain_session(&state, &root, id, after)
-                    .await
-                    .map(|next| {
-                        Some(next.map_or(
-                            MaintenanceCursor::History {
-                                start: 0,
-                                through: None,
-                            },
-                            |key| MaintenanceCursor::Artifacts(Some(key)),
-                        ))
-                    }),
+                MaintenanceCursor::Artifacts(after) => {
+                    maintain_session_at(&state, &root, id, after, now_ms())
+                        .await
+                        .map(|next| {
+                            Some(next.map_or(
+                                MaintenanceCursor::History {
+                                    start: 0,
+                                    through: None,
+                                },
+                                |key| MaintenanceCursor::Artifacts(Some(key)),
+                            ))
+                        })
+                }
                 MaintenanceCursor::History { start, through } => {
-                    maintain_history(&state, &root, id, start, through).await
+                    maintain_history(&state, &root, id, start, through, now_ms()).await
                 }
             };
             match outcome {
@@ -187,6 +191,7 @@ async fn maintain_history(
     id: SessionId,
     start: u64,
     through: Option<u64>,
+    now: u64,
 ) -> Result<Option<MaintenanceCursor>, String> {
     if state
         .shutdown_requested
@@ -203,7 +208,6 @@ async fn maintain_history(
     if !policy.enabled {
         return Ok(None);
     }
-    let now = super::current_time_ms();
     let access_root = root.to_path_buf();
     let observation = tokio::task::spawn_blocking(move || observe_session_access(&access_root, id))
         .await
@@ -292,15 +296,6 @@ async fn reclaim_completed_pass(
         Ok(_) => {}
         Err(_) => tracing::debug!("automatic session reclamation deferred"),
     }
-}
-
-async fn maintain_session(
-    state: &ServerState,
-    root: &std::path::Path,
-    id: SessionId,
-    after: Option<ArtifactSweepCursor>,
-) -> Result<Option<ArtifactSweepCursor>, String> {
-    maintain_session_at(state, root, id, after, super::current_time_ms()).await
 }
 
 async fn observe_access_for_sweep(
