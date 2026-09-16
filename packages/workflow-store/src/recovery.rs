@@ -22,6 +22,20 @@ pub fn verify(connection: &Connection) -> Result<(), WorkflowStoreError> {
     Ok(())
 }
 
+pub fn require_execution(connection: &Connection, run_id: &str) -> Result<(), WorkflowStoreError> {
+    let recovering: bool = connection.query_row(
+        "SELECT EXISTS(SELECT 1 FROM workflow_recovery_barriers WHERE run_id = ?1)",
+        [run_id],
+        |row| row.get(0),
+    )?;
+    if recovering {
+        return Err(WorkflowStoreError::InvalidData(
+            "workflow recovery prohibits child admission".into(),
+        ));
+    }
+    Ok(())
+}
+
 pub fn initialize(connection: &Connection) -> Result<(), WorkflowStoreError> {
     connection.execute_batch(
         "CREATE TABLE IF NOT EXISTS workflow_recovery_barriers (

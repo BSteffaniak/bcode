@@ -4011,6 +4011,75 @@ impl WorkflowStore {
         Ok(true)
     }
 
+    /// Atomically acquire recovery-only authority after verified coordinator termination.
+    ///
+    /// Unlike executable reassignment, unresolved attempts are preserved and permitted.
+    /// The caller must verify termination and retain canonical session ownership. Receipt
+    /// compatibility is not implied by this transfer; execution remains durably blocked.
+    ///
+    /// # Errors
+    /// Rejects stale authority, mismatched evidence, invalid generation/fence, terminal runs,
+    /// or persistence failure. All changes roll back together.
+    pub fn take_recovery_authority(
+        &mut self,
+        run_id: &str,
+        expected: &WorkflowExecutionAuthority,
+        replacement: &WorkflowExecutionAuthority,
+        evidence: &EndedOwnerEvidence,
+        now_ms: u64,
+    ) -> Result<(), WorkflowStoreError> {
+        validate_id("run_id", run_id)?;
+        if evidence.liveness != EndedOwnerLiveness::ObservedEnded
+            || evidence.ended_daemon_instance_id != expected.daemon_instance_id
+            || evidence.ended_target_artifact_id != expected.target_artifact_id
+            || expected.generation.checked_add(1) != Some(replacement.generation)
+            || expected.fencing_token == replacement.fencing_token
+            || expected.daemon_instance_id == replacement.daemon_instance_id
+        {
+            return Err(WorkflowStoreError::InvalidData(
+                "invalid recovery authority transfer".into(),
+            ));
+        }
+        validate_id("replacement artifact", &replacement.target_artifact_id)?;
+        validate_id("replacement daemon", &replacement.daemon_instance_id)?;
+        validate_id("replacement fence", &replacement.fencing_token)?;
+        let tx = self.connection.unchecked_transaction()?;
+        self.verify_execution_authority(run_id, expected)?;
+        tx.execute(
+            "INSERT OR IGNORE INTO workflow_recovery_barriers VALUES (?1, ?2, ?3)",
+            rusqlite::params![run_id, expected.target_artifact_id, now_ms],
+        )?;
+        let changed = tx.execute(
+            "UPDATE workflow_runs SET target_artifact_id = ?2, coordinator_daemon_instance_id = ?3,
+             coordinator_generation = ?4, coordinator_fencing_token = ?5,
+             status = CASE WHEN status = 'running' THEN 'paused' ELSE status END, updated_at_ms = ?6
+             WHERE run_id = ?1 AND status IN ('running', 'paused', 'repair_required')",
+            rusqlite::params![
+                run_id,
+                replacement.target_artifact_id,
+                replacement.daemon_instance_id,
+                replacement.generation,
+                replacement.fencing_token,
+                now_ms
+            ],
+        )?;
+        if changed != 1 {
+            return Err(WorkflowStoreError::InvalidData(
+                "terminal workflow cannot transfer recovery authority".into(),
+            ));
+        }
+        append_event(
+            &tx,
+            run_id,
+            "recovery_authority_transferred",
+            &serde_json::json!({"from": expected, "to": replacement, "evidence": evidence})
+                .to_string(),
+            now_ms,
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+
     /// Atomically transfer one active run to a replacement coordinator.
     ///
     /// The compare-and-swap predicate fences stale owners. Artifact identity cannot change.
@@ -4433,6 +4502,7 @@ impl WorkflowStore {
         let transaction = self
             .connection
             .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        recovery::require_execution(&transaction, &request.link.parent_run_id)?;
         let parent = transaction
             .query_row(
                 "SELECT run.workspace_snapshot, activation.status,
@@ -22960,6 +23030,53 @@ mod tests {
     }
 
     #[test]
+    fn schema_33_upgrade_installs_recovery_barrier_without_changing_run() {
+        let (temp, store) = initialized_store();
+        let before = store.run_summary("run-1").expect("summary");
+        store
+            .connection
+            .execute_batch(
+                "DROP TRIGGER recovery_blocks_attempt_insert;
+             DROP TRIGGER recovery_blocks_resume;
+             DROP TRIGGER recovery_blocks_handoff;
+             DROP TABLE workflow_recovery_barriers;
+             UPDATE workflow_store_contract SET schema_version = 33;",
+            )
+            .expect("schema 33 fixture");
+        drop(store);
+        assert!(matches!(
+            WorkflowStore::open_in_state_dir(temp.path()),
+            Err(WorkflowStoreError::UnsupportedStore { .. })
+        ));
+        let store = WorkflowStore::initialize_in_state_dir(temp.path(), 993).expect("upgrade");
+        assert_eq!(store.run_summary("run-1").expect("preserved"), before);
+        recovery::verify(&store.connection).expect("barriers installed");
+        assert_eq!(
+            store
+                .connection
+                .query_row("SELECT COUNT(*) FROM workflow_recovery_barriers", [], |r| r
+                    .get::<_, u64>(0))
+                .expect("rows"),
+            0
+        );
+    }
+
+    #[test]
+    fn missing_recovery_barrier_is_not_recreated_on_open() {
+        let (temp, store) = initialized_store();
+        store
+            .connection
+            .execute_batch("DROP TRIGGER recovery_blocks_handoff;")
+            .expect("damage");
+        drop(store);
+        assert!(WorkflowStore::open_in_state_dir(temp.path()).is_err());
+        assert!(WorkflowStore::initialize_in_state_dir(temp.path(), 994).is_err());
+        let connection =
+            Connection::open(workflow_database_path(temp.path())).expect("inspect fixture");
+        assert!(!connection.query_row("SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE name = 'recovery_blocks_handoff')", [], |r| r.get::<_, bool>(0)).expect("still missing"));
+    }
+
+    #[test]
     fn schema_32_missing_package_bindings_upgrade_preserves_runs_and_allows_admission() {
         let (temp, store) = initialized_store();
         store.connection.execute_batch(
@@ -31148,6 +31265,24 @@ mod tests {
                 )
                 .expect("restore definition fixture");
         }
+        store
+            .connection
+            .execute(
+                "INSERT INTO workflow_recovery_barriers VALUES (?1, 'original-artifact', 1)",
+                [&request.link.parent_run_id],
+            )
+            .expect("recovery barrier");
+        let before = store.connection.total_changes();
+        assert!(store.create_child_run_idempotent(&request).is_err());
+        assert_eq!(store.connection.total_changes(), before);
+        assert!(store.run_summary(&child_id).expect("lookup").is_none());
+        store
+            .connection
+            .execute(
+                "DELETE FROM workflow_recovery_barriers WHERE run_id = ?1",
+                [&request.link.parent_run_id],
+            )
+            .expect("clear test barrier");
         assert!(
             store
                 .create_child_run_idempotent(&request)
@@ -38015,6 +38150,69 @@ mod tests {
                 .expect("terminal artifacts")
                 .is_empty()
         );
+    }
+
+    #[test]
+    fn recovery_takeover_preserves_unsettled_attempt_and_blocks_execution_after_reopen() {
+        let (temp, mut store, run, authority, _) = connected_publication_fixture();
+        let id = activation_identity(&run.run_id, "first", 0);
+        let prepared = store
+            .prepare_pending_activation(
+                &run.run_id,
+                "first",
+                &id,
+                DispatchSideEffect::Mutating,
+                serde_json::json!({}),
+                10,
+            )
+            .expect("prepare")
+            .expect("pending");
+        let replacement = WorkflowExecutionAuthority {
+            target_artifact_id: "new-artifact".into(),
+            daemon_instance_id: "new-owner".into(),
+            generation: authority.generation + 1,
+            fencing_token: "new-fence".into(),
+        };
+        let evidence = EndedOwnerEvidence {
+            ended_daemon_instance_id: authority.daemon_instance_id.clone(),
+            ended_target_artifact_id: authority.target_artifact_id.clone(),
+            liveness: EndedOwnerLiveness::ObservedEnded,
+            artifact_image_available: true,
+        };
+        store
+            .take_recovery_authority(&run.run_id, &authority, &replacement, &evidence, 20)
+            .expect("takeover");
+        drop(store);
+        let mut store = WorkflowStore::open_in_state_dir(temp.path()).expect("reopen");
+        assert!(
+            store
+                .verify_execution_authority(&run.run_id, &authority)
+                .is_err()
+        );
+        store
+            .verify_execution_authority(&run.run_id, &replacement)
+            .expect("new owner");
+        assert_eq!(
+            store
+                .attempt_by_dispatch_identity(&prepared.dispatch_identity)
+                .expect("lookup")
+                .expect("attempt")
+                .status,
+            "prepared"
+        );
+        assert!(
+            store
+                .resume_run_owned(&run.run_id, 21, &replacement)
+                .is_err()
+        );
+        assert!(
+            store
+                .finish_recovery_only(&run.run_id, &replacement, 22)
+                .is_err()
+        );
+        store
+            .request_cancellation_owned(&run.run_id, 23, &replacement)
+            .expect("cancel intent allowed");
     }
 
     #[test]
