@@ -77387,7 +77387,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
                     metadata: Some(serde_json::json!({
                         "availability": "complete",
                         "complete": true,
-                        "checksum_sha256": "abc123"
+                        "content_checksum_sha256": "a".repeat(64)
                     })),
                 }],
             }),
@@ -77417,7 +77417,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
             .expect("bounded artifact lookup")
             .expect("projected reference");
         assert_eq!(reference.byte_len, Some(42));
-        assert_eq!(reference.checksum_sha256.as_deref(), Some("abc123"));
+        assert_eq!(reference.checksum_sha256, Some("a".repeat(64)));
 
         let projection = state
             .sessions

@@ -3994,8 +3994,7 @@ impl WorkflowStore {
         validate_id("run_id", run_id)?;
         let unsettled: bool = self.connection.query_row(
             "SELECT EXISTS(SELECT 1 FROM workflow_attempts WHERE run_id = ?1 \
-             AND status IN ('prepared', 'admitted', 'running', 'cancelling', \
-                            'sibling_cancelling', 'repair_required'))",
+             AND status NOT IN ('succeeded', 'failed', 'cancelled', 'paused', 'abandoned'))",
             [run_id],
             |row| row.get(0),
         )?;
@@ -30081,6 +30080,7 @@ mod tests {
             "cancelling",
             "sibling_cancelling",
             "repair_required",
+            "future_attempt_state",
         ] {
             store
                 .connection
