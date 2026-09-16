@@ -30,7 +30,7 @@ pub fn require_execution(connection: &Connection, run_id: &str) -> Result<(), Wo
     )?;
     if recovering {
         return Err(WorkflowStoreError::InvalidData(
-            "workflow recovery prohibits child admission".into(),
+            "workflow recovery prohibits execution admission".into(),
         ));
     }
     Ok(())

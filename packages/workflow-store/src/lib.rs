@@ -3930,6 +3930,19 @@ impl WorkflowStore {
         }
     }
 
+    /// Read whether a run is fenced to recovery-only work without mutating storage.
+    ///
+    /// # Errors
+    /// Rejects malformed run identities or database failures.
+    pub fn is_recovery_only(&self, run_id: &str) -> Result<bool, WorkflowStoreError> {
+        validate_id("run_id", run_id)?;
+        Ok(self.connection.query_row(
+            "SELECT EXISTS(SELECT 1 FROM workflow_recovery_barriers WHERE run_id = ?1)",
+            [run_id],
+            |row| row.get(0),
+        )?)
+    }
+
     /// Enter durable recovery-only mode under current ownership, preserving receipt provenance.
     /// No attempt may be dispatched or run resumed until explicit recovery completion.
     ///
@@ -6881,6 +6894,7 @@ impl WorkflowStore {
                 "dispatch handoff execution authority changed".to_string(),
             ));
         }
+        recovery::require_execution(&transaction, &request.activation.run_id)?;
         let eligible: bool = transaction.query_row(
             "SELECT EXISTS(SELECT 1 FROM workflow_attempts attempt
              JOIN workflow_activations activation USING (run_id, node_id, activation_id)
@@ -7878,6 +7892,8 @@ impl WorkflowStore {
         let mut statement = self.connection.prepare(
             "SELECT DISTINCT target_artifact_id FROM workflow_runs \
              WHERE status IN ('running', 'paused', 'repair_required') AND target_artifact_id IS NOT NULL \
+             UNION SELECT barrier.source_artifact_id FROM workflow_recovery_barriers barrier \
+             JOIN workflow_runs run USING(run_id) WHERE run.status IN ('running', 'paused', 'repair_required') \
              ORDER BY target_artifact_id LIMIT ?1",
         )?;
         statement
@@ -38210,6 +38226,23 @@ mod tests {
                 .finish_recovery_only(&run.run_id, &replacement, 22)
                 .is_err()
         );
+        assert!(
+            store
+                .record_dispatch_handoff(&prepared, Some(&replacement))
+                .is_err()
+        );
+        let handed_off: bool = store
+            .connection
+            .query_row(
+                "SELECT handed_off FROM workflow_dispatch_handoffs WHERE dispatch_identity = ?1",
+                [&prepared.dispatch_identity],
+                |row| row.get(0),
+            )
+            .expect("handoff unchanged");
+        assert!(!handed_off);
+        let retained = store.active_target_artifact_ids(10).expect("retention");
+        assert!(retained.contains(&authority.target_artifact_id));
+        assert!(retained.contains(&replacement.target_artifact_id));
         store
             .request_cancellation_owned(&run.run_id, 23, &replacement)
             .expect("cancel intent allowed");

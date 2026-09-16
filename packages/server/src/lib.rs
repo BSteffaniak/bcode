@@ -15830,6 +15830,13 @@ async fn drive_workflow_run(state: &Arc<ServerState>, run_id: &str) -> Result<()
         let iteration_started_at = std::time::Instant::now();
         let now_ms = current_unix_millis();
         retry_owned_workflow_cancellation(state, run_id, &authority.authority).await?;
+        if bcode_workflow_store::WorkflowStore::open_at_path(&store_path)?
+            .is_recovery_only(run_id)?
+        {
+            // Recovery may observe/cancel existing work, but never enter ordinary
+            // scheduling, deadline terminalization, or automatic retry admission.
+            break;
+        }
         propagate_publication_cancellation(state, run_id, &authority.authority).await?;
         if bcode_workflow_store::WorkflowStore::open_at_path(&store_path)?
             .expire_run_deadline(run_id, now_ms)?
@@ -32181,6 +32188,7 @@ async fn restore_workflow_runs(
         // Prepared work may be between intent and receipt in a concurrent live dispatch.
         // Periodic recovery must not classify or redispatch that gap.
         if restore_prepared
+            && !store.is_recovery_only(&run_id).unwrap_or(true)
             && let Err(error) = store.reconcile_owned_prepared_attempts_for_run(
                 &run_id,
                 &authority.authority,
@@ -32192,6 +32200,7 @@ async fn restore_workflow_runs(
             continue;
         }
         if restore_prepared
+            && !store.is_recovery_only(&run_id).unwrap_or(true)
             && let Err(error) = store
                 .redispatch_owned_prepared_read_only_for_run(
                     &owner,
@@ -32630,15 +32639,18 @@ async fn propagate_persisted_workflow_cancellation_with_authorities(
             Err(WorkflowStoreError::InvalidData(message))
                 if message.starts_with("active runtime work not found for workflow dispatch:") =>
             {
-                state
+                let mut store = state
                     .workflow_store
                     .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .settle_orphaned_attempt_cancellation_owned(
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                store.verify_execution_authority(&attempt.run_id, &authority)?;
+                if !store.is_recovery_only(&attempt.run_id)? {
+                    store.settle_orphaned_attempt_cancellation_owned(
                         &attempt.dispatch_identity,
                         current_unix_millis(),
                         &authority,
                     )?;
+                }
             }
             Err(error) => return Err(error),
         }
@@ -67385,6 +67397,74 @@ event_symbol = "bcode_plugin_handle_event_v1"
     }
 
     #[tokio::test]
+    async fn recovery_cancellation_preserves_missing_external_owner() {
+        let root = tempfile::tempdir().expect("root");
+        let authority = test_workflow_execution_authority();
+        let mut store =
+            mutation_resolution_store_with_authority(root.path(), None, Some(authority.clone()));
+        store
+            .enter_recovery_only("expiration", &authority, 3)
+            .expect("recovery");
+        store
+            .request_cancellation_owned("expiration", 4, &authority)
+            .expect("intent");
+        let state = {
+            let mut state = test_server_state(SessionManager::default());
+            state.workflow_store = StdMutex::new(store).into();
+            state
+        };
+        let attempts = state
+            .workflow_store
+            .lock()
+            .expect("store")
+            .active_attempt_cancellations("expiration", 10)
+            .expect("attempts");
+        propagate_persisted_workflow_cancellation(&state, attempts)
+            .await
+            .expect("defer");
+        let store = state.workflow_store.lock().expect("store");
+        assert!(
+            store
+                .is_recovery_only("expiration")
+                .expect("barrier retained")
+        );
+        drop(store);
+        drop(state);
+    }
+
+    #[tokio::test]
+    async fn recovery_only_driver_does_not_admit_work() {
+        let root = tempfile::tempdir().expect("root");
+        let authority = test_workflow_execution_authority();
+        let mut store =
+            mutation_resolution_store_with_authority(root.path(), None, Some(authority.clone()));
+        store
+            .enter_recovery_only("expiration", &authority, 3)
+            .expect("recovery");
+        let before = store
+            .attempt_history("expiration", None, 10)
+            .expect("attempts");
+        let state = Arc::new({
+            let mut server = test_server_state(SessionManager::default());
+            server.workflow_store = StdMutex::new(store).into();
+            server
+        });
+        drive_workflow_run(&state, "expiration")
+            .await
+            .expect("recovery drive");
+        let store = state.workflow_store.lock().expect("store");
+        assert!(store.is_recovery_only("expiration").expect("barrier"));
+        assert_eq!(
+            store
+                .attempt_history("expiration", None, 10)
+                .expect("attempts"),
+            before
+        );
+        drop(store);
+        drop(state);
+    }
+
+    #[tokio::test]
     async fn child_cancellation_rejects_foreign_authority_before_intent() {
         let root = tempfile::tempdir().expect("root");
         let mut owner = test_workflow_execution_authority();
@@ -68552,7 +68632,27 @@ event_symbol = "bcode_plugin_handle_event_v1"
     }
 
     #[tokio::test]
+    async fn associated_resume_completes_quiescent_recovery_before_admission() {
+        assert_associated_resume_pending(true).await;
+    }
+
+    #[tokio::test]
     async fn associated_resume_drives_pending_activation() {
+        assert_associated_resume_pending(false).await;
+    }
+
+    fn enter_test_run_recovery(state: &ServerState, run_id: &str) {
+        let mut store = state.workflow_store.lock().expect("store");
+        let authority = store
+            .execution_authority(run_id)
+            .expect("authority")
+            .expect("owner");
+        store
+            .enter_recovery_only(run_id, &authority, 3)
+            .expect("recovery");
+    }
+
+    async fn assert_associated_resume_pending(recovering: bool) {
         let sessions = SessionManager::default();
         let session = sessions
             .create_session(Some("resume pending".to_string()), PathBuf::from("."))
@@ -68630,6 +68730,9 @@ event_symbol = "bcode_plugin_handle_event_v1"
             sessions, store,
         ));
 
+        if recovering {
+            enter_test_run_recovery(&state, "resume-pending-run");
+        }
         let (_, changed) = workflow_operations::control_associated_run(
             &state,
             &key,

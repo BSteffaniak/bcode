@@ -5720,15 +5720,14 @@ fn run_parent_session_id(
 ///
 /// * Same daemon instance: returns the recorded authority.
 /// * Same artifact, different (ended) instance: same-artifact compare-and-swap transfer.
-/// * Different artifact: allowed only when the recorded coordinator verifiably ended and the run
-///   holds no live attempt. The run is then reassigned to this artifact with an audited evidence
-///   record. Live or unverifiable prior owners are refused with an error that names them.
+/// * Different artifact: after verified coordinator termination, acquire recovery-only
+///   authority with an audited durable dispatch barrier. Unsettled attempts are preserved.
+///   Live or unverifiable prior owners are refused with an error that names them.
 ///
 /// # Errors
 ///
-/// Returns an error when the recorded coordinator is live or unverifiable, when the run still has
-/// live attempts on another artifact, when session ownership cannot be acquired, or when the
-/// compare-and-swap loses a race.
+/// Returns an error when the recorded coordinator is live or unverifiable, when session
+/// ownership cannot be acquired, or when the compare-and-swap loses a race.
 pub async fn execution_authority(
     state: &std::sync::Arc<ServerState>,
     run_id: &str,
@@ -5789,20 +5788,14 @@ pub async fn execution_authority(
                 &current.target_artifact_id,
             ),
         };
-        store.reassign_execution_authority_from_ended_owner(
-            run_id,
-            &current,
-            &replacement,
-            &evidence,
-            now_ms,
-        )?;
+        store.take_recovery_authority(run_id, &current, &replacement, &evidence, now_ms)?;
         tracing::info!(
             target: "bcode_server::workflow",
             run_id,
             from_artifact = %current.target_artifact_id,
             from_instance = %current.daemon_instance_id,
             liveness = ?evidence.liveness,
-            "reassigned quiescent workflow run from an ended coordinator on another artifact"
+            "acquired recovery-only workflow authority from an ended coordinator on another artifact"
         );
     }
     drop(store);
@@ -6704,11 +6697,30 @@ pub async fn resume_run(
             "active workflow has no durable execution authority".to_string(),
         )
     })?;
-    let changed = state
-        .workflow_store
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .resume_run_owned(run_id, super::current_unix_millis(), &authority.authority)?;
+    let changed = {
+        let mut store = state
+            .workflow_store
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if store.is_recovery_only(run_id)? {
+            let current = store.run_summary(run_id)?.ok_or_else(|| {
+                bcode_workflow_store::WorkflowStoreError::RunNotFound {
+                    run_id: run_id.into(),
+                }
+            })?;
+            if current.cancellation_requested_at_ms.is_some() {
+                return Err(
+                    bcode_workflow_store::WorkflowStoreError::CancellationPreventsControl.into(),
+                );
+            }
+            store.finish_recovery_only(
+                run_id,
+                &authority.authority,
+                super::current_unix_millis(),
+            )?;
+        }
+        store.resume_run_owned(run_id, super::current_unix_millis(), &authority.authority)?
+    };
     if changed
         && let Some(parent_session_id) = run
             .parent_session_id
