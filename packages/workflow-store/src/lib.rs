@@ -25,6 +25,7 @@ use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use thiserror::Error;
 
+mod recovery;
 mod run_graph;
 pub use run_graph::{RunGraphCandidateValidation, RunGraphEdge, RunGraphNode};
 
@@ -38,7 +39,7 @@ const RESET_BACKUP_DIRECTORY: &str = "reset-backups";
 /// Stable destructive confirmation required by public workflow-store reset surfaces.
 pub const WORKFLOW_STORE_RESET_CONFIRMATION: &str = "DELETE-INCOMPATIBLE-WORKFLOW-STATE";
 /// Current clean-break workflow store schema version.
-pub const WORKFLOW_STORE_SCHEMA_VERSION: u32 = 33;
+pub const WORKFLOW_STORE_SCHEMA_VERSION: u32 = 34;
 /// Current bounded workflow-store reset receipt version.
 pub const WORKFLOW_STORE_RESET_RECEIPT_VERSION: u32 = 1;
 /// Current explicit workflow-store migration receipt contract.
@@ -1159,7 +1160,7 @@ impl WorkflowStore {
                         match Self::open_with_ownership(&path, ownership) {
                             Ok(store) => return Ok(store),
                             Err(WorkflowStoreError::UnsupportedStore {
-                                actual: Some(14..=32),
+                                actual: Some(14..=33),
                                 ..
                             }) => {}
                             Err(error) => return Err(error),
@@ -1189,7 +1190,7 @@ impl WorkflowStore {
                         match Self::open_with_ownership(&path, probe) {
                             Ok(store) => return Ok(store),
                             Err(WorkflowStoreError::UnsupportedStore {
-                                actual: Some(14..=32),
+                                actual: Some(14..=33),
                                 ..
                             }) => {}
                             Err(error) => return Err(error),
@@ -1339,7 +1340,7 @@ impl WorkflowStore {
                 "workflow store migration cannot read the source schema".to_string(),
             )
         })?;
-        if !matches!(previous_schema_version, 14..=32) {
+        if !matches!(previous_schema_version, 14..=33) {
             return Err(WorkflowStoreError::UnsupportedStore {
                 actual: Some(previous_schema_version),
                 expected: WORKFLOW_STORE_SCHEMA_VERSION,
@@ -1389,6 +1390,7 @@ impl WorkflowStore {
         }
         run_graph::initialize_edit_candidates(&transaction)?;
         migrate_run_package_bindings(&transaction)?;
+        recovery::initialize(&transaction)?;
         transaction.execute(
             "UPDATE workflow_store_contract SET schema_version = ?1 WHERE contract_id = 1",
             [WORKFLOW_STORE_SCHEMA_VERSION],
@@ -3926,6 +3928,87 @@ impl WorkflowStore {
                 "workflow execution authority is stale or foreign: {run_id}"
             )))
         }
+    }
+
+    /// Enter durable recovery-only mode under current ownership, preserving receipt provenance.
+    /// No attempt may be dispatched or run resumed until explicit recovery completion.
+    ///
+    /// # Errors
+    /// Rejects stale authority, terminal runs, or database failures.
+    pub fn enter_recovery_only(
+        &mut self,
+        run_id: &str,
+        authority: &WorkflowExecutionAuthority,
+        now_ms: u64,
+    ) -> Result<(), WorkflowStoreError> {
+        let tx = self.connection.unchecked_transaction()?;
+        self.verify_execution_authority(run_id, authority)?;
+        let run = self
+            .run_summary(run_id)?
+            .ok_or_else(|| WorkflowStoreError::RunNotFound {
+                run_id: run_id.into(),
+            })?;
+        if !matches!(
+            run.status,
+            RunStatus::Running | RunStatus::Paused | RunStatus::RepairRequired
+        ) {
+            return Err(WorkflowStoreError::InvalidData(
+                "terminal run cannot enter recovery".into(),
+            ));
+        }
+        let changed = tx.execute(
+            "INSERT OR IGNORE INTO workflow_recovery_barriers VALUES (?1, ?2, ?3)",
+            rusqlite::params![run_id, authority.target_artifact_id, now_ms],
+        )?;
+        if changed == 1 {
+            append_event(&tx, run_id, "recovery_started", "{}", now_ms)?;
+        }
+        tx.execute(
+            "UPDATE workflow_runs SET status = 'paused' WHERE run_id = ?1 AND status = 'running'",
+            [run_id],
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Finish recovery without resuming execution or changing terminal outcomes.
+    ///
+    /// Only the original execution artifact may clear the barrier; cross-artifact
+    /// execution compatibility must be established separately, never inferred from ownership.
+    ///
+    /// # Errors
+    /// Rejects stale authority, unsettled attempts, incompatible artifacts, or storage failures.
+    pub fn finish_recovery_only(
+        &mut self,
+        run_id: &str,
+        authority: &WorkflowExecutionAuthority,
+        now_ms: u64,
+    ) -> Result<bool, WorkflowStoreError> {
+        let tx = self.connection.unchecked_transaction()?;
+        self.verify_execution_authority(run_id, authority)?;
+        let source: Option<String> = tx
+            .query_row(
+                "SELECT source_artifact_id FROM workflow_recovery_barriers WHERE run_id = ?1",
+                [run_id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        let Some(source) = source else {
+            return Ok(false);
+        };
+        if source != authority.target_artifact_id {
+            return Err(WorkflowStoreError::InvalidData(
+                "recovery completion requires compatible execution artifact".into(),
+            ));
+        }
+        self.validate_quiescent_reassignment(run_id)?;
+        tx.execute(
+            "DELETE FROM workflow_recovery_barriers WHERE run_id = ?1",
+            [run_id],
+        )?;
+        append_event(&tx, run_id, "recovery_completed", "{}", now_ms)?;
+        tx.commit()?;
+        Ok(true)
     }
 
     /// Atomically transfer one active run to a replacement coordinator.
@@ -16970,6 +17053,7 @@ fn initialize_schema(connection: &mut Connection) -> Result<(), WorkflowStoreErr
     )?;
     run_graph::initialize(&transaction)?;
     run_graph::initialize_edit_candidates(&transaction)?;
+    recovery::initialize(&transaction)?;
     transaction.execute(
         "INSERT INTO workflow_store_contract (contract_id, schema_version) VALUES (1, ?1)",
         [WORKFLOW_STORE_SCHEMA_VERSION],
@@ -16994,6 +17078,10 @@ fn verify_store_schema(connection: &Connection) -> Result<(), WorkflowStoreError
             expected: WORKFLOW_STORE_SCHEMA_VERSION,
         });
     }
+    recovery::verify(connection)?;
+    connection.prepare(
+        "SELECT run_id, source_artifact_id, created_at_ms FROM workflow_recovery_barriers LIMIT 0",
+    )?;
     connection
         .prepare("SELECT run_id, package_id, lock_digest FROM workflow_run_packages LIMIT 0")?;
     Ok(())
@@ -37927,6 +38015,63 @@ mod tests {
                 .expect("terminal artifacts")
                 .is_empty()
         );
+    }
+
+    #[test]
+    fn recovery_completion_is_fenced_idempotent_and_does_not_resume() {
+        let (_temp, mut store, run, authority, _) = connected_publication_fixture();
+        store
+            .enter_recovery_only(&run.run_id, &authority, 20)
+            .expect("enter");
+        let mut stale = authority.clone();
+        stale.generation += 1;
+        assert!(store.finish_recovery_only(&run.run_id, &stale, 21).is_err());
+        assert!(store.resume_run(&run.run_id, 22).is_err());
+        assert!(
+            store
+                .finish_recovery_only(&run.run_id, &authority, 23)
+                .expect("finish")
+        );
+        assert!(
+            !store
+                .finish_recovery_only(&run.run_id, &authority, 24)
+                .expect("duplicate")
+        );
+        assert_eq!(
+            store
+                .run_summary(&run.run_id)
+                .expect("summary")
+                .expect("run")
+                .status,
+            RunStatus::Paused
+        );
+        assert!(
+            store
+                .resume_run_owned(&run.run_id, 25, &authority)
+                .expect("explicit resume")
+        );
+    }
+
+    #[test]
+    fn recovery_only_survives_reopen_and_blocks_resume() {
+        let (temp, mut store, run, authority, _) = connected_publication_fixture();
+        store
+            .enter_recovery_only(&run.run_id, &authority, 20)
+            .expect("recovery");
+        drop(store);
+        let mut store = WorkflowStore::open_in_state_dir(temp.path()).expect("reopen");
+        assert!(store.resume_run_owned(&run.run_id, 21, &authority).is_err());
+        assert_eq!(
+            store
+                .run_summary(&run.run_id)
+                .expect("summary")
+                .expect("run")
+                .status,
+            RunStatus::Paused
+        );
+        store
+            .request_cancellation_owned(&run.run_id, 22, &authority)
+            .expect("cancellation still allowed");
     }
 
     #[test]
