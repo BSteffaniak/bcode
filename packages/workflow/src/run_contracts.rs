@@ -940,6 +940,10 @@ pub struct WorkflowCoordinatorStatus {
     pub daemon_instance_id: String,
     /// Whether the responding daemon is that coordinator.
     pub owned_by_this_daemon: bool,
+    /// Whether durable recovery fencing prohibits new execution. Absent in older
+    /// observations means unknown, not permission to execute; commands remain authoritative.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recovery_only: Option<bool>,
     /// Whether the responding daemon could take control of the run on demand.
     ///
     /// `false` means another daemon still owns the run (or ownership cannot be verified), and
@@ -1664,6 +1668,17 @@ pub struct WorkflowRunInspection {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn coordinator_recovery_observation_preserves_unknown_older_state() {
+        let older = serde_json::json!({"target_artifact_id":"artifact", "daemon_instance_id":"daemon",
+            "owned_by_this_daemon":true,"controllable_from_this_daemon":true});
+        let mut status: super::WorkflowCoordinatorStatus = serde_json::from_value(older).unwrap();
+        assert_eq!(status.recovery_only, None);
+        status.recovery_only = Some(true);
+        let decoded: super::WorkflowCoordinatorStatus =
+            serde_json::from_value(serde_json::to_value(&status).unwrap()).unwrap();
+        assert_eq!(decoded.recovery_only, Some(true));
+    }
     use super::*;
 
     #[test]

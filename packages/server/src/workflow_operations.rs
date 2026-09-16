@@ -10042,6 +10042,13 @@ pub async fn inspect_run(
                 target_artifact_id: authority.target_artifact_id,
                 daemon_instance_id: authority.daemon_instance_id,
                 owned_by_this_daemon,
+                recovery_only: Some(
+                    state
+                        .workflow_store
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .is_recovery_only(run_id)?,
+                ),
                 controllable_from_this_daemon,
             })
         }
