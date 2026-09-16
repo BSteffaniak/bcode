@@ -389,8 +389,7 @@ pub(crate) async fn acquire_tracking_admission(
     {
         let root = root.to_path_buf();
         tokio::task::spawn_blocking(move || {
-            crate::storage_admission::StorageAdmissionRegistry::open_session(&root, id)?
-                .admit_maintenance(4096)
+            crate::storage_admission::StorageAdmissionRegistry::admit_session_maintenance(&root, id)
         })
         .await
         .map_err(|_| io::Error::other("storage tracking admission task failed"))?

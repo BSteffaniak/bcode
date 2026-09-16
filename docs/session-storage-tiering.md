@@ -2,6 +2,15 @@
 
 ## Admission diagnosis and explicit recovery
 
+Compression admission now automatically invokes the same verified recovery operation when an
+initial admission attempt finds invalid evidence. Recovery proceeds only for a complete inventory
+of supported, unlocked participant records under verified session maintenance ownership. Busy,
+unknown, malformed, unsafe or over-budget state remains blocked. Admission is reacquired after
+recovery, so racing readers cannot be bypassed. This is maintenance-only: ordinary reads and dry
+runs do not recover records. Age-filtered compression rechecks the newly reset access timestamp
+under ownership and defers; explicit ID compression without an age filter may proceed. The
+explicit command below remains available for inspection or deliberate recovery.
+
 `bcode session storage-admission <session-id>` inspects up to 4096 session admission entries
 without creating registry files or updating access age. It reports abandoned/clean participant
 counts, busy ownership, and invalid/incomplete evidence. Missing or unsafe registries return an

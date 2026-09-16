@@ -92,6 +92,32 @@ impl StorageAdmissionRegistry {
         Ok(Self { directory })
     }
 
+    /// Admit compression, recovering only supported abandoned read evidence when safe.
+    ///
+    /// Recovery uses the same exclusive validation and conservative age reset as explicit repair.
+    /// Admission is reacquired afterward; a racing reader or new invalid record still blocks work.
+    /// Normal reads and preview paths must not call this operation.
+    ///
+    /// # Errors
+    /// Returns active ownership, unknown/corrupt evidence, tracking persistence or I/O failures.
+    pub fn admit_session_maintenance(
+        root: &Path,
+        id: SessionId,
+    ) -> io::Result<StorageMaintenanceAdmission> {
+        let registry = Self::open_session(root, id)?;
+        match registry.admit_maintenance(4096) {
+            Ok(admission) => Ok(admission),
+            Err(error) if error.kind() == io::ErrorKind::InvalidData => {
+                let report = Self::session_report(root, id, true)?;
+                if report.busy || report.invalid || report.retired == 0 {
+                    return Err(error);
+                }
+                registry.admit_maintenance(4096)
+            }
+            Err(error) => Err(error),
+        }
+    }
+
     /// Inspect session admission without creating files; optionally retire verified abandoned reads.
     /// Recovery resets access age durably before removing known participants under exclusive locks.
     ///
@@ -637,6 +663,60 @@ unsafe fn errno() -> *mut libc::c_int {
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test]
+    async fn automatic_recovery_resets_age_and_preserves_unknown_evidence() {
+        let root = tempfile::tempdir().expect("root");
+        let sessions = crate::SessionManager::persistent(root.path()).expect("sessions");
+        let id = sessions
+            .create_session(None, root.path().to_path_buf())
+            .await
+            .expect("session")
+            .id;
+        sessions
+            .release_session_ownership(id)
+            .await
+            .expect("release");
+        let registry = StorageAdmissionRegistry::open_session(root.path(), id).expect("registry");
+        let reader = registry.admit_read(SessionId::new()).expect("reader");
+        assert!(StorageAdmissionRegistry::admit_session_maintenance(root.path(), id).is_err());
+        drop(reader);
+        let before = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("time")
+            .as_millis();
+        drop(
+            StorageAdmissionRegistry::admit_session_maintenance(root.path(), id)
+                .expect("automatic recovery"),
+        );
+        let access =
+            crate::storage_access::observe_session_access(root.path(), id).expect("access");
+        let crate::storage_access::StorageAccessObservation::Recorded(record) = access else {
+            panic!("recorded age");
+        };
+        assert!(u128::from(record.observed_at_ms) >= before);
+        drop(
+            StorageAdmissionRegistry::admit_session_maintenance(root.path(), id)
+                .expect("idempotent"),
+        );
+        assert_eq!(
+            crate::storage_access::observe_session_access(root.path(), id).expect("same access"),
+            access
+        );
+        drop(registry.admit_read(SessionId::new()).expect("abandoned"));
+        let path = root
+            .path()
+            .join("storage-admission-sessions-v1")
+            .join(id.to_string())
+            .join("unknown");
+        std::fs::write(&path, b"future").expect("fixture");
+        assert!(StorageAdmissionRegistry::admit_session_maintenance(root.path(), id).is_err());
+        assert_eq!(std::fs::read(&path).expect("preserved"), b"future");
+        assert_eq!(
+            crate::storage_access::observe_session_access(root.path(), id).expect("same access"),
+            access
+        );
+    }
+
     #[tokio::test]
     async fn session_recovery_requires_released_readers_and_resets_age() {
         let root = tempfile::tempdir().expect("root");

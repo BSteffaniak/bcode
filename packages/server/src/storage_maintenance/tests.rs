@@ -51,7 +51,7 @@ async fn maintenance_pass_ignores_unrelated_daemon() {
 }
 
 #[tokio::test]
-async fn automatic_publication_is_blocked_by_registered_readers_and_dirty_records() {
+async fn automatic_publication_recovers_abandoned_readers_but_not_active_readers() {
     let (root, state, id, artifacts, _) = fixture(1).await;
     let registry =
         bcode_session::storage_admission::StorageAdmissionRegistry::open_session(root.path(), id)
@@ -66,10 +66,11 @@ async fn automatic_publication_is_blocked_by_registered_readers_and_dirty_record
     drop(read);
     maintain_session_at(&state, root.path(), id, None, future)
         .await
-        .expect("deferred dirty candidate");
-    assert!(artifacts.join("recording-000").is_file());
+        .expect("recover abandoned candidate");
+    // This test's clock is 31 days ahead of real recovery time, so the reset age is eligible.
+    assert!(artifacts.join("recording-000").is_dir());
     drop(state);
-    assert!(registry.check_health(4096).is_err());
+    assert!(registry.check_health(4096).is_ok());
 }
 
 #[tokio::test]

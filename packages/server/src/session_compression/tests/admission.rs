@@ -28,6 +28,15 @@ async fn unrelated_daemon_does_not_block_session_sweep() {
     let unrelated_reader = unrelated
         .admit_read(bcode_session_models::SessionId::new())
         .expect("unrelated read");
+    let scoped =
+        bcode_session::storage_admission::StorageAdmissionRegistry::open_session(root.path(), id)
+            .expect("scoped");
+    drop(
+        scoped
+            .admit_read(bcode_session_models::SessionId::new())
+            .expect("abandoned read"),
+    );
+    assert!(scoped.admit_maintenance(4096).is_err());
     let request = StorageCompressionRequest {
         session_id: id,
         as_of_ms: crate::current_time_ms(),
@@ -42,6 +51,11 @@ async fn unrelated_daemon_does_not_block_session_sweep() {
     assert_eq!(blocked.failure, None);
     assert_eq!(blocked.disposition, Disposition::Processed);
     assert_eq!(blocked.failures, 0);
+    drop(
+        scoped
+            .admit_maintenance(4096)
+            .expect("manual compression recovered abandoned reader"),
+    );
     assert!(blocked.next.is_some());
     drop(unrelated_reader);
     foreign.finish().expect("clean foreign shutdown");
