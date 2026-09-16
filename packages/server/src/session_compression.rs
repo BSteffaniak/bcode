@@ -148,13 +148,8 @@ async fn execute_page(
     });
     match cursor {
         Cursor::Artifacts { after, through } => {
-            let Ok(page) = maintenance_candidates_through(
-                root,
-                request.session_id,
-                after.as_ref().map(|(a, b)| (a.as_str(), b.as_str())),
-                through,
-            )
-            .await
+            let Ok(page) =
+                artifact_candidates(root, request.session_id, after.as_ref(), through).await
             else {
                 return Ok(result);
             };
@@ -188,7 +183,12 @@ async fn execute_page(
                         result.artifact_failure = Some(artifact_failure_context(
                             artifact, reference, &error, timed_out,
                         ));
-                        return Ok(failed(result, Failure::ArtifactFailed));
+                        return Ok(artifact_failed_page(
+                            result,
+                            artifact,
+                            reference,
+                            page.through_sequence,
+                        ));
                     }
                 }
                 result.next = Some(Cursor::Artifacts {
@@ -287,4 +287,38 @@ fn artifact_failure_context(
             bcode_session::artifact_storage::artifact_failure_reason(error)
         },
     }
+}
+
+fn artifact_failed_page(
+    result: StorageCompressionResult,
+    artifact: &str,
+    reference: &str,
+    through: u64,
+) -> StorageCompressionResult {
+    let missing = result.artifact_failure.as_ref().is_some_and(|context| {
+        context.reason == bcode_session_models::ArtifactCompressionFailureReason::ContentMissing
+    });
+    let mut result = failed(result, Failure::ArtifactFailed);
+    if missing {
+        result.next = Some(Cursor::Artifacts {
+            after: Some((artifact.to_owned(), reference.to_owned())),
+            through: Some(through),
+        });
+    }
+    result
+}
+
+async fn artifact_candidates(
+    root: &std::path::Path,
+    id: bcode_session_models::SessionId,
+    after: Option<&(String, String)>,
+    through: Option<u64>,
+) -> std::io::Result<bcode_session::artifact_storage::ArtifactMaintenancePage> {
+    maintenance_candidates_through(
+        root,
+        id,
+        after.map(|(a, b)| (a.as_str(), b.as_str())),
+        through,
+    )
+    .await
 }

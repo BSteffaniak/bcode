@@ -153,6 +153,8 @@ pub enum ArtifactCompressionFailureReason {
     OwnershipUnavailable,
     /// Durable read admission could not be acquired.
     AdmissionUnavailable,
+    /// Original artifact path is missing before any replacement work begins.
+    ContentMissing,
     /// Referenced storage does not exist.
     NotFound,
     /// Filesystem access was denied.

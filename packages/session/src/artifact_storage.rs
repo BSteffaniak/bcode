@@ -460,6 +460,14 @@ impl std::fmt::Display for ArtifactFailure {
 }
 impl std::error::Error for ArtifactFailure {}
 
+fn original_content_error(error: io::Error) -> io::Error {
+    if error.kind() == io::ErrorKind::NotFound {
+        artifact_failure(bcode_session_models::ArtifactCompressionFailureReason::ContentMissing)
+    } else {
+        error
+    }
+}
+
 fn artifact_failure(reason: bcode_session_models::ArtifactCompressionFailureReason) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, ArtifactFailure(reason))
 }
@@ -579,7 +587,8 @@ pub async fn compress_finalized_artifact_cancellable(
     let artifacts = confined(
         &root.join("session-artifacts").join(session_id.to_string()),
         &root,
-    )?;
+    )
+    .map_err(original_content_error)?;
     let resolved = crate::artifact_reference::resolve_artifact_reference(
         &reference
             .storage_uri
@@ -587,7 +596,7 @@ pub async fn compress_finalized_artifact_cancellable(
         &artifacts,
     )
     .map_err(|_| artifact_failure(Reason::InvalidReference))?;
-    let resolved = confined(&resolved, &artifacts)?;
+    let resolved = confined(&resolved, &artifacts).map_err(original_content_error)?;
     let relative = resolved
         .strip_prefix(&artifacts)
         .map_err(|_| invalid())?
@@ -603,7 +612,8 @@ pub async fn compress_finalized_artifact_cancellable(
             &root.join("session-artifacts").join(session_id.to_string()),
             &root,
         )?;
-        let (file, encoding) = open_content(&artifacts.join(&relative), &artifacts)?;
+        let (file, encoding) =
+            open_content(&artifacts.join(&relative), &artifacts).map_err(original_content_error)?;
         let mut reader = ArtifactReader::new(file, encoding)?;
         if reader.logical_bytes() != expected_bytes {
             return Err(artifact_failure(Reason::LengthMismatch));

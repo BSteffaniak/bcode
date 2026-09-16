@@ -1,5 +1,14 @@
 # Session storage tiering
 
+## Missing artifacts during manual compression
+
+A confirmed missing original artifact path before replacement produces `ContentMissing` with the
+artifact/reference identity and a continuation. The CLI attempts remaining artifacts and history,
+then exits nonzero for partial failure. No reference is deleted and no content is fabricated.
+Generic `NotFound` errors from other stages, integrity failures, admission/ownership failures and
+publication errors still stop the session sweep. This supersedes earlier blanket stop-on-failure
+wording below.
+
 ## Admission diagnosis and explicit recovery
 
 Compression admission now automatically invokes the same verified recovery operation when an

@@ -91,6 +91,74 @@ async fn automatic_publication_resumes_after_successful_reader_completion() {
     assert!(artifacts.join("recording-000").is_dir());
 }
 
+#[tokio::test]
+async fn manual_sweep_continues_after_missing_artifact_through_history() {
+    use bcode_session_models::{
+        ArtifactCompressionFailureReason, StorageCompressionRequest, StorageCompressionTier,
+    };
+    let (root, state, id, artifacts, _) = fixture(2).await;
+    std::fs::remove_file(artifacts.join("recording-000")).expect("missing fixture");
+    state
+        .sessions
+        .append_event(
+            id,
+            SessionEventKind::SystemMessage {
+                text: "compressible history ".repeat(10000),
+            },
+        )
+        .await
+        .expect("history");
+    let history = state.sessions.session_history(id).await.expect("history");
+    state
+        .sessions
+        .release_session_ownership(id)
+        .await
+        .expect("release");
+    let mut request = StorageCompressionRequest {
+        session_id: id,
+        as_of_ms: crate::current_time_ms(),
+        minimum_age_ms: None,
+        tier: StorageCompressionTier::Light,
+        dry_run: false,
+        cursor: None,
+    };
+    let first = crate::session_compression::compress_page(&state, request.clone())
+        .await
+        .expect("missing");
+    assert_eq!(first.failures, 1);
+    assert_eq!(
+        first.artifact_failure.expect("reason").reason,
+        ArtifactCompressionFailureReason::ContentMissing
+    );
+    assert!(first.next.is_some());
+    request.cursor = first.next;
+    let mut history_saved = 0;
+    loop {
+        let page = crate::session_compression::compress_page(&state, request.clone())
+            .await
+            .expect("continue");
+        assert_eq!(page.failures, 0);
+        history_saved += page.history_payload_bytes_saved;
+        request.cursor = page.next;
+        if request.cursor.is_none() {
+            break;
+        }
+    }
+    assert!(history_saved > 0);
+    assert!(!artifacts.join("recording-000").exists());
+    assert!(artifacts.join("recording-001").is_dir());
+    assert_eq!(
+        state
+            .sessions
+            .session_history(id)
+            .await
+            .expect("preserved history"),
+        history
+    );
+    drop(state);
+    drop(root);
+}
+
 async fn fixture(count: usize) -> (tempfile::TempDir, ServerState, SessionId, PathBuf, Vec<u8>) {
     let root = tempfile::tempdir().expect("root");
     let sessions = bcode_session::SessionManager::persistent(root.path()).expect("manager");

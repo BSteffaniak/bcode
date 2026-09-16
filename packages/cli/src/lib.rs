@@ -6741,7 +6741,13 @@ fn print_compression_result(
                 context.artifact_id, context.reference_key, context.reason
             );
         }
-        if let Some(reason) = result.failure {
+        if result.artifact_failure.as_ref().is_some_and(|context| {
+            context.reason == bcode_session_models::ArtifactCompressionFailureReason::ContentMissing
+        }) {
+            eprintln!(
+                "{id}: original artifact storage is missing; continuing other artifacts and history; final status will report partial failure"
+            );
+        } else if let Some(reason) = result.failure {
             eprintln!("{id}: {}", reason.message());
         }
     }
