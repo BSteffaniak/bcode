@@ -6528,10 +6528,10 @@ pub async fn cancel_run(
 /// Explicit maintenance: reconcile nonterminal runs whose recorded coordinator verifiably ended.
 ///
 /// Each nonterminal run is classified with the same evidence `execution_authority` uses. Runs
-/// whose coordinator is live or unverifiable, runs that still hold live attempts on another
-/// artifact, and runs already owned by this daemon are reported as skipped. When `apply` is set,
-/// every orphaned run is reassigned to this daemon (audited) and cancelled; a `repair_required`
-/// run keeps that status because it still needs explicit attempt-level repair.
+/// whose coordinator is live or unverifiable and runs already owned by this daemon are skipped.
+/// Applying acquires qualified authority and requests cancellation; foreign-artifact runs enter
+/// recovery-only mode. Acceptance is not terminal evidence. A `repair_required` run retains its
+/// status because it still needs explicit attempt-level resolution.
 ///
 /// # Errors
 ///
@@ -6589,17 +6589,6 @@ pub async fn reconcile_orphaned_runs(
             }
             PriorOwnerLiveness::ObservedEnded => {}
         }
-        if authority.target_artifact_id != current_artifact_id(state) {
-            let eligibility = state
-                .workflow_store
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .validate_quiescent_reassignment(&run.run_id);
-            if let Err(error) = eligibility {
-                report.skipped.push(skip(error.to_string()));
-                continue;
-            }
-        }
         let orphan = bcode_workflow::OrphanedWorkflowRun {
             run_id: run.run_id.clone(),
             workflow_kind: run
@@ -6620,14 +6609,23 @@ pub async fn reconcile_orphaned_runs(
             report.reconciled.push(orphan);
             continue;
         }
-        // Reassignment goes through the same fenced path every control operation uses, so a
-        // run that still holds live attempts on the ended artifact is refused here too.
-        if let Err(error) = execution_authority(state, &run.run_id).await {
-            report
-                .skipped
-                .push(skip(format!("authority reassignment refused: {error}")));
-            continue;
-        }
+        // Retain canonical session ownership through cancellation, not just the transfer.
+        // Foreign-artifact attempts stay behind a recovery barrier until owner evidence settles them.
+        let _ownership = match execution_authority(state, &run.run_id).await {
+            Ok(Some(guard)) => guard,
+            Ok(None) => {
+                report
+                    .skipped
+                    .push(skip("recovery authority is unavailable".into()));
+                continue;
+            }
+            Err(error) => {
+                report
+                    .skipped
+                    .push(skip(format!("authority reassignment refused: {error}")));
+                continue;
+            }
+        };
         if run.status == bcode_workflow_store::RunStatus::RepairRequired {
             // Ownership is now local; the run still needs explicit attempt repair.
             report.reconciled.push(orphan);
