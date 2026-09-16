@@ -5598,8 +5598,6 @@ enum PriorOwnerLiveness {
     LiveOrUnverifiable,
     /// A session-owner observation positively classified the recorded coordinator as stale.
     ObservedEnded,
-    /// No lease observation and no live daemon record name the recorded coordinator instance.
-    NoLiveTrace,
 }
 
 /// Classify whether the run's recorded coordinator daemon still exists.
@@ -5659,8 +5657,33 @@ async fn prior_owner_liveness(
     Ok(if observed_ended {
         PriorOwnerLiveness::ObservedEnded
     } else {
-        PriorOwnerLiveness::NoLiveTrace
+        // Missing records are not positive evidence of process termination.
+        PriorOwnerLiveness::LiveOrUnverifiable
     })
+}
+
+#[cfg(test)]
+#[tokio::test]
+async fn missing_prior_owner_records_do_not_authorize_takeover() {
+    let root = tempfile::tempdir().expect("state root");
+    let sessions = bcode_session::SessionManager::persistent_lazy(root.path());
+    let session = sessions
+        .create_session(None, std::path::PathBuf::from("."))
+        .await
+        .expect("session");
+    let mut state = super::tests::test_server_state(sessions);
+    state.state_root = root.path().to_path_buf();
+    let owner = bcode_workflow_store::WorkflowExecutionAuthority {
+        target_artifact_id: "missing-artifact".into(),
+        daemon_instance_id: "missing-instance".into(),
+        generation: 1,
+        fencing_token: "missing-token".into(),
+    };
+    let liveness = prior_owner_liveness(&state, session.id, &owner)
+        .await
+        .expect("classify");
+    drop(state);
+    assert_eq!(liveness, PriorOwnerLiveness::LiveOrUnverifiable);
 }
 
 fn current_artifact_id(state: &ServerState) -> String {
@@ -5759,14 +5782,8 @@ pub async fn execution_authority(
         let evidence = bcode_workflow_store::EndedOwnerEvidence {
             ended_daemon_instance_id: current.daemon_instance_id.clone(),
             ended_target_artifact_id: current.target_artifact_id.clone(),
-            liveness: match liveness {
-                PriorOwnerLiveness::ObservedEnded => {
-                    bcode_workflow_store::EndedOwnerLiveness::ObservedEnded
-                }
-                PriorOwnerLiveness::NoLiveTrace | PriorOwnerLiveness::LiveOrUnverifiable => {
-                    bcode_workflow_store::EndedOwnerLiveness::NoLiveTrace
-                }
-            },
+            // Live or unverifiable ownership was rejected before acquiring the lease.
+            liveness: bcode_workflow_store::EndedOwnerLiveness::ObservedEnded,
             artifact_image_available: bcode_daemon_lifecycle::artifact_image_is_available(
                 &state.state_root,
                 &current.target_artifact_id,
@@ -6577,7 +6594,7 @@ pub async fn reconcile_orphaned_runs(
                 )));
                 continue;
             }
-            PriorOwnerLiveness::ObservedEnded | PriorOwnerLiveness::NoLiveTrace => {}
+            PriorOwnerLiveness::ObservedEnded => {}
         }
         if authority.target_artifact_id != current_artifact_id(state) {
             let eligibility = state
@@ -6639,7 +6656,7 @@ pub async fn pause_run(
     state: &std::sync::Arc<ServerState>,
     run_id: &str,
 ) -> Result<bool, super::ServerError> {
-    let _authority = execution_authority(state, run_id).await?.ok_or_else(|| {
+    let authority = execution_authority(state, run_id).await?.ok_or_else(|| {
         bcode_workflow_store::WorkflowStoreError::InvalidData(
             "active workflow has no durable execution authority".to_string(),
         )
@@ -6648,7 +6665,7 @@ pub async fn pause_run(
         .workflow_store
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .pause_run(run_id, super::current_unix_millis())?;
+        .pause_run_owned(run_id, super::current_unix_millis(), &authority.authority)?;
     if changed {
         // An explicitly paused run with in-flight attempts keeps its node work registered until
         // those attempts observe the pause; the run-level registration is suspended now so a
@@ -6682,7 +6699,7 @@ pub async fn resume_run(
             .resume_run(run_id, super::current_unix_millis())
             .map_err(super::ServerError::from);
     }
-    let _authority = execution_authority(state, run_id).await?.ok_or_else(|| {
+    let authority = execution_authority(state, run_id).await?.ok_or_else(|| {
         bcode_workflow_store::WorkflowStoreError::InvalidData(
             "active workflow has no durable execution authority".to_string(),
         )
@@ -6691,7 +6708,7 @@ pub async fn resume_run(
         .workflow_store
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .resume_run(run_id, super::current_unix_millis())?;
+        .resume_run_owned(run_id, super::current_unix_millis(), &authority.authority)?;
     if changed
         && let Some(parent_session_id) = run
             .parent_session_id
@@ -8382,7 +8399,7 @@ pub async fn repair_attempt(
                 "workflow repair attempt does not exist".to_string(),
             )
         })?;
-    let _authority = execution_authority(state, &attempt.run_id)
+    let authority = execution_authority(state, &attempt.run_id)
         .await?
         .ok_or_else(|| {
             bcode_workflow_store::WorkflowStoreError::InvalidData(
@@ -8394,7 +8411,12 @@ pub async fn repair_attempt(
         .workflow_store
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .repair_attempt(dispatch_identity, resolution, super::current_unix_millis())?;
+        .repair_attempt_owned(
+            dispatch_identity,
+            resolution,
+            super::current_unix_millis(),
+            &authority.authority,
+        )?;
     let resolution_label = match resolution {
         bcode_workflow_store::RepairResolution::ConfirmSucceeded { .. } => "confirm_succeeded",
         bcode_workflow_store::RepairResolution::ConfirmFailed { .. } => "confirm_failed",
@@ -9987,7 +10009,7 @@ pub async fn inspect_run(
                 {
                     Some(session_id) => matches!(
                         prior_owner_liveness(state, session_id, &authority).await?,
-                        PriorOwnerLiveness::ObservedEnded | PriorOwnerLiveness::NoLiveTrace
+                        PriorOwnerLiveness::ObservedEnded
                     ),
                     None => false,
                 }

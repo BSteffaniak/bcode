@@ -3931,6 +3931,8 @@ impl WorkflowStore {
     /// Atomically transfer one active run to a replacement coordinator.
     ///
     /// The compare-and-swap predicate fences stale owners. Artifact identity cannot change.
+    /// Repair-required runs may transfer without changing their status: ownership is needed
+    /// to resolve ambiguity, but the transfer does not authorize dispatch or retry.
     ///
     /// # Errors
     ///
@@ -3945,7 +3947,9 @@ impl WorkflowStore {
     ) -> Result<(), WorkflowStoreError> {
         validate_id("run_id", run_id)?;
         if expected.target_artifact_id != replacement.target_artifact_id
-            || replacement.generation != expected.generation.saturating_add(1)
+            || expected.daemon_instance_id == replacement.daemon_instance_id
+            || expected.fencing_token == replacement.fencing_token
+            || expected.generation.checked_add(1) != Some(replacement.generation)
         {
             return Err(WorkflowStoreError::InvalidData(
                 "workflow execution authority transfer is invalid".to_string(),
@@ -3956,7 +3960,7 @@ impl WorkflowStore {
              coordinator_generation = ?7, coordinator_fencing_token = ?8, updated_at_ms = ?9 \
              WHERE run_id = ?1 AND target_artifact_id = ?2 \
                AND coordinator_daemon_instance_id = ?3 AND coordinator_generation = ?4 \
-               AND coordinator_fencing_token = ?5 AND status IN ('running', 'paused')",
+               AND coordinator_fencing_token = ?5 AND status IN ('running', 'paused', 'repair_required')",
             rusqlite::params![
                 run_id,
                 &expected.target_artifact_id,
@@ -4028,7 +4032,12 @@ impl WorkflowStore {
         reassigned_at_ms: u64,
     ) -> Result<(), WorkflowStoreError> {
         validate_id("run_id", run_id)?;
-        if replacement.generation != expected.generation.saturating_add(1) {
+        if expected.generation.checked_add(1) != Some(replacement.generation)
+            || expected.daemon_instance_id == replacement.daemon_instance_id
+            || expected.fencing_token == replacement.fencing_token
+            || evidence.ended_daemon_instance_id != expected.daemon_instance_id
+            || evidence.ended_target_artifact_id != expected.target_artifact_id
+        {
             return Err(WorkflowStoreError::InvalidData(
                 "workflow execution authority reassignment is invalid".to_string(),
             ));
@@ -7701,9 +7710,10 @@ impl WorkflowStore {
 
     /// Return bounded artifact identities that still own resumable workflow runs.
     ///
-    /// Deleting a daemon image whose artifact still owns `running`/`paused` runs would strand
-    /// them permanently: execution authority is fenced to the artifact, so no other daemon can
-    /// legitimately continue or terminalize the run. Callers use this as retention evidence.
+    /// Deleting a daemon image whose artifact still owns `running`, `paused`, or
+    /// `repair_required` runs can strand their recovery: execution authority is fenced to
+    /// the artifact, and unresolved receipts may require its operation-owner contracts.
+    /// Callers use this as retention evidence.
     ///
     /// # Errors
     ///
@@ -7715,7 +7725,7 @@ impl WorkflowStore {
         let limit = bounded_limit(limit)?;
         let mut statement = self.connection.prepare(
             "SELECT DISTINCT target_artifact_id FROM workflow_runs \
-             WHERE status IN ('running', 'paused') AND target_artifact_id IS NOT NULL \
+             WHERE status IN ('running', 'paused', 'repair_required') AND target_artifact_id IS NOT NULL \
              ORDER BY target_artifact_id LIMIT ?1",
         )?;
         statement
@@ -8335,11 +8345,46 @@ impl WorkflowStore {
         resolution: &RepairResolution,
         repaired_at_ms: u64,
     ) -> Result<RepairResult, WorkflowStoreError> {
+        self.repair_attempt_with_authority(dispatch_identity, resolution, repaired_at_ms, None)
+    }
+
+    /// Resolve one ambiguous attempt under the caller's current durable authority.
+    ///
+    /// Ownership is rechecked in the same transaction as the repair, so a transfer
+    /// between application admission and persistence cannot authorize a stale repair.
+    ///
+    /// # Errors
+    /// Rejects stale authority, invalid resolution, non-repairable attempts, or persistence failure.
+    pub fn repair_attempt_owned(
+        &mut self,
+        dispatch_identity: &str,
+        resolution: &RepairResolution,
+        repaired_at_ms: u64,
+        authority: &WorkflowExecutionAuthority,
+    ) -> Result<RepairResult, WorkflowStoreError> {
+        self.repair_attempt_with_authority(
+            dispatch_identity,
+            resolution,
+            repaired_at_ms,
+            Some(authority),
+        )
+    }
+
+    fn repair_attempt_with_authority(
+        &self,
+        dispatch_identity: &str,
+        resolution: &RepairResolution,
+        repaired_at_ms: u64,
+        authority: Option<&WorkflowExecutionAuthority>,
+    ) -> Result<RepairResult, WorkflowStoreError> {
         validate_id("dispatch_identity", dispatch_identity)?;
         validate_repair_resolution(resolution)?;
-        let transaction = self.connection.transaction()?;
+        let transaction = self.connection.unchecked_transaction()?;
         let attempt = repair_required_attempt(&transaction, dispatch_identity)?;
         let (run_id, node_id, activation_id, attempt_number, side_effect) = attempt;
+        if let Some(authority) = authority {
+            self.verify_execution_authority(&run_id, authority)?;
+        }
         if parse_side_effect(&side_effect)? != DispatchSideEffect::Mutating {
             return Err(WorkflowStoreError::InvalidData(
                 "only ambiguous mutating attempts require explicit repair".to_string(),
@@ -8352,7 +8397,7 @@ impl WorkflowStore {
             ));
         }
 
-        let (attempt_status, event_type, payload) = match resolution {
+        let (attempt_status, event_type) = match resolution {
             RepairResolution::ConfirmSucceeded { output } => {
                 if output.run_id != run_id
                     || output.node_id != node_id
@@ -8363,27 +8408,13 @@ impl WorkflowStore {
                     ));
                 }
                 persist_validated_output_transaction(&transaction, output)?;
-                (
-                    "succeeded",
-                    "attempt_repair_succeeded",
-                    serde_json::to_value(resolution)?,
-                )
+                ("succeeded", "attempt_repair_succeeded")
             }
-            RepairResolution::ConfirmFailed { .. } => (
-                "failed",
-                "attempt_repair_failed",
-                serde_json::to_value(resolution)?,
-            ),
-            RepairResolution::ConfirmCancelled { .. } => (
-                "cancelled",
-                "attempt_repair_cancelled",
-                serde_json::to_value(resolution)?,
-            ),
-            RepairResolution::AbandonForExplicitRetry { .. } => (
-                "abandoned",
-                "attempt_repair_abandoned",
-                serde_json::to_value(resolution)?,
-            ),
+            RepairResolution::ConfirmFailed { .. } => ("failed", "attempt_repair_failed"),
+            RepairResolution::ConfirmCancelled { .. } => ("cancelled", "attempt_repair_cancelled"),
+            RepairResolution::AbandonForExplicitRetry { .. } => {
+                ("abandoned", "attempt_repair_abandoned")
+            }
         };
         let changed = transaction.execute(
             "UPDATE workflow_attempts SET status = ?2, terminal_at_ms = ?3 \
@@ -8401,7 +8432,7 @@ impl WorkflowStore {
             event_type,
             &serde_json::json!({
                 "dispatch_identity": dispatch_identity,
-                "resolution": payload,
+                "resolution": resolution,
             })
             .to_string(),
             repaired_at_ms,
@@ -8412,7 +8443,7 @@ impl WorkflowStore {
             [&run_id],
             |row| row.get(0),
         )?;
-        let run_status = if remaining {
+        let mut run_status = if remaining {
             RunStatus::RepairRequired
         } else if matches!(resolution, RepairResolution::AbandonForExplicitRetry { .. }) {
             RunStatus::Running
@@ -8423,6 +8454,12 @@ impl WorkflowStore {
             "UPDATE workflow_runs SET status = ?2, updated_at_ms = ?3 WHERE run_id = ?1",
             (&run_id, run_status.as_str(), repaired_at_ms),
         )?;
+        if !remaining
+            && cancellation_requested_for_run(&transaction, &run_id)?
+            && finalize_run_cancellation_if_settled(&transaction, &run_id, repaired_at_ms)?
+        {
+            run_status = RunStatus::Cancelled;
+        }
         transaction.commit()?;
         Ok(RepairResult {
             dispatch_identity: dispatch_identity.to_string(),
@@ -8452,6 +8489,28 @@ impl WorkflowStore {
             RunStatus::Paused,
             "run_paused",
             paused_at_ms,
+            None,
+        )
+    }
+
+    /// Pause a run while atomically verifying its durable execution authority.
+    ///
+    /// # Errors
+    /// Rejects stale authority, invalid lifecycle transitions, or database failure.
+    pub fn pause_run_owned(
+        &mut self,
+        run_id: &str,
+        paused_at_ms: u64,
+        authority: &WorkflowExecutionAuthority,
+    ) -> Result<bool, WorkflowStoreError> {
+        transition_run_control_state(
+            &mut self.connection,
+            run_id,
+            RunStatus::Running,
+            RunStatus::Paused,
+            "run_paused",
+            paused_at_ms,
+            Some(authority),
         )
     }
 
@@ -8476,6 +8535,28 @@ impl WorkflowStore {
             RunStatus::Running,
             "run_resumed",
             resumed_at_ms,
+            None,
+        )
+    }
+
+    /// Resume a run while atomically verifying its durable execution authority.
+    ///
+    /// # Errors
+    /// Rejects stale authority, cancellation intent, invalid transitions, or database failure.
+    pub fn resume_run_owned(
+        &mut self,
+        run_id: &str,
+        resumed_at_ms: u64,
+        authority: &WorkflowExecutionAuthority,
+    ) -> Result<bool, WorkflowStoreError> {
+        transition_run_control_state(
+            &mut self.connection,
+            run_id,
+            RunStatus::Paused,
+            RunStatus::Running,
+            "run_resumed",
+            resumed_at_ms,
+            Some(authority),
         )
     }
 
@@ -9667,6 +9748,24 @@ impl WorkflowStore {
             signalled_at_ms,
             false,
             None,
+        )
+    }
+
+    /// Persist sibling cancellation signalling under current durable authority.
+    ///
+    /// # Errors
+    /// Rejects stale authority, missing attempt identity, or database failure.
+    pub fn mark_sibling_cancellation_signalled_owned(
+        &mut self,
+        dispatch_identity: &str,
+        signalled_at_ms: u64,
+        authority: &WorkflowExecutionAuthority,
+    ) -> Result<bool, WorkflowStoreError> {
+        self.mark_cancellation_signalled_with_requirement(
+            dispatch_identity,
+            signalled_at_ms,
+            false,
+            Some(authority),
         )
     }
 
@@ -12481,7 +12580,7 @@ fn receipt_backed_attempts(
 ) -> Result<Vec<AttemptReconciliationRequest>, WorkflowStoreError> {
     let mut statement = connection.prepare(
         "SELECT run_id, node_id, activation_id, attempt, dispatch_identity, side_effect, \
-         receipt_json FROM workflow_attempts WHERE status IN ('admitted', 'running', 'cancelling') \
+         receipt_json FROM workflow_attempts WHERE status IN ('admitted', 'running', 'cancelling', 'sibling_cancelling') \
          AND receipt_json IS NOT NULL AND (?1 = '' OR run_id = ?1) \
          ORDER BY prepared_at_ms, dispatch_identity LIMIT ?2",
     )?;
@@ -14929,9 +15028,30 @@ fn transition_run_control_state(
     target: RunStatus,
     event_type: &str,
     changed_at_ms: u64,
+    authority: Option<&WorkflowExecutionAuthority>,
 ) -> Result<bool, WorkflowStoreError> {
     validate_id("run_id", run_id)?;
     let transaction = connection.transaction()?;
+    if let Some(authority) = authority {
+        let owned: bool = transaction.query_row(
+            "SELECT EXISTS(SELECT 1 FROM workflow_runs WHERE run_id = ?1
+             AND target_artifact_id = ?2 AND coordinator_daemon_instance_id = ?3
+             AND coordinator_generation = ?4 AND coordinator_fencing_token = ?5)",
+            rusqlite::params![
+                run_id,
+                authority.target_artifact_id,
+                authority.daemon_instance_id,
+                authority.generation,
+                authority.fencing_token
+            ],
+            |row| row.get(0),
+        )?;
+        if !owned {
+            return Err(WorkflowStoreError::InvalidData(
+                "workflow control authority is stale or foreign".into(),
+            ));
+        }
+    }
     let (status, cancellation_requested) = transaction
         .query_row(
             "SELECT status, cancellation_requested_at_ms IS NOT NULL FROM workflow_runs WHERE run_id = ?1",
@@ -30123,6 +30243,35 @@ mod tests {
     }
 
     #[test]
+    fn sibling_cancellation_receipt_is_observed_after_restart_before_signal_ack() {
+        struct Observer;
+        impl AttemptStatusObserver for Observer {
+            fn observe(
+                &self,
+                _request: &AttemptReconciliationRequest,
+            ) -> Result<AttemptObservation, WorkflowStoreError> {
+                Ok(AttemptObservation::Cancelled)
+            }
+        }
+        let (temp, mut store) = initialized_store();
+        let identity = prepare_receipt_backed_attempt(&mut store, DispatchSideEffect::Mutating);
+        store.connection.execute(
+            "UPDATE workflow_attempts SET status = 'sibling_cancelling' WHERE dispatch_identity = ?1",
+            [&identity],
+        ).expect("interrupted sibling signal");
+        drop(store);
+        let mut store = WorkflowStore::open_in_state_dir(temp.path()).expect("restart");
+        let summary = store
+            .reconcile_receipt_backed_attempts(&Observer, 10, 20)
+            .expect("observe");
+        assert_eq!(summary.cancelled, [identity]);
+        assert_eq!(
+            store.attempt_history("run-1", None, 10).expect("history")[0].status,
+            "cancelled"
+        );
+    }
+
+    #[test]
     fn unknown_receipt_backed_mutation_becomes_repair_required() {
         struct Observer;
         impl AttemptStatusObserver for Observer {
@@ -32302,6 +32451,38 @@ mod tests {
             .query_row("SELECT COUNT(*) FROM workflow_events", [], |row| row.get(0))
             .expect("events");
         assert_eq!(event_count_before, event_count_after);
+    }
+
+    #[test]
+    fn explicit_repair_finishes_persisted_cancellation_after_restart() {
+        let (temp, mut store) = initialized_store();
+        let identity = prepare_receipt_backed_attempt(&mut store, DispatchSideEffect::Mutating);
+        store.request_cancellation("run-1", 20).expect("intent");
+        store
+            .settle_orphaned_attempt_cancellation(&identity, 21)
+            .expect("ambiguous");
+        drop(store);
+        let mut store = WorkflowStore::open_in_state_dir(temp.path()).expect("restart");
+        let result = store
+            .repair_attempt(
+                &identity,
+                &RepairResolution::ConfirmCancelled {
+                    message: "operator verified external work stopped".into(),
+                },
+                22,
+            )
+            .expect("repair");
+        assert_eq!(result.run_status, RunStatus::Cancelled);
+        assert_eq!(result.attempt_status, "cancelled");
+        assert!(store.resume_run("run-1", 23).is_err());
+        assert_eq!(
+            store
+                .run_summary("run-1")
+                .expect("summary")
+                .expect("run")
+                .status,
+            RunStatus::Cancelled
+        );
     }
 
     #[test]
@@ -37571,6 +37752,184 @@ mod tests {
     }
 
     #[test]
+    fn repair_rechecks_authority_after_transfer_and_preserves_attempt_on_refusal() {
+        let (_temp, mut store, run, authority, _) = connected_publication_fixture();
+        let id = activation_identity(&run.run_id, "first", 0);
+        let prepared = store
+            .prepare_pending_activation(
+                &run.run_id,
+                "first",
+                &id,
+                DispatchSideEffect::Mutating,
+                serde_json::json!({}),
+                25,
+            )
+            .expect("prepare")
+            .expect("pending");
+        store
+            .reconcile_prepared_attempts(10, 26)
+            .expect("ambiguous attempt");
+        let replacement = WorkflowExecutionAuthority {
+            daemon_instance_id: "replacement".into(),
+            generation: authority.generation + 1,
+            fencing_token: "replacement-token".into(),
+            ..authority.clone()
+        };
+        store
+            .transfer_execution_authority(&run.run_id, &authority, &replacement, 27)
+            .expect("transfer");
+        let resolution = RepairResolution::ConfirmCancelled {
+            message: "operator verified termination".into(),
+        };
+        assert!(
+            store
+                .repair_attempt_owned(&prepared.dispatch_identity, &resolution, 28, &authority)
+                .is_err()
+        );
+        assert_eq!(
+            store
+                .attempt_by_dispatch_identity(&prepared.dispatch_identity)
+                .expect("lookup")
+                .expect("attempt")
+                .status,
+            "repair_required"
+        );
+        let repaired = store
+            .repair_attempt_owned(&prepared.dispatch_identity, &resolution, 29, &replacement)
+            .expect("current owner repair");
+        assert_eq!(repaired.attempt_status, "cancelled");
+    }
+
+    #[test]
+    fn authority_transfer_rejects_reused_fence_and_mismatched_end_evidence() {
+        let (_temp, mut store, run, authority, _) = connected_publication_fixture();
+        let mut replacement = WorkflowExecutionAuthority {
+            daemon_instance_id: "replacement".into(),
+            generation: authority.generation + 1,
+            ..authority.clone()
+        };
+        assert!(
+            store
+                .transfer_execution_authority(&run.run_id, &authority, &replacement, 20)
+                .is_err()
+        );
+        replacement.fencing_token = "new-fence".into();
+        let evidence = EndedOwnerEvidence {
+            ended_daemon_instance_id: "unrelated-owner".into(),
+            ended_target_artifact_id: authority.target_artifact_id.clone(),
+            liveness: EndedOwnerLiveness::ObservedEnded,
+            artifact_image_available: true,
+        };
+        assert!(
+            store
+                .reassign_execution_authority_from_ended_owner(
+                    &run.run_id,
+                    &authority,
+                    &replacement,
+                    &evidence,
+                    21,
+                )
+                .is_err()
+        );
+        assert_eq!(
+            store.execution_authority(&run.run_id).expect("authority"),
+            Some(authority)
+        );
+    }
+
+    #[test]
+    fn pause_and_resume_reject_stale_owners_after_transfer() {
+        let (_temp, mut store, run, authority, _) = connected_publication_fixture();
+        let replacement = WorkflowExecutionAuthority {
+            daemon_instance_id: "replacement".into(),
+            generation: authority.generation + 1,
+            fencing_token: "replacement-token".into(),
+            ..authority.clone()
+        };
+        store
+            .transfer_execution_authority(&run.run_id, &authority, &replacement, 20)
+            .expect("transfer");
+        assert!(store.pause_run_owned(&run.run_id, 21, &authority).is_err());
+        assert!(
+            store
+                .pause_run_owned(&run.run_id, 22, &replacement)
+                .expect("pause")
+        );
+        assert!(store.resume_run_owned(&run.run_id, 23, &authority).is_err());
+        assert_eq!(
+            store
+                .run_summary(&run.run_id)
+                .expect("summary")
+                .expect("run")
+                .status,
+            RunStatus::Paused
+        );
+        assert!(
+            store
+                .resume_run_owned(&run.run_id, 24, &replacement)
+                .expect("resume")
+        );
+        assert!(
+            !store
+                .resume_run_owned(&run.run_id, 25, &replacement)
+                .expect("idempotent")
+        );
+    }
+
+    #[test]
+    fn unresolved_repair_retains_owning_artifact_until_terminal_resolution() {
+        let (_temp, mut store, run, authority, _) = connected_publication_fixture();
+        let id = activation_identity(&run.run_id, "first", 0);
+        let prepared = store
+            .prepare_pending_activation(
+                &run.run_id,
+                "first",
+                &id,
+                DispatchSideEffect::Mutating,
+                serde_json::json!({}),
+                25,
+            )
+            .expect("prepare")
+            .expect("pending");
+        store
+            .request_cancellation_owned(&run.run_id, 26, &authority)
+            .expect("cancel");
+        store
+            .settle_orphaned_attempt_cancellation_owned(&prepared.dispatch_identity, 27, &authority)
+            .expect("repair required");
+        assert_eq!(
+            store
+                .run_summary(&run.run_id)
+                .expect("summary")
+                .expect("run")
+                .status,
+            RunStatus::RepairRequired
+        );
+        assert_eq!(
+            store
+                .active_target_artifact_ids(10)
+                .expect("retained artifacts"),
+            *std::slice::from_ref(&authority.target_artifact_id)
+        );
+        store
+            .repair_attempt_owned(
+                &prepared.dispatch_identity,
+                &RepairResolution::ConfirmCancelled {
+                    message: "operator verified termination".into(),
+                },
+                28,
+                &authority,
+            )
+            .expect("resolution");
+        assert!(
+            store
+                .active_target_artifact_ids(10)
+                .expect("terminal artifacts")
+                .is_empty()
+        );
+    }
+
+    #[test]
     fn cancellation_intent_rejects_stale_authority_without_mutation() {
         let (_temp, mut store, run, authority, _) = connected_publication_fixture();
         let mut stale = authority.clone();
@@ -37611,6 +37970,11 @@ mod tests {
         store.request_cancellation(&run.run_id, 26).expect("cancel");
         let mut stale = authority.clone();
         stale.generation += 1;
+        assert!(
+            store
+                .mark_sibling_cancellation_signalled_owned(&prepared.dispatch_identity, 27, &stale,)
+                .is_err()
+        );
         assert!(
             store
                 .mark_cancellation_signalled_owned(&prepared.dispatch_identity, 27, &stale)
