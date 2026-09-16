@@ -3978,12 +3978,38 @@ impl WorkflowStore {
         }
     }
 
+    /// Check whether cross-artifact reassignment has unsettled external work.
+    ///
+    /// This read-only check uses the same eligibility rule as reassignment. A cancellation
+    /// request or signal is not evidence that an operation ended. Ambiguous outcomes also
+    /// remain pinned until an authorized recovery path resolves them.
+    ///
+    /// # Errors
+    /// Returns an error for an invalid identity, unsettled work, or database failure.
+    pub fn validate_quiescent_reassignment(&self, run_id: &str) -> Result<(), WorkflowStoreError> {
+        validate_id("run_id", run_id)?;
+        let unsettled: bool = self.connection.query_row(
+            "SELECT EXISTS(SELECT 1 FROM workflow_attempts WHERE run_id = ?1 \
+             AND status IN ('prepared', 'admitted', 'running', 'cancelling', \
+                            'sibling_cancelling', 'repair_required'))",
+            [run_id],
+            |row| row.get(0),
+        )?;
+        if unsettled {
+            return Err(WorkflowStoreError::InvalidData(format!(
+                "workflow run has unsettled attempts and requires operation-owner recovery before cross-artifact reassignment: {run_id}"
+            )));
+        }
+        Ok(())
+    }
+
     /// Atomically reassign one quiescent run from a coordinator that verifiably ended to a
     /// coordinator on a different daemon artifact.
     ///
     /// This is the cross-artifact counterpart of [`Self::transfer_execution_authority`]. It is
-    /// permitted only when the run holds no live attempt (`prepared`, `admitted`, or `running`),
-    /// because such a run is durable data rather than live work and no artifact-specific receipt
+    /// permitted only when the run holds no unsettled attempt (including cancellation in
+    /// progress and repair-required outcomes), because such a run is durable data rather than
+    /// live or ambiguous work and no artifact-specific receipt
     /// interpretation is pending. The caller must have already proven that the recorded
     /// coordinator daemon ended; that evidence is persisted as a `authority_reassigned` event so
     /// the reassignment is auditable.
@@ -4007,18 +4033,8 @@ impl WorkflowStore {
                 "workflow execution authority reassignment is invalid".to_string(),
             ));
         }
-        let transaction = self.connection.transaction()?;
-        let live_attempts: u64 = transaction.query_row(
-            "SELECT COUNT(*) FROM workflow_attempts \
-             WHERE run_id = ?1 AND status IN ('prepared', 'admitted', 'running')",
-            [run_id],
-            |row| row.get(0),
-        )?;
-        if live_attempts > 0 {
-            return Err(WorkflowStoreError::InvalidData(format!(
-                "workflow run still has {live_attempts} live attempt(s) and cannot be reassigned: {run_id}"
-            )));
-        }
+        let transaction = self.connection.unchecked_transaction()?;
+        self.validate_quiescent_reassignment(run_id)?;
         let changed = transaction.execute(
             "UPDATE workflow_runs SET target_artifact_id = ?6, coordinator_daemon_instance_id = ?7, \
              coordinator_generation = ?8, coordinator_fencing_token = ?9, updated_at_ms = ?10 \
@@ -8051,12 +8067,9 @@ impl WorkflowStore {
     {
         let mut observations = Vec::with_capacity(requests.len());
         for request in requests {
-            let observation = if cancellation_requested_for_run(&self.connection, &request.run_id)?
-            {
-                AttemptObservation::Cancelled
-            } else {
-                observer.observe_async(&request).await?
-            };
+            // Cancellation intent is not terminal evidence. The operation owner must
+            // still prove that execution ended, including after a coordinator restart.
+            let observation = observer.observe_async(&request).await?;
             observations.push((request, observation));
         }
         let transaction = self.connection.transaction()?;
@@ -21135,8 +21148,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn cancelled_async_reconciliation_does_not_query_owner() {
-        struct Observer;
+    async fn cancellation_recovery_requires_terminal_owner_evidence_after_restart() {
+        struct Observer(AttemptObservation);
         impl AsyncAttemptStatusObserver for Observer {
             fn observe_async<'a>(
                 &'a self,
@@ -21146,26 +21159,52 @@ mod tests {
                     dyn Future<Output = Result<AttemptObservation, WorkflowStoreError>> + Send + 'a,
                 >,
             > {
-                Box::pin(async {
-                    Err(WorkflowStoreError::InvalidData(
-                        "owner must not be queried after cancellation".to_string(),
-                    ))
-                })
+                Box::pin(async { Ok(self.0.clone()) })
             }
         }
 
-        let (_temp, mut store) = initialized_store();
+        let (temp, mut store) = initialized_store();
         let identity = prepare_receipt_backed_attempt(&mut store, DispatchSideEffect::Mutating);
         store.request_cancellation("run-1", 20).expect("intent");
         store
             .mark_cancellation_signalled(&identity, 21)
             .expect("signal");
+        drop(store);
+        let mut store = WorkflowStore::open_in_state_dir(temp.path()).expect("restart");
+
+        for observation in [
+            AttemptObservation::Running,
+            AttemptObservation::Unknown,
+            AttemptObservation::Deferred {
+                reason: "owner temporarily unavailable".to_string(),
+            },
+        ] {
+            let summary = store
+                .reconcile_receipt_backed_attempts_async(&Observer(observation), 10, 22)
+                .await
+                .expect("observe cancellation progress");
+            assert!(summary.cancelled.is_empty());
+            assert_ne!(
+                store
+                    .run_summary("run-1")
+                    .expect("summary")
+                    .expect("run")
+                    .status,
+                RunStatus::Cancelled
+            );
+            let attempts = store.attempt_history("run-1", None, 10).expect("attempts");
+            assert_eq!(attempts[0].status, "cancelling");
+            assert!(attempts[0].terminal_at_ms.is_none());
+        }
 
         let summary = store
-            .reconcile_receipt_backed_attempts_async(&Observer, 10, 22)
+            .reconcile_receipt_backed_attempts_async(
+                &Observer(AttemptObservation::Cancelled),
+                10,
+                23,
+            )
             .await
-            .expect("cancel without owner");
-
+            .expect("confirmed cancellation");
         assert_eq!(summary.cancelled, [identity]);
         assert_eq!(
             store
@@ -29910,6 +29949,41 @@ mod tests {
             .expect("current authority");
     }
 
+    fn assert_unsettled_reassignment_refused(
+        store: &mut WorkflowStore,
+        identity: &str,
+        initial: &WorkflowExecutionAuthority,
+        replacement: &WorkflowExecutionAuthority,
+        evidence: &EndedOwnerEvidence,
+    ) {
+        for status in [
+            "running",
+            "cancelling",
+            "sibling_cancelling",
+            "repair_required",
+        ] {
+            store
+                .connection
+                .execute(
+                    "UPDATE workflow_attempts SET status = ?2 WHERE dispatch_identity = ?1",
+                    rusqlite::params![identity, status],
+                )
+                .expect("persist unresolved operation state");
+            assert!(store.validate_quiescent_reassignment("run-1").is_err());
+            assert!(
+                store
+                    .reassign_execution_authority_from_ended_owner(
+                        "run-1",
+                        initial,
+                        replacement,
+                        evidence,
+                        21,
+                    )
+                    .is_err()
+            );
+        }
+    }
+
     #[test]
     fn cross_artifact_reassignment_requires_quiescent_run_and_is_audited() {
         let (_temp, mut store) = initialized_store();
@@ -29947,25 +30021,15 @@ mod tests {
             artifact_image_available: false,
         };
 
-        // Same-artifact transfer must still refuse an artifact change.
-        assert!(
-            store
-                .transfer_execution_authority("run-1", &initial, &replacement, 20)
-                .is_err()
-        );
-
-        // A live attempt pins the run to its original artifact.
+        // Every unresolved state pins the run to its original artifact.
         let identity = prepare_receipt_backed_attempt(&mut store, DispatchSideEffect::Mutating);
-        let refused = store
-            .reassign_execution_authority_from_ended_owner(
-                "run-1",
-                &initial,
-                &replacement,
-                &evidence,
-                21,
-            )
-            .expect_err("live attempt must block reassignment");
-        assert!(refused.to_string().contains("live attempt"));
+        assert_unsettled_reassignment_refused(
+            &mut store,
+            &identity,
+            &initial,
+            &replacement,
+            &evidence,
+        );
         assert_eq!(
             store.execution_authority("run-1").expect("authority"),
             Some(initial.clone())

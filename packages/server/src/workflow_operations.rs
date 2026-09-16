@@ -6579,6 +6579,17 @@ pub async fn reconcile_orphaned_runs(
             }
             PriorOwnerLiveness::ObservedEnded | PriorOwnerLiveness::NoLiveTrace => {}
         }
+        if authority.target_artifact_id != current_artifact_id(state) {
+            let eligibility = state
+                .workflow_store
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .validate_quiescent_reassignment(&run.run_id);
+            if let Err(error) = eligibility {
+                report.skipped.push(skip(error.to_string()));
+                continue;
+            }
+        }
         let orphan = bcode_workflow::OrphanedWorkflowRun {
             run_id: run.run_id.clone(),
             workflow_kind: run
