@@ -2,7 +2,10 @@
 use crate::WorkflowStoreError;
 use rusqlite::Connection;
 
-pub fn verify(connection: &Connection) -> Result<(), WorkflowStoreError> {
+pub fn verify_barriers(connection: &Connection) -> Result<(), WorkflowStoreError> {
+    connection.prepare(
+        "SELECT run_id, source_artifact_id, created_at_ms FROM workflow_recovery_barriers LIMIT 0",
+    )?;
     for name in [
         "recovery_blocks_attempt_insert",
         "recovery_blocks_resume",
@@ -22,6 +25,19 @@ pub fn verify(connection: &Connection) -> Result<(), WorkflowStoreError> {
     Ok(())
 }
 
+pub fn verify(connection: &Connection) -> Result<(), WorkflowStoreError> {
+    verify_barriers(connection)?;
+    connection.prepare(
+        "SELECT dispatch_identity FROM workflow_attempts INDEXED BY workflow_receipt_recovery_page
+        WHERE run_id = ?1 AND dispatch_identity > ?2
+        AND status IN ('admitted', 'running', 'cancelling', 'sibling_cancelling')
+        AND receipt_json IS NOT NULL ORDER BY dispatch_identity LIMIT 1",
+    )?;
+    connection
+        .prepare("SELECT run_id, after_dispatch_identity FROM workflow_receipt_cursors LIMIT 0")?;
+    Ok(())
+}
+
 pub fn require_execution(connection: &Connection, run_id: &str) -> Result<(), WorkflowStoreError> {
     let recovering: bool = connection.query_row(
         "SELECT EXISTS(SELECT 1 FROM workflow_recovery_barriers WHERE run_id = ?1)",
@@ -38,7 +54,15 @@ pub fn require_execution(connection: &Connection, run_id: &str) -> Result<(), Wo
 
 pub fn initialize(connection: &Connection) -> Result<(), WorkflowStoreError> {
     connection.execute_batch(
-        "CREATE TABLE IF NOT EXISTS workflow_recovery_barriers (
+        "CREATE INDEX IF NOT EXISTS workflow_receipt_recovery_page
+            ON workflow_attempts(run_id, dispatch_identity)
+            WHERE status IN ('admitted', 'running', 'cancelling', 'sibling_cancelling')
+            AND receipt_json IS NOT NULL;
+        CREATE TABLE IF NOT EXISTS workflow_receipt_cursors (
+            run_id TEXT PRIMARY KEY NOT NULL REFERENCES workflow_runs(run_id),
+            after_dispatch_identity TEXT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS workflow_recovery_barriers (
             run_id TEXT PRIMARY KEY NOT NULL REFERENCES workflow_runs(run_id),
             source_artifact_id TEXT NOT NULL,
             created_at_ms INTEGER NOT NULL

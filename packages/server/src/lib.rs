@@ -2632,11 +2632,14 @@ impl ServerState {
                         for run_id in run_ids {
                             if state.shutdown_requested.load(Ordering::SeqCst) { return; }
                             after_run_id.clone_from(&run_id);
-                            let runnable = state.workflow_store.lock()
-                                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                                .run_summary(&run_id)
-                                .is_ok_and(|run| run.is_some_and(|run| matches!(run.status,
-                                    bcode_workflow_store::RunStatus::Running | bcode_workflow_store::RunStatus::Paused)));
+                            let runnable = {
+                                let store = state.workflow_store.lock()
+                                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                                store.run_summary(&run_id).is_ok_and(|run| run.is_some_and(|run|
+                                    matches!(run.status, bcode_workflow_store::RunStatus::Running | bcode_workflow_store::RunStatus::Paused)
+                                    || (run.status == bcode_workflow_store::RunStatus::RepairRequired
+                                        && store.is_recovery_only(&run_id).unwrap_or(false))))
+                            };
                             if !runnable { continue; }
                             // Paused runs still need receipt settlement and cancellation recovery.
                             // Discovery is only a hint; recovery qualifies durable ownership.
@@ -29932,7 +29935,11 @@ impl bcode_workflow_store::AsyncAttemptStatusObserver for WorkflowTurnReceiptObs
         >,
     > {
         Box::pin(async move {
-            if workflow_receipt_belongs_to_foreign_daemon(self.state, request) {
+            if workflow_receipt_belongs_to_foreign_daemon(self.state, request)
+                && !workflow_operations::can_observe_recovered_agent_turn(self.state, request)
+                    .await
+                    .unwrap_or(false)
+            {
                 return Ok(bcode_workflow_store::AttemptObservation::Deferred {
                     reason: "workflow attempt belongs to another daemon artifact or instance"
                         .to_string(),
@@ -29961,7 +29968,10 @@ impl bcode_workflow_store::AsyncAttemptStatusObserver for WorkflowTurnReceiptObs
                 .and_then(serde_json::Value::as_str)
                 == Some(bcode_workflow::WORKFLOW_BLOCK_INTERFACE_ID)
             {
-                return observe_workflow_plugin_receipt(request);
+                return structural_observation_or_unknown(
+                    observe_workflow_plugin_receipt(request),
+                    request,
+                );
             }
             if request
                 .receipt
@@ -30031,6 +30041,18 @@ fn workflow_receipt_belongs_to_foreign_daemon(
         != Some("bcode.server.agent-turn/v1")
     {
         return false;
+    }
+    if ["owner_artifact_id", "owner_daemon_instance_id"]
+        .iter()
+        .any(|field| {
+            request.receipt.get(*field).is_some_and(|value| {
+                value
+                    .as_str()
+                    .is_none_or(|identity| identity.trim().is_empty())
+            })
+        })
+    {
+        return true;
     }
     let receipt_artifact = request
         .receipt
@@ -30160,9 +30182,10 @@ fn observe_workflow_plugin_receipt(
                 .unwrap_or("workflow plugin block failed")
                 .to_string(),
         }),
-        _ => Err(WorkflowStoreError::InvalidData(format!(
-            "invalid workflow plugin receipt status: {status}"
-        ))),
+        _ => Ok(bcode_workflow_store::AttemptObservation::Deferred {
+            reason: "workflow plugin receipt status requires an unavailable recovery contract"
+                .into(),
+        }),
     }
 }
 
@@ -30226,7 +30249,7 @@ async fn observe_workflow_turn(
     output_schema_id: &str,
     request: &bcode_workflow_store::AttemptReconciliationRequest,
 ) -> Result<bcode_workflow_store::AttemptObservation, WorkflowStoreError> {
-    let mut page = match state
+    let Ok(mut page) = state
         .sessions
         .session_history_page(
             session_id,
@@ -30237,27 +30260,30 @@ async fn observe_workflow_turn(
             },
         )
         .await
-    {
-        Ok(page) => page,
-        Err(bcode_session::SessionError::NotFound(_)) => bcode_session_models::SessionHistoryPage {
-            session_id,
-            events: Vec::new(),
-            compatibility_issues: Vec::new(),
-            next_cursor: None,
-            has_more: false,
-        },
-        Err(_) => {
-            return Ok(bcode_workflow_store::AttemptObservation::Deferred {
-                reason: "session history unavailable for bounded outcome observation".into(),
-            });
-        }
+    else {
+        return Ok(bcode_workflow_store::AttemptObservation::Deferred {
+            reason: "session history unavailable for bounded outcome observation".into(),
+        });
     };
+    if !page.compatibility_issues.is_empty() {
+        return Ok(bcode_workflow_store::AttemptObservation::Deferred {
+            reason: "session history is incompatible with bounded outcome observation".into(),
+        });
+    }
     if !page.events.iter().any(|event| {
         matches!(&event.kind,
         SessionEventKind::ModelTurnFinished { turn_id: id, .. } if id == turn_id)
-    }) && let Ok(Some(events)) = workflow_turn_terminal_window(state, session_id, turn_id).await
-    {
-        page.events = events;
+    }) {
+        match workflow_turn_terminal_window(state, session_id, turn_id).await {
+            Ok(Some(events)) => page.events = events,
+            Ok(None) => {}
+            Err(_) => {
+                return Ok(bcode_workflow_store::AttemptObservation::Deferred {
+                    reason: "session terminal evidence unavailable for bounded outcome observation"
+                        .into(),
+                });
+            }
+        }
     }
     let terminal = page
         .events
@@ -32215,7 +32241,7 @@ async fn restore_workflow_runs(
             continue;
         }
         let reconciliation = store
-            .reconcile_owned_receipts_for_run_async(
+            .advance_receipt_recovery(
                 &WorkflowTurnReceiptObserver { state },
                 &run_id,
                 &authority.authority,
@@ -32372,6 +32398,19 @@ async fn signal_workflow_attempt_cancellation(
                 .workflow_store
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let child = store.run_summary(child_run_id)?.ok_or_else(|| {
+                WorkflowStoreError::InvalidData(
+                    "workflow child cancellation target is missing".into(),
+                )
+            })?;
+            if matches!(
+                child.status,
+                bcode_workflow_store::RunStatus::Completed
+                    | bcode_workflow_store::RunStatus::Failed
+                    | bcode_workflow_store::RunStatus::Cancelled
+            ) {
+                return Ok(());
+            }
             let authority = store.execution_authority(child_run_id)?.ok_or_else(|| {
                 WorkflowStoreError::InvalidData(
                     "child cancellation requires durable execution authority".into(),
@@ -32457,6 +32496,18 @@ async fn retry_owned_workflow_cancellation(
         store.active_attempt_cancellations(run_id, 100)?
     };
     for attempt in attempts {
+        if state
+            .workflow_store
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .cancel_never_dispatched_owned(
+                &attempt.dispatch_identity,
+                authority,
+                current_unix_millis(),
+            )?
+        {
+            continue;
+        }
         state
             .workflow_store
             .lock()
@@ -32621,6 +32672,18 @@ async fn propagate_persisted_workflow_cancellation_with_authorities(
             }
             authority
         };
+        if state
+            .workflow_store
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .cancel_never_dispatched_owned(
+                &attempt.dispatch_identity,
+                &authority,
+                current_unix_millis(),
+            )?
+        {
+            continue;
+        }
         match signal_workflow_attempt_cancellation(state, &attempt).await {
             Ok(()) => {
                 let changed = state
@@ -63926,7 +63989,10 @@ event_symbol = "bcode_plugin_handle_event_v1"
             let execution_authority =
                 current_owner.map(
                     |is_current| bcode_workflow_store::WorkflowExecutionAuthority {
-                        target_artifact_id: state.daemon_status.build_fingerprint.clone(),
+                        target_artifact_id: state.daemon_status.artifact_id.as_ref().map_or_else(
+                            || state.daemon_status.build_fingerprint.clone(),
+                            ToString::to_string,
+                        ),
                         daemon_instance_id: if is_current {
                             state.daemon_status.instance_id.clone()
                         } else {
@@ -65941,6 +66007,84 @@ event_symbol = "bcode_plugin_handle_event_v1"
         }
     }
 
+    #[tokio::test]
+    async fn plugin_receipt_recovery_isolates_damage_and_defers_future_status() {
+        use bcode_workflow_store::AsyncAttemptStatusObserver as _;
+        let state = test_server_state(SessionManager::default());
+        let mut request = bcode_workflow_store::AttemptReconciliationRequest {
+            run_id: "run".into(),
+            node_id: "node".into(),
+            activation_id: "activation".into(),
+            attempt: 1,
+            dispatch_identity: "dispatch".into(),
+            side_effect: bcode_workflow::DispatchSideEffect::Mutating,
+            receipt: serde_json::Value::Null,
+        };
+        for receipt in [
+            serde_json::json!({"owner": bcode_workflow::WORKFLOW_BLOCK_INTERFACE_ID}),
+            serde_json::json!({"owner": bcode_workflow::WORKFLOW_BLOCK_INTERFACE_ID,
+                "status": "succeeded"}),
+        ] {
+            request.receipt = receipt;
+            assert!(matches!(
+                WorkflowTurnReceiptObserver { state: &state }
+                    .observe_async(&request)
+                    .await
+                    .expect("isolated damage"),
+                bcode_workflow_store::AttemptObservation::Unknown
+            ));
+        }
+        request.receipt = serde_json::json!({
+            "owner": bcode_workflow::WORKFLOW_BLOCK_INTERFACE_ID,
+            "status": "future-terminal-status"
+        });
+        assert!(matches!(
+            WorkflowTurnReceiptObserver { state: &state }
+                .observe_async(&request)
+                .await
+                .expect("future contract"),
+            bcode_workflow_store::AttemptObservation::Deferred { .. }
+        ));
+        request.receipt = serde_json::json!({
+            "owner": bcode_workflow::WORKFLOW_BLOCK_INTERFACE_ID,
+            "status": "failed", "message": "operation failed"
+        });
+        assert!(matches!(
+            WorkflowTurnReceiptObserver { state: &state }
+                .observe_async(&request)
+                .await
+                .expect("known terminal"),
+            bcode_workflow_store::AttemptObservation::Failed { .. }
+        ));
+        drop(state);
+    }
+
+    #[tokio::test]
+    async fn foreign_receipt_without_recovery_authority_remains_deferred() {
+        use bcode_workflow_store::AsyncAttemptStatusObserver as _;
+        let state = test_server_state(SessionManager::default());
+        let request = bcode_workflow_store::AttemptReconciliationRequest {
+            run_id: "absent-run".into(),
+            node_id: "node".into(),
+            activation_id: "activation".into(),
+            attempt: 1,
+            dispatch_identity: "dispatch".into(),
+            side_effect: bcode_workflow::DispatchSideEffect::Mutating,
+            receipt: serde_json::json!({"owner":"bcode.server.agent-turn/v1",
+                "owner_artifact_id":"foreign", "owner_daemon_instance_id":"ended",
+                "session_id": SessionId::new(), "turn_id":"turn", "output_schema_id":"u32"}),
+        };
+        let observation = WorkflowTurnReceiptObserver { state: &state }
+            .observe_async(&request)
+            .await
+            .expect("observe");
+        drop(state);
+        assert!(matches!(
+            observation,
+            bcode_workflow_store::AttemptObservation::Deferred { .. }
+        ));
+    }
+
     #[test]
     fn foreign_artifact_workflow_receipt_is_deferred_before_observation() {
         let mut state = test_server_state(SessionManager::default());
@@ -65963,6 +66107,22 @@ event_symbol = "bcode_plugin_handle_event_v1"
         };
 
         assert!(workflow_receipt_belongs_to_foreign_daemon(&state, &request));
+        for field in ["owner_artifact_id", "owner_daemon_instance_id"] {
+            for value in [
+                serde_json::Value::Null,
+                serde_json::json!(12),
+                serde_json::json!(""),
+            ] {
+                let mut malformed = request.clone();
+                malformed.receipt["owner_artifact_id"] = serde_json::json!("current-artifact");
+                malformed.receipt["owner_daemon_instance_id"] =
+                    serde_json::json!("current-instance");
+                malformed.receipt[field] = value;
+                assert!(workflow_receipt_belongs_to_foreign_daemon(
+                    &state, &malformed
+                ));
+            }
+        }
         drop(state);
     }
 
@@ -67433,7 +67593,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
     }
 
     #[tokio::test]
-    async fn recovery_only_driver_does_not_admit_work() {
+    async fn recovery_driver_rejects_missing_canonical_session_without_admission() {
         let root = tempfile::tempdir().expect("root");
         let authority = test_workflow_execution_authority();
         let mut store =
@@ -67449,9 +67609,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
             server.workflow_store = StdMutex::new(store).into();
             server
         });
-        drive_workflow_run(&state, "expiration")
-            .await
-            .expect("recovery drive");
+        assert!(drive_workflow_run(&state, "expiration").await.is_err());
         let store = state.workflow_store.lock().expect("store");
         assert!(store.is_recovery_only("expiration").expect("barrier"));
         assert_eq!(
@@ -67494,8 +67652,17 @@ event_symbol = "bcode_plugin_handle_event_v1"
             .run_summary("expiration")
             .expect("summary")
             .expect("run");
-        drop(state);
         assert!(run.cancellation_requested_at_ms.is_none());
+        state
+            .workflow_store
+            .lock()
+            .expect("store")
+            .request_cancellation("expiration", 5)
+            .expect("fixture termination");
+        signal_workflow_attempt_cancellation(&state, &attempt)
+            .await
+            .expect("terminal child needs no takeover");
+        drop(state);
     }
 
     #[test]
@@ -68755,6 +68922,27 @@ event_symbol = "bcode_plugin_handle_event_v1"
     }
 
     #[tokio::test]
+    async fn workflow_turn_missing_session_defers_without_terminalizing() {
+        let state = test_server_state(SessionManager::default());
+        let session_id = SessionId::new();
+        let request = bcode_workflow_store::AttemptReconciliationRequest {
+            run_id: "absent-run".into(),
+            node_id: "node".into(),
+            activation_id: "activation".into(),
+            attempt: 1,
+            dispatch_identity: "dispatch".into(),
+            side_effect: bcode_workflow::DispatchSideEffect::Mutating,
+            receipt: serde_json::json!({"session_id": session_id, "turn_id": "turn"}),
+        };
+        assert!(matches!(
+            observe_workflow_turn(&state, session_id, "turn", "output", &request)
+                .await
+                .expect("unavailable evidence is not a structural receipt failure"),
+            bcode_workflow_store::AttemptObservation::Deferred { .. }
+        ));
+    }
+
+    #[tokio::test]
     async fn workflow_terminal_window_finds_outcome_before_recent_history() {
         let root = tempfile::tempdir().expect("session root");
         let sessions = SessionManager::persistent_lazy(root.path());
@@ -68979,6 +69167,16 @@ event_symbol = "bcode_plugin_handle_event_v1"
             lookup,
         )
         .await;
+        let mut state = Arc::try_unwrap(state).unwrap_or_else(|_| panic!("exclusive test state"));
+        state.daemon_status.artifact_id =
+            Some(bcode_ipc::ArtifactId::parse("inconsistent-artifact").expect("artifact"));
+        let inspection = workflow_operations::inspect_run(&state, "loop-control-run", 10)
+            .await
+            .expect("inspection");
+        drop(state);
+        let coordinator = inspection.coordinator.expect("coordinator");
+        assert!(!coordinator.owned_by_this_daemon);
+        assert!(!coordinator.controllable_from_this_daemon);
     }
 
     // This consumer deliberately accepts no daemon state, IPC request, or persistence handle.

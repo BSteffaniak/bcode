@@ -142,10 +142,14 @@ Connection, startup, and application-request deadlines are separate client setti
 Artifact-specific daemon routing does not create artifact-specific canonical session history. All artifacts use the canonical session root. Session leases include daemon compatibility and instance metadata and prevent conflicting runtime ownership across artifact versions. Historical daemon records remain conservative control evidence.
 
 The canonical workflow store is likewise shared rather than forked by artifact. Active runs persist
-the immutable artifact they target and a generation-fenced daemon coordinator. A foreign artifact or
-stale daemon may perform bounded discovery for diagnostics but cannot mutate, recover, or control the
-run. A matching artifact may transfer authority only after session-owner evidence proves that the
-prior coordinator ended; unverifiable ownership defers without mutation.
+the current coordinator artifact and generation-fenced authority. A stale or foreign coordinator
+cannot mutate a run. After positive evidence that the prior owner ended and acquisition of canonical
+session ownership, a different artifact may atomically acquire recovery-only authority. A durable
+barrier preserves the original execution artifact and prohibits dispatch; takeover is not execution
+compatibility. Missing owner records remain unverifiable, not proof of termination. Recovery-only
+operations retain session ownership and recheck authority. See
+[workflow persistence](workflow-persistence-architecture.md#reconciliation-and-repair) for the
+implemented boundaries and remaining reconciliation gaps.
 
 Snapshots, event envelopes, and bounded reconnect checkpoints are state transfer only. They are not described as durable resume unless retention, acknowledgement, replay, and conflict behavior are defined by the relevant transport contract.
 

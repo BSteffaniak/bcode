@@ -605,8 +605,10 @@ repair-required state when trust cannot be established.
 ## Reconciliation and repair
 
 Automatic reconciliation is allowed only when durable receipts and owner APIs prove the current
-operation state. Every production run persists an immutable target artifact plus a current daemon
-coordinator generation and fencing token. Scheduling, continuation, and startup restoration qualify
+operation state. Every production run persists its current coordinator artifact plus a daemon
+coordinator generation and fencing token. Recovery barriers separately retain the original
+execution artifact; coordinator replacement does not imply execution compatibility. Scheduling,
+continuation, and startup restoration qualify
 that authority before entering a mutation cycle and recheck it throughout the cycle; stale or foreign
 authority cannot dispatch, observe, cancel, resume, or terminalize the run. Authority transfer is a
 compare-and-swap to the next generation and occurs only after canonical evidence proves the prior
@@ -614,21 +616,25 @@ daemon ended. Two forms exist:
 
 * **Same-artifact transfer** preserves the target artifact and requires session-owner evidence that
   the prior coordinator ended. It is the normal replacement-daemon path and may recover live work.
-* **Cross-artifact reassignment** changes the target artifact and is allowed only for a *quiescent*
-  run: one with no `prepared`, `admitted`, or `running` attempt. It requires both session-owner
-  lease observations and the daemon registry to agree that the prior coordinator ended (a lost
-  lease alone is not enough), and it persists an `authority_reassigned` event carrying that
-  evidence. A quiescent run is durable data rather than live work, so no artifact-specific receipt
-  interpretation is pending and no other artifact's live work is recovered or terminalized.
+* **Cross-artifact recovery takeover** changes the coordinator and atomically installs a
+  recovery-only barrier, preserving unresolved attempts and their original artifact. Positive
+  ended-owner evidence is required; missing records are unverifiable. New attempts, dispatch
+  handoff, resume, and child admission are blocked. Receipt observation and authorized cancellation
+  remain possible, but incompatible receipts defer. Explicit resume can clear the barrier only
+  with settled attempts, terminal linked children, and the original execution artifact. Barrier
+  removal and resume commit together. The quiescent reassignment store operation remains available,
+  but application ownership resolution uses recovery-only takeover instead.
 
 Agent-turn receipts additionally persist the exact daemon artifact and daemon-instance identity that
 accepted the turn. A daemon with a different artifact, or a replacement daemon while the recorded
 session owner remains live or unverifiable, defers observation without mutating the attempt and
 reports the owning daemon in a typed `workflow_owned_by_live_daemon` error so operators can act on
 it. This keeps the workflow database canonical across artifact-isolated daemons without letting one
-artifact recover or terminalize another artifact's live work, while ensuring a run can never become
-permanently uncontrollable merely because the build that started it is gone. Prepared mutation
-without a trustworthy receipt or externally provable outcome becomes `repair_required`; it is not
+artifact reinterpret another artifact's private receipts. This is not yet complete crash recovery:
+exact lifetime-independent outcome lookup, cross-artifact operation reconciliation, and durable
+replacement remain unfinished. Prepared mutation
+without a trustworthy receipt or externally provable outcome becomes `repair_required` on the
+compatible startup path; recovery-only takeover preserves it without guessing. It is not
 retried automatically.
 
 A paused run holds no live process resources. Pausing suspends the run's session-level runtime
@@ -639,8 +645,9 @@ quiescent (terminal or paused) run.
 
 `bcode workflow reconcile-orphans` is the explicit maintenance operation for nonterminal runs whose
 coordinator verifiably ended. It reports each candidate with its evidence and, only with `--apply`,
-reassigns and cancels them (a `repair_required` run is reassigned but keeps its status for
-attempt-level repair). Runs owned by a live or unverifiable daemon are always skipped.
+acquires qualified authority and requests cancellation (a `repair_required` run retains its status
+for attempt-level repair). Foreign-artifact takeover remains recovery-only. Cancellation acceptance
+is not proof of termination. Runs owned by a live or unverifiable daemon are always skipped.
 
 Full replay, projection rebuild, receipt investigation, forced retry, and ambiguity resolution are
 explicit doctor/reconcile/repair operations. Maintenance acquires exclusive workflow-store
@@ -650,8 +657,10 @@ damaged or stale.
 ## Schema upgrades and explicit reset
 
 The workflow database has one current schema version. A missing database is initialized directly
-at that version. Domain-owned startup coordination automatically upgrades supported schemas 14–32
-under the migration safety contract in `INVARIANTS.md`. Schema 33 supplies the run-package binding
+at that version. Domain-owned startup coordination automatically upgrades supported schemas 14–33
+under the migration safety contract in `INVARIANTS.md`. Schema 34 adds durable recovery barriers
+and dispatch/resume triggers; current-schema opens fail closed when required barriers are missing.
+Schema 33 supplies the run-package binding
 table omitted by earlier upgrades. If that table is absent, automatic creation requires an empty
 publication catalog; existing publications make the missing bindings ambiguous and require explicit
 maintenance. Existing binding rows are preserved. Current-schema opens validate the required table

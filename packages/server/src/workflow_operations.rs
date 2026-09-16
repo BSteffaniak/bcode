@@ -5686,6 +5686,140 @@ async fn missing_prior_owner_records_do_not_authorize_takeover() {
     assert_eq!(liveness, PriorOwnerLiveness::LiveOrUnverifiable);
 }
 
+/// Qualify observation of the stable agent-turn/v1 contract after cross-artifact takeover.
+/// This grants no dispatch permission and never treats registry absence as termination proof.
+pub async fn can_observe_recovered_agent_turn(
+    state: &ServerState,
+    request: &bcode_workflow_store::AttemptReconciliationRequest,
+) -> Result<bool, super::ServerError> {
+    if request
+        .receipt
+        .get("owner")
+        .and_then(serde_json::Value::as_str)
+        != Some("bcode.server.agent-turn/v1")
+    {
+        return Ok(false);
+    }
+    let Some(artifact) = request
+        .receipt
+        .get("owner_artifact_id")
+        .and_then(serde_json::Value::as_str)
+    else {
+        return Ok(false);
+    };
+    let Some(instance) = request
+        .receipt
+        .get("owner_daemon_instance_id")
+        .and_then(serde_json::Value::as_str)
+    else {
+        return Ok(false);
+    };
+    let Some(session_id) = request
+        .receipt
+        .get("session_id")
+        .and_then(serde_json::Value::as_str)
+        .and_then(|id| id.parse::<super::SessionId>().ok())
+    else {
+        return Ok(false);
+    };
+    if artifact.is_empty() || instance.is_empty() {
+        return Ok(false);
+    }
+    let authority = {
+        let store = state
+            .workflow_store
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let Some(authority) = store.execution_authority(&request.run_id)? else {
+            return Ok(false);
+        };
+        if !authority_targets_current_daemon(state, &authority)
+            || store.recovery_source_artifact(&request.run_id)?.as_deref() != Some(artifact)
+        {
+            return Ok(false);
+        }
+        drop(store);
+        authority
+    };
+    let Ok(summary) = state.sessions.session_summary(session_id).await else {
+        return Ok(false);
+    };
+    let Some(execution) = summary.execution else {
+        return Ok(false);
+    };
+    let provenance = execution.provenance;
+    if provenance.owner != "bcode.workflow"
+        || provenance.parent_session_id != run_parent_session_id(state, &request.run_id)?
+        || provenance.run_id != request.run_id
+        || provenance.node_id != request.node_id
+        || provenance.activation_id.as_deref() != Some(request.activation_id.as_str())
+        || provenance.attempt != request.attempt
+    {
+        return Ok(false);
+    }
+    // The accepting operation owner is independent of the current workflow coordinator.
+    let accepting_owner = bcode_workflow_store::WorkflowExecutionAuthority {
+        target_artifact_id: artifact.into(),
+        daemon_instance_id: instance.into(),
+        generation: 0,
+        fencing_token: String::new(),
+    };
+    let ended = prior_owner_liveness(state, session_id, &accepting_owner).await?
+        == PriorOwnerLiveness::ObservedEnded;
+    state
+        .workflow_store
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .verify_execution_authority(&request.run_id, &authority)?;
+    Ok(ended)
+}
+
+fn verify_current_coordinator_artifact(
+    state: &ServerState,
+    authority: &bcode_workflow_store::WorkflowExecutionAuthority,
+) -> Result<(), bcode_workflow_store::WorkflowStoreError> {
+    if !authority_targets_current_daemon(state, authority) {
+        return Err(bcode_workflow_store::WorkflowStoreError::InvalidData(
+            "workflow coordinator instance has inconsistent artifact identity".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn authority_targets_current_daemon(
+    state: &ServerState,
+    authority: &bcode_workflow_store::WorkflowExecutionAuthority,
+) -> bool {
+    authority.daemon_instance_id == state.daemon_status.instance_id
+        && authority.target_artifact_id == current_artifact_id(state)
+}
+
+#[cfg(test)]
+#[test]
+fn recovery_authority_requires_both_artifact_and_instance_identity() {
+    let mut state = super::tests::test_server_state(bcode_session::SessionManager::default());
+    state.daemon_status.instance_id = "current-instance".into();
+    state.daemon_status.artifact_id =
+        Some(bcode_ipc::ArtifactId::parse("current-artifact").expect("artifact"));
+    let mut authority = bcode_workflow_store::WorkflowExecutionAuthority {
+        target_artifact_id: "current-artifact".into(),
+        daemon_instance_id: "current-instance".into(),
+        generation: 1,
+        fencing_token: "fence".into(),
+    };
+    assert!(authority_targets_current_daemon(&state, &authority));
+    authority.target_artifact_id = "foreign-artifact".into();
+    assert!(!authority_targets_current_daemon(&state, &authority));
+    authority.target_artifact_id = "current-artifact".into();
+    authority.daemon_instance_id = "foreign-instance".into();
+    assert!(!authority_targets_current_daemon(&state, &authority));
+    state.daemon_status.artifact_id = None;
+    authority.daemon_instance_id = "current-instance".into();
+    authority.target_artifact_id = state.daemon_status.build_fingerprint.clone();
+    assert!(authority_targets_current_daemon(&state, &authority));
+    drop(state);
+}
+
 fn current_artifact_id(state: &ServerState) -> String {
     state.daemon_status.artifact_id.as_ref().map_or_else(
         || state.daemon_status.build_fingerprint.clone(),
@@ -5741,9 +5875,37 @@ pub async fn execution_authority(
         return Ok(None);
     };
     if current.daemon_instance_id == state.daemon_status.instance_id {
+        verify_current_coordinator_artifact(state, &current)?;
+        let recovering = state
+            .workflow_store
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .is_recovery_only(run_id)?;
+        let session_ownership = if recovering {
+            let session_id = run_parent_session_id(state, run_id)?;
+            Some(
+                state
+                    .sessions
+                    .acquire_session_ownership(
+                        session_id,
+                        bcode_session::SessionOwnershipKind::RuntimeWork,
+                    )
+                    .await
+                    .map_err(|error| {
+                        bcode_workflow_store::WorkflowStoreError::InvalidData(error.to_string())
+                    })?,
+            )
+        } else {
+            None
+        };
+        state
+            .workflow_store
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .verify_execution_authority(run_id, &current)?;
         return Ok(Some(AuthorityGuard {
             authority: current,
-            _session_ownership: None,
+            _session_ownership: session_ownership,
         }));
     }
     let artifact_id = current_artifact_id(state);
@@ -10021,10 +10183,12 @@ pub async fn inspect_run(
         .execution_authority(run_id)?;
     let coordinator = match authority {
         Some(authority) => {
-            let owned_by_this_daemon =
-                authority.daemon_instance_id == state.daemon_status.instance_id;
+            let owned_by_this_daemon = authority_targets_current_daemon(state, &authority);
             let controllable_from_this_daemon = if owned_by_this_daemon {
                 true
+            } else if authority.daemon_instance_id == state.daemon_status.instance_id {
+                // Conflicting artifact identity is inconsistent state, not an ended foreign owner.
+                false
             } else {
                 match run
                     .parent_session_id
@@ -10038,17 +10202,22 @@ pub async fn inspect_run(
                     None => false,
                 }
             };
+            let (recovery_only, recovery_source_artifact_id) = {
+                let store = state
+                    .workflow_store
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                (
+                    store.is_recovery_only(run_id)?,
+                    store.recovery_source_artifact(run_id)?,
+                )
+            };
             Some(bcode_workflow::WorkflowCoordinatorStatus {
                 target_artifact_id: authority.target_artifact_id,
                 daemon_instance_id: authority.daemon_instance_id,
                 owned_by_this_daemon,
-                recovery_only: Some(
-                    state
-                        .workflow_store
-                        .lock()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner)
-                        .is_recovery_only(run_id)?,
-                ),
+                recovery_only: Some(recovery_only),
+                recovery_source_artifact_id,
                 controllable_from_this_daemon,
             })
         }

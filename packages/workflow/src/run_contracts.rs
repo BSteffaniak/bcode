@@ -944,6 +944,10 @@ pub struct WorkflowCoordinatorStatus {
     /// observations means unknown, not permission to execute; commands remain authoritative.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub recovery_only: Option<bool>,
+    /// Original execution artifact retained by a recovery barrier. Absence does not
+    /// establish cross-artifact compatibility or authorize execution.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recovery_source_artifact_id: Option<String>,
     /// Whether the responding daemon could take control of the run on demand.
     ///
     /// `false` means another daemon still owns the run (or ownership cannot be verified), and
@@ -1674,6 +1678,8 @@ mod tests {
             "owned_by_this_daemon":true,"controllable_from_this_daemon":true});
         let mut status: super::WorkflowCoordinatorStatus = serde_json::from_value(older).unwrap();
         assert_eq!(status.recovery_only, None);
+        assert_eq!(status.recovery_source_artifact_id, None);
+        status.recovery_source_artifact_id = Some("original-artifact".into());
         status.recovery_only = Some(true);
         let decoded: super::WorkflowCoordinatorStatus =
             serde_json::from_value(serde_json::to_value(&status).unwrap()).unwrap();
