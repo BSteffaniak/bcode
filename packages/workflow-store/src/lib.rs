@@ -3997,8 +3997,47 @@ impl WorkflowStore {
         authority: &WorkflowExecutionAuthority,
         now_ms: u64,
     ) -> Result<bool, WorkflowStoreError> {
+        self.complete_recovery(run_id, authority, now_ms, false)
+    }
+
+    /// Atomically complete compatible recovery and explicitly resume a paused run.
+    ///
+    /// # Errors
+    /// Rejects cancellation, non-paused state, stale ownership, unresolved work, or incompatible artifacts.
+    pub fn resume_recovered_run(
+        &mut self,
+        run_id: &str,
+        authority: &WorkflowExecutionAuthority,
+        now_ms: u64,
+    ) -> Result<bool, WorkflowStoreError> {
+        self.complete_recovery(run_id, authority, now_ms, true)
+    }
+
+    fn complete_recovery(
+        &self,
+        run_id: &str,
+        authority: &WorkflowExecutionAuthority,
+        now_ms: u64,
+        resume: bool,
+    ) -> Result<bool, WorkflowStoreError> {
         let tx = self.connection.unchecked_transaction()?;
         self.verify_execution_authority(run_id, authority)?;
+        if resume {
+            let run = self
+                .run_summary(run_id)?
+                .ok_or_else(|| WorkflowStoreError::RunNotFound {
+                    run_id: run_id.into(),
+                })?;
+            if run.cancellation_requested_at_ms.is_some() {
+                return Err(WorkflowStoreError::CancellationPreventsControl);
+            }
+            if run.status != RunStatus::Paused {
+                return Err(WorkflowStoreError::InvalidRunTransition {
+                    current: run.status,
+                    target: RunStatus::Running,
+                });
+            }
+        }
         let source: Option<String> = tx
             .query_row(
                 "SELECT source_artifact_id FROM workflow_recovery_barriers WHERE run_id = ?1",
@@ -4020,6 +4059,19 @@ impl WorkflowStore {
             [run_id],
         )?;
         append_event(&tx, run_id, "recovery_completed", "{}", now_ms)?;
+        if resume {
+            tx.execute(
+                "UPDATE workflow_runs SET status = 'running', updated_at_ms = ?2 WHERE run_id = ?1",
+                (run_id, now_ms),
+            )?;
+            append_event(
+                &tx,
+                run_id,
+                "run_resumed",
+                "{\"status\":\"running\"}",
+                now_ms,
+            )?;
+        }
         tx.commit()?;
         Ok(true)
     }
@@ -4085,7 +4137,7 @@ impl WorkflowStore {
             &tx,
             run_id,
             "recovery_authority_transferred",
-            &serde_json::json!({"from": expected, "to": replacement, "evidence": evidence})
+            &serde_json::json!({"from": expected, "to": replacement, "evidence": evidence, "reassigned_at_ms": now_ms})
                 .to_string(),
             now_ms,
         )?;
@@ -8613,7 +8665,9 @@ impl WorkflowStore {
         )?;
         let mut run_status = if remaining {
             RunStatus::RepairRequired
-        } else if matches!(resolution, RepairResolution::AbandonForExplicitRetry { .. }) {
+        } else if matches!(resolution, RepairResolution::AbandonForExplicitRetry { .. })
+            && !self.is_recovery_only(&run_id)?
+        {
             RunStatus::Running
         } else {
             RunStatus::Paused
@@ -38246,6 +38300,102 @@ mod tests {
         store
             .request_cancellation_owned(&run.run_id, 23, &replacement)
             .expect("cancel intent allowed");
+    }
+
+    #[test]
+    fn recovery_resume_rolls_back_barrier_and_audit_when_resume_write_fails() {
+        let (temp, mut store, run, authority, _) = connected_publication_fixture();
+        store
+            .enter_recovery_only(&run.run_id, &authority, 20)
+            .expect("enter");
+        let before = store.event_history(&run.run_id, None, 100).expect("events");
+        store
+            .connection
+            .execute_batch(
+                "CREATE TRIGGER fail_resume_write BEFORE UPDATE OF status ON workflow_runs
+             WHEN NEW.status = 'running'
+             BEGIN SELECT RAISE(ABORT, 'injected resume failure'); END;",
+            )
+            .expect("fault");
+        assert!(
+            store
+                .resume_recovered_run(&run.run_id, &authority, 21)
+                .is_err()
+        );
+        drop(store);
+        let mut store = WorkflowStore::open_in_state_dir(temp.path()).expect("reopen");
+        assert!(
+            store
+                .is_recovery_only(&run.run_id)
+                .expect("barrier survived")
+        );
+        assert_eq!(
+            store
+                .run_summary(&run.run_id)
+                .expect("summary")
+                .expect("run")
+                .status,
+            RunStatus::Paused
+        );
+        assert_eq!(
+            store.event_history(&run.run_id, None, 100).expect("events"),
+            before
+        );
+        store
+            .connection
+            .execute_batch("DROP TRIGGER fail_resume_write;")
+            .expect("remove fault");
+        assert!(
+            store
+                .resume_recovered_run(&run.run_id, &authority, 22)
+                .expect("retry")
+        );
+        assert!(!store.is_recovery_only(&run.run_id).expect("completed"));
+        assert_eq!(
+            store
+                .run_summary(&run.run_id)
+                .expect("summary")
+                .expect("run")
+                .status,
+            RunStatus::Running
+        );
+    }
+
+    #[test]
+    fn recovery_repair_abandonment_does_not_grant_execution() {
+        let (_temp, mut store, run, authority, _) = connected_publication_fixture();
+        let id = activation_identity(&run.run_id, "first", 0);
+        let prepared = store
+            .prepare_pending_activation(
+                &run.run_id,
+                "first",
+                &id,
+                DispatchSideEffect::Mutating,
+                serde_json::json!({}),
+                10,
+            )
+            .expect("prepare")
+            .expect("pending");
+        store
+            .reconcile_prepared_attempts(10, 11)
+            .expect("ambiguity");
+        store
+            .enter_recovery_only(&run.run_id, &authority, 12)
+            .expect("recovery");
+        let result = store
+            .repair_attempt_owned(
+                &prepared.dispatch_identity,
+                &RepairResolution::AbandonForExplicitRetry {
+                    reason: "operator accepts unresolved effects".into(),
+                },
+                13,
+                &authority,
+            )
+            .expect("resolve without execution");
+        assert_eq!(result.attempt_status, "abandoned");
+        assert_eq!(result.run_status, RunStatus::Paused);
+        assert!(store.is_recovery_only(&run.run_id).expect("barrier"));
+        assert!(store.resume_run_owned(&run.run_id, 14, &authority).is_err());
     }
 
     #[test]

@@ -6701,23 +6701,14 @@ pub async fn resume_run(
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         if store.is_recovery_only(run_id)? {
-            let current = store.run_summary(run_id)?.ok_or_else(|| {
-                bcode_workflow_store::WorkflowStoreError::RunNotFound {
-                    run_id: run_id.into(),
-                }
-            })?;
-            if current.cancellation_requested_at_ms.is_some() {
-                return Err(
-                    bcode_workflow_store::WorkflowStoreError::CancellationPreventsControl.into(),
-                );
-            }
-            store.finish_recovery_only(
+            store.resume_recovered_run(
                 run_id,
                 &authority.authority,
                 super::current_unix_millis(),
-            )?;
+            )?
+        } else {
+            store.resume_run_owned(run_id, super::current_unix_millis(), &authority.authority)?
         }
-        store.resume_run_owned(run_id, super::current_unix_millis(), &authority.authority)?
     };
     if changed
         && let Some(parent_session_id) = run
@@ -7397,7 +7388,10 @@ fn history_event(
         lifecycle
     } else if row.event_type == "output_validated" {
         output_validation_observation(&row.payload)
-    } else if row.event_type == "authority_reassigned" {
+    } else if matches!(
+        row.event_type.as_str(),
+        "authority_reassigned" | "recovery_authority_transferred"
+    ) {
         authority_transfer_observation(&row.payload)
     } else if row.event_type == "waiting_activation_resolved" {
         serde_json::from_value::<bcode_workflow::WorkflowWaitResolutionObservation>(
@@ -7556,6 +7550,26 @@ fn history_authority_transfer_excludes_credentials_and_fails_closed() {
             );
         }
     }
+}
+
+#[cfg(test)]
+#[test]
+fn recovery_transfer_history_exposes_only_generations_and_time() {
+    let event = history_event(bcode_workflow_store::WorkflowEventRow {
+        event_seq: 9,
+        run_id: "run".into(),
+        event_type: "recovery_authority_transferred".into(),
+        payload: serde_json::json!({"from":{"generation":2,"fencing_token":"SECRET"},
+            "to":{"generation":3,"fencing_token":"SECRET"},
+            "evidence":{"private":"SECRET"},"reassigned_at_ms":456}),
+        created_at_ms: 456,
+    });
+    assert!(!serde_json::to_string(&event).unwrap().contains("SECRET"));
+    let transfer: bcode_workflow::WorkflowAuthorityTransferObservation =
+        serde_json::from_value(event.payload).unwrap();
+    assert_eq!(transfer.previous_generation, 2);
+    assert_eq!(transfer.generation, 3);
+    assert_eq!(transfer.reassigned_at_ms, 456);
 }
 
 #[cfg(test)]
