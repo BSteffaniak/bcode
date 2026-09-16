@@ -256,18 +256,21 @@ fn format_workflow_inspection_status(inspection: &bcode_ipc::WorkflowRunInspecti
                 | bcode_workflow_store::RunStatus::RepairRequired
         )
     {
+        if coordinator.recovery_only == Some(true) {
+            status.push_str(" · recovery only: new execution is blocked until operation outcomes and execution compatibility are resolved");
+        }
         if coordinator.owned_by_this_daemon {
             status.push_str(" · owned by this daemon");
         } else if coordinator.controllable_from_this_daemon {
             let _ = write!(
                 status,
-                " · previous owner daemon {} ended; /loop stop or /loop resume will take it over",
+                " · previous owner daemon {} ended; controls may acquire recovery ownership, but resume still requires compatible settled work",
                 coordinator.daemon_instance_id
             );
         } else {
             let _ = write!(
                 status,
-                " · owned by another live daemon {} (artifact {}); stop that daemon with `bcode server stop-all --yes` to control it here",
+                " · coordinator {} (artifact {}) is live or unverifiable; verify that owner's status before attempting takeover",
                 coordinator.daemon_instance_id, coordinator.target_artifact_id
             );
         }
