@@ -4904,6 +4904,12 @@ struct ArtifactRangeArgs {
 
 #[derive(Debug, Subcommand)]
 enum SessionCommand {
+    /// Inspect compression admission; --apply retires verified abandoned reads and resets access age.
+    StorageAdmission {
+        session_id: SessionId,
+        #[arg(long)]
+        apply: bool,
+    },
     /// Losslessly compress finalized artifacts and history; never runs VACUUM.
     Compress {
         #[arg(required_unless_present = "older_than")]
@@ -6848,6 +6854,16 @@ async fn dispatch_session_command(command: Box<SessionCommand>) -> Result<(), Cl
             json,
         } => {
             run_session_compression(session_id, older_than, &tier, dry_run, json).await?;
+        }
+        SessionCommand::StorageAdmission { session_id, apply } => {
+            ensure_server_running().await?;
+            let report = BcodeClient::default_endpoint()
+                .session_admission(session_id, apply)
+                .await?;
+            print_json(&report)?;
+            if report.busy || report.invalid {
+                return Err(CliError::SessionCompressionIncomplete);
+            }
         }
         SessionCommand::StorageUsage {
             session_id,

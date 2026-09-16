@@ -1,5 +1,19 @@
 # Session storage tiering
 
+## Admission diagnosis and explicit recovery
+
+`bcode session storage-admission <session-id>` inspects up to 4096 session admission entries
+without creating registry files or updating access age. It reports abandoned/clean participant
+counts, busy ownership, and invalid/incomplete evidence. Missing or unsafe registries return an
+error rather than silently creating a substitute registry.
+
+`bcode session storage-admission <session-id> --apply` is explicit recovery. It acquires exclusive
+admission plus each participant lock, validates every entry before mutation, and verifies session
+maintenance ownership. It durably advances the session access timestamp before retiring known
+participants. Active owners, unknown formats, malformed records, and over-budget inventories are
+preserved and refused. Interrupted retirement is safe to retry: the conservative timestamp is
+persisted first. It never rewrites canonical history or repairs damaged session storage.
+
 ## Artifact checksum scope
 
 Reference metadata `content_checksum_sha256` is an optional SHA-256 digest of the entire logical

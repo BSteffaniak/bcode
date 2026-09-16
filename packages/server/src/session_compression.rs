@@ -12,6 +12,28 @@ use bcode_session_models::{
     StorageCompressionTier,
 };
 
+pub async fn admission_report(
+    state: &ServerState,
+    id: bcode_session_models::SessionId,
+    apply: bool,
+) -> Result<bcode_session_models::StorageAdmissionReport, &'static str> {
+    if !state
+        .session_catalog
+        .ambiguous_location_ids(id)
+        .await
+        .is_empty()
+    {
+        return Err("session location is ambiguous");
+    }
+    let root = state
+        .sessions
+        .session_store_root()
+        .ok_or("persistent storage unavailable")?;
+    tokio::task::spawn_blocking(move || bcode_session::storage_admission::StorageAdmissionRegistry::session_report(&root, id, apply))
+        .await.map_err(|_| "admission inspection task failed")?
+        .map_err(|_| "admission inspection/recovery refused: storage is missing, unsafe, busy, or unavailable; evidence was preserved")
+}
+
 pub async fn compress_page(
     state: &ServerState,
     request: StorageCompressionRequest,

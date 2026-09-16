@@ -5334,7 +5334,8 @@ fn request_metrics_context(
 const fn request_session_id(request: &Request) -> Option<SessionId> {
     match request {
         Request::SessionCompress { request } => Some(request.session_id),
-        Request::RenameSession { session_id, .. }
+        Request::SessionAdmission { session_id, .. }
+        | Request::RenameSession { session_id, .. }
         | Request::DeleteSession { session_id }
         | Request::ReadSessionArtifact { session_id, .. }
         | Request::InvocationInput { session_id, .. }
@@ -5575,6 +5576,7 @@ const fn request_kind(request: &Request) -> &'static str {
         Request::AgentPolicyStatus => "agent_policy_status",
         Request::UsageCatalog { .. } => "usage_catalog",
         Request::SessionCompress { .. } => "session_compress",
+        Request::SessionAdmission { .. } => "session_admission",
         Request::UsageReport { .. } => "usage_report",
         Request::UsageCollect { .. } => "usage_collect",
         Request::SetSessionAgent { .. } => "set_session_agent",
@@ -5971,6 +5973,16 @@ async fn handle_request_inner(
                 Ok(page) => Response::Ok(ResponsePayload::UsageCollected { page }),
                 Err(message) => Response::Err(ErrorResponse::new("usage_unavailable", message)),
             };
+            send_response(writer, request_id, response).await
+        }
+        SessionLifecycleRequest::SessionAdmission { session_id, apply } => {
+            let response =
+                match session_compression::admission_report(state, session_id, apply).await {
+                    Ok(report) => Response::Ok(ResponsePayload::SessionAdmission { report }),
+                    Err(message) => {
+                        Response::Err(ErrorResponse::new("session_admission_unavailable", message))
+                    }
+                };
             send_response(writer, request_id, response).await
         }
         SessionLifecycleRequest::SessionCompress { request } => {
@@ -34230,6 +34242,7 @@ const fn response_payload_kind(response: &Response) -> &'static str {
         Response::Ok(payload) => match payload {
             ResponsePayload::Attached { .. } => "attached",
             ResponsePayload::SessionHistory { .. } => "session_history",
+            ResponsePayload::SessionAdmission { .. } => "session_admission",
             ResponsePayload::SessionCompressed { .. } => "session_compressed",
             ResponsePayload::SessionStorageUsage { .. } => "session_storage_usage",
             ResponsePayload::SessionHistoryPage { .. } => "session_history_page",

@@ -1179,6 +1179,11 @@ pub enum Request {
     SessionCompress {
         request: bcode_session_models::StorageCompressionRequest,
     },
+    /// Explicit admission inspection or recovery.
+    SessionAdmission {
+        session_id: SessionId,
+        apply: bool,
+    },
 }
 
 /// Server stop request policy.
@@ -2332,6 +2337,9 @@ pub enum ResponsePayload {
     },
     SessionCompressed {
         result: bcode_session_models::StorageCompressionResult,
+    },
+    SessionAdmission {
+        report: bcode_session_models::StorageAdmissionReport,
     },
 }
 

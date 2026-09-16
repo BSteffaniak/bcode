@@ -30,6 +30,8 @@ use std::str::FromStr;
 use std::time::{SystemTime, UNIX_EPOCH};
 use uuid::Uuid;
 
+mod storage_admission;
+pub use storage_admission::StorageAdmissionReport;
 mod storage_compression;
 pub use storage_compression::*;
 mod storage;

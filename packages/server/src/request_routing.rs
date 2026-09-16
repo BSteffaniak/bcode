@@ -179,6 +179,10 @@ pub enum SessionLifecycleRequest {
         session_id: SessionId,
         query: bcode_session_models::SessionUsageQuery,
     },
+    SessionAdmission {
+        session_id: SessionId,
+        apply: bool,
+    },
     SessionCompress {
         request: bcode_session_models::StorageCompressionRequest,
     },
@@ -886,6 +890,12 @@ impl RoutedRequest {
                 Self::SessionLifecycle(Box::new(SessionLifecycleRequest::UsageCollect {
                     session_id,
                     query,
+                }))
+            }
+            Request::SessionAdmission { session_id, apply } => {
+                Self::SessionLifecycle(Box::new(SessionLifecycleRequest::SessionAdmission {
+                    session_id,
+                    apply,
                 }))
             }
             Request::SessionCompress { request } => {

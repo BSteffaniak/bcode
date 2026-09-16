@@ -92,6 +92,101 @@ impl StorageAdmissionRegistry {
         Ok(Self { directory })
     }
 
+    /// Inspect session admission without creating files; optionally retire verified abandoned reads.
+    /// Recovery resets access age durably before removing known participants under exclusive locks.
+    ///
+    /// # Errors
+    /// Returns confinement, ownership, tracking persistence, or filesystem failures. Unknown evidence
+    /// is reported and preserved; partial retirement is safe because age reset precedes all removal.
+    pub fn session_report(
+        root: &Path,
+        id: SessionId,
+        apply: bool,
+    ) -> io::Result<bcode_session_models::StorageAdmissionReport> {
+        use std::io::{Read as _, Seek as _};
+        use std::os::unix::fs::OpenOptionsExt as _;
+        let root_handle = std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_DIRECTORY | libc::O_CLOEXEC)
+            .open(root)?;
+        let parent = open_child(
+            &root_handle,
+            c"storage-admission-sessions-v1",
+            libc::O_RDONLY | libc::O_DIRECTORY,
+        )?;
+        let name = std::ffi::CString::new(id.to_string()).map_err(|_| invalid())?;
+        let directory = open_child(&parent, &name, libc::O_RDONLY | libc::O_DIRECTORY)?;
+        let mut report = bcode_session_models::StorageAdmissionReport::default();
+        let gate = open_child(&directory, c"gate", libc::O_RDWR)?;
+        if gate.try_lock().is_err() {
+            report.busy = true;
+            return Ok(report);
+        }
+        let Ok(entries) = names(&directory, 4096) else {
+            report.invalid = true;
+            return Ok(report);
+        };
+        let mut participants = Vec::new();
+        for entry in entries {
+            if entry == "gate" {
+                continue;
+            }
+            let valid = entry
+                .to_str()
+                .and_then(|s| s.strip_suffix(".participant"))
+                .is_some_and(|s| s.parse::<SessionId>().is_ok());
+            if !valid {
+                report.invalid = true;
+                return Ok(report);
+            }
+            let name = std::ffi::CString::new(entry.as_bytes()).map_err(|_| invalid())?;
+            let mut file = open_child(&directory, &name, libc::O_RDONLY)?;
+            if file.try_lock().is_err() {
+                report.busy = true;
+                return Ok(report);
+            }
+            if file.metadata()?.len() != super::DIRTY.len() as u64 {
+                report.invalid = true;
+                return Ok(report);
+            }
+            let mut bytes = [0; 17];
+            file.rewind()?;
+            file.read_exact(&mut bytes)?;
+            if &bytes == super::DIRTY {
+                report.abandoned += 1;
+            } else if &bytes == super::CLEAN {
+                report.clean += 1;
+            } else {
+                report.invalid = true;
+                return Ok(report);
+            }
+            participants.push((name, file));
+        }
+        if apply && !participants.is_empty() {
+            let _ownership = crate::lease::acquire_session_maintenance_guard(root, id)
+                .map_err(io::Error::other)?;
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_err(io::Error::other)?
+                .as_millis();
+            crate::storage_access::record_session_access(
+                root,
+                id,
+                crate::storage_access::StorageAccessKind::History,
+                u64::try_from(now).map_err(io::Error::other)?,
+            )?;
+            for (name, _file) in &participants {
+                // SAFETY: each name is a verified UUID participant under the exclusively locked directory.
+                if unsafe { libc::unlinkat(raw(&directory), name.as_ptr(), 0) } != 0 {
+                    return Err(io::Error::last_os_error());
+                }
+                directory.sync_all()?;
+                report.retired += 1;
+            }
+        }
+        Ok(report)
+    }
+
     /// Remove only verified clean, completed daemon records under exclusive registry admission.
     ///
     /// The complete directory scan must fit the budget before any record is removed. Live,
@@ -542,6 +637,68 @@ unsafe fn errno() -> *mut libc::c_int {
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test]
+    async fn session_recovery_requires_released_readers_and_resets_age() {
+        let root = tempfile::tempdir().expect("root");
+        let sessions = crate::SessionManager::persistent(root.path()).expect("sessions");
+        let id = sessions
+            .create_session(None, root.path().to_path_buf())
+            .await
+            .expect("session")
+            .id;
+        sessions
+            .release_session_ownership(id)
+            .await
+            .expect("release");
+        let registry = StorageAdmissionRegistry::open_session(root.path(), id).expect("registry");
+        let reader = registry.admit_read(SessionId::new()).expect("reader");
+        assert!(
+            StorageAdmissionRegistry::session_report(root.path(), id, true)
+                .expect("busy")
+                .busy
+        );
+        drop(reader);
+        let observation =
+            crate::storage_access::observe_session_access(root.path(), id).expect("before");
+        let preview =
+            StorageAdmissionRegistry::session_report(root.path(), id, false).expect("preview");
+        assert_eq!(preview.abandoned, 1);
+        assert_eq!(preview.retired, 0);
+        assert_eq!(
+            crate::storage_access::observe_session_access(root.path(), id).expect("unchanged"),
+            observation
+        );
+        assert!(registry.admit_maintenance(4096).is_err());
+        let recovered =
+            StorageAdmissionRegistry::session_report(root.path(), id, true).expect("recover");
+        assert_eq!(recovered.retired, 1);
+        assert!(matches!(
+            crate::storage_access::observe_session_access(root.path(), id).expect("reset"),
+            crate::storage_access::StorageAccessObservation::Recorded(_)
+        ));
+        drop(registry.admit_maintenance(4096).expect("admitted"));
+        assert_eq!(
+            StorageAdmissionRegistry::session_report(root.path(), id, true)
+                .expect("repeat")
+                .retired,
+            0
+        );
+        drop(registry.admit_read(SessionId::new()).expect("reader"));
+        let directory = root
+            .path()
+            .join("storage-admission-sessions-v1")
+            .join(id.to_string());
+        std::fs::write(directory.join("future-format"), b"unknown").expect("fixture");
+        let invalid =
+            StorageAdmissionRegistry::session_report(root.path(), id, true).expect("preserved");
+        assert!(invalid.invalid);
+        assert_eq!(invalid.retired, 0);
+        assert_eq!(
+            std::fs::read(directory.join("future-format")).expect("preserved"),
+            b"unknown"
+        );
+    }
+
     use super::*;
 
     #[test]

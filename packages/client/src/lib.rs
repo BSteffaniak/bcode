@@ -3023,6 +3023,23 @@ impl BcodeClient {
         }
     }
 
+    /// Inspect admission; apply explicitly resets access age and retires abandoned reads.
+    /// # Errors
+    /// Returns ownership, validation or transport failures.
+    pub async fn session_admission(
+        &self,
+        session_id: SessionId,
+        apply: bool,
+    ) -> Result<bcode_session_models::StorageAdmissionReport, ClientError> {
+        match self
+            .send_request(Request::SessionAdmission { session_id, apply })
+            .await?
+        {
+            ResponsePayload::SessionAdmission { report } => Ok(report),
+            _ => Err(ClientError::UnexpectedResponse),
+        }
+    }
+
     /// Execute one bounded compression page. Continuations are not durable operation handles.
     ///
     /// # Errors
