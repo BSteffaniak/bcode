@@ -36599,6 +36599,63 @@ mod tests {
         thread.join().expect("package export lifecycle");
     }
 
+    async fn verify_package_export_replacement_selection(
+        client: &bcode_client::BcodeClient,
+        state: &Arc<ServerState>,
+        started: &bcode_workflow::WorkflowPackageExportRunStartResponse,
+        parent: SessionId,
+    ) {
+        let run = &started.started.started.run;
+        let request = bcode_workflow::WorkflowReplacementRequest {
+            old_run_id: run.run_id.clone(),
+            authored_selection: None,
+            package_export: Some(started.package_export.clone()),
+            configuration: None,
+            successor: bcode_workflow::WorkflowRunStartRequest {
+                definition_id: run.definition_id.clone(),
+                definition_version: run.definition_version,
+                run_id: Some("package-export-successor".into()),
+                workspace_snapshot: run.workspace_snapshot.clone(),
+                parent_session_id: parent,
+                parent_session_generation: None,
+                binding: run.binding.clone(),
+                input: Some(serde_json::json!({})),
+                limits: state
+                    .workflow_store
+                    .lock()
+                    .expect("store")
+                    .run_limits(&run.run_id)
+                    .expect("limits")
+                    .expect("run"),
+            },
+        };
+        let mut wrong = request.clone();
+        wrong
+            .package_export
+            .as_mut()
+            .expect("export")
+            .package_lock_digest_sha256 = Some("0".repeat(64));
+        assert!(client.request_workflow_replacement(wrong).await.is_err());
+        // The original export may already have completed. Selection must still resolve
+        // exactly; terminal admission is checked separately by the store.
+        let selection = state
+            .workflow_store
+            .lock()
+            .expect("store")
+            .resolve_run_package_export(
+                &run.run_id,
+                request.package_export.as_ref().expect("export"),
+            )
+            .expect("exact export");
+        assert_eq!(
+            selection,
+            bcode_workflow::AuthoredWorkflowRunSelection::Revision {
+                workflow_id: started.started.workflow_id.clone(),
+                revision: started.started.revision
+            }
+        );
+    }
+
     #[allow(clippy::too_many_lines)]
     async fn published_package_export_lifecycle() {
         let sessions = SessionManager::default();
@@ -36897,6 +36954,7 @@ mod tests {
         assert_eq!(started.package_export.export, "main");
         assert_eq!(started.started.started.run.run_id, "package-export-run");
         assert!(started.exported.published_revision.is_some());
+        verify_package_export_replacement_selection(&client, &state, &started, parent.id).await;
         assert!(
             state
                 .workflow_store
