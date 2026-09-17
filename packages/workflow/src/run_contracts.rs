@@ -927,6 +927,9 @@ pub struct WorkflowReplacementRequest {
     /// Optional published authored selection. The resolved definition must match `successor`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub authored_selection: Option<AuthoredWorkflowRunSelection>,
+    /// Select an export from the old run's pinned package. Mutually exclusive with authored selection.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub package_export: Option<crate::WorkflowPackageExportIdentity>,
     /// Configuration for the selected authored revision or preset.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub configuration: Option<serde_json::Value>,

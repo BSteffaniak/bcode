@@ -2359,6 +2359,50 @@ impl WorkflowStore {
         Self::package_lock_on(&self.connection, package_id, digest)
     }
 
+    /// Resolve an exact export from the immutable package bound to a run.
+    ///
+    /// # Errors
+    /// Rejects unbound runs, mismatched package/digest, missing exports, or corrupt publication.
+    pub fn resolve_run_package_export(
+        &self,
+        run_id: &str,
+        selection: &bcode_workflow::WorkflowPackageExportIdentity,
+    ) -> Result<bcode_workflow::AuthoredWorkflowRunSelection, WorkflowStoreError> {
+        validate_id("run", run_id)?;
+        selection
+            .validate()
+            .map_err(|error| WorkflowStoreError::InvalidData(error.to_string()))?;
+        let (id, digest): (String, String) = self.connection.query_row(
+            "SELECT package_id, lock_digest FROM workflow_run_packages WHERE run_id=?1",
+            [run_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+        if selection.package_id != id
+            || selection
+                .package_lock_digest_sha256
+                .as_ref()
+                .is_some_and(|requested| requested != &digest)
+        {
+            return Err(WorkflowStoreError::InvalidData(
+                "replacement export does not match pinned package".into(),
+            ));
+        }
+        let lock = Self::package_lock_on(&self.connection, &id, &digest)?
+            .ok_or_else(|| WorkflowStoreError::InvalidData("pinned package unavailable".into()))?;
+        let revision = lock
+            .exports
+            .iter()
+            .find(|export| export.export == selection.export)
+            .and_then(|export| export.published_revision.as_ref())
+            .ok_or_else(|| {
+                WorkflowStoreError::InvalidData("pinned export has no published revision".into())
+            })?;
+        Ok(bcode_workflow::AuthoredWorkflowRunSelection::Revision {
+            workflow_id: revision.workflow_id.clone(),
+            revision: revision.revision,
+        })
+    }
+
     /// Resolve a package-local member only through a run's immutable publication binding.
     ///
     /// # Errors
@@ -20138,6 +20182,30 @@ mod tests {
             }),
             ..run.clone()
         };
+        let selection = bcode_workflow::WorkflowPackageExportIdentity {
+            package_id: receipt.package_id.clone(),
+            package_lock_digest_sha256: Some(receipt.package_lock_digest_sha256.clone()),
+            export: receipt.exports[0].export.clone(),
+        };
+        assert!(
+            store
+                .resolve_run_package_export(&run.run_id, &selection)
+                .is_ok()
+        );
+        let mut wrong = selection.clone();
+        wrong.package_lock_digest_sha256 = Some("0".repeat(64));
+        assert!(
+            store
+                .resolve_run_package_export(&run.run_id, &wrong)
+                .is_err()
+        );
+        wrong = selection;
+        wrong.export = "missing".into();
+        assert!(
+            store
+                .resolve_run_package_export(&run.run_id, &wrong)
+                .is_err()
+        );
         store
             .request_replacement_owned(&run.run_id, &owner, &successor, 30)
             .expect("intent");

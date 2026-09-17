@@ -6290,18 +6290,46 @@ fn persist_exact_template_call_dependencies(
     Ok(())
 }
 
+fn replacement_authored_selection(
+    state: &ServerState,
+    request: &bcode_workflow::WorkflowReplacementRequest,
+) -> Result<Option<bcode_workflow::AuthoredWorkflowRunSelection>, super::ServerError> {
+    if request.configuration.is_some()
+        && request.authored_selection.is_none()
+        && request.package_export.is_none()
+    {
+        return Err(bcode_workflow_store::WorkflowStoreError::InvalidData(
+            "replacement configuration requires selection".into(),
+        )
+        .into());
+    }
+    let package_selection = if let Some(export) = &request.package_export {
+        if request.authored_selection.is_some() {
+            return Err(bcode_workflow_store::WorkflowStoreError::InvalidData(
+                "replacement selections are mutually exclusive".into(),
+            )
+            .into());
+        }
+        Some(
+            state
+                .workflow_store
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .resolve_run_package_export(&request.old_run_id, export)?,
+        )
+    } else {
+        None
+    };
+    Ok(package_selection.or_else(|| request.authored_selection.clone()))
+}
+
 async fn resolve_replacement_authored_selection(
     client_id: super::ClientId,
     state: &std::sync::Arc<ServerState>,
     request: &bcode_workflow::WorkflowReplacementRequest,
 ) -> Result<Option<bcode_workflow::AuthoredWorkflowRunProvenance>, super::ServerError> {
-    let Some(selection) = &request.authored_selection else {
-        if request.configuration.is_some() {
-            return Err(bcode_workflow_store::WorkflowStoreError::InvalidData(
-                "replacement configuration requires authored selection".into(),
-            )
-            .into());
-        }
+    let selection = replacement_authored_selection(state, request)?;
+    let Some(selection) = &selection else {
         return Ok(None);
     };
     let (workflow_id, revision_number, revision, preset) = resolve_authored_run(state, selection)?;
