@@ -4669,6 +4669,178 @@ impl WorkflowStore {
         Ok(true)
     }
 
+    /// Withdraw an exact pending successor without undoing old-run cancellation.
+    ///
+    /// This is an explicitly authorized control operation, not automatic repair.
+    /// Repeated withdrawal returns `false`; a different pending successor is rejected.
+    ///
+    /// # Errors
+    /// Rejects stale authority, mismatched successor identity, damaged intent, or storage failure.
+    pub fn withdraw_replacement_owned(
+        &mut self,
+        old_run_id: &str,
+        successor_run_id: &str,
+        authority: &WorkflowExecutionAuthority,
+        now_ms: u64,
+    ) -> Result<bool, WorkflowStoreError> {
+        validate_id("successor run", successor_run_id)?;
+        let tx = self.connection.unchecked_transaction()?;
+        self.verify_execution_authority(old_run_id, authority)?;
+        let Some(pending) = self.pending_replacement(old_run_id)? else {
+            return Ok(false);
+        };
+        if pending.run_id != successor_run_id {
+            return Err(WorkflowStoreError::InvalidData(
+                "replacement withdrawal targets a different successor".into(),
+            ));
+        }
+        tx.execute(
+            "DELETE FROM workflow_replacement_intents WHERE old_run_id=?1",
+            [old_run_id],
+        )?;
+        append_event(
+            &tx,
+            old_run_id,
+            "replacement_withdrawn",
+            &serde_json::json!({"successor_run_id": successor_run_id}).to_string(),
+            now_ms,
+        )?;
+        tx.commit()?;
+        Ok(true)
+    }
+
+    /// Discover a bounded keyset page of pending replacement owners, including terminal runs.
+    ///
+    /// These identities are hints only. Callers must acquire current ownership and
+    /// reauthorize the pending request before cancellation or handoff. An empty page
+    /// ends a sweep; restart from the empty cursor to revisit blocked replacements.
+    ///
+    /// # Errors
+    /// Rejects invalid cursors, invalid bounds, damaged identities, or storage failure.
+    pub fn pending_replacement_run_ids_after(
+        &self,
+        after_run_id: &str,
+        limit: usize,
+    ) -> Result<Vec<String>, WorkflowStoreError> {
+        if !after_run_id.is_empty() {
+            validate_id("replacement cursor", after_run_id)?;
+        }
+        let limit = bounded_limit(limit)?;
+        let mut statement = self.connection.prepare(
+            "SELECT CASE WHEN typeof(old_run_id)='text' AND length(CAST(old_run_id AS BLOB)) <= ?3 THEN old_run_id ELSE NULL END FROM workflow_replacement_intents WHERE old_run_id > ?1 ORDER BY old_run_id LIMIT ?2",
+        )?;
+        let ids = statement
+            .query_map(
+                rusqlite::params![after_run_id, limit, MAX_ID_BYTES],
+                |row| row.get::<_, String>(0),
+            )?
+            .collect::<Result<Vec<_>, _>>()?;
+        for id in &ids {
+            validate_id("pending replacement run", id)?;
+        }
+        Ok(ids)
+    }
+
+    /// Read one pending replacement without acquiring execution authority or mutating state.
+    ///
+    /// # Errors
+    /// Rejects invalid identity, oversized/malformed durable requests, and storage failures.
+    pub fn pending_replacement(
+        &self,
+        old_run_id: &str,
+    ) -> Result<Option<NewWorkflowRun>, WorkflowStoreError> {
+        validate_id("old run", old_run_id)?;
+        let row: Option<(String, String)> = self.connection.query_row(
+            "SELECT CASE WHEN typeof(successor_json)='text' AND length(CAST(successor_json AS BLOB)) <= ?2 THEN successor_json ELSE NULL END, CASE WHEN typeof(successor_run_id)='text' AND length(CAST(successor_run_id AS BLOB)) <= ?3 THEN successor_run_id ELSE NULL END FROM workflow_replacement_intents WHERE old_run_id=?1",
+            rusqlite::params![old_run_id, MAX_INLINE_JSON_BYTES, MAX_ID_BYTES], |row| Ok((row.get(0)?, row.get(1)?)),
+        ).optional()?;
+        row.map(|(payload, successor_id)| {
+            let successor: NewWorkflowRun = serde_json::from_str(&payload)?;
+            validate_run(&successor)?;
+            let binding = successor.binding.as_ref().filter(|binding| binding.single_active)
+                .ok_or_else(|| WorkflowStoreError::InvalidData("replacement binding is missing or not single-active".into()))?;
+            let matches: bool = self.connection.query_row(
+                "SELECT EXISTS(SELECT 1 FROM workflow_runs WHERE run_id=?1 AND owner_plugin_id=?2 AND workflow_kind=?3 AND scope_key=?4 AND single_active=1 AND cancellation_requested_at_ms IS NOT NULL)",
+                (old_run_id, &binding.owner_plugin_id, &binding.workflow_kind, &binding.scope_key), |row| row.get(0),
+            )?;
+            if successor.run_id != successor_id || successor.run_id == old_run_id || !matches {
+                return Err(WorkflowStoreError::InvalidData("replacement intent disagrees with durable identity or binding; maintenance required".into()));
+            }
+            Ok(successor)
+        }).transpose()
+    }
+
+    /// Atomically admit a persisted replacement after a leaf run is fully quiescent.
+    ///
+    /// The caller must reauthorize the exact successor request before handoff. Child
+    /// workflows conservatively block this operation until descendant proof is supported.
+    /// Missing intent returns `false`, including retries after a committed handoff.
+    ///
+    /// # Errors
+    /// Rejects stale authority, nonterminal or ambiguous old work, child links,
+    /// mismatched successor intent/authority, or admission failure. Failures preserve intent.
+    pub fn complete_leaf_replacement_owned(
+        &mut self,
+        old_run_id: &str,
+        authority: &WorkflowExecutionAuthority,
+        successor: &NewWorkflowRun,
+        now_ms: u64,
+    ) -> Result<bool, WorkflowStoreError> {
+        validate_run(successor)?;
+        let tx = self.connection.unchecked_transaction()?;
+        self.verify_execution_authority(old_run_id, authority)?;
+        let Some(mut stored) = self.pending_replacement(old_run_id)? else {
+            return Ok(false);
+        };
+        if stored
+            .execution_authority
+            .as_ref()
+            .is_none_or(|original| original.target_artifact_id != authority.target_artifact_id)
+        {
+            return Err(WorkflowStoreError::InvalidData(
+                "replacement execution artifact compatibility is not established".into(),
+            ));
+        }
+        // Coordinator identity is runtime ownership, not authorized successor content.
+        // Rebind only after validating the current durable fence; every other field is exact.
+        stored.execution_authority = Some(authority.clone());
+        if &stored != successor || successor.execution_authority.as_ref() != Some(authority) {
+            return Err(WorkflowStoreError::InvalidData(
+                "replacement requires the exact reauthorized successor and current coordinator"
+                    .into(),
+            ));
+        }
+        let ready: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM workflow_runs WHERE run_id=?1 AND status IN ('completed','failed','cancelled') AND cancellation_requested_at_ms IS NOT NULL)
+             AND NOT EXISTS(SELECT 1 FROM workflow_run_links WHERE parent_run_id=?1)
+             AND NOT EXISTS(SELECT 1 FROM workflow_attempts WHERE run_id=?1 AND status NOT IN ('succeeded','failed','cancelled'))",
+            [old_run_id], |row| row.get(0),
+        )?;
+        if !ready {
+            return Err(WorkflowStoreError::InvalidData(
+                "replacement requires a terminal leaf run with no unresolved effects".into(),
+            ));
+        }
+        tx.execute(
+            "DELETE FROM workflow_replacement_intents WHERE old_run_id=?1",
+            [old_run_id],
+        )?;
+        create_run_in_transaction(&tx, successor)?;
+        #[cfg(test)]
+        if std::env::var("BCODE_TEST_REPLACEMENT_CRASH_PHASE").as_deref() == Ok("before_commit") {
+            std::process::exit(73);
+        }
+        append_event(
+            &tx,
+            old_run_id,
+            "replacement_completed",
+            &serde_json::json!({"successor_run_id": successor.run_id}).to_string(),
+            now_ms,
+        )?;
+        tx.commit()?;
+        Ok(true)
+    }
+
     /// Atomically create and link one exact child run before parent admission completes.
     ///
     /// Returns `true` when created and `false` for a byte-equivalent duplicate parent attempt.
@@ -19332,6 +19504,478 @@ mod tests {
     }
 
     #[test]
+    fn replacement_withdrawal_is_fenced_and_preserves_cancellation() {
+        let (temp, mut store, _, authority, _) = connected_publication_fixture();
+        store
+            .persist_definition("example", 1, &definition("example"))
+            .expect("definition");
+        let old = NewWorkflowRun {
+            run_id: "old".into(),
+            execution_authority: Some(authority.clone()),
+            binding: Some(WorkflowRunBinding {
+                owner_plugin_id: "test".into(),
+                workflow_kind: "replacement".into(),
+                scope_key: "scope".into(),
+                display_label: None,
+                single_active: true,
+            }),
+            ..new_run()
+        };
+        store.create_run(&old).expect("old");
+        let successor = NewWorkflowRun {
+            run_id: "successor".into(),
+            ..old
+        };
+        store
+            .request_replacement_owned("old", &authority, &successor, 20)
+            .expect("intent");
+        let stale = WorkflowExecutionAuthority {
+            fencing_token: "stale".into(),
+            ..authority.clone()
+        };
+        assert!(
+            store
+                .withdraw_replacement_owned("old", "successor", &stale, 21)
+                .is_err()
+        );
+        assert!(
+            store
+                .withdraw_replacement_owned("old", "different", &authority, 21)
+                .is_err()
+        );
+        assert!(
+            store
+                .withdraw_replacement_owned("old", "successor", &authority, 22)
+                .expect("withdraw")
+        );
+        drop(store);
+        let mut store = WorkflowStore::open_in_state_dir(temp.path()).expect("restart");
+        assert!(
+            !store
+                .withdraw_replacement_owned("old", "successor", &authority, 23)
+                .expect("retry")
+        );
+        assert!(store.pending_replacement("old").expect("absent").is_none());
+        assert_eq!(
+            store
+                .run_summary("old")
+                .expect("summary")
+                .expect("old")
+                .cancellation_requested_at_ms,
+            Some(20)
+        );
+        assert!(
+            store.create_run(&successor).is_err(),
+            "old active binding remains occupied"
+        );
+        store
+            .connection
+            .execute_batch("UPDATE workflow_runs SET status='cancelled' WHERE run_id='old'")
+            .expect("settled fixture");
+        store
+            .create_run(&successor)
+            .expect("released reservation after settlement");
+        assert_eq!(
+            store
+                .event_history("old", None, 100)
+                .expect("events")
+                .iter()
+                .filter(|event| event.event_type == "replacement_withdrawn")
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn replacement_discovery_pages_terminal_owners_without_mutation() {
+        let (temp, mut store, _, authority, _) = connected_publication_fixture();
+        store
+            .persist_definition("example", 1, &definition("example"))
+            .expect("definition");
+        for id in ["a", "b", "c"] {
+            let old = NewWorkflowRun {
+                run_id: id.into(),
+                execution_authority: Some(authority.clone()),
+                binding: Some(WorkflowRunBinding {
+                    owner_plugin_id: "test".into(),
+                    workflow_kind: "replacement".into(),
+                    scope_key: id.into(),
+                    display_label: None,
+                    single_active: true,
+                }),
+                ..new_run()
+            };
+            store.create_run(&old).expect("old");
+            let successor = NewWorkflowRun {
+                run_id: format!("next-{id}"),
+                ..old
+            };
+            store
+                .request_replacement_owned(id, &authority, &successor, 20)
+                .expect("intent");
+        }
+        store
+            .connection
+            .execute_batch("UPDATE workflow_runs SET status='cancelled' WHERE run_id='b'")
+            .expect("terminal fixture");
+        drop(store);
+        let store = WorkflowStore::open_in_state_dir(temp.path()).expect("restart");
+        let before = store.connection.total_changes();
+        assert_eq!(
+            store
+                .pending_replacement_run_ids_after("", 1)
+                .expect("first"),
+            ["a"]
+        );
+        assert_eq!(
+            store
+                .pending_replacement_run_ids_after("a", 1)
+                .expect("terminal"),
+            ["b"]
+        );
+        assert_eq!(
+            store
+                .pending_replacement_run_ids_after("b", 1)
+                .expect("last"),
+            ["c"]
+        );
+        assert!(
+            store
+                .pending_replacement_run_ids_after("c", 1)
+                .expect("end")
+                .is_empty()
+        );
+        assert!(store.pending_replacement_run_ids_after("", 0).is_err());
+        assert!(
+            store
+                .pending_replacement_run_ids_after(&"x".repeat(MAX_ID_BYTES + 1), 1)
+                .is_err()
+        );
+        assert_eq!(store.connection.total_changes(), before);
+        assert!(store.run_summary("next-b").expect("no admission").is_none());
+    }
+
+    #[test]
+    fn replacement_damaged_identity_and_payload_fail_closed_without_writes() {
+        let (_temp, mut store, _, authority, _) = connected_publication_fixture();
+        store
+            .persist_definition("example", 1, &definition("example"))
+            .expect("definition");
+        let old = NewWorkflowRun {
+            run_id: "old".into(),
+            execution_authority: Some(authority.clone()),
+            binding: Some(WorkflowRunBinding {
+                owner_plugin_id: "test".into(),
+                workflow_kind: "replacement".into(),
+                scope_key: "scope".into(),
+                display_label: None,
+                single_active: true,
+            }),
+            ..new_run()
+        };
+        store.create_run(&old).expect("old");
+        let successor = NewWorkflowRun {
+            run_id: "successor".into(),
+            ..old
+        };
+        store
+            .request_replacement_owned("old", &authority, &successor, 20)
+            .expect("intent");
+        for damage in [
+            "UPDATE workflow_replacement_intents SET successor_run_id='different'",
+            "UPDATE workflow_replacement_intents SET successor_json='{}'",
+            "UPDATE workflow_replacement_intents SET successor_json=zeroblob(2000000)",
+            "UPDATE workflow_runs SET scope_key='different' WHERE run_id='old'",
+            "UPDATE workflow_runs SET cancellation_requested_at_ms=NULL WHERE run_id='old'",
+        ] {
+            let payload = serde_json::to_string(&successor).expect("payload");
+            store.connection.execute_batch(damage).expect("damage");
+            let before = store.connection.total_changes();
+            assert!(store.pending_replacement("old").is_err(), "{damage}");
+            assert!(
+                store
+                    .complete_leaf_replacement_owned("old", &authority, &successor, 21)
+                    .is_err(),
+                "{damage}"
+            );
+            assert_eq!(store.connection.total_changes(), before);
+            store.connection.execute("UPDATE workflow_replacement_intents SET successor_run_id='successor', successor_json=?1", [payload]).expect("restore intent");
+            store.connection.execute_batch("UPDATE workflow_runs SET scope_key='scope', cancellation_requested_at_ms=20 WHERE run_id='old'").expect("restore run");
+        }
+        assert_eq!(
+            store.pending_replacement("old").expect("intact"),
+            Some(successor)
+        );
+    }
+
+    #[test]
+    fn replacement_process_loss_child() {
+        let Ok(root) = std::env::var("BCODE_TEST_REPLACEMENT_CRASH_ROOT") else {
+            return;
+        };
+        let mut store = WorkflowStore::open_in_state_dir(Path::new(&root)).expect("store");
+        let authority = store
+            .execution_authority("old")
+            .expect("authority")
+            .expect("owner");
+        let successor = store
+            .pending_replacement("old")
+            .expect("pending")
+            .expect("intent");
+        if std::env::var("BCODE_TEST_REPLACEMENT_CRASH_PHASE").as_deref() != Ok("before_handoff") {
+            assert!(
+                store
+                    .complete_leaf_replacement_owned("old", &authority, &successor, 22)
+                    .expect("handoff")
+            );
+        }
+        std::process::exit(73);
+    }
+
+    #[test]
+    fn replacement_process_loss_preserves_atomic_handoff() {
+        for phase in ["before_handoff", "before_commit", "after_commit"] {
+            let commit = phase == "after_commit";
+            let (temp, mut store, _, authority, _) = connected_publication_fixture();
+            store
+                .persist_definition("example", 1, &definition("example"))
+                .expect("definition");
+            let old = NewWorkflowRun {
+                run_id: "old".into(),
+                execution_authority: Some(authority.clone()),
+                binding: Some(WorkflowRunBinding {
+                    owner_plugin_id: "test".into(),
+                    workflow_kind: "replacement".into(),
+                    scope_key: "scope".into(),
+                    display_label: None,
+                    single_active: true,
+                }),
+                ..new_run()
+            };
+            store.create_run(&old).expect("old");
+            let successor = NewWorkflowRun {
+                run_id: "successor".into(),
+                ..old
+            };
+            store
+                .request_replacement_owned("old", &authority, &successor, 20)
+                .expect("intent");
+            store
+                .connection
+                .execute_batch("UPDATE workflow_runs SET status='cancelled' WHERE run_id='old'")
+                .expect("settled fixture");
+            drop(store);
+            let status = std::process::Command::new(std::env::current_exe().expect("executable"))
+                .args(["--exact", "tests::replacement_process_loss_child"])
+                .env("BCODE_TEST_REPLACEMENT_CRASH_ROOT", temp.path())
+                .env("BCODE_TEST_REPLACEMENT_CRASH_PHASE", phase)
+                .status()
+                .expect("child");
+            assert_eq!(status.code(), Some(73));
+            let mut store = WorkflowStore::open_in_state_dir(temp.path()).expect("restart");
+            assert_eq!(
+                store.pending_replacement("old").expect("intent").is_none(),
+                commit
+            );
+            assert_eq!(
+                store.run_summary("successor").expect("successor").is_some(),
+                commit
+            );
+            assert_eq!(
+                store
+                    .complete_leaf_replacement_owned("old", &authority, &successor, 23)
+                    .expect("retry"),
+                !commit
+            );
+            let events = store.event_history("old", None, 100).expect("events");
+            assert_eq!(
+                events
+                    .iter()
+                    .filter(|event| event.event_type == "replacement_completed")
+                    .count(),
+                1
+            );
+            assert!(
+                store
+                    .attempt_history("successor", None, 10)
+                    .expect("no implicit dispatch")
+                    .is_empty()
+            );
+            assert_eq!(
+                store.run_summary("old").expect("old").expect("run").status,
+                RunStatus::Cancelled
+            );
+        }
+    }
+
+    #[test]
+    fn replacement_admission_failure_rolls_back_reservation_release() {
+        let (temp, mut store, _, authority, _) = connected_publication_fixture();
+        store
+            .persist_definition("example", 1, &definition("example"))
+            .expect("definition");
+        let old = NewWorkflowRun {
+            run_id: "old".into(),
+            execution_authority: Some(authority.clone()),
+            binding: Some(WorkflowRunBinding {
+                owner_plugin_id: "test".into(),
+                workflow_kind: "replacement".into(),
+                scope_key: "scope".into(),
+                display_label: None,
+                single_active: true,
+            }),
+            ..new_run()
+        };
+        store.create_run(&old).expect("old");
+        let successor = NewWorkflowRun {
+            run_id: "successor".into(),
+            ..old.clone()
+        };
+        store
+            .request_replacement_owned("old", &authority, &successor, 20)
+            .expect("intent");
+        store.connection.execute_batch("UPDATE workflow_runs SET status='cancelled' WHERE run_id='old'; CREATE TRIGGER reject_successor BEFORE INSERT ON workflow_runs WHEN NEW.run_id='successor' BEGIN SELECT RAISE(ABORT, 'injected admission failure'); END;").expect("fault fixture");
+        assert!(
+            store
+                .complete_leaf_replacement_owned("old", &authority, &successor, 21)
+                .is_err()
+        );
+        drop(store);
+        let mut store = WorkflowStore::open_in_state_dir(temp.path()).expect("restart");
+        assert_eq!(
+            store.pending_replacement("old").expect("pending"),
+            Some(successor.clone())
+        );
+        assert!(
+            store
+                .run_summary("successor")
+                .expect("no partial run")
+                .is_none()
+        );
+        let competitor = NewWorkflowRun {
+            run_id: "competitor".into(),
+            ..successor.clone()
+        };
+        assert!(store.create_run(&competitor).is_err());
+        let events = store.event_history("old", None, 100).expect("history");
+        assert!(
+            !events
+                .iter()
+                .any(|event| event.event_type == "replacement_completed")
+        );
+        store
+            .connection
+            .execute_batch("DROP TRIGGER reject_successor")
+            .expect("clear fault");
+        assert!(
+            store
+                .complete_leaf_replacement_owned("old", &authority, &successor, 22)
+                .expect("retry")
+        );
+        assert!(
+            store
+                .pending_replacement("old")
+                .expect("consumed")
+                .is_none()
+        );
+        let events = store.event_history("old", None, 100).expect("history");
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| event.event_type == "replacement_completed")
+                .count(),
+            1
+        );
+        assert!(store.create_run(&competitor).is_err());
+    }
+
+    #[test]
+    fn replacement_rebinds_only_coordinator_after_restart() {
+        let (temp, mut store, run, authority, _) = connected_publication_fixture();
+        let mut old = new_run();
+        old.run_id = "replacement-old".into();
+        old.execution_authority = Some(authority.clone());
+        old.binding = Some(WorkflowRunBinding {
+            owner_plugin_id: "test".into(),
+            workflow_kind: "replace".into(),
+            scope_key: "scope".into(),
+            display_label: None,
+            single_active: true,
+        });
+        store
+            .persist_definition("example", 1, &definition("example"))
+            .expect("definition");
+        store.create_run(&old).expect("old");
+        let successor = NewWorkflowRun {
+            run_id: "replacement-new".into(),
+            ..old.clone()
+        };
+        store
+            .request_replacement_owned(&old.run_id, &authority, &successor, 20)
+            .expect("intent");
+        drop(store);
+        let mut store = WorkflowStore::open_in_state_dir(temp.path()).expect("restart");
+        let replacement = WorkflowExecutionAuthority {
+            daemon_instance_id: "replacement-daemon".into(),
+            generation: authority.generation + 1,
+            fencing_token: "replacement-fence".into(),
+            ..authority.clone()
+        };
+        store
+            .transfer_execution_authority(&old.run_id, &authority, &replacement, 21)
+            .expect("transfer");
+        let mut pending = store
+            .pending_replacement(&old.run_id)
+            .expect("read")
+            .expect("intent");
+        assert_eq!(pending, successor);
+        pending.execution_authority = Some(replacement.clone());
+        store
+            .connection
+            .execute(
+                "UPDATE workflow_runs SET status='cancelled' WHERE run_id=?1",
+                [&old.run_id],
+            )
+            .expect("settled fixture");
+        assert!(
+            store
+                .complete_leaf_replacement_owned(&old.run_id, &authority, &successor, 22)
+                .is_err()
+        );
+        let mut changed = pending.clone();
+        changed.workspace_snapshot = "different-workspace".into();
+        assert!(
+            store
+                .complete_leaf_replacement_owned(&old.run_id, &replacement, &changed, 23)
+                .is_err()
+        );
+        assert!(
+            store
+                .pending_replacement(&old.run_id)
+                .expect("preserved")
+                .is_some()
+        );
+        assert!(
+            store
+                .complete_leaf_replacement_owned(&old.run_id, &replacement, &pending, 24)
+                .expect("handoff")
+        );
+        assert_eq!(
+            store
+                .execution_authority(&pending.run_id)
+                .expect("successor owner"),
+            Some(replacement)
+        );
+        assert!(
+            store
+                .pending_replacement(&old.run_id)
+                .expect("consumed")
+                .is_none()
+        );
+        assert!(store.run_summary(&run.run_id).expect("unrelated").is_some());
+    }
+
+    #[test]
     fn replacement_intent_survives_restart_and_reserves_terminal_binding() {
         let temp = tempfile::tempdir().expect("temp");
         let mut store = WorkflowStore::open_in_state_dir(temp.path()).expect("store");
@@ -19380,6 +20024,11 @@ mod tests {
                 .cancellation_requested_at_ms,
             Some(20)
         );
+        assert!(
+            store
+                .complete_leaf_replacement_owned(&old.run_id, &authority, &successor, 22)
+                .is_err()
+        );
         let conflicting = NewWorkflowRun {
             run_id: "conflict".into(),
             ..successor.clone()
@@ -19403,6 +20052,36 @@ mod tests {
                 .run_summary("successor")
                 .expect("not admitted")
                 .is_none()
+        );
+        assert!(
+            store
+                .complete_leaf_replacement_owned(&old.run_id, &authority, &conflicting, 23)
+                .is_err()
+        );
+        assert!(
+            store
+                .complete_leaf_replacement_owned(&old.run_id, &authority, &successor, 24)
+                .expect("handoff")
+        );
+        drop(store);
+        let mut store = WorkflowStore::open_in_state_dir(temp.path()).expect("restart handoff");
+        assert!(
+            !store
+                .complete_leaf_replacement_owned(&old.run_id, &authority, &successor, 25)
+                .expect("idempotent")
+        );
+        assert_replacement_running(&store);
+        assert!(store.create_run(&conflicting).is_err());
+    }
+
+    fn assert_replacement_running(store: &WorkflowStore) {
+        assert_eq!(
+            store
+                .run_summary("successor")
+                .expect("summary")
+                .expect("successor")
+                .status,
+            RunStatus::Running
         );
     }
 
