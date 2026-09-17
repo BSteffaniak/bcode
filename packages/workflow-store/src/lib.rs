@@ -4706,6 +4706,7 @@ impl WorkflowStore {
                 "replacement binding or old run state does not match".into(),
             ));
         }
+        validate_replacement_package(&tx, old_run_id, successor)?;
         validate_replacement_successor(&tx, successor, authority)?;
         validate_stored_run_input(&tx, successor)?;
         if let Some(provenance) = &successor.authored_provenance {
@@ -5027,7 +5028,14 @@ impl WorkflowStore {
             "DELETE FROM workflow_replacement_intents WHERE old_run_id=?1",
             [old_run_id],
         )?;
+        let package = validate_replacement_package(&tx, old_run_id, successor)?;
         create_run_in_transaction(&tx, successor)?;
+        if let Some((id, digest)) = package {
+            tx.execute(
+                "INSERT INTO workflow_run_packages VALUES (?1, ?2, ?3)",
+                (&successor.run_id, id, digest),
+            )?;
+        }
         #[cfg(test)]
         if std::env::var("BCODE_TEST_REPLACEMENT_CRASH_PHASE").as_deref() == Ok("before_commit") {
             std::process::exit(73);
@@ -16396,6 +16404,31 @@ fn request_run_cancellation_in_transaction(
     Ok(changed == 1)
 }
 
+fn validate_replacement_package(
+    transaction: &Transaction<'_>,
+    old_run_id: &str,
+    successor: &NewWorkflowRun,
+) -> Result<Option<(String, String)>, WorkflowStoreError> {
+    let package: Option<(String, String)> = transaction.query_row(
+        "SELECT CASE WHEN typeof(package_id)='text' AND length(CAST(package_id AS BLOB))<=?2 THEN package_id END, CASE WHEN typeof(lock_digest)='text' AND length(CAST(lock_digest AS BLOB))<=64 THEN lock_digest END FROM workflow_run_packages WHERE run_id=?1",
+        rusqlite::params![old_run_id, MAX_ID_BYTES], |row| Ok((row.get(0)?,row.get(1)?)),
+    ).optional()?;
+    if let Some((id, digest)) = &package {
+        let lock = WorkflowStore::package_lock_on(transaction, id, digest)?.ok_or_else(|| {
+            WorkflowStoreError::InvalidData("replacement package lock unavailable".into())
+        })?;
+        if !lock.members.iter().any(|member| {
+            member.definition_identity.definition_id == successor.definition_id
+                && member.definition_identity.definition_version == successor.definition_version
+        }) {
+            return Err(WorkflowStoreError::InvalidData(
+                "replacement definition is not in the pinned package".into(),
+            ));
+        }
+    }
+    Ok(package)
+}
+
 fn validate_replacement_successor(
     transaction: &Transaction<'_>,
     successor: &NewWorkflowRun,
@@ -18511,6 +18544,7 @@ mod tests {
         );
         assert!(!store.create_run_with_package(&run, binding).unwrap());
         assert!(store.create_run_with_package(&run, None).is_err());
+        verify_package_replacement(&mut store, &run, &receipt);
         assert!(
             store
                 .resolve_run_package_member(&run.run_id, "missing-member")
@@ -20084,6 +20118,44 @@ mod tests {
         let old = store.run_summary("old").expect("summary").expect("old");
         assert_eq!(old.status, RunStatus::RepairRequired);
         assert_eq!(old.cancellation_requested_at_ms, None);
+    }
+
+    fn verify_package_replacement(
+        store: &mut WorkflowStore,
+        run: &NewWorkflowRun,
+        receipt: &bcode_workflow::WorkflowPackagePublicationReceipt,
+    ) {
+        let owner = WorkflowExecutionAuthority {
+            target_artifact_id: "artifact".into(),
+            daemon_instance_id: "daemon".into(),
+            generation: 1,
+            fencing_token: "fence".into(),
+        };
+        store.connection.execute("UPDATE workflow_runs SET owner_plugin_id='test', workflow_kind='package', scope_key='scope', single_active=1, target_artifact_id='artifact', coordinator_daemon_instance_id='daemon', coordinator_generation=1, coordinator_fencing_token='fence' WHERE run_id=?1", [&run.run_id]).expect("owner fixture");
+        let successor = NewWorkflowRun {
+            run_id: "package-successor".into(),
+            execution_authority: Some(owner.clone()),
+            binding: Some(WorkflowRunBinding {
+                owner_plugin_id: "test".into(),
+                workflow_kind: "package".into(),
+                scope_key: "scope".into(),
+                display_label: None,
+                single_active: true,
+            }),
+            ..run.clone()
+        };
+        store
+            .request_replacement_owned(&run.run_id, &owner, &successor, 30)
+            .expect("intent");
+        store
+            .complete_leaf_replacement_owned(&run.run_id, &owner, &successor, 31)
+            .expect("handoff");
+        assert_eq!(
+            store
+                .resolve_run_package_member(&successor.run_id, &receipt.exports[0].member_id)
+                .expect("inherited binding"),
+            receipt.exports[0].definition_identity
+        );
     }
 
     #[test]
