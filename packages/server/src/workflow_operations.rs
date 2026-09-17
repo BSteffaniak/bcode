@@ -393,6 +393,17 @@ impl bcode_workflow::WorkflowRunApplication for WorkflowAuthoringApplication<'_>
             .await
             .map_err(run_operation_failure)
     }
+    async fn request_workflow_replacement(
+        &self,
+        request: bcode_workflow::WorkflowReplacementRequest,
+    ) -> Result<bcode_workflow::WorkflowReplacementResponse, Self::Error> {
+        self.state
+            .require_workflow_store()
+            .map_err(run_operation_failure)?;
+        request_replacement(self.state, request)
+            .await
+            .map_err(run_operation_failure)
+    }
     async fn start_workflow_run(
         &self,
         request: bcode_workflow::WorkflowRunStartRequest,
@@ -6239,6 +6250,51 @@ fn persist_exact_template_call_dependencies(
     Ok(())
 }
 
+async fn request_replacement(
+    state: &std::sync::Arc<ServerState>,
+    request: bcode_workflow::WorkflowReplacementRequest,
+) -> Result<bcode_workflow::WorkflowReplacementResponse, super::ServerError> {
+    let parent = run_parent_session_id(state, &request.old_run_id)?;
+    if request.successor.parent_session_id != parent || request.successor.run_id.is_none() {
+        return Err(bcode_workflow_store::WorkflowStoreError::InvalidData(
+            "replacement requires the same parent session and a stable successor ID".into(),
+        )
+        .into());
+    }
+    let (mut successor, _session_owner) =
+        prepare_workflow_run(state, request.successor, None, &mut "prepare_replacement").await?;
+    let authority = execution_authority(state, &request.old_run_id)
+        .await?
+        .ok_or_else(|| {
+            bcode_workflow_store::WorkflowStoreError::InvalidData(
+                "replacement owner unavailable".into(),
+            )
+        })?;
+    successor.execution_authority = Some(authority.authority.clone());
+    let created = {
+        let mut store = state
+            .workflow_store
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(pending) = store.pending_replacement(&request.old_run_id)? {
+            successor.created_at_ms = pending.created_at_ms;
+            // Identical retry keeps the originally authorized coordinator in the intent.
+            successor.execution_authority = pending.execution_authority;
+        }
+        store.request_replacement_owned(
+            &request.old_run_id,
+            &authority.authority,
+            &successor,
+            super::current_unix_millis(),
+        )?
+    };
+    Ok(bcode_workflow::WorkflowReplacementResponse {
+        old_run_id: request.old_run_id,
+        successor_run_id: successor.run_id,
+        created,
+    })
+}
+
 pub async fn start_run(
     state: &std::sync::Arc<ServerState>,
     request: bcode_workflow::WorkflowRunStartRequest,
@@ -6270,13 +6326,18 @@ async fn start_run_with_package(
 }
 
 #[allow(clippy::too_many_lines)]
-async fn start_run_with_stage(
+async fn prepare_workflow_run(
     state: &std::sync::Arc<ServerState>,
     request: bcode_workflow::WorkflowRunStartRequest,
     authored_provenance: Option<bcode_workflow_store::AuthoredWorkflowRunProvenance>,
-    package: Option<(&str, &str)>,
     phase: &mut &'static str,
-) -> Result<bcode_workflow::WorkflowRunStartResponse, super::ServerError> {
+) -> Result<
+    (
+        bcode_workflow_store::NewWorkflowRun,
+        bcode_session::SessionOwnershipGuard,
+    ),
+    super::ServerError,
+> {
     *phase = "read_definition";
     let stored_definition = state
         .workflow_store
@@ -6403,6 +6464,28 @@ async fn start_run_with_stage(
         authorization_ceiling: bcode_workflow::WorkflowToolCapability::Mutating,
         limits: request.limits,
     };
+    Ok((new_run, workflow_session_ownership))
+}
+
+#[allow(clippy::too_many_lines)]
+async fn start_run_with_stage(
+    state: &std::sync::Arc<ServerState>,
+    request: bcode_workflow::WorkflowRunStartRequest,
+    authored_provenance: Option<bcode_workflow_store::AuthoredWorkflowRunProvenance>,
+    package: Option<(&str, &str)>,
+    phase: &mut &'static str,
+) -> Result<bcode_workflow::WorkflowRunStartResponse, super::ServerError> {
+    let (new_run, workflow_session_ownership) =
+        prepare_workflow_run(state, request, authored_provenance, phase).await?;
+    let run_id = new_run.run_id.clone();
+    let parent_session_id = new_run
+        .parent_session_id
+        .as_ref()
+        .expect("prepared parent")
+        .parse()
+        .map_err(|_| {
+            bcode_workflow_store::WorkflowStoreError::InvalidData("invalid prepared parent".into())
+        })?;
     let run = {
         let mut store = state
             .workflow_store
@@ -6417,11 +6500,11 @@ async fn start_run_with_stage(
     };
     let runtime_work_id = super::register_workflow_runtime_work(
         state,
-        parent_session.id,
+        parent_session_id,
         &run_id,
         format!(
             "workflow {} v{}",
-            request.definition_id, request.definition_version
+            new_run.definition_id, new_run.definition_version
         ),
     )
     .await;

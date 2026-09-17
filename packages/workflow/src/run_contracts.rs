@@ -355,6 +355,15 @@ pub trait WorkflowRunApplication: Sync {
         approved: bool,
     ) -> impl std::future::Future<Output = Result<WaitingResolutionResult, Self::Error>> + Send;
 
+    /// Persist replacement intent through ordinary admission and ownership checks.
+    ///
+    /// # Errors
+    /// Rejects invalid successors, denied policy, foreign ownership, or conflicting intent.
+    fn request_workflow_replacement(
+        &self,
+        request: WorkflowReplacementRequest,
+    ) -> impl std::future::Future<Output = Result<WorkflowReplacementResponse, Self::Error>> + Send;
+
     /// Admit a run of an exact registered definition through normal admission checks.
     ///
     /// # Errors
@@ -896,6 +905,26 @@ pub struct WorkflowRunStartRequest {
     pub input: Option<serde_json::Value>,
     #[serde(default)]
     pub limits: WorkflowRunLimits,
+}
+
+/// Request a durable replacement of one exact run. A pending response is not admission
+/// of the successor; completion requires quiescence, compatible ownership, and policy.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WorkflowReplacementRequest {
+    /// Exact run to stop and replace.
+    pub old_run_id: String,
+    /// Successor prepared through ordinary workflow-start checks. A stable run ID is required.
+    pub successor: WorkflowRunStartRequest,
+}
+
+/// Durable replacement intent acknowledgment, not a running-successor acknowledgment.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkflowReplacementResponse {
+    pub old_run_id: String,
+    pub successor_run_id: String,
+    /// False for an identical already-persisted request.
+    pub created: bool,
 }
 
 /// Result of one explicit orphaned-workflow-run reconciliation pass.

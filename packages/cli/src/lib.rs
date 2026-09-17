@@ -867,6 +867,16 @@ async fn handle_ralph_command(command: RalphCommand) -> Result<(), CliError> {
     Ok(())
 }
 
+async fn request_cli_replacement(path: &Path) -> Result<(), CliError> {
+    let request = serde_json::from_value(read_bounded_json(path)?)
+        .map_err(|_| CliError::InvalidArguments("invalid workflow replacement request".into()))?;
+    print_json(
+        &BcodeClient::default_endpoint()
+            .request_workflow_replacement(request)
+            .await?,
+    )
+}
+
 async fn handle_associated_run<A: bcode_workflow::WorkflowRunApplication>(
     client: &A,
     key: bcode_workflow::WorkflowRunBindingLookup,
@@ -1045,6 +1055,9 @@ async fn handle_workflow_command(command: Box<WorkflowCommand>) -> Result<(), Cl
         ))
         .await;
     }
+    if let WorkflowCommand::RequestReplacement { request, yes: _ } = command.as_ref() {
+        return request_cli_replacement(request).await;
+    }
     if let WorkflowCommand::AssociatedRun {
         owner_plugin_id,
         workflow_kind,
@@ -1203,6 +1216,7 @@ async fn dispatch_workflow_command(command: Box<WorkflowCommand>) -> Result<(), 
         | WorkflowCommand::Watch
         | WorkflowCommand::CatchUp { .. }
         | WorkflowCommand::RepairAttempt { .. }
+        | WorkflowCommand::RequestReplacement { .. }
         | WorkflowCommand::AssociatedRun { .. }
         | WorkflowCommand::PackagePublication { .. }
         | WorkflowCommand::LaunchDetail { .. } => {
@@ -4095,6 +4109,15 @@ enum WorkflowCommand {
         #[arg(long, required = true)]
         yes: bool,
     },
+    /// Persist a replacement intent; does not imply successor execution has begun.
+    RequestReplacement {
+        /// `WorkflowReplacementRequest` JSON file, or - for stdin.
+        #[arg(long)]
+        request: PathBuf,
+        /// Confirm cancellation of the old run as part of replacement admission.
+        #[arg(long, required = true)]
+        yes: bool,
+    },
     /// Look up, inspect, or control the newest run for an exact binding key as JSON.
     AssociatedRun {
         #[arg(long)]
@@ -6684,6 +6707,19 @@ async fn handle_session_command(command: Box<SessionCommand>) -> Result<(), CliE
 
 #[cfg(test)]
 mod replacement_control_cli_tests {
+    #[test]
+    fn replacement_admission_requires_confirmation() {
+        use clap::Parser as _;
+        let args = [
+            "bcode",
+            "workflow",
+            "request-replacement",
+            "--request",
+            "replacement.json",
+        ];
+        assert!(super::Cli::try_parse_from(args).is_err());
+        assert!(super::Cli::try_parse_from(args.into_iter().chain(["--yes"])).is_ok());
+    }
     use clap::Parser as _;
 
     #[test]

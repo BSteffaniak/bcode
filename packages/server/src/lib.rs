@@ -5376,6 +5376,7 @@ const fn request_session_id(request: &Request) -> Option<SessionId> {
         | Request::RuntimeWorkHistory { session_id, .. }
         | Request::SubscribeRuntimeWork { session_id }
         | Request::AttachSessionProjectionWindow { session_id, .. } => Some(*session_id),
+        Request::RequestWorkflowReplacement(request) => Some(request.successor.parent_session_id),
         Request::StartWorkflowRun(request) => Some(request.parent_session_id),
         Request::StartWorkflowPackageExport(request) => Some(request.parent_session_id),
         _ => None,
@@ -5526,6 +5527,7 @@ const fn request_kind(request: &Request) -> &'static str {
         Request::StartWorkflowTemplate(_) => "start_workflow_template",
         Request::RegisterWorkflowDefinition(_) => "register_workflow_definition",
         Request::StartWorkflow(_) => "start_workflow",
+        Request::RequestWorkflowReplacement(_) => "request_workflow_replacement",
         Request::StartWorkflowRun(_) => "start_workflow_run",
         Request::ListWorkflowDefinitions { .. } => "list_workflow_definitions",
         Request::DescribeWorkflowDefinition { .. } => "describe_workflow_definition",
@@ -7211,6 +7213,20 @@ async fn handle_workflow_validation_request(
             .await;
             let response = match result {
                 Ok(started) => Response::Ok(ResponsePayload::WorkflowRunStarted(started)),
+                Err(failure) => Response::Err(ErrorResponse::new(failure.code, failure.message)),
+            };
+            send_response(writer, request_id, response).await
+        }
+        WorkflowDefinitionRequest::RequestWorkflowReplacement(request) => {
+            let result = bcode_workflow::WorkflowRunApplication::request_workflow_replacement(
+                &workflow_operations::WorkflowAuthoringApplication::new(state, client_id),
+                request,
+            )
+            .await;
+            let response = match result {
+                Ok(response) => {
+                    Response::Ok(ResponsePayload::WorkflowReplacementRequested(response))
+                }
                 Err(failure) => Response::Err(ErrorResponse::new(failure.code, failure.message)),
             };
             send_response(writer, request_id, response).await
@@ -68995,6 +69011,50 @@ event_symbol = "bcode_plugin_handle_event_v1"
         drop(store);
     }
 
+    async fn verify_replacement_admission(
+        state: &Arc<ServerState>,
+        old_id: &str,
+        successor: &bcode_workflow_store::NewWorkflowRun,
+    ) {
+        let request = bcode_workflow::WorkflowReplacementRequest {
+            old_run_id: old_id.into(),
+            successor: bcode_workflow::WorkflowRunStartRequest {
+                definition_id: successor.definition_id.clone(),
+                definition_version: successor.definition_version,
+                run_id: Some(successor.run_id.clone()),
+                workspace_snapshot: successor.workspace_snapshot.clone(),
+                parent_session_id: successor
+                    .parent_session_id
+                    .as_ref()
+                    .expect("parent")
+                    .parse()
+                    .expect("id"),
+                parent_session_generation: successor.parent_session_generation,
+                binding: successor.binding.clone(),
+                input: successor.input.clone(),
+                limits: successor.limits.clone(),
+            },
+        };
+        let application =
+            workflow_operations::WorkflowAuthoringApplication::new(state, ClientId::new());
+        let result = bcode_workflow::WorkflowRunApplication::request_workflow_replacement(
+            &application,
+            request.clone(),
+        )
+        .await
+        .expect("admission");
+        assert!(result.created);
+        assert_eq!(result.successor_run_id, successor.run_id);
+        let retry = bcode_workflow::WorkflowRunApplication::request_workflow_replacement(
+            &application,
+            request,
+        )
+        .await
+        .expect("retry");
+        drop(application);
+        assert!(!retry.created);
+    }
+
     async fn verify_authorized_replacement_completion(
         previous: &Arc<ServerState>,
         key: &bcode_workflow_store::WorkflowRunBindingKey,
@@ -69036,7 +69096,6 @@ event_symbol = "bcode_plugin_handle_event_v1"
             profile_id: profile.profile_id,
             policy_digest_sha256: profile.policy_digest_sha256,
         };
-        let authority = successor.execution_authority.clone().expect("authority");
         let old_id = successor.run_id.clone();
         let definition = previous
             .workflow_store
@@ -69055,11 +69114,10 @@ event_symbol = "bcode_plugin_handle_event_v1"
                 )
                 .expect("persist");
             store.create_run(&successor).expect("old run");
+            drop(store);
             successor.run_id = "completed-replacement-successor".into();
-            store
-                .request_replacement_owned(&old_id, &authority, &successor, 40)
-                .expect("intent");
         }
+        verify_replacement_admission(&state, &old_id, &successor).await;
         state.start_workflow_driver().await;
         tokio::time::timeout(Duration::from_secs(10), async {
             loop {

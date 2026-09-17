@@ -567,6 +567,12 @@ impl bcode_workflow::WorkflowRunApplication for BcodeClient {
     ) -> Result<bcode_workflow::WaitingResolutionResult, Self::Error> {
         Self::resolve_workflow_approval(self, run_id, node_id, activation_id, approved).await
     }
+    async fn request_workflow_replacement(
+        &self,
+        request: bcode_workflow::WorkflowReplacementRequest,
+    ) -> Result<bcode_workflow::WorkflowReplacementResponse, Self::Error> {
+        Self::request_workflow_replacement(self, request).await
+    }
     async fn start_workflow_run(
         &self,
         request: bcode_workflow::WorkflowRunStartRequest,
@@ -4898,6 +4904,23 @@ impl BcodeClient {
             .await?
         {
             ResponsePayload::WorkflowPackageExportRunStarted(response) => Ok(*response),
+            _ => Err(ClientError::UnexpectedResponse),
+        }
+    }
+
+    /// Request durable replacement through normal application admission.
+    ///
+    /// # Errors
+    /// Returns an error for transport failure, denied admission, or ownership conflicts.
+    pub async fn request_workflow_replacement(
+        &self,
+        request: bcode_workflow::WorkflowReplacementRequest,
+    ) -> Result<bcode_workflow::WorkflowReplacementResponse, ClientError> {
+        match self
+            .send_request(Request::RequestWorkflowReplacement(request))
+            .await?
+        {
+            ResponsePayload::WorkflowReplacementRequested(response) => Ok(response),
             _ => Err(ClientError::UnexpectedResponse),
         }
     }
