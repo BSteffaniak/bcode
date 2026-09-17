@@ -83,6 +83,7 @@ pub struct SessionState {
     pub(crate) latest_compaction_sequence: Option<u64>,
     pub(crate) context_epoch: u64,
     pub(crate) context_occupancy: Option<bcode_session_models::RequestContextOccupancy>,
+    pub(crate) turn_evidence: BTreeMap<String, Vec<SessionEvent>>,
     pub(crate) turn_receipts: BTreeMap<(String, String), bcode_session_models::TurnReceipt>,
     pub(crate) total_metered_tokens: u64,
     pub(crate) load_status: SessionLoadStatusKind,
@@ -150,6 +151,7 @@ impl SessionState {
             latest_compaction_sequence: None,
             context_epoch: 0,
             context_occupancy: None,
+            turn_evidence: BTreeMap::new(),
             turn_receipts: BTreeMap::new(),
             total_metered_tokens: 0,
             load_status: SessionLoadStatusKind::SummaryOnly,
@@ -213,6 +215,7 @@ impl SessionState {
             latest_compaction_sequence: state.latest_compaction_sequence,
             context_epoch: state.latest_compaction_sequence.unwrap_or_default(),
             context_occupancy: None,
+            turn_evidence: BTreeMap::new(),
             turn_receipts: BTreeMap::new(),
             total_metered_tokens: 0,
             load_status: SessionLoadStatusKind::Current,
@@ -419,6 +422,51 @@ impl SessionState {
                 }
             }
             _ => {}
+        }
+        if self.events.is_some() {
+            match &event.kind {
+                SessionEventKind::ModelTurnFinished { turn_id, .. } => {
+                    let evidence = self.turn_evidence.entry(turn_id.clone()).or_default();
+                    if !evidence
+                        .iter()
+                        .any(|item| matches!(item.kind, SessionEventKind::ModelTurnFinished { .. }))
+                    {
+                        evidence.push(event.clone());
+                    }
+                }
+                SessionEventKind::AssistantResponseSegment {
+                    turn_id,
+                    segment_order,
+                    ..
+                }
+                | SessionEventKind::PositionedAssistantResponseSegment {
+                    turn_id,
+                    segment_order,
+                    ..
+                } => {
+                    let evidence = self.turn_evidence.entry(turn_id.clone()).or_default();
+                    if !evidence
+                        .iter()
+                        .any(|item| matches!(item.kind, SessionEventKind::ModelTurnFinished { .. }))
+                    {
+                        let prior_order = evidence.first().and_then(|item| match &item.kind {
+                            SessionEventKind::AssistantResponseSegment {
+                                segment_order, ..
+                            }
+                            | SessionEventKind::PositionedAssistantResponseSegment {
+                                segment_order,
+                                ..
+                            } => Some(*segment_order),
+                            _ => None,
+                        });
+                        if prior_order.is_none_or(|order| order <= *segment_order) {
+                            evidence.clear();
+                            evidence.push(event.clone());
+                        }
+                    }
+                }
+                _ => {}
+            }
         }
         if let Some(events) = &mut self.events {
             events.push(event.clone());

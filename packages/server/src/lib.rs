@@ -31,6 +31,7 @@ pub mod storage_maintenance_worker;
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 pub mod storage_read_admission;
 mod workflow_operations;
+mod workflow_receipts;
 pub use workflow_operations::{
     WorkflowApplicationAuthorizationDecision, WorkflowRunGraphEditPolicy,
     WorkflowRunGraphPublicationPolicy,
@@ -119,12 +120,11 @@ use bcode_session::{
 };
 use bcode_session_models::{
     CURRENT_SESSION_EVENT_SCHEMA_VERSION, ClientId, ModelTurnOutcome, ProviderStreamEvent,
-    ProviderToolCallProgress, RuntimeWorkKind, RuntimeWorkStatus, SessionEventKind,
-    SessionHistoryDirection, SessionHistoryQuery, SessionId, SessionLiveEventKind, SessionSummary,
-    SessionTokenUsage, SessionTraceEvent, SessionTracePayload, SessionTracePhase,
-    ToolInvocationResult, TraceBlobRef, TraceRedaction, TurnExecutionCorrelation,
-    TurnExecutionOptions, TurnOrigin, TurnPriority, TurnStructuredOutputRequest, TurnToolPolicy,
-    WorkId,
+    ProviderToolCallProgress, RuntimeWorkKind, RuntimeWorkStatus, SessionEventKind, SessionId,
+    SessionLiveEventKind, SessionSummary, SessionTokenUsage, SessionTraceEvent,
+    SessionTracePayload, SessionTracePhase, ToolInvocationResult, TraceBlobRef, TraceRedaction,
+    TurnExecutionCorrelation, TurnExecutionOptions, TurnOrigin, TurnPriority,
+    TurnStructuredOutputRequest, TurnToolPolicy, WorkId,
 };
 use bcode_session_models::{ExecutionSessionProvenance, PermissionSummary};
 use bcode_session_models::{SessionCatalogSourceStatus, SessionCatalogStatus};
@@ -2610,7 +2610,7 @@ impl ServerState {
         *task = Some(tokio::spawn(async move {
             let mut recovery_tick = tokio::time::interval(Duration::from_secs(1));
             recovery_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-            let mut after_run_id = String::new();
+            let discovery_artifact = workflow_operations::current_artifact_id(&state);
             loop {
                 tokio::select! {
                     biased;
@@ -2618,7 +2618,7 @@ impl ServerState {
                     _ = recovery_tick.tick() => {
                         let page = state.workflow_store.lock()
                             .unwrap_or_else(std::sync::PoisonError::into_inner)
-                            .continuation_run_ids_after(&after_run_id, 16);
+                            .advance_continuation_discovery(&discovery_artifact, 16);
                         // A slow page must not leave the biased timer perpetually ready,
                         // starving queued publications between discovery passes.
                         recovery_tick.reset();
@@ -2626,12 +2626,8 @@ impl ServerState {
                             tracing::warn!("workflow continuation discovery failed");
                             continue;
                         };
-                        if run_ids.is_empty() {
-                            after_run_id.clear();
-                        }
                         for run_id in run_ids {
                             if state.shutdown_requested.load(Ordering::SeqCst) { return; }
-                            after_run_id.clone_from(&run_id);
                             let runnable = {
                                 let store = state.workflow_store.lock()
                                     .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -29985,47 +29981,23 @@ impl bcode_workflow_store::AsyncAttemptStatusObserver for WorkflowTurnReceiptObs
                             .into(),
                 });
             }
-            let observation = (|| {
-                let session_id = request
-                    .receipt
-                    .get("session_id")
-                    .and_then(serde_json::Value::as_str)
-                    .ok_or_else(|| {
-                        WorkflowStoreError::InvalidData(
-                            "workflow prompt receipt has no session_id".to_string(),
-                        )
-                    })
-                    .and_then(|value| {
-                        SessionId::from_str(value)
-                            .map_err(|error| WorkflowStoreError::InvalidData(error.to_string()))
-                    })?;
-                let turn_id = request
-                    .receipt
-                    .get("turn_id")
-                    .and_then(serde_json::Value::as_str)
-                    .ok_or_else(|| {
-                        WorkflowStoreError::InvalidData(
-                            "workflow prompt receipt has no turn_id".to_string(),
-                        )
-                    })?;
-                let output_schema_id = request
-                    .receipt
-                    .get("output_schema_id")
-                    .and_then(serde_json::Value::as_str)
-                    .ok_or_else(|| {
-                        WorkflowStoreError::InvalidData(
-                            "workflow prompt receipt has no output_schema_id".to_string(),
-                        )
-                    })?;
-                Ok((session_id, turn_id, output_schema_id))
-            })();
-            let (session_id, turn_id, output_schema_id) = match observation {
-                Ok(values) => values,
-                Err(error) => return structural_observation_or_unknown(Err(error), request),
+            let receipt = match workflow_receipts::AgentTurnReceipt::decode(&request.receipt) {
+                Ok(receipt) => receipt,
+                Err(message) => {
+                    return structural_observation_or_unknown(
+                        Err(WorkflowStoreError::InvalidData(message.into())),
+                        request,
+                    );
+                }
             };
-            let observation =
-                observe_workflow_turn(self.state, session_id, turn_id, output_schema_id, request)
-                    .await;
+            let observation = observe_workflow_turn(
+                self.state,
+                receipt.session_id,
+                &receipt.turn_id,
+                &receipt.output_schema_id,
+                request,
+            )
+            .await;
             structural_observation_or_unknown(observation, request)
         })
     }
@@ -30197,51 +30169,6 @@ const fn mutating_workflow_attempt(
     request.may_mutate()
 }
 
-/// Locate older terminal evidence without replaying unrelated session history.
-/// Exhausting the bounded candidate page is not proof that a turn is still running.
-async fn workflow_turn_terminal_window(
-    state: &ServerState,
-    session_id: SessionId,
-    turn_id: &str,
-) -> Result<Option<Vec<bcode_session_models::SessionEvent>>, bcode_session::SessionError> {
-    let terminals = state
-        .sessions
-        .session_inspection_page(
-            session_id,
-            bcode_session_models::SessionInspectionQuery {
-                category: bcode_session_models::SessionInspectionCategory::TerminalOutcomes,
-                cursor: None,
-                limit: bcode_session_models::MAX_SESSION_INSPECTION_EVENTS,
-                direction: SessionHistoryDirection::Backward,
-            },
-        )
-        .await?;
-    if !terminals.compatibility_issues.is_empty() {
-        return Ok(None);
-    }
-    let Some(terminal) = terminals.events.iter().rev().find(|event| {
-        matches!(&event.kind,
-        SessionEventKind::ModelTurnFinished { turn_id: id, .. } if id == turn_id)
-    }) else {
-        return Ok(None);
-    };
-    let window = state
-        .sessions
-        .session_history_around(
-            session_id,
-            bcode_session_models::SessionHistoryAroundQuery {
-                sequence: terminal.sequence,
-                before: 255,
-                after: 0,
-            },
-        )
-        .await?;
-    if !window.anchor_present || !window.compatibility_issues.is_empty() {
-        return Ok(None);
-    }
-    Ok(Some(window.events))
-}
-
 #[allow(clippy::too_many_lines)]
 async fn observe_workflow_turn(
     state: &ServerState,
@@ -30250,54 +30177,24 @@ async fn observe_workflow_turn(
     output_schema_id: &str,
     request: &bcode_workflow_store::AttemptReconciliationRequest,
 ) -> Result<bcode_workflow_store::AttemptObservation, WorkflowStoreError> {
-    let Ok(mut page) = state
+    let Ok(events) = state
         .sessions
-        .session_history_page(
-            session_id,
-            SessionHistoryQuery {
-                cursor: None,
-                limit: 256,
-                direction: SessionHistoryDirection::Backward,
-            },
-        )
+        .session_turn_evidence(session_id, turn_id)
         .await
     else {
         return Ok(bcode_workflow_store::AttemptObservation::Deferred {
-            reason: "session history unavailable for bounded outcome observation".into(),
+            reason: "exact session turn evidence unavailable; session maintenance may be required"
+                .into(),
         });
     };
-    if !page.compatibility_issues.is_empty() {
-        return Ok(bcode_workflow_store::AttemptObservation::Deferred {
-            reason: "session history is incompatible with bounded outcome observation".into(),
-        });
-    }
-    if !page.events.iter().any(|event| {
-        matches!(&event.kind,
-        SessionEventKind::ModelTurnFinished { turn_id: id, .. } if id == turn_id)
-    }) {
-        match workflow_turn_terminal_window(state, session_id, turn_id).await {
-            Ok(Some(events)) => page.events = events,
-            Ok(None) => {}
-            Err(_) => {
-                return Ok(bcode_workflow_store::AttemptObservation::Deferred {
-                    reason: "session terminal evidence unavailable for bounded outcome observation"
-                        .into(),
-                });
-            }
-        }
-    }
-    let terminal = page
-        .events
-        .iter()
-        .rev()
-        .find_map(|event| match &event.kind {
-            SessionEventKind::ModelTurnFinished {
-                turn_id: event_turn_id,
-                outcome,
-                message,
-            } if event_turn_id == turn_id => Some((*outcome, message.clone(), event.timestamp_ms)),
-            _ => None,
-        });
+    let terminal = events.iter().rev().find_map(|event| match &event.kind {
+        SessionEventKind::ModelTurnFinished {
+            turn_id: event_turn_id,
+            outcome,
+            message,
+        } if event_turn_id == turn_id => Some((*outcome, message.clone(), event.timestamp_ms)),
+        _ => None,
+    });
     let Some((outcome, message, terminal_at_ms)) = terminal else {
         return Ok(bcode_workflow_store::AttemptObservation::Deferred {
             reason: "terminal outcome not established by bounded session observation".into(),
@@ -30332,7 +30229,7 @@ async fn observe_workflow_turn(
                         )
                     })?,
                 bcode_workflow::WorkflowPromptOutputPolicy::Structured { .. } => {
-                    let Some(output) = workflow_turn_output(&page.events, turn_id) else {
+                    let Some(output) = workflow_turn_output(&events, turn_id) else {
                         return Ok(bcode_workflow_store::AttemptObservation::Deferred {
                             reason: "completed turn output not established by bounded session observation".into(),
                         });
@@ -69129,18 +69026,21 @@ event_symbol = "bcode_plugin_handle_event_v1"
                 .expect("append");
         }
         let state = test_server_state(sessions);
-        let events = workflow_turn_terminal_window(&state, session.id, "old-turn")
+        let events = state
+            .sessions
+            .session_turn_evidence(session.id, "old-turn")
             .await
-            .expect("lookup")
-            .expect("terminal window");
+            .expect("lookup");
         assert!(events.iter().any(|event| matches!(&event.kind,
             SessionEventKind::ModelTurnFinished { turn_id, outcome: ModelTurnOutcome::Cancelled, .. }
                 if turn_id == "old-turn")));
         assert!(
-            workflow_turn_terminal_window(&state, session.id, "missing")
+            state
+                .sessions
+                .session_turn_evidence(session.id, "missing")
                 .await
                 .expect("absent lookup")
-                .is_none()
+                .is_empty()
         );
         drop(state);
     }

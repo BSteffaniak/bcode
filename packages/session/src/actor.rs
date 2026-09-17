@@ -89,6 +89,7 @@ const fn append_rejection_metric(error: &SessionDbError) -> &'static str {
         | SessionDbError::Serialize(_)
         | SessionDbError::PersistedEvent(_)
         | SessionDbError::InvalidCompactionMarker { .. }
+        | SessionDbError::InvalidData(_)
         | SessionDbError::InvalidRow { .. }
         | SessionDbError::MigrationHistoryIncompatible { .. }
         | SessionDbError::HistoryReadLimitExceeded { .. } => {
@@ -532,6 +533,11 @@ impl SessionHandle {
             .await?
     }
 
+    pub async fn turn_evidence(&self, turn_id: String) -> Result<Vec<SessionEvent>, SessionError> {
+        self.send(|reply| SessionCommand::TurnEvidence { turn_id, reply })
+            .await?
+    }
+
     pub async fn inspection_page(
         &self,
         query: SessionInspectionQuery,
@@ -809,6 +815,10 @@ enum SessionCommand {
     HistoryAround {
         query: SessionHistoryAroundQuery,
         reply: oneshot::Sender<Result<SessionHistoryWindow, SessionError>>,
+    },
+    TurnEvidence {
+        turn_id: String,
+        reply: oneshot::Sender<Result<Vec<SessionEvent>, SessionError>>,
     },
     InspectionPage {
         query: SessionInspectionQuery,
@@ -1095,6 +1105,21 @@ impl SessionActor {
                     Ok(None) => Err(SessionError::EventSerialization(
                         "usage reporting requires a persisted accounting projection".into(),
                     )),
+                    Err(error) => Err(error),
+                };
+                let _ = reply.send(result);
+            }
+            SessionCommand::TurnEvidence { turn_id, reply } => {
+                let in_memory = self.state.events.is_some();
+                let result = match self.existing_session_db().await {
+                    Ok(Some(db)) => db.turn_evidence(&turn_id).await.map_err(Into::into),
+                    Ok(None) if in_memory => Ok(self
+                        .state
+                        .turn_evidence
+                        .get(&turn_id)
+                        .cloned()
+                        .unwrap_or_default()),
+                    Ok(None) => Err(SessionError::DbUnavailable(self.state.summary.id)),
                     Err(error) => Err(error),
                 };
                 let _ = reply.send(result);

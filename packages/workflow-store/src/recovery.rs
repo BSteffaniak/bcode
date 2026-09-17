@@ -35,6 +35,9 @@ pub fn verify(connection: &Connection) -> Result<(), WorkflowStoreError> {
     )?;
     connection
         .prepare("SELECT run_id, after_dispatch_identity FROM workflow_receipt_cursors LIMIT 0")?;
+    connection.prepare("SELECT old_run_id, successor_run_id, successor_json, requested_at_ms FROM workflow_replacement_intents LIMIT 0")?;
+    connection
+        .prepare("SELECT artifact_id, after_run_id FROM workflow_discovery_cursors LIMIT 0")?;
     Ok(())
 }
 
@@ -58,6 +61,16 @@ pub fn initialize(connection: &Connection) -> Result<(), WorkflowStoreError> {
             ON workflow_attempts(run_id, dispatch_identity)
             WHERE status IN ('admitted', 'running', 'cancelling', 'sibling_cancelling')
             AND receipt_json IS NOT NULL;
+        CREATE TABLE IF NOT EXISTS workflow_replacement_intents (
+            old_run_id TEXT PRIMARY KEY NOT NULL REFERENCES workflow_runs(run_id),
+            successor_run_id TEXT UNIQUE NOT NULL,
+            successor_json TEXT NOT NULL,
+            requested_at_ms INTEGER NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS workflow_discovery_cursors (
+            artifact_id TEXT PRIMARY KEY NOT NULL,
+            after_run_id TEXT NOT NULL
+        );
         CREATE TABLE IF NOT EXISTS workflow_receipt_cursors (
             run_id TEXT PRIMARY KEY NOT NULL REFERENCES workflow_runs(run_id),
             after_dispatch_identity TEXT NOT NULL

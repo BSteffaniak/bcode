@@ -24,12 +24,15 @@ pub enum MaterializedProjection {
     RuntimeWork,
     /// Cumulative session usage and replaceable derived cost valuations.
     SessionUsage,
+    /// Exact canonical turn terminal and response locators.
+    TurnEvidence,
     /// Authoritative current context occupancy.
     RequestContextOccupancy,
 }
 
 impl MaterializedProjection {
-    const ALL: [Self; 8] = [
+    const ALL: [Self; 9] = [
+        Self::TurnEvidence,
         Self::SessionState,
         Self::InputHistory,
         Self::Transcript,
@@ -57,6 +60,7 @@ impl MaterializedProjection {
             | Self::InputHistory
             | Self::ArtifactReferences
             | Self::RuntimeWork
+            | Self::TurnEvidence
             | Self::SessionUsage => 1,
         }
     }
@@ -71,6 +75,7 @@ impl MaterializedProjection {
             Self::ToolRuns => "tool_runs",
             Self::ArtifactReferences => "artifact_references",
             Self::RuntimeWork => "runtime_work",
+            Self::TurnEvidence => "turn_evidence",
             Self::SessionUsage => "session_usage",
             Self::RequestContextOccupancy => "context_occupancy",
         }
@@ -124,7 +129,8 @@ pub async fn update_projection_checkpoint(
 }
 
 /// Current projections finalized together for each canonical event.
-pub const BASE_MATERIALIZED_PROJECTIONS: [MaterializedProjection; 7] = [
+pub const BASE_MATERIALIZED_PROJECTIONS: [MaterializedProjection; 8] = [
+    MaterializedProjection::TurnEvidence,
     MaterializedProjection::SessionState,
     MaterializedProjection::InputHistory,
     MaterializedProjection::Transcript,
@@ -147,7 +153,7 @@ mod tests {
 
     #[test]
     fn projection_inventory_is_complete_and_stable() {
-        assert_eq!(MaterializedProjection::all().len(), 8);
+        assert_eq!(MaterializedProjection::all().len(), 9);
         assert_eq!(
             MaterializedProjection::RequestContextOccupancy.schema_version(),
             4

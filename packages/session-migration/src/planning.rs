@@ -394,9 +394,9 @@ mod tests {
     }
 
     #[test]
-    fn writer_epoch_4_requires_complete_migration_to_epoch_10() {
+    fn writer_epoch_4_requires_complete_migration_to_epoch_11() {
         let plan = plan_writer_epoch_migration(4).expect("epoch 4 corrective plan");
-        assert_eq!(plan.steps.len(), 6);
+        assert_eq!(plan.steps.len(), 7);
         assert_eq!(plan.steps[0].id, "session-writer-epoch-4-to-5");
         assert_eq!(plan.steps[1].id, "session-writer-epoch-5-to-6");
         assert_eq!(plan.steps[2].id, "session-writer-epoch-6-to-7");

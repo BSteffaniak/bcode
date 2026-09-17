@@ -122,6 +122,9 @@ const CONTEXT_OCCUPANCY_PROJECTION_ID: i32 = 1;
 /// Errors returned by Switchy-backed session database operations.
 #[derive(Debug, Error)]
 pub enum SessionDbError {
+    /// Exact turn evidence disagrees with canonical storage.
+    #[error("invalid turn evidence: {0}")]
+    InvalidData(String),
     /// Database connection initialization failed.
     #[error("failed to initialize database connection: {0}")]
     Connection(#[from] switchy::database_connection::InitTursoError),
@@ -3039,15 +3042,103 @@ impl SessionDb {
         })
     }
 
-    /// Return one bounded structured investigation page from canonical events.
+    /// Return exact canonical terminal evidence and the final correlated response for a turn.
     ///
-    /// The query reads only event types relevant to the requested category. Categories requiring
-    /// semantic confirmation, such as failed tool calls, decode at most a fixed candidate bound.
+    /// Reads at most two indexed locators and two canonical events. Missing or stale
+    /// projections fail closed; this read never rebuilds derived state.
     ///
     /// # Errors
     ///
-    /// Returns an error if the requested result limit is too large or canonical candidates cannot
-    /// be queried or decoded.
+    /// Returns an error for unavailable, incompatible, stale, or inconsistent storage.
+    pub async fn turn_evidence(&self, turn_id: &str) -> SessionDbResult<Vec<SessionEvent>> {
+        if let Some(tail) = self.last_event_sequence().await? {
+            let snapshot = projection_checkpoint_snapshot(&**self.db).await?;
+            validate_projection_checkpoint_snapshot(&snapshot, tail)?;
+        }
+        let indexes = self
+            .db
+            .select("sqlite_master")
+            .columns(&["name"])
+            .where_eq("type", "index")
+            .where_eq("name", "idx_turn_evidence_sequence")
+            .limit(1)
+            .execute(&**self.db)
+            .await?;
+        if indexes.is_empty() {
+            return Err(SessionDbError::InvalidData(
+                "turn evidence index missing; explicit maintenance required".into(),
+            ));
+        }
+        let mut events = Vec::new();
+        for kind in ["terminal", "output"] {
+            let mut query = self
+                .db
+                .select("turn_evidence")
+                .columns(&["event_seq"])
+                .where_eq("turn_id", turn_id.to_owned())
+                .where_eq("evidence_kind", kind)
+                .limit(1);
+            if kind == "output" {
+                query = query.sort("segment_order", SortDirection::Desc);
+                if let Some(terminal) = events.first() {
+                    let terminal: &SessionEvent = terminal;
+                    query = query.where_lte("event_seq", seq_to_value(terminal.sequence));
+                }
+            }
+            let rows = query
+                .sort(
+                    "event_seq",
+                    if kind == "terminal" {
+                        SortDirection::Asc
+                    } else {
+                        SortDirection::Desc
+                    },
+                )
+                .execute(&**self.db)
+                .await?;
+            let Some(locator) = rows.first() else {
+                continue;
+            };
+            let sequence = required_i64(locator, "event_seq")?;
+            let rows = self
+                .db
+                .select("events")
+                .columns(&["event_seq", "payload"])
+                .where_eq("event_seq", DatabaseValue::Int64(sequence))
+                .limit(1)
+                .execute(&**self.db)
+                .await?;
+            let row = rows.first().ok_or_else(|| {
+                SessionDbError::InvalidData(
+                    "turn evidence references a missing canonical event".into(),
+                )
+            })?;
+            let event = strict_event_from_row(row, self.session_id)?;
+            let matches = match &event.kind {
+                SessionEventKind::ModelTurnFinished { turn_id: id, .. } => {
+                    kind == "terminal" && id == turn_id
+                }
+                SessionEventKind::AssistantResponseSegment { turn_id: id, .. }
+                | SessionEventKind::PositionedAssistantResponseSegment { turn_id: id, .. } => {
+                    kind == "output" && id == turn_id
+                }
+                _ => false,
+            };
+            if !matches {
+                return Err(SessionDbError::InvalidData(
+                    "turn evidence disagrees with canonical event".into(),
+                ));
+            }
+            events.push(event);
+        }
+        events.sort_by_key(|event| event.sequence);
+        Ok(events)
+    }
+
+    /// Return one bounded structured investigation page from canonical events.
+    ///
+    /// # Errors
+    /// Returns an error if the limit is too large or canonical candidates cannot be decoded.
     pub async fn inspection_page(
         &self,
         query: SessionInspectionQuery,
@@ -4330,6 +4421,7 @@ impl bcode_session_migration_target::MigrationTarget for SessionMigrationTarget<
     async fn materialize_current_schema(&mut self) -> Result<(), Self::Error> {
         run_session_migrations(self.db).await?;
         for table in [
+            "turn_evidence",
             "turn_receipts",
             "model_context_entries",
             "model_context_projection_state",
@@ -4874,7 +4966,33 @@ async fn project_appended_event(db: &dyn Database, event: &SessionEvent) -> Sess
     project_turn_receipt(db, event).await
 }
 
+async fn project_turn_evidence(db: &dyn Database, event: &SessionEvent) -> SessionDbResult<()> {
+    let (turn_id, kind, order) = match &event.kind {
+        SessionEventKind::ModelTurnFinished { turn_id, .. } => (turn_id, "terminal", 0),
+        SessionEventKind::AssistantResponseSegment {
+            turn_id,
+            segment_order,
+            ..
+        }
+        | SessionEventKind::PositionedAssistantResponseSegment {
+            turn_id,
+            segment_order,
+            ..
+        } => (turn_id, "output", u64::from(*segment_order)),
+        _ => return Ok(()),
+    };
+    db.insert("turn_evidence")
+        .value("turn_id", turn_id.clone())
+        .value("evidence_kind", kind)
+        .value("segment_order", seq_to_value(order))
+        .value("event_seq", seq_to_value(event.sequence))
+        .execute(db)
+        .await?;
+    Ok(())
+}
+
 async fn project_turn_receipt(db: &dyn Database, event: &SessionEvent) -> SessionDbResult<()> {
+    project_turn_evidence(db, event).await?;
     let SessionEventKind::UserMessage { admission, .. } = &event.kind else {
         return Ok(());
     };
@@ -9358,6 +9476,10 @@ mod tests {
 
     async fn remove_usage_staging_fixture(db: &SessionDb) {
         db.database()
+            .exec_raw("DROP TABLE turn_evidence")
+            .await
+            .unwrap();
+        db.database()
             .exec_raw("DROP TABLE usage_valuation_staging")
             .await
             .unwrap();
@@ -9976,6 +10098,83 @@ mod tests {
                 .expect("checkpoint snapshot after append"),
             before
         );
+    }
+
+    #[tokio::test]
+    async fn exact_turn_evidence_survives_unrelated_history_and_restart() {
+        let temp = tempfile::tempdir().expect("temp");
+        let id = SessionId::new();
+        let db = SessionDb::open_turso_in_root(id, temp.path())
+            .await
+            .expect("open");
+        db.append_event(&event(
+            id,
+            0,
+            SessionEventKind::AssistantResponseSegment {
+                turn_id: "target".into(),
+                segment_id: "answer".into(),
+                segment_order: 1,
+                text: "exact output".into(),
+            },
+        ))
+        .await
+        .expect("output");
+        db.append_event(&event(
+            id,
+            1,
+            SessionEventKind::ModelTurnFinished {
+                turn_id: "target".into(),
+                outcome: bcode_session_models::ModelTurnOutcome::Completed,
+                message: None,
+            },
+        ))
+        .await
+        .expect("terminal");
+        for sequence in 2..302 {
+            db.append_event(&event(
+                id,
+                sequence,
+                SessionEventKind::ModelTurnFinished {
+                    turn_id: format!("other-{sequence}"),
+                    outcome: bcode_session_models::ModelTurnOutcome::Cancelled,
+                    message: None,
+                },
+            ))
+            .await
+            .expect("unrelated terminal");
+        }
+        drop(db);
+        let db = SessionDb::open_existing_turso_in_root(id, temp.path())
+            .await
+            .expect("reopen");
+        let evidence = db.turn_evidence("target").await.expect("exact lookup");
+        assert_eq!(
+            evidence
+                .iter()
+                .map(|event| event.sequence)
+                .collect::<Vec<_>>(),
+            vec![0, 1]
+        );
+        assert!(db.turn_evidence("absent").await.expect("absent").is_empty());
+        db.database()
+            .exec_raw("DROP INDEX idx_turn_evidence_sequence")
+            .await
+            .expect("remove index");
+        assert!(matches!(
+            db.turn_evidence("target").await,
+            Err(SessionDbError::InvalidData(_))
+        ));
+        db.database().exec_raw("CREATE INDEX idx_turn_evidence_sequence ON turn_evidence(turn_id, evidence_kind, event_seq)").await.expect("restore fixture index");
+        db.database()
+            .delete("projection_checkpoints")
+            .where_eq("projection_name", "turn_evidence")
+            .execute(db.database())
+            .await
+            .expect("damage checkpoint");
+        assert!(matches!(
+            db.turn_evidence("target").await,
+            Err(SessionDbError::ProjectionStale { .. })
+        ));
     }
 
     #[tokio::test]
@@ -12143,7 +12342,10 @@ mod tests {
         let migrated = SessionDb::migrate_turso_in_root(id, root.path(), &maintenance, &write)
             .await
             .expect("upgrade");
-        assert_eq!(migrated.storage_writer_epoch().await.expect("writer"), 10);
+        assert_eq!(
+            migrated.storage_writer_epoch().await.expect("writer"),
+            u64::from(CURRENT_SESSION_STORAGE_WRITER_EPOCH)
+        );
         assert_eq!(
             migrated
                 .all_events_strict()

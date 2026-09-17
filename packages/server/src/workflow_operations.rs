@@ -5700,31 +5700,16 @@ pub async fn can_observe_recovered_agent_turn(
     {
         return Ok(false);
     }
-    let Some(artifact) = request
-        .receipt
-        .get("owner_artifact_id")
-        .and_then(serde_json::Value::as_str)
-    else {
+    let Ok(receipt) = super::workflow_receipts::AgentTurnReceipt::decode(&request.receipt) else {
         return Ok(false);
     };
-    let Some(instance) = request
-        .receipt
-        .get("owner_daemon_instance_id")
-        .and_then(serde_json::Value::as_str)
-    else {
+    let (Some(artifact), Some(instance)) = (
+        receipt.owner_artifact_id.as_deref(),
+        receipt.owner_daemon_instance_id.as_deref(),
+    ) else {
         return Ok(false);
     };
-    let Some(session_id) = request
-        .receipt
-        .get("session_id")
-        .and_then(serde_json::Value::as_str)
-        .and_then(|id| id.parse::<super::SessionId>().ok())
-    else {
-        return Ok(false);
-    };
-    if artifact.is_empty() || instance.is_empty() {
-        return Ok(false);
-    }
+    let session_id = receipt.session_id;
     let authority = {
         let store = state
             .workflow_store
@@ -5821,7 +5806,7 @@ fn recovery_authority_requires_both_artifact_and_instance_identity() {
     drop(state);
 }
 
-fn current_artifact_id(state: &ServerState) -> String {
+pub fn current_artifact_id(state: &ServerState) -> String {
     state.daemon_status.artifact_id.as_ref().map_or_else(
         || state.daemon_status.build_fingerprint.clone(),
         ToString::to_string,

@@ -1501,6 +1501,7 @@ impl SessionManager {
             latest_compaction_sequence: None,
             context_epoch: 0,
             context_occupancy: None,
+            turn_evidence: BTreeMap::new(),
             turn_receipts: BTreeMap::new(),
             total_metered_tokens: 0,
             load_status: SessionLoadStatusKind::Current,
@@ -2347,6 +2348,32 @@ impl SessionManager {
         }
         let db = db::SessionDb::open_existing_turso_in_root(session_id, &store.root_path()).await?;
         Ok(db.inspection_page(query).await?)
+    }
+
+    /// Read exact canonical outcome and correlated output evidence for one turn.
+    ///
+    /// # Errors
+    /// Returns an error when session storage or its current evidence projection is unavailable.
+    pub async fn session_turn_evidence(
+        &self,
+        session_id: SessionId,
+        turn_id: &str,
+    ) -> Result<Vec<SessionEvent>, SessionError> {
+        let gate = self.session_load_gate(session_id).await;
+        let _guard = gate.lock().await;
+        let cached = self.inner.lock().await.sessions.get(&session_id).cloned();
+        if let Some(handle) = cached {
+            return handle.turn_evidence(turn_id.to_owned()).await;
+        }
+        let store = self
+            .store
+            .as_ref()
+            .ok_or(SessionError::NotFound(session_id))?;
+        if !db::session_db_path(&store.root_path(), session_id).exists() {
+            return Err(SessionError::NotFound(session_id));
+        }
+        let db = db::SessionDb::open_existing_turso_in_root(session_id, &store.root_path()).await?;
+        Ok(db.turn_evidence(turn_id).await?)
     }
 
     /// Return canonical plugin status-note events for one stable note identity.

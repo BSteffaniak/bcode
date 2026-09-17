@@ -39,7 +39,7 @@ const RESET_BACKUP_DIRECTORY: &str = "reset-backups";
 /// Stable destructive confirmation required by public workflow-store reset surfaces.
 pub const WORKFLOW_STORE_RESET_CONFIRMATION: &str = "DELETE-INCOMPATIBLE-WORKFLOW-STATE";
 /// Current clean-break workflow store schema version.
-pub const WORKFLOW_STORE_SCHEMA_VERSION: u32 = 36;
+pub const WORKFLOW_STORE_SCHEMA_VERSION: u32 = 38;
 /// Current bounded workflow-store reset receipt version.
 pub const WORKFLOW_STORE_RESET_RECEIPT_VERSION: u32 = 1;
 /// Current explicit workflow-store migration receipt contract.
@@ -1160,7 +1160,7 @@ impl WorkflowStore {
                         match Self::open_with_ownership(&path, ownership) {
                             Ok(store) => return Ok(store),
                             Err(WorkflowStoreError::UnsupportedStore {
-                                actual: Some(14..=35),
+                                actual: Some(14..=37),
                                 ..
                             }) => {}
                             Err(error) => return Err(error),
@@ -1190,7 +1190,7 @@ impl WorkflowStore {
                         match Self::open_with_ownership(&path, probe) {
                             Ok(store) => return Ok(store),
                             Err(WorkflowStoreError::UnsupportedStore {
-                                actual: Some(14..=35),
+                                actual: Some(14..=37),
                                 ..
                             }) => {}
                             Err(error) => return Err(error),
@@ -1340,20 +1340,13 @@ impl WorkflowStore {
                 "workflow store migration cannot read the source schema".to_string(),
             )
         })?;
-        if !matches!(previous_schema_version, 14..=35) {
+        if !matches!(previous_schema_version, 14..=37) {
             return Err(WorkflowStoreError::UnsupportedStore {
                 actual: Some(previous_schema_version),
                 expected: WORKFLOW_STORE_SCHEMA_VERSION,
             });
         }
-        if previous_schema_version >= 34 {
-            recovery::verify_barriers(&transaction)?;
-        }
-        if previous_schema_version >= 35 {
-            transaction.prepare(
-                "SELECT run_id, after_dispatch_identity FROM workflow_receipt_cursors LIMIT 0",
-            )?;
-        }
+        verify_upgrade_recovery_source(&transaction, previous_schema_version)?;
         let backup_directory = root.join(MIGRATION_BACKUP_DIRECTORY);
         std::fs::create_dir_all(&backup_directory)?;
         let mut backup_path = backup_directory.join(format!("workflow-{migrated_at_ms}.db"));
@@ -4598,6 +4591,82 @@ impl WorkflowStore {
         create_run_in_transaction(&transaction, run)?;
         transaction.commit()?;
         Ok(())
+    }
+
+    /// Persist an authorized successor intent and stop old admission atomically.
+    ///
+    /// This does not create or dispatch the successor, nor claim child cancellation.
+    /// The application must independently authorize the successor before calling.
+    /// Identical retries are idempotent; conflicting successors are rejected.
+    ///
+    /// # Errors
+    /// Rejects stale authority, invalid successor, mismatched binding, conflicting intent,
+    /// terminal old runs, oversized payloads, or storage failure.
+    pub fn request_replacement_owned(
+        &mut self,
+        old_run_id: &str,
+        authority: &WorkflowExecutionAuthority,
+        successor: &NewWorkflowRun,
+        now_ms: u64,
+    ) -> Result<bool, WorkflowStoreError> {
+        validate_run(successor)?;
+        let binding = successor
+            .binding
+            .as_ref()
+            .filter(|binding| binding.single_active)
+            .ok_or_else(|| {
+                WorkflowStoreError::InvalidData(
+                    "replacement requires a single-active binding".into(),
+                )
+            })?;
+        if successor.run_id == old_run_id {
+            return Err(WorkflowStoreError::InvalidData(
+                "replacement must use a new run identity".into(),
+            ));
+        }
+        let payload = serde_json::to_string(successor)?;
+        if payload.len() > MAX_INLINE_JSON_BYTES {
+            return Err(WorkflowStoreError::InvalidData(
+                "replacement intent exceeds inline limit".into(),
+            ));
+        }
+        let tx = self.connection.unchecked_transaction()?;
+        self.verify_execution_authority(old_run_id, authority)?;
+        let existing: Option<String> = tx.query_row(
+            "SELECT CASE WHEN length(CAST(successor_json AS BLOB)) <= ?2 THEN successor_json ELSE NULL END FROM workflow_replacement_intents WHERE old_run_id = ?1",
+            rusqlite::params![old_run_id, MAX_INLINE_JSON_BYTES], |row| row.get(0),
+        ).optional()?;
+        if let Some(existing) = existing {
+            if existing != payload {
+                return Err(WorkflowStoreError::InvalidData(
+                    "conflicting replacement intent".into(),
+                ));
+            }
+            return Ok(false);
+        }
+        let matches: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM workflow_runs WHERE run_id=?1 AND owner_plugin_id=?2 AND workflow_kind=?3 AND scope_key=?4 AND single_active=1 AND status IN ('running','paused','repair_required'))",
+            (old_run_id, &binding.owner_plugin_id, &binding.workflow_kind, &binding.scope_key), |row| row.get(0),
+        )?;
+        if !matches {
+            return Err(WorkflowStoreError::InvalidData(
+                "replacement binding or old run state does not match".into(),
+            ));
+        }
+        tx.execute(
+            "INSERT INTO workflow_replacement_intents VALUES (?1,?2,?3,?4)",
+            (old_run_id, &successor.run_id, payload, now_ms),
+        )?;
+        tx.execute("UPDATE workflow_runs SET cancellation_requested_at_ms=COALESCE(cancellation_requested_at_ms,?2), updated_at_ms=?2 WHERE run_id=?1", (old_run_id, now_ms))?;
+        append_event(
+            &tx,
+            old_run_id,
+            "replacement_requested",
+            &serde_json::json!({"successor_run_id": successor.run_id}).to_string(),
+            now_ms,
+        )?;
+        tx.commit()?;
+        Ok(true)
     }
 
     /// Atomically create and link one exact child run before parent admission completes.
@@ -7977,6 +8046,36 @@ impl WorkflowStore {
             .query_map(rusqlite::params![after_run_id, limit], |row| row.get(0))?
             .collect::<Result<Vec<_>, _>>()
             .map_err(WorkflowStoreError::from)
+    }
+
+    /// Discover the next bounded page, durably rotating this artifact's sweep cursor.
+    ///
+    /// Discovery grants no execution authority. A crash may skip a returned page for
+    /// the current sweep, but wraparound revisits it; no canonical work is acknowledged.
+    /// Separate artifacts cannot consume each other's discovery progress.
+    ///
+    /// # Errors
+    /// Rejects invalid bounds, malformed identities, damaged cursors, or storage errors.
+    pub fn advance_continuation_discovery(
+        &mut self,
+        artifact_id: &str,
+        limit: usize,
+    ) -> Result<Vec<String>, WorkflowStoreError> {
+        validate_id("discovery artifact", artifact_id)?;
+        bounded_limit(limit)?;
+        let tx = self.connection.unchecked_transaction()?;
+        let cursor: String = tx.query_row(
+            "SELECT CASE WHEN typeof(after_run_id) = 'text' AND length(CAST(after_run_id AS BLOB)) <= 1024 THEN after_run_id ELSE NULL END FROM workflow_discovery_cursors WHERE artifact_id = ?1",
+            [artifact_id], |row| row.get(0),
+        ).optional()?.unwrap_or_default();
+        let page = self.continuation_run_ids_after(&cursor, limit)?;
+        let next = page.last().map_or("", String::as_str);
+        tx.execute(
+            "INSERT INTO workflow_discovery_cursors(artifact_id, after_run_id) VALUES (?1, ?2) ON CONFLICT(artifact_id) DO UPDATE SET after_run_id = excluded.after_run_id",
+            (artifact_id, next),
+        )?;
+        tx.commit()?;
+        Ok(page)
     }
 
     /// Return bounded artifact identities that still own resumable workflow runs.
@@ -15903,6 +16002,15 @@ fn create_run_in_transaction_diagnosed(
         && binding.single_active
     {
         *operation = "check_single_active_binding";
+        let reserved: bool = transaction.query_row(
+            "SELECT EXISTS(SELECT 1 FROM workflow_replacement_intents replacement JOIN workflow_runs old ON old.run_id=replacement.old_run_id WHERE old.owner_plugin_id=?1 AND old.workflow_kind=?2 AND old.scope_key=?3)",
+            (&binding.owner_plugin_id, &binding.workflow_kind, &binding.scope_key), |row| row.get(0),
+        )?;
+        if reserved {
+            return Err(WorkflowStoreError::InvalidData(
+                "single-active binding reserved by pending replacement".into(),
+            ));
+        }
         let active: Option<(String, RunStatus)> = transaction
             .query_row(
                 "SELECT run_id, status FROM workflow_runs WHERE owner_plugin_id = ?1 \
@@ -17499,6 +17607,30 @@ fn verify_store_schema(connection: &Connection) -> Result<(), WorkflowStoreError
     )?;
     connection
         .prepare("SELECT run_id, package_id, lock_digest FROM workflow_run_packages LIMIT 0")?;
+    Ok(())
+}
+
+fn verify_upgrade_recovery_source(
+    transaction: &Connection,
+    previous_schema_version: u32,
+) -> Result<(), WorkflowStoreError> {
+    if previous_schema_version >= 34 {
+        recovery::verify_barriers(transaction)?;
+    }
+    if previous_schema_version >= 35 {
+        transaction.prepare(
+            "SELECT run_id, after_dispatch_identity FROM workflow_receipt_cursors LIMIT 0",
+        )?;
+    }
+    if previous_schema_version >= 36 {
+        transaction.prepare(
+                "SELECT dispatch_identity FROM workflow_attempts INDEXED BY workflow_receipt_recovery_page WHERE run_id = ?1 AND dispatch_identity > ?2 AND status IN ('admitted', 'running', 'cancelling', 'sibling_cancelling') AND receipt_json IS NOT NULL ORDER BY dispatch_identity LIMIT 1",
+            )?;
+    }
+    if previous_schema_version >= 37 {
+        transaction
+            .prepare("SELECT artifact_id, after_run_id FROM workflow_discovery_cursors LIMIT 0")?;
+    }
     Ok(())
 }
 
@@ -19197,6 +19329,81 @@ mod tests {
         };
         assert!(store.create_run(&run).is_err());
         assert!(store.run_summary("run-1").expect("summary").is_none());
+    }
+
+    #[test]
+    fn replacement_intent_survives_restart_and_reserves_terminal_binding() {
+        let temp = tempfile::tempdir().expect("temp");
+        let mut store = WorkflowStore::open_in_state_dir(temp.path()).expect("store");
+        store
+            .persist_definition("example", 1, &definition("example"))
+            .expect("definition");
+        let authority = WorkflowExecutionAuthority {
+            target_artifact_id: "artifact".into(),
+            daemon_instance_id: "daemon".into(),
+            generation: 1,
+            fencing_token: "fence".into(),
+        };
+        let old = NewWorkflowRun {
+            binding: Some(WorkflowRunBinding {
+                owner_plugin_id: "test".into(),
+                workflow_kind: "test".into(),
+                scope_key: "session".into(),
+                display_label: None,
+                single_active: true,
+            }),
+            execution_authority: Some(authority.clone()),
+            ..new_run()
+        };
+        store.create_run(&old).expect("old");
+        let successor = NewWorkflowRun {
+            run_id: "successor".into(),
+            ..old.clone()
+        };
+        assert!(
+            store
+                .request_replacement_owned(&old.run_id, &authority, &successor, 20)
+                .expect("intent")
+        );
+        drop(store);
+        let mut store = WorkflowStore::open_in_state_dir(temp.path()).expect("restart");
+        assert!(
+            !store
+                .request_replacement_owned(&old.run_id, &authority, &successor, 21)
+                .expect("retry")
+        );
+        assert_eq!(
+            store
+                .run_summary(&old.run_id)
+                .expect("summary")
+                .expect("old")
+                .cancellation_requested_at_ms,
+            Some(20)
+        );
+        let conflicting = NewWorkflowRun {
+            run_id: "conflict".into(),
+            ..successor.clone()
+        };
+        assert!(
+            store
+                .request_replacement_owned(&old.run_id, &authority, &conflicting, 22)
+                .is_err()
+        );
+        store
+            .connection
+            .execute(
+                "UPDATE workflow_runs SET status='cancelled' WHERE run_id=?1",
+                [&old.run_id],
+            )
+            .expect("settled fixture");
+        assert!(store.create_run(&successor).is_err());
+        assert!(store.create_run(&conflicting).is_err());
+        assert!(
+            store
+                .run_summary("successor")
+                .expect("not admitted")
+                .is_none()
+        );
     }
 
     #[test]
@@ -23678,6 +23885,58 @@ mod tests {
     }
 
     #[test]
+    fn schema_37_upgrade_preserves_discovery_and_adds_replacement_intents() {
+        let (temp, mut store) = initialized_store();
+        store
+            .advance_continuation_discovery("artifact", 1)
+            .expect("cursor");
+        store.connection.execute_batch("DROP TABLE workflow_replacement_intents; UPDATE workflow_store_contract SET schema_version=37;").expect("old schema");
+        drop(store);
+        let mut store = WorkflowStore::initialize_in_state_dir(temp.path(), 1001).expect("upgrade");
+        assert!(
+            store
+                .advance_continuation_discovery("artifact", 1)
+                .expect("retained cursor")
+                .is_empty()
+        );
+        recovery::verify(&store.connection).expect("current schema");
+        store
+            .connection
+            .execute_batch("DROP TABLE workflow_replacement_intents")
+            .expect("damage");
+        drop(store);
+        assert!(WorkflowStore::initialize_in_state_dir(temp.path(), 1002).is_err());
+    }
+
+    #[test]
+    fn schema_36_upgrade_adds_durable_discovery_without_changing_authority() {
+        let (temp, mut store, run, authority, _) = connected_publication_fixture();
+        store
+            .enter_recovery_only(&run.run_id, &authority, 20)
+            .expect("barrier");
+        store.connection.execute_batch("DROP TABLE workflow_discovery_cursors; UPDATE workflow_store_contract SET schema_version = 36;").expect("previous schema");
+        drop(store);
+        let mut store = WorkflowStore::initialize_in_state_dir(temp.path(), 999).expect("upgrade");
+        assert_eq!(
+            store.execution_authority(&run.run_id).expect("authority"),
+            Some(authority)
+        );
+        assert!(store.is_recovery_only(&run.run_id).expect("barrier"));
+        assert_eq!(
+            store
+                .advance_continuation_discovery("artifact", 1)
+                .expect("page"),
+            [run.run_id]
+        );
+        store
+            .connection
+            .execute_batch("DROP TABLE workflow_discovery_cursors")
+            .expect("damage");
+        drop(store);
+        assert!(WorkflowStore::initialize_in_state_dir(temp.path(), 1000).is_err());
+    }
+
+    #[test]
     fn schema_35_index_upgrade_preserves_recovery_cursor_and_barrier() {
         let (temp, mut store, run, authority, _) = connected_publication_fixture();
         store
@@ -24050,6 +24309,114 @@ mod tests {
             )
             .expect("uncommitted migration");
         std::process::exit(73);
+    }
+
+    #[test]
+    fn cancellation_process_loss_child() {
+        let Ok(root) = std::env::var("BCODE_TEST_CANCELLATION_CRASH_ROOT") else {
+            return;
+        };
+        let mut store = initialized_store_at(Path::new(&root));
+        prepare_receipt_backed_attempt(&mut store, DispatchSideEffect::Mutating);
+        store.connection.execute_batch("UPDATE workflow_runs SET target_artifact_id='old-artifact', coordinator_daemon_instance_id='old-daemon', coordinator_generation=1, coordinator_fencing_token='old-fence' WHERE run_id='run-1'").expect("fixture authority");
+        let authority = store
+            .execution_authority("run-1")
+            .expect("authority")
+            .expect("owner");
+        store
+            .request_cancellation_owned("run-1", 20, &authority)
+            .expect("durable intent");
+        // Intentionally skip destructors, receipt observation, and cursor advancement.
+        std::process::exit(73);
+    }
+
+    #[tokio::test]
+    async fn cancellation_process_loss_preserves_intent_and_fences_takeover() {
+        struct Cancelled;
+        impl AsyncAttemptStatusObserver for Cancelled {
+            fn observe_async<'a>(
+                &'a self,
+                _: &'a AttemptReconciliationRequest,
+            ) -> Pin<
+                Box<
+                    dyn Future<Output = Result<AttemptObservation, WorkflowStoreError>> + Send + 'a,
+                >,
+            > {
+                Box::pin(async { Ok(AttemptObservation::Cancelled) })
+            }
+        }
+        let temp = tempfile::tempdir().expect("temp");
+        let status = std::process::Command::new(std::env::current_exe().expect("executable"))
+            .args(["--exact", "tests::cancellation_process_loss_child"])
+            .env("BCODE_TEST_CANCELLATION_CRASH_ROOT", temp.path())
+            .status()
+            .expect("child");
+        assert_eq!(status.code(), Some(73));
+        let mut store = WorkflowStore::open_in_state_dir(temp.path()).expect("restart");
+        let old = store
+            .execution_authority("run-1")
+            .expect("authority")
+            .expect("owner");
+        assert_eq!(
+            store
+                .run_summary("run-1")
+                .expect("summary")
+                .expect("run")
+                .cancellation_requested_at_ms,
+            Some(20)
+        );
+        let next = WorkflowExecutionAuthority {
+            target_artifact_id: "new-artifact".into(),
+            daemon_instance_id: "new-daemon".into(),
+            generation: old.generation + 1,
+            fencing_token: "new-fence".into(),
+        };
+        store
+            .take_recovery_authority(
+                "run-1",
+                &old,
+                &next,
+                &EndedOwnerEvidence {
+                    ended_daemon_instance_id: old.daemon_instance_id.clone(),
+                    ended_target_artifact_id: old.target_artifact_id.clone(),
+                    liveness: EndedOwnerLiveness::ObservedEnded,
+                    artifact_image_available: false,
+                },
+                21,
+            )
+            .expect("takeover after observed child exit");
+        assert!(store.request_cancellation_owned("run-1", 22, &old).is_err());
+        assert!(recovery::require_execution(&store.connection, "run-1").is_err());
+        let result = store
+            .advance_receipt_recovery(&Cancelled, "run-1", &next, 1, 23)
+            .await
+            .expect("settle");
+        assert_eq!(result.cancelled.len(), 1);
+        assert_eq!(
+            store
+                .run_summary("run-1")
+                .expect("summary")
+                .expect("run")
+                .status,
+            RunStatus::Cancelled
+        );
+        drop(store);
+        let store = WorkflowStore::open_in_state_dir(temp.path()).expect("second restart");
+        assert_eq!(
+            store
+                .attempt_history("run-1", None, 10)
+                .expect("attempts")
+                .len(),
+            1
+        );
+        assert_eq!(
+            store
+                .run_summary("run-1")
+                .expect("summary")
+                .expect("run")
+                .status,
+            RunStatus::Cancelled
+        );
     }
 
     #[test]
@@ -41937,6 +42304,70 @@ mod tests {
         assert_eq!(events.len(), 2);
         assert_eq!(events[0].event_type, "run_created");
         assert_eq!(events[1].event_type, "activation_created");
+    }
+
+    #[test]
+    fn durable_discovery_survives_restart_and_isolates_artifacts() {
+        let temp = tempfile::tempdir().expect("temp");
+        let mut store = WorkflowStore::open_in_state_dir(temp.path()).expect("store");
+        store
+            .persist_definition("example", 1, &definition("example"))
+            .expect("definition");
+        for id in ["a", "b", "c"] {
+            let mut run = new_run();
+            run.run_id = id.into();
+            store.create_run(&run).expect("run");
+        }
+        assert_eq!(
+            store
+                .advance_continuation_discovery("artifact-a", 1)
+                .expect("first"),
+            ["a"]
+        );
+        drop(store);
+        let mut store = WorkflowStore::open_in_state_dir(temp.path()).expect("restart");
+        assert_eq!(
+            store
+                .advance_continuation_discovery("artifact-a", 1)
+                .expect("second"),
+            ["b"]
+        );
+        assert_eq!(
+            store
+                .advance_continuation_discovery("artifact-b", 1)
+                .expect("independent"),
+            ["a"]
+        );
+        assert_eq!(
+            store
+                .advance_continuation_discovery("artifact-a", 1)
+                .expect("third"),
+            ["c"]
+        );
+        assert!(
+            store
+                .advance_continuation_discovery("artifact-a", 1)
+                .expect("end")
+                .is_empty()
+        );
+        assert_eq!(
+            store
+                .advance_continuation_discovery("artifact-a", 1)
+                .expect("revisit"),
+            ["a"]
+        );
+        store.connection.execute("UPDATE workflow_discovery_cursors SET after_run_id = zeroblob(1000000) WHERE artifact_id = 'artifact-a'", []).expect("damage");
+        assert!(
+            store
+                .advance_continuation_discovery("artifact-a", 1)
+                .is_err()
+        );
+        assert_eq!(
+            store
+                .advance_continuation_discovery("artifact-b", 1)
+                .expect("isolated"),
+            ["b"]
+        );
     }
 
     #[test]

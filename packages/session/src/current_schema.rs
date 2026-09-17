@@ -109,6 +109,18 @@ fn add_session_execution_migrations(source: &mut CodeMigrationSource<'static>) {
         "CREATE TABLE usage_valuation_staging (request_key TEXT PRIMARY KEY, usage_json TEXT NOT NULL, cost_json TEXT NOT NULL)",
         "DROP TABLE usage_valuation_staging",
     );
+    add_sql_migration(
+        source,
+        "042_turn_evidence",
+        "CREATE TABLE turn_evidence (turn_id TEXT NOT NULL, evidence_kind TEXT NOT NULL, segment_order INTEGER NOT NULL, event_seq INTEGER NOT NULL, PRIMARY KEY(turn_id, evidence_kind, segment_order, event_seq), FOREIGN KEY(event_seq) REFERENCES events(event_seq))",
+        "DROP TABLE turn_evidence",
+    );
+    add_sql_migration(
+        source,
+        "043_turn_evidence_terminal_index",
+        "CREATE INDEX idx_turn_evidence_sequence ON turn_evidence(turn_id, evidence_kind, event_seq)",
+        "DROP INDEX idx_turn_evidence_sequence",
+    );
 }
 
 fn add_session_base_migrations(source: &mut CodeMigrationSource<'static>) {
