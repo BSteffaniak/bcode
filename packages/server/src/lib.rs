@@ -5542,6 +5542,7 @@ const fn request_kind(request: &Request) -> &'static str {
         Request::WorkflowRunStatus { .. } => "workflow_run_status",
         Request::AssociatedWorkflowRun { .. } => "associated_workflow_run",
         Request::InspectAssociatedWorkflowRun { .. } => "inspect_associated_workflow_run",
+        Request::ControlWorkflowRun { .. } => "control_workflow_run",
         Request::ControlAssociatedWorkflowRun { .. } => "control_associated_workflow_run",
         Request::ListWorkflowRuns { .. } => "list_workflow_runs",
         Request::WorkflowRunOutputs { .. } => "workflow_run_outputs",
@@ -7407,6 +7408,21 @@ async fn handle_workflow_run_request(
                 Ok(inspection) => Response::Ok(ResponsePayload::AssociatedWorkflowRunInspection {
                     inspection: inspection.map(Box::new),
                 }),
+                Err(failure) => Response::Err(ErrorResponse::new(failure.code, failure.message)),
+            };
+            send_response(writer, request_id, response).await
+        }
+        RuntimeAndModelRequest::ControlWorkflowRun { run_id, action } => {
+            let result = bcode_workflow::WorkflowRunApplication::control_workflow_run(
+                &workflow_operations::WorkflowAuthoringApplication::new(state, client_id),
+                run_id,
+                action,
+            )
+            .await;
+            let response = match result {
+                Ok((run, changed)) => {
+                    Response::Ok(ResponsePayload::AssociatedWorkflowRunControlled { run, changed })
+                }
                 Err(failure) => Response::Err(ErrorResponse::new(failure.code, failure.message)),
             };
             send_response(writer, request_id, response).await
@@ -68987,9 +69003,9 @@ event_symbol = "bcode_plugin_handle_event_v1"
             "fixture policy must not authorize replacement completion"
         );
         verify_foreign_replacement_withdrawal(state, key, &old_id, &authority).await;
-        let (run, changed) = workflow_operations::control_associated_run(
+        let (run, changed) = workflow_operations::control_exact_run(
             state,
-            key,
+            &old_id,
             bcode_workflow::WorkflowRunControlAction::WithdrawReplacement,
         )
         .await

@@ -579,6 +579,10 @@ pub enum RuntimeAndModelRequest {
         limit: usize,
     },
     /// Apply one lifecycle transition to the newest run for one exact binding key.
+    ControlWorkflowRun {
+        run_id: String,
+        action: WorkflowRunControlAction,
+    },
     ControlAssociatedWorkflowRun {
         key: WorkflowRunBindingLookup,
         action: WorkflowRunControlAction,
@@ -1284,6 +1288,12 @@ impl RoutedRequest {
             Request::InspectAssociatedWorkflowRun { key, limit } => Self::RuntimeAndModel(
                 Box::new(RuntimeAndModelRequest::InspectAssociatedWorkflowRun { key, limit }),
             ),
+            Request::ControlWorkflowRun { run_id, action } => {
+                Self::RuntimeAndModel(Box::new(RuntimeAndModelRequest::ControlWorkflowRun {
+                    run_id,
+                    action,
+                }))
+            }
             Request::ControlAssociatedWorkflowRun { key, action } => Self::RuntimeAndModel(
                 Box::new(RuntimeAndModelRequest::ControlAssociatedWorkflowRun { key, action }),
             ),

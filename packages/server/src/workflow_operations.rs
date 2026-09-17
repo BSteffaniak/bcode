@@ -461,6 +461,18 @@ impl bcode_workflow::WorkflowRunApplication for WorkflowAuthoringApplication<'_>
             .map(|value| value.map(|inspection| *inspection))
             .map_err(run_operation_failure)
     }
+    async fn control_workflow_run(
+        &self,
+        run_id: String,
+        action: bcode_workflow::WorkflowRunControlAction,
+    ) -> Result<(Option<bcode_workflow::WorkflowRunSummary>, bool), Self::Error> {
+        self.state
+            .require_workflow_store()
+            .map_err(run_operation_failure)?;
+        control_exact_run(self.state, &run_id, action)
+            .await
+            .map_err(run_operation_failure)
+    }
     async fn control_associated_workflow_run(
         &self,
         key: bcode_workflow::WorkflowRunBindingLookup,
@@ -8957,6 +8969,23 @@ pub async fn control_associated_run(
     action: bcode_workflow::WorkflowRunControlAction,
 ) -> Result<(Option<bcode_workflow_store::WorkflowRunSummary>, bool), super::ServerError> {
     let run = associated_run(state, key)?;
+    let Some(run) = run else {
+        return Ok((None, false));
+    };
+    control_exact_run(state, &run.run_id, action).await
+}
+
+/// Control an exact run, preserving its identity across asynchronous ownership checks.
+pub async fn control_exact_run(
+    state: &std::sync::Arc<ServerState>,
+    run_id: &str,
+    action: bcode_workflow::WorkflowRunControlAction,
+) -> Result<(Option<bcode_workflow_store::WorkflowRunSummary>, bool), super::ServerError> {
+    let run = state
+        .workflow_store
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .run_summary(run_id)?;
     let changed = if let Some(run) = &run {
         match action {
             bcode_workflow::WorkflowRunControlAction::CompleteReplacement => {
@@ -9046,7 +9075,12 @@ pub async fn control_associated_run(
     } else {
         false
     };
-    Ok((associated_run(state, key)?, changed))
+    let run = state
+        .workflow_store
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .run_summary(run_id)?;
+    Ok((run, changed))
 }
 
 /// Apply one explicit repair resolution to an exact workflow attempt.

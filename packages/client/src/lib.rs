@@ -614,6 +614,13 @@ impl bcode_workflow::WorkflowRunApplication for BcodeClient {
     ) -> Result<Option<bcode_workflow::WorkflowRunInspection>, Self::Error> {
         Self::inspect_associated_workflow_run(self, key, limit).await
     }
+    async fn control_workflow_run(
+        &self,
+        run_id: String,
+        action: bcode_workflow::WorkflowRunControlAction,
+    ) -> Result<(Option<bcode_workflow::WorkflowRunSummary>, bool), Self::Error> {
+        Self::control_workflow_run(self, run_id, action).await
+    }
     async fn control_associated_workflow_run(
         &self,
         key: bcode_workflow::WorkflowRunBindingLookup,
@@ -5167,6 +5174,28 @@ impl BcodeClient {
     ///
     /// Returns an error when the daemon cannot be reached, lookup fails, or the transition is not
     /// valid for the associated run.
+    /// Control one exact workflow run.
+    ///
+    /// # Errors
+    /// Returns transport, ownership, policy, or transition errors from the application.
+    pub async fn control_workflow_run(
+        &self,
+        run_id: String,
+        action: bcode_workflow::WorkflowRunControlAction,
+    ) -> Result<(Option<bcode_workflow::WorkflowRunSummary>, bool), ClientError> {
+        match self
+            .send_request(Request::ControlWorkflowRun { run_id, action })
+            .await?
+        {
+            ResponsePayload::AssociatedWorkflowRunControlled { run, changed } => Ok((run, changed)),
+            _ => Err(ClientError::UnexpectedResponse),
+        }
+    }
+
+    /// Control the newest run for one binding.
+    ///
+    /// # Errors
+    /// Returns transport, ownership, policy, or transition errors from the application.
     pub async fn control_associated_workflow_run(
         &self,
         key: bcode_workflow::WorkflowRunBindingLookup,

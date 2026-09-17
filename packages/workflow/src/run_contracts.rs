@@ -424,6 +424,16 @@ pub trait WorkflowRunApplication: Sync {
     /// # Errors
     /// Returns an error on unavailable state, foreign ownership, invalid transitions,
     /// cancellation propagation failure, or transport failure.
+    /// Control one exact run without associated-binding selection.
+    ///
+    /// # Errors
+    /// Rejects missing runs, foreign ownership, denied policy, or invalid transitions.
+    fn control_workflow_run(
+        &self,
+        run_id: String,
+        action: WorkflowRunControlAction,
+    ) -> impl std::future::Future<Output = Result<(Option<WorkflowRunSummary>, bool), Self::Error>> + Send;
+
     fn control_associated_workflow_run(
         &self,
         key: WorkflowRunBindingLookup,

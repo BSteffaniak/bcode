@@ -740,6 +740,11 @@ pub enum Request {
         limit: usize,
     },
     /// Apply one lifecycle transition to the newest run for one exact binding key.
+    /// Control one exact run without newest-binding selection.
+    ControlWorkflowRun {
+        run_id: String,
+        action: WorkflowRunControlAction,
+    },
     ControlAssociatedWorkflowRun {
         key: WorkflowRunBindingLookup,
         action: WorkflowRunControlAction,

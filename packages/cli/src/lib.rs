@@ -867,6 +867,19 @@ async fn handle_ralph_command(command: RalphCommand) -> Result<(), CliError> {
     Ok(())
 }
 
+async fn control_cli_replacement(run_id: &str, action: &str) -> Result<(), CliError> {
+    let action = if action == "complete" {
+        bcode_workflow::WorkflowRunControlAction::CompleteReplacement
+    } else {
+        bcode_workflow::WorkflowRunControlAction::WithdrawReplacement
+    };
+    print_json(
+        &BcodeClient::default_endpoint()
+            .control_workflow_run(run_id.to_owned(), action)
+            .await?,
+    )
+}
+
 async fn request_cli_replacement(path: &Path) -> Result<(), CliError> {
     let request = serde_json::from_value(read_bounded_json(path)?)
         .map_err(|_| CliError::InvalidArguments("invalid workflow replacement request".into()))?;
@@ -1055,6 +1068,9 @@ async fn handle_workflow_command(command: Box<WorkflowCommand>) -> Result<(), Cl
         ))
         .await;
     }
+    if let WorkflowCommand::ControlReplacement { run_id, action } = command.as_ref() {
+        return control_cli_replacement(run_id, action).await;
+    }
     if let WorkflowCommand::RequestReplacement { request, yes: _ } = command.as_ref() {
         return request_cli_replacement(request).await;
     }
@@ -1216,6 +1232,7 @@ async fn dispatch_workflow_command(command: Box<WorkflowCommand>) -> Result<(), 
         | WorkflowCommand::Watch
         | WorkflowCommand::CatchUp { .. }
         | WorkflowCommand::RepairAttempt { .. }
+        | WorkflowCommand::ControlReplacement { .. }
         | WorkflowCommand::RequestReplacement { .. }
         | WorkflowCommand::AssociatedRun { .. }
         | WorkflowCommand::PackagePublication { .. }
@@ -4109,6 +4126,12 @@ enum WorkflowCommand {
         #[arg(long, required = true)]
         yes: bool,
     },
+    /// Complete or withdraw a replacement on one exact run, not its newest sibling.
+    ControlReplacement {
+        run_id: String,
+        #[arg(value_parser = ["complete", "withdraw"])]
+        action: String,
+    },
     /// Persist a replacement intent; does not imply successor execution has begun.
     RequestReplacement {
         /// `WorkflowReplacementRequest` JSON file, or - for stdin.
@@ -6707,6 +6730,40 @@ async fn handle_session_command(command: Box<SessionCommand>) -> Result<(), CliE
 
 #[cfg(test)]
 mod replacement_control_cli_tests {
+    #[test]
+    fn exact_replacement_control_requires_run_and_known_action() {
+        use clap::Parser as _;
+        assert!(
+            super::Cli::try_parse_from([
+                "bcode",
+                "workflow",
+                "control-replacement",
+                "run-1",
+                "complete"
+            ])
+            .is_ok()
+        );
+        assert!(
+            super::Cli::try_parse_from([
+                "bcode",
+                "workflow",
+                "control-replacement",
+                "run-1",
+                "withdraw"
+            ])
+            .is_ok()
+        );
+        assert!(
+            super::Cli::try_parse_from([
+                "bcode",
+                "workflow",
+                "control-replacement",
+                "run-1",
+                "replace"
+            ])
+            .is_err()
+        );
+    }
     #[test]
     fn replacement_admission_requires_confirmation() {
         use clap::Parser as _;
