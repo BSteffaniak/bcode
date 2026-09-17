@@ -5929,13 +5929,34 @@ pub async fn execution_authority(
         generation: current.generation.saturating_add(1),
         fencing_token: uuid::Uuid::new_v4().to_string(),
     };
+    transfer_ended_workflow_owner(state, run_id, &current, &replacement)?;
+    Ok(Some(AuthorityGuard {
+        authority: replacement,
+        _session_ownership: Some(session_ownership),
+    }))
+}
+
+fn transfer_ended_workflow_owner(
+    state: &ServerState,
+    run_id: &str,
+    current: &bcode_workflow_store::WorkflowExecutionAuthority,
+    replacement: &bcode_workflow_store::WorkflowExecutionAuthority,
+) -> Result<(), super::ServerError> {
     let now_ms = super::current_unix_millis();
     let mut store = state
         .workflow_store
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    if current.target_artifact_id == artifact_id {
-        store.transfer_execution_authority(run_id, &current, &replacement, now_ms)?;
+    let terminal_descendant = store.run_summary(run_id)?.is_some_and(|run| {
+        matches!(
+            run.status,
+            bcode_workflow_store::RunStatus::Completed
+                | bcode_workflow_store::RunStatus::Failed
+                | bcode_workflow_store::RunStatus::Cancelled
+        )
+    }) && store.parent_run_link(run_id)?.is_some();
+    if current.target_artifact_id == replacement.target_artifact_id && !terminal_descendant {
+        store.transfer_execution_authority(run_id, current, replacement, now_ms)?;
     } else {
         let evidence = bcode_workflow_store::EndedOwnerEvidence {
             ended_daemon_instance_id: current.daemon_instance_id.clone(),
@@ -5947,7 +5968,17 @@ pub async fn execution_authority(
                 &current.target_artifact_id,
             ),
         };
-        store.take_recovery_authority(run_id, &current, &replacement, &evidence, now_ms)?;
+        if terminal_descendant {
+            store.take_descendant_proof_authority(
+                run_id,
+                current,
+                replacement,
+                &evidence,
+                now_ms,
+            )?;
+        } else {
+            store.take_recovery_authority(run_id, current, replacement, &evidence, now_ms)?;
+        }
         tracing::info!(
             target: "bcode_server::workflow",
             run_id,
@@ -5958,10 +5989,7 @@ pub async fn execution_authority(
         );
     }
     drop(store);
-    Ok(Some(AuthorityGuard {
-        authority: replacement,
-        _session_ownership: Some(session_ownership),
-    }))
+    Ok(())
 }
 
 pub fn validate_workflow_definition_for_production(
@@ -8632,7 +8660,33 @@ pub async fn recover_parent_cancellation(state: &std::sync::Arc<ServerState>, ru
 }
 
 /// Advance terminal subtree proof only for this daemon's current durable authority.
-pub fn recover_subtree_quiescence(state: &ServerState, run_id: &str) {
+pub async fn recover_subtree_quiescence(state: &std::sync::Arc<ServerState>, run_id: &str) {
+    let needs_takeover = {
+        let store = state
+            .workflow_store
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        store.run_summary(run_id).is_ok_and(|run| {
+            run.is_some_and(|run| {
+                matches!(
+                    run.status,
+                    bcode_workflow_store::RunStatus::Completed
+                        | bcode_workflow_store::RunStatus::Failed
+                        | bcode_workflow_store::RunStatus::Cancelled
+                )
+            })
+        }) && store
+            .parent_run_link(run_id)
+            .is_ok_and(|link| link.is_some())
+    };
+    let _authority = if needs_takeover {
+        match execution_authority(state, run_id).await {
+            Ok(authority) => authority,
+            Err(_) => return,
+        }
+    } else {
+        None
+    };
     let result = (|| -> Result<(), bcode_workflow_store::WorkflowStoreError> {
         let mut store = state
             .workflow_store

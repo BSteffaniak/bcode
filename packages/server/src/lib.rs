@@ -2643,7 +2643,7 @@ impl ServerState {
                             }
                             // Terminal old runs may still hold a replacement reservation.
                             // Completion independently rechecks policy and durable ownership.
-                            workflow_operations::recover_subtree_quiescence(&state, &run_id);
+                            workflow_operations::recover_subtree_quiescence(&state, &run_id).await;
                             workflow_operations::recover_pending_replacement(&state, &run_id).await;
                         }
                         recovery_tick.reset();

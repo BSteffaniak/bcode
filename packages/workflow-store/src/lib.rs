@@ -4135,6 +4135,48 @@ impl WorkflowStore {
         evidence: &EndedOwnerEvidence,
         now_ms: u64,
     ) -> Result<(), WorkflowStoreError> {
+        self.take_recovery_authority_with_terminal_proof(
+            run_id,
+            expected,
+            replacement,
+            evidence,
+            now_ms,
+            false,
+        )
+    }
+
+    /// Acquire proof-only recovery authority for a terminal descendant after verified owner loss.
+    /// This preserves its terminal outcome and installs the ordinary recovery dispatch barrier.
+    ///
+    /// # Errors
+    /// Rejects missing parent links, nonterminal runs, stale ownership, or invalid ended-owner evidence.
+    pub fn take_descendant_proof_authority(
+        &mut self,
+        run_id: &str,
+        expected: &WorkflowExecutionAuthority,
+        replacement: &WorkflowExecutionAuthority,
+        evidence: &EndedOwnerEvidence,
+        now_ms: u64,
+    ) -> Result<(), WorkflowStoreError> {
+        self.take_recovery_authority_with_terminal_proof(
+            run_id,
+            expected,
+            replacement,
+            evidence,
+            now_ms,
+            true,
+        )
+    }
+
+    fn take_recovery_authority_with_terminal_proof(
+        &self,
+        run_id: &str,
+        expected: &WorkflowExecutionAuthority,
+        replacement: &WorkflowExecutionAuthority,
+        evidence: &EndedOwnerEvidence,
+        now_ms: u64,
+        terminal_proof: bool,
+    ) -> Result<(), WorkflowStoreError> {
         validate_id("run_id", run_id)?;
         if evidence.liveness != EndedOwnerLiveness::ObservedEnded
             || evidence.ended_daemon_instance_id != expected.daemon_instance_id
@@ -4152,6 +4194,14 @@ impl WorkflowStore {
         validate_id("replacement fence", &replacement.fencing_token)?;
         let tx = self.connection.unchecked_transaction()?;
         self.verify_execution_authority(run_id, expected)?;
+        if terminal_proof {
+            let terminal: bool = tx.query_row("SELECT status IN ('completed','failed','cancelled') FROM workflow_runs WHERE run_id=?1", [run_id], |row| row.get(0))?;
+            if !terminal || self.parent_run_link(run_id)?.is_none() {
+                return Err(WorkflowStoreError::InvalidData(
+                    "proof takeover requires a terminal descendant".into(),
+                ));
+            }
+        }
         tx.execute(
             "INSERT OR IGNORE INTO workflow_recovery_barriers VALUES (?1, ?2, ?3)",
             rusqlite::params![run_id, expected.target_artifact_id, now_ms],
@@ -4160,14 +4210,15 @@ impl WorkflowStore {
             "UPDATE workflow_runs SET target_artifact_id = ?2, coordinator_daemon_instance_id = ?3,
              coordinator_generation = ?4, coordinator_fencing_token = ?5,
              status = CASE WHEN status = 'running' THEN 'paused' ELSE status END, updated_at_ms = ?6
-             WHERE run_id = ?1 AND status IN ('running', 'paused', 'repair_required')",
+             WHERE run_id = ?1 AND (status IN ('running', 'paused', 'repair_required') OR ?7)",
             rusqlite::params![
                 run_id,
                 replacement.target_artifact_id,
                 replacement.daemon_instance_id,
                 replacement.generation,
                 replacement.fencing_token,
-                now_ms
+                now_ms,
+                terminal_proof
             ],
         )?;
         if changed != 1 {
@@ -20934,6 +20985,84 @@ mod tests {
                 .run_id,
             "run-2"
         );
+    }
+
+    #[test]
+    fn terminal_descendant_proof_takeover_is_fenced_recovery_only_and_durable() {
+        let (temp, mut store) = initialized_store();
+        let old = WorkflowExecutionAuthority {
+            target_artifact_id: "old".into(),
+            daemon_instance_id: "ended".into(),
+            generation: 1,
+            fencing_token: "old-fence".into(),
+        };
+        store
+            .create_run(&NewWorkflowRun {
+                run_id: "child".into(),
+                execution_authority: Some(old.clone()),
+                ..new_run()
+            })
+            .expect("child");
+        let identity = bcode_workflow::WorkflowDefinitionIdentity::for_definition(
+            "example",
+            &definition("example"),
+        )
+        .expect("identity");
+        let target =
+            serde_json::to_string(&bcode_workflow::WorkflowCallTarget::Definition { identity })
+                .expect("target");
+        store.connection.execute("INSERT INTO workflow_run_links VALUES ('run-1','run-1','review','activation',1,'child',?1,?2,2,0)", rusqlite::params![WORKFLOW_RUN_LINK_VERSION,target]).expect("link");
+        store
+            .request_cancellation_owned("child", 20, &old)
+            .expect("terminal");
+        let next = WorkflowExecutionAuthority {
+            target_artifact_id: "new".into(),
+            daemon_instance_id: "next".into(),
+            generation: 2,
+            fencing_token: "new-fence".into(),
+        };
+        let mut evidence = EndedOwnerEvidence {
+            ended_daemon_instance_id: old.daemon_instance_id.clone(),
+            ended_target_artifact_id: old.target_artifact_id.clone(),
+            liveness: EndedOwnerLiveness::NoLiveTrace,
+            artifact_image_available: false,
+        };
+        assert!(
+            store
+                .take_descendant_proof_authority("child", &old, &next, &evidence, 21)
+                .is_err()
+        );
+        evidence.liveness = EndedOwnerLiveness::ObservedEnded;
+        store
+            .take_descendant_proof_authority("child", &old, &next, &evidence, 22)
+            .expect("takeover");
+        assert!(
+            store
+                .advance_subtree_quiescence_owned("child", &old, 1)
+                .is_err()
+        );
+        drop(store);
+        let mut store = WorkflowStore::open_in_state_dir(temp.path()).expect("restart");
+        assert!(store.is_recovery_only("child").expect("barrier"));
+        assert_eq!(
+            store
+                .run_summary("child")
+                .expect("summary")
+                .expect("child")
+                .status,
+            RunStatus::Cancelled
+        );
+        assert!(
+            !store
+                .advance_subtree_quiescence_owned("child", &next, 1)
+                .expect("page")
+        );
+        assert!(
+            store
+                .advance_subtree_quiescence_owned("child", &next, 1)
+                .expect("proof")
+        );
+        assert!(recovery::require_execution(&store.connection, "child").is_err());
     }
 
     #[test]
