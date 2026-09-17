@@ -4667,15 +4667,9 @@ impl WorkflowStore {
         now_ms: u64,
     ) -> Result<bool, WorkflowStoreError> {
         validate_run(successor)?;
-        let binding = successor
-            .binding
-            .as_ref()
-            .filter(|binding| binding.single_active)
-            .ok_or_else(|| {
-                WorkflowStoreError::InvalidData(
-                    "replacement requires a single-active binding".into(),
-                )
-            })?;
+        let binding = successor.binding.as_ref().ok_or_else(|| {
+            WorkflowStoreError::InvalidData("replacement requires an exact binding".into())
+        })?;
         if successor.run_id == old_run_id {
             return Err(WorkflowStoreError::InvalidData(
                 "replacement must use a new run identity".into(),
@@ -4698,8 +4692,8 @@ impl WorkflowStore {
             return Ok(false);
         }
         let matches: bool = tx.query_row(
-            "SELECT EXISTS(SELECT 1 FROM workflow_runs WHERE run_id=?1 AND owner_plugin_id=?2 AND workflow_kind=?3 AND scope_key=?4 AND single_active=1 AND status IN ('running','paused'))",
-            (old_run_id, &binding.owner_plugin_id, &binding.workflow_kind, &binding.scope_key), |row| row.get(0),
+            "SELECT EXISTS(SELECT 1 FROM workflow_runs WHERE run_id=?1 AND owner_plugin_id=?2 AND workflow_kind=?3 AND scope_key=?4 AND single_active=?5 AND status IN ('running','paused'))",
+            (old_run_id, &binding.owner_plugin_id, &binding.workflow_kind, &binding.scope_key, binding.single_active), |row| row.get(0),
         )?;
         if !matches {
             return Err(WorkflowStoreError::InvalidData(
@@ -4919,11 +4913,11 @@ impl WorkflowStore {
         row.map(|(payload, successor_id)| {
             let successor: NewWorkflowRun = serde_json::from_str(&payload)?;
             validate_run(&successor)?;
-            let binding = successor.binding.as_ref().filter(|binding| binding.single_active)
-                .ok_or_else(|| WorkflowStoreError::InvalidData("replacement binding is missing or not single-active".into()))?;
+            let binding = successor.binding.as_ref()
+                .ok_or_else(|| WorkflowStoreError::InvalidData("replacement binding is missing".into()))?;
             let matches: bool = self.connection.query_row(
-                "SELECT EXISTS(SELECT 1 FROM workflow_runs WHERE run_id=?1 AND owner_plugin_id=?2 AND workflow_kind=?3 AND scope_key=?4 AND single_active=1 AND cancellation_requested_at_ms IS NOT NULL)",
-                (old_run_id, &binding.owner_plugin_id, &binding.workflow_kind, &binding.scope_key), |row| row.get(0),
+                "SELECT EXISTS(SELECT 1 FROM workflow_runs WHERE run_id=?1 AND owner_plugin_id=?2 AND workflow_kind=?3 AND scope_key=?4 AND single_active=?5 AND cancellation_requested_at_ms IS NOT NULL)",
+                (old_run_id, &binding.owner_plugin_id, &binding.workflow_kind, &binding.scope_key, binding.single_active), |row| row.get(0),
             )?;
             if successor.run_id != successor_id || successor.run_id == old_run_id || !matches {
                 return Err(WorkflowStoreError::InvalidData("replacement intent disagrees with durable identity or binding; maintenance required".into()));
@@ -16531,7 +16525,7 @@ fn create_run_in_transaction_diagnosed(
     if let Some(binding) = &run.binding {
         *operation = "check_replacement_binding_reservation";
         let reserved: bool = transaction.query_row(
-            "SELECT EXISTS(SELECT 1 FROM workflow_replacement_intents replacement JOIN workflow_runs old ON old.run_id=replacement.old_run_id WHERE old.owner_plugin_id=?1 AND old.workflow_kind=?2 AND old.scope_key=?3)",
+            "SELECT EXISTS(SELECT 1 FROM workflow_replacement_intents replacement JOIN workflow_runs old ON old.run_id=replacement.old_run_id WHERE old.owner_plugin_id=?1 AND old.workflow_kind=?2 AND old.scope_key=?3 AND old.single_active=1)",
             (&binding.owner_plugin_id, &binding.workflow_kind, &binding.scope_key), |row| row.get(0),
         )?;
         if reserved {
@@ -20155,6 +20149,74 @@ mod tests {
                 .resolve_run_package_member(&successor.run_id, &receipt.exports[0].member_id)
                 .expect("inherited binding"),
             receipt.exports[0].definition_identity
+        );
+    }
+
+    #[test]
+    fn multi_active_replacement_preserves_siblings_and_exact_cardinality() {
+        let (_temp, mut store) = initialized_store();
+        let owner = WorkflowExecutionAuthority {
+            target_artifact_id: "a".into(),
+            daemon_instance_id: "d".into(),
+            generation: 1,
+            fencing_token: "f".into(),
+        };
+        let old = NewWorkflowRun {
+            run_id: "old".into(),
+            execution_authority: Some(owner.clone()),
+            binding: Some(WorkflowRunBinding {
+                owner_plugin_id: "authored".into(),
+                workflow_kind: "workflow".into(),
+                scope_key: "revision/1".into(),
+                display_label: None,
+                single_active: false,
+            }),
+            ..new_run()
+        };
+        store.create_run(&old).expect("old");
+        let sibling = NewWorkflowRun {
+            run_id: "sibling".into(),
+            ..old.clone()
+        };
+        store.create_run(&sibling).expect("sibling");
+        let mut successor = NewWorkflowRun {
+            run_id: "successor".into(),
+            ..old
+        };
+        successor.binding.as_mut().expect("binding").single_active = true;
+        assert!(
+            store
+                .request_replacement_owned("old", &owner, &successor, 20)
+                .is_err()
+        );
+        successor.binding.as_mut().expect("binding").single_active = false;
+        store
+            .request_replacement_owned("old", &owner, &successor, 21)
+            .expect("intent");
+        store
+            .create_run(&NewWorkflowRun {
+                run_id: "another".into(),
+                ..sibling.clone()
+            })
+            .expect("unrelated sibling remains admissible");
+        assert!(
+            store
+                .complete_leaf_replacement_owned("old", &owner, &successor, 22)
+                .expect("handoff")
+        );
+        let sibling = store
+            .run_summary("sibling")
+            .expect("summary")
+            .expect("sibling");
+        assert_eq!(sibling.status, RunStatus::Running);
+        assert_eq!(sibling.cancellation_requested_at_ms, None);
+        assert_eq!(
+            store
+                .run_summary("old")
+                .expect("summary")
+                .expect("old")
+                .status,
+            RunStatus::Cancelled
         );
     }
 
