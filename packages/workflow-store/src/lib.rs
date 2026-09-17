@@ -388,6 +388,24 @@ pub struct NewWorkflowRun {
     pub limits: WorkflowRunLimits,
 }
 
+/// Store-level replacement readiness; never an authorization or execution grant.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReplacementReadiness {
+    /// No pending successor exists.
+    Absent,
+    /// The old run has not reached a terminal outcome.
+    WaitingForOldRun,
+    /// Operation-owner evidence has not settled all effects.
+    WaitingForEffects,
+    /// Child workflows require independently qualified quiescence.
+    DescendantProofRequired,
+    /// The successor's execution artifact is not the current coordinator artifact.
+    ExecutionCompatibilityRequired,
+    /// Leaf storage conditions permit an independently authorized handoff.
+    ReadyForAuthorization,
+}
+
 pub use bcode_workflow::NewActivation;
 
 /// Prepared external-operation intent written before dispatch.
@@ -4771,6 +4789,42 @@ impl WorkflowStore {
         }).transpose()
     }
 
+    /// Inspect replacement blockers without changing intent, ownership, or execution.
+    ///
+    /// # Errors
+    /// Rejects damaged intent, missing authority, or storage failures.
+    pub fn replacement_readiness(
+        &self,
+        old_run_id: &str,
+    ) -> Result<ReplacementReadiness, WorkflowStoreError> {
+        let Some(pending) = self.pending_replacement(old_run_id)? else {
+            return Ok(ReplacementReadiness::Absent);
+        };
+        let authority = self.execution_authority(old_run_id)?.ok_or_else(|| {
+            WorkflowStoreError::InvalidData("replacement owner is unavailable".into())
+        })?;
+        if pending
+            .execution_authority
+            .as_ref()
+            .is_none_or(|original| original.target_artifact_id != authority.target_artifact_id)
+        {
+            return Ok(ReplacementReadiness::ExecutionCompatibilityRequired);
+        }
+        let (terminal, children, unsettled): (bool, bool, bool) = self.connection.query_row(
+            "SELECT EXISTS(SELECT 1 FROM workflow_runs WHERE run_id=?1 AND status IN ('completed','failed','cancelled') AND cancellation_requested_at_ms IS NOT NULL), EXISTS(SELECT 1 FROM workflow_run_links WHERE parent_run_id=?1), EXISTS(SELECT 1 FROM workflow_attempts WHERE run_id=?1 AND status NOT IN ('succeeded','failed','cancelled'))",
+            [old_run_id], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )?;
+        Ok(if !terminal {
+            ReplacementReadiness::WaitingForOldRun
+        } else if unsettled {
+            ReplacementReadiness::WaitingForEffects
+        } else if children {
+            ReplacementReadiness::DescendantProofRequired
+        } else {
+            ReplacementReadiness::ReadyForAuthorization
+        })
+    }
+
     /// Atomically admit a persisted replacement after a leaf run is fully quiescent.
     ///
     /// The caller must reauthorize the exact successor request before handoff. Child
@@ -4811,13 +4865,7 @@ impl WorkflowStore {
                     .into(),
             ));
         }
-        let ready: bool = tx.query_row(
-            "SELECT EXISTS(SELECT 1 FROM workflow_runs WHERE run_id=?1 AND status IN ('completed','failed','cancelled') AND cancellation_requested_at_ms IS NOT NULL)
-             AND NOT EXISTS(SELECT 1 FROM workflow_run_links WHERE parent_run_id=?1)
-             AND NOT EXISTS(SELECT 1 FROM workflow_attempts WHERE run_id=?1 AND status NOT IN ('succeeded','failed','cancelled'))",
-            [old_run_id], |row| row.get(0),
-        )?;
-        if !ready {
+        if self.replacement_readiness(old_run_id)? != ReplacementReadiness::ReadyForAuthorization {
             return Err(WorkflowStoreError::InvalidData(
                 "replacement requires a terminal leaf run with no unresolved effects".into(),
             ));
@@ -19544,6 +19592,68 @@ mod tests {
         };
         assert!(store.create_run(&run).is_err());
         assert!(store.run_summary("run-1").expect("summary").is_none());
+    }
+
+    #[test]
+    fn replacement_readiness_is_read_only_and_never_grants_execution() {
+        let (_temp, mut store, _, authority, _) = connected_publication_fixture();
+        store
+            .persist_definition("example", 1, &definition("example"))
+            .expect("definition");
+        let old = NewWorkflowRun {
+            run_id: "old".into(),
+            execution_authority: Some(authority.clone()),
+            binding: Some(WorkflowRunBinding {
+                owner_plugin_id: "test".into(),
+                workflow_kind: "replacement".into(),
+                scope_key: "scope".into(),
+                display_label: None,
+                single_active: true,
+            }),
+            ..new_run()
+        };
+        store.create_run(&old).expect("old");
+        assert_eq!(
+            store.replacement_readiness("old").expect("absent"),
+            ReplacementReadiness::Absent
+        );
+        let successor = NewWorkflowRun {
+            run_id: "successor".into(),
+            ..old
+        };
+        store
+            .request_replacement_owned("old", &authority, &successor, 20)
+            .expect("intent");
+        let before = store.connection.total_changes();
+        assert_eq!(
+            store.replacement_readiness("old").expect("waiting"),
+            ReplacementReadiness::WaitingForOldRun
+        );
+        assert_eq!(store.connection.total_changes(), before);
+        store
+            .connection
+            .execute_batch("UPDATE workflow_runs SET status='cancelled' WHERE run_id='old'")
+            .expect("settled fixture");
+        assert_eq!(
+            store.replacement_readiness("old").expect("ready"),
+            ReplacementReadiness::ReadyForAuthorization
+        );
+        assert!(
+            store
+                .run_summary("successor")
+                .expect("not admitted")
+                .is_none()
+        );
+        store
+            .connection
+            .execute_batch(
+                "UPDATE workflow_runs SET target_artifact_id='foreign' WHERE run_id='old'",
+            )
+            .expect("foreign fixture");
+        assert_eq!(
+            store.replacement_readiness("old").expect("incompatible"),
+            ReplacementReadiness::ExecutionCompatibilityRequired
+        );
     }
 
     #[test]
