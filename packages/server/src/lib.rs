@@ -2628,6 +2628,7 @@ impl ServerState {
                         };
                         for run_id in run_ids {
                             if state.shutdown_requested.load(Ordering::SeqCst) { return; }
+                            workflow_operations::recover_parent_cancellation(&state, &run_id).await;
                             let runnable = {
                                 let store = state.workflow_store.lock()
                                     .unwrap_or_else(std::sync::PoisonError::into_inner);

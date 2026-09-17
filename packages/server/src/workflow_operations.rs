@@ -8580,6 +8580,57 @@ pub async fn inspect_associated_run(
     )))
 }
 
+/// Propagate durable parent cancellation through each child's own verified authority.
+/// Discovery never lends parent ownership to a child; foreign/unverifiable owners defer.
+pub async fn recover_parent_cancellation(state: &std::sync::Arc<ServerState>, run_id: &str) {
+    let requested = {
+        let store = state
+            .workflow_store
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        (|| -> Result<bool, bcode_workflow_store::WorkflowStoreError> {
+            let Some(link) = store.parent_run_link(run_id)? else {
+                return Ok(false);
+            };
+            let parent = store.run_summary(&link.parent_run_id)?.ok_or_else(|| {
+                bcode_workflow_store::WorkflowStoreError::InvalidData(
+                    "child has missing parent".into(),
+                )
+            })?;
+            let child = store.run_summary(run_id)?.ok_or_else(|| {
+                bcode_workflow_store::WorkflowStoreError::InvalidData("child run missing".into())
+            })?;
+            Ok(parent.cancellation_requested_at_ms.is_some()
+                && matches!(
+                    child.status,
+                    bcode_workflow_store::RunStatus::Running
+                        | bcode_workflow_store::RunStatus::Paused
+                ))
+        })()
+    };
+    if !matches!(requested, Ok(true)) {
+        return;
+    }
+    let Ok(Some(authority)) = execution_authority(state, run_id).await else {
+        return;
+    };
+    let result = state
+        .workflow_store
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .inherit_parent_cancellation_owned(
+            run_id,
+            &authority.authority,
+            super::current_unix_millis(),
+        );
+    if result.is_err() {
+        tracing::warn!(
+            run_id,
+            "child cancellation recovery deferred; durable state preserved"
+        );
+    }
+}
+
 /// Revisit a ready replacement during bounded background discovery.
 /// Readiness is only a hint; completion rechecks policy, session ownership, and fencing.
 pub async fn recover_pending_replacement(state: &std::sync::Arc<ServerState>, run_id: &str) {

@@ -10021,6 +10021,33 @@ impl WorkflowStore {
         self.request_cancellation_with_authority(run_id, requested_at_ms, None)
     }
 
+    /// Record inherited cancellation only while the durable direct parent still requests it.
+    /// The child authority is required independently; parent ownership grants nothing.
+    ///
+    /// # Errors
+    /// Rejects stale child authority, invalid links, missing parent state, or storage failure.
+    pub fn inherit_parent_cancellation_owned(
+        &mut self,
+        run_id: &str,
+        authority: &WorkflowExecutionAuthority,
+        now_ms: u64,
+    ) -> Result<bool, WorkflowStoreError> {
+        let tx = self.connection.unchecked_transaction()?;
+        self.verify_execution_authority(run_id, authority)?;
+        let Some(link) = self.parent_run_link(run_id)? else {
+            return Ok(false);
+        };
+        let parent = self
+            .run_summary(&link.parent_run_id)?
+            .ok_or_else(|| WorkflowStoreError::InvalidData("child has missing parent".into()))?;
+        if parent.cancellation_requested_at_ms.is_none() {
+            return Ok(false);
+        }
+        let changed = request_run_cancellation_in_transaction(&tx, run_id, now_ms)?;
+        tx.commit()?;
+        Ok(changed)
+    }
+
     /// Persist cancellation intent under the initiating caller's execution authority.
     ///
     /// # Errors
@@ -20804,6 +20831,75 @@ mod tests {
                 .expect("latest")
                 .run_id,
             "run-2"
+        );
+    }
+
+    #[test]
+    fn inherited_cancellation_requires_child_authority_and_parent_intent() {
+        let (_temp, mut store) = initialized_store();
+        let authority = WorkflowExecutionAuthority {
+            target_artifact_id: "artifact".into(),
+            daemon_instance_id: "child-owner".into(),
+            generation: 1,
+            fencing_token: "child-fence".into(),
+        };
+        let child = NewWorkflowRun {
+            run_id: "child".into(),
+            execution_authority: Some(authority.clone()),
+            ..new_run()
+        };
+        store.create_run(&child).expect("child");
+        let identity = bcode_workflow::WorkflowDefinitionIdentity::for_definition(
+            "example",
+            &definition("example"),
+        )
+        .expect("identity");
+        let target =
+            serde_json::to_string(&bcode_workflow::WorkflowCallTarget::Definition { identity })
+                .expect("target");
+        store.connection.execute("INSERT INTO workflow_run_links VALUES ('run-1','run-1','review','activation',1,'child',?1,?2,2,0)", rusqlite::params![WORKFLOW_RUN_LINK_VERSION, target]).expect("link");
+        assert!(
+            !store
+                .inherit_parent_cancellation_owned("child", &authority, 20)
+                .expect("no parent intent")
+        );
+        store
+            .request_cancellation("run-1", 21)
+            .expect("parent cancellation");
+        let stale = WorkflowExecutionAuthority {
+            fencing_token: "parent-fence".into(),
+            ..authority.clone()
+        };
+        assert!(
+            store
+                .inherit_parent_cancellation_owned("child", &stale, 22)
+                .is_err()
+        );
+        assert!(
+            store
+                .run_summary("child")
+                .expect("summary")
+                .expect("child")
+                .cancellation_requested_at_ms
+                .is_none()
+        );
+        assert!(
+            store
+                .inherit_parent_cancellation_owned("child", &authority, 23)
+                .expect("inherited")
+        );
+        assert_eq!(
+            store
+                .run_summary("child")
+                .expect("summary")
+                .expect("child")
+                .status,
+            RunStatus::Cancelled
+        );
+        assert!(
+            !store
+                .inherit_parent_cancellation_owned("child", &authority, 24)
+                .expect("idempotent")
         );
     }
 
