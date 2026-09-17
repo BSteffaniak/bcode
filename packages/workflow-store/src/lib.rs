@@ -4632,12 +4632,8 @@ impl WorkflowStore {
         }
         let tx = self.connection.unchecked_transaction()?;
         self.verify_execution_authority(old_run_id, authority)?;
-        let existing: Option<String> = tx.query_row(
-            "SELECT CASE WHEN length(CAST(successor_json AS BLOB)) <= ?2 THEN successor_json ELSE NULL END FROM workflow_replacement_intents WHERE old_run_id = ?1",
-            rusqlite::params![old_run_id, MAX_INLINE_JSON_BYTES], |row| row.get(0),
-        ).optional()?;
-        if let Some(existing) = existing {
-            if existing != payload {
+        if let Some(existing) = self.pending_replacement(old_run_id)? {
+            if &existing != successor {
                 return Err(WorkflowStoreError::InvalidData(
                     "conflicting replacement intent".into(),
                 ));
@@ -4652,6 +4648,11 @@ impl WorkflowStore {
             return Err(WorkflowStoreError::InvalidData(
                 "replacement binding or old run state does not match".into(),
             ));
+        }
+        validate_replacement_successor(&tx, successor, authority)?;
+        validate_stored_run_input(&tx, successor)?;
+        if let Some(provenance) = &successor.authored_provenance {
+            validate_persisted_authored_run_provenance(&tx, successor, provenance)?;
         }
         tx.execute(
             "INSERT INTO workflow_replacement_intents VALUES (?1,?2,?3,?4)",
@@ -16151,57 +16152,33 @@ fn run_creation_database_reason(error: &rusqlite::Error) -> &'static str {
     }
 }
 
-fn create_run_in_transaction(
+fn validate_replacement_successor(
     transaction: &Transaction<'_>,
-    run: &NewWorkflowRun,
+    successor: &NewWorkflowRun,
+    authority: &WorkflowExecutionAuthority,
 ) -> Result<(), WorkflowStoreError> {
-    let mut operation = "validate_provenance";
-    create_run_in_transaction_diagnosed(transaction, run, &mut operation).inspect_err(|error| {
-        diagnose_run_creation_database_error(operation, error);
-    })
+    if successor.execution_authority.as_ref() != Some(authority) {
+        return Err(WorkflowStoreError::InvalidData(
+            "replacement successor must target the current fenced coordinator".into(),
+        ));
+    }
+    let exists: bool = transaction.query_row(
+        "SELECT EXISTS(SELECT 1 FROM workflow_runs WHERE run_id=?1)",
+        [&successor.run_id],
+        |row| row.get(0),
+    )?;
+    if exists {
+        return Err(WorkflowStoreError::InvalidData(
+            "replacement successor identity already exists".into(),
+        ));
+    }
+    Ok(())
 }
 
-#[allow(clippy::too_many_lines)]
-fn create_run_in_transaction_diagnosed(
+fn validate_stored_run_input(
     transaction: &Transaction<'_>,
     run: &NewWorkflowRun,
-    operation: &mut &'static str,
-) -> Result<(), WorkflowStoreError> {
-    if let Some(provenance) = &run.authored_provenance {
-        validate_persisted_authored_run_provenance(transaction, run, provenance)?;
-    }
-    if let Some(binding) = &run.binding
-        && binding.single_active
-    {
-        *operation = "check_single_active_binding";
-        let reserved: bool = transaction.query_row(
-            "SELECT EXISTS(SELECT 1 FROM workflow_replacement_intents replacement JOIN workflow_runs old ON old.run_id=replacement.old_run_id WHERE old.owner_plugin_id=?1 AND old.workflow_kind=?2 AND old.scope_key=?3)",
-            (&binding.owner_plugin_id, &binding.workflow_kind, &binding.scope_key), |row| row.get(0),
-        )?;
-        if reserved {
-            return Err(WorkflowStoreError::InvalidData(
-                "single-active binding reserved by pending replacement".into(),
-            ));
-        }
-        let active: Option<(String, RunStatus)> = transaction
-            .query_row(
-                "SELECT run_id, status FROM workflow_runs WHERE owner_plugin_id = ?1 \
-                     AND workflow_kind = ?2 AND scope_key = ?3 \
-                     AND status IN ('running', 'paused', 'repair_required') \
-                     ORDER BY updated_at_ms DESC, run_id LIMIT 1",
-                (
-                    &binding.owner_plugin_id,
-                    &binding.workflow_kind,
-                    &binding.scope_key,
-                ),
-                |row| Ok((row.get(0)?, decode_run_status(row, 1)?)),
-            )
-            .optional()?;
-        if let Some((run_id, status)) = active {
-            return Err(WorkflowStoreError::ActiveBindingConflict { run_id, status });
-        }
-    }
-    *operation = "read_definition";
+) -> Result<(WorkflowDefinition, Option<String>), WorkflowStoreError> {
     let definition_json = transaction
         .query_row(
             "SELECT CASE WHEN typeof(definition_json) = 'text' \
@@ -16241,6 +16218,72 @@ fn create_run_in_transaction_diagnosed(
         .as_ref()
         .map(|input| validate_run_input(&definition, input))
         .transpose()?;
+    Ok((definition, input_json))
+}
+
+fn create_run_in_transaction(
+    transaction: &Transaction<'_>,
+    run: &NewWorkflowRun,
+) -> Result<(), WorkflowStoreError> {
+    let mut operation = "validate_provenance";
+    create_run_in_transaction_diagnosed(transaction, run, &mut operation).inspect_err(|error| {
+        diagnose_run_creation_database_error(operation, error);
+    })
+}
+
+#[allow(clippy::too_many_lines)]
+fn create_run_in_transaction_diagnosed(
+    transaction: &Transaction<'_>,
+    run: &NewWorkflowRun,
+    operation: &mut &'static str,
+) -> Result<(), WorkflowStoreError> {
+    *operation = "check_replacement_identity_reservation";
+    let reserved: bool = transaction.query_row(
+        "SELECT EXISTS(SELECT 1 FROM workflow_replacement_intents WHERE successor_run_id=?1)",
+        [&run.run_id],
+        |row| row.get(0),
+    )?;
+    if reserved {
+        return Err(WorkflowStoreError::InvalidData(
+            "run identity reserved by pending replacement".into(),
+        ));
+    }
+    if let Some(provenance) = &run.authored_provenance {
+        validate_persisted_authored_run_provenance(transaction, run, provenance)?;
+    }
+    if let Some(binding) = &run.binding
+        && binding.single_active
+    {
+        *operation = "check_single_active_binding";
+        let reserved: bool = transaction.query_row(
+            "SELECT EXISTS(SELECT 1 FROM workflow_replacement_intents replacement JOIN workflow_runs old ON old.run_id=replacement.old_run_id WHERE old.owner_plugin_id=?1 AND old.workflow_kind=?2 AND old.scope_key=?3)",
+            (&binding.owner_plugin_id, &binding.workflow_kind, &binding.scope_key), |row| row.get(0),
+        )?;
+        if reserved {
+            return Err(WorkflowStoreError::InvalidData(
+                "single-active binding reserved by pending replacement".into(),
+            ));
+        }
+        let active: Option<(String, RunStatus)> = transaction
+            .query_row(
+                "SELECT run_id, status FROM workflow_runs WHERE owner_plugin_id = ?1 \
+                     AND workflow_kind = ?2 AND scope_key = ?3 \
+                     AND status IN ('running', 'paused', 'repair_required') \
+                     ORDER BY updated_at_ms DESC, run_id LIMIT 1",
+                (
+                    &binding.owner_plugin_id,
+                    &binding.workflow_kind,
+                    &binding.scope_key,
+                ),
+                |row| Ok((row.get(0)?, decode_run_status(row, 1)?)),
+            )
+            .optional()?;
+        if let Some((run_id, status)) = active {
+            return Err(WorkflowStoreError::ActiveBindingConflict { run_id, status });
+        }
+    }
+    *operation = "read_definition";
+    let (definition, input_json) = validate_stored_run_input(transaction, run)?;
     let (owner_plugin_id, workflow_kind, scope_key, display_label, single_active) = run
         .binding
         .as_ref()
@@ -19504,6 +19547,174 @@ mod tests {
     }
 
     #[test]
+    fn replacement_reserves_successor_identity_across_unrelated_bindings() {
+        let (temp, mut store, _, authority, _) = connected_publication_fixture();
+        store
+            .persist_definition("example", 1, &definition("example"))
+            .expect("definition");
+        let old = NewWorkflowRun {
+            run_id: "old".into(),
+            execution_authority: Some(authority.clone()),
+            binding: Some(WorkflowRunBinding {
+                owner_plugin_id: "test".into(),
+                workflow_kind: "replacement".into(),
+                scope_key: "scope".into(),
+                display_label: None,
+                single_active: true,
+            }),
+            ..new_run()
+        };
+        store.create_run(&old).expect("old");
+        let successor = NewWorkflowRun {
+            run_id: "successor".into(),
+            ..old
+        };
+        store
+            .request_replacement_owned("old", &authority, &successor, 20)
+            .expect("intent");
+        drop(store);
+        let mut store = WorkflowStore::open_in_state_dir(temp.path()).expect("restart");
+        let unrelated = NewWorkflowRun {
+            binding: None,
+            ..successor.clone()
+        };
+        assert!(store.create_run(&unrelated).is_err());
+        assert!(store.run_summary("successor").expect("uncreated").is_none());
+        assert_eq!(
+            store.pending_replacement("old").expect("preserved"),
+            Some(successor)
+        );
+        store
+            .withdraw_replacement_owned("old", "successor", &authority, 21)
+            .expect("withdraw");
+        store.create_run(&unrelated).expect("released identity");
+    }
+
+    #[test]
+    fn replacement_rejects_existing_successor_and_foreign_authority_before_cancellation() {
+        let (_temp, mut store, existing, authority, _) = connected_publication_fixture();
+        store
+            .persist_definition("example", 1, &definition("example"))
+            .expect("definition");
+        let old = NewWorkflowRun {
+            run_id: "old".into(),
+            execution_authority: Some(authority.clone()),
+            binding: Some(WorkflowRunBinding {
+                owner_plugin_id: "test".into(),
+                workflow_kind: "replacement".into(),
+                scope_key: "scope".into(),
+                display_label: None,
+                single_active: true,
+            }),
+            ..new_run()
+        };
+        store.create_run(&old).expect("old");
+        let mut successor = NewWorkflowRun {
+            run_id: existing.run_id,
+            ..old
+        };
+        assert!(
+            store
+                .request_replacement_owned("old", &authority, &successor, 20)
+                .is_err()
+        );
+        successor.run_id = "successor".into();
+        for owner in [
+            None,
+            Some(WorkflowExecutionAuthority {
+                daemon_instance_id: "foreign".into(),
+                ..authority.clone()
+            }),
+        ] {
+            successor.execution_authority = owner;
+            assert!(
+                store
+                    .request_replacement_owned("old", &authority, &successor, 21)
+                    .is_err()
+            );
+        }
+        assert!(
+            store
+                .pending_replacement("old")
+                .expect("no intent")
+                .is_none()
+        );
+        assert_eq!(
+            store
+                .run_summary("old")
+                .expect("summary")
+                .expect("old")
+                .cancellation_requested_at_ms,
+            None
+        );
+        successor.execution_authority = Some(authority.clone());
+        assert!(
+            store
+                .request_replacement_owned("old", &authority, &successor, 22)
+                .expect("valid")
+        );
+    }
+
+    #[test]
+    fn replacement_invalid_definition_does_not_cancel_old_run() {
+        let (_temp, mut store, _, authority, _) = connected_publication_fixture();
+        store
+            .persist_definition("example", 1, &definition("example"))
+            .expect("definition");
+        let old = NewWorkflowRun {
+            run_id: "old".into(),
+            execution_authority: Some(authority.clone()),
+            binding: Some(WorkflowRunBinding {
+                owner_plugin_id: "test".into(),
+                workflow_kind: "replacement".into(),
+                scope_key: "scope".into(),
+                display_label: None,
+                single_active: true,
+            }),
+            ..new_run()
+        };
+        store.create_run(&old).expect("old");
+        let mut successor = NewWorkflowRun {
+            run_id: "successor".into(),
+            definition_id: "missing".into(),
+            ..old
+        };
+        assert!(
+            store
+                .request_replacement_owned("old", &authority, &successor, 20)
+                .is_err()
+        );
+        successor.definition_id = "example".into();
+        successor.input = Some(serde_json::json!({"invalid": true}));
+        assert!(
+            store
+                .request_replacement_owned("old", &authority, &successor, 21)
+                .is_err()
+        );
+        assert!(
+            store
+                .pending_replacement("old")
+                .expect("no intent")
+                .is_none()
+        );
+        assert_eq!(
+            store
+                .run_summary("old")
+                .expect("summary")
+                .expect("old")
+                .cancellation_requested_at_ms,
+            None
+        );
+        assert!(
+            !store
+                .event_history("old", None, 100)
+                .expect("history")
+                .iter()
+                .any(|event| event.event_type == "replacement_requested")
+        );
+    }
+
+    #[test]
     fn replacement_withdrawal_is_fenced_and_preserves_cancellation() {
         let (temp, mut store, _, authority, _) = connected_publication_fixture();
         store
@@ -19692,6 +19903,12 @@ mod tests {
             store.connection.execute_batch(damage).expect("damage");
             let before = store.connection.total_changes();
             assert!(store.pending_replacement("old").is_err(), "{damage}");
+            assert!(
+                store
+                    .request_replacement_owned("old", &authority, &successor, 21)
+                    .is_err(),
+                "retry must reject {damage}"
+            );
             assert!(
                 store
                     .complete_leaf_replacement_owned("old", &authority, &successor, 21)
