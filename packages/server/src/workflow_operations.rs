@@ -400,7 +400,7 @@ impl bcode_workflow::WorkflowRunApplication for WorkflowAuthoringApplication<'_>
         self.state
             .require_workflow_store()
             .map_err(run_operation_failure)?;
-        request_replacement(self.state, request)
+        request_replacement(self.client_id, self.state, request)
             .await
             .map_err(run_operation_failure)
     }
@@ -6278,7 +6278,110 @@ fn persist_exact_template_call_dependencies(
     Ok(())
 }
 
+async fn resolve_replacement_authored_selection(
+    client_id: super::ClientId,
+    state: &std::sync::Arc<ServerState>,
+    request: &bcode_workflow::WorkflowReplacementRequest,
+) -> Result<Option<bcode_workflow::AuthoredWorkflowRunProvenance>, super::ServerError> {
+    let Some(selection) = &request.authored_selection else {
+        if request.configuration.is_some() {
+            return Err(bcode_workflow_store::WorkflowStoreError::InvalidData(
+                "replacement configuration requires authored selection".into(),
+            )
+            .into());
+        }
+        return Ok(None);
+    };
+    let (workflow_id, revision_number, revision, preset) = resolve_authored_run(state, selection)?;
+    let configuration = preset
+        .as_ref()
+        .map(|preset| preset.configuration.clone())
+        .or_else(|| request.configuration.clone())
+        .or_else(|| revision.document.configuration_defaults.clone())
+        .unwrap_or_else(|| serde_json::json!({}));
+    let catalog = authoring_catalog(state).await?;
+    let compiled = revision
+        .document
+        .compilation_preview(&catalog, Some(&configuration))
+        .compiled
+        .ok_or_else(|| {
+            super::ServerError::WorkflowDefinitionUnsupported(
+                "replacement authored selection is not executable".into(),
+            )
+        })?;
+    let successor_matches = (
+        &request.successor.definition_id,
+        request.successor.definition_version,
+    ) == (
+        &revision.definition_identity.definition_id,
+        revision.definition_identity.definition_version,
+    );
+    if compiled.definition_identity != revision.definition_identity || !successor_matches {
+        return Err(super::ServerError::WorkflowDefinitionUnsupported(
+            "replacement selection does not match exact successor definition".into(),
+        ));
+    }
+    state.authorize_local_workflow_application_operation(
+        client_id,
+        LocalApplicationOperationRequest {
+            operation: match selection {
+                bcode_workflow::AuthoredWorkflowRunSelection::Revision { .. } => {
+                    bcode_workflow::WorkflowApplicationOperation::StartRevision
+                }
+                bcode_workflow::AuthoredWorkflowRunSelection::Active { .. } => {
+                    bcode_workflow::WorkflowApplicationOperation::StartActiveRevision
+                }
+                bcode_workflow::AuthoredWorkflowRunSelection::Preset { .. } => {
+                    bcode_workflow::WorkflowApplicationOperation::StartPreset
+                }
+            },
+            workflow_id: workflow_id.clone(),
+            draft_id: None,
+            revision: matches!(
+                selection,
+                bcode_workflow::AuthoredWorkflowRunSelection::Revision { .. }
+            )
+            .then_some(revision_number),
+            preset_id: preset.as_ref().map(|preset| preset.preset_id.clone()),
+            producer: Some(revision.producer.clone()),
+            requirements: compiled.requirements.clone(),
+            effects: compiled.effects.clone(),
+            activates: false,
+            executes: true,
+        },
+    )?;
+    let limits = preset
+        .as_ref()
+        .and_then(|preset| preset.run_limits.as_ref())
+        .unwrap_or(&compiled.run_limits);
+    let requested = &request.successor.limits;
+    if requested.node_execution_cap > limits.node_execution_cap
+        || requested.concurrency_cap > limits.concurrency_cap
+        || requested.cycle_cap > limits.cycle_cap
+        || requested.retry_cap > limits.retry_cap
+        || limits.maximum_duration_ms.is_some_and(|duration| {
+            requested
+                .deadline_at_ms
+                .is_none_or(|deadline| deadline > super::current_time_ms().saturating_add(duration))
+        })
+    {
+        return Err(bcode_workflow_store::WorkflowStoreError::InvalidData(
+            "replacement exceeds authored execution limits".into(),
+        )
+        .into());
+    }
+    Ok(Some(bcode_workflow::AuthoredWorkflowRunProvenance::new(
+        workflow_id,
+        revision_number,
+        revision.definition_identity,
+        preset.as_ref().map(|preset| preset.preset_id.clone()),
+        preset.as_ref().map(|preset| preset.generation),
+        configuration,
+    )))
+}
+
 async fn request_replacement(
+    client_id: super::ClientId,
     state: &std::sync::Arc<ServerState>,
     request: bcode_workflow::WorkflowReplacementRequest,
 ) -> Result<bcode_workflow::WorkflowReplacementResponse, super::ServerError> {
@@ -6289,8 +6392,14 @@ async fn request_replacement(
         )
         .into());
     }
-    let (mut successor, _session_owner) =
-        prepare_workflow_run(state, request.successor, None, &mut "prepare_replacement").await?;
+    let provenance = resolve_replacement_authored_selection(client_id, state, &request).await?;
+    let (mut successor, _session_owner) = prepare_workflow_run(
+        state,
+        request.successor,
+        provenance,
+        &mut "prepare_replacement",
+    )
+    .await?;
     let authority = execution_authority(state, &request.old_run_id)
         .await?
         .ok_or_else(|| {

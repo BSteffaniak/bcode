@@ -914,6 +914,12 @@ pub struct WorkflowRunStartRequest {
 pub struct WorkflowReplacementRequest {
     /// Exact run to stop and replace.
     pub old_run_id: String,
+    /// Optional published authored selection. The resolved definition must match `successor`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub authored_selection: Option<AuthoredWorkflowRunSelection>,
+    /// Configuration for the selected authored revision or preset.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub configuration: Option<serde_json::Value>,
     /// Successor prepared through ordinary workflow-start checks. A stable run ID is required.
     pub successor: WorkflowRunStartRequest,
 }

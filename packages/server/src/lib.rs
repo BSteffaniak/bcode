@@ -69019,6 +69019,8 @@ event_symbol = "bcode_plugin_handle_event_v1"
         successor: &bcode_workflow_store::NewWorkflowRun,
     ) {
         let request = bcode_workflow::WorkflowReplacementRequest {
+            authored_selection: None,
+            configuration: None,
             old_run_id: old_id.into(),
             successor: bcode_workflow::WorkflowRunStartRequest {
                 definition_id: successor.definition_id.clone(),
