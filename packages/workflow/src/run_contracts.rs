@@ -1638,6 +1638,10 @@ pub struct WorkflowHistoryEvent {
 /// Bounded aggregate workflow inspection snapshot.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WorkflowRunInspection {
+    /// Replacement blockers observed without acquiring control. Missing in older senders
+    /// means unknown, not readiness or authorization to execute.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub replacement_readiness: Option<ReplacementReadiness>,
     pub run: crate::WorkflowRunSummary,
     /// Absent for older senders; absence must not be interpreted as an empty graph.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1820,4 +1824,22 @@ mod tests {
                 .is_err()
         );
     }
+}
+
+/// Store-level replacement readiness; never an authorization or execution grant.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReplacementReadiness {
+    /// No pending successor exists.
+    Absent,
+    /// The old run has not reached a terminal outcome.
+    WaitingForOldRun,
+    /// Operation-owner evidence has not settled all effects.
+    WaitingForEffects,
+    /// Child workflows require independently qualified quiescence.
+    DescendantProofRequired,
+    /// The successor's execution artifact is not the current coordinator artifact.
+    ExecutionCompatibilityRequired,
+    /// Leaf storage conditions permit an independently authorized handoff.
+    ReadyForAuthorization,
 }

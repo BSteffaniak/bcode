@@ -10209,7 +10209,15 @@ pub async fn inspect_run(
         }
         None => None,
     };
+    let replacement_readiness = Some(
+        state
+            .workflow_store
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .replacement_readiness(run_id)?,
+    );
     Ok(bcode_workflow::WorkflowRunInspection {
+        replacement_readiness,
         run,
         graph: Some(graph),
         definition,

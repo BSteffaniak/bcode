@@ -388,23 +388,7 @@ pub struct NewWorkflowRun {
     pub limits: WorkflowRunLimits,
 }
 
-/// Store-level replacement readiness; never an authorization or execution grant.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum ReplacementReadiness {
-    /// No pending successor exists.
-    Absent,
-    /// The old run has not reached a terminal outcome.
-    WaitingForOldRun,
-    /// Operation-owner evidence has not settled all effects.
-    WaitingForEffects,
-    /// Child workflows require independently qualified quiescence.
-    DescendantProofRequired,
-    /// The successor's execution artifact is not the current coordinator artifact.
-    ExecutionCompatibilityRequired,
-    /// Leaf storage conditions permit an independently authorized handoff.
-    ReadyForAuthorization,
-}
+pub use bcode_workflow::ReplacementReadiness;
 
 pub use bcode_workflow::NewActivation;
 
@@ -16299,10 +16283,8 @@ fn create_run_in_transaction_diagnosed(
     if let Some(provenance) = &run.authored_provenance {
         validate_persisted_authored_run_provenance(transaction, run, provenance)?;
     }
-    if let Some(binding) = &run.binding
-        && binding.single_active
-    {
-        *operation = "check_single_active_binding";
+    if let Some(binding) = &run.binding {
+        *operation = "check_replacement_binding_reservation";
         let reserved: bool = transaction.query_row(
             "SELECT EXISTS(SELECT 1 FROM workflow_replacement_intents replacement JOIN workflow_runs old ON old.run_id=replacement.old_run_id WHERE old.owner_plugin_id=?1 AND old.workflow_kind=?2 AND old.scope_key=?3)",
             (&binding.owner_plugin_id, &binding.workflow_kind, &binding.scope_key), |row| row.get(0),
@@ -16312,6 +16294,11 @@ fn create_run_in_transaction_diagnosed(
                 "single-active binding reserved by pending replacement".into(),
             ));
         }
+    }
+    if let Some(binding) = &run.binding
+        && binding.single_active
+    {
+        *operation = "check_single_active_binding";
         let active: Option<(String, RunStatus)> = transaction
             .query_row(
                 "SELECT run_id, status FROM workflow_runs WHERE owner_plugin_id = ?1 \
@@ -19592,6 +19579,54 @@ mod tests {
         };
         assert!(store.create_run(&run).is_err());
         assert!(store.run_summary("run-1").expect("summary").is_none());
+    }
+
+    #[test]
+    fn replacement_binding_reservation_cannot_be_bypassed_by_multi_active_request() {
+        let (_temp, mut store, _, authority, _) = connected_publication_fixture();
+        store
+            .persist_definition("example", 1, &definition("example"))
+            .expect("definition");
+        let old = NewWorkflowRun {
+            run_id: "old".into(),
+            execution_authority: Some(authority.clone()),
+            binding: Some(WorkflowRunBinding {
+                owner_plugin_id: "test".into(),
+                workflow_kind: "replacement".into(),
+                scope_key: "scope".into(),
+                display_label: None,
+                single_active: true,
+            }),
+            ..new_run()
+        };
+        store.create_run(&old).expect("old");
+        let successor = NewWorkflowRun {
+            run_id: "successor".into(),
+            ..old
+        };
+        store
+            .request_replacement_owned("old", &authority, &successor, 20)
+            .expect("intent");
+        let mut competitor = NewWorkflowRun {
+            run_id: "competitor".into(),
+            ..successor.clone()
+        };
+        competitor.binding.as_mut().expect("binding").single_active = false;
+        assert!(store.create_run(&competitor).is_err());
+        store
+            .connection
+            .execute_batch("UPDATE workflow_runs SET status='cancelled' WHERE run_id='old'")
+            .expect("settled fixture");
+        assert!(store.create_run(&competitor).is_err());
+        assert!(store.run_summary("competitor").expect("absent").is_none());
+        assert_eq!(
+            store.pending_replacement("old").expect("preserved"),
+            Some(successor)
+        );
+        store
+            .withdraw_replacement_owned("old", "successor", &authority, 21)
+            .expect("withdraw");
+        store.create_run(&competitor).expect("reservation released");
     }
 
     #[test]
