@@ -8631,6 +8631,29 @@ pub async fn recover_parent_cancellation(state: &std::sync::Arc<ServerState>, ru
     }
 }
 
+/// Advance terminal subtree proof only for this daemon's current durable authority.
+pub fn recover_subtree_quiescence(state: &ServerState, run_id: &str) {
+    let result = (|| -> Result<(), bcode_workflow_store::WorkflowStoreError> {
+        let mut store = state
+            .workflow_store
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(authority) = store.execution_authority(run_id)?
+            && authority_targets_current_daemon(state, &authority)
+        {
+            store.advance_subtree_quiescence_owned(run_id, &authority, 64)?;
+        }
+        drop(store);
+        Ok(())
+    })();
+    if result.is_err() {
+        tracing::warn!(
+            run_id,
+            "subtree quiescence verification unavailable; handoff remains blocked"
+        );
+    }
+}
+
 /// Revisit a ready replacement during bounded background discovery.
 /// Readiness is only a hint; completion rechecks policy, session ownership, and fencing.
 pub async fn recover_pending_replacement(state: &std::sync::Arc<ServerState>, run_id: &str) {

@@ -39,7 +39,7 @@ const RESET_BACKUP_DIRECTORY: &str = "reset-backups";
 /// Stable destructive confirmation required by public workflow-store reset surfaces.
 pub const WORKFLOW_STORE_RESET_CONFIRMATION: &str = "DELETE-INCOMPATIBLE-WORKFLOW-STATE";
 /// Current clean-break workflow store schema version.
-pub const WORKFLOW_STORE_SCHEMA_VERSION: u32 = 38;
+pub const WORKFLOW_STORE_SCHEMA_VERSION: u32 = 39;
 /// Current bounded workflow-store reset receipt version.
 pub const WORKFLOW_STORE_RESET_RECEIPT_VERSION: u32 = 1;
 /// Current explicit workflow-store migration receipt contract.
@@ -1162,7 +1162,7 @@ impl WorkflowStore {
                         match Self::open_with_ownership(&path, ownership) {
                             Ok(store) => return Ok(store),
                             Err(WorkflowStoreError::UnsupportedStore {
-                                actual: Some(14..=37),
+                                actual: Some(14..=38),
                                 ..
                             }) => {}
                             Err(error) => return Err(error),
@@ -1192,7 +1192,7 @@ impl WorkflowStore {
                         match Self::open_with_ownership(&path, probe) {
                             Ok(store) => return Ok(store),
                             Err(WorkflowStoreError::UnsupportedStore {
-                                actual: Some(14..=37),
+                                actual: Some(14..=38),
                                 ..
                             }) => {}
                             Err(error) => return Err(error),
@@ -1342,7 +1342,7 @@ impl WorkflowStore {
                 "workflow store migration cannot read the source schema".to_string(),
             )
         })?;
-        if !matches!(previous_schema_version, 14..=37) {
+        if !matches!(previous_schema_version, 14..=38) {
             return Err(WorkflowStoreError::UnsupportedStore {
                 actual: Some(previous_schema_version),
                 expected: WORKFLOW_STORE_SCHEMA_VERSION,
@@ -4748,6 +4748,102 @@ impl WorkflowStore {
         Ok(ids)
     }
 
+    /// Verify one bounded page of immutable terminal work and direct-child proofs.
+    /// Progress is persisted; no recursive traversal or replay is performed. Descendants
+    /// are advanced separately under their own authority and terminal outcomes never reopen.
+    ///
+    /// # Errors
+    /// Rejects stale authority, invalid limits, inconsistent storage, or database failure.
+    pub fn advance_subtree_quiescence_owned(
+        &mut self,
+        run_id: &str,
+        authority: &WorkflowExecutionAuthority,
+        limit: usize,
+    ) -> Result<bool, WorkflowStoreError> {
+        let limit = bounded_limit(limit)?;
+        let tx = self.connection.unchecked_transaction()?;
+        self.verify_execution_authority(run_id, authority)?;
+        let terminal: bool = tx.query_row("SELECT status IN ('completed','failed','cancelled') FROM workflow_runs WHERE run_id=?1", [run_id], |row| row.get(0))?;
+        if !terminal {
+            return Ok(false);
+        }
+        tx.execute(
+            "INSERT OR IGNORE INTO workflow_quiescence(run_id) VALUES (?1)",
+            [run_id],
+        )?;
+        let (after, child, attempts_complete, complete): (String,String,bool,bool) = tx.query_row(
+            "SELECT CASE WHEN typeof(after_dispatch)='text' AND length(CAST(after_dispatch AS BLOB))<=64 THEN after_dispatch END, CASE WHEN typeof(after_child)='text' AND length(CAST(after_child AS BLOB))<=512 THEN after_child END, CASE WHEN attempts_complete IN (0,1) THEN attempts_complete END, CASE WHEN complete IN (0,1) THEN complete END FROM workflow_quiescence WHERE run_id=?1", [run_id], |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?)))?;
+        validate_receipt_recovery_cursor(&after)?;
+        if !child.is_empty() {
+            validate_id("quiescence child cursor", &child)?;
+        }
+        if complete && !attempts_complete {
+            return Err(WorkflowStoreError::InvalidData(
+                "inconsistent quiescence proof".into(),
+            ));
+        }
+        if complete {
+            return Ok(true);
+        }
+        if attempts_complete {
+            let mut statement = tx.prepare("SELECT link.child_run_id, COALESCE(proof.complete,0) FROM workflow_run_links link INDEXED BY workflow_quiescence_children LEFT JOIN workflow_quiescence proof ON proof.run_id=link.child_run_id WHERE link.parent_run_id=?1 AND link.child_run_id>?2 ORDER BY link.child_run_id LIMIT ?3")?;
+            let rows = statement
+                .query_map((run_id, &child, limit), |row| {
+                    Ok((row.get::<_, String>(0)?, row.get::<_, bool>(1)?))
+                })?
+                .collect::<Result<Vec<_>, _>>()?;
+            if rows.iter().any(|(_, ready)| !ready) {
+                drop(statement);
+                tx.commit()?;
+                return Ok(false);
+            }
+            if let Some((last, _)) = rows.last() {
+                tx.execute(
+                    "UPDATE workflow_quiescence SET after_child=?2 WHERE run_id=?1",
+                    (run_id, last),
+                )?;
+            } else {
+                tx.execute(
+                    "UPDATE workflow_quiescence SET complete=1 WHERE run_id=?1",
+                    [run_id],
+                )?;
+                drop(statement);
+                tx.commit()?;
+                return Ok(true);
+            }
+        } else {
+            let mut statement = tx.prepare("SELECT dispatch_identity,status FROM workflow_attempts INDEXED BY workflow_quiescence_attempts WHERE run_id=?1 AND dispatch_identity>?2 ORDER BY dispatch_identity LIMIT ?3")?;
+            let rows = statement
+                .query_map((run_id, &after, limit), |row| {
+                    Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+                })?
+                .collect::<Result<Vec<_>, _>>()?;
+            if rows
+                .iter()
+                .any(|(_, status)| !matches!(status.as_str(), "succeeded" | "failed" | "cancelled"))
+            {
+                // Do not freeze unresolved operations; explicit owner repair must remain possible.
+                tx.execute("DELETE FROM workflow_quiescence WHERE run_id=?1", [run_id])?;
+                drop(statement);
+                tx.commit()?;
+                return Ok(false);
+            }
+            if let Some((last, _)) = rows.last() {
+                tx.execute(
+                    "UPDATE workflow_quiescence SET after_dispatch=?2 WHERE run_id=?1",
+                    (run_id, last),
+                )?;
+            } else {
+                tx.execute(
+                    "UPDATE workflow_quiescence SET attempts_complete=1 WHERE run_id=?1",
+                    [run_id],
+                )?;
+            }
+        }
+        tx.commit()?;
+        Ok(false)
+    }
+
     /// Read one pending replacement without acquiring execution authority or mutating state.
     ///
     /// # Errors
@@ -4818,7 +4914,13 @@ impl WorkflowStore {
             ReplacementReadiness::WaitingForOldRun
         } else if unsettled {
             ReplacementReadiness::WaitingForEffects
-        } else if children {
+        } else if children
+            && !self.connection.query_row(
+                "SELECT EXISTS(SELECT 1 FROM workflow_quiescence WHERE run_id=?1 AND complete=1)",
+                [old_run_id],
+                |row| row.get::<_, bool>(0),
+            )?
+        {
             ReplacementReadiness::DescendantProofRequired
         } else {
             ReplacementReadiness::ReadyForAuthorization
@@ -20835,6 +20937,95 @@ mod tests {
     }
 
     #[test]
+    fn subtree_quiescence_is_incremental_restart_safe_and_freezes_verified_work() {
+        let (temp, mut store) = initialized_store();
+        let owner = WorkflowExecutionAuthority {
+            target_artifact_id: "a".into(),
+            daemon_instance_id: "d".into(),
+            generation: 1,
+            fencing_token: "f".into(),
+        };
+        store.connection.execute_batch("UPDATE workflow_runs SET target_artifact_id='a', coordinator_daemon_instance_id='d', coordinator_generation=1, coordinator_fencing_token='f', status='cancelled' WHERE run_id='run-1'").expect("parent fixture");
+        let child = NewWorkflowRun {
+            run_id: "child".into(),
+            execution_authority: Some(owner.clone()),
+            ..new_run()
+        };
+        store.create_run(&child).expect("child");
+        store.connection.execute_batch("INSERT INTO workflow_run_links VALUES ('run-1','run-1','review','activation',1,'child',1,'{}',2,0)").expect("link fixture");
+        assert!(
+            !store
+                .advance_subtree_quiescence_owned("run-1", &owner, 1)
+                .expect("attempt page")
+        );
+        assert!(
+            !store
+                .advance_subtree_quiescence_owned("run-1", &owner, 1)
+                .expect("child blocks")
+        );
+        assert!(
+            !store
+                .advance_subtree_quiescence_owned("child", &owner, 1)
+                .expect("active child")
+        );
+        store
+            .request_cancellation_owned("child", 20, &owner)
+            .expect("cancel child");
+        assert!(
+            !store
+                .advance_subtree_quiescence_owned("child", &owner, 1)
+                .expect("child attempts")
+        );
+        assert!(
+            store
+                .advance_subtree_quiescence_owned("child", &owner, 1)
+                .expect("child proven")
+        );
+        drop(store);
+        let mut store = WorkflowStore::open_in_state_dir(temp.path()).expect("restart");
+        assert!(
+            !store
+                .advance_subtree_quiescence_owned("run-1", &owner, 1)
+                .expect("child page")
+        );
+        assert!(
+            store
+                .advance_subtree_quiescence_owned("run-1", &owner, 1)
+                .expect("parent proven")
+        );
+        assert!(
+            store
+                .connection
+                .execute(
+                    "UPDATE workflow_runs SET status='running' WHERE run_id='child'",
+                    []
+                )
+                .is_err()
+        );
+        assert!(
+            store
+                .connection
+                .execute(
+                    "DELETE FROM workflow_run_links WHERE parent_run_id='run-1'",
+                    []
+                )
+                .is_err()
+        );
+        assert!(
+            store
+                .advance_subtree_quiescence_owned(
+                    "run-1",
+                    &WorkflowExecutionAuthority {
+                        fencing_token: "stale".into(),
+                        ..owner
+                    },
+                    1
+                )
+                .is_err()
+        );
+    }
+
+    #[test]
     fn inherited_cancellation_requires_child_authority_and_parent_intent() {
         let (_temp, mut store) = initialized_store();
         let authority = WorkflowExecutionAuthority {
@@ -25313,6 +25504,29 @@ mod tests {
                 .current_run_graph_page("run-1", Some(2), None, None, 1)
                 .is_err()
         );
+    }
+
+    #[test]
+    fn schema_38_upgrade_adds_quiescence_without_changing_runs() {
+        let (temp, store) = initialized_store();
+        store.connection.execute_batch("DROP TABLE workflow_quiescence; UPDATE workflow_store_contract SET schema_version=38").expect("old fixture");
+        drop(store);
+        let store = WorkflowStore::initialize_in_state_dir(temp.path(), 2000).expect("upgrade");
+        assert_eq!(
+            store
+                .run_summary("run-1")
+                .expect("summary")
+                .expect("run")
+                .status,
+            RunStatus::Running
+        );
+        recovery::verify(&store.connection).expect("guards");
+        store
+            .connection
+            .execute_batch("DROP TRIGGER quiescence_blocks_reopen")
+            .expect("damage");
+        drop(store);
+        assert!(WorkflowStore::open_in_state_dir(temp.path()).is_err());
     }
 
     #[test]
