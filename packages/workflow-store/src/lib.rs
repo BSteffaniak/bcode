@@ -3881,10 +3881,13 @@ impl WorkflowStore {
         let row = self
             .connection
             .query_row(
-                "SELECT target_artifact_id, coordinator_daemon_instance_id, \
-                 coordinator_generation, coordinator_fencing_token \
-                 FROM workflow_runs WHERE run_id = ?1",
-                [run_id],
+                "SELECT CASE WHEN typeof(target_artifact_id) = 'text' AND length(CAST(target_artifact_id AS BLOB)) <= ?2 THEN target_artifact_id ELSE '' END, \
+                 CASE WHEN typeof(coordinator_daemon_instance_id) = 'text' AND length(CAST(coordinator_daemon_instance_id AS BLOB)) <= ?2 THEN coordinator_daemon_instance_id ELSE '' END, \
+                 coordinator_generation, \
+                 CASE WHEN typeof(coordinator_fencing_token) = 'text' AND length(CAST(coordinator_fencing_token AS BLOB)) <= ?2 THEN coordinator_fencing_token ELSE '' END \
+                 FROM workflow_runs WHERE run_id = ?1 AND NOT (target_artifact_id IS NULL \
+                 AND coordinator_daemon_instance_id IS NULL AND coordinator_generation IS NULL AND coordinator_fencing_token IS NULL)",
+                rusqlite::params![run_id, MAX_ID_BYTES],
                 |row| {
                     Ok((
                         row.get::<_, Option<String>>(0)?,
@@ -3902,12 +3905,17 @@ impl WorkflowStore {
                 Some(daemon_instance_id),
                 Some(generation),
                 Some(fencing_token),
-            )) => Ok(Some(WorkflowExecutionAuthority {
-                target_artifact_id,
-                daemon_instance_id,
-                generation,
-                fencing_token,
-            })),
+            )) => {
+                validate_id("authority artifact", &target_artifact_id)?;
+                validate_id("authority daemon", &daemon_instance_id)?;
+                validate_id("authority fence", &fencing_token)?;
+                Ok(Some(WorkflowExecutionAuthority {
+                    target_artifact_id,
+                    daemon_instance_id,
+                    generation,
+                    fencing_token,
+                }))
+            }
             Some(_) => Err(WorkflowStoreError::InvalidData(
                 "workflow run has incomplete execution authority".to_string(),
             )),
@@ -3963,8 +3971,9 @@ impl WorkflowStore {
         let source: Option<String> = self
             .connection
             .query_row(
-                "SELECT source_artifact_id FROM workflow_recovery_barriers WHERE run_id = ?1",
-                [run_id],
+                "SELECT CASE WHEN typeof(source_artifact_id) = 'text' AND length(CAST(source_artifact_id AS BLOB)) <= ?2 THEN source_artifact_id ELSE '' END \
+                 FROM workflow_recovery_barriers WHERE run_id = ?1",
+                rusqlite::params![run_id, MAX_ID_BYTES],
                 |row| row.get(0),
             )
             .optional()?;
@@ -4069,13 +4078,7 @@ impl WorkflowStore {
                 });
             }
         }
-        let source: Option<String> = tx
-            .query_row(
-                "SELECT source_artifact_id FROM workflow_recovery_barriers WHERE run_id = ?1",
-                [run_id],
-                |row| row.get(0),
-            )
-            .optional()?;
+        let source = self.recovery_source_artifact(run_id)?;
         let Some(source) = source else {
             return Ok(false);
         };
@@ -4216,6 +4219,8 @@ impl WorkflowStore {
                 "workflow execution authority transfer is invalid".to_string(),
             ));
         }
+        validate_id("replacement daemon", &replacement.daemon_instance_id)?;
+        validate_id("replacement fence", &replacement.fencing_token)?;
         let changed = self.connection.execute(
             "UPDATE workflow_runs SET coordinator_daemon_instance_id = ?6, \
              coordinator_generation = ?7, coordinator_fencing_token = ?8, updated_at_ms = ?9 \
@@ -4302,6 +4307,9 @@ impl WorkflowStore {
                 "workflow execution authority reassignment is invalid".to_string(),
             ));
         }
+        validate_id("replacement artifact", &replacement.target_artifact_id)?;
+        validate_id("replacement daemon", &replacement.daemon_instance_id)?;
+        validate_id("replacement fence", &replacement.fencing_token)?;
         let transaction = self.connection.unchecked_transaction()?;
         self.validate_quiescent_reassignment(run_id)?;
         let changed = transaction.execute(
@@ -8400,7 +8408,10 @@ impl WorkflowStore {
         let cursor: String = self
             .connection
             .query_row(
-                "SELECT after_dispatch_identity FROM workflow_receipt_cursors WHERE run_id = ?1",
+                "SELECT CASE WHEN typeof(after_dispatch_identity) = 'text' \
+                 AND length(CAST(after_dispatch_identity AS BLOB)) <= 64 \
+                 THEN after_dispatch_identity ELSE 'invalid recovery cursor' END \
+                 FROM workflow_receipt_cursors WHERE run_id = ?1",
                 [run_id],
                 |row| row.get(0),
             )
@@ -8450,6 +8461,14 @@ impl WorkflowStore {
     {
         let mut observations = Vec::with_capacity(requests.len());
         for request in requests {
+            if let Some((run_id, authority, revision)) = authority {
+                self.verify_execution_authority(run_id, authority)?;
+                if run_graph::graph_revision(&self.connection, run_id)? != Some(revision) {
+                    return Err(WorkflowStoreError::InvalidData(
+                        "receipt observation graph revision conflict".into(),
+                    ));
+                }
+            }
             // Cancellation intent is not terminal evidence. The operation owner must
             // still prove that execution ended, including after a coordinator restart.
             let observation = observer.observe_async(&request).await?;
@@ -9864,13 +9883,19 @@ impl WorkflowStore {
         let limit = bounded_limit(limit)?;
         require_cancellation_requested(&self.connection, run_id)?;
         let mut statement = self.connection.prepare(
-            "SELECT run_id, node_id, activation_id, attempt, dispatch_identity, receipt_json \
+            "SELECT run_id, node_id, activation_id, attempt, dispatch_identity, \
+             CASE WHEN receipt_json IS NULL THEN NULL \
+                  WHEN typeof(receipt_json) = 'text' AND length(CAST(receipt_json AS BLOB)) <= ?3 \
+                  THEN receipt_json ELSE 'invalid oversized or non-text cancellation receipt' END \
              FROM workflow_attempts WHERE run_id = ?1 \
              AND status IN ('prepared', 'admitted', 'running') \
              ORDER BY prepared_at_ms, dispatch_identity LIMIT ?2",
         )?;
         statement
-            .query_map((run_id, limit), active_attempt_cancellation_row)?
+            .query_map(
+                (run_id, limit, MAX_INLINE_JSON_BYTES),
+                active_attempt_cancellation_row,
+            )?
             .map(|row| active_attempt_cancellation(row?))
             .collect()
     }
@@ -9892,7 +9917,10 @@ impl WorkflowStore {
         let transaction = self.connection.unchecked_transaction()?;
         self.verify_execution_authority(run_id, authority)?;
         let mut statement = transaction.prepare(
-            "SELECT run_id, node_id, activation_id, attempt, dispatch_identity, receipt_json
+            "SELECT run_id, node_id, activation_id, attempt, dispatch_identity,
+             CASE WHEN receipt_json IS NULL THEN NULL
+                  WHEN typeof(receipt_json) = 'text' AND length(CAST(receipt_json AS BLOB)) <= ?3
+                  THEN receipt_json ELSE 'invalid oversized or non-text cancellation receipt' END
              FROM workflow_attempts attempt WHERE run_id = ?1
              AND status IN ('prepared', 'admitted', 'running', 'cancelling')
              AND EXISTS (SELECT 1 FROM workflow_publication_cancellations intent
@@ -9900,7 +9928,10 @@ impl WorkflowStore {
              ORDER BY prepared_at_ms, dispatch_identity LIMIT ?2",
         )?;
         statement
-            .query_map((run_id, limit), active_attempt_cancellation_row)?
+            .query_map(
+                (run_id, limit, MAX_INLINE_JSON_BYTES),
+                active_attempt_cancellation_row,
+            )?
             .map(|row| active_attempt_cancellation(row?))
             .collect()
     }
@@ -9957,12 +9988,48 @@ impl WorkflowStore {
     ) -> Result<Vec<ActiveAttemptCancellation>, WorkflowStoreError> {
         let limit = bounded_limit(limit)?;
         let mut statement = self.connection.prepare(
-            "SELECT run_id, node_id, activation_id, attempt, dispatch_identity, receipt_json \
-             FROM workflow_attempts WHERE status = 'sibling_cancelling' \
+            "SELECT run_id, node_id, activation_id, attempt, dispatch_identity,
+             CASE WHEN receipt_json IS NULL THEN NULL
+                  WHEN typeof(receipt_json) = 'text' AND length(CAST(receipt_json AS BLOB)) <= ?2
+                  THEN receipt_json ELSE 'invalid cancellation receipt' END
+             FROM workflow_attempts WHERE status = 'sibling_cancelling'
              ORDER BY prepared_at_ms, dispatch_identity LIMIT ?1",
         )?;
         statement
-            .query_map([limit], active_attempt_cancellation_row)?
+            .query_map(
+                (limit, MAX_INLINE_JSON_BYTES),
+                active_attempt_cancellation_row,
+            )?
+            .map(|row| active_attempt_cancellation(row?))
+            .collect()
+    }
+
+    /// Return bounded sibling cancellation intents for one owned run.
+    ///
+    /// # Errors
+    /// Rejects stale authority, invalid bounds, malformed receipts, or storage failure.
+    pub fn pending_owned_sibling_cancellations(
+        &self,
+        run_id: &str,
+        authority: &WorkflowExecutionAuthority,
+        limit: usize,
+    ) -> Result<Vec<ActiveAttemptCancellation>, WorkflowStoreError> {
+        let limit = bounded_limit(limit)?;
+        let transaction = self.connection.unchecked_transaction()?;
+        self.verify_execution_authority(run_id, authority)?;
+        let mut statement = transaction.prepare(
+            "SELECT run_id, node_id, activation_id, attempt, dispatch_identity,
+             CASE WHEN receipt_json IS NULL THEN NULL
+                  WHEN typeof(receipt_json) = 'text' AND length(CAST(receipt_json AS BLOB)) <= ?3
+                  THEN receipt_json ELSE 'invalid cancellation receipt' END
+             FROM workflow_attempts WHERE run_id = ?1 AND status = 'sibling_cancelling'
+             ORDER BY prepared_at_ms, dispatch_identity LIMIT ?2",
+        )?;
+        statement
+            .query_map(
+                (run_id, limit, MAX_INLINE_JSON_BYTES),
+                active_attempt_cancellation_row,
+            )?
             .map(|row| active_attempt_cancellation(row?))
             .collect()
     }
@@ -12988,9 +13055,10 @@ fn receipt_backed_attempt(
     connection
         .query_row(
             "SELECT run_id, node_id, activation_id, attempt, dispatch_identity, side_effect, \
-             receipt_json FROM workflow_attempts WHERE dispatch_identity = ?1 \
+             CASE WHEN typeof(receipt_json) = 'text' AND length(CAST(receipt_json AS BLOB)) <= ?2 THEN receipt_json END \
+             FROM workflow_attempts WHERE dispatch_identity = ?1 \
              AND status IN ('admitted', 'running', 'cancelling', 'sibling_cancelling') AND receipt_json IS NOT NULL",
-            [dispatch_identity],
+            rusqlite::params![dispatch_identity, MAX_INLINE_JSON_BYTES],
             attempt_reconciliation_row,
         )
         .optional()?
@@ -13005,12 +13073,16 @@ fn receipt_backed_attempts(
 ) -> Result<Vec<AttemptReconciliationRequest>, WorkflowStoreError> {
     let mut statement = connection.prepare(
         "SELECT run_id, node_id, activation_id, attempt, dispatch_identity, side_effect, \
-         receipt_json FROM workflow_attempts WHERE status IN ('admitted', 'running', 'cancelling', 'sibling_cancelling') \
+         CASE WHEN typeof(receipt_json) = 'text' AND length(CAST(receipt_json AS BLOB)) <= ?3 THEN receipt_json END \
+         FROM workflow_attempts WHERE status IN ('admitted', 'running', 'cancelling', 'sibling_cancelling') \
          AND receipt_json IS NOT NULL AND (?1 = '' OR run_id = ?1) \
          ORDER BY prepared_at_ms, dispatch_identity LIMIT ?2",
     )?;
     statement
-        .query_map((run_id.unwrap_or(""), limit), attempt_reconciliation_row)?
+        .query_map(
+            (run_id.unwrap_or(""), limit, MAX_INLINE_JSON_BYTES),
+            attempt_reconciliation_row,
+        )?
         .map(|row| attempt_reconciliation_request(row?))
         .collect()
 }
@@ -21555,6 +21627,72 @@ mod tests {
         assert_eq!(prepared.attempt, 2);
     }
 
+    #[test]
+    fn receipt_discovery_bounds_exact_and_batch_payloads_without_writes() {
+        let (_temp, mut store) = initialized_store();
+        let identity = prepare_receipt_backed_attempt(&mut store, DispatchSideEffect::Mutating);
+        assert!(
+            receipt_backed_attempt(&store.connection, &identity)
+                .expect("valid")
+                .is_some()
+        );
+        assert_eq!(
+            receipt_backed_attempts(&store.connection, Some("run-1"), 1)
+                .expect("valid")
+                .len(),
+            1
+        );
+        store
+            .connection
+            .execute(
+                "UPDATE workflow_attempts SET receipt_json = ?2 WHERE dispatch_identity = ?1",
+                rusqlite::params![
+                    identity,
+                    serde_json::json!("x".repeat(MAX_INLINE_JSON_BYTES)).to_string()
+                ],
+            )
+            .expect("oversized valid JSON");
+        let before = store.connection.total_changes();
+        assert!(receipt_backed_attempt(&store.connection, &identity).is_err());
+        assert!(receipt_backed_attempts(&store.connection, Some("run-1"), 1).is_err());
+        assert!(receipt_backed_attempts(&store.connection, None, 1).is_err());
+        assert_eq!(store.connection.total_changes(), before);
+    }
+
+    #[test]
+    fn cancellation_discovery_rejects_oversized_receipts_without_writes() {
+        let (_temp, mut store) = initialized_store();
+        let identity = prepare_receipt_backed_attempt(&mut store, DispatchSideEffect::Mutating);
+        store.request_cancellation("run-1", 20).expect("intent");
+        assert_eq!(
+            store
+                .active_attempt_cancellations("run-1", 10)
+                .expect("valid")
+                .len(),
+            1
+        );
+        for receipt in [
+            serde_json::json!("x".repeat(MAX_INLINE_JSON_BYTES)).to_string(),
+            "null".into(),
+        ] {
+            store
+                .connection
+                .execute(
+                    "UPDATE workflow_attempts SET receipt_json = ?2 WHERE dispatch_identity = ?1",
+                    rusqlite::params![identity, receipt],
+                )
+                .expect("damage");
+            if receipt == "null" {
+                // Small valid JSON remains readable; the operation owner decides its meaning.
+                assert!(store.active_attempt_cancellations("run-1", 10).is_ok());
+            } else {
+                let before = store.connection.total_changes();
+                assert!(store.active_attempt_cancellations("run-1", 10).is_err());
+                assert_eq!(store.connection.total_changes(), before);
+            }
+        }
+    }
+
     #[tokio::test]
     async fn receipt_page_advances_past_deferred_work() {
         struct Observer;
@@ -21676,6 +21814,23 @@ mod tests {
             )
             .expect("cursor");
         assert_eq!(cursor, "later-progress");
+        for damage in [
+            "UPDATE workflow_receipt_cursors SET after_dispatch_identity = zeroblob(1000000)",
+            "UPDATE workflow_receipt_cursors SET after_dispatch_identity = 42",
+        ] {
+            store
+                .connection
+                .execute(damage, [])
+                .expect("damaged cursor");
+            let before = store.connection.total_changes();
+            assert!(
+                store
+                    .advance_receipt_recovery(&observer, "run-1", &authority, 1, 21)
+                    .await
+                    .is_err()
+            );
+            assert_eq!(store.connection.total_changes(), before);
+        }
         let before = store.connection.total_changes();
         assert!(
             store
@@ -21683,6 +21838,75 @@ mod tests {
                 .await
                 .is_err()
         );
+        assert_eq!(store.connection.total_changes(), before);
+    }
+
+    #[tokio::test]
+    async fn receipt_observation_stops_between_requests_when_authority_changes() {
+        verify_observation_stops_between_requests(
+            "UPDATE workflow_runs SET coordinator_generation = 2 WHERE run_id = 'run-1'",
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn receipt_observation_stops_between_requests_when_graph_changes() {
+        verify_observation_stops_between_requests(
+            "UPDATE workflow_run_graphs SET revision = 2 WHERE run_id = 'run-1'",
+        )
+        .await;
+    }
+
+    async fn verify_observation_stops_between_requests(change: &'static str) {
+        struct Observer(
+            std::path::PathBuf,
+            std::sync::atomic::AtomicUsize,
+            &'static str,
+        );
+        impl AsyncAttemptStatusObserver for Observer {
+            fn observe_async<'a>(
+                &'a self,
+                _: &'a AttemptReconciliationRequest,
+            ) -> Pin<
+                Box<
+                    dyn Future<Output = Result<AttemptObservation, WorkflowStoreError>> + Send + 'a,
+                >,
+            > {
+                Box::pin(async move {
+                    self.1.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    let store = WorkflowStore::open_at_path(&self.0)?;
+                    store.connection.execute(self.2, [])?;
+                    Ok(AttemptObservation::Running)
+                })
+            }
+        }
+        let (_temp, mut store) = initialized_store();
+        prepare_receipt_backed_attempt(&mut store, DispatchSideEffect::Mutating);
+        store.connection.execute_batch("UPDATE workflow_runs SET target_artifact_id='a', coordinator_daemon_instance_id='d', coordinator_generation=1, coordinator_fencing_token='f' WHERE run_id='run-1'").expect("owner");
+        let authority = store.execution_authority("run-1").unwrap().unwrap();
+        let revision = store.run_graph_revision("run-1").unwrap().unwrap();
+        let request = receipt_backed_attempts(&store.connection, Some("run-1"), 1)
+            .expect("requests")
+            .pop()
+            .expect("request");
+        let observer = Observer(
+            store.path().to_path_buf(),
+            std::sync::atomic::AtomicUsize::new(0),
+            change,
+        );
+        let before = store.connection.total_changes();
+        assert!(
+            store
+                .reconcile_attempt_requests_with_authority_async(
+                    &observer,
+                    vec![request.clone(), request],
+                    20,
+                    Some(("run-1", &authority, revision)),
+                )
+                .await
+                .is_err()
+        );
+        assert_eq!(observer.1.load(std::sync::atomic::Ordering::SeqCst), 1);
         assert_eq!(store.connection.total_changes(), before);
     }
 
@@ -32284,6 +32508,9 @@ mod tests {
                 .pending_publication_cancellations(run_id, &stale, 10)
                 .is_err()
         );
+        store
+            .enter_recovery_only(run_id, authority, 29)
+            .expect("recovery retains accepted publication cancellation");
         let pending = store
             .pending_publication_cancellations(run_id, authority, 10)
             .expect("discover accepted intent");
@@ -38607,6 +38834,93 @@ mod tests {
     }
 
     #[test]
+    fn authority_reads_reject_damaged_identity_without_repair() {
+        for damage in [
+            "UPDATE workflow_runs SET target_artifact_id = ''",
+            "UPDATE workflow_runs SET coordinator_daemon_instance_id = ' '",
+            "UPDATE workflow_runs SET coordinator_fencing_token = ''",
+            "UPDATE workflow_runs SET target_artifact_id = zeroblob(1000000)",
+            "UPDATE workflow_runs SET coordinator_daemon_instance_id = zeroblob(1000000)",
+            "UPDATE workflow_runs SET coordinator_fencing_token = zeroblob(1000000)",
+        ] {
+            let (_temp, store, run, authority, _) = connected_publication_fixture();
+            store.connection.execute(damage, []).expect("damage");
+            let before = store.connection.total_changes();
+            assert!(store.execution_authority(&run.run_id).is_err());
+            assert!(
+                store
+                    .verify_execution_authority(&run.run_id, &authority)
+                    .is_err()
+            );
+            assert_eq!(store.connection.total_changes(), before);
+        }
+    }
+
+    #[test]
+    fn reassignment_rejects_empty_replacement_identity_without_writes() {
+        let (_temp, mut store, run, authority, _) = connected_publication_fixture();
+        let evidence = EndedOwnerEvidence {
+            ended_daemon_instance_id: authority.daemon_instance_id.clone(),
+            ended_target_artifact_id: authority.target_artifact_id.clone(),
+            liveness: EndedOwnerLiveness::ObservedEnded,
+            artifact_image_available: true,
+        };
+        for (artifact, daemon, fence) in [
+            ("", "new-daemon", "new-fence"),
+            ("new-artifact", "", "new-fence"),
+            ("new-artifact", "new-daemon", ""),
+        ] {
+            let replacement = WorkflowExecutionAuthority {
+                target_artifact_id: artifact.into(),
+                daemon_instance_id: daemon.into(),
+                fencing_token: fence.into(),
+                generation: authority.generation + 1,
+            };
+            let before = store.connection.total_changes();
+            assert!(
+                store
+                    .reassign_execution_authority_from_ended_owner(
+                        &run.run_id,
+                        &authority,
+                        &replacement,
+                        &evidence,
+                        20,
+                    )
+                    .is_err()
+            );
+            assert_eq!(store.connection.total_changes(), before);
+            assert_eq!(
+                store.execution_authority(&run.run_id).expect("owner"),
+                Some(authority.clone())
+            );
+        }
+    }
+
+    #[test]
+    fn authority_transfer_rejects_empty_replacement_identity_without_writes() {
+        let (_temp, mut store, run, authority, _) = connected_publication_fixture();
+        for (daemon, fence) in [("", "new-fence"), ("new-daemon", ""), (" ", "new-fence")] {
+            let replacement = WorkflowExecutionAuthority {
+                daemon_instance_id: daemon.into(),
+                fencing_token: fence.into(),
+                generation: authority.generation + 1,
+                ..authority.clone()
+            };
+            let before = store.connection.total_changes();
+            assert!(
+                store
+                    .transfer_execution_authority(&run.run_id, &authority, &replacement, 20,)
+                    .is_err()
+            );
+            assert_eq!(store.connection.total_changes(), before);
+            assert_eq!(
+                store.execution_authority(&run.run_id).expect("owner"),
+                Some(authority.clone())
+            );
+        }
+    }
+
+    #[test]
     fn pause_and_resume_reject_stale_owners_after_transfer() {
         let (_temp, mut store, run, authority, _) = connected_publication_fixture();
         let replacement = WorkflowExecutionAuthority {
@@ -38872,6 +39186,91 @@ mod tests {
                 .expect("retention")
                 .is_empty()
         );
+    }
+
+    #[test]
+    fn owned_sibling_cancellation_discovery_survives_restart_and_rejects_stale_owner() {
+        let (temp, mut store, run, authority, _) = connected_publication_fixture();
+        let id = activation_identity(&run.run_id, "first", 0);
+        let prepared = store
+            .prepare_pending_activation(
+                &run.run_id,
+                "first",
+                &id,
+                DispatchSideEffect::Mutating,
+                serde_json::json!({}),
+                10,
+            )
+            .expect("prepare")
+            .expect("pending");
+        store.connection.execute(
+            "UPDATE workflow_attempts SET status = 'sibling_cancelling' WHERE dispatch_identity = ?1",
+            [&prepared.dispatch_identity],
+        ).expect("durable sibling intent");
+        drop(store);
+        let store = WorkflowStore::open_in_state_dir(temp.path()).expect("restart");
+        let pending = store
+            .pending_owned_sibling_cancellations(&run.run_id, &authority, 1)
+            .expect("pending");
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].dispatch_identity, prepared.dispatch_identity);
+        assert_eq!(
+            store.pending_sibling_cancellations(1).expect("global"),
+            pending
+        );
+        store
+            .connection
+            .execute(
+                "UPDATE workflow_attempts SET receipt_json = ?2 WHERE dispatch_identity = ?1",
+                rusqlite::params![
+                    prepared.dispatch_identity,
+                    serde_json::json!("x".repeat(MAX_INLINE_JSON_BYTES)).to_string()
+                ],
+            )
+            .expect("oversized receipt");
+        let before = store.connection.total_changes();
+        assert!(store.pending_sibling_cancellations(1).is_err());
+        assert!(
+            store
+                .pending_owned_sibling_cancellations(&run.run_id, &authority, 1)
+                .is_err()
+        );
+        assert_eq!(store.connection.total_changes(), before);
+        let stale = WorkflowExecutionAuthority {
+            generation: authority.generation + 1,
+            ..authority
+        };
+        assert!(
+            store
+                .pending_owned_sibling_cancellations(&run.run_id, &stale, 1)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn damaged_recovery_provenance_cannot_clear_barrier() {
+        let (_temp, mut store, run, authority, _) = connected_publication_fixture();
+        store
+            .enter_recovery_only(&run.run_id, &authority, 20)
+            .expect("barrier");
+        store.connection.execute(
+            "UPDATE workflow_recovery_barriers SET source_artifact_id = zeroblob(1000000) WHERE run_id = ?1",
+            [&run.run_id],
+        ).expect("damaged provenance");
+        let before = store.connection.total_changes();
+        assert!(store.recovery_source_artifact(&run.run_id).is_err());
+        assert!(
+            store
+                .finish_recovery_only(&run.run_id, &authority, 21)
+                .is_err()
+        );
+        assert!(
+            store
+                .resume_recovered_run(&run.run_id, &authority, 22)
+                .is_err()
+        );
+        assert!(store.is_recovery_only(&run.run_id).expect("preserved"));
+        assert_eq!(store.connection.total_changes(), before);
     }
 
     #[test]

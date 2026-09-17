@@ -15833,6 +15833,8 @@ async fn drive_workflow_run(state: &Arc<ServerState>, run_id: &str) -> Result<()
         let iteration_started_at = std::time::Instant::now();
         let now_ms = current_unix_millis();
         retry_owned_workflow_cancellation(state, run_id, &authority.authority).await?;
+        propagate_publication_cancellation(state, run_id, &authority.authority).await?;
+        retry_owned_sibling_cancellation(state, run_id, &authority.authority).await?;
         if bcode_workflow_store::WorkflowStore::open_at_path(&store_path)?
             .is_recovery_only(run_id)?
         {
@@ -15840,7 +15842,6 @@ async fn drive_workflow_run(state: &Arc<ServerState>, run_id: &str) -> Result<()
             // scheduling, deadline terminalization, or automatic retry admission.
             break;
         }
-        propagate_publication_cancellation(state, run_id, &authority.authority).await?;
         if bcode_workflow_store::WorkflowStore::open_at_path(&store_path)?
             .expire_run_deadline(run_id, now_ms)?
         {
@@ -32211,6 +32212,38 @@ async fn restore_workflow_runs(
             tracing::debug!(run_id, %error, "workflow recovery lost execution authority");
             continue;
         }
+        // Durable stop intent must progress even when receipt observation is unavailable.
+        // This path qualifies authority independently and does not admit successor work.
+        let cancellation_available = if let Err(error) =
+            retry_owned_workflow_cancellation(state, &run_id, &authority.authority).await
+        {
+            tracing::warn!(run_id, %error, "failed to restore workflow cancellation");
+            false
+        } else {
+            true
+        };
+        let publication_available = if let Err(error) =
+            propagate_publication_cancellation(state, &run_id, &authority.authority).await
+        {
+            tracing::warn!(run_id, %error, "failed to restore publication cancellation");
+            false
+        } else {
+            true
+        };
+        let sibling_available = if let Err(error) =
+            retry_owned_sibling_cancellation(state, &run_id, &authority.authority).await
+        {
+            tracing::warn!(run_id, %error, "failed to restore sibling cancellation");
+            false
+        } else {
+            true
+        };
+        // Observation can still establish terminal evidence after a signal failure. Do not
+        // admit prepared work on that pass; observation independently rechecks authority.
+        let restore_prepared = restore_prepared
+            && cancellation_available
+            && publication_available
+            && sibling_available;
         // Prepared work may be between intent and receipt in a concurrent live dispatch.
         // Periodic recovery must not classify or redispatch that gap.
         if restore_prepared
@@ -32416,7 +32449,7 @@ async fn signal_workflow_attempt_cancellation(
                     "child cancellation requires durable execution authority".into(),
                 )
             })?;
-            if authority.daemon_instance_id != state.daemon_status.instance_id {
+            if !workflow_operations::authority_targets_current_daemon(state, &authority) {
                 return Err(WorkflowStoreError::InvalidData(
                     "child cancellation belongs to a foreign daemon".into(),
                 ));
@@ -32580,6 +32613,20 @@ async fn propagate_publication_cancellation(
     Ok(())
 }
 
+async fn retry_owned_sibling_cancellation(
+    state: &ServerState,
+    run_id: &str,
+    authority: &bcode_workflow_store::WorkflowExecutionAuthority,
+) -> Result<(), WorkflowStoreError> {
+    let attempts = state
+        .workflow_store
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .pending_owned_sibling_cancellations(run_id, authority, 100)?;
+    propagate_fail_fast_sibling_cancellation(state, attempts).await?;
+    Ok(())
+}
+
 async fn propagate_fail_fast_sibling_cancellation(
     state: &ServerState,
     attempts: Vec<bcode_workflow_store::ActiveAttemptCancellation>,
@@ -32596,7 +32643,7 @@ async fn propagate_fail_fast_sibling_cancellation(
                     "sibling cancellation requires durable authority".into(),
                 )
             })?;
-        if authority.daemon_instance_id != state.daemon_status.instance_id {
+        if !workflow_operations::authority_targets_current_daemon(state, &authority) {
             return Err(WorkflowStoreError::InvalidData(
                 "sibling cancellation belongs to a foreign daemon".into(),
             ));
@@ -32665,7 +32712,7 @@ async fn propagate_persisted_workflow_cancellation_with_authorities(
                 })?
             };
             drop(store);
-            if authority.daemon_instance_id != state.daemon_status.instance_id {
+            if !workflow_operations::authority_targets_current_daemon(state, &authority) {
                 return Err(WorkflowStoreError::InvalidData(
                     "cancellation belongs to a foreign daemon".into(),
                 ));
@@ -66368,8 +66415,22 @@ event_symbol = "bcode_plugin_handle_event_v1"
     }
 
     #[tokio::test]
-    #[allow(clippy::too_many_lines)]
     async fn orphaned_workflow_cancellation_does_not_require_runtime_registration() {
+        verify_orphaned_workflow_cancellation(false, false).await;
+    }
+
+    #[tokio::test]
+    async fn recovery_settles_terminal_evidence_without_cancellation_handle() {
+        verify_orphaned_workflow_cancellation(true, false).await;
+    }
+
+    #[tokio::test]
+    async fn recovery_only_settles_terminal_evidence_without_reopening_execution() {
+        verify_orphaned_workflow_cancellation(true, true).await;
+    }
+
+    #[allow(clippy::too_many_lines)]
+    async fn verify_orphaned_workflow_cancellation(terminal_evidence: bool, recovery_only: bool) {
         let sessions = SessionManager::default();
         let parent = sessions
             .create_session(
@@ -66465,15 +66526,66 @@ event_symbol = "bcode_plugin_handle_event_v1"
                 admitted_at_ms: 3,
             })
             .expect("receipt");
+        if recovery_only {
+            let authority = store
+                .execution_authority("orphaned-cancellation-run")
+                .expect("authority")
+                .expect("owner");
+            store
+                .enter_recovery_only("orphaned-cancellation-run", &authority, 4)
+                .expect("recovery barrier");
+        }
         store
             .request_cancellation("orphaned-cancellation-run", 4)
             .expect("cancellation");
         let attempts = store
             .active_attempt_cancellations("orphaned-cancellation-run", 10)
             .expect("attempts");
-        let mut state = test_server_state_with_fake_provider_and_workflow_store(sessions, store);
-        state.daemon_status.instance_id = test_workflow_execution_authority().daemon_instance_id;
+        let state = Arc::new({
+            let mut server =
+                test_server_state_with_fake_provider_and_workflow_store(sessions, store);
+            server.daemon_status.instance_id =
+                test_workflow_execution_authority().daemon_instance_id;
+            server
+        });
 
+        if terminal_evidence {
+            state
+                .sessions
+                .append_model_turn_started(parent.id, "missing-turn".into())
+                .await
+                .expect("start evidence");
+            state
+                .sessions
+                .append_model_turn_finished(
+                    parent.id,
+                    "missing-turn".into(),
+                    ModelTurnOutcome::Cancelled,
+                    None,
+                )
+                .await
+                .expect("terminal evidence");
+            restore_workflow_runs(&state, vec!["orphaned-cancellation-run".into()], false).await;
+            let run = state
+                .workflow_store
+                .lock()
+                .expect("store")
+                .run_summary("orphaned-cancellation-run")
+                .expect("summary")
+                .expect("run");
+            assert_eq!(run.status, bcode_workflow::RunStatus::Cancelled);
+            assert_eq!(
+                state
+                    .workflow_store
+                    .lock()
+                    .expect("store")
+                    .is_recovery_only("orphaned-cancellation-run")
+                    .expect("barrier"),
+                recovery_only
+            );
+            drop(state);
+            return;
+        }
         let authority = state
             .workflow_store
             .lock()
@@ -66506,9 +66618,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
             ),
         )
         .await;
-        retry_owned_workflow_cancellation(&state, "orphaned-cancellation-run", &authority)
-            .await
-            .expect("retry signal after owner reattachment");
+        restore_workflow_runs(&state, vec!["orphaned-cancellation-run".into()], false).await;
         assert!(cancellation.is_cancelled());
         assert_eq!(
             state
@@ -67557,6 +67667,36 @@ event_symbol = "bcode_plugin_handle_event_v1"
     }
 
     #[tokio::test]
+    async fn sibling_cancellation_rejects_same_instance_foreign_artifact() {
+        let root = tempfile::tempdir().expect("root");
+        let authority = test_workflow_execution_authority();
+        let store = mutation_resolution_store_with_authority(root.path(), None, Some(authority));
+        let mut state = test_server_state(SessionManager::default());
+        state.workflow_store = StdMutex::new(store).into();
+        state.daemon_status.artifact_id =
+            Some(bcode_ipc::ArtifactId::parse("foreign-artifact").expect("artifact"));
+        let attempt = bcode_workflow_store::ActiveAttemptCancellation {
+            run_id: "expiration".into(),
+            node_id: "node".into(),
+            activation_id: "activation".into(),
+            attempt: 1,
+            dispatch_identity: "dispatch".into(),
+            receipt: None,
+        };
+        let result = propagate_fail_fast_sibling_cancellation(&state, vec![attempt.clone()]).await;
+        let run_result = propagate_persisted_workflow_cancellation(&state, vec![attempt]).await;
+        drop(state);
+        assert!(
+            matches!(run_result, Err(WorkflowStoreError::InvalidData(message))
+            if message == "cancellation belongs to a foreign daemon")
+        );
+        assert!(
+            matches!(result, Err(WorkflowStoreError::InvalidData(message))
+            if message == "sibling cancellation belongs to a foreign daemon")
+        );
+    }
+
+    #[tokio::test]
     async fn recovery_cancellation_preserves_missing_external_owner() {
         let root = tempfile::tempdir().expect("root");
         let authority = test_workflow_execution_authority();
@@ -67653,6 +67793,25 @@ event_symbol = "bcode_plugin_handle_event_v1"
             .expect("summary")
             .expect("run");
         assert!(run.cancellation_requested_at_ms.is_none());
+        state.daemon_status.instance_id = "foreign-child-owner".into();
+        state.daemon_status.artifact_id =
+            Some(bcode_ipc::ArtifactId::parse("other-child-artifact").expect("artifact"));
+        assert!(
+            signal_workflow_attempt_cancellation(&state, &attempt)
+                .await
+                .is_err()
+        );
+        assert!(
+            state
+                .workflow_store
+                .lock()
+                .expect("store")
+                .run_summary("expiration")
+                .expect("summary")
+                .expect("run")
+                .cancellation_requested_at_ms
+                .is_none()
+        );
         state
             .workflow_store
             .lock()

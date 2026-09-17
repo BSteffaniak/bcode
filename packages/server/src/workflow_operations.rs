@@ -5786,7 +5786,8 @@ fn verify_current_coordinator_artifact(
     Ok(())
 }
 
-fn authority_targets_current_daemon(
+/// Check the coordinator's artifact and instance against this daemon, without granting authority.
+pub fn authority_targets_current_daemon(
     state: &ServerState,
     authority: &bcode_workflow_store::WorkflowExecutionAuthority,
 ) -> bool {
