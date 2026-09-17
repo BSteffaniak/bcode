@@ -2636,10 +2636,13 @@ impl ServerState {
                                     || (run.status == bcode_workflow_store::RunStatus::RepairRequired
                                         && store.is_recovery_only(&run_id).unwrap_or(false))))
                             };
-                            if !runnable { continue; }
-                            // Paused runs still need receipt settlement and cancellation recovery.
-                            // Discovery is only a hint; recovery qualifies durable ownership.
-                            restore_workflow_runs(&state, vec![run_id], false).await;
+                            if runnable {
+                                // Paused runs still need receipt settlement and cancellation recovery.
+                                restore_workflow_runs(&state, vec![run_id.clone()], false).await;
+                            }
+                            // Terminal old runs may still hold a replacement reservation.
+                            // Completion independently rechecks policy and durable ownership.
+                            workflow_operations::recover_pending_replacement(&state, &run_id).await;
                         }
                         recovery_tick.reset();
                     }
@@ -68209,6 +68212,10 @@ event_symbol = "bcode_plugin_handle_event_v1"
         else {
             panic!("expected populated inspection");
         };
+        assert_eq!(
+            inspection.replacement_readiness,
+            Some(bcode_workflow::ReplacementReadiness::Absent)
+        );
         let grant = inspection
             .grants
             .iter()
@@ -68875,6 +68882,258 @@ event_symbol = "bcode_plugin_handle_event_v1"
             .expect("recovery");
     }
 
+    async fn assert_no_pending_replacement_withdrawal(
+        state: &Arc<ServerState>,
+        key: &bcode_workflow_store::WorkflowRunBindingKey,
+    ) {
+        let (_, changed) = workflow_operations::control_associated_run(
+            state,
+            key,
+            bcode_workflow::WorkflowRunControlAction::WithdrawReplacement,
+        )
+        .await
+        .expect("no pending replacement");
+        assert!(!changed);
+    }
+
+    async fn verify_foreign_replacement_withdrawal(
+        state: &Arc<ServerState>,
+        key: &bcode_workflow_store::WorkflowRunBindingKey,
+        old_id: &str,
+        authority: &bcode_workflow_store::WorkflowExecutionAuthority,
+    ) {
+        let foreign = bcode_workflow_store::WorkflowExecutionAuthority {
+            daemon_instance_id: "foreign-unverifiable-owner".into(),
+            generation: authority.generation + 1,
+            fencing_token: "foreign-fence".into(),
+            ..authority.clone()
+        };
+        state
+            .workflow_store
+            .lock()
+            .expect("store")
+            .transfer_execution_authority(old_id, authority, &foreign, 31)
+            .expect("foreign fixture");
+        assert!(
+            workflow_operations::control_associated_run(
+                state,
+                key,
+                bcode_workflow::WorkflowRunControlAction::WithdrawReplacement
+            )
+            .await
+            .is_err()
+        );
+        let mut store = state.workflow_store.lock().expect("store");
+        assert!(
+            store
+                .pending_replacement(old_id)
+                .expect("preserved")
+                .is_some()
+        );
+        assert_eq!(
+            store.execution_authority(old_id).expect("unchanged owner"),
+            Some(foreign.clone())
+        );
+        let restored = bcode_workflow_store::WorkflowExecutionAuthority {
+            generation: foreign.generation + 1,
+            ..authority.clone()
+        };
+        store
+            .transfer_execution_authority(old_id, &foreign, &restored, 32)
+            .expect("restore local owner fixture");
+        drop(store);
+    }
+
+    async fn verify_associated_replacement_withdrawal(
+        state: &Arc<ServerState>,
+        key: &bcode_workflow_store::WorkflowRunBindingKey,
+        mut successor: bcode_workflow_store::NewWorkflowRun,
+    ) {
+        let old_id = successor.run_id.clone();
+        successor.run_id = "withdraw-successor".into();
+        let authority = successor.execution_authority.clone().expect("owner");
+        state
+            .workflow_store
+            .lock()
+            .expect("store")
+            .request_replacement_owned(&old_id, &authority, &successor, 30)
+            .expect("intent");
+        assert!(
+            workflow_operations::control_associated_run(
+                state,
+                key,
+                bcode_workflow::WorkflowRunControlAction::CompleteReplacement,
+            )
+            .await
+            .is_err(),
+            "fixture policy must not authorize replacement completion"
+        );
+        verify_foreign_replacement_withdrawal(state, key, &old_id, &authority).await;
+        let (run, changed) = workflow_operations::control_associated_run(
+            state,
+            key,
+            bcode_workflow::WorkflowRunControlAction::WithdrawReplacement,
+        )
+        .await
+        .expect("withdraw");
+        assert!(changed);
+        assert!(run.expect("old run").cancellation_requested_at_ms.is_some());
+        assert_no_pending_replacement_withdrawal(state, key).await;
+        let store = state.workflow_store.lock().expect("store");
+        assert!(
+            store
+                .pending_replacement(&old_id)
+                .expect("pending")
+                .is_none()
+        );
+        assert!(
+            store
+                .run_summary(&successor.run_id)
+                .expect("successor")
+                .is_none()
+        );
+        drop(store);
+    }
+
+    async fn verify_authorized_replacement_completion(
+        previous: &Arc<ServerState>,
+        key: &bcode_workflow_store::WorkflowRunBindingKey,
+        mut successor: bcode_workflow_store::NewWorkflowRun,
+    ) {
+        let root = tempfile::tempdir().expect("store");
+        let store =
+            bcode_workflow_store::WorkflowStore::open_in_state_dir(root.path()).expect("store");
+        let state = Arc::new(test_server_state_with_workflow_authorization(
+            previous.sessions.clone(),
+            store,
+        ));
+        let session_id = successor
+            .parent_session_id
+            .as_ref()
+            .expect("parent")
+            .parse()
+            .expect("id");
+        let profile: AgentPolicyProfileIdentity = state
+            .plugins
+            .invoke_service_by_interface_json(
+                AGENT_PROFILE_INTERFACE_ID,
+                OP_RESOLVE_POLICY_PROFILE_IDENTITY,
+                &ResolveAgentPolicyProfileIdentityRequest {
+                    profile_id: session_agent_selection(&state, session_id).await,
+                    effective_config_toml: Some(Box::new(
+                        bcode_config::encode_effective_config(
+                            &state.session_config(session_id).await,
+                        )
+                        .expect("config"),
+                    )),
+                },
+            )
+            .await
+            .expect("profile");
+        successor.authorization_profile = bcode_workflow::WorkflowAuthorizationProfileIdentity {
+            version: profile.version,
+            provider_id: profile.provider_id,
+            profile_id: profile.profile_id,
+            policy_digest_sha256: profile.policy_digest_sha256,
+        };
+        let authority = successor.execution_authority.clone().expect("authority");
+        let old_id = successor.run_id.clone();
+        let definition = previous
+            .workflow_store
+            .lock()
+            .expect("store")
+            .definition(&successor.definition_id, successor.definition_version)
+            .expect("definition")
+            .expect("exists");
+        {
+            let mut store = state.workflow_store.lock().expect("store");
+            store
+                .persist_definition(
+                    &successor.definition_id,
+                    successor.definition_version,
+                    &serde_json::from_str(&definition.definition_json).expect("decode"),
+                )
+                .expect("persist");
+            store.create_run(&successor).expect("old run");
+            successor.run_id = "completed-replacement-successor".into();
+            store
+                .request_replacement_owned(&old_id, &authority, &successor, 40)
+                .expect("intent");
+        }
+        state.start_workflow_driver().await;
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                let complete = state
+                    .workflow_store
+                    .lock()
+                    .expect("store")
+                    .run_summary(&successor.run_id)
+                    .expect("summary")
+                    .is_some();
+                if complete {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("background replacement completion");
+        state.request_shutdown();
+        let driver = state
+            .workflow_driver_task
+            .lock()
+            .await
+            .take()
+            .expect("driver");
+        driver.await.expect("driver shutdown");
+        let (_, changed) = workflow_operations::control_associated_run(
+            &state,
+            key,
+            bcode_workflow::WorkflowRunControlAction::CompleteReplacement,
+        )
+        .await
+        .expect("retry");
+        assert!(!changed);
+        assert_completed_replacement(&state, &old_id, &successor.run_id);
+        drop(state);
+    }
+
+    fn assert_completed_replacement(state: &ServerState, old_id: &str, successor_id: &str) {
+        let store = state.workflow_store.lock().expect("store");
+        assert!(
+            store
+                .pending_replacement(old_id)
+                .expect("intent consumed")
+                .is_none()
+        );
+        assert_eq!(
+            store.run_summary(old_id).expect("old").expect("run").status,
+            bcode_workflow_store::RunStatus::Cancelled
+        );
+        assert_eq!(
+            store
+                .waiting_activations(successor_id, 10)
+                .expect("successor driven")
+                .len(),
+            1
+        );
+        drop(store);
+    }
+
+    fn assert_resumed_pending(state: &ServerState, changed: bool) {
+        assert!(changed);
+        assert_eq!(
+            state
+                .workflow_store
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .waiting_activations("resume-pending-run", 10)
+                .expect("waits")
+                .len(),
+            1
+        );
+    }
+
     async fn assert_associated_resume_pending(recovering: bool) {
         let sessions = SessionManager::default();
         let session = sessions
@@ -68919,40 +69178,40 @@ event_symbol = "bcode_plugin_handle_event_v1"
         store
             .persist_definition("resume-pending", 1, &definition)
             .expect("definition");
-        store
-            .create_run(&bcode_workflow_store::NewWorkflowRun {
-                run_id: "resume-pending-run".to_string(),
-                definition_id: "resume-pending".to_string(),
-                definition_version: 1,
-                workspace_snapshot: "snapshot".to_string(),
-                parent_session_id: Some(session.id.to_string()),
-                parent_session_generation: None,
-                binding: Some(bcode_workflow_store::WorkflowRunBinding {
-                    owner_plugin_id: key.owner_plugin_id.clone(),
-                    workflow_kind: key.workflow_kind.clone(),
-                    scope_key: key.scope_key.clone(),
-                    display_label: None,
-                    single_active: true,
-                }),
-                authored_provenance: None,
-                input: Some(serde_json::json!(true)),
-                execution_authority: Some(test_workflow_execution_authority()),
-                created_at_ms: 1,
-                authorization_profile: bcode_workflow::WorkflowAuthorizationProfileIdentity {
-                    version: 1,
-                    provider_id: "test-policy".to_string(),
-                    profile_id: "build".to_string(),
-                    policy_digest_sha256: "a".repeat(64),
-                },
-                authorization_ceiling: bcode_workflow::WorkflowToolCapability::Mutating,
-                limits: bcode_workflow_store::WorkflowRunLimits::default(),
-            })
-            .expect("run");
+        let new_run = bcode_workflow_store::NewWorkflowRun {
+            run_id: "resume-pending-run".to_string(),
+            definition_id: "resume-pending".to_string(),
+            definition_version: 1,
+            workspace_snapshot: "snapshot".to_string(),
+            parent_session_id: Some(session.id.to_string()),
+            parent_session_generation: None,
+            binding: Some(bcode_workflow_store::WorkflowRunBinding {
+                owner_plugin_id: key.owner_plugin_id.clone(),
+                workflow_kind: key.workflow_kind.clone(),
+                scope_key: key.scope_key.clone(),
+                display_label: None,
+                single_active: true,
+            }),
+            authored_provenance: None,
+            input: Some(serde_json::json!(true)),
+            execution_authority: Some(test_workflow_execution_authority()),
+            created_at_ms: 1,
+            authorization_profile: bcode_workflow::WorkflowAuthorizationProfileIdentity {
+                version: 1,
+                provider_id: "test-policy".to_string(),
+                profile_id: "build".to_string(),
+                policy_digest_sha256: "a".repeat(64),
+            },
+            authorization_ceiling: bcode_workflow::WorkflowToolCapability::Mutating,
+            limits: bcode_workflow_store::WorkflowRunLimits::default(),
+        };
+        store.create_run(&new_run).expect("run");
         store.pause_run("resume-pending-run", 2).expect("pause");
         let state = Arc::new(test_server_state_with_fake_provider_and_workflow_store(
             sessions, store,
         ));
 
+        assert_no_pending_replacement_withdrawal(&state, &key).await;
         if recovering {
             enter_test_run_recovery(&state, "resume-pending-run");
         }
@@ -68964,17 +69223,12 @@ event_symbol = "bcode_plugin_handle_event_v1"
         .await
         .expect("resume");
 
-        assert!(changed);
-        assert_eq!(
-            state
-                .workflow_store
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .waiting_activations("resume-pending-run", 10)
-                .expect("waits")
-                .len(),
-            1
-        );
+        assert_resumed_pending(&state, changed);
+        verify_associated_replacement_withdrawal(&state, &key, new_run.clone()).await;
+        Box::pin(verify_authorized_replacement_completion(
+            &state, &key, new_run,
+        ))
+        .await;
     }
 
     #[tokio::test]

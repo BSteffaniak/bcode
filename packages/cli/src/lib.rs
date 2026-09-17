@@ -882,6 +882,8 @@ where
             "pause" => bcode_workflow::WorkflowRunControlAction::Pause,
             "resume" => bcode_workflow::WorkflowRunControlAction::Resume,
             "cancel" => bcode_workflow::WorkflowRunControlAction::Cancel,
+            "complete-replacement" => bcode_workflow::WorkflowRunControlAction::CompleteReplacement,
+            "withdraw-replacement" => bcode_workflow::WorkflowRunControlAction::WithdrawReplacement,
             _ => unreachable!("clap validates lifecycle action"),
         };
         print_json(&client.control_associated_workflow_run(key, action).await?)
@@ -4107,7 +4109,7 @@ enum WorkflowCommand {
         #[arg(long, default_value_t = 100, requires = "inspect")]
         limit: usize,
         /// Apply a daemon-owned lifecycle transition; prints [run-or-null, changed].
-        #[arg(long, value_parser = ["pause", "resume", "cancel"], conflicts_with = "inspect")]
+        #[arg(long, value_parser = ["pause", "resume", "cancel", "withdraw-replacement", "complete-replacement"], conflicts_with = "inspect")]
         action: Option<String>,
     },
     /// Read a package publication receipt as JSON, or null when unpublished.
@@ -6677,6 +6679,49 @@ async fn handle_session_command(command: Box<SessionCommand>) -> Result<(), CliE
             print_derivation_cancellation(*operation_id).await
         }
         _ => Box::pin(dispatch_session_command(command)).await,
+    }
+}
+
+#[cfg(test)]
+mod replacement_control_cli_tests {
+    use clap::Parser as _;
+
+    #[test]
+    fn completion_parses_only_as_mutually_exclusive_control() {
+        let args = [
+            "bcode",
+            "workflow",
+            "associated-run",
+            "--owner-plugin-id",
+            "test",
+            "--workflow-kind",
+            "test",
+            "--scope-key",
+            "scope",
+            "--action",
+            "complete-replacement",
+        ];
+        assert!(super::Cli::try_parse_from(args).is_ok());
+        assert!(super::Cli::try_parse_from(args.into_iter().chain(["--inspect"])).is_err());
+    }
+
+    #[test]
+    fn withdrawal_parses_only_as_mutually_exclusive_control() {
+        let args = [
+            "bcode",
+            "workflow",
+            "associated-run",
+            "--owner-plugin-id",
+            "test",
+            "--workflow-kind",
+            "test",
+            "--scope-key",
+            "scope",
+            "--action",
+            "withdraw-replacement",
+        ];
+        assert!(super::Cli::try_parse_from(args).is_ok());
+        assert!(super::Cli::try_parse_from(args.into_iter().chain(["--inspect"])).is_err());
     }
 }
 

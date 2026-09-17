@@ -962,6 +962,10 @@ pub enum WorkflowRunControlAction {
     Pause,
     Resume,
     Cancel,
+    /// Withdraw the currently pending replacement without undoing cancellation.
+    WithdrawReplacement,
+    /// Reauthorize and complete a quiescent pending replacement.
+    CompleteReplacement,
 }
 
 /// Generic associated workflow run lookup key.
@@ -1676,6 +1680,34 @@ pub struct WorkflowRunInspection {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn replacement_readiness_preserves_states_and_rejects_future_variants() {
+        use super::ReplacementReadiness;
+        for state in [
+            ReplacementReadiness::Absent,
+            ReplacementReadiness::WaitingForOldRun,
+            ReplacementReadiness::WaitingForEffects,
+            ReplacementReadiness::DescendantProofRequired,
+            ReplacementReadiness::ExecutionCompatibilityRequired,
+            ReplacementReadiness::ReadyForAuthorization,
+        ] {
+            let value = serde_json::to_value(state).expect("encode");
+            assert_eq!(
+                serde_json::from_value::<ReplacementReadiness>(value).expect("decode"),
+                state
+            );
+        }
+        assert!(
+            serde_json::from_value::<ReplacementReadiness>(serde_json::json!("future_ready"))
+                .is_err()
+        );
+        assert_eq!(
+            serde_json::from_value::<Option<ReplacementReadiness>>(serde_json::Value::Null)
+                .expect("unknown"),
+            None
+        );
+    }
+
     #[test]
     fn coordinator_recovery_observation_preserves_unknown_older_state() {
         let older = serde_json::json!({"target_artifact_id":"artifact", "daemon_instance_id":"daemon",

@@ -8497,6 +8497,139 @@ pub async fn inspect_associated_run(
     )))
 }
 
+/// Revisit a ready replacement during bounded background discovery.
+/// Readiness is only a hint; completion rechecks policy, session ownership, and fencing.
+pub async fn recover_pending_replacement(state: &std::sync::Arc<ServerState>, run_id: &str) {
+    let ready = state
+        .workflow_store
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .replacement_readiness(run_id);
+    match ready {
+        Ok(bcode_workflow::ReplacementReadiness::ReadyForAuthorization) => {
+            if complete_pending_replacement(state, run_id).await.is_err() {
+                tracing::warn!(
+                    run_id,
+                    "pending replacement remains blocked by policy, ownership, or storage; explicit inspection required"
+                );
+            }
+        }
+        Ok(_) => {}
+        Err(_) => tracing::warn!(
+            run_id,
+            "replacement inspection unavailable; durable state preserved"
+        ),
+    }
+}
+
+/// Complete an existing replacement through current policy and execution boundaries.
+async fn complete_pending_replacement(
+    state: &std::sync::Arc<ServerState>,
+    run_id: &str,
+) -> Result<Option<String>, super::ServerError> {
+    let Some(mut pending) = state
+        .workflow_store
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .pending_replacement(run_id)?
+    else {
+        return Ok(None);
+    };
+    let session_id = run_parent_session_id(state, run_id)?;
+    if pending.parent_session_id.as_deref() != Some(session_id.to_string().as_str()) {
+        return Err(bcode_workflow_store::WorkflowStoreError::InvalidData(
+            "replacement parent session mismatch".into(),
+        )
+        .into());
+    }
+    let definition = state
+        .workflow_store
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .definition(&pending.definition_id, pending.definition_version)?
+        .ok_or_else(|| {
+            bcode_workflow_store::WorkflowStoreError::InvalidData(
+                "replacement definition unavailable".into(),
+            )
+        })?;
+    validate_workflow_definition_for_production(
+        state,
+        &serde_json::from_str(&definition.definition_json)?,
+    )?;
+    let profile = state
+        .plugins
+        .invoke_service_by_interface_json::<_, super::AgentPolicyProfileIdentity>(
+            super::AGENT_PROFILE_INTERFACE_ID,
+            super::OP_RESOLVE_POLICY_PROFILE_IDENTITY,
+            &super::ResolveAgentPolicyProfileIdentityRequest {
+                profile_id: super::session_agent_selection(state, session_id).await,
+                effective_config_toml: Some(Box::new(
+                    bcode_config::encode_effective_config(&state.session_config(session_id).await)
+                        .map_err(|error| {
+                            bcode_workflow_store::WorkflowStoreError::InvalidData(error.to_string())
+                        })?,
+                )),
+            },
+        )
+        .await
+        .map_err(|_| {
+            bcode_workflow_store::WorkflowStoreError::InvalidData(
+                "replacement policy resolution unavailable".into(),
+            )
+        })?;
+    let current_profile = bcode_workflow::WorkflowAuthorizationProfileIdentity {
+        version: profile.version,
+        provider_id: profile.provider_id,
+        profile_id: profile.profile_id,
+        policy_digest_sha256: profile.policy_digest_sha256,
+    };
+    if current_profile != pending.authorization_profile {
+        return Err(bcode_workflow_store::WorkflowStoreError::InvalidData("replacement policy profile changed; withdraw and request a newly authorized replacement".into()).into());
+    }
+    let _session_owner = state
+        .sessions
+        .acquire_session_ownership(session_id, bcode_session::SessionOwnershipKind::RuntimeWork)
+        .await?;
+    let authority = execution_authority(state, run_id).await?.ok_or_else(|| {
+        bcode_workflow_store::WorkflowStoreError::InvalidData(
+            "replacement authority unavailable".into(),
+        )
+    })?;
+    pending.execution_authority = Some(authority.authority.clone());
+    let changed = state
+        .workflow_store
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .complete_leaf_replacement_owned(
+            run_id,
+            &authority.authority,
+            &pending,
+            super::current_unix_millis(),
+        )?;
+    if changed {
+        super::register_workflow_runtime_work(
+            state,
+            session_id,
+            &pending.run_id,
+            format!(
+                "workflow {} v{}",
+                pending.definition_id, pending.definition_version
+            ),
+        )
+        .await;
+        if super::drive_workflow_run(state, &pending.run_id)
+            .await
+            .is_err()
+        {
+            // Handoff is already committed. Never report an admission failure that
+            // encourages a caller to submit a second replacement. Normal discovery
+            // revisits the durable successor through ownership-fenced recovery.
+            tracing::warn!(run_id = %pending.run_id, "replacement committed; initial continuation deferred to workflow recovery");
+        }
+    }
+    Ok(changed.then_some(pending.run_id))
+}
+
 /// Control the workflow run associated with one plugin-owned binding.
 pub async fn control_associated_run(
     state: &std::sync::Arc<ServerState>,
@@ -8506,6 +8639,47 @@ pub async fn control_associated_run(
     let run = associated_run(state, key)?;
     let changed = if let Some(run) = &run {
         match action {
+            bcode_workflow::WorkflowRunControlAction::CompleteReplacement => {
+                if let Some(successor_id) = complete_pending_replacement(state, &run.run_id).await?
+                {
+                    let successor = state
+                        .workflow_store
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .run_summary(&successor_id)?;
+                    return Ok((successor, true));
+                }
+                false
+            }
+            bcode_workflow::WorkflowRunControlAction::WithdrawReplacement => {
+                let pending = state
+                    .workflow_store
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .pending_replacement(&run.run_id)?;
+                if let Some(pending) = pending {
+                    let authority =
+                        execution_authority(state, &run.run_id)
+                            .await?
+                            .ok_or_else(|| {
+                                bcode_workflow_store::WorkflowStoreError::InvalidData(
+                                    "replacement has no durable authority".into(),
+                                )
+                            })?;
+                    state
+                        .workflow_store
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .withdraw_replacement_owned(
+                            &run.run_id,
+                            &pending.run_id,
+                            &authority.authority,
+                            super::current_unix_millis(),
+                        )?
+                } else {
+                    false
+                }
+            }
             bcode_workflow::WorkflowRunControlAction::Pause => {
                 pause_run(state, &run.run_id).await?
             }
