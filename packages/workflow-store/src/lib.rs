@@ -20158,6 +20158,27 @@ mod tests {
         assert_eq!(old.cancellation_requested_at_ms, None);
     }
 
+    #[test]
+    fn package_replacement_crash_child() {
+        let Ok(path) = std::env::var("BCODE_TEST_PACKAGE_REPLACEMENT_DB") else {
+            return;
+        };
+        let mut store = WorkflowStore::open_at_path(Path::new(&path)).expect("store");
+        let run_id = std::env::var("BCODE_TEST_PACKAGE_REPLACEMENT_RUN").expect("run");
+        let owner = store
+            .execution_authority(&run_id)
+            .expect("authority")
+            .expect("owner");
+        let successor = store
+            .pending_replacement(&run_id)
+            .expect("pending")
+            .expect("intent");
+        store
+            .complete_leaf_replacement_owned(&run_id, &owner, &successor, 31)
+            .expect("handoff");
+        std::process::exit(74);
+    }
+
     fn verify_package_replacement(
         store: &mut WorkflowStore,
         run: &NewWorkflowRun,
@@ -20209,9 +20230,36 @@ mod tests {
         store
             .request_replacement_owned(&run.run_id, &owner, &successor, 30)
             .expect("intent");
-        store
-            .complete_leaf_replacement_owned(&run.run_id, &owner, &successor, 31)
-            .expect("handoff");
+        for phase in ["before_commit", "after_commit"] {
+            let status = std::process::Command::new(std::env::current_exe().expect("test binary"))
+                .args(["--exact", "tests::package_replacement_crash_child"])
+                .env("BCODE_TEST_PACKAGE_REPLACEMENT_DB", store.path())
+                .env("BCODE_TEST_PACKAGE_REPLACEMENT_RUN", &run.run_id)
+                .env("BCODE_TEST_REPLACEMENT_CRASH_PHASE", phase)
+                .status()
+                .expect("child");
+            let committed = phase == "after_commit";
+            assert_eq!(status.code(), Some(if committed { 74 } else { 73 }));
+            assert_eq!(
+                store
+                    .run_summary(&successor.run_id)
+                    .expect("successor")
+                    .is_some(),
+                committed
+            );
+            assert_eq!(
+                store
+                    .pending_replacement(&run.run_id)
+                    .expect("intent")
+                    .is_none(),
+                committed
+            );
+        }
+        assert!(
+            !store
+                .complete_leaf_replacement_owned(&run.run_id, &owner, &successor, 32)
+                .expect("idempotent retry")
+        );
         assert_eq!(
             store
                 .resolve_run_package_member(&successor.run_id, &receipt.exports[0].member_id)

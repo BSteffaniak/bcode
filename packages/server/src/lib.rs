@@ -36599,6 +36599,14 @@ mod tests {
         thread.join().expect("package export lifecycle");
     }
 
+    fn package_replacement_test_document() -> bcode_workflow::WorkflowAuthoringDocument {
+        let mut document = test_workflow_authoring_document();
+        let node = document.definition.nodes.get_mut("agent").expect("node");
+        node.kind = bcode_workflow::NodeKind::Input;
+        node.configuration = serde_json::json!({});
+        document
+    }
+
     async fn verify_package_export_replacement_selection(
         client: &bcode_client::BcodeClient,
         state: &Arc<ServerState>,
@@ -36636,8 +36644,48 @@ mod tests {
             .expect("export")
             .package_lock_digest_sha256 = Some("0".repeat(64));
         assert!(client.request_workflow_replacement(wrong).await.is_err());
-        // The original export may already have completed. Selection must still resolve
-        // exactly; terminal admission is checked separately by the store.
+        let accepted = client
+            .request_workflow_replacement(request.clone())
+            .await
+            .expect("package replacement admission");
+        assert!(accepted.created);
+        assert!(
+            !client
+                .request_workflow_replacement(request.clone())
+                .await
+                .expect("retry")
+                .created
+        );
+        let (_, changed) = client
+            .control_workflow_run(
+                run.run_id.clone(),
+                bcode_workflow::WorkflowRunControlAction::CompleteReplacement,
+            )
+            .await
+            .expect("package handoff");
+        assert!(changed);
+        let store = state.workflow_store.lock().expect("store");
+        let successor = store
+            .run_summary("package-export-successor")
+            .expect("summary")
+            .expect("successor");
+        assert!(successor.authored_provenance.is_some());
+        assert_eq!(
+            store
+                .resolve_run_package_member(&successor.run_id, &started.exported.member_id)
+                .expect("package binding"),
+            started.exported.definition_identity
+        );
+        assert_eq!(
+            store
+                .run_summary(&run.run_id)
+                .expect("old")
+                .expect("run")
+                .status,
+            bcode_workflow::RunStatus::Cancelled
+        );
+        drop(store);
+        // Selection still resolves against the original pinned package after handoff.
         let selection = state
             .workflow_store
             .lock()
@@ -36667,7 +36715,7 @@ mod tests {
         let mut store =
             bcode_workflow_store::WorkflowStore::open_in_state_dir(workflow_root.path())
                 .expect("workflow store");
-        let document = test_workflow_authoring_document();
+        let document = package_replacement_test_document();
         let now = current_time_ms();
         let workflow = bcode_workflow_store::AuthoredWorkflow {
             workflow_id: document.workflow_id.clone(),
