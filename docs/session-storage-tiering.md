@@ -51,6 +51,14 @@ Active owners, unknown nonempty formats, malformed records, and over-budget inve
 preserved and refused. Interrupted retirement is safe to retry: the conservative timestamp is
 persisted first. It never rewrites canonical history or repairs damaged session storage.
 
+Legacy global reader evidence can be consolidated explicitly with
+`bcode session compact-legacy-admission --apply --entry-budget 16384`. Each bounded batch holds
+the existing global gate, durably retains `unregistered-read.blocked`, and removes only verified
+unlocked UUID participant records (clean, dirty, or empty interrupted registrations). The blocker
+preserves the registry's refusal of maintenance; this is not a declaration of healthy access ages.
+Daemon registrations, unknown evidence, and the gate remain intact. Repeat batches as needed;
+zero retired does not prove a complete inventory. This command never scans canonical history.
+
 ## Artifact checksum scope
 
 Reference metadata `content_checksum_sha256` is an optional SHA-256 digest of the entire logical

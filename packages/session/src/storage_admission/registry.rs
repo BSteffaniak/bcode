@@ -241,6 +241,77 @@ impl StorageAdmissionRegistry {
         Ok(report)
     }
 
+    /// Retire a bounded batch of legacy global reader records without restoring health.
+    ///
+    /// A durable fallback blocker is persisted before removal. Live daemon registrations,
+    /// unknown records and the coordinator gate are never removed. A partial scan is safe
+    /// because this operation never grants maintenance authority or asserts registry health.
+    /// Repeat until no more records are retired; zero does not prove an empty registry.
+    ///
+    /// # Errors
+    /// Returns unsafe paths, lock contention, invalid budgets or durability failures.
+    pub fn compact_legacy_readers(root: &Path, entry_budget: usize) -> io::Result<usize> {
+        use std::io::Read as _;
+        use std::os::unix::fs::OpenOptionsExt as _;
+        if entry_budget == 0 || entry_budget > 65_536 {
+            return Err(invalid());
+        }
+        let root = std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_DIRECTORY | libc::O_CLOEXEC)
+            .open(root)?;
+        let directory = open_child(
+            &root,
+            c"storage-admission-v1",
+            libc::O_RDONLY | libc::O_DIRECTORY,
+        )?;
+        let gate = open_child(&directory, c"gate", libc::O_RDWR)?;
+        gate.try_lock().map_err(io::Error::from)?;
+        let marker = open_child(
+            &directory,
+            c"unregistered-read.blocked",
+            libc::O_RDWR | libc::O_CREAT,
+        )?;
+        marker.sync_all()?;
+        directory.sync_all()?;
+        let entries = names_bounded(&directory, entry_budget, false)?;
+        let mut retired = 0;
+        for entry in entries {
+            if entry
+                .to_str()
+                .and_then(|s| s.strip_suffix(".participant"))
+                .is_none_or(|s| s.parse::<SessionId>().is_err())
+            {
+                continue;
+            }
+            let name = std::ffi::CString::new(entry.as_bytes()).map_err(|_| invalid())?;
+            let Ok(mut file) = open_child(&directory, &name, libc::O_RDONLY) else {
+                continue;
+            };
+            if file.try_lock().is_err() {
+                continue;
+            }
+            let length = file.metadata()?.len();
+            if length != 0 {
+                if length != super::DIRTY.len() as u64 {
+                    continue;
+                }
+                let mut bytes = [0; 17];
+                file.read_exact(&mut bytes)?;
+                if &bytes != super::DIRTY && &bytes != super::CLEAN {
+                    continue;
+                }
+            }
+            // SAFETY: typed single component, pinned directory, exclusive gate and file lock.
+            if unsafe { libc::unlinkat(raw(&directory), name.as_ptr(), 0) } != 0 {
+                return Err(io::Error::last_os_error());
+            }
+            retired += 1;
+        }
+        directory.sync_all()?;
+        Ok(retired)
+    }
+
     /// Remove only verified clean, completed daemon records under exclusive registry admission.
     ///
     /// The complete directory scan must fit the budget before any record is removed. Live,
@@ -638,6 +709,14 @@ impl Drop for Directory {
 }
 
 fn names(directory: &File, budget: usize) -> io::Result<Vec<std::ffi::OsString>> {
+    names_bounded(directory, budget, true)
+}
+
+fn names_bounded(
+    directory: &File,
+    budget: usize,
+    require_complete: bool,
+) -> io::Result<Vec<std::ffi::OsString>> {
     use std::os::fd::{FromRawFd as _, IntoRawFd as _};
     use std::os::unix::ffi::OsStringExt as _;
     let fd = open_child(directory, c".", libc::O_RDONLY | libc::O_DIRECTORY)?.into_raw_fd();
@@ -671,7 +750,10 @@ fn names(directory: &File, budget: usize) -> io::Result<Vec<std::ffi::OsString>>
             continue;
         }
         if names.len() == budget {
-            return Err(invalid());
+            if require_complete {
+                return Err(invalid());
+            }
+            break;
         }
         names.push(std::ffi::OsString::from_vec(bytes.to_vec()));
     }
@@ -691,6 +773,42 @@ unsafe fn errno() -> *mut libc::c_int {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn legacy_compaction_keeps_blocker_live_daemons_and_unknown_evidence() {
+        use super::StorageAdmissionRegistry;
+        let root = tempfile::tempdir().expect("root");
+        let registry = StorageAdmissionRegistry::open(root.path()).expect("registry");
+        let daemon = registry
+            .register_daemon(bcode_session_models::SessionId::new())
+            .expect("daemon");
+        for _ in 0..5 {
+            drop(
+                registry
+                    .admit_read(bcode_session_models::SessionId::new())
+                    .expect("read"),
+            );
+        }
+        let directory = root.path().join("storage-admission-v1");
+        let unknown = directory.join(format!(
+            "{}.participant",
+            bcode_session_models::SessionId::new()
+        ));
+        std::fs::write(&unknown, b"future").expect("unknown");
+        assert_eq!(
+            StorageAdmissionRegistry::compact_legacy_readers(root.path(), 32).expect("compact"),
+            5
+        );
+        assert_eq!(std::fs::read(unknown).expect("preserved"), b"future");
+        assert!(directory.join("unregistered-read.blocked").exists());
+        assert!(daemon.healthy());
+        let active = registry
+            .admit_read(bcode_session_models::SessionId::new())
+            .expect("active");
+        assert!(StorageAdmissionRegistry::compact_legacy_readers(root.path(), 32).is_err());
+        drop(active);
+        assert!(registry.admit_maintenance(32).is_err());
+    }
+
     #[tokio::test]
     async fn empty_registration_requires_explicit_recovery_and_unknown_bytes_are_preserved() {
         let root = tempfile::tempdir().expect("root");

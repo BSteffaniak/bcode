@@ -4981,6 +4981,15 @@ struct ArtifactRangeArgs {
 
 #[derive(Debug, Subcommand)]
 enum SessionCommand {
+    /// Compact legacy global reader evidence while retaining a durable maintenance blocker.
+    CompactLegacyAdmission {
+        /// Maximum entries inspected in this batch; repeat to drain large registries.
+        #[arg(long, default_value_t = 16384, value_parser = clap::value_parser!(u32).range(1..=65536))]
+        entry_budget: u32,
+        /// Confirm removal of verified unlocked participant files.
+        #[arg(long, required = true)]
+        apply: bool,
+    },
     /// Inspect compression admission; --apply retires verified abandoned reads and resets access age.
     StorageAdmission {
         session_id: SessionId,
@@ -7034,6 +7043,30 @@ async fn dispatch_session_command(command: Box<SessionCommand>) -> Result<(), Cl
             json,
         } => {
             run_session_compression(session_id, older_than, &tier, dry_run, json).await?;
+        }
+        SessionCommand::CompactLegacyAdmission {
+            entry_budget,
+            apply,
+        } => {
+            if !apply {
+                return Err(CliError::InvalidArguments(
+                    "explicit --apply is required".to_owned(),
+                ));
+            }
+            let root = bcode_config::default_session_store_dir();
+            let retired =
+                bcode_session::storage_admission::StorageAdmissionRegistry::compact_legacy_readers(
+                    &root,
+                    entry_budget as usize,
+                )
+                .map_err(|error| {
+                    CliError::InvalidArguments(format!(
+                        "legacy admission compaction refused: {error}"
+                    ))
+                })?;
+            print_json(
+                &serde_json::json!({ "retired": retired, "maintenance_blocker_retained": true }),
+            )?;
         }
         SessionCommand::StorageAdmission { session_id, apply } => {
             ensure_server_running().await?;
