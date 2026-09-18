@@ -41,13 +41,21 @@ pub async fn attach_recent(
     limit: usize,
 ) -> Result<bcode_session::SessionAttachment, bcode_session::SessionError> {
     #[cfg(any(target_os = "macos", target_os = "linux"))]
-    let admission =
+    let mut admission =
         super::storage_read_admission::RegisteredStorageRead::for_session(state, session_id)
             .await?;
     let attachment = state
         .sessions
         .attach_session_recent(session_id, client_id, limit)
-        .await?;
+        .await;
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    let attachment = super::storage_read_admission::RegisteredStorageRead::finish_failed(
+        &mut admission,
+        attachment,
+    )
+    .await?;
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    let attachment = attachment?;
     #[cfg(any(target_os = "macos", target_os = "linux"))]
     if let Some(admission) = admission {
         admission.finish_history(state, session_id).await;
@@ -71,13 +79,21 @@ pub async fn attach_projection_window(
     request: bcode_session_models::ProjectionWindowRequest,
 ) -> Result<bcode_session::SessionProjectionWindowAttachment, bcode_session::SessionError> {
     #[cfg(any(target_os = "macos", target_os = "linux"))]
-    let admission =
+    let mut admission =
         super::storage_read_admission::RegisteredStorageRead::for_session(state, session_id)
             .await?;
     let attachment = state
         .sessions
         .attach_session_projection_window(session_id, client_id, request)
-        .await?;
+        .await;
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    let attachment = super::storage_read_admission::RegisteredStorageRead::finish_failed(
+        &mut admission,
+        attachment,
+    )
+    .await?;
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    let attachment = attachment?;
     #[cfg(any(target_os = "macos", target_os = "linux"))]
     if let Some(admission) = admission {
         admission.finish_history(state, session_id).await;
@@ -115,15 +131,20 @@ pub async fn attach(
         .1
         .map_err(AttachError::Namespace)?;
     #[cfg(any(target_os = "macos", target_os = "linux"))]
-    let admission =
+    let mut admission =
         super::storage_read_admission::RegisteredStorageRead::for_session(state, session_id)
             .await
             .map_err(AttachError::Session)?;
-    let attachment = state
-        .sessions
-        .attach_session(session_id, client_id)
-        .await
-        .map_err(AttachError::Session)?;
+    let attachment = state.sessions.attach_session(session_id, client_id).await;
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    let attachment = super::storage_read_admission::RegisteredStorageRead::finish_failed(
+        &mut admission,
+        attachment,
+    )
+    .await
+    .map_err(AttachError::Session)?;
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    let attachment = attachment.map_err(AttachError::Session)?;
     #[cfg(any(target_os = "macos", target_os = "linux"))]
     if let Some(admission) = admission {
         admission.finish_history(state, session_id).await;
@@ -806,10 +827,18 @@ pub async fn complete_history(
         return Err(ReadHistoryError::IncompatibleActiveNamespace(namespace));
     }
     #[cfg(any(target_os = "macos", target_os = "linux"))]
-    let admission =
+    let mut admission =
         super::storage_read_admission::RegisteredStorageRead::for_session(state, session_id)
             .await?;
-    let history = state.sessions.session_history(session_id).await?;
+    let history = state.sessions.session_history(session_id).await;
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    let history = super::storage_read_admission::RegisteredStorageRead::finish_failed(
+        &mut admission,
+        history,
+    )
+    .await?;
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    let history = history?;
     #[cfg(any(target_os = "macos", target_os = "linux"))]
     if let Some(admission) = admission {
         admission.finish_history(state, session_id).await;
@@ -835,13 +864,19 @@ pub async fn inspect(
         return Err(ReadHistoryError::IncompatibleActiveNamespace(namespace));
     }
     #[cfg(any(target_os = "macos", target_os = "linux"))]
-    let admission =
+    let mut admission =
         super::storage_read_admission::RegisteredStorageRead::for_session(state, session_id)
             .await?;
     let page = state
         .sessions
         .session_inspection_page(session_id, query)
-        .await?;
+        .await;
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    let page =
+        super::storage_read_admission::RegisteredStorageRead::finish_failed(&mut admission, page)
+            .await?;
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    let page = page?;
     #[cfg(any(target_os = "macos", target_os = "linux"))]
     if let Some(admission) = admission {
         admission.finish_history(state, session_id).await;
@@ -884,15 +919,20 @@ pub async fn collect_usage(
         return Err("session storage location is ambiguous");
     }
     #[cfg(any(target_os = "macos", target_os = "linux"))]
-    let admission =
+    let mut admission =
         super::storage_read_admission::RegisteredStorageRead::for_session(state, session_id)
             .await
             .map_err(|_| "usage storage read admission unavailable")?;
-    let mut page = state
+    let page = state
         .sessions
         .session_usage_page(session_id, query.clone())
-        .await
-        .map_err(|_| "usage projection unavailable or changed; restart collection")?;
+        .await;
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    let page =
+        super::storage_read_admission::RegisteredStorageRead::finish_failed(&mut admission, page)
+            .await;
+    let mut page =
+        page.map_err(|_| "usage projection unavailable or changed; restart collection")?;
     #[cfg(any(target_os = "macos", target_os = "linux"))]
     if let Some(admission) = admission {
         admission.finish_history(state, session_id).await;
@@ -981,13 +1021,16 @@ pub async fn history_page(
         return Err(ReadHistoryError::IncompatibleActiveNamespace(namespace));
     }
     #[cfg(any(target_os = "macos", target_os = "linux"))]
-    let admission =
+    let mut admission =
         super::storage_read_admission::RegisteredStorageRead::for_session(state, session_id)
             .await?;
-    let page = state
-        .sessions
-        .session_history_page(session_id, query)
-        .await?;
+    let page = state.sessions.session_history_page(session_id, query).await;
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    let page =
+        super::storage_read_admission::RegisteredStorageRead::finish_failed(&mut admission, page)
+            .await?;
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    let page = page?;
     #[cfg(any(target_os = "macos", target_os = "linux"))]
     if let Some(admission) = admission {
         admission.finish_history(state, session_id).await;
@@ -1013,13 +1056,19 @@ pub async fn history_around(
         return Err(ReadHistoryError::IncompatibleActiveNamespace(namespace));
     }
     #[cfg(any(target_os = "macos", target_os = "linux"))]
-    let admission =
+    let mut admission =
         super::storage_read_admission::RegisteredStorageRead::for_session(state, session_id)
             .await?;
     let window = state
         .sessions
         .session_history_around(session_id, query)
-        .await?;
+        .await;
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    let window =
+        super::storage_read_admission::RegisteredStorageRead::finish_failed(&mut admission, window)
+            .await?;
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    let window = window?;
     #[cfg(any(target_os = "macos", target_os = "linux"))]
     if let Some(admission) = admission {
         admission.finish_history(state, session_id).await;

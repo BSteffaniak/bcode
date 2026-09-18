@@ -10,6 +10,8 @@ use bcode_session_models::{SessionEventKind, SessionId};
 const ACTIVE_ARTIFACT_FETCH_BYTES: u32 = 256 * 1024;
 const ACTIVE_ARTIFACT_RETRY_BASE: Duration = Duration::from_millis(100);
 const ACTIVE_ARTIFACT_RETRY_MAX: Duration = Duration::from_secs(2);
+// Presentation hydration retries are bounded per observed target, not workflow execution.
+const ACTIVE_ARTIFACT_MAX_FAILURES: u32 = 8;
 
 type ActiveArtifactKey = (SessionId, String, String, String);
 
@@ -187,6 +189,7 @@ impl ArtifactStreamCoordinator {
         for (key, state) in &mut self.artifact_fetches {
             if key.0 == session_id {
                 state.terminal_error = None;
+                state.consecutive_failures = 0;
                 state.retry_at = Some(Instant::now());
             }
         }
@@ -256,11 +259,16 @@ impl ArtifactStreamCoordinator {
             if state
                 .target
                 .as_ref()
-                .is_some_and(|target| sequence < target.revision)
+                .is_some_and(|target| target.finalized && sequence <= target.revision)
             {
                 continue;
             }
+            // Live producer revisions and canonical event sequences are different domains.
+            // Finalization replaces the live target even when its sequence is numerically lower.
+            // Duplicate finalization must not reopen an exhausted retry loop.
             state.terminal_error = None;
+            state.consecutive_failures = 0;
+            state.retry_at = None;
             state.target = Some(ActiveArtifactTarget {
                 producer_plugin_id: artifact.producer_plugin_id.clone(),
                 schema: artifact.schema.clone(),
@@ -392,13 +400,20 @@ impl ArtifactStreamCoordinator {
         if state
             .target
             .as_ref()
-            .is_some_and(|current| target.revision <= current.revision)
+            .is_some_and(|current| current.finalized || target.revision <= current.revision)
         {
             self.stats.coalesced_targets = self.stats.coalesced_targets.saturating_add(1);
             return;
         }
         if state.fetching && state.target.is_some() {
             self.stats.coalesced_targets = self.stats.coalesced_targets.saturating_add(1);
+        }
+        if state.consecutive_failures >= ACTIVE_ARTIFACT_MAX_FAILURES {
+            // A new source revision may repair the failed range. Re-observing the same
+            // revision above does not restart a stopped retry loop.
+            state.consecutive_failures = 0;
+            state.terminal_error = None;
+            state.retry_at = None;
         }
         state.target = Some(target);
         self.schedule_active_artifact_fetch(session_id, key);
@@ -502,7 +517,12 @@ impl ArtifactStreamCoordinator {
                             self.stats.terminal_failures.saturating_add(1);
                     } else {
                         Self::defer_active_artifact_fetch(state, &error_message);
-                        self.stats.retries = self.stats.retries.saturating_add(1);
+                        if state.terminal_error.is_some() {
+                            self.stats.terminal_failures =
+                                self.stats.terminal_failures.saturating_add(1);
+                        } else {
+                            self.stats.retries = self.stats.retries.saturating_add(1);
+                        }
                     }
                     return false;
                 }
@@ -517,7 +537,12 @@ impl ArtifactStreamCoordinator {
                 Ok(expected_end) => expected_end,
                 Err(error) => {
                     Self::defer_active_artifact_fetch(state, error);
-                    self.stats.retries = self.stats.retries.saturating_add(1);
+                    if state.terminal_error.is_some() {
+                        self.stats.terminal_failures =
+                            self.stats.terminal_failures.saturating_add(1);
+                    } else {
+                        self.stats.retries = self.stats.retries.saturating_add(1);
+                    }
                     return false;
                 }
             };
@@ -630,6 +655,13 @@ impl ArtifactStreamCoordinator {
             "deferring active artifact fetch"
         );
         state.consecutive_failures = state.consecutive_failures.saturating_add(1);
+        if state.consecutive_failures >= ACTIVE_ARTIFACT_MAX_FAILURES {
+            state.retry_at = None;
+            state.terminal_error = Some(
+                "artifact hydration paused after repeated failures; reconnect to retry".to_owned(),
+            );
+            return;
+        }
         let exponent = state.consecutive_failures.saturating_sub(1).min(4);
         let multiplier = 1_u32 << exponent;
         let delay = ACTIVE_ARTIFACT_RETRY_BASE
@@ -962,6 +994,53 @@ mod tests {
             0,
             3
         ));
+    }
+
+    #[test]
+    fn repeated_invalid_ranges_pause_without_losing_the_committed_prefix() {
+        let mut coordinator = ArtifactStreamCoordinator::new(BcodeClient::default_endpoint());
+        let session_id = SessionId::new();
+        let key = (
+            session_id,
+            "tool".to_owned(),
+            "artifact".to_owned(),
+            "reference".to_owned(),
+        );
+        coordinator.artifact_fetches.insert(
+            key.clone(),
+            ActiveArtifactFetchState {
+                next_offset: 4,
+                target: Some(target(8, 3, false)),
+                ..ActiveArtifactFetchState::default()
+            },
+        );
+        for _ in 0..ACTIVE_ARTIFACT_MAX_FAILURES {
+            let completion = ActiveArtifactFetchCompletion {
+                session_id,
+                key: key.clone(),
+                requested_offset: 4,
+                requested_end: 8,
+                target_revision: 3,
+                result: Ok(range(0, 8, 2, b"stale")),
+            };
+            assert!(
+                !coordinator.handle_completion(Some(session_id), completion, |_| {
+                    panic!("invalid bytes must not be delivered")
+                })
+            );
+        }
+        assert!(coordinator.next_retry_at().is_none());
+        assert_eq!(coordinator.failed_invocations(), vec!["tool"]);
+        assert_eq!(coordinator.artifact_fetches[&key].next_offset, 4);
+        coordinator.observe_artifact_target(session_id, &key, target(8, 3, false), false);
+        coordinator.start_due_fetches(Instant::now() + Duration::from_secs(60));
+        assert!(!coordinator.artifact_fetches[&key].fetching);
+        assert_eq!(coordinator.stats.terminal_failures, 1);
+        coordinator.reset_session(session_id);
+        assert!(coordinator.failed_invocations().is_empty());
+        assert_eq!(coordinator.artifact_fetches[&key].consecutive_failures, 0);
+        assert_eq!(coordinator.artifact_fetches[&key].next_offset, 4);
+        assert!(coordinator.next_retry_at().is_some());
     }
 
     #[test]

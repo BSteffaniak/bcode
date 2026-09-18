@@ -11401,9 +11401,10 @@ async fn read_session_artifact_range(
         .await
         .map_err(|error| error.to_string())?;
     #[cfg(any(target_os = "macos", target_os = "linux"))]
-    let admission = storage_read_admission::RegisteredStorageRead::for_session(state, session_id)
-        .await
-        .map_err(|error| error.to_string())?;
+    let mut admission =
+        storage_read_admission::RegisteredStorageRead::for_session(state, session_id)
+            .await
+            .map_err(|error| error.to_string())?;
     let range = read_session_artifact_range_untracked(
         state,
         session_id,
@@ -11413,7 +11414,12 @@ async fn read_session_artifact_range(
         length,
         ownership.clone(),
     )
-    .await?;
+    .await;
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    let range =
+        storage_read_admission::RegisteredStorageRead::finish_failed(&mut admission, range).await?;
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    let range = range?;
     #[cfg(any(target_os = "macos", target_os = "linux"))]
     if let Some(admission) = admission {
         admission
@@ -22993,9 +22999,15 @@ async fn build_model_turn_request(
     let build_timer = state.metrics.timer();
     let history_timer = state.metrics.timer();
     #[cfg(any(target_os = "macos", target_os = "linux"))]
-    let admission =
+    let mut admission =
         storage_read_admission::RegisteredStorageRead::for_session(state, session_id).await?;
-    let history = state.sessions.model_context_events(session_id).await?;
+    let history = state.sessions.model_context_events(session_id).await;
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    let history =
+        storage_read_admission::RegisteredStorageRead::finish_failed(&mut admission, history)
+            .await?;
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    let history = history?;
     #[cfg(any(target_os = "macos", target_os = "linux"))]
     if let Some(admission) = admission {
         admission

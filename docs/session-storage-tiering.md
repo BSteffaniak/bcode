@@ -1,5 +1,20 @@
 # Session storage tiering
 
+## Completed failures versus abandoned reads
+
+Application read operations retire their own admission participant after an ordinary error returns,
+without recording successful consumption. Retirement occurs only after the read future completes;
+it is not performed from `Drop`. Cancellation, process loss, tracking failures after successful
+consumption, and unverifiable participant identity still preserve dirty evidence and block
+maintenance. Repeated missing-artifact and missing-session reads therefore do not create one
+permanent participant per attempt. Existing abandoned records still require verified maintenance;
+normal reads do not sweep or repair them.
+
+The TUI bounds hydration failures to eight consecutive attempts for an unchanged artifact target.
+Exhaustion preserves the decoded prefix and exposes a failed invocation instead of polling forever.
+A newer source revision or explicit session reset permits another attempt. This is local
+presentation-fetch policy, not an execution or workflow retry limit.
+
 ## Missing artifacts during manual compression
 
 A confirmed missing original artifact path before replacement produces `ContentMissing` with the

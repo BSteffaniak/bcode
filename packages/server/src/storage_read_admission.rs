@@ -74,6 +74,23 @@ impl RegisteredStorageRead {
         }
     }
 
+    /// Retire an ordinary failed read after all its content work has finished.
+    ///
+    /// No content was returned to the caller, so access tracking is unnecessary. Cancellation
+    /// must not call this: dropping admission continues to preserve dirty crash evidence.
+    pub async fn finish_failed<T, E>(
+        admission: &mut Option<Self>,
+        result: Result<T, E>,
+    ) -> Result<T, E> {
+        if result.is_err()
+            && let Some(admission) = admission.take()
+            && admission.complete().await.is_err()
+        {
+            tracing::warn!("failed storage read participant retirement deferred");
+        }
+        result
+    }
+
     /// Register one operation without running blocking lock/sync calls on the async executor.
     ///
     /// # Errors
@@ -158,6 +175,80 @@ pub(super) async fn block_unregistered_reads(state: &super::ServerState, root: P
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn repeated_missing_artifact_reads_retire_admission_without_changing_history() {
+        let root = tempfile::tempdir().expect("root");
+        let sessions = bcode_session::SessionManager::persistent(root.path()).expect("manager");
+        let session = sessions
+            .create_session(None, root.path().to_path_buf())
+            .await
+            .expect("session");
+        let before = sessions.session_history(session.id).await.expect("history");
+        let state = crate::tests::test_server_state(sessions);
+        let registry =
+            StorageAdmissionRegistry::open_session(root.path(), session.id).expect("registry");
+        for _ in 0..32 {
+            assert!(
+                crate::read_session_artifact_range(
+                    &state,
+                    session.id,
+                    "missing",
+                    "recording",
+                    0,
+                    64,
+                )
+                .await
+                .is_err()
+            );
+            drop(
+                registry
+                    .admit_maintenance(1)
+                    .expect("only the gate remains"),
+            );
+        }
+        assert_eq!(
+            state
+                .sessions
+                .session_history(session.id)
+                .await
+                .expect("history"),
+            before
+        );
+    }
+
+    #[tokio::test]
+    async fn failed_history_lookup_retires_but_dropped_read_preserves_evidence() {
+        let root = tempfile::tempdir().expect("root");
+        let sessions = bcode_session::SessionManager::persistent(root.path()).expect("manager");
+        let state = crate::tests::test_server_state(sessions);
+        let id = SessionId::new();
+        for _ in 0..16 {
+            assert!(
+                crate::session_operations::complete_history(
+                    &state,
+                    bcode_session_models::ClientId::new(),
+                    id,
+                )
+                .await
+                .is_err()
+            );
+            let registry =
+                StorageAdmissionRegistry::open_session(root.path(), id).expect("registry");
+            drop(
+                registry
+                    .admit_maintenance(1)
+                    .expect("failed lookup retired"),
+            );
+        }
+        drop(
+            RegisteredStorageRead::begin(root.path().to_path_buf(), id)
+                .await
+                .expect("read"),
+        );
+        let registry = StorageAdmissionRegistry::open_session(root.path(), id).expect("registry");
+        assert!(registry.admit_maintenance(16).is_err());
+    }
 
     #[tokio::test]
     async fn maintenance_contention_rejects_read_until_authority_is_released() {
