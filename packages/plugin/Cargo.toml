@@ -20,6 +20,7 @@ bcode_tool                 = { workspace = true }
 bcode_workflow             = { workspace = true }
 bmux_plugin                = { workspace = true }
 bmux_plugin_sdk            = { workspace = true }
+hex                        = { workspace = true }
 libloading                 = { workspace = true }
 semver                     = { workspace = true, features = ["serde"] }
 serde                      = { workspace = true, features = ["derive", "std"] }

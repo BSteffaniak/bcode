@@ -1547,7 +1547,7 @@ fn search_query_fingerprint(request: &SessionSearchRequest) -> String {
     let mut stable = request.clone();
     stable.cursor = None;
     let bytes = serde_json::to_vec(&stable).expect("validated search request serializes");
-    format!("{:x}", Sha256::digest(bytes))
+    hex::encode(Sha256::digest(bytes))
 }
 
 fn decode_search_offset(request: &SessionSearchRequest) -> Result<usize, ProviderError> {

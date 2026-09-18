@@ -42,12 +42,9 @@ impl MacosOperationFactorSource {
         {
             return Err(AuthVaultLifecycleError::InvalidCredential);
         }
-        Ok(format!(
-            "{:x}",
-            sha2::Sha256::digest(
-                format!("sshenv-operation-v1:{}:{}", self.binding, intent.operation).as_bytes()
-            )
-        ))
+        Ok(hex::encode(sha2::Sha256::digest(
+            format!("sshenv-operation-v1:{}:{}", self.binding, intent.operation).as_bytes(),
+        )))
     }
 }
 
@@ -63,7 +60,7 @@ impl AuthDeviceFactorSource for MacosOperationFactorSource {
         let random = sshenv_vault::crypto::generate_data_key();
         Ok((
             "macos-operation-v1".into(),
-            format!("{:x}", sha2::Sha256::digest(&random[..])),
+            hex::encode(sha2::Sha256::digest(&random[..])),
         ))
     }
 

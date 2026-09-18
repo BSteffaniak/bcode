@@ -3215,7 +3215,7 @@ fn short_scope_digest(components: &[&[u8]]) -> String {
         hasher.update(component);
         hasher.update([0]);
     }
-    let digest = format!("{:x}", hasher.finalize());
+    let digest = hex::encode(hasher.finalize());
     digest[..16].to_owned()
 }
 
@@ -3264,7 +3264,7 @@ fn socket_scope_digest(user: &str, namespace: &str, state_location_id: &str) -> 
     hasher.update(namespace.as_bytes());
     hasher.update([0]);
     hasher.update(state_location_id.as_bytes());
-    let digest = format!("{:x}", hasher.finalize());
+    let digest = hex::encode(hasher.finalize());
     digest[..SOCKET_SCOPE_HEX_BYTES].to_owned()
 }
 

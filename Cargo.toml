@@ -334,6 +334,7 @@ futures = { version = "0.3.32", default-features = false, features = ["std"] }
 futures-util = { version = "0.3.32", default-features = false }
 git2 = { version = "0.20.3", default-features = false }
 globset = { version = "0.4.18", default-features = false }
+hex = { version = "0.4.3", default-features = false, features = ["alloc"] }
 http = { version = "1.4.0", default-features = false }
 httpdate = { version = "1.0.3", default-features = false }
 hyperchad = { git = "https://github.com/MoosicBox/MoosicBox.git", branch = "master", default-features = false }
@@ -398,11 +399,8 @@ serde_json = { version = "1.0.149", default-features = false, features = [
     "std",
     "raw_value",
 ] }
-# `sha2`'s `asm-aarch64` feature enables the `sha2-asm` build dependency on
-# every target, including MSVC where its GNU `.S` sources cannot be compiled.
-# Keep the portable implementation so one workspace feature set builds on all
-# supported release targets.
-sha2 = { version = "0.10.9", default-features = false }
+# Rust intrinsics provide CPU-detected acceleration without the nonportable sha2-asm build.
+sha2 = { version = "0.11.0", default-features = false }
 shuck-formatter = { version = "0.0.41", default-features = false }
 smallvec = { version = "1.15.2", default-features = false, features = [
     "union",

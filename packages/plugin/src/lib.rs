@@ -5676,7 +5676,7 @@ pub fn resolve_external_workflow_templates(
                 "source grew beyond its bounded size while reading".to_string(),
             ));
         }
-        let actual_digest = format!("{:x}", Sha256::digest(&bytes));
+        let actual_digest = hex::encode(Sha256::digest(&bytes));
         if actual_digest != source.sha256 {
             return Err(fail(format!(
                 "source digest mismatch: expected {}, got {actual_digest}",
@@ -11286,7 +11286,7 @@ library = "libexample_plugin.dylib"
         std::fs::write(root.join("templates/example.json"), &bytes).expect("template source");
         template.document_source = Some(WorkflowTemplateDocumentSource {
             path: PathBuf::from("templates/example.json"),
-            sha256: format!("{:x}", Sha256::digest(&bytes)),
+            sha256: hex::encode(Sha256::digest(&bytes)),
         });
         let mut manifest = test_manifest("bcode.example");
         manifest.workflow_templates.push(template);

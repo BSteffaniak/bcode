@@ -75,10 +75,7 @@ impl StoredWorkflowDefinition {
             ));
         }
         crate::validate_sha256("definition.checksum_sha256", &self.checksum_sha256)?;
-        let digest = format!(
-            "{:x}",
-            sha2::Sha256::digest(self.definition_json.as_bytes())
-        );
+        let digest = hex::encode(sha2::Sha256::digest(self.definition_json.as_bytes()));
         if digest != self.checksum_sha256 {
             return Err(crate::authoring_error(
                 "definition.checksum_sha256",

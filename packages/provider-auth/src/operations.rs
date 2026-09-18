@@ -93,7 +93,7 @@ pub(crate) fn provisioning_binding(
         ))
         .map_err(|_| crate::lifecycle::AuthVaultLifecycleError::InvalidCredential)?,
     );
-    Ok(format!("{:x}", sha2::Sha256::digest(bytes.as_slice())))
+    Ok(hex::encode(sha2::Sha256::digest(bytes.as_slice())))
 }
 
 /// Caller-selected retrieval of an existing device factor.

@@ -54,6 +54,7 @@ bcode_worktree = { workspace = true }
 bcode_worktree_models = { workspace = true }
 chrono = { workspace = true }
 futures = { workspace = true }
+hex = { workspace = true }
 jsonschema = { workspace = true }
 serde = { workspace = true, features = ["derive", "std"] }
 serde_json = { workspace = true }

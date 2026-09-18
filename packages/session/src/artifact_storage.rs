@@ -442,7 +442,7 @@ fn verify_reference_checksum(
         }
         digest.update(&buffer[..count]);
     }
-    if !format!("{:x}", digest.finalize()).eq_ignore_ascii_case(expected) {
+    if !hex::encode(digest.finalize()).eq_ignore_ascii_case(expected) {
         return Err(artifact_failure(
             bcode_session_models::ArtifactCompressionFailureReason::ChecksumMismatch,
         ));
@@ -908,7 +908,7 @@ mod tests {
     fn reference_checksum_rejects_damaged_or_malformed_original_evidence() {
         use sha2::{Digest as _, Sha256};
         let bytes = b"original terminal output";
-        let expected = format!("{:x}", Sha256::digest(bytes));
+        let expected = hex::encode(Sha256::digest(bytes));
         let cancellation = ArtifactMaintenanceCancellation::default();
         verify_reference_checksum(&mut bytes.as_slice(), Some(&expected), &cancellation)
             .expect("checksum");

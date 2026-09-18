@@ -14,6 +14,7 @@ version     = { workspace = true }
 bcode_session_models = { workspace = true }
 bcode_workflow_view_models = { workspace = true }
 futures = { workspace = true }
+hex = { workspace = true }
 jsonschema = { workspace = true }
 schemars = { workspace = true }
 serde = { workspace = true, features = ["derive", "std"] }

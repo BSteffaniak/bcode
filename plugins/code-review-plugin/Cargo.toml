@@ -34,6 +34,7 @@ bmux_tui_components = { workspace = true, features = [
 ] }
 clap = { workspace = true, features = ["derive", "std"] }
 crossterm = { workspace = true, features = ["events"] }
+hex = { workspace = true }
 serde = { workspace = true, features = ["derive", "std"] }
 serde_json = { workspace = true }
 sha2 = { workspace = true }

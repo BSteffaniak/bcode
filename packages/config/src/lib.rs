@@ -5817,7 +5817,7 @@ impl StateLocationId {
 
         let mut hasher = Sha256::new();
         hasher.update(root.as_os_str().as_encoded_bytes());
-        let digest = format!("{:x}", hasher.finalize());
+        let digest = hex::encode(hasher.finalize());
         Self(digest[..32].to_owned())
     }
 
@@ -5858,7 +5858,7 @@ pub fn runtime_scope_id(state_root: &Path, config_dir: &Path) -> String {
     hasher.update(state_root.as_os_str().as_encoded_bytes());
     hasher.update([0]);
     hasher.update(config_dir.as_os_str().as_encoded_bytes());
-    let digest = format!("{:x}", hasher.finalize());
+    let digest = hex::encode(hasher.finalize());
     digest[..32].to_owned()
 }
 

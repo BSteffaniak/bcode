@@ -19,6 +19,7 @@ bcode_plugin_sdk     = { workspace = true }
 bcode_prompt_cache   = { workspace = true }
 bcode_session_models = { workspace = true }
 bcode_tool           = { workspace = true }
+hex                  = { workspace = true }
 regex                = { workspace = true, features = ["std"] }
 serde                = { workspace = true, features = ["derive", "std"] }
 serde_json           = { workspace = true }

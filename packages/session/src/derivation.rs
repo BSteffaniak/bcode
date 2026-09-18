@@ -805,7 +805,7 @@ fn derivation_request_fingerprint(
 ) -> Result<String, SessionError> {
     let encoded = serde_json::to_vec(request)
         .map_err(|error| SessionError::DerivationSerialization(error.to_string()))?;
-    Ok(format!("{:x}", Sha256::digest(encoded)))
+    Ok(hex::encode(Sha256::digest(encoded)))
 }
 
 const fn initial_operation_snapshot(

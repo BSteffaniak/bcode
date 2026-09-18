@@ -1689,7 +1689,7 @@ fn canonical_generation_fingerprint(summary: &bcode_session_models::SessionSumma
     } else {
         digest.update(b"native\0");
     }
-    format!("{:x}", digest.finalize())
+    hex::encode(digest.finalize())
 }
 
 fn apply_session_summary_attributes(

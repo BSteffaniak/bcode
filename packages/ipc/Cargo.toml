@@ -33,6 +33,7 @@ bcode_workflow_view_models = { workspace = true }
 bcode_worktree_models      = { workspace = true }
 bmux_codec                 = { workspace = true }
 bmux_ipc                   = { workspace = true }
+hex                        = { workspace = true }
 serde                      = { workspace = true, features = ["derive", "std"] }
 serde_json                 = { workspace = true, features = ["std"] }
 sha2                       = { workspace = true }

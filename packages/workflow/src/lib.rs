@@ -1984,7 +1984,7 @@ pub fn workflow_block_input_sha256(input: &serde_json::Value) -> Result<String, 
     use sha2::Digest as _;
 
     serde_json::to_vec(input)
-        .map(|encoded| format!("{:x}", sha2::Sha256::digest(encoded)))
+        .map(|encoded| hex::encode(sha2::Sha256::digest(encoded)))
         .map_err(|error| format!("failed to encode workflow block input: {error}"))
 }
 
@@ -12731,7 +12731,7 @@ fn assertion_byte_length(value: &serde_json::Value) -> Result<u64, WorkflowError
 fn assertion_sha256(value: &serde_json::Value) -> Result<String, WorkflowError> {
     if let Some(text) = value.as_str() {
         use sha2::Digest as _;
-        return Ok(format!("{:x}", sha2::Sha256::digest(text.as_bytes())));
+        return Ok(hex::encode(sha2::Sha256::digest(text.as_bytes())));
     }
     let checksum = value
         .get("checksum_sha256")
@@ -20631,7 +20631,7 @@ steps:
             StoredWorkflowDefinition {
                 definition_id: "definition/test".to_string(),
                 version: 1,
-                checksum_sha256: format!("{:x}", Sha256::digest(json.as_bytes())),
+                checksum_sha256: hex::encode(Sha256::digest(json.as_bytes())),
                 definition_json: json,
             }
         }

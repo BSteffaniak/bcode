@@ -98,7 +98,7 @@ async fn migration_source_evidence(
             classified_event_count,
             event_count,
             event_tail,
-            payload_digest_sha256: format!("{:x}", digest.finalize()),
+            payload_digest_sha256: hex::encode(digest.finalize()),
         },
         converted_events,
         retired_known_events,

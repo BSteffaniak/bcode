@@ -28,6 +28,7 @@ bcode_workflow = { workspace = true }
 bmux_keyboard = { workspace = true, optional = true }
 bmux_terminal_grid = { workspace = true, optional = true }
 bmux_tui = { workspace = true, optional = true }
+hex = { workspace = true }
 portable-pty = { workspace = true }
 serde = { workspace = true, features = ["derive", "std"] }
 serde_json = { workspace = true }

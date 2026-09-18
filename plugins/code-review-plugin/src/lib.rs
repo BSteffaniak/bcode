@@ -4224,7 +4224,7 @@ fn surface_id(source_id: &str, path: &str, kind: ReviewSurfaceKind) -> String {
     hasher.update(path.as_bytes());
     hasher.update(b"\0");
     hasher.update(format!("{kind:?}").as_bytes());
-    format!("surface-{:x}", hasher.finalize())
+    format!("surface-{}", hex::encode(hasher.finalize()))
 }
 
 fn workspace_id(repo_root: &Path, title: &str, now: u64) -> String {
@@ -4234,7 +4234,7 @@ fn workspace_id(repo_root: &Path, title: &str, now: u64) -> String {
     hasher.update(title.as_bytes());
     hasher.update(b"\0");
     hasher.update(now.to_string().as_bytes());
-    format!("workspace-{:x}", hasher.finalize())
+    format!("workspace-{}", hex::encode(hasher.finalize()))
 }
 
 fn workspace_review_key(workspace: &ReviewWorkspace) -> String {
@@ -4260,7 +4260,7 @@ fn review_key(repo_root: &Path, target: &ReviewTarget) -> Result<String, ReviewE
     hasher.update(repo_root.display().to_string().as_bytes());
     hasher.update(b"\0");
     hasher.update(serde_json::to_string(target)?.as_bytes());
-    Ok(format!("review-{:x}", hasher.finalize()))
+    Ok(format!("review-{}", hex::encode(hasher.finalize())))
 }
 
 fn thread_id(review_key: &str, anchor: &DraftAnchor) -> Result<String, ReviewError> {
@@ -4268,7 +4268,7 @@ fn thread_id(review_key: &str, anchor: &DraftAnchor) -> Result<String, ReviewErr
     hasher.update(review_key.as_bytes());
     hasher.update(b"\0");
     hasher.update(serde_json::to_string(anchor)?.as_bytes());
-    Ok(format!("thread-{:x}", hasher.finalize()))
+    Ok(format!("thread-{}", hex::encode(hasher.finalize())))
 }
 
 fn comment_id(thread_id: &str, body: &str, now: u64) -> String {
@@ -4278,7 +4278,7 @@ fn comment_id(thread_id: &str, body: &str, now: u64) -> String {
     hasher.update(body.as_bytes());
     hasher.update(b"\0");
     hasher.update(now.to_string().as_bytes());
-    format!("comment-{:x}", hasher.finalize())
+    format!("comment-{}", hex::encode(hasher.finalize()))
 }
 
 const fn target_kind(target: &ReviewTarget) -> &'static str {

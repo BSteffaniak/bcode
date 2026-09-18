@@ -920,7 +920,7 @@ impl ShellRecordingWriter {
             rows: self.rows,
             frame_count: self.frame_count,
             output_bytes: self.output_bytes,
-            checksum_sha256: format!("{:x}", self.checksum.clone().finalize()),
+            checksum_sha256: hex::encode(self.checksum.clone().finalize()),
         })
     }
 
@@ -1196,7 +1196,7 @@ pub fn read_recording(
             rows,
             frame_count: u64::try_from(frames.len()).unwrap_or(u64::MAX),
             output_bytes,
-            checksum_sha256: format!("{:x}", checksum.finalize()),
+            checksum_sha256: hex::encode(checksum.finalize()),
         },
         frames,
     ))

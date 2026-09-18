@@ -702,7 +702,7 @@ fn sha256_url(url: &str) -> Result<String> {
         {
             Ok(bytes) => {
                 let digest = Sha256::digest(&bytes);
-                return Ok(format!("{digest:x}"));
+                return Ok(hex::encode(digest));
             }
             Err(error) => {
                 last_error = Some(error);
@@ -1305,7 +1305,7 @@ fn generated_artifact_id() -> String {
 }
 
 fn sha256_bytes(bytes: &[u8]) -> String {
-    format!("{:x}", Sha256::digest(bytes))
+    hex::encode(Sha256::digest(bytes))
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2345,7 +2345,7 @@ fn archive_sha256(archive: &Path) -> Result<String> {
         }
         hasher.update(&buffer[..count]);
     }
-    Ok(format!("{:x}", hasher.finalize()))
+    Ok(hex::encode(hasher.finalize()))
 }
 
 fn write_checksum(archive: &Path) -> Result<()> {

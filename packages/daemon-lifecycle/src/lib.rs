@@ -857,7 +857,7 @@ impl ArtifactBootstrap {
                 path: target.to_path_buf(),
                 source,
             })?;
-        let digest = format!("{:x}", hasher.finalize());
+        let digest = hex::encode(hasher.finalize());
         let _ = self.executable_digest.set(digest.clone());
         Ok(digest)
     }
@@ -925,7 +925,7 @@ fn sha256_reader(mut reader: impl Read, path: &Path) -> Result<String, DaemonLif
         }
         hasher.update(&buffer[..read]);
     }
-    Ok(format!("{:x}", hasher.finalize()))
+    Ok(hex::encode(hasher.finalize()))
 }
 
 /// Return the immutable cached executable path for one binary digest.
@@ -1634,6 +1634,25 @@ mod tests {
     fn write_test_image(path: &Path) {
         fs::create_dir_all(path.parent().expect("image parent")).expect("image directory");
         fs::write(path, b"stale daemon image").expect("image");
+    }
+
+    #[test]
+    fn executable_digest_preserves_standard_sha256_encoding() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("fixture");
+        for (bytes, expected) in [
+            (
+                b"".as_slice(),
+                "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+            ),
+            (
+                b"abc".as_slice(),
+                "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad",
+            ),
+        ] {
+            fs::write(&path, bytes).unwrap();
+            assert_eq!(executable_sha256(&path).unwrap(), expected);
+        }
     }
 
     #[test]

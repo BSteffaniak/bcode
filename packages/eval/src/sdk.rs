@@ -760,7 +760,7 @@ fn sdk_eval_fingerprint(
         cases,
     })
     .map_err(|error| SdkEvalError::Serialization(error.to_string()))?;
-    Ok(format!("{:x}", Sha256::digest(encoded)))
+    Ok(hex::encode(Sha256::digest(encoded)))
 }
 
 /// Atomically persist one SDK evaluation run in a directory.

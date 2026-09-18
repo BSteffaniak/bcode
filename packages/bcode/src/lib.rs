@@ -2255,7 +2255,7 @@ impl ModelResponseCacheKey {
         let digest = Sha256::digest(encoded);
         Ok(Self {
             schema_version: 2,
-            digest_hex: format!("{digest:x}"),
+            digest_hex: hex::encode(digest),
         })
     }
 }
@@ -6893,7 +6893,7 @@ impl FrontendSessionSnapshot {
 fn frontend_event_digest(envelope: &FrontendEventEnvelope) -> String {
     let encoded =
         serde_json::to_vec(envelope).expect("serializing a frontend event envelope cannot fail");
-    format!("{:x}", Sha256::digest(encoded))
+    hex::encode(Sha256::digest(encoded))
 }
 
 /// Current portable SDK session payload schema version.

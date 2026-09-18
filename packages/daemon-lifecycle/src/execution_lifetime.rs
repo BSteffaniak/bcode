@@ -109,7 +109,7 @@ pub enum ExecutionLifetimeStatus {
 fn evidence_path(root: &Path, instance_id: &str) -> PathBuf {
     let digest = Sha256::digest(instance_id.as_bytes());
     root.join("daemon-execution-lifetimes")
-        .join(format!("{digest:x}.json"))
+        .join(format!("{}.json", hex::encode(digest)))
 }
 
 fn invalid() -> io::Error {

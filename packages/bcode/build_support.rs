@@ -116,7 +116,7 @@ pub fn source_digest(workspace: &Path, files: &[PathBuf]) -> String {
             update(&mut digest, &contents);
         }
     }
-    format!("{:x}", digest.finalize())
+    hex::encode(digest.finalize())
 }
 
 fn update(digest: &mut Sha256, value: &[u8]) {

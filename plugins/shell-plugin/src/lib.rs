@@ -620,7 +620,7 @@ fn canonical_command_plan_sha256(plan: &ShellWorkflowCommandPlan) -> Result<Stri
     let normalized = normalized_command_plan(plan);
     let normalized = serde_json::to_vec(&normalized)
         .map_err(|error| format!("failed to encode canonical shell command plan: {error}"))?;
-    Ok(format!("{:x}", Sha256::digest(normalized)))
+    Ok(hex::encode(Sha256::digest(normalized)))
 }
 
 fn execute_workflow_command_plan(
@@ -2497,7 +2497,7 @@ fn recording_content_checksum(path: &Path) -> std::io::Result<String> {
         }
         checksum.update(&buffer[..count]);
     }
-    Ok(format!("{:x}", checksum.finalize()))
+    Ok(hex::encode(checksum.finalize()))
 }
 
 fn clean_artifact_ref(path: &Path, output: &LimitedOutput) -> ToolArtifactRef {

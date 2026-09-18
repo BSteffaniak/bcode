@@ -269,7 +269,7 @@ pub fn ordered_payload_digest<'a>(payloads: impl IntoIterator<Item = &'a str>) -
         digest.update(length.to_le_bytes());
         digest.update(payload.as_bytes());
     }
-    format!("{:x}", digest.finalize())
+    hex::encode(digest.finalize())
 }
 
 /// Accumulate converted and retired-known audit counts.

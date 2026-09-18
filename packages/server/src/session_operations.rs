@@ -263,7 +263,7 @@ pub async fn reprice(
         return Err("catalog snapshot exceeds 16 MiB".to_owned());
     }
     let revision = catalog.catalog_revision.clone();
-    let digest = format!("{:x}", sha2::Sha256::digest(&bytes));
+    let digest = hex::encode(sha2::Sha256::digest(&bytes));
     let catalog = Arc::new(bcode_model_catalog::ModelCatalog::new(catalog));
     let plugins = state.plugins.clone();
     let (count, summary) = state

@@ -1360,7 +1360,7 @@ fn validate_root(root: &Path) -> Result<(), ProviderError> {
 }
 
 fn digest(bytes: &[u8]) -> String {
-    format!("{:x}", Sha256::digest(bytes))
+    hex::encode(Sha256::digest(bytes))
 }
 fn serialized_records_bytes(records: &[SessionSearchRecord]) -> usize {
     serde_json::to_vec(records).map_or(0, |bytes| bytes.len())

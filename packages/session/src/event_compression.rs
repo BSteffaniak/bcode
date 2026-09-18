@@ -39,9 +39,9 @@ pub fn compress_event_payload(payload: &str, level: i32) -> io::Result<String> {
     serde_json::from_str::<serde_json::Value>(payload).map_err(|_| invalid())?;
     let compressed = zstd::bulk::compress(payload.as_bytes(), level)?;
     let encoded = format!(
-        "{PREFIX}{VERSION}:{}:{:x}:{}",
+        "{PREFIX}{VERSION}:{}:{}:{}",
         payload.len(),
-        Sha256::digest(payload.as_bytes()),
+        hex::encode(Sha256::digest(payload.as_bytes())),
         base64::engine::general_purpose::STANDARD.encode(compressed)
     );
     Ok(if encoded.len() < payload.len() {
@@ -115,7 +115,7 @@ pub fn decode_event_payload_with_limit(
     let mut expanded = Vec::with_capacity(length);
     decoder.take(length as u64 + 1).read_to_end(&mut expanded)?;
     if expanded.len() != length
-        || !format!("{:x}", Sha256::digest(&expanded)).eq_ignore_ascii_case(checksum)
+        || !hex::encode(Sha256::digest(&expanded)).eq_ignore_ascii_case(checksum)
     {
         return Err(invalid());
     }

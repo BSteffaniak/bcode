@@ -1451,7 +1451,7 @@ impl ApplySearchRecordsRequest {
     #[must_use]
     pub fn operation_digest_sha256(&self) -> String {
         let bytes = serde_json::to_vec(self).expect("serializing owned search batch cannot fail");
-        format!("{:x}", Sha256::digest(bytes))
+        hex::encode(Sha256::digest(bytes))
     }
 
     /// Validate record count, byte limits, identities, and monotonic checkpoint facts.

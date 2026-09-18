@@ -3991,7 +3991,7 @@ async fn migration_payload_digest(
             event_tail = Some(sequence);
         }
     }
-    Ok((event_count, event_tail, format!("{:x}", digest.finalize())))
+    Ok((event_count, event_tail, hex::encode(digest.finalize())))
 }
 
 async fn set_storage_writer_contract(db: &dyn Database, writer_epoch: u32) -> SessionDbResult<()> {
@@ -4198,7 +4198,7 @@ async fn rebuild_migration_projections(
     Ok(MigrationReplayOutcome {
         tail,
         evidence: bcode_session_migration_target::ReplayEvidence {
-            source_payload_digest_sha256: format!("{:x}", source_digest.finalize()),
+            source_payload_digest_sha256: hex::encode(source_digest.finalize()),
             converted_events,
             retired_known_events,
         },
@@ -10608,7 +10608,7 @@ mod tests {
             .iter()
             .map(|row| {
                 let payload = required_string(row, "payload").expect("canonical payload");
-                format!("{:x}", sha2::Sha256::digest(payload.as_bytes()))
+                hex::encode(sha2::Sha256::digest(payload.as_bytes()))
             })
             .collect::<Vec<_>>();
         drop(db);
@@ -10658,7 +10658,7 @@ mod tests {
             .iter()
             .map(|row| {
                 let payload = required_string(row, "payload").expect("canonical payload");
-                format!("{:x}", sha2::Sha256::digest(payload.as_bytes()))
+                hex::encode(sha2::Sha256::digest(payload.as_bytes()))
             })
             .collect::<Vec<_>>();
         assert_eq!(payload_hashes_after, payload_hashes_before);
@@ -12284,7 +12284,7 @@ mod tests {
             .expect("digest");
         assert_eq!(count, (MIGRATION_EVENT_PAGE_SIZE + 3) as u64);
         assert_eq!(tail, Some(count - 1));
-        assert_eq!(actual, format!("{:x}", expected.finalize()));
+        assert_eq!(actual, hex::encode(expected.finalize()));
         db.database()
             .delete("events")
             .where_eq("event_seq", 1)

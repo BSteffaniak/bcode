@@ -1178,16 +1178,13 @@ mod tests {
         ) -> Result<crate::operations::AuthProvisionedDeviceFactor, AuthVaultLifecycleError>
         {
             use sha2::Digest as _;
-            let slot = format!(
-                "{:x}",
-                sha2::Sha256::digest(
-                    format!(
-                        "sshenv-operation-v1:{}:{}",
-                        intent.profile_binding, intent.operation
-                    )
-                    .as_bytes()
+            let slot = hex::encode(sha2::Sha256::digest(
+                format!(
+                    "sshenv-operation-v1:{}:{}",
+                    intent.profile_binding, intent.operation
                 )
-            );
+                .as_bytes(),
+            ));
             self.slots.lock().unwrap().push(slot);
             self.source.provision_attempt(intent)
         }

@@ -48,7 +48,7 @@ impl WorkflowStore {
                 "definition exceeds offline compatibility inspection budget",
             ));
         }
-        let checksum = format!("{:x}", Sha256::digest(stored.definition_json.as_bytes()));
+        let checksum = hex::encode(Sha256::digest(stored.definition_json.as_bytes()));
         if checksum != stored.checksum_sha256 {
             return Err(invalid_recovery("workflow definition checksum mismatch"));
         }

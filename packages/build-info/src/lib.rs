@@ -243,7 +243,7 @@ pub fn diagnostic_digest<'a>(facts: impl IntoIterator<Item = &'a [u8]>) -> Strin
         digest.update(u64::try_from(fact.len()).unwrap_or(u64::MAX).to_le_bytes());
         digest.update(fact);
     }
-    let hex = format!("{:x}", digest.finalize());
+    let hex = hex::encode(digest.finalize());
     hex[..SHORT_DIGEST_LEN].to_owned()
 }
 

@@ -26784,8 +26784,8 @@ where
 {
     use sha2::{Digest as _, Sha256};
 
-    let invocation_key = format!("{:x}", Sha256::digest(invocation_id.as_bytes()));
-    let artifact_key = format!("{:x}", Sha256::digest(request.artifact_id.as_bytes()));
+    let invocation_key = hex::encode(Sha256::digest(invocation_id.as_bytes()));
+    let artifact_key = hex::encode(Sha256::digest(request.artifact_id.as_bytes()));
     std::fs::create_dir_all(root)
         .map_err(|error| ("create_directory_failed".to_string(), error.to_string()))?;
     let canonical_root = root
@@ -29489,7 +29489,7 @@ fn sha256_json(value: &serde_json::Value) -> Option<String> {
     use sha2::Digest as _;
     serde_json::to_vec(value)
         .ok()
-        .map(|input| format!("{:x}", sha2::Sha256::digest(input)))
+        .map(|input| hex::encode(sha2::Sha256::digest(input)))
 }
 
 async fn append_tool_invocation_lifecycle_event(
@@ -70582,7 +70582,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
                 authoring_document: None,
                 document_source: Some(bcode_plugin::WorkflowTemplateDocumentSource {
                     path: "template.json".into(),
-                    sha256: format!("{:x}", sha2::Sha256::digest(bytes)),
+                    sha256: hex::encode(sha2::Sha256::digest(bytes)),
                 }),
                 required_plugins: Vec::new(),
                 required_capabilities: Vec::new(),
