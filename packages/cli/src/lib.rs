@@ -1042,16 +1042,25 @@ async fn cli_launch_catalog(
     page.ok_or_else(|| CliError::InvalidArguments("workflow discovery interrupted".to_string()))
 }
 
-fn recover_offline_workflow(run_id: &str, apply: bool) -> Result<(), CliError> {
+async fn verify_offline_daemon_records(root: &std::path::Path) -> Result<(), CliError> {
+    // The execution fence is authority; disposable records may survive process death.
+    // Observe records without removing them, and preserve any live or ambiguous owner.
+    for (_, record) in bcode_daemon_lifecycle::read_records(root) {
+        let classification = bcode_daemon_lifecycle::classify_daemon_record(&record).await;
+        if classification != bcode_daemon_lifecycle::DaemonRecordClassification::UnreachableStale {
+            return Err(CliError::InvalidArguments(format!(
+                "offline workflow recovery blocked by daemon {} (pid {:?}): {classification:?}; stop a live owner or resolve unverifiable identity evidence",
+                record.instance_id, record.pid
+            )));
+        }
+    }
+    Ok(())
+}
+
+async fn recover_offline_workflow(run_id: &str, apply: bool) -> Result<(), CliError> {
     let root = bcode_config::default_state_dir();
     let maintenance = bcode_daemon_lifecycle::ExecutionMaintenance::acquire(&root)?;
-    // Registry absence is not evidence by itself. Exclusive upgraded execution admission is
-    // the authority; leftover records still block maintenance rather than being silently removed.
-    if !bcode_daemon_lifecycle::read_records(&root).is_empty() {
-        return Err(CliError::InvalidArguments(
-            "stop all daemons before offline workflow recovery".into(),
-        ));
-    }
+    verify_offline_daemon_records(&root).await?;
     let mut store = bcode_workflow_store::WorkflowStore::open_in_state_dir(&root)?;
     let run = store
         .run_summary(run_id)?
@@ -1103,14 +1112,14 @@ fn recover_offline_workflow(run_id: &str, apply: bool) -> Result<(), CliError> {
     )
 }
 
-fn dispatch_offline_recovery(command: &WorkflowCommand) -> Result<(), CliError> {
+async fn dispatch_offline_recovery(command: &WorkflowCommand) -> Result<(), CliError> {
     if let WorkflowCommand::RecoverOffline {
         run_id,
         all_clients_upgraded: true,
         apply,
     } = command
     {
-        recover_offline_workflow(run_id, *apply)
+        recover_offline_workflow(run_id, *apply).await
     } else {
         Err(CliError::InvalidArguments("offline recovery requires confirmation that all clients and daemons have been upgraded".into()))
     }
@@ -1118,7 +1127,7 @@ fn dispatch_offline_recovery(command: &WorkflowCommand) -> Result<(), CliError> 
 
 async fn handle_workflow_command(command: Box<WorkflowCommand>) -> Result<(), CliError> {
     if matches!(command.as_ref(), WorkflowCommand::RecoverOffline { .. }) {
-        return dispatch_offline_recovery(command.as_ref());
+        return dispatch_offline_recovery(command.as_ref()).await;
     }
     if let WorkflowCommand::CancelDiscovery { token } = command.as_ref() {
         let released = Box::pin(
@@ -17876,8 +17885,36 @@ fn read_prompt_bytes(reader: impl std::io::Read) -> Result<Vec<u8>, CliError> {
 mod prompt_input_tests {
     use super::{CliError, MAX_CLI_PROMPT_BYTES, PromptInput};
 
-    #[test]
-    fn offline_recovery_requires_explicit_upgrade_confirmation() {
+    #[tokio::test]
+    async fn offline_recovery_preserves_stale_records_and_rejects_ambiguity() {
+        let root = tempfile::tempdir().unwrap();
+        let mut record = bcode_daemon_lifecycle::DaemonRecord::current_with_digest(
+            &bcode_ipc::IpcEndpoint::unix_socket(root.path().join("absent.sock")),
+            root.path().join("daemon.log"),
+            None,
+            Some("a".repeat(64)),
+            "ended-instance".into(),
+        )
+        .unwrap();
+        record.pid = Some(u32::MAX);
+        let path = bcode_daemon_lifecycle::write_record(root.path(), &record).unwrap();
+        let before = std::fs::read(&path).unwrap();
+        super::verify_offline_daemon_records(root.path())
+            .await
+            .unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+        record.pid = None;
+        bcode_daemon_lifecycle::write_record(root.path(), &record).unwrap();
+        let error = super::verify_offline_daemon_records(root.path())
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("ended-instance"));
+        assert!(error.to_string().contains("Unverifiable"));
+        assert!(path.exists());
+    }
+
+    #[tokio::test]
+    async fn offline_recovery_requires_explicit_upgrade_confirmation() {
         use super::Cli;
         use clap::Parser as _;
         assert!(
@@ -17901,6 +17938,7 @@ mod prompt_input_tests {
                 all_clients_upgraded: false,
                 apply: true,
             })
+            .await
             .is_err()
         );
     }
