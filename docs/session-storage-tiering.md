@@ -35,8 +35,10 @@ runs do not recover records. Age-filtered compression rechecks the newly reset a
 under ownership and defers; explicit ID compression without an age filter may proceed. The
 explicit command below remains available for inspection or deliberate recovery.
 
-`bcode session storage-admission <session-id>` inspects up to 4096 session admission entries
-without creating registry files or updating access age. It reports abandoned/clean participant
+`bcode session storage-admission <session-id>` explicitly inspects up to 1,000,000 session admission entries
+without creating registry files or updating access age. Explicit recovery retains only names and
+file identities during validation, not a descriptor per record, and syncs retirement as a batch
+under the exclusive gate. Automatic compression recovery retains its 4096-entry budget. It reports abandoned/clean participant
 counts, busy ownership, and invalid/incomplete evidence. Missing or unsafe registries return an
 error rather than silently creating a substitute registry.
 

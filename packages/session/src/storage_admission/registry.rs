@@ -108,7 +108,7 @@ impl StorageAdmissionRegistry {
         match registry.admit_maintenance(4096) {
             Ok(admission) => Ok(admission),
             Err(error) if error.kind() == io::ErrorKind::InvalidData => {
-                let report = Self::session_report(root, id, true)?;
+                let report = Self::session_report_bounded(root, id, true, 4096)?;
                 if report.busy || report.invalid || report.retired == 0 {
                     return Err(error);
                 }
@@ -129,7 +129,17 @@ impl StorageAdmissionRegistry {
         id: SessionId,
         apply: bool,
     ) -> io::Result<bcode_session_models::StorageAdmissionReport> {
+        Self::session_report_bounded(root, id, apply, 1_000_000)
+    }
+
+    fn session_report_bounded(
+        root: &Path,
+        id: SessionId,
+        apply: bool,
+        entry_budget: usize,
+    ) -> io::Result<bcode_session_models::StorageAdmissionReport> {
         use std::io::{Read as _, Seek as _};
+        use std::os::unix::fs::MetadataExt as _;
         use std::os::unix::fs::OpenOptionsExt as _;
         let root_handle = std::fs::OpenOptions::new()
             .read(true)
@@ -148,7 +158,7 @@ impl StorageAdmissionRegistry {
             report.busy = true;
             return Ok(report);
         }
-        let Ok(entries) = names(&directory, 4096) else {
+        let Ok(entries) = names(&directory, entry_budget) else {
             report.invalid = true;
             return Ok(report);
         };
@@ -186,7 +196,10 @@ impl StorageAdmissionRegistry {
                 report.invalid = true;
                 return Ok(report);
             }
-            participants.push((name, file));
+            // The exclusive gate excludes all cooperating readers for the complete inventory
+            // and retirement. Retain identity, not one open descriptor per abandoned operation.
+            let metadata = file.metadata()?;
+            participants.push((name, metadata.dev(), metadata.ino()));
         }
         if apply && !participants.is_empty() {
             let _ownership = crate::lease::acquire_session_maintenance_guard(root, id)
@@ -201,14 +214,20 @@ impl StorageAdmissionRegistry {
                 crate::storage_access::StorageAccessKind::History,
                 u64::try_from(now).map_err(io::Error::other)?,
             )?;
-            for (name, _file) in &participants {
+            for (name, device, inode) in &participants {
+                let file = open_child(&directory, name, libc::O_RDONLY)?;
+                file.try_lock().map_err(io::Error::from)?;
+                let metadata = file.metadata()?;
+                if metadata.dev() != *device || metadata.ino() != *inode {
+                    return Err(invalid());
+                }
                 // SAFETY: each name is a verified UUID participant under the exclusively locked directory.
                 if unsafe { libc::unlinkat(raw(&directory), name.as_ptr(), 0) } != 0 {
                     return Err(io::Error::last_os_error());
                 }
-                directory.sync_all()?;
                 report.retired += 1;
             }
+            directory.sync_all()?;
         }
         Ok(report)
     }
@@ -663,6 +682,49 @@ unsafe fn errno() -> *mut libc::c_int {
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test]
+    async fn explicit_recovery_handles_inventory_larger_than_automatic_budget() {
+        let root = tempfile::tempdir().expect("root");
+        let sessions = crate::SessionManager::persistent(root.path()).expect("sessions");
+        let id = sessions
+            .create_session(None, root.path().to_path_buf())
+            .await
+            .expect("session")
+            .id;
+        let registry =
+            super::StorageAdmissionRegistry::open_session(root.path(), id).expect("registry");
+        drop(
+            registry
+                .admit_read(bcode_session_models::SessionId::new())
+                .expect("read"),
+        );
+        let directory = root
+            .path()
+            .join("storage-admission-sessions-v1")
+            .join(id.to_string());
+        for _ in 0..4100 {
+            std::fs::write(
+                directory.join(format!(
+                    "{}.participant",
+                    bcode_session_models::SessionId::new()
+                )),
+                super::super::DIRTY,
+            )
+            .expect("record");
+        }
+        assert!(
+            super::StorageAdmissionRegistry::admit_session_maintenance(root.path(), id).is_err()
+        );
+        let report = super::StorageAdmissionRegistry::session_report(root.path(), id, false)
+            .expect("report");
+        assert_eq!(report.abandoned, 4101);
+        assert!(!report.invalid);
+        let report = super::StorageAdmissionRegistry::session_report(root.path(), id, true)
+            .expect("recovery");
+        assert_eq!(report.retired, 4101);
+        drop(registry.admit_maintenance(1).expect("gate only"));
+    }
+
     #[tokio::test]
     async fn automatic_recovery_resets_age_and_preserves_unknown_evidence() {
         let root = tempfile::tempdir().expect("root");

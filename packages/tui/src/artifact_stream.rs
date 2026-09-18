@@ -1033,7 +1033,7 @@ mod tests {
         assert_eq!(coordinator.failed_invocations(), vec!["tool"]);
         assert_eq!(coordinator.artifact_fetches[&key].next_offset, 4);
         coordinator.observe_artifact_target(session_id, &key, target(8, 3, false), false);
-        coordinator.start_due_fetches(Instant::now() + Duration::from_secs(60));
+        coordinator.start_due_fetches(Instant::now() + Duration::from_mins(1));
         assert!(!coordinator.artifact_fetches[&key].fetching);
         assert_eq!(coordinator.stats.terminal_failures, 1);
         coordinator.reset_session(session_id);

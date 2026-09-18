@@ -78,6 +78,10 @@ impl RegisteredStorageRead {
     ///
     /// No content was returned to the caller, so access tracking is unnecessary. Cancellation
     /// must not call this: dropping admission continues to preserve dirty crash evidence.
+    ///
+    /// # Errors
+    /// Returns the original read error unchanged. Retirement failures preserve evidence and
+    /// are logged rather than replacing the operation's error.
     pub async fn finish_failed<T, E>(
         admission: &mut Option<Self>,
         result: Result<T, E>,
@@ -215,6 +219,7 @@ mod tests {
                 .expect("history"),
             before
         );
+        drop(state);
     }
 
     #[tokio::test]
