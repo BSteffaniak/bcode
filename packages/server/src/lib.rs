@@ -32312,11 +32312,17 @@ async fn restore_workflow_runs(
 /// Settle run-level runtime work left registered by a prior daemon for runs that are now
 /// quiescent (terminal or paused), so restarted daemons do not inherit phantom active work.
 async fn settle_restored_quiescent_workflow_runtime_work(state: &ServerState) {
-    let runs = state
-        .workflow_store
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .quiescent_runs(1_000);
+    let runs = {
+        let lock_phase = bcode_metrics::startup::phase("workflow_settle.store_lock");
+        let store = state
+            .workflow_store
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        lock_phase.finish();
+        bcode_metrics::startup::measure("workflow_settle.discover_quiescent", || {
+            store.quiescent_runs(1_000)
+        })
+    };
     let runs = match runs {
         Ok(runs) => runs,
         Err(error) => {
@@ -32324,6 +32330,10 @@ async fn settle_restored_quiescent_workflow_runtime_work(state: &ServerState) {
             return;
         }
     };
+    bcode_metrics::startup::count(
+        "workflow_settle.discovered_runs",
+        u64::try_from(runs.len()).unwrap_or(u64::MAX),
+    );
     for run in runs {
         let Some(session_id) = run
             .parent_session_id
@@ -32333,7 +32343,11 @@ async fn settle_restored_quiescent_workflow_runtime_work(state: &ServerState) {
             continue;
         };
         let work_id = WorkId::new(format!("workflow:{}", run.run_id));
-        let active = match state.sessions.active_runtime_work(session_id).await {
+        bcode_metrics::startup::count("workflow_settle.sessions_checked", 1);
+        let inspect_phase = bcode_metrics::startup::phase("workflow_settle.session_active_work");
+        let active_result = state.sessions.active_runtime_work(session_id).await;
+        inspect_phase.finish_result(&active_result);
+        let active = match active_result {
             Ok(active) => active.iter().any(|work| work.work_id == work_id),
             Err(error) => {
                 tracing::warn!(%session_id, "failed to inspect restored workflow work: {error}");
@@ -32343,6 +32357,8 @@ async fn settle_restored_quiescent_workflow_runtime_work(state: &ServerState) {
         if !active {
             continue;
         }
+        bcode_metrics::startup::count("workflow_settle.active_runs", 1);
+        let register_phase = bcode_metrics::startup::phase("workflow_settle.register_runtime_work");
         register_workflow_runtime_work(
             state,
             session_id,
@@ -32350,7 +32366,11 @@ async fn settle_restored_quiescent_workflow_runtime_work(state: &ServerState) {
             format!("workflow {} v{}", run.definition_id, run.definition_version),
         )
         .await;
-        if let Err(error) = settle_workflow_runtime_work(state, &run.run_id).await {
+        register_phase.finish();
+        let phase = bcode_metrics::startup::phase("workflow_settle.reconcile_runtime_work");
+        let result = settle_workflow_runtime_work(state, &run.run_id).await;
+        phase.finish_result(&result);
+        if let Err(error) = result {
             tracing::warn!(run_id = %run.run_id, "failed to finish terminal workflow work: {error}");
         }
     }

@@ -314,28 +314,56 @@ pub async fn run(build_info: bcode_build_info::BuildInfo) -> Result<(), CliError
     run_with_static_bundled(build_info, Vec::new()).await
 }
 
+static PROCESS_ENTRY: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
+static RUNTIME_READY: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
+
+/// Capture executable entry before constructing the async runtime. No persistence occurs.
+pub fn record_process_entry() {
+    let _ = PROCESS_ENTRY.set(Instant::now());
+}
+
+/// Capture runtime readiness before constructing bundled plugin metadata.
+pub fn record_runtime_ready() {
+    let _ = RUNTIME_READY.set(Instant::now());
+}
+
+fn record_early_startup(times: [Instant; 6]) {
+    let [entry, cli, tracing, bootstrap, arguments, config] = times;
+    let runtime = RUNTIME_READY.get().copied().unwrap_or(cli);
+    for (name, start, end) in [
+        ("process.runtime_build", entry, runtime),
+        ("process.build_and_plugin_metadata", runtime, cli),
+        ("cli.tracing", cli, tracing),
+        ("cli.artifact_bootstrap", tracing, bootstrap),
+        ("cli.plugin_commands_and_arguments", bootstrap, arguments),
+        ("cli.config_and_diagnostics", arguments, config),
+    ] {
+        bcode_metrics::startup::completed_interval(name, start, end);
+    }
+}
+
 /// Parse CLI arguments and run with caller-provided static bundled plugins.
 ///
 /// # Errors
-///
 /// Returns an error when the requested command fails.
 ///
 /// # Panics
-///
-/// Panics when CLI startup is initialized more than once in one process with
-/// independently supplied build information.
+/// Panics when CLI startup is initialized more than once in one process.
 pub async fn run_with_static_bundled(
     artifact_build_info: bcode_build_info::BuildInfo,
     static_plugins: Vec<bcode_plugin::StaticBundledPlugin>,
 ) -> Result<(), CliError> {
-    let process_started = Instant::now();
+    let cli_started = Instant::now();
+    let process_started = PROCESS_ENTRY.get().copied().unwrap_or(cli_started);
     init_tracing();
+    let tracing_ready = Instant::now();
     register_workflow_artifact_retention();
     BUILD_INFO
         .set(artifact_build_info.clone())
         .expect("Bcode CLI build information initialized more than once");
     bcode_tui::initialize_build_info(artifact_build_info);
     bcode_daemon_lifecycle::initialize_artifact_bootstrap()?;
+    let bootstrap_ready = Instant::now();
     let static_plugin_ids = bcode_plugin::static_bundled_plugin_ids(&static_plugins)?;
     let static_default_plugin_ids =
         bcode_plugin::static_bundled_default_plugin_ids(&static_plugins)?;
@@ -352,6 +380,7 @@ pub async fn run_with_static_bundled(
         plugin_cli::compose(root_command_with_build_info(build_info()), &registrations);
     command = command.version(build_info().display_version());
     let matches = command.get_matches();
+    let arguments_ready = Instant::now();
     let _config_override = config_override_from_matches(&matches);
     let _state_location = state_location_from_matches(&matches)?;
     let reading_startup_reports = matches.subcommand().is_some_and(|(name, sub)| {
@@ -370,6 +399,14 @@ pub async fn run_with_static_bundled(
             "bcode: startup reports unavailable; check diagnostic storage permissions or format"
         );
     }
+    record_early_startup([
+        process_started,
+        cli_started,
+        tracing_ready,
+        bootstrap_ready,
+        arguments_ready,
+        Instant::now(),
+    ]);
     let exceptional_execution_mode = matches.get_flag("dangerously_bypass_all_permissions")
         || matches.get_flag("disable_all_tools");
     if let Some(plugin) = plugin_cli::matched(&matches, &registrations)

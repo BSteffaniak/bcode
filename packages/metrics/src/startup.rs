@@ -34,6 +34,9 @@ pub struct StartupReport {
     pub unattributed_us: u64,
     /// Events omitted because the bounded phase capacity was exhausted.
     pub dropped_phases: u64,
+    /// Bounded low-cardinality workload counts; absent in older schema-1 reports.
+    #[serde(default)]
+    pub counts: std::collections::BTreeMap<String, u64>,
     /// A readiness milestone was observed; not a durable-resume guarantee.
     pub ready: bool,
     /// Bounded phase intervals; unfinished phases remain explicitly incomplete.
@@ -66,6 +69,8 @@ struct Recorder {
 enum Message {
     Start(u64, StartupPhase),
     End(u64, u64, &'static str),
+    Count(&'static str, u64),
+    Interval(u64, u64, u64),
     Ready(u64),
     Overflow,
     Flush(mpsc::SyncSender<()>),
@@ -164,6 +169,38 @@ pub fn phase_for(name: &'static str, subject: &str) -> Phase {
     Phase(Some(id))
 }
 
+/// Record a bounded, secret-safe workload count while startup collection is active.
+pub fn count(name: &'static str, value: u64) {
+    if let Some(recorder) = RECORDER.get()
+        && !recorder.ready.load(std::sync::atomic::Ordering::Relaxed)
+    {
+        let _ = recorder.sender.try_send(Message::Count(name, value));
+    }
+}
+
+/// Record a completed pre-configuration interval after opt-in has been resolved.
+/// Invalid or out-of-order intervals are ignored; names must be secret-safe constants.
+pub fn completed_interval(name: &'static str, start: Instant, end: Instant) {
+    let Some(recorder) = RECORDER.get() else {
+        return;
+    };
+    let (Some(start), Some(end)) = (
+        start.checked_duration_since(recorder.started),
+        end.checked_duration_since(recorder.started),
+    ) else {
+        return;
+    };
+    if end < start {
+        return;
+    }
+    let mut guard = phase(name);
+    if let Some(id) = guard.0.take() {
+        let _ = recorder
+            .sender
+            .try_send(Message::Interval(id, micros(start), micros(end)));
+    }
+}
+
 /// Record a readiness milestone without redefining application readiness.
 pub fn ready() {
     if let Some(recorder) = RECORDER.get() {
@@ -253,6 +290,7 @@ pub fn initialize(root: &Path, started: Instant, artifact: String) -> io::Result
         elapsed_us: micros(started.elapsed()),
         unattributed_us: 0,
         dropped_phases: 0,
+        counts: std::collections::BTreeMap::new(),
         ready: false,
         phases: Vec::new(),
     };
@@ -310,9 +348,22 @@ fn persist(path: &Path, report: &StartupReport) -> io::Result<()> {
 }
 
 fn worker(path: &Path, _lock: File, mut report: StartupReport, receiver: &mpsc::Receiver<Message>) {
-    let mut ids = std::collections::BTreeMap::new();
+    let mut ids: std::collections::BTreeMap<u64, usize> = std::collections::BTreeMap::new();
     while let Ok(message) = receiver.recv() {
         match message {
+            Message::Count(name, value) => {
+                if report.counts.len() < 32 || report.counts.contains_key(name) {
+                    let count = report.counts.entry(name.to_owned()).or_default();
+                    *count = count.saturating_add(value);
+                }
+            }
+            Message::Interval(id, start, end) => {
+                if let Some(index) = ids.remove(&id) {
+                    report.phases[index].start_us = start;
+                    report.phases[index].end_us = Some(end);
+                    "ok".clone_into(&mut report.phases[index].outcome);
+                }
+            }
             Message::Overflow => {
                 report.dropped_phases += 1;
             }
@@ -426,6 +477,7 @@ mod tests {
             elapsed_us: 100,
             unattributed_us: 0,
             dropped_phases: 0,
+            counts: std::collections::BTreeMap::new(),
             ready: false,
             phases: Vec::new(),
         }
@@ -524,10 +576,12 @@ mod tests {
         assert_eq!(report.dropped_phases, 1);
         assert_eq!(report.phases[0].outcome, "error");
         assert_eq!(report.phases[0].end_us, Some(20));
+        assert!(report.phases[1].end_us.is_none());
+        assert_eq!(report.phases[1].outcome, "incomplete");
     }
 
     #[test]
-    fn worker_retains_incomplete_phases_and_ready_marker() {
+    fn worker_retains_early_intervals_counts_and_ready_marker() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("0.json");
         let lock = File::create(dir.path().join("0.lock")).unwrap();
@@ -544,11 +598,15 @@ mod tests {
                 },
             ))
             .unwrap();
+        sender.send(Message::Count("runs", 3)).unwrap();
+        sender.send(Message::Interval(1, 1, 50)).unwrap();
         sender.send(Message::Ready(100)).unwrap();
         drop(sender);
         worker(&path, lock, report(), &receiver);
         let reports = reports(dir.path()).unwrap();
         assert!(reports[0].ready);
-        assert!(reports[0].phases[0].end_us.is_none());
+        assert_eq!(reports[0].counts["runs"], 3);
+        assert_eq!(reports[0].phases[0].start_us, 1);
+        assert_eq!(reports[0].phases[0].end_us, Some(50));
     }
 }

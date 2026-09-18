@@ -55,20 +55,27 @@ fn build_info() -> bcode_build_info::BuildInfo {
     .expect("build script must embed valid Bcode build information")
 }
 
-#[tokio::main]
-async fn main() {
-    let build_info = build_info();
-    #[cfg(feature = "static-bundled-plugins")]
-    let result = bcode_cli::run_with_static_bundled(
-        build_info,
-        bcode_bundled_plugins::static_bundled_plugins(),
-    )
-    .await;
-    #[cfg(not(feature = "static-bundled-plugins"))]
-    let result = bcode_cli::run(build_info).await;
+fn main() {
+    bcode_cli::record_process_entry();
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .expect("failed to build async runtime");
+    bcode_cli::record_runtime_ready();
+    runtime.block_on(async {
+        let build_info = build_info();
+        #[cfg(feature = "static-bundled-plugins")]
+        let result = bcode_cli::run_with_static_bundled(
+            build_info,
+            bcode_bundled_plugins::static_bundled_plugins(),
+        )
+        .await;
+        #[cfg(not(feature = "static-bundled-plugins"))]
+        let result = bcode_cli::run(build_info).await;
 
-    if let Err(error) = result {
-        eprintln!("error: {error}");
-        std::process::exit(i32::from(error.exit_code()));
-    }
+        if let Err(error) = result {
+            eprintln!("error: {error}");
+            std::process::exit(i32::from(error.exit_code()));
+        }
+    });
 }

@@ -16,8 +16,14 @@ impl SessionManager {
         &self,
         session_id: SessionId,
     ) -> Result<Vec<db::RuntimeWorkProjection>, SessionError> {
-        let handle = self.session_handle(session_id).await?;
-        handle.active_runtime_work().await
+        let phase = bcode_metrics::startup::phase("session.active_work.acquire_handle");
+        let result = self.session_handle(session_id).await;
+        phase.finish_result(&result);
+        let handle = result?;
+        let phase = bcode_metrics::startup::phase("session.active_work.actor_query");
+        let result = handle.active_runtime_work().await;
+        phase.finish_result(&result);
+        result
     }
 
     /// Return latest runtime-work rows from the DB read model.
