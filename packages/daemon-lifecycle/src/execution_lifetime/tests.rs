@@ -86,6 +86,29 @@ fn unsupported_damaged_and_foreign_evidence_fails_closed() {
 }
 
 #[test]
+fn maintenance_excludes_execution_and_publishes_released_coordinator() {
+    let root = tempfile::tempdir().unwrap();
+    let record = record(root.path());
+    let guard = ExecutionLifetime::begin(root.path(), &record).unwrap();
+    assert!(ExecutionMaintenance::acquire(root.path()).is_err());
+    drop(guard);
+    let maintenance = ExecutionMaintenance::acquire(root.path()).unwrap();
+    let mut next = record.clone();
+    next.instance_id = "maintenance-owner".into();
+    assert!(ExecutionLifetime::begin(root.path(), &next).is_err());
+    maintenance.publish_coordinator(root.path(), &next).unwrap();
+    assert_eq!(
+        status(root.path(), &next),
+        ExecutionLifetimeStatus::Released
+    );
+    assert!(ExecutionMaintenance::acquire(root.path()).is_err());
+    drop(maintenance);
+    let mut daemon = record;
+    daemon.instance_id = "new-daemon".into();
+    assert!(ExecutionLifetime::begin(root.path(), &daemon).is_ok());
+}
+
+#[test]
 fn lifetime_crash_helper() {
     let Some(root) = std::env::var_os("BCODE_LIFETIME_TEST_ROOT") else {
         return;

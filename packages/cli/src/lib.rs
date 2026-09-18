@@ -1042,7 +1042,84 @@ async fn cli_launch_catalog(
     page.ok_or_else(|| CliError::InvalidArguments("workflow discovery interrupted".to_string()))
 }
 
+fn recover_offline_workflow(run_id: &str, apply: bool) -> Result<(), CliError> {
+    let root = bcode_config::default_state_dir();
+    let maintenance = bcode_daemon_lifecycle::ExecutionMaintenance::acquire(&root)?;
+    // Registry absence is not evidence by itself. Exclusive upgraded execution admission is
+    // the authority; leftover records still block maintenance rather than being silently removed.
+    if !bcode_daemon_lifecycle::read_records(&root).is_empty() {
+        return Err(CliError::InvalidArguments(
+            "stop all daemons before offline workflow recovery".into(),
+        ));
+    }
+    let mut store = bcode_workflow_store::WorkflowStore::open_in_state_dir(&root)?;
+    let run = store
+        .run_summary(run_id)?
+        .ok_or_else(|| CliError::InvalidArguments("workflow run not found".into()))?;
+    let session_id = run
+        .parent_session_id
+        .as_deref()
+        .and_then(|id| id.parse().ok())
+        .ok_or_else(|| CliError::InvalidArguments("workflow parent session missing".into()))?;
+    let session_root = root.join("sessions");
+    let session =
+        bcode_session::lease::acquire_session_maintenance_guard(&session_root, session_id)
+            .map_err(|error| CliError::InvalidArguments(error.to_string()))?;
+    let _write = bcode_session::lease::acquire_maintenance_session_write_lock(
+        &session,
+        &session_root,
+        session_id,
+    )
+    .map_err(|error| CliError::InvalidArguments(error.to_string()))?;
+    store.validate_offline_continuation(run_id)?;
+    let expected = store
+        .execution_authority(run_id)?
+        .ok_or_else(|| CliError::InvalidArguments("workflow authority missing".into()))?;
+    if apply {
+        let record = bcode_daemon_lifecycle::DaemonRecord::current(
+            &bcode_ipc::default_endpoint(),
+            root.join("logs").join("offline-recovery.log"),
+            None,
+            format!("maintenance-{}", uuid::Uuid::new_v4()),
+        )?;
+        maintenance.publish_coordinator(&root, &record)?;
+        let replacement = bcode_workflow_store::WorkflowExecutionAuthority {
+            target_artifact_id: bcode_ipc::ArtifactId::current().to_string(),
+            daemon_instance_id: record.instance_id,
+            generation: expected.generation.checked_add(1).ok_or_else(|| {
+                CliError::InvalidArguments("workflow authority generation exhausted".into())
+            })?,
+            fencing_token: uuid::Uuid::new_v4().to_string(),
+        };
+        store.recover_offline_continuation(
+            run_id,
+            &expected,
+            &replacement,
+            current_unix_time_ms()?,
+        )?;
+    }
+    print_json(
+        &serde_json::json!({"run_id": run_id, "applied": apply, "status": "paused", "compatible": true, "next": "workflow resume-run --run-id"}),
+    )
+}
+
+fn dispatch_offline_recovery(command: &WorkflowCommand) -> Result<(), CliError> {
+    if let WorkflowCommand::RecoverOffline {
+        run_id,
+        all_clients_upgraded: true,
+        apply,
+    } = command
+    {
+        recover_offline_workflow(run_id, *apply)
+    } else {
+        Err(CliError::InvalidArguments("offline recovery requires confirmation that all clients and daemons have been upgraded".into()))
+    }
+}
+
 async fn handle_workflow_command(command: Box<WorkflowCommand>) -> Result<(), CliError> {
+    if matches!(command.as_ref(), WorkflowCommand::RecoverOffline { .. }) {
+        return dispatch_offline_recovery(command.as_ref());
+    }
     if let WorkflowCommand::CancelDiscovery { token } = command.as_ref() {
         let released = Box::pin(
             bcode_workflow::WorkflowAuthoringApplication::cancel_workflow_discovery(
@@ -1458,6 +1535,9 @@ async fn dispatch_workflow_command(command: Box<WorkflowCommand>) -> Result<(), 
                 )
                 .await?,
             )?;
+        }
+        WorkflowCommand::RecoverOffline { .. } => {
+            unreachable!("offline maintenance handled before client creation")
         }
         WorkflowCommand::ReconcileOrphans { apply, limit, json } => {
             let report = bcode_workflow::WorkflowRunApplication::reconcile_orphaned_workflow_runs(
@@ -4292,6 +4372,17 @@ enum WorkflowCommand {
     PauseRun {
         #[arg(long)]
         run_id: String,
+    },
+    /// Offline exact-run recovery after upgrading and stopping all clients and daemons.
+    RecoverOffline {
+        #[arg(long)]
+        run_id: String,
+        /// Confirm every client and daemon has been upgraded to execution admission fencing.
+        #[arg(long, required = true)]
+        all_clients_upgraded: bool,
+        /// Apply the audited transfer; without this flag only validate.
+        #[arg(long)]
+        apply: bool,
     },
     /// Resume a paused workflow; print the transition result as JSON.
     ResumeRun {
@@ -17784,6 +17875,35 @@ fn read_prompt_bytes(reader: impl std::io::Read) -> Result<Vec<u8>, CliError> {
 #[cfg(test)]
 mod prompt_input_tests {
     use super::{CliError, MAX_CLI_PROMPT_BYTES, PromptInput};
+
+    #[test]
+    fn offline_recovery_requires_explicit_upgrade_confirmation() {
+        use super::Cli;
+        use clap::Parser as _;
+        assert!(
+            Cli::try_parse_from(["bcode", "workflow", "recover-offline", "--run-id", "test"])
+                .is_err()
+        );
+        assert!(
+            Cli::try_parse_from([
+                "bcode",
+                "workflow",
+                "recover-offline",
+                "--run-id",
+                "test",
+                "--all-clients-upgraded"
+            ])
+            .is_ok()
+        );
+        assert!(
+            super::dispatch_offline_recovery(&super::WorkflowCommand::RecoverOffline {
+                run_id: "test".into(),
+                all_clients_upgraded: false,
+                apply: true,
+            })
+            .is_err()
+        );
+    }
 
     #[test]
     fn prompt_reader_stops_without_waiting_for_eof() {

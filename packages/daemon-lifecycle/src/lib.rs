@@ -6,7 +6,7 @@
 
 mod execution_lifetime;
 pub use execution_lifetime::{
-    ExecutionLifetime, ExecutionLifetimeStatus, execution_lifetime_status,
+    ExecutionLifetime, ExecutionLifetimeStatus, ExecutionMaintenance, execution_lifetime_status,
 };
 
 use bcode_ipc::{BUILD_FINGERPRINT, CURRENT_PROTOCOL_VERSION, IpcEndpoint, daemon_namespace};

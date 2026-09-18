@@ -31,6 +31,66 @@ struct Evidence {
 #[derive(Debug)]
 pub struct ExecutionLifetime {
     _file: File,
+    _execution_admission: File,
+}
+
+/// Exclusive state-location execution admission for explicit offline maintenance.
+/// All clients and daemons must first be upgraded to the execution-fence protocol.
+#[derive(Debug)]
+pub struct ExecutionMaintenance {
+    file: File,
+    root: PathBuf,
+}
+
+fn admission_file(root: &Path) -> io::Result<File> {
+    let root = directory(root, true)?;
+    let path = root
+        .join("daemon-execution-lifetimes")
+        .join("admission.lock");
+    let mut options = OpenOptions::new();
+    options.read(true).write(true).create(true).truncate(false);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options.custom_flags(libc::O_NOFOLLOW);
+    }
+    let file = options.open(path)?;
+    if !file.metadata()?.is_file() {
+        return Err(invalid());
+    }
+    Ok(file)
+}
+
+impl ExecutionMaintenance {
+    /// Fence startup and execution in this state location during offline maintenance.
+    ///
+    /// # Errors
+    /// Rejects active upgraded execution owners, unsafe paths and IO failures.
+    /// Publish a released maintenance coordinator after a fenced offline transfer.
+    /// The caller must retain this exclusive guard until the store transaction commits.
+    ///
+    /// # Errors
+    /// Rejects reused identities, unsupported paths or persistence failures.
+    pub fn publish_coordinator(&self, root: &Path, record: &DaemonRecord) -> io::Result<()> {
+        if root.canonicalize()? != self.root {
+            return Err(invalid());
+        }
+        let _lifetime = ExecutionLifetime::publish(root, record, self.file.try_clone()?)?;
+        Ok(())
+    }
+
+    /// Fence execution and startup for explicit offline maintenance.
+    ///
+    /// # Errors
+    /// Rejects live upgraded owners, unsafe paths and IO failures.
+    pub fn acquire(root: &Path) -> io::Result<Self> {
+        let file = admission_file(root)?;
+        file.try_lock().map_err(io::Error::from)?;
+        Ok(Self {
+            file,
+            root: root.canonicalize()?,
+        })
+    }
 }
 
 /// Result of a bounded, non-mutating lifetime observation.
@@ -90,6 +150,14 @@ impl ExecutionLifetime {
     /// # Errors
     /// Returns an error for missing identity, reused instance IDs, unsafe paths or IO failure.
     pub fn begin(root: &Path, record: &DaemonRecord) -> io::Result<Self> {
+        let execution_admission = admission_file(root)?;
+        execution_admission
+            .try_lock_shared()
+            .map_err(io::Error::from)?;
+        Self::publish(root, record, execution_admission)
+    }
+
+    fn publish(root: &Path, record: &DaemonRecord, execution_admission: File) -> io::Result<Self> {
         let root = directory(root, true)?;
         let evidence = Evidence {
             version: VERSION,
@@ -115,7 +183,10 @@ impl ExecutionLifetime {
         file.sync_all()?;
         #[cfg(unix)]
         File::open(root.join("daemon-execution-lifetimes"))?.sync_all()?;
-        Ok(Self { _file: file })
+        Ok(Self {
+            _file: file,
+            _execution_admission: execution_admission,
+        })
     }
 }
 

@@ -25,6 +25,7 @@ use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use thiserror::Error;
 
+mod offline_recovery;
 mod recovery;
 mod run_graph;
 pub use run_graph::{RunGraphCandidateValidation, RunGraphEdge, RunGraphNode};
@@ -41894,6 +41895,74 @@ mod tests {
                 if handoff { "prepared" } else { "cancelled" }
             );
         }
+    }
+
+    #[test]
+    fn offline_continuation_preserves_run_and_rejects_stale_owner() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut store = WorkflowStore::open_in_state_dir(temp.path()).unwrap();
+        let mut definition = sequential_definition();
+        for node in definition.nodes.values_mut() {
+            node.kind = bcode_workflow::NodeKind::Agent;
+            node.configuration = serde_json::json!({
+                "version": 3, "execution_target": "shared_parent_sequential", "agent_profile": "build",
+                "provider": null, "model": null, "output": {"mode":"preserve_input"},
+                "read_only": false, "tool_capability": "mutating", "tool_allowlist": [],
+                "timeout_ms": 1000, "prompt_mode": "json_input", "system_prompt": "work"
+            });
+        }
+        store
+            .persist_definition("sequential", 1, &definition)
+            .unwrap();
+        let mut run = new_run();
+        run.definition_id = "sequential".into();
+        let old = WorkflowExecutionAuthority {
+            target_artifact_id: "old-artifact".into(),
+            daemon_instance_id: "missing-owner".into(),
+            generation: 1,
+            fencing_token: "old-fence".into(),
+        };
+        run.execution_authority = Some(old.clone());
+        store.create_run(&run).unwrap();
+        store.enter_recovery_only(&run.run_id, &old, 20).unwrap();
+        let next = WorkflowExecutionAuthority {
+            target_artifact_id: "current-artifact".into(),
+            daemon_instance_id: "maintenance-owner".into(),
+            generation: 2,
+            fencing_token: "new-fence".into(),
+        };
+        let before = store.pending_activations(10).unwrap();
+        // Stale authority must leave the barrier intact.
+        let mut stale = old.clone();
+        stale.fencing_token = "stale".into();
+        assert!(
+            store
+                .recover_offline_continuation(&run.run_id, &stale, &next, 21)
+                .is_err()
+        );
+        assert!(store.is_recovery_only(&run.run_id).unwrap());
+        store
+            .recover_offline_continuation(&run.run_id, &old, &next, 21)
+            .unwrap();
+        assert!(!store.is_recovery_only(&run.run_id).unwrap());
+        assert_eq!(
+            store.run_summary(&run.run_id).unwrap().unwrap().status,
+            RunStatus::Paused
+        );
+        assert_eq!(store.pending_activations(10).unwrap(), before);
+        assert!(
+            store
+                .recover_offline_continuation(&run.run_id, &old, &next, 22)
+                .is_err()
+        );
+        drop(store);
+        let mut store = WorkflowStore::open_in_state_dir(temp.path()).unwrap();
+        assert_eq!(
+            store.execution_authority(&run.run_id).unwrap(),
+            Some(next.clone())
+        );
+        assert!(store.resume_run_owned(&run.run_id, 23, &next).unwrap());
+        assert!(store.validate_offline_continuation(&run.run_id).is_err());
     }
 
     #[test]
