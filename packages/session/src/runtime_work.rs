@@ -26,6 +26,28 @@ impl SessionManager {
         result
     }
 
+    /// Probe active work without sleeping on database-open contention.
+    ///
+    /// Intended for best-effort recovery discovery. Contention remains an error;
+    /// callers must defer rather than interpret it as an empty work set.
+    /// Existing actor connections and projection freshness checks are unchanged.
+    ///
+    /// # Errors
+    /// Returns normal active-work errors, including immediate database-open contention.
+    pub async fn probe_active_runtime_work(
+        &self,
+        session_id: SessionId,
+    ) -> Result<Vec<db::RuntimeWorkProjection>, SessionError> {
+        let phase = bcode_metrics::startup::phase("session.active_work.acquire_handle");
+        let result = self.session_handle(session_id).await;
+        phase.finish_result(&result);
+        let handle = result?;
+        let phase = bcode_metrics::startup::phase("session.active_work.actor_query");
+        let result = handle.active_runtime_work_with_policy(true).await;
+        phase.finish_result(&result);
+        result
+    }
+
     /// Return latest runtime-work rows from the DB read model.
     ///
     /// # Errors

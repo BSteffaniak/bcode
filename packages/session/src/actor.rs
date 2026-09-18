@@ -608,9 +608,20 @@ impl SessionHandle {
     pub async fn active_runtime_work(
         &self,
     ) -> Result<Vec<crate::db::RuntimeWorkProjection>, SessionError> {
+        self.active_runtime_work_with_policy(false).await
+    }
+
+    pub(crate) async fn active_runtime_work_with_policy(
+        &self,
+        fail_fast: bool,
+    ) -> Result<Vec<crate::db::RuntimeWorkProjection>, SessionError> {
         let queued = bcode_metrics::startup::phase("session.active_work.mailbox_wait");
-        self.send(|reply| SessionCommand::ActiveRuntimeWork { reply, queued })
-            .await?
+        self.send(|reply| SessionCommand::ActiveRuntimeWork {
+            reply,
+            queued,
+            fail_fast,
+        })
+        .await?
     }
 
     pub async fn current_runtime_selection(
@@ -853,6 +864,7 @@ enum SessionCommand {
     ActiveRuntimeWork {
         reply: oneshot::Sender<Result<Vec<crate::db::RuntimeWorkProjection>, SessionError>>,
         queued: bcode_metrics::startup::Phase,
+        fail_fast: bool,
     },
     CurrentRuntimeSelection(oneshot::Sender<crate::SessionRuntimeSelection>),
     CurrentModelSelection(oneshot::Sender<(Option<String>, Option<String>)>),
@@ -1173,9 +1185,18 @@ impl SessionActor {
             SessionCommand::ActiveToolRuns(reply) => {
                 let _ = reply.send(self.active_tool_runs().await);
             }
-            SessionCommand::ActiveRuntimeWork { reply, queued } => {
+            SessionCommand::ActiveRuntimeWork {
+                reply,
+                queued,
+                fail_fast,
+            } => {
                 queued.finish();
-                let _ = reply.send(self.active_runtime_work().await);
+                let result = if fail_fast {
+                    crate::db_connection::without_open_retries(self.active_runtime_work()).await
+                } else {
+                    self.active_runtime_work().await
+                };
+                let _ = reply.send(result);
             }
             SessionCommand::CurrentRuntimeSelection(reply) => {
                 let _ = reply.send(crate::SessionRuntimeSelection {

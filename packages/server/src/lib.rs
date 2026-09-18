@@ -32354,7 +32354,7 @@ async fn settle_restored_quiescent_workflow_runtime_work(state: &ServerState) {
         let work_id = WorkId::new(format!("workflow:{}", run.run_id));
         bcode_metrics::startup::count("workflow_settle.sessions_checked", 1);
         let inspect_phase = bcode_metrics::startup::phase("workflow_settle.session_active_work");
-        let active_result = state.sessions.active_runtime_work(session_id).await;
+        let active_result = state.sessions.probe_active_runtime_work(session_id).await;
         inspect_phase.finish_result(&active_result);
         let active = match active_result {
             Ok(active) => active.iter().any(|work| work.work_id == work_id),
