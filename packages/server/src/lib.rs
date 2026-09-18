@@ -63838,16 +63838,21 @@ event_symbol = "bcode_plugin_handle_event_v1"
 
     #[tokio::test]
     async fn workflow_turn_observer_materializes_validated_output_and_completes_run() {
-        assert_workflow_output_observation(false).await;
+        assert_workflow_output_observation(false, true).await;
     }
 
     #[tokio::test]
-    async fn workflow_turn_observer_defers_when_output_is_outside_bounded_history() {
-        assert_workflow_output_observation(true).await;
+    async fn workflow_turn_observer_recovers_correlated_output_outside_recent_history() {
+        assert_workflow_output_observation(true, true).await;
+    }
+
+    #[tokio::test]
+    async fn workflow_turn_observer_defers_uncorrelated_output() {
+        assert_workflow_output_observation(false, false).await;
     }
 
     #[allow(clippy::too_many_lines)]
-    async fn assert_workflow_output_observation(output_outside_window: bool) {
+    async fn assert_workflow_output_observation(output_outside_window: bool, correlated: bool) {
         let sessions = SessionManager::default();
         let parent = sessions
             .create_session(Some("parent".to_string()), PathBuf::from("."))
@@ -63877,10 +63882,23 @@ event_symbol = "bcode_plugin_handle_event_v1"
             .append_model_turn_started(child.id, turn_id.clone())
             .await
             .expect("turn start");
-        sessions
-            .append_assistant_message(child.id, "1".to_string())
-            .await
-            .expect("output");
+        if correlated {
+            sessions
+                .append_assistant_response_segment(
+                    child.id,
+                    turn_id.clone(),
+                    "output".into(),
+                    0,
+                    "1".into(),
+                )
+                .await
+                .expect("correlated output");
+        } else {
+            sessions
+                .append_assistant_message(child.id, "1".to_string())
+                .await
+                .expect("uncorrelated output");
+        }
         if output_outside_window {
             for _ in 0..300 {
                 sessions
@@ -64000,7 +64018,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
             .reconcile_receipt_backed_attempts_async(&observer, 10, 4)
             .await
             .expect("reconcile");
-        if output_outside_window {
+        if !correlated {
             assert_eq!(summary.deferred.len(), 1);
             assert!(summary.repair_required.is_empty());
             assert!(summary.failed.is_empty());
@@ -64505,8 +64523,11 @@ event_symbol = "bcode_plugin_handle_event_v1"
                 .expect("turn start");
             if scenario.outcome == ModelTurnOutcome::Completed {
                 sessions
-                    .append_assistant_message(
+                    .append_assistant_response_segment(
                         child.id,
+                        turn_id.clone(),
+                        "loop-output".into(),
+                        0,
                         if index == scenarios.len() {
                             "Implementation completed; this is prose, not workflow JSON.".into()
                         } else {
