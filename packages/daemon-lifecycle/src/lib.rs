@@ -2405,6 +2405,7 @@ pub async fn ensure_daemon_running(options: &EnsureDaemonOptions) -> Result<(), 
                     .map_err(|error| std::io::Error::other(error.to_string()))?;
             let mut command = tokio::process::Command::new(exe);
             detach_daemon_process(&mut command);
+            let spawn_phase = bcode_metrics::startup::phase("launcher.process_spawn");
             let mut child = command
                 .args(["server", "run"])
                 .env(endpoint_env_name, endpoint_env_value)
@@ -2446,16 +2447,14 @@ pub async fn ensure_daemon_running(options: &EnsureDaemonOptions) -> Result<(), 
                 .stdout(std::process::Stdio::piped())
                 .stderr(std::process::Stdio::from(stderr_log))
                 .spawn()?;
+            spawn_phase.finish();
             tracing::debug!(
                 target: "bcode_daemon_lifecycle::startup",
                 elapsed_ms = spawn_started_at.elapsed().as_millis(),
                 "daemon child spawned"
             );
 
-            let phase = bcode_metrics::startup::phase("launcher.spawn_to_notification");
-            let result = wait_for_child_notification(&endpoint, &mut child, &log_path).await;
-            phase.finish_result(&result);
-            result
+            measured_child_readiness(&endpoint, &mut child, &log_path).await
         }
     })
     .instrument(span)
@@ -2774,6 +2773,17 @@ pub fn notify_launcher_ready() {
         let _ = stdout.write_all(b"BCODE_READY_V1\n");
         let _ = stdout.flush();
     }
+}
+
+async fn measured_child_readiness(
+    endpoint: &IpcEndpoint,
+    child: &mut tokio::process::Child,
+    log_path: &Path,
+) -> Result<(), DaemonStartError> {
+    let phase = bcode_metrics::startup::phase("launcher.spawn_to_notification");
+    let result = wait_for_child_notification(endpoint, child, log_path).await;
+    phase.finish_result(&result);
+    result
 }
 
 async fn wait_for_child_notification(

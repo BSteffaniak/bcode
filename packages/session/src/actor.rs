@@ -608,7 +608,9 @@ impl SessionHandle {
     pub async fn active_runtime_work(
         &self,
     ) -> Result<Vec<crate::db::RuntimeWorkProjection>, SessionError> {
-        self.send(SessionCommand::ActiveRuntimeWork).await?
+        let queued = bcode_metrics::startup::phase("session.active_work.mailbox_wait");
+        self.send(|reply| SessionCommand::ActiveRuntimeWork { reply, queued })
+            .await?
     }
 
     pub async fn current_runtime_selection(
@@ -848,7 +850,10 @@ enum SessionCommand {
     ),
     ModelContextEvents(oneshot::Sender<Result<Vec<SessionEvent>, SessionError>>),
     ActiveToolRuns(oneshot::Sender<Result<Vec<crate::db::ToolRun>, SessionError>>),
-    ActiveRuntimeWork(oneshot::Sender<Result<Vec<crate::db::RuntimeWorkProjection>, SessionError>>),
+    ActiveRuntimeWork {
+        reply: oneshot::Sender<Result<Vec<crate::db::RuntimeWorkProjection>, SessionError>>,
+        queued: bcode_metrics::startup::Phase,
+    },
     CurrentRuntimeSelection(oneshot::Sender<crate::SessionRuntimeSelection>),
     CurrentModelSelection(oneshot::Sender<(Option<String>, Option<String>)>),
     CurrentReasoningSelection(oneshot::Sender<(Option<String>, Option<String>)>),
@@ -1168,7 +1173,8 @@ impl SessionActor {
             SessionCommand::ActiveToolRuns(reply) => {
                 let _ = reply.send(self.active_tool_runs().await);
             }
-            SessionCommand::ActiveRuntimeWork(reply) => {
+            SessionCommand::ActiveRuntimeWork { reply, queued } => {
+                queued.finish();
                 let _ = reply.send(self.active_runtime_work().await);
             }
             SessionCommand::CurrentRuntimeSelection(reply) => {
@@ -2553,14 +2559,23 @@ impl SessionActor {
     ) -> Result<Vec<crate::db::RuntimeWorkProjection>, SessionError> {
         let session_id = self.state.summary.id;
         let expected_last_sequence = self.state.next_sequence.saturating_sub(1);
-        let Some(db) = self.existing_session_db().await? else {
+        let phase = bcode_metrics::startup::phase("session.active_work.open_existing_db");
+        let result = self.existing_session_db().await;
+        phase.finish_result(&result);
+        let Some(db) = result? else {
             return Ok(Vec::new());
         };
-        let checkpoint = db
+        let phase = bcode_metrics::startup::phase("session.active_work.projection_checkpoint");
+        let result = db
             .materialized_projection_checkpoint(MaterializedProjection::RuntimeWork)
-            .await?;
+            .await;
+        phase.finish_result(&result);
+        let checkpoint = result?;
         if checkpoint.is_some_and(|checkpoint| checkpoint >= expected_last_sequence) {
-            return Ok(db.active_runtime_work().await?);
+            let phase = bcode_metrics::startup::phase("session.active_work.select_rows");
+            let result = db.active_runtime_work().await;
+            phase.finish_result(&result);
+            return Ok(result?);
         }
         Err(SessionError::ProjectionStale {
             session_id,

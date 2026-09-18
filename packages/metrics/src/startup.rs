@@ -11,7 +11,7 @@ use std::sync::{OnceLock, mpsc};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 const SLOTS: usize = 32;
-const MAX_PHASES: usize = 512;
+const MAX_PHASES: usize = 1_024;
 const MAX_BYTES: u64 = 512 * 1024;
 static RECORDER: OnceLock<Recorder> = OnceLock::new();
 
@@ -295,7 +295,7 @@ pub fn initialize(root: &Path, started: Instant, artifact: String) -> io::Result
         phases: Vec::new(),
     };
     persist(&path, &report)?;
-    let (sender, receiver) = mpsc::sync_channel(2048);
+    let (sender, receiver) = mpsc::sync_channel(4096);
     std::thread::Builder::new()
         .name("startup-report".to_owned())
         .spawn(move || {

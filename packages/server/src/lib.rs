@@ -32334,6 +32334,15 @@ async fn settle_restored_quiescent_workflow_runtime_work(state: &ServerState) {
         "workflow_settle.discovered_runs",
         u64::try_from(runs.len()).unwrap_or(u64::MAX),
     );
+    let unique_sessions: BTreeSet<_> = runs
+        .iter()
+        .filter_map(|run| run.parent_session_id.as_deref())
+        .collect();
+    bcode_metrics::startup::count(
+        "workflow_settle.distinct_parent_sessions",
+        u64::try_from(unique_sessions.len()).unwrap_or(u64::MAX),
+    );
+    drop(unique_sessions);
     for run in runs {
         let Some(session_id) = run
             .parent_session_id
