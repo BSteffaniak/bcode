@@ -349,7 +349,36 @@ fn persist(path: &Path, report: &StartupReport) -> io::Result<()> {
 
 fn worker(path: &Path, _lock: File, mut report: StartupReport, receiver: &mpsc::Receiver<Message>) {
     let mut ids: std::collections::BTreeMap<u64, usize> = std::collections::BTreeMap::new();
-    while let Ok(message) = receiver.recv() {
+    let mut last_persist = Instant::now();
+    let mut dirty = false;
+    loop {
+        let pending = if dirty {
+            receiver.recv_timeout(std::time::Duration::from_millis(25))
+        } else {
+            receiver
+                .recv()
+                .map_err(|_| mpsc::RecvTimeoutError::Disconnected)
+        };
+        let message = match pending {
+            Ok(message) => message,
+            Err(mpsc::RecvTimeoutError::Disconnected) => break,
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                if dirty {
+                    report.unattributed_us = unattributed(&report);
+                    if persist(path, &report).is_err() {
+                        eprintln!(
+                            "bcode: startup diagnostic persistence failed; report may be incomplete"
+                        );
+                        return;
+                    }
+                    last_persist = Instant::now();
+                    dirty = false;
+                }
+                continue;
+            }
+        };
+        dirty = true;
+        let urgent = matches!(&message, Message::Ready(_) | Message::Flush(_));
         match message {
             Message::Count(name, value) => {
                 if report.counts.len() < 32 || report.counts.contains_key(name) {
@@ -368,6 +397,12 @@ fn worker(path: &Path, _lock: File, mut report: StartupReport, receiver: &mpsc::
                 report.dropped_phases += 1;
             }
             Message::Flush(sender) => {
+                report.unattributed_us = unattributed(&report);
+                if persist(path, &report).is_err() {
+                    break;
+                }
+                last_persist = Instant::now();
+                dirty = false;
                 let _ = sender.try_send(());
                 continue;
             }
@@ -392,11 +427,19 @@ fn worker(path: &Path, _lock: File, mut report: StartupReport, receiver: &mpsc::
                 report.ready = true;
             }
         }
-        report.unattributed_us = unattributed(&report);
-        if persist(path, &report).is_err() {
-            eprintln!("bcode: startup diagnostic persistence failed; report may be incomplete");
-            break;
+        if urgent || last_persist.elapsed() >= std::time::Duration::from_millis(25) {
+            report.unattributed_us = unattributed(&report);
+            if persist(path, &report).is_err() {
+                eprintln!("bcode: startup diagnostic persistence failed; report may be incomplete");
+                return;
+            }
+            last_persist = Instant::now();
+            dirty = false;
         }
+    }
+    report.unattributed_us = unattributed(&report);
+    if persist(path, &report).is_err() {
+        eprintln!("bcode: startup diagnostic persistence failed; report may be incomplete");
     }
 }
 
@@ -496,6 +539,25 @@ mod tests {
             measure("test.failure", || Err::<(), _>("unchanged")),
             Err("unchanged")
         );
+    }
+
+    #[test]
+    fn flush_acknowledges_persisted_batch_before_worker_exit() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("0.json");
+        let worker_path = path.clone();
+        let lock = File::create(dir.path().join("0.lock")).unwrap();
+        let (sender, receiver) = mpsc::sync_channel(8);
+        let worker = std::thread::spawn(move || worker(&worker_path, lock, report(), &receiver));
+        sender.send(Message::Count("observed", 7)).unwrap();
+        let (ack, acknowledged) = mpsc::sync_channel(1);
+        sender.send(Message::Flush(ack)).unwrap();
+        acknowledged
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .unwrap();
+        assert_eq!(read_report(&path).unwrap().counts["observed"], 7);
+        drop(sender);
+        worker.join().unwrap();
     }
 
     #[test]

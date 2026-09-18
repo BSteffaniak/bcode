@@ -7152,8 +7152,18 @@ impl ClientConnection {
     async fn send_request(&mut self, request: Request) -> Result<ResponsePayload, ClientError> {
         let request_id = self.next_request_id;
         self.next_request_id += 1;
+        let hello = matches!(&request, Request::Hello { .. });
+        let encoding = hello.then(|| bcode_metrics::startup::phase("client.hello.encode"));
         let envelope = request_envelope(request_id, &request)?;
+        if let Some(phase) = encoding {
+            phase.finish();
+        }
+        let sending = hello.then(|| bcode_metrics::startup::phase("client.hello.send"));
         send_envelope(&mut self.stream, &envelope).await?;
+        if let Some(phase) = sending {
+            phase.finish();
+        }
+        let waiting = hello.then(|| bcode_metrics::startup::phase("client.hello.response"));
 
         let mut compaction_accepted = false;
         loop {
@@ -7186,6 +7196,9 @@ impl ClientConnection {
                 }
                 compaction_accepted = true;
                 continue;
+            }
+            if let Some(phase) = waiting {
+                phase.finish();
             }
             return match response {
                 Response::Ok(payload) => Ok(payload),
