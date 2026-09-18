@@ -108,7 +108,7 @@ impl StorageAdmissionRegistry {
         match registry.admit_maintenance(4096) {
             Ok(admission) => Ok(admission),
             Err(error) if error.kind() == io::ErrorKind::InvalidData => {
-                let report = Self::session_report_bounded(root, id, true, 4096)?;
+                let report = Self::session_report_bounded(root, id, true, 4096, false)?;
                 if report.busy || report.invalid || report.retired == 0 {
                     return Err(error);
                 }
@@ -129,7 +129,7 @@ impl StorageAdmissionRegistry {
         id: SessionId,
         apply: bool,
     ) -> io::Result<bcode_session_models::StorageAdmissionReport> {
-        Self::session_report_bounded(root, id, apply, 1_000_000)
+        Self::session_report_bounded(root, id, apply, 1_000_000, true)
     }
 
     fn session_report_bounded(
@@ -137,6 +137,7 @@ impl StorageAdmissionRegistry {
         id: SessionId,
         apply: bool,
         entry_budget: usize,
+        permit_empty: bool,
     ) -> io::Result<bcode_session_models::StorageAdmissionReport> {
         use std::io::{Read as _, Seek as _};
         use std::os::unix::fs::MetadataExt as _;
@@ -181,7 +182,15 @@ impl StorageAdmissionRegistry {
                 report.busy = true;
                 return Ok(report);
             }
-            if file.metadata()?.len() != super::DIRTY.len() as u64 {
+            let metadata = file.metadata()?;
+            if permit_empty && metadata.len() == 0 {
+                // Creation precedes the durable DIRTY write. Explicit maintenance may retire
+                // this interrupted registration only after exclusion and an access-age reset.
+                report.abandoned += 1;
+                participants.push((name, metadata.dev(), metadata.ino()));
+                continue;
+            }
+            if metadata.len() != super::DIRTY.len() as u64 {
                 report.invalid = true;
                 return Ok(report);
             }
@@ -682,6 +691,54 @@ unsafe fn errno() -> *mut libc::c_int {
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test]
+    async fn empty_registration_requires_explicit_recovery_and_unknown_bytes_are_preserved() {
+        let root = tempfile::tempdir().expect("root");
+        let sessions = crate::SessionManager::persistent(root.path()).expect("sessions");
+        let id = sessions
+            .create_session(None, root.path().to_path_buf())
+            .await
+            .expect("session")
+            .id;
+        let registry =
+            super::StorageAdmissionRegistry::open_session(root.path(), id).expect("registry");
+        drop(
+            registry
+                .admit_read(bcode_session_models::SessionId::new())
+                .expect("read"),
+        );
+        let directory = root
+            .path()
+            .join("storage-admission-sessions-v1")
+            .join(id.to_string());
+        let empty = directory.join(format!(
+            "{}.participant",
+            bcode_session_models::SessionId::new()
+        ));
+        std::fs::write(&empty, []).expect("empty interrupted registration");
+        assert!(
+            super::StorageAdmissionRegistry::admit_session_maintenance(root.path(), id).is_err()
+        );
+        assert!(empty.exists());
+        let unknown = directory.join(format!(
+            "{}.participant",
+            bcode_session_models::SessionId::new()
+        ));
+        std::fs::write(&unknown, b"future").expect("unknown record");
+        let report =
+            super::StorageAdmissionRegistry::session_report(root.path(), id, true).expect("report");
+        assert!(report.invalid);
+        assert_eq!(report.retired, 0);
+        assert!(empty.exists());
+        std::fs::remove_file(unknown).expect("remove test obstruction");
+        let report = super::StorageAdmissionRegistry::session_report(root.path(), id, true)
+            .expect("recovery");
+        assert_eq!(report.abandoned, 2);
+        assert_eq!(report.retired, 2);
+        assert!(!empty.exists());
+        drop(registry.admit_maintenance(1).expect("gate only"));
+    }
+
     #[tokio::test]
     async fn explicit_recovery_handles_inventory_larger_than_automatic_budget() {
         let root = tempfile::tempdir().expect("root");

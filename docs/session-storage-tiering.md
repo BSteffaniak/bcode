@@ -45,7 +45,9 @@ error rather than silently creating a substitute registry.
 `bcode session storage-admission <session-id> --apply` is explicit recovery. It acquires exclusive
 admission plus each participant lock, validates every entry before mutation, and verifies session
 maintenance ownership. It durably advances the session access timestamp before retiring known
-participants. Active owners, unknown formats, malformed records, and over-budget inventories are
+participants, including empty interrupted registrations (creation precedes the durable dirty write).
+Empty records count as abandoned during explicit inspection; automatic recovery still refuses them.
+Active owners, unknown nonempty formats, malformed records, and over-budget inventories are
 preserved and refused. Interrupted retirement is safe to retry: the conservative timestamp is
 persisted first. It never rewrites canonical history or repairs damaged session storage.
 
