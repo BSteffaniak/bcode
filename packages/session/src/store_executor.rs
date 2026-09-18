@@ -34,6 +34,14 @@ impl SessionStoreExecutor {
         self.store.lease_owner()
     }
 
+    pub async fn load_catalog_session(
+        &self,
+        session_id: SessionId,
+    ) -> Result<Option<SessionState>, SessionStoreError> {
+        let store = self.store.clone();
+        spawn_blocking(move || store.load_catalog_session(session_id)).await?
+    }
+
     pub async fn load_catalog(
         &self,
     ) -> Result<BTreeMap<SessionId, SessionState>, SessionStoreError> {

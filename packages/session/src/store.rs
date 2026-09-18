@@ -90,6 +90,22 @@ impl SessionStore {
         Ok(summaries)
     }
 
+    /// Load one catalog-backed actor seed without enumerating unrelated sessions when
+    /// its current manifest is available. Canonical existence remains required.
+    pub(crate) fn load_catalog_session(
+        &self,
+        session_id: SessionId,
+    ) -> Result<Option<SessionState>, SessionStoreError> {
+        if db::session_db_path(&self.root, session_id).is_file()
+            && let Ok(Some(summary)) = self.load_session_manifest(session_id)
+        {
+            return Ok(Some(SessionState::from_catalog_summary(summary)));
+        }
+        // Preserve the existing degraded discovery behavior for absent/damaged metadata.
+        self.load_catalog()
+            .map(|mut catalog| catalog.remove(&session_id))
+    }
+
     pub(crate) fn load_catalog(
         &self,
     ) -> Result<BTreeMap<SessionId, SessionState>, SessionStoreError> {
@@ -359,6 +375,42 @@ impl SessionStore {
 mod tests {
     use super::SessionStore;
     use bcode_session_models::SessionId;
+
+    #[test]
+    fn targeted_manifest_lookup_preserves_summary_without_opening_database() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = SessionStore::new(temp.path());
+        let id = SessionId::new();
+        let directory = temp.path().join(id.to_string());
+        std::fs::create_dir_all(&directory).unwrap();
+        let database = directory.join("session.db");
+        std::fs::write(&database, b"not opened by metadata lookup").unwrap();
+        let mut summary = store
+            .discover_canonical_session_summaries()
+            .unwrap()
+            .remove(0);
+        summary.name = Some("target".to_owned());
+        summary.updated_at_ms = 123;
+        store.write_session_manifest(&summary).unwrap();
+        let before = std::fs::read(&database).unwrap();
+        let targeted = store.load_catalog_session(id).unwrap().unwrap();
+        let catalog = store.load_catalog().unwrap().remove(&id).unwrap();
+        assert_eq!(targeted.summary, catalog.summary);
+        assert_eq!(targeted.summary, summary);
+        assert_eq!(std::fs::read(&database).unwrap(), before);
+        std::fs::write(directory.join("manifest.json"), b"broken").unwrap();
+        assert!(store.load_catalog_session(id).unwrap().is_some());
+        assert_eq!(
+            std::fs::read(directory.join("manifest.json")).unwrap(),
+            b"broken"
+        );
+        assert!(
+            store
+                .load_catalog_session(SessionId::new())
+                .unwrap()
+                .is_none()
+        );
+    }
 
     #[test]
     fn readable_discovery_of_a_missing_root_is_empty_and_non_fatal() {

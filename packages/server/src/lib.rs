@@ -8261,6 +8261,7 @@ async fn handle_hello(
         )
         .await;
     }
+    let validation_phase = state.metrics.span("server.hello.validate_config");
     let validation =
         server_operations::validate_client_effective_config(hello.runtime_context.as_ref())
             .and_then(|()| {
@@ -8274,6 +8275,7 @@ async fn handle_hello(
                     hello.runtime_context.as_ref(),
                 )
             });
+    validation_phase.finish_result(&validation);
     if let Err(error) = validation {
         return send_response(
             writer,
@@ -8299,9 +8301,11 @@ async fn handle_hello(
     if client_name_supports_message_accepted(&hello.client_name) {
         state.register_message_accepted_client(client_id).await;
     }
+    let context_phase = state.metrics.span("server.hello.runtime_context");
     state
         .set_client_runtime_context(client_id, hello.runtime_context)
         .await;
+    context_phase.finish_ok();
     state
         .set_client_session_namespace(client_id, hello.daemon_namespace)
         .await;

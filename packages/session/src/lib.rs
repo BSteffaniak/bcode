@@ -967,11 +967,10 @@ impl SessionManager {
         let Some(store) = &self.store else {
             return Err(SessionError::NotFound(session_id));
         };
-        let state = store
-            .load_catalog()
-            .await?
-            .remove(&session_id)
-            .ok_or(SessionError::NotFound(session_id))?;
+        let phase = bcode_metrics::startup::phase("session.handle.catalog_lookup");
+        let result = store.load_catalog_session(session_id).await;
+        phase.finish_result(&result);
+        let state = result?.ok_or(SessionError::NotFound(session_id))?;
         let handle = SessionHandle::new(state, Some(store.clone()), None);
         self.inner
             .lock()
