@@ -6,6 +6,7 @@
 //! Lightweight in-process metrics for Bcode runtime diagnostics.
 
 pub mod dashboard;
+pub mod startup;
 
 use serde::{Deserialize, Serialize};
 use std::cmp::Reverse;

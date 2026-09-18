@@ -1914,6 +1914,9 @@ const fn default_metrics_max_recent_events() -> usize {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ConfigDoc)]
 #[config_doc(section = "metrics")]
 pub struct MetricsConfig {
+    /// Collect bounded startup phase reports separately from the runtime metrics timeline.
+    #[serde(default)]
+    pub startup_reports: bool,
     /// Whether runtime metrics collection is enabled.
     #[serde(default)]
     pub enabled: bool,
@@ -1937,6 +1940,7 @@ pub struct MetricsConfig {
 impl Default for MetricsConfig {
     fn default() -> Self {
         Self {
+            startup_reports: false,
             enabled: false,
             persist_events: false,
             segment_max_bytes: default_metrics_segment_max_bytes(),
@@ -1944,6 +1948,23 @@ impl Default for MetricsConfig {
             recent_read_max_bytes: default_metrics_recent_read_max_bytes(),
             max_recent_events: default_metrics_max_recent_events(),
         }
+    }
+}
+
+#[cfg(test)]
+mod startup_config_tests {
+    #[test]
+    fn startup_reports_are_explicit_and_round_trip() {
+        let default: super::MetricsConfig = toml::from_str("").unwrap();
+        assert!(!default.startup_reports);
+        let enabled: super::MetricsConfig = toml::from_str("startup_reports = true").unwrap();
+        assert!(enabled.startup_reports);
+        assert!(!enabled.enabled);
+        let serialized = toml::to_string(&enabled).unwrap();
+        assert_eq!(
+            toml::from_str::<super::MetricsConfig>(&serialized).unwrap(),
+            enabled
+        );
     }
 }
 

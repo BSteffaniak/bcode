@@ -572,7 +572,7 @@ impl ChatLoopState {
         self.markdown_projection.completion_receiver()
     }
 
-    pub const fn observe_daemon(&mut self, chat: &mut ActiveChat, observation: &DaemonObservation) {
+    pub fn observe_daemon(&mut self, chat: &mut ActiveChat, observation: &DaemonObservation) {
         if let Some(state) = self.daemon_connection.observe(observation) {
             chat.app.set_daemon_connection(state);
         }
@@ -2247,19 +2247,33 @@ impl ChatLoopState {
     }
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug)]
 struct DaemonConnectionMonitor {
     saw_success: bool,
+    startup_phase: Option<bcode_metrics::startup::Phase>,
+}
+
+impl Default for DaemonConnectionMonitor {
+    fn default() -> Self {
+        Self {
+            saw_success: false,
+            startup_phase: Some(bcode_metrics::startup::phase("tui.initial_connection")),
+        }
+    }
 }
 
 impl DaemonConnectionMonitor {
-    const fn observe(
+    fn observe(
         &mut self,
         observation: &DaemonObservation,
     ) -> Option<super::app::DaemonConnectionState> {
         match observation {
             DaemonObservation::None | DaemonObservation::Failed(_) => None,
             DaemonObservation::Success => {
+                if let Some(phase) = self.startup_phase.take() {
+                    phase.finish();
+                    bcode_metrics::startup::ready();
+                }
                 self.saw_success = true;
                 Some(super::app::DaemonConnectionState::Connected)
             }

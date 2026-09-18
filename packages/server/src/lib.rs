@@ -4201,9 +4201,11 @@ async fn run_with_static_bundled_inner(
     publish_daemon_record: bool,
 ) -> Result<(), ServerError> {
     let startup_started_at = Instant::now();
+    let config_phase = bcode_metrics::startup::phase("server.config");
     let stage_started_at = startup_started_at;
     tracing::debug!(target: "bcode_server::startup", "loading config");
     let config = bcode_config::load_config()?;
+    config_phase.finish();
     tracing::debug!(
         target: "bcode_server::startup",
         elapsed_ms = stage_started_at.elapsed().as_millis(),
@@ -4229,6 +4231,7 @@ async fn run_with_config(
     startup_started_at: Instant,
 ) -> Result<(), ServerError> {
     let stage_started_at = Instant::now();
+    let plugin_phase = bcode_metrics::startup::phase("server.plugins_and_model_catalog");
     let default_plugin_ids = bcode_plugin::static_bundled_default_plugin_ids(static_plugins)?;
     let plugin_selection =
         bcode_config::plugin_selection_with_default_plugin_ids(&config, &default_plugin_ids);
@@ -4254,6 +4257,7 @@ async fn run_with_config(
         total_elapsed_ms = startup_started_at.elapsed().as_millis(),
         "plugins loaded"
     );
+    plugin_phase.finish();
     run_with_services(
         endpoint,
         publish_daemon_record,
@@ -4472,8 +4476,10 @@ async fn run_with_services(
         });
     let mut stage_started_at = Instant::now();
     let startup_resources = (|| {
+        let phase = bcode_metrics::startup::phase("server.historical_storage_recovery");
         let legacy_recovery =
             session_migration_adapter::recover_historical_session_storage(&state_root)?;
+        phase.finish();
         if !legacy_recovery.relocated.is_empty() {
             tracing::info!(
                 target: "bcode_server::startup",
@@ -4504,12 +4510,14 @@ async fn run_with_services(
         );
         stage_started_at = Instant::now();
         tracing::debug!(target: "bcode_server::startup", endpoint = ?endpoint, "binding IPC endpoint");
+        let phase = bcode_metrics::startup::phase("server.bind_and_register");
         let listener = LocalIpcListener::bind(&endpoint)?;
         let daemon_record = if publish_daemon_record {
             Some(register_daemon(&endpoint)?)
         } else {
             None
         };
+        phase.finish();
         Ok::<_, ServerError>((listener, daemon_record))
     })();
     let (plugins, listener, daemon_record) = match startup_resources {
@@ -4605,18 +4613,23 @@ async fn run_with_services(
         "model selection resolved"
     );
     let configured_agent_ids: Vec<String> = config.agent.keys().cloned().collect();
+    let skills_phase = bcode_metrics::startup::phase("server.skills");
     let skills = build_skill_registry(
         &config,
         &std::env::current_dir()
             .and_then(fs::canonicalize)
             .unwrap_or_else(|_| PathBuf::from(".")),
     );
+    skills_phase.finish();
+    let auth_phase = bcode_metrics::startup::phase("server.auth_materialization");
     let selected_provider_context = bcode_provider_auth::resolve_provider_request_context(
         bcode_provider_auth::ProviderRequestContextResolution {
             config: &config,
             selection: resolved_model.clone(),
         },
     );
+    auth_phase.finish();
+    let workflow_phase = bcode_metrics::startup::phase("server.workflow_store_initialize");
     let (workflow_store, workflow_store_unavailable) = workflow_store_or_degraded(
         bcode_workflow_store::WorkflowStore::initialize_in_state_dir(
             &state_root,
@@ -4626,6 +4639,8 @@ async fn run_with_services(
             .join("degraded-domains")
             .join(format!("workflow-{}", std::process::id())),
     );
+    workflow_phase.finish();
+    let construction_phase = bcode_metrics::startup::phase("server.state_construction");
     let construction_started_at = Instant::now();
     let state = Arc::new(ServerState::new_with_workflow_status(
         sessions,
@@ -4672,6 +4687,7 @@ async fn run_with_services(
         total_elapsed_ms = startup_started_at.elapsed().as_millis(),
         "server state constructed"
     );
+    construction_phase.finish();
     run_constructed_server(
         state,
         listener,
@@ -4701,22 +4717,30 @@ async fn run_constructed_server(
     // Register before recovery, callbacks, or background services can consume session content.
     #[cfg(any(target_os = "macos", target_os = "linux"))]
     if let Some(root) = state.sessions.session_store_root() {
+        let phase = bcode_metrics::startup::phase("server.storage_read_admission");
         storage_read_admission::register_startup(&state, root).await;
+        phase.finish();
     }
     let startup_started_at = state.startup_started_at;
+    let background_phase = bcode_metrics::startup::phase("server.background_services");
     let stage_started_at = Instant::now();
     state.start_catalog_event_forwarder().await;
     state.start_workflow_event_forwarder().await;
     state.start_session_search_ingestion().await;
     start_catalog_refresh(&state).await;
     interrupt_stale_ralph_runs_best_effort(&state);
+    background_phase.finish();
     let workflow_recovery_started_at = Instant::now();
+    let phase = bcode_metrics::startup::phase("server.workflow_restore");
     restore_workflow_runtime_work(&state).await;
+    phase.finish();
     if state.shutdown_requested.load(Ordering::SeqCst) || host_shutdown.is_cancelled() {
         drop(listener);
         return shutdown_constructed_server(state, Ok(())).await;
     }
+    let phase = bcode_metrics::startup::phase("server.workflow_settle");
     settle_restored_quiescent_workflow_runtime_work(&state).await;
+    phase.finish();
     if state.shutdown_requested.load(Ordering::SeqCst) || host_shutdown.is_cancelled() {
         drop(listener);
         return shutdown_constructed_server(state, Ok(())).await;
@@ -4735,13 +4759,17 @@ async fn run_constructed_server(
             .start_idle_shutdown_watcher(Duration::from_secs(daemon.idle_shutdown_after_secs))
             .await;
     }
+    let phase = bcode_metrics::startup::phase("server.agent_registration");
     warn_on_unregistered_agent_ids(&state, configured_agent_ids).await;
+    phase.finish();
     let mut shutdown = state.subscribe_shutdown();
     state.metrics.set_gauge(
         "server.startup.session_search_enabled",
         i64::from(session_search_enabled),
     );
+    let phase = bcode_metrics::startup::phase("server.search_provider_status");
     let search_providers = session_search::list_providers(&state).await.providers;
+    phase.finish();
     state.metrics.set_gauge(
         "server.startup.session_search_provider_count",
         i64::try_from(search_providers.len()).unwrap_or(i64::MAX),
@@ -4802,7 +4830,10 @@ async fn run_constructed_server(
         total_elapsed_ms = startup_started_at.elapsed().as_millis(),
         "server ready; accepting clients"
     );
+    let phase = bcode_metrics::startup::phase("server.storage_worker_start");
     state.storage_worker.start(Arc::clone(&state)).await;
+    phase.finish();
+    bcode_metrics::startup::ready();
     bcode_daemon_lifecycle::notify_launcher_ready();
     let mut clients = JoinSet::new();
     let accept_result = loop {

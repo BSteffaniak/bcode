@@ -1767,6 +1767,7 @@ version = "0.0.1-alpha.0"
 dependencies = [
  "bcode_config",
  "bcode_ipc",
+ "bcode_metrics",
  "bcode_plugin_sdk",
  "bcode_session_models",
  "libc",
@@ -2108,6 +2109,7 @@ dependencies = [
 name = "bcode_metrics"
 version = "0.0.1-alpha.0"
 dependencies = [
+ "libc",
  "serde",
  "serde_json",
  "tempfile",

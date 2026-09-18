@@ -53,6 +53,11 @@ const SESSION_CLI_PAGE_LIMIT: usize = 500;
 /// Errors returned by the CLI.
 #[derive(Debug, Error)]
 pub enum CliError {
+    /// Startup diagnostic storage could not be read safely.
+    #[error(
+        "startup reports unavailable: check permissions; corrupt, oversized, and unsupported reports are preserved"
+    )]
+    StartupReportUnavailable,
     #[error("client error: {0}")]
     Client(#[from] ClientError),
     /// A normalized workflow application failure, independent of its transport.
@@ -204,6 +209,7 @@ impl CliError {
             | Self::SessionSearchBackfillCancelled
             | Self::AuthFlowCancelled => 4,
             Self::SessionSearchBackfillIncomplete => 1,
+            Self::StartupReportUnavailable => 1,
             Self::Signal(_) => 1,
             Self::Client(_)
             | Self::DaemonLifecycle(_)
@@ -322,6 +328,7 @@ pub async fn run_with_static_bundled(
     artifact_build_info: bcode_build_info::BuildInfo,
     static_plugins: Vec<bcode_plugin::StaticBundledPlugin>,
 ) -> Result<(), CliError> {
+    let process_started = Instant::now();
     init_tracing();
     register_workflow_artifact_retention();
     BUILD_INFO
@@ -347,6 +354,22 @@ pub async fn run_with_static_bundled(
     let matches = command.get_matches();
     let _config_override = config_override_from_matches(&matches);
     let _state_location = state_location_from_matches(&matches)?;
+    let reading_startup_reports = matches.subcommand().is_some_and(|(name, sub)| {
+        name == "server" && sub.subcommand_name() == Some("startup-report")
+    });
+    if !reading_startup_reports
+        && bcode_config::load_config()?.metrics.startup_reports
+        && let Err(error) = bcode_metrics::startup::initialize(
+            &bcode_config::default_state_dir().join("startup-reports"),
+            process_started,
+            bcode_ipc::ArtifactId::current().to_string(),
+        )
+    {
+        let _ = error;
+        eprintln!(
+            "bcode: startup reports unavailable; check diagnostic storage permissions or format"
+        );
+    }
     let exceptional_execution_mode = matches.get_flag("dangerously_bypass_all_permissions")
         || matches.get_flag("disable_all_tools");
     if let Some(plugin) = plugin_cli::matched(&matches, &registrations)
@@ -386,7 +409,11 @@ pub async fn run_with_static_bundled(
         Ok(cli) => cli,
         Err(error) => error.exit(),
     };
-    Box::pin(handle_cli(cli)).await
+    let result = Box::pin(handle_cli(cli)).await;
+    if !bcode_metrics::startup::flush() {
+        eprintln!("bcode: startup report flush failed; report may be incomplete");
+    }
+    result
 }
 
 /// Resolve a plugin-supplied surface repository path against the CLI process working directory.
@@ -4874,6 +4901,8 @@ enum ServerCommand {
     /// Measure one verified connection using the normal client availability policy.
     #[command(hide = true)]
     StartupProbe,
+    /// Read bounded retained startup reports without connecting to or starting a daemon.
+    StartupReport,
     Metrics {
         #[arg(long)]
         json: bool,
@@ -6468,6 +6497,13 @@ async fn handle_server_command(command: ServerCommand) -> Result<(), CliError> {
         ServerCommand::Run => run_server_foreground().await?,
         ServerCommand::Status { verbose } => server_status(verbose).await?,
         ServerCommand::StartupProbe => daemon_startup_probe().await?,
+        ServerCommand::StartupReport => {
+            let reports = bcode_metrics::startup::reports(
+                &bcode_config::default_state_dir().join("startup-reports"),
+            )
+            .map_err(|_| CliError::StartupReportUnavailable)?;
+            print_json(&reports)?;
+        }
         ServerCommand::Metrics { json, report } => server_metrics(json, report).await?,
         ServerCommand::Diagnose { json } => server_diagnose(json).await?,
         ServerCommand::Stop { force, yes } => {

@@ -5218,12 +5218,15 @@ impl PluginHost {
     ) -> Result<(), PluginLoadError> {
         for (manifest, vtable) in plugins {
             tracing::debug!(target: "bcode_plugin::startup", plugin_id = %manifest.id, "loading static plugin");
+            let phase =
+                bcode_metrics::startup::phase_for("plugin.static_load_activate", &manifest.id);
             let mut loaded = load_static_plugin(manifest.clone(), *vtable)?;
             if let Some(config) = self.configs.get(&manifest.id).cloned() {
                 loaded.set_config(config);
             }
             tracing::debug!(target: "bcode_plugin::startup", plugin_id = %loaded.manifest().id, "activating plugin");
             self.activate_plugin(loaded)?;
+            phase.finish();
         }
         Ok(())
     }
@@ -5234,12 +5237,17 @@ impl PluginHost {
     ) -> Result<(), PluginLoadError> {
         for plugin in plugins {
             tracing::debug!(target: "bcode_plugin::startup", plugin_id = %plugin.manifest.id, "loading plugin");
+            let phase = bcode_metrics::startup::phase_for(
+                "plugin.native_load_activate",
+                &plugin.manifest.id,
+            );
             let mut loaded = load_registered_plugin(plugin)?;
             if let Some(config) = self.configs.get(&plugin.manifest.id).cloned() {
                 loaded.set_config(config);
             }
             tracing::debug!(target: "bcode_plugin::startup", plugin_id = %loaded.manifest().id, "activating plugin");
             self.activate_plugin(loaded)?;
+            phase.finish();
         }
         Ok(())
     }

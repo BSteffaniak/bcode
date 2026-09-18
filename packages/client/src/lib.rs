@@ -6305,9 +6305,15 @@ impl BcodeClient {
         &self,
         client_name: &str,
     ) -> Result<ClientConnection, ClientError> {
+        let phase = bcode_metrics::startup::phase("client.verified_connection_attempt");
         let started = std::time::Instant::now();
         let result =
             tokio::time::timeout(self.connect_timeout, self.connect_once(client_name)).await;
+        if matches!(&result, Ok(Ok(_))) {
+            phase.finish();
+        } else {
+            phase.fail();
+        }
         tracing::debug!(
             target: "bcode_client::startup",
             elapsed_us = started.elapsed().as_micros(),
@@ -6347,8 +6353,10 @@ impl BcodeClient {
     }
 
     async fn connect_once(&self, client_name: &str) -> Result<ClientConnection, ClientError> {
+        let phase = bcode_metrics::startup::phase("client.transport_connect");
         let transport_started = std::time::Instant::now();
         let stream = LocalIpcStream::connect(&self.endpoint).await;
+        phase.finish_result(&stream);
         tracing::debug!(
             target: "bcode_client::startup",
             elapsed_us = transport_started.elapsed().as_micros(),
@@ -6356,6 +6364,7 @@ impl BcodeClient {
             "local transport connection completed"
         );
         let stream = stream?;
+        let handshake_phase = bcode_metrics::startup::phase("client.hello");
         let handshake_started = std::time::Instant::now();
         let mut connection = ClientConnection {
             stream,
@@ -6395,6 +6404,7 @@ impl BcodeClient {
                     "daemon identity handshake verified"
                 );
                 connection.client_id = Some(client_id);
+                handshake_phase.finish();
                 Ok(connection)
             }
             _ => Err(ClientError::UnexpectedResponse),

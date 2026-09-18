@@ -2326,6 +2326,12 @@ fn config_home_for_daemon(config_dir: &Path) -> PathBuf {
     config_dir.to_path_buf()
 }
 
+fn diagnostic_startup_id() -> u128 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |duration| duration.as_nanos())
+}
+
 /// Ensure the current namespace daemon is running, starting it when needed.
 ///
 /// # Errors
@@ -2335,9 +2341,7 @@ fn config_home_for_daemon(config_dir: &Path) -> PathBuf {
 pub async fn ensure_daemon_running(options: &EnsureDaemonOptions) -> Result<(), DaemonStartError> {
     use tracing::Instrument as _;
 
-    let startup_id = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_or(0, |duration| duration.as_nanos());
+    let startup_id = diagnostic_startup_id();
     let launcher_pid = std::process::id();
     let span = tracing::debug_span!(
         target: "bcode_daemon_lifecycle::startup",
@@ -2345,7 +2349,11 @@ pub async fn ensure_daemon_running(options: &EnsureDaemonOptions) -> Result<(), 
         startup_id,
         launcher_pid
     );
-    ensure_daemon_running_with_start(options, |options, startup_lock| {
+    let acquisition_phase = bcode_metrics::startup::phase_for(
+        "launcher.acquire",
+        &format!("{launcher_pid}-{startup_id}"),
+    );
+    let result = ensure_daemon_running_with_start(options, |options, startup_lock| {
         let inherited_startup_lock = startup_lock.file.try_clone();
         let endpoint = options.endpoint.clone();
         let log_path = options.log_path.clone();
@@ -2364,7 +2372,9 @@ pub async fn ensure_daemon_running(options: &EnsureDaemonOptions) -> Result<(), 
             let stderr_log = log_file.try_clone()?;
 
             let spawn_started_at = std::time::Instant::now();
+            let phase = bcode_metrics::startup::phase("launcher.artifact_prepare");
             let cached_exe = ensure_current_executable_cached()?;
+            phase.finish();
             let executable_digest = cached_executable_digest(&cached_exe)
                 .ok_or_else(|| DaemonLifecycleError::Io {
                     path: cached_exe.clone(),
@@ -2437,11 +2447,16 @@ pub async fn ensure_daemon_running(options: &EnsureDaemonOptions) -> Result<(), 
                 "daemon child spawned"
             );
 
-            wait_for_child_notification(&endpoint, &mut child, &log_path).await
+            let phase = bcode_metrics::startup::phase("launcher.spawn_to_notification");
+            let result = wait_for_child_notification(&endpoint, &mut child, &log_path).await;
+            phase.finish_result(&result);
+            result
         }
     })
     .instrument(span)
-    .await
+    .await;
+    acquisition_phase.finish_result(&result);
+    result
 }
 
 /// Detach the child from the launching terminal, not merely its stdio handles.
@@ -2521,7 +2536,10 @@ where
         return Ok(());
     }
 
-    let Some(lock) = StartupLock::acquire(&options.endpoint).await? else {
+    let phase = bcode_metrics::startup::phase("launcher.startup_lock");
+    let acquired = StartupLock::acquire(&options.endpoint).await;
+    phase.finish_result(&acquired);
+    let Some(lock) = acquired? else {
         print_daemon_status(options, "server already running");
         return Ok(());
     };
