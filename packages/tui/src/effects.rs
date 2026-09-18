@@ -2289,6 +2289,58 @@ fn message_acceptance_from_action_outcome(
 }
 
 #[allow(clippy::too_many_lines)]
+fn submission_stage_error(stage: &'static str, error: ClientError) -> ClientError {
+    match error {
+        ClientError::RequestTimeout { timeout } => ClientError::Server {
+            code: "tui_submission_request_timeout".into(),
+            message: format!(
+                "Message submission timed out while {stage} after {timeout:?}. Acceptance is not confirmed; check session history before retrying."
+            ),
+        },
+        other => other,
+    }
+}
+
+#[cfg(test)]
+mod submission_error_tests {
+    use super::*;
+
+    #[test]
+    fn timeout_reports_stage_without_claiming_rejection_or_restart() {
+        let error = submission_stage_error(
+            "waiting for message acceptance",
+            ClientError::RequestTimeout {
+                timeout: std::time::Duration::from_secs(30),
+            },
+        );
+        let ClientError::Server { code, message } = error else {
+            panic!("stage diagnostic");
+        };
+        assert_eq!(code, "tui_submission_request_timeout");
+        assert!(message.contains("waiting for message acceptance"));
+        assert!(message.contains("Acceptance is not confirmed"));
+        let startup = submission_stage_error(
+            "creating the session",
+            ClientError::DaemonStartupTimeout {
+                timeout: std::time::Duration::from_secs(10),
+            },
+        );
+        assert!(matches!(startup, ClientError::DaemonStartupTimeout { .. }));
+    }
+}
+
+fn submission_attach_error(error: TuiError) -> ClientError {
+    match error {
+        TuiError::Client(error) => {
+            submission_stage_error("attaching the session event stream", error)
+        }
+        other => ClientError::Server {
+            code: "tui_session_attach_failed".into(),
+            message: other.to_string(),
+        },
+    }
+}
+
 async fn submit_message(
     client: &BcodeClient,
     request: SubmitMessageRequest,
@@ -2320,7 +2372,8 @@ async fn submit_message(
     } else {
         let session = client
             .create_session_in_working_directory(None, launch_working_directory.clone())
-            .await?;
+            .await
+            .map_err(|error| submission_stage_error("creating the session", error))?;
         let _ = execute_session_view_action(
             client,
             SessionViewAction::UpdateDraft {
@@ -2334,13 +2387,7 @@ async fn submit_message(
         let (attached, task, release) =
             history_flow::attach_paused_session_event_stream(client, session.id, event_sender)
                 .await
-                .map_err(|error| match error {
-                    TuiError::Client(error) => error,
-                    other => ClientError::Server {
-                        code: "tui_session_attach_failed".to_owned(),
-                        message: other.to_string(),
-                    },
-                })?;
+                .map_err(submission_attach_error)?;
         let session_id = session.id;
         message = clipboard_image::promote_draft_clipboard_images(
             &message,
@@ -2365,7 +2412,8 @@ async fn submit_message(
         reasoning_effort.clone(),
         reasoning_summary.clone(),
     )
-    .await?;
+    .await
+    .map_err(|error| submission_stage_error("applying model/agent/reasoning selections", error))?;
     let placement = match placement {
         PromptPlacement::Steering => bcode_session_view_models::PromptPlacementView::Steering,
         PromptPlacement::FollowUp => bcode_session_view_models::PromptPlacementView::FollowUp,
@@ -2380,7 +2428,8 @@ async fn submit_message(
             execution: Box::new(execution),
         },
     )
-    .await?;
+    .await
+    .map_err(|error| submission_stage_error("waiting for message acceptance", error))?;
     let acceptance = message_acceptance_from_action_outcome(&outcome)?;
     Ok(SubmitMessageResult {
         session_id,

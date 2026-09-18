@@ -1,6 +1,5 @@
 //! Composer submission flow for the TUI.
 
-use super::app::DaemonConnectionState;
 use super::effects::{SubmitMessageRequest, TuiEffect};
 use super::session_flow::ActiveChat;
 use super::slash_registry;
@@ -100,15 +99,55 @@ pub fn stage_session_message(
             event_sender: chat.event_sender.clone(),
         }),
     });
-    chat.app
-        .set_daemon_connection(DaemonConnectionState::Starting);
-    chat.app.set_status("starting daemon…".to_owned());
+    chat.app.set_status("sending message…".to_owned());
     true
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn submission_preserves_observed_connection_for_new_and_existing_sessions() {
+        use super::super::app::{BmuxApp, DaemonConnectionState};
+        use super::super::session_flow::{ActiveChat, AgentCatalog, ChatSessionAttachment};
+        for attached in [false, true] {
+            for connection in [
+                DaemonConnectionState::Connected,
+                DaemonConnectionState::Connecting,
+                DaemonConnectionState::IdleOffline,
+                DaemonConnectionState::Unavailable,
+            ] {
+                let (event_sender, event_receiver) = crate::history_flow::session_stream_channel();
+                let session_id = attached.then(bcode_session_models::SessionId::new);
+                let mut chat = ActiveChat {
+                    app: BmuxApp::new_with_history(session_id, &[], &[], false),
+                    agents: AgentCatalog::default(),
+                    attachment: session_id.map_or(ChatSessionAttachment::Draft, |session_id| {
+                        ChatSessionAttachment::Attached { session_id }
+                    }),
+                    event_sender,
+                    event_receiver,
+                    event_task: None,
+                    opening_session_progress: None,
+                    pending_effects: super::super::effects::TuiEffectQueue::default(),
+                };
+                chat.app.set_daemon_connection(connection);
+                chat.app.replace_composer_with("fresh message");
+                chat.app.stage_submission();
+                assert!(stage_session_message(
+                    std::path::Path::new("."),
+                    crate::TuiLaunchOptions::default(),
+                    &mut chat,
+                    bcode_ipc::PromptPlacement::FollowUp
+                ));
+                assert_eq!(chat.app.daemon_connection(), connection);
+                assert_eq!(chat.app.status(), "sending message…");
+                assert!(chat.pending_effects.queued_execution_options().is_some());
+                drop(chat);
+            }
+        }
+    }
 
     #[test]
     fn opening_session_defers_message_without_consuming_composer_text() {
