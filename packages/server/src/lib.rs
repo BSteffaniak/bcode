@@ -261,11 +261,19 @@ pub enum ServerError {
     WorkflowComputationCancelled(String),
     #[error("authored-workflow computation control is invalid: {0}")]
     WorkflowComputationControlInvalid(String),
-    /// A run's recorded coordinator daemon is still live (or cannot be proven ended), so this
-    /// daemon must not control the run. The error names the owner so operators can act on it.
+    /// Termination of the recorded owner cannot be verified; takeover remains fenced.
+    #[error(
+        "workflow run {run_id} owner {daemon_instance_id} (artifact {target_artifact_id}) has unverifiable termination; maintenance required: inspect `bcode workflow reconcile-orphans` for ownership evidence. Stopping other daemons does not restore missing evidence"
+    )]
+    WorkflowOwnerUnverifiable {
+        run_id: String,
+        daemon_instance_id: String,
+        target_artifact_id: String,
+    },
+    /// A run's recorded coordinator daemon is still live.
     #[error(
         "workflow run {run_id} is owned by live daemon {daemon_instance_id} (artifact {target_artifact_id}); \
-         control it from that daemon or stop it with `bcode server stop-all --yes`"
+         control it from its owning daemon; ownership transfer requires verified release"
     )]
     WorkflowOwnedByLiveDaemon {
         run_id: String,
@@ -441,6 +449,8 @@ pub struct ServerState {
     idle_shutdown_failed: std::sync::atomic::AtomicBool,
     daemon_status: DaemonStatus,
     daemon_record_path: Option<PathBuf>,
+    // Retained through the final execution-capable reference, including detached tasks.
+    execution_lifetime: std::sync::OnceLock<bcode_daemon_lifecycle::ExecutionLifetime>,
     startup_started_at: Instant,
     first_hello_recorded: std::sync::atomic::AtomicBool,
     metrics: MetricsRegistry,
@@ -2052,6 +2062,7 @@ impl ServerState {
             idle_shutdown_failed: std::sync::atomic::AtomicBool::new(false),
             daemon_status: init.daemon_status,
             daemon_record_path: init.daemon_record_path,
+            execution_lifetime: std::sync::OnceLock::new(),
             startup_started_at: init.startup_started_at.unwrap_or_else(Instant::now),
             first_hello_recorded: std::sync::atomic::AtomicBool::new(false),
             metrics: init.metrics,
@@ -4530,6 +4541,14 @@ async fn run_with_services(
             return Err(error);
         }
     };
+    let execution_lifetime = daemon_record
+        .as_ref()
+        .map(|record| bcode_daemon_lifecycle::ExecutionLifetime::begin(&state_root, record))
+        .transpose()
+        .map_err(|source| bcode_daemon_lifecycle::DaemonLifecycleError::Io {
+            path: state_root.clone(),
+            source,
+        })?;
     let daemon_status = daemon_record.as_ref().map_or_else(
         || DaemonStatus {
             namespace: bcode_ipc::daemon_namespace(),
@@ -4687,6 +4706,12 @@ async fn run_with_services(
         total_elapsed_ms = startup_started_at.elapsed().as_millis(),
         "server state constructed"
     );
+    if let Some(lifetime) = execution_lifetime {
+        state
+            .execution_lifetime
+            .set(lifetime)
+            .expect("new server lifetime slot is empty");
+    }
     construction_phase.finish();
     run_constructed_server(
         state,
@@ -5182,6 +5207,9 @@ fn request_error_response(error: &ServerError) -> ErrorResponse {
             "workflow computation control request is invalid",
         ),
         // The owning daemon identity is operator-actionable and secret-free, so it is included.
+        ServerError::WorkflowOwnerUnverifiable { .. } => {
+            return ErrorResponse::new("workflow_owner_unverifiable", error.to_string());
+        }
         ServerError::WorkflowOwnedByLiveDaemon { .. } => {
             return ErrorResponse::new("workflow_owned_by_live_daemon", error.to_string());
         }
@@ -64269,7 +64297,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
             } else {
                 assert!(matches!(
                     error,
-                    ServerError::WorkflowOwnedByLiveDaemon { .. }
+                    ServerError::WorkflowOwnerUnverifiable { .. }
                 ));
             }
             (

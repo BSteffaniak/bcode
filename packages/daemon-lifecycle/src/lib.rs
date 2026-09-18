@@ -4,6 +4,11 @@
 
 //! Daemon lifecycle registry and cleanup models.
 
+mod execution_lifetime;
+pub use execution_lifetime::{
+    ExecutionLifetime, ExecutionLifetimeStatus, execution_lifetime_status,
+};
+
 use bcode_ipc::{BUILD_FINGERPRINT, CURRENT_PROTOCOL_VERSION, IpcEndpoint, daemon_namespace};
 use bcode_plugin_sdk::path::display_from_current_dir;
 use serde::{Deserialize, Serialize};

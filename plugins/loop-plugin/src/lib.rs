@@ -361,11 +361,7 @@ fn control_loop(
         Err(LoopIpcError::Client(ClientError::Server { code, message }))
             if code == "workflow_owned_by_live_daemon" =>
         {
-            status_response(&format!(
-                "{message}. If that daemon is a stale build with no other clients, `bcode server stop-all --yes` \
-                 stops it and this loop becomes controllable here; `bcode workflow reconcile-orphans` lists \
-                 loops whose daemon already ended."
-            ))
+            status_response(&message)
         }
         Err(LoopIpcError::Client(ClientError::Server { message, .. })) => status_response(&message),
         Err(error) => status_response(&format!("workflow lifecycle unavailable: {error}")),

@@ -5617,10 +5617,24 @@ pub struct AuthorityGuard {
 /// How the current daemon relates to a run's recorded coordinator.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum PriorOwnerLiveness {
-    /// Canonical evidence shows the recorded coordinator is still live or cannot be classified.
-    LiveOrUnverifiable,
+    /// Canonical evidence shows the recorded coordinator is still live.
+    Live,
+    /// Termination cannot be established from supported evidence.
+    Unverifiable,
     /// A session-owner observation positively classified the recorded coordinator as stale.
     ObservedEnded,
+}
+
+impl PriorOwnerLiveness {
+    const fn blocked_reason(self) -> &'static str {
+        match self {
+            Self::Live => "is live; control it through its owning daemon",
+            Self::Unverifiable => {
+                "has no trustworthy termination evidence; maintenance required (missing, unsupported or ambiguous owner evidence); stopping other daemons will not establish release"
+            }
+            Self::ObservedEnded => "has verifiably released execution authority",
+        }
+    }
 }
 
 /// Classify whether the run's recorded coordinator daemon still exists.
@@ -5633,6 +5647,22 @@ async fn prior_owner_liveness(
     session_id: super::SessionId,
     current: &bcode_workflow_store::WorkflowExecutionAuthority,
 ) -> Result<PriorOwnerLiveness, super::ServerError> {
+    use bcode_daemon_lifecycle::ExecutionLifetimeStatus;
+    match bcode_daemon_lifecycle::execution_lifetime_status(
+        &state.state_root,
+        &current.daemon_instance_id,
+        &current.target_artifact_id,
+        state
+            .daemon_status
+            .state_location_id
+            .as_deref()
+            .unwrap_or_default(),
+    ) {
+        ExecutionLifetimeStatus::Live => return Ok(PriorOwnerLiveness::Live),
+        ExecutionLifetimeStatus::Released => return Ok(PriorOwnerLiveness::ObservedEnded),
+        ExecutionLifetimeStatus::Unverifiable => return Ok(PriorOwnerLiveness::Unverifiable),
+        ExecutionLifetimeStatus::Missing => {}
+    }
     let root = state.sessions.session_store_root().ok_or_else(|| {
         bcode_workflow_store::WorkflowStoreError::InvalidData(
             "workflow ownership transfer requires a persistent session store".to_string(),
@@ -5650,9 +5680,11 @@ async fn prior_owner_liveness(
             continue;
         }
         match observation.liveness {
-            bcode_session::lease::SessionOwnerLiveness::Live
-            | bcode_session::lease::SessionOwnerLiveness::Unverifiable => {
-                return Ok(PriorOwnerLiveness::LiveOrUnverifiable);
+            bcode_session::lease::SessionOwnerLiveness::Live => {
+                return Ok(PriorOwnerLiveness::Live);
+            }
+            bcode_session::lease::SessionOwnerLiveness::Unverifiable => {
+                return Ok(PriorOwnerLiveness::Unverifiable);
             }
             bcode_session::lease::SessionOwnerLiveness::Stale => observed_ended = true,
         }
@@ -5667,10 +5699,12 @@ async fn prior_owner_liveness(
         match bcode_daemon_lifecycle::classify_daemon_record(&record).await {
             bcode_daemon_lifecycle::DaemonRecordClassification::CurrentHealthy
             | bcode_daemon_lifecycle::DaemonRecordClassification::HistoricalExactResponsive
-            | bcode_daemon_lifecycle::DaemonRecordClassification::HistoricalProcessVerifiedProtocolUnsupported
-            | bcode_daemon_lifecycle::DaemonRecordClassification::ResponsiveIdentityMismatch
+            | bcode_daemon_lifecycle::DaemonRecordClassification::HistoricalProcessVerifiedProtocolUnsupported => {
+                return Ok(PriorOwnerLiveness::Live);
+            }
+            bcode_daemon_lifecycle::DaemonRecordClassification::ResponsiveIdentityMismatch
             | bcode_daemon_lifecycle::DaemonRecordClassification::Unverifiable => {
-                return Ok(PriorOwnerLiveness::LiveOrUnverifiable);
+                return Ok(PriorOwnerLiveness::Unverifiable);
             }
             bcode_daemon_lifecycle::DaemonRecordClassification::UnreachableStale => {
                 observed_ended = true;
@@ -5681,8 +5715,100 @@ async fn prior_owner_liveness(
         PriorOwnerLiveness::ObservedEnded
     } else {
         // Missing records are not positive evidence of process termination.
-        PriorOwnerLiveness::LiveOrUnverifiable
+        PriorOwnerLiveness::Unverifiable
     })
+}
+
+#[cfg(test)]
+#[tokio::test]
+async fn durable_lifetime_survives_missing_registry_and_lease_records() {
+    let root = tempfile::tempdir().expect("state root");
+    let sessions = bcode_session::SessionManager::persistent_lazy(root.path());
+    let session = sessions
+        .create_session(None, std::path::PathBuf::from("."))
+        .await
+        .expect("session");
+    let mut state = super::tests::test_server_state(sessions);
+    state.state_root = root.path().to_path_buf();
+    let record = bcode_daemon_lifecycle::DaemonRecord::current(
+        &bcode_ipc::default_endpoint(),
+        root.path().join("daemon.log"),
+        None,
+        "previous-lifetime-instance".into(),
+    )
+    .expect("record");
+    state
+        .daemon_status
+        .state_location_id
+        .clone_from(&record.state_location_id);
+    let owner = bcode_workflow_store::WorkflowExecutionAuthority {
+        target_artifact_id: record.artifact_id.as_ref().unwrap().to_string(),
+        daemon_instance_id: record.instance_id.clone(),
+        generation: 1,
+        fencing_token: "prior-fence".into(),
+    };
+    let guard =
+        bcode_daemon_lifecycle::ExecutionLifetime::begin(root.path(), &record).expect("lifetime");
+    assert_eq!(
+        prior_owner_liveness(&state, session.id, &owner)
+            .await
+            .unwrap(),
+        PriorOwnerLiveness::Live
+    );
+    drop(guard);
+    assert_eq!(
+        prior_owner_liveness(&state, session.id, &owner)
+            .await
+            .unwrap(),
+        PriorOwnerLiveness::ObservedEnded
+    );
+    let mut foreign = owner;
+    foreign.target_artifact_id = "different-artifact".into();
+    assert_eq!(
+        prior_owner_liveness(&state, session.id, &foreign)
+            .await
+            .unwrap(),
+        PriorOwnerLiveness::Unverifiable
+    );
+    drop(state);
+}
+
+#[cfg(test)]
+#[tokio::test]
+async fn retained_server_task_keeps_execution_lifetime_live() {
+    let root = tempfile::tempdir().expect("root");
+    let sessions = bcode_session::SessionManager::persistent_lazy(root.path());
+    let state = std::sync::Arc::new(super::tests::test_server_state(sessions));
+    let record = bcode_daemon_lifecycle::DaemonRecord::current(
+        &bcode_ipc::default_endpoint(),
+        root.path().join("daemon.log"),
+        None,
+        "retained-server-instance".into(),
+    )
+    .unwrap();
+    state
+        .execution_lifetime
+        .set(bcode_daemon_lifecycle::ExecutionLifetime::begin(root.path(), &record).unwrap())
+        .unwrap();
+    let task_reference = std::sync::Arc::clone(&state);
+    let status = || {
+        bcode_daemon_lifecycle::execution_lifetime_status(
+            root.path(),
+            &record.instance_id,
+            &record.artifact_id.as_ref().unwrap().to_string(),
+            record.state_location_id.as_deref().unwrap(),
+        )
+    };
+    drop(state);
+    assert_eq!(
+        status(),
+        bcode_daemon_lifecycle::ExecutionLifetimeStatus::Live
+    );
+    drop(task_reference);
+    assert_eq!(
+        status(),
+        bcode_daemon_lifecycle::ExecutionLifetimeStatus::Released
+    );
 }
 
 #[cfg(test)]
@@ -5706,7 +5832,7 @@ async fn missing_prior_owner_records_do_not_authorize_takeover() {
         .await
         .expect("classify");
     drop(state);
-    assert_eq!(liveness, PriorOwnerLiveness::LiveOrUnverifiable);
+    assert_eq!(liveness, PriorOwnerLiveness::Unverifiable);
 }
 
 /// Qualify observation of the stable agent-turn/v1 contract after cross-artifact takeover.
@@ -5920,7 +6046,14 @@ pub async fn execution_authority(
     let artifact_id = current_artifact_id(state);
     let session_id = run_parent_session_id(state, run_id)?;
     let liveness = prior_owner_liveness(state, session_id, &current).await?;
-    if liveness == PriorOwnerLiveness::LiveOrUnverifiable {
+    if liveness == PriorOwnerLiveness::Unverifiable {
+        return Err(super::ServerError::WorkflowOwnerUnverifiable {
+            run_id: run_id.to_string(),
+            daemon_instance_id: current.daemon_instance_id.clone(),
+            target_artifact_id: current.target_artifact_id.clone(),
+        });
+    }
+    if liveness == PriorOwnerLiveness::Live {
         return Err(super::ServerError::WorkflowOwnedByLiveDaemon {
             run_id: run_id.to_string(),
             daemon_instance_id: current.daemon_instance_id.clone(),
@@ -6988,9 +7121,10 @@ pub async fn reconcile_orphaned_runs(
             continue;
         };
         match prior_owner_liveness(state, session_id, &authority).await? {
-            PriorOwnerLiveness::LiveOrUnverifiable => {
+            liveness @ (PriorOwnerLiveness::Live | PriorOwnerLiveness::Unverifiable) => {
+                let reason = liveness.blocked_reason();
                 report.skipped.push(skip(format!(
-                    "coordinator daemon {} (artifact {}) is live or unverifiable",
+                    "coordinator daemon {} (artifact {}) {reason}",
                     authority.daemon_instance_id, authority.target_artifact_id
                 )));
                 continue;
