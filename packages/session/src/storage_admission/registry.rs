@@ -71,7 +71,7 @@ impl StorageAdmissionRegistry {
             return Err(io::Error::last_os_error());
         }
         let directory = open_child(&root, name, libc::O_RDONLY | libc::O_DIRECTORY)?;
-        root.sync_all()?;
+        bcode_metrics::startup::measure("storage_admission.root_sync", || root.sync_all())?;
         Ok(Self { directory })
     }
 
@@ -376,8 +376,12 @@ impl StorageAdmissionRegistry {
             libc::O_RDWR | libc::O_CREAT | libc::O_EXCL,
         )?;
         let registration =
-            crate::storage_daemon_registration::StorageDaemonRegistration::begin(file)?;
-        self.directory.sync_all()?;
+            bcode_metrics::startup::measure("storage_admission.registration_begin", || {
+                crate::storage_daemon_registration::StorageDaemonRegistration::begin(file)
+            })?;
+        bcode_metrics::startup::measure("storage_admission.registration_directory_sync", || {
+            self.directory.sync_all()
+        })?;
         gate.unlock()?;
         Ok(registration)
     }

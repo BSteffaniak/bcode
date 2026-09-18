@@ -1152,12 +1152,19 @@ impl WorkflowStore {
         let root = path.parent().ok_or_else(|| {
             WorkflowStoreError::InvalidData("workflow database has no parent directory".to_string())
         })?;
-        std::fs::create_dir_all(root)?;
-        let ownership = open_ownership_file(root)?;
+        bcode_metrics::startup::measure("workflow_store.prepare_directory", || {
+            std::fs::create_dir_all(root)
+        })?;
+        let ownership =
+            bcode_metrics::startup::measure("workflow_store.ownership_file_open", || {
+                open_ownership_file(root)
+            })?;
+        let shared_wait = bcode_metrics::startup::phase("workflow_store.shared_ownership_wait");
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
         loop {
             match ownership.try_lock_shared() {
                 Ok(()) => {
+                    shared_wait.finish();
                     if path.is_file() {
                         match Self::open_with_ownership(&path, ownership) {
                             Ok(store) => return Ok(store),
@@ -1182,9 +1189,14 @@ impl WorkflowStore {
             }
         }
         let ownership = open_ownership_file(root)?;
+        let exclusive_wait =
+            bcode_metrics::startup::phase("workflow_store.exclusive_ownership_wait");
         loop {
             match ownership.try_lock() {
-                Ok(()) => break,
+                Ok(()) => {
+                    exclusive_wait.finish();
+                    break;
+                }
                 Err(std::fs::TryLockError::WouldBlock) if std::time::Instant::now() < deadline => {
                     // A competing initializer may already have completed and retained a reader.
                     let probe = open_ownership_file(root)?;
@@ -1211,12 +1223,16 @@ impl WorkflowStore {
             let schema = detected_store_schema(&connection);
             drop(connection);
             if schema != Some(WORKFLOW_STORE_SCHEMA_VERSION) {
-                Self::migrate_owned(&path, migrated_at_ms)?;
+                bcode_metrics::startup::measure("workflow_store.migrate", || {
+                    Self::migrate_owned(&path, migrated_at_ms)
+                })?;
             }
         }
         let lock = ownership.try_clone()?;
         let store = Self::open_with_ownership(&path, ownership)?;
-        lock.lock_shared()?;
+        bcode_metrics::startup::measure("workflow_store.downgrade_ownership", || {
+            lock.lock_shared()
+        })?;
         drop(lock);
         Ok(store)
     }
@@ -1253,14 +1269,23 @@ impl WorkflowStore {
     }
 
     fn open_with_ownership(path: &Path, ownership: File) -> Result<Self, WorkflowStoreError> {
+        use bcode_metrics::startup::measure;
         let existed = path.exists();
-        let mut connection = Connection::open(path)?;
-        connection.pragma_update(None, "foreign_keys", true)?;
-        connection.busy_timeout(std::time::Duration::from_secs(5))?;
+        let mut connection = measure("workflow_store.connection_open", || Connection::open(path))?;
+        measure("workflow_store.foreign_keys", || {
+            connection.pragma_update(None, "foreign_keys", true)
+        })?;
+        measure("workflow_store.busy_timeout_configure", || {
+            connection.busy_timeout(std::time::Duration::from_secs(5))
+        })?;
         if existed {
-            verify_store_schema(&connection)?;
+            measure("workflow_store.verify_schema", || {
+                verify_store_schema(&connection)
+            })?;
         } else {
-            initialize_schema(&mut connection)?;
+            measure("workflow_store.create_schema", || {
+                initialize_schema(&mut connection)
+            })?;
         }
         Ok(Self {
             path: path.to_path_buf(),
@@ -18119,6 +18144,7 @@ fn initialize_schema(connection: &mut Connection) -> Result<(), WorkflowStoreErr
 }
 
 fn verify_store_schema(connection: &Connection) -> Result<(), WorkflowStoreError> {
+    let version_phase = bcode_metrics::startup::phase("workflow_store.schema_version_query");
     let actual = connection
         .query_row(
             "SELECT schema_version FROM workflow_store_contract WHERE contract_id = 1",
@@ -18128,13 +18154,16 @@ fn verify_store_schema(connection: &Connection) -> Result<(), WorkflowStoreError
         .optional()
         .ok()
         .flatten();
+    version_phase.finish();
     if actual != Some(WORKFLOW_STORE_SCHEMA_VERSION) {
         return Err(WorkflowStoreError::UnsupportedStore {
             actual,
             expected: WORKFLOW_STORE_SCHEMA_VERSION,
         });
     }
-    recovery::verify(connection)?;
+    bcode_metrics::startup::measure("workflow_store.recovery_schema_verify", || {
+        recovery::verify(connection)
+    })?;
     connection.prepare(
         "SELECT run_id, source_artifact_id, created_at_ms FROM workflow_recovery_barriers LIMIT 0",
     )?;

@@ -110,6 +110,17 @@ impl Drop for Phase {
     }
 }
 
+/// Time a synchronous fallible operation without retaining its value or error.
+///
+/// # Errors
+/// Returns the operation's original error unchanged.
+pub fn measure<T, E>(name: &'static str, operation: impl FnOnce() -> Result<T, E>) -> Result<T, E> {
+    let phase = phase(name);
+    let result = operation();
+    phase.finish_result(&result);
+    result
+}
+
 /// Start a low-cardinality phase. Names must be static, secret-safe operation names.
 #[must_use]
 pub fn phase(name: &'static str) -> Phase {
@@ -418,6 +429,21 @@ mod tests {
             ready: false,
             phases: Vec::new(),
         }
+    }
+
+    #[test]
+    fn measured_operation_preserves_values_errors_and_runs_once() {
+        let mut calls = 0;
+        let result = measure("test.operation", || {
+            calls += 1;
+            Ok::<_, &str>(42)
+        });
+        assert_eq!(result, Ok(42));
+        assert_eq!(calls, 1);
+        assert_eq!(
+            measure("test.failure", || Err::<(), _>("unchanged")),
+            Err("unchanged")
+        );
     }
 
     #[test]

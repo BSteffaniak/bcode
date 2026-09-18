@@ -3158,6 +3158,7 @@ name = "bcode_workflow_store"
 version = "0.0.1-alpha.0"
 dependencies = [
  "bcode_config",
+ "bcode_metrics",
  "bcode_workflow",
  "jsonschema",
  "rusqlite",

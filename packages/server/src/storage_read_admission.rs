@@ -136,14 +136,24 @@ impl RegisteredStorageRead {
 /// Registration failure disables optional maintenance without preventing unrelated startup.
 pub(super) async fn register_startup(state: &super::ServerState, root: PathBuf) {
     let fallback_root = root.clone();
+    let queue = bcode_metrics::startup::phase("storage_admission.blocking_queue_wait");
     let registered = tokio::task::spawn_blocking(move || {
-        let registry = StorageAdmissionRegistry::open(&root)?;
-        if registry.retire_completed_daemons(4096).is_err() {
+        queue.finish();
+        let registry = bcode_metrics::startup::measure("storage_admission.registry_open", || {
+            StorageAdmissionRegistry::open(&root)
+        })?;
+        if bcode_metrics::startup::measure("storage_admission.retire_completed_daemons", || {
+            registry.retire_completed_daemons(4096)
+        })
+        .is_err()
+        {
             tracing::debug!(
                 "completed storage registrations could not be retired; preserving registry"
             );
         }
-        registry.register_daemon(SessionId::new())
+        bcode_metrics::startup::measure("storage_admission.register_daemon", || {
+            registry.register_daemon(SessionId::new())
+        })
     })
     .await;
     if let Ok(Ok(registration)) = registered {
