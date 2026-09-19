@@ -9137,19 +9137,35 @@ pub async fn control_associated_run(
     control_exact_run(state, &run.run_id, action).await
 }
 
+async fn detach_run(
+    state: &std::sync::Arc<ServerState>,
+    run_id: &str,
+) -> Result<bool, super::ServerError> {
+    let authority = execution_authority(state, run_id).await?.ok_or_else(|| {
+        bcode_workflow_store::WorkflowStoreError::InvalidData(
+            "workflow detachment requires verified execution authority".into(),
+        )
+    })?;
+    let changed = state
+        .workflow_store
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .detach_run_owned(run_id, &authority.authority, super::current_unix_millis())?;
+    Ok(changed)
+}
+
 /// Control an exact run, preserving its identity across asynchronous ownership checks.
 pub async fn control_exact_run(
     state: &std::sync::Arc<ServerState>,
     run_id: &str,
     action: bcode_workflow::WorkflowRunControlAction,
 ) -> Result<(Option<bcode_workflow_store::WorkflowRunSummary>, bool), super::ServerError> {
-    let run = state
-        .workflow_store
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .run_summary(run_id)?;
+    let run = run_status(state, run_id)?;
     let changed = if let Some(run) = &run {
         match action {
+            bcode_workflow::WorkflowRunControlAction::Detach => {
+                detach_run(state, &run.run_id).await?
+            }
             bcode_workflow::WorkflowRunControlAction::CompleteReplacement => {
                 if let Some(successor_id) = complete_pending_replacement(state, &run.run_id).await?
                 {

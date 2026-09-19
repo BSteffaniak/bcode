@@ -29,6 +29,15 @@ running or failed state. Exact lookup of older outcomes remains incomplete.
 A single-active binding includes repair-required runs. Starting a replacement returns
 `workflow_active_binding_conflict`, not a storage-unavailable error. Existing ambiguous attempts
 still require explicit ownership-verified maintenance; installing these fixes does not repair them.
+
+For a repair-required prompt loop, `/loop detach` (or the **Detach Loop** command)
+explicitly releases the session binding. Detachment requires verified execution ownership and
+rejects pending replacements; withdraw those first. It preserves the old run ID, parent provenance,
+repair-required status, and all attempt outcomes, recording the previous binding in a `run_detached`
+audit event. It does not cancel, undo, retry, or prove the previous operation's outcome. Review any
+possible effects before using `/loop` separately to start fresh. Running and paused loops cannot
+be detached through this action.
+
 Receipt reconciliation records `attempt_repair_required` with normalized reason
 `operation_outcome_unproven`. Doctor checks structural consistency: an empty issues list alone
 does not establish executability; inspect the run and attempt statuses too.

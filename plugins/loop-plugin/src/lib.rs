@@ -54,6 +54,7 @@ const WORKFLOW_KIND: &str = "bcode.loop";
 const START_COMMAND: &str = "loop";
 const STATUS_COMMAND: &str = "loop.status";
 const PAUSE_COMMAND: &str = "loop.pause";
+const DETACH_COMMAND: &str = "loop.detach";
 const STOP_COMMAND: &str = "loop.stop";
 const RESUME_COMMAND: &str = "loop.resume";
 const SURFACE_KIND: &str = "loop.start";
@@ -107,6 +108,11 @@ fn commands() -> Vec<CommandContribution> {
         session_command(STATUS_COMMAND, "Loop Status", "Show prompt loop status"),
         session_command(PAUSE_COMMAND, "Pause Loop", "Pause the active prompt loop"),
         session_command(STOP_COMMAND, "Stop Loop", "Stop the active prompt loop"),
+        session_command(
+            DETACH_COMMAND,
+            "Detach Loop",
+            "Detach a repair-required loop without resolving its previous operation",
+        ),
         session_command(RESUME_COMMAND, "Resume Loop", "Resume a paused prompt loop"),
     ]
 }
@@ -220,7 +226,7 @@ fn terminal_workflow_control_message(
 fn format_workflow_status(run: &bcode_workflow_store::WorkflowRunSummary) -> String {
     if run.status == bcode_workflow_store::RunStatus::RepairRequired {
         return format!(
-            "loop workflow {} · repair required because recovery could not prove the previous operation outcome · definition {} v{}",
+            "loop workflow {} · repair required because recovery could not prove the previous operation outcome · definition {} v{} · use /loop detach to release this session without resolving the previous outcome",
             run.run_id, run.definition_id, run.definition_version
         );
     }
@@ -323,6 +329,12 @@ fn format_control_outcome(
 ) -> String {
     use bcode_ipc::WorkflowRunControlAction as Action;
     use bcode_workflow_store::RunStatus as Status;
+    if changed && action == Action::Detach {
+        return format!(
+            "loop workflow {} detached; its previous operation outcome remains unknown and may have had effects. Use /loop to start a new loop separately",
+            run.run_id
+        );
+    }
     let verb = match (action, run.status) {
         (Action::Resume, Status::Running) => Some("resumed"),
         (Action::Pause, Status::Paused) => Some("paused"),
@@ -420,6 +432,14 @@ fn command_response(request: &InvokeCommandRequest) -> ServiceResponse {
             || status_response("/loop pause requires an active session"),
             |session_id| control_loop(session_id, bcode_ipc::WorkflowRunControlAction::Pause),
         ),
+        START_COMMAND if arguments == "detach" => session_id.map_or_else(
+            || status_response("/loop detach requires an active session"),
+            |session_id| control_loop(session_id, bcode_ipc::WorkflowRunControlAction::Detach),
+        ),
+        DETACH_COMMAND => session_id.map_or_else(
+            || missing_enforced_session_response(DETACH_COMMAND),
+            |session_id| control_loop(session_id, bcode_ipc::WorkflowRunControlAction::Detach),
+        ),
         START_COMMAND if arguments == "stop" => session_id.map_or_else(
             || status_response("/loop stop requires an active session"),
             |session_id| control_loop(session_id, bcode_ipc::WorkflowRunControlAction::Cancel),
@@ -457,7 +477,7 @@ fn command_response(request: &InvokeCommandRequest) -> ServiceResponse {
             |session_id| control_loop(session_id, bcode_ipc::WorkflowRunControlAction::Resume),
         ),
         START_COMMAND => {
-            status_response("unknown /loop action; use status, pause, stop, or resume")
+            status_response("unknown /loop action; use status, pause, stop, resume, or detach")
         }
         _ => status_response("unsupported loop command"),
     };
@@ -1879,12 +1899,18 @@ mod tests {
             format_control_outcome(&run, bcode_ipc::WorkflowRunControlAction::Resume, true);
         assert!(message.contains("repair required"));
         assert!(!message.contains("resumed"));
+        let message =
+            format_control_outcome(&run, bcode_ipc::WorkflowRunControlAction::Detach, true);
+        assert!(message.contains("detached"));
+        assert!(message.contains("outcome remains unknown"));
+        assert!(message.contains("Use /loop"));
+        assert!(format_workflow_status(&run).contains("/loop detach"));
     }
 
     #[test]
     fn commands_cover_the_loop_lifecycle() {
         let commands = commands();
-        assert_eq!(commands.len(), 5);
+        assert_eq!(commands.len(), 6);
         assert!(commands.iter().all(|command| {
             command.execution == bcode_command::CommandExecution::Immediate
                 && command.surfaces.contains(&CommandSurface::Slash)
@@ -1918,7 +1944,13 @@ mod tests {
     #[test]
     fn loop_control_commands_declare_required_session_context() {
         let commands = commands();
-        for control in [STATUS_COMMAND, PAUSE_COMMAND, STOP_COMMAND, RESUME_COMMAND] {
+        for control in [
+            STATUS_COMMAND,
+            PAUSE_COMMAND,
+            STOP_COMMAND,
+            RESUME_COMMAND,
+            DETACH_COMMAND,
+        ] {
             let command = commands
                 .iter()
                 .find(|command| command.id == control)

@@ -11562,6 +11562,56 @@ impl WorkflowStore {
         Ok(WorkflowRunCatalogPage { entries, has_more })
     }
 
+    /// Detach a repair-required run from its generic session binding.
+    ///
+    /// Execution state, parent provenance, and unresolved attempts remain unchanged. The prior
+    /// binding is retained in an audit event; repeated detachment is a no-op.
+    ///
+    /// # Errors
+    /// Rejects stale authority, runs not requiring repair, pending replacements, or storage errors.
+    pub fn detach_run_owned(
+        &mut self,
+        run_id: &str,
+        authority: &WorkflowExecutionAuthority,
+        now_ms: u64,
+    ) -> Result<bool, WorkflowStoreError> {
+        let tx = self.connection.unchecked_transaction()?;
+        self.verify_execution_authority(run_id, authority)?;
+        let run = self
+            .run_summary(run_id)?
+            .ok_or_else(|| WorkflowStoreError::RunNotFound {
+                run_id: run_id.to_owned(),
+            })?;
+        if run.status != RunStatus::RepairRequired {
+            return Err(WorkflowStoreError::InvalidData(
+                "only repair-required workflows can be detached".into(),
+            ));
+        }
+        if self.pending_replacement(run_id)?.is_some() {
+            return Err(WorkflowStoreError::InvalidData(
+                "withdraw the pending replacement before detaching".into(),
+            ));
+        }
+        let Some(binding) = run.binding else {
+            return Ok(false);
+        };
+        tx.execute(
+            "UPDATE workflow_runs SET owner_plugin_id = NULL, workflow_kind = NULL, \
+             scope_key = NULL, display_label = NULL, single_active = 0, updated_at_ms = ?2 \
+             WHERE run_id = ?1",
+            (run_id, now_ms),
+        )?;
+        append_event(
+            &tx,
+            run_id,
+            "run_detached",
+            &serde_json::to_string(&binding)?,
+            now_ms,
+        )?;
+        tx.commit()?;
+        Ok(true)
+    }
+
     /// Return the newest run associated with one exact generic binding key.
     ///
     /// This uses a bounded indexed lookup and never replays workflow events.
@@ -21199,6 +21249,85 @@ mod tests {
                 .status,
             RunStatus::Running
         );
+    }
+
+    #[test]
+    fn detach_preserves_repair_state_and_releases_binding() {
+        let temp = tempfile::tempdir().expect("temp");
+        let mut store = WorkflowStore::open_in_state_dir(temp.path()).expect("store");
+        store
+            .persist_definition("example", 1, &definition("example"))
+            .expect("definition");
+        let authority = WorkflowExecutionAuthority {
+            target_artifact_id: "artifact".into(),
+            daemon_instance_id: "daemon".into(),
+            generation: 1,
+            fencing_token: "fence".into(),
+        };
+        let binding = WorkflowRunBinding {
+            owner_plugin_id: "bcode.test".into(),
+            workflow_kind: "test".into(),
+            scope_key: "session-1".into(),
+            display_label: None,
+            single_active: true,
+        };
+        let run = NewWorkflowRun {
+            binding: Some(binding.clone()),
+            execution_authority: Some(authority.clone()),
+            ..new_run()
+        };
+        store.create_run(&run).expect("run");
+        assert!(store.detach_run_owned(&run.run_id, &authority, 11).is_err());
+        store
+            .connection
+            .execute(
+                "UPDATE workflow_runs SET status = 'repair_required' WHERE run_id = ?1",
+                [&run.run_id],
+            )
+            .expect("repair fixture");
+        let stale = WorkflowExecutionAuthority {
+            generation: 2,
+            ..authority.clone()
+        };
+        assert!(store.detach_run_owned(&run.run_id, &stale, 12).is_err());
+        assert!(
+            store
+                .run_summary(&run.run_id)
+                .unwrap()
+                .unwrap()
+                .binding
+                .is_some()
+        );
+        assert!(
+            store
+                .detach_run_owned(&run.run_id, &authority, 13)
+                .expect("detach")
+        );
+        assert!(
+            !store
+                .detach_run_owned(&run.run_id, &authority, 14)
+                .expect("duplicate")
+        );
+        let key = WorkflowRunBindingKey {
+            owner_plugin_id: binding.owner_plugin_id,
+            workflow_kind: binding.workflow_kind,
+            scope_key: binding.scope_key,
+        };
+        assert!(store.associated_run(&key).expect("lookup").is_none());
+        drop(store);
+        let mut store = WorkflowStore::open_in_state_dir(temp.path()).expect("reopen");
+        let detached = store.run_summary(&run.run_id).unwrap().unwrap();
+        assert_eq!(detached.status, RunStatus::RepairRequired);
+        assert_eq!(detached.parent_session_id, run.parent_session_id);
+        assert!(detached.binding.is_none());
+        store
+            .create_run(&NewWorkflowRun {
+                run_id: "fresh".into(),
+                created_at_ms: 15,
+                ..run
+            })
+            .expect("fresh run");
+        assert_eq!(store.associated_run(&key).unwrap().unwrap().run_id, "fresh");
     }
 
     #[test]

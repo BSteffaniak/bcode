@@ -1010,6 +1010,8 @@ pub enum WorkflowRunControlAction {
     Pause,
     Resume,
     Cancel,
+    /// Remove a repair-required run's session binding without changing execution outcomes.
+    Detach,
     /// Withdraw the currently pending replacement without undoing cancellation.
     WithdrawReplacement,
     /// Reauthorize and complete a quiescent pending replacement.
