@@ -15,6 +15,9 @@ pub async fn hydrate_tool_result_images(
     provider_plugin_id: Option<&str>,
     request: &mut ModelTurnRequest,
 ) {
+    if !needs_artifact_hydration(&request.messages) {
+        return;
+    }
     let Some((supported, catalog_limit)) = resolve_image_input_support(
         state,
         provider_plugin_id,
@@ -87,6 +90,22 @@ pub async fn hydrate_tool_result_images(
             }
         }
     }
+}
+
+fn needs_artifact_hydration(messages: &[bcode_model::ModelMessage]) -> bool {
+    messages
+        .iter()
+        .flat_map(|message| &message.content)
+        .any(|block| {
+            let ContentBlock::ToolResult { result } = block else {
+                return false;
+            };
+            result.content.iter().any(|content| {
+                matches!(content,
+            bcode_model::ToolResultContent::ImageRef { image }
+                if image.artifact_id.is_some() && image.reference_key.is_some())
+            })
+        })
 }
 
 #[derive(Default)]
@@ -367,6 +386,57 @@ mod tests {
         let mut bounded = RequestImageCache::default();
         bounded.insert(key, &"A".repeat(5 * 1024 * 1024 + 1));
         assert!(bounded.images.is_empty());
+    }
+
+    #[test]
+    fn only_artifact_backed_tool_images_require_hydration() {
+        use bcode_model::{
+            ImageContent, ImageMetadata, ImageRefContent, MessageRole, ModelMessage, ToolResult,
+            ToolResultContent,
+        };
+        assert!(!needs_artifact_hydration(&[]));
+        let mut message = ModelMessage {
+            role: MessageRole::Tool,
+            content: vec![ContentBlock::Text {
+                text: "hello".to_string(),
+            }],
+        };
+        assert!(!needs_artifact_hydration(std::slice::from_ref(&message)));
+        message.content = vec![ContentBlock::Image {
+            image: ImageContent {
+                mime_type: "image/png".to_string(),
+                data_base64: "AQID".to_string(),
+                metadata: ImageMetadata::default(),
+            },
+        }];
+        assert!(!needs_artifact_hydration(std::slice::from_ref(&message)));
+        for (artifact_id, reference_key, expected) in [
+            (None, None, false),
+            (Some("artifact"), None, false),
+            (None, Some("image"), false),
+            (Some("artifact"), Some("image"), true),
+        ] {
+            message.content = vec![ContentBlock::ToolResult {
+                result: ToolResult {
+                    call_id: "call".to_string(),
+                    output: String::new(),
+                    is_error: false,
+                    content: vec![ToolResultContent::ImageRef {
+                        image: ImageRefContent {
+                            path: "/not-authority/image.png".to_string(),
+                            mime_type: "image/png".to_string(),
+                            artifact_id: artifact_id.map(str::to_string),
+                            reference_key: reference_key.map(str::to_string),
+                            metadata: ImageMetadata::default(),
+                        },
+                    }],
+                },
+            }];
+            assert_eq!(
+                needs_artifact_hydration(std::slice::from_ref(&message)),
+                expected
+            );
+        }
     }
 
     #[test]

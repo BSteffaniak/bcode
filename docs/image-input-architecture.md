@@ -8,6 +8,12 @@ themselves, and prompt-cache savings are distinct from transport savings.
 
 Implemented first slice:
 
+* Artifact hydration skips capability/model discovery when no artifact-backed tool image exists.
+  Within one request, finalized artifact bytes are reused with a 32-entry/5 MiB retention bound;
+  every image occurrence stays in the semantic context. Active artifacts are not cached. Range
+  reads reject inconsistent totals, revisions, offsets, oversized chunks, and non-progress.
+  This is request-local reuse, not deferred provider-boundary hydration.
+
 * `bcode model verify-images`: bounded provider-operation probes for image acknowledgement,
   inline follow-up, repeated inline follow-up, and explicitly authorized continuation. Add
   `--tool-result` to test correlated tool-result image history rather than user images; this
