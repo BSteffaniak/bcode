@@ -2275,8 +2275,8 @@ fn generated_candidate_lines(candidate: &GeneratedWorkflowCandidate) -> Vec<Stri
         lines.push(format!(
             "  resources={} · grants={} · approvals={}",
             compiled.effects.resources.len(),
-            compiled.permissions.explicit_grant_nodes.len(),
-            compiled.permissions.mutation_approval_nodes.len()
+            compiled.permissions.explicit_grant_count(),
+            compiled.permissions.mutation_approval_count()
         ));
     }
     lines
@@ -3187,8 +3187,8 @@ fn inspector_lines(
         lines.push(format!(
             "  resources={} · grants={} · approvals={}",
             compiled.effects.resources.len(),
-            compiled.permissions.explicit_grant_nodes.len(),
-            compiled.permissions.mutation_approval_nodes.len()
+            compiled.permissions.explicit_grant_count(),
+            compiled.permissions.mutation_approval_count()
         ));
         if !compiled.requirements.agents.is_empty() {
             lines.push(format!(

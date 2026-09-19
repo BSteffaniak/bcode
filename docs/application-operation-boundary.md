@@ -2,6 +2,28 @@
 
 Bcode application behavior is reusable without making a second transport or a generic application framework. The current boundary is a set of focused, server-owned operation modules backed by portable domain contracts.
 
+## Workflow permission previews
+
+Current permission previews include a version-1 finite graph: content-derived definition
+keys own local grant/approval requirements, runtime-checked nodes, and call edges.
+Shared calls are represented once per definition, not expanded into invocation paths.
+Counts refer to distinct nodes, never numbers of approvals or invocations. Agent, plugin,
+and call nodes are explicitly marked runtime-checked: the preview cannot predict their
+concrete operations, arguments, paths, or future policy decisions.
+
+The graph is advisory and grants no authority. Every runtime invocation retains its
+existing operation-level policy checks and user approvals. Recursion does not inherit
+blanket permission. Runtime invocation identity and audit paths are not replaced by graph
+keys. Missing or unresolved call targets still fail compilation rather than disappearing
+from a successful preview.
+
+Compatibility: absence of `graph` identifies historical path-only previews; current
+previews use their retained list fields for root-local facts and the graph for all child
+facts. Graph-aware consumers count graph nodes. Older strict readers reject the new field;
+unknown graph versions are rejected rather than interpreted as version 1. No stored
+preview is silently rewritten. This graph does not itself enable compilation of recursive
+package calls, whose executable identity resolution remains separate work.
+
 ## Request lifetime and ordered transport
 
 Local IPC uses bounded read-ahead and ordered execution. Queued bytes can delay EOF

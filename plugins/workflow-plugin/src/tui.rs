@@ -5003,8 +5003,8 @@ fn launch_item_lines(
     lines.push(Line::from(format!(
         "Permissions: {:?} · {} explicit grants · {} mutation approvals",
         item.permissions.maximum_capability,
-        item.permissions.explicit_grant_nodes.len(),
-        item.permissions.mutation_approval_nodes.len()
+        item.permissions.explicit_grant_count(),
+        item.permissions.mutation_approval_count()
     )));
     if !item.diagnostics.is_empty() {
         lines.push(Line::from("Validation diagnostics:"));

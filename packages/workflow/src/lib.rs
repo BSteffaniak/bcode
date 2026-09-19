@@ -4195,18 +4195,78 @@ impl From<&WorkflowProductionAdmission> for WorkflowAuthoringProductionAdmission
     }
 }
 
-/// Exact authorization implications exposed before publication or execution.
+/// Advisory permission facts for one definition, never an authorization grant.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WorkflowPermissionGraphNode {
+    /// Local nodes requiring explicit grants.
+    pub explicit_grant_nodes: Vec<String>,
+    /// Local nodes retaining mutation approval.
+    pub mutation_approval_nodes: Vec<String>,
+    /// Local nodes whose concrete runtime operations cannot be predicted statically.
+    pub runtime_checked_nodes: Vec<String>,
+    /// Local call node to target definition key.
+    pub calls: BTreeMap<String, String>,
+}
+
+/// Versioned finite permission graph. Unknown representations fail deserialization.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "version", deny_unknown_fields)]
+pub enum WorkflowPermissionGraph {
+    /// Definition-scoped requirements and call edges; runtime authorizes every invocation.
+    #[serde(rename = "1")]
+    V1 {
+        /// Key of the preview's root definition.
+        root: String,
+        /// Content-derived definition keys, not invocation paths.
+        definitions: BTreeMap<String, WorkflowPermissionGraphNode>,
+    },
+}
+
+/// Advisory authorization implications exposed before publication or execution.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct WorkflowPermissionPreview {
+    /// Finite graph for current previews. Absence identifies historical path-only previews;
+    /// historical fields must not be interpreted as an exhaustive recursive graph.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub graph: Option<WorkflowPermissionGraph>,
     /// Maximum tool capability requested by any compiled node.
     pub maximum_capability: WorkflowToolCapability,
-    /// Exact parent/child node paths whose owner contract requires an explicit grant.
+    /// Root-local nodes requiring an explicit grant when `graph` is present;
+    /// historical previews without a graph contain parent/child paths.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub explicit_grant_nodes: Vec<String>,
-    /// Exact parent/child node paths that retain runtime mutation approval.
+    /// Root-local nodes retaining runtime mutation approval when `graph` is present;
+    /// historical previews without a graph contain parent/child paths.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub mutation_approval_nodes: Vec<String>,
+}
+
+impl WorkflowPermissionPreview {
+    /// Number of distinct nodes requiring a grant, not the number of invocations.
+    #[must_use]
+    pub fn explicit_grant_count(&self) -> usize {
+        match &self.graph {
+            Some(WorkflowPermissionGraph::V1 { definitions, .. }) => definitions
+                .values()
+                .map(|node| node.explicit_grant_nodes.len())
+                .sum(),
+            None => self.explicit_grant_nodes.len(),
+        }
+    }
+
+    /// Number of distinct nodes retaining mutation approval.
+    #[must_use]
+    pub fn mutation_approval_count(&self) -> usize {
+        match &self.graph {
+            Some(WorkflowPermissionGraph::V1 { definitions, .. }) => definitions
+                .values()
+                .map(|node| node.mutation_approval_nodes.len())
+                .sum(),
+            None => self.mutation_approval_nodes.len(),
+        }
+    }
 }
 
 /// Successful side-effect-free compilation result.
@@ -10423,57 +10483,72 @@ fn resolve_authoring_catalog(
 > {
     let (mut requirements, mut effects, mut permissions) =
         resolve_authoring_catalog_inner(definition, declared, plugin_input_defaults, catalog)?;
-    // Each frame retains its iterator and path, rather than using the Rust call stack.
-    let mut stack = vec![(definition.nodes.iter(), String::new(), None)];
-    let mut active = BTreeSet::new();
+    let root = digest_serializable(definition)?;
+    let mut definitions = BTreeMap::new();
+    let mut pending = vec![(root.clone(), definition)];
     let empty_defaults = BTreeMap::new();
-    let mut remaining_expansions = MAX_WORKFLOW_AUTHORING_REQUIREMENTS;
-    while let Some((nodes, prefix, _)) = stack.last_mut() {
-        let Some((node_id, node)) = nodes.next() else {
-            if let Some((_, _, Some(identity))) = stack.pop() {
-                active.remove(&identity);
+    while let Some((key, current)) = pending.pop() {
+        if definitions.contains_key(&key) {
+            continue;
+        }
+        let (_, _, local) = resolve_authoring_catalog_inner(
+            current,
+            &WorkflowRequirementSummary::default(),
+            if key == root {
+                plugin_input_defaults
+            } else {
+                &empty_defaults
+            },
+            catalog,
+        )?;
+        let mut graph_node = WorkflowPermissionGraphNode {
+            explicit_grant_nodes: local.explicit_grant_nodes,
+            mutation_approval_nodes: local.mutation_approval_nodes,
+            runtime_checked_nodes: current
+                .nodes
+                .iter()
+                .filter(|(_, node)| {
+                    matches!(
+                        node.kind,
+                        NodeKind::Agent | NodeKind::PluginBlock | NodeKind::WorkflowCall
+                    )
+                })
+                .map(|(id, _)| id.clone())
+                .collect(),
+            calls: BTreeMap::new(),
+        };
+        for (node_id, node) in &current.nodes {
+            if node.kind != NodeKind::WorkflowCall {
+                continue;
             }
-            continue;
-        };
-        if node.kind != NodeKind::WorkflowCall {
-            continue;
+            let (_, child) = resolve_authoring_workflow_call(node_id, node, catalog)?;
+            let child_key = digest_serializable(child)?;
+            graph_node.calls.insert(node_id.clone(), child_key.clone());
+            pending.push((child_key, child));
         }
-        remaining_expansions = remaining_expansions.checked_sub(1).ok_or_else(|| {
-            authoring_error(
-                "definition.workflow_calls",
-                "workflow call preview expansion exceeds the bounded analysis budget",
-            )
-        })?;
-        let path = if prefix.is_empty() {
-            node_id.clone()
-        } else {
-            format!("{prefix}/{node_id}")
-        };
-        let (identity, child) = resolve_authoring_workflow_call(node_id, node, catalog)?;
-        if !active.insert(identity.clone()) {
-            return Err(authoring_error(
-                format!("definition.nodes.{path}.configuration"),
-                "workflow call dependency graph is recursive",
-            ));
+        if key != root {
+            let (child_requirements, child_effects, mut child_permissions) =
+                resolve_authoring_catalog_inner(
+                    current,
+                    &WorkflowRequirementSummary::default(),
+                    &empty_defaults,
+                    catalog,
+                )?;
+            child_permissions.explicit_grant_nodes.clear();
+            child_permissions.mutation_approval_nodes.clear();
+            merge_child_preview(
+                "",
+                child_requirements,
+                child_effects,
+                child_permissions,
+                &mut requirements,
+                &mut effects,
+                &mut permissions,
+            );
         }
-        let (child_requirements, child_effects, child_permissions) =
-            resolve_authoring_catalog_inner(
-                child,
-                &WorkflowRequirementSummary::default(),
-                &empty_defaults,
-                catalog,
-            )?;
-        merge_child_preview(
-            &path,
-            child_requirements,
-            child_effects,
-            child_permissions,
-            &mut requirements,
-            &mut effects,
-            &mut permissions,
-        );
-        stack.push((child.nodes.iter(), path, Some(identity)));
+        definitions.insert(key, graph_node);
     }
+    permissions.graph = Some(WorkflowPermissionGraph::V1 { root, definitions });
     let effects = effects.normalized();
     effects.validate()?;
     requirements.validate()?;
@@ -19043,6 +19118,37 @@ steps:
     }
 
     #[test]
+    fn permission_graph_compatibility_is_explicit() {
+        let legacy = WorkflowPermissionPreview::default();
+        let value = serde_json::to_value(&legacy).expect("legacy preview");
+        assert!(value.get("graph").is_none());
+        let restored: WorkflowPermissionPreview =
+            serde_json::from_value(value.clone()).expect("legacy read");
+        assert!(restored.graph.is_none());
+        let mut future = value;
+        future["graph"] = serde_json::json!({"version": "2", "root": "root", "definitions": {}});
+        assert!(serde_json::from_value::<WorkflowPermissionPreview>(future).is_err());
+        let graph = WorkflowPermissionGraph::V1 {
+            root: "root".into(),
+            definitions: BTreeMap::from([(
+                "root".into(),
+                WorkflowPermissionGraphNode {
+                    runtime_checked_nodes: vec!["call".into()],
+                    calls: BTreeMap::from([("call".into(), "root".into())]),
+                    ..WorkflowPermissionGraphNode::default()
+                },
+            )]),
+        };
+        assert_eq!(
+            serde_json::from_value::<WorkflowPermissionGraph>(
+                serde_json::to_value(&graph).expect("serialize")
+            )
+            .expect("recursive graph roundtrip"),
+            graph
+        );
+    }
+
+    #[test]
     fn capability_analysis_is_not_limited_by_runtime_call_depth() {
         let mut catalog = authoring_catalog();
         let mut child = lower_workflow_authoring_source(
@@ -19127,14 +19233,24 @@ steps:
             child.entries = vec!["left".into(), "right".into()];
             child.exits = child.entries.clone();
         }
-        let error = resolve_authoring_catalog(
+        let (_, _, permissions) = resolve_authoring_catalog(
             &child,
             &WorkflowRequirementSummary::default(),
             &BTreeMap::new(),
             &catalog,
         )
-        .expect_err("shared invocation expansion must be bounded");
-        assert!(error.to_string().contains("bounded analysis budget"));
+        .expect("shared calls are represented without invocation expansion");
+        let Some(WorkflowPermissionGraph::V1 { definitions, .. }) = permissions.graph else {
+            panic!("finite graph");
+        };
+        assert_eq!(definitions.len(), 17);
+        assert_eq!(
+            definitions
+                .values()
+                .map(|node| node.calls.len())
+                .sum::<usize>(),
+            32
+        );
     }
 
     #[test]
@@ -21306,11 +21422,15 @@ steps:
                 .resources
                 .contains(&ResourceClaim::write("repository"))
         );
-        assert_eq!(compiled.permissions.explicit_grant_nodes, ["agent/commit"]);
-        assert_eq!(
-            compiled.permissions.mutation_approval_nodes,
-            ["agent/commit"]
-        );
+        assert_eq!(compiled.permissions.explicit_grant_count(), 1);
+        assert_eq!(compiled.permissions.mutation_approval_count(), 1);
+        let Some(WorkflowPermissionGraph::V1 { root, definitions }) = &compiled.permissions.graph
+        else {
+            panic!("finite graph");
+        };
+        let target = &definitions[root].calls["agent"];
+        assert_eq!(definitions[target].explicit_grant_nodes, ["commit"]);
+        assert_eq!(definitions[target].mutation_approval_nodes, ["commit"]);
     }
 
     #[test]
