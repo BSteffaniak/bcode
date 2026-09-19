@@ -87,6 +87,9 @@ pub struct ImageVerificationCase {
     pub transfer: ImageVerificationOutcome,
     /// Sum of measured JSON bodies across attempts; absent if any measurement is unavailable.
     pub serialized_body_bytes: Option<u64>,
+    /// Sum of prepared HTTP bodies after encoding; not socket traffic or remote upload bytes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub encoded_body_bytes: Option<u64>,
     /// Local elapsed time, not provider processing time.
     pub latency_ms: u128,
     /// Every observed attempt reports retained history and a consistent nonzero omitted prefix.
@@ -559,6 +562,7 @@ fn unexecuted(name: &str, outcome: ImageVerificationOutcome) -> ImageVerificatio
         context: outcome,
         transfer: outcome,
         serialized_body_bytes: None,
+        encoded_body_bytes: None,
         latency_ms: 0,
         used_continuation: false,
         stop_reason: None,
@@ -689,6 +693,7 @@ fn collect<I: BlockingModelProviderInvoker>(
                     },
                     transfer: ImageVerificationOutcome::Inconclusive,
                     serialized_body_bytes: measured_bytes(&projections),
+                    encoded_body_bytes: measured_encoded_bytes(&projections),
                     latency_ms: started.elapsed().as_millis(),
                     stop_reason: Some(summary.stop_reason),
                     error_category: summary.error_category,
@@ -712,6 +717,15 @@ fn collect<I: BlockingModelProviderInvoker>(
         }
         std::thread::sleep(Duration::from_millis(10));
     }
+}
+
+fn measured_encoded_bytes(projections: &[ProviderRequestProjection]) -> Option<u64> {
+    if projections.is_empty() {
+        return None;
+    }
+    projections.iter().try_fold(0u64, |sum, projection| {
+        sum.checked_add(projection.encoded_body_bytes?)
+    })
 }
 
 fn measured_bytes(projections: &[ProviderRequestProjection]) -> Option<u64> {
@@ -1174,6 +1188,35 @@ mod tests {
                 .iter()
                 .flat_map(|message| &message.content)
                 .all(|block| !matches!(block, ContentBlock::Image { .. }))
+        );
+    }
+
+    #[test]
+    fn encoded_measurements_are_independent_complete_and_overflow_checked() {
+        let projection = ProviderRequestProjection {
+            serialized_body_bytes: Some(1000),
+            encoded_body_bytes: Some(100),
+            ..Default::default()
+        };
+        let projections = [projection.clone(), projection];
+        assert_eq!(measured_bytes(&projections), Some(2000));
+        assert_eq!(measured_encoded_bytes(&projections), Some(200));
+        assert_eq!(measured_encoded_bytes(&[]), None);
+        let missing = ProviderRequestProjection {
+            serialized_body_bytes: Some(1000),
+            ..Default::default()
+        };
+        assert_eq!(
+            measured_encoded_bytes(&[projections[0].clone(), missing]),
+            None
+        );
+        let overflow = ProviderRequestProjection {
+            encoded_body_bytes: Some(u64::MAX),
+            ..Default::default()
+        };
+        assert_eq!(
+            measured_encoded_bytes(&[projections[0].clone(), overflow]),
+            None
         );
     }
 

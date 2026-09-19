@@ -193,10 +193,16 @@ before HTTP transmission. Gzip is used only when smaller than the original seria
 Both Chat Completions and Responses use the same preparation path. No automatic retry with a
 different encoding is performed on rejection; this avoids duplicating ambiguous generations.
 No provider/model capability is inferred or promoted by this option. Enable it only for endpoints
-known to accept gzip; remote acceptance has not been verified.
+known to accept gzip. `model verify-images --request-compression gzip` explicitly probes acceptance
+without modifying provider config; `off` supplies an identity baseline. This setting is currently
+implemented only by the OpenAI-compatible adapter, so check encoded-byte observations rather than
+assuming another adapter applied the requested mode.
 
 `serialized_body_bytes` remains the uncompressed JSON size. Optional `encoded_body_bytes` records
-the prepared HTTP body after encoding, not actual socket traffic. Tests decode the exact request
+the prepared HTTP body after encoding, not actual socket traffic. Image verification cases expose
+this separately from serialized bytes, summing all measured attempts. Missing measurements and
+arithmetic overflow remain unknown rather than becoming zero or estimated compression savings.
+Tests decode the exact request
 builder body and assert byte identity, encoding headers, and measurement agreement. This is
 lossless transport compression, never image resizing/re-encoding.
 
@@ -228,6 +234,16 @@ acknowledgement, inline follow-up, and inline repeat all passed. Prepared JSON b
 | --- | ---: | ---: | ---: | ---: |
 | User | 652 | 2881 | 3283 | 3283 |
 | Tool result | 949 | 3438 | 3840 | 3840 |
+
+A subsequent user-image run on the same Astra configuration and seed explicitly enabled gzip.
+All four executed cases passed with `end_turn`: control 652 → 412 bytes, acknowledgement
+2881 → 650, follow-up 3283 → 810, repeat 3283 → 810 (serialized → encoded body). The shared
+seed plus follow-up was 6164 → 1460 prepared body bytes. Report: `/tmp/astra-gzip-image-report.json`.
+This verifies gzip acceptance for that configured endpoint/model only, not other compatible
+providers or actual socket traffic. A subsequent tool-result gzip run on the same model and seed
+also passed all four executed cases: control 949 → 525 bytes, acknowledgement 3438 → 816,
+follow-up 3840 → 966, repeat 3840 → 966. Seed plus follow-up was 7278 → 1782 prepared body
+bytes. Report: `/tmp/astra-gzip-tool-image-report.json`. Continuation remains unverified.
 
 Continuation was policy-blocked: conversation storage was not enabled. No remote file uploads
 were performed. These observations establish only inline visual correctness for this configured

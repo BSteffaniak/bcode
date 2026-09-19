@@ -6009,6 +6009,9 @@ enum ModelCommand {
 /// Arguments for bounded, explicitly requested image verification.
 #[derive(Debug, clap::Args)]
 struct VerifyImagesArgs {
+    /// Explicit endpoint compression probe; does not assert provider support.
+    #[arg(long, value_parser = ["off", "gzip"])]
+    request_compression: Option<String>,
     /// Generate two nonsensitive, order-sensitive images from a reproducible seed.
     #[arg(long, conflicts_with_all = ["image", "question", "expected_answer"])]
     generated_seed: Option<u64>,
@@ -12704,6 +12707,11 @@ async fn verify_model_images(args: &VerifyImagesArgs) -> Result<(), CliError> {
             let mut provider_context = context.clone();
             if provider_context.api_surface.is_none() {
                 provider_context.api_surface = model.api_surface;
+            }
+            if let Some(compression) = &args.request_compression {
+                provider_context
+                    .settings
+                    .insert("request_compression".to_string(), compression.clone());
             }
             match run_image_verification(
                 &mut invoker,
@@ -24704,6 +24712,33 @@ mod model_cli_tests {
             panic!("expected image verification");
         };
         assert!(super::image_verification_fixture(&args).is_err());
+    }
+
+    #[test]
+    fn image_compression_probe_rejects_unknown_modes() {
+        for mode in ["off", "gzip"] {
+            assert!(
+                Cli::try_parse_from([
+                    "bcode",
+                    "model",
+                    "verify-images",
+                    "--dry-run",
+                    "--request-compression",
+                    mode
+                ])
+                .is_ok()
+            );
+        }
+        assert!(
+            Cli::try_parse_from([
+                "bcode",
+                "model",
+                "verify-images",
+                "--request-compression",
+                "unknown"
+            ])
+            .is_err()
+        );
     }
 
     #[test]
