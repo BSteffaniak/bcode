@@ -65178,6 +65178,37 @@ library = "test"
     }
 
     #[tokio::test]
+    async fn definition_registration_does_not_load_unrelated_store_definitions() {
+        let state = test_server_state(SessionManager::default());
+        let definition = test_workflow_authoring_document().definition;
+        {
+            let mut store = state.workflow_store.lock().unwrap();
+            for index in 0..1_001 {
+                store
+                    .persist_definition(&format!("unrelated-{index}"), 1, &definition)
+                    .unwrap();
+            }
+            assert!(
+                store
+                    .definition_snapshot_with_budget(1_000, 16 * 1024 * 1024)
+                    .is_err()
+            );
+            drop(store);
+        }
+        let request = bcode_workflow::WorkflowDefinitionRegistrationRequest {
+            definition_id: "demand-driven-registration".into(),
+            version: 1,
+            definition,
+        };
+        let registered =
+            workflow_operations::register_definition(&state, ClientId::new(), &request)
+                .await
+                .expect("unrelated definitions do not consume dependency allowance");
+        drop(state);
+        assert_eq!(registered.definition().unwrap(), request.definition);
+    }
+
+    #[tokio::test]
     async fn definition_registration_denial_precedes_persistence() {
         let (mut state,) = (test_server_state(SessionManager::default()),);
         let mut definition = test_workflow_authoring_document().definition;

@@ -10606,13 +10606,43 @@ pub async fn register_definition(
     request: &bcode_workflow::WorkflowDefinitionRegistrationRequest,
 ) -> Result<bcode_workflow::StoredWorkflowDefinition, super::ServerError> {
     validate_workflow_definition_for_production(state, &request.definition)?;
-    let catalog = authoring_catalog(state).await?;
+    let catalog = authoring_catalog_with_definitions(state, false).await?;
     let definition = request.definition.clone();
+    let store = std::sync::Arc::clone(&state.workflow_store);
     let (requirements, effects) = run_computation(
         state,
         bcode_workflow::WorkflowComputationControl::default(),
         uuid::Uuid::new_v4().to_string(),
-        move || bcode_workflow::workflow_definition_policy_summaries(&definition, &catalog),
+        move || {
+            let store = store
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            bcode_workflow::workflow_definition_policy_summaries_with_lookup(
+                &definition,
+                catalog,
+                1_000,
+                16 * 1024 * 1024,
+                |identity, remaining| {
+                    store
+                        .definition_with_byte_budget(
+                            &identity.definition_id,
+                            identity.definition_version,
+                            remaining,
+                        )
+                        .map_err(|_| bcode_workflow::WorkflowError::Build {
+                            path: "catalog".into(),
+                            message:
+                                "exact workflow dependency could not be read within its allowance"
+                                    .into(),
+                        })?
+                        .map(|stored| stored.definition_json)
+                        .ok_or_else(|| bcode_workflow::WorkflowError::Build {
+                            path: "catalog".into(),
+                            message: "exact workflow dependency is unavailable".into(),
+                        })
+                },
+            )
+        },
     )
     .await??;
     state.authorize_workflow_application_operation(
@@ -10647,6 +10677,13 @@ pub async fn register_definition(
 pub async fn authoring_catalog(
     state: &ServerState,
 ) -> Result<bcode_workflow::WorkflowAuthoringCatalogSnapshot, super::ServerError> {
+    authoring_catalog_with_definitions(state, true).await
+}
+
+async fn authoring_catalog_with_definitions(
+    state: &ServerState,
+    include_definitions: bool,
+) -> Result<bcode_workflow::WorkflowAuthoringCatalogSnapshot, super::ServerError> {
     let plugins = state
         .plugins
         .registry()
@@ -10673,7 +10710,7 @@ pub async fn authoring_catalog(
         .into_iter()
         .flat_map(|agent| std::iter::once(agent.id).chain(agent.aliases))
         .collect::<std::collections::BTreeSet<_>>();
-    let workflow_definitions = {
+    let workflow_definitions = if include_definitions {
         let store = state
             .workflow_store
             .lock()
@@ -10690,6 +10727,8 @@ pub async fn authoring_catalog(
                 std::collections::BTreeMap<_, _>,
                 bcode_workflow_store::WorkflowStoreError,
             >>()?
+    } else {
+        std::collections::BTreeMap::new()
     };
     let catalog = bcode_workflow::WorkflowAuthoringCatalogSnapshot {
         version: bcode_workflow::WORKFLOW_AUTHORING_CATALOG_VERSION,

@@ -10947,6 +10947,79 @@ fn validate_declared_authoring_requirements(
     Ok(())
 }
 
+/// Resolve only exact call dependencies needed for policy analysis.
+///
+/// The lookup receives the remaining encoded-byte allowance and must reject oversized
+/// values before loading them. The definition allowance counts distinct dependencies,
+/// not invocations or unrelated stored definitions. Neither allowance limits runtime runs.
+///
+/// # Errors
+/// Returns an error for invalid contracts, missing or inconsistent exact identities,
+/// exhausted allowances, or lookup failures. No partial summary is returned.
+pub fn workflow_definition_policy_summaries_with_lookup(
+    definition: &WorkflowDefinition,
+    mut catalog: WorkflowAuthoringCatalogSnapshot,
+    definition_limit: usize,
+    byte_budget: usize,
+    mut lookup: impl FnMut(&WorkflowDefinitionIdentity, usize) -> Result<String, WorkflowError>,
+) -> Result<(WorkflowRequirementSummary, WorkflowEffectSummary), WorkflowError> {
+    definition.validate()?;
+    catalog.validate()?;
+    let mut remaining = byte_budget;
+    let mut resolved = BTreeSet::new();
+    let mut pending = vec![definition.clone()];
+    while let Some(current) = pending.pop() {
+        for (node_id, node) in &current.nodes {
+            if node.kind != NodeKind::WorkflowCall {
+                continue;
+            }
+            let call: WorkflowCallConfiguration =
+                serde_json::from_value(node.configuration.clone())
+                    .map_err(|_| authoring_error(node_id, "invalid workflow call configuration"))?;
+            call.validate()?;
+            let identity = call.target.definition_identity();
+            if resolved.contains(&identity.definition_id) {
+                // Repeated references still verify the complete identity, not just its key.
+                resolve_authoring_workflow_call(node_id, node, &catalog)?;
+                continue;
+            }
+            if resolved.len() >= definition_limit {
+                return Err(authoring_error(
+                    "catalog",
+                    "call dependency allowance exceeded",
+                ));
+            }
+            if !catalog
+                .workflow_definitions
+                .contains_key(&identity.definition_id)
+            {
+                let json = lookup(identity, remaining)?;
+                remaining = remaining.checked_sub(json.len()).ok_or_else(|| {
+                    authoring_error("catalog", "call dependency byte allowance exceeded")
+                })?;
+                let child: WorkflowDefinition = serde_json::from_str(&json).map_err(|_| {
+                    authoring_error("catalog", "invalid call dependency definition")
+                })?;
+                child.validate()?;
+                let actual = WorkflowDefinitionIdentity::for_definition(&identity.kind, &child)?;
+                if &actual != identity {
+                    return Err(authoring_error(
+                        "catalog",
+                        "call dependency identity mismatch",
+                    ));
+                }
+                catalog
+                    .workflow_definitions
+                    .insert(identity.definition_id.clone(), child);
+            }
+            let (_, child) = resolve_authoring_workflow_call(node_id, node, &catalog)?;
+            pending.push(child.clone());
+            resolved.insert(identity.definition_id.clone());
+        }
+    }
+    workflow_definition_policy_summaries(definition, &catalog)
+}
+
 /// Resolve normalized requirements and effects for an already compiled definition.
 ///
 /// # Errors
@@ -20270,8 +20343,7 @@ steps:
         .expect("analysis traverses beyond the runtime default depth");
     }
 
-    #[test]
-    fn capability_analysis_bounds_shared_child_expansion() {
+    fn branching_call_catalog() -> (WorkflowDefinition, WorkflowAuthoringCatalogSnapshot) {
         let mut catalog = authoring_catalog();
         let mut child = lower_workflow_authoring_source(
             &single_gate_source(None, None).to_string(),
@@ -20308,6 +20380,72 @@ steps:
             child.entries = vec!["left".into(), "right".into()];
             child.exits = child.entries.clone();
         }
+        (child, catalog)
+    }
+
+    #[test]
+    fn policy_lookup_visits_exact_dependencies_once_and_enforces_allowances() {
+        let (child, catalog) = branching_call_catalog();
+        let expected = workflow_definition_policy_summaries(&child, &catalog).unwrap();
+        let mut metadata = catalog.clone();
+        metadata.workflow_definitions.clear();
+        let mut reads = BTreeSet::new();
+        let actual = workflow_definition_policy_summaries_with_lookup(
+            &child,
+            metadata.clone(),
+            16,
+            usize::MAX,
+            |identity, _| {
+                assert!(reads.insert(identity.definition_id.clone()));
+                Ok(
+                    serde_json::to_string(&catalog.workflow_definitions[&identity.definition_id])
+                        .unwrap(),
+                )
+            },
+        )
+        .unwrap();
+        assert_eq!(actual, expected);
+        assert_eq!(reads.len(), 16);
+        assert!(
+            workflow_definition_policy_summaries_with_lookup(
+                &child,
+                metadata.clone(),
+                0,
+                usize::MAX,
+                |_, _| panic!("budget checked before lookup"),
+            )
+            .is_err()
+        );
+        assert!(
+            workflow_definition_policy_summaries_with_lookup(
+                &child,
+                metadata.clone(),
+                16,
+                0,
+                |identity, _| {
+                    Ok(serde_json::to_string(
+                        &catalog.workflow_definitions[&identity.definition_id],
+                    )
+                    .unwrap())
+                },
+            )
+            .is_err()
+        );
+        assert!(
+            workflow_definition_policy_summaries_with_lookup(
+                &child,
+                metadata,
+                16,
+                usize::MAX,
+                |_, _| Ok(serde_json::to_string(&child).unwrap()),
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn capability_analysis_bounds_shared_child_expansion() {
+        let (child, catalog) = branching_call_catalog();
         let (_, _, permissions) = resolve_authoring_catalog(
             &child,
             &WorkflowRequirementSummary::default(),

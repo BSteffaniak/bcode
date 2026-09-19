@@ -2704,6 +2704,39 @@ impl WorkflowStore {
         Ok(())
     }
 
+    /// Read one exact definition without loading a payload larger than the allowance.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for an invalid identifier, an oversized or corrupt definition,
+    /// or a database failure.
+    pub fn definition_with_byte_budget(
+        &self,
+        definition_id: &str,
+        version: u32,
+        byte_budget: usize,
+    ) -> Result<Option<StoredWorkflowDefinition>, WorkflowStoreError> {
+        validate_id("definition_id", definition_id)?;
+        let query = select("workflow_definitions")
+            .projections(vec![
+                Projection::new(identifier("definition_id")),
+                Projection::new(identifier("version")),
+                Projection::new(identifier("checksum_sha256")),
+                Projection::new(bounded_text(
+                    identifier("definition_json"),
+                    byte_budget.min(MAX_INLINE_JSON_BYTES) as u64,
+                    DatabaseValue::Null,
+                ))
+                .alias("definition_json"),
+            ])
+            .where_eq("definition_id", definition_id)
+            .where_eq("version", i64::from(version));
+        authoring_one(&self.connection, query)?
+            .as_ref()
+            .map(|row| verify_stored_definition(decode_authoring_definition(row)?))
+            .transpose()
+    }
+
     /// Load one exact definition version with checksum verification.
     ///
     /// # Errors

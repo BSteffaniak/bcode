@@ -24914,6 +24914,39 @@ fn canonical_path_is_below_workflows_directory() {
 }
 
 #[test]
+fn exact_definition_read_enforces_byte_budget_and_checksum() {
+    let temp = tempfile::tempdir().unwrap();
+    let mut store = WorkflowStore::open_in_state_dir(temp.path()).unwrap();
+    let expected = store.persist_definition("a", 1, &definition("a")).unwrap();
+    let bytes = expected.definition_json.len();
+    assert_eq!(
+        store.definition_with_byte_budget("a", 1, bytes).unwrap(),
+        Some(expected)
+    );
+    assert!(
+        store
+            .definition_with_byte_budget("a", 1, bytes - 1)
+            .is_err()
+    );
+    assert!(store.definition_with_byte_budget("a", 1, 0).is_err());
+    assert!(
+        store
+            .definition_with_byte_budget("missing", 1, 0)
+            .unwrap()
+            .is_none()
+    );
+    block_on(
+        store.connection.exec_update_count(
+            &update("workflow_definitions")
+                .value("checksum_sha256", "corrupt")
+                .where_eq("definition_id", "a"),
+        ),
+    )
+    .unwrap();
+    assert!(store.definition_with_byte_budget("a", 1, bytes).is_err());
+}
+
+#[test]
 fn definition_window_enforces_aggregate_budget_without_partial_success() {
     let temp = tempfile::tempdir().unwrap();
     let mut store = WorkflowStore::open_in_state_dir(temp.path()).unwrap();
