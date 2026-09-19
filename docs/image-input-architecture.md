@@ -201,8 +201,25 @@ Timeout, output-overflow, and successful-process behavior have offline subproces
 
 The aggregate verdict covers inline visual verification only, requiring the negative control,
 acknowledgement, baseline, and repeat to pass. Unsupported/inconclusive results are not successes.
-Continuation and transfer evidence remain separate in each raw report. This runner is implemented
-but has not been used against live providers; it is not evidence of upload/URL/compression support.
+Continuation and transfer evidence remain separate in each raw report.
+
+### Recorded live evidence
+
+A bounded live run using the user-authorized `astra-full.toml` configuration and exact model
+`gpt-6-astra` passed on seed 726 for both user and tool-result images. The no-image control,
+acknowledgement, inline follow-up, and inline repeat all passed. Prepared JSON body bytes were:
+
+| Source | Control | Acknowledgement | Follow-up | Repeat |
+| --- | ---: | ---: | ---: | ---: |
+| User | 652 | 2881 | 3283 | 3283 |
+| Tool result | 949 | 3438 | 3840 | 3840 |
+
+Continuation was policy-blocked: conversation storage was not enabled. No remote file uploads
+were performed. These observations establish only inline visual correctness for this configured
+surface/model and fixture; they do not establish upload, URL, compression, or continuation support.
+The run used `--seed 726 --timeout-seconds 45 --live`; local reports were retained under
+`bcode-image-matrix-0tohtu20` in the system temporary directory. Credentials and config contents
+are deliberately not included here. Other provider configurations remain unverified.
 
 ```sh
 python3 scripts/verify-image-matrix.py --config ./provider.toml --model EXACT_MODEL_ID
