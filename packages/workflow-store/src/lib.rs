@@ -11565,18 +11565,13 @@ impl WorkflowStore {
     /// Detach a repair-required run from its generic session binding.
     ///
     /// Execution state, parent provenance, and unresolved attempts remain unchanged. The prior
-    /// binding is retained in an audit event; repeated detachment is a no-op.
+    /// binding is retained in an audit event; repeated detachment is a no-op. This association-only
+    /// operation deliberately does not verify, acquire, or modify execution authority.
     ///
     /// # Errors
-    /// Rejects stale authority, runs not requiring repair, pending replacements, or storage errors.
-    pub fn detach_run_owned(
-        &mut self,
-        run_id: &str,
-        authority: &WorkflowExecutionAuthority,
-        now_ms: u64,
-    ) -> Result<bool, WorkflowStoreError> {
+    /// Rejects runs not requiring repair, pending replacements, or storage errors.
+    pub fn detach_run(&mut self, run_id: &str, now_ms: u64) -> Result<bool, WorkflowStoreError> {
         let tx = self.connection.unchecked_transaction()?;
-        self.verify_execution_authority(run_id, authority)?;
         let run = self
             .run_summary(run_id)?
             .ok_or_else(|| WorkflowStoreError::RunNotFound {
@@ -21277,7 +21272,7 @@ mod tests {
             ..new_run()
         };
         store.create_run(&run).expect("run");
-        assert!(store.detach_run_owned(&run.run_id, &authority, 11).is_err());
+        assert!(store.detach_run(&run.run_id, 11).is_err());
         store
             .connection
             .execute(
@@ -21285,28 +21280,11 @@ mod tests {
                 [&run.run_id],
             )
             .expect("repair fixture");
-        let stale = WorkflowExecutionAuthority {
-            generation: 2,
-            ..authority.clone()
-        };
-        assert!(store.detach_run_owned(&run.run_id, &stale, 12).is_err());
-        assert!(
-            store
-                .run_summary(&run.run_id)
-                .unwrap()
-                .unwrap()
-                .binding
-                .is_some()
-        );
-        assert!(
-            store
-                .detach_run_owned(&run.run_id, &authority, 13)
-                .expect("detach")
-        );
-        assert!(
-            !store
-                .detach_run_owned(&run.run_id, &authority, 14)
-                .expect("duplicate")
+        assert!(store.detach_run(&run.run_id, 13).expect("detach"));
+        assert!(!store.detach_run(&run.run_id, 14).expect("duplicate"));
+        assert_eq!(
+            store.execution_authority(&run.run_id).expect("authority"),
+            Some(authority)
         );
         let key = WorkflowRunBindingKey {
             owner_plugin_id: binding.owner_plugin_id,

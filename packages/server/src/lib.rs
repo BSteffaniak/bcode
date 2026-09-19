@@ -71927,6 +71927,124 @@ event_symbol = "bcode_plugin_handle_event_v1"
         assert_eq!(spans[0].duration_ms(), None);
     }
 
+    fn foreign_repair_required_detach_fixture(
+        store: &mut bcode_workflow_store::WorkflowStore,
+    ) -> bcode_workflow_store::WorkflowExecutionAuthority {
+        let definition = bcode_workflow::WorkflowBuilder::new(
+            "detach",
+            bcode_workflow::Step::task("node", |value: u32, _context| async move { Ok(value) }),
+        )
+        .build()
+        .unwrap()
+        .definition()
+        .clone();
+        store.persist_definition("detach", 1, &definition).unwrap();
+        let authority = bcode_workflow_store::WorkflowExecutionAuthority {
+            target_artifact_id: "older-artifact".into(),
+            daemon_instance_id: "unverifiable-older-daemon".into(),
+            ..test_workflow_execution_authority()
+        };
+        store
+            .create_run(&bcode_workflow_store::NewWorkflowRun {
+                run_id: "detached-run".into(),
+                definition_id: "detach".into(),
+                definition_version: 1,
+                workspace_snapshot: "snapshot".into(),
+                parent_session_id: Some("session".into()),
+                parent_session_generation: None,
+                binding: Some(bcode_workflow_store::WorkflowRunBinding {
+                    owner_plugin_id: "bcode.loop".into(),
+                    workflow_kind: "loop".into(),
+                    scope_key: "session".into(),
+                    display_label: None,
+                    single_active: true,
+                }),
+                authored_provenance: None,
+                input: Some(serde_json::json!(1)),
+                execution_authority: Some(authority.clone()),
+                created_at_ms: 1,
+                authorization_profile: bcode_workflow::WorkflowAuthorizationProfileIdentity {
+                    version: 1,
+                    provider_id: "test-policy".into(),
+                    profile_id: "build".into(),
+                    policy_digest_sha256: "a".repeat(64),
+                },
+                authorization_ceiling: bcode_workflow::WorkflowToolCapability::Mutating,
+                limits: bcode_workflow_store::WorkflowRunLimits::default(),
+            })
+            .unwrap();
+        store
+            .prepare_attempt(&bcode_workflow_store::PreparedAttempt {
+                run_id: "detached-run".into(),
+                node_id: "node".into(),
+                activation_id: bcode_workflow_store::activation_identity("detached-run", "node", 0),
+                attempt: 1,
+                side_effect: bcode_workflow::DispatchSideEffect::Mutating,
+                intent: serde_json::json!({}),
+                prepared_at_ms: 2,
+            })
+            .unwrap();
+        store
+            .reconcile_owned_prepared_attempts_for_run("detached-run", &authority, 10, 3)
+            .unwrap();
+        authority
+    }
+
+    #[tokio::test]
+    async fn detach_associated_workflow_ignores_foreign_execution_owner() {
+        use bcode_workflow::WorkflowRunApplication as _;
+        let temp = tempfile::tempdir().expect("store");
+        let mut store =
+            bcode_workflow_store::WorkflowStore::open_in_state_dir(temp.path()).unwrap();
+        let authority = foreign_repair_required_detach_fixture(&mut store);
+        let before = store.run_summary("detached-run").unwrap().unwrap();
+        assert_eq!(
+            before.status,
+            bcode_workflow_store::RunStatus::RepairRequired
+        );
+        let state = Arc::new(test_server_state_with_fake_provider_and_workflow_store(
+            SessionManager::default(),
+            store,
+        ));
+        let application =
+            workflow_operations::WorkflowAuthoringApplication::new(&state, ClientId::new());
+        let key = bcode_workflow::WorkflowRunBindingLookup {
+            owner_plugin_id: "bcode.loop".into(),
+            workflow_kind: "loop".into(),
+            scope_key: "session".into(),
+        };
+        let (after, changed) = application
+            .control_associated_workflow_run(
+                key.clone(),
+                bcode_workflow::WorkflowRunControlAction::Detach,
+            )
+            .await
+            .expect("detach must not verify or acquire the foreign owner");
+        assert!(changed);
+        let after = after.unwrap();
+        assert!(after.binding.is_none());
+        assert_eq!(after.status, before.status);
+        assert_eq!(
+            after.cancellation_requested_at_ms,
+            before.cancellation_requested_at_ms
+        );
+        assert!(
+            application
+                .associated_workflow_run(key)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        drop(application);
+        let store = state.workflow_store.lock().unwrap();
+        assert_eq!(
+            store.execution_authority("detached-run").unwrap(),
+            Some(authority)
+        );
+        assert!(!store.is_recovery_only("detached-run").unwrap());
+        drop(store);
+    }
+
     #[tokio::test]
     async fn workflow_cancellation_routes_exact_dispatch_to_runtime_owner() {
         let sessions = SessionManager::default();
