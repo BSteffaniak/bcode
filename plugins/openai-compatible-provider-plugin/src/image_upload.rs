@@ -9,6 +9,8 @@ pub fn failure_report(code: &'static str) -> VerifyImageUploadResponse {
         code,
         "image_upload_not_authorized_or_unsupported_version"
             | "image_upload_cancelled_before_dispatch"
+            | "image_upload_invalid_visual_probe"
+            | "image_upload_credentials_unavailable"
             | "image_upload_requires_api_key"
             | "image_upload_requires_responses_api"
             | "image_upload_unsupported_mime"
@@ -28,6 +30,7 @@ pub fn failure_report(code: &'static str) -> VerifyImageUploadResponse {
         diagnostic: Some(code.to_string()),
         upload_attempted: Some(!before_upload),
         expiry_confirmed: None,
+        reference_reuse_verified: None,
     }
 }
 
@@ -43,6 +46,16 @@ pub async fn verify(
     if request.schema_version != 1 || !request.allow_remote_storage {
         return Err("image_upload_not_authorized_or_unsupported_version");
     }
+    if request.visual_probe.as_ref().is_some_and(|probe| {
+        probe.model_id.trim().is_empty()
+            || probe.question.trim().is_empty()
+            || probe.expected_answer.trim().is_empty()
+            || probe.model_id.len() > 256
+            || probe.question.len() > 4096
+            || probe.expected_answer.len() > 4096
+    }) {
+        return Err("image_upload_invalid_visual_probe");
+    }
     let settings = settings_for_context(&request.provider_context);
     verify_with_settings(request, &settings, &cancellation).await
 }
@@ -52,19 +65,17 @@ async fn verify_with_settings(
     settings: &super::Settings,
     cancellation: &bcode_plugin_sdk::ServiceCancellation,
 ) -> Result<VerifyImageUploadResponse, &'static str> {
-    let AuthSettings::ApiKey(key) = &settings.auth else {
-        return Err("image_upload_requires_api_key");
+    let key = match &settings.auth {
+        AuthSettings::ApiKey(key) if !key.trim().is_empty() => key,
+        AuthSettings::ChatGpt { .. } => return Err("image_upload_requires_api_key"),
+        AuthSettings::Missing | AuthSettings::ApiKey(_) => {
+            return Err("image_upload_credentials_unavailable");
+        }
     };
     if !matches!(settings.dialect, OpenAiCompatibleDialect::ResponsesApi) {
         return Err("image_upload_requires_responses_api");
     }
-    let suffix = match request.image.mime_type.as_str() {
-        "image/png" => "png",
-        "image/jpeg" => "jpg",
-        "image/webp" => "webp",
-        "image/gif" => "gif",
-        _ => return Err("image_upload_unsupported_mime"),
-    };
+    let suffix = image_suffix(&request.image.mime_type)?;
     if request.image.data_base64.len() > LIMIT {
         return Err("image_upload_fixture_too_large");
     }
@@ -106,23 +117,23 @@ async fn verify_with_settings(
         .map_err(|()| "image_upload_receipt_unavailable_cleanup_unknown")?;
     let receipt: serde_json::Value = serde_json::from_slice(&body)
         .map_err(|_| "image_upload_receipt_invalid_cleanup_unknown")?;
-    let id = receipt
-        .get("id")
-        .and_then(serde_json::Value::as_str)
-        .filter(|id| {
-            !id.is_empty()
-                && id.len() <= 256
-                && id
-                    .bytes()
-                    .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
-        })
-        .ok_or("image_upload_id_invalid_cleanup_unknown")?;
+    let id = receipt_file_id(&receipt)?;
     let expiry_confirmed = receipt_expiry_confirmed(&receipt);
     let file_url = format!("{endpoint}/{id}");
     let retrieved = retrieve_bytes(&client, &file_url, key, bytes.len(), cancellation).await;
     let bytes_verified = retrieved
         .as_ref()
         .is_some_and(|retrieved| retrieved == &bytes);
+    let reference_reuse_verified = if let Some(probe) = &request.visual_probe {
+        Some(
+            bytes_verified
+                && expiry_confirmed
+                && verify_reference(&client, &settings.base_url, key, id, probe, cancellation)
+                    .await,
+        )
+    } else {
+        None
+    };
     let deletion_confirmed = delete_created_file(&client, &file_url, key, id)
         .await
         .unwrap_or(false);
@@ -130,6 +141,7 @@ async fn verify_with_settings(
         schema_version: 1,
         upload_attempted: Some(true),
         expiry_confirmed: Some(expiry_confirmed),
+        reference_reuse_verified,
         bytes_verified,
         deletion_confirmed,
         image_bytes: bytes.len() as u64,
@@ -141,10 +153,103 @@ async fn verify_with_settings(
             Some("image_upload_expiry_unconfirmed".to_string())
         } else if !bytes_verified {
             Some("image_upload_bytes_unverified".to_string())
+        } else if reference_reuse_verified == Some(false) {
+            Some("image_upload_reference_unverified".to_string())
         } else {
             None
         },
     })
+}
+
+fn receipt_file_id(receipt: &serde_json::Value) -> Result<&str, &'static str> {
+    receipt
+        .get("id")
+        .and_then(serde_json::Value::as_str)
+        .filter(|id| {
+            !id.is_empty()
+                && id.len() <= 256
+                && id
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+        })
+        .ok_or("image_upload_id_invalid_cleanup_unknown")
+}
+
+fn image_suffix(mime: &str) -> Result<&'static str, &'static str> {
+    match mime {
+        "image/png" => Ok("png"),
+        "image/jpeg" => Ok("jpg"),
+        "image/webp" => Ok("webp"),
+        "image/gif" => Ok("gif"),
+        _ => Err("image_upload_unsupported_mime"),
+    }
+}
+
+async fn verify_reference(
+    client: &reqwest::Client,
+    base: &str,
+    key: &str,
+    id: &str,
+    probe: &bcode_model::image_upload::UploadedImageVisualProbe,
+    cancellation: &bcode_plugin_sdk::ServiceCancellation,
+) -> bool {
+    for _ in 0..2 {
+        if cancellation.is_cancelled() {
+            return false;
+        }
+        let body = serde_json::json!({"model":probe.model_id,"store":false,"stream":false,
+            "max_output_tokens":256,"input":[{"role":"user","content":[
+                {"type":"input_text","text":probe.question},
+                {"type":"input_image","file_id":id}]}]});
+        let Ok(response) = client
+            .post(format!("{}/responses", base.trim_end_matches('/')))
+            .bearer_auth(key)
+            .json(&body)
+            .send()
+            .await
+        else {
+            return false;
+        };
+        if !response.status().is_success() {
+            return false;
+        }
+        let Ok(bytes) = bounded(response, 64 * 1024).await else {
+            return false;
+        };
+        let Ok(value) = serde_json::from_slice::<serde_json::Value>(&bytes) else {
+            return false;
+        };
+        if value.get("status").and_then(serde_json::Value::as_str) != Some("completed") {
+            return false;
+        }
+        let text = value
+            .get("output")
+            .and_then(serde_json::Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter(|item| {
+                item.get("type").and_then(serde_json::Value::as_str) == Some("message")
+                    && item.get("role").and_then(serde_json::Value::as_str) == Some("assistant")
+            })
+            .flat_map(|item| {
+                item.get("content")
+                    .and_then(serde_json::Value::as_array)
+                    .into_iter()
+                    .flatten()
+            })
+            .filter(|part| {
+                part.get("type").and_then(serde_json::Value::as_str) == Some("output_text")
+            })
+            .filter_map(|part| part.get("text").and_then(serde_json::Value::as_str))
+            .collect::<String>();
+        if !text
+            .trim()
+            .eq_ignore_ascii_case(probe.expected_answer.trim())
+        {
+            return false;
+        }
+    }
+    true
 }
 
 async fn retrieve_bytes(
@@ -252,6 +357,7 @@ mod tests {
                 metadata: bcode_model::ImageMetadata::default(),
             },
             allow_remote_storage: true,
+            visual_probe: None,
         }
     }
 
@@ -293,7 +399,7 @@ mod tests {
                 assert!(length < 2 * LIMIT);
                 let mut body = vec![0; length];
                 reader.read_exact(&mut body).expect("body");
-                if expected_path.starts_with("POST") {
+                if expected_path.starts_with("POST /files") {
                     let multipart = String::from_utf8_lossy(&body);
                     assert!(multipart.contains("name=\"purpose\""));
                     assert!(multipart.contains("vision"));
@@ -303,6 +409,13 @@ mod tests {
                         flag.store(true, std::sync::atomic::Ordering::SeqCst);
                     }
                     assert!(body.windows(3).any(|bytes| bytes == [1, 2, 3]));
+                }
+                if expected_path.starts_with("POST /responses") {
+                    let value: serde_json::Value =
+                        serde_json::from_slice(&body).expect("generation JSON");
+                    assert_eq!(value["input"][0]["content"][1]["file_id"], "file-probe");
+                    assert_eq!(value["store"], false);
+                    assert!(!String::from_utf8_lossy(&body).contains("red blue"));
                 }
                 drop(reader);
                 write!(
@@ -492,6 +605,142 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn unavailable_credentials_are_distinct_from_unsupported_auth() {
+        for auth in [AuthSettings::Missing, AuthSettings::ApiKey(String::new())] {
+            let settings =
+                super::super::tests::test_settings(auth, OpenAiCompatibleDialect::ResponsesApi);
+            let code = verify_with_settings(
+                fixture(),
+                &settings,
+                &bcode_plugin_sdk::ServiceCancellation::default(),
+            )
+            .await
+            .expect_err("missing credentials");
+            assert_eq!(code, "image_upload_credentials_unavailable");
+            assert_eq!(failure_report(code).upload_attempted, Some(false));
+        }
+    }
+
+    #[tokio::test]
+    async fn uploaded_reference_is_reused_twice_then_deleted() {
+        let answer = br#"{"status":"completed","output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"red blue"}]}]}"#.to_vec();
+        let (url, worker) = endpoint(vec![
+            (
+                "POST /files ",
+                "200 OK",
+                br#"{"id":"file-probe","created_at":100,"expires_at":3700}"#.to_vec(),
+            ),
+            ("GET /files/file-probe/content ", "200 OK", vec![1, 2, 3]),
+            ("POST /responses ", "200 OK", answer.clone()),
+            ("POST /responses ", "200 OK", answer),
+            (
+                "DELETE /files/file-probe ",
+                "200 OK",
+                br#"{"id":"file-probe","deleted":true}"#.to_vec(),
+            ),
+        ]);
+        let mut settings = super::super::tests::test_settings(
+            AuthSettings::ApiKey("test".to_string()),
+            OpenAiCompatibleDialect::ResponsesApi,
+        );
+        settings.base_url = url;
+        let mut request = fixture();
+        request.visual_probe = Some(bcode_model::image_upload::UploadedImageVisualProbe {
+            model_id: "model".to_string(),
+            question: "Name the colors.".to_string(),
+            expected_answer: "red blue".to_string(),
+        });
+        let report = verify_with_settings(
+            request,
+            &settings,
+            &bcode_plugin_sdk::ServiceCancellation::default(),
+        )
+        .await
+        .expect("report");
+        worker.join().expect("server");
+        assert_eq!(report.reference_reuse_verified, Some(true));
+        assert!(report.deletion_confirmed);
+        assert!(report.diagnostic.is_none());
+    }
+
+    #[tokio::test]
+    async fn failed_reference_generation_stops_and_deletes() {
+        for (status, response) in [
+            ("400 Bad Request", br#"{"error":"private diagnostic"}"#.to_vec()),
+            ("200 OK", br#"{"status":"incomplete","output":[]}"#.to_vec()),
+            ("200 OK", br#"{"status":"completed","output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"wrong"}]}]}"#.to_vec()),
+            ("200 OK", vec![b'x'; 64 * 1024 + 1]),
+        ] {
+            let (url, worker) = endpoint(vec![
+                ("POST /files ", "200 OK", br#"{"id":"file-probe","created_at":100,"expires_at":3700}"#.to_vec()),
+                ("GET /files/file-probe/content ", "200 OK", vec![1,2,3]),
+                ("POST /responses ", status, response),
+                ("DELETE /files/file-probe ", "200 OK", br#"{"id":"file-probe","deleted":true}"#.to_vec()),
+            ]);
+            let mut settings = super::super::tests::test_settings(AuthSettings::ApiKey("test".to_string()), OpenAiCompatibleDialect::ResponsesApi);
+            settings.base_url = url;
+            let mut request = fixture();
+            request.visual_probe = Some(bcode_model::image_upload::UploadedImageVisualProbe {
+                model_id: "model".to_string(), question: "Name the colors.".to_string(), expected_answer: "red blue".to_string(),
+            });
+            let report = verify_with_settings(request, &settings, &bcode_plugin_sdk::ServiceCancellation::default()).await.expect("report");
+            worker.join().expect("server");
+            assert_eq!(report.reference_reuse_verified, Some(false));
+            assert!(report.deletion_confirmed);
+            assert_eq!(report.diagnostic.as_deref(), Some("image_upload_reference_unverified"));
+            assert!(!serde_json::to_string(&report).expect("JSON").contains("private diagnostic"));
+        }
+    }
+
+    #[tokio::test]
+    async fn invalid_upload_prerequisites_skip_generation_and_still_delete() {
+        for (receipt, bytes, diagnostic) in [
+            (
+                br#"{"id":"file-probe"}"#.to_vec(),
+                vec![1, 2, 3],
+                "image_upload_expiry_unconfirmed",
+            ),
+            (
+                br#"{"id":"file-probe","created_at":100,"expires_at":3700}"#.to_vec(),
+                vec![3, 2, 1],
+                "image_upload_bytes_unverified",
+            ),
+        ] {
+            let (url, worker) = endpoint(vec![
+                ("POST /files ", "200 OK", receipt),
+                ("GET /files/file-probe/content ", "200 OK", bytes),
+                (
+                    "DELETE /files/file-probe ",
+                    "200 OK",
+                    br#"{"id":"file-probe","deleted":true}"#.to_vec(),
+                ),
+            ]);
+            let mut settings = super::super::tests::test_settings(
+                AuthSettings::ApiKey("test".to_string()),
+                OpenAiCompatibleDialect::ResponsesApi,
+            );
+            settings.base_url = url;
+            let mut request = fixture();
+            request.visual_probe = Some(bcode_model::image_upload::UploadedImageVisualProbe {
+                model_id: "model".to_string(),
+                question: "Name the colors.".to_string(),
+                expected_answer: "red blue".to_string(),
+            });
+            let report = verify_with_settings(
+                request,
+                &settings,
+                &bcode_plugin_sdk::ServiceCancellation::default(),
+            )
+            .await
+            .expect("report");
+            worker.join().expect("server");
+            assert!(report.deletion_confirmed);
+            assert_eq!(report.reference_reuse_verified, Some(false));
+            assert_eq!(report.diagnostic.as_deref(), Some(diagnostic));
+        }
+    }
+
+    #[tokio::test]
     async fn cancellation_before_dispatch_has_no_remote_outcome() {
         let flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
         let cancellation = bcode_plugin_sdk::ServiceCancellation::new(flag);
@@ -513,6 +762,7 @@ mod tests {
                 metadata: bcode_model::ImageMetadata::default(),
             },
             allow_remote_storage: false,
+            visual_probe: None,
         };
         assert_eq!(
             verify(

@@ -15,6 +15,20 @@ pub struct VerifyImageUploadRequest {
     pub image: crate::ImageContent,
     /// Explicit authorization to create and delete a remote file for this probe.
     pub allow_remote_storage: bool,
+    /// Optional bounded visual generation check using the uploaded reference twice.
+    #[serde(default)]
+    pub visual_probe: Option<UploadedImageVisualProbe>,
+}
+
+/// Explicitly requested visual verification; expected answer never enters generation requests.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UploadedImageVisualProbe {
+    /// Catalog-resolved target model.
+    pub model_id: String,
+    /// Question about the single uploaded image.
+    pub question: String,
+    /// Withheld exact answer, trimmed and ASCII-case-insensitive.
+    pub expected_answer: String,
 }
 
 /// Secret-safe lifecycle observation. No file ID or URL leaves provider ownership.
@@ -37,4 +51,7 @@ pub struct VerifyImageUploadResponse {
     /// Absent means unverified, including reports from older implementations.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub expiry_confirmed: Option<bool>,
+    /// Two correct visual responses using the same file ID; absent means not requested.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reference_reuse_verified: Option<bool>,
 }

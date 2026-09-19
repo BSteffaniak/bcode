@@ -210,6 +210,19 @@ crash recovery; loss of the process can still leave cleanup unknown.
 `--allow-remote-storage` authorizes one generated-image probe using the configured provider;
 `--generated-seed` selects its fixture. The command fails unless both exact bytes and deletion
 are verified. It never accepts caller-supplied remote IDs and never uploads local user files.
+The typed operation additionally accepts an optional `visual_probe` (resolved model, question,
+withheld answer). It sends two bounded, nonstreaming Responses requests using the same file ID,
+with `store=false`, then deletes the file even if reference verification fails. Only assistant
+output text in completed responses is judged. Local HTTP tests verify repeated file-ID use,
+withheld answers, and deletion. Failure tests cover HTTP rejection, incomplete generation,
+wrong answers, and oversized responses; each stops before a second generation and still deletes
+the created file without exposing upstream diagnostics. `reference_reuse_verified` is absent when
+not requested. Add `--verify-reference` to the upload CLI to authorize the two model requests
+using the configured model and the first generated image's withheld answer. Storage-only remains
+the default; dry-run prints both upload and generation budgets. The command requires successful
+reference verification when requested, in addition to bytes, expiry, and cleanup. This probe
+currently has no no-image negative control, so visual correctness alone is not proof of use.
+
 The operation is not wired into normal generation. It does not implement
 session reference reuse, durable recovery, cancellation reconciliation, or live-tested cleanup.
 Authorization/version tests and local HTTP lifecycle tests pass. The HTTP tests verify multipart
@@ -225,6 +238,13 @@ Report: `/tmp/astra-upload-probe.json`. The authorized `grok-4-6.toml` upload in
 returned `image_upload_requires_api_key` and `upload_attempted = false` (`/tmp/xai-upload-probe.json`).
 Its declared auth scheme is API-key, so this is unresolved credential availability/resolution,
 not evidence that the remote file endpoint lacks support. No remote upload was dispatched.
+The adapter now distinguishes missing/empty credentials (`image_upload_credentials_unavailable`)
+from subscription credentials (`image_upload_requires_api_key`); both are pre-dispatch failures.
+The historical xAI report predates this diagnostic distinction and has not been rerun.
+A subsequent supported auth-status check (`BCODE_CONFIG=.../grok-4-6.toml bcode auth status xai
+--profile xai`) reported `Configured: true`, `Available: false`, and
+`auth_vault_profile_missing`: profile `xai` does not exist. The reported remediation is provider
+login. No vault contents were read directly and no alternate credentials were substituted.
 
 ## Opt-in request compression
 

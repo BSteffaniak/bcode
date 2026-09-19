@@ -6010,6 +6010,9 @@ enum ModelCommand {
 
 #[derive(Debug, clap::Args)]
 struct VerifyImageUploadArgs {
+    /// Also make two model requests using the uploaded reference (may incur model charges).
+    #[arg(long)]
+    verify_reference: bool,
     /// Authorize creation/deletion of one generated remote fixture file.
     #[arg(long, required_unless_present = "dry_run")]
     allow_remote_storage: bool,
@@ -12683,10 +12686,12 @@ fn verify_image_upload(args: &VerifyImageUploadArgs) -> Result<(), CliError> {
         allow_remote_storage,
         dry_run,
         generated_seed: seed,
+        verify_reference,
     } = *args;
     if dry_run {
         return print_json(&serde_json::json!({"schema_version": 1, "dry_run": true,
             "operation": "verify_image_upload", "maximum_uploads": 1,
+            "maximum_generations": if verify_reference { 2 } else { 0 },
             "cleanup": "delete only the created file; expiry requested as a backstop"}));
     }
     if !allow_remote_storage {
@@ -12703,6 +12708,17 @@ fn verify_image_upload(args: &VerifyImageUploadArgs) -> Result<(), CliError> {
         .ok_or_else(|| CliError::PluginCli("no provider configured".to_string()))?;
     let mut context = configured_provider_context(&config);
     bcode_provider_auth::auth_pool_routing::apply_auth_pool_selection(&mut context);
+    let visual_probe = if verify_reference {
+        Some(bcode_model::image_upload::UploadedImageVisualProbe {
+            model_id: config.resolved_model_selection().selected_model_id
+                .filter(|id| !id.trim().is_empty())
+                .ok_or_else(|| CliError::PluginCli("reference verification requires a configured model".to_string()))?,
+            question: "Name the left then right panel color in this image. Reply only with two lowercase color names separated by a single space.".to_string(),
+            expected_answer: fixture.expected_answer.split_whitespace().take(2).collect::<Vec<_>>().join(" "),
+        })
+    } else {
+        None
+    };
     let request = bcode_model::image_upload::VerifyImageUploadRequest {
         schema_version: 1,
         provider_context: context,
@@ -12712,6 +12728,7 @@ fn verify_image_upload(args: &VerifyImageUploadArgs) -> Result<(), CliError> {
             .next()
             .ok_or_else(|| CliError::PluginCli("empty fixture".to_string()))?,
         allow_remote_storage,
+        visual_probe,
     };
     let mut host = load_cli_plugin_host()?;
     let response = host
@@ -12736,6 +12753,7 @@ fn verify_image_upload(args: &VerifyImageUploadArgs) -> Result<(), CliError> {
     print_json(&response)?;
     if response.bytes_verified
         && response.deletion_confirmed
+        && (!verify_reference || response.reference_reuse_verified == Some(true))
         && response.expiry_confirmed == Some(true)
         && response.diagnostic.is_none()
     {
