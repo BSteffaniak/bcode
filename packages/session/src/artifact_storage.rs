@@ -12,7 +12,7 @@ use std::io::{self, Read as _, Seek as _, SeekFrom};
 use std::path::{Path, PathBuf};
 
 #[cfg(unix)]
-mod confined;
+pub(crate) mod confined;
 
 const PAYLOAD: &str = "content.v1.zstd";
 

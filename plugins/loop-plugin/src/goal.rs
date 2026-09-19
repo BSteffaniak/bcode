@@ -11,7 +11,11 @@ struct GeneratedGoalPrompts {
     stop_condition: String,
 }
 
-fn generation_request(objective: &str, guidance: &str) -> PluginStructuredGenerationRequest {
+fn generation_request(
+    objective: &str,
+    guidance: &str,
+    progress_document: bool,
+) -> PluginStructuredGenerationRequest {
     PluginStructuredGenerationRequest {
         session_name: "Goal prompt generation".into(),
         system_prompt: [
@@ -20,7 +24,7 @@ fn generation_request(objective: &str, guidance: &str) -> PluginStructuredGenera
             include_str!("../prompts/goal-stop-condition-guidance.md"),
         ]
         .join("\n\n"),
-        prompt: serde_json::json!({"objective": objective, "additional_guidance": guidance})
+        prompt: serde_json::json!({"objective": objective, "additional_guidance": guidance, "progress_document_enabled": progress_document, "progress_document_guidance": if progress_document { include_str!("../prompts/goal-progress-document.md") } else { "No progress document. Do not instruct creation of one." }})
             .to_string(),
         output_name: "goal_loop_prompts".into(),
         output_schema: serde_json::json!({
@@ -57,6 +61,127 @@ fn decode_prompts(
         format!("{prefix}{}", generated.stop_condition),
         limit,
     )
+}
+
+#[derive(Default)]
+pub struct ProgressDocumentSetup {
+    objective: String,
+    guidance: String,
+    pub path: Option<String>,
+}
+
+impl ProgressDocumentSetup {
+    pub fn request(
+        &self,
+        session_id: SessionId,
+        run_id: &str,
+    ) -> bcode_session_models::SessionWorkingDocumentRequest {
+        let source =
+            serde_json::json!({"objective": self.objective, "additional_guidance": self.guidance});
+        bcode_session_models::SessionWorkingDocumentRequest {
+            version: 1,
+            session_id,
+            scope_id: run_id.into(),
+            initial_text: Some(format!(
+                "{}\n## Identity\nSession: {session_id}\nWorkflow run: {run_id}\n\n## Original objective and guidance\n```json\n{source}\n```\n",
+                include_str!("../prompts/goal-progress-template.md")
+            )),
+        }
+    }
+}
+
+pub fn attach_document(
+    request: &mut PluginWorkflowStartRequest,
+    document: &bcode_session_models::SessionWorkingDocument,
+) -> Result<(), String> {
+    if request.run_id.as_deref() != Some(document.scope_id.as_str())
+        || request.parent_session_id != document.session_id
+    {
+        return Err("working document owner does not match loop".into());
+    }
+    let path = serde_json::to_string(&document.path).map_err(|e| e.to_string())?;
+    let mut input: LoopWorkflowIteration =
+        serde_json::from_value(request.input.clone()).map_err(|e| e.to_string())?;
+    input.implementation_prompt = format!(
+        "{}\n\nLiving progress document path (JSON string): {path}\n{}",
+        input.implementation_prompt,
+        include_str!("../prompts/goal-progress-document.md")
+    );
+    input.stop_condition = format!(
+        "{}\n\nRead the living progress document at this path (JSON string): {path}. Use its phases, checkboxes, decisions and evidence to locate remaining work. Independently verify claims against the original objective and current state. Checked boxes or a Done heading are not proof. Do not edit the document; report discrepancies through the normal evaluation result. Missing or unreadable notes are an explicit verification gap, not success.",
+        input.stop_condition
+    );
+    LoopWorkflowInput::new(
+        input.implementation_prompt.clone(),
+        input.stop_condition.clone(),
+        u64::from(input.max_iterations),
+    )?;
+    request.input = serde_json::to_value(input).map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+pub fn progress_status(session_id: SessionId) -> InvokeCommandResponse {
+    let result = run_async(async move {
+        let client = BcodeClient::default_endpoint();
+        let Some(run) = client
+            .associated_workflow_run(workflow_binding_key(session_id))
+            .await?
+        else {
+            return Ok("No associated loop".into());
+        };
+        let mut status = format_workflow_status(&run);
+        match client
+            .session_working_document(bcode_session_models::SessionWorkingDocumentRequest {
+                version: 1,
+                session_id,
+                scope_id: run.run_id,
+                initial_text: None,
+            })
+            .await?
+        {
+            Some(document) => {
+                let _ = write!(
+                    status,
+                    "\nProgress document: {} · /goal.progress to read",
+                    document.path
+                );
+            }
+            None => status.push_str("\nNo progress document"),
+        }
+        Ok(status)
+    });
+    match result {
+        Ok(status) => status_response(&status),
+        Err(error) => status_response(&format!("Goal status unavailable: {error}")),
+    }
+}
+
+pub fn progress_response(session_id: SessionId) -> InvokeCommandResponse {
+    let result = run_async(async move {
+        let client = BcodeClient::default_endpoint();
+        let Some(run) = client
+            .associated_workflow_run(workflow_binding_key(session_id))
+            .await?
+        else {
+            return Ok(None);
+        };
+        client
+            .session_working_document(bcode_session_models::SessionWorkingDocumentRequest {
+                version: 1,
+                session_id,
+                scope_id: run.run_id,
+                initial_text: None,
+            })
+            .await
+    });
+    match result {
+        Ok(Some(document)) => status_response(&format!(
+            "Progress document: {}\n\n{}",
+            document.path, document.text
+        )),
+        Ok(None) => status_response("No progress document for the associated loop"),
+        Err(error) => status_response(&format!("Progress document unavailable: {error}")),
+    }
 }
 
 pub struct GoalSurfaceFactory;
@@ -96,6 +221,7 @@ impl GoalSurface {
     fn new(session: Option<SessionId>) -> Self {
         let mut editor = LoopSurface::new(session);
         editor.setup_kind = SetupKind::Goal;
+        editor.progress_document = Some(ProgressDocumentSetup::default());
         editor.limit = text_state("");
         Self {
             editor,
@@ -136,10 +262,18 @@ impl GoalSurface {
                 return PluginTuiAction::Redraw;
             }
         };
+        if let Some(setup) = &mut self.editor.progress_document {
+            setup.objective.clone_from(&objective);
+            setup.guidance.clone_from(&guidance);
+        }
         self.source = Some((objective.clone(), guidance.clone(), limit));
         self.phase = GoalPhase::Generating { review };
         self.editor.status = "Generating loop prompts… Esc closes without launching".into();
-        let future = host.generate_structured_output(generation_request(&objective, &guidance));
+        let future = host.generate_structured_output(generation_request(
+            &objective,
+            &guidance,
+            self.editor.progress_document.is_some(),
+        ));
         let completion = Arc::clone(&self.completion);
         host.spawn(Box::pin(async move {
             *completion.lock().expect("goal generation completion") =
@@ -215,6 +349,14 @@ impl PluginTuiSurface for GoalSurface {
                 return PluginTuiAction::Close { outcome: None };
             }
             if self.phase == GoalPhase::Draft {
+                if stroke.modifiers.ctrl && stroke.key == KeyCode::Char('p') {
+                    self.editor.progress_document = if self.editor.progress_document.is_some() {
+                        None
+                    } else {
+                        Some(ProgressDocumentSetup::default())
+                    };
+                    return PluginTuiAction::Redraw;
+                }
                 if stroke.modifiers.ctrl && stroke.key == KeyCode::Char('r') {
                     return self.generate(host, true);
                 }
@@ -241,6 +383,7 @@ mod tests {
     struct Host {
         tasks: Mutex<Vec<bcode_plugin_sdk::tui::PluginTask>>,
         starts: Mutex<Vec<PluginWorkflowStartRequest>>,
+        documents: Mutex<Vec<bcode_session_models::SessionWorkingDocumentRequest>>,
         generations: Mutex<usize>,
     }
     impl PluginTuiHost for Host {
@@ -258,6 +401,20 @@ mod tests {
                 Ok(
                     serde_json::json!({"implementation_prompt":"Implement", "stop_condition":"Verify"}),
                 )
+            })
+        }
+        fn session_working_document(
+            &self,
+            request: bcode_session_models::SessionWorkingDocumentRequest,
+        ) -> bcode_plugin_sdk::tui::PluginWorkingDocumentFuture {
+            self.documents.lock().unwrap().push(request.clone());
+            Box::pin(async move {
+                Ok(Some(bcode_session_models::SessionWorkingDocument {
+                    session_id: request.session_id,
+                    scope_id: request.scope_id,
+                    path: "/state/session/progress.md".into(),
+                    text: request.initial_text.unwrap_or_default(),
+                }))
             })
         }
         fn associated_workflow(
@@ -300,11 +457,94 @@ mod tests {
         surface.poll(&host);
         surface.editor.start();
         surface.editor.begin_pending_host_work(&host);
+        host.finish().await;
+        surface.poll(&host);
+        surface.poll(&host);
         let starts = host.starts.lock().unwrap();
         assert_eq!(starts.len(), 1);
         assert_eq!(starts[0].limits.cycle_cap, 20);
+        let document_requests = host.documents.lock().unwrap();
+        assert_eq!(document_requests.len(), 1);
+        assert_eq!(
+            starts[0].run_id.as_deref(),
+            Some(document_requests[0].scope_id.as_str())
+        );
+        assert!(
+            document_requests[0]
+                .initial_text
+                .as_ref()
+                .unwrap()
+                .contains("- [ ]")
+        );
+        assert!(
+            starts[0].input["implementation_prompt"]
+                .as_str()
+                .unwrap()
+                .contains("/state/session/progress.md")
+        );
+        drop(document_requests);
         drop(starts);
         assert_eq!(input_text(&surface.editor.limit), "20");
+    }
+
+    #[tokio::test]
+    async fn failed_preparation_retries_same_run_without_launching() {
+        let host = Host::default();
+        let mut surface = GoalSurface::new(Some(SessionId::new()));
+        surface.editor.prompt = text_state("goal");
+        surface.generate(&host, false);
+        host.finish().await;
+        surface.poll(&host);
+        host.finish().await;
+        {
+            let mut completions = surface.editor.completions.lock().unwrap();
+            for completion in completions.iter_mut() {
+                if let LoopSurfaceCompletion::DocumentPrepared { result, .. } = completion {
+                    *result = Err(bcode_plugin_sdk::tui::PluginTuiHostError::Internal(
+                        "unavailable".into(),
+                    ));
+                }
+            }
+        }
+        surface.poll(&host);
+        assert!(host.starts.lock().unwrap().is_empty());
+        surface.editor.start();
+        surface.editor.begin_pending_host_work(&host);
+        host.finish().await;
+        surface.poll(&host);
+        surface.poll(&host);
+        let requests = host.documents.lock().unwrap();
+        assert_eq!(requests.len(), 2);
+        assert_eq!(requests[0].scope_id, requests[1].scope_id);
+        drop(requests);
+        assert_eq!(host.starts.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn disabled_document_does_not_prepare_storage() {
+        let host = Host::default();
+        let mut surface = GoalSurface::new(Some(SessionId::new()));
+        surface.editor.progress_document = None;
+        surface.editor.prompt = text_state("goal");
+        surface.generate(&host, false);
+        host.finish().await;
+        surface.poll(&host);
+        assert!(host.documents.lock().unwrap().is_empty());
+        assert_eq!(host.starts.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn closing_during_document_preparation_never_launches() {
+        let host = Host::default();
+        let mut surface = GoalSurface::new(Some(SessionId::new()));
+        surface.editor.prompt = text_state("goal");
+        surface.generate(&host, false);
+        host.finish().await;
+        surface.poll(&host);
+        surface.phase = GoalPhase::Closed;
+        host.finish().await;
+        surface.poll(&host);
+        assert!(host.starts.lock().unwrap().is_empty());
     }
 
     #[tokio::test]
@@ -319,6 +559,9 @@ mod tests {
         surface.editor.prompt = text_state("edited implementation");
         surface.editor.start();
         surface.editor.begin_pending_host_work(&host);
+        host.finish().await;
+        surface.poll(&host);
+        surface.poll(&host);
         assert_eq!(host.starts.lock().unwrap().len(), 1);
 
         let host = Host::default();

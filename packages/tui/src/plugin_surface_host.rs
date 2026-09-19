@@ -280,6 +280,19 @@ impl PluginTuiHost for BcodePluginTuiHost {
         })
     }
 
+    fn session_working_document(
+        &self,
+        request: bcode_session_models::SessionWorkingDocumentRequest,
+    ) -> bcode_plugin_sdk::tui::PluginWorkingDocumentFuture {
+        let client = self.client.clone();
+        Box::pin(async move {
+            client
+                .session_working_document(request)
+                .await
+                .map_err(|error| PluginTuiHostError::Internal(error.to_string()))
+        })
+    }
+
     fn generate_structured_output(
         &self,
         request: PluginStructuredGenerationRequest,

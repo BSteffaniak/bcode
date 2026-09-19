@@ -1031,6 +1031,10 @@ pub enum Request {
     },
     /// Inspect effective model catalog and refresh state.
     ModelCatalogDiagnostics,
+    /// Explicitly prepare or inspect a bounded mutable session working document.
+    SessionWorkingDocument {
+        request: bcode_session_models::SessionWorkingDocumentRequest,
+    },
     /// Read a bounded byte range from a generic session artifact reference.
     ReadSessionArtifact {
         session_id: SessionId,
@@ -2255,6 +2259,9 @@ pub enum ResponsePayload {
     /// Effective model catalog diagnostics.
     ModelCatalogDiagnostics {
         diagnostics: ModelCatalogDiagnostics,
+    },
+    SessionWorkingDocument {
+        document: Option<bcode_session_models::SessionWorkingDocument>,
     },
     SessionArtifactRange {
         range: SessionArtifactRange,

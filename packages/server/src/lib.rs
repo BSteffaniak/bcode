@@ -5399,6 +5399,7 @@ fn request_metrics_context(
 const fn request_session_id(request: &Request) -> Option<SessionId> {
     match request {
         Request::SessionCompress { request } => Some(request.session_id),
+        Request::SessionWorkingDocument { request } => Some(request.session_id),
         Request::SessionAdmission { session_id, .. }
         | Request::RenameSession { session_id, .. }
         | Request::DeleteSession { session_id }
@@ -5463,6 +5464,7 @@ const fn request_kind(request: &Request) -> &'static str {
         Request::SessionCompatibilityInventory { .. } => "session_compatibility_inventory",
         Request::RenameSession { .. } => "rename_session",
         Request::DeleteSession { .. } => "delete_session",
+        Request::SessionWorkingDocument { .. } => "session_working_document",
         Request::ReadSessionArtifact { .. } => "read_session_artifact",
         Request::InvocationInput { .. } => "invocation_input",
         Request::SessionHistory { .. } => "session_history",
@@ -5964,6 +5966,9 @@ async fn handle_request_inner(
         }
         SessionLifecycleRequest::DeleteSession { session_id } => {
             handle_delete_session(request_id, state, writer, session_id).await
+        }
+        SessionLifecycleRequest::SessionWorkingDocument(request) => {
+            Box::pin(handle_working_document(request_id, state, writer, request)).await
         }
         SessionLifecycleRequest::ReadSessionArtifact {
             session_id,
@@ -11211,6 +11216,43 @@ async fn handle_invocation_input(
 }
 
 use bcode_session_models::MAX_SESSION_ARTIFACT_RANGE_BYTES as MAX_ARTIFACT_RANGE_BYTES;
+
+async fn handle_working_document(
+    request_id: u64,
+    state: &Arc<ServerState>,
+    writer: &SharedWriter,
+    request: bcode_session_models::SessionWorkingDocumentRequest,
+) -> Result<(), ServerError> {
+    if let Some(response) = ambiguous_session_location_response(state, request.session_id).await {
+        return send_response(writer, request_id, response).await;
+    }
+    let result = async {
+        let ownership = state
+            .sessions
+            .acquire_session_ownership(
+                request.session_id,
+                bcode_session::SessionOwnershipKind::RuntimeWork,
+            )
+            .await
+            .map_err(|_| ())?;
+        let root = state.sessions.session_store_root().ok_or(())?;
+        tokio::task::spawn_blocking(move || {
+            let _ownership = ownership;
+            bcode_session::working_document::access(&root, &request).map_err(|_| ())
+        })
+        .await
+        .map_err(|_| ())?
+    }
+    .await;
+    let response = match result {
+        Ok(document) => Response::Ok(ResponsePayload::SessionWorkingDocument { document }),
+        Err(()) => Response::Err(ErrorResponse::new(
+            "working_document_unavailable",
+            "Working document unavailable: check session ownership, contract version, size and confined storage",
+        )),
+    };
+    send_response(writer, request_id, response).await
+}
 
 #[allow(clippy::too_many_arguments)]
 async fn handle_read_session_artifact(

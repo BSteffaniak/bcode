@@ -283,6 +283,19 @@ pub struct PluginWorkflowAuthoringRevision {
     pub document: bcode_workflow::WorkflowAuthoringDocument,
 }
 
+/// Bounded session working-document operation result.
+pub type PluginWorkingDocumentFuture = Pin<
+    Box<
+        dyn Future<
+                Output = Result<
+                    Option<bcode_session_models::SessionWorkingDocument>,
+                    PluginTuiHostError,
+                >,
+            > + Send
+            + 'static,
+    >,
+>;
+
 /// Bounded renderer-neutral request for one tool-free structured model generation.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -710,6 +723,18 @@ pub trait PluginTuiHost: Send + Sync {
         Box::pin(async {
             Err(PluginTuiHostError::Unsupported(
                 "workflow launch detail is not available from this host".to_string(),
+            ))
+        })
+    }
+
+    /// Explicitly prepare or inspect a confined, mutable session working document.
+    fn session_working_document(
+        &self,
+        _request: bcode_session_models::SessionWorkingDocumentRequest,
+    ) -> PluginWorkingDocumentFuture {
+        Box::pin(async {
+            Err(PluginTuiHostError::Unsupported(
+                "session working documents are unavailable".into(),
             ))
         })
     }

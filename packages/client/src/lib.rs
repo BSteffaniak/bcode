@@ -2920,6 +2920,23 @@ impl BcodeClient {
         }
     }
 
+    /// Prepare or inspect one session-owned mutable working document.
+    ///
+    /// # Errors
+    /// Returns transport, ownership, version, confinement or storage errors.
+    pub async fn session_working_document(
+        &self,
+        request: bcode_session_models::SessionWorkingDocumentRequest,
+    ) -> Result<Option<bcode_session_models::SessionWorkingDocument>, ClientError> {
+        match self
+            .send_request(Request::SessionWorkingDocument { request })
+            .await?
+        {
+            ResponsePayload::SessionWorkingDocument { document } => Ok(document),
+            _ => Err(ClientError::UnexpectedResponse),
+        }
+    }
+
     /// Submit an ordinary turn with generic admission metadata.
     ///
     /// # Errors

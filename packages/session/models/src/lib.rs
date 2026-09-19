@@ -31,6 +31,11 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use uuid::Uuid;
 
 mod storage_admission;
+pub mod working_document;
+pub use working_document::{
+    MAX_WORKING_DOCUMENT_BYTES, SessionWorkingDocument, SessionWorkingDocumentRequest,
+};
+
 pub use storage_admission::StorageAdmissionReport;
 mod storage_compression;
 pub use storage_compression::*;

@@ -127,6 +127,7 @@ pub enum SessionLifecycleRequest {
         session_id: SessionId,
     },
     /// Read a bounded byte range from a generic session artifact reference.
+    SessionWorkingDocument(bcode_session_models::SessionWorkingDocumentRequest),
     ReadSessionArtifact {
         session_id: SessionId,
         artifact_id: String,
@@ -1713,6 +1714,9 @@ impl RoutedRequest {
             Request::ModelCatalogDiagnostics => {
                 Self::SessionLifecycle(Box::new(SessionLifecycleRequest::ModelCatalogDiagnostics))
             }
+            Request::SessionWorkingDocument { request } => Self::SessionLifecycle(Box::new(
+                SessionLifecycleRequest::SessionWorkingDocument(request),
+            )),
             Request::ReadSessionArtifact {
                 session_id,
                 artifact_id,

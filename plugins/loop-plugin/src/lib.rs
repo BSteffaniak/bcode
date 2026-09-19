@@ -106,6 +106,11 @@ impl RustPlugin for LoopPlugin {
 
 fn commands() -> Vec<CommandContribution> {
     vec![
+        session_command(
+            "goal.progress",
+            "Goal Progress",
+            "Read the session loop's living progress document",
+        ),
         session_command("goal", "Goal", "Generate loop prompts from a goal"),
         session_command("goal.status", "Goal Status", "Show the session loop status"),
         session_command("goal.pause", "Pause Goal", "Pause the session loop"),
@@ -436,7 +441,6 @@ fn command_response(request: &InvokeCommandRequest) -> ServiceResponse {
     let session_id = command_session_id(request);
     let arguments = request.args.get("arguments").map_or("", String::as_str);
     let command_id = match request.command_id.as_str() {
-        "goal.status" => STATUS_COMMAND,
         "goal.pause" => PAUSE_COMMAND,
         "goal.resume" => RESUME_COMMAND,
         "goal.stop" => STOP_COMMAND,
@@ -444,6 +448,14 @@ fn command_response(request: &InvokeCommandRequest) -> ServiceResponse {
         other => other,
     };
     let response = match command_id {
+        "goal.status" => session_id.map_or_else(
+            || missing_enforced_session_response(STATUS_COMMAND),
+            goal::progress_status,
+        ),
+        "goal.progress" => session_id.map_or_else(
+            || missing_enforced_session_response("goal.progress"),
+            goal::progress_response,
+        ),
         "goal" => InvokeCommandResponse {
             success: true,
             message: None,
@@ -633,6 +645,13 @@ enum LoopSurfaceCompletion {
             bcode_plugin_sdk::tui::PluginTuiHostError,
         >,
     },
+    DocumentPrepared {
+        request: Box<PluginWorkflowStartRequest>,
+        result: Result<
+            Option<bcode_session_models::SessionWorkingDocument>,
+            bcode_plugin_sdk::tui::PluginTuiHostError,
+        >,
+    },
     /// The existing loop was asked to cancel so a replacement loop can start.
     ReplaceCancel(
         Result<
@@ -676,6 +695,7 @@ struct LoopSurface {
     limit_area: Rect,
     setup_kind: SetupKind,
     launch_state: LaunchState,
+    progress_document: Option<goal::ProgressDocumentSetup>,
     theme: Option<PluginTuiTheme>,
 }
 
@@ -701,6 +721,7 @@ impl LoopSurface {
             limit_area: Rect::new(0, 0, 0, 0),
             setup_kind: SetupKind::Loop,
             launch_state: LaunchState::Ready,
+            progress_document: None,
             theme: None,
         }
     }
@@ -893,6 +914,25 @@ impl LoopSurface {
         };
         let completion = Arc::clone(&self.completions);
         self.launch_state = LaunchState::InFlight;
+        if let Some(setup) = &self.progress_document
+            && setup.path.is_none()
+        {
+            let future = host.session_working_document(setup.request(
+                request.parent_session_id,
+                request.run_id.as_deref().expect("loop run identity"),
+            ));
+            host.spawn(Box::pin(async move {
+                let result = future.await;
+                completion
+                    .lock()
+                    .expect("loop surface completion lock")
+                    .push(LoopSurfaceCompletion::DocumentPrepared {
+                        request: Box::new(request),
+                        result,
+                    });
+            }));
+            return;
+        }
         let future = host.start_workflow(request.clone());
         host.spawn(Box::pin(async move {
             let result = future.await;
@@ -906,6 +946,34 @@ impl LoopSurface {
         }));
     }
 
+    fn apply_document_prepared(
+        &mut self,
+        mut request: PluginWorkflowStartRequest,
+        result: Result<
+            Option<bcode_session_models::SessionWorkingDocument>,
+            bcode_plugin_sdk::tui::PluginTuiHostError,
+        >,
+    ) {
+        self.launch_state = LaunchState::Ready;
+        let prepared = result
+            .map_err(|error| error.to_string())
+            .and_then(|document| document.ok_or_else(|| "working document was not created".into()))
+            .and_then(|document| goal::attach_document(&mut request, &document).map(|()| document));
+        match prepared {
+            Ok(document) => {
+                if let Some(setup) = &mut self.progress_document {
+                    setup.path = Some(document.path);
+                }
+                self.pending_workflow_start = Some(request);
+            }
+            Err(error) => {
+                self.failed_workflow_start = Some(request);
+                self.status =
+                    format!("Progress document preparation failed: {error}; submit to retry");
+            }
+        }
+    }
+
     fn apply_completions(&mut self) -> PluginTuiAction {
         let completions = {
             let mut pending = self
@@ -917,6 +985,10 @@ impl LoopSurface {
         let mut action = PluginTuiAction::None;
         for completion in completions {
             match completion {
+                LoopSurfaceCompletion::DocumentPrepared { request, result } => {
+                    self.apply_document_prepared(*request, result);
+                    action = PluginTuiAction::Redraw;
+                }
                 LoopSurfaceCompletion::WorkflowLookup(result) => {
                     self.active_workflow = result.unwrap_or_else(|error| {
                         self.status = format!("failed to inspect active loop: {error}");
@@ -936,6 +1008,7 @@ impl LoopSurface {
                             outcome: Some(serde_json::json!({
                                 "status": "loop started through durable workflow runtime",
                                 "append_text": "Loop started. Use /loop status, /loop stop, or /loop resume.",
+                                "progress_document": self.progress_document.as_ref().and_then(|setup| setup.path.as_ref()),
                                 "run_id": started.run_id,
                                 "runtime_work_id": started.runtime_work_id,
                             })),
@@ -1114,12 +1187,17 @@ impl PluginTuiSurface for LoopSurface {
                 )
             },
         );
+        let goal_title = if self.progress_document.is_some() {
+            " Goal · Ctrl+P: [x] progress doc · Ctrl+R: review "
+        } else {
+            " Goal · Ctrl+P: [ ] progress doc · Ctrl+R: review "
+        };
         let modal = ModalFrame::new(
             ModalSizing::new(Size::new(64, 22), Size::new(100, 32), Insets::all(2)),
             modal_theme,
         )
         .title(if self.setup_kind == SetupKind::Goal {
-            " Start goal · Ctrl+R: generate and review "
+            goal_title
         } else {
             " Start deterministic loop "
         })
@@ -1983,7 +2061,7 @@ mod tests {
     #[test]
     fn commands_cover_the_loop_lifecycle() {
         let commands = commands();
-        assert_eq!(commands.len(), 12);
+        assert_eq!(commands.len(), 13);
         assert!(commands.iter().all(|command| {
             command.execution == bcode_command::CommandExecution::Immediate
                 && command.surfaces.contains(&CommandSurface::Slash)

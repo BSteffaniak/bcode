@@ -60,6 +60,7 @@ mod store_executor;
 mod subscription;
 mod tools;
 mod usage;
+pub mod working_document;
 
 use actor::{AttachMode, SessionHandle};
 pub use actor::{
