@@ -17,6 +17,7 @@ fn generation_request(
     progress_document: bool,
 ) -> PluginStructuredGenerationRequest {
     PluginStructuredGenerationRequest {
+        source_session_id: None,
         session_name: "Goal prompt generation".into(),
         system_prompt: [
             include_str!("../prompts/goal-generation.md"),
@@ -29,8 +30,10 @@ fn generation_request(
         output_name: "goal_loop_prompts".into(),
         output_schema: serde_json::json!({
             "type": "object", "additionalProperties": false,
-            "required": ["implementation_prompt", "stop_condition"],
+            "required": ["outcome", "clarification", "implementation_prompt", "stop_condition"],
             "properties": {
+                "outcome": {"type": "string", "enum": ["ready", "clarification_required"]},
+                "clarification": {"type": "string", "maxLength": 4096},
                 "implementation_prompt": {"type": "string", "minLength": 1, "maxLength": MAX_PROMPT_BYTES},
                 "stop_condition": {"type": "string", "minLength": 1, "maxLength": MAX_PROMPT_BYTES}
             }
@@ -68,6 +71,7 @@ pub struct ProgressDocumentSetup {
     objective: String,
     guidance: String,
     pub path: Option<String>,
+    context: Option<bcode_session_models::SessionDerivationSourceSnapshot>,
 }
 
 impl ProgressDocumentSetup {
@@ -76,8 +80,7 @@ impl ProgressDocumentSetup {
         session_id: SessionId,
         run_id: &str,
     ) -> bcode_session_models::SessionWorkingDocumentRequest {
-        let source =
-            serde_json::json!({"objective": self.objective, "additional_guidance": self.guidance});
+        let source = serde_json::json!({"objective": self.objective, "additional_guidance": self.guidance, "source_context": self.context});
         bcode_session_models::SessionWorkingDocumentRequest {
             version: 1,
             session_id,
@@ -201,7 +204,7 @@ impl PluginTuiSurfaceFactory for GoalSurfaceFactory {
     }
 }
 
-type GenerationResult = Result<serde_json::Value, String>;
+type GenerationResult = Result<bcode_plugin_sdk::tui::PluginStructuredGenerationResult, String>;
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum GoalPhase {
     Draft,
@@ -268,12 +271,15 @@ impl GoalSurface {
         }
         self.source = Some((objective.clone(), guidance.clone(), limit));
         self.phase = GoalPhase::Generating { review };
-        self.editor.status = "Generating loop prompts… Esc closes without launching".into();
-        let future = host.generate_structured_output(generation_request(
+        self.editor.status =
+            "Generating with this session's context… Esc closes without launching".into();
+        let mut request = generation_request(
             &objective,
             &guidance,
             self.editor.progress_document.is_some(),
-        ));
+        );
+        request.source_session_id = self.editor.session_id;
+        let future = host.generate_structured_output(request);
         let completion = Arc::clone(&self.completion);
         host.spawn(Box::pin(async move {
             *completion.lock().expect("goal generation completion") =
@@ -322,7 +328,47 @@ impl PluginTuiSurface for GoalSurface {
         let Some((objective, guidance, limit)) = self.source.take() else {
             return action;
         };
-        match result.and_then(|value| decode_prompts(value, &objective, &guidance, limit)) {
+        let result = result.and_then(|result| {
+            let source = result
+                .source
+                .ok_or_else(|| "Generation returned no source context provenance".to_string())?;
+            if Some(source.session_id) != self.editor.session_id {
+                return Err("Generation context belongs to another session".into());
+            }
+            let provenance = format!(
+                "Generation source session {} at sequence {} (generation {}).\n",
+                source.session_id, source.latest_sequence, source.generation
+            );
+            if let Some(setup) = &mut self.editor.progress_document {
+                setup.context = Some(source);
+            }
+            let mut value = result.output;
+            if value.get("outcome").and_then(serde_json::Value::as_str)
+                == Some("clarification_required")
+            {
+                return Err(format!(
+                    "Clarify the goal: {}",
+                    value
+                        .get("clarification")
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or("Please specify the intended outcome")
+                ));
+            }
+            if value.get("outcome").and_then(serde_json::Value::as_str) != Some("ready") {
+                return Err("Unknown goal generation outcome".into());
+            }
+            if let Some(object) = value.as_object_mut() {
+                object.remove("outcome");
+                object.remove("clarification");
+            }
+            let input = decode_prompts(value, &objective, &guidance, limit)?;
+            LoopWorkflowInput::new(
+                format!("{provenance}{}", input.implementation_prompt),
+                format!("{provenance}{}", input.stop_condition),
+                limit,
+            )
+        });
+        match result {
             Ok(input) => {
                 self.editor.prompt = text_state(&input.implementation_prompt);
                 self.editor.condition = text_state(&input.stop_condition);
@@ -394,13 +440,21 @@ mod tests {
         fn request_redraw(&self) {}
         fn generate_structured_output(
             &self,
-            _: PluginStructuredGenerationRequest,
+            request: PluginStructuredGenerationRequest,
         ) -> bcode_plugin_sdk::tui::PluginStructuredGenerationFuture {
             *self.generations.lock().unwrap() += 1;
-            Box::pin(async {
-                Ok(
-                    serde_json::json!({"implementation_prompt":"Implement", "stop_condition":"Verify"}),
-                )
+            Box::pin(async move {
+                Ok(bcode_plugin_sdk::tui::PluginStructuredGenerationResult {
+                    output: serde_json::json!({"outcome":"ready", "clarification":"", "implementation_prompt":"Implement", "stop_condition":"Verify"}),
+                    source: Some(bcode_session_models::SessionDerivationSourceSnapshot {
+                        version: 1,
+                        session_id: request.source_session_id.unwrap(),
+                        generation: 42,
+                        latest_sequence: 42,
+                        title: None,
+                        working_directory: "/repo".into(),
+                    }),
+                })
             })
         }
         fn session_working_document(
@@ -575,13 +629,36 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn clarification_never_launches_or_creates_document() {
+        let host = Host::default();
+        let mut surface = GoalSurface::new(Some(SessionId::new()));
+        surface.editor.prompt = text_state("finish that");
+        surface.generate(&host, false);
+        host.finish().await;
+        {
+            let mut completion = surface.completion.lock().unwrap();
+            completion.as_mut().unwrap().as_mut().unwrap().output = serde_json::json!({"outcome":"clarification_required", "clarification":"Which migration?", "implementation_prompt":"Not ready", "stop_condition":"Not ready"});
+        }
+        surface.poll(&host);
+        assert!(surface.editor.status.contains("Which migration?"));
+        assert!(host.starts.lock().unwrap().is_empty());
+        assert!(host.documents.lock().unwrap().is_empty());
+        assert_eq!(input_text(&surface.editor.prompt), "finish that");
+    }
+
+    #[tokio::test]
     async fn invalid_generation_preserves_draft_and_can_retry() {
         let host = Host::default();
         let mut surface = GoalSurface::new(Some(SessionId::new()));
         surface.editor.prompt = text_state("original goal");
         surface.generate(&host, false);
         host.finish().await;
-        *surface.completion.lock().unwrap() = Some(Ok(serde_json::json!({})));
+        *surface.completion.lock().unwrap() = Some(Ok(
+            bcode_plugin_sdk::tui::PluginStructuredGenerationResult {
+                output: serde_json::json!({}),
+                source: None,
+            },
+        ));
         surface.poll(&host);
         assert_eq!(input_text(&surface.editor.prompt), "original goal");
         assert!(host.starts.lock().unwrap().is_empty());

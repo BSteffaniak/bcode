@@ -30,7 +30,10 @@ use std::str::FromStr;
 use std::time::{SystemTime, UNIX_EPOCH};
 use uuid::Uuid;
 
+pub mod context_generation;
 mod storage_admission;
+pub use context_generation::{PrepareContextGeneration, PreparedContextGeneration};
+
 pub mod working_document;
 pub use working_document::{
     MAX_WORKING_DOCUMENT_BYTES, SessionWorkingDocument, SessionWorkingDocumentRequest,
@@ -1783,6 +1786,9 @@ pub struct TurnExecutionOptions {
     /// Immutable provider-neutral reasoning request overrides for this turn.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reasoning: Option<Box<TurnReasoningOptions>>,
+    /// Request-only context capability. Missing daemon memory fails closed on resume.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub request_context_id: Option<String>,
     /// Optional provider-neutral structured-output request for this turn.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub structured_output: Option<TurnStructuredOutputRequest>,
@@ -1794,7 +1800,7 @@ pub struct TurnExecutionOptions {
 /// Earliest persisted turn execution-options schema version accepted by this build.
 pub const MIN_TURN_EXECUTION_OPTIONS_SCHEMA_VERSION: u32 = 1;
 /// Current persisted turn execution-options schema version.
-pub const TURN_EXECUTION_OPTIONS_SCHEMA_VERSION: u32 = 4;
+pub const TURN_EXECUTION_OPTIONS_SCHEMA_VERSION: u32 = 5;
 
 const fn turn_execution_options_schema_version() -> u32 {
     TURN_EXECUTION_OPTIONS_SCHEMA_VERSION
@@ -1812,6 +1818,7 @@ impl Default for TurnExecutionOptions {
             provider_plugin_id: None,
             model_id: None,
             reasoning: None,
+            request_context_id: None,
             structured_output: None,
             skill_contexts: Vec::new(),
         }
@@ -2051,6 +2058,9 @@ impl TurnAdmissionMetadata {
         if !(MIN_TURN_EXECUTION_OPTIONS_SCHEMA_VERSION..=TURN_EXECUTION_OPTIONS_SCHEMA_VERSION)
             .contains(&self.execution.schema_version)
         {
+            return Err(TurnAdmissionMetadataError::UnsupportedExecutionOptionsVersion);
+        }
+        if self.execution.request_context_id.is_some() && self.execution.schema_version < 5 {
             return Err(TurnAdmissionMetadataError::UnsupportedExecutionOptionsVersion);
         }
         if self.execution.schema_version < 2 && self.execution.reasoning.is_some() {

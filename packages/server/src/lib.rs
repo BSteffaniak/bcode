@@ -330,6 +330,8 @@ struct WorktreeCreateOperation {
     changed: Arc<Notify>,
 }
 
+mod context_generation;
+
 #[derive(Debug)]
 pub struct ServerState {
     usage_index: Mutex<bcode_usage::index::UsageIndex>,
@@ -409,6 +411,7 @@ pub struct ServerState {
     runtime_work: RuntimeWorkManager,
     ralph_store: bcode_ralph::RalphStateStore,
     active_ralph_runs: Mutex<BTreeMap<PathBuf, JoinHandle<()>>>,
+    generation_contexts: Mutex<BTreeMap<String, context_generation::CapturedContext>>,
     session_model_selections: Mutex<BTreeMap<SessionId, SessionModelSelection>>,
     session_model_selection_origins: Mutex<BTreeMap<SessionId, SessionModelSelectionOrigin>>,
     required_skill_model_overrides:
@@ -2024,6 +2027,7 @@ impl ServerState {
             runtime_work: RuntimeWorkManager::with_metrics(init.metrics.clone()),
             ralph_store: init.ralph_store,
             active_ralph_runs: Mutex::default(),
+            generation_contexts: Mutex::default(),
             session_model_selections: Mutex::default(),
             session_model_selection_origins: Mutex::default(),
             required_skill_model_overrides: Mutex::default(),
@@ -5399,6 +5403,7 @@ fn request_metrics_context(
 const fn request_session_id(request: &Request) -> Option<SessionId> {
     match request {
         Request::SessionCompress { request } => Some(request.session_id),
+        Request::PrepareContextGeneration { request } => Some(request.source_session_id),
         Request::SessionWorkingDocument { request } => Some(request.session_id),
         Request::SessionAdmission { session_id, .. }
         | Request::RenameSession { session_id, .. }
@@ -5464,6 +5469,7 @@ const fn request_kind(request: &Request) -> &'static str {
         Request::SessionCompatibilityInventory { .. } => "session_compatibility_inventory",
         Request::RenameSession { .. } => "rename_session",
         Request::DeleteSession { .. } => "delete_session",
+        Request::PrepareContextGeneration { .. } => "prepare_context_generation",
         Request::SessionWorkingDocument { .. } => "session_working_document",
         Request::ReadSessionArtifact { .. } => "read_session_artifact",
         Request::InvocationInput { .. } => "invocation_input",
@@ -5966,6 +5972,12 @@ async fn handle_request_inner(
         }
         SessionLifecycleRequest::DeleteSession { session_id } => {
             handle_delete_session(request_id, state, writer, session_id).await
+        }
+        SessionLifecycleRequest::PrepareContextGeneration(request) => {
+            Box::pin(context_generation::handle(
+                request_id, state, writer, request,
+            ))
+            .await
         }
         SessionLifecycleRequest::SessionWorkingDocument(request) => {
             Box::pin(handle_working_document(request_id, state, writer, request)).await
@@ -17237,6 +17249,11 @@ async fn run_model_turn(
         phase,
     ))
     .await;
+    state
+        .generation_contexts
+        .lock()
+        .await
+        .retain(|_, capture| capture.session_id != session_id);
     service_runtime_priority_commands(state, session_id, command_context).await;
     set_runtime_phase(phase, SessionRuntimePhase::FinishingTurn).await;
     finish_current_turn(command_context).await;
@@ -17331,8 +17348,15 @@ async fn run_model_turn_inner(
 
     let provider_plugin_id = selection.provider_plugin_id.clone();
     let compaction_policy_timer = state.metrics.timer();
-    let compaction_policy =
+    let mut compaction_policy =
         automatic_compaction_policy(state, &selection, &turn_config.model.compaction).await;
+    if execution.request_context_id.is_some() {
+        compaction_policy.decision = context_compaction::CompactionDecision {
+            strategy: AutomaticCompactionStrategy::Disabled,
+            overflow_recovery: false,
+            reason: "request-only captured context must not be persisted by compaction",
+        };
+    }
     state.metrics.record_histogram_with_labels(
         "model.turn.setup.compaction_policy_duration_ms",
         compaction_policy_timer.elapsed_ms(),
@@ -17506,8 +17530,24 @@ async fn run_model_turn_inner(
                 }],
             });
         }
-        let should_evaluate_proactive =
-            compaction_decision.strategy == AutomaticCompactionStrategy::LocalProactive;
+        if execution.request_context_id.is_some()
+            && request_exceeds_compaction_capacity(
+                state,
+                session_id,
+                &selection,
+                &request,
+                context_projection.context_tokens.tokens(),
+            )
+            .await
+            .is_some()
+        {
+            return ModelTurnCompletion::with_message(
+                ModelTurnOutcome::Error,
+                "Source context exceeds generation model capacity; compact the source session and regenerate",
+            );
+        }
+        let should_evaluate_proactive = execution.request_context_id.is_none()
+            && compaction_decision.strategy == AutomaticCompactionStrategy::LocalProactive;
         if should_evaluate_proactive {
             set_runtime_phase(phase, SessionRuntimePhase::Compacting).await;
         }
@@ -23140,6 +23180,20 @@ async fn build_model_turn_request(
         context_format.map(|format| format.compatibility_key.as_str()),
         config.model.tool_output.fallback_argument_chars.get(),
     );
+    if let Some(source) = context_generation::events(state, session_id, execution).await? {
+        let mut preceding = session_events_to_model_messages_for_target_with_limits(
+            &source,
+            config.model.tool_output.context_chars,
+            provider_plugin_id,
+            Some(&model_id_for_provider_request(selected_model_id)),
+            selection.provider_context.auth_profile.as_deref(),
+            context_format.map(|format| format.version),
+            context_format.map(|format| format.compatibility_key.as_str()),
+            config.model.tool_output.fallback_argument_chars.get(),
+        );
+        preceding.append(&mut messages);
+        messages = preceding;
+    }
     state.metrics.record_histogram_with_labels(
         "model.request_build.convert_events_duration_ms",
         convert_timer.elapsed_ms(),
@@ -23339,8 +23393,8 @@ async fn build_model_turn_request(
         metric_labels.clone(),
     );
     let request_assembly_timer = state.metrics.timer();
-    let context_management = if compaction_policy.decision.strategy
-        == AutomaticCompactionStrategy::ProviderManaged
+    let context_management = if execution.request_context_id.is_none()
+        && compaction_policy.decision.strategy == AutomaticCompactionStrategy::ProviderManaged
     {
         let status =
             model_status_for_selection(state, selection.clone(), Some(session_id), config).await;
@@ -60995,7 +61049,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
         state
     }
 
-    fn test_server_state_with_fake_provider(sessions: SessionManager) -> ServerState {
+    pub fn test_server_state_with_fake_provider(sessions: SessionManager) -> ServerState {
         let plugin = bcode_plugin::StaticBundledPlugin::new(
             include_str!("../../../plugins/fake-provider-plugin/bcode-plugin.toml"),
             bcode_fake_provider_plugin::static_plugin(),

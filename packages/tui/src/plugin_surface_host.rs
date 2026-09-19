@@ -45,6 +45,35 @@ struct BcodePluginTuiHost {
     client: BcodeClient,
 }
 
+async fn prepare_generation_session(
+    client: &BcodeClient,
+    request: &PluginStructuredGenerationRequest,
+) -> Result<
+    (
+        SessionId,
+        Option<bcode_session_models::PreparedContextGeneration>,
+    ),
+    PluginTuiHostError,
+> {
+    if let Some(source_session_id) = request.source_session_id {
+        let prepared = client
+            .prepare_context_generation(bcode_session_models::PrepareContextGeneration {
+                version: 1,
+                source_session_id,
+                name: request.session_name.clone(),
+            })
+            .await
+            .map_err(|error| PluginTuiHostError::Internal(error.to_string()))?;
+        Ok((prepared.session_id, Some(prepared)))
+    } else {
+        let session = client
+            .create_session(Some(request.session_name.clone()))
+            .await
+            .map_err(|error| PluginTuiHostError::Internal(error.to_string()))?;
+        Ok((session.id, None))
+    }
+}
+
 fn workflow_start_request(
     request: PluginWorkflowStartRequest,
 ) -> Result<bcode_workflow::WorkflowStartRequest, PluginTuiHostError> {
@@ -304,17 +333,17 @@ impl PluginTuiHost for BcodePluginTuiHost {
                     "structured generation timeout must be positive".to_string(),
                 ));
             }
-            let session = client
-                .create_session(Some(request.session_name))
-                .await
-                .map_err(|error| PluginTuiHostError::Internal(error.to_string()))?;
+            let (session_id, prepared) = prepare_generation_session(&client, &request).await?;
             let prompt = format!("{}\n\n{}", request.system_prompt, request.prompt);
             client
                 .send_user_message_with_execution(
-                    session.id,
+                    session_id,
                     prompt,
                     bcode_ipc::PromptPlacement::FollowUp,
                     bcode_session_models::TurnExecutionOptions {
+                        request_context_id: prepared
+                            .as_ref()
+                            .map(|prepared| prepared.context_id.clone()),
                         tools: bcode_session_models::TurnToolPolicy::Disabled,
                         structured_output: Some(
                             bcode_session_models::TurnStructuredOutputRequest {
@@ -335,7 +364,7 @@ impl PluginTuiHost for BcodePluginTuiHost {
             loop {
                 let page = client
                     .session_history_page(
-                        session.id,
+                        session_id,
                         bcode_session_models::SessionHistoryQuery {
                             cursor,
                             limit: 100,
@@ -369,17 +398,21 @@ impl PluginTuiHost for BcodePluginTuiHost {
                                         .to_string(),
                                 )
                             })?;
-                            return serde_json::from_str(&text).map_err(|error| {
+                            let output = serde_json::from_str(&text).map_err(|error| {
                                 PluginTuiHostError::Internal(format!(
                                     "structured generation returned invalid JSON: {error}"
                                 ))
+                            })?;
+                            return Ok(bcode_plugin_sdk::tui::PluginStructuredGenerationResult {
+                                output,
+                                source: prepared.map(|prepared| prepared.source),
                             });
                         }
                         _ => {}
                     }
                 }
                 if started.elapsed() >= std::time::Duration::from_millis(request.timeout_ms) {
-                    let _ = client.cancel_session_turn(session.id).await;
+                    let _ = client.cancel_session_turn(session_id).await;
                     return Err(PluginTuiHostError::Internal(
                         "structured generation timed out".to_string(),
                     ));

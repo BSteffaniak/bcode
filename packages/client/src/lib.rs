@@ -2920,6 +2920,23 @@ impl BcodeClient {
         }
     }
 
+    /// Capture bounded source context for an isolated structured-generation session.
+    ///
+    /// # Errors
+    /// Returns source compatibility, capture, admission or transport errors.
+    pub async fn prepare_context_generation(
+        &self,
+        request: bcode_session_models::PrepareContextGeneration,
+    ) -> Result<bcode_session_models::PreparedContextGeneration, ClientError> {
+        match self
+            .send_request(Request::PrepareContextGeneration { request })
+            .await?
+        {
+            ResponsePayload::PreparedContextGeneration { prepared } => Ok(prepared),
+            _ => Err(ClientError::UnexpectedResponse),
+        }
+    }
+
     /// Prepare or inspect one session-owned mutable working document.
     ///
     /// # Errors

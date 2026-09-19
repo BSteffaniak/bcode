@@ -2,7 +2,9 @@
 
 `/goal` opens a goal setup modal owned by the bundled loop plugin. Enter a goal;
 additional guidance and maximum iterations are optional. A blank maximum uses the
-existing loop default (20). No repository or conversation scan occurs during setup.
+existing loop default (20). Generation captures the source session's bounded normal
+model context at submission, including portable compaction summaries and projected tool
+exchanges. It does not scan the repository or replay the full session history.
 
 * **Ctrl+Enter** generates prompts and starts the loop after validation.
 * **Ctrl+R** generates prompts for review. Edit the iteration prompt and stop
@@ -30,6 +32,29 @@ An existing active loop must be explicitly replaced through the usual confirmati
 it is not cancelled merely to generate prompts. Exhausting the iteration allowance
 is not evidence that the goal was achieved. Generated stop conditions and evaluator
 claims remain fallible and should be checked against current evidence.
+
+## Conversation-aware generation
+
+The daemon captures a generation-pinned source model-context view, checks that the source
+has not changed during capture, and creates a separate generation session in the source
+working directory. Source events stay in bounded daemon memory and are projected using the
+normal model-message rules when constructing the tool-free structured request. They are
+never appended as copied messages to the destination session. Only normal generated output,
+execution capability identity and accepted provenance are durable. Other structured generators
+without a source retain their previous behavior.
+
+Captures expire after ten minutes, are released at turn completion, and are limited to 32
+pending captures of at most 4 MiB each. Lost/expired capabilities fail closed, including after
+daemon replacement; regenerate rather than resuming without context. Opaque provider-managed
+source compaction is rejected instead of copying provider-private state. Oversized requests
+use the normal context estimator/capacity check and require explicit source compaction rather
+than silently dropping history or persisting an automatic summary of request-only content.
+
+The generator resolves conversational references, retains applicable decisions and later
+corrections, and excludes unrelated prior tasks. Ambiguous objectives return a clarification
+question without launching work. Host-verified source session/generation/cutoff provenance is
+separate from model output and is retained in accepted prompts and progress-document setup.
+A fresh generation captures fresh context; workflow-start retries reuse accepted prompts.
 
 ## Living progress document
 

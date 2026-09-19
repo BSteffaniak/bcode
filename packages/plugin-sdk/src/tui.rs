@@ -300,6 +300,9 @@ pub type PluginWorkingDocumentFuture = Pin<
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct PluginStructuredGenerationRequest {
+    /// Optional source whose model-visible context is captured at submission.
+    #[serde(default)]
+    pub source_session_id: Option<SessionId>,
     pub session_name: String,
     pub system_prompt: String,
     pub prompt: String,
@@ -308,9 +311,23 @@ pub struct PluginStructuredGenerationRequest {
     pub timeout_ms: u64,
 }
 
+/// Structured output and optional host-verified source provenance.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PluginStructuredGenerationResult {
+    /// Model-produced schema-validated output.
+    pub output: serde_json::Value,
+    /// Captured by the host, never supplied by the model.
+    pub source: Option<bcode_session_models::SessionDerivationSourceSnapshot>,
+}
+
 /// Async structured model-generation result.
-pub type PluginStructuredGenerationFuture =
-    Pin<Box<dyn Future<Output = Result<serde_json::Value, PluginTuiHostError>> + Send + 'static>>;
+pub type PluginStructuredGenerationFuture = Pin<
+    Box<
+        dyn Future<Output = Result<PluginStructuredGenerationResult, PluginTuiHostError>>
+            + Send
+            + 'static,
+    >,
+>;
 
 /// Result of explicitly accepting one generated workflow candidate.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

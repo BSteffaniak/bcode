@@ -1813,7 +1813,10 @@ impl PluginTuiSurface for WorkflowAuthorSurface {
             let future = host.generate_structured_output(request);
             let sender = self.authoring_sender.clone();
             host.spawn(Box::pin(async move {
-                let result = future.await.map_err(|error| error.to_string());
+                let result = future
+                    .await
+                    .map(|result| result.output)
+                    .map_err(|error| error.to_string());
                 let _ = sender.send(AuthoringAsyncResult::Generate(result));
             }));
         }
@@ -2220,6 +2223,7 @@ fn generation_request(
         "Create a new portable workflow authoring document matching the request."
     };
     PluginStructuredGenerationRequest {
+        source_session_id: None,
         session_name: "Workflow draft generation".to_string(),
         system_prompt: format!(
             "You are the bcode.workflow draft generator. {task} Return only one WorkflowAuthoringDocument. Use only identities and contracts present in the supplied bounded portable catalog. Do not publish, activate, start, grant permissions, include secrets, invent plugin contracts, or access external/private APIs. Generated provenance must be {{\"kind\":\"generated\",\"producer_id\":\"bcode.workflow.prompt\"}}."

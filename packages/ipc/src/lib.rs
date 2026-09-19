@@ -1031,6 +1031,10 @@ pub enum Request {
     },
     /// Inspect effective model catalog and refresh state.
     ModelCatalogDiagnostics,
+    /// Prepare a pinned request-only context for isolated structured generation.
+    PrepareContextGeneration {
+        request: bcode_session_models::PrepareContextGeneration,
+    },
     /// Explicitly prepare or inspect a bounded mutable session working document.
     SessionWorkingDocument {
         request: bcode_session_models::SessionWorkingDocumentRequest,
@@ -2259,6 +2263,9 @@ pub enum ResponsePayload {
     /// Effective model catalog diagnostics.
     ModelCatalogDiagnostics {
         diagnostics: ModelCatalogDiagnostics,
+    },
+    PreparedContextGeneration {
+        prepared: bcode_session_models::PreparedContextGeneration,
     },
     SessionWorkingDocument {
         document: Option<bcode_session_models::SessionWorkingDocument>,
