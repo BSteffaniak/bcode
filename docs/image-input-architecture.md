@@ -185,6 +185,21 @@ Upload costs must be included when upload mechanisms are added; currently there 
 Latency is local elapsed time. Future upload/transport observations must remain independently labeled and must not
 contain signed URLs or credentials. Cache usage analysis remains owned by `bcode_prompt_cache`.
 
+## Opt-in request compression
+
+The OpenAI-compatible provider accepts provider setting `request_compression = "gzip"` only
+as explicit endpoint-owner opt-in. Default/`off` sends identity encoding; unknown values fail
+before HTTP transmission. Gzip is used only when smaller than the original serialized body.
+Both Chat Completions and Responses use the same preparation path. No automatic retry with a
+different encoding is performed on rejection; this avoids duplicating ambiguous generations.
+No provider/model capability is inferred or promoted by this option. Enable it only for endpoints
+known to accept gzip; remote acceptance has not been verified.
+
+`serialized_body_bytes` remains the uncompressed JSON size. Optional `encoded_body_bytes` records
+the prepared HTTP body after encoding, not actual socket traffic. Tests decode the exact request
+builder body and assert byte identity, encoding headers, and measurement agreement. This is
+lossless transport compression, never image resizing/re-encoding.
+
 ## Opt-in provider matrix runner
 
 `scripts/verify-image-matrix.py` accepts repeated `--config PATH --model EXACT_ID` pairs and

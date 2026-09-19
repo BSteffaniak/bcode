@@ -25,6 +25,7 @@ bcode_provider_auth = { workspace = true }
 bcode_provider_auth_models = { workspace = true }
 bcode_session_models = { workspace = true }
 bcode_tool = { workspace = true }
+flate2 = { workspace = true }
 rand = { workspace = true }
 reqwest = { workspace = true }
 rustls = { workspace = true }

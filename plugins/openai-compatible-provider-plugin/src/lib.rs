@@ -75,6 +75,7 @@ use std::time::{Duration, Instant};
 use tokio::sync::Notify;
 
 mod context_compaction;
+mod request_compression;
 mod turn_routing;
 
 const DEFAULT_BASE_URL: &str = "https://api.openai.com/v1";
@@ -4524,6 +4525,39 @@ fn build_chat_completion_request(
     })
 }
 
+fn prepare_http_body(
+    builder: reqwest::RequestBuilder,
+    bytes: Vec<u8>,
+    request: &ModelTurnRequest,
+    mut projection: ProviderRequestProjection,
+    turn: Option<&TurnState>,
+) -> Result<reqwest::RequestBuilder, ProviderError> {
+    let encoded = request_compression::encode(
+        bytes,
+        request
+            .provider_context
+            .settings
+            .get("request_compression")
+            .map(String::as_str),
+    )
+    .map_err(|message| {
+        provider_error(
+            "invalid_request_compression",
+            ProviderErrorCategory::InvalidRequest,
+            message,
+        )
+    })?;
+    projection.encoded_body_bytes = Some(encoded.bytes.len() as u64);
+    if let Some(turn) = turn {
+        turn.push(ProviderTurnEvent::RequestProjection { projection });
+    }
+    let mut builder = builder.header(reqwest::header::CONTENT_TYPE, "application/json");
+    if encoded.gzip {
+        builder = builder.header(reqwest::header::CONTENT_ENCODING, "gzip");
+    }
+    Ok(builder.body(encoded.bytes))
+}
+
 async fn send_chat_completion_request(
     client: &Client,
     settings: &Settings,
@@ -4538,24 +4572,22 @@ async fn send_chat_completion_request(
     );
     let request_body = build_chat_completion_request(settings, request, model_id)?;
     let bytes = encode_request_body(&request_body)?;
-    if let Some(turn) = turn {
-        turn.push(ProviderTurnEvent::RequestProjection {
-            projection: openai_request_projection(
-                settings,
-                request,
-                bytes.len() as u64,
-                request_body.messages.len(),
-            ),
-        });
-    }
-    let response = client
-        .post(url)
-        .bearer_auth(api_key)
-        .header(reqwest::header::CONTENT_TYPE, "application/json")
-        .body(bytes)
-        .send()
-        .await
-        .map_err(|error| reqwest_provider_error("request_failed", &error))?;
+    let projection = openai_request_projection(
+        settings,
+        request,
+        bytes.len() as u64,
+        request_body.messages.len(),
+    );
+    let response = prepare_http_body(
+        client.post(url).bearer_auth(api_key),
+        bytes,
+        request,
+        projection,
+        turn,
+    )?
+    .send()
+    .await
+    .map_err(|error| reqwest_provider_error("request_failed", &error))?;
     let status = response.status();
     if !status.is_success() {
         let headers = response.headers().clone();
@@ -4636,22 +4668,16 @@ async fn send_responses_request_to(
         builder = builder.header(turn_routing::HEADER, token);
     }
     let bytes = encode_request_body(&request_body)?;
-    if let Some(turn) = turn {
-        turn.push(ProviderTurnEvent::RequestProjection {
-            projection: openai_request_projection(
-                settings,
-                request,
-                bytes.len() as u64,
-                request_body
-                    .get("input")
-                    .and_then(serde_json::Value::as_array)
-                    .map_or(0, Vec::len),
-            ),
-        });
-    }
-    let mut builder = builder
-        .header(reqwest::header::CONTENT_TYPE, "application/json")
-        .body(bytes);
+    let projection = openai_request_projection(
+        settings,
+        request,
+        bytes.len() as u64,
+        request_body
+            .get("input")
+            .and_then(serde_json::Value::as_array)
+            .map_or(0, Vec::len),
+    );
+    let mut builder = prepare_http_body(builder, bytes, request, projection, turn)?;
     if let AuthSettings::ChatGpt {
         account_id: Some(account_id),
         ..
@@ -10953,6 +10979,44 @@ mod tests {
             created: Some(created),
             metadata: BTreeMap::new(),
         }
+    }
+
+    #[test]
+    fn gzip_request_builder_sets_encoding_and_measures_transmitted_body() {
+        use std::io::Read as _;
+        let mut request = test_request(vec![]);
+        request
+            .provider_context
+            .settings
+            .insert("request_compression".to_string(), "gzip".to_string());
+        let original = "AQID".repeat(4096).into_bytes();
+        let turn = TurnState::default();
+        let http = prepare_http_body(
+            Client::new().post("http://localhost/test"),
+            original.clone(),
+            &request,
+            ProviderRequestProjection {
+                serialized_body_bytes: Some(original.len() as u64),
+                ..Default::default()
+            },
+            Some(&turn),
+        )
+        .expect("prepare")
+        .build()
+        .expect("HTTP request");
+        assert_eq!(http.headers()[reqwest::header::CONTENT_ENCODING], "gzip");
+        let body = http.body().expect("body").as_bytes().expect("bytes");
+        let mut decoded = Vec::new();
+        flate2::read::GzDecoder::new(body)
+            .read_to_end(&mut decoded)
+            .expect("decode");
+        assert_eq!(decoded, original);
+        let events = turn.drain();
+        let ProviderTurnEvent::RequestProjection { projection } = &events[0] else {
+            panic!("projection")
+        };
+        assert_eq!(projection.encoded_body_bytes, Some(body.len() as u64));
+        assert!(body.len() < original.len());
     }
 
     fn assert_single_body_measurement(turn: &TurnState, bytes: usize) {

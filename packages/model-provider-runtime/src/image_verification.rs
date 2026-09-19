@@ -145,7 +145,7 @@ fn deserialize_report_version<'de, D: serde::Deserializer<'de>>(
 }
 
 impl ImageVerificationReport {
-    fn for_source(source: ImageVerificationSource) -> Self {
+    const fn for_source(source: ImageVerificationSource) -> Self {
         Self {
             schema_version: 1,
             source,

@@ -3235,6 +3235,9 @@ pub struct ProviderRequestProjection {
     /// Absent means the adapter did not measure it; zero is a measured empty body.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub serialized_body_bytes: Option<u64>,
+    /// Prepared HTTP body bytes after content encoding, excluding headers and socket overhead.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub encoded_body_bytes: Option<u64>,
     #[serde(default)]
     pub used_previous_response_id: bool,
     #[serde(default)]
