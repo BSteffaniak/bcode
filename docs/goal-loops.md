@@ -1,5 +1,12 @@
 # Goal setup for prompt loops
 
+`/goal` and `/loop` can open from a fresh sessionless screen. Opening or cancelling an
+unsubmitted modal creates nothing. Valid submission creates a session in the current working
+directory, applies draft model/provider/agent/reasoning selections, and attaches it before
+generation or workflow dispatch. Configuration and attachment retries reuse the created
+session. Existing-session invocations continue using that session. Control commands still
+require a session. Closing after creation may leave an empty session but does not launch work.
+
 `/goal` opens a goal setup modal owned by the bundled loop plugin. Enter a goal;
 additional guidance and maximum iterations are optional. A blank maximum uses the
 existing loop default (20). Generation captures the source session's bounded normal

@@ -216,6 +216,7 @@ enum GoalPhase {
 struct GoalSurface {
     editor: LoopSurface,
     phase: GoalPhase,
+    pending_review: Option<bool>,
     source: Option<(String, String, u64)>,
     completion: Arc<Mutex<Option<GenerationResult>>>,
 }
@@ -229,6 +230,7 @@ impl GoalSurface {
         Self {
             editor,
             phase: GoalPhase::Draft,
+            pending_review: None,
             source: None,
             completion: Arc::default(),
         }
@@ -253,9 +255,6 @@ impl GoalSurface {
             if guidance.len() > MAX_PROMPT_BYTES {
                 return Err("additional guidance is too large".into());
             }
-            if self.editor.session_id.is_none() {
-                return Err("an active persisted session is required".into());
-            }
             Ok(limit)
         });
         let limit = match validation {
@@ -265,6 +264,10 @@ impl GoalSurface {
                 return PluginTuiAction::Redraw;
             }
         };
+        if !self.editor.ensure_session(host) {
+            self.pending_review = Some(review);
+            return PluginTuiAction::Redraw;
+        }
         if let Some(setup) = &mut self.editor.progress_document {
             setup.objective.clone_from(&objective);
             setup.guidance.clone_from(&guidance);
@@ -290,6 +293,10 @@ impl GoalSurface {
 }
 
 impl PluginTuiSurface for GoalSurface {
+    fn session_navigation_finished(&mut self, session_id: SessionId, result: Result<(), String>) {
+        self.editor.session_navigation_finished(session_id, result);
+    }
+
     fn id(&self) -> &'static str {
         SURFACE_KIND
     }
@@ -313,6 +320,12 @@ impl PluginTuiSurface for GoalSurface {
     fn poll(&mut self, host: &dyn PluginTuiHost) -> PluginTuiAction {
         if self.phase == GoalPhase::Closed {
             return PluginTuiAction::None;
+        }
+        if self.editor.fresh_session == FreshSessionState::Resume {
+            self.editor.fresh_session = FreshSessionState::Ready;
+            if let Some(review) = self.pending_review.take() {
+                return self.generate(host, review);
+            }
         }
         let action = self.editor.poll(host);
         let result = self
@@ -394,7 +407,15 @@ impl PluginTuiSurface for GoalSurface {
                 self.phase = GoalPhase::Closed;
                 return PluginTuiAction::Close { outcome: None };
             }
-            if self.phase == GoalPhase::Draft {
+            if self.phase == GoalPhase::Draft
+                && !matches!(
+                    self.editor.fresh_session,
+                    FreshSessionState::Creating
+                        | FreshSessionState::Configuring
+                        | FreshSessionState::NeedsConfiguration
+                        | FreshSessionState::Attaching
+                )
+            {
                 if stroke.modifiers.ctrl && stroke.key == KeyCode::Char('p') {
                     self.editor.progress_document = if self.editor.progress_document.is_some() {
                         None
@@ -430,9 +451,27 @@ mod tests {
         tasks: Mutex<Vec<bcode_plugin_sdk::tui::PluginTask>>,
         starts: Mutex<Vec<PluginWorkflowStartRequest>>,
         documents: Mutex<Vec<bcode_session_models::SessionWorkingDocumentRequest>>,
+        created_sessions: Mutex<usize>,
+        configured_sessions: Mutex<Vec<SessionId>>,
         generations: Mutex<usize>,
     }
     impl PluginTuiHost for Host {
+        fn prepare_fresh_session(
+            &self,
+            existing: Option<SessionId>,
+        ) -> bcode_plugin_sdk::tui::PluginCreateSessionFuture {
+            let id = existing.map_or_else(
+                || {
+                    *self.created_sessions.lock().unwrap() += 1;
+                    SessionId::new()
+                },
+                |id| {
+                    self.configured_sessions.lock().unwrap().push(id);
+                    id
+                },
+            );
+            Box::pin(async move { Ok(id) })
+        }
         fn spawn(&self, task: bcode_plugin_sdk::tui::PluginTask) {
             self.tasks.lock().unwrap().push(task);
         }
@@ -497,6 +536,61 @@ mod tests {
                 task.await;
             }
         }
+    }
+
+    #[tokio::test]
+    async fn fresh_goal_creates_once_and_waits_for_attachment() {
+        let host = Host::default();
+        let mut surface = GoalSurface::new(None);
+        surface.generate(&host, false);
+        assert_eq!(*host.created_sessions.lock().unwrap(), 0);
+        surface.editor.prompt = text_state("Implement a new feature");
+        surface.generate(&host, false);
+        surface.generate(&host, false);
+        assert_eq!(*host.created_sessions.lock().unwrap(), 1);
+        host.finish().await;
+        surface.poll(&host);
+        surface.poll(&host);
+        host.finish().await;
+        let PluginTuiAction::OpenSession { session_id } = surface.poll(&host) else {
+            panic!("must attach first");
+        };
+        assert_eq!(*host.generations.lock().unwrap(), 0);
+        surface.session_navigation_finished(session_id, Err("attach failed".into()));
+        surface.generate(&host, false);
+        host.finish().await;
+        assert_eq!(
+            surface.poll(&host),
+            PluginTuiAction::OpenSession { session_id }
+        );
+        surface.session_navigation_finished(session_id, Ok(()));
+        surface.poll(&host);
+        assert_eq!(*host.created_sessions.lock().unwrap(), 1);
+        assert_eq!(*host.generations.lock().unwrap(), 1);
+    }
+
+    #[tokio::test]
+    async fn fresh_loop_validates_before_creation_and_waits_for_attachment() {
+        let host = Host::default();
+        let mut surface = LoopSurface::new(None);
+        surface.submit(&host);
+        assert_eq!(*host.created_sessions.lock().unwrap(), 0);
+        surface.prompt = text_state("implement");
+        surface.condition = text_state("verified");
+        surface.submit(&host);
+        host.finish().await;
+        surface.poll(&host);
+        surface.poll(&host);
+        host.finish().await;
+        let PluginTuiAction::OpenSession { session_id } = surface.poll(&host) else {
+            panic!("must attach");
+        };
+        assert!(host.starts.lock().unwrap().is_empty());
+        surface.session_navigation_finished(session_id, Ok(()));
+        surface.poll(&host);
+        surface.poll(&host);
+        assert_eq!(*host.created_sessions.lock().unwrap(), 1);
+        assert_eq!(host.starts.lock().unwrap().len(), 1);
     }
 
     #[tokio::test]

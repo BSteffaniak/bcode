@@ -283,6 +283,10 @@ pub struct PluginWorkflowAuthoringRevision {
     pub document: bcode_workflow::WorkflowAuthoringDocument,
 }
 
+/// Result of preparing a fresh session for a plugin setup surface.
+pub type PluginCreateSessionFuture =
+    Pin<Box<dyn Future<Output = Result<SessionId, PluginTuiHostError>> + Send + 'static>>;
+
 /// Bounded session working-document operation result.
 pub type PluginWorkingDocumentFuture = Pin<
     Box<
@@ -740,6 +744,16 @@ pub trait PluginTuiHost: Send + Sync {
         Box::pin(async {
             Err(PluginTuiHostError::Unsupported(
                 "workflow launch detail is not available from this host".to_string(),
+            ))
+        })
+    }
+
+    /// Create a fresh session using the current frontend draft settings, or finish configuring
+    /// a previously created session after a failed attempt. Never submits a model turn.
+    fn prepare_fresh_session(&self, _existing: Option<SessionId>) -> PluginCreateSessionFuture {
+        Box::pin(async {
+            Err(PluginTuiHostError::Unsupported(
+                "fresh session setup is unavailable".into(),
             ))
         })
     }

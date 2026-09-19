@@ -42,7 +42,18 @@ struct BcodePluginTuiHost {
     handle: tokio::runtime::Handle,
     redraw: InvalidationSignal,
     active_tasks: Arc<AtomicUsize>,
+    launch: FreshSessionSettings,
     client: BcodeClient,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct FreshSessionSettings {
+    pub working_directory: std::path::PathBuf,
+    pub provider: Option<String>,
+    pub model: Option<String>,
+    pub agent: Option<String>,
+    pub effort: Option<String>,
+    pub summary: Option<String>,
 }
 
 async fn prepare_generation_session(
@@ -134,6 +145,37 @@ fn workflow_run_limits(
 }
 
 impl PluginTuiHost for BcodePluginTuiHost {
+    fn prepare_fresh_session(
+        &self,
+        existing: Option<SessionId>,
+    ) -> bcode_plugin_sdk::tui::PluginCreateSessionFuture {
+        let client = self.client.clone();
+        let launch = self.launch.clone();
+        Box::pin(async move {
+            // Creation and configuration are separate: the plugin retains the returned identity
+            // before asking to apply selections, so configuration retries cannot create duplicates.
+            let Some(session_id) = existing else {
+                return client
+                    .create_session_in_working_directory(None, launch.working_directory)
+                    .await
+                    .map(|session| session.id)
+                    .map_err(|error| PluginTuiHostError::Internal(error.to_string()));
+            };
+            super::effects::apply_submit_runtime_selections(
+                &client,
+                session_id,
+                launch.provider,
+                launch.model,
+                launch.agent,
+                launch.effort,
+                launch.summary,
+            )
+            .await
+            .map_err(|error| PluginTuiHostError::Internal(error.to_string()))?;
+            Ok(session_id)
+        })
+    }
+
     fn usage_report(
         &self,
         query: bcode_usage_models::UsageQuery,
@@ -731,12 +773,14 @@ impl PluginTuiHost for BcodePluginTuiHost {
 pub fn root_host(
     redraw: InvalidationSignal,
     client: BcodeClient,
+    launch: FreshSessionSettings,
     active_tasks: Arc<AtomicUsize>,
 ) -> impl PluginTuiHost {
     BcodePluginTuiHost {
         handle: tokio::runtime::Handle::current(),
         redraw,
         active_tasks,
+        launch,
         client,
     }
 }

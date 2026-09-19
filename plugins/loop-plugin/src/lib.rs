@@ -111,7 +111,7 @@ fn commands() -> Vec<CommandContribution> {
             "Goal Progress",
             "Read the session loop's living progress document",
         ),
-        session_command("goal", "Goal", "Generate loop prompts from a goal"),
+        command("goal", "Goal", "Generate loop prompts from a goal"),
         session_command("goal.status", "Goal Status", "Show the session loop status"),
         session_command("goal.pause", "Pause Goal", "Pause the session loop"),
         session_command("goal.resume", "Resume Goal", "Resume the session loop"),
@@ -632,6 +632,10 @@ impl Field {
 }
 
 enum LoopSurfaceCompletion {
+    SessionPrepared {
+        configuring: bool,
+        result: Result<SessionId, bcode_plugin_sdk::tui::PluginTuiHostError>,
+    },
     WorkflowLookup(
         Result<
             Option<bcode_plugin_sdk::tui::PluginWorkflowSummary>,
@@ -673,8 +677,22 @@ enum LaunchState {
     InFlight,
 }
 
+#[derive(Default, PartialEq, Eq)]
+enum FreshSessionState {
+    #[default]
+    Idle,
+    Creating,
+    Configuring,
+    NeedsConfiguration,
+    RetryConfiguration,
+    Attaching,
+    Resume,
+    Ready,
+}
+
 struct LoopSurface {
     session_id: Option<SessionId>,
+    fresh_session: FreshSessionState,
     prompt: TextInputState,
     condition: TextInputState,
     limit: TextInputState,
@@ -703,6 +721,7 @@ impl LoopSurface {
     fn new(session_id: Option<SessionId>) -> Self {
         Self {
             session_id,
+            fresh_session: FreshSessionState::Idle,
             prompt: text_state(""),
             condition: text_state(""),
             limit: text_state(&DEFAULT_MAX_ITERATIONS.to_string()),
@@ -750,6 +769,55 @@ impl LoopSurface {
         } else if event_click_in(event, self.limit_area) {
             self.field = Field::Limit;
         }
+    }
+
+    fn ensure_session(&mut self, host: &dyn PluginTuiHost) -> bool {
+        if self.fresh_session == FreshSessionState::Ready
+            || (self.session_id.is_some() && self.fresh_session == FreshSessionState::Idle)
+        {
+            return true;
+        }
+        if matches!(
+            self.fresh_session,
+            FreshSessionState::Creating
+                | FreshSessionState::Configuring
+                | FreshSessionState::Attaching
+        ) {
+            return false;
+        }
+        let configuring = self.session_id.is_some();
+        self.fresh_session = if configuring {
+            FreshSessionState::Configuring
+        } else {
+            FreshSessionState::Creating
+        };
+        self.status = "Preparing a fresh session…".into();
+        let future = host.prepare_fresh_session(self.session_id);
+        let completion = Arc::clone(&self.completions);
+        host.spawn(Box::pin(async move {
+            let result = future.await;
+            completion.lock().expect("session setup completion").push(
+                LoopSurfaceCompletion::SessionPrepared {
+                    configuring,
+                    result,
+                },
+            );
+        }));
+        false
+    }
+
+    fn submit(&mut self, host: &dyn PluginTuiHost) -> PluginTuiAction {
+        let limit = input_text(&self.limit).parse::<u64>().unwrap_or(0);
+        if let Err(error) =
+            LoopWorkflowInput::new(input_text(&self.prompt), input_text(&self.condition), limit)
+        {
+            self.status = error;
+            return PluginTuiAction::Redraw;
+        }
+        if !self.ensure_session(host) {
+            return PluginTuiAction::Redraw;
+        }
+        self.start()
     }
 
     fn start(&mut self) -> PluginTuiAction {
@@ -878,6 +946,9 @@ impl LoopSurface {
     }
 
     fn begin_workflow_lookup(&mut self, host: &dyn PluginTuiHost) {
+        if self.session_id.is_none() {
+            return;
+        }
         if self.pending_workflow_lookup {
             return;
         }
@@ -974,6 +1045,35 @@ impl LoopSurface {
         }
     }
 
+    fn apply_session_prepared(
+        &mut self,
+        configuring: bool,
+        result: Result<SessionId, bcode_plugin_sdk::tui::PluginTuiHostError>,
+    ) -> PluginTuiAction {
+        match result {
+            Ok(session_id) => {
+                self.session_id = Some(session_id);
+                self.fresh_session = if configuring {
+                    FreshSessionState::Attaching
+                } else {
+                    FreshSessionState::NeedsConfiguration
+                };
+                if configuring {
+                    return PluginTuiAction::OpenSession { session_id };
+                }
+            }
+            Err(error) => {
+                self.fresh_session = if configuring {
+                    FreshSessionState::RetryConfiguration
+                } else {
+                    FreshSessionState::Idle
+                };
+                self.status = format!("Session setup failed: {error}; submit to retry");
+            }
+        }
+        PluginTuiAction::Redraw
+    }
+
     fn apply_completions(&mut self) -> PluginTuiAction {
         let completions = {
             let mut pending = self
@@ -985,6 +1085,12 @@ impl LoopSurface {
         let mut action = PluginTuiAction::None;
         for completion in completions {
             match completion {
+                LoopSurfaceCompletion::SessionPrepared {
+                    configuring,
+                    result,
+                } => {
+                    return self.apply_session_prepared(configuring, result);
+                }
                 LoopSurfaceCompletion::DocumentPrepared { request, result } => {
                     self.apply_document_prepared(*request, result);
                     action = PluginTuiAction::Redraw;
@@ -1161,6 +1267,22 @@ impl LoopSurface {
 }
 
 impl PluginTuiSurface for LoopSurface {
+    fn session_navigation_finished(&mut self, session_id: SessionId, result: Result<(), String>) {
+        if self.session_id != Some(session_id) || self.fresh_session != FreshSessionState::Attaching
+        {
+            return;
+        }
+        match result {
+            Ok(()) => {
+                self.fresh_session = FreshSessionState::Resume;
+            }
+            Err(error) => {
+                self.fresh_session = FreshSessionState::RetryConfiguration;
+                self.status = format!("Session attach failed: {error}; submit to retry");
+            }
+        }
+    }
+
     fn id(&self) -> &'static str {
         SURFACE_KIND
     }
@@ -1284,12 +1406,32 @@ impl PluginTuiSurface for LoopSurface {
     }
 
     fn poll(&mut self, host: &dyn PluginTuiHost) -> PluginTuiAction {
+        if self.fresh_session == FreshSessionState::NeedsConfiguration {
+            self.ensure_session(host);
+        }
+        if self.fresh_session == FreshSessionState::Resume {
+            self.fresh_session = FreshSessionState::Ready;
+            return self.start();
+        }
         self.begin_workflow_lookup(host);
         self.begin_pending_host_work(host);
         self.apply_completions()
     }
 
     fn handle_event(&mut self, event: &Event, host: &dyn PluginTuiHost) -> PluginTuiAction {
+        if matches!(event, Event::Key(stroke) if stroke.key == KeyCode::Escape && stroke.modifiers.is_empty())
+        {
+            return PluginTuiAction::Close { outcome: None };
+        }
+        if matches!(
+            self.fresh_session,
+            FreshSessionState::Creating
+                | FreshSessionState::Configuring
+                | FreshSessionState::Attaching
+                | FreshSessionState::NeedsConfiguration
+        ) {
+            return PluginTuiAction::None;
+        }
         if let Event::Key(stroke) = event {
             if stroke.key == KeyCode::Escape && stroke.modifiers.is_empty() {
                 return PluginTuiAction::Close { outcome: None };
@@ -1303,7 +1445,7 @@ impl PluginTuiSurface for LoopSurface {
                 return PluginTuiAction::Redraw;
             }
             if stroke.key == KeyCode::Enter && stroke.modifiers.ctrl {
-                let action = self.start();
+                let action = self.submit(host);
                 self.begin_pending_host_work(host);
                 return action;
             }
@@ -1312,7 +1454,7 @@ impl PluginTuiSurface for LoopSurface {
                 return PluginTuiAction::Redraw;
             }
             if stroke.key == KeyCode::Enter && self.field == Field::Limit {
-                let action = self.start();
+                let action = self.submit(host);
                 self.begin_pending_host_work(host);
                 return action;
             }

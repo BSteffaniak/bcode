@@ -271,6 +271,32 @@ impl RootTimer {
 }
 
 impl BcodeRuntimeModel {
+    fn fresh_session_settings(&self) -> super::plugin_surface_host::FreshSessionSettings {
+        super::plugin_surface_host::FreshSessionSettings {
+            working_directory: self
+                .chat
+                .app
+                .working_directory()
+                .unwrap_or_else(|| self.settings.launch_working_directory())
+                .to_path_buf(),
+            provider: self
+                .chat
+                .app
+                .selected_provider_plugin_id()
+                .map(ToOwned::to_owned),
+            model: self.chat.app.selected_model_id().map(ToOwned::to_owned),
+            agent: Some(
+                self.chat
+                    .app
+                    .pending_agent_id()
+                    .unwrap_or_else(|| self.chat.app.current_agent_id())
+                    .to_owned(),
+            ),
+            effort: self.chat.app.reasoning_effort().map(ToOwned::to_owned),
+            summary: self.chat.app.reasoning_summary().map(ToOwned::to_owned),
+        }
+    }
+
     #[allow(dead_code)]
     pub fn new(chat: ActiveChat, settings: TuiRuntimeSettings, loop_state: ChatLoopState) -> Self {
         let draft_autosave = DraftAutosave::new(
@@ -536,7 +562,11 @@ impl BcodeRuntimeModel {
         {
             let action = self
                 .loop_state
-                .handle_root_plugin_surface_event(&event, &self.loop_state.foreground_client())
+                .handle_root_plugin_surface_event(
+                    &event,
+                    &self.loop_state.foreground_client(),
+                    self.fresh_session_settings(),
+                )
                 .expect("plugin surface was present");
             match action {
                 bcode_plugin_sdk::tui::PluginTuiAction::None
@@ -2702,7 +2732,9 @@ impl bmux_tui_runtime::Program for BcodeRuntimeModel {
                 BcodeRuntimeMessage::PluginSurfaceInvalidated,
             ) => {
                 let client = self.loop_state.foreground_client();
-                let action = self.loop_state.poll_root_plugin_surface(&client);
+                let action = self
+                    .loop_state
+                    .poll_root_plugin_surface(&client, self.fresh_session_settings());
                 if self.loop_state.has_root_plugin_surface()
                     && let Some(invalidation) = self.loop_state.root_plugin_surface_invalidation()
                 {

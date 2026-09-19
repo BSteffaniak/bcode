@@ -1010,11 +1010,13 @@ impl ChatLoopState {
         &mut self,
         event: &Event,
         client: &BcodeClient,
+        launch: super::plugin_surface_host::FreshSessionSettings,
     ) -> Option<bcode_plugin_sdk::tui::PluginTuiAction> {
         let surface = self.plugin_surface.as_mut()?;
         let host = super::plugin_surface_host::root_host(
             surface.invalidation.clone(),
             client.clone(),
+            launch,
             std::sync::Arc::clone(&surface.active_tasks),
         );
         Some(surface.surface.handle_event(event, &host))
@@ -1029,11 +1031,13 @@ impl ChatLoopState {
     pub fn poll_root_plugin_surface(
         &mut self,
         client: &BcodeClient,
+        launch: super::plugin_surface_host::FreshSessionSettings,
     ) -> Option<bcode_plugin_sdk::tui::PluginTuiAction> {
         let surface = self.plugin_surface.as_mut()?;
         let host = super::plugin_surface_host::root_host(
             surface.invalidation.clone(),
             client.clone(),
+            launch,
             std::sync::Arc::clone(&surface.active_tasks),
         );
         let invalidated = surface.invalidation.take();

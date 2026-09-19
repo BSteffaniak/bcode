@@ -2214,7 +2214,7 @@ async fn run_submit_message(
     }
 }
 
-async fn apply_submit_runtime_selections(
+pub async fn apply_submit_runtime_selections(
     client: &BcodeClient,
     session_id: SessionId,
     provider_plugin_id: Option<String>,
