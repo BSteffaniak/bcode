@@ -51,6 +51,8 @@ use serde::{Deserialize, Serialize};
 
 const PLUGIN_ID: &str = "bcode.loop";
 const WORKFLOW_KIND: &str = "bcode.loop";
+mod goal;
+
 const START_COMMAND: &str = "loop";
 const STATUS_COMMAND: &str = "loop.status";
 const PAUSE_COMMAND: &str = "loop.pause";
@@ -104,6 +106,16 @@ impl RustPlugin for LoopPlugin {
 
 fn commands() -> Vec<CommandContribution> {
     vec![
+        session_command("goal", "Goal", "Generate loop prompts from a goal"),
+        session_command("goal.status", "Goal Status", "Show the session loop status"),
+        session_command("goal.pause", "Pause Goal", "Pause the session loop"),
+        session_command("goal.resume", "Resume Goal", "Resume the session loop"),
+        session_command("goal.stop", "Stop Goal", "Stop the session loop"),
+        session_command(
+            "goal.detach",
+            "Detach Goal",
+            "Detach a repair-required session loop",
+        ),
         command(START_COMMAND, "Loop", "Start a deterministic prompt loop"),
         session_command(STATUS_COMMAND, "Loop Status", "Show prompt loop status"),
         session_command(PAUSE_COMMAND, "Pause Loop", "Pause the active prompt loop"),
@@ -423,7 +435,27 @@ fn command_session_id(request: &InvokeCommandRequest) -> Option<SessionId> {
 fn command_response(request: &InvokeCommandRequest) -> ServiceResponse {
     let session_id = command_session_id(request);
     let arguments = request.args.get("arguments").map_or("", String::as_str);
-    let response = match request.command_id.as_str() {
+    let command_id = match request.command_id.as_str() {
+        "goal.status" => STATUS_COMMAND,
+        "goal.pause" => PAUSE_COMMAND,
+        "goal.resume" => RESUME_COMMAND,
+        "goal.stop" => STOP_COMMAND,
+        "goal.detach" => DETACH_COMMAND,
+        other => other,
+    };
+    let response = match command_id {
+        "goal" => InvokeCommandResponse {
+            success: true,
+            message: None,
+            updated_model: None,
+            updated_provider: None,
+            updated_thinking: None,
+            effects: vec![CommandEffect::OpenPluginSurface {
+                surface_kind: goal::SURFACE_KIND.to_owned(),
+                instance_id: "goal-start".to_owned(),
+                options: serde_json::json!({}),
+            }],
+        },
         START_COMMAND if arguments == "status" => session_id.map_or_else(
             || status_response("/loop status requires an active session"),
             status_for_session,
@@ -539,6 +571,7 @@ pub fn static_plugin() -> StaticPluginVtable {
 pub fn tui_registry() -> PluginTuiRegistry {
     let mut registry = PluginTuiRegistry::default();
     registry.register_factory(Box::new(LoopSurfaceFactory));
+    registry.register_factory(Box::new(goal::GoalSurfaceFactory));
     registry
 }
 
@@ -609,6 +642,18 @@ enum LoopSurfaceCompletion {
     ),
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SetupKind {
+    Loop,
+    Goal,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum LaunchState {
+    Ready,
+    InFlight,
+}
+
 struct LoopSurface {
     session_id: Option<SessionId>,
     prompt: TextInputState,
@@ -629,6 +674,8 @@ struct LoopSurface {
     prompt_area: Rect,
     condition_area: Rect,
     limit_area: Rect,
+    setup_kind: SetupKind,
+    launch_state: LaunchState,
     theme: Option<PluginTuiTheme>,
 }
 
@@ -652,6 +699,8 @@ impl LoopSurface {
             prompt_area: Rect::new(0, 0, 0, 0),
             condition_area: Rect::new(0, 0, 0, 0),
             limit_area: Rect::new(0, 0, 0, 0),
+            setup_kind: SetupKind::Loop,
+            launch_state: LaunchState::Ready,
             theme: None,
         }
     }
@@ -683,7 +732,10 @@ impl LoopSurface {
     }
 
     fn start(&mut self) -> PluginTuiAction {
-        if self.pending_workflow_start.is_some() || self.pending_replace_cancel.is_some() {
+        if self.launch_state == LaunchState::InFlight
+            || self.pending_workflow_start.is_some()
+            || self.pending_replace_cancel.is_some()
+        {
             "a durable loop start is already in progress".clone_into(&mut self.status);
             return PluginTuiAction::Redraw;
         }
@@ -840,6 +892,7 @@ impl LoopSurface {
             return;
         };
         let completion = Arc::clone(&self.completions);
+        self.launch_state = LaunchState::InFlight;
         let future = host.start_workflow(request.clone());
         host.spawn(Box::pin(async move {
             let result = future.await;
@@ -889,6 +942,7 @@ impl LoopSurface {
                         };
                     }
                     Err(error) => {
+                        self.launch_state = LaunchState::Ready;
                         self.failed_workflow_start = Some(*request);
                         self.status = format!(
                             "failed to start durable loop workflow: {error}; submit again to retry"
@@ -1064,7 +1118,11 @@ impl PluginTuiSurface for LoopSurface {
             ModalSizing::new(Size::new(64, 22), Size::new(100, 32), Insets::all(2)),
             modal_theme,
         )
-        .title(" Start deterministic loop ")
+        .title(if self.setup_kind == SetupKind::Goal {
+            " Start goal · Ctrl+R: generate and review "
+        } else {
+            " Start deterministic loop "
+        })
         .padding(Insets::new(1, 2, 1, 2))
         .placement(ModalPlacement::Centered);
         let content = modal.content_area(area);
@@ -1092,10 +1150,17 @@ impl PluginTuiSurface for LoopSurface {
             content.width.min(36),
             4,
         );
+        self.prompt_area = self.prompt_area.intersection(content).intersection(area);
+        self.condition_area = self.condition_area.intersection(content).intersection(area);
+        self.limit_area = self.limit_area.intersection(content).intersection(area);
         Self::render_input(
             self.prompt_area,
             frame,
-            "Iteration prompt",
+            if self.setup_kind == SetupKind::Goal {
+                "Goal (required)"
+            } else {
+                "Iteration prompt"
+            },
             &mut self.prompt,
             self.field == Field::Prompt,
             self.prompt_area.height,
@@ -1104,7 +1169,11 @@ impl PluginTuiSurface for LoopSurface {
         Self::render_input(
             self.condition_area,
             frame,
-            "Stop condition",
+            if self.setup_kind == SetupKind::Goal {
+                "Additional guidance (optional)"
+            } else {
+                "Stop condition"
+            },
             &mut self.condition,
             self.field == Field::Condition,
             self.condition_area.height,
@@ -1113,7 +1182,11 @@ impl PluginTuiSurface for LoopSurface {
         Self::render_input(
             self.limit_area,
             frame,
-            "Maximum iterations",
+            if self.setup_kind == SetupKind::Goal {
+                "Max iterations (blank = 20)"
+            } else {
+                "Maximum iterations"
+            },
             &mut self.limit,
             self.field == Field::Limit,
             1,
@@ -1910,7 +1983,7 @@ mod tests {
     #[test]
     fn commands_cover_the_loop_lifecycle() {
         let commands = commands();
-        assert_eq!(commands.len(), 6);
+        assert_eq!(commands.len(), 12);
         assert!(commands.iter().all(|command| {
             command.execution == bcode_command::CommandExecution::Immediate
                 && command.surfaces.contains(&CommandSurface::Slash)

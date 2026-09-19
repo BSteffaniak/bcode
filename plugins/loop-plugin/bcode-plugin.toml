@@ -19,6 +19,11 @@ description = "Configure and start a deterministic prompt loop"
 kind        = "loop.start"
 title       = "Start Loop"
 
+[[tui_surfaces]]
+description = "Generate loop prompts from an objective and start the existing loop"
+kind        = "goal.start"
+title       = "Start Goal"
+
 [concurrency]
 max  = 1
 type = "limited"
