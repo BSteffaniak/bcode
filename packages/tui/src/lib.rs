@@ -66,6 +66,7 @@ pub(crate) mod ralph_start_dialog_render;
 pub(crate) mod render;
 #[cfg(test)]
 mod renderer_fixtures;
+mod resurrection;
 mod root_program;
 pub(crate) mod runtime;
 mod runtime_adapter;

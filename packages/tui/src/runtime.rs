@@ -116,8 +116,15 @@ pub async fn run_event_loop_with_startup_and_static_bundled<W: Write>(
     static_plugins: &[bcode_plugin::StaticBundledPlugin],
     launch_options: super::TuiLaunchOptions,
 ) -> Result<(), TuiError> {
+    let config = bcode_config::load_config();
+    let (session_id, publisher) = if let Ok(config) = &config {
+        super::resurrection::connect(&config.tui.session_resurrection, session_id).await?
+    } else {
+        // Preserve the existing in-TUI configuration error reporting path.
+        (session_id, None)
+    };
     let initialized = initialize_tui(terminal.area(), session_id, static_plugins, launch_options);
-    Box::pin(run_root(terminal, initialized, startup_action)).await
+    Box::pin(run_root(terminal, initialized, startup_action, publisher)).await
 }
 
 struct InitializedTui {
@@ -275,6 +282,7 @@ async fn run_root<W: Write>(
     terminal: &mut Terminal<&mut W>,
     initialized: InitializedTui,
     startup_action: StartupTuiAction,
+    publisher: Option<super::resurrection::Publisher>,
 ) -> Result<(), TuiError> {
     let passive_client = initialized
         .client
@@ -293,6 +301,7 @@ async fn run_root<W: Write>(
             initialized.settings,
             loop_state,
         );
+        model.resurrection = publisher;
         if let StartupTuiAction::OpenRalphHome { repo_path } = startup_action {
             let surface =
                 super::ralph_launcher::open_root_ralph_home_surface(repo_path, None).await?;

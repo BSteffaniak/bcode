@@ -2373,10 +2373,39 @@ pub enum StreamingInterpolationCurveConfig {
     EaseInOut,
 }
 
+/// Host-independent application resurrection participation.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, ConfigDoc)]
+#[config_doc(section = "session_resurrection")]
+pub struct SessionResurrectionConfig {
+    /// Auto-detect a compatible host, explicitly enable, or disable participation.
+    #[serde(default)]
+    pub mode: SessionResurrectionMode,
+    /// Optional local host endpoint used when integration is explicitly enabled.
+    #[serde(default)]
+    pub endpoint: Option<String>,
+}
+
+/// Whether to exchange session references with a resurrection host.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, ConfigDocEnum)]
+#[serde(rename_all = "snake_case")]
+pub enum SessionResurrectionMode {
+    /// Participate only when the host advertises the supported protocol.
+    #[default]
+    Auto,
+    /// Participate using the configured endpoint or host advertisement.
+    Enabled,
+    /// Ignore host advertisements and restoration offers.
+    Disabled,
+}
+
 /// Terminal UI configuration.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, ConfigDoc)]
 #[config_doc(section = "tui")]
 pub struct TuiConfig {
+    /// Host-independent session resurrection integration.
+    #[config_doc(nested)]
+    #[serde(default)]
+    pub session_resurrection: SessionResurrectionConfig,
     /// Render scheduling configuration.
     #[config_doc(nested)]
     #[serde(default)]

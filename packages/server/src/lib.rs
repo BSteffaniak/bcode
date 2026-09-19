@@ -18112,14 +18112,14 @@ async fn maybe_retry_after_provider_error(
     ) {
         recovery.retried_after_context_pressure = true;
         set_runtime_phase(context.phase, SessionRuntimePhase::Compacting).await;
-        let result = compact_session_after_context_overflow(
+        let result = Box::pin(compact_session_after_context_overflow(
             state,
             session_id,
             context.selection,
             context.trigger_event_sequence,
             error,
             context.cancel_state,
-        )
+        ))
         .await;
         set_runtime_phase(context.phase, SessionRuntimePhase::ProviderActive).await;
         return match result {

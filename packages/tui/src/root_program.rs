@@ -237,6 +237,7 @@ pub struct BcodeRuntimeModel {
     plugin_surface_result: Option<(String, Option<serde_json::Value>)>,
     /// Whether the root program should terminate after its dirty state is committed.
     pub exit_requested: bool,
+    pub(crate) resurrection: Option<super::resurrection::Publisher>,
     theme_input_signature: u64,
     theme_reload_at: Instant,
     scheduled_deadlines: BTreeMap<bmux_tui_runtime::TimerId, Instant>,
@@ -304,6 +305,7 @@ impl BcodeRuntimeModel {
             exit_after_plugin_surface: false,
             plugin_surface_result: None,
             exit_requested: false,
+            resurrection: None,
             theme_input_signature,
             theme_reload_at,
             scheduled_deadlines: BTreeMap::new(),
@@ -2950,6 +2952,9 @@ impl bmux_tui_runtime::Program for BcodeRuntimeModel {
         let route_invalidation = self.synchronize_screen();
         self.invalidation = self.invalidation.merge(route_invalidation);
         self.draft_autosave.observe(&self.chat, Instant::now());
+        if let Some(publisher) = &mut self.resurrection {
+            publisher.observe(self.chat.attachment);
+        }
         let housekeeping = self
             .loop_state
             .prepare_runtime_work(&mut self.chat, self.committed_area);
