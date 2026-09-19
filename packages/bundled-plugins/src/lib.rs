@@ -65,11 +65,6 @@ pub fn static_tui_extensions() -> Vec<bcode_plugin_sdk::tui::StaticPluginTuiExte
         "bcode.question",
         bcode_question_plugin::question_tui_registry,
     ));
-    #[cfg(feature = "static-bundled-ralph-plugin")]
-    extensions.push(bcode_plugin_sdk::tui::StaticPluginTuiExtension::new(
-        "bcode.ralph",
-        bcode_ralph_plugin::tui_registry,
-    ));
     #[cfg(feature = "static-bundled-session-derivation-plugin")]
     extensions.push(bcode_plugin_sdk::tui::StaticPluginTuiExtension::new(
         "bcode.session-derivation",
@@ -135,8 +130,6 @@ pub fn tui_registry(plugin_id: &str) -> Option<bcode_plugin_sdk::tui::PluginTuiR
         "bcode.ocr" => Some(bcode_ocr_plugin::ocr_tui_registry()),
         #[cfg(feature = "static-bundled-question-plugin")]
         "bcode.question" => Some(bcode_question_plugin::question_tui_registry()),
-        #[cfg(feature = "static-bundled-ralph-plugin")]
-        "bcode.ralph" => Some(bcode_ralph_plugin::tui_registry()),
         #[cfg(feature = "static-bundled-session-derivation-plugin")]
         "bcode.session-derivation" => {
             Some(bcode_session_derivation_plugin::session_derivation_tui_registry())
@@ -261,8 +254,6 @@ fn append_static_bundled_plugins(plugins: &mut Vec<bcode_plugin::StaticBundledPl
     plugins.push(question_plugin());
     #[cfg(feature = "static-bundled-loop-plugin")]
     plugins.push(static_loop_plugin());
-    #[cfg(feature = "static-bundled-ralph-plugin")]
-    plugins.push(ralph_plugin());
     #[cfg(feature = "static-bundled-read-plugin")]
     plugins.push(read_plugin());
     #[cfg(feature = "static-bundled-session-derivation-plugin")]
@@ -435,14 +426,6 @@ pub fn static_loop_plugin() -> bcode_plugin::StaticBundledPlugin {
     bcode_plugin::StaticBundledPlugin::new(
         include_str!("../../../plugins/loop-plugin/bcode-plugin.toml"),
         bcode_loop_plugin::static_plugin(),
-    )
-}
-
-#[cfg(feature = "static-bundled-ralph-plugin")]
-fn ralph_plugin() -> bcode_plugin::StaticBundledPlugin {
-    bcode_plugin::StaticBundledPlugin::new(
-        include_str!("../../../plugins/ralph-plugin/bcode-plugin.toml"),
-        bcode_ralph_plugin::static_plugin(),
     )
 }
 
@@ -828,7 +811,6 @@ mod tests {
         feature = "static-bundled-opencode-session-import-plugin",
         feature = "static-bundled-pi-session-import-plugin",
         feature = "static-bundled-question-plugin",
-        feature = "static-bundled-ralph-plugin",
         feature = "static-bundled-read-plugin",
         feature = "static-bundled-shell-plugin",
         feature = "static-bundled-skills-plugin",

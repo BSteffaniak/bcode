@@ -120,7 +120,6 @@ static-bundled-plugins = [
     "static-bundled-opencode-session-import-plugin",
     "static-bundled-pi-session-import-plugin",
     "static-bundled-question-plugin",
-    "static-bundled-ralph-plugin",
     "static-bundled-read-plugin",
     "static-bundled-session-derivation-plugin",
     "static-bundled-shell-plugin",
@@ -133,10 +132,6 @@ static-bundled-plugins = [
 static-bundled-question-plugin = [
     "_static-bundled",
     "bcode_hyperchad?/static-bundled-question-plugin",
-]
-static-bundled-ralph-plugin = [
-    "_static-bundled",
-    "bcode_tui/static-bundled-ralph-plugin",
 ]
 static-bundled-read-plugin = ["_static-bundled"]
 static-bundled-session-derivation-plugin = ["_static-bundled"]

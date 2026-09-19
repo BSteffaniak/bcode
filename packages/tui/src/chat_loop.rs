@@ -5441,7 +5441,6 @@ fn interaction_surface_request(
     feature = "static-bundled-code-review-plugin",
     feature = "static-bundled-filesystem-plugin",
     feature = "static-bundled-plugins",
-    feature = "static-bundled-ralph-plugin",
     feature = "static-bundled-workflow-plugin"
 ))]
 fn interaction_adapter_for_summary(
@@ -5459,7 +5458,6 @@ fn interaction_adapter_for_summary(
     feature = "static-bundled-code-review-plugin",
     feature = "static-bundled-filesystem-plugin",
     feature = "static-bundled-plugins",
-    feature = "static-bundled-ralph-plugin",
     feature = "static-bundled-workflow-plugin"
 )))]
 const fn interaction_adapter_for_summary(
@@ -5472,7 +5470,6 @@ const fn interaction_adapter_for_summary(
     feature = "static-bundled-code-review-plugin",
     feature = "static-bundled-filesystem-plugin",
     feature = "static-bundled-plugins",
-    feature = "static-bundled-ralph-plugin",
     feature = "static-bundled-workflow-plugin"
 )))]
 const fn tool_exchange_surface_request(
@@ -5485,7 +5482,6 @@ const fn tool_exchange_surface_request(
     feature = "static-bundled-code-review-plugin",
     feature = "static-bundled-filesystem-plugin",
     feature = "static-bundled-plugins",
-    feature = "static-bundled-ralph-plugin",
     feature = "static-bundled-workflow-plugin"
 ))]
 fn tool_exchange_surface_request(

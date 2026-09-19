@@ -33,7 +33,6 @@ bcode_plugin                            = { workspace = true }
 bcode_plugin_sdk                        = { workspace = true, features = ["tui"] }
 bcode_prompt_profile_plugin             = { workspace = true, optional = true }
 bcode_question_plugin                   = { workspace = true, optional = true }
-bcode_ralph_plugin                      = { workspace = true, optional = true }
 bcode_read_plugin                       = { workspace = true, optional = true }
 bcode_session_derivation_plugin         = { workspace = true, optional = true }
 bcode_shell_plugin                      = { workspace = true, optional = true }
@@ -168,7 +167,6 @@ static-bundled-plugins = [
     "static-bundled-pi-session-import-plugin",
     "static-bundled-question-plugin",
     "static-bundled-loop-plugin",
-    "static-bundled-ralph-plugin",
     "static-bundled-read-plugin",
     "static-bundled-session-derivation-plugin",
     "static-bundled-shell-plugin",
@@ -186,10 +184,6 @@ static-bundled-prompt-profile-plugin = [
 static-bundled-question-plugin = [
     "dep:bcode_question_plugin",
     "bcode_question_plugin/static-bundled",
-]
-static-bundled-ralph-plugin = [
-    "dep:bcode_ralph_plugin",
-    "bcode_ralph_plugin/static-bundled",
 ]
 static-bundled-read-plugin = [
     "dep:bcode_read_plugin",

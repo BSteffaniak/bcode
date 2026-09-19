@@ -2544,7 +2544,6 @@ async fn load_plugin_session_status(
     feature = "static-bundled-code-review-plugin",
     feature = "static-bundled-filesystem-plugin",
     feature = "static-bundled-plugins",
-    feature = "static-bundled-ralph-plugin",
     feature = "static-bundled-workflow-plugin"
 ))]
 fn interaction_adapter_for_exchange(
@@ -2560,7 +2559,6 @@ fn interaction_adapter_for_exchange(
     feature = "static-bundled-code-review-plugin",
     feature = "static-bundled-filesystem-plugin",
     feature = "static-bundled-plugins",
-    feature = "static-bundled-ralph-plugin",
     feature = "static-bundled-workflow-plugin"
 )))]
 const fn interaction_adapter_for_exchange(

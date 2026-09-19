@@ -24,7 +24,6 @@ pub enum BuiltinCommandId {
     Cwd,
     Worktree,
     Ralph,
-    Goal,
     Skills,
     Skill,
     Thinking,
@@ -220,11 +219,6 @@ const BUILTIN_COMMANDS: &[BuiltinCommandSpec] = &[
         ],
     },
     BuiltinCommandSpec {
-        id: BuiltinCommandId::Goal,
-        names: &["goal"],
-        completions: &[completion!("/goal", "Start/continue Ralph goal workflow")],
-    },
-    BuiltinCommandSpec {
         id: BuiltinCommandId::Skills,
         names: &["skills"],
         completions: &[completion!("/skills", "Open skill picker")],
@@ -385,6 +379,13 @@ pub async fn resolve(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn goal_is_available_to_plugin_command_resolution() {
+        assert!(builtin_command("goal").is_none());
+        assert!(!is_builtin_command_name("goal"));
+        assert!(static_completions().all(|completion| completion.command() != "/goal"));
+    }
 
     #[test]
     fn search_is_discoverable_and_reserved_as_a_builtin() {

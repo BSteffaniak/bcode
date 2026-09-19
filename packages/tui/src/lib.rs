@@ -358,7 +358,6 @@ fn current_time_ms() -> u64 {
     feature = "static-bundled-code-review-plugin",
     feature = "static-bundled-filesystem-plugin",
     feature = "static-bundled-plugins",
-    feature = "static-bundled-ralph-plugin",
     feature = "static-bundled-workflow-plugin"
 ))]
 #[must_use]
@@ -366,7 +365,6 @@ fn current_time_ms() -> u64 {
     feature = "static-bundled-code-review-plugin",
     feature = "static-bundled-filesystem-plugin",
     feature = "static-bundled-plugins",
-    feature = "static-bundled-ralph-plugin",
     feature = "static-bundled-workflow-plugin"
 ))]
 pub fn static_bundled_plugins() -> Vec<bcode_plugin::StaticBundledPlugin> {
@@ -378,7 +376,6 @@ pub fn static_bundled_plugins() -> Vec<bcode_plugin::StaticBundledPlugin> {
     feature = "static-bundled-code-review-plugin",
     feature = "static-bundled-filesystem-plugin",
     feature = "static-bundled-plugins",
-    feature = "static-bundled-ralph-plugin",
     feature = "static-bundled-workflow-plugin"
 )))]
 #[must_use]
@@ -390,7 +387,6 @@ pub const fn static_bundled_plugins() -> Vec<bcode_plugin::StaticBundledPlugin> 
     feature = "static-bundled-code-review-plugin",
     feature = "static-bundled-filesystem-plugin",
     feature = "static-bundled-plugins",
-    feature = "static-bundled-ralph-plugin",
     feature = "static-bundled-workflow-plugin"
 ))]
 fn bundled_interaction_adapters(
@@ -403,7 +399,6 @@ fn bundled_interaction_adapters(
     feature = "static-bundled-code-review-plugin",
     feature = "static-bundled-filesystem-plugin",
     feature = "static-bundled-plugins",
-    feature = "static-bundled-ralph-plugin",
     feature = "static-bundled-workflow-plugin"
 )))]
 const fn bundled_interaction_adapters(
@@ -416,7 +411,6 @@ const fn bundled_interaction_adapters(
     feature = "static-bundled-code-review-plugin",
     feature = "static-bundled-filesystem-plugin",
     feature = "static-bundled-plugins",
-    feature = "static-bundled-ralph-plugin",
     feature = "static-bundled-workflow-plugin"
 ))]
 fn bundled_interaction_adapter(
@@ -432,7 +426,6 @@ fn bundled_interaction_adapter(
     feature = "static-bundled-code-review-plugin",
     feature = "static-bundled-filesystem-plugin",
     feature = "static-bundled-plugins",
-    feature = "static-bundled-ralph-plugin",
     feature = "static-bundled-workflow-plugin"
 ))]
 fn bundled_tui_extensions() -> Vec<bcode_plugin_sdk::tui::StaticPluginTuiExtension> {
@@ -443,7 +436,6 @@ fn bundled_tui_extensions() -> Vec<bcode_plugin_sdk::tui::StaticPluginTuiExtensi
     feature = "static-bundled-code-review-plugin",
     feature = "static-bundled-filesystem-plugin",
     feature = "static-bundled-plugins",
-    feature = "static-bundled-ralph-plugin",
     feature = "static-bundled-workflow-plugin"
 )))]
 const fn bundled_tui_extensions() -> Vec<bcode_plugin_sdk::tui::StaticPluginTuiExtension> {
