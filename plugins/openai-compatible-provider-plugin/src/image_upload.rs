@@ -8,6 +8,7 @@ pub fn failure_report(code: &'static str) -> VerifyImageUploadResponse {
     let before_upload = matches!(
         code,
         "image_upload_not_authorized_or_unsupported_version"
+            | "image_upload_cancelled_before_dispatch"
             | "image_upload_requires_api_key"
             | "image_upload_requires_responses_api"
             | "image_upload_unsupported_mime"
@@ -26,6 +27,7 @@ pub fn failure_report(code: &'static str) -> VerifyImageUploadResponse {
         image_bytes: 0,
         diagnostic: Some(code.to_string()),
         upload_attempted: Some(!before_upload),
+        expiry_confirmed: None,
     }
 }
 
@@ -33,17 +35,22 @@ const LIMIT: usize = 1024 * 1024;
 
 pub async fn verify(
     request: VerifyImageUploadRequest,
+    cancellation: bcode_plugin_sdk::ServiceCancellation,
 ) -> Result<VerifyImageUploadResponse, &'static str> {
+    if cancellation.is_cancelled() {
+        return Err("image_upload_cancelled_before_dispatch");
+    }
     if request.schema_version != 1 || !request.allow_remote_storage {
         return Err("image_upload_not_authorized_or_unsupported_version");
     }
     let settings = settings_for_context(&request.provider_context);
-    verify_with_settings(request, &settings).await
+    verify_with_settings(request, &settings, &cancellation).await
 }
 
 async fn verify_with_settings(
     request: VerifyImageUploadRequest,
     settings: &super::Settings,
+    cancellation: &bcode_plugin_sdk::ServiceCancellation,
 ) -> Result<VerifyImageUploadResponse, &'static str> {
     let AuthSettings::ApiKey(key) = &settings.auth else {
         return Err("image_upload_requires_api_key");
@@ -79,6 +86,11 @@ async fn verify_with_settings(
         .text("expires_after[anchor]", "created_at")
         .text("expires_after[seconds]", "3600")
         .part("file", part);
+    if cancellation.is_cancelled() {
+        return Err("image_upload_cancelled_before_dispatch");
+    }
+    // Once dispatched, await the bounded receipt even if cancelled, so cleanup can identify
+    // the created file. Cancelling this HTTP future would discard that cleanup authority.
     let response = client
         .post(&endpoint)
         .bearer_auth(key)
@@ -105,20 +117,9 @@ async fn verify_with_settings(
                     .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
         })
         .ok_or("image_upload_id_invalid_cleanup_unknown")?;
+    let expiry_confirmed = receipt_expiry_confirmed(&receipt);
     let file_url = format!("{endpoint}/{id}");
-    let retrieved = async {
-        let response = client
-            .get(format!("{file_url}/content"))
-            .bearer_auth(key)
-            .send()
-            .await
-            .ok()?;
-        if !response.status().is_success() {
-            return None;
-        }
-        bounded(response, bytes.len()).await.ok()
-    }
-    .await;
+    let retrieved = retrieve_bytes(&client, &file_url, key, bytes.len(), cancellation).await;
     let bytes_verified = retrieved
         .as_ref()
         .is_some_and(|retrieved| retrieved == &bytes);
@@ -128,17 +129,57 @@ async fn verify_with_settings(
     Ok(VerifyImageUploadResponse {
         schema_version: 1,
         upload_attempted: Some(true),
+        expiry_confirmed: Some(expiry_confirmed),
         bytes_verified,
         deletion_confirmed,
         image_bytes: bytes.len() as u64,
         diagnostic: if !deletion_confirmed {
             Some("image_upload_cleanup_unconfirmed".to_string())
+        } else if cancellation.is_cancelled() {
+            Some("image_upload_cancelled_cleanup_confirmed".to_string())
+        } else if !expiry_confirmed {
+            Some("image_upload_expiry_unconfirmed".to_string())
         } else if !bytes_verified {
             Some("image_upload_bytes_unverified".to_string())
         } else {
             None
         },
     })
+}
+
+async fn retrieve_bytes(
+    client: &reqwest::Client,
+    file_url: &str,
+    key: &str,
+    limit: usize,
+    cancellation: &bcode_plugin_sdk::ServiceCancellation,
+) -> Option<Vec<u8>> {
+    if cancellation.is_cancelled() {
+        return None;
+    }
+    let response = client
+        .get(format!("{file_url}/content"))
+        .bearer_auth(key)
+        .send()
+        .await
+        .ok()?;
+    if !response.status().is_success() {
+        return None;
+    }
+    bounded(response, limit).await.ok()
+}
+
+fn receipt_expiry_confirmed(receipt: &serde_json::Value) -> bool {
+    receipt
+        .get("created_at")
+        .and_then(serde_json::Value::as_u64)
+        .zip(
+            receipt
+                .get("expires_at")
+                .and_then(serde_json::Value::as_u64),
+        )
+        .and_then(|(created, expires)| expires.checked_sub(created))
+        .is_some_and(|lifetime| (1..=3600).contains(&lifetime))
 }
 
 fn files_endpoint(base: &str) -> Result<String, &'static str> {
@@ -217,6 +258,13 @@ mod tests {
     fn endpoint(
         responses: Vec<(&'static str, &'static str, Vec<u8>)>,
     ) -> (String, std::thread::JoinHandle<()>) {
+        endpoint_with_cancellation(responses, None)
+    }
+
+    fn endpoint_with_cancellation(
+        responses: Vec<(&'static str, &'static str, Vec<u8>)>,
+        cancel_after_upload: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
+    ) -> (String, std::thread::JoinHandle<()>) {
         use std::io::{BufRead as _, Read as _, Write as _};
         let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("listener");
         let url = format!("http://{}", listener.local_addr().expect("address"));
@@ -251,6 +299,9 @@ mod tests {
                     assert!(multipart.contains("vision"));
                     assert!(multipart.contains("expires_after[seconds]"));
                     assert!(multipart.contains("3600"));
+                    if let Some(flag) = &cancel_after_upload {
+                        flag.store(true, std::sync::atomic::Ordering::SeqCst);
+                    }
                     assert!(body.windows(3).any(|bytes| bytes == [1, 2, 3]));
                 }
                 drop(reader);
@@ -273,7 +324,7 @@ mod tests {
             (vec![9, 9, 9, 9], true, false, true),
             (vec![1, 2, 3], false, true, false),
         ] {
-            let receipt = br#"{"id":"file-probe"}"#.to_vec();
+            let receipt = br#"{"id":"file-probe","created_at":100,"expires_at":3700}"#.to_vec();
             let deleted = format!("{{\"id\":\"file-probe\",\"deleted\":{deletion}}}").into_bytes();
             let (url, worker) = endpoint(vec![
                 ("POST /files ", "200 OK", receipt),
@@ -285,9 +336,13 @@ mod tests {
                 OpenAiCompatibleDialect::ResponsesApi,
             );
             settings.base_url = url;
-            let report = verify_with_settings(fixture(), &settings)
-                .await
-                .expect("report");
+            let report = verify_with_settings(
+                fixture(),
+                &settings,
+                &bcode_plugin_sdk::ServiceCancellation::default(),
+            )
+            .await
+            .expect("report");
             worker.join().expect("server");
             assert_eq!(report.bytes_verified, expected_bytes);
             assert_eq!(report.deletion_confirmed, expected_deleted);
@@ -316,12 +371,66 @@ mod tests {
         );
         settings.base_url = url;
         assert_eq!(
-            verify_with_settings(fixture(), &settings)
-                .await
-                .expect_err("unsafe ID"),
+            verify_with_settings(
+                fixture(),
+                &settings,
+                &bcode_plugin_sdk::ServiceCancellation::default()
+            )
+            .await
+            .expect_err("unsafe ID"),
             "image_upload_id_invalid_cleanup_unknown"
         );
         worker.join().expect("server");
+    }
+
+    #[test]
+    fn receipt_expiry_fails_closed_for_missing_invalid_or_excessive_lifetimes() {
+        assert!(receipt_expiry_confirmed(
+            &serde_json::json!({"created_at":100,"expires_at":3700})
+        ));
+        for receipt in [
+            serde_json::json!({}),
+            serde_json::json!({"created_at":100}),
+            serde_json::json!({"created_at":100,"expires_at":100}),
+            serde_json::json!({"created_at":100,"expires_at":99}),
+            serde_json::json!({"created_at":100,"expires_at":3701}),
+            serde_json::json!({"created_at":-1,"expires_at":100}),
+            serde_json::json!({"created_at":0,"expires_at":u64::MAX}),
+        ] {
+            assert!(!receipt_expiry_confirmed(&receipt));
+        }
+    }
+
+    #[tokio::test]
+    async fn missing_expiry_still_deletes_the_created_file() {
+        let (url, worker) = endpoint(vec![
+            ("POST /files ", "200 OK", br#"{"id":"file-probe"}"#.to_vec()),
+            ("GET /files/file-probe/content ", "200 OK", vec![1, 2, 3]),
+            (
+                "DELETE /files/file-probe ",
+                "200 OK",
+                br#"{"id":"file-probe","deleted":true}"#.to_vec(),
+            ),
+        ]);
+        let mut settings = super::super::tests::test_settings(
+            AuthSettings::ApiKey("test".to_string()),
+            OpenAiCompatibleDialect::ResponsesApi,
+        );
+        settings.base_url = url;
+        let report = verify_with_settings(
+            fixture(),
+            &settings,
+            &bcode_plugin_sdk::ServiceCancellation::default(),
+        )
+        .await
+        .expect("report");
+        worker.join().expect("server");
+        assert!(report.bytes_verified && report.deletion_confirmed);
+        assert_eq!(report.expiry_confirmed, Some(false));
+        assert_eq!(
+            report.diagnostic.as_deref(),
+            Some("image_upload_expiry_unconfirmed")
+        );
     }
 
     #[test]
@@ -346,6 +455,54 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn cancellation_after_upload_receipt_skips_download_but_deletes() {
+        let flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let cancellation = bcode_plugin_sdk::ServiceCancellation::new(flag.clone());
+        let (url, worker) = endpoint_with_cancellation(
+            vec![
+                (
+                    "POST /files ",
+                    "200 OK",
+                    br#"{"id":"file-probe","created_at":100,"expires_at":3700}"#.to_vec(),
+                ),
+                (
+                    "DELETE /files/file-probe ",
+                    "200 OK",
+                    br#"{"id":"file-probe","deleted":true}"#.to_vec(),
+                ),
+            ],
+            Some(flag),
+        );
+        let mut settings = super::super::tests::test_settings(
+            AuthSettings::ApiKey("test".to_string()),
+            OpenAiCompatibleDialect::ResponsesApi,
+        );
+        settings.base_url = url;
+        let report = verify_with_settings(fixture(), &settings, &cancellation)
+            .await
+            .expect("cleanup report");
+        worker.join().expect("server");
+        assert!(!report.bytes_verified);
+        assert!(report.deletion_confirmed);
+        assert_eq!(report.upload_attempted, Some(true));
+        assert_eq!(
+            report.diagnostic.as_deref(),
+            Some("image_upload_cancelled_cleanup_confirmed")
+        );
+    }
+
+    #[tokio::test]
+    async fn cancellation_before_dispatch_has_no_remote_outcome() {
+        let flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let cancellation = bcode_plugin_sdk::ServiceCancellation::new(flag);
+        let code = verify(fixture(), cancellation)
+            .await
+            .expect_err("cancelled");
+        assert_eq!(code, "image_upload_cancelled_before_dispatch");
+        assert_eq!(failure_report(code).upload_attempted, Some(false));
+    }
+
+    #[tokio::test]
     async fn authorization_and_version_precede_auth_and_network() {
         let mut request = VerifyImageUploadRequest {
             schema_version: 1,
@@ -358,13 +515,20 @@ mod tests {
             allow_remote_storage: false,
         };
         assert_eq!(
-            verify(request.clone()).await.expect_err("denied"),
+            verify(
+                request.clone(),
+                bcode_plugin_sdk::ServiceCancellation::default()
+            )
+            .await
+            .expect_err("denied"),
             "image_upload_not_authorized_or_unsupported_version"
         );
         request.allow_remote_storage = true;
         request.schema_version = 2;
         assert_eq!(
-            verify(request).await.expect_err("future"),
+            verify(request, bcode_plugin_sdk::ServiceCancellation::default())
+                .await
+                .expect_err("future"),
             "image_upload_not_authorized_or_unsupported_version"
         );
     }

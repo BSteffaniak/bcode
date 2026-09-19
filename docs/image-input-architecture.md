@@ -196,7 +196,15 @@ Embedded URL credentials, queries, and fragments are rejected before transmissio
 operation has a timeout, responses are bounded, and file IDs
 are validated before URL construction. Reports expose neither IDs nor response bodies. Unknown
 upload outcomes are not retried; invalid receipts report that cleanup is unknown. Expiry is a
-requested provider backstop, not a local guarantee. Cleanup failures are explicit.
+requested provider backstop, not a local guarantee. The receipt must confirm a positive lifetime
+of at most one hour (`expires_at - created_at`) for the probe to succeed; the additive
+`expiry_confirmed` field distinguishes this evidence from the request. Missing or invalid expiry
+still triggers deletion, but returns an explicit expiry-unconfirmed diagnostic. Cleanup failures
+are explicit. Service cancellation before dispatch prevents upload. After dispatch, the bounded
+receipt is awaited so a returned ID can still be deleted; cancellation skips a not-yet-started
+verification download but does not skip cleanup. In-flight HTTP phases remain bounded by their
+30-second timeout rather than being immediately aborted. This is not durable cancellation or
+crash recovery; loss of the process can still leave cleanup unknown.
 
 `bcode model verify-image-upload --dry-run` prints the plan without loading plugins.
 `--allow-remote-storage` authorizes one generated-image probe using the configured provider;
@@ -213,7 +221,10 @@ before upload: `diagnostic = image_upload_requires_api_key`, `upload_attempted =
 That configuration uses subscription authentication, not an API-key file endpoint. No remote
 file was created. The additive `upload_attempted` report field distinguishes local preflight
 rejections from dispatched uploads/unknown cleanup; absence in older reports remains unknown.
-Report: `/tmp/astra-upload-probe.json`.
+Report: `/tmp/astra-upload-probe.json`. The authorized `grok-4-6.toml` upload invocation likewise
+returned `image_upload_requires_api_key` and `upload_attempted = false` (`/tmp/xai-upload-probe.json`).
+Its declared auth scheme is API-key, so this is unresolved credential availability/resolution,
+not evidence that the remote file endpoint lacks support. No remote upload was dispatched.
 
 ## Opt-in request compression
 
@@ -287,6 +298,11 @@ are retained under `bcode-image-matrix-1g29s1_z`. This is an authentication-bloc
 not evidence that the model lacks vision. No capability claim is changed. Remaining configurations
 are unverified. Reports now include optional normalized `stop_reason` and `error_category` fields
 so provider failures are distinguishable from incorrect visual answers without exposing raw errors.
+
+An authorized `grok-4.6` matrix run with `grok-4-6.toml`, seed 726, reported `unsupported` for
+both user and tool-result input at capability negotiation, before generation. Reports are under
+`bcode-image-matrix-p_nwpfbh`. This means Bcode did not obtain affirmative claims for both scopes;
+it is not a live demonstration of remote vision failure. No claims were promoted.
 
 ```sh
 python3 scripts/verify-image-matrix.py --config ./provider.toml --model EXACT_MODEL_ID

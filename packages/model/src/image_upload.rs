@@ -33,4 +33,8 @@ pub struct VerifyImageUploadResponse {
     /// Whether upload dispatch began; absent in older reports or when unknown.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub upload_attempted: Option<bool>,
+    /// Whether the receipt confirmed a positive lifetime no longer than the requested hour.
+    /// Absent means unverified, including reports from older implementations.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expiry_confirmed: Option<bool>,
 }

@@ -1375,9 +1375,7 @@ impl OpenAiCompatibleProviderPlugin {
             }
             OP_MODELS => self.models_response(&context.request),
             OP_VALIDATE_CONFIG => self.validate_config(&context.request),
-            bcode_model::image_upload::OP_VERIFY_IMAGE_UPLOAD => {
-                self.verify_image_upload(&context.request)
-            }
+            bcode_model::image_upload::OP_VERIFY_IMAGE_UPLOAD => self.verify_image_upload(context),
             OP_VERIFY_MODEL => self.verify_model(&context.request),
             OP_AUTH_USAGE => self.auth_usage(&context.request),
             OP_AUTH_PRIME => self.auth_prime(&context.request),
@@ -1413,19 +1411,21 @@ impl OpenAiCompatibleProviderPlugin {
         json_response(&self.models(&model_list_request(request)))
     }
 
-    fn verify_image_upload(&self, request: &ServiceRequest) -> ServiceResponse {
-        let request =
-            match request.payload_json::<bcode_model::image_upload::VerifyImageUploadRequest>() {
-                Ok(request) => request,
-                Err(error) => return invalid_request(&error),
-            };
+    fn verify_image_upload(&self, context: &NativeServiceContext) -> ServiceResponse {
+        let request = match context
+            .request
+            .payload_json::<bcode_model::image_upload::VerifyImageUploadRequest>()
+        {
+            Ok(request) => request,
+            Err(error) => return invalid_request(&error),
+        };
         let Ok(runtime) = &self.runtime else {
             return ServiceResponse::error(
                 "image_upload_runtime_unavailable",
                 "image upload verification runtime unavailable",
             );
         };
-        match runtime.block_on(image_upload::verify(request)) {
+        match runtime.block_on(image_upload::verify(request, context.cancellation.clone())) {
             Ok(Ok(response)) => json_response(&response),
             Ok(Err(code)) => json_response(&image_upload::failure_report(code)),
             Err(_) => ServiceResponse::error(

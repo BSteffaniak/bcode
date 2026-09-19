@@ -12734,7 +12734,11 @@ fn verify_image_upload(args: &VerifyImageUploadArgs) -> Result<(), CliError> {
         ));
     }
     print_json(&response)?;
-    if response.bytes_verified && response.deletion_confirmed && response.diagnostic.is_none() {
+    if response.bytes_verified
+        && response.deletion_confirmed
+        && response.expiry_confirmed == Some(true)
+        && response.diagnostic.is_none()
+    {
         Ok(())
     } else {
         Err(CliError::PluginCli(
