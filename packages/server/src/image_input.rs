@@ -33,6 +33,7 @@ pub async fn hydrate_tool_result_images(
         return;
     }
 
+    let mut cache = RequestImageCache::default();
     for message in &mut request.messages {
         for block in &mut message.content {
             let ContentBlock::ToolResult { result } = block else {
@@ -46,15 +47,26 @@ pub async fn hydrate_tool_result_images(
                 else {
                     continue;
                 };
-                match read_image_artifact(
-                    state,
-                    session_id,
-                    &artifact_id,
-                    &reference_key,
-                    encoded_limit,
-                )
-                .await
-                {
+                let identity = (artifact_id.clone(), reference_key.clone());
+                let hydrated = if let Some(encoded) = cache.get(&identity) {
+                    Ok(encoded.to_owned())
+                } else {
+                    read_image_artifact_snapshot(
+                        state,
+                        session_id,
+                        &artifact_id,
+                        &reference_key,
+                        encoded_limit,
+                    )
+                    .await
+                    .map(|(encoded, finalized)| {
+                        if finalized {
+                            cache.insert(identity, &encoded);
+                        }
+                        encoded
+                    })
+                };
+                match hydrated {
                     Ok(data_base64) => {
                         *content = bcode_model::ToolResultContent::Image {
                             image: bcode_model::ImageContent {
@@ -74,6 +86,30 @@ pub async fn hydrate_tool_result_images(
                 }
             }
         }
+    }
+}
+
+#[derive(Default)]
+struct RequestImageCache {
+    bytes: usize,
+    images: std::collections::BTreeMap<(String, String), String>,
+}
+
+impl RequestImageCache {
+    fn get(&self, identity: &(String, String)) -> Option<&str> {
+        self.images.get(identity).map(String::as_str)
+    }
+
+    fn insert(&mut self, identity: (String, String), encoded: &str) {
+        // Bound both retained bytes and keys. Skipping a cache entry never drops context.
+        if self.images.len() >= 32
+            || self.images.contains_key(&identity)
+            || self.bytes.saturating_add(encoded.len()) > 5 * 1024 * 1024
+        {
+            return;
+        }
+        self.bytes += encoded.len();
+        self.images.insert(identity, encoded.to_owned());
     }
 }
 
@@ -135,6 +171,7 @@ fn artifact_identity_for_image_ref(
     Some((image.artifact_id.clone()?, image.reference_key.clone()?))
 }
 
+#[cfg(test)]
 pub async fn read_image_artifact(
     state: &ServerState,
     session_id: SessionId,
@@ -142,9 +179,23 @@ pub async fn read_image_artifact(
     reference_key: &str,
     encoded_limit: u64,
 ) -> Result<String, String> {
+    read_image_artifact_snapshot(state, session_id, artifact_id, reference_key, encoded_limit)
+        .await
+        .map(|(encoded, _)| encoded)
+}
+
+async fn read_image_artifact_snapshot(
+    state: &ServerState,
+    session_id: SessionId,
+    artifact_id: &str,
+    reference_key: &str,
+    encoded_limit: u64,
+) -> Result<(String, bool), String> {
     let raw_limit = encoded_limit.saturating_mul(3) / 4;
     let mut offset = 0_u64;
     let mut expected_total = None;
+    let mut revision = None;
+    let mut finalized = true;
     let mut bytes = Vec::new();
     loop {
         let remaining = raw_limit.saturating_add(1).saturating_sub(offset);
@@ -162,6 +213,13 @@ pub async fn read_image_artifact(
             length,
         )
         .await?;
+        if response.offset != offset
+            || revision.is_some_and(|value| value != response.reference_revision)
+        {
+            return Err("image artifact changed revision or returned the wrong offset".to_string());
+        }
+        revision = Some(response.reference_revision);
+        finalized &= response.finalized;
         let total_bytes = response.total_bytes;
         let chunk = response.bytes;
         validate_image_chunk(
@@ -183,7 +241,7 @@ pub async fn read_image_artifact(
         }
     }
     let encoded = encode_image_bytes(bytes, encoded_limit)?;
-    Ok(encoded)
+    Ok((encoded, finalized))
 }
 
 fn validate_image_chunk(
@@ -286,6 +344,29 @@ mod tests {
         ] {
             assert!(validate_image_chunk(expected, total, offset, len, requested, limit).is_err());
         }
+    }
+
+    #[test]
+    fn request_cache_is_identity_scoped_bounded_and_disposable() {
+        let mut cache = RequestImageCache::default();
+        let key = ("artifact".to_string(), "image".to_string());
+        cache.insert(key.clone(), "AAAA");
+        cache.insert(key.clone(), "BBBB");
+        assert_eq!(cache.get(&key), Some("AAAA"));
+        assert_eq!(cache.bytes, 4);
+        assert!(
+            cache
+                .get(&("other".to_string(), "image".to_string()))
+                .is_none()
+        );
+        for n in 0..40 {
+            cache.insert((n.to_string(), "image".to_string()), "AQID");
+        }
+        assert_eq!(cache.images.len(), 32);
+        assert!(RequestImageCache::default().get(&key).is_none());
+        let mut bounded = RequestImageCache::default();
+        bounded.insert(key, &"A".repeat(5 * 1024 * 1024 + 1));
+        assert!(bounded.images.is_empty());
     }
 
     #[test]
