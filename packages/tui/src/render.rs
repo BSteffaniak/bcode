@@ -2271,7 +2271,7 @@ pub fn transcript_item_rows_from_item_with_markdown(
     diff_viewer_config: TuiDiffViewerConfig,
     markdown: Option<&bcode_markdown_render::MarkdownRenderResult>,
 ) -> Vec<Line> {
-    let (rows, _) =
+    let (rows, _, _) =
         transcript_item_layout_from_item(item, width, plugin_host, diff_viewer_config, markdown);
     rows
 }
@@ -2285,12 +2285,22 @@ pub fn transcript_item_layout_from_item(
 ) -> (
     Vec<Line>,
     Vec<bcode_plugin_sdk::tui_visual::TuiVisualAnchor>,
+    Vec<(usize, bcode_plugin_sdk::tui::PluginTuiSelectionRow)>,
 ) {
     DIFF_VIEWER_CONFIG.with(|config| config.set(diff_viewer_config));
     let mut rows = Vec::new();
     let mut anchors = Vec::new();
-    push_transcript_item_rows(&mut rows, &mut anchors, item, width, plugin_host, markdown);
-    (rows, anchors)
+    let mut selection = Vec::new();
+    push_transcript_item_rows(
+        &mut rows,
+        &mut anchors,
+        &mut selection,
+        item,
+        width,
+        plugin_host,
+        markdown,
+    );
+    (rows, anchors, selection)
 }
 
 #[cfg(test)]
@@ -2382,6 +2392,7 @@ pub fn pending_submission_signature(
 fn push_transcript_item_rows(
     rows: &mut Vec<Line>,
     anchors: &mut Vec<bcode_plugin_sdk::tui_visual::TuiVisualAnchor>,
+    selection: &mut Vec<(usize, bcode_plugin_sdk::tui::PluginTuiSelectionRow)>,
     item: &TranscriptItem,
     width: u16,
     plugin_host: Option<&crate::plugin_tui::PluginTuiPresentation>,
@@ -2477,8 +2488,7 @@ fn push_transcript_item_rows(
                 )
             }) {
                 push_routed_tool_surface(
-                    rows,
-                    anchors,
+                    (rows, anchors, selection),
                     routed,
                     item,
                     tool_name,
@@ -2506,6 +2516,7 @@ fn push_transcript_item_rows(
             push_tool_result_rows(
                 rows,
                 anchors,
+                selection,
                 item,
                 &ToolResultRenderContext {
                     tool_name: tool_name.as_deref(),
@@ -2610,8 +2621,7 @@ fn push_transcript_item_rows(
                 resolve_canonical_plugin_visual(plugin_visual, None, width, plugin_host)
             {
                 push_routed_tool_surface(
-                    rows,
-                    anchors,
+                    (rows, anchors, selection),
                     routed,
                     item,
                     "Tool request draft",
@@ -2664,8 +2674,7 @@ fn push_transcript_item_rows(
                 plugin_host,
             ) {
                 push_routed_tool_surface(
-                    rows,
-                    anchors,
+                    (rows, anchors, selection),
                     routed,
                     item,
                     "Tool contribution",
@@ -2726,6 +2735,18 @@ fn push_transcript_item_rows(
     }
     for anchor in anchors.iter_mut() {
         anchor.row = anchor.row.saturating_add(layout.bottom_rows);
+    }
+    for (row, source) in selection.iter_mut() {
+        *row = row.saturating_add(layout.bottom_rows);
+        source.cells.retain_mut(|cell| {
+            let fits = cell.width > 0
+                && cell
+                    .column
+                    .checked_add(cell.width)
+                    .is_some_and(|end| end <= layout.content_width);
+            cell.column = cell.column.saturating_add(layout.content_x);
+            fits
+        });
     }
     apply_container_recipe(rows, item_start, layout);
 }
@@ -4538,8 +4559,11 @@ fn resolve_canonical_plugin_visual(
 
 /// Compose every tool lifecycle surface through the same chrome boundary.
 fn push_routed_tool_surface(
-    rows: &mut Vec<Line>,
-    anchors: &mut Vec<bcode_plugin_sdk::tui_visual::TuiVisualAnchor>,
+    output: (
+        &mut Vec<Line>,
+        &mut Vec<bcode_plugin_sdk::tui_visual::TuiVisualAnchor>,
+        &mut Vec<(usize, bcode_plugin_sdk::tui::PluginTuiSelectionRow)>,
+    ),
     routed: crate::plugin_tui::RoutedTuiVisual,
     item: &TranscriptItem,
     title: &str,
@@ -4549,6 +4573,7 @@ fn push_routed_tool_surface(
     ),
     width: u16,
 ) {
+    let (rows, anchors, selection) = output;
     let (status, is_error) = state;
     if routed.render_mode != PluginTuiVisualRenderMode::FullBlock {
         let mut timing = item.tool_timing();
@@ -4570,6 +4595,10 @@ fn push_routed_tool_surface(
         }
         anchor.row = anchor.row.saturating_add(body_start);
         anchor
+    }));
+    selection.extend(routed.selection.into_iter().map(|(row, mut source)| {
+        source.identity = format!("{}:{}", routed.route.plugin_id, source.identity);
+        (row.saturating_add(body_start), source)
     }));
     rows.extend(routed.rows);
     rows.push(Line::default());
@@ -4809,6 +4838,7 @@ struct ToolResultRenderContext<'a> {
 fn push_tool_result_rows(
     rows: &mut Vec<Line>,
     anchors: &mut Vec<bcode_plugin_sdk::tui_visual::TuiVisualAnchor>,
+    selection: &mut Vec<(usize, bcode_plugin_sdk::tui::PluginTuiSelectionRow)>,
     item: &TranscriptItem,
     context: &ToolResultRenderContext<'_>,
     width: u16,
@@ -4834,8 +4864,7 @@ fn push_tool_result_rows(
                 &title
             };
             push_routed_tool_surface(
-                rows,
-                anchors,
+                (rows, anchors, selection),
                 routed,
                 item,
                 title,

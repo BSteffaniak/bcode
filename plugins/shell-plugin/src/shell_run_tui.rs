@@ -582,16 +582,38 @@ impl bcode_plugin_sdk::tui::PluginTuiVisualAdapter for ShellRunTuiVisualAdapter 
             .collect()
     }
 
+    fn projection(
+        &self,
+        kind: &str,
+        payload: &serde_json::Value,
+        context: &bcode_plugin_sdk::tui::PluginTuiVisualRenderContext,
+    ) -> bcode_plugin_sdk::tui::PluginTuiVisualProjection {
+        ACTIVE_THEME.with(|theme| theme.set(context.theme()));
+        let mut projection = bcode_plugin_sdk::tui::PluginTuiVisualProjection::default();
+        projection.rows = self.rows_with_active_theme(kind, payload, context, &mut projection);
+        ACTIVE_THEME.with(|theme| theme.set(None));
+        if projection.anchors.is_empty() && payload.get("preview").is_none() {
+            let row = shell_terminal_prompt_rows(payload, context.width(), context).len();
+            if row < projection.rows.len() {
+                projection
+                    .anchors
+                    .push(bcode_plugin_sdk::tui_visual::TuiVisualAnchor {
+                        key: "terminal-body".to_owned(),
+                        row,
+                        source: None,
+                    });
+            }
+        }
+        projection
+    }
+
     fn rows(
         &self,
         kind: &str,
         payload: &serde_json::Value,
         context: &bcode_plugin_sdk::tui::PluginTuiVisualRenderContext,
     ) -> Vec<Line> {
-        ACTIVE_THEME.with(|theme| theme.set(context.theme()));
-        let rows = self.rows_with_active_theme(kind, payload, context);
-        ACTIVE_THEME.with(|theme| theme.set(None));
-        rows
+        self.projection(kind, payload, context).rows
     }
 }
 
@@ -601,10 +623,11 @@ impl ShellRunTuiVisualAdapter {
         kind: &str,
         payload: &serde_json::Value,
         context: &bcode_plugin_sdk::tui::PluginTuiVisualRenderContext,
+        projection: &mut bcode_plugin_sdk::tui::PluginTuiVisualProjection,
     ) -> Vec<Line> {
         let width = context.width();
         if kind == "bcode.tool.request.shell.run" {
-            return self.shell_request_rows(payload, width, context);
+            return self.shell_request_rows(payload, width, context, projection);
         }
         if kind == SHELL_RUN_SCHEMA
             && let Some(key) = payload
@@ -613,7 +636,7 @@ impl ShellRunTuiVisualAdapter {
                 .and_then(serde_json::Value::as_str)
             && let Some(replay) = self.live_replay_data(key)
         {
-            return self.live_shell_result_rows(key, payload, width, context, &replay);
+            return self.live_shell_result_rows(key, payload, context, &replay, projection);
         }
         let mode = payload
             .get("mode")
@@ -662,11 +685,63 @@ impl ShellRunTuiVisualAdapter {
         key: &str,
         input: TerminalViewerInput<'_>,
         width: u16,
+        body_start: usize,
+        projection: &mut bcode_plugin_sdk::tui::PluginTuiVisualProjection,
     ) -> Option<Vec<Line>> {
         let mut replays = self.live_replays.lock().ok()?;
         let replay = replays.get_mut(key)?;
         let stream = replay.stream.as_ref()?;
         let rows = shell_terminal_grid_rows(input, stream.grid(), width, &mut replay.projection);
+        let alternate = stream.grid().mode() == GridMode::Alternate;
+        if alternate {
+            for index in 0..rows.len() {
+                projection
+                    .anchors
+                    .push(bcode_plugin_sdk::tui_visual::TuiVisualAnchor {
+                        key: format!("terminal:{}:{}:0:{index}", key.len(), key),
+                        row: body_start + index,
+                        source: None,
+                    });
+                if let Some(row) = replay.projection.selection.get(index) {
+                    let mut row = row.clone();
+                    row.identity = format!("{}:{}:{}", key.len(), key, row.identity);
+                    projection.selection.push((body_start + index, row));
+                }
+            }
+        }
+        for (index, source) in replay
+            .projection
+            .sources
+            .iter()
+            .enumerate()
+            .take(rows.len())
+        {
+            let identity = format!(
+                "terminal:{}:{}:{}:{}",
+                key.len(),
+                key,
+                source.start.capture,
+                source.start.line
+            );
+            projection
+                .anchors
+                .push(bcode_plugin_sdk::tui_visual::TuiVisualAnchor {
+                    key: format!("terminal-row:{index}"),
+                    row: body_start + index,
+                    source: (!alternate).then_some({
+                        bcode_plugin_sdk::tui_visual::TuiVisualSourceRange {
+                            identity,
+                            start: source.start.column,
+                            end: source.end.column,
+                        }
+                    }),
+                });
+            if let Some(row) = replay.projection.selection.get(index) {
+                let mut row = row.clone();
+                row.identity = format!("{}:{}:{}", key.len(), key, row.identity);
+                projection.selection.push((body_start + index, row));
+            }
+        }
         drop(replays);
         Some(rows)
     }
@@ -694,10 +769,11 @@ impl ShellRunTuiVisualAdapter {
         &self,
         key: &str,
         payload: &serde_json::Value,
-        width: u16,
         context: &bcode_plugin_sdk::tui::PluginTuiVisualRenderContext,
         replay: &TerminalReplayData,
+        projection: &mut bcode_plugin_sdk::tui::PluginTuiVisualProjection,
     ) -> Vec<Line> {
+        let width = context.width();
         let mut lines = shell_terminal_prompt_rows(payload, width, context);
         lines.extend(shell_replay_status_rows(replay));
         let input = TerminalViewerInput {
@@ -717,7 +793,7 @@ impl ShellRunTuiVisualAdapter {
             show_status: false,
             sizing: TerminalViewerSizing::Compact,
         };
-        if let Some(rows) = self.live_grid_rows(key, input, width) {
+        if let Some(rows) = self.live_grid_rows(key, input, width, lines.len(), projection) {
             if let Ok(mut diagnostics) = self.diagnostics.lock() {
                 diagnostics.emitted_rows = diagnostics
                     .emitted_rows
@@ -776,6 +852,7 @@ impl ShellRunTuiVisualAdapter {
         payload: &serde_json::Value,
         width: u16,
         context: &bcode_plugin_sdk::tui::PluginTuiVisualRenderContext,
+        projection: &mut bcode_plugin_sdk::tui::PluginTuiVisualProjection,
     ) -> Vec<Line> {
         if payload.get("preview").is_some() {
             return shell_request_draft_rows(payload, width, context);
@@ -834,7 +911,7 @@ impl ShellRunTuiVisualAdapter {
         }
         let mut lines = shell_terminal_prompt_rows(payload, width, context);
         lines.extend(self.live_replay_status_rows(key, runtime));
-        let retained_rows = self.live_grid_rows(key, input, width);
+        let retained_rows = self.live_grid_rows(key, input, width, lines.len(), projection);
         let used_retained_grid = retained_rows.is_some();
         let terminal_rows = retained_rows.unwrap_or_else(|| terminal_viewer_rows(input, width));
         if !used_retained_grid {
@@ -1562,7 +1639,14 @@ fn shell_terminal_grid_rows(
             visible_rows.max(1).min(max_rows)
         };
         if output.len() > target_rows {
-            output = output[output.len().saturating_sub(target_rows)..].to_vec();
+            let removed = output.len().saturating_sub(target_rows);
+            output = output.split_off(removed);
+            projection
+                .sources
+                .drain(..removed.min(projection.sources.len()));
+            projection
+                .selection
+                .drain(..removed.min(projection.selection.len()));
         }
         while output.len() < target_rows {
             output.push(Line::default());
@@ -3087,6 +3171,48 @@ mod tests {
             40
         );
         assert_eq!(screen.snapshot(0, 40), before);
+    }
+
+    #[test]
+    fn owned_shell_projection_keeps_selection_after_reflow_and_replay_release() {
+        use bcode_plugin_sdk::tui::{
+            PluginTuiDiffLayout, PluginTuiVisualAdapter, PluginTuiVisualRenderContext,
+        };
+        for output in [
+            b"abcdefghijklmno".as_slice(),
+            b"\x1b[?1049habcdefghijklmno".as_slice(),
+        ] {
+            let adapter = ShellRunTuiVisualAdapter::default();
+            adapter.update_live_replay("owned", output, None, 20, 3);
+            let payload =
+                serde_json::json!({"mode":"terminal", "_bcode_runtime":{"live_state_key":"owned"}});
+            let narrow = adapter.projection(
+                SHELL_RUN_SCHEMA,
+                &payload,
+                &PluginTuiVisualRenderContext::new(12, PluginTuiDiffLayout::Unified, None),
+            );
+            let wide = adapter.projection(
+                SHELL_RUN_SCHEMA,
+                &payload,
+                &PluginTuiVisualRenderContext::new(40, PluginTuiDiffLayout::Unified, None),
+            );
+            adapter.live_replays.lock().unwrap().clear();
+            assert!(!narrow.selection.is_empty());
+            assert_ne!(narrow.selection, wide.selection);
+            for projection in [narrow, wide] {
+                for (index, row) in projection.selection {
+                    assert!(
+                        projection.rows[index]
+                            .plain_text()
+                            .contains(row.text.trim_end()),
+                        "{} / {}",
+                        projection.rows[index].plain_text(),
+                        row.text
+                    );
+                    assert!(projection.anchors.iter().any(|anchor| anchor.row == index));
+                }
+            }
+        }
     }
 
     #[test]

@@ -1457,6 +1457,65 @@ pub struct PluginTuiSelectionRow {
     pub revision: u64,
 }
 
+impl PluginTuiSelectionRow {
+    /// Whether bounded source metadata preserves UTF-8 and terminal cell boundaries.
+    #[must_use]
+    pub fn is_valid(&self) -> bool {
+        if self.identity.len() > 256 || self.text.len() > 256 * 1024 || self.cells.len() > 4096 {
+            return false;
+        }
+        let Some(end) = self.byte_start.checked_add(self.text.len()) else {
+            return false;
+        };
+        self.cells.iter().all(|cell| {
+            cell.width > 0
+                && cell.column.checked_add(cell.width).is_some()
+                && cell.bytes.start >= self.byte_start
+                && cell.bytes.end <= end
+                && cell.bytes.start <= cell.bytes.end
+                && self
+                    .text
+                    .is_char_boundary(cell.bytes.start - self.byte_start)
+                && self.text.is_char_boundary(cell.bytes.end - self.byte_start)
+        })
+    }
+}
+
+#[cfg(test)]
+#[test]
+fn selection_metadata_rejects_invalid_source_and_cell_boundaries() {
+    let mut row = PluginTuiSelectionRow {
+        identity: "source".to_owned(),
+        byte_start: 8,
+        text: "界".to_owned(),
+        revision: 1,
+        cells: vec![PluginTuiSelectionCell {
+            column: 4,
+            width: 2,
+            bytes: 8..11,
+        }],
+    };
+    assert!(row.is_valid());
+    row.cells[0].bytes.start = 9;
+    assert!(!row.is_valid());
+    row.cells[0].bytes = 8..12;
+    assert!(!row.is_valid());
+    row.cells[0].bytes = 8..11;
+    row.cells[0].column = u16::MAX;
+    assert!(!row.is_valid());
+    row.cells[0].column = 4;
+    row.byte_start = usize::MAX;
+    assert!(!row.is_valid());
+}
+
+/// One native projection owns its rows, correspondence, and source selection together.
+#[derive(Debug, Clone, Default)]
+pub struct PluginTuiVisualProjection {
+    pub rows: Vec<Line>,
+    pub anchors: Vec<crate::tui_visual::TuiVisualAnchor>,
+    pub selection: Vec<(usize, PluginTuiSelectionRow)>,
+}
+
 /// Native Rust plugin artifact/view renderer for inline transcript content.
 pub trait PluginTuiVisualAdapter: Send + Sync {
     /// Return whether this adapter can render the artifact/view kind.
@@ -1573,6 +1632,33 @@ pub trait PluginTuiVisualAdapter: Send + Sync {
         let rows = self.rows(kind, payload, context);
         let anchors = self.anchors(kind, payload, context, &rows);
         (rows, anchors)
+    }
+
+    /// Prepare an owned projection. Source-aware adapters should override this
+    /// to return selection directly from the same measurement as the rows.
+    /// The default preserves the existing native adapter contract.
+    fn projection(
+        &self,
+        kind: &str,
+        payload: &serde_json::Value,
+        context: &PluginTuiVisualRenderContext,
+    ) -> PluginTuiVisualProjection {
+        let (rows, anchors) = self.layout(kind, payload, context);
+        let selection = anchors
+            .iter()
+            .filter_map(|anchor| {
+                let source = anchor.source.as_ref()?;
+                Some((
+                    anchor.row,
+                    self.selection_row(&source.identity, source.start)?,
+                ))
+            })
+            .collect();
+        PluginTuiVisualProjection {
+            rows,
+            anchors,
+            selection,
+        }
     }
 
     /// Build transcript rows for the artifact/view payload at the given width.
@@ -2469,6 +2555,29 @@ impl PluginTuiRegistry {
             })
             .take(MAX_PLUGIN_TUI_DIAGNOSTICS_PER_DRAIN)
             .collect()
+    }
+
+    /// Prepare an owned native projection without changing serialized adapter contracts.
+    #[must_use]
+    pub fn visual_projection(
+        &self,
+        adapter_id: &str,
+        kind: &str,
+        payload: &serde_json::Value,
+        context: &PluginTuiVisualRenderContext,
+    ) -> Option<PluginTuiVisualProjection> {
+        let projection = self
+            .visual_adapter(adapter_id, kind)?
+            .projection(kind, payload, context);
+        crate::tui_visual::validate_visual_anchors(&projection.anchors, projection.rows.len())
+            .ok()?;
+        let mut selected_rows = std::collections::BTreeSet::new();
+        if projection.selection.iter().any(|(row, source)| {
+            *row >= projection.rows.len() || !selected_rows.insert(*row) || !source.is_valid()
+        }) {
+            return None;
+        }
+        Some(projection)
     }
 
     /// Prepare rows and correspondence together through one adapter invocation.

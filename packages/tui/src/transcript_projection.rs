@@ -81,7 +81,7 @@ fn transcript_item_rows(
         return TranscriptLayoutRows::BlankSpan(usize::from(height.max(1)));
     }
     let markdown = render::transcript_markdown_projection_for_layout(app, item, input.width);
-    let (rows, anchors) = render::transcript_item_layout_from_item(
+    let (rows, anchors, selection) = render::transcript_item_layout_from_item(
         item,
         input.width,
         input.plugin_host,
@@ -111,20 +111,10 @@ fn transcript_item_rows(
             body_start,
         }
     } else {
-        let selection = anchors
-            .iter()
-            .filter_map(|anchor| {
-                let source = anchor.source.as_ref()?;
-                let row = app
-                    .plugin_presentation()?
-                    .selection_row(&source.identity, source.start)?;
-                Some((anchor.row, row))
-            })
-            .collect();
         TranscriptLayoutRows::Selected {
             rows,
             anchors,
-            selection,
+            selection: selection.into_iter().collect(),
         }
     }
 }

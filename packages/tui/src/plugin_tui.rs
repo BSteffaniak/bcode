@@ -377,6 +377,7 @@ pub struct RoutedTuiVisual {
     pub rows: Vec<bmux_tui::prelude::Line>,
     pub header: bcode_plugin_sdk::tui::PluginTuiTranscriptHeader,
     pub anchors: Vec<bcode_plugin_sdk::tui_visual::TuiVisualAnchor>,
+    pub selection: Vec<(usize, bcode_plugin_sdk::tui::PluginTuiSelectionRow)>,
 }
 
 impl PluginTuiPresentation {
@@ -463,18 +464,7 @@ impl PluginTuiPresentation {
         let mut row = self
             .registry(plugin)?
             .visual_selection_row(identity, offset)?;
-        if row.identity.len() > 256 || row.text.len() > 256 * 1024 || row.cells.len() > 4096 {
-            return None;
-        }
-        let end = row.byte_start.checked_add(row.text.len())?;
-        if row.cells.iter().any(|cell| {
-            cell.width == 0
-                || cell.bytes.start < row.byte_start
-                || cell.bytes.end > end
-                || cell.bytes.start > cell.bytes.end
-                || !row.text.is_char_boundary(cell.bytes.start - row.byte_start)
-                || !row.text.is_char_boundary(cell.bytes.end - row.byte_start)
-        }) {
+        if !row.is_valid() {
             return None;
         }
         row.identity = format!("{plugin}:{}", row.identity);
@@ -680,8 +670,12 @@ impl PluginTuiPresentation {
     ) -> Option<RoutedTuiVisual> {
         for route in self.visual_routes(schema, schema_version, producer_plugin_id) {
             if let Some(registry) = self.registry(&route.plugin_id)
-                && let Some((mut rows, anchors)) =
-                    registry.visual_layout(&route.adapter_id, &route.schema, payload, context)
+                && let Some(bcode_plugin_sdk::tui::PluginTuiVisualProjection {
+                    mut rows,
+                    anchors,
+                    selection,
+                }) =
+                    registry.visual_projection(&route.adapter_id, &route.schema, payload, context)
             {
                 if self
                     .artifact_delivery_failures
@@ -704,6 +698,7 @@ impl PluginTuiPresentation {
                     rows,
                     header,
                     anchors,
+                    selection,
                 });
             }
             if !self.backend.has_service(
@@ -732,6 +727,7 @@ impl PluginTuiPresentation {
                     route,
                     rows: serialized_visual_rows(&response, context.theme().as_ref()),
                     anchors: response.anchors.clone(),
+                    selection: Vec::new(),
                     header: bcode_plugin_sdk::tui::PluginTuiTranscriptHeader {
                         title: response.title,
                         timeout_ms: response.timeout_ms,

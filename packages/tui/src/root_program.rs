@@ -219,6 +219,7 @@ pub struct BcodeRuntimeModel {
     /// Last successfully committed logical content-selection scene.
     pub committed_selection: bmux_tui::selection::SelectionScene,
     committed_visual_text: Vec<bcode_plugin_sdk::tui::PluginTuiSelectionRow>,
+    committed_visual_targets: Vec<(bmux_tui::geometry::Rect, String)>,
     /// Bcode-owned transcript selection gesture state.
     pub transcript_selection: bmux_tui::selection::SelectionController,
     /// Canonical plain-text export for the current logical selection.
@@ -293,6 +294,7 @@ impl BcodeRuntimeModel {
             committed_hits: bmux_tui::hit::HitMap::default(),
             committed_selection: bmux_tui::selection::SelectionScene::new(),
             committed_visual_text: Vec::new(),
+            committed_visual_targets: Vec::new(),
             transcript_selection: bmux_tui::selection::SelectionController::new(),
             selected_plain_text: None,
             committed_area: bmux_tui::geometry::Rect::new(0, 0, 0, 0),
@@ -1107,32 +1109,19 @@ impl BcodeRuntimeModel {
                                 bmux_tui::event::MouseButton::Right
                             )
                     )
+                    && let Some(identity) =
+                        self.committed_visual_targets
+                            .iter()
+                            .find_map(|(area, identity)| {
+                                area.contains(mouse.position).then_some(identity)
+                            })
+                    && let Some(presentation) = self.chat.app.plugin_presentation()
+                    && presentation.content_event(identity, &Event::Mouse(mouse))
                 {
-                    let area = super::render::transcript_area_for_frame(
-                        &self.chat.app,
-                        self.committed_area,
-                    );
-                    if area.contains(mouse.position) {
-                        let layout = self.chat.app.transcript_layout();
-                        let visible = layout.visible_lines_from_top(
-                            self.chat.app.transcript_top_row(area.height),
-                            area.height,
-                        );
-                        if let Some(line) =
-                            visible.get(usize::from(mouse.position.y.saturating_sub(area.y)))
-                            && line.source
-                                == super::transcript_layout::VisibleTranscriptSource::Transcript
-                            && let Some((identity, _)) =
-                                layout.content_anchor(line.entry_index, line.row_in_entry)
-                            && let Some(presentation) = self.chat.app.plugin_presentation()
-                            && presentation.content_event(identity, &Event::Mouse(mouse))
-                        {
-                            if matches!(mouse.kind, bmux_tui::event::MouseEventKind::Down(_)) {
-                                self.focused_visual = Some(identity.to_owned());
-                            }
-                            return super::invalidation::UiInvalidation::Structural;
-                        }
+                    if matches!(mouse.kind, bmux_tui::event::MouseEventKind::Down(_)) {
+                        self.focused_visual = Some(identity.clone());
                     }
+                    return super::invalidation::UiInvalidation::Structural;
                 }
                 if self.loop_state.foreground() == Some(super::foreground::Foreground::Permission) {
                     let hit_id = super::mouse_flow::mouse_hit_id(&self.committed_hits, mouse);
@@ -1880,12 +1869,43 @@ impl<W: std::io::Write> bmux_tui_runtime::Presenter<BcodeRuntimeModel>
         program.committed_hits = self.terminal.hits().clone();
         program.committed_selection = self.terminal.selection().clone();
         program.committed_visual_text.clear();
+        program.committed_visual_targets.clear();
         if let Some(layout) = layout {
             let body = layout.body();
-            for line in program.chat.app.transcript_layout().visible_lines_from_top(
-                program.chat.app.transcript_top_row(body.height),
-                body.height,
-            ) {
+            for (offset, line) in program
+                .chat
+                .app
+                .transcript_layout()
+                .visible_lines_from_top(
+                    program.chat.app.transcript_top_row(body.height),
+                    body.height,
+                )
+                .into_iter()
+                .enumerate()
+            {
+                if line.source != super::transcript_layout::VisibleTranscriptSource::Transcript {
+                    continue;
+                }
+                if let Some((identity, _)) = program
+                    .chat
+                    .app
+                    .transcript_layout()
+                    .content_anchor(line.entry_index, line.row_in_entry)
+                {
+                    let area = bmux_tui::geometry::Rect::new(
+                        body.x,
+                        body.y
+                            .saturating_add(u16::try_from(offset).unwrap_or(u16::MAX)),
+                        body.width,
+                        1,
+                    )
+                    .intersection(body);
+                    if !area.is_empty() {
+                        program
+                            .committed_visual_targets
+                            .push((area, identity.to_owned()));
+                    }
+                }
                 if let Some(row) = program
                     .chat
                     .app
@@ -1895,6 +1915,14 @@ impl<W: std::io::Write> bmux_tui_runtime::Presenter<BcodeRuntimeModel>
                     program.committed_visual_text.push(row.clone());
                 }
             }
+        }
+        if program.focused_visual.as_ref().is_some_and(|focused| {
+            !program
+                .committed_visual_targets
+                .iter()
+                .any(|(_, identity)| identity == focused)
+        }) {
+            program.focused_visual = None;
         }
         let reconciliation = program
             .transcript_selection
@@ -3199,6 +3227,33 @@ mod tests {
         }
     }
 
+    fn assert_visual_selection_matches_container(app: &super::super::app::BmuxApp) {
+        let retained = app.transcript_layout();
+        let mut checked = 0;
+        for visible in retained.visible_lines_from_top(0, u16::MAX) {
+            let Some(source) = retained.selection_row(visible.entry_index, visible.row_in_entry)
+            else {
+                continue;
+            };
+            let Some(cell) = source.cells.first() else {
+                continue;
+            };
+            if source.text.is_empty() {
+                continue;
+            }
+            let painted = retained.line(visible).unwrap().plain_text();
+            let start = painted
+                .find(&source.text)
+                .expect("source appears in painted container");
+            assert_eq!(
+                usize::from(cell.column),
+                bmux_tui::text_width::display_width(&painted[..start])
+            );
+            checked += 1;
+        }
+        assert!(checked > 0);
+    }
+
     #[tokio::test]
     async fn visual_selection_text_commits_on_first_frame_and_survives_failed_resize() {
         use bmux_tui_runtime::Presenter;
@@ -3252,6 +3307,7 @@ mod tests {
                     },
                 },
             });
+        assert!(model.chat.app.preview_theme("terminal-native-structured"));
         let fail = std::rc::Rc::new(std::cell::Cell::new(false));
         let mut output = FailingSelectionOutput { fail: fail.clone() };
         let mut terminal = bmux_tui::terminal::Terminal::new(
@@ -3262,6 +3318,10 @@ mod tests {
             .present(&mut model)
             .unwrap();
         assert!(!model.committed_visual_text.is_empty());
+        assert_visual_selection_matches_container(&model.chat.app);
+        let targets = model.committed_visual_targets.clone();
+        assert!(!targets.is_empty());
+        model.focused_visual = Some("removed-target".to_owned());
         let before: Vec<_> = model
             .committed_visual_text
             .iter()
@@ -3281,12 +3341,16 @@ mod tests {
             .map(|row| (row.identity.clone(), row.byte_start, row.text.clone()))
             .collect();
         assert_eq!(before, after);
+        assert_eq!(targets, model.committed_visual_targets);
+        assert_eq!(model.focused_visual.as_deref(), Some("removed-target"));
         fail.set(false);
         model.presentation_damage = bmux_tui::damage::Damage::Full;
         super::BcodeRuntimePresenter::new(&mut terminal)
             .present(&mut model)
             .unwrap();
         assert!(!model.committed_visual_text.is_empty());
+        assert!(model.focused_visual.is_none());
+        assert_ne!(targets, model.committed_visual_targets);
         drop(model);
     }
 

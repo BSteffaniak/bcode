@@ -24,6 +24,46 @@ pub struct FilesystemTuiVisualAdapter {
 }
 
 impl bcode_plugin_sdk::tui::PluginTuiVisualAdapter for FilesystemTuiVisualAdapter {
+    fn projection(
+        &self,
+        kind: &str,
+        payload: &Value,
+        context: &bcode_plugin_sdk::tui::PluginTuiVisualRenderContext,
+    ) -> bcode_plugin_sdk::tui::PluginTuiVisualProjection {
+        if matches!(
+            kind,
+            "bcode.filesystem.read" | "bcode.filesystem.artifact.read"
+        ) {
+            ACTIVE_THEME.with(|theme| theme.set(context.theme()));
+            let (rows, anchors, source_rows) = read_layout(kind, payload, context.width(), context);
+            ACTIVE_THEME.with(|theme| theme.set(None));
+            let mut source_rows: BTreeMap<_, _> = source_rows
+                .into_iter()
+                .map(|row| ((row.identity.clone(), row.byte_start), row))
+                .collect();
+            let selection = anchors
+                .iter()
+                .filter_map(|anchor| {
+                    let source = anchor.source.as_ref()?;
+                    let row = source_rows.remove(&(source.identity.clone(), source.start))?;
+                    Some((anchor.row, row))
+                })
+                .collect();
+            bcode_plugin_sdk::tui::PluginTuiVisualProjection {
+                rows,
+                anchors,
+                selection,
+            }
+        } else {
+            let (rows, anchors) = self.layout(kind, payload, context);
+            bcode_plugin_sdk::tui::PluginTuiVisualProjection {
+                rows,
+                anchors,
+                selection: Vec::new(),
+            }
+        }
+    }
+
     fn selection_row(
         &self,
         identity: &str,
@@ -1274,6 +1314,40 @@ mod tests {
             rows.iter().all(|row| line_text(row).len() < 8 * 1024),
             "one long source line escaped the per-row bound"
         );
+    }
+
+    #[test]
+    fn owned_source_projection_survives_same_source_reflow_without_cache_lookup() {
+        use bcode_plugin_sdk::tui::{
+            PluginTuiDiffLayout, PluginTuiVisualAdapter, PluginTuiVisualRenderContext,
+        };
+        let adapter = FilesystemTuiVisualAdapter::default();
+        let payload = serde_json::json!({"path":"test.rs", "contents":"a界e\u{301}long source text\r\nsecond", "start_line":9});
+        let narrow = adapter.projection(
+            "bcode.filesystem.read",
+            &payload,
+            &PluginTuiVisualRenderContext::new(24, PluginTuiDiffLayout::Unified, None),
+        );
+        let wide = adapter.projection(
+            "bcode.filesystem.read",
+            &payload,
+            &PluginTuiVisualRenderContext::new(60, PluginTuiDiffLayout::Unified, None),
+        );
+        assert!(!narrow.selection.is_empty());
+        assert_ne!(narrow.selection, wide.selection);
+        assert!(adapter.selection.lock().unwrap().is_empty());
+        for projection in [narrow, wide] {
+            for (index, source) in projection.selection {
+                assert!(projection.rows[index].plain_text().contains(&source.text));
+                assert!(projection.anchors.iter().any(|anchor| {
+                    anchor.row == index
+                        && anchor.source.as_ref().is_some_and(|range| {
+                            (range.identity.as_str(), range.start)
+                                == (source.identity.as_str(), source.byte_start)
+                        })
+                }));
+            }
+        }
     }
 
     #[test]
