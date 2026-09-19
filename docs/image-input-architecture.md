@@ -19,6 +19,9 @@ Implemented first slice:
 * Responses continuation requires enabled reuse, a nonempty response ID, and an in-range history
   boundary. Otherwise the full inline context is projected.
 * Deterministic provider-operation tests and an actual Responses request-projection test.
+  Verifier fault tests cover empty polls/timeouts, missing terminal usage, excessive events,
+  oversized output, stale post-terminal text, and cleanup failures. Errors remain normalized;
+  failed probes attempt cancellation and finish and do not start further requests.
 * `fake-vision-panels` is a dedicated fake-provider model for generated 256x128 PNG panel
   fixtures. It decodes bounded PNG bytes and checks uniform panel pixels in order, rather than
   returning a configured answer. Public-operation round trips cover user and tool-result images,
@@ -28,9 +31,14 @@ Implemented first slice:
 * `bash scripts/check-image-input-eval.sh` builds a real CLI/daemon with bundled plugins in a
   scrubbed, isolated environment. It generates a PNG, reads it through `filesystem.read`,
   restarts the daemon, and verifies exact pixel-derived answers and completed outcomes in both
-  exported transcripts. Artifacts are retained for inspection. Requires Python 3 and Cargo;
+  exported transcripts. Missing-file and truncated-PNG fault cases each require one tool error
+  and `UNKNOWN` answers before and after restart, so failed reads cannot count as visual context.
+  Artifacts are retained for inspection. Requires Python 3 and Cargo;
   no credentials or remote provider calls are needed. This proves inline artifact hydration and
-  replay, not native conversation storage or upload reuse.
+  replay, not native conversation storage or upload reuse. The script also runs the matrix
+  runner end to end against `fake-vision-panels` for two seeds and both image sources. Fault
+  assertions count unique failed invocation IDs so duplicate result delivery is not mistaken
+  for an additional tool execution.
 
 Not implemented or verified by this slice: provider uploads/file IDs, authorized hosted URLs,
 request compression, lazy image hydration, durable reference lifecycle,
@@ -170,6 +178,31 @@ remain unknown, and unverified visual context cannot produce a successful worklo
 Upload costs must be included when upload mechanisms are added; currently there are none.
 Latency is local elapsed time. Future upload/transport observations must remain independently labeled and must not
 contain signed URLs or credentials. Cache usage analysis remains owned by `bcode_prompt_cache`.
+
+## Opt-in provider matrix runner
+
+`scripts/verify-image-matrix.py` accepts repeated `--config PATH --model EXACT_ID` pairs and
+runs user/tool-result generated fixtures against each selection. Without `--live`, it prints the
+request budget without invoking Bcode. With `--live`, normal configured authentication is used;
+model calls may cost money. Conversation storage additionally requires
+`--allow-conversation-storage`. Reports are retained in a private temporary directory; no remote
+file upload service is enabled. Defaults are two seeds, at most five started turns per source and
+seed; provider retries may add calls. The subprocess deadline stops further probes on timeout,
+but does not establish remote cancellation. Captured stdout and report parsing are capped at
+1 MiB per probe; excess output terminates local work and stops the matrix with an unknown-remote-
+completion diagnostic. On POSIX, the probe has its own process group for local termination.
+Timeout, output-overflow, and successful-process behavior have offline subprocess tests.
+
+The aggregate verdict covers inline visual verification only, requiring the negative control,
+acknowledgement, baseline, and repeat to pass. Unsupported/inconclusive results are not successes.
+Continuation and transfer evidence remain separate in each raw report. This runner is implemented
+but has not been used against live providers; it is not evidence of upload/URL/compression support.
+
+```sh
+python3 scripts/verify-image-matrix.py --config ./provider.toml --model EXACT_MODEL_ID
+# Add --live only to authorize actual model requests.
+PYTHONDONTWRITEBYTECODE=1 python3 scripts/test-verify-image-matrix.py
+```
 
 ## Remaining implementation and acceptance gates
 

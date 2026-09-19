@@ -709,12 +709,50 @@ fn measured_bytes(projections: &[ProviderRequestProjection]) -> Option<u64> {
 mod tests {
     use super::*;
 
+    #[derive(Clone, Copy, Default)]
+    enum ProbeFault {
+        #[default]
+        None,
+        EmptyPoll,
+        MissingUsage,
+        OversizedOutput,
+        ExcessEvents,
+        LateText,
+        Cleanup,
+    }
+
+    impl ProbeFault {
+        fn apply(self, events: &mut Vec<ProviderTurnEvent>) {
+            match self {
+                Self::None | Self::Cleanup => {}
+                Self::EmptyPoll => events.clear(),
+                Self::MissingUsage => {
+                    events.retain(|event| !matches!(event, ProviderTurnEvent::Usage { .. }));
+                }
+                Self::OversizedOutput => {
+                    for event in events {
+                        if let ProviderTurnEvent::TextDelta { text } = event {
+                            *text = "X".repeat(MAX_TEXT_BYTES + 1);
+                        }
+                    }
+                }
+                Self::ExcessEvents => {
+                    *events = vec![ProviderTurnEvent::TurnStarted; MAX_EVENTS + 1];
+                }
+                Self::LateText => events.push(ProviderTurnEvent::TextDelta {
+                    text: "stale".to_string(),
+                }),
+            }
+        }
+    }
+
     #[derive(Default)]
     struct ProbeProvider {
         requests: Vec<ModelTurnRequest>,
         finishes: usize,
         cancels: usize,
         fail_poll: bool,
+        fault: ProbeFault,
         guess_without_image: bool,
         lose_continued_image: bool,
         tool_images: bcode_model::CapabilitySupport,
@@ -781,7 +819,7 @@ mod tests {
                     } else {
                         "BLUE"
                     };
-                    let events = vec![
+                    let mut events = vec![
                         ProviderTurnEvent::TurnStarted,
                         ProviderTurnEvent::RequestProjection {
                             projection: ProviderRequestProjection {
@@ -819,10 +857,14 @@ mod tests {
                             stop_reason: StopReason::EndTurn,
                         },
                     ];
+                    self.fault.apply(&mut events);
                     serde_json::to_value(PollTurnEventsResponse { events }).expect("poll response")
                 }
                 bcode_model::OP_FINISH_TURN => {
                     self.finishes += 1;
+                    if matches!(self.fault, ProbeFault::Cleanup) {
+                        return Err("secret cleanup failure".to_string());
+                    }
                     serde_json::json!({})
                 }
                 bcode_model::OP_CANCEL_TURN => {
@@ -1039,6 +1081,39 @@ mod tests {
             serde_json::from_value::<ImageVerificationReport>(serde_json::json!({"cases": []}))
                 .is_err()
         );
+    }
+
+    #[test]
+    fn stream_faults_are_bounded_cleaned_up_and_secret_safe() {
+        for (fault, diagnostic) in [
+            (ProbeFault::EmptyPoll, "timed out"),
+            (ProbeFault::MissingUsage, "terminal contract violation"),
+            (ProbeFault::OversizedOutput, "output limit exceeded"),
+            (ProbeFault::ExcessEvents, "event limit exceeded"),
+            (ProbeFault::LateText, "stream contract violation"),
+        ] {
+            let mut provider = ProbeProvider {
+                fault,
+                ..Default::default()
+            };
+            let mut options = probe_options(false);
+            options.timeout = Duration::from_millis(20);
+            let error =
+                run_image_verification(&mut provider, &options).expect_err("fault rejected");
+            assert!(error.contains(diagnostic), "{error}");
+            assert!(!error.contains("secret"));
+            assert_eq!((provider.cancels, provider.finishes), (1, 1));
+            assert_eq!(provider.requests.len(), 1);
+        }
+        let mut provider = ProbeProvider {
+            fault: ProbeFault::Cleanup,
+            ..Default::default()
+        };
+        let error = run_image_verification(&mut provider, &probe_options(false))
+            .expect_err("cleanup failure");
+        assert_eq!(error, "image verification cleanup failed");
+        assert_eq!(provider.finishes, 1);
+        assert_eq!(provider.requests.len(), 1);
     }
 
     #[test]
