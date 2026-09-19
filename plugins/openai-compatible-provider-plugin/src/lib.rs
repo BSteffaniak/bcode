@@ -75,6 +75,7 @@ use std::time::{Duration, Instant};
 use tokio::sync::Notify;
 
 mod context_compaction;
+mod image_upload;
 mod request_compression;
 mod turn_routing;
 
@@ -1374,6 +1375,9 @@ impl OpenAiCompatibleProviderPlugin {
             }
             OP_MODELS => self.models_response(&context.request),
             OP_VALIDATE_CONFIG => self.validate_config(&context.request),
+            bcode_model::image_upload::OP_VERIFY_IMAGE_UPLOAD => {
+                self.verify_image_upload(&context.request)
+            }
             OP_VERIFY_MODEL => self.verify_model(&context.request),
             OP_AUTH_USAGE => self.auth_usage(&context.request),
             OP_AUTH_PRIME => self.auth_prime(&context.request),
@@ -1407,6 +1411,28 @@ impl OpenAiCompatibleProviderPlugin {
 
     fn models_response(&self, request: &ServiceRequest) -> ServiceResponse {
         json_response(&self.models(&model_list_request(request)))
+    }
+
+    fn verify_image_upload(&self, request: &ServiceRequest) -> ServiceResponse {
+        let request =
+            match request.payload_json::<bcode_model::image_upload::VerifyImageUploadRequest>() {
+                Ok(request) => request,
+                Err(error) => return invalid_request(&error),
+            };
+        let Ok(runtime) = &self.runtime else {
+            return ServiceResponse::error(
+                "image_upload_runtime_unavailable",
+                "image upload verification runtime unavailable",
+            );
+        };
+        match runtime.block_on(image_upload::verify(request)) {
+            Ok(Ok(response)) => json_response(&response),
+            Ok(Err(code)) => json_response(&image_upload::failure_report(code)),
+            Err(_) => ServiceResponse::error(
+                "image_upload_runtime_failed",
+                "image upload verification runtime failed",
+            ),
+        }
     }
 
     fn verify_model(&self, request: &ServiceRequest) -> ServiceResponse {
@@ -11213,7 +11239,7 @@ mod tests {
         worker.join().unwrap();
     }
 
-    fn test_settings(auth: AuthSettings, dialect: OpenAiCompatibleDialect) -> Settings {
+    pub fn test_settings(auth: AuthSettings, dialect: OpenAiCompatibleDialect) -> Settings {
         Settings {
             auth,
             auth_diagnostics: AuthDiagnostics {

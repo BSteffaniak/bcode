@@ -185,6 +185,36 @@ Upload costs must be included when upload mechanisms are added; currently there 
 Latency is local elapsed time. Future upload/transport observations must remain independently labeled and must not
 contain signed URLs or credentials. Cache usage analysis remains owned by `bcode_prompt_cache`.
 
+## Upload lifecycle probe (initial implementation)
+
+An optional typed provider operation `verify_image_upload` accepts only schema version 1 and
+explicit `allow_remote_storage`. The OpenAI-compatible implementation requires API-key Responses
+mode. It posts a bounded image to `/files` with purpose `vision` and requested one-hour expiry,
+retrieves bytes for exact comparison, then attempts deletion of only the returned file ID.
+Redirects are disabled; endpoints require HTTPS except literal loopback HTTP for local tests.
+Embedded URL credentials, queries, and fragments are rejected before transmission. Each HTTP
+operation has a timeout, responses are bounded, and file IDs
+are validated before URL construction. Reports expose neither IDs nor response bodies. Unknown
+upload outcomes are not retried; invalid receipts report that cleanup is unknown. Expiry is a
+requested provider backstop, not a local guarantee. Cleanup failures are explicit.
+
+`bcode model verify-image-upload --dry-run` prints the plan without loading plugins.
+`--allow-remote-storage` authorizes one generated-image probe using the configured provider;
+`--generated-seed` selects its fixture. The command fails unless both exact bytes and deletion
+are verified. It never accepts caller-supplied remote IDs and never uploads local user files.
+The operation is not wired into normal generation. It does not implement
+session reference reuse, durable recovery, cancellation reconciliation, or live-tested cleanup.
+Authorization/version tests and local HTTP lifecycle tests pass. The HTTP tests verify multipart
+purpose/expiry fields and exact bytes, cleanup after oversized download, unconfirmed deletion,
+and rejection of unsafe returned IDs. Remote probing remains required
+before enabling this in sessions. Existing providers may reject the optional operation without
+impacting ordinary turns. A live CLI invocation with authorized `astra-full.toml` was rejected
+before upload: `diagnostic = image_upload_requires_api_key`, `upload_attempted = false`.
+That configuration uses subscription authentication, not an API-key file endpoint. No remote
+file was created. The additive `upload_attempted` report field distinguishes local preflight
+rejections from dispatched uploads/unknown cleanup; absence in older reports remains unknown.
+Report: `/tmp/astra-upload-probe.json`.
+
 ## Opt-in request compression
 
 The OpenAI-compatible provider accepts provider setting `request_compression = "gzip"` only

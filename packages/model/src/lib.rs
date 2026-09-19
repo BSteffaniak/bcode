@@ -22,6 +22,8 @@ use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 
+pub mod image_upload;
+
 mod usage;
 pub use usage::{UsageCaptureSpec, UsageDecoder};
 
@@ -215,6 +217,13 @@ pub const MODEL_PROVIDER_OPERATIONS: &[ProviderOperationContract] = &[
             ProviderCapability::NativeContextCompaction,
         ),
         behavior: "return lossless replayable replacement context in its declared format",
+    },
+    ProviderOperationContract {
+        operation: image_upload::OP_VERIFY_IMAGE_UPLOAD,
+        request_type: "VerifyImageUploadRequest",
+        response_type: "VerifyImageUploadResponse",
+        requirement: ProviderOperationRequirement::Optional,
+        behavior: "explicitly authorized bounded image upload verification and cleanup",
     },
     ProviderOperationContract {
         operation: OP_VERIFY_MODEL,
@@ -3843,6 +3852,7 @@ mod tests {
             super::OP_VALIDATE_CONFIG,
             super::OP_START_TURN,
             super::OP_VERIFY_MODEL,
+            super::image_upload::OP_VERIFY_IMAGE_UPLOAD,
             super::OP_POLL_TURN_EVENTS,
             super::OP_CANCEL_TURN,
             super::OP_NATIVE_WEB_SEARCH,

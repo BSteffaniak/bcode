@@ -27,7 +27,7 @@ bcode_session_models = { workspace = true }
 bcode_tool = { workspace = true }
 flate2 = { workspace = true }
 rand = { workspace = true }
-reqwest = { workspace = true }
+reqwest = { workspace = true, features = ["multipart"] }
 rustls = { workspace = true }
 serde = { workspace = true, features = ["derive", "std"] }
 serde_json = { workspace = true }

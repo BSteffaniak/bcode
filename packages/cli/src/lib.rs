@@ -5995,6 +5995,8 @@ enum ModelCommand {
     VerifyCache(VerifyCacheArgs),
     /// Verify image context through inline replay and optionally provider continuation.
     VerifyImages(VerifyImagesArgs),
+    /// Upload one generated image, verify retrieved bytes, then delete the created remote file.
+    VerifyImageUpload(VerifyImageUploadArgs),
     Set {
         session_id: SessionId,
         model_id: String,
@@ -6004,6 +6006,19 @@ enum ModelCommand {
         #[arg(long)]
         json: bool,
     },
+}
+
+#[derive(Debug, clap::Args)]
+struct VerifyImageUploadArgs {
+    /// Authorize creation/deletion of one generated remote fixture file.
+    #[arg(long, required_unless_present = "dry_run")]
+    allow_remote_storage: bool,
+    /// Print the plan without loading plugins or contacting providers.
+    #[arg(long)]
+    dry_run: bool,
+    /// Reproducible generated fixture seed.
+    #[arg(long, default_value_t = 726)]
+    generated_seed: u64,
 }
 
 /// Arguments for bounded, explicitly requested image verification.
@@ -8008,6 +8023,7 @@ async fn handle_model_command(command: ModelCommand) -> Result<(), CliError> {
         }
         ModelCommand::VerifyCache(args) => verify_model_caches(&args).await?,
         ModelCommand::VerifyImages(args) => verify_model_images(&args).await?,
+        ModelCommand::VerifyImageUpload(args) => verify_image_upload(&args)?,
         other => {
             ensure_server_running().await?;
             match other {
@@ -8027,6 +8043,7 @@ async fn handle_model_command(command: ModelCommand) -> Result<(), CliError> {
                 ModelCommand::Verify { .. }
                 | ModelCommand::VerifyCache(_)
                 | ModelCommand::VerifyImages(_)
+                | ModelCommand::VerifyImageUpload(_)
                 | ModelCommand::Ignore { .. }
                 | ModelCommand::Unignore { .. }
                 | ModelCommand::Ignored { .. } => unreachable!("handled above"),
@@ -12659,6 +12676,71 @@ fn prepare_image_probe(
         |fixture| fixture.expected_answer.clone(),
     );
     Ok((fixture, question, expected_answer))
+}
+
+fn verify_image_upload(args: &VerifyImageUploadArgs) -> Result<(), CliError> {
+    let VerifyImageUploadArgs {
+        allow_remote_storage,
+        dry_run,
+        generated_seed: seed,
+    } = *args;
+    if dry_run {
+        return print_json(&serde_json::json!({"schema_version": 1, "dry_run": true,
+            "operation": "verify_image_upload", "maximum_uploads": 1,
+            "cleanup": "delete only the created file; expiry requested as a backstop"}));
+    }
+    if !allow_remote_storage {
+        return Err(CliError::PluginCli(
+            "remote image storage must be explicitly authorized".to_string(),
+        ));
+    }
+    let fixture = bcode_model_provider_runtime::image_fixtures::generate_image_fixture(seed)
+        .map_err(CliError::PluginCli)?;
+    let config = bcode_config::load_config()?;
+    let provider = config
+        .resolved_model_selection()
+        .provider_plugin_id
+        .ok_or_else(|| CliError::PluginCli("no provider configured".to_string()))?;
+    let mut context = configured_provider_context(&config);
+    bcode_provider_auth::auth_pool_routing::apply_auth_pool_selection(&mut context);
+    let request = bcode_model::image_upload::VerifyImageUploadRequest {
+        schema_version: 1,
+        provider_context: context,
+        image: fixture
+            .images
+            .into_iter()
+            .next()
+            .ok_or_else(|| CliError::PluginCli("empty fixture".to_string()))?,
+        allow_remote_storage,
+    };
+    let mut host = load_cli_plugin_host()?;
+    let response = host
+        .invoke_service_json::<_, bcode_model::image_upload::VerifyImageUploadResponse>(
+            &provider,
+            bcode_model::MODEL_PROVIDER_INTERFACE_ID,
+            bcode_model::image_upload::OP_VERIFY_IMAGE_UPLOAD,
+            &request,
+        );
+    host.deactivate_all()?;
+    let response = response.map_err(|_| {
+        CliError::PluginCli(
+            "image upload probe failed or is unsupported; remote cleanup may be unconfirmed"
+                .to_string(),
+        )
+    })?;
+    if response.schema_version != 1 {
+        return Err(CliError::PluginCli(
+            "unsupported image upload report version; cleanup unverified".to_string(),
+        ));
+    }
+    print_json(&response)?;
+    if response.bytes_verified && response.deletion_confirmed && response.diagnostic.is_none() {
+        Ok(())
+    } else {
+        Err(CliError::PluginCli(
+            "image upload bytes or cleanup were not verified".to_string(),
+        ))
+    }
 }
 
 async fn verify_model_images(args: &VerifyImagesArgs) -> Result<(), CliError> {
@@ -24712,6 +24794,23 @@ mod model_cli_tests {
             panic!("expected image verification");
         };
         assert!(super::image_verification_fixture(&args).is_err());
+    }
+
+    #[test]
+    fn upload_probe_requires_explicit_storage_authorization() {
+        assert!(Cli::try_parse_from(["bcode", "model", "verify-image-upload"]).is_err());
+        assert!(
+            Cli::try_parse_from(["bcode", "model", "verify-image-upload", "--dry-run"]).is_ok()
+        );
+        assert!(
+            Cli::try_parse_from([
+                "bcode",
+                "model",
+                "verify-image-upload",
+                "--allow-remote-storage"
+            ])
+            .is_ok()
+        );
     }
 
     #[test]

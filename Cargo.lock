@@ -9839,6 +9839,7 @@ dependencies = [
  "hyper-util",
  "js-sys",
  "log 0.4.33",
+ "mime_guess",
  "percent-encoding 2.3.2",
  "pin-project-lite",
  "quinn",
