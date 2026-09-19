@@ -219,7 +219,13 @@ were performed. These observations establish only inline visual correctness for 
 surface/model and fixture; they do not establish upload, URL, compression, or continuation support.
 The run used `--seed 726 --timeout-seconds 45 --live`; local reports were retained under
 `bcode-image-matrix-0tohtu20` in the system temporary directory. Credentials and config contents
-are deliberately not included here. Other provider configurations remain unverified.
+are deliberately not included here. A bounded `bedrock-fable.toml` probe against
+`global.anthropic.claude-fable-5-1`, seed 726, failed for both sources with normalized terminal
+reason `error` and category `auth` in both the no-image control and acknowledgement. Reports
+are retained under `bcode-image-matrix-1g29s1_z`. This is an authentication-blocked verification,
+not evidence that the model lacks vision. No capability claim is changed. Remaining configurations
+are unverified. Reports now include optional normalized `stop_reason` and `error_category` fields
+so provider failures are distinguishable from incorrect visual answers without exposing raw errors.
 
 ```sh
 python3 scripts/verify-image-matrix.py --config ./provider.toml --model EXACT_MODEL_ID

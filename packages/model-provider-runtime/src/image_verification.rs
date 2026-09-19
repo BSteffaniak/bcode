@@ -91,6 +91,12 @@ pub struct ImageVerificationCase {
     pub latency_ms: u128,
     /// Every observed attempt reports retained history and a consistent nonzero omitted prefix.
     pub used_continuation: bool,
+    /// Normalized terminal reason, absent for unexecuted or older report cases.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stop_reason: Option<StopReason>,
+    /// Normalized provider failure category; never includes provider diagnostic text.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error_category: Option<bcode_model::ProviderErrorCategory>,
 }
 
 /// Measured preparation volume for comparable seed-plus-follow-up workloads.
@@ -139,6 +145,15 @@ fn deserialize_report_version<'de, D: serde::Deserializer<'de>>(
 }
 
 impl ImageVerificationReport {
+    fn for_source(source: ImageVerificationSource) -> Self {
+        Self {
+            schema_version: 1,
+            source,
+            workload_transfer: None,
+            cases: Vec::new(),
+        }
+    }
+
     /// Whether an executed assertion failed. Unsupported and inconclusive are not successes.
     #[must_use]
     pub fn has_failures(&self) -> bool {
@@ -174,12 +189,7 @@ pub fn run_image_verification<I: BlockingModelProviderInvoker>(
 ) -> Result<ImageVerificationReport, String> {
     validate_options(options)?;
     let provider = discover_image_provider(invoker, options)?;
-    let mut report = ImageVerificationReport {
-        schema_version: 1,
-        source: options.source,
-        workload_transfer: None,
-        cases: Vec::new(),
-    };
+    let mut report = ImageVerificationReport::for_source(options.source);
     if !image_source_supported(&provider, options) {
         report
             .cases
@@ -188,7 +198,11 @@ pub fn run_image_verification<I: BlockingModelProviderInvoker>(
     }
     let control = run_image_absence_control(invoker, options)?;
     let image_evidence = control.context == ImageVerificationOutcome::Passed;
+    let control_failed = control.context == ImageVerificationOutcome::Failed;
     report.cases.push(control);
+    if control_failed {
+        return Ok(report);
+    }
     let mut request = base_request(options);
     let mut seed = execute(invoker, options, &request, "image_acknowledgement", "READY")?;
     let seed_passed = seed.case.context == ImageVerificationOutcome::Passed;
@@ -547,6 +561,8 @@ fn unexecuted(name: &str, outcome: ImageVerificationOutcome) -> ImageVerificatio
         serialized_body_bytes: None,
         latency_ms: 0,
         used_continuation: false,
+        stop_reason: None,
+        error_category: None,
     }
 }
 
@@ -674,6 +690,8 @@ fn collect<I: BlockingModelProviderInvoker>(
                     transfer: ImageVerificationOutcome::Inconclusive,
                     serialized_body_bytes: measured_bytes(&projections),
                     latency_ms: started.elapsed().as_millis(),
+                    stop_reason: Some(summary.stop_reason),
+                    error_category: summary.error_category,
                     used_continuation: !projections.is_empty()
                         && projections.iter().all(|projection| {
                             projection.used_previous_response_id
@@ -719,12 +737,25 @@ mod tests {
         ExcessEvents,
         LateText,
         Cleanup,
+        Auth,
     }
 
     impl ProbeFault {
         fn apply(self, events: &mut Vec<ProviderTurnEvent>) {
             match self {
                 Self::None | Self::Cleanup => {}
+                Self::Auth => {
+                    let error = serde_json::from_value(serde_json::json!({
+                        "code": "test_auth", "category": "auth", "message": "secret auth diagnostic", "retryable": false
+                    })).expect("normalized error");
+                    *events = vec![
+                        ProviderTurnEvent::TurnStarted,
+                        ProviderTurnEvent::Error { error },
+                        ProviderTurnEvent::TurnFinished {
+                            stop_reason: StopReason::Error,
+                        },
+                    ];
+                }
                 Self::EmptyPoll => events.clear(),
                 Self::MissingUsage => {
                     events.retain(|event| !matches!(event, ProviderTurnEvent::Usage { .. }));
@@ -1114,6 +1145,36 @@ mod tests {
         assert_eq!(error, "image verification cleanup failed");
         assert_eq!(provider.finishes, 1);
         assert_eq!(provider.requests.len(), 1);
+    }
+
+    #[test]
+    fn failed_control_stops_before_transmitting_images() {
+        let mut provider = ProbeProvider {
+            fault: ProbeFault::Auth,
+            ..Default::default()
+        };
+        let report = run_image_verification(&mut provider, &probe_options(false)).expect("report");
+        assert!(report.has_failures());
+        assert_eq!(provider.requests.len(), 1);
+        assert_eq!(provider.finishes, 1);
+        assert_eq!(report.cases.len(), 1);
+        assert_eq!(report.cases[0].stop_reason, Some(StopReason::Error));
+        assert_eq!(
+            report.cases[0].error_category,
+            Some(bcode_model::ProviderErrorCategory::Auth)
+        );
+        assert!(
+            !serde_json::to_string(&report)
+                .expect("JSON")
+                .contains("secret")
+        );
+        assert!(
+            provider.requests[0]
+                .messages
+                .iter()
+                .flat_map(|message| &message.content)
+                .all(|block| !matches!(block, ContentBlock::Image { .. }))
+        );
     }
 
     #[test]
