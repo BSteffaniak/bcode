@@ -2356,6 +2356,42 @@ fn diagnostic_startup_id() -> u128 {
         .map_or(0, |duration| duration.as_nanos())
 }
 
+/// Prepare and execute the immutable current-artifact image without starting a daemon.
+///
+/// Uses the normal startup fence and image retention guard. Preparation is explicit
+/// so installer/build time can absorb first-execution OS validation without weakening it.
+///
+/// # Errors
+/// Returns normal lifecycle errors or a failed cached-image identity probe.
+pub async fn prepare_daemon_image(endpoint: &IpcEndpoint) -> Result<(), DaemonStartError> {
+    let Some(_startup) = StartupLock::acquire(endpoint).await? else {
+        return Ok(());
+    };
+    let _retention = DaemonImageUseGuard::acquire(&bcode_config::default_state_dir())?;
+    let image = ensure_current_executable_cached()?;
+    let output = tokio::time::timeout(
+        Duration::from_secs(30),
+        tokio::process::Command::new(image)
+            .arg("artifact-id")
+            .stdin(std::process::Stdio::null())
+            .kill_on_drop(true)
+            .output(),
+    )
+    .await
+    .map_err(|_| {
+        std::io::Error::new(
+            std::io::ErrorKind::TimedOut,
+            "prepared daemon image probe timed out",
+        )
+    })??;
+    if !output.status.success()
+        || output.stdout != format!("{}\n", bcode_ipc::ArtifactId::current()).as_bytes()
+    {
+        return Err(std::io::Error::other("prepared daemon image identity probe failed").into());
+    }
+    Ok(())
+}
+
 /// Ensure the current namespace daemon is running, starting it when needed.
 ///
 /// # Errors

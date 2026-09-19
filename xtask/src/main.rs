@@ -1579,6 +1579,22 @@ fn dev_release(options: &Options) -> Result<()> {
             )));
         }
         println!("verified post-processing artifact identity: {actual_artifact_id}");
+        let mut prepare = Command::new(&binary);
+        prepare.args(["server", "prepare-image"]);
+        // Do not inherit the invoking daemon's endpoint/artifact identity. Preserve
+        // the user's config/state scope so preparation benefits the next normal launch.
+        for key in [
+            "BCODE_IPC_ENDPOINT",
+            "BCODE_IPC_ENDPOINT_NAMESPACE",
+            "BCODE_DAEMON_LOG",
+            "BCODE_DAEMON_READY_STDOUT",
+            "BCODE_EXECUTABLE_DIGEST",
+            "BCODE_STARTUP_CORRELATION",
+        ] {
+            prepare.env_remove(key);
+        }
+        run_command(&mut prepare)?;
+        println!("prepared immutable daemon image for the next launch");
     }
 
     Ok(())

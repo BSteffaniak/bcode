@@ -5026,6 +5026,8 @@ enum RuntimeWorkCommand {
 
 #[derive(Debug, Subcommand)]
 enum ServerCommand {
+    /// Materialize and prime this artifact's immutable image without starting a daemon.
+    PrepareImage,
     Start {
         #[arg(long)]
         foreground: bool,
@@ -6642,6 +6644,9 @@ async fn handle_server_command(command: ServerCommand) -> Result<(), CliError> {
         }
         ServerCommand::Run => run_server_foreground().await?,
         ServerCommand::Status { verbose } => server_status(verbose).await?,
+        ServerCommand::PrepareImage => {
+            bcode_daemon_lifecycle::prepare_daemon_image(&default_endpoint()).await?;
+        }
         ServerCommand::StartupProbe => daemon_startup_probe().await?,
         ServerCommand::StartupReport => {
             let reports = bcode_metrics::startup::reports(
