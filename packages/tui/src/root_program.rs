@@ -3255,6 +3255,104 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn shell_navigation_uses_committed_clipped_targets() {
+        use bmux_tui::event::{Event, MouseButton, MouseEvent, MouseEventKind};
+        use bmux_tui::geometry::{Point, Rect};
+        use bmux_tui_runtime::Presenter;
+        let session_id = bcode_session_models::SessionId::new();
+        let mut model = root_test_model_with_history(session_id, &[]);
+        let bundled = [bcode_plugin::StaticBundledPlugin::new(
+            include_str!("../../../plugins/shell-plugin/bcode-plugin.toml"),
+            bcode_shell_plugin::static_plugin(),
+        )];
+        let selected = bcode_plugin::filter_selected_static_plugins(
+            &bundled,
+            &bcode_plugin::PluginSelection::all_enabled(),
+        )
+        .unwrap();
+        model.chat.app.set_plugin_host(std::sync::Arc::new(
+            bcode_plugin::PluginHost::load_static_plugins(&selected).unwrap(),
+        ));
+        model.chat.app.absorb_session_event(&bcode_session_models::SessionEvent {
+            schema_version: bcode_session_models::CURRENT_SESSION_EVENT_SCHEMA_VERSION,
+            sequence: 1, timestamp_ms: 1, session_id, provenance: None,
+            kind: bcode_session_models::SessionEventKind::ToolInvocationResultRecorded {
+                record: bcode_session_models::ToolInvocationResultRecord {
+                    invocation_id: "shell-navigation".to_owned(), model_output: "fallback".to_owned(), is_error: false, presentation: None,
+                    result: Some(bcode_session_models::ToolInvocationResult::Artifact {
+                        artifact: Box::new(bcode_session_models::ToolArtifact {
+                            artifact_id: "shell-navigation".to_owned(), producer_plugin_id: "bcode.shell".to_owned(),
+                            schema: "bcode.tool.request.shell.run".to_owned(), schema_version: 1, title: None,
+                            tool_call_id: Some("shell-navigation".to_owned()),
+                            metadata: serde_json::json!({"arguments":{"command":"fixture"}, "_bcode_runtime": {
+                                "live_state_key":"shell-navigation", "columns":80, "rows":24, "streaming":true,
+                                "output":"\u{1b}[?1049habcdefghijklmnopqrstuvwxyz0123456789"}}),
+                            refs: Vec::new(),
+                        }),
+                    }),
+                    content: Vec::new(),
+                },
+            },
+        });
+        let registry = model
+            .chat
+            .app
+            .plugin_presentation()
+            .unwrap()
+            .registry("bcode.shell")
+            .unwrap();
+        let seed = registry.visual_projection(
+            "shell-run-request-card",
+            "bcode.tool.request.shell.run",
+            &serde_json::json!({"arguments":{"command":"fixture"}, "_bcode_runtime": {
+                "live_state_key":"shell-navigation", "columns":80, "rows":24, "streaming":true,
+                "output":"\u{1b}[?1049habcdefghijklmnopqrstuvwxyz0123456789"}}),
+            &bcode_plugin_sdk::tui::PluginTuiVisualRenderContext::new(
+                24,
+                bcode_plugin_sdk::tui::PluginTuiDiffLayout::Unified,
+                None,
+            ),
+        );
+        assert!(seed.is_some());
+        drop(registry);
+        let mut bytes = Vec::new();
+        let mut terminal = bmux_tui::terminal::Terminal::new(&mut bytes, Rect::new(0, 0, 24, 40));
+        super::BcodeRuntimePresenter::new(&mut terminal)
+            .present(&mut model)
+            .unwrap();
+        let (target, identity) = model
+            .committed_visual_targets
+            .first()
+            .cloned()
+            .expect("visible shell target");
+        assert!(target.height == 1 && target.width <= 24);
+        assert!(!model.committed_visual_text.is_empty());
+        let event = Event::Mouse(MouseEvent::new(
+            MouseEventKind::Down(MouseButton::Right),
+            Point::new(target.x, target.y),
+        ));
+        assert_eq!(
+            model.handle_basic_terminal_event(event),
+            super::super::invalidation::UiInvalidation::Structural
+        );
+        assert_eq!(model.focused_visual.as_deref(), Some(identity.as_str()));
+        let before = model.committed_visual_text.clone();
+        assert_eq!(
+            model.handle_basic_terminal_event(Event::Key(bmux_keyboard::KeyStroke {
+                key: bmux_keyboard::KeyCode::Right,
+                modifiers: bmux_keyboard::Modifiers::default(),
+            })),
+            super::super::invalidation::UiInvalidation::Structural
+        );
+        model.presentation_damage = bmux_tui::damage::Damage::Full;
+        super::BcodeRuntimePresenter::new(&mut terminal)
+            .present(&mut model)
+            .unwrap();
+        assert_ne!(before, model.committed_visual_text);
+        drop(model);
+    }
+
+    #[tokio::test]
     async fn visual_selection_text_commits_on_first_frame_and_survives_failed_resize() {
         use bmux_tui_runtime::Presenter;
 
