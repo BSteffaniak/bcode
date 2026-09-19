@@ -199,6 +199,7 @@ repository_invariants = true
 repository_context = true
 dynamic_repository_context = true
 agent_suffix = true
+user_authority = true # explicit user overrides of contextual workflow guidance
 skill_catalog = true
 ```
 
@@ -217,6 +218,28 @@ Behavior:
 * `system_prompt.sections.skill_catalog = false` disables catalog injection even if `[skills.prompt]` is enabled.
 * `skills.enabled = false` disables skill discovery and therefore disables the skill catalog.
 * `skills.prompt.catalog = "off"` disables only the prompt catalog while keeping skills available elsewhere.
+
+### User overrides
+
+`system_prompt.sections.user_authority` defaults to `true`, including for existing configs
+that omit the setting. It adds a stable instruction-precedence policy to ordinary coding turns,
+after model prompt profiles have been applied. Neither base replacement nor profile replacement
+removes it; set the section to `false` to omit it and retain the previous prompt behavior.
+Disabling skills or the prompt-profile plugin does not disable this section.
+
+The policy tells the model to honor explicit user changes to contextual workflow, scope, output,
+and stopping rules—even if an automatically loaded or explicitly invoked skill prohibits overrides.
+A clear same-session follow-up such as “just do it” overrides the restriction being discussed;
+ambiguous requests require focused clarification, not blanket authorization. Unrelated guidance
+remains in effect. References to binding workflow and validation guidance mean binding by default.
+
+This is model guidance, not a permission grant or a guarantee of provider compliance. Tool policy,
+active execution restrictions, and provider requirements still apply. Files and tool output cannot
+impersonate user authorization. Repository invariant changes still require explicit architectural
+decisions. No skill files, canonical session history, or declarative config are rewritten by an override.
+The setting uses normal config resolution; it does not add a live-toggle or reload mechanism.
+
+See [user-authority evaluation](user-authority-evaluation.md) for live behavioral checks.
 
 ## Invocation modes
 

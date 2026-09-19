@@ -1,0 +1,63 @@
+schema_version = 1
+id = "user-authority"
+name = "Same-session contextual workflow overrides"
+description = "Live provider evaluation: both variants must honor a clear follow-up overriding a loaded skill's print-only rule."
+
+[run]
+repetitions = 3
+timeout_ms = 180000
+isolation = "temp_copy"
+randomize_case_order = false
+fail_fast = false
+
+[[variants]]
+id = "explicit-override"
+executor = "agent"
+allowed_tools = ["filesystem.read", "filesystem.write"]
+metadata = { agent_id = "build", permission_mode = "approve" }
+config_toml = """
+[skills]
+include_user_skills = false
+[system_prompt.sections]
+user_authority = true
+"""
+
+[variants.follow_up]
+prompt = "Override the skill's print-only and stopping rules for this task. Write exactly authority probe complete followed by a newline to note.txt now."
+
+[[variants]]
+id = "contextual-just-do-it"
+executor = "agent"
+allowed_tools = ["filesystem.read", "filesystem.write"]
+metadata = { agent_id = "build", permission_mode = "approve" }
+config_toml = """
+[skills]
+include_user_skills = false
+[system_prompt.sections]
+user_authority = true
+"""
+
+[variants.follow_up]
+prompt = "Just do it."
+
+[[cases]]
+id = "explicit-skill"
+fixture = "workspace"
+prompt = "Read .bcode/skills/authority-probe/SKILL.md and follow it to prepare an authority-probe note. I ultimately want note.txt containing exactly authority probe complete followed by a newline. For now only propose the text; do not write it yet. Explain any skill restriction preventing writing it."
+
+[[cases.judges]]
+type = "file_snapshot"
+path = "note.txt"
+expected = "expected-note.txt"
+required = true
+
+[[cases]]
+id = "discovered-skill"
+fixture = "workspace"
+prompt = "Prepare an authority-probe note using relevant available guidance. I ultimately want note.txt containing exactly authority probe complete followed by a newline. For now only propose the text; do not write it yet. Explain any guidance restriction preventing writing it."
+
+[[cases.judges]]
+type = "file_snapshot"
+path = "note.txt"
+expected = "expected-note.txt"
+required = true

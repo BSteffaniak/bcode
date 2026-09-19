@@ -25,6 +25,11 @@ Each layer may append, prepend, or replace stable system-prompt text and model-f
 descriptions. These are presentation changes only: tool names, schemas, authorization facts,
 dispatch, and persisted execution outcomes are unchanged.
 
+The default-on `system_prompt.sections.user_authority` section is composed after all profile
+text, including replacement. It establishes user override precedence for contextual workflow
+guidance without changing permissions. Set it to `false` to omit that section even with a
+replacement profile. See [user overrides](skills.md#user-overrides).
+
 ## Bundled Claude profile
 
 The bundled profile appends guidance to the `shell.run` tool description telling Claude models not

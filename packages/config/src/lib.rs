@@ -1522,6 +1522,9 @@ pub struct SystemPromptSectionsConfig {
     /// Include agent-specific suffix text.
     #[serde(default = "default_true")]
     pub agent_suffix: bool,
+    /// Allow explicit user overrides of contextual workflow guidance, without bypassing permissions.
+    #[serde(default = "default_true")]
+    pub user_authority: bool,
     /// Include the skill catalog.
     #[serde(default = "default_true")]
     pub skill_catalog: bool,
@@ -1546,6 +1549,7 @@ impl Default for SystemPromptSectionsConfig {
             repository_context: true,
             dynamic_repository_context: true,
             agent_suffix: true,
+            user_authority: true,
             skill_catalog: true,
             model_profile: true,
         }
@@ -7638,6 +7642,9 @@ fn write_system_prompt_toml(output: &mut String, system_prompt: &SystemPromptCon
         if !system_prompt.sections.agent_suffix {
             output.push_str("agent_suffix = false\n");
         }
+        if !system_prompt.sections.user_authority {
+            output.push_str("user_authority = false\n");
+        }
         if !system_prompt.sections.skill_catalog {
             output.push_str("skill_catalog = false\n");
         }
@@ -12775,6 +12782,29 @@ extends = ["a"]
 
         assert!(paths.contains(&root.join("bcode.toml")));
         assert!(paths.contains(&root.join(".bcode").join("bcode.toml")));
+    }
+
+    #[test]
+    fn user_authority_config_defaults_and_round_trips() {
+        let omitted: BcodeConfig = toml::from_str("").expect("empty config");
+        assert!(omitted.system_prompt.sections.user_authority);
+        assert!(super::SystemPromptSectionsConfig::default().user_authority);
+        for enabled in [true, false] {
+            let input = format!("[system_prompt.sections]\nuser_authority = {enabled}\n");
+            let config: BcodeConfig = toml::from_str(&input).expect("explicit setting");
+            assert_eq!(config.system_prompt.sections.user_authority, enabled);
+            let rendered = super::config_to_toml(&config);
+            let decoded: BcodeConfig = toml::from_str(&rendered).expect("round trip");
+            assert_eq!(
+                decoded.system_prompt.sections,
+                config.system_prompt.sections
+            );
+        }
+        assert!(
+            super::SystemPromptSectionsConfig::field_docs()
+                .iter()
+                .any(|field| field.toml_key == "user_authority")
+        );
     }
 
     #[test]
