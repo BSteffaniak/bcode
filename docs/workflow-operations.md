@@ -38,6 +38,8 @@ audit event. It does not cancel, undo, retry, or prove the previous operation's 
 possible effects before using `/loop` separately to start fresh. Running and paused loops cannot
 be detached through this action.
 
+Architectural requirement: session-association detachment does not require execution ownership or daemon-owner verification. The current detach implementation still requires verified execution ownership; this is an implementation gap, not an exception to the architectural requirement.
+
 Receipt reconciliation records `attempt_repair_required` with normalized reason
 `operation_outcome_unproven`. Doctor checks structural consistency: an empty issues list alone
 does not establish executability; inspect the run and attempt statuses too.
