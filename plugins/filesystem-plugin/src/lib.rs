@@ -2808,6 +2808,7 @@ pub fn filesystem_tui_registry() -> bcode_plugin_sdk::tui::PluginTuiRegistry {
         [
             "filesystem-write-request-draft",
             "filesystem-edit-request-draft",
+            "filesystem-multi-edit-request-draft",
             "filesystem-request-card",
             "filesystem-read-card",
             "filesystem-image-card",
@@ -3085,6 +3086,45 @@ mod tests {
             registry.supports_visual_adapter("filesystem-change-card", "bcode.filesystem.change")
         );
         assert!(!registry.supports_visual_adapter("filesystem-batch-card", "unrelated.schema"));
+    }
+
+    #[test]
+    #[cfg(feature = "static-bundled")]
+    fn registered_multi_edit_draft_projects_incomplete_arguments() {
+        let registry = filesystem_tui_registry();
+        let context = bcode_plugin_sdk::tui::PluginTuiVisualRenderContext::new(
+            80,
+            bcode_plugin_sdk::tui::PluginTuiDiffLayout::Unified,
+            None,
+        );
+        let preview = r#"{"files":[{"path":"first.rs","edits":[{"old_text":"original","new_text":"replacement"}]},{"path":"second.rs","edits":[{"new_text":"arriving"#;
+        let projection = registry
+            .visual_projection(
+                "filesystem-multi-edit-request-draft",
+                "bcode.filesystem.request-draft.multi-edit",
+                &json!({"preview": preview, "argument_bytes": preview.len()}),
+                &context,
+            )
+            .expect("registered draft adapter must produce a projection, not fallback");
+        let rendered = projection
+            .rows
+            .iter()
+            .flat_map(|line| line.spans.iter())
+            .map(|span| span.content.as_str())
+            .collect::<String>();
+        for expected in [
+            "first.rs",
+            "second.rs",
+            "original",
+            "replacement",
+            "arriving",
+            "not applied",
+        ] {
+            assert!(
+                rendered.contains(expected),
+                "missing {expected}: {rendered}"
+            );
+        }
     }
 
     #[test]
