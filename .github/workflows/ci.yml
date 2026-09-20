@@ -1,0 +1,134 @@
+name: Build and Test
+
+on:
+  pull_request:
+  push:
+    branches: [master]
+  workflow_dispatch:
+    inputs:
+      packages:
+        description: Comma-separated packages (empty selects all)
+        type: string
+      seed:
+        description: Reproduction seed
+        type: string
+
+permissions:
+  contents: read
+  actions: read
+
+concurrency:
+  group: build-test-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+  CARGO_PROFILE_DEV_DEBUG: 0
+  CARGO_PROFILE_TEST_DEBUG: 0
+
+jobs:
+  analyze:
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.matrix.outputs.matrix }}
+      changed: ${{ steps.matrix.outputs.has-changes }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Generate affected package and feature matrix
+        id: matrix
+        uses: MoosicBox/MoosicBox/.github/actions/clippier@ab9e4a62e0febcf9527714513d693004dd8e24f8
+        with:
+          command: features
+          workspace-path: .
+          packages: ${{ inputs.packages }}
+          chunked: 8
+          spread: true
+          seed: ${{ inputs.seed || '1' }}
+          skip-features: fail-on-warnings
+          git-strategy: workflow-history
+          include-reasoning: true
+          jq-filter: 'map(.os |= (if endswith("-latest") then . else . + "-latest" end))'
+          force-full-matrix-condition: ${{ github.event_name == 'workflow_dispatch' }}
+          generate-summary: true
+          summary-include-seed: true
+
+  packages:
+    name: ${{ matrix.package.name }} (${{ matrix.package.os }})
+    needs: analyze
+    if: needs.analyze.outputs.changed == 'true'
+    runs-on: ${{ matrix.package.os }}
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      max-parallel: 6
+      matrix:
+        package: ${{ fromJson(needs.analyze.outputs.matrix) }}
+    steps:
+      - uses: actions/checkout@v7
+      - name: Set up package environment
+        uses: MoosicBox/MoosicBox/.github/actions/clippier@ab9e4a62e0febcf9527714513d693004dd8e24f8
+        with:
+          command: setup
+          package-json: ${{ toJson(matrix.package) }}
+          skip-checkout: true
+          rust-components: clippy
+      - name: Check and test feature combinations
+        id: suite
+        uses: MoosicBox/MoosicBox/.github/actions/clippier@ab9e4a62e0febcf9527714513d693004dd8e24f8
+        with:
+          command: run-matrix
+          run-matrix-package-json: ${{ toJson(matrix.package) }}
+          run-matrix-steps: |
+            clippy:
+              commands: cargo clippy --locked --all-targets --no-default-features {{clippier.feature-flags}} -- -D warnings
+              strategy: sequential
+            tests:
+              commands: cargo test --locked --no-default-features {{clippier.feature-flags}}
+              strategy: sequential
+          run-matrix-auto-upload: true
+      - name: Upload structured failures
+        if: always() && steps.suite.outputs.failure-artifact-path != ''
+        uses: actions/upload-artifact@v7
+        with:
+          name: ${{ steps.suite.outputs.failure-artifact-name }}
+          path: ${{ steps.suite.outputs.failure-artifact-path }}
+          if-no-files-found: ignore
+
+  workspace:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - run: cargo fmt --all -- --check
+      - run: cargo check --workspace --locked
+      - run: cargo clippy --workspace --all-targets --locked -- -D warnings
+      - run: scripts/check-prompt-cache-eval.sh
+
+  failures:
+    needs: [packages]
+    if: failure()
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: test-results-*
+          path: failure-data
+          merge-multiple: true
+      - id: report
+        uses: MoosicBox/MoosicBox/.github/actions/clippier@ab9e4a62e0febcf9527714513d693004dd8e24f8
+        with:
+          command: report
+          run-matrix-working-directory: ./failure-data
+          report-output-file: ./failures-summary.md
+      - uses: actions/upload-artifact@v7
+        if: always() && steps.report.outputs.aggregate-summary-path != ''
+        with:
+          name: workflow-failures-summary
+          path: ${{ steps.report.outputs.aggregate-summary-path }}

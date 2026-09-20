@@ -1,0 +1,7 @@
+# Portable packages run on Linux. Package-local OS lists replace this default;
+# always retain Ubuntu when adding a native-platform contract check.
+[[config]]
+os = "ubuntu"
+
+[rust]
+cargo = ["--locked"]

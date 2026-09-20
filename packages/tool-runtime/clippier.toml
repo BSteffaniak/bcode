@@ -1,0 +1,5 @@
+# Windows job/process-tree cancellation differs from Unix process groups.
+[[config]]
+os = "ubuntu"
+[[config]]
+os = "windows"

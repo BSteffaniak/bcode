@@ -1,0 +1,7 @@
+# Native process identity, startup locking, and process lifetime contracts.
+[[config]]
+os = "ubuntu"
+[[config]]
+os = "macos"
+[[config]]
+os = "windows"

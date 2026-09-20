@@ -1,0 +1,5 @@
+# Exercise ConPTY and Windows command construction as well as Unix PTYs.
+[[config]]
+os = "ubuntu"
+[[config]]
+os = "windows"
