@@ -716,6 +716,9 @@ struct LoopSurface {
     progress_document: Option<goal::ProgressDocumentSetup>,
     progress_document_area: Rect,
     review_area: Rect,
+    goal_option_focus: Option<goal::GoalOption>,
+    progress_checkbox: std::cell::Cell<bmux_tui_components::checkbox::CheckboxState>,
+    review_button: std::cell::Cell<bmux_tui_components::button::ButtonState>,
     theme: Option<PluginTuiTheme>,
 }
 
@@ -745,6 +748,11 @@ impl LoopSurface {
             progress_document: None,
             progress_document_area: Rect::new(0, 0, 0, 0),
             review_area: Rect::new(0, 0, 0, 0),
+            goal_option_focus: None,
+            progress_checkbox: std::cell::Cell::new(
+                bmux_tui_components::checkbox::CheckboxState::new(false),
+            ),
+            review_button: std::cell::Cell::new(bmux_tui_components::button::ButtonState::new()),
             theme: None,
         }
     }
@@ -1175,21 +1183,32 @@ impl LoopSurface {
         action
     }
 
+    fn sync_goal_controls(&self) {
+        let mut checkbox = self.progress_checkbox.get();
+        checkbox.set_checked(self.progress_document.is_some());
+        checkbox.set_focused(self.goal_option_focus == Some(goal::GoalOption::Progress));
+        self.progress_checkbox.set(checkbox);
+        let mut button = self.review_button.get();
+        button.set_focused(self.goal_option_focus == Some(goal::GoalOption::Review));
+        self.review_button.set(button);
+    }
+
     fn paint_goal_options(&mut self, mut content: Rect, frame: &mut PaintCx<'_, '_>) -> Rect {
         self.progress_document_area = Rect::new(0, 0, 0, 0);
         self.review_area = Rect::new(0, 0, 0, 0);
         if self.setup_kind == SetupKind::Goal {
-            use bmux_tui_components::checkbox::{CheckboxComponent, CheckboxState};
+            use bmux_tui_components::button::{ButtonComponent, ButtonPolicy};
+            use bmux_tui_components::checkbox::CheckboxComponent;
 
             self.progress_document_area =
                 Rect::new(content.x, content.y, content.width, 1).intersection(content);
             self.review_area = Rect::new(content.x, content.y.saturating_add(1), content.width, 1)
                 .intersection(content);
-            let state = std::cell::Cell::new(CheckboxState::new(self.progress_document.is_some()));
+            self.sync_goal_controls();
             let checkbox = CheckboxComponent::new(
                 "goal.progress-document",
-                "Maintain a progress document (Ctrl+P)",
-                &state,
+                goal::PROGRESS_LABEL,
+                &self.progress_checkbox,
             )
             .fallback_style(
                 self.theme
@@ -1206,12 +1225,9 @@ impl LoopSurface {
                 LocalRect::new(0, 0, rect.width, rect.height),
                 |cx| checkbox.paint(&layout, cx),
             );
-            let review = [StatusSegment::new(
-                "Review generated instructions before starting (Ctrl+R)",
-            )];
-            let review = StatusBarComponent::new("goal.review")
-                .left(&review)
-                .styles(loop_status_styles(self.theme.as_ref()));
+            let review =
+                ButtonComponent::new("goal.review", goal::REVIEW_LABEL, &self.review_button)
+                    .policy(ButtonPolicy::interactive());
             let rect = self.review_area;
             let layout = review.layout(Constraints::tight(rect.size()), &mut LayoutCx::new());
             frame.with_child(
@@ -1414,7 +1430,7 @@ impl PluginTuiSurface for LoopSurface {
                 "Iteration prompt"
             },
             &mut self.prompt,
-            self.field == Field::Prompt,
+            self.field == Field::Prompt && self.goal_option_focus.is_none(),
             self.prompt_area.height,
             self.theme.as_ref(),
         );
@@ -1427,7 +1443,7 @@ impl PluginTuiSurface for LoopSurface {
                 "Stop condition"
             },
             &mut self.condition,
-            self.field == Field::Condition,
+            self.field == Field::Condition && self.goal_option_focus.is_none(),
             self.condition_area.height,
             self.theme.as_ref(),
         );
@@ -1440,7 +1456,7 @@ impl PluginTuiSurface for LoopSurface {
                 "Maximum iterations"
             },
             &mut self.limit,
-            self.field == Field::Limit,
+            self.field == Field::Limit && self.goal_option_focus.is_none(),
             1,
             self.theme.as_ref(),
         );

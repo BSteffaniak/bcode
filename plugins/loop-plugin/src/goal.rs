@@ -213,6 +213,15 @@ enum GoalPhase {
     Closed,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum GoalOption {
+    Progress,
+    Review,
+}
+
+pub const PROGRESS_LABEL: &str = "Maintain a progress document (Ctrl+P)";
+pub const REVIEW_LABEL: &str = "Review generated instructions before starting (Ctrl+R)";
+
 struct GoalSurface {
     editor: LoopSurface,
     phase: GoalPhase,
@@ -234,6 +243,111 @@ impl GoalSurface {
             source: None,
             completion: Arc::default(),
         }
+    }
+
+    fn prepare_controls(&self) {
+        let disabled = self.phase != GoalPhase::Draft
+            || matches!(
+                self.editor.fresh_session,
+                FreshSessionState::Creating
+                    | FreshSessionState::Configuring
+                    | FreshSessionState::Attaching
+            );
+        let mut checkbox = self.editor.progress_checkbox.get();
+        checkbox.set_disabled(disabled);
+        self.editor.progress_checkbox.set(checkbox);
+        let mut button = self.editor.review_button.get();
+        button.set_disabled(disabled);
+        self.editor.review_button.set(button);
+    }
+
+    fn handle_options(
+        &mut self,
+        event: &Event,
+        host: &dyn PluginTuiHost,
+    ) -> Option<PluginTuiAction> {
+        use bmux_tui_components::button::{Button, ButtonOutcome, ButtonPolicy};
+        use bmux_tui_components::checkbox::{Checkbox, CheckboxOutcome};
+
+        self.prepare_controls();
+        let editor = &mut self.editor;
+        if let Event::Key(stroke) = event
+            && stroke.key == KeyCode::Tab
+        {
+            editor.goal_option_focus = match (
+                editor.goal_option_focus,
+                editor.field,
+                stroke.modifiers.shift,
+            ) {
+                (Some(GoalOption::Progress), _, false) | (None, Field::Prompt, true) => {
+                    Some(GoalOption::Review)
+                }
+                (Some(GoalOption::Review), _, true) | (None, Field::Limit, false) => {
+                    Some(GoalOption::Progress)
+                }
+                (Some(_), _, reverse) => {
+                    editor.field = if reverse { Field::Limit } else { Field::Prompt };
+                    None
+                }
+
+                (None, _, _) => return None,
+            };
+            editor.sync_goal_controls();
+            return Some(PluginTuiAction::Redraw);
+        }
+        editor.sync_goal_controls();
+        let mut checkbox = editor.progress_checkbox.get();
+        let mut button = editor.review_button.get();
+        let checkbox_outcome = if !matches!(event, Event::Key(_) | Event::Paste(_))
+            || editor.goal_option_focus == Some(GoalOption::Progress)
+        {
+            Checkbox::new(PROGRESS_LABEL).handle_event(
+                editor.progress_document_area,
+                &mut checkbox,
+                event,
+            )
+        } else {
+            CheckboxOutcome::Ignored
+        };
+        let button_outcome = if !matches!(event, Event::Key(_) | Event::Paste(_))
+            || editor.goal_option_focus == Some(GoalOption::Review)
+        {
+            Button::new(REVIEW_LABEL)
+                .policy(ButtonPolicy::interactive())
+                .handle_event(editor.review_area, &mut button, event)
+        } else {
+            ButtonOutcome::Ignored
+        };
+        if !editor.progress_checkbox.get().interaction().focused && checkbox.interaction().focused {
+            editor.goal_option_focus = Some(GoalOption::Progress);
+        }
+        if !editor.review_button.get().focused() && button.focused() {
+            editor.goal_option_focus = Some(GoalOption::Review);
+        }
+        editor.progress_checkbox.set(checkbox);
+        editor.review_button.set(button);
+        if let CheckboxOutcome::Toggled(checked) = checkbox_outcome {
+            editor.progress_document = checked.then(ProgressDocumentSetup::default);
+        }
+        if button_outcome == ButtonOutcome::Pressed {
+            return Some(self.generate(host, true));
+        }
+        if !matches!(checkbox_outcome, CheckboxOutcome::Ignored) || button_outcome.is_handled() {
+            return Some(PluginTuiAction::Redraw);
+        }
+        if matches!(event, Event::Mouse(_)) {
+            if event_click_in(event, editor.prompt_area)
+                || event_click_in(event, editor.condition_area)
+                || event_click_in(event, editor.limit_area)
+            {
+                editor.goal_option_focus = None;
+            }
+        } else if editor.goal_option_focus.is_some()
+            && matches!(event, Event::Key(_) | Event::Paste(_))
+        {
+            return Some(PluginTuiAction::None);
+        }
+        None
     }
 
     fn generate(&mut self, host: &dyn PluginTuiHost, review: bool) -> PluginTuiAction {
@@ -307,6 +421,7 @@ impl PluginTuiSurface for GoalSurface {
         self.editor.preferred_height(width)
     }
     fn render(&mut self, area: Rect, frame: &mut PaintCx<'_, '_>) {
+        self.prepare_controls();
         self.editor.render(area, frame);
     }
     fn render_with_theme(
@@ -315,6 +430,7 @@ impl PluginTuiSurface for GoalSurface {
         frame: &mut PaintCx<'_, '_>,
         theme: Option<&PluginTuiTheme>,
     ) {
+        self.prepare_controls();
         self.editor.render_with_theme(area, frame, theme);
     }
     fn poll(&mut self, host: &dyn PluginTuiHost) -> PluginTuiAction {
@@ -387,6 +503,7 @@ impl PluginTuiSurface for GoalSurface {
                 self.editor.condition = text_state(&input.stop_condition);
                 self.editor.limit = text_state(&limit.to_string());
                 self.editor.setup_kind = SetupKind::Loop;
+                self.editor.goal_option_focus = None;
                 self.phase = GoalPhase::Generated;
                 self.editor.status = "Review generated prompts · Ctrl+Enter starts the loop".into();
                 if !review {
@@ -428,7 +545,9 @@ impl PluginTuiSurface for GoalSurface {
                     return self.generate(host, true);
                 }
                 if stroke.key == KeyCode::Enter
-                    && (stroke.modifiers.ctrl || self.editor.field == Field::Limit)
+                    && (stroke.modifiers.ctrl
+                        || (self.editor.field == Field::Limit
+                            && self.editor.goal_option_focus.is_none()))
                 {
                     return self.generate(host, false);
                 }
@@ -441,18 +560,9 @@ impl PluginTuiSurface for GoalSurface {
                     | FreshSessionState::Configuring
                     | FreshSessionState::Attaching
             )
+            && let Some(action) = self.handle_options(event, host)
         {
-            if event_click_in(event, self.editor.progress_document_area) {
-                self.editor.progress_document = if self.editor.progress_document.is_some() {
-                    None
-                } else {
-                    Some(ProgressDocumentSetup::default())
-                };
-                return PluginTuiAction::Redraw;
-            }
-            if event_click_in(event, self.editor.review_area) {
-                return self.generate(host, true);
-            }
+            return action;
         }
         // Freeze source inputs during generation; no stale response can replace newer edits.
         if matches!(self.phase, GoalPhase::Generating { .. } | GoalPhase::Closed) {
@@ -817,13 +927,34 @@ mod tests {
                 Point::new(rect.x, rect.y),
             ))
         };
+        let release = |rect: Rect| {
+            Event::Mouse(MouseEvent::new(
+                MouseEventKind::Up(MouseButton::Left),
+                Point::new(rect.x, rect.y),
+            ))
+        };
         let checkbox = surface.editor.progress_document_area;
         assert!(checkbox.height > 0);
+        let outside = Rect::new(0, 0, 1, 1);
         surface.handle_event(&click(checkbox), &host);
-        assert!(surface.editor.progress_document.is_none());
+        surface.handle_event(&release(outside), &host);
+        assert!(surface.editor.progress_document.is_some());
+        let right_click = Event::Mouse(MouseEvent::new(
+            MouseEventKind::Down(MouseButton::Right),
+            Point::new(checkbox.x, checkbox.y),
+        ));
+        surface.handle_event(&right_click, &host);
+        surface.handle_event(&release(checkbox), &host);
+        assert!(surface.editor.progress_document.is_some());
         surface.handle_event(&click(checkbox), &host);
         assert!(surface.editor.progress_document.is_some());
+        surface.handle_event(&release(checkbox), &host);
+        assert!(surface.editor.progress_document.is_none());
+        surface.handle_event(&click(checkbox), &host);
+        surface.handle_event(&release(checkbox), &host);
+        assert!(surface.editor.progress_document.is_some());
         surface.handle_event(&click(surface.editor.review_area), &host);
+        surface.handle_event(&release(surface.editor.review_area), &host);
         assert!(matches!(
             surface.phase,
             GoalPhase::Generating { review: true }
@@ -831,6 +962,38 @@ mod tests {
         assert!(host.starts.lock().unwrap().is_empty());
         surface.handle_event(&click(checkbox), &host);
         assert!(surface.editor.progress_document.is_some());
+    }
+
+    #[test]
+    fn goal_options_follow_keyboard_focus() {
+        let host = Host::default();
+        let mut surface = GoalSurface::new(Some(SessionId::new()));
+        surface.editor.prompt = text_state("Implement the goal");
+        let key = |key, shift| {
+            Event::Key(bmux_keyboard::KeyStroke {
+                key,
+                modifiers: bmux_keyboard::Modifiers {
+                    shift,
+                    ..Default::default()
+                },
+            })
+        };
+        surface.handle_event(&key(KeyCode::Tab, true), &host);
+        assert!(surface.editor.goal_option_focus == Some(GoalOption::Review));
+        surface.handle_event(&key(KeyCode::Tab, true), &host);
+        assert!(surface.editor.goal_option_focus == Some(GoalOption::Progress));
+        surface.handle_event(&key(KeyCode::Char(' '), false), &host);
+        assert!(surface.editor.progress_document.is_none());
+        surface.handle_event(&key(KeyCode::Tab, true), &host);
+        assert!(surface.editor.goal_option_focus.is_none());
+        assert_eq!(surface.editor.field, Field::Limit);
+        surface.handle_event(&key(KeyCode::Tab, false), &host);
+        surface.handle_event(&key(KeyCode::Tab, false), &host);
+        surface.handle_event(&key(KeyCode::Enter, false), &host);
+        assert!(matches!(
+            surface.phase,
+            GoalPhase::Generating { review: true }
+        ));
     }
 
     #[test]
