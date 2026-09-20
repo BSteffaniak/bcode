@@ -2,6 +2,9 @@
 //!
 //! No network access, credential handling, or canonical persistence occurs here.
 
+/// Bounded provider-owned remote history access.
+pub mod client;
+
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::{BTreeMap, BTreeSet};
