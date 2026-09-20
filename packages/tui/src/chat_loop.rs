@@ -2981,6 +2981,13 @@ pub fn apply_effect_result(
                         bcode_command::CommandEffect::Status { message } => {
                             chat.app.set_status(message);
                         }
+                        bcode_command::CommandEffect::CopyText { text } => {
+                            let status = match super::markdown_activation::copy_text(&text) {
+                                Ok(()) => "copied to clipboard".to_owned(),
+                                Err(error) => format!("copy failed: {error}"),
+                            };
+                            chat.app.set_status(status);
+                        }
                         bcode_command::CommandEffect::AppendText { text, format } => {
                             chat.append_durable_presentation_note(plugin_id.clone(), text, format);
                         }

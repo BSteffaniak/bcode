@@ -97,6 +97,11 @@ pub enum CommandTextFormat {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum CommandEffect {
+    /// Copy literal text to the frontend's clipboard. Report write failures to the user.
+    CopyText {
+        /// Complete text to copy without presentation formatting.
+        text: String,
+    },
     /// Show a user-facing status message.
     Status {
         /// Message to show.

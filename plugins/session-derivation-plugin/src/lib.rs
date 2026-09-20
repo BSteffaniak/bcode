@@ -31,6 +31,7 @@ use std::fmt::Write as _;
 const PLUGIN_ID: &str = "bcode.session-derivation";
 const FORK_COMMAND_ID: &str = "session-derivation.fork";
 const CLONE_COMMAND_ID: &str = "session-derivation.clone";
+const COPY_SESSION_ID_COMMAND_ID: &str = "session-derivation.copy-session-id";
 
 #[derive(Default)]
 pub struct SessionDerivationPlugin;
@@ -61,6 +62,12 @@ impl RustPlugin for SessionDerivationPlugin {
 
 fn commands() -> Vec<CommandContribution> {
     vec![
+        command(
+            COPY_SESSION_ID_COMMAND_ID,
+            "copy-session-id",
+            "Copy Session ID",
+            "Copy the current session ID to the clipboard and display its full value",
+        ),
         command(
             FORK_COMMAND_ID,
             "fork",
@@ -111,6 +118,9 @@ fn invoke_command(
     let Some(session_id) = command_context.session_id else {
         return ServiceResponse::error("session_required", "command requires an active session");
     };
+    if request.command_id == COPY_SESSION_ID_COMMAND_ID {
+        return json_response(&copy_session_id_response(session_id));
+    }
     let snapshot = match call_derivation_service(
         context,
         &request.command_id,
@@ -311,6 +321,24 @@ fn call_derivation_service(
             Err("session derivation cancelled".to_owned())
         }
         _ => Err("session derivation service unavailable".to_owned()),
+    }
+}
+
+fn copy_session_id_response(session_id: bcode_session_models::SessionId) -> InvokeCommandResponse {
+    let text = session_id.to_string();
+    InvokeCommandResponse {
+        success: true,
+        message: None,
+        updated_model: None,
+        updated_provider: None,
+        updated_thinking: None,
+        effects: vec![
+            CommandEffect::CopyText { text: text.clone() },
+            CommandEffect::AppendText {
+                text: format!("Session ID: {text}"),
+                format: bcode_command::CommandTextFormat::PlainText,
+            },
+        ],
     }
 }
 
@@ -520,8 +548,8 @@ mod tests {
     #[test]
     fn commands_are_plugin_owned_first_class_entries() {
         let commands = commands();
-        assert_eq!(commands.len(), 2);
-        for (command, slash) in commands.iter().zip(["fork", "clone"]) {
+        assert_eq!(commands.len(), 3);
+        for (command, slash) in commands.iter().zip(["copy-session-id", "fork", "clone"]) {
             assert_eq!(command.slash_name(), Some(slash));
             assert_eq!(command.session, CommandSessionRequirement::Required);
             assert!(command.surfaces.contains(&CommandSurface::Palette));
@@ -531,6 +559,51 @@ mod tests {
                 CommandAction::Plugin { plugin_id, .. } if plugin_id == PLUGIN_ID
             ));
         }
+    }
+
+    #[test]
+    fn copy_session_id_uses_canonical_context_without_service_access() {
+        let context: NativeServiceContext = serde_json::from_value(serde_json::json!({
+            "plugin_id": PLUGIN_ID,
+            "request": {
+                "interface_id": COMMAND_INTERFACE_ID,
+                "operation": OP_INVOKE_COMMAND,
+                "payload": []
+            }
+        }))
+        .expect("context without a service bridge");
+        let session_id = "12345678-1234-5678-9abc-123456789abc"
+            .parse::<bcode_session_models::SessionId>()
+            .expect("session ID");
+        let mut request = InvokeCommandRequest {
+            command_id: COPY_SESSION_ID_COMMAND_ID.to_owned(),
+            args: BTreeMap::from([("session_id".to_owned(), "untrusted".to_owned())]),
+            context: Some(bcode_command::CommandInvocationContext {
+                session_id: Some(session_id),
+                working_directory: std::env::temp_dir(),
+            }),
+        };
+        let response = invoke_command(&context, request.clone());
+        assert_eq!(response.error, None);
+        let response: InvokeCommandResponse =
+            serde_json::from_slice(&response.payload).expect("copy response");
+        assert!(response.success);
+        assert_eq!(
+            response.effects,
+            vec![
+                CommandEffect::CopyText {
+                    text: "12345678-1234-5678-9abc-123456789abc".to_owned(),
+                },
+                CommandEffect::AppendText {
+                    text: "Session ID: 12345678-1234-5678-9abc-123456789abc".to_owned(),
+                    format: bcode_command::CommandTextFormat::PlainText,
+                },
+            ]
+        );
+        request.context.as_mut().expect("context").session_id = None;
+        assert!(invoke_command(&context, request.clone()).error.is_some());
+        request.context = None;
+        assert!(invoke_command(&context, request).error.is_some());
     }
 
     #[test]
