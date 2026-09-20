@@ -777,6 +777,14 @@ equal the canonical event tail. Missing/stale projection state surfaces `Project
 state surfaces repair-required. Relative and supported legacy absolute/file references are accepted
 only after canonical path confinement beneath the session artifact root.
 
+Live artifact revisions and persisted finalizing event sequences are separate domains. A live
+reference may already be finalized before its canonical event is observed. Clients identify a
+persisted range by `finalized_event_seq`, never by numeric revision ordering or `finalized` alone.
+Persistence supersedes live state even when its sequence is smaller; stale live updates cannot
+replace persisted state. Transport preserves delivered byte offsets across this transition and
+rejects obsolete in-flight completions without replaying previously delivered bytes. Presentation
+warnings clear only after successful delivery and recovery of every tracked stream for the invocation.
+
 ## Non-negotiable invariants
 
 * A session id has one canonical database path.

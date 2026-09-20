@@ -53,6 +53,7 @@ struct ActiveArtifactFetchState {
     retry_at: Option<Instant>,
     consecutive_failures: u32,
     terminal_error: Option<String>,
+    delivered_successfully: bool,
 }
 
 #[derive(Debug)]
@@ -235,7 +236,8 @@ impl ArtifactStreamCoordinator {
     pub(crate) fn recovered_invocations(&self) -> Vec<String> {
         let mut recovered = BTreeMap::new();
         for (key, state) in &self.artifact_fetches {
-            let healthy = state.terminal_error.is_none()
+            let healthy = state.delivered_successfully
+                && state.terminal_error.is_none()
                 && state.retry_at.is_none()
                 && state
                     .target
@@ -248,7 +250,8 @@ impl ArtifactStreamCoordinator {
         }
         recovered
             .into_iter()
-            .filter_map(|(id, healthy)| healthy.then(|| id.clone()))
+            .filter(|(_, healthy)| *healthy)
+            .map(|(id, _)| id.clone())
             .take(256)
             .collect()
     }
@@ -641,6 +644,7 @@ impl ArtifactStreamCoordinator {
             match delivery {
                 Ok(true) => {
                     state.next_offset = expected_end;
+                    state.delivered_successfully = true;
                     state.consecutive_failures = 0;
                     state.retry_at = None;
                     self.stats.delivered_chunks = self.stats.delivered_chunks.saturating_add(1);
@@ -1220,7 +1224,7 @@ mod tests {
             .get(&key)
             .expect("artifact state");
         assert_eq!(state.next_offset, 0);
-        assert!(!state.fetching);
+        assert!(state.fetching);
         assert_eq!(coordinator.stats.stale_completions, 1);
     }
 
@@ -1443,6 +1447,46 @@ mod tests {
                 },
             );
             assert!(coordinator.recovered_invocations().is_empty());
+        }
+    }
+
+    #[tokio::test]
+    async fn canonical_transition_discards_pending_live_response_and_reschedules() {
+        for live_revision in [22, 6145] {
+            let mut coordinator = ArtifactStreamCoordinator::new(BcodeClient::default_endpoint());
+            let session_id = SessionId::new();
+            let key = (
+                session_id,
+                "tool".to_owned(),
+                "artifact".to_owned(),
+                "reference".to_owned(),
+            );
+            let mut persisted = target(8, 22, true);
+            persisted.revision = ArtifactRevision::Persisted(22);
+            coordinator.artifact_fetches.insert(
+                key.clone(),
+                ActiveArtifactFetchState {
+                    next_offset: 4,
+                    target: Some(persisted),
+                    fetching: true,
+                    ..ActiveArtifactFetchState::default()
+                },
+            );
+            assert!(!coordinator.handle_completion(
+                Some(session_id),
+                ActiveArtifactFetchCompletion {
+                    session_id,
+                    key: key.clone(),
+                    requested_offset: 4,
+                    requested_end: 8,
+                    target_revision: ArtifactRevision::Live(live_revision),
+                    result: Ok(range(4, 8, live_revision, b"tail")),
+                },
+                |_| panic!("stale response must not reach the adapter")
+            ));
+            assert_eq!(coordinator.artifact_fetches[&key].next_offset, 4);
+            assert!(coordinator.artifact_fetches[&key].fetching);
+            assert_eq!(coordinator.stats.fetches_started, 1);
         }
     }
 

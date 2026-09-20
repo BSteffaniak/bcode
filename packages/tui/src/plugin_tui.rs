@@ -2056,6 +2056,7 @@ library = "libdynamic_visual_test.dylib"
                 &context,
             )
             .expect("recovered visual");
+        drop(presentation);
         assert!(!routed_text(&recovered).contains("Artifact replay failed"));
     }
 
