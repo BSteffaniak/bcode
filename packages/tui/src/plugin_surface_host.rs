@@ -56,6 +56,58 @@ pub struct FreshSessionSettings {
     pub summary: Option<String>,
 }
 
+#[derive(Default)]
+struct GenerationAssistantOutput {
+    turn_id: Option<String>,
+    legacy: Option<String>,
+    segment: Option<(u32, String)>,
+}
+
+impl GenerationAssistantOutput {
+    fn observe(&mut self, event: &bcode_session_models::SessionEventKind) {
+        use bcode_session_models::SessionEventKind;
+        match event {
+            SessionEventKind::ModelTurnStarted { turn_id, .. } => {
+                self.turn_id = Some(turn_id.clone());
+                self.legacy = None;
+                self.segment = None;
+            }
+            SessionEventKind::AssistantMessage { text } => self.legacy = Some(text.clone()),
+            SessionEventKind::AssistantResponseSegment {
+                turn_id,
+                segment_order,
+                text,
+                ..
+            }
+            | SessionEventKind::PositionedAssistantResponseSegment {
+                turn_id,
+                segment_order,
+                text,
+                ..
+            } if self.turn_id.as_ref() == Some(turn_id)
+                && self
+                    .segment
+                    .as_ref()
+                    .is_none_or(|(order, _)| segment_order >= order) =>
+            {
+                // Complete responses, not deltas: use the latest finalization segment.
+                self.segment = Some((*segment_order, text.clone()));
+            }
+            _ => {}
+        }
+    }
+
+    fn for_turn(&self, turn_id: &str) -> Option<&str> {
+        if self.turn_id.as_deref() != Some(turn_id) {
+            return None;
+        }
+        self.segment
+            .as_ref()
+            .map(|(_, text)| text.as_str())
+            .or(self.legacy.as_deref())
+    }
+}
+
 async fn prepare_generation_session(
     client: &BcodeClient,
     request: &PluginStructuredGenerationRequest,
@@ -402,7 +454,7 @@ impl PluginTuiHost for BcodePluginTuiHost {
                 .map_err(|error| PluginTuiHostError::Internal(error.to_string()))?;
             let started = std::time::Instant::now();
             let mut cursor = None;
-            let mut assistant = None;
+            let mut assistant = GenerationAssistantOutput::default();
             loop {
                 let page = client
                     .session_history_page(
@@ -419,38 +471,34 @@ impl PluginTuiHost for BcodePluginTuiHost {
                     cursor = Some(bcode_session_models::SessionHistoryCursor {
                         sequence: event.sequence,
                     });
-                    match event.kind {
-                        bcode_session_models::SessionEventKind::AssistantMessage { text } => {
-                            assistant = Some(text);
+                    assistant.observe(&event.kind);
+                    if let bcode_session_models::SessionEventKind::ModelTurnFinished {
+                        turn_id,
+                        outcome,
+                        message,
+                        ..
+                    } = event.kind
+                    {
+                        if outcome != bcode_session_models::ModelTurnOutcome::Completed {
+                            return Err(PluginTuiHostError::Internal(format!(
+                                "structured generation ended with {outcome:?}: {}",
+                                message.unwrap_or_default()
+                            )));
                         }
-                        bcode_session_models::SessionEventKind::ModelTurnFinished {
-                            outcome,
-                            message,
-                            ..
-                        } => {
-                            if outcome != bcode_session_models::ModelTurnOutcome::Completed {
-                                return Err(PluginTuiHostError::Internal(format!(
-                                    "structured generation ended with {outcome:?}: {}",
-                                    message.unwrap_or_default()
-                                )));
-                            }
-                            let text = assistant.ok_or_else(|| {
-                                PluginTuiHostError::Internal(
-                                    "structured generation returned no assistant payload"
-                                        .to_string(),
-                                )
-                            })?;
-                            let output = serde_json::from_str(&text).map_err(|error| {
-                                PluginTuiHostError::Internal(format!(
-                                    "structured generation returned invalid JSON: {error}"
-                                ))
-                            })?;
-                            return Ok(bcode_plugin_sdk::tui::PluginStructuredGenerationResult {
-                                output,
-                                source: prepared.map(|prepared| prepared.source),
-                            });
-                        }
-                        _ => {}
+                        let text = assistant.for_turn(&turn_id).ok_or_else(|| {
+                            PluginTuiHostError::Internal(
+                                "structured generation returned no assistant payload".to_string(),
+                            )
+                        })?;
+                        let output = serde_json::from_str(text).map_err(|error| {
+                            PluginTuiHostError::Internal(format!(
+                                "structured generation returned invalid JSON: {error}"
+                            ))
+                        })?;
+                        return Ok(bcode_plugin_sdk::tui::PluginStructuredGenerationResult {
+                            output,
+                            source: prepared.map(|prepared| prepared.source),
+                        });
                     }
                 }
                 if started.elapsed() >= std::time::Duration::from_millis(request.timeout_ms) {
@@ -1503,6 +1551,58 @@ pub fn subscribe_workflow_views(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn generation_reads_positioned_clarification_and_prefers_final_segment() {
+        use bcode_session_models::SessionEventKind as Event;
+        let mut output = super::GenerationAssistantOutput::default();
+        output.observe(&Event::ModelTurnStarted {
+            turn_id: "generation".into(),
+        });
+        output.observe(&Event::AssistantMessage {
+            text: "preliminary prose".into(),
+        });
+        let json = r#"{"outcome":"clarification_required","clarification":"Which capability?","implementation_prompt":"Not ready","stop_condition":"Not ready"}"#;
+        output.observe(&Event::PositionedAssistantResponseSegment {
+            turn_id: "generation".into(),
+            output_position: bcode_session_models::TurnOutputPosition::new(0),
+            segment_id: "segment-0".into(),
+            segment_order: 1,
+            text: json.into(),
+        });
+        output.observe(&Event::AssistantResponseSegment {
+            turn_id: "generation".into(),
+            segment_id: "older".into(),
+            segment_order: 0,
+            text: "older".into(),
+        });
+        output.observe(&Event::AssistantResponseSegment {
+            turn_id: "other".into(),
+            segment_id: "foreign".into(),
+            segment_order: 2,
+            text: "foreign".into(),
+        });
+        assert_eq!(output.for_turn("generation"), Some(json));
+        let parsed: serde_json::Value =
+            serde_json::from_str(output.for_turn("generation").unwrap()).unwrap();
+        assert_eq!(parsed["outcome"], "clarification_required");
+        assert!(output.for_turn("other").is_none());
+        output.observe(&Event::ModelTurnStarted {
+            turn_id: "next".into(),
+        });
+        assert!(output.for_turn("next").is_none());
+        output.observe(&Event::AssistantMessage {
+            text: "legacy response".into(),
+        });
+        assert_eq!(output.for_turn("next"), Some("legacy response"));
+        output.observe(&Event::AssistantResponseSegment {
+            turn_id: "next".into(),
+            segment_id: "final".into(),
+            segment_order: 0,
+            text: "canonical response".into(),
+        });
+        assert_eq!(output.for_turn("next"), Some("canonical response"));
+    }
+
     use super::{
         PluginWorkflowPackageExportStartRequest, PluginWorkflowStartRequest, SessionId,
         workflow_catalog_selection, workflow_event_refreshes_selected_detail,
