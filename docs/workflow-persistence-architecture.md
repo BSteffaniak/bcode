@@ -592,6 +592,21 @@ A process crash may leave an attempt prepared, admitted, or running. Restart rec
 use the persisted identity and receipt. It must never blindly duplicate an operation whose
 mutating outcome is unknown.
 
+Live admission uses the same recovery policy. The daemon holds an ephemeral per-run drive gate
+across admission and receipt commit; periodic recovery acquires that gate without waiting before
+classifying receipt-less attempts. Durable execution authority remains mandatory: the gate is
+not cross-daemon authority. An abandoned read-only preparation is redispatched with its original
+identity through the existing owner contract; an ambiguous mutating preparation becomes
+repair-required rather than being replayed. Cancellation fences still apply before handoff.
+
+`workflows.admission_timeout_ms` (positive, default 30000) bounds the complete owner admission
+future, including session-context and shared-session permit acquisition. Shutdown also interrupts
+admission. Neither interruption nor timeout proves non-acceptance; prepared intent remains for
+ownership-qualified reconciliation. This deadline does not bound workflow lifetime or model
+execution after admission. `workflows.continuation_workers` (positive, default 16) bounds concurrent
+background run continuations, so a blocked admission does not monopolize the discovery worker.
+The worker set is supervised and dropped on shutdown; durable discovery retries abandoned work.
+
 Git preparation, exact commit composition/approval, owner re-verification, and explicit commit
 reconciliation are documented in [`git-workflow-blocks.md`](git-workflow-blocks.md).
 

@@ -1667,9 +1667,24 @@ pub struct WorkflowsConfig {
     /// Disabled by default; does not grant plugin access or bypass execution safety checks.
     #[serde(default)]
     pub run_publication_local_clients: bool,
+    /// Maximum time allowed for owner admission, including session/permit acquisition.
+    /// Timing out does not establish that the owner accepted no work.
+    #[serde(default = "default_workflow_admission_timeout_ms")]
+    pub admission_timeout_ms: std::num::NonZeroU64,
+    /// Maximum concurrent workflow continuation workers in this daemon.
+    #[serde(default = "default_workflow_continuation_workers")]
+    pub continuation_workers: std::num::NonZeroUsize,
     /// Additional filesystem roots scanned for workflow packages.
     #[serde(default)]
     pub paths: Vec<PathBuf>,
+}
+
+const fn default_workflow_admission_timeout_ms() -> std::num::NonZeroU64 {
+    std::num::NonZeroU64::new(30_000).unwrap()
+}
+
+const fn default_workflow_continuation_workers() -> std::num::NonZeroUsize {
+    std::num::NonZeroUsize::new(16).unwrap()
 }
 
 impl Default for WorkflowsConfig {
@@ -1680,6 +1695,8 @@ impl Default for WorkflowsConfig {
             run_edit_plugins: BTreeSet::new(),
             run_publication_plugins: BTreeSet::new(),
             run_publication_local_clients: false,
+            admission_timeout_ms: default_workflow_admission_timeout_ms(),
+            continuation_workers: default_workflow_continuation_workers(),
             paths: Vec::new(),
         }
     }
@@ -8219,6 +8236,22 @@ fn write_workflows_toml(output: &mut String, workflows: &WorkflowsConfig) {
         return;
     }
     output.push_str("[workflows]\n");
+    if workflows.admission_timeout_ms != default_workflow_admission_timeout_ms() {
+        writeln!(
+            output,
+            "admission_timeout_ms = {}",
+            workflows.admission_timeout_ms
+        )
+        .expect("write to string");
+    }
+    if workflows.continuation_workers != default_workflow_continuation_workers() {
+        writeln!(
+            output,
+            "continuation_workers = {}",
+            workflows.continuation_workers
+        )
+        .expect("write to string");
+    }
     if !workflows.include_repo_workflows {
         output.push_str("include_repo_workflows = false\n");
     }
@@ -11095,6 +11128,18 @@ on_timeout = "deterministic"
             toml::from_str::<BcodeConfig>("[model.tool_output]\nfallback_argument_chars = 0\n")
                 .is_err()
         );
+    }
+
+    #[test]
+    fn workflow_admission_policy_round_trips_and_rejects_zero() {
+        let mut config = BcodeConfig::default();
+        config.workflows.admission_timeout_ms = std::num::NonZeroU64::new(1234).unwrap();
+        config.workflows.continuation_workers = std::num::NonZeroUsize::new(3).unwrap();
+        let decoded: BcodeConfig = toml::from_str(&super::config_to_toml(&config)).unwrap();
+        assert_eq!(decoded.workflows, config.workflows);
+        for field in ["admission_timeout_ms", "continuation_workers"] {
+            assert!(toml::from_str::<BcodeConfig>(&format!("[workflows]\n{field} = 0")).is_err());
+        }
     }
 
     #[test]

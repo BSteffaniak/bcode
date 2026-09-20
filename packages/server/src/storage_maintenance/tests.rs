@@ -356,12 +356,12 @@ async fn scheduler_recent_access_and_damage_defer_but_cold_content_reaches_deep_
 
 #[tokio::test]
 async fn worker_compresses_and_preserves_continued_writes() {
-    verify_worker_history(false).await;
+    Box::pin(verify_worker_history(false)).await;
 }
 
 #[tokio::test]
 async fn application_upgrade_then_worker_preserves_history_and_writes() {
-    verify_worker_history(true).await;
+    Box::pin(verify_worker_history(true)).await;
 }
 
 async fn upgrade_worker_fixture(state: &Arc<ServerState>, root: &std::path::Path, id: SessionId) {

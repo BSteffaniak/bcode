@@ -30,6 +30,8 @@ pub mod storage_maintenance;
 pub mod storage_maintenance_worker;
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 pub mod storage_read_admission;
+#[cfg(test)]
+mod workflow_admission_tests;
 mod workflow_operations;
 mod workflow_receipts;
 pub use workflow_operations::{
@@ -444,6 +446,7 @@ pub struct ServerState {
     workflow_event_forwarder_failed: std::sync::atomic::AtomicBool,
     workflow_driver_sender: std::sync::OnceLock<mpsc::Sender<String>>,
     workflow_driver_task: Mutex<Option<JoinHandle<()>>>,
+    workflow_drive_gates: std::sync::Mutex<BTreeMap<String, std::sync::Weak<Mutex<()>>>>,
     catalog_events_started: std::sync::atomic::AtomicBool,
     catalog_workers: Mutex<Vec<JoinHandle<()>>>,
     catalog_workers_failed: std::sync::atomic::AtomicBool,
@@ -2058,6 +2061,7 @@ impl ServerState {
             workflow_event_forwarder_failed: std::sync::atomic::AtomicBool::new(false),
             workflow_driver_sender: std::sync::OnceLock::new(),
             workflow_driver_task: Mutex::new(None),
+            workflow_drive_gates: std::sync::Mutex::new(BTreeMap::new()),
             catalog_events_started: std::sync::atomic::AtomicBool::new(false),
             catalog_workers: Mutex::new(Vec::new()),
             catalog_workers_failed: std::sync::atomic::AtomicBool::new(false),
@@ -2626,14 +2630,29 @@ impl ServerState {
             let mut recovery_tick = tokio::time::interval(Duration::from_secs(1));
             recovery_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
             let discovery_artifact = workflow_operations::current_artifact_id(&state);
+            let mut workers = tokio::task::JoinSet::<String>::new();
+            let mut active = BTreeSet::new();
+            let capacity = state.startup_config.workflows.continuation_workers.get();
             loop {
                 tokio::select! {
                     biased;
                     _ = shutdown.recv() => break,
-                    _ = recovery_tick.tick() => {
+                    result = workers.join_next(), if !workers.is_empty() => {
+                        match result {
+                            Some(Ok(run_id)) => { active.remove(&run_id); }
+                            Some(Err(error)) => {
+                                // Gates drop on unwind. Reset worker bookkeeping; persisted
+                                // discovery remains authoritative and will re-offer the runs.
+                                active.clear();
+                                tracing::warn!(%error, "workflow continuation worker failed");
+                            }
+                            None => {}
+                        }
+                    }
+                    _ = recovery_tick.tick(), if workers.len() < capacity => {
                         let page = state.workflow_store.lock()
                             .unwrap_or_else(std::sync::PoisonError::into_inner)
-                            .advance_continuation_discovery(&discovery_artifact, 16);
+                            .advance_continuation_discovery(&discovery_artifact, capacity.saturating_sub(workers.len()).min(16));
                         // A slow page must not leave the biased timer perpetually ready,
                         // starving queued publications between discovery passes.
                         recovery_tick.reset();
@@ -2643,31 +2662,25 @@ impl ServerState {
                         };
                         for run_id in run_ids {
                             if state.shutdown_requested.load(Ordering::SeqCst) { return; }
-                            workflow_operations::recover_parent_cancellation(&state, &run_id).await;
-                            let runnable = {
-                                let store = state.workflow_store.lock()
-                                    .unwrap_or_else(std::sync::PoisonError::into_inner);
-                                store.run_summary(&run_id).is_ok_and(|run| run.is_some_and(|run|
-                                    matches!(run.status, bcode_workflow_store::RunStatus::Running | bcode_workflow_store::RunStatus::Paused)
-                                    || (run.status == bcode_workflow_store::RunStatus::RepairRequired
-                                        && store.is_recovery_only(&run_id).unwrap_or(false))))
-                            };
-                            if runnable {
-                                // Paused runs still need receipt settlement and cancellation recovery.
-                                restore_workflow_runs(&state, vec![run_id.clone()], false).await;
+                            if active.insert(run_id.clone()) {
+                                let state = Arc::clone(&state);
+                                workers.spawn(async move {
+                                    recover_workflow_continuation(&state, &run_id).await;
+                                    run_id
+                                });
                             }
-                            // Terminal old runs may still hold a replacement reservation.
-                            // Completion independently rechecks policy and durable ownership.
-                            workflow_operations::recover_subtree_quiescence(&state, &run_id).await;
-                            workflow_operations::recover_pending_replacement(&state, &run_id).await;
                         }
                         recovery_tick.reset();
                     }
-                    run_id = receiver.recv() => {
+                    run_id = receiver.recv(), if workers.len() < capacity => {
                         let Some(run_id) = run_id else { break };
                         if state.shutdown_requested.load(Ordering::SeqCst) { break; }
-                        if drive_workflow_run(&state, &run_id).await.is_err() {
-                            tracing::warn!("published workflow continuation failed; durable work remains available for recovery");
+                        if active.insert(run_id.clone()) {
+                            let state = Arc::clone(&state);
+                            workers.spawn(async move {
+                                recover_workflow_continuation(&state, &run_id).await;
+                                run_id
+                            });
                         }
                     }
                 }
@@ -15971,7 +15984,62 @@ async fn broadcast_workflow_event(
     state.unregister_workflow_event_clients(&disconnected).await;
 }
 
+async fn recover_workflow_continuation(state: &Arc<ServerState>, run_id: &str) {
+    workflow_operations::recover_parent_cancellation(state, run_id).await;
+    let runnable = {
+        let store = state
+            .workflow_store
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        store.run_summary(run_id).is_ok_and(|run| {
+            run.is_some_and(|run| {
+                matches!(
+                    run.status,
+                    bcode_workflow_store::RunStatus::Running
+                        | bcode_workflow_store::RunStatus::Paused
+                ) || (run.status == bcode_workflow_store::RunStatus::RepairRequired
+                    && store.is_recovery_only(run_id).unwrap_or(false))
+            })
+        })
+    };
+    if runnable {
+        // Paused runs still need receipt settlement and cancellation recovery.
+        restore_workflow_runs(state, vec![run_id.to_owned()]).await;
+    }
+    // Terminal old runs may still hold a replacement reservation.
+    // Completion independently rechecks policy and durable ownership.
+    workflow_operations::recover_subtree_quiescence(state, run_id).await;
+    workflow_operations::recover_pending_replacement(state, run_id).await;
+}
+
+/// Exclude live handoffs from preparation recovery without retaining idle run identities.
+fn workflow_drive_gate(state: &ServerState, run_id: &str) -> Arc<Mutex<()>> {
+    let mut gates = state
+        .workflow_drive_gates
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    gates.retain(|_, gate| gate.strong_count() > 0);
+    if let Some(gate) = gates.get(run_id).and_then(std::sync::Weak::upgrade) {
+        return gate;
+    }
+    let gate = Arc::new(Mutex::new(()));
+    gates.insert(run_id.to_owned(), Arc::downgrade(&gate));
+    gate
+}
+
 async fn drive_workflow_run(state: &Arc<ServerState>, run_id: &str) -> Result<(), ServerError> {
+    let gate = workflow_drive_gate(state, run_id);
+    let Ok(_guard) = gate.try_lock() else {
+        // The active driver or bounded periodic discovery will observe the durable successor.
+        return Ok(());
+    };
+    drive_workflow_run_exclusive(state, run_id).await
+}
+
+async fn drive_workflow_run_exclusive(
+    state: &Arc<ServerState>,
+    run_id: &str,
+) -> Result<(), ServerError> {
     let Some(authority) = workflow_operations::execution_authority(state, run_id).await? else {
         return Ok(());
     };
@@ -17847,13 +17915,13 @@ async fn run_model_turn_inner(
                     MAX_TOKENS_CONTINUATION_INSTRUCTION
                 });
                 set_runtime_phase(phase, SessionRuntimePhase::Compacting).await;
-                let result = compact_session_after_max_tokens(
+                let result = Box::pin(compact_session_after_max_tokens(
                     state,
                     session_id,
                     &selection,
                     trigger_event.sequence,
                     cancel_state.as_ref(),
-                )
+                ))
                 .await;
                 set_runtime_phase(phase, SessionRuntimePhase::ProviderActive).await;
                 match result {
@@ -31088,19 +31156,29 @@ impl ActivationDispatchOwner for WorkflowActivationOwner<'_> {
                 node_kind = bcode_workflow::node_kind_name(request.activation.node.kind),
                 "workflow activation dispatch started"
             );
-            let result = match request.activation.node.kind {
-                bcode_workflow::NodeKind::Agent => {
-                    dispatch_workflow_prompt_turn(self.state, request).await
-                }
-                bcode_workflow::NodeKind::PluginBlock => {
-                    dispatch_workflow_plugin_block(self.state, request).await
-                }
-                bcode_workflow::NodeKind::WorkflowCall => {
-                    dispatch_workflow_child(self.state, request).await
-                }
-                _ => Err(WorkflowStoreError::InvalidData(
-                    "workflow activation has no production owner".to_string(),
+            let mut shutdown = self.state.subscribe_shutdown();
+            let timeout = Duration::from_millis(
+                self.state
+                    .startup_config
+                    .workflows
+                    .admission_timeout_ms
+                    .get(),
+            );
+            let result = tokio::select! {
+                biased;
+                _ = shutdown.recv() => Err(WorkflowStoreError::InvalidData(
+                    "workflow admission interrupted; owner acceptance requires reconciliation".into(),
                 )),
+                result = tokio::time::timeout(timeout, async {
+                    match request.activation.node.kind {
+                        bcode_workflow::NodeKind::Agent => dispatch_workflow_prompt_turn(self.state, request).await,
+                        bcode_workflow::NodeKind::PluginBlock => dispatch_workflow_plugin_block(self.state, request).await,
+                        bcode_workflow::NodeKind::WorkflowCall => dispatch_workflow_child(self.state, request).await,
+                        _ => Err(WorkflowStoreError::InvalidData("workflow activation has no production owner".into())),
+                    }
+                }) => result.unwrap_or_else(|_| Err(WorkflowStoreError::InvalidData(
+                    "workflow admission timed out; owner acceptance requires reconciliation".into(),
+                ))),
             };
             self.state.metrics.record_histogram_with_labels(
                 "workflow.activation.execution.duration_ms",
@@ -31318,9 +31396,12 @@ async fn dispatch_workflow_child(
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
         .create_child_run_idempotent(&child)?;
-    drive_workflow_run_and_parents(state, &child_run_id)
-        .await
-        .map_err(|error| WorkflowStoreError::InvalidData(error.to_string()))?;
+    // Child creation is durable admission, not child execution. Do not recursively
+    // hold the parent's admission deadline across descendant scheduling. Discovery
+    // covers a full/unavailable wake queue without changing the accepted outcome.
+    if let Some(sender) = state.workflow_driver_sender.get() {
+        let _ = sender.try_send(child_run_id.clone());
+    }
     Ok(serde_json::json!({
         "owner": "bcode.server.workflow-child/v1",
         "child_run_id": child_run_id,
@@ -32308,17 +32389,17 @@ async fn restore_workflow_runtime_work(state: &Arc<ServerState>) {
             return;
         }
     };
-    restore_workflow_runs(state, run_ids, true).await;
+    restore_workflow_runs(state, run_ids).await;
 }
 
 /// Recover a bounded discovery page; each run independently qualifies durable ownership.
 #[allow(clippy::too_many_lines)]
-async fn restore_workflow_runs(
-    state: &Arc<ServerState>,
-    run_ids: Vec<String>,
-    restore_prepared: bool,
-) {
+async fn restore_workflow_runs(state: &Arc<ServerState>, run_ids: Vec<String>) {
     for run_id in run_ids {
+        let gate = workflow_drive_gate(state, &run_id);
+        let Ok(_guard) = gate.try_lock() else {
+            continue;
+        };
         let authority = match workflow_operations::execution_authority(state, &run_id).await {
             Ok(Some(authority)) => authority,
             Ok(None) => {
@@ -32385,12 +32466,10 @@ async fn restore_workflow_runs(
         };
         // Observation can still establish terminal evidence after a signal failure. Do not
         // admit prepared work on that pass; observation independently rechecks authority.
-        let restore_prepared = restore_prepared
-            && cancellation_available
-            && publication_available
-            && sibling_available;
-        // Prepared work may be between intent and receipt in a concurrent live dispatch.
-        // Periodic recovery must not classify or redispatch that gap.
+        let restore_prepared = cancellation_available && publication_available && sibling_available;
+        // The per-run gate excludes all live dispatch futures in this daemon. Durable
+        // authority excludes foreign dispatchers. Prepared attempts here are abandoned,
+        // not merely slow: classify mutating ambiguity and recover read-only identities.
         if restore_prepared
             && !store.is_recovery_only(&run_id).unwrap_or(true)
             && let Err(error) = store.reconcile_owned_prepared_attempts_for_run(
@@ -32440,7 +32519,7 @@ async fn restore_workflow_runs(
                 {
                     tracing::warn!(run_id, %error, "failed to restore sibling cancellation");
                 }
-                if let Err(error) = drive_workflow_run(state, &run_id).await {
+                if let Err(error) = drive_workflow_run_exclusive(state, &run_id).await {
                     tracing::warn!(run_id, %error, "failed to continue owned workflow");
                 }
             }
@@ -52341,7 +52420,7 @@ library = "test"
         );
     }
 
-    fn test_workflow_execution_authority() -> bcode_workflow_store::WorkflowExecutionAuthority {
+    pub fn test_workflow_execution_authority() -> bcode_workflow_store::WorkflowExecutionAuthority {
         bcode_workflow_store::WorkflowExecutionAuthority {
             target_artifact_id: bcode_ipc::ArtifactId::current().to_string(),
             daemon_instance_id: "test-workflow-daemon".to_string(),
@@ -61242,7 +61321,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
         }
     }
 
-    fn test_workflow_prompt_configuration(
+    pub fn test_workflow_prompt_configuration(
         schema: bcode_workflow::ValueSchema,
         execution_target: bcode_workflow::PromptContextTarget,
     ) -> serde_json::Value {
@@ -61357,7 +61436,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
         }
     }
 
-    fn test_server_state_with_fake_provider_and_workflow_store(
+    pub fn test_server_state_with_fake_provider_and_workflow_store(
         sessions: SessionManager,
         workflow_store: bcode_workflow_store::WorkflowStore,
     ) -> ServerState {
@@ -67270,7 +67349,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
                 )
                 .await
                 .expect("terminal evidence");
-            restore_workflow_runs(&state, vec!["orphaned-cancellation-run".into()], false).await;
+            restore_workflow_runs(&state, vec!["orphaned-cancellation-run".into()]).await;
             let run = state
                 .workflow_store
                 .lock()
@@ -67323,7 +67402,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
             ),
         )
         .await;
-        restore_workflow_runs(&state, vec!["orphaned-cancellation-run".into()], false).await;
+        restore_workflow_runs(&state, vec!["orphaned-cancellation-run".into()]).await;
         assert!(cancellation.is_cancelled());
         assert_eq!(
             state
