@@ -2010,6 +2010,10 @@ pub struct SessionImportConfig {
     #[config_doc(nested)]
     #[serde(default)]
     pub opencode: OpenCodeSessionImportConfig,
+    /// Default-on `ChatGPT` history synchronization policy.
+    #[config_doc(nested)]
+    #[serde(default)]
+    pub chatgpt: ChatGptSessionImportConfig,
 }
 
 impl Default for SessionImportConfig {
@@ -2020,6 +2024,114 @@ impl Default for SessionImportConfig {
             hide_already_imported: true,
             pi: PiSessionImportConfig::default(),
             opencode: OpenCodeSessionImportConfig::default(),
+            chatgpt: ChatGptSessionImportConfig::default(),
+        }
+    }
+}
+
+impl SessionImportConfig {
+    /// Whether a compatible profile is authorized by configuration to synchronize history.
+    ///
+    /// Callers must additionally verify provider compatibility and remote ownership. This
+    /// policy does not authorize arbitrary profiles, resolve credentials, or perform I/O.
+    /// Startup discovery controls timing, not authorization; manual synchronization uses
+    /// the same exclusion policy. Disabling never requests deletion of existing imports.
+    #[must_use]
+    pub fn chatgpt_sync_enabled(&self, profile: &str) -> bool {
+        self.enabled
+            && self.chatgpt.enabled
+            && self
+                .chatgpt
+                .profiles
+                .get(profile)
+                .is_none_or(|policy| policy.enabled)
+    }
+}
+
+/// Controls automatic import of history using compatible subscription auth profiles.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ConfigDoc)]
+#[config_doc(section = "chatgpt")]
+#[serde(default, deny_unknown_fields)]
+pub struct ChatGptSessionImportConfig {
+    /// Import and periodically synchronize `ChatGPT` conversations by default.
+    /// Set false to stop retrieval for every profile without deleting imported history.
+    pub enabled: bool,
+    /// Exact auth-profile overrides. Unlisted compatible profiles, including newly added
+    /// profiles, inherit enabled synchronization. No model auth-pool fallback is implied.
+    pub profiles: BTreeMap<String, ChatGptSessionImportProfileConfig>,
+}
+
+impl Default for ChatGptSessionImportConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            profiles: BTreeMap::new(),
+        }
+    }
+}
+
+/// Per-auth-profile history synchronization exclusion.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ConfigDoc)]
+#[config_doc(section = "chatgpt_profile")]
+#[serde(default, deny_unknown_fields)]
+pub struct ChatGptSessionImportProfileConfig {
+    /// Whether this profile participates. Global import disables always take precedence.
+    pub enabled: bool,
+}
+
+impl Default for ChatGptSessionImportProfileConfig {
+    fn default() -> Self {
+        Self { enabled: true }
+    }
+}
+
+#[cfg(test)]
+mod chatgpt_import_policy_tests {
+    use super::SessionImportConfig;
+
+    #[test]
+    fn default_on_includes_new_profiles_and_round_trips() {
+        let policy: SessionImportConfig = toml::from_str("").unwrap();
+        assert_eq!(policy, SessionImportConfig::default());
+        for profile in ["openai", "openai-2", "new-profile"] {
+            assert!(policy.chatgpt_sync_enabled(profile));
+        }
+        assert_eq!(
+            toml::from_str::<SessionImportConfig>(&toml::to_string(&policy).unwrap()).unwrap(),
+            policy
+        );
+    }
+
+    #[test]
+    fn exclusions_are_exact_and_global_disables_win() {
+        let mut policy: SessionImportConfig = toml::from_str(
+            "[chatgpt.profiles.openai-2]\nenabled = false\n[chatgpt.profiles.openai]\nenabled = true"
+        ).unwrap();
+        assert!(policy.chatgpt_sync_enabled("openai"));
+        assert!(!policy.chatgpt_sync_enabled("openai-2"));
+        assert!(policy.chatgpt_sync_enabled("openai-20"));
+        policy.chatgpt.enabled = false;
+        assert!(!policy.chatgpt_sync_enabled("openai"));
+        policy.chatgpt.enabled = true;
+        policy.enabled = false;
+        assert!(!policy.chatgpt_sync_enabled("openai"));
+    }
+
+    #[test]
+    fn discovery_timing_is_not_an_authorization_override() {
+        let policy: SessionImportConfig =
+            toml::from_str("auto_discover_on_startup = false").unwrap();
+        assert!(policy.chatgpt_sync_enabled("openai"));
+    }
+
+    #[test]
+    fn invalid_privacy_settings_fail_instead_of_silently_enabling() {
+        for input in [
+            "[chatgpt]\nenabeld = false",
+            "[chatgpt]\nenabled = 'false'",
+            "[chatgpt.profiles.openai]\nenabeld = false",
+        ] {
+            assert!(toml::from_str::<SessionImportConfig>(input).is_err());
         }
     }
 }
