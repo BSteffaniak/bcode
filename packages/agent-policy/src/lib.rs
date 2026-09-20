@@ -130,15 +130,26 @@ pub fn evaluate_tool_call(
     if let Some(path) = external_path(config, request, cwd) {
         return match config.permission.external_directory {
             Action::Allow => evaluate_after_path(config, request),
-            Action::Ask => evaluation(
-                AgentDecision::Ask,
-                format!(
-                    "{} agent asks before external directory access: {}",
-                    request.agent_id, path
-                ),
-                None,
-                None,
-            ),
+            Action::Ask => {
+                // Preserve single-path precedence, but never let an external-path prompt
+                // mask a denial on another resource in a batch.
+                let paths = candidate_paths(request);
+                if paths.len() > 1 {
+                    let path_decision = evaluate_after_path(config, request);
+                    if path_decision.response.decision == AgentDecision::Deny {
+                        return path_decision;
+                    }
+                }
+                evaluation(
+                    AgentDecision::Ask,
+                    format!(
+                        "{} agent asks before external directory access: {}",
+                        request.agent_id, path
+                    ),
+                    None,
+                    None,
+                )
+            }
             Action::Deny => evaluation(
                 AgentDecision::Deny,
                 format!(
@@ -262,45 +273,64 @@ fn evaluate_filesystem_path(
     rules: &BTreeMap<String, Action>,
 ) -> PolicyEvaluation {
     let candidates = candidate_paths(request);
-    let path = candidates.first().cloned();
     let compiled = compile_path_rules(rules);
+    let evaluate_path = |path: Option<&str>| {
+        let rule_match = path.and_then(|path| matching_path_rule(&compiled, path));
 
-    let rule_match = path
-        .as_deref()
-        .and_then(|path| matching_path_rule(&compiled, path));
-
-    if let Some(rule) = rule_match {
-        let rule_pattern = Some(rule.pattern.clone());
-        let subject = path.unwrap_or_default();
-        return match rule.action {
-            Action::Allow => evaluation(AgentDecision::Allow, String::new(), rule_pattern, None),
-            Action::Ask => evaluation(
-                AgentDecision::Ask,
-                format!(
-                    "{} agent asks before {} on {}",
-                    request.agent_id, request.tool_name, subject
+        if let Some(rule) = rule_match {
+            let rule_pattern = Some(rule.pattern.clone());
+            let subject = path.unwrap_or_default().to_owned();
+            return match rule.action {
+                Action::Allow => {
+                    evaluation(AgentDecision::Allow, String::new(), rule_pattern, None)
+                }
+                Action::Ask => evaluation(
+                    AgentDecision::Ask,
+                    format!(
+                        "{} agent asks before {} on {}",
+                        request.agent_id, request.tool_name, subject
+                    ),
+                    rule_pattern,
+                    Some(subject),
                 ),
-                rule_pattern,
-                Some(subject),
-            ),
-            Action::Deny => evaluation(
-                AgentDecision::Deny,
-                format!(
-                    "{} agent denied {} on '{}' by rule '{}'",
-                    request.agent_id, request.tool_name, subject, rule.pattern
+                Action::Deny => evaluation(
+                    AgentDecision::Deny,
+                    format!(
+                        "{} agent denied {} on '{}' by rule '{}'",
+                        request.agent_id, request.tool_name, subject, rule.pattern
+                    ),
+                    rule_pattern,
+                    Some(subject),
                 ),
-                rule_pattern,
-                Some(subject),
-            ),
-        };
-    }
-
-    match request.operation {
-        ToolPolicyOperation::Read { .. } => {
-            evaluation(AgentDecision::Allow, String::new(), None, None)
+            };
         }
-        ToolPolicyOperation::Write { .. } => evaluate_mutating_fallback(config, request),
-        _ => evaluation(AgentDecision::Allow, String::new(), None, None),
+
+        match request.operation {
+            ToolPolicyOperation::Read { .. } => {
+                evaluation(AgentDecision::Allow, String::new(), None, None)
+            }
+            ToolPolicyOperation::Write { .. } => evaluate_mutating_fallback(config, request),
+            _ => evaluation(AgentDecision::Allow, String::new(), None, None),
+        }
+    };
+    let mut paths = candidates.iter();
+    let mut result = evaluate_path(paths.next().map(String::as_str));
+    for path in paths {
+        let candidate = evaluate_path(Some(path));
+        if decision_priority(candidate.response.decision)
+            > decision_priority(result.response.decision)
+        {
+            result = candidate;
+        }
+    }
+    result
+}
+
+const fn decision_priority(decision: AgentDecision) -> u8 {
+    match decision {
+        AgentDecision::Allow => 0,
+        AgentDecision::Ask => 1,
+        AgentDecision::Deny => 2,
     }
 }
 
@@ -1421,6 +1451,129 @@ mod tests {
 
         assert_eq!(result.response.decision, AgentDecision::Deny);
         assert_eq!(result.matched_rule.as_deref(), Some("generated/**"));
+    }
+
+    #[test]
+    fn batch_paths_aggregate_rules_independently_of_order() {
+        let config = AgentConfig {
+            accent: None,
+            tools: BTreeMap::new(),
+            permission: PermissionConfig {
+                edit: BTreeMap::from([
+                    ("src/**".to_owned(), Action::Allow),
+                    ("review/**".to_owned(), Action::Ask),
+                    ("secret/**".to_owned(), Action::Deny),
+                ]),
+                ..PermissionConfig::default()
+            },
+        };
+        for (paths, expected) in [
+            (vec!["src/a", "src/b"], AgentDecision::Allow),
+            (vec!["src/a", "review/b"], AgentDecision::Ask),
+            (vec!["review/b", "src/a"], AgentDecision::Ask),
+            (vec!["src/a", "secret/b"], AgentDecision::Deny),
+            (vec!["secret/b", "src/a"], AgentDecision::Deny),
+            (vec!["review/a", "secret/b"], AgentDecision::Deny),
+            (vec!["../external", "secret/b"], AgentDecision::Deny),
+            (vec!["src/a", "unmatched/b"], AgentDecision::Deny),
+        ] {
+            let request = EvaluateToolCallRequest {
+                session_id: bcode_session_models::SessionId::new(),
+                agent_id: BUILD_AGENT.to_owned(),
+                tool_name: "custom.batch".to_owned(),
+                operation: ToolPolicyOperation::Write {
+                    paths: paths.iter().map(ToString::to_string).collect(),
+                    category: "edit".to_owned(),
+                },
+                aliases: vec!["edit".to_owned()],
+                requires_permission: true,
+                policy_profile: None,
+                cwd: Some("/tmp/project".to_owned()),
+                effective_config_toml: None,
+            };
+            let result = evaluate_tool_call(&config, &request, Path::new("/tmp/project"));
+            assert_eq!(result.response.decision, expected, "{paths:?}");
+        }
+    }
+
+    #[test]
+    fn batch_path_categories_preserve_specificity_fallback_and_external_access() {
+        let rules = BTreeMap::from([
+            ("src/**".to_owned(), Action::Allow),
+            ("src/private/**".to_owned(), Action::Deny),
+            ("src/private/public.rs".to_owned(), Action::Allow),
+            ("../external/**".to_owned(), Action::Allow),
+        ]);
+        for category in ["read", "write", "edit"] {
+            let config = AgentConfig {
+                accent: None,
+                tools: BTreeMap::from([("custom.batch".to_owned(), true)]),
+                permission: PermissionConfig {
+                    read: rules.clone(),
+                    write: rules.clone(),
+                    edit: rules.clone(),
+                    external_directory: Action::Allow,
+                    ..PermissionConfig::default()
+                },
+            };
+            for (paths, expected, winning_rule) in [
+                (
+                    vec!["src/a", "src/private/secret.rs"],
+                    AgentDecision::Deny,
+                    Some("src/private/**"),
+                ),
+                (
+                    vec!["src/private/public.rs", "src/a"],
+                    AgentDecision::Allow,
+                    Some("src/private/public.rs"),
+                ),
+                (
+                    vec!["src/a", "../external/b"],
+                    AgentDecision::Allow,
+                    Some("src/**"),
+                ),
+                (
+                    vec!["src/a", "unmatched/b"],
+                    if category == "read" {
+                        AgentDecision::Allow
+                    } else {
+                        AgentDecision::Ask
+                    },
+                    if category == "read" {
+                        Some("src/**")
+                    } else {
+                        None
+                    },
+                ),
+            ] {
+                let paths = paths.into_iter().map(str::to_owned).collect();
+                let request = EvaluateToolCallRequest {
+                    session_id: bcode_session_models::SessionId::new(),
+                    agent_id: BUILD_AGENT.to_owned(),
+                    tool_name: "custom.batch".to_owned(),
+                    operation: if category == "read" {
+                        ToolPolicyOperation::Read { paths }
+                    } else {
+                        ToolPolicyOperation::Write {
+                            paths,
+                            category: category.to_owned(),
+                        }
+                    },
+                    aliases: Vec::new(),
+                    requires_permission: category != "read",
+                    policy_profile: None,
+                    cwd: Some("/tmp/project".to_owned()),
+                    effective_config_toml: None,
+                };
+                let result = evaluate_tool_call(&config, &request, Path::new("/tmp/project"));
+                assert_eq!(
+                    result.response.decision, expected,
+                    "{category}: {:?}",
+                    request.operation
+                );
+                assert_eq!(result.matched_rule.as_deref(), winning_rule);
+            }
+        }
     }
 
     #[test]

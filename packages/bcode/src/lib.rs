@@ -4150,17 +4150,21 @@ async fn execute_plugin_tool(
     if !scope.register_cancellation(Arc::new(PluginInvocationCancellation(
         invocation.cancel.clone(),
     ))) {
-        invocation.cancel.cancel();
-        return Err(RuntimeError::Cancelled);
+        return Ok(invocation.settle_cancelled_tool().await);
     }
+    let cancellation = scope.cancellation();
     loop {
-        match invocation
-            .next_event()
-            .await
-            .map_err(|error| RuntimeError::ToolExecution {
-                tool_name: descriptor.tool_name.clone(),
-                message: error.to_string(),
-            })? {
+        let event = tokio::select! {
+            biased;
+            () = cancellation.cancelled() => {
+                return Ok(invocation.settle_cancelled_tool().await);
+            }
+            event = invocation.next_event() => event,
+        };
+        match event.map_err(|error| RuntimeError::ToolExecution {
+            tool_name: descriptor.tool_name.clone(),
+            message: error.to_string(),
+        })? {
             bcode_plugin::StreamingServiceInvocationEvent::Event(payload) => {
                 if let Ok(event) =
                     serde_json::from_slice::<bcode_tool::ToolInvocationLifecycleEvent>(&payload)

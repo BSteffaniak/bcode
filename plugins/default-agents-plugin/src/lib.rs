@@ -738,6 +738,7 @@ read = { "**" = "deny" }
         assert!(tools.contains(&"filesystem.stat".to_string()));
         assert!(!tools.contains(&"filesystem.write".to_string()));
         assert!(!tools.contains(&"filesystem.edit".to_string()));
+        assert!(!tools.contains(&"filesystem.multi_edit".to_string()));
     }
 
     #[test]
@@ -776,6 +777,7 @@ command = { "python3 *" = "allow" }
 
         assert!(tools.contains(&"filesystem.write".to_string()));
         assert!(tools.contains(&"filesystem.edit".to_string()));
+        assert!(tools.contains(&"filesystem.multi_edit".to_string()));
         assert!(tools.contains(&"shell.run".to_string()));
         assert_eq!(build.accent.as_deref(), Some("#22d3ee"));
         assert_eq!(
@@ -791,6 +793,29 @@ command = { "python3 *" = "allow" }
 
         restore_env("BCODE_CONFIG", previous_config);
         restore_env("BCODE_PERMISSIONS_STATE", previous_state);
+    }
+
+    #[test]
+    fn multi_edit_is_independently_selectable() {
+        let mut build = agent_config(&default_config(), BUILD_AGENT);
+        assert!(active_tools_for(&build).contains(&"filesystem.multi_edit".to_owned()));
+        let mut selection = bcode_config::ToolsConfig {
+            disabled: BTreeSet::from(["filesystem.multi_edit".to_owned()]),
+            ..bcode_config::ToolsConfig::default()
+        };
+        apply_tool_selection(&mut build, &selection, &[]);
+        let tools = active_tools_for(&build);
+        assert!(!tools.contains(&"filesystem.multi_edit".to_owned()));
+        assert!(tools.contains(&"filesystem.edit".to_owned()));
+        assert!(tools.contains(&"filesystem.write".to_owned()));
+        selection.default = bcode_config::ToolDefaultMode::None;
+        selection.disabled.clear();
+        selection.enabled.insert("filesystem.multi_edit".to_owned());
+        apply_tool_selection(&mut build, &selection, &[]);
+        assert_eq!(
+            active_tools_for(&build),
+            vec!["filesystem.multi_edit".to_owned()]
+        );
     }
 
     #[test]
@@ -823,6 +848,68 @@ command = { "python3 *" = "allow" }
         let tools = active_tools_for(&agent);
 
         assert!(!tools.contains(&"shell.run".to_string()));
+    }
+
+    #[test]
+    fn context_service_applies_multi_edit_selection_and_available_providers() {
+        let _guard = ENV_LOCK.lock().expect("env lock should not be poisoned");
+        let root = unique_temp_dir();
+        let _state = StateGuard::set(&root.join("missing-permissions.toml"));
+        let context_tools = |agent: &str, config: &str, names: &[&str]| {
+            let request = AgentContextRequest {
+                session_id: SessionId::new(),
+                agent_id: agent.to_owned(),
+                available_tools: names
+                    .iter()
+                    .map(|name| bcode_tool::ToolDefinition {
+                        name: (*name).to_owned(),
+                        description: String::new(),
+                        input_schema: json!({}),
+                    })
+                    .collect(),
+                effective_config_toml: Some(Box::new(config.to_owned())),
+            };
+            let response = agent_context(&ServiceRequest {
+                interface_id: AGENT_PROFILE_INTERFACE_ID.to_owned(),
+                operation: OP_AGENT_CONTEXT.to_owned(),
+                payload: serde_json::to_vec(&request).unwrap(),
+            });
+            let decoded: AgentContextResponse = serde_json::from_slice(&response.payload).unwrap();
+            decoded.enabled_tools.unwrap()
+        };
+        let available = [
+            "filesystem.multi_edit",
+            "filesystem.edit",
+            "filesystem.write",
+            "question",
+        ];
+        let build = context_tools(BUILD_AGENT, "", &available);
+        assert!(
+            available
+                .iter()
+                .all(|name| build.iter().any(|tool| tool == name))
+        );
+        let plan = context_tools(PLAN_AGENT, "", &available);
+        assert_eq!(plan, vec!["question"]);
+        for config in [
+            "[tools]\ndisabled = [\"filesystem.multi_edit\"]\n",
+            "[agent.build]\ntools = { \"filesystem.multi_edit\" = false }\n",
+        ] {
+            let tools = context_tools(BUILD_AGENT, config, &available);
+            assert!(!tools.iter().any(|tool| tool == "filesystem.multi_edit"));
+            assert!(tools.iter().any(|tool| tool == "filesystem.edit"));
+            assert!(tools.iter().any(|tool| tool == "filesystem.write"));
+        }
+        assert_eq!(
+            context_tools(BUILD_AGENT, "", &["question"]),
+            vec!["question"]
+        );
+        let explicit = context_tools(
+            PLAN_AGENT,
+            "[agent.plan]\ntools = { \"filesystem.multi_edit\" = true }\n",
+            &available,
+        );
+        assert!(explicit.iter().any(|tool| tool == "filesystem.multi_edit"));
     }
 
     #[test]

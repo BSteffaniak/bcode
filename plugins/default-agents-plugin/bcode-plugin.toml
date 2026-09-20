@@ -18,6 +18,7 @@ build_tools = [
     "filesystem.stat",
     "filesystem.write",
     "filesystem.edit",
+    "filesystem.multi_edit",
     "vim_edit.preview",
     "vim_edit.apply",
     "web.search",
@@ -35,7 +36,11 @@ build_tools = [
     "question",
     "ask",
 ]
-plan_disabled_tools = ["filesystem.write", "filesystem.edit"]
+plan_disabled_tools = [
+    "filesystem.write",
+    "filesystem.edit",
+    "filesystem.multi_edit",
+]
 
 [runtime]
 abi_version  = 4

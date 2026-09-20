@@ -9,6 +9,13 @@ mod file_change_tui;
 #[cfg(feature = "static-bundled")]
 mod filesystem_tui;
 
+mod batch_request;
+#[cfg(unix)]
+mod confined;
+#[cfg(unix)]
+mod coordination;
+mod replacement;
+
 use bcode_plugin_sdk::path::display;
 use bcode_plugin_sdk::prelude::*;
 use bcode_tool::{
@@ -309,6 +316,15 @@ struct StatResponse {
 
 fn invoke_filesystem_service(context: &NativeServiceContext) -> ServiceResponse {
     let request = &context.request;
+    #[cfg(unix)]
+    let _mutation_guard = if matches!(request.operation.as_str(), "write" | "edit") {
+        match coordination::acquire(&|| context.cancellation.is_cancelled()) {
+            Ok(guard) => Some(guard),
+            Err(error) => return io_error(&error),
+        }
+    } else {
+        None
+    };
     match request.operation.as_str() {
         "read" => read_file(request),
         "write" => write_file(request),
@@ -393,6 +409,33 @@ fn filesystem_policy_operation(
     definition: &ToolDefinition,
 ) -> Result<bcode_plugin_sdk::ToolPolicyPreparation, String> {
     let workspace_root = filesystem_workspace_root(request)?;
+    if definition.name == "filesystem.multi_edit" {
+        if request.invocation.arguments.is_null() {
+            return Ok(bcode_plugin_sdk::ToolPolicyPreparation::new(
+                true,
+                bcode_plugin_sdk::ToolPolicyOperation::Write {
+                    paths: Vec::new(),
+                    category: "edit".to_owned(),
+                },
+            )
+            .with_identity(path_policy(&["edit"], "edit")));
+        }
+        let batch =
+            batch_request::prepare(&request.invocation.arguments, workspace_root.as_deref())?;
+        return Ok(bcode_plugin_sdk::ToolPolicyPreparation::new(
+            true,
+            bcode_plugin_sdk::ToolPolicyOperation::Write {
+                paths: batch
+                    .targets
+                    .iter()
+                    .map(|target| target.path.display().to_string())
+                    .collect(),
+                category: "edit".to_owned(),
+            },
+        )
+        .with_identity(path_policy(&["edit"], "edit"))
+        .with_descriptor(serde_json::to_value(batch).map_err(|error| error.to_string())?));
+    }
     let path = filesystem_prepared_path(request, workspace_root.as_deref())?;
     let paths = path
         .as_ref()
@@ -486,23 +529,9 @@ fn invoke_tool_service(context: &NativeServiceContext) -> ServiceResponse {
     let request = &context.request;
     match request.operation.as_str() {
         OP_LIST_TOOLS => list_tools(request),
-        bcode_tool::OP_PREPARE_TOOL => prepare_tool_service_response(
-            request,
-            [
-                read_tool_definition(),
-                write_tool_definition(),
-                edit_tool_definition(),
-                exists_tool_definition(),
-                list_tool_definition(),
-                find_tool_definition(),
-                grep_tool_definition(),
-                stat_tool_definition(),
-                artifact_metadata_tool_definition(),
-                artifact_read_tool_definition(),
-                artifact_grep_tool_definition(),
-            ],
-            filesystem_policy_operation,
-        ),
+        bcode_tool::OP_PREPARE_TOOL => {
+            prepare_tool_service_response(request, tool_definitions(), filesystem_policy_operation)
+        }
         OP_INVOKE_TOOL => invoke_tool(context),
         _ => ServiceResponse::error(
             "unsupported_operation",
@@ -516,20 +545,25 @@ fn list_tools(request: &ServiceRequest) -> ServiceResponse {
         return invalid_request(&error);
     }
     json_response(&ToolList {
-        tools: vec![
-            read_tool_definition(),
-            write_tool_definition(),
-            edit_tool_definition(),
-            exists_tool_definition(),
-            list_tool_definition(),
-            find_tool_definition(),
-            grep_tool_definition(),
-            stat_tool_definition(),
-            artifact_metadata_tool_definition(),
-            artifact_read_tool_definition(),
-            artifact_grep_tool_definition(),
-        ],
+        tools: tool_definitions(),
     })
+}
+
+fn tool_definitions() -> Vec<ToolDefinition> {
+    vec![
+        read_tool_definition(),
+        write_tool_definition(),
+        edit_tool_definition(),
+        multi_edit_tool_definition(),
+        exists_tool_definition(),
+        list_tool_definition(),
+        find_tool_definition(),
+        grep_tool_definition(),
+        stat_tool_definition(),
+        artifact_metadata_tool_definition(),
+        artifact_read_tool_definition(),
+        artifact_grep_tool_definition(),
+    ]
 }
 
 fn path_policy(aliases: &[&str], category: &str) -> bcode_plugin_sdk::ToolPolicyIdentity {
@@ -593,6 +627,33 @@ fn write_tool_definition() -> ToolDefinition {
                     "description": "Complete UTF-8 file contents. Provide after path."
                 }
             }
+        }),
+    }
+}
+
+fn multi_edit_tool_definition() -> ToolDefinition {
+    ToolDefinition {
+        name: "filesystem.multi_edit".to_owned(),
+        description: "Replace unique exact matches across existing UTF-8 files. All edits match original snapshots, not earlier replacements. Overlaps and duplicate targets are rejected. Validates the whole batch before writing; publication is per-file, not transactional. Inspect partial or unknown outcomes before retrying.".to_owned(),
+        input_schema: json!({
+            "type": "object", "additionalProperties": false, "required": ["files"],
+            "properties": {"files": {
+                "type": "array", "minItems": 1, "maxItems": 64,
+                "items": {"type": "object", "additionalProperties": false, "required": ["path", "edits"],
+                    "properties": {
+                        "path": {"type": "string", "minLength": 1},
+                        "edits": {"type": "array", "minItems": 1, "maxItems": 1024,
+                            "items": {"type": "object", "additionalProperties": false,
+                                "required": ["old_text", "new_text"],
+                                "properties": {
+                                    "old_text": {"type": "string", "minLength": 1},
+                                    "new_text": {"type": "string"}
+                                }
+                            }
+                        }
+                    }
+                }
+            }}
         }),
     }
 }
@@ -793,6 +854,21 @@ fn invoke_tool(context: &NativeServiceContext) -> ServiceResponse {
             result: None,
         });
     }
+    #[cfg(unix)]
+    let _mutation_guard = if matches!(
+        request.name.as_str(),
+        "filesystem.write" | "filesystem.edit" | "filesystem.multi_edit"
+    ) {
+        match coordination::acquire(&|| context.cancellation.is_cancelled()) {
+            Ok(guard) => Some(guard),
+            Err(error) => return json_response(&tool_io_error(&error)),
+        }
+    } else {
+        None
+    };
+    if request.name == "filesystem.multi_edit" {
+        return invoke_batch(context, &request);
+    }
     let descriptor = match serde_json::from_value::<FilesystemPreparationDescriptor>(
         request.preparation_descriptor.clone(),
     ) {
@@ -852,6 +928,189 @@ fn invoke_tool(context: &NativeServiceContext) -> ServiceResponse {
     };
     publish_filesystem_result_presentation(&mut presentation, &response);
     json_response(&response)
+}
+
+fn invoke_batch(
+    context: &NativeServiceContext,
+    request: &ToolInvocationRequest,
+) -> ServiceResponse {
+    let mut presentation =
+        context.primary_presentation(&request.tool_call_id, FILESYSTEM_REQUEST_SCHEMA, 1);
+    let _ = presentation.replace(&filesystem_request_payload(
+        &request.name,
+        &request.arguments,
+    ));
+    let checked = serde_json::from_value::<batch_request::PreparedBatch>(
+        request.preparation_descriptor.clone(),
+    )
+    .map_err(|error| format!("invalid multi-edit preparation: {error}"))
+    .and_then(|descriptor| {
+        batch_request::execute_with_changes(
+            &request.arguments,
+            &descriptor,
+            &|| context.cancellation.is_cancelled(),
+            &mut |index, old, new| {
+                retain_batch_change(context, &request.tool_call_id, index, old, new)
+            },
+        )
+    });
+    let response = batch_tool_response(checked, &request.tool_call_id);
+    publish_filesystem_result_presentation(&mut presentation, &response);
+    json_response(&response)
+}
+
+fn retain_batch_change(
+    context: &NativeServiceContext,
+    invocation_id: &str,
+    index: usize,
+    old: &str,
+    new: &str,
+) -> serde_json::Value {
+    // Each source is already bounded by the batch snapshot budget. Store raw UTF-8
+    // separately to avoid JSON escaping amplification and allow bounded text reads.
+    let mut references = serde_json::Map::new();
+    let diff = batch_request::retained_diff(old, new);
+    for (side, text) in [("old", old), ("new", new), ("diff", diff.as_str())] {
+        let value = retain_source_parts(text.as_bytes(), &mut |part, bytes| {
+            let response = context.bridge.request(&ServiceBridgeRequest::WriteArtifact(
+                bcode_tool::ToolArtifactWriteRequest {
+                    invocation_id: invocation_id.to_owned(),
+                    artifact_id: format!("{invocation_id}-batch-{index}-{side}-{part}"),
+                    content_type: "application/octet-stream".to_owned(),
+                    bytes: bytes.to_vec(),
+                    metadata: json!({"schema":"bcode.filesystem.change-source", "version":1, "file_index":index, "side":side}),
+                },
+            ));
+            match response {
+                Ok(ServiceBridgeResponse::Artifact(resolution)) => {
+                    retained_source_value(resolution)
+                }
+                _ => json!({"unavailable":true,"reason":"bridge_unavailable"}),
+            }
+        });
+        references.insert(side.to_owned(), value);
+    }
+    serde_json::Value::Object(references)
+}
+
+fn retain_source_parts(
+    bytes: &[u8],
+    write: &mut impl FnMut(usize, &[u8]) -> serde_json::Value,
+) -> serde_json::Value {
+    let initial = write(0, bytes);
+    if initial["reason"] != "size_limit" {
+        return initial;
+    }
+    let Some(limit) = initial["max_bytes"]
+        .as_u64()
+        .and_then(|n| usize::try_from(n).ok())
+    else {
+        return initial;
+    };
+    if limit == 0 || bytes.len().div_ceil(limit) > 64 {
+        return initial;
+    }
+    let mut parts = Vec::new();
+    for (index, chunk) in bytes.chunks(limit).enumerate() {
+        let mut part = write(index + 1, chunk);
+        if part["unavailable"] == true {
+            return part;
+        }
+        part["offset"] = json!(index * limit);
+        parts.push(part);
+    }
+    json!({"version":1,"byte_len":bytes.len(),"parts":parts})
+}
+
+fn retained_source_value(resolution: bcode_tool::ToolArtifactWriteResolution) -> serde_json::Value {
+    use bcode_tool::ToolArtifactWriteResolution;
+    match resolution {
+        ToolArtifactWriteResolution::Written {
+            artifact_id,
+            byte_len,
+            reference,
+        } => {
+            json!({"artifact_id":artifact_id,"byte_len":byte_len,"reference":reference})
+        }
+        ToolArtifactWriteResolution::TooLarge { max_bytes } => {
+            json!({"unavailable":true,"reason":"size_limit","max_bytes":max_bytes})
+        }
+        ToolArtifactWriteResolution::Cancelled => json!({"unavailable":true,"reason":"cancelled"}),
+        // Do not propagate arbitrary host diagnostics into public result metadata.
+        ToolArtifactWriteResolution::Failed { .. } => {
+            json!({"unavailable":true,"reason":"storage_failure"})
+        }
+    }
+}
+
+fn batch_tool_response(
+    checked: Result<serde_json::Value, String>,
+    tool_call_id: &str,
+) -> ToolInvocationResponse {
+    match checked {
+        Ok(outcome) => ToolInvocationResponse {
+            output: compact_batch_output(&outcome),
+            is_error: outcome["is_error"].as_bool().unwrap_or(true),
+            content: Vec::new(),
+            full_output: None,
+            result: Some(batch_outcome_artifact(tool_call_id, outcome)),
+        },
+        Err(error) => tool_error(error),
+    }
+}
+
+/// Keep model-facing outcomes independent of potentially large presentation text.
+fn compact_batch_output(outcome: &serde_json::Value) -> String {
+    let files =
+        outcome["files"].as_array().map(|files| {
+            files.iter().map(|file| {
+            let change = &file["change"];
+            json!({
+                "path": file["path"],
+                "status": file["status"],
+                "error": file["error"],
+                "change": if change.is_null() { serde_json::Value::Null } else {
+                    json!({"available": change["omitted"] == false, "reason": change["reason"], "retained": change["retained"]})
+                }
+            })
+        }).collect::<Vec<_>>()
+        });
+    json!({"version": outcome["version"], "is_error": outcome["is_error"], "files": files})
+        .to_string()
+}
+
+/// Version one records ordered per-file publication outcomes, including unknown
+/// outcomes. Consumers must reject unsupported schema versions rather than infer
+/// success from unfamiliar statuses. The text response remains the generic fallback.
+fn batch_outcome_artifact(tool_call_id: &str, outcome: serde_json::Value) -> ToolInvocationResult {
+    let refs = outcome["files"].as_array().into_iter().flatten().enumerate().flat_map(|(index, file)| {
+        ["old", "new", "diff"].into_iter().flat_map(move |side| {
+            let retained = &file["change"]["retained"][side];
+            let parts = retained["parts"].as_array().map_or_else(|| vec![retained], |parts| parts.iter().collect());
+            parts.into_iter().enumerate().filter_map(move |(part_index, part)| {
+                let uri = part["reference"]["uri"].as_str()?;
+                Some(bcode_tool::ToolArtifactRef {
+                    key: if retained["parts"].is_array() { format!("file-{index}-{side}-{part_index}") } else { format!("file-{index}-{side}") },
+                    content_type: Some("application/octet-stream".to_owned()),
+                    storage_uri: Some(uri.to_owned()),
+                    byte_len: part["byte_len"].as_u64(),
+                    metadata: Some(json!({"file_index":index,"side":side,"path":file["path"],"artifact_id":part["artifact_id"],"offset":part["offset"]})),
+                })
+            })
+        })
+    }).collect();
+    ToolInvocationResult::Artifact {
+        artifact: Box::new(ToolArtifact {
+            artifact_id: format!("{tool_call_id}-filesystem-batch"),
+            producer_plugin_id: "bcode.filesystem".to_owned(),
+            schema: "bcode.filesystem.batch".to_owned(),
+            schema_version: 1,
+            tool_call_id: Some(tool_call_id.to_owned()),
+            title: Some("Batch file changes".to_owned()),
+            metadata: outcome,
+            refs,
+        }),
+    }
 }
 
 fn tool_read(
@@ -2401,9 +2660,20 @@ fn edit_file_inner(request: &EditRequest) -> Result<(usize, u32), String> {
             "old_text must match exactly once, found {matches} matches"
         ));
     }
-    let match_offset = contents
-        .find(&request.old_text)
-        .ok_or_else(|| "old_text match disappeared".to_string())?;
+    // Retain legacy empty-search behavior for the existing single-edit interface.
+    let (updated, match_offset) = if request.old_text.is_empty() {
+        (
+            contents.replacen(&request.old_text, &request.new_text, 1),
+            0,
+        )
+    } else {
+        replacement::replace_snapshot(
+            &contents,
+            &[(&request.old_text, &request.new_text)],
+            usize::MAX,
+            true,
+        )?
+    };
     let start_line = u32::try_from(
         contents[..match_offset]
             .bytes()
@@ -2412,7 +2682,6 @@ fn edit_file_inner(request: &EditRequest) -> Result<(usize, u32), String> {
     )
     .unwrap_or(u32::MAX)
     .saturating_add(1);
-    let updated = contents.replacen(&request.old_text, &request.new_text, 1);
     std::fs::write(&request.path, updated.as_bytes()).map_err(|error| error.to_string())?;
     Ok((1, start_line))
 }
@@ -2532,8 +2801,8 @@ pub fn static_plugin() -> bcode_plugin_sdk::StaticPluginVtable {
 pub fn filesystem_tui_registry() -> bcode_plugin_sdk::tui::PluginTuiRegistry {
     let mut registry = bcode_plugin_sdk::tui::PluginTuiRegistry::default();
     registry.register_visual_adapter(
-        ["filesystem-change-card"],
-        Box::new(file_change_tui::FileChangeTuiVisualAdapter),
+        ["filesystem-change-card", "filesystem-batch-card"],
+        Box::new(file_change_tui::FileChangeTuiVisualAdapter::default()),
     );
     registry.register_visual_adapter(
         [
@@ -2590,11 +2859,7 @@ mod tests {
         Vec<bcode_tool::ToolPresentationUpdate>,
     ) {
         let updates = Mutex::new(Vec::<Vec<u8>>::new());
-        let prepared_path = arguments
-            .get("path")
-            .and_then(serde_json::Value::as_str)
-            .map(PathBuf::from);
-        let context = NativeServiceContext {
+        let mut context = NativeServiceContext {
             plugin_id: FILESYSTEM_PLUGIN_ID.to_owned(),
             request: ServiceRequest {
                 interface_id: bcode_tool::TOOL_SERVICE_INTERFACE_ID.to_owned(),
@@ -2603,11 +2868,7 @@ mod tests {
                     tool_call_id: tool_call_id.to_owned(),
                     name: name.to_owned(),
                     arguments,
-                    preparation_descriptor: serde_json::to_value(FilesystemPreparationDescriptor {
-                        workspace_root: Some(workspace_root.to_path_buf()),
-                        path: prepared_path,
-                    })
-                    .expect("preparation descriptor"),
+                    preparation_descriptor: serde_json::Value::Null,
                 })
                 .expect("tool request"),
             },
@@ -2620,7 +2881,29 @@ mod tests {
             bridge: bcode_plugin_sdk::ServiceBridge::default(),
             transient_progress_limits: bcode_plugin_sdk::TransientProgressLimits::default(),
         };
-        let response = invoke_tool(&context);
+        let invocation: ToolInvocationRequest =
+            serde_json::from_slice(&context.request.payload).unwrap();
+        context.request.operation = bcode_tool::OP_PREPARE_TOOL.to_owned();
+        context.request.payload = serde_json::to_vec(&bcode_tool::ToolPreparationRequest {
+            invocation: bcode_tool::ToolInvocationDescriptor {
+                invocation_id: tool_call_id.to_owned(),
+                tool_name: name.to_owned(),
+                arguments: invocation.arguments.clone(),
+            },
+            host_context: workspace_context(workspace_root),
+        })
+        .unwrap();
+        let prepared = invoke_tool_service(&context);
+        assert!(prepared.error.is_none(), "{:?}", prepared.error);
+        let prepared: bcode_tool::ToolPreparationResponse =
+            serde_json::from_slice(&prepared.payload).unwrap();
+        context.request.operation = bcode_tool::OP_INVOKE_TOOL.to_owned();
+        context.request.payload = serde_json::to_vec(&ToolInvocationRequest {
+            preparation_descriptor: prepared.descriptor,
+            ..invocation
+        })
+        .unwrap();
+        let response = invoke_tool_service(&context);
         let response = serde_json::from_slice::<ToolInvocationResponse>(&response.payload)
             .expect("tool response");
         let updates = updates
@@ -2633,6 +2916,118 @@ mod tests {
             })
             .collect();
         (response, updates)
+    }
+
+    #[test]
+    fn service_batch_validation_failure_preserves_every_target() {
+        let root = temp_dir("batch-service-invalid-tail");
+        let first = root.join("first.txt");
+        let second = root.join("second.txt");
+        std::fs::write(&first, "alpha\r\n").unwrap();
+        std::fs::write(&second, "beta\n").unwrap();
+        let (response, updates) = invoke_tool_with_captured_presentations(
+            "batch-invalid",
+            "filesystem.multi_edit",
+            json!({"files":[
+                {"path":first,"edits":[{"old_text":"alpha","new_text":"changed"}]},
+                {"path":second,"edits":[{"old_text":"missing","new_text":"changed"}]}
+            ]}),
+            &root,
+        );
+        assert!(response.is_error);
+        assert_eq!(std::fs::read(&first).unwrap(), b"alpha\r\n");
+        assert_eq!(std::fs::read(&second).unwrap(), b"beta\n");
+        assert_eq!(std::fs::read_dir(&root).unwrap().count(), 2);
+        assert_eq!(updates.len(), 2);
+        assert_eq!(updates[1].schema, "bcode.filesystem.result");
+        assert_eq!(updates[1].payload["is_error"], true);
+    }
+
+    #[test]
+    fn batch_and_independent_single_edits_produce_identical_bytes() {
+        let root = temp_dir("batch-single-comparison");
+        // Representative source, escaped configuration, and mixed-newline Unicode text.
+        for (index, (original, edits)) in [
+            (
+                "fn old() { old_helper(); }\n",
+                [("fn old", "fn new"), ("old_helper", "new_helper")],
+            ),
+            (
+                "{\"path\":\"C:\\\\old\",\"enabled\":false}\n",
+                [("old", "new"), ("false", "true")],
+            ),
+            (
+                "\u{feff}日本語\r\nalpha\nbeta",
+                [("alpha", "α"), ("beta", "β")],
+            ),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let batch_path = root.join(format!("batch-{index}"));
+            let single_path = root.join(format!("single-{index}"));
+            std::fs::write(&batch_path, original).unwrap();
+            std::fs::write(&single_path, original).unwrap();
+            let replacements: Vec<_> = edits
+                .iter()
+                .map(|(old, new)| json!({"old_text":old,"new_text":new}))
+                .collect();
+            let (batch, _) = invoke_tool_with_captured_presentations(
+                "comparison-batch",
+                "filesystem.multi_edit",
+                json!({"files":[{"path":batch_path,"edits":replacements}]}),
+                &root,
+            );
+            assert!(!batch.is_error, "{}", batch.output);
+            let mut expected = original.to_owned();
+            for (old, new) in edits {
+                let (single, _) = invoke_tool_with_captured_presentations(
+                    "comparison-single",
+                    "filesystem.edit",
+                    json!({"path":single_path,"old_text":old,"new_text":new}),
+                    &root,
+                );
+                assert!(!single.is_error, "{}", single.output);
+                expected = expected.replace(old, new);
+            }
+            assert_eq!(std::fs::read(&batch_path).unwrap(), expected.as_bytes());
+            assert_eq!(std::fs::read(&single_path).unwrap(), expected.as_bytes());
+        }
+    }
+
+    #[test]
+    fn listed_multi_edit_prepares_and_invokes_with_batch_presentation() {
+        let response = list_tools(&ServiceRequest {
+            interface_id: bcode_tool::TOOL_SERVICE_INTERFACE_ID.to_owned(),
+            operation: bcode_tool::OP_LIST_TOOLS.to_owned(),
+            payload: b"{}".to_vec(),
+        });
+        let list: ToolList = serde_json::from_slice(&response.payload).unwrap();
+        assert!(
+            list.tools
+                .iter()
+                .any(|tool| tool.name == "filesystem.multi_edit")
+        );
+        let root = temp_dir("batch-service-chain");
+        let first = root.join("first.txt");
+        let second = root.join("second.txt");
+        std::fs::write(&first, "alpha beta").unwrap();
+        std::fs::write(&second, "gamma").unwrap();
+        let (response, updates) = invoke_tool_with_captured_presentations(
+            "batch-chain",
+            "filesystem.multi_edit",
+            json!({"files":[
+                {"path":first,"edits":[{"old_text":"beta","new_text":"B"},{"old_text":"alpha","new_text":"A"}]},
+                {"path":second,"edits":[{"old_text":"gamma","new_text":"G"}]}
+            ]}),
+            &root,
+        );
+        assert!(!response.is_error, "{}", response.output);
+        assert_eq!(std::fs::read_to_string(first).unwrap(), "A B");
+        assert_eq!(std::fs::read_to_string(second).unwrap(), "G");
+        assert_eq!(updates.len(), 2);
+        assert_eq!(updates[1].schema, "bcode.filesystem.batch");
+        assert_eq!(updates[1].payload["files"][1]["status"], "committed");
     }
 
     #[test]
@@ -2677,6 +3072,163 @@ mod tests {
                 vec![1, 2]
             );
         }
+    }
+
+    #[test]
+    #[cfg(feature = "static-bundled")]
+    fn registered_batch_adapter_is_reachable() {
+        let registry = filesystem_tui_registry();
+        assert!(
+            registry.supports_visual_adapter("filesystem-batch-card", "bcode.filesystem.batch")
+        );
+        assert!(
+            registry.supports_visual_adapter("filesystem-change-card", "bcode.filesystem.change")
+        );
+        assert!(!registry.supports_visual_adapter("filesystem-batch-card", "unrelated.schema"));
+    }
+
+    #[test]
+    fn multipart_retention_stops_on_failure_without_claiming_partial_success() {
+        for reason in [
+            "cancelled",
+            "storage_failure",
+            "bridge_unavailable",
+            "size_limit",
+        ] {
+            let mut calls = Vec::new();
+            let result = super::retain_source_parts(b"abcdef", &mut |index, bytes| {
+                calls.push((index, bytes.to_vec()));
+                match index {
+                    0 => json!({"unavailable":true,"reason":"size_limit","max_bytes":2}),
+                    1 => json!({"byte_len":2,"reference":{"uri":"artifact://first"}}),
+                    2 => json!({"unavailable":true,"reason":reason}),
+                    _ => panic!("must stop after the first failed part"),
+                }
+            });
+            assert_eq!(result, json!({"unavailable":true,"reason":reason}));
+            assert_eq!(
+                calls,
+                vec![
+                    (0, b"abcdef".to_vec()),
+                    (1, b"ab".to_vec()),
+                    (2, b"cd".to_vec())
+                ]
+            );
+        }
+    }
+
+    #[test]
+    fn multipart_retention_rejects_invalid_or_excessive_partitioning() {
+        for limit in [json!(0), json!(1), json!(null), json!("invalid")] {
+            let mut calls = 0;
+            let failure = json!({"unavailable":true,"reason":"size_limit","max_bytes":limit});
+            let result = super::retain_source_parts(&[0; 65], &mut |_, _| {
+                calls += 1;
+                failure.clone()
+            });
+            assert_eq!(calls, 1);
+            assert_eq!(result, failure);
+        }
+        let mut calls = 0;
+        let result = super::retain_source_parts(&[0; 64], &mut |index, bytes| {
+            calls += 1;
+            if index == 0 {
+                json!({"unavailable":true,"reason":"size_limit","max_bytes":1})
+            } else {
+                json!({"byte_len":bytes.len(),"reference":{"uri":format!("artifact://{index}")}})
+            }
+        });
+        assert_eq!(calls, 65);
+        assert_eq!(result["parts"].as_array().unwrap().len(), 64);
+        assert_eq!(result["byte_len"], 64);
+    }
+
+    #[test]
+    fn retained_sources_split_at_host_limit_without_losing_utf8_bytes() {
+        let bytes = "🙂abc".repeat(10).into_bytes();
+        let mut stored = Vec::new();
+        let retained = super::retain_source_parts(&bytes, &mut |index, part| {
+            if part.len() > 5 {
+                return json!({"unavailable":true,"reason":"size_limit","max_bytes":5});
+            }
+            stored.extend_from_slice(part);
+            json!({"artifact_id":index.to_string(),"byte_len":part.len(),"reference":{"uri":format!("artifact://{index}")}})
+        });
+        assert_eq!(stored, bytes);
+        assert_eq!(retained["byte_len"], bytes.len());
+        for (index, part) in retained["parts"].as_array().unwrap().iter().enumerate() {
+            assert_eq!(part["offset"], index * 5);
+        }
+    }
+
+    #[test]
+    fn retained_source_failures_are_bounded_and_secret_safe() {
+        use bcode_tool::ToolArtifactWriteResolution;
+        assert_eq!(
+            super::retained_source_value(ToolArtifactWriteResolution::TooLarge { max_bytes: 1024 }),
+            json!({"unavailable":true,"reason":"size_limit","max_bytes":1024})
+        );
+        assert_eq!(
+            super::retained_source_value(ToolArtifactWriteResolution::Cancelled),
+            json!({"unavailable":true,"reason":"cancelled"})
+        );
+        assert_eq!(
+            super::retained_source_value(ToolArtifactWriteResolution::Failed {
+                code: "private-code".to_owned(),
+                message: "secret".repeat(10000)
+            }),
+            json!({"unavailable":true,"reason":"storage_failure"})
+        );
+    }
+
+    #[test]
+    fn batch_retained_sources_use_standard_artifact_references() {
+        let outcome = json!({"version":1,"files":[{"path":"large.rs","status":"committed","change":{"omitted":true,"retained":{
+            "old":{"artifact_id":"old-id","byte_len":20000,"reference":{"uri":"bcode-artifact://invocation/test/old"}},
+            "new":{"unavailable":true}
+        }}}]});
+        let ToolInvocationResult::Artifact { artifact } = batch_outcome_artifact("test", outcome)
+        else {
+            panic!("artifact expected")
+        };
+        assert_eq!(artifact.refs.len(), 1);
+        assert_eq!(artifact.refs[0].key, "file-0-old");
+        assert_eq!(artifact.refs[0].byte_len, Some(20000));
+        assert_eq!(
+            artifact.refs[0].storage_uri.as_deref(),
+            Some("bcode-artifact://invocation/test/old")
+        );
+        assert_eq!(artifact.metadata["files"][0]["status"], "committed");
+    }
+
+    #[test]
+    fn batch_response_publishes_versioned_outcomes() {
+        let updates = Mutex::new(Vec::<Vec<u8>>::new());
+        let events = ServiceEventEmitter::new(
+            Some(capture_presentation_update),
+            std::ptr::from_ref(&updates).cast_mut().cast(),
+        );
+        let mut presentation = PrimaryPresentationPublisher::with_limits_and_cancellation(
+            events,
+            "batch-call",
+            FILESYSTEM_PLUGIN_ID,
+            FILESYSTEM_REQUEST_SCHEMA,
+            1,
+            bcode_tool::ToolPresentationRetention::RetainLatest,
+            bcode_plugin_sdk::TransientProgressLimits::default(),
+            bcode_plugin_sdk::ServiceCancellation::default(),
+        );
+        let outcome = json!({"version":1,"is_error":true,"files":[{"path":"target","status":"unknown","error":"inspect before retrying","change":null}]});
+        let response = batch_tool_response(Ok(outcome), "batch-call");
+        assert!(response.is_error);
+        publish_filesystem_result_presentation(&mut presentation, &response);
+        let updates = updates.lock().unwrap();
+        assert_eq!(updates.len(), 1);
+        let update: bcode_tool::ToolPresentationUpdate =
+            serde_json::from_slice(&updates[0]).unwrap();
+        drop(updates);
+        assert_eq!(update.schema, "bcode.filesystem.batch");
+        assert_eq!(update.revision, 1);
     }
 
     #[test]
@@ -2754,19 +3306,7 @@ mod tests {
 
     #[test]
     fn filesystem_catalog_preparation_accepts_missing_resources() {
-        for definition in [
-            read_tool_definition(),
-            write_tool_definition(),
-            edit_tool_definition(),
-            exists_tool_definition(),
-            list_tool_definition(),
-            find_tool_definition(),
-            grep_tool_definition(),
-            stat_tool_definition(),
-            artifact_metadata_tool_definition(),
-            artifact_read_tool_definition(),
-            artifact_grep_tool_definition(),
-        ] {
+        for definition in tool_definitions() {
             let request = bcode_tool::ToolPreparationRequest {
                 invocation: bcode_tool::ToolInvocationDescriptor {
                     invocation_id: "catalog".to_owned(),
@@ -2892,7 +3432,7 @@ mod tests {
         assert_eq!(decoded.message.as_deref(), Some("searching"));
     }
 
-    fn temp_dir(name: &str) -> PathBuf {
+    pub fn temp_dir(name: &str) -> PathBuf {
         let path = std::env::temp_dir().join(format!(
             "bcode-filesystem-plugin-{name}-{}",
             std::process::id()
@@ -2900,6 +3440,48 @@ mod tests {
         let _ = std::fs::remove_dir_all(&path);
         std::fs::create_dir_all(&path).expect("create temp dir");
         path
+    }
+
+    #[test]
+    fn compact_batch_output_preserves_outcomes_without_copying_diff_text() {
+        let outcome = json!({"version":1,"is_error":true,"files":[
+            {"path":"first","status":"committed","error":null,"change":{"omitted":false,"old_text":"old".repeat(4096),"new_text":"new".repeat(4096)}},
+            {"path":"second","status":"unknown","error":"inspect before retrying","change":null},
+            {"path":"third","status":"committed","error":null,"change":{"omitted":true,"reason":"display_budget"}}
+        ]});
+        let output = compact_batch_output(&outcome);
+        assert!(output.len() < 1024);
+        let decoded: serde_json::Value = serde_json::from_str(&output).unwrap();
+        assert_eq!(decoded["files"][0]["change"]["available"], true);
+        assert!(decoded["files"][0]["change"].get("old_text").is_none());
+        assert_eq!(decoded["files"][1]["status"], "unknown");
+        assert_eq!(decoded["files"][1]["error"], "inspect before retrying");
+        assert_eq!(decoded["files"][2]["change"]["available"], false);
+        assert_eq!(decoded["files"][2]["change"]["reason"], "display_budget");
+        assert_eq!(
+            outcome["files"][0]["change"]["old_text"],
+            "old".repeat(4096)
+        );
+    }
+
+    #[test]
+    fn batch_artifact_preserves_ordered_partial_and_unknown_outcomes() {
+        let outcome = json!({"version":1,"is_error":true,"files":[
+            {"path":"first","status":"committed","error":null},
+            {"path":"second","status":"unknown","error":"inspect before retrying"},
+            {"path":"third","status":"not_attempted","error":null}
+        ]});
+        let result = batch_outcome_artifact("batch-call", outcome.clone());
+        let encoded = serde_json::to_value(&result).unwrap();
+        let decoded: ToolInvocationResult = serde_json::from_value(encoded).unwrap();
+        let ToolInvocationResult::Artifact { artifact } = decoded else {
+            panic!("expected batch artifact");
+        };
+        assert_eq!(artifact.schema, "bcode.filesystem.batch");
+        assert_eq!(artifact.schema_version, 1);
+        assert_eq!(artifact.producer_plugin_id, "bcode.filesystem");
+        assert_eq!(artifact.tool_call_id.as_deref(), Some("batch-call"));
+        assert_eq!(artifact.metadata, outcome);
     }
 
     #[test]

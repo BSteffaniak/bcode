@@ -13882,12 +13882,14 @@ where
                 }
                 if cancel_state.is_cancelled() {
                     let _ = scope.control().begin_cancellation();
-                    return finalize_cancelled_provider_call(&mut batch).await;
+                    // The runtime owns bounded tool settlement. A provider deadline here
+                    // could discard its outcomes before that settlement budget expires.
+                    return FinalizedProviderCall::Cancelled(Some(batch.await));
                 }
             }
             () = cancel_state.cancelled() => {
                 let _ = scope.control().begin_cancellation();
-                return finalize_cancelled_provider_call(&mut batch).await;
+                return FinalizedProviderCall::Cancelled(Some(batch.await));
             }
         }
     }
@@ -25734,7 +25736,9 @@ async fn invoke_server_registered_tool(
             .await;
         }
         tool_span.finish_err();
-        return Err(RuntimeError::Cancelled);
+        // Preserve settled side-effect accounting without changing the cancelled lifecycle.
+        // The runtime owns the turn's terminal outcome independently of this response.
+        return Ok(result);
     }
     finish_server_registered_tool(invoker, call, result, tool_labels, tool_span, tool_start).await
 }
@@ -27444,8 +27448,8 @@ async fn invoke_plugin_tool_transport(
             invocation.cancel.clone(),
         )))
     }) {
-        invocation.cancel.cancel();
-        return Ok(tool_error("tool cancelled before invocation became active"));
+        let response = invocation.settle_cancelled_tool().await;
+        return Ok(response);
     }
     let response = loop {
         tokio::select! {
@@ -27454,7 +27458,11 @@ async fn invoke_plugin_tool_transport(
                 invocation.cancel.cancel();
                 drop(bridge_resolutions);
                 input_receiver.lock().await.close();
-                return Ok(tool_error("tool invocation cancelled"));
+                let response = invocation.settle_cancelled_tool().await;
+                if let Some(scope) = invocation_scope {
+                    let _ = scope.unregister_cancellation();
+                }
+                return Ok(response);
             }
             () = async {
                 if let Some(cancellation) = &scope_cancellation {
@@ -27466,7 +27474,11 @@ async fn invoke_plugin_tool_transport(
                 invocation.cancel.cancel();
                 drop(bridge_resolutions);
                 input_receiver.lock().await.close();
-                return Ok(tool_error("tool invocation cancelled"));
+                let response = invocation.settle_cancelled_tool().await;
+                if let Some(scope) = invocation_scope {
+                    let _ = scope.unregister_cancellation();
+                }
+                return Ok(response);
             }
             bridge_call = async {
                 bridge_requests
@@ -56801,16 +56813,32 @@ event_symbol = "bcode_plugin_handle_event_v1"
                 cancel_state.close();
             };
         let (response, ()) = tokio::join!(invocation, cancellation);
-        assert!(
-            response.is_none(),
-            "cancelled shell must not publish a tool result"
-        );
+        let response =
+            response.expect("cancelled invocation retains settled side-effect accounting");
+        let expected_output = response.result.clone();
+        append_tool_finished_event_inner(&state, session_id, response)
+            .await
+            .expect("settled cancellation outcome persists");
 
         let history = state
             .sessions
             .session_history(session_id)
             .await
             .expect("terminal lifecycle history");
+        let recorded = history
+            .iter()
+            .filter_map(|event| match &event.kind {
+                SessionEventKind::ToolInvocationResultRecorded { record }
+                    if record.invocation_id == "cancelled-shell" =>
+                {
+                    Some(record)
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(recorded.len(), 1);
+        assert!(recorded[0].is_error);
+        assert_eq!(recorded[0].model_output, expected_output);
         let stages = history
             .iter()
             .filter_map(|event| match &event.kind {
@@ -56899,9 +56927,61 @@ event_symbol = "bcode_plugin_handle_event_v1"
         })
         .await
         .expect("scope cancellation must close locally");
-        assert!(matches!(response, Err(RuntimeError::Cancelled)));
+        assert!(
+            response
+                .expect("scope cancellation retains settled outcome")
+                .is_error
+        );
+        assert!(!invocation_scope.accepts_work());
         assert!(!cancel_state.is_cancelled());
         drop(state);
+    }
+
+    #[tokio::test]
+    async fn cancelled_tool_batch_retains_outcome_beyond_provider_grace() {
+        let workspace = tempfile::tempdir().expect("batch workspace");
+        let sessions =
+            SessionManager::persistent(workspace.path().join("sessions")).expect("batch sessions");
+        let state = test_server_state_with_filesystem_plugin(sessions);
+        let (_followup_tx, mut followup_rx) = mpsc::channel(1);
+        let (_steering_tx, mut steering_rx) = mpsc::channel(1);
+        let (_cancel_tx, mut cancel_rx) = mpsc::channel(1);
+        let queued = AtomicUsize::new(0);
+        let mut context = RuntimeCommandContext::new(
+            &mut followup_rx,
+            &mut steering_rx,
+            &mut cancel_rx,
+            &queued,
+            Arc::new(Mutex::new(None)),
+        );
+        let cancellation = TurnCancelState::default();
+        cancellation.close();
+        let scope = TurnScope::without_events("delayed-batch", TurnGeneration::new(0));
+        let token = scope.control().cancellation();
+        let batch = Box::pin(async move {
+            token.cancelled().await;
+            tokio::time::sleep(PROVIDER_CANCELLATION_GRACE + Duration::from_millis(100)).await;
+            Ok::<_, RuntimeError>("settled outcome")
+        });
+        let outcome = tokio::time::timeout(
+            Duration::from_secs(5),
+            wait_for_server_tool_batch(
+                &state,
+                SessionId::new(),
+                &mut context,
+                &cancellation,
+                &scope,
+                batch,
+            ),
+        )
+        .await
+        .expect("runtime settlement must complete");
+        drop(state);
+        assert_eq!(
+            completed_result_after_cancellation(outcome),
+            Some("settled outcome")
+        );
+        assert!(!scope.accepts_work());
     }
 
     #[cfg(unix)]
@@ -56989,6 +57069,219 @@ event_symbol = "bcode_plugin_handle_event_v1"
 
     #[cfg(unix)]
     #[tokio::test]
+    async fn server_multi_edit_batch_persists_outcome_and_changes_both_files() {
+        Box::pin(assert_server_multi_edit_permission_outcome(
+            Some(true),
+            false,
+        ))
+        .await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn server_multi_edit_denied_permission_preserves_both_files() {
+        Box::pin(assert_server_multi_edit_permission_outcome(
+            Some(false),
+            false,
+        ))
+        .await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn server_multi_edit_cancelled_permission_preserves_both_files() {
+        Box::pin(assert_server_multi_edit_permission_outcome(None, false)).await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn server_multi_edit_retained_sources_are_readable_after_finalization() {
+        Box::pin(assert_server_multi_edit_permission_outcome(
+            Some(true),
+            true,
+        ))
+        .await;
+    }
+
+    #[cfg(unix)]
+    #[allow(clippy::too_many_lines)] // One end-to-end permission, publication and durable-artifact scenario.
+    async fn assert_server_multi_edit_permission_outcome(decision: Option<bool>, oversized: bool) {
+        let approved = decision == Some(true);
+        let cancellation = Arc::new(TurnCancelState::default());
+        let workspace = tempfile::tempdir().unwrap();
+        let first = workspace.path().join("first.txt");
+        let second = workspace.path().join("second.txt");
+        let first_source = if oversized {
+            format!("alpha{}", "界".repeat(30000))
+        } else {
+            "alpha\r\n".to_owned()
+        };
+        std::fs::write(&first, &first_source).unwrap();
+        std::fs::write(&second, "beta\n").unwrap();
+        let sessions = SessionManager::persistent(workspace.path().join("sessions")).unwrap();
+        let session_id = sessions
+            .create_session(None, workspace.path().to_path_buf())
+            .await
+            .unwrap()
+            .id;
+        let mut state = test_server_state_with_filesystem_plugin(sessions);
+        state.trace_store = TraceStore::new(workspace.path().join("traces"));
+        let (_followup_tx, mut followup_rx) = mpsc::channel(1);
+        let (_steering_tx, mut steering_rx) = mpsc::channel(1);
+        let (_cancel_tx, mut cancel_rx) = mpsc::channel(1);
+        let queued = AtomicUsize::new(0);
+        let mut context = RuntimeCommandContext::new(
+            &mut followup_rx,
+            &mut steering_rx,
+            &mut cancel_rx,
+            &queued,
+            Arc::new(Mutex::new(None)),
+        );
+        let approve = async {
+            let pending = wait_for_pending_permissions(&state, 1).await;
+            assert_eq!(pending[0].summary.tool_call_id, "multi-edit-server");
+            assert_eq!(std::fs::read(&first).unwrap(), first_source.as_bytes());
+            assert_eq!(std::fs::read(&second).unwrap(), b"beta\n");
+            if decision.is_none() {
+                cancellation.close();
+                interaction_operations::cancel_pending_permissions_for_session(&state, session_id)
+                    .await;
+                return;
+            }
+            assert!(
+                interaction_operations::resolve_permission(
+                    &state,
+                    &pending[0].summary.permission_id,
+                    approved,
+                    false,
+                )
+                .await
+            );
+        };
+        let execute = async {
+            execute_model_tool_batch(
+                &state,
+                session_id,
+                vec![bcode_model::ToolCall {
+                    id: "multi-edit-server".to_owned(),
+                    name: "filesystem.multi_edit".to_owned(),
+                    arguments: serde_json::json!({"files":[
+                        {"path":first,"edits":[{"old_text":"alpha","new_text":"A"}]},
+                        {"path":second,"edits":[{"old_text":"beta","new_text":"B"}]}
+                    ]}),
+                }],
+                &BTreeMap::new(),
+                Arc::clone(&cancellation),
+                &mut context,
+                &bcode_session_models::TurnExecutionOptions::default(),
+                bcode_tool::ToolExecutionOptions::default(),
+            )
+            .await
+        };
+        let (completed, ()) = tokio::time::timeout(Duration::from_secs(10), async {
+            tokio::join!(execute, approve)
+        })
+        .await
+        .expect("authorized batch completes");
+        assert_eq!(completed, decision.is_some());
+        assert!(state.pending_permissions.lock().await.is_empty());
+        let history = state.sessions.session_history(session_id).await.unwrap();
+        let results = history
+            .iter()
+            .filter_map(|event| match &event.kind {
+                SessionEventKind::ToolInvocationResultRecorded { record }
+                    if record.invocation_id == "multi-edit-server" =>
+                {
+                    Some(record)
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].is_error, !approved);
+        let expected_first = if approved {
+            first_source.replacen("alpha", "A", 1)
+        } else {
+            first_source.clone()
+        };
+        assert_eq!(std::fs::read(first).unwrap(), expected_first.as_bytes());
+        assert_eq!(
+            std::fs::read(second).unwrap(),
+            if approved {
+                b"B\n".as_slice()
+            } else {
+                b"beta\n".as_slice()
+            }
+        );
+        if oversized {
+            assert_retained_batch_sources(
+                &state,
+                session_id,
+                results[0].result.as_ref(),
+                &first_source,
+                &expected_first,
+            )
+            .await;
+        }
+        drop(state);
+    }
+
+    #[cfg(unix)]
+    async fn assert_retained_batch_sources(
+        state: &ServerState,
+        session_id: SessionId,
+        result: Option<&ToolInvocationResult>,
+        before: &str,
+        after: &str,
+    ) {
+        let Some(ToolInvocationResult::Artifact { artifact }) = result else {
+            panic!("batch artifact must be finalized")
+        };
+        // This scenario changes one oversized line with no final newline.
+        // Assert the presentation bytes independently of the plugin's generator.
+        let diff = format!(
+            "--- before\n+++ after\n@@ -1,1 +1,1 @@\n-{before}\n\\ No newline at end of file\n+{after}\n\\ No newline at end of file\n"
+        );
+        for (key, expected) in [
+            ("file-0-old", before.as_bytes()),
+            ("file-0-new", after.as_bytes()),
+            ("file-0-diff", diff.as_bytes()),
+        ] {
+            let mut bytes = Vec::new();
+            while bytes.len() < expected.len() {
+                let range = read_session_artifact_range(
+                    state,
+                    session_id,
+                    &artifact.artifact_id,
+                    key,
+                    u64::try_from(bytes.len()).unwrap(),
+                    4096,
+                )
+                .await
+                .unwrap();
+                assert!(range.finalized && range.finalized_event_seq.is_some());
+                assert!(!range.bytes.is_empty() && range.bytes.len() <= 4096);
+                bytes.extend(range.bytes);
+            }
+            assert_eq!(bytes, expected);
+        }
+    }
+
+    #[cfg(unix)]
+    fn assert_cancelled_report_in_history(
+        history: &[bcode_session_models::SessionEvent],
+        invocation_id: &str,
+    ) {
+        assert!(history.iter().any(|event| matches!(
+            &event.kind,
+            SessionEventKind::ToolInvocationLifecycle { event }
+                if event.invocation_id == invocation_id
+                    && event.stage == bcode_session_models::ToolInvocationLifecycleStage::Cancelled
+                    && event.message.as_ref().is_some_and(|message| !message.is_empty())
+        )));
+    }
+
+    #[tokio::test]
     async fn canonical_server_batch_cancellation_persists_terminal_result() {
         let workspace = tempfile::tempdir().expect("canonical cancellation workspace");
         let sessions = SessionManager::persistent(workspace.path().join("sessions"))
@@ -57004,6 +57297,9 @@ event_symbol = "bcode_plugin_handle_event_v1"
         let (mut state,) = (test_server_state_with_shell_plugin(sessions),);
         state.trace_store = TraceStore::new(workspace.path().join("traces"));
         let state = Arc::new(state);
+        let socket_dir = tempfile::tempdir().unwrap();
+        let (mut connection, server) =
+            cancellation_test_client(&state, session_id, socket_dir.path()).await;
         let cancel_state = Arc::new(TurnCancelState::default());
         let task_state = Arc::clone(&state);
         let task_cancel = Arc::clone(&cancel_state);
@@ -57026,7 +57322,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
                 vec![bcode_model::ToolCall {
                     id: "canonical-cancelled-shell".to_owned(),
                     name: "shell.run".to_owned(),
-                    arguments: serde_json::json!({"command": "sleep 30"}),
+                    arguments: serde_json::json!({"command": "printf committed > cancellation-marker; sleep 30"}),
                 }],
                 &BTreeMap::new(),
                 task_cancel,
@@ -57040,19 +57336,14 @@ event_symbol = "bcode_plugin_handle_event_v1"
         approve_pending_permission_for_test(state.as_ref(), &pending[0]).await;
         tokio::time::timeout(Duration::from_secs(10), async {
             loop {
-                if state
-                    .active_plugin_invocations
-                    .lock()
-                    .expect("active invocation registry")
-                    .contains_key(&(session_id, "canonical-cancelled-shell".to_owned()))
-                {
+                if workspace.path().join("cancellation-marker").exists() {
                     break;
                 }
                 tokio::task::yield_now().await;
             }
         })
         .await
-        .expect("canonical shell invocation should become active");
+        .expect("canonical shell side effect must precede cancellation");
         cancel_state.close();
         assert!(
             !tokio::time::timeout(Duration::from_secs(5), task)
@@ -57065,11 +57356,89 @@ event_symbol = "bcode_plugin_handle_event_v1"
             .session_history(session_id)
             .await
             .expect("canonical cancellation history");
-        assert!(history.iter().any(|event| matches!(
-            &event.kind,
+        assert_cancelled_report_in_history(&history, "canonical-cancelled-shell");
+        assert_eq!(
+            std::fs::read(workspace.path().join("cancellation-marker")).unwrap(),
+            b"committed"
+        );
+        assert_cancelled_shell_stages(&history);
+        assert_cancelled_client_report(&mut connection, settled_shell_report(&history)).await;
+        server.abort();
+        drop(state);
+    }
+
+    fn settled_shell_report(history: &[bcode_session_models::SessionEvent]) -> &str {
+        let report = history
+            .iter()
+            .find_map(|event| match &event.kind {
+                SessionEventKind::ToolInvocationLifecycle { event }
+                    if event.invocation_id == "canonical-cancelled-shell"
+                        && event.stage
+                            == bcode_session_models::ToolInvocationLifecycleStage::Cancelled =>
+                {
+                    event.message.as_deref()
+                }
+                _ => None,
+            })
+            .unwrap();
+        assert!(
+            report.starts_with("Tool cancelled; final invocation report: "),
+            "{report}"
+        );
+        assert!(history.iter().any(|event| matches!(&event.kind,
             SessionEventKind::ToolInvocationResultRecorded { record }
-                if record.invocation_id == "canonical-cancelled-shell" && record.is_error
-        )));
+                if record.invocation_id == "canonical-cancelled-shell" && record.is_error)));
+        report
+    }
+
+    async fn assert_cancelled_client_report(
+        connection: &mut bcode_client::ClientConnection,
+        report: &str,
+    ) {
+        let delivered = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if let bcode_ipc::Event::Session(event) = connection.recv_event().await.unwrap()
+                    && let SessionEventKind::ToolInvocationLifecycle { event } = event.kind
+                    && event.invocation_id == "canonical-cancelled-shell"
+                    && event.stage == bcode_session_models::ToolInvocationLifecycleStage::Cancelled
+                {
+                    break event.message;
+                }
+            }
+        })
+        .await
+        .expect("settled cancellation report reaches attached client");
+        assert_eq!(delivered.as_deref(), Some(report));
+    }
+
+    async fn cancellation_test_client(
+        state: &Arc<ServerState>,
+        session_id: SessionId,
+        socket_dir: &Path,
+    ) -> (bcode_client::ClientConnection, tokio::task::JoinHandle<()>) {
+        let endpoint = bcode_ipc::IpcEndpoint::unix_socket(socket_dir.join("server.sock"));
+        let listener = LocalIpcListener::bind(&endpoint).unwrap();
+        let server_state = Arc::clone(state);
+        let server = tokio::spawn(async move {
+            let stream = listener.accept().await.unwrap();
+            handle_client(stream, server_state).await.unwrap();
+        });
+        let client = bcode_client::BcodeClient::new(endpoint);
+        let mut connection = client.connect("cancel-settlement-test").await.unwrap();
+        connection
+            .attach_session_projection_window_with_input_history(
+                session_id,
+                projection_ipc_window_request(
+                    bcode_session_models::ProjectionWindowAnchor::Latest,
+                    bcode_session_models::ProjectionWindowDirection::Backward,
+                ),
+            )
+            .await
+            .unwrap();
+        (connection, server)
+    }
+
+    fn assert_cancelled_shell_stages(history: &[bcode_session_models::SessionEvent]) {
         let stages = history
             .iter()
             .filter_map(|event| match &event.kind {
@@ -57088,7 +57457,6 @@ event_symbol = "bcode_plugin_handle_event_v1"
                 bcode_session_models::ToolInvocationLifecycleStage::Cancelled,
             ]
         );
-        drop(state);
     }
 
     #[cfg(unix)]

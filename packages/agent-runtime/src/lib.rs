@@ -2035,28 +2035,41 @@ impl AgentRuntime {
             let remaining = timeout
                 .checked_sub(instant_now().saturating_duration_since(started))
                 .ok_or(RuntimeError::Timeout { timeout })?;
-            let batch = switchy::unsync::select! {
+            let mut batch_execution = Box::pin(self.execute_prepared_tool_batch_with_host_context(
+                catalog,
+                authorization,
+                invoker,
+                &calls,
+                &mut rounds,
+                context,
+                host_context,
+                options,
+                scope,
+            ));
+            let batch = Box::pin(async {
+                switchy::unsync::select! {
                 biased;
                 () = cancellation.cancelled() => {
                     let _ = self.cancel_turn_scope(scope);
-                    return Err(RuntimeError::Cancelled);
+                    switchy::unsync::select! {
+                        _ = &mut batch_execution => {},
+                        () = sleep(TOOL_SETTLEMENT_GRACE) => {},
+                    }
+                    Err(RuntimeError::Cancelled)
                 }
                 () = sleep(remaining) => {
                     let _ = self.cancel_turn_scope(scope);
-                    return Err(RuntimeError::Timeout { timeout });
+                    switchy::unsync::select! {
+                        _ = &mut batch_execution => {},
+                        () = sleep(TOOL_SETTLEMENT_GRACE) => {},
+                    }
+                    Err(RuntimeError::Timeout { timeout })
                 }
-                batch = self.execute_prepared_tool_batch_with_host_context(
-                    catalog,
-                    authorization,
-                    invoker,
-                    &calls,
-                    &mut rounds,
-                    context,
-                    host_context,
-                    options,
-                    scope,
-                ) => batch?,
-            };
+                batch = &mut batch_execution => batch,
+                }
+            })
+            .await?;
+            drop(batch_execution);
 
             append_tool_batch_results(
                 &mut messages,
@@ -3730,6 +3743,9 @@ struct RuntimeToolGroupExecution {
     running_cancellations: usize,
 }
 
+// Bounds cooperative cleanup of active calls; queued calls still fail the scope gate.
+const TOOL_SETTLEMENT_GRACE: Duration = Duration::from_secs(3);
+
 async fn execute_runtime_tool_group<I>(
     invoker: &I,
     group: &[PreparedRuntimeToolCall],
@@ -3774,6 +3790,16 @@ where
             () = cancellation.cancelled() => {
                 let running = observation.active();
                 let queued = remaining.len().saturating_sub(running);
+                let drain = async {
+                    while let Some((index, result)) = executions.next().await {
+                        remaining.remove(&index);
+                        completions.push((index, result));
+                    }
+                };
+                switchy::unsync::select! {
+                    () = drain => {},
+                    () = sleep(TOOL_SETTLEMENT_GRACE) => {},
+                }
                 completions.extend(
                     remaining
                         .iter()
@@ -3893,13 +3919,20 @@ impl InvocationLifecycleGuard {
     }
 
     fn cancel(&mut self) -> bool {
+        self.cancel_with_message(
+            "Tool cancelled; execution outcome is unknown. Side effects may have occurred."
+                .to_owned(),
+        )
+    }
+
+    fn cancel_with_message(&mut self, message: String) -> bool {
         self.terminal = true;
         self.scope
             .emit_cancellation_lifecycle(ToolInvocationLifecycleEvent {
                 invocation_id: self.scope.invocation_id().to_string(),
                 sequence: u64::MAX,
                 stage: bcode_tool::ToolInvocationLifecycleStage::Cancelled,
-                message: None,
+                message: Some(message),
                 metadata: serde_json::Value::Null,
             })
     }
@@ -3953,6 +3986,10 @@ where
     let invocation = match invocation {
         Ok(invocation) => invocation,
         Err(error) => {
+            if !invocation_scope.accepts_work() {
+                let _ = lifecycle.cancel();
+                return Err(RuntimeError::Cancelled);
+            }
             tracing::info!(
                 target: "bcode::sdk",
                 event = "bcode.error",
@@ -3968,12 +4005,15 @@ where
             return Err(error);
         }
     };
-    if !scope.control().accepts_normal_output() {
-        let _ = lifecycle.cancel();
-        return Err(RuntimeError::Cancelled);
-    }
     let mut output = tool_execution_output(&prepared.call, invocation);
     apply_tool_result_policy(&mut output, result_policy);
+    if !scope.control().accepts_normal_output() {
+        let _ = lifecycle.cancel_with_message(format!(
+            "Tool cancelled; final invocation report: {}",
+            output.model_result.output
+        ));
+        return Err(RuntimeError::Cancelled);
+    }
     for event in &output.events {
         if matches!(event, AgentRuntimeEvent::ToolCallFinished(_)) {
             continue;
@@ -3982,7 +4022,10 @@ where
             if invocation_scope.accepts_work() {
                 let _ = lifecycle.finish(bcode_tool::ToolInvocationLifecycleStage::Failed);
             } else {
-                let _ = lifecycle.cancel();
+                let _ = lifecycle.cancel_with_message(format!(
+                    "Tool cancelled; final invocation report: {}",
+                    output.model_result.output
+                ));
             }
             return Err(RuntimeError::Cancelled);
         }
@@ -6769,6 +6812,9 @@ mod tests {
                         response_policy: ToolExchangeResponsePolicy::Required,
                     })
                     .await;
+                if matches!(resolution, ToolExchangeResolution::Cancelled) {
+                    return Err(RuntimeError::Cancelled);
+                }
                 assert!(matches!(
                     resolution,
                     ToolExchangeResolution::Responded { .. }
@@ -7245,17 +7291,17 @@ mod tests {
                 tokio::task::yield_now().await;
             }
             assert!(control.begin_cancellation());
+            assert_eq!(first.load(Ordering::SeqCst), 1);
+            assert_eq!(second.load(Ordering::SeqCst), 1);
         };
-        let output = tokio::time::timeout(Duration::from_secs(1), async {
+        let output = tokio::time::timeout(Duration::from_secs(5), async {
             let (output, ()) = tokio::join!(execution, cancellation);
             output
         })
         .await
-        .expect("local cancellation must not wait for invocations")
+        .expect("uncooperative invocations must not exceed bounded settlement")
         .expect("batch orchestration should finish");
 
-        assert_eq!(first.load(Ordering::SeqCst), 1);
-        assert_eq!(second.load(Ordering::SeqCst), 1);
         assert!(
             output
                 .results
@@ -7744,6 +7790,11 @@ mod tests {
         let output = output.expect("batch orchestration should finish");
 
         assert_eq!(invoker.started.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            invoker.active.load(Ordering::SeqCst),
+            0,
+            "active work must settle before the batch returns"
+        );
         assert_eq!(control.running_cancellation_count(), 1);
         assert_eq!(control.queued_cancellation_count(), 1);
         assert_eq!(control.discarded_normal_event_count(), 0);
@@ -7758,6 +7809,12 @@ mod tests {
                 .events
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
+            assert!(events.iter().any(|event| matches!(
+                event,
+                ScopedTurnEvent::InvocationLifecycle(event)
+                    if event.stage == ToolInvocationLifecycleStage::Cancelled
+                    && event.message.as_deref() == Some("Tool cancelled; final invocation report: called first")
+            )));
             events
                 .iter()
                 .filter_map(|event| match event {

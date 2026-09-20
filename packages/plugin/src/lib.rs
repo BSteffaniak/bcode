@@ -2592,6 +2592,18 @@ pub enum StreamingServiceInvocationEvent {
     Response(Result<ServiceResponse, PluginLoadError>),
 }
 
+/// Result of requesting cancellation and waiting for an invocation to settle.
+///
+/// Settlement acknowledges a final response, not rollback or successful execution.
+/// An unknown outcome must not be interpreted as proof that no side effects occurred.
+#[derive(Debug)]
+pub enum PluginInvocationSettlement {
+    /// The plugin finished and supplied its authoritative service response.
+    Settled(ServiceResponse),
+    /// The invocation did not supply a trustworthy response within the budget.
+    Unknown,
+}
+
 /// Running streaming plugin service invocation.
 ///
 /// Dropping before receiving the final response requests nonblocking cancellation. This
@@ -2617,6 +2629,53 @@ impl Drop for StreamingServiceInvocation {
 }
 
 impl StreamingServiceInvocation {
+    /// Request cancellation and wait at most `budget` for the final response.
+    ///
+    /// Intermediate presentation events are discarded rather than published after cancellation.
+    /// Executor-owned work retains its ownership until it actually exits, even on timeout.
+    /// Missing, failed, already-consumed, or timed-out responses produce an unknown outcome.
+    /// Callers remain responsible for publishing settlement through their terminal bookkeeping
+    /// boundary without reopening a cancelled operation.
+    pub async fn cancel_and_settle(&mut self, budget: Duration) -> PluginInvocationSettlement {
+        self.cancel.cancel();
+        self.events.close();
+        if self.completed {
+            return PluginInvocationSettlement::Unknown;
+        }
+        let response = tokio::time::timeout(budget, self.take_final_response()).await;
+        // Close the consumer even on timeout; the executor still owns active work.
+        self.complete();
+        match response {
+            Ok(Ok(StreamingServiceInvocationEvent::Response(Ok(response)))) => {
+                PluginInvocationSettlement::Settled(response)
+            }
+            _ => PluginInvocationSettlement::Unknown,
+        }
+    }
+
+    /// Settle a cancelled tool-service invocation using the shared bounded grace period.
+    ///
+    /// Returns the plugin's tool response when available. Unavailable or invalid responses
+    /// become an explicit error explaining that side effects are unknown; no retry is implied.
+    /// This does not publish results or change the owning turn's terminal state.
+    pub async fn settle_cancelled_tool(&mut self) -> bcode_tool::ToolInvocationResponse {
+        match self.cancel_and_settle(Duration::from_secs(2)).await {
+            PluginInvocationSettlement::Settled(response) => {
+                if let Ok(response) = decode_service_response(response) {
+                    return response;
+                }
+            }
+            PluginInvocationSettlement::Unknown => {}
+        }
+        bcode_tool::ToolInvocationResponse {
+            output: "Tool cancelled; execution outcome is unknown. Side effects may have occurred; inspect the affected resources before retrying.".to_owned(),
+            is_error: true,
+            content: Vec::new(),
+            full_output: None,
+            result: None,
+        }
+    }
+
     /// Wait for the next invocation event or final response.
     ///
     /// Queued events are always delivered before the final response, even when both are ready.
@@ -8240,6 +8299,173 @@ library = "libexample_plugin.dylib"
             drop(invocation);
             assert!(!cancellation.is_cancelled());
         });
+    }
+
+    #[tokio::test]
+    async fn cancelled_tool_settlement_decodes_response_or_reports_uncertainty() {
+        let expected = bcode_tool::ToolInvocationResponse {
+            output: "one committed".to_owned(),
+            is_error: true,
+            content: Vec::new(),
+            full_output: None,
+            result: None,
+        };
+        for valid in [true, false] {
+            let (response_tx, response) = oneshot::channel();
+            let (_events_tx, events) = mpsc::unbounded_channel();
+            let mut invocation = StreamingServiceInvocation {
+                response,
+                pending_response: None,
+                response_taken: false,
+                completed: false,
+                events,
+                cancel: PluginInvocationCancelHandle {
+                    id: PluginInvocationId(1),
+                    cancellation: bcode_plugin_sdk::ServiceCancellation::default(),
+                },
+                resource_permit: None,
+            };
+            response_tx
+                .send(Ok(if valid {
+                    ServiceResponse::json(&expected).unwrap()
+                } else {
+                    ServiceResponse::text("invalid tool response")
+                }))
+                .unwrap();
+            let response = invocation.settle_cancelled_tool().await;
+            drop(invocation);
+            if valid {
+                assert_eq!(response, expected);
+            } else {
+                assert!(response.is_error);
+                assert!(response.output.contains("outcome is unknown"));
+                assert!(response.result.is_none());
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn cancellation_waits_for_active_tool_response_after_signal() {
+        let (response_tx, response) = oneshot::channel();
+        let (events_tx, events) = mpsc::unbounded_channel();
+        let cancellation = bcode_plugin_sdk::ServiceCancellation::default();
+        let mut invocation = StreamingServiceInvocation {
+            response,
+            pending_response: None,
+            response_taken: false,
+            completed: false,
+            events,
+            cancel: PluginInvocationCancelHandle {
+                id: PluginInvocationId(1),
+                cancellation: cancellation.clone(),
+            },
+            resource_permit: None,
+        };
+        let expected = bcode_tool::ToolInvocationResponse {
+            output: "active operation committed; remaining work cancelled".to_owned(),
+            is_error: true,
+            content: Vec::new(),
+            full_output: None,
+            result: None,
+        };
+        let final_response = expected.clone();
+        let worker = tokio::spawn(async move {
+            while !cancellation.is_cancelled() {
+                tokio::task::yield_now().await;
+            }
+            // The active operation finishes only after observing cancellation.
+            assert!(events_tx.send(b"late presentation".to_vec()).is_err());
+            response_tx
+                .send(Ok(ServiceResponse::json(&final_response).unwrap()))
+                .unwrap();
+        });
+        let settled =
+            tokio::time::timeout(Duration::from_secs(5), invocation.settle_cancelled_tool())
+                .await
+                .expect("settlement must remain bounded");
+        worker.await.unwrap();
+        assert_eq!(settled, expected);
+        assert!(invocation.next_event().await.is_err());
+        let repeated = invocation.settle_cancelled_tool().await;
+        drop(invocation);
+        assert!(repeated.is_error);
+        assert!(repeated.output.contains("outcome is unknown"));
+    }
+
+    #[tokio::test]
+    async fn cancellation_settlement_preserves_response_and_discards_events() {
+        let (response_tx, response) = oneshot::channel();
+        let (events_tx, events) = mpsc::unbounded_channel();
+        let cancellation = bcode_plugin_sdk::ServiceCancellation::default();
+        let mut invocation = StreamingServiceInvocation {
+            response,
+            pending_response: None,
+            response_taken: false,
+            completed: false,
+            events,
+            cancel: PluginInvocationCancelHandle {
+                id: PluginInvocationId(1),
+                cancellation: cancellation.clone(),
+            },
+            resource_permit: None,
+        };
+        events_tx.send(b"presentation".to_vec()).unwrap();
+        response_tx
+            .send(Ok(ServiceResponse::text(
+                "one committed; two not attempted",
+            )))
+            .unwrap();
+        let settlement = invocation.cancel_and_settle(Duration::from_secs(1)).await;
+        assert!(cancellation.is_cancelled());
+        let super::PluginInvocationSettlement::Settled(response) = settlement else {
+            panic!("expected settled response");
+        };
+        assert_eq!(
+            response,
+            ServiceResponse::text("one committed; two not attempted")
+        );
+        assert!(events_tx.send(b"late".to_vec()).is_err());
+        assert!(invocation.next_event().await.is_err());
+        assert!(matches!(
+            invocation.cancel_and_settle(Duration::ZERO).await,
+            super::PluginInvocationSettlement::Unknown
+        ));
+        drop(invocation);
+    }
+
+    #[tokio::test]
+    async fn cancellation_settlement_reports_unknown_for_lost_or_unsettled_work() {
+        for lost in [false, true] {
+            let (response_tx, response) = oneshot::channel();
+            let (_events_tx, events) = mpsc::unbounded_channel();
+            let cancellation = bcode_plugin_sdk::ServiceCancellation::default();
+            let mut invocation = StreamingServiceInvocation {
+                response,
+                pending_response: None,
+                response_taken: false,
+                completed: false,
+                events,
+                cancel: PluginInvocationCancelHandle {
+                    id: PluginInvocationId(1),
+                    cancellation: cancellation.clone(),
+                },
+                resource_permit: None,
+            };
+            let sender = if lost {
+                drop(response_tx);
+                None
+            } else {
+                Some(response_tx)
+            };
+            assert!(matches!(
+                invocation.cancel_and_settle(Duration::from_millis(1)).await,
+                super::PluginInvocationSettlement::Unknown
+            ));
+            assert!(cancellation.is_cancelled());
+            assert!(invocation.next_event().await.is_err());
+            drop(invocation);
+            drop(sender);
+        }
     }
 
     #[tokio::test]

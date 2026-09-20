@@ -193,36 +193,403 @@ fn static_shell_runtime() -> bcode_plugin::PluginRuntimeHost {
 }
 
 fn dynamic_shell_runtime() -> bcode_plugin::PluginRuntimeHost {
+    dynamic_plugin_runtime("shell", "bcode.shell")
+}
+
+fn dynamic_plugin_runtime(domain: &str, plugin_id: &str) -> bcode_plugin::PluginRuntimeHost {
     let executable = std::env::current_exe().expect("current test executable path");
     let directory = executable.parent().expect("test executable parent");
     let target_profile = directory
         .parent()
         .expect("test executable profile directory");
     let exact_library_name = format!(
-        "{}bcode_shell_plugin{}",
+        "{}bcode_{domain}_plugin{}",
         std::env::consts::DLL_PREFIX,
         std::env::consts::DLL_SUFFIX
     );
     let library = target_profile.join(&exact_library_name);
     assert!(
         library.is_file(),
-        "build the standalone shell plugin with `cargo build -p bcode_shell_plugin` before adapter conformance; expected {}",
+        "build the standalone {domain} plugin with `cargo build -p bcode_{domain}_plugin` before adapter conformance; expected {}",
         library.display(),
     );
-    let root =
-        std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../plugins/shell-plugin");
+    let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join(format!("../../plugins/{domain}-plugin"));
     let mut registered = bcode_plugin::discover_plugins_in_roots(&[root])
-        .expect("shell plugin manifest should be discovered");
+        .expect("plugin manifest should be discovered");
     let plugin = registered
         .iter_mut()
-        .find(|plugin| plugin.manifest.id == "bcode.shell")
-        .expect("shell plugin should be registered");
+        .find(|plugin| plugin.manifest.id == plugin_id)
+        .expect("plugin should be registered");
     let bcode_plugin::PluginRuntime::Native(runtime) = &mut plugin.manifest.runtime;
     runtime.library = library;
     bcode_plugin::PluginRuntimeHost::from(
         bcode_plugin::PluginHost::load_registered_plugins(std::slice::from_ref(plugin))
             .expect("shell plugin should load dynamically"),
     )
+}
+
+#[tokio::test]
+async fn embedded_filesystem_batch_prepares_and_commits_both_targets() {
+    let directory = tempfile::tempdir().expect("workspace");
+    let first = directory.path().join("first.txt");
+    let second = directory.path().join("second.txt");
+    std::fs::write(&first, "alpha\r\n").expect("first fixture");
+    std::fs::write(&second, "beta\n").expect("second fixture");
+    let agent = Agent::builder()
+        .plugin_runtime(dynamic_plugin_runtime("filesystem", "bcode.filesystem"))
+        .plugin_tool(
+            ToolDefinition {
+                name: "filesystem.multi_edit".to_owned(),
+                description: "batch integration".to_owned(),
+                input_schema: serde_json::json!({"type":"object"}),
+            },
+            "bcode.filesystem",
+        )
+        .authorization_coordinator(Arc::new(AllowAuthorization))
+        .build();
+    let output = agent
+        .execute_tool_call(&ToolCall {
+            id: "embedded-batch".to_owned(),
+            name: "filesystem.multi_edit".to_owned(),
+            arguments: serde_json::json!({"files":[
+                {"path":first,"edits":[{"old_text":"alpha","new_text":"one"}]},
+                {"path":second,"edits":[{"old_text":"beta","new_text":"two"}]}
+            ]}),
+        })
+        .await
+        .expect("batch invocation");
+    assert!(!output.invocation.is_error, "{}", output.invocation.output);
+    assert_eq!(std::fs::read(&first).unwrap(), b"one\r\n");
+    assert_eq!(std::fs::read(&second).unwrap(), b"two\n");
+    let outcome: serde_json::Value = serde_json::from_str(&output.invocation.output).unwrap();
+    assert_eq!(outcome["files"][0]["status"], "committed");
+    assert_eq!(outcome["files"][1]["status"], "committed");
+    assert!(output.invocation.result.is_some());
+
+    // Validation of a later target must precede publication of an earlier one.
+    let rejected = agent
+        .execute_tool_call(&ToolCall {
+            id: "embedded-invalid-batch".to_owned(),
+            name: "filesystem.multi_edit".to_owned(),
+            arguments: serde_json::json!({"files":[
+                {"path":first,"edits":[{"old_text":"one","new_text":"unexpected"}]},
+                {"path":second,"edits":[{"old_text":"missing","new_text":"unexpected"}]}
+            ]}),
+        })
+        .await
+        .expect("validation failure is a tool outcome");
+    assert!(rejected.invocation.is_error);
+    assert_eq!(std::fs::read(&first).unwrap(), b"one\r\n");
+    assert_eq!(std::fs::read(&second).unwrap(), b"two\n");
+    assert_eq!(std::fs::read_dir(directory.path()).unwrap().count(), 2);
+}
+
+#[derive(Debug, Default)]
+struct BoundedSnapshotSink(Mutex<std::collections::BTreeMap<String, Vec<u8>>>);
+
+impl InvocationArtifactSink for BoundedSnapshotSink {
+    fn write(
+        &self,
+        request: ToolArtifactWriteRequest,
+        commit: ArtifactCommitGuard,
+    ) -> InvocationCapabilityFuture<'_, ToolArtifactWriteResolution> {
+        Box::pin(async move {
+            if request.bytes.len() > 4096 {
+                return ToolArtifactWriteResolution::TooLarge { max_bytes: 4096 };
+            }
+            commit
+                .commit(|| {
+                    let byte_len = u64::try_from(request.bytes.len()).unwrap();
+                    let uri = format!("artifact://{}", request.artifact_id);
+                    self.0.lock().unwrap().insert(uri.clone(), request.bytes);
+                    ToolArtifactWriteResolution::Written {
+                        artifact_id: request.artifact_id,
+                        byte_len,
+                        reference: serde_json::json!({"uri":uri}),
+                    }
+                })
+                .unwrap_or(ToolArtifactWriteResolution::Cancelled)
+        })
+    }
+}
+
+#[tokio::test]
+async fn embedded_filesystem_retains_oversized_sources_through_artifact_sink() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("large.txt");
+    let before = format!("old{}", "界".repeat(30000));
+    let after = before.replacen("old", "new", 1);
+    std::fs::write(&path, &before).unwrap();
+    let sink = Arc::new(BoundedSnapshotSink::default());
+    let agent = Agent::builder()
+        .plugin_runtime(dynamic_plugin_runtime("filesystem", "bcode.filesystem"))
+        .plugin_tool(
+            ToolDefinition {
+                name: "filesystem.multi_edit".to_owned(),
+                description: "retention integration".to_owned(),
+                input_schema: serde_json::json!({"type":"object"}),
+            },
+            "bcode.filesystem",
+        )
+        .authorization_coordinator(Arc::new(AllowAuthorization))
+        .artifact_sink(sink.clone())
+        .build();
+    let output = agent.execute_tool_call(&ToolCall {
+        id: "retained-batch".to_owned(),
+        name: "filesystem.multi_edit".to_owned(),
+        arguments: serde_json::json!({"files":[{"path":path,"edits":[{"old_text":"old","new_text":"new"}]}]}),
+    }).await.unwrap();
+    assert!(!output.invocation.is_error, "{}", output.invocation.output);
+    assert_eq!(std::fs::read(&path).unwrap(), after.as_bytes());
+    let outcome: serde_json::Value = serde_json::from_str(&output.invocation.output).unwrap();
+    let stored = sink.0.lock().unwrap();
+    let diff = format!(
+        "--- before\n+++ after\n@@ -1,1 +1,1 @@\n-{before}\n\\ No newline at end of file\n+{after}\n\\ No newline at end of file\n"
+    );
+    for (side, expected) in [("old", before), ("new", after), ("diff", diff)] {
+        let source = &outcome["files"][0]["change"]["retained"][side];
+        assert_eq!(source["version"], 1);
+        let mut reconstructed = Vec::new();
+        for part in source["parts"].as_array().expect("multipart source") {
+            assert_eq!(part["offset"], reconstructed.len());
+            let bytes = &stored[part["reference"]["uri"].as_str().unwrap()];
+            assert_eq!(part["byte_len"], bytes.len());
+            reconstructed.extend_from_slice(bytes);
+        }
+        assert_eq!(reconstructed, expected.as_bytes());
+    }
+}
+
+#[tokio::test]
+async fn embedded_filesystem_denial_prevents_mutation_and_retention() {
+    let directory = tempfile::tempdir().unwrap();
+    let first = directory.path().join("first.txt");
+    let second = directory.path().join("second.txt");
+    std::fs::write(&first, "one").unwrap();
+    std::fs::write(&second, "two").unwrap();
+    let sink = Arc::new(BoundedSnapshotSink::default());
+    let agent = Agent::builder()
+        .plugin_runtime(dynamic_plugin_runtime("filesystem", "bcode.filesystem"))
+        .plugin_tool(
+            ToolDefinition {
+                name: "filesystem.multi_edit".to_owned(),
+                description: "denial integration".to_owned(),
+                input_schema: serde_json::json!({"type":"object"}),
+            },
+            "bcode.filesystem",
+        )
+        .cwd(directory.path().canonicalize().unwrap())
+        .agent_config(bcode::AgentConfig {
+            accent: None,
+            tools: Default::default(),
+            permission: bcode::PermissionConfig {
+                edit: std::collections::BTreeMap::from([
+                    ("**/first.txt".to_owned(), bcode::Action::Allow),
+                    ("**/second.txt".to_owned(), bcode::Action::Deny),
+                ]),
+                ..Default::default()
+            },
+        })
+        .artifact_sink(sink.clone())
+        .build();
+    let output = agent
+        .execute_tool_call(&ToolCall {
+            id: "denied-batch".to_owned(),
+            name: "filesystem.multi_edit".to_owned(),
+            arguments: serde_json::json!({"files":[
+                {"path":first,"edits":[{"old_text":"one","new_text":"changed"}]},
+                {"path":second,"edits":[{"old_text":"two","new_text":"changed"}]}
+            ]}),
+        })
+        .await;
+    assert!(output.is_err(), "denied invocation must fail");
+    assert_eq!(std::fs::read(&first).unwrap(), b"one");
+    assert_eq!(std::fs::read(&second).unwrap(), b"two");
+    assert_eq!(std::fs::read_dir(directory.path()).unwrap().count(), 2);
+    assert!(sink.0.lock().unwrap().is_empty());
+
+    // The allowed target succeeds alone, so the batch rejection above is not a
+    // blanket tool denial or an unrelated preparation failure.
+    let allowed = agent
+        .execute_tool_call(&ToolCall {
+            id: "allowed-single-target".to_owned(),
+            name: "filesystem.multi_edit".to_owned(),
+            arguments: serde_json::json!({"files":[
+                {"path":first,"edits":[{"old_text":"one","new_text":"changed"}]}
+            ]}),
+        })
+        .await
+        .expect("first target policy allows editing");
+    assert!(
+        !allowed.invocation.is_error,
+        "{}",
+        allowed.invocation.output
+    );
+    assert_eq!(std::fs::read(&first).unwrap(), b"changed");
+    assert_eq!(std::fs::read(&second).unwrap(), b"two");
+}
+
+#[derive(Debug)]
+struct CancelAuthorization;
+
+impl ToolAuthorizationCoordinator for CancelAuthorization {
+    fn authorize_batch<'a>(
+        &'a self,
+        requests: &'a [ToolAuthorizationRequest],
+        scope: &'a bcode_agent_runtime::TurnScope,
+    ) -> bcode::RuntimeFuture<'a, Vec<ToolAuthorizationDecision>> {
+        Box::pin(async move {
+            assert!(scope.control().begin_cancellation());
+            Ok(requests
+                .iter()
+                .map(|_| ToolAuthorizationDecision::Allow)
+                .collect())
+        })
+    }
+}
+
+#[tokio::test]
+async fn embedded_filesystem_cancelled_admission_prevents_mutation() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("unchanged.txt");
+    std::fs::write(&path, "before").unwrap();
+    let sink = Arc::new(BoundedSnapshotSink::default());
+    let agent = Agent::builder()
+        .plugin_runtime(dynamic_plugin_runtime("filesystem", "bcode.filesystem"))
+        .plugin_tool(
+            ToolDefinition {
+                name: "filesystem.multi_edit".to_owned(),
+                description: "cancelled admission integration".to_owned(),
+                input_schema: serde_json::json!({"type":"object"}),
+            },
+            "bcode.filesystem",
+        )
+        .authorization_coordinator(Arc::new(CancelAuthorization))
+        .artifact_sink(sink.clone())
+        .build();
+    let result = agent
+        .execute_tool_call(&ToolCall {
+            id: "cancelled-batch".to_owned(),
+            name: "filesystem.multi_edit".to_owned(),
+            arguments: serde_json::json!({"files":[
+                {"path":path,"edits":[{"old_text":"before","new_text":"after"}]}
+            ]}),
+        })
+        .await;
+    assert!(result.is_err());
+    assert_eq!(std::fs::read(&path).unwrap(), b"before");
+    assert_eq!(std::fs::read_dir(directory.path()).unwrap().count(), 1);
+    assert!(sink.0.lock().unwrap().is_empty());
+}
+
+#[derive(Default)]
+struct CancelAfterPublication(Mutex<Option<Arc<bcode_agent_runtime::TurnControl>>>);
+
+impl ToolAuthorizationCoordinator for CancelAfterPublication {
+    fn authorize_batch<'a>(
+        &'a self,
+        requests: &'a [ToolAuthorizationRequest],
+        scope: &'a bcode_agent_runtime::TurnScope,
+    ) -> bcode::RuntimeFuture<'a, Vec<ToolAuthorizationDecision>> {
+        Box::pin(async move {
+            *self.0.lock().unwrap() = Some(scope.control());
+            Ok(requests
+                .iter()
+                .map(|_| ToolAuthorizationDecision::Allow)
+                .collect())
+        })
+    }
+}
+
+impl InvocationArtifactSink for CancelAfterPublication {
+    fn write(
+        &self,
+        _request: ToolArtifactWriteRequest,
+        _commit: ArtifactCommitGuard,
+    ) -> InvocationCapabilityFuture<'_, ToolArtifactWriteResolution> {
+        Box::pin(async move {
+            // Oversized change retention occurs only after publication. Cancel here,
+            // not on a timer, so the test necessarily exercises an active invocation.
+            self.0
+                .lock()
+                .unwrap()
+                .as_ref()
+                .unwrap()
+                .begin_cancellation();
+            ToolArtifactWriteResolution::Cancelled
+        })
+    }
+}
+
+#[tokio::test]
+async fn embedded_filesystem_active_cancellation_preserves_committed_outcome() {
+    let directory = tempfile::tempdir().unwrap();
+    let first = directory.path().join("first.txt");
+    let second = directory.path().join("second.txt");
+    let before = format!("old{}", "界".repeat(30000));
+    std::fs::write(&first, &before).unwrap();
+    std::fs::write(&second, "untouched").unwrap();
+    let cancellation = Arc::new(CancelAfterPublication::default());
+    let observer = Arc::new(ContributionObserver::default());
+    let agent = Agent::builder()
+        .plugin_runtime(dynamic_plugin_runtime("filesystem", "bcode.filesystem"))
+        .plugin_tool(
+            ToolDefinition {
+                name: "filesystem.multi_edit".to_owned(),
+                description: "active cancellation integration".to_owned(),
+                input_schema: serde_json::json!({"type":"object"}),
+            },
+            "bcode.filesystem",
+        )
+        .authorization_coordinator(cancellation.clone())
+        .artifact_sink(cancellation)
+        .event_observability(observer.clone())
+        .build();
+    let output = agent
+        .execute_tool_call(&ToolCall {
+            id: "active-cancellation".to_owned(),
+            name: "filesystem.multi_edit".to_owned(),
+            arguments: serde_json::json!({"files":[
+                {"path":first,"edits":[{"old_text":"old","new_text":"new"}]},
+                {"path":second,"edits":[{"old_text":"untouched","new_text":"unexpected"}]}
+            ]}),
+        })
+        .await;
+    assert!(matches!(
+        output,
+        Err(bcode::BcodeError::Runtime(
+            bcode_agent_runtime::RuntimeError::Cancelled
+        ))
+    ));
+    let events = observer.lifecycle.lock().unwrap();
+    let terminal = events
+        .last()
+        .expect("client receives cancelled terminal outcome");
+    assert_eq!(
+        terminal.stage,
+        bcode_tool::ToolInvocationLifecycleStage::Cancelled
+    );
+    assert!(!events.iter().any(|event| matches!(
+        event.stage,
+        bcode_tool::ToolInvocationLifecycleStage::Completed
+            | bcode_tool::ToolInvocationLifecycleStage::Failed
+    )));
+    let report = terminal
+        .message
+        .as_ref()
+        .unwrap()
+        .strip_prefix("Tool cancelled; final invocation report: ")
+        .unwrap();
+    let outcome: serde_json::Value = serde_json::from_str(report).unwrap();
+    assert_eq!(outcome["files"][0]["status"], "committed");
+    assert_eq!(outcome["files"][1]["status"], "cancelled");
+    assert_eq!(
+        std::fs::read_to_string(first).unwrap(),
+        before.replacen("old", "new", 1)
+    );
+    assert_eq!(std::fs::read_to_string(second).unwrap(), "untouched");
+    assert_eq!(std::fs::read_dir(directory.path()).unwrap().count(), 2);
 }
 
 async fn assert_direct_batch_overlaps() {
