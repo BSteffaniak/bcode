@@ -10,6 +10,8 @@
 //! deserialize/persist/replay round trip.
 
 mod discovery;
+/// Provider-owned conversion of external conversation history.
+pub mod history;
 
 use base64::Engine as _;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
