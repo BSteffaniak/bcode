@@ -8280,6 +8280,16 @@ async fn refresh_chatgpt_auth_if_needed_at(
     if *expires_at > unix_timestamp() + 60 {
         return Ok(None);
     }
+    if profile
+        .as_deref()
+        .is_none_or(|profile| profile.trim().is_empty())
+    {
+        return Err(provider_error(
+            "token_refresh_persist_failed",
+            ProviderErrorCategory::Auth,
+            "credential refresh requires an owned auth profile",
+        ));
+    }
     let refreshed = refresh_openai_codex_token_at(token_url, refresh_token).await?;
     let next_refresh_token = refreshed
         .refresh_token
@@ -9279,6 +9289,7 @@ mod tests {
         let turn = TurnState::default();
         let server_turn = turn.clone();
         let (release, released) = std::sync::mpsc::channel();
+        let (arrived, arrival) = tokio::sync::oneshot::channel();
         let server = thread::spawn(move || {
             let deadline = std::time::Instant::now() + Duration::from_secs(5);
             let (mut stream, _) = loop {
@@ -9301,6 +9312,7 @@ mod tests {
             let mut byte = [0];
             assert_eq!(stream.read(&mut byte).unwrap(), 1);
             server_turn.cancel();
+            let _ = arrived.send(());
             // Do not send headers until the cancelled attempt has returned.
             let _ = released.recv_timeout(Duration::from_secs(5));
         });
@@ -9317,11 +9329,18 @@ mod tests {
             .provider_context
             .env
             .insert("BCODE_OPENAI_API_KEY".into(), "test-key".into());
-        let result = tokio::time::timeout(
-            Duration::from_secs(2),
-            stream_chat_completion(&request, &turn),
-        )
-        .await;
+        let attempt = stream_chat_completion(&request, &turn);
+        tokio::pin!(attempt);
+        // Connection setup is not cancellation latency. Start the strict deadline
+        // only once the server has received request data and cancelled the turn.
+        tokio::select! {
+            biased;
+            result = tokio::time::timeout(Duration::from_secs(10), arrival) => {
+                result.expect("request setup deadline").expect("server arrival signal");
+            }
+            () = &mut attempt => panic!("attempt finished before server cancellation"),
+        }
+        let result = tokio::time::timeout(Duration::from_secs(2), &mut attempt).await;
         let _ = release.send(());
         server.join().unwrap();
         result.expect("cancelled turn must finish while headers are withheld");
@@ -9854,6 +9873,43 @@ mod tests {
             .expect_err("device timeout");
         assert!(error.contains("timed out"));
         assert!(state.lock().expect("auth state").auth_flows.is_empty());
+    }
+
+    #[test]
+    fn expired_auth_without_an_owner_is_rejected_before_refresh() {
+        let runtime = ProviderRuntime::new().expect("runtime");
+        for profile in [None, Some(String::new()), Some("  ".to_owned())] {
+            let mut settings = settings_for_context(&ProviderRequestContext::default());
+            settings.auth = AuthSettings::ChatGpt {
+                access_token: "expired-access".to_owned(),
+                refresh_token: Some("unowned-refresh".to_owned()),
+                expires_at: Some(1),
+                account_id: None,
+                profile,
+            };
+            let (settings, result) = runtime
+                .block_on(async move {
+                    let result =
+                        refresh_chatgpt_auth_if_needed_at(&mut settings, "not-a-network-url").await;
+                    (settings, result)
+                })
+                .expect("runtime");
+            let Err(error) = result else {
+                panic!("unowned refresh must fail");
+            };
+            assert_eq!(error.code, "token_refresh_persist_failed");
+            assert!(!error.message.contains("unowned-refresh"));
+            let AuthSettings::ChatGpt {
+                access_token,
+                refresh_token,
+                ..
+            } = settings.auth
+            else {
+                panic!("expected ChatGPT auth");
+            };
+            assert_eq!(access_token, "expired-access");
+            assert_eq!(refresh_token.as_deref(), Some("unowned-refresh"));
+        }
     }
 
     #[test]
