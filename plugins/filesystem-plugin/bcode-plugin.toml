@@ -28,11 +28,21 @@ request_schema_version       = 1
 tool_name                    = "filesystem.edit"
 
 [[tool_presentations]]
-request_draft_schema         = "bcode.filesystem.request"
+request_draft_schema         = "bcode.filesystem.request-draft.multi-edit"
 request_draft_schema_version = 1
 request_schema               = "bcode.filesystem.request"
 request_schema_version       = 1
 tool_name                    = "filesystem.multi_edit"
+
+[[visual_adapters]]
+artifact_schema    = "bcode.filesystem.request-draft.multi-edit"
+id                 = "filesystem-multi-edit-request-draft"
+max_schema_version = 1
+min_schema_version = 1
+priority           = 110
+producer_default   = true
+render_mode        = "full_block"
+surfaces           = ["tui"]
 
 [[visual_adapters]]
 artifact_schema    = "bcode.filesystem.batch"

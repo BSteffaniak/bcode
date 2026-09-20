@@ -93,6 +93,7 @@ impl bcode_plugin_sdk::tui::PluginTuiVisualAdapter for FilesystemTuiVisualAdapte
                 | "bcode.filesystem.artifact.grep"
                 | "bcode.filesystem.request-draft.write"
                 | "bcode.filesystem.request-draft.edit"
+                | "bcode.filesystem.request-draft.multi-edit"
         )
     }
 
@@ -105,6 +106,7 @@ impl bcode_plugin_sdk::tui::PluginTuiVisualAdapter for FilesystemTuiVisualAdapte
             kind,
             "bcode.filesystem.request-draft.write"
                 | "bcode.filesystem.request-draft.edit"
+                | "bcode.filesystem.request-draft.multi-edit"
                 | "bcode.filesystem.request"
         ) {
             bcode_plugin_sdk::tui::PluginTuiVisualRenderMode::FullBlock
@@ -125,6 +127,9 @@ impl bcode_plugin_sdk::tui::PluginTuiVisualAdapter for FilesystemTuiVisualAdapte
         ACTIVE_THEME.with(|theme| theme.set(context.theme()));
         let result = match kind {
             "bcode.filesystem.request" => request_layout(payload, context),
+            "bcode.filesystem.request-draft.multi-edit" => {
+                multi_edit_draft_layout(payload, context)
+            }
             "bcode.filesystem.request-draft.write" | "bcode.filesystem.request-draft.edit" => {
                 request_draft_layout(kind, payload, context)
             }
@@ -159,6 +164,9 @@ impl bcode_plugin_sdk::tui::PluginTuiVisualAdapter for FilesystemTuiVisualAdapte
         ACTIVE_THEME.with(|theme| theme.set(context.theme()));
         let width = context.width();
         let rows = match kind {
+            "bcode.filesystem.request-draft.multi-edit" => {
+                multi_edit_draft_layout(payload, context).0
+            }
             "bcode.filesystem.request" => request_rows(payload, context),
             "bcode.filesystem.request-draft.write" | "bcode.filesystem.request-draft.edit" => {
                 request_draft_rows(kind, payload, width, context)
@@ -181,6 +189,105 @@ impl bcode_plugin_sdk::tui::PluginTuiVisualAdapter for FilesystemTuiVisualAdapte
         ACTIVE_THEME.with(|theme| theme.set(None));
         rows
     }
+}
+
+// Read only the requested structural level: edit text may itself contain JSON.
+fn partial_json_members(input: &str, array: bool) -> Vec<(String, &str)> {
+    let mut cursor = skip_json_whitespace(input, 0);
+    let opening = if array { '[' } else { '{' };
+    if !input[cursor..].starts_with(opening) {
+        return Vec::new();
+    }
+    cursor += 1;
+    let mut members = Vec::new();
+    while members.len() < 1024 {
+        cursor = skip_json_whitespace(input, cursor);
+        if cursor == input.len() || input[cursor..].starts_with(['}', ']']) {
+            break;
+        }
+        let key = if array {
+            String::new()
+        } else {
+            let Some((key, end, true)) = parse_json_string_at(input, cursor) else {
+                break;
+            };
+            cursor = skip_json_whitespace(input, end);
+            if !input[cursor..].starts_with(':') {
+                break;
+            }
+            cursor = skip_json_whitespace(input, cursor + 1);
+            key
+        };
+        let end = skip_json_value(input, cursor);
+        members.push((key, &input[cursor..end]));
+        cursor = skip_json_whitespace(input, end);
+        if !input[cursor..].starts_with(',') {
+            break;
+        }
+        cursor += 1;
+    }
+    members
+}
+
+fn multi_edit_draft_layout(
+    payload: &Value,
+    context: &bcode_plugin_sdk::tui::PluginTuiVisualRenderContext,
+) -> (
+    Vec<Line>,
+    Vec<bcode_plugin_sdk::tui_visual::TuiVisualAnchor>,
+) {
+    let preview = text(payload, "preview").unwrap_or_default();
+    let mut end = preview.len().min(64 * 1024);
+    while !preview.is_char_boundary(end) {
+        end -= 1;
+    }
+    let members = partial_json_members(&preview[..end], false);
+    let files = members.iter().find(|(key, _)| key == "files");
+    let mut rows = card_header("Filesystem multi-edit · assembling…");
+    let mut anchors = Vec::new();
+    if let Some((_, files)) = files {
+        for (file_index, (_, file)) in partial_json_members(files, true)
+            .into_iter()
+            .take(64)
+            .enumerate()
+        {
+            let fields = partial_json_object_strings(file);
+            let path = fields.get("path").map_or("<path pending>", String::as_str);
+            let members = partial_json_members(file, false);
+            let Some((_, edits)) = members.iter().find(|(key, _)| key == "edits") else {
+                push_path_kv(&mut rows, "path", Some(path), context);
+                continue;
+            };
+            for (edit_index, (_, edit)) in partial_json_members(edits, true).into_iter().enumerate()
+            {
+                if rows.len() >= 1024 {
+                    rows.push(Line::from("Additional edits omitted from live preview"));
+                    return (rows, anchors);
+                }
+                let fields = partial_json_object_strings(edit);
+                let (edit_rows, edit_anchors) = file_change_layout(
+                    &serde_json::json!({
+                        "path": path,
+                        "old_text": fields.get("old_text"),
+                        "new_text": fields.get("new_text"),
+                        "title": format!("Proposed edit {} · assembling…", edit_index + 1),
+                        "subtitle": "not applied · fragment line numbers pending execution",
+                        "argument_bytes": payload.get("argument_bytes"),
+                        "truncated": end < preview.len() || payload["truncated"] == true,
+                    }),
+                    context,
+                );
+                let offset = rows.len();
+                anchors.extend(edit_anchors.into_iter().map(|mut anchor| {
+                    anchor.key = format!("draft:{file_index}:{edit_index}:{}", anchor.key);
+                    anchor.row += offset;
+                    anchor
+                }));
+                rows.extend(edit_rows);
+            }
+        }
+    }
+    (rows, anchors)
 }
 
 fn request_draft_rows(
@@ -364,7 +471,7 @@ fn skip_json_value(input: &str, start: usize) -> usize {
             '"' => in_string = true,
             '{' | '[' => depth = depth.saturating_add(1),
             '}' | ']' if depth > 0 => depth = depth.saturating_sub(1),
-            ',' | '}' if depth == 0 => return start.saturating_add(offset),
+            ']' | ',' | '}' if depth == 0 => return start.saturating_add(offset),
             _ => {}
         }
     }
@@ -1087,6 +1194,46 @@ mod tests {
             .iter()
             .map(|span| span.content.as_ref() as &str)
             .collect::<String>()
+    }
+
+    #[test]
+    fn multi_edit_drafts_show_partial_nested_edits_before_execution() {
+        use bcode_plugin_sdk::tui::PluginTuiVisualAdapter;
+        let adapter = FilesystemTuiVisualAdapter::default();
+        let schema = "bcode.filesystem.request-draft.multi-edit";
+        assert!(adapter.supports(schema));
+        for width in [0, 1, 8, 80, 160] {
+            let context = bcode_plugin_sdk::tui::PluginTuiVisualRenderContext::new(
+                width,
+                bcode_plugin_sdk::tui::PluginTuiDiffLayout::Unified,
+                None,
+            );
+            let preview = r#"{"files":[{"path":"one.rs","edits":[{"old_text":"before","new_text":"after"},{"old_text":"other","new_text":"changed"}]},{"edits":[{"new_text":"世界🙂e\u0301"}],"path":"two.rs"},{"path":"three.rs","edits":[{"old_text":"last","new_text":"arriving"#;
+            for end in (0..=preview.len()).filter(|end| preview.is_char_boundary(*end)) {
+                let payload =
+                    serde_json::json!({"preview": &preview[..end], "argument_bytes": end});
+                let (rows, anchors) = adapter.layout(schema, &payload, &context);
+                assert!(anchors.iter().all(|anchor| anchor.row < rows.len()));
+                if width == 80 && end == preview.len() {
+                    let rendered = rows.iter().map(line_text).collect::<Vec<_>>().join("\n");
+                    for expected in [
+                        "one.rs",
+                        "two.rs",
+                        "three.rs",
+                        "after",
+                        "changed",
+                        "世界",
+                        "arriving",
+                        "not applied",
+                    ] {
+                        assert!(
+                            rendered.contains(expected),
+                            "missing {expected}: {rendered}"
+                        );
+                    }
+                }
+            }
+        }
     }
 
     #[test]
