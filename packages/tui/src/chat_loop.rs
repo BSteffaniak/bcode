@@ -5212,6 +5212,9 @@ fn handle_artifact_completion(
     );
     let failures = loop_state.artifact_stream.failed_invocations();
     if let Some(presentation) = presentation.as_ref() {
+        for invocation_id in loop_state.artifact_stream.recovered_invocations() {
+            presentation.clear_artifact_failure(&invocation_id);
+        }
         for invocation_id in &failures {
             presentation.mark_artifact_unavailable(invocation_id);
         }

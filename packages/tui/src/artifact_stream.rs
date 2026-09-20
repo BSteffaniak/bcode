@@ -15,6 +15,25 @@ const ACTIVE_ARTIFACT_MAX_FAILURES: u32 = 8;
 
 type ActiveArtifactKey = (SessionId, String, String, String);
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ArtifactRevision {
+    Live(u64),
+    Persisted(u64),
+}
+
+impl ArtifactRevision {
+    // Persistence is an authority transition, not a numeric revision increment.
+    const fn supersedes(self, previous: Self) -> bool {
+        match (self, previous) {
+            (Self::Live(next), Self::Live(old)) | (Self::Persisted(next), Self::Persisted(old)) => {
+                next > old
+            }
+            (Self::Persisted(_), Self::Live(_)) => true,
+            (Self::Live(_), Self::Persisted(_)) => false,
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 struct ActiveArtifactTarget {
     producer_plugin_id: String,
@@ -22,7 +41,7 @@ struct ActiveArtifactTarget {
     schema_version: u32,
     content_type: Option<String>,
     committed_bytes: u64,
-    revision: u64,
+    revision: ArtifactRevision,
     finalized: bool,
 }
 
@@ -42,7 +61,7 @@ pub struct ActiveArtifactFetchCompletion {
     key: ActiveArtifactKey,
     requested_offset: u64,
     requested_end: u64,
-    target_revision: u64,
+    target_revision: ArtifactRevision,
     result: Result<bcode_client::SessionArtifactRange, ClientError>,
 }
 
@@ -71,14 +90,23 @@ fn validate_active_artifact_range(
     next_offset: u64,
     requested_end: u64,
     target: &ActiveArtifactTarget,
-    requested_revision: u64,
+    requested_revision: ArtifactRevision,
 ) -> Result<u64, &'static str> {
     let expected_end = range.next_offset();
+    let response_revision = range.finalized_event_seq.map_or(
+        ArtifactRevision::Live(range.reference_revision),
+        ArtifactRevision::Persisted,
+    );
     if range.offset != next_offset
         || expected_end > requested_end
         || range.total_bytes < expected_end
-        || requested_revision > target.revision
-        || range.reference_revision < requested_revision
+        || (requested_revision != target.revision
+            && !target.revision.supersedes(requested_revision))
+        || (response_revision != requested_revision
+            && !response_revision.supersedes(requested_revision))
+        || range
+            .finalized_event_seq
+            .is_some_and(|sequence| !range.finalized || sequence != range.reference_revision)
     {
         return Err("artifact range response did not match the requested committed prefix");
     }
@@ -204,6 +232,27 @@ impl ArtifactStreamCoordinator {
             .collect()
     }
 
+    pub(crate) fn recovered_invocations(&self) -> Vec<String> {
+        let mut recovered = BTreeMap::new();
+        for (key, state) in &self.artifact_fetches {
+            let healthy = state.terminal_error.is_none()
+                && state.retry_at.is_none()
+                && state
+                    .target
+                    .as_ref()
+                    .is_some_and(|target| state.next_offset >= target.committed_bytes);
+            recovered
+                .entry(&key.1)
+                .and_modify(|value| *value &= healthy)
+                .or_insert(healthy);
+        }
+        recovered
+            .into_iter()
+            .filter_map(|(id, healthy)| healthy.then(|| id.clone()))
+            .take(256)
+            .collect()
+    }
+
     pub(crate) fn retain_session(&mut self, session_id: Option<SessionId>) {
         self.artifact_fetches
             .retain(|key, _| Some(key.0) == session_id);
@@ -256,11 +305,9 @@ impl ArtifactStreamCoordinator {
                 reference.key.clone(),
             );
             let state = self.artifact_fetches.entry(key.clone()).or_default();
-            if state
-                .target
-                .as_ref()
-                .is_some_and(|target| target.finalized && sequence <= target.revision)
-            {
+            if state.target.as_ref().is_some_and(|target| {
+                !ArtifactRevision::Persisted(sequence).supersedes(target.revision)
+            }) {
                 continue;
             }
             // Live producer revisions and canonical event sequences are different domains.
@@ -275,7 +322,7 @@ impl ArtifactStreamCoordinator {
                 schema_version: artifact.schema_version,
                 content_type: reference.content_type.clone(),
                 committed_bytes,
-                revision: sequence,
+                revision: ArtifactRevision::Persisted(sequence),
                 finalized: true,
             });
             self.schedule_active_artifact_fetch(session_id, &key);
@@ -371,7 +418,7 @@ impl ArtifactStreamCoordinator {
                 schema_version,
                 content_type: artifact.content_type.clone(),
                 committed_bytes: artifact.committed_bytes,
-                revision: artifact.revision,
+                revision: ArtifactRevision::Live(artifact.revision),
                 finalized: artifact.finalized,
             },
             artifact.availability.as_deref() == Some("incomplete"),
@@ -387,6 +434,13 @@ impl ArtifactStreamCoordinator {
     ) {
         self.stats.observed_targets = self.stats.observed_targets.saturating_add(1);
         let state = self.artifact_fetches.entry(key.clone()).or_default();
+        if state
+            .target
+            .as_ref()
+            .is_some_and(|current| matches!(current.revision, ArtifactRevision::Persisted(_)))
+        {
+            return;
+        }
         if incomplete {
             state.fetching = false;
             state.retry_at = None;
@@ -397,11 +451,9 @@ impl ArtifactStreamCoordinator {
             self.stats.terminal_failures = self.stats.terminal_failures.saturating_add(1);
             return;
         }
-        if state
-            .target
-            .as_ref()
-            .is_some_and(|current| current.finalized || target.revision <= current.revision)
-        {
+        if state.target.as_ref().is_some_and(|current| {
+            current.finalized || !target.revision.supersedes(current.revision)
+        }) {
             self.stats.coalesced_targets = self.stats.coalesced_targets.saturating_add(1);
             return;
         }
@@ -499,6 +551,7 @@ impl ArtifactStreamCoordinator {
             if completion.target_revision != target.revision {
                 state.fetching = false;
                 self.stats.stale_completions = self.stats.stale_completions.saturating_add(1);
+                self.schedule_active_artifact_fetch(completion.session_id, &key);
                 return false;
             }
             state.fetching = false;
@@ -546,6 +599,13 @@ impl ArtifactStreamCoordinator {
                     return false;
                 }
             };
+            if let Some(sequence) = range.finalized_event_seq {
+                let mut persisted = target.clone();
+                persisted.revision = ArtifactRevision::Persisted(sequence);
+                persisted.committed_bytes = range.total_bytes;
+                persisted.finalized = true;
+                state.target = Some(persisted);
+            }
             if range.bytes.is_empty() {
                 state.consecutive_failures = 0;
                 state.retry_at = None;
@@ -691,7 +751,7 @@ mod tests {
             schema_version: 1,
             content_type: Some("application/octet-stream".to_owned()),
             committed_bytes,
-            revision,
+            revision: ArtifactRevision::Live(revision),
             finalized,
         }
     }
@@ -775,7 +835,7 @@ mod tests {
         assert!(state.fetching);
         let target = state.target.as_ref().expect("presentation artifact target");
         assert_eq!(target.committed_bytes, 9);
-        assert_eq!(target.revision, 2);
+        assert_eq!(target.revision, ArtifactRevision::Live(2));
         assert_eq!(target.schema, "test.artifact");
     }
 
@@ -908,12 +968,39 @@ mod tests {
                 content: Vec::new(),
             },
         };
+        let key = (
+            session_id,
+            "call".to_owned(),
+            "artifact".to_owned(),
+            "accepted".to_owned(),
+        );
+        coordinator.artifact_fetches.insert(
+            key.clone(),
+            ActiveArtifactFetchState {
+                next_offset: 10,
+                target: Some(target(10, 6145, true)),
+                terminal_error: Some("exhausted live retries".to_owned()),
+                ..ActiveArtifactFetchState::default()
+            },
+        );
         coordinator.observe_finalized_artifact(
             session_id,
             7,
             &event,
             |_producer, _schema, _version, key, _content_type| key == "accepted",
         );
+        assert_eq!(
+            coordinator.artifact_fetches[&key]
+                .target
+                .as_ref()
+                .unwrap()
+                .revision,
+            ArtifactRevision::Persisted(7)
+        );
+        assert!(coordinator.artifact_fetches[&key].terminal_error.is_none());
+        coordinator.observe_artifact_target(session_id, &key, target(20, 9000, false), true);
+        assert_eq!(coordinator.artifact_fetches[&key].next_offset, 10);
+        assert!(coordinator.artifact_fetches[&key].terminal_error.is_none());
         assert_eq!(coordinator.artifact_fetches.len(), 1);
         assert!(
             coordinator
@@ -978,7 +1065,13 @@ mod tests {
     fn range_validation_accepts_contiguous_growth_and_rejects_duplicates() {
         let active = target(10, 2, false);
         assert_eq!(
-            validate_active_artifact_range(&range(0, 10, 2, b"abc"), 0, 10, &active, 2),
+            validate_active_artifact_range(
+                &range(0, 10, 2, b"abc"),
+                0,
+                10,
+                &active,
+                ArtifactRevision::Live(2)
+            ),
             Ok(3)
         );
         let session_id = SessionId::new();
@@ -1020,7 +1113,7 @@ mod tests {
                 key: key.clone(),
                 requested_offset: 4,
                 requested_end: 8,
-                target_revision: 3,
+                target_revision: ArtifactRevision::Live(3),
                 result: Ok(range(0, 8, 2, b"stale")),
             };
             assert!(
@@ -1067,7 +1160,7 @@ mod tests {
             key: key.clone(),
             requested_offset: 4,
             requested_end: 8,
-            target_revision: 3,
+            target_revision: ArtifactRevision::Live(3),
             result: Ok(range(0, 8, 2, b"stale")),
         };
 
@@ -1111,7 +1204,7 @@ mod tests {
             key: key.clone(),
             requested_offset: 0,
             requested_end: 10,
-            target_revision: 2,
+            target_revision: ArtifactRevision::Live(2),
             result: Ok(range(0, 20, 3, b"abcdefghij")),
         };
         let mut delivered = false;
@@ -1155,7 +1248,7 @@ mod tests {
             key: key.clone(),
             requested_offset: 0,
             requested_end: 3,
-            target_revision: 42,
+            target_revision: ArtifactRevision::Live(42),
             result: Err(ClientError::Server {
                 code: "artifact_not_found".to_owned(),
                 message: "artifact reference was not found in the finalized projection".to_owned(),
@@ -1197,7 +1290,7 @@ mod tests {
                 key: key.clone(),
                 requested_offset: 0,
                 requested_end: 3,
-                target_revision: 42,
+                target_revision: ArtifactRevision::Live(42),
                 result: Err(ClientError::Server {
                     code: code.to_owned(),
                     message: "artifact bytes are unavailable".to_owned(),
@@ -1248,7 +1341,7 @@ mod tests {
                 key,
                 requested_offset: 0,
                 requested_end: 3,
-                target_revision: index + 1,
+                target_revision: ArtifactRevision::Live(index + 1),
                 result: Err(ClientError::Server {
                     code: "artifact_not_found".to_owned(),
                     message: "artifact reference was not found in the finalized projection"
@@ -1278,7 +1371,7 @@ mod tests {
             key: live_key.clone(),
             requested_offset: 0,
             requested_end: 3,
-            target_revision: 1,
+            target_revision: ArtifactRevision::Live(1),
             result: Ok(range(0, 3, 1, b"abc")),
         };
         assert!(coordinator.handle_completion(Some(session_id), live_completion, |_| Ok(true)));
@@ -1289,6 +1382,84 @@ mod tests {
                 .expect("live artifact state")
                 .next_offset,
             3
+        );
+    }
+
+    #[test]
+    fn persisted_response_can_complete_a_live_request_without_replaying_bytes() {
+        for live_revision in [22, 6145] {
+            let mut coordinator = ArtifactStreamCoordinator::new(BcodeClient::default_endpoint());
+            let session_id = SessionId::new();
+            let key = (
+                session_id,
+                "tool".to_owned(),
+                "artifact".to_owned(),
+                "reference".to_owned(),
+            );
+            coordinator.artifact_fetches.insert(
+                key.clone(),
+                ActiveArtifactFetchState {
+                    next_offset: 4,
+                    target: Some(target(8, live_revision, true)),
+                    fetching: true,
+                    ..ActiveArtifactFetchState::default()
+                },
+            );
+            let mut response = range(4, 8, 22, b"tail");
+            response.finalized = true;
+            response.finalized_event_seq = Some(22);
+            let completion = ActiveArtifactFetchCompletion {
+                session_id,
+                key: key.clone(),
+                requested_offset: 4,
+                requested_end: 8,
+                target_revision: ArtifactRevision::Live(live_revision),
+                result: Ok(response),
+            };
+            assert!(
+                coordinator.handle_completion(Some(session_id), completion, |chunk| {
+                    assert_eq!(chunk.offset, 4);
+                    assert_eq!(chunk.bytes, b"tail");
+                    Ok(true)
+                })
+            );
+            assert_eq!(coordinator.artifact_fetches[&key].next_offset, 8);
+            assert_eq!(
+                coordinator.artifact_fetches[&key]
+                    .target
+                    .as_ref()
+                    .unwrap()
+                    .revision,
+                ArtifactRevision::Persisted(22)
+            );
+            assert_eq!(coordinator.recovered_invocations(), vec!["tool"]);
+            let mut other = key;
+            other.3 = "other".to_owned();
+            coordinator.artifact_fetches.insert(
+                other,
+                ActiveArtifactFetchState {
+                    terminal_error: Some("still broken".to_owned()),
+                    ..ActiveArtifactFetchState::default()
+                },
+            );
+            assert!(coordinator.recovered_invocations().is_empty());
+        }
+    }
+
+    #[test]
+    fn persisted_request_rejects_live_and_inconsistent_responses() {
+        let mut persisted = target(8, 22, true);
+        persisted.revision = ArtifactRevision::Persisted(22);
+        let mut response = range(0, 8, 6145, b"data");
+        assert!(
+            validate_active_artifact_range(&response, 0, 8, &persisted, persisted.revision)
+                .is_err()
+        );
+        response.finalized_event_seq = Some(22);
+        response.finalized = true;
+        assert!(
+            validate_active_artifact_range(&response, 0, 8, &persisted, persisted.revision)
+                .is_err()
         );
     }
 
@@ -1316,7 +1487,7 @@ mod tests {
             key: key.clone(),
             requested_offset: 0,
             requested_end: 3,
-            target_revision: 1,
+            target_revision: ArtifactRevision::Live(1),
             result: Ok(range(0, 3, 1, b"abc")),
         };
         let changed = coordinator.handle_completion(Some(session_id), completion, |chunk| {

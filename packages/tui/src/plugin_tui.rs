@@ -889,6 +889,21 @@ impl PluginTuiPresentation {
         }
     }
 
+    /// Clear an invocation warning only after its artifact streams have recovered.
+    pub(crate) fn clear_artifact_failure(&self, invocation_id: &str) {
+        let changed = self
+            .artifact_delivery_failures
+            .lock()
+            .is_ok_and(|mut failures| failures.remove(invocation_id));
+        if changed {
+            if let Ok(mut revisions) = self.visual_revisions.lock() {
+                let revision = revisions.entry(invocation_id.to_owned()).or_default();
+                *revision = revision.wrapping_add(1);
+            }
+            self.mark_visual_dirty(invocation_id);
+        }
+    }
+
     /// Deliver opaque artifact bytes to the retained adapter selected by generic routing metadata.
     ///
     /// # Errors
@@ -2025,8 +2040,23 @@ library = "libdynamic_visual_test.dylib"
                 &context,
             )
             .expect("visual");
-        drop(presentation);
         assert!(routed_text(&visual).contains("Artifact replay failed"));
+        let revision = presentation.visual_revision("broken");
+        presentation.clear_artifact_failure("broken");
+        assert!(presentation.visual_revision("broken") > revision);
+        assert!(presentation.drain_dirty_visuals().contains("broken"));
+        let recovered = presentation
+            .routed_visual(
+                "broken",
+                1,
+                "bcode.shell.run",
+                1,
+                Some("bcode.shell"),
+                &serde_json::json!({"mode":"terminal"}),
+                &context,
+            )
+            .expect("recovered visual");
+        assert!(!routed_text(&recovered).contains("Artifact replay failed"));
     }
 
     fn test_presentation() -> PluginTuiPresentation {
