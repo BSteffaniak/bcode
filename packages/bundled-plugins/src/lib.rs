@@ -517,6 +517,93 @@ fn workflow_plugin() -> bcode_plugin::StaticBundledPlugin {
 #[cfg(test)]
 mod tests {
     #[test]
+    fn bundled_plugins_activate_alone_and_with_each_peer_disabled() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("test runtime");
+        let _entered = runtime.enter();
+        let bundles = super::static_bundled_plugins();
+        let all = bcode_plugin::filter_selected_static_plugins(
+            &bundles,
+            &bcode_plugin::PluginSelection::all_enabled(),
+        )
+        .expect("bundle manifests");
+        let mut baseline =
+            bcode_plugin::PluginHost::load_static_plugins(&all).expect("baseline plugins activate");
+        let catalogs = tool_catalogs(&baseline);
+        baseline.deactivate_all().expect("baseline deactivation");
+        for (manifest, vtable) in &all {
+            let mut isolated =
+                bcode_plugin::PluginHost::load_static_plugins(&[(manifest.clone(), *vtable)])
+                    .unwrap_or_else(|error| panic!("{} alone: {error}", manifest.id));
+            assert_eq!(isolated.loaded_plugins().len(), 1);
+            for (id, catalog) in tool_catalogs(&isolated) {
+                assert_eq!(Some(&catalog), catalogs.get(&id), "{id} alone");
+            }
+            isolated.deactivate_all().expect("isolated deactivation");
+
+            let selection = bcode_plugin::PluginSelection {
+                mode: bcode_plugin::PluginSelectionMode::All,
+                enabled: std::collections::BTreeSet::new(),
+                disabled: std::collections::BTreeSet::from([manifest.id.clone()]),
+            };
+            let selected = bcode_plugin::filter_selected_static_plugins(&bundles, &selection)
+                .expect("disabled selection");
+            let mut host = bcode_plugin::PluginHost::load_static_plugins(&selected)
+                .unwrap_or_else(|error| panic!("without {}: {error}", manifest.id));
+            let actual = host
+                .loaded_plugins()
+                .iter()
+                .map(|plugin| plugin.manifest().id.clone())
+                .collect::<std::collections::BTreeSet<_>>();
+            let expected = all
+                .iter()
+                .map(|(candidate, _)| candidate.id.clone())
+                .filter(|id| id != &manifest.id)
+                .collect::<std::collections::BTreeSet<_>>();
+            assert_eq!(actual, expected, "without {}", manifest.id);
+            for (id, catalog) in tool_catalogs(&host) {
+                assert_eq!(
+                    Some(&catalog),
+                    catalogs.get(&id),
+                    "{id} without {}",
+                    manifest.id
+                );
+            }
+            host.deactivate_all().expect("remaining plugins deactivate");
+        }
+    }
+
+    fn tool_catalogs(
+        host: &bcode_plugin::PluginHost,
+    ) -> std::collections::BTreeMap<String, serde_json::Value> {
+        host.loaded_plugins()
+            .iter()
+            .filter(|plugin| {
+                plugin
+                    .manifest()
+                    .services
+                    .iter()
+                    .any(|service| service.interface_id == bcode_tool::TOOL_SERVICE_INTERFACE_ID)
+            })
+            .map(|plugin| {
+                let catalog = plugin
+                    .invoke_service_json::<_, bcode_tool::ToolList>(
+                        bcode_tool::TOOL_SERVICE_INTERFACE_ID,
+                        bcode_tool::OP_LIST_TOOLS,
+                        &bcode_tool::ListToolsRequest::default(),
+                    )
+                    .unwrap_or_else(|error| panic!("{} catalog: {error}", plugin.manifest().id));
+                (
+                    plugin.manifest().id.clone(),
+                    serde_json::to_value(catalog).expect("catalog serialization"),
+                )
+            })
+            .collect()
+    }
+
+    #[test]
     fn bundled_tui_extensions_cover_every_manifest_declared_visual_schema() {
         let static_plugins = super::static_bundled_plugins();
         let selected = bcode_plugin::filter_selected_static_plugins(
@@ -669,6 +756,11 @@ mod tests {
     #[cfg(feature = "static-bundled-session-derivation-plugin")]
     #[test]
     fn session_derivation_plugin_is_first_class_and_disableable() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("test runtime");
+        let _entered = runtime.enter();
         let static_plugins = super::static_bundled_plugins();
         let host = bcode_plugin::PluginRuntimeHost::load_defaults_with_static_bundled(
             &bcode_plugin::PluginSelection::all_enabled(),

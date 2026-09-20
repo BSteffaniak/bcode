@@ -8,6 +8,10 @@ mod web_search_tui;
 #[path = "providers/exa.rs"]
 pub(crate) mod exa;
 
+use bcode_model::{
+    MODEL_PROVIDER_INTERFACE_ID, NativeWebSearchRequest, NativeWebSearchResponse,
+    OP_NATIVE_WEB_SEARCH,
+};
 use bcode_model_provider_runtime::ProviderRuntime;
 use bcode_plugin_sdk::prelude::*;
 use bcode_provider_auth_models::{
@@ -27,8 +31,6 @@ use std::env;
 use std::time::Duration;
 use thiserror::Error;
 
-const MODEL_PROVIDER_SERVICE_INTERFACE: &str = "bcode.model-provider/v1";
-const MODEL_NATIVE_WEB_SEARCH_OPERATION: &str = "native_web_search";
 const DEFAULT_TIMEOUT_MS: u64 = 15_000;
 const DEFAULT_MAX_RESULTS: usize = 8;
 const DEFAULT_FETCH_MAX_BYTES: usize = 256 * 1024;
@@ -929,11 +931,11 @@ fn prepare_web_tool_service_response(
             })
             .and_then(|routes| {
                 routes.into_iter().find(|route| {
-                    route.interface_id == MODEL_PROVIDER_SERVICE_INTERFACE
+                    route.interface_id == MODEL_PROVIDER_INTERFACE_ID
                         && route
                             .operations
                             .iter()
-                            .any(|operation| operation == MODEL_NATIVE_WEB_SEARCH_OPERATION)
+                            .any(|operation| operation == OP_NATIVE_WEB_SEARCH)
                 })
             })
             .map(|route| route.route_id);
@@ -966,16 +968,18 @@ fn search_model_native(
                 invocation_id: invocation_id.to_string(),
                 request_id: format!("{invocation_id}-model-native-search"),
                 route_id: Some(route_id),
-                interface_id: MODEL_PROVIDER_SERVICE_INTERFACE.to_string(),
-                operation: MODEL_NATIVE_WEB_SEARCH_OPERATION.to_string(),
-                payload: serde_json::json!({
-                    "query": request.query,
-                    "max_results": request.max_results,
-                    "site": request.site,
-                    "freshness": request.freshness,
-                    "region": request.region,
-                    "safe_search": request.safe_search,
-                }),
+                interface_id: MODEL_PROVIDER_INTERFACE_ID.to_string(),
+                operation: OP_NATIVE_WEB_SEARCH.to_string(),
+                payload: serde_json::to_value(NativeWebSearchRequest {
+                    query: request.query.clone(),
+                    max_results: request.max_results,
+                    site: request.site.clone(),
+                    freshness: request.freshness.clone(),
+                    region: request.region.clone(),
+                    safe_search: request.safe_search.clone(),
+                    provider_context: bcode_model::ProviderRequestContext::default(),
+                    metadata: std::collections::BTreeMap::new(),
+                })?,
             },
         ))
         .map_err(|error| WebError::InvalidRequest(error.to_string()))?;
@@ -998,25 +1002,24 @@ fn search_model_native(
             )));
         }
     };
-    let response = serde_json::from_value::<ModelNativeSearchResponse>(payload)?;
+    let response = serde_json::from_value::<NativeWebSearchResponse>(payload)?;
     Ok(SearchResponse {
         query,
         provider: response.provider,
-        results: response.results,
+        results: response
+            .results
+            .into_iter()
+            .map(|result| SearchResult {
+                title: result.title,
+                url: result.url,
+                snippet: result.snippet,
+                published: result.published,
+                source: result.source,
+            })
+            .collect(),
         partial: response.partial,
         message: response.message,
     })
-}
-
-#[derive(Debug, Deserialize)]
-struct ModelNativeSearchResponse {
-    provider: String,
-    #[serde(default)]
-    results: Vec<SearchResult>,
-    #[serde(default)]
-    partial: bool,
-    #[serde(default)]
-    message: Option<String>,
 }
 
 async fn search_brave(
@@ -3472,6 +3475,20 @@ mod tests {
         assert_eq!(response.results[0].title, "Rust");
     }
 
+    #[test]
+    fn model_native_search_without_provider_route_is_unavailable() {
+        let bridge = ServiceBridge::new(
+            Some(test_model_native_bridge),
+            std::ptr::null_mut(),
+            bcode_plugin_sdk::ServiceCancellation::default(),
+        );
+        let request = serde_json::from_value::<SearchRequest>(json!({"query": "rust"}))
+            .expect("search request");
+        let error = search_model_native(&request, &bridge, "call-native", &json!({}))
+            .expect_err("missing provider must not dispatch a service request");
+        assert!(matches!(error, WebError::InvalidRequest(_)));
+    }
+
     extern "C" fn test_model_native_bridge(
         request_ptr: *const u8,
         request_len: usize,
@@ -3488,8 +3505,12 @@ mod tests {
         };
         assert_eq!(request.invocation_id, "call-native");
         assert_eq!(request.route_id.as_deref(), Some("test-provider-route"));
-        assert_eq!(request.interface_id, MODEL_PROVIDER_SERVICE_INTERFACE);
-        assert_eq!(request.operation, MODEL_NATIVE_WEB_SEARCH_OPERATION);
+        assert_eq!(request.interface_id, MODEL_PROVIDER_INTERFACE_ID);
+        assert_eq!(request.operation, OP_NATIVE_WEB_SEARCH);
+        let payload: NativeWebSearchRequest =
+            serde_json::from_value(request.payload).expect("provider contract request decodes");
+        assert_eq!(payload.query, "rust");
+        assert_eq!(payload.max_results, Some(3));
         let response = ServiceBridgeResponse::Service(ToolInvocationServiceResolution::Responded {
             payload: serde_json::json!({
                 "provider": "provider-native",

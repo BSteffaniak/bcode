@@ -1579,6 +1579,7 @@ dependencies = [
  "bcode_shell_plugin",
  "bcode_skills_plugin",
  "bcode_tantivy_session_search_plugin",
+ "bcode_tool",
  "bcode_usage_plugin",
  "bcode_vim_edit_plugin",
  "bcode_web_search_plugin",
@@ -3085,6 +3086,7 @@ dependencies = [
 name = "bcode_web_search_plugin"
 version = "0.0.1-alpha.0"
 dependencies = [
+ "bcode_model",
  "bcode_model_provider_runtime",
  "bcode_plugin_sdk",
  "bcode_provider_auth_models",
