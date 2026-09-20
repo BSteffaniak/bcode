@@ -1,4 +1,4 @@
-# Filesystem multi-edit (implementation in progress)
+# Filesystem multi-edit
 
 `filesystem.multi_edit` accepts JSON:
 
@@ -36,8 +36,7 @@ rolled back or automatically retried when later work fails.
 
 Cancellation stops further work; an already completed publication remains
 committed. An invocation that cannot settle must not be interpreted as having
-made no changes. End-to-end cancellation and recovery verification remains part
-of the unfinished integration work.
+made no changes.
 
 ## Batch artifact contract
 
@@ -61,7 +60,6 @@ Statuses are:
 Consumers must reject unsupported schema/metadata versions and must not interpret
 unknown statuses as success. Unknown representations should remain available via
 the generic artifact fallback rather than being guessed as a known version.
-Consumer enforcement and native batch presentation are not yet complete.
 
 Only confirmed commits contain change data. Exact changed-region before/after pairs
 have `omitted: false`, `old_text`, `new_text`, `old_start_line`, and
@@ -80,14 +78,15 @@ references (or ordered multipart references). Fixed `before`/`after` headers avo
 path injection. This linear-time presentation is not a minimal diff or a mutation
 interface. It preserves CRLF and explicit missing-final-newline markers. Its byte
 size is at most twice the combined source bytes plus 128 bytes, and only one file's
-diff is built at a time. Interactive large-change diff consumption remains unfinished.
+diff is built at a time. Full retained diffs are accessible through artifact tools;
+the inline TUI displays bounded previews rather than a complete large-diff browser.
 
 The compact text response preserves paths, statuses and errors, replacing change
 text with availability and omission reason. Artifact content is not duplicated
 into that text response. This alone does not establish how every model-context
 or frontend consumer handles artifacts.
 
-## Delivery status and exclusions
+## Retained sources
 
 Omitted changes attempt to retain complete old/new sources through the host artifact
 sink. Each unavailable source includes a bounded reason: `size_limit` (with
@@ -102,36 +101,37 @@ reference. Single-reference sources retain their existing shape. If any part fai
 the source is unavailable; already written parts are not a complete source.
 Native oversized-change summaries show unified-diff references before source
 snapshots, including byte-ordered multipart references and explicit unavailable
-states. Interactive multipart diff consumption remains unfinished.
+states. The inline TUI previews only the first part of multipart sources;
+complete content is accessible through the ordered artifact references.
 Retention failure does not change an already committed outcome.
 
-The editing engine, partial outcomes, outcome artifact and bounded source pairs
-are implemented. The native batch adapter reuses single-file diff presentation,
-validates version/status/display bounds, and namespaces file source anchors.
-Complete exposure/configuration verification, large-change access and end-to-end
-acceptance are not yet complete.
-This document is not a production-readiness claim.
+## Presentation
 
-JSON is the initial portable representation. No measured superiority over
-single-edit, JSON-wrapped patches or grammar-constrained patches is claimed.
-The behavioral comparison `batch_and_independent_single_edits_produce_identical_bytes`
-executes source-symbol replacements, escaped JSON configuration edits, and
-BOM/mixed-newline Unicode edits through the plugin tool boundary. For each task,
-one batch invocation and two independent single-edit invocations produce identical
-expected bytes. This is deterministic execution evidence, not model-generated
-accuracy, latency, token usage, permission-dialog, or provider-round measurement.
-The replacements are independent; sequentially dependent replacements intentionally
-have different semantics and are not claimed equivalent.
+While request arguments stream, the native TUI displays proposed edit fragments
+before execution, including when a file path has not arrived yet. Draft previews
+are bounded and labeled as not applied; they do not establish mutation outcomes.
+Final results use the batch artifact's per-file statuses and retained changes.
 
-Format evaluation remains limited: replacement arrays require JSON escaping of
-both search and replacement strings; JSON-wrapped patches also escape their patch
-string and add patch syntax/context. Grammar-constrained freeform patches can avoid
-that JSON-string escaping but require provider support and a separately validated
-parser. Encoded byte counts are not tokenizer counts. No provider/model trial has
-established relative edit accuracy, failure rates, or actual tool rounds; there is
-no evidence justifying an alternate production interface yet.
-Provider-specific encodings, if justified later, belong at provider boundaries
-and must reuse normalized authorization and mutation logic.
+The native batch adapter reuses single-file diff presentation, validates
+version/status/display bounds, and namespaces file source anchors.
+
+## Configuration
+
+`filesystem.multi_edit` is independently selectable through `[tools]` and
+`[agent.<id>.tools]`. The default build profile exposes it; the default plan
+profile does not. Selecting or disabling it does not select or disable
+`filesystem.edit` or `filesystem.write`.
+
+## Format and scope
+
+JSON replacement arrays are the portable request format. Search and replacement
+strings use JSON escaping. Matching uses original snapshots, so a replacement
+cannot target text introduced by another replacement in the same batch.
+
+The tool does not accept JSON-wrapped patches or grammar-constrained freeform
+patches. One batch can replace multiple single-edit invocations for independent
+replacements; this does not imply a particular token cost, latency, or
+model-generated edit accuracy.
 
 Fuzzy/regex matching, create/delete/rename languages, automatic shell verification
 or LSP diagnostics in the critical path, cross-file transactions and crash-proof
