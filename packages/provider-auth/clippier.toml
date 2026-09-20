@@ -1,0 +1,9 @@
+# Native credential custody and device sealing.
+[[config]]
+os = "ubuntu"
+[[config]]
+os = "macos"
+[[config]]
+os = "windows"
+[config.env]
+SSHENV_DEVICE_SEAL_BACKEND = "windows-dpapi-current-user"

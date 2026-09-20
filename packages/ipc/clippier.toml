@@ -1,0 +1,5 @@
+# Exercise Unix sockets and Windows named pipes on their native kernels.
+[[config]]
+os = "ubuntu"
+[[config]]
+os = "windows"

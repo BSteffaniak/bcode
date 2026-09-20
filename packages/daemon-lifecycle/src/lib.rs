@@ -17,7 +17,7 @@ use std::fs;
 use std::io::{Read, Seek as _, Write as _};
 #[cfg(unix)]
 use std::os::fd::AsRawFd as _;
-#[cfg(unix)]
+#[cfg(target_os = "macos")]
 use std::os::unix::ffi::OsStrExt as _;
 #[cfg(all(unix, test))]
 use std::os::unix::fs::MetadataExt as _;

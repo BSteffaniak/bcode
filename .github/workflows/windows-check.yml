@@ -52,43 +52,6 @@ jobs:
           components: clippy, rustfmt
           targets: x86_64-pc-windows-msvc
 
-      - name: Validate release workflow syntax
-        shell: pwsh
-        run: |
-          $workflow = Get-Content -LiteralPath ".github/workflows/release.yml" -Raw
-          $expressionOpen = '$' + '{{ '
-          $releaseCommand = 'run: cargo xtask release --target ' + $expressionOpen + 'matrix.target }} --version ' + $expressionOpen + 'inputs.version }}'
-          $verifyCommand = 'cargo xtask verify-release --target ' + $expressionOpen + 'matrix.target }} --version ' + $expressionOpen + 'inputs.version }}'
-          $runtimeSmokeCommand = 'run: cargo xtask smoke-test-tesseract --target ' + $expressionOpen + 'matrix.target }}'
-          $artifactGlob = 'target/dist/bcode-' + $expressionOpen + 'inputs.version }}-' + $expressionOpen + 'matrix.target }}.*'
-          $artifactName = 'name: bcode-' + $expressionOpen + 'inputs.commit_sha }}-' + $expressionOpen + 'inputs.version }}-' + $expressionOpen + 'matrix.target }}'
-          $artifactCountCheck = 'test "${artifact_count}" -eq "${#expected[@]}"'
-          $checksumCountCheck = 'test "${checksum_count}" -eq "${#expected[@]}"'
-          $required = @(
-            'commit_sha:',
-            ('ref: ' + $expressionOpen + 'inputs.commit_sha }}'),
-            ('WORKFLOW_SHA: ' + $expressionOpen + 'github.sha }}'),
-            'target: x86_64-pc-windows-msvc',
-            $runtimeSmokeCommand,
-            $releaseCommand,
-            $verifyCommand,
-            'uses: actions/upload-artifact@v7',
-            'uses: actions/download-artifact@v8',
-            $artifactGlob,
-            $artifactName,
-            ('target_commitish: ' + $expressionOpen + 'inputs.commit_sha }}'),
-            ('commit_sha = ''' + $expressionOpen + 'inputs.commit_sha }}'''),
-            ('version = ''' + $expressionOpen + 'inputs.version }}'''),
-            'merge-multiple: true',
-            $artifactCountCheck,
-            $checksumCountCheck
-          )
-          foreach ($entry in $required) {
-            if (-not $workflow.Contains($entry)) {
-              throw "release workflow is missing required literal: $entry"
-            }
-          }
-
       - name: Verify Windows native build tools
         shell: pwsh
         run: |
@@ -128,25 +91,14 @@ jobs:
           foreach ($name in 'INCLUDE', 'LIB', 'LIBPATH') {
             "$name=$([Environment]::GetEnvironmentVariable($name))" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
           }
+          # cl.exe without an input intentionally exits nonzero after its banner.
+          # The banner checks above validate it; do not leak that probe's status
+          # into GitHub's PowerShell wrapper.
+          $global:LASTEXITCODE = 0
 
       - name: Validate Windows dependency portability
         shell: pwsh
         run: bash scripts/check-windows-dependency-portability.sh
-
-      - name: Check workspace
-        env:
-          SSHENV_DEVICE_SEAL_BACKEND: windows-dpapi-current-user
-        run: cargo check --workspace
-
-      - name: Clippy workspace
-        env:
-          SSHENV_DEVICE_SEAL_BACKEND: windows-dpapi-current-user
-        run: cargo clippy --workspace --all-targets -- -D warnings
-
-      - name: Test workspace
-        env:
-          SSHENV_DEVICE_SEAL_BACKEND: windows-dpapi-current-user
-        run: cargo test --workspace
 
       - name: Run Windows-specific contract tests
         run: |

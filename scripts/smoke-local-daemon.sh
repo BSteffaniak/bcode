@@ -3,6 +3,8 @@ set -euo pipefail
 
 # Smoke tests own isolated process state and must not inherit the invoking daemon.
 unset BCODE_DAEMON_LOG BCODE_IPC_ENDPOINT BCODE_IPC_ENDPOINT_NAMESPACE
+unset BCODE_CONFIG BCODE_CONFIG_TOML BCODE_SESSION_STORE_DIR
+unset BCODE_STARTUP_CORRELATION BCODE_DAEMON_READY_STDOUT
 
 root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 workdir="$(mktemp -d /tmp/bcode-smoke.XXXXXX)"

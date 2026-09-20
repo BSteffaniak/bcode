@@ -1,0 +1,7 @@
+# Native file locking and storage admission must agree across kernels.
+[[config]]
+os = "ubuntu"
+[[config]]
+os = "macos"
+[[config]]
+os = "windows"

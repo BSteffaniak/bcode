@@ -1,0 +1,5 @@
+# Native path, link, and atomic replacement semantics.
+[[config]]
+os = "ubuntu"
+[[config]]
+os = "windows"
