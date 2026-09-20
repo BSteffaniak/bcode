@@ -162,9 +162,11 @@ fn valid_id(id: &str) -> bool {
 fn decode_page(bytes: &[u8], offset: u64, limit: u16) -> Result<HistoryPage, HistoryAccessError> {
     let page: WirePage =
         serde_json::from_slice(bytes).map_err(|_| HistoryAccessError::IncompatibleResponse)?;
+    let mut identities = std::collections::BTreeSet::new();
     if page.items.len() > usize::from(limit)
         || page.items.iter().any(|item| {
-            !valid_id(&item.id)
+            !identities.insert(&item.id)
+                || !valid_id(&item.id)
                 || item
                     .update_time
                     .is_some_and(|time| !time.is_finite() || time < 0.0)
@@ -390,6 +392,16 @@ mod tests {
         assert!(decode_page(br#"{"items":[{"id":"../evil"}]}"#, 0, 1).is_err());
         assert!(decode_page(br#"{"items":[{"id":"a"},{"id":"b"}]}"#, 0, 1).is_err());
         assert!(decode_page(br#"{"unexpected":[]}"#, 0, 1).is_err());
+        assert_eq!(
+            decode_page(br#"{"items":[{"id":"a"},{"id":"a"}]}"#, 0, 2).err(),
+            Some(HistoryAccessError::IncompatibleResponse)
+        );
+        assert_eq!(
+            decode_page(br#"{"items":[{"id":"a"},{"id":"b"}]}"#, 0, 2)
+                .unwrap()
+                .next_offset,
+            Some(2)
+        );
     }
 
     #[test]

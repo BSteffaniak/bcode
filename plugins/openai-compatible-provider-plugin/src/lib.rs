@@ -8266,7 +8266,7 @@ async fn refresh_chatgpt_auth_if_needed_at(
     token_url: &str,
 ) -> Result<Option<RefreshedChatGptAuth>, ProviderError> {
     let AuthSettings::ChatGpt {
-        refresh_token: Some(refresh_token),
+        refresh_token,
         expires_at,
         profile,
         ..
@@ -8280,6 +8280,16 @@ async fn refresh_chatgpt_auth_if_needed_at(
     if *expires_at > unix_timestamp() + 60 {
         return Ok(None);
     }
+    let Some(refresh_token) = refresh_token
+        .as_deref()
+        .filter(|token| !token.trim().is_empty())
+    else {
+        return Err(provider_error(
+            "token_refresh_requires_reconnect",
+            ProviderErrorCategory::Auth,
+            "ChatGPT credentials have expired; reconnect this auth profile",
+        ));
+    };
     if profile
         .as_deref()
         .is_none_or(|profile| profile.trim().is_empty())
@@ -8294,7 +8304,7 @@ async fn refresh_chatgpt_auth_if_needed_at(
     let next_refresh_token = refreshed
         .refresh_token
         .clone()
-        .unwrap_or_else(|| refresh_token.clone());
+        .unwrap_or_else(|| refresh_token.to_owned());
     let next_expires_at =
         unix_timestamp() + refreshed.expires_in.unwrap_or(3600).saturating_sub(60);
     let account_id = refreshed
@@ -9873,6 +9883,31 @@ mod tests {
             .expect_err("device timeout");
         assert!(error.contains("timed out"));
         assert!(state.lock().expect("auth state").auth_flows.is_empty());
+    }
+
+    #[test]
+    fn expired_auth_without_refresh_material_requires_reconnect() {
+        let runtime = ProviderRuntime::new().expect("runtime");
+        for refresh_token in [None, Some(String::new()), Some("  ".to_owned())] {
+            let mut settings = settings_for_context(&ProviderRequestContext::default());
+            settings.auth = AuthSettings::ChatGpt {
+                access_token: "expired-access".to_owned(),
+                refresh_token,
+                expires_at: Some(1),
+                account_id: None,
+                profile: Some("openai".to_owned()),
+            };
+            let result = runtime
+                .block_on(async move {
+                    refresh_chatgpt_auth_if_needed_at(&mut settings, "not-a-network-url").await
+                })
+                .expect("runtime");
+            let Err(error) = result else {
+                panic!("reconnect required");
+            };
+            assert_eq!(error.code, "token_refresh_requires_reconnect");
+            assert!(!error.message.contains("expired-access"));
+        }
     }
 
     #[test]
