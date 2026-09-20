@@ -714,6 +714,8 @@ struct LoopSurface {
     setup_kind: SetupKind,
     launch_state: LaunchState,
     progress_document: Option<goal::ProgressDocumentSetup>,
+    progress_document_area: Rect,
+    review_area: Rect,
     theme: Option<PluginTuiTheme>,
 }
 
@@ -741,6 +743,8 @@ impl LoopSurface {
             setup_kind: SetupKind::Loop,
             launch_state: LaunchState::Ready,
             progress_document: None,
+            progress_document_area: Rect::new(0, 0, 0, 0),
+            review_area: Rect::new(0, 0, 0, 0),
             theme: None,
         }
     }
@@ -1171,6 +1175,58 @@ impl LoopSurface {
         action
     }
 
+    fn paint_goal_options(&mut self, mut content: Rect, frame: &mut PaintCx<'_, '_>) -> Rect {
+        self.progress_document_area = Rect::new(0, 0, 0, 0);
+        self.review_area = Rect::new(0, 0, 0, 0);
+        if self.setup_kind == SetupKind::Goal {
+            use bmux_tui_components::checkbox::{CheckboxComponent, CheckboxState};
+
+            self.progress_document_area =
+                Rect::new(content.x, content.y, content.width, 1).intersection(content);
+            self.review_area = Rect::new(content.x, content.y.saturating_add(1), content.width, 1)
+                .intersection(content);
+            let state = std::cell::Cell::new(CheckboxState::new(self.progress_document.is_some()));
+            let checkbox = CheckboxComponent::new(
+                "goal.progress-document",
+                "Maintain a progress document (Ctrl+P)",
+                &state,
+            )
+            .fallback_style(
+                self.theme
+                    .map_or_else(Style::new, |theme| theme.text.patch(theme.canvas)),
+            );
+            let layout = checkbox.layout(
+                Constraints::tight(self.progress_document_area.size()),
+                &mut LayoutCx::new(),
+            );
+            let rect = self.progress_document_area;
+            frame.with_child(
+                i32::from(rect.x),
+                i64::from(rect.y),
+                LocalRect::new(0, 0, rect.width, rect.height),
+                |cx| checkbox.paint(&layout, cx),
+            );
+            let review = [StatusSegment::new(
+                "Review generated instructions before starting (Ctrl+R)",
+            )];
+            let review = StatusBarComponent::new("goal.review")
+                .left(&review)
+                .styles(loop_status_styles(self.theme.as_ref()));
+            let rect = self.review_area;
+            let layout = review.layout(Constraints::tight(rect.size()), &mut LayoutCx::new());
+            frame.with_child(
+                i32::from(rect.x),
+                i64::from(rect.y),
+                LocalRect::new(0, 0, rect.width, rect.height),
+                |cx| review.paint(&layout, cx),
+            );
+            let reserved = content.height.min(3);
+            content.y = content.y.saturating_add(reserved);
+            content.height = content.height.saturating_sub(reserved);
+        }
+        content
+    }
+
     fn paint_footer(&self, content: Rect, frame: &mut PaintCx<'_, '_>) {
         let status_y = self.limit_area.bottom().saturating_add(1);
         if status_y < content.bottom() {
@@ -1309,17 +1365,12 @@ impl PluginTuiSurface for LoopSurface {
                 )
             },
         );
-        let goal_title = if self.progress_document.is_some() {
-            " Goal · Ctrl+P: [x] progress doc · Ctrl+R: review "
-        } else {
-            " Goal · Ctrl+P: [ ] progress doc · Ctrl+R: review "
-        };
         let modal = ModalFrame::new(
             ModalSizing::new(Size::new(64, 22), Size::new(100, 32), Insets::all(2)),
             modal_theme,
         )
         .title(if self.setup_kind == SetupKind::Goal {
-            goal_title
+            " Goal "
         } else {
             " Start deterministic loop "
         })
@@ -1334,6 +1385,7 @@ impl PluginTuiSurface for LoopSurface {
             LocalRect::new(0, 0, area.width, area.height),
             |cx| shell.paint(&layout, cx),
         );
+        let content = self.paint_goal_options(content.intersection(area), frame);
         let available = content.height.saturating_sub(8);
         let prompt_rows = available.saturating_mul(3) / 5;
         let condition_rows = available.saturating_sub(prompt_rows).max(3);

@@ -434,6 +434,26 @@ impl PluginTuiSurface for GoalSurface {
                 }
             }
         }
+        if self.phase == GoalPhase::Draft
+            && !matches!(
+                self.editor.fresh_session,
+                FreshSessionState::Creating
+                    | FreshSessionState::Configuring
+                    | FreshSessionState::Attaching
+            )
+        {
+            if event_click_in(event, self.editor.progress_document_area) {
+                self.editor.progress_document = if self.editor.progress_document.is_some() {
+                    None
+                } else {
+                    Some(ProgressDocumentSetup::default())
+                };
+                return PluginTuiAction::Redraw;
+            }
+            if event_click_in(event, self.editor.review_area) {
+                return self.generate(host, true);
+            }
+        }
         // Freeze source inputs during generation; no stale response can replace newer edits.
         if matches!(self.phase, GoalPhase::Generating { .. } | GoalPhase::Closed) {
             return PluginTuiAction::None;
@@ -772,10 +792,45 @@ mod tests {
                 surface.editor.prompt_area,
                 surface.editor.condition_area,
                 surface.editor.limit_area,
+                surface.editor.progress_document_area,
+                surface.editor.review_area,
             ] {
                 assert_eq!(hit, hit.intersection(area));
             }
         }
+    }
+
+    #[test]
+    fn goal_body_controls_accept_clicks() {
+        use bmux_tui::event::{MouseButton, MouseEvent};
+        use bmux_tui::geometry::Point;
+
+        let host = Host::default();
+        let mut surface = GoalSurface::new(Some(SessionId::new()));
+        surface.editor.prompt = text_state("Implement the goal");
+        let area = Rect::new(0, 0, 100, 32);
+        let mut buffer = bmux_tui::buffer::Buffer::empty(area);
+        surface.render(area, &mut PaintCx::new(&mut Frame::new(&mut buffer)));
+        let click = |rect: Rect| {
+            Event::Mouse(MouseEvent::new(
+                MouseEventKind::Down(MouseButton::Left),
+                Point::new(rect.x, rect.y),
+            ))
+        };
+        let checkbox = surface.editor.progress_document_area;
+        assert!(checkbox.height > 0);
+        surface.handle_event(&click(checkbox), &host);
+        assert!(surface.editor.progress_document.is_none());
+        surface.handle_event(&click(checkbox), &host);
+        assert!(surface.editor.progress_document.is_some());
+        surface.handle_event(&click(surface.editor.review_area), &host);
+        assert!(matches!(
+            surface.phase,
+            GoalPhase::Generating { review: true }
+        ));
+        assert!(host.starts.lock().unwrap().is_empty());
+        surface.handle_event(&click(checkbox), &host);
+        assert!(surface.editor.progress_document.is_some());
     }
 
     #[test]
