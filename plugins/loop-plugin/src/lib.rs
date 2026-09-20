@@ -717,6 +717,7 @@ struct LoopSurface {
     progress_document_area: Rect,
     review_area: Rect,
     goal_option_focus: Option<goal::GoalOption>,
+    goal_phase: goal::GoalPhase,
     progress_checkbox: std::cell::Cell<bmux_tui_components::checkbox::CheckboxState>,
     review_button: std::cell::Cell<bmux_tui_components::button::ButtonState>,
     theme: Option<PluginTuiTheme>,
@@ -749,6 +750,7 @@ impl LoopSurface {
             progress_document_area: Rect::new(0, 0, 0, 0),
             review_area: Rect::new(0, 0, 0, 0),
             goal_option_focus: None,
+            goal_phase: goal::GoalPhase::Draft,
             progress_checkbox: std::cell::Cell::new(
                 bmux_tui_components::checkbox::CheckboxState::new(false),
             ),
@@ -1196,12 +1198,15 @@ impl LoopSurface {
     fn paint_goal_options(&mut self, mut content: Rect, frame: &mut PaintCx<'_, '_>) -> Rect {
         self.progress_document_area = Rect::new(0, 0, 0, 0);
         self.review_area = Rect::new(0, 0, 0, 0);
-        if self.setup_kind == SetupKind::Goal {
+        if self.setup_kind == SetupKind::Goal || (self.goal_phase == goal::GoalPhase::Generated) {
             use bmux_tui_components::button::{ButtonComponent, ButtonPolicy};
             use bmux_tui_components::checkbox::CheckboxComponent;
 
-            self.progress_document_area =
-                Rect::new(content.x, content.y, content.width, 1).intersection(content);
+            self.progress_document_area = if self.goal_phase == goal::GoalPhase::Generated {
+                Rect::new(0, 0, 0, 0)
+            } else {
+                Rect::new(content.x, content.y, content.width, 1).intersection(content)
+            };
             self.review_area = Rect::new(content.x, content.y.saturating_add(1), content.width, 1)
                 .intersection(content);
             self.sync_goal_controls();
@@ -1225,9 +1230,15 @@ impl LoopSurface {
                 LocalRect::new(0, 0, rect.width, rect.height),
                 |cx| checkbox.paint(&layout, cx),
             );
-            let review =
-                ButtonComponent::new("goal.review", goal::REVIEW_LABEL, &self.review_button)
-                    .policy(ButtonPolicy::interactive());
+            let label = if matches!(self.goal_phase, goal::GoalPhase::Generating { .. }) {
+                "Generating instructions…"
+            } else if self.goal_phase == goal::GoalPhase::Generated {
+                "Start goal (Ctrl+Enter)"
+            } else {
+                goal::REVIEW_LABEL
+            };
+            let review = ButtonComponent::new("goal.review", label, &self.review_button)
+                .policy(ButtonPolicy::interactive());
             let rect = self.review_area;
             let layout = review.layout(Constraints::tight(rect.size()), &mut LayoutCx::new());
             frame.with_child(
@@ -1236,7 +1247,22 @@ impl LoopSurface {
                 LocalRect::new(0, 0, rect.width, rect.height),
                 |cx| review.paint(&layout, cx),
             );
-            let reserved = content.height.min(3);
+            let explanation = if self.goal_phase == goal::GoalPhase::Generated {
+                "Edit the instructions below, then Start goal. Nothing has run yet."
+            } else {
+                "Review and edit before starting. This won't run the goal yet."
+            };
+            let explanation = TextBlock::new(explanation);
+            let rect = Rect::new(content.x, content.y.saturating_add(2), content.width, 2)
+                .intersection(content);
+            let layout = explanation.layout(Constraints::tight(rect.size()), &mut LayoutCx::new());
+            frame.with_child(
+                i32::from(rect.x),
+                i64::from(rect.y),
+                LocalRect::new(0, 0, rect.width, rect.height),
+                |cx| explanation.paint(&layout, cx),
+            );
+            let reserved = content.height.min(4);
             content.y = content.y.saturating_add(reserved);
             content.height = content.height.saturating_sub(reserved);
         }

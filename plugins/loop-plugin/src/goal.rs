@@ -206,7 +206,7 @@ impl PluginTuiSurfaceFactory for GoalSurfaceFactory {
 
 type GenerationResult = Result<bcode_plugin_sdk::tui::PluginStructuredGenerationResult, String>;
 #[derive(Clone, Copy, PartialEq, Eq)]
-enum GoalPhase {
+pub enum GoalPhase {
     Draft,
     Generating { review: bool },
     Generated,
@@ -220,7 +220,7 @@ pub enum GoalOption {
 }
 
 pub const PROGRESS_LABEL: &str = "Maintain a progress document (Ctrl+P)";
-pub const REVIEW_LABEL: &str = "Review generated instructions before starting (Ctrl+R)";
+pub const REVIEW_LABEL: &str = "Generate instructions… (Ctrl+R)";
 
 struct GoalSurface {
     editor: LoopSurface,
@@ -245,8 +245,9 @@ impl GoalSurface {
         }
     }
 
-    fn prepare_controls(&self) {
-        let disabled = self.phase != GoalPhase::Draft
+    fn prepare_controls(&mut self) {
+        self.editor.goal_phase = self.phase;
+        let disabled = !matches!(self.phase, GoalPhase::Draft | GoalPhase::Generated)
             || matches!(
                 self.editor.fresh_session,
                 FreshSessionState::Creating
@@ -279,6 +280,15 @@ impl GoalSurface {
                 editor.field,
                 stroke.modifiers.shift,
             ) {
+                (Some(GoalOption::Review), _, true)
+                    if editor.goal_phase == GoalPhase::Generated =>
+                {
+                    editor.field = Field::Limit;
+                    None
+                }
+                (None, Field::Limit, false) if editor.goal_phase == GoalPhase::Generated => {
+                    Some(GoalOption::Review)
+                }
                 (Some(GoalOption::Progress), _, false) | (None, Field::Prompt, true) => {
                     Some(GoalOption::Review)
                 }
@@ -330,6 +340,11 @@ impl GoalSurface {
             editor.progress_document = checked.then(ProgressDocumentSetup::default);
         }
         if button_outcome == ButtonOutcome::Pressed {
+            if self.phase == GoalPhase::Generated {
+                let action = self.editor.submit(host);
+                self.editor.begin_pending_host_work(host);
+                return Some(action);
+            }
             return Some(self.generate(host, true));
         }
         if !matches!(checkbox_outcome, CheckboxOutcome::Ignored) || button_outcome.is_handled() {
@@ -388,8 +403,7 @@ impl GoalSurface {
         }
         self.source = Some((objective.clone(), guidance.clone(), limit));
         self.phase = GoalPhase::Generating { review };
-        self.editor.status =
-            "Generating with this session's context… Esc closes without launching".into();
+        self.editor.status = "Generating instructions… Goal has not started. Esc closes.".into();
         let mut request = generation_request(
             &objective,
             &guidance,
@@ -553,7 +567,7 @@ impl PluginTuiSurface for GoalSurface {
                 }
             }
         }
-        if self.phase == GoalPhase::Draft
+        if matches!(self.phase, GoalPhase::Draft | GoalPhase::Generated)
             && !matches!(
                 self.editor.fresh_session,
                 FreshSessionState::Creating
@@ -835,8 +849,23 @@ mod tests {
         surface.poll(&host);
         assert!(host.starts.lock().unwrap().is_empty());
         surface.editor.prompt = text_state("edited implementation");
-        surface.editor.start();
-        surface.editor.begin_pending_host_work(&host);
+        let area = Rect::new(0, 0, 100, 32);
+        let mut buffer = bmux_tui::buffer::Buffer::empty(area);
+        surface.render(area, &mut PaintCx::new(&mut Frame::new(&mut buffer)));
+        assert!(surface.editor.review_area.height > 0);
+        let position = bmux_tui::geometry::Point::new(
+            surface.editor.review_area.x,
+            surface.editor.review_area.y,
+        );
+        for kind in [
+            MouseEventKind::Down(bmux_tui::event::MouseButton::Left),
+            MouseEventKind::Up(bmux_tui::event::MouseButton::Left),
+        ] {
+            surface.handle_event(
+                &Event::Mouse(bmux_tui::event::MouseEvent::new(kind, position)),
+                &host,
+            );
+        }
         host.finish().await;
         surface.poll(&host);
         surface.poll(&host);
