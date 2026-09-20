@@ -14,6 +14,16 @@ use std::collections::{BTreeMap, BTreeSet};
 pub struct HistoryMessage {
     /// Stable source node identity, scoped by the conversation and remote account.
     pub node_id: String,
+    /// Original message identity, distinct from the graph node identity.
+    pub message_id: Option<String>,
+    /// Source model label, not a locally resolved model or routing instruction.
+    pub model_slug: Option<String>,
+    /// Historical author/tool name; never an executable tool identifier.
+    pub author_name: Option<String>,
+    /// Historical destination label; never a local routing instruction.
+    pub recipient: Option<String>,
+    /// Original content discriminator for faithful historical presentation.
+    pub content_type: Option<String>,
     /// Original role; callers must not elevate system/developer messages into local instructions.
     pub role: String,
     /// Source timestamp in seconds, if supplied and valid.
@@ -95,6 +105,23 @@ pub fn decode_history(
     expected_id: &str,
     max_bytes: usize,
 ) -> Result<HistorySnapshot, HistoryDecodeError> {
+    decode_history_branch(bytes, expected_id, max_bytes, None)
+}
+
+/// Decode one explicitly selected source branch, or the upstream selection when absent.
+///
+/// Branch selection follows parent links and never merges sibling answers. The returned
+/// selection records the actual requested node, without changing upstream state.
+///
+/// # Errors
+/// Returns the same bounded schema, identity and graph errors as [`decode_history`].
+/// An absent requested node is an invalid graph, not a fallback to another branch.
+pub fn decode_history_branch(
+    bytes: &[u8],
+    expected_id: &str,
+    max_bytes: usize,
+    selected_node: Option<&str>,
+) -> Result<HistorySnapshot, HistoryDecodeError> {
     if bytes.len() > max_bytes {
         return Err(HistoryDecodeError::TooLarge);
     }
@@ -105,7 +132,8 @@ pub fn decode_history(
     }
     let mut visited = BTreeSet::new();
     let mut ancestry = Vec::new();
-    let mut current = Some(source.current_node.as_str());
+    let selected_node = selected_node.unwrap_or(&source.current_node);
+    let mut current = Some(selected_node);
     while let Some(id) = current {
         if !visited.insert(id) {
             return Err(HistoryDecodeError::Cycle);
@@ -133,7 +161,7 @@ pub fn decode_history(
     Ok(HistorySnapshot {
         conversation_id: source.conversation_id,
         title: source.title,
-        selected_node: source.current_node,
+        selected_node: selected_node.to_owned(),
         messages,
         warnings,
     })
@@ -182,12 +210,36 @@ fn decode_message(
                 }
             }
         }
+        Some("code" | "execution_output") => {
+            let value = message
+                .pointer("/content/text")
+                .and_then(Value::as_str)
+                .ok_or(HistoryDecodeError::InvalidSchema)?;
+            text.push(value);
+        }
         _ => {
             warnings.insert(HistoryFidelityWarning::UnsupportedContent);
         }
     }
     Ok(HistoryMessage {
         node_id: id.to_owned(),
+        message_id: message.get("id").and_then(Value::as_str).map(str::to_owned),
+        model_slug: message
+            .pointer("/metadata/model_slug")
+            .and_then(Value::as_str)
+            .map(str::to_owned),
+        author_name: message
+            .pointer("/author/name")
+            .and_then(Value::as_str)
+            .map(str::to_owned),
+        recipient: message
+            .get("recipient")
+            .and_then(Value::as_str)
+            .map(str::to_owned),
+        content_type: message
+            .pointer("/content/content_type")
+            .and_then(Value::as_str)
+            .map(str::to_owned),
         role: role.to_owned(),
         created_at,
         text: text.join("\n"),
@@ -210,6 +262,57 @@ mod tests {
 
     fn decode(value: &Value) -> Result<HistorySnapshot, HistoryDecodeError> {
         decode_history(&serde_json::to_vec(value).unwrap(), "api-id", 65536)
+    }
+
+    #[test]
+    fn explicit_branch_selection_never_merges_or_falls_back() {
+        let bytes = serde_json::to_vec(&graph()).unwrap();
+        let alternative =
+            decode_history_branch(&bytes, "api-id", 65536, Some("alternative")).unwrap();
+        assert_eq!(alternative.selected_node, "alternative");
+        assert_eq!(
+            alternative
+                .messages
+                .iter()
+                .map(|m| m.text.as_str())
+                .collect::<Vec<_>>(),
+            vec!["question", "other answer"]
+        );
+        assert_eq!(
+            decode_history_branch(&bytes, "api-id", 65536, Some("missing")),
+            Err(HistoryDecodeError::InvalidGraph)
+        );
+        let selected = decode_history(&bytes, "api-id", 65536).unwrap();
+        assert_eq!(selected.selected_node, "answer");
+        assert_eq!(selected.messages.last().unwrap().text, "selected answer");
+    }
+
+    #[test]
+    fn historical_tool_text_and_provenance_are_preserved_as_data() {
+        for content_type in ["code", "execution_output"] {
+            let mut source = graph();
+            source["mapping"]["answer"]["message"] = json!({
+                "id": "message-id", "author": {"role": "tool", "name": "python"},
+                "recipient": "all", "metadata": {"model_slug": "source-model"},
+                "content": {"content_type": content_type, "text": "historical output"}
+            });
+            let snapshot = decode(&source).unwrap();
+            let message = snapshot.messages.last().unwrap();
+            assert_eq!(message.node_id, "answer");
+            assert_eq!(message.message_id.as_deref(), Some("message-id"));
+            assert_eq!(message.model_slug.as_deref(), Some("source-model"));
+            assert_eq!(message.author_name.as_deref(), Some("python"));
+            assert_eq!(message.recipient.as_deref(), Some("all"));
+            assert_eq!(message.content_type.as_deref(), Some(content_type));
+            assert_eq!(message.text, "historical output");
+            assert!(
+                !snapshot
+                    .warnings
+                    .contains(&HistoryFidelityWarning::UnsupportedContent)
+            );
+            source["mapping"]["answer"]["message"]["content"]["text"] = json!(42);
+            assert_eq!(decode(&source), Err(HistoryDecodeError::InvalidSchema));
+        }
     }
 
     #[test]

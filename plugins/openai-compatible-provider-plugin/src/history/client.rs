@@ -258,6 +258,94 @@ async fn read_response(
 mod tests {
     use super::*;
 
+    async fn mock_response(headers: &str, body: &[u8]) -> Response {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let wire = [headers.as_bytes(), body].concat();
+        let worker = std::thread::spawn(move || {
+            let (mut socket, _) = listener.accept().unwrap();
+            socket
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            socket
+                .set_write_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            let mut request = [0; 4096];
+            let _ = socket.read(&mut request).unwrap();
+            socket.write_all(&wire).unwrap();
+        });
+        let response = Client::builder()
+            .no_proxy()
+            .redirect(reqwest::redirect::Policy::none())
+            .timeout(Duration::from_secs(5))
+            .build()
+            .unwrap()
+            .get(format!("http://{address}"))
+            .send()
+            .await
+            .unwrap();
+        worker.join().unwrap();
+        response
+    }
+
+    #[tokio::test]
+    async fn bounded_response_reader_accepts_json_and_rejects_large_chunked_body() {
+        let response = mock_response("HTTP/1.1 200 OK\r\nContent-Type: application/json; charset=utf-8\r\nContent-Length: 2\r\nConnection: close\r\n\r\n", b"{}").await;
+        assert_eq!(read_response(response, 2).await.unwrap(), b"{}");
+        let response = mock_response("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n", b"4\r\n1234\r\n0\r\n\r\n").await;
+        assert_eq!(
+            read_response(response, 3).await,
+            Err(HistoryAccessError::TooLarge)
+        );
+    }
+
+    #[tokio::test]
+    async fn response_failures_never_include_private_remote_bodies() {
+        for (status, extra, expected) in [
+            (
+                "401 Unauthorized",
+                "",
+                HistoryAccessError::AuthenticationRequired,
+            ),
+            (
+                "403 Forbidden",
+                "cf-mitigated: challenge\r\n",
+                HistoryAccessError::AccessChallenge,
+            ),
+            (
+                "302 Found",
+                "Location: https://example.invalid/\r\n",
+                HistoryAccessError::IncompatibleResponse,
+            ),
+            (
+                "429 Too Many Requests",
+                "Retry-After: 17\r\n",
+                HistoryAccessError::RateLimited {
+                    retry_after_seconds: Some(17),
+                },
+            ),
+        ] {
+            let response = mock_response(
+                &format!(
+                    "HTTP/1.1 {status}\r\n{extra}Content-Length: 14\r\nConnection: close\r\n\r\n"
+                ),
+                b"private secret",
+            )
+            .await;
+            assert_eq!(read_response(response, 1024).await, Err(expected));
+        }
+    }
+
+    #[tokio::test]
+    async fn html_success_is_not_mistaken_for_history() {
+        let response = mock_response("HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: 0\r\nConnection: close\r\n\r\n", b"").await;
+        assert_eq!(
+            read_response(response, 1024).await,
+            Err(HistoryAccessError::IncompatibleResponse)
+        );
+    }
+
     #[test]
     fn failures_have_distinct_safe_categories() {
         assert_eq!(
