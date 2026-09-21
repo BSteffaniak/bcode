@@ -485,6 +485,47 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn workflow_activity_selection_is_optional_and_fail_open() {
+        let mut state = crate::tests::test_server_state(bcode_session::SessionManager::default());
+        state.plugins = bcode_plugin::PluginRuntimeHost::load_defaults_with_static_bundled(
+            &bcode_plugin::PluginSelection {
+                mode: bcode_plugin::PluginSelectionMode::Explicit,
+                enabled: std::collections::BTreeSet::from(["bcode.loop".into()]),
+                disabled: std::collections::BTreeSet::new(),
+            },
+            &[bcode_bundled_plugins::static_loop_plugin()],
+        )
+        .unwrap();
+        let mut configuration =
+            bcode_workflow::WorkflowPromptConfiguration::preserve_input("build", "unchanged");
+        let input = serde_json::json!({"implementation_prompt":"Implement safely", "stop_condition":"Tests pass", "max_iterations":10, "iteration":2, "condition_met":false, "summary":"", "evidence":[]});
+        let prompt =
+            crate::workflow_prompt_input_message(&configuration.system_prompt, "", &input).unwrap();
+        assert!(
+            crate::workflow_prompt_activity(&state, &configuration, &input)
+                .await
+                .is_none()
+        );
+        configuration.activity_producer = Some(bcode_workflow::WorkflowActivityProducer {
+            plugin: "bcode.loop".into(),
+            stage: "implementation".into(),
+        });
+        let presentation = crate::workflow_prompt_activity(&state, &configuration, &input)
+            .await
+            .unwrap();
+        assert_eq!(presentation.activity_id, "iteration:2");
+        assert_eq!(presentation.payload["exact_structured_input"], input);
+        assert_eq!(
+            crate::workflow_prompt_input_message(&configuration.system_prompt, "", &input).unwrap(),
+            prompt
+        );
+        configuration.activity_producer.as_mut().unwrap().plugin = "missing.plugin".into();
+        let missing = crate::workflow_prompt_activity(&state, &configuration, &input).await;
+        drop(state);
+        assert!(missing.is_none());
+    }
+
+    #[tokio::test]
     async fn activity_round_trip_through_bundled_loop_producer() {
         let mut state = crate::tests::test_server_state(bcode_session::SessionManager::default());
         state.plugins = bcode_plugin::PluginRuntimeHost::load_defaults_with_static_bundled(

@@ -1835,6 +1835,9 @@ impl Default for TurnExecutionOptions {
 /// Generic metadata carried by an ordinary admitted turn.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TurnAdmissionMetadata {
+    /// Host-associated display projection; never used to construct model input or authorize work.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub activity: Option<Box<crate::ActivityPresentation>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub origin: Option<TurnOrigin>,
     #[serde(default)]

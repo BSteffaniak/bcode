@@ -350,6 +350,9 @@ pub async fn submit_turn(
     admission: bcode_session_models::TurnAdmissionMetadata,
     ownership: &mut Option<bcode_session::SessionOwnershipGuard>,
 ) -> Result<bcode_session_models::TurnAdmission, SubmitTurnError> {
+    let mut admission = admission;
+    // Public callers cannot supply host-associated activity display metadata.
+    admission.activity = None;
     *ownership = Some(
         state
             .sessions

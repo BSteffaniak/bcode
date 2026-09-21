@@ -2472,6 +2472,7 @@ fn generic_node(
                 .ok_or_else(|| "no configured prompt profile is available".to_string())?;
             serde_json::to_value(bcode_workflow::WorkflowPromptConfiguration {
                 version: bcode_workflow::WORKFLOW_PROMPT_CONFIGURATION_VERSION,
+                activity_producer: None,
                 execution_target: bcode_workflow::PromptContextTarget::FreshIsolated,
                 agent_profile: profile,
                 provider: None,

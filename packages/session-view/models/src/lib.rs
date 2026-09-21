@@ -1206,9 +1206,34 @@ pub enum SkillViewStatus {
     Failed,
 }
 
+/// Host-correlated activity details available to every frontend.
+///
+/// Exact submitted instructions are included only within the inline budget. Larger
+/// instructions remain in the canonical event identified by `source_sequence` and
+/// require bounded session history retrieval.
+/// The inline producer envelope is bounded independently of those instructions.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ActivityMessageView {
+    /// Canonical accepted-message event for this displayed revision.
+    pub source_sequence: u64,
+    /// Exact submitted instructions when they fit the shared inline budget.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exact_instructions: Option<String>,
+    /// Original UTF-8 byte count; omission is not an empty instruction string.
+    #[serde(default)]
+    pub instruction_bytes: usize,
+    /// Execution identity and retry attempt, separate from producer iteration identity.
+    pub execution: bcode_session_models::TurnExecutionCorrelation,
+    /// Versioned producer data; unknown schemas use the message's readable fallback.
+    pub presentation: bcode_session_models::ActivityPresentation,
+}
+
 /// Chat text plus renderer-neutral annotations.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ChatMessageView {
+    /// Optional activity details; absent for ordinary chat and older snapshots.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub activity: Option<Box<ActivityMessageView>>,
     /// Plain text or markdown-compatible message content.
     pub text: String,
     /// Optional renderer-neutral role/display label suffix.
@@ -1224,6 +1249,7 @@ impl ChatMessageView {
         Self {
             text: text.into(),
             display_label: None,
+            activity: None,
             format: TextFormat::Markdown,
         }
     }
@@ -1234,6 +1260,7 @@ impl ChatMessageView {
         Self {
             text: text.into(),
             display_label: None,
+            activity: None,
             format: TextFormat::PlainText,
         }
     }

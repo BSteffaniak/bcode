@@ -18721,6 +18721,7 @@ mod tests {
                         configuration: serde_json::to_value(
                             bcode_workflow::WorkflowPromptConfiguration {
                                 version: bcode_workflow::WORKFLOW_PROMPT_CONFIGURATION_VERSION,
+                                activity_producer: None,
                                 execution_target:
                                     bcode_workflow::PromptContextTarget::FreshIsolated,
                                 agent_profile: "review".to_string(),

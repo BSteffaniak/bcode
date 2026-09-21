@@ -1144,15 +1144,69 @@ impl SessionView {
                     .origin
                     .as_ref()
                     .and_then(|origin| origin.display_label.clone());
-                let mut message = ChatMessageView::markdown(text.clone());
-                message.display_label = display_label;
-                self.push_item(
-                    TranscriptViewItemId::event(event.sequence),
-                    event.sequence,
-                    Some(event.timestamp_ms),
-                    false,
-                    TranscriptViewItemKind::UserMessage { message },
+                let activity = admission.activity.as_ref().filter(|activity| {
+                    activity.validate(&activity.producer).is_ok()
+                        && admission.execution.correlation.is_some()
+                });
+                let mut message = activity.map_or_else(
+                    || ChatMessageView::markdown(text.clone()),
+                    |activity| ChatMessageView::plain(activity.fallback.clone()),
                 );
+                message.display_label = display_label;
+                message.activity = activity.zip(admission.execution.correlation.as_ref()).map(
+                    |(presentation, execution)| {
+                        Box::new(bcode_session_view_models::ActivityMessageView {
+                            source_sequence: event.sequence,
+                            exact_instructions: (text.len() <= 16_384).then(|| text.clone()),
+                            instruction_bytes: text.len(),
+                            execution: execution.clone(),
+                            presentation: presentation.as_ref().clone(),
+                        })
+                    },
+                );
+                let activity_id = activity.zip(admission.execution.correlation.as_ref()).map(
+                    |(activity, correlation)| {
+                        // Length-prefix every component so delimiter-bearing IDs cannot collide.
+                        let parts = [
+                            &correlation.execution_id,
+                            &activity.producer,
+                            &activity.activity_id,
+                        ];
+                        let mut id = String::from("activity:");
+                        for part in parts {
+                            use std::fmt::Write as _;
+                            let _ = write!(id, "{}:{part}", part.len());
+                        }
+                        TranscriptViewItemId::new(id)
+                    },
+                );
+                if let Some(id) = activity_id {
+                    // Keep the original chronological position/source anchor while revising content.
+                    let anchor = self
+                        .snapshot
+                        .transcript
+                        .items
+                        .iter()
+                        .find(|item| item.id == id)
+                        .map_or((event.sequence, Some(event.timestamp_ms)), |item| {
+                            (item.sequence.unwrap_or(event.sequence), item.timestamp_ms)
+                        });
+                    self.upsert_item(
+                        id,
+                        anchor.0,
+                        anchor.1,
+                        false,
+                        TranscriptViewItemKind::UserMessage { message },
+                    );
+                } else {
+                    self.push_item(
+                        TranscriptViewItemId::event(event.sequence),
+                        event.sequence,
+                        Some(event.timestamp_ms),
+                        false,
+                        TranscriptViewItemKind::UserMessage { message },
+                    );
+                }
             }
             SessionEventKind::AssistantDelta { text } => {
                 self.push_or_append_streaming_message(
@@ -1901,6 +1955,7 @@ impl SessionView {
                     Some("json") => ChatMessageView {
                         text: text.clone(),
                         display_label: None,
+                        activity: None,
                         format: bcode_session_view_models::TextFormat::Json,
                     },
                     _ => ChatMessageView::plain(text.clone()),
@@ -4429,6 +4484,7 @@ impl StreamingMessageKind {
         let message = ChatMessageView {
             text,
             display_label: None,
+            activity: None,
             format: TextFormat::Markdown,
         };
         match self {
@@ -9622,6 +9678,87 @@ mod tests {
         assert_eq!(full_ids, shifted_ids);
         assert_eq!(full_ids[0].get(), "event:2");
         assert_eq!(full_ids[1].get(), "tool:tool-1");
+    }
+
+    #[test]
+    fn activity_updates_keep_identity_anchor_and_unrelated_messages() {
+        let session_id = SessionId::new();
+        let mut view = SessionView::new();
+        let make = |sequence, run: &str, fallback: &str| {
+            event(
+                session_id,
+                sequence,
+                SessionEventKind::UserMessage {
+                    client_id: bcode_session_models::ClientId::new(),
+                    text: "canonical instructions".into(),
+                    admission: bcode_session_models::TurnAdmissionMetadata {
+                        activity: Some(Box::new(bcode_session_models::ActivityPresentation {
+                            version: bcode_session_models::ACTIVITY_PRESENTATION_VERSION,
+                            producer: "example.plugin".into(),
+                            activity_id: "iteration:1".into(),
+                            revision: 1,
+                            schema: "example.card".into(),
+                            schema_version: 1,
+                            fallback: fallback.into(),
+                            payload: serde_json::json!({}),
+                        })),
+                        execution: bcode_session_models::TurnExecutionOptions {
+                            correlation: Some(bcode_session_models::TurnExecutionCorrelation {
+                                execution_id: run.into(),
+                                unit_id: "node".into(),
+                                attempt: 1,
+                            }),
+                            ..bcode_session_models::TurnExecutionOptions::default()
+                        },
+                        ..bcode_session_models::TurnAdmissionMetadata::default()
+                    },
+                },
+            )
+        };
+        view.apply_event(&make(1, "run-a", "Implementation"));
+        let id = view.snapshot().transcript.items[0].id.clone();
+        view.apply_event(&event(
+            session_id,
+            2,
+            SessionEventKind::UserMessage {
+                client_id: bcode_session_models::ClientId::new(),
+                text: "<workflow-input-json>ordinary user XML</workflow-input-json>".into(),
+                admission: bcode_session_models::TurnAdmissionMetadata::default(),
+            },
+        ));
+        let update = make(3, "run-a", "Evaluation");
+        view.apply_event(&update);
+        assert_eq!(view.snapshot().transcript.items.len(), 2);
+        let item = &view.snapshot().transcript.items[0];
+        assert_eq!(item.id, id);
+        assert_eq!(item.sequence, Some(1));
+        let TranscriptViewItemKind::UserMessage { message } = &item.kind else {
+            panic!("expected activity message");
+        };
+        let details = message.activity.as_ref().unwrap();
+        assert_eq!(details.source_sequence, 3);
+        assert_eq!(
+            details.exact_instructions.as_deref(),
+            Some("canonical instructions")
+        );
+        assert_eq!(details.instruction_bytes, "canonical instructions".len());
+        assert_eq!(details.execution.execution_id, "run-a");
+        assert_eq!(details.execution.attempt, 1);
+        assert_eq!(details.presentation.activity_id, "iteration:1");
+        let restored: ChatMessageView =
+            serde_json::from_value(serde_json::to_value(message).unwrap()).unwrap();
+        assert_eq!(&restored, message);
+        assert_eq!(super::transcript_item_text(item), Some("Evaluation"));
+        let snapshot = view.snapshot().clone();
+        view.apply_event(&update);
+        assert_eq!(view.snapshot(), &snapshot);
+        view.apply_event(&make(4, "run-b", "Other run"));
+        assert_eq!(view.snapshot().transcript.items.len(), 3);
+        assert_ne!(view.snapshot().transcript.items[2].id, id);
+        assert_eq!(
+            super::transcript_item_text(&view.snapshot().transcript.items[1]),
+            Some("<workflow-input-json>ordinary user XML</workflow-input-json>")
+        );
     }
 
     #[test]

@@ -176,6 +176,29 @@ pub(super) fn message_content(message: &ChatMessageView) -> Containers {
             @if truncated {
                 (truncation_notice("Message truncated for display."))
             }
+            @if let Some(activity) = &message.activity {
+                (disclosure("Activity details", &container! {
+                    div white-space="preserve-wrap" color=(color::MUTED) {
+                        "Execution: " (&activity.execution.execution_id)
+                        " · unit: " (&activity.execution.unit_id)
+                        " · attempt: " (activity.execution.attempt.to_string())
+                    }
+                    div color=(color::MUTED) {
+                        "Canonical instructions: session event " (activity.source_sequence.to_string())
+                        ". The compact message is a preview, not the exact submitted instructions."
+                    }
+                    @if let Some(instructions) = &activity.exact_instructions {
+                        (disclosure("Exact submitted instructions", &container! {
+                            div white-space="preserve-wrap" color=(color::TEXT) { (instructions) }
+                        }))
+                    } @else {
+                        div color=(color::MUTED) {
+                            "Exact instructions unavailable inline; retrieve the canonical event."
+                        }
+                    }
+                    (json_panel("Producer presentation and available structured input", &serde_json::to_value(&activity.presentation).unwrap_or(serde_json::Value::Null)))
+                }))
+            }
         }
     }
 }

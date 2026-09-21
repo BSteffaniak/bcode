@@ -614,6 +614,7 @@ fn markdown_messages_use_hyperchad_markdown_with_highlighting_and_xss_protection
         text: "# Heading\n\n```rust\nfn main() {}\n```\n\n<script>alert('unsafe')</script>\n\n[unsafe link](javascript:alert(2))\n\n[safe link](https://example.com)"
             .to_owned(),
         display_label: None,
+        activity: None,
         format: TextFormat::Markdown,
     };
 
@@ -633,10 +634,56 @@ fn markdown_messages_use_hyperchad_markdown_with_highlighting_and_xss_protection
 }
 
 #[test]
+fn activity_messages_expose_bounded_details_without_parsing_payload_markup() {
+    let mut message = ChatMessageView::plain("Iteration preview");
+    message.activity = Some(Box::new(bcode_session_view_models::ActivityMessageView {
+        source_sequence: 42,
+        exact_instructions: Some("**exact instructions** <script>not markup</script>".into()),
+        instruction_bytes: 48,
+        execution: bcode_session_models::TurnExecutionCorrelation {
+            execution_id: "run-a".into(),
+            unit_id: "evaluate".into(),
+            attempt: 2,
+        },
+        presentation: bcode_session_models::ActivityPresentation {
+            version: bcode_session_models::ACTIVITY_PRESENTATION_VERSION,
+            producer: "example.plugin".into(),
+            activity_id: "iteration:1".into(),
+            revision: 1,
+            schema: "unknown.schema".into(),
+            schema_version: 1,
+            fallback: "Iteration preview".into(),
+            payload: serde_json::json!({"input":"<script>alert(1)</script>", "large": "x".repeat(40_000)}),
+        },
+    }));
+    let containers = message_content(&message);
+    let mut text = String::new();
+    for container in &containers {
+        container_text(container, &mut text);
+    }
+    assert!(text.contains("Activity details"));
+    assert!(text.contains("Exact submitted instructions"));
+    assert!(text.contains("**exact instructions** <script>not markup</script>"));
+    assert!(text.contains("run-a"));
+    assert!(text.contains("session event 42"));
+    assert!(text.contains("not the exact submitted instructions"));
+    assert!(text.contains("Structured details truncated for display."));
+    assert!(!format!("{containers:?}").contains("Element::Raw"));
+    assert!(!text.contains(&"x".repeat(40_000)));
+    message.activity = None;
+    let mut ordinary = String::new();
+    for container in &message_content(&message) {
+        container_text(container, &mut ordinary);
+    }
+    assert!(!ordinary.contains("Activity details"));
+}
+
+#[test]
 fn plain_text_messages_do_not_parse_markdown() {
     let message = ChatMessageView {
         text: "**literal**".to_owned(),
         display_label: None,
+        activity: None,
         format: TextFormat::PlainText,
     };
 

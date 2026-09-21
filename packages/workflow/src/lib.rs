@@ -5075,6 +5075,7 @@ impl WorkflowStructuredSourceConcisePrompt {
         };
         let configuration = WorkflowPromptConfiguration {
             version: WORKFLOW_PROMPT_CONFIGURATION_VERSION,
+            activity_producer: None,
             execution_target: self.execution_target,
             agent_profile: self.agent_profile.clone(),
             provider: self.provider.clone(),
@@ -11824,6 +11825,16 @@ impl WorkflowPromptOutputPolicy {
     }
 }
 
+/// Explicit display producer selection. This metadata grants no execution authority.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WorkflowActivityProducer {
+    /// Plugin identity resolved through the host's versioned activity service.
+    pub plugin: String,
+    /// Producer-defined lifecycle stage, never inferred from prompt text.
+    pub stage: String,
+}
+
 /// Versioned serializable durable prompt-node configuration.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -11840,6 +11851,9 @@ pub struct WorkflowPromptConfiguration {
     pub timeout_ms: u64,
     pub prompt_mode: String,
     pub system_prompt: String,
+    /// Optional display routing; absent on existing durable configurations.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub activity_producer: Option<WorkflowActivityProducer>,
 }
 
 #[derive(Deserialize)]
@@ -11860,6 +11874,8 @@ struct WorkflowPromptConfigurationWire {
     timeout_ms: u64,
     prompt_mode: String,
     system_prompt: String,
+    #[serde(default)]
+    activity_producer: Option<WorkflowActivityProducer>,
 }
 
 impl<'de> Deserialize<'de> for WorkflowPromptConfiguration {
@@ -11914,6 +11930,7 @@ impl<'de> Deserialize<'de> for WorkflowPromptConfiguration {
             timeout_ms: wire.timeout_ms,
             prompt_mode: wire.prompt_mode,
             system_prompt: wire.system_prompt,
+            activity_producer: wire.activity_producer,
         })
     }
 }
@@ -11953,6 +11970,7 @@ impl WorkflowPromptConfiguration {
     ) -> Self {
         Self {
             version: WORKFLOW_PROMPT_CONFIGURATION_VERSION,
+            activity_producer: None,
             execution_target: PromptContextTarget::FreshIsolated,
             agent_profile: agent_profile.into(),
             provider: None,
@@ -16527,9 +16545,31 @@ mod tests {
         assert!(batch.validate().is_err());
     }
 
+    #[test]
+    fn activity_producer_round_trip_preserves_execution_configuration() {
+        let original = valid_prompt_configuration();
+        let old_wire = serde_json::to_value(&original).unwrap();
+        assert!(old_wire.get("activity_producer").is_none());
+        let mut selected = original.clone();
+        selected.activity_producer = Some(WorkflowActivityProducer {
+            plugin: "example.producer".into(),
+            stage: "implementation".into(),
+        });
+        let mut restored: WorkflowPromptConfiguration =
+            serde_json::from_value(serde_json::to_value(&selected).unwrap()).unwrap();
+        assert_eq!(restored, selected);
+        restored.activity_producer = None;
+        assert_eq!(restored, original);
+        assert_eq!(
+            serde_json::from_value::<WorkflowPromptConfiguration>(old_wire).unwrap(),
+            original
+        );
+    }
+
     fn valid_prompt_configuration() -> WorkflowPromptConfiguration {
         WorkflowPromptConfiguration {
             version: WORKFLOW_PROMPT_CONFIGURATION_VERSION,
+            activity_producer: None,
             execution_target: PromptContextTarget::FreshIsolated,
             agent_profile: "build".to_string(),
             provider: None,
@@ -16717,6 +16757,7 @@ mod tests {
                         resources: vec![ResourceClaim::read("repository")],
                         configuration: serde_json::to_value(WorkflowPromptConfiguration {
                             version: WORKFLOW_PROMPT_CONFIGURATION_VERSION,
+                            activity_producer: None,
                             execution_target: PromptContextTarget::FreshIsolated,
                             agent_profile: "review".to_string(),
                             provider: None,
@@ -18336,6 +18377,7 @@ steps:
         };
         let configuration = WorkflowPromptConfiguration {
             version: WORKFLOW_PROMPT_CONFIGURATION_VERSION,
+            activity_producer: None,
             execution_target: PromptContextTarget::FixedGenerationFork,
             agent_profile: "review".to_string(),
             provider: None,
@@ -22586,6 +22628,7 @@ steps:
     fn versioned_agent_configuration_rejects_workflow_skill_selection_and_escalation() {
         let contract = WorkflowPromptConfiguration {
             version: WORKFLOW_PROMPT_CONFIGURATION_VERSION,
+            activity_producer: None,
             execution_target: PromptContextTarget::FreshIsolated,
             agent_profile: "build".to_string(),
             provider: Some("configured".to_string()),
@@ -24822,6 +24865,7 @@ steps:
     fn prompt_configuration(schema: &ValueSchema, read_only: bool) -> WorkflowPromptConfiguration {
         WorkflowPromptConfiguration {
             version: WORKFLOW_PROMPT_CONFIGURATION_VERSION,
+            activity_producer: None,
             execution_target: PromptContextTarget::FreshIsolated,
             agent_profile: "build".to_string(),
             provider: None,

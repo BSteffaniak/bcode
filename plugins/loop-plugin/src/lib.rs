@@ -1890,6 +1890,7 @@ fn commit_message_agent_configuration(
     }
     Ok(bcode_workflow::WorkflowPromptConfiguration {
         version: bcode_workflow::WORKFLOW_PROMPT_CONFIGURATION_VERSION,
+        activity_producer: None,
         execution_target: bcode_workflow::PromptContextTarget::FreshIsolated,
         agent_profile: "plan".to_string(),
         provider: None,
@@ -1944,6 +1945,15 @@ fn loop_agent_configuration<O: JsonSchema>(
 ) -> bcode_workflow::WorkflowPromptConfiguration {
     bcode_workflow::WorkflowPromptConfiguration {
         version: bcode_workflow::WORKFLOW_PROMPT_CONFIGURATION_VERSION,
+        activity_producer: Some(bcode_workflow::WorkflowActivityProducer {
+            plugin: PLUGIN_ID.to_string(),
+            stage: if read_only {
+                "evaluation"
+            } else {
+                "implementation"
+            }
+            .to_string(),
+        }),
         execution_target: bcode_workflow::PromptContextTarget::SharedParentSequential,
         agent_profile: agent_profile.to_string(),
         provider: None,

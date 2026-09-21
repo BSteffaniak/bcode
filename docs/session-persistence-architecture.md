@@ -72,6 +72,33 @@ sequence-ordered input; migration does not invent output positions that were nev
 This durable ordering does not make live checkpoints durable. Ordered assistant/reasoning appends,
 active presentations, and terminal tombstones remain bounded actor-owned state as described below.
 
+## Admitted workflow activity display
+
+Workflow prompt configuration may explicitly select an activity producer and stage. At dispatch,
+the host requests a bounded versioned projection with a two-second deadline. Missing producers,
+invalid responses and timeouts omit the display projection; canonical prompt construction and
+execution policy are unchanged. Public turn submission clears caller-supplied activity metadata.
+
+An admitted turn may retain this initial projection in its admission metadata alongside its
+unchanged canonical user text. Older metadata-free events retain ordinary text rendering. The
+shared view uses validated, execution-correlated projections as plain readable fallback; it does
+not infer activity identity from XML. Repeated admitted projections update one transcript item
+keyed by execution, producer and producer activity identity, retaining its original source anchor.
+Canonical event ordering governs these admission updates. Shared message contracts also retain
+the bounded producer envelope, execution/retry correlation and latest canonical source sequence
+for bounded exact-instruction retrieval. The latest source reference is separate from the original
+scroll anchor. Exact instructions up to 16 KiB are included verbatim in the shared snapshot;
+larger instructions are omitted with their byte count and canonical reference, never silently
+truncated as exact content. Older snapshots
+without this optional annotation remain readable. The existing HyperChad frontend exposes an
+Activity details disclosure with execution/attempt identity, canonical source-event reference,
+plain-text exact inline instructions and bounded producer JSON. It labels previews and truncated
+structured details explicitly; larger instructions have an explicit unavailable-inline notice
+and still require canonical history retrieval.
+This remains fallback delivery, not a
+full revisioned iteration card: lifecycle updates, historical document snapshots and exact-detail
+frontend inspection still require integration. No live provider fragments are persisted by this path.
+
 ## Live-only progress boundary
 
 Intermediate provider argument fragments, request previews, execution frames, replaceable progress,

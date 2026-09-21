@@ -32046,6 +32046,37 @@ fn workflow_prompt_input_message(
     }
 }
 
+async fn workflow_prompt_activity(
+    state: &ServerState,
+    configuration: &bcode_workflow::WorkflowPromptConfiguration,
+    input: &serde_json::Value,
+) -> Option<bcode_session_models::ActivityPresentation> {
+    let producer = configuration.activity_producer.as_ref()?;
+    let request = bcode_session_models::ActivityProjectionRequest {
+        stage: producer.stage.clone(),
+        revision: 1,
+        input: input.clone(),
+    };
+    let payload = serde_json::to_vec(&request).ok()?;
+    let response = tokio::time::timeout(
+        Duration::from_secs(2),
+        plugin_operations::invoke_service(
+            state,
+            &producer.plugin,
+            bcode_session_models::ACTIVITY_PRESENTATION_INTERFACE_ID,
+            bcode_session_models::OP_PROJECT_ACTIVITY.into(),
+            payload,
+        ),
+    )
+    .await
+    .ok()?
+    .ok()?;
+    if response.error.is_some() {
+        return None;
+    }
+    serde_json::from_slice(&response.payload).ok()
+}
+
 #[allow(clippy::too_many_lines)]
 async fn dispatch_workflow_prompt_turn(
     state: &Arc<ServerState>,
@@ -32195,6 +32226,9 @@ async fn dispatch_workflow_prompt_turn(
     )
     .await;
     let metadata = bcode_session_models::TurnAdmissionMetadata {
+        activity: workflow_prompt_activity(state, &configuration, input)
+            .await
+            .map(Box::new),
         origin: Some(TurnOrigin {
             producer: "bcode.workflow".to_string(),
             correlation_id: Some(request.dispatch_identity.clone()),
@@ -61317,6 +61351,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
     ) -> bcode_workflow::WorkflowPromptConfiguration {
         bcode_workflow::WorkflowPromptConfiguration {
             version: bcode_workflow::WORKFLOW_PROMPT_CONFIGURATION_VERSION,
+            activity_producer: None,
             execution_target,
             agent_profile: "build".to_string(),
             provider: Some("bcode.fake-provider".to_string()),
@@ -64256,6 +64291,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
         };
         let configuration = bcode_workflow::WorkflowPromptConfiguration {
             version: bcode_workflow::WORKFLOW_PROMPT_CONFIGURATION_VERSION,
+            activity_producer: None,
             execution_target: bcode_workflow::PromptContextTarget::FreshIsolated,
             agent_profile: "build".to_string(),
             provider: None,
@@ -64465,6 +64501,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
             }),
             priority: TurnPriority::Background,
             idempotency_key: Some(dispatch_identity),
+            activity: None,
             execution: TurnExecutionOptions::default(),
         };
         let first = submit_session_model_turn_with_admission(
@@ -66172,6 +66209,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
             resources: Vec::new(),
             configuration: serde_json::to_value(bcode_workflow::WorkflowPromptConfiguration {
                 version: bcode_workflow::WORKFLOW_PROMPT_CONFIGURATION_VERSION,
+                activity_producer: None,
                 execution_target: bcode_workflow::PromptContextTarget::SharedParentSequential,
                 agent_profile: "build".to_string(),
                 provider: None,
@@ -66376,6 +66414,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
             resources: Vec::new(),
             configuration: serde_json::to_value(bcode_workflow::WorkflowPromptConfiguration {
                 version: bcode_workflow::WORKFLOW_PROMPT_CONFIGURATION_VERSION,
+                activity_producer: None,
                 execution_target: bcode_workflow::PromptContextTarget::SharedParentSequential,
                 agent_profile: "build".to_string(),
                 provider: None,
@@ -66667,6 +66706,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
                         configuration: serde_json::to_value(
                             bcode_workflow::WorkflowPromptConfiguration {
                                 version: bcode_workflow::WORKFLOW_PROMPT_CONFIGURATION_VERSION,
+                                activity_producer: None,
                                 execution_target:
                                     bcode_workflow::PromptContextTarget::FreshIsolated,
                                 agent_profile: "plan".to_string(),
@@ -67037,6 +67077,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
         };
         let configuration = bcode_workflow::WorkflowPromptConfiguration {
             version: bcode_workflow::WORKFLOW_PROMPT_CONFIGURATION_VERSION,
+            activity_producer: None,
             execution_target: bcode_workflow::PromptContextTarget::SharedParentSequential,
             agent_profile: "plan".to_string(),
             provider: None,
@@ -67491,6 +67532,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
                     configuration: serde_json::to_value(
                         bcode_workflow::WorkflowPromptConfiguration {
                             version: bcode_workflow::WORKFLOW_PROMPT_CONFIGURATION_VERSION,
+                            activity_producer: None,
                             execution_target: bcode_workflow::PromptContextTarget::FreshIsolated,
                             agent_profile: "build".to_string(),
                             provider: Some("bcode.fake-provider".to_string()),
@@ -67689,6 +67731,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
                     configuration: serde_json::to_value(
                         bcode_workflow::WorkflowPromptConfiguration {
                             version: bcode_workflow::WORKFLOW_PROMPT_CONFIGURATION_VERSION,
+                            activity_producer: None,
                             execution_target: bcode_workflow::PromptContextTarget::FreshIsolated,
                             agent_profile: "build".to_string(),
                             provider: Some("bcode.fake-provider".to_string()),

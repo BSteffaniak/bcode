@@ -1276,6 +1276,7 @@ mod tests {
                     message: bcode_session_view_models::ChatMessageView {
                         text: "* value".to_owned(),
                         display_label: None,
+                        activity: None,
                         format,
                     },
                 },
@@ -1326,6 +1327,7 @@ mod tests {
                 message: bcode_session_view_models::ChatMessageView {
                     text: "* value".to_owned(),
                     display_label: None,
+                    activity: None,
                     format,
                 },
             },

@@ -7878,6 +7878,7 @@ mod tests {
             .await
             .expect("session should be created");
         let metadata = bcode_session_models::TurnAdmissionMetadata {
+            activity: None,
             origin: Some(bcode_session_models::TurnOrigin {
                 producer: "test.producer".to_string(),
                 correlation_id: Some("run-1".to_string()),

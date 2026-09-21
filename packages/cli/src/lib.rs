@@ -18211,6 +18211,7 @@ async fn send_message(session_id: SessionId, options: SendOptions) -> Result<(),
                         bcode_session_models::TurnPriority::Interactive
                     },
                     idempotency_key,
+                    activity: None,
                     execution: launch_options.turn_execution_options(),
                 },
             )
