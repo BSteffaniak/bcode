@@ -1308,6 +1308,25 @@ fn waited_prompt_reports_unavailable_provider_through_live_daemon() {
         graph_cli_json(root.path(), &["session", "history", id, "--json"]),
         history
     );
+    std::fs::write(
+        root.path().join("prompt.txt"),
+        "Different prompt for the same job",
+    )
+    .unwrap();
+    // Admission identity is producer/key, not prompt content. Reusing it must
+    // observe the original turn, never execute the replacement prompt. The
+    // nonzero exit alone cannot prove conflict rejection: the original turn
+    // already failed because its provider was unavailable.
+    let changed_prompt_replay =
+        run_cli_at_root(root.path(), &arguments, Stdio::piped(), Stdio::null());
+    assert!(!changed_prompt_replay.status.success());
+    let changed_prompt_replay: serde_json::Value =
+        serde_json::from_slice(&changed_prompt_replay.stdout).expect("original terminal JSON");
+    assert_eq!(changed_prompt_replay, result);
+    assert_eq!(
+        graph_cli_json(root.path(), &["session", "history", id, "--json"]),
+        history
+    );
     assert!(!root.path().join("should-not-exist").exists());
     drop(daemon);
 }
