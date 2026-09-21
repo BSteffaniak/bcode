@@ -401,9 +401,9 @@ filesystem_edit_partial_marker = b"PTYFILESYSTEMEDI"
 filesystem_edit_marker = b"PTYFILESYSTEMEDITED"
 assistant_prefix_marker = b"ASSISTANTPREFIX"
 assistant_suffix_marker = b"ASSISTANTSUFFIX"
-reasoning_first_marker = b"  REASONINGFIRST "
-reasoning_combined_marker = b"  REASONINGFIRSTREASONINGSECOND "
-reasoning_final_marker = b"  REASONINGFINAL "
+reasoning_first_marker = b"  REASONINGFIRST"
+reasoning_combined_marker = b"  REASONINGFIRSTREASONINGSECOND"
+reasoning_final_marker = b"  REASONINGFINAL"
 
 # SGR mouse reports use one-based terminal coordinates. These two events target
 # ordinary transcript space and exercise generic scroll routing without relying
@@ -695,9 +695,10 @@ while time.monotonic() < deadline:
             os.write(fd, b"stream-reasoning REASONINGFIRSTREASONINGSECOND\r")
             reasoning_request_sent = True
         if reasoning_request_sent:
-            first_visible = reasoning_first_marker in screen
-            combined_visible = reasoning_combined_marker in screen
-            final_visible = reasoning_final_marker in screen
+            visible_lines = screen.splitlines()
+            first_visible = reasoning_first_marker in visible_lines
+            combined_visible = reasoning_combined_marker in visible_lines
+            final_visible = reasoning_final_marker in visible_lines
             if first_visible:
                 reasoning_first_before_second = True
             if combined_visible or final_visible:
