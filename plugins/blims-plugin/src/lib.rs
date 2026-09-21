@@ -9659,8 +9659,8 @@ fn department_report(
         format!("Agents: {} total, {active_agents} active", agents.len()),
         format!("Assigned tasks: {}", tasks.len()),
         format!("Ready reviews across company: {ready_reviews}"),
-        format!("Standup yesterday: moved priority work and kept context fresh."),
-        format!("Standup today: focus on highest-priority active tasks and review queue."),
+        "Standup yesterday: moved priority work and kept context fresh.".to_owned(),
+        "Standup today: focus on highest-priority active tasks and review queue.".to_owned(),
     ];
     let risk_count = agents
         .iter()
