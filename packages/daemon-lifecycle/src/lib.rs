@@ -2085,6 +2085,27 @@ mod tests {
     }
 
     #[test]
+    fn daemon_launch_preserves_exclusive_config_as_one_argument() {
+        let mut command = tokio::process::Command::new("bcode");
+        let path = Path::new("trusted directory/config ; $(ignored).toml");
+        super::configure_daemon_config(&mut command, Some(path));
+        command.args(["server", "run"]);
+        let args: Vec<_> = command.as_std().get_args().collect();
+        assert_eq!(
+            args,
+            vec![
+                std::ffi::OsStr::new("--config-only"),
+                path.as_os_str(),
+                std::ffi::OsStr::new("server"),
+                std::ffi::OsStr::new("run"),
+            ]
+        );
+        let mut ordinary = tokio::process::Command::new("bcode");
+        super::configure_daemon_config(&mut ordinary, None);
+        assert_eq!(ordinary.as_std().get_args().count(), 0);
+    }
+
+    #[test]
     fn daemon_config_home_reproduces_the_resolved_config_directory() {
         // A spawned daemon resolves `<XDG_CONFIG_HOME>/bcode`, so the parent must be
         // passed for the child to land on the same directory the client resolved.
@@ -2616,6 +2637,22 @@ fn config_home_for_daemon(config_dir: &Path) -> PathBuf {
     config_dir.to_path_buf()
 }
 
+fn daemon_command(exe: &Path) -> tokio::process::Command {
+    let mut command = tokio::process::Command::new(exe);
+    detach_daemon_process(&mut command);
+    configure_daemon_config(
+        &mut command,
+        bcode_config::process_exclusive_config_path().as_deref(),
+    );
+    command
+}
+
+fn configure_daemon_config(command: &mut tokio::process::Command, path: Option<&Path>) {
+    if let Some(path) = path {
+        command.arg("--config-only").arg(path);
+    }
+}
+
 fn diagnostic_startup_id() -> u128 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -2724,8 +2761,7 @@ pub async fn ensure_daemon_running(options: &EnsureDaemonOptions) -> Result<(), 
             let (endpoint_env_name, endpoint_env_value) =
                 bcode_ipc::endpoint_env_pair(&endpoint)
                     .map_err(|error| std::io::Error::other(error.to_string()))?;
-            let mut command = tokio::process::Command::new(exe);
-            detach_daemon_process(&mut command);
+            let mut command = daemon_command(&exe);
             let spawn_phase = bcode_metrics::startup::phase("launcher.process_spawn");
             let mut child = command
                 .args(["server", "run"])

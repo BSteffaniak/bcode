@@ -1142,6 +1142,18 @@ pub fn push_process_inline_config_overlay(
     Ok(push_process_config_overrides(overrides))
 }
 
+/// Return the required exclusive configuration file selected for this process.
+///
+/// Launchers must explicitly forward this selection to child Bcode processes;
+/// process-scoped overrides are not inherited across process boundaries.
+pub fn process_exclusive_config_path() -> Option<PathBuf> {
+    process_config_overrides()
+        .read()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .as_ref()
+        .and_then(|overrides| overrides.exclusive_config_path.clone())
+}
+
 fn canonical_profile_id(profile_id: &str) -> String {
     profile_id.trim().to_ascii_lowercase()
 }

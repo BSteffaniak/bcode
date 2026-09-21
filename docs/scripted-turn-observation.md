@@ -51,8 +51,9 @@ publication idempotent.
 
 Do not treat `--config-only FILE` on a sending client as an end-to-end CI
 security boundary. It selects a process-local configuration override. Automatic
-daemon startup currently forwards resolved state/config directories, but not
-that exclusive-file override to `server run`. An already-running daemon also
+daemon startup forwards the exclusive-file selection to `server run` as a
+separate command-line argument, along with resolved state/config directories.
+This does not establish compatibility with an already-running daemon, which
 has its own configuration. Tool plugins may load configuration in the daemon;
 for example, the shell plugin discovers configuration from its effective working
 directory. A client input-validation test does not prove those loads exclude
