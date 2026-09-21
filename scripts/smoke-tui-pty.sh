@@ -622,7 +622,9 @@ while time.monotonic() < deadline:
                 assistant_prefix_before_finish = True
             if suffix_visible and not prefix_visible and not assistant_prefix_before_finish:
                 assistant_suffix_before_prefix = True
-            if prefix_visible and suffix_visible and assistant_prefix_before_finish:
+            # The Markdown response is taller than the viewport. Its first and
+            # last source markers must be observed in order, not in one frame.
+            if suffix_visible and assistant_prefix_before_finish:
                 assistant_final_after_prefix = True
             if (
                 assistant_final_after_prefix

@@ -736,16 +736,9 @@ mod tests {
 
     /// Minimal executor so this test does not pull in a runtime dependency.
     fn futures_lite_block_on<T>(future: impl Future<Output = T>) -> T {
-        use std::sync::Arc;
-        use std::task::{Context, Poll, Wake, Waker};
+        use std::task::{Context, Poll, Waker};
 
-        struct NoopWaker;
-        impl Wake for NoopWaker {
-            fn wake(self: Arc<Self>) {}
-        }
-
-        let waker = Waker::from(Arc::new(NoopWaker));
-        let mut context = Context::from_waker(&waker);
+        let mut context = Context::from_waker(Waker::noop());
         let mut future = Box::pin(future);
         loop {
             if let Poll::Ready(value) = future.as_mut().poll(&mut context) {
