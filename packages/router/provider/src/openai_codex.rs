@@ -607,17 +607,40 @@ async fn refresh_openai_codex_token(
         .send()
         .await?;
     let status = response.status();
-    let body = response.text().await?;
+    // Error bodies may echo submitted credentials. Do not read or expose them.
     if !status.is_success() {
         return Err(ProviderError::Auth {
             provider_id: model.provider.to_string(),
-            message: format!("ChatGPT/Codex token refresh failed with {status}: {body}"),
+            message: format!("ChatGPT/Codex token refresh failed with {status}"),
         });
     }
-    serde_json::from_str(&body).map_err(|error| ProviderError::Auth {
-        provider_id: model.provider.to_string(),
-        message: format!("failed to decode ChatGPT/Codex token refresh response: {error}"),
-    })
+    let body = response.bytes().await?;
+    decode_refreshed_token(&body, model)
+}
+
+fn decode_refreshed_token(
+    body: &[u8],
+    model: &RouteableModel,
+) -> Result<OpenAiOauthTokenResponse, ProviderError> {
+    // Serde errors can include unexpected string values from the response, including tokens.
+    let token: OpenAiOauthTokenResponse =
+        serde_json::from_slice(body).map_err(|_| ProviderError::Auth {
+            provider_id: model.provider.to_string(),
+            message: "invalid ChatGPT/Codex token refresh response".to_string(),
+        })?;
+    if token.access_token.trim().is_empty()
+        || token
+            .refresh_token
+            .as_ref()
+            .is_some_and(|value| value.trim().is_empty())
+        || token.expires_in == Some(0)
+    {
+        return Err(ProviderError::Auth {
+            provider_id: model.provider.to_string(),
+            message: "invalid ChatGPT/Codex token refresh response".to_string(),
+        });
+    }
+    Ok(token)
 }
 
 fn store_refreshed_auth(
@@ -1210,6 +1233,41 @@ mod tests {
     use brouter_provider_models::{ModelCapability, ModelId, ProviderId};
 
     use super::*;
+
+    #[test]
+    fn refresh_response_rejects_invalid_credentials_without_exposing_values() {
+        let model = routeable_model();
+        for body in [
+            br#"{"access_token":"secret-canary","expires_in":"secret-canary"}"#.as_slice(),
+            br#"{"access_token":"secret-canary","refresh_token":false}"#.as_slice(),
+            br#"{"access_token":" "}"#.as_slice(),
+            br#"{"access_token":"secret-canary","refresh_token":""}"#.as_slice(),
+            br#"{"access_token":"secret-canary","expires_in":0}"#.as_slice(),
+            b"not-json-secret-canary".as_slice(),
+        ] {
+            let error = decode_refreshed_token(body, &model).unwrap_err();
+            assert!(matches!(error, ProviderError::Auth { .. }));
+            assert!(!error.to_string().contains("secret-canary"));
+            assert!(!format!("{error:?}").contains("secret-canary"));
+        }
+    }
+
+    #[test]
+    fn refresh_response_accepts_optional_rotation_metadata() {
+        let model = routeable_model();
+        let token = decode_refreshed_token(br#"{"access_token":"access"}"#, &model).unwrap();
+        assert_eq!(token.access_token, "access");
+        assert!(token.refresh_token.is_none());
+        assert!(token.expires_in.is_none());
+
+        let token = decode_refreshed_token(
+            br#"{"access_token":"access","refresh_token":"next","expires_in":3600}"#,
+            &model,
+        )
+        .unwrap();
+        assert_eq!(token.refresh_token.as_deref(), Some("next"));
+        assert_eq!(token.expires_in, Some(3600));
+    }
 
     #[test]
     fn codex_request_uses_responses_shape() {
