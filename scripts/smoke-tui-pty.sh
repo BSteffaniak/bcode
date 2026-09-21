@@ -95,6 +95,7 @@ cat >"${BCODE_CONFIG}" <<'EOF'
 [plugins]
 default = "none"
 enabled = ["bcode.fake-provider", "bcode.shell", "bcode.filesystem", "bcode.default-agents"]
+disabled = ["bcode.bedrock", "bcode.openai-compatible"]
 
 [model]
 provider_plugin_id = "bcode.fake-provider"
@@ -126,6 +127,9 @@ edit = { "**" = "allow" }
 
 [tools.shell.env]
 mode = "inherit"
+
+[metrics]
+startup_reports = true
 
 [daemon]
 idle_shutdown = true
@@ -263,6 +267,12 @@ if failures:
         output.write(capture)
     print("cold TUI auto-start acceptance failed: " + ", ".join(failures), file=sys.stderr)
     print(repr(bytes(capture[-2000:])), file=sys.stderr)
+    for path in glob.glob(os.path.join(os.environ["BCODE_STATE_DIR"], "startup-reports", "*.json")):
+        with open(path, encoding="utf-8") as report:
+            print(report.read(), file=sys.stderr)
+    for path in glob.glob(os.path.join(os.environ["BCODE_STATE_DIR"], "logs", "*.log")):
+        with open(path, encoding="utf-8") as log:
+            print(log.read()[-12000:], file=sys.stderr)
     sys.exit(1)
 PY
 
@@ -404,8 +414,9 @@ mouse_scroll_down = b"\x1b[<65;2;2M"
 def screen_text():
     with open(capture_path, "wb") as capture_file:
         capture_file.write(capture)
+    rows, columns, _, _ = struct.unpack("HHHH", fcntl.ioctl(fd, termios.TIOCGWINSZ, b"\0" * 8))
     result = subprocess.run(
-        [probe_binary, capture_path],
+        [probe_binary, capture_path, str(columns), str(rows)],
         check=True,
         capture_output=True,
     )
@@ -598,6 +609,10 @@ while time.monotonic() < deadline:
             and viewport_check_frames >= 2
             and b"ready" in lower_screen
         ):
+            # Keep the response header visible while the rich Markdown fixture streams;
+            # later stages explicitly exercise narrow, wide, and tiny terminals.
+            fcntl.ioctl(fd, termios.TIOCSWINSZ, struct.pack("HHHH", 100, 120, 0, 0))
+            os.kill(pid, signal.SIGWINCH)
             # Return to the live edge before testing streamed output. The detached
             # viewport above deliberately stays on earlier user content.
             os.write(fd, b"\x1b[1;5F")
@@ -613,14 +628,16 @@ while time.monotonic() < deadline:
         if assistant_request_sent:
             if not assistant_final_after_prefix:
                 os.write(fd, b"\x1b[1;5F")
-            prefix_visible = assistant_prefix_marker in screen
+            assistant_response = screen.rsplit(b"\nBcode\n", 1)
+            assistant_text = assistant_response[1] if len(assistant_response) == 2 else b""
+            prefix_visible = assistant_prefix_marker in assistant_text
             suffix_visible = assistant_suffix_marker in screen
             if prefix_visible and not suffix_visible and not assistant_composer_edit_responsive:
                 os.write(fd, b"composer-remains-responsive")
                 assistant_composer_edit_responsive = True
             if prefix_visible and not suffix_visible:
                 assistant_prefix_before_finish = True
-            if suffix_visible and not prefix_visible and not assistant_prefix_before_finish:
+            if suffix_visible and not prefix_visible and not assistant_prefix_before_finish and assistant_text:
                 assistant_suffix_before_prefix = True
             # The Markdown response is taller than the viewport. Its first and
             # last source markers must be observed in order, not in one frame.
@@ -631,7 +648,7 @@ while time.monotonic() < deadline:
                 and assistant_redetached
                 and not cancellation_request_sent
             ):
-                os.write(fd, b"\x15")
+                os.write(fd, b"\x1b[1;5F\x15")
                 os.write(fd, b"stream-text CANCELPREFIXCANCELSUFFIX\r")
                 cancellation_request_sent = True
         if assistant_final_after_prefix and not assistant_markdown_focus_responsive:
@@ -655,8 +672,13 @@ while time.monotonic() < deadline:
             os.write(fd, b"\x1b[5~")
             assistant_redetached = True
         if cancellation_request_sent and not cancellation_responsive:
-            cancel_prefix = b"CANCELPREFIX" in screen
-            cancel_suffix = b"CANCELSUFFIX" in screen
+            os.write(fd, b"\x1b[1;5F")
+            # The submitted user message contains both markers. Only the assistant
+            # block can establish partial delivery before the final suffix.
+            cancel_response = screen.rsplit(b"\nBcode\n", 1)
+            cancel_text = cancel_response[1] if len(cancel_response) == 2 else b""
+            cancel_prefix = b"CANCELPREFIX" in cancel_text
+            cancel_suffix = b"CANCELSUFFIX" in cancel_text
             if cancel_prefix and not cancel_suffix:
                 cancellation_prefix_visible = True
                 os.write(fd, b"\x03")
