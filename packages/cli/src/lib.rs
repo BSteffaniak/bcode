@@ -7216,8 +7216,17 @@ async fn dispatch_session_command(command: Box<SessionCommand>) -> Result<(), Cl
                     "explicit --apply is required".to_owned(),
                 ));
             }
-            let root = bcode_config::default_session_store_dir();
-            let retired =
+            #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+            {
+                let _ = entry_budget;
+                return Err(CliError::InvalidArguments(
+                    "legacy admission compaction is unsupported on this platform".to_owned(),
+                ));
+            }
+            #[cfg(any(target_os = "macos", target_os = "linux"))]
+            {
+                let root = bcode_config::default_session_store_dir();
+                let retired =
                 bcode_session::storage_admission::StorageAdmissionRegistry::compact_legacy_readers(
                     &root,
                     entry_budget as usize,
@@ -7227,9 +7236,10 @@ async fn dispatch_session_command(command: Box<SessionCommand>) -> Result<(), Cl
                         "legacy admission compaction refused: {error}"
                     ))
                 })?;
-            print_json(
-                &serde_json::json!({ "retired": retired, "maintenance_blocker_retained": true }),
-            )?;
+                print_json(
+                    &serde_json::json!({ "retired": retired, "maintenance_blocker_retained": true }),
+                )?;
+            }
         }
         SessionCommand::StorageAdmission { session_id, apply } => {
             ensure_server_running().await?;

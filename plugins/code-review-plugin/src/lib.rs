@@ -4695,7 +4695,7 @@ fn parse_hunk_range(range: &str, prefix: char) -> Result<(u32, u32), ReviewError
             "hunk range missing '{prefix}' prefix: {range}"
         )));
     };
-    let (start, count) = range.split_once(',').map_or((range, "1"), |parts| parts);
+    let (start, count) = range.split_once(',').unwrap_or((range, "1"));
     let start = start
         .parse::<u32>()
         .map_err(|error| ReviewError::Parse(format!("invalid hunk start '{start}': {error}")))?;
