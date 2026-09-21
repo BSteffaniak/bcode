@@ -611,6 +611,8 @@ while time.monotonic() < deadline:
             if viewport_anchor in screen:
                 viewport_stable_during_stream = True
         if assistant_request_sent:
+            if not assistant_final_after_prefix:
+                os.write(fd, b"\x1b[1;5F")
             prefix_visible = assistant_prefix_marker in screen
             suffix_visible = assistant_suffix_marker in screen
             if prefix_visible and not suffix_visible and not assistant_composer_edit_responsive:

@@ -4858,7 +4858,7 @@ mod tests {
                 .all(|hit| hit.id.as_str() != "composer")
         );
         assert!(terminal.selection().fragments().is_empty());
-        assert!(terminal.image_scene().placements().is_empty());
+        assert_eq!(terminal.image_scene().placements().len(), 0);
         let snapshot = terminal.retained_buffer().cloned();
         let cursor = terminal.cursor();
         model
