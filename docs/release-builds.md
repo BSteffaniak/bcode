@@ -3,6 +3,33 @@
 Bcode release artifacts are produced by the repository `xtask` release automation and the
 `release.yml` GitHub Actions workflow.
 
+## CI installation prerequisite
+
+The composite Action at `.github/actions/setup-bcode` exposes this installer with
+required `archive` and `sha256` inputs and `installation` / `binary` outputs.
+Consumers must pin the Action repository to a reviewed full commit SHA, provide
+an absolute archive path in trusted runner storage, and use an ephemeral Unix
+runner with Python 3. It does not download a release, execute Bcode, alter PATH,
+accept credentials, or run prompts. Installation files remain in `RUNNER_TEMP`
+for the job; runner disposal is responsible for final cleanup. This setup Action
+is not the still-required prompt-execution Action.
+
+`scripts/install-action-release.py --archive RELEASE.tar.gz --sha256 TRUSTED_DIGEST
+--parent PRIVATE_RUNNER_DIRECTORY` verifies a Unix distribution and prints a new
+private installation directory. Supply a reviewed SHA-256 pin from trusted workflow
+configuration; fetching a digest beside an archive is not an independent trust
+anchor. The caller must download into trusted private storage and enforce network
+deadlines; this helper does not download or execute binaries. Both the archive and
+parent directory must be outside untrusted checkout control. Windows ZIP installation
+is not supported by this helper.
+
+The installer hashes a bounded private snapshot before extraction, rejects links,
+devices, traversal and duplicate paths, bounds the entire decompressed tar stream
+(including metadata) before parsing as well as extracted size and entry count,
+preserves bundled runtime layout, and strips archive ownership and privileged modes.
+Failed installations are removed. This is an installation prerequisite, not yet a
+reusable Action, authentication setup, sandbox, or execution supervisor.
+
 ## Local commands
 
 `build` defaults to the slim `app` feature set. `release` and `dev-release` default to the complete

@@ -24509,6 +24509,28 @@ fn run_creation_atomically_materializes_stable_entry_activations() {
 }
 
 #[test]
+fn idle_discovery_preserves_publication_read_fence() {
+    let temp = tempfile::tempdir().expect("temp");
+    let mut store = WorkflowStore::open_in_state_dir(temp.path()).expect("store");
+    let fence = store.publication_read_fence().expect("fence");
+    for _ in 0..3 {
+        assert!(
+            store
+                .advance_continuation_discovery("artifact-a", 1)
+                .unwrap()
+                .is_empty()
+        );
+        store
+            .validate_publication_read_fence(&fence)
+            .expect("idle discovery is non-mutating");
+    }
+    store
+        .persist_definition("example", 1, &definition("example"))
+        .unwrap();
+    assert!(store.validate_publication_read_fence(&fence).is_err());
+}
+
+#[test]
 fn durable_discovery_survives_restart_and_isolates_artifacts() {
     let temp = tempfile::tempdir().expect("temp");
     let mut store = WorkflowStore::open_in_state_dir(temp.path()).expect("store");

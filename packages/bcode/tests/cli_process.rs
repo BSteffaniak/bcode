@@ -437,7 +437,7 @@ fn workflow_repair_cli_resolves_persistent_attempt_without_retry() {
             authored_provenance: None,
             input: Some(serde_json::json!(1)),
             execution_authority: Some(bcode_workflow_store::WorkflowExecutionAuthority {
-                target_artifact_id: field("build fingerprint: "),
+                target_artifact_id: field("artifact identity: "),
                 daemon_instance_id: field("instance: "),
                 generation: 1,
                 fencing_token: "repair-cli-fence".to_string(),
@@ -680,6 +680,79 @@ fn capture_output(mut pipe: impl std::io::Read) -> std::io::Result<(Vec<u8>, boo
         truncated |= keep != count;
         retained.extend_from_slice(&buffer[..keep]);
     }
+}
+
+#[test]
+fn send_wait_input_failure_emits_unverified_process_result() {
+    let session = "00000000-0000-0000-0000-000000000001";
+    let output = run_cli(&["send", session, "--file", "missing-prompt.txt", "--wait"]);
+    assert!(!output.status.success());
+    let value: serde_json::Value = serde_json::from_slice(&output.stdout)
+        .expect("one complete JSON result despite input failure");
+    assert_eq!(
+        value,
+        serde_json::json!({
+            "schema_version": 1,
+            "session_id": session,
+            "receipt": null,
+            "outcome": null,
+            "observation": "unverified",
+            "cancellation_requested": false,
+        })
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn send_wait_rejects_fifo_without_waiting_for_a_writer() {
+    let session = "00000000-0000-0000-0000-000000000001";
+    let output = run_cli_with_fixture(
+        &["send", session, "--file", "prompt.fifo", "--wait"],
+        true,
+        Stdio::piped(),
+        |root| {
+            let status = Command::new("mkfifo")
+                .arg(root.join("prompt.fifo"))
+                .status()
+                .expect("create FIFO fixture");
+            assert!(status.success());
+        },
+    );
+    assert!(!output.status.success());
+    let value: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("FIFO rejection emits one complete result");
+    assert_eq!(value["observation"], "unverified");
+    assert!(value["receipt"].is_null());
+    assert_eq!(value["cancellation_requested"], false);
+    assert!(String::from_utf8_lossy(&output.stderr).contains("regular file"));
+}
+
+#[test]
+fn config_only_bypasses_malformed_repository_config_in_process() {
+    let session = "00000000-0000-0000-0000-000000000001";
+    let output = run_cli_with_fixture(
+        &[
+            "--config-only",
+            "trusted.toml",
+            "send",
+            session,
+            "--file",
+            "missing-prompt.txt",
+            "--wait",
+        ],
+        false,
+        Stdio::piped(),
+        |root| {
+            std::fs::write(root.join("trusted.toml"), "").expect("trusted config");
+            std::fs::write(root.join("bcode.toml"), "invalid TOML !!!").expect("untrusted config");
+        },
+    );
+    assert!(!output.status.success());
+    let value: serde_json::Value = serde_json::from_slice(&output.stdout)
+        .expect("command reached input handling without parsing repository config");
+    assert_eq!(value["observation"], "unverified");
+    assert!(value["receipt"].is_null());
+    assert!(!String::from_utf8_lossy(&output.stderr).contains("invalid TOML"));
 }
 
 fn run_cli(arguments: &[&str]) -> Output {
@@ -1188,6 +1261,92 @@ fn composer_draft_cli_reads_sets_and_clears_live_daemon() {
     clear.push("--clear");
     assert_eq!(graph_cli_json(root.path(), &clear), serde_json::Value::Null);
     assert_eq!(graph_cli_json(root.path(), &base), serde_json::Value::Null);
+    drop(daemon);
+}
+
+#[test]
+#[ignore = "requires BCODE_DEFAULT_AGENTS_PLUGIN_TEST_LIBRARY pointing to the built default-agents plugin"]
+fn waited_prompt_reports_unavailable_provider_through_live_daemon() {
+    let root = tempfile::tempdir().unwrap();
+    let daemon = start_graph_test_daemon(&root);
+    let session = graph_cli_json(root.path(), &["session", "create", "wait-target", "--json"]);
+    let id = session["id"].as_str().unwrap();
+    std::fs::write(
+        root.path().join("prompt.txt"),
+        "Arbitrary prompt: $(touch should-not-exist) 🦀",
+    )
+    .unwrap();
+    let arguments = [
+        "send",
+        id,
+        "--file",
+        "prompt.txt",
+        "--wait",
+        "--timeout-secs",
+        "10",
+        "--producer",
+        "ci.regression",
+        "--idempotency-key",
+        "same-job",
+    ];
+    let output = run_cli_at_root(root.path(), &arguments, Stdio::piped(), Stdio::null());
+    assert!(!output.status.success());
+    let result: serde_json::Value = serde_json::from_slice(&output.stdout).expect("terminal JSON");
+    assert_eq!(result["schema_version"], 1);
+    assert_eq!(result["session_id"], id);
+    assert!(result["receipt"]["turn_id"].as_str().is_some());
+    assert_eq!(result["outcome"], "provider_unavailable");
+    let history = graph_cli_json(root.path(), &["session", "history", id, "--json"]);
+    let repeated = run_cli_at_root(root.path(), &arguments, Stdio::piped(), Stdio::null());
+    assert!(!repeated.status.success());
+    let repeated: serde_json::Value =
+        serde_json::from_slice(&repeated.stdout).expect("repeated terminal JSON");
+    assert_eq!(repeated["receipt"], result["receipt"]);
+    assert_eq!(repeated["session_id"], result["session_id"]);
+    assert_eq!(repeated, result);
+    assert_eq!(
+        graph_cli_json(root.path(), &["session", "history", id, "--json"]),
+        history
+    );
+    assert!(!root.path().join("should-not-exist").exists());
+    drop(daemon);
+}
+
+#[test]
+#[ignore = "requires BCODE_DEFAULT_AGENTS_PLUGIN_TEST_LIBRARY pointing to the built default-agents plugin"]
+fn targeted_cancellation_cli_reports_live_daemon_acknowledgement() {
+    let root = tempfile::tempdir().unwrap();
+    let daemon = start_graph_test_daemon(&root);
+    let session = graph_cli_json(
+        root.path(),
+        &["session", "create", "cancel-target", "--json"],
+    );
+    let id = session["id"].as_str().unwrap();
+    let result = graph_cli_json(
+        root.path(),
+        &["cancel", id, "--turn-id", "stale-具体", "--json"],
+    );
+    assert_eq!(
+        result,
+        serde_json::json!({
+            "kind": "turn", "cancellation_requested": false,
+        })
+    );
+    let conflict = run_cli_at_root(
+        root.path(),
+        &[
+            "cancel",
+            id,
+            "--turn-id",
+            "stale-具体",
+            "--clear-queue",
+            "--json",
+        ],
+        Stdio::piped(),
+        Stdio::null(),
+    );
+    assert!(!conflict.status.success());
+    assert!(conflict.stdout.is_empty());
     drop(daemon);
 }
 

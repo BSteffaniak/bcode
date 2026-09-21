@@ -212,7 +212,11 @@ pub(crate) fn apply_profile_override(
     };
     let mut selected = None;
     for raw in [
-        overrides.env_config_toml.as_deref(),
+        overrides
+            .exclusive_config_path
+            .is_none()
+            .then_some(overrides.env_config_toml.as_deref())
+            .flatten(),
         overrides.cli_config_toml.as_deref(),
     ]
     .into_iter()

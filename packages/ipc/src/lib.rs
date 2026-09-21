@@ -613,6 +613,9 @@ pub enum Request {
     },
     CancelSessionTurn {
         session_id: SessionId,
+        /// When supplied, cancel only this turn; never clear unrelated queued work.
+        #[serde(default)]
+        expected_turn_id: Option<String>,
         #[serde(default)]
         clear_queue: bool,
     },
@@ -5285,6 +5288,40 @@ mod tests {
         assert!(
             matches!(decoded, Response::Ok(ResponsePayload::SubmissionAccepted { receipt }) if receipt.submission_id == id && receipt.accepted_event_sequence == 42)
         );
+    }
+
+    #[test]
+    fn targeted_cancellation_preserves_identity_and_legacy_defaults() {
+        let session_id = SessionId::new();
+        let request = Request::CancelSessionTurn {
+            session_id,
+            expected_turn_id: Some("turn-具体-1".to_owned()),
+            clear_queue: false,
+        };
+        let encoded = encode_request(&request).expect("encode cancellation");
+        assert_eq!(
+            decode_request(&encoded).expect("decode cancellation"),
+            request
+        );
+
+        let mut legacy = serde_json::to_value(&request).expect("request value");
+        legacy["cancel_session_turn"]
+            .as_object_mut()
+            .expect("request payload")
+            .remove("expected_turn_id");
+        assert_eq!(
+            serde_json::from_value::<Request>(legacy.clone()).expect("legacy cancellation"),
+            Request::CancelSessionTurn {
+                session_id,
+                expected_turn_id: None,
+                clear_queue: false
+            }
+        );
+        legacy["cancel_session_turn"]
+            .as_object_mut()
+            .expect("request payload")
+            .insert("expected_turn_id".to_owned(), serde_json::json!(42));
+        assert!(serde_json::from_value::<Request>(legacy).is_err());
     }
 
     #[test]

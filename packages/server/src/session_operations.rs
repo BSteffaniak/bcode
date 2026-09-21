@@ -1217,8 +1217,16 @@ pub async fn cancel_turn(
     session_id: bcode_session_models::SessionId,
     clear_queue: bool,
     client_id: bcode_session_models::ClientId,
+    expected_turn_id: Option<String>,
 ) -> Result<bool, super::ServerError> {
-    super::enqueue_cancel_turn_command(state, session_id, clear_queue, Some(client_id)).await
+    super::enqueue_targeted_cancel_turn_command(
+        state,
+        session_id,
+        clear_queue,
+        Some(client_id),
+        expected_turn_id,
+    )
+    .await
 }
 
 /// Application failure while appending a bounded presentation-only note.

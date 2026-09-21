@@ -527,7 +527,12 @@ fn config_override_from_matches(
     let context = matches.get_one::<String>("context");
     let profile = matches.get_one::<String>("profile");
     let request_timeout_secs = matches.get_one::<u64>("request_timeout_secs");
-    if profile.is_none() && request_timeout_secs.is_none() && context.is_none() {
+    let config_only = matches.get_one::<PathBuf>("config_only");
+    if profile.is_none()
+        && request_timeout_secs.is_none()
+        && context.is_none()
+        && config_only.is_none()
+    {
         return None;
     }
     let mut override_toml = String::new();
@@ -548,9 +553,10 @@ fn config_override_from_matches(
         )
         .expect("writing to string should not fail");
     }
-    Some(bcode_config::push_process_config_overrides(
-        bcode_config::ConfigLoadOverrides::from_env_with_cli(None, Some(override_toml)),
-    ))
+    let mut overrides =
+        bcode_config::ConfigLoadOverrides::from_env_with_cli(None, Some(override_toml));
+    overrides.exclusive_config_path = config_only.cloned();
+    Some(bcode_config::push_process_config_overrides(overrides))
 }
 
 fn state_location_from_matches(
@@ -3858,8 +3864,9 @@ async fn handle_session_io_command(
         Commands::Cancel {
             session_id,
             clear_queue,
+            turn_id,
             json,
-        } => cancel_session_turn(session_id, clear_queue, json).await?,
+        } => cancel_session_turn(session_id, clear_queue, turn_id, json).await?,
         Commands::Attach { session_id } => attach_session(session_id).await?,
         Commands::Tui { session_id } => {
             bcode_tui::run_with_static_bundled_and_options(
@@ -3881,6 +3888,10 @@ async fn handle_session_io_command(
             idempotency_key,
             background,
             json,
+            wait,
+            timeout_secs,
+            cancel_on_timeout,
+            cancellation_grace_secs,
         } => {
             Box::pin(send_message(
                 session_id,
@@ -3901,6 +3912,11 @@ async fn handle_session_io_command(
                     idempotency_key,
                     background,
                     json,
+                    observation: wait.then(|| TurnObservationOptions {
+                        timeout: std::time::Duration::from_secs(timeout_secs),
+                        cancellation_grace: cancel_on_timeout
+                            .then(|| std::time::Duration::from_secs(cancellation_grace_secs)),
+                    }),
                     launch_options,
                 },
             ))
@@ -4135,6 +4151,9 @@ struct Cli {
     /// Create a new session in a new worktree and open it in the terminal UI.
     #[arg(long, value_name = "NAME", requires = "new")]
     worktree: Option<String>,
+    /// Load only this trusted config file, excluding discovered and environment config.
+    #[arg(long, global = true, value_name = "FILE")]
+    config_only: Option<PathBuf>,
     /// Select a user-defined configuration context for this invocation.
     #[arg(long, global = true, value_name = "CONTEXT")]
     context: Option<String>,
@@ -4347,6 +4366,9 @@ enum Commands {
         session_id: SessionId,
         #[arg(long)]
         clear_queue: bool,
+        /// Target only this active turn; never cancel a successor or queued work.
+        #[arg(long, conflicts_with = "clear_queue")]
+        turn_id: Option<String>,
         /// Print the cancellation request result as JSON.
         #[arg(long)]
         json: bool,
@@ -4382,9 +4404,22 @@ enum Commands {
         /// Admit the turn at background scheduling priority.
         #[arg(long)]
         background: bool,
-        /// Print exact canonical `TurnAdmission` as JSON.
+        /// Print exact canonical `TurnAdmission` as JSON (terminal result with --wait).
         #[arg(long)]
         json: bool,
+        /// Observe this exact turn's terminal outcome; timeout leaves work running by default.
+        #[arg(long, conflicts_with_all = ["follow_up", "steering"])]
+        wait: bool,
+        /// Maximum terminal observation time in seconds; requires --wait.
+        #[arg(long, requires = "wait", default_value_t = 600, value_parser = clap::value_parser!(u64).range(1..=86400))]
+        timeout_secs: u64,
+        /// On observation timeout, request cancellation of this exact active turn.
+        /// Acknowledgement does not establish a terminal outcome or cancel queued work.
+        #[arg(long, requires = "wait")]
+        cancel_on_timeout: bool,
+        /// Maximum terminal observation time after the cancellation request, in seconds.
+        #[arg(long, requires = "cancel_on_timeout", default_value_t = 5, value_parser = clap::value_parser!(u64).range(1..=300))]
+        cancellation_grace_secs: u64,
     },
 }
 
@@ -7379,6 +7414,51 @@ mod optional_judgement_cli_tests {
 
 #[cfg(test)]
 mod replacement_control_cli_tests {
+    #[test]
+    fn send_wait_requires_bounded_timeout_and_non_follow_up_submission() {
+        use clap::Parser as _;
+        let session = "00000000-0000-0000-0000-000000000001";
+        for args in [
+            vec!["bcode", "send", session, "hello"],
+            vec!["bcode", "send", session, "hello", "--wait"],
+            vec![
+                "bcode",
+                "send",
+                session,
+                "--stdin",
+                "--wait",
+                "--timeout-secs",
+                "1",
+            ],
+        ] {
+            assert!(super::Cli::try_parse_from(args).is_ok());
+        }
+        for args in [
+            vec!["bcode", "send", session, "hello", "--wait", "--follow-up"],
+            vec!["bcode", "send", session, "hello", "--timeout-secs", "1"],
+            vec![
+                "bcode",
+                "send",
+                session,
+                "hello",
+                "--wait",
+                "--timeout-secs",
+                "0",
+            ],
+            vec![
+                "bcode",
+                "send",
+                session,
+                "hello",
+                "--wait",
+                "--timeout-secs",
+                "86401",
+            ],
+        ] {
+            assert!(super::Cli::try_parse_from(args).is_err());
+        }
+    }
+
     #[test]
     fn exact_replacement_control_requires_run_and_known_action() {
         use clap::Parser as _;
@@ -18387,11 +18467,19 @@ fn write_runtime_work_history(
 async fn cancel_session_turn(
     session_id: SessionId,
     clear_queue: bool,
+    turn_id: Option<String>,
     json: bool,
 ) -> Result<(), CliError> {
-    let cancelled = BcodeClient::default_endpoint()
-        .cancel_session_turn_with_options(session_id, clear_queue)
-        .await?;
+    let client = BcodeClient::default_endpoint();
+    let cancelled = if let Some(turn_id) = turn_id {
+        client
+            .cancel_exact_session_turn(session_id, turn_id)
+            .await?
+    } else {
+        client
+            .cancel_session_turn_with_options(session_id, clear_queue)
+            .await?
+    };
     print_cancellation_result("turn", cancelled, json)
 }
 
@@ -18754,7 +18842,13 @@ struct SendOptions {
     idempotency_key: Option<String>,
     background: bool,
     json: bool,
+    observation: Option<TurnObservationOptions>,
     launch_options: bcode_tui::TuiLaunchOptions,
+}
+
+struct TurnObservationOptions {
+    timeout: std::time::Duration,
+    cancellation_grace: Option<std::time::Duration>,
 }
 
 impl PromptInput {
@@ -18774,6 +18868,12 @@ impl PromptInput {
                 read_prompt_bytes(std::io::stdin())?
             } else if let Some(path) = self.file {
                 let metadata = fs::metadata(&path)?;
+                if !metadata.is_file() {
+                    return Err(CliError::InvalidArguments(
+                        "prompt file must be a regular file; use --stdin for streamed input"
+                            .to_owned(),
+                    ));
+                }
                 if metadata.len() > MAX_CLI_PROMPT_BYTES as u64 {
                     return Err(prompt_too_large_error());
                 }
@@ -18891,6 +18991,34 @@ mod prompt_input_tests {
     }
 
     #[test]
+    fn prompt_file_rejects_directories() {
+        let directory = tempfile::tempdir().unwrap();
+        let result = PromptInput {
+            message: None,
+            file: Some(directory.path().to_path_buf()),
+            stdin: false,
+        }
+        .read();
+        assert!(
+            matches!(result, Err(CliError::InvalidArguments(message)) if message.contains("regular file"))
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn prompt_file_rejects_devices() {
+        let result = PromptInput {
+            message: None,
+            file: Some(std::path::PathBuf::from("/dev/zero")),
+            stdin: false,
+        }
+        .read();
+        assert!(
+            matches!(result, Err(CliError::InvalidArguments(message)) if message.contains("regular file"))
+        );
+    }
+
+    #[test]
     fn prompt_file_enforces_size_and_utf8_without_changing_content() {
         let file = tempfile::NamedTempFile::new().unwrap();
         let read = || {
@@ -18938,6 +19066,14 @@ fn write_follow_up_disposition(
 }
 
 async fn send_message(session_id: SessionId, options: SendOptions) -> Result<(), CliError> {
+    send_message_with_client(&BcodeClient::default_endpoint(), session_id, options).await
+}
+
+async fn send_message_with_client(
+    client: &BcodeClient,
+    session_id: SessionId,
+    options: SendOptions,
+) -> Result<(), CliError> {
     let SendOptions {
         input,
         placement,
@@ -18945,43 +19081,35 @@ async fn send_message(session_id: SessionId, options: SendOptions) -> Result<(),
         idempotency_key,
         background,
         json,
+        observation: observe_options,
         launch_options,
     } = options;
-    let text = input.read()?;
-    let client = BcodeClient::default_endpoint();
+    let wait_timeout = observe_options.as_ref().map(|options| options.timeout);
+    let text = report_unverified_submission(input.read(), session_id, wait_timeout.is_some())?;
+    let mut watcher = if wait_timeout.is_some() {
+        Some(watch_submitted_turn(client, session_id).await?)
+    } else {
+        None
+    };
     if let Some(placement) = placement {
-        let submission_id = bcode_session_models::SubmissionId(
-            idempotency_key
-                .clone()
-                .unwrap_or_else(|| SessionId::new().to_string()),
-        );
-        let receipt = client
-            .submit_prompt(
-                session_id,
-                submission_id,
-                text,
-                placement,
-                bcode_session_models::TurnAdmissionMetadata {
-                    origin: Some(bcode_session_models::TurnOrigin {
-                        producer,
-                        correlation_id: None,
-                        display_label: Some("Bcode CLI".to_owned()),
-                    }),
-                    idempotency_key,
-                    execution: launch_options.turn_execution_options(),
-                    ..bcode_session_models::TurnAdmissionMetadata::default()
-                },
-            )
-            .await?;
-        if json {
-            print_json(&serde_json::json!({ "session_id": session_id, "submission": receipt }))?;
-        } else {
-            writeln!(
-                std::io::stdout().lock(),
-                "Accepted submission {} (activation pending)",
-                receipt.submission_id.0
-            )?;
-        }
+        let receipt = submit_cli_prompt(
+            client,
+            session_id,
+            text,
+            placement,
+            bcode_session_models::TurnAdmissionMetadata {
+                origin: Some(bcode_session_models::TurnOrigin {
+                    producer,
+                    correlation_id: None,
+                    display_label: Some("Bcode CLI".to_owned()),
+                }),
+                idempotency_key,
+                execution: launch_options.turn_execution_options(),
+                ..bcode_session_models::TurnAdmissionMetadata::default()
+            },
+        )
+        .await?;
+        write_submission_receipt(session_id, &receipt, json)?;
     } else {
         let admission = client
             .submit_turn(
@@ -19003,8 +19131,319 @@ async fn send_message(session_id: SessionId, options: SendOptions) -> Result<(),
                     execution: launch_options.turn_execution_options(),
                 },
             )
-            .await?;
-        write_turn_admission(&mut std::io::stdout().lock(), session_id, &admission, json)?;
+            .await
+            .map_err(CliError::from);
+        let admission =
+            report_unverified_submission(admission, session_id, wait_timeout.is_some())?;
+        if let (Some(watcher), Some(timeout)) = (&mut watcher, wait_timeout) {
+            if let Some(error) = turn_admission_failure(&admission) {
+                write_unstarted_turn_result(session_id, &admission)?;
+                return Err(error);
+            }
+            let (bcode_session_models::TurnAdmission::Accepted(receipt)
+            | bcode_session_models::TurnAdmission::Existing(receipt)
+            | bcode_session_models::TurnAdmission::Deferred(receipt)) = &admission
+            else {
+                unreachable!("failed admission was handled")
+            };
+            let observation = watcher
+                .recover_and_wait_for_turn_outcome(&receipt.turn_id.to_string(), timeout)
+                .await;
+            let outcome = match observation {
+                Ok(outcome) => outcome,
+                Err(error) => {
+                    return report_observation_failure(
+                        client,
+                        session_id,
+                        receipt,
+                        observe_options.as_ref(),
+                        error,
+                        watcher,
+                    )
+                    .await;
+                }
+            };
+            write_terminal_turn_result(session_id, receipt, outcome)?;
+        } else {
+            write_turn_admission(&mut std::io::stdout().lock(), session_id, &admission, json)?;
+        }
+    }
+    Ok(())
+}
+
+async fn submit_cli_prompt(
+    client: &BcodeClient,
+    session_id: SessionId,
+    text: String,
+    placement: bcode_session_models::SubmissionPlacement,
+    metadata: bcode_session_models::TurnAdmissionMetadata,
+) -> Result<bcode_session_models::SubmissionReceipt, CliError> {
+    let submission_id = bcode_session_models::SubmissionId(
+        metadata
+            .idempotency_key
+            .clone()
+            .unwrap_or_else(|| SessionId::new().to_string()),
+    );
+    Ok(client
+        .submit_prompt(session_id, submission_id, text, placement, metadata)
+        .await?)
+}
+
+fn write_submission_receipt(
+    session_id: SessionId,
+    receipt: &bcode_session_models::SubmissionReceipt,
+    json: bool,
+) -> Result<(), CliError> {
+    if json {
+        print_json(&serde_json::json!({ "session_id": session_id, "submission": receipt }))?;
+    } else {
+        writeln!(
+            std::io::stdout().lock(),
+            "Accepted submission {} (activation pending)",
+            receipt.submission_id.0
+        )?;
+    }
+    Ok(())
+}
+
+async fn report_observation_failure(
+    client: &BcodeClient,
+    session_id: SessionId,
+    receipt: &bcode_session_models::TurnReceipt,
+    options: Option<&TurnObservationOptions>,
+    error: ClientError,
+    watcher: &mut bcode_client::SessionWatcher,
+) -> Result<(), CliError> {
+    let cancellation_grace = options
+        .and_then(|options| options.cancellation_grace)
+        .filter(|_| matches!(error, ClientError::RequestTimeout { .. }));
+    let requested = cancellation_grace.is_some();
+    let deadline = cancellation_grace.map(|grace| tokio::time::Instant::now() + grace);
+    let acknowledged = if let Some(deadline) = deadline {
+        tokio::time::timeout_at(
+            deadline,
+            request_observation_cancellation(client, session_id, receipt.turn_id.to_string(), true),
+        )
+        .await
+        .ok()
+        .flatten()
+    } else {
+        None
+    };
+    // Even a lost acknowledgement can follow an accepted cancellation. Recover
+    // canonical history on the original subscription, without replaying work.
+    // Cancellation transport and recovery share one grace budget.
+    if let Some(remaining) =
+        deadline.and_then(|deadline| deadline.checked_duration_since(tokio::time::Instant::now()))
+        && !remaining.is_zero()
+        && let Ok(outcome) = watcher
+            .recover_and_wait_for_turn_outcome(&receipt.turn_id.to_string(), remaining)
+            .await
+    {
+        return write_terminal_turn_result(session_id, receipt, outcome);
+    }
+    write_unverified_observation(
+        &mut std::io::stdout().lock(),
+        session_id,
+        receipt,
+        requested,
+        acknowledged,
+    )?;
+    Err(error.into())
+}
+
+fn write_unverified_observation(
+    output: &mut impl std::io::Write,
+    session_id: SessionId,
+    receipt: &impl serde::Serialize,
+    cancellation_requested: bool,
+    cancellation_acknowledged: Option<bool>,
+) -> Result<(), CliError> {
+    write_json_result(
+        output,
+        &serde_json::json!({
+            "schema_version": 1,
+            "session_id": session_id,
+            "receipt": receipt,
+            "outcome": null,
+            "observation": "unverified",
+            "cancellation_requested": cancellation_requested,
+            "cancellation_acknowledged": cancellation_acknowledged,
+        }),
+    )
+}
+
+#[cfg(all(test, unix))]
+mod timeout_cancellation_tests;
+
+async fn request_observation_cancellation(
+    client: &BcodeClient,
+    session_id: SessionId,
+    turn_id: String,
+    requested: bool,
+) -> Option<bool> {
+    // Never retry submission or broaden cancellation to a successor.
+    // Transport failure leaves acknowledgement unknown, not false.
+    if requested {
+        client
+            .cancel_exact_session_turn(session_id, turn_id)
+            .await
+            .ok()
+    } else {
+        None
+    }
+}
+
+async fn watch_submitted_turn(
+    client: &BcodeClient,
+    session_id: SessionId,
+) -> Result<bcode_client::SessionWatcher, CliError> {
+    report_unverified_submission(
+        client
+            .watch_session(session_id, 100)
+            .await
+            .map_err(CliError::from),
+        session_id,
+        true,
+    )
+}
+
+fn write_unstarted_turn_result(
+    session_id: SessionId,
+    admission: &bcode_session_models::TurnAdmission,
+) -> Result<(), CliError> {
+    print_json(&serde_json::json!({
+        "schema_version": 1,
+        "session_id": session_id,
+        "admission": admission,
+        "receipt": null,
+        "outcome": null,
+        "observation": "not_started",
+        "cancellation_requested": false,
+    }))
+}
+
+fn report_unverified_submission<T>(
+    result: Result<T, CliError>,
+    session_id: SessionId,
+    enabled: bool,
+) -> Result<T, CliError> {
+    report_unverified_submission_to(&mut std::io::stdout().lock(), result, session_id, enabled)
+}
+
+fn report_unverified_submission_to<T>(
+    output: &mut impl std::io::Write,
+    result: Result<T, CliError>,
+    session_id: SessionId,
+    enabled: bool,
+) -> Result<T, CliError> {
+    if enabled && result.is_err() {
+        write_json_result(
+            output,
+            &serde_json::json!({
+                "schema_version": 1,
+                "session_id": session_id,
+                "receipt": null,
+                "outcome": null,
+                "observation": "unverified",
+                "cancellation_requested": false,
+            }),
+        )?;
+    }
+    result
+}
+
+#[cfg(test)]
+mod submission_failure_output_tests {
+    use super::*;
+
+    #[test]
+    fn ambiguous_failure_preserves_error_without_exposing_it_in_json() {
+        let session_id = SessionId::new();
+        let mut output = Vec::new();
+        let result = report_unverified_submission_to::<()>(
+            &mut output,
+            Err(CliError::InvalidArguments("secret-canary".to_owned())),
+            session_id,
+            true,
+        );
+        assert!(
+            matches!(result, Err(CliError::InvalidArguments(message)) if message == "secret-canary")
+        );
+        let value: serde_json::Value = serde_json::from_slice(&output).expect("JSON envelope");
+        assert_eq!(
+            value,
+            serde_json::json!({
+                "schema_version": 1,
+                "session_id": session_id,
+                "receipt": null,
+                "outcome": null,
+                "observation": "unverified",
+                "cancellation_requested": false,
+            })
+        );
+    }
+
+    #[test]
+    fn successful_or_disabled_reporting_emits_nothing() {
+        let mut output = Vec::new();
+        assert_eq!(
+            report_unverified_submission_to(&mut output, Ok(42), SessionId::new(), true)
+                .expect("success"),
+            42
+        );
+        assert!(
+            report_unverified_submission_to::<()>(
+                &mut output,
+                Err(CliError::InvalidArguments("disabled".to_owned())),
+                SessionId::new(),
+                false
+            )
+            .is_err()
+        );
+        assert!(output.is_empty());
+    }
+
+    #[test]
+    fn envelope_write_failure_is_propagated() {
+        struct BrokenOutput;
+        impl std::io::Write for BrokenOutput {
+            fn write(&mut self, _: &[u8]) -> std::io::Result<usize> {
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::BrokenPipe,
+                    "closed",
+                ))
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let result = report_unverified_submission_to::<()>(
+            &mut BrokenOutput,
+            Err(CliError::InvalidArguments("original".to_owned())),
+            SessionId::new(),
+            true,
+        );
+        assert!(result.is_err());
+        assert!(!matches!(result, Err(CliError::InvalidArguments(_))));
+    }
+}
+
+fn write_terminal_turn_result(
+    session_id: SessionId,
+    receipt: &bcode_session_models::TurnReceipt,
+    outcome: bcode_session_models::ModelTurnOutcome,
+) -> Result<(), CliError> {
+    print_json(&serde_json::json!({
+        "schema_version": 1,
+        "session_id": session_id,
+        "receipt": receipt,
+        "outcome": outcome,
+    }))?;
+    if outcome != bcode_session_models::ModelTurnOutcome::Completed {
+        return Err(CliError::InvalidArguments(format!(
+            "turn terminated with {outcome:?}"
+        )));
     }
     Ok(())
 }
@@ -24677,6 +25116,34 @@ mod cancellation_cli_tests {
     use clap::Parser as _;
 
     #[test]
+    fn exact_turn_cancellation_parses_and_rejects_queue_clearing() {
+        let session = bcode_session_models::SessionId::new().to_string();
+        let parsed = Cli::try_parse_from([
+            "bcode",
+            "cancel",
+            &session,
+            "--turn-id",
+            "turn-具体",
+            "--json",
+        ])
+        .expect("targeted cancellation parses");
+        assert!(matches!(parsed.command, Some(Commands::Cancel {
+            turn_id: Some(turn_id), clear_queue: false, json: true, ..
+        }) if turn_id == "turn-具体"));
+        assert!(
+            Cli::try_parse_from([
+                "bcode",
+                "cancel",
+                &session,
+                "--turn-id",
+                "turn-具体",
+                "--clear-queue",
+            ])
+            .is_err()
+        );
+    }
+
+    #[test]
     fn turn_and_runtime_work_commands_parse_structured_results() {
         let session_id = bcode_session_models::SessionId::new();
         let session = session_id.to_string();
@@ -24736,6 +25203,100 @@ mod cancellation_cli_tests {
 mod send_cli_tests {
     use super::{Cli, Commands};
     use clap::Parser as _;
+
+    #[test]
+    fn send_cancellation_grace_is_bounded_and_requires_cancellation() {
+        let session = bcode_session_models::SessionId::new().to_string();
+        for value in ["0", "301", "18446744073709551615"] {
+            assert!(
+                Cli::try_parse_from([
+                    "bcode",
+                    "send",
+                    &session,
+                    "hello",
+                    "--wait",
+                    "--cancel-on-timeout",
+                    "--cancellation-grace-secs",
+                    value,
+                ])
+                .is_err()
+            );
+        }
+        assert!(
+            Cli::try_parse_from([
+                "bcode",
+                "send",
+                &session,
+                "hello",
+                "--wait",
+                "--cancellation-grace-secs",
+                "5",
+            ])
+            .is_err()
+        );
+        for value in ["1", "300"] {
+            let parsed = Cli::try_parse_from([
+                "bcode",
+                "send",
+                &session,
+                "hello",
+                "--wait",
+                "--cancel-on-timeout",
+                "--cancellation-grace-secs",
+                value,
+            ])
+            .unwrap();
+            assert!(matches!(parsed.command, Some(Commands::Send {
+                cancellation_grace_secs, ..
+            }) if cancellation_grace_secs == value.parse::<u64>().unwrap()));
+        }
+    }
+
+    #[test]
+    fn send_timeout_cancellation_requires_exact_turn_observation() {
+        let session = bcode_session_models::SessionId::new().to_string();
+        assert!(
+            Cli::try_parse_from(["bcode", "send", &session, "hello", "--cancel-on-timeout"])
+                .is_err()
+        );
+        assert!(
+            Cli::try_parse_from([
+                "bcode",
+                "send",
+                &session,
+                "hello",
+                "--wait",
+                "--cancel-on-timeout",
+                "--follow-up"
+            ])
+            .is_err()
+        );
+        let parsed = Cli::try_parse_from([
+            "bcode",
+            "send",
+            &session,
+            "hello",
+            "--wait",
+            "--cancel-on-timeout",
+        ])
+        .unwrap();
+        assert!(matches!(
+            parsed.command,
+            Some(Commands::Send {
+                wait: true,
+                cancel_on_timeout: true,
+                ..
+            })
+        ));
+        let default = Cli::try_parse_from(["bcode", "send", &session, "hello", "--wait"]).unwrap();
+        assert!(matches!(
+            default.command,
+            Some(Commands::Send {
+                cancel_on_timeout: false,
+                ..
+            })
+        ));
+    }
 
     #[test]
     fn send_defaults_to_independent_turn_and_requires_explicit_steering() {
@@ -28067,6 +28628,49 @@ mod client_timeout_cli_tests {
             let cli = Cli::try_parse_from(args).unwrap();
             assert_eq!(cli.context.as_deref(), Some("custom-team"));
         }
+    }
+
+    #[test]
+    fn exclusive_configuration_reaches_default_client_and_fails_closed() {
+        let _lock = CONFIG_OVERRIDE_LOCK.lock().expect("config override lock");
+        let root = tempfile::tempdir().expect("temporary config directory");
+        let config = root.path().join("trusted.toml");
+        std::fs::write(&config, "[client]\nrequest_timeout_secs = 73\n").expect("trusted config");
+        let path = config.to_str().expect("UTF-8 temp path");
+        for args in [
+            vec!["bcode", "--config-only", path],
+            vec!["bcode", "session", "list", "--config-only", path],
+        ] {
+            let matches = Cli::command().try_get_matches_from(args).expect("parse");
+            let guard = config_override_from_matches(&matches).expect("exclusive override");
+            assert_eq!(
+                bcode_client::BcodeClient::default_endpoint()
+                    .request_timeout()
+                    .as_secs(),
+                73
+            );
+            drop(guard);
+        }
+        let matches = Cli::command()
+            .try_get_matches_from([
+                "bcode",
+                "--config-only",
+                path,
+                "--request-timeout-secs",
+                "81",
+            ])
+            .expect("parse CLI overlay");
+        let guard = config_override_from_matches(&matches).expect("exclusive override");
+        assert_eq!(
+            bcode_config::load_config()
+                .expect("trusted config with overlay")
+                .client
+                .request_timeout_secs,
+            81
+        );
+        std::fs::remove_file(config).expect("remove config");
+        assert!(bcode_config::load_config().is_err());
+        drop(guard);
     }
 
     #[test]

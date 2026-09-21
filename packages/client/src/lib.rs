@@ -1772,6 +1772,98 @@ impl SessionWatcher {
         self.initial.take()
     }
 
+    /// Observe the terminal outcome of one exact turn, including bounded initial history.
+    ///
+    /// Callers should subscribe before submitting new work. Missing historical outcomes are
+    /// not inferred from session idleness. Timeout does not cancel or resubmit the turn.
+    ///
+    /// # Errors
+    ///
+    /// Returns a transport error, a timeout, or a protocol error when the view requires
+    /// resynchronization. Such errors do not establish whether the turn completed.
+    pub async fn wait_for_turn_outcome(
+        &mut self,
+        turn_id: &str,
+        timeout: Duration,
+    ) -> Result<bcode_session_models::ModelTurnOutcome, ClientError> {
+        if let Some(initial) = &self.initial {
+            for event in &initial.history {
+                if event.session_id == self.session_id
+                    && let Some(outcome) = matching_turn_outcome(event, turn_id)
+                {
+                    return Ok(outcome);
+                }
+            }
+        }
+        tokio::time::timeout(timeout, async {
+            loop {
+                match self.next_event().await? {
+                    SessionWatchEvent::Durable(event) => {
+                        if event.session_id == self.session_id
+                            && let Some(outcome) = matching_turn_outcome(&event, turn_id)
+                        {
+                            return Ok(outcome);
+                        }
+                    }
+                    SessionWatchEvent::Live(_) => {}
+                    SessionWatchEvent::ResyncRequired => {
+                        return Err(ClientError::Protocol(
+                            "turn outcome observation requires resynchronization".to_string(),
+                        ));
+                    }
+                }
+            }
+        })
+        .await
+        .map_err(|_| ClientError::RequestTimeout { timeout })?
+    }
+
+    /// Recover a recent canonical terminal outcome, then observe the subscribed stream.
+    ///
+    /// Reads at most one history page; older outcomes outside that page remain unknown.
+    /// The timeout bounds both the history request and live observation. This never
+    /// submits or cancels work.
+    ///
+    /// # Errors
+    /// Returns transport, history, protocol, resynchronization or timeout errors.
+    pub async fn recover_and_wait_for_turn_outcome(
+        &mut self,
+        turn_id: &str,
+        timeout: Duration,
+    ) -> Result<bcode_session_models::ModelTurnOutcome, ClientError> {
+        tokio::time::timeout(timeout, async {
+            let response = self
+                .connection
+                .send_request(Request::SessionHistoryPage {
+                    session_id: self.session_id,
+                    query: SessionHistoryQuery {
+                        cursor: None,
+                        limit: bcode_session_models::MAX_SESSION_HISTORY_READ_EVENTS,
+                        direction: bcode_session_models::SessionHistoryDirection::Backward,
+                    },
+                })
+                .await?;
+            let ResponsePayload::SessionHistoryPage { page } = response else {
+                return Err(ClientError::UnexpectedResponse);
+            };
+            if page.session_id != self.session_id {
+                return Err(ClientError::Protocol(
+                    "turn history session identity mismatch".to_owned(),
+                ));
+            }
+            for event in &page.events {
+                if event.session_id == self.session_id
+                    && let Some(outcome) = matching_turn_outcome(event, turn_id)
+                {
+                    return Ok(outcome);
+                }
+            }
+            self.wait_for_turn_outcome(turn_id, timeout).await
+        })
+        .await
+        .map_err(|_| ClientError::RequestTimeout { timeout })?
+    }
+
     /// Wait for the next durable or live session event.
     ///
     /// # Errors
@@ -1796,6 +1888,18 @@ impl SessionWatcher {
                 | Event::SessionViewResyncRequired { .. } => {}
             }
         }
+    }
+}
+
+fn matching_turn_outcome(
+    event: &SessionEvent,
+    expected: &str,
+) -> Option<bcode_session_models::ModelTurnOutcome> {
+    match &event.kind {
+        bcode_session_models::SessionEventKind::ModelTurnFinished {
+            turn_id, outcome, ..
+        } if turn_id == expected => Some(*outcome),
+        _ => None,
     }
 }
 
@@ -4657,7 +4761,33 @@ impl BcodeClient {
         match self
             .send_request(Request::CancelSessionTurn {
                 session_id,
+                expected_turn_id: None,
                 clear_queue,
+            })
+            .await?
+        {
+            ResponsePayload::TurnCancellationRequested { cancelled } => Ok(cancelled),
+            _ => Err(ClientError::UnexpectedResponse),
+        }
+    }
+
+    /// Request cancellation only if the specified turn is still active.
+    ///
+    /// Never clears queued work. A true acknowledgement is not a terminal outcome.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when transport fails or the daemon rejects the request.
+    pub async fn cancel_exact_session_turn(
+        &self,
+        session_id: SessionId,
+        turn_id: String,
+    ) -> Result<bool, ClientError> {
+        match self
+            .send_request(Request::CancelSessionTurn {
+                session_id,
+                expected_turn_id: Some(turn_id),
+                clear_queue: false,
             })
             .await?
         {
@@ -8604,10 +8734,45 @@ const fn session_open_failure_code(
     }
 }
 
+#[cfg(all(test, unix))]
+mod turn_observation_tests;
+
 #[cfg(test)]
 mod message_acceptance_tests {
     use super::*;
     use bcode_session_models::MessageAcceptanceDisposition as Disposition;
+
+    #[test]
+    fn outcome_matching_requires_exact_terminal_turn_identity() {
+        use bcode_session_models::{ModelTurnOutcome, SessionEventKind};
+        let mut event = SessionEvent {
+            schema_version: 1,
+            sequence: 1,
+            timestamp_ms: 0,
+            session_id: SessionId::new(),
+            provenance: None,
+            kind: SessionEventKind::ModelTurnStarted {
+                turn_id: "wanted".to_string(),
+            },
+        };
+        assert_eq!(matching_turn_outcome(&event, "wanted"), None);
+        for outcome in [
+            ModelTurnOutcome::Completed,
+            ModelTurnOutcome::Cancelled,
+            ModelTurnOutcome::Error,
+            ModelTurnOutcome::IdleTimeout,
+            ModelTurnOutcome::ToolRoundLimitReached,
+            ModelTurnOutcome::ProviderUnavailable,
+        ] {
+            event.kind = SessionEventKind::ModelTurnFinished {
+                turn_id: "wanted".to_string(),
+                outcome,
+                message: None,
+            };
+            assert_eq!(matching_turn_outcome(&event, "other"), None);
+            assert_eq!(matching_turn_outcome(&event, "wanted"), Some(outcome));
+        }
+    }
 
     #[test]
     fn acceptance_decoder_preserves_all_reported_fields() {
@@ -9673,6 +9838,67 @@ mod client_timeout_tests {
             .await
             .unwrap();
         assert_eq!(refreshed.catalog_revision, 2);
+        server.await.unwrap();
+        std::fs::remove_dir_all(socket_dir).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn exact_cancellation_preserves_target_and_acknowledgement_over_ipc() {
+        use bcode_ipc::{Request, Response, ResponsePayload};
+        use bcode_session_models::ClientId;
+
+        let socket_dir = std::path::PathBuf::from(format!("/tmp/bcc-{}", SessionId::new()));
+        std::fs::create_dir_all(&socket_dir).unwrap();
+        let endpoint = bcode_ipc::IpcEndpoint::unix_socket(socket_dir.join("cancel.sock"));
+        let listener = bcode_ipc::LocalIpcListener::bind(&endpoint).unwrap();
+        let session_id = SessionId::new();
+        let server = tokio::spawn(async move {
+            for cancelled in [false, true] {
+                let mut stream = listener.accept().await.unwrap();
+                let hello = bcode_ipc::recv_envelope(&mut stream).await.unwrap();
+                let response = Response::Ok(ResponsePayload::Hello {
+                    protocol_version: bcode_ipc::ProtocolVersion(
+                        bcode_ipc::CURRENT_PROTOCOL_VERSION,
+                    ),
+                    client_id: ClientId::new(),
+                    daemon: matching_daemon_status(),
+                });
+                bcode_ipc::send_envelope(
+                    &mut stream,
+                    &bcode_ipc::response_envelope(hello.request_id, &response).unwrap(),
+                )
+                .await
+                .unwrap();
+                let request = bcode_ipc::recv_envelope(&mut stream).await.unwrap();
+                assert_eq!(
+                    bcode_ipc::decode_request(&request.payload).unwrap(),
+                    Request::CancelSessionTurn {
+                        session_id,
+                        expected_turn_id: Some("turn-具体".to_owned()),
+                        clear_queue: false,
+                    }
+                );
+                let response =
+                    Response::Ok(ResponsePayload::TurnCancellationRequested { cancelled });
+                bcode_ipc::send_envelope(
+                    &mut stream,
+                    &bcode_ipc::response_envelope(request.request_id, &response).unwrap(),
+                )
+                .await
+                .unwrap();
+            }
+        });
+        let client = BcodeClient::new(endpoint).with_request_timeout(Duration::from_secs(5));
+        for expected in [false, true] {
+            assert_eq!(
+                client
+                    .cancel_exact_session_turn(session_id, "turn-具体".to_owned())
+                    .await
+                    .unwrap(),
+                expected
+            );
+        }
         server.await.unwrap();
         std::fs::remove_dir_all(socket_dir).unwrap();
     }

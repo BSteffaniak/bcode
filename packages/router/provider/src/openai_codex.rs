@@ -613,8 +613,24 @@ async fn refresh_openai_codex_token(
             message: format!("ChatGPT/Codex token refresh failed with {status}"),
         });
     }
-    let body = response.bytes().await?;
+    let mut response = response;
+    let mut body = Vec::new();
+    while let Some(chunk) = response.chunk().await? {
+        if body.len().saturating_add(chunk.len()) > MAX_REFRESH_RESPONSE_BYTES {
+            return Err(invalid_refresh_response(model));
+        }
+        body.extend_from_slice(&chunk);
+    }
     decode_refreshed_token(&body, model)
+}
+
+const MAX_REFRESH_RESPONSE_BYTES: usize = 64 * 1024;
+
+fn invalid_refresh_response(model: &RouteableModel) -> ProviderError {
+    ProviderError::Auth {
+        provider_id: model.provider.to_string(),
+        message: "invalid ChatGPT/Codex token refresh response".to_string(),
+    }
 }
 
 fn decode_refreshed_token(
@@ -622,11 +638,11 @@ fn decode_refreshed_token(
     model: &RouteableModel,
 ) -> Result<OpenAiOauthTokenResponse, ProviderError> {
     // Serde errors can include unexpected string values from the response, including tokens.
+    if body.len() > MAX_REFRESH_RESPONSE_BYTES {
+        return Err(invalid_refresh_response(model));
+    }
     let token: OpenAiOauthTokenResponse =
-        serde_json::from_slice(body).map_err(|_| ProviderError::Auth {
-            provider_id: model.provider.to_string(),
-            message: "invalid ChatGPT/Codex token refresh response".to_string(),
-        })?;
+        serde_json::from_slice(body).map_err(|_| invalid_refresh_response(model))?;
     if token.access_token.trim().is_empty()
         || token
             .refresh_token
@@ -1325,6 +1341,16 @@ mod tests {
         .unwrap_err();
         assert_eq!(values, before);
         assert!(!error.to_string().contains("new-refresh"));
+    }
+
+    #[test]
+    fn refresh_response_size_is_bounded() {
+        let model = routeable_model();
+        let mut body = br#"{"access_token":"access"}"#.to_vec();
+        body.resize(MAX_REFRESH_RESPONSE_BYTES, b' ');
+        assert!(decode_refreshed_token(&body, &model).is_ok());
+        body.push(b' ');
+        assert!(decode_refreshed_token(&body, &model).is_err());
     }
 
     #[test]

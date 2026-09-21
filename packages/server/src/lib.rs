@@ -800,6 +800,7 @@ struct SteeringCommand {
 
 #[derive(Debug)]
 struct CancelCommand {
+    expected_turn_id: Option<String>,
     clear_queue: bool,
     requested_by: Option<ClientId>,
     response: oneshot::Sender<bool>,
@@ -7552,6 +7553,7 @@ async fn handle_turn_workflow_model_request(
         }
         SessionTurnRequest::CancelSessionTurn {
             session_id,
+            expected_turn_id,
             clear_queue,
         } => {
             handle_cancel_session_turn(
@@ -7561,6 +7563,7 @@ async fn handle_turn_workflow_model_request(
                 session_id,
                 client_id,
                 clear_queue,
+                expected_turn_id,
             )
             .await
         }
@@ -15638,12 +15641,33 @@ async fn enqueue_cancel_turn_command(
     clear_queue: bool,
     requested_by: Option<ClientId>,
 ) -> Result<bool, ServerError> {
+    enqueue_targeted_cancel_turn_command(state, session_id, clear_queue, requested_by, None).await
+}
+
+async fn enqueue_targeted_cancel_turn_command(
+    state: &Arc<ServerState>,
+    session_id: SessionId,
+    clear_queue: bool,
+    requested_by: Option<ClientId>,
+    expected_turn_id: Option<String>,
+) -> Result<bool, ServerError> {
     state.sessions.session_summary(session_id).await?;
     let handle = session_runtime_handle(state, session_id).await;
+    let clear_queue = clear_queue && expected_turn_id.is_none();
+    let expected_turn_id = match expected_turn_id {
+        Some(turn_id) => Some(turn_id),
+        None => handle
+            .current_turn
+            .lock()
+            .await
+            .as_ref()
+            .map(|turn| turn.turn_id.clone()),
+    };
     let (response, completion) = oneshot::channel();
     if handle
         .cancel_commands
         .send(CancelCommand {
+            expected_turn_id,
             clear_queue,
             requested_by,
             response,
@@ -16412,7 +16436,29 @@ async fn process_cancel_turn_command_inner(
 ) {
     let lock = turn_admission_lock(state, session_id).await;
     let admission_guard = lock.lock().await;
-    let current_turn = close_session_turn(state, session_id).await;
+    let current_turn = {
+        let handle = state
+            .session_runtimes
+            .lock()
+            .await
+            .get(&session_id)
+            .cloned();
+        let Some(handle) = handle else {
+            acknowledge_cancel_command(command, false);
+            return;
+        };
+        let current_turn = handle.current_turn.lock().await;
+        if current_turn.as_ref().map(|turn| turn.turn_id.as_str())
+            != command.expected_turn_id.as_deref()
+        {
+            acknowledge_cancel_command(command, false);
+            return;
+        }
+        if let Some(turn) = current_turn.as_ref() {
+            turn.cancel_state.close();
+        }
+        current_turn.clone()
+    };
     if let Some(turn) = &current_turn
         && let Err(error) = cancel_pending_turn_submissions(state, session_id, &turn.turn_id).await
     {
@@ -18665,15 +18711,6 @@ async fn handle_set_session_agent(
     }
 }
 
-async fn close_session_turn(
-    state: &ServerState,
-    session_id: SessionId,
-) -> Option<RuntimeCurrentTurn> {
-    let current_turn = state.session_current_turn(session_id).await?;
-    current_turn.cancel_state.close();
-    Some(current_turn)
-}
-
 fn dispatch_provider_turn_cleanup(
     plugins: bcode_plugin::PluginRuntimeHost,
     metrics: MetricsRegistry,
@@ -18781,9 +18818,16 @@ async fn handle_cancel_session_turn(
     session_id: SessionId,
     client_id: ClientId,
     clear_queue: bool,
+    expected_turn_id: Option<String>,
 ) -> Result<(), ServerError> {
-    let cancelled =
-        session_operations::cancel_turn(state, session_id, clear_queue, client_id).await?;
+    let cancelled = session_operations::cancel_turn(
+        state,
+        session_id,
+        clear_queue,
+        client_id,
+        expected_turn_id,
+    )
+    .await?;
     send_response(
         writer,
         request_id,
@@ -49081,6 +49125,141 @@ library = "test"
     }
 
     #[tokio::test]
+    async fn stale_cancellation_does_not_close_successor_or_clear_queue() {
+        let sessions = SessionManager::default();
+        let session = sessions
+            .create_session(
+                Some("targeted cancellation".to_owned()),
+                std::env::temp_dir(),
+            )
+            .await
+            .expect("session");
+        let session_id = session.id;
+        let state = Arc::new(test_server_state_with_fake_provider(sessions));
+        let (followup_commands, mut followups) = mpsc::channel(8);
+        let (steering_commands, _steering) = mpsc::channel(8);
+        let (cancel_commands, mut cancels) = mpsc::channel(1);
+        let cancel_state = Arc::new(TurnCancelState::default());
+        let handle = SessionRuntimeHandle {
+            followup_commands,
+            steering_commands,
+            cancel_commands,
+            queued_followups: Arc::new(AtomicUsize::new(1)),
+            queued_steering: Arc::new(AtomicUsize::new(0)),
+            phase: Arc::new(Mutex::new(SessionRuntimePhase::ProviderActive)),
+            current_turn: Arc::new(Mutex::new(Some(RuntimeCurrentTurn {
+                interaction_route: None,
+                kind: RuntimeOperationKind::ModelTurn,
+                client_id: ClientId::new(),
+                turn_id: "successor".to_owned(),
+                cancel_state: Arc::clone(&cancel_state),
+                model: None,
+                agent_profile: None,
+                execution: Some(TurnExecutionOptions::default()),
+                selection: None,
+            }))),
+        };
+        state
+            .session_runtimes
+            .lock()
+            .await
+            .insert(session_id, handle.clone());
+        let request = Box::pin(session_operations::cancel_turn(
+            &state,
+            session_id,
+            true,
+            ClientId::new(),
+            Some("predecessor".to_owned()),
+        ));
+        let process = async {
+            let command = cancels.recv().await.expect("queued cancellation");
+            assert_eq!(command.expected_turn_id.as_deref(), Some("predecessor"));
+            assert!(
+                !command.clear_queue,
+                "targeting must not clear unrelated work"
+            );
+            process_cancel_turn_command(
+                &state,
+                session_id,
+                &mut followups,
+                &handle.queued_followups,
+                command,
+            )
+            .await;
+        };
+        let (result, ()) = tokio::time::timeout(Duration::from_secs(5), async {
+            tokio::join!(request, process)
+        })
+        .await
+        .expect("bounded targeted cancellation");
+        assert!(!result.expect("application cancellation"));
+        assert!(
+            tokio::time::timeout(Duration::from_millis(10), cancel_state.cancelled())
+                .await
+                .is_err()
+        );
+        assert_eq!(handle.queued_followups.load(Ordering::Acquire), 1);
+
+        for expected_turn_id in [Some("predecessor".to_owned()), None] {
+            let (response, completion) = oneshot::channel();
+            process_cancel_turn_command(
+                &state,
+                session_id,
+                &mut followups,
+                &handle.queued_followups,
+                CancelCommand {
+                    expected_turn_id,
+                    clear_queue: true,
+                    requested_by: None,
+                    response,
+                },
+            )
+            .await;
+            assert!(!completion.await.expect("acknowledgement"));
+            assert!(
+                tokio::time::timeout(Duration::from_millis(10), cancel_state.cancelled())
+                    .await
+                    .is_err()
+            );
+            assert_eq!(handle.queued_followups.load(Ordering::Acquire), 1);
+        }
+        drop(state);
+    }
+
+    #[tokio::test]
+    async fn cancellation_without_runtime_rejects_without_queue_mutation() {
+        let state = test_server_state_with_fake_provider(SessionManager::default());
+        let session_id = SessionId::new();
+        let (_sender, mut followups) = mpsc::channel(1);
+        let queued_followups = AtomicUsize::new(1);
+        for expected_turn_id in [Some("finished".to_owned()), None] {
+            let (response, completion) = oneshot::channel();
+            process_cancel_turn_command(
+                &state,
+                session_id,
+                &mut followups,
+                &queued_followups,
+                CancelCommand {
+                    expected_turn_id,
+                    clear_queue: true,
+                    requested_by: None,
+                    response,
+                },
+            )
+            .await;
+            assert!(!completion.await.expect("cancellation acknowledgement"));
+            assert_eq!(queued_followups.load(Ordering::Acquire), 1);
+            assert!(
+                !state
+                    .session_runtimes
+                    .lock()
+                    .await
+                    .contains_key(&session_id)
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn cancel_acknowledgement_precedes_commit_bookkeeping() {
         let cancel_state = TurnCancelState::default();
         let commit = cancel_state.marker_commit.lock().await;
@@ -49088,6 +49267,7 @@ library = "test"
         let (response, completion) = oneshot::channel();
         let requested_by = acknowledge_cancel_command(
             CancelCommand {
+                expected_turn_id: None,
                 clear_queue: true,
                 requested_by: None,
                 response,
@@ -68719,6 +68899,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
             &mut followups,
             &queued,
             CancelCommand {
+                expected_turn_id: None,
                 clear_queue: true,
                 requested_by: None,
                 response,

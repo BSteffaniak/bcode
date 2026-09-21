@@ -414,6 +414,7 @@ pub enum SessionTurnRequest {
     },
     CancelSessionTurn {
         session_id: SessionId,
+        expected_turn_id: Option<String>,
         clear_queue: bool,
     },
     CancelRuntimeWork {
@@ -1205,9 +1206,11 @@ impl RoutedRequest {
             }),
             Request::CancelSessionTurn {
                 session_id,
+                expected_turn_id,
                 clear_queue,
             } => Self::SessionTurn(SessionTurnRequest::CancelSessionTurn {
                 session_id,
+                expected_turn_id,
                 clear_queue,
             }),
             Request::CancelRuntimeWork {

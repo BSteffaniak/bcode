@@ -970,6 +970,9 @@ pub fn config_launch_context(cwd: &Path) -> ConfigLaunchContext {
 /// Config loading overrides layered above discovered config files.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ConfigLoadOverrides {
+    /// Load only this required file, bypassing discovered and environment layers.
+    /// Explicit CLI TOML remains applicable above this file.
+    pub exclusive_config_path: Option<PathBuf>,
     /// Optional base layer merged below discovered config files.
     pub base_config_path: Option<PathBuf>,
     /// Config file path from environment or caller-provided equivalent.
@@ -1004,6 +1007,7 @@ impl ConfigLoadOverrides {
         cli_config_toml: Option<String>,
     ) -> Self {
         Self {
+            exclusive_config_path: None,
             base_config_path: None,
             env_config_path: environment.var_os(BCODE_CONFIG_ENV).map(PathBuf::from),
             env_config_toml: merge_config_toml_overrides(
@@ -1021,7 +1025,8 @@ impl ConfigLoadOverrides {
     /// Return true when no override layers are configured.
     #[must_use]
     pub const fn is_empty(&self) -> bool {
-        self.base_config_path.is_none()
+        self.exclusive_config_path.is_none()
+            && self.base_config_path.is_none()
             && self.env_config_path.is_none()
             && self.env_config_toml.is_none()
             && self.cli_config_path.is_none()
@@ -9314,6 +9319,13 @@ fn merged_raw_config_value_with_overrides(
     paths: &[PathBuf],
     overrides: &ConfigLoadOverrides,
 ) -> Result<toml::Value, ConfigError> {
+    if let Some(path) = &overrides.exclusive_config_path {
+        let mut merged = load_toml_file(path)?;
+        if let Some(raw) = overrides.cli_config_toml.as_deref() {
+            merge_toml_value(&mut merged, parse_raw_toml_config(raw, "cli")?);
+        }
+        return Ok(merged);
+    }
     let mut merged = toml::Value::Table(toml::Table::new());
 
     if let Some(path) = overrides.base_config_path.as_ref()
@@ -13576,6 +13588,7 @@ extends = ["a"]
         let config = load_config_from_paths_with_overrides(
             &[user],
             &ConfigLoadOverrides {
+                exclusive_config_path: None,
                 base_config_path: Some(base),
                 env_config_path: Some(env_path),
                 env_config_toml: Some("[model]\nmax_tool_rounds = 4\n".to_string()),
@@ -13586,6 +13599,40 @@ extends = ["a"]
         .expect("config should load");
 
         assert_eq!(config.model.max_tool_rounds, Some(6));
+    }
+
+    #[test]
+    fn exclusive_config_ignores_untrusted_layers_and_requires_file() {
+        let root = unique_temp_dir();
+        std::fs::create_dir_all(&root).expect("directory");
+        let trusted = root.join("trusted.toml");
+        let untrusted = root.join("untrusted.toml");
+        std::fs::write(&trusted, "[model]\nmax_tool_rounds = 3\n").expect("trusted config");
+        std::fs::write(&untrusted, "invalid TOML !!!").expect("untrusted config");
+        let mut overrides = ConfigLoadOverrides {
+            exclusive_config_path: Some(trusted.clone()),
+            base_config_path: Some(untrusted.clone()),
+            cli_config_path: Some(untrusted.clone()),
+            env_config_path: Some(untrusted.clone()),
+            env_config_toml: Some("invalid TOML !!!".to_owned()),
+            ..ConfigLoadOverrides::default()
+        };
+        let config = load_config_from_paths_with_overrides(&[untrusted], &overrides)
+            .expect("untrusted layers must not be parsed");
+        assert_eq!(config.model.max_tool_rounds, Some(3));
+        overrides.cli_config_toml = Some("[model]\nmax_tool_rounds = 4\n".to_owned());
+        assert_eq!(
+            load_config_from_paths_with_overrides(&[], &overrides)
+                .expect("CLI overlay")
+                .model
+                .max_tool_rounds,
+            Some(4)
+        );
+        std::fs::write(&trusted, "invalid TOML !!!").expect("corrupt trusted config");
+        assert!(load_config_from_paths_with_overrides(&[], &overrides).is_err());
+        std::fs::remove_file(trusted).expect("remove trusted config");
+        assert!(load_config_from_paths_with_overrides(&[], &overrides).is_err());
+        std::fs::remove_dir_all(root).expect("cleanup");
     }
 
     #[test]

@@ -1,0 +1,29 @@
+name: Set up verified Bcode
+description: Install a checksum-pinned Unix Bcode archive without executing it
+inputs:
+  archive:
+    description: Absolute path to a downloaded release tar.gz in trusted runner-owned storage
+    required: true
+  sha256:
+    description: Independently trusted lowercase SHA-256 pin for the complete distribution
+    required: true
+outputs:
+  installation:
+    description: Private installation directory with bundled runtime layout preserved
+    value: ${{ steps.install.outputs.installation }}
+  binary:
+    description: Absolute path to the installed Bcode binary (not added to PATH)
+    value: ${{ steps.install.outputs.binary }}
+runs:
+  using: composite
+  steps:
+    - name: Verify and install distribution
+      id: install
+      shell: bash
+      env:
+        BCODE_SETUP_ARCHIVE: ${{ inputs.archive }}
+        BCODE_SETUP_SHA256: ${{ inputs.sha256 }}
+        BCODE_SETUP_ACTION_PATH: ${{ github.action_path }}
+      run: |
+        set -euo pipefail
+        python3 -I -B "$BCODE_SETUP_ACTION_PATH/setup.py"

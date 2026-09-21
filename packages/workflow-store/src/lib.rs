@@ -4241,21 +4241,23 @@ impl WorkflowStore {
         .map(|row| database::text(row, "run_id"))
         .collect::<Result<Vec<_>, _>>()?;
         let next = page.last().map_or("", String::as_str);
-        if rows.is_empty() {
-            crate::database::block_on(
-                db.insert("workflow_discovery_cursors")
-                    .value("artifact_id", artifact_id)
-                    .value("after_run_id", next)
-                    .execute(db),
-            )?;
-        } else {
-            crate::database::block_on(
-                db.exec_update_count(
-                    &update("workflow_discovery_cursors")
+        if next != cursor {
+            if rows.is_empty() {
+                crate::database::block_on(
+                    db.insert("workflow_discovery_cursors")
+                        .value("artifact_id", artifact_id)
                         .value("after_run_id", next)
-                        .where_eq("artifact_id", artifact_id),
-                ),
-            )?;
+                        .execute(db),
+                )?;
+            } else {
+                crate::database::block_on(
+                    db.exec_update_count(
+                        &update("workflow_discovery_cursors")
+                            .value("after_run_id", next)
+                            .where_eq("artifact_id", artifact_id),
+                    ),
+                )?;
+            }
         }
         database::commit(tx)?;
         Ok(page)
