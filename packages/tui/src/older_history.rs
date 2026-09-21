@@ -15,6 +15,12 @@ pub enum TranscriptWindowMode {
     },
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PageAcceptance {
+    Pending,
+    Ready,
+}
+
 /// Tracks bidirectional history pagination and reveal requests.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OlderHistoryState {
@@ -22,6 +28,8 @@ pub struct OlderHistoryState {
     newer_cursor: Option<SessionHistoryCursor>,
     older_reveal_request: Option<usize>,
     newer_reveal_request: Option<usize>,
+    older_page_ready: PageAcceptance,
+    newer_page_ready: PageAcceptance,
     loading_older: bool,
     loading_newer: bool,
     mode: TranscriptWindowMode,
@@ -36,6 +44,8 @@ impl OlderHistoryState {
             newer_cursor: None,
             older_reveal_request: None,
             newer_reveal_request: None,
+            older_page_ready: PageAcceptance::Pending,
+            newer_page_ready: PageAcceptance::Pending,
             loading_older: false,
             loading_newer: false,
             mode: TranscriptWindowMode::Tail,
@@ -66,16 +76,10 @@ impl OlderHistoryState {
         self.loading_older
     }
 
-    /// Return whether a newer-history request is in flight.
-    #[must_use]
-    pub const fn loading_newer(&self) -> bool {
-        self.loading_newer
-    }
-
     /// Mark older history as loading or idle.
     pub const fn set_loading(&mut self, loading: bool) {
         self.loading_older = loading;
-        if !loading {
+        if !loading && matches!(self.older_page_ready, PageAcceptance::Pending) {
             self.older_reveal_request = None;
         }
     }
@@ -83,7 +87,7 @@ impl OlderHistoryState {
     /// Mark newer history as loading or idle.
     pub const fn set_loading_newer(&mut self, loading: bool) {
         self.loading_newer = loading;
-        if !loading {
+        if !loading && matches!(self.newer_page_ready, PageAcceptance::Pending) {
             self.newer_reveal_request = None;
         }
     }
@@ -103,23 +107,31 @@ impl OlderHistoryState {
     /// Return whether an older-history request should be started.
     #[must_use]
     pub const fn should_load(&self) -> bool {
-        self.older_cursor.is_some() && !self.loading_older && self.older_reveal_request.is_some()
+        self.older_cursor.is_some()
+            && !self.loading_older
+            && matches!(self.older_page_ready, PageAcceptance::Pending)
+            && self.older_reveal_request.is_some()
     }
 
     /// Return whether a newer-history request should be started.
     #[must_use]
     pub const fn should_load_newer(&self) -> bool {
-        self.newer_cursor.is_some() && !self.loading_newer && self.newer_reveal_request.is_some()
+        self.newer_cursor.is_some()
+            && !self.loading_newer
+            && matches!(self.newer_page_ready, PageAcceptance::Pending)
+            && self.newer_reveal_request.is_some()
     }
 
     /// Set cursor based on a loaded older page.
     pub fn update_cursor(&mut self, events: &[SessionEvent], has_more: bool) {
         self.older_cursor = oldest_history_cursor(events, has_more);
+        self.older_page_ready = PageAcceptance::Ready;
     }
 
     /// Set cursor based on a loaded newer page.
     pub fn update_newer_cursor(&mut self, events: &[SessionEvent], has_more: bool) {
         self.newer_cursor = newest_history_cursor(events, has_more);
+        self.newer_page_ready = PageAcceptance::Ready;
         if self.newer_cursor.is_none() {
             self.mode = TranscriptWindowMode::Tail;
         }
@@ -137,6 +149,8 @@ impl OlderHistoryState {
         self.newer_cursor = newest_history_cursor(events, has_newer);
         self.older_reveal_request = None;
         self.newer_reveal_request = None;
+        self.older_page_ready = PageAcceptance::Pending;
+        self.newer_page_ready = PageAcceptance::Pending;
         self.loading_older = false;
         self.loading_newer = false;
         self.mode = if has_newer {
@@ -171,17 +185,56 @@ impl OlderHistoryState {
 
     /// Request loading older history and reveal this many rows afterward.
     pub const fn request_load(&mut self, reveal_rows: usize) {
-        self.older_reveal_request = Some(reveal_rows);
+        self.newer_reveal_request = None;
+        let previous = match self.older_reveal_request {
+            Some(rows) => rows,
+            None => 0,
+        };
+        self.older_reveal_request = Some(previous.saturating_add(reveal_rows));
     }
 
     /// Request loading newer history.
     pub const fn request_load_newer(&mut self, reveal_rows: usize) {
-        self.newer_reveal_request = Some(reveal_rows);
+        self.older_reveal_request = None;
+        let previous = match self.newer_reveal_request {
+            Some(rows) => rows,
+            None => 0,
+        };
+        self.newer_reveal_request = Some(previous.saturating_add(reveal_rows));
     }
 
-    /// Take the pending older reveal request.
-    pub const fn take_reveal_request(&mut self) -> Option<usize> {
-        self.older_reveal_request.take()
+    /// Cancel movement waiting beyond the older boundary after a direction reversal.
+    pub const fn cancel_older_reveal(&mut self) {
+        self.older_reveal_request = None;
+    }
+
+    /// Cancel movement waiting beyond the newer boundary after a direction reversal.
+    pub const fn cancel_newer_reveal(&mut self) {
+        self.newer_reveal_request = None;
+    }
+
+    /// Consume page acceptance separately from the fetch request and navigation intent.
+    pub const fn take_ready_pages(&mut self) -> (bool, bool) {
+        let ready = (
+            matches!(self.older_page_ready, PageAcceptance::Ready),
+            matches!(self.newer_page_ready, PageAcceptance::Ready),
+        );
+        self.older_page_ready = PageAcceptance::Pending;
+        self.newer_page_ready = PageAcceptance::Pending;
+        ready
+    }
+
+    /// Consume only movement fulfilled by newly available rows.
+    pub fn consume_reveal(&mut self, older: bool, rows: usize) {
+        let (request, has_more) = if older {
+            (&mut self.older_reveal_request, self.older_cursor.is_some())
+        } else {
+            (&mut self.newer_reveal_request, self.newer_cursor.is_some())
+        };
+        *request = request.and_then(|requested| {
+            let remaining = requested.saturating_sub(rows);
+            (has_more && remaining > 0).then_some(remaining)
+        });
     }
 
     /// Return pending older-history reveal request rows.

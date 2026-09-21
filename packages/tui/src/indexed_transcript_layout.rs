@@ -332,10 +332,14 @@ impl IndexedTranscriptLayout {
             .iter()
             .filter(|anchor| anchor.row <= row)
             .max_by_key(|anchor| anchor.row)
-            .map(|anchor| {
+            .and_then(|anchor| {
                 anchor.source.as_ref().map_or_else(
-                    || (anchor.key.as_str(), row.saturating_sub(anchor.row)),
-                    |source| (source.identity.as_str(), source.start),
+                    || Some((anchor.key.as_str(), row.saturating_sub(anchor.row))),
+                    // Source ranges describe this row, not the unmapped rows after it.
+                    // Those rows retain the caller's item-row fallback.
+                    |source| {
+                        (anchor.row == row).then_some((source.identity.as_str(), source.start))
+                    },
                 )
             })
     }
@@ -662,6 +666,33 @@ mod tests {
         );
         assert_eq!(layout.resolve_content_anchor(0, "body", 20), Some(3));
         assert_eq!(layout.resolve_content_anchor(0, "missing", 0), None);
+    }
+
+    #[test]
+    fn source_correspondence_does_not_capture_unmapped_following_rows() {
+        use bcode_plugin_sdk::tui_visual::{TuiVisualAnchor, TuiVisualSourceRange};
+        let mut layout = IndexedTranscriptLayout::default();
+        layout.sync_transcript(
+            1,
+            |_| TranscriptLayoutSignature::new("source and trailing chrome".to_owned()),
+            |_| TranscriptLayoutRows::Anchored {
+                rows: vec![Line::default(); 5],
+                anchors: vec![TuiVisualAnchor {
+                    key: "source-row".to_owned(),
+                    row: 1,
+                    source: Some(TuiVisualSourceRange {
+                        identity: "source".to_owned(),
+                        start: 0,
+                        end: 4,
+                    }),
+                }],
+            },
+            |_| None,
+        );
+        assert_eq!(layout.content_anchor(0, 1), Some(("source", 0)));
+        for row in 2..5 {
+            assert_eq!(layout.content_anchor(0, row), None);
+        }
     }
 
     #[test]

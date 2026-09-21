@@ -58,10 +58,20 @@ impl PendingSubmissions {
         }
     }
 
-    /// Return whether an equivalent submission is awaiting semantic acceptance.
+    /// Supersede positioning from submissions preceding manual navigation.
+    pub fn cancel_reveals(&mut self) {
+        for pending in &mut self.items {
+            pending.cancel_reveal();
+        }
+    }
+
+    /// Whether the first matching submission still owns its acceptance reveal.
     #[must_use]
-    pub fn contains(&self, text: &str) -> bool {
-        self.items.iter().any(|pending| pending.text() == text)
+    pub fn reveals_on_acceptance(&self, text: &str) -> bool {
+        self.items
+            .iter()
+            .find(|pending| pending.text() == text)
+            .is_some_and(PendingSubmission::reveals_on_acceptance)
     }
 
     /// Remove a pending submission by text.

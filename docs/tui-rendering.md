@@ -175,7 +175,16 @@ The bar cannot create its own visibility condition by reducing the viewport. Lay
 then synchronizes the actual viewport once. Stable item anchors are captured before layout
 synchronization as well as before semantic adaptation, covering asynchronous presentation acceptance
 and width changes. Restored row offsets are confined to the surviving item, and manual input clears
-pending correspondence from the preceding navigation intent.
+pending correspondence from the preceding navigation intent. Manual input also cancels deferred
+sequence jumps and acceptance reveals belonging to already-pending submissions; a later submission
+retains its own reveal. Source-backed row anchors apply only to their mapped row. Unmapped rows
+retain item-row fallback instead of snapping to preceding source content.
+
+History-boundary input first traverses available rows, then retains unfulfilled movement while a
+bounded page is fetched. Page acceptance and navigation consumption are separate: frame preparation
+must not erase a fetch request, and successful page reconciliation consumes movement once through
+the presentation checkpoint. Direction reversal cancels outstanding movement in the other direction.
+Resident-window bottom is not the session tail.
 
 Accepted rows retain optional content keys alongside their geometry. Native adapters prepare rows
 and keys together; serialized visual responses support bounded keys in contract version 3 while

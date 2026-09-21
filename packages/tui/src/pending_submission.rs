@@ -4,6 +4,7 @@
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PendingSubmission {
     text: String,
+    reveal_on_acceptance: bool,
     state: PendingSubmissionState,
 }
 
@@ -13,8 +14,20 @@ impl PendingSubmission {
     pub const fn new(text: String) -> Self {
         Self {
             text,
+            reveal_on_acceptance: true,
             state: PendingSubmissionState::Sending,
         }
+    }
+
+    /// Supersede the positioning associated with this submission, but retain its data.
+    pub const fn cancel_reveal(&mut self) {
+        self.reveal_on_acceptance = false;
+    }
+
+    /// Whether acceptance still owns a pending navigation intent.
+    #[must_use]
+    pub const fn reveals_on_acceptance(&self) -> bool {
+        self.reveal_on_acceptance
     }
 
     /// Mark the submission as queued.

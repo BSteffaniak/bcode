@@ -196,12 +196,10 @@ impl TranscriptViewport {
         let current_top = self.top_row(self.previous_total_rows, self.viewport_height);
         let new_top = current_top.saturating_sub(rows);
         let unrevealed_rows = rows.saturating_sub(current_top);
+        let previous_request = older_history.reveal_request();
+        older_history.cancel_newer_reveal();
         if unrevealed_rows > 0 {
-            let previous_request = older_history.reveal_request();
             request_older_history_load(older_history, unrevealed_rows);
-            if previous_request != older_history.reveal_request() {
-                return true;
-            }
         }
         self.mode = TranscriptViewportMode::AnchoredTop {
             top_row: new_top,
@@ -209,7 +207,7 @@ impl TranscriptViewport {
         };
         self.bottom_overscroll = 0;
         self.refresh_offset_cache();
-        *self != previous
+        *self != previous || previous_request != older_history.reveal_request()
     }
 
     /// Scroll down by rendered rows.
@@ -219,13 +217,20 @@ impl TranscriptViewport {
         }
         let previous = *self;
         let viewport_height = usize::from(self.viewport_height);
+        history.cancel_older_reveal();
+        if history.has_newer_history() {
+            let current_top = self.top_row(self.previous_total_rows, self.viewport_height);
+            let boundary = self.previous_total_rows.saturating_sub(viewport_height);
+            let next = current_top.saturating_add(rows);
+            let previous_request = history.newer_reveal_request();
+            if next >= boundary {
+                history.request_load_newer(next.saturating_sub(boundary).max(1));
+            }
+            self.follow_anchor(next.min(boundary));
+            return *self != previous || previous_request != history.newer_reveal_request();
+        }
         match self.mode {
             TranscriptViewportMode::FollowBottom | TranscriptViewportMode::TailSpace { .. } => {
-                if history.has_newer_history() && !history.loading_newer() {
-                    let previous_request = history.newer_reveal_request();
-                    history.request_load_newer(rows.max(1));
-                    return previous_request != history.newer_reveal_request();
-                }
                 self.bottom_overscroll = self
                     .bottom_overscroll
                     .saturating_add(rows)
@@ -236,15 +241,6 @@ impl TranscriptViewport {
                 let bottom_top = self.previous_total_rows.saturating_sub(viewport_height);
                 let next_top = current_top.saturating_add(rows);
                 if next_top >= bottom_top {
-                    if history.has_newer_history() && !history.loading_newer() {
-                        let previous_request = history.newer_reveal_request();
-                        history.request_load_newer(next_top.saturating_sub(bottom_top).max(1));
-                        self.mode = TranscriptViewportMode::FollowBottom;
-                        self.bottom_overscroll = 0;
-                        self.refresh_offset_cache();
-                        return *self != previous
-                            || previous_request != history.newer_reveal_request();
-                    }
                     self.mode = TranscriptViewportMode::FollowBottom;
                     self.bottom_overscroll = next_top
                         .saturating_sub(bottom_top)
@@ -289,21 +285,13 @@ impl TranscriptViewport {
         total_rows: usize,
         viewport_height: u16,
         _manual_scroll_active: bool,
-        older_history: &mut OlderHistoryState,
+        _older_history: &mut OlderHistoryState,
     ) {
-        let previous_max = self.max_offset;
         self.previous_total_rows = total_rows;
         self.viewport_height = viewport_height;
         self.max_offset = max_offset;
         self.max_bottom_overscroll = max_bottom_overscroll;
         self.resolve_tail_space();
-        if let Some(requested_rows) = older_history.take_reveal_request() {
-            let inserted_rows = max_offset.saturating_sub(previous_max);
-            let reveal_rows = requested_rows.min(inserted_rows);
-            if let TranscriptViewportMode::AnchoredTop { top_row, .. } = &mut self.mode {
-                *top_row = top_row.saturating_add(reveal_rows);
-            }
-        }
         self.clamp_anchor();
         self.bottom_overscroll = self.bottom_overscroll.min(self.max_bottom_overscroll);
         self.refresh_offset_cache();
@@ -317,6 +305,14 @@ impl TranscriptViewport {
         anchor: Option<usize>,
         history: &mut OlderHistoryState,
     ) {
+        let previous_total = self.previous_total_rows;
+        let previous_top = self.top_row(previous_total, self.viewport_height);
+        let (older_ready, newer_ready) = history.take_ready_pages();
+        let inserted_rows = bounds.2.saturating_sub(previous_total);
+        let anchor = anchor.or_else(|| {
+            (older_ready && !self.follows_bottom())
+                .then_some(previous_top.saturating_add(inserted_rows))
+        });
         if let Some(top_row) = anchor {
             self.mode = match self.mode {
                 TranscriptViewportMode::FollowBottom => TranscriptViewportMode::FollowBottom,
@@ -328,12 +324,29 @@ impl TranscriptViewport {
                 }
             };
         }
-        if anchor.is_some() {
-            // Identity correspondence already includes history inserted above the
-            // reader. Do not apply a second max-offset-based prepend adjustment.
-            history.clear_reveal_request();
-        }
         self.sync_max(bounds.0, bounds.1, bounds.2, bounds.3, false, history);
+        if older_ready {
+            let requested = history.reveal_request().unwrap_or(0);
+            let top = self.top_row(bounds.2, bounds.3);
+            let movement = requested.min(top);
+            if requested > 0 {
+                self.follow_anchor(top.saturating_sub(movement));
+            }
+            history.consume_reveal(true, movement);
+        }
+        if newer_ready {
+            let requested = history.newer_reveal_request().unwrap_or(0);
+            let top = self.top_row(bounds.2, bounds.3);
+            let available = bounds
+                .2
+                .saturating_sub(usize::from(bounds.3))
+                .saturating_sub(top);
+            let movement = requested.min(available);
+            if requested > 0 {
+                self.follow_anchor(top.saturating_add(movement));
+            }
+            history.consume_reveal(false, movement);
+        }
     }
 
     /// Apply explicit reveal overflow policy at the viewport ownership boundary.
@@ -398,7 +411,7 @@ impl TranscriptViewport {
 }
 
 fn request_older_history_load(older_history: &mut OlderHistoryState, reveal_rows: usize) {
-    if older_history.cursor().is_none() || older_history.loading() {
+    if older_history.cursor().is_none() {
         return;
     }
     older_history.request_load(reveal_rows.max(1));
@@ -578,14 +591,49 @@ mod tests {
     }
 
     #[test]
+    fn boundary_scroll_applies_available_rows_and_retains_loading_movement() {
+        let mut viewport = TranscriptViewport::default();
+        let mut history = older_history();
+        history.mark_dropped_history_before(10);
+        viewport.sync_max(20, 9, 30, 10, false, &mut history);
+        viewport.follow_anchor(2);
+        assert!(viewport.scroll_up(3, &mut history));
+        assert_eq!(viewport.top_row(30, 10), 0);
+        assert_eq!(history.reveal_request(), Some(1));
+        history.set_loading(true);
+        viewport.scroll_up(2, &mut history);
+        viewport.sync_with_anchor((20, 9, 30, 10), Some(0), &mut history);
+        assert_eq!(history.reveal_request(), Some(3));
+        history.update_cursor(&[], false);
+        history.set_loading(false);
+        viewport.sync_with_anchor((30, 9, 40, 10), Some(10), &mut history);
+        assert_eq!(viewport.top_row(40, 10), 7);
+        assert_eq!(history.reveal_request(), None);
+    }
+
+    #[test]
+    fn direction_reversal_cancels_pending_history_movement() {
+        let mut viewport = TranscriptViewport::default();
+        let mut history = older_history();
+        history.mark_dropped_history_before(10);
+        viewport.sync_max(20, 9, 30, 10, false, &mut history);
+        viewport.follow_anchor(0);
+        viewport.scroll_up(3, &mut history);
+        viewport.scroll_down(2, &mut history);
+        history.update_cursor(&[], false);
+        viewport.sync_with_anchor((30, 9, 40, 10), Some(12), &mut history);
+        assert_eq!(viewport.top_row(40, 10), 12);
+    }
+
+    #[test]
     fn older_history_reveal_keeps_same_content_visible_after_prepend() {
         let mut viewport = TranscriptViewport::default();
         let mut older = older_history();
         viewport.sync_max(20, 0, 30, 10, false, &mut older);
         viewport.scroll_up(8, &mut older);
-        older.request_load(4);
-
-        viewport.sync_max(24, 0, 34, 10, false, &mut older);
+        // Unsolicited prepend preserves the reader; it is not a request to move.
+        older.update_cursor(&[], false);
+        viewport.sync_with_anchor((24, 0, 34, 10), Some(16), &mut older);
 
         assert_eq!(viewport.top_row(34, 10), 16);
     }

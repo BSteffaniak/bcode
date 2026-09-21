@@ -2888,11 +2888,15 @@ impl BmuxApp {
         self.assistant_scroll_anchor = AssistantScrollAnchorState::Idle;
         self.pending_assistant_stream_anchor = false;
         self.pending_visual_overflow_bottom = None;
+        self.pending_transcript_top_anchor_sequence = None;
+        self.pending_submissions.cancel_reveals();
         self.viewport.scroll_to_bottom(&mut self.older_history)
     }
 
     /// Animate transcript to the newest rows.
     pub fn transition_transcript_to_bottom(&mut self) -> bool {
+        self.pending_transcript_top_anchor_sequence = None;
+        self.pending_submissions.cancel_reveals();
         self.navigation_checkpoint = None;
         let start_top_row = self
             .viewport
@@ -2937,6 +2941,8 @@ impl BmuxApp {
         // It must not undo input received between semantic updates and preparation.
         self.pending_stable_transcript_anchor = None;
         self.presented_transcript_anchor = None;
+        self.pending_transcript_top_anchor_sequence = None;
+        self.pending_submissions.cancel_reveals();
         self.manual_transcript_scroll_until = Some(Instant::now() + MANUAL_TRANSCRIPT_SCROLL_GRACE);
     }
 
@@ -3920,7 +3926,7 @@ impl BmuxApp {
             .unwrap_or_else(|| text.to_owned());
         self.input_history
             .push_committed(sequence, timestamp_ms, &text);
-        let accepted_pending_submission = self.pending_submissions.contains(&text);
+        let accepted_pending_submission = self.pending_submissions.reveals_on_acceptance(&text);
         self.remove_pending_submission(&text);
         if accepted_pending_submission {
             self.submitted_user_message_following = SubmittedUserMessageFollowing::PendingAnchor;
@@ -5043,6 +5049,59 @@ const fn event_affects_transcript_rows(event: &SessionEvent) -> bool {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn manual_scroll_cancels_deferred_sequence_and_submission_reveals() {
+        let mut app = super::BmuxApp::new_with_history(None, &[], &[], false);
+        app.viewport
+            .sync_max(20, 9, 30, 10, false, &mut app.older_history);
+        app.pending_submissions.stage("pending".to_owned());
+        app.request_transcript_top_anchor_sequence(42);
+        assert!(app.scroll_transcript_up(2));
+        app.expire_manual_transcript_scroll_for_test();
+        app.sync_transcript_anchor_requests();
+        assert!(app.pending_transcript_top_anchor_sequence.is_none());
+        assert!(!app.pending_submissions.reveals_on_acceptance("pending"));
+        assert_eq!(app.pending_submissions.items()[0].text(), "pending");
+        app.pending_submissions.stage("later".to_owned());
+        assert!(app.pending_submissions.reveals_on_acceptance("later"));
+        drop(app);
+    }
+
+    #[test]
+    fn newer_boundary_requests_survive_app_bottom_policy_and_page_arrival() {
+        let mut app = super::BmuxApp::new_with_history(None, &[], &[], false);
+        let session_id = bcode_session_models::SessionId::new();
+        let event = bcode_session_models::SessionEvent {
+            schema_version: bcode_session_models::CURRENT_SESSION_EVENT_SCHEMA_VERSION,
+            sequence: 10,
+            timestamp_ms: 10,
+            session_id,
+            provenance: None,
+            kind: bcode_session_models::SessionEventKind::AssistantMessage {
+                text: "history".to_owned(),
+            },
+        };
+        app.older_history.replace_centered(&[event], true, true, 10);
+        app.viewport
+            .sync_max(20, 9, 30, 10, false, &mut app.older_history);
+        app.viewport.follow_anchor(18);
+        assert!(app.scroll_transcript_down(3));
+        assert_eq!(app.viewport.top_row(30, 10), 20);
+        assert!(app.should_load_newer_history());
+        app.older_history.set_loading_newer(true);
+        assert!(app.scroll_transcript_down(2));
+        app.viewport
+            .sync_with_anchor((20, 9, 30, 10), Some(20), &mut app.older_history);
+        assert_eq!(app.older_history.newer_reveal_request(), Some(3));
+        app.older_history.update_newer_cursor(&[], false);
+        app.older_history.set_loading_newer(false);
+        app.viewport
+            .sync_with_anchor((30, 9, 40, 10), Some(20), &mut app.older_history);
+        assert_eq!(app.viewport.top_row(40, 10), 23);
+        assert_eq!(app.older_history.newer_reveal_request(), None);
+        drop(app);
+    }
+
     #[test]
     fn uncommitted_retries_do_not_accumulate_hidden_activity() {
         let mut app = super::BmuxApp::new_with_history(None, &[], &[], false);
