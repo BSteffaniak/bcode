@@ -66,9 +66,96 @@ pub async fn load(context: NativeServiceContext) -> ServiceResponse {
                 warnings: snapshot.import_warnings(),
             })
         }
-        Err(error) => ServiceResponse::error(
-            "history_retrieval_failed",
-            format!("history retrieval failed: {error:?}"),
+        Err(error) => access_error(error),
+    }
+}
+
+fn access_error(error: super::client::HistoryAccessError) -> ServiceResponse {
+    use super::client::HistoryAccessError;
+    let (code, message) = match error {
+        HistoryAccessError::Cancelled => ("history_cancelled", "history retrieval cancelled"),
+        HistoryAccessError::InvalidRequest => (
+            "history_invalid_request",
+            "invalid history identifier or budget",
         ),
+        HistoryAccessError::AuthenticationRequired => (
+            "history_auth_required",
+            "refresh or reconnect the selected auth profile",
+        ),
+        HistoryAccessError::AccessDenied => (
+            "history_access_denied",
+            "the selected profile cannot access this history",
+        ),
+        HistoryAccessError::AccessChallenge => (
+            "history_access_challenge",
+            "upstream access challenge prevents history retrieval",
+        ),
+        HistoryAccessError::RateLimited { .. } => (
+            "history_rate_limited",
+            "upstream rate limit; retry history retrieval later",
+        ),
+        HistoryAccessError::NotFound => (
+            "history_not_found",
+            "remote conversation unavailable; retain previously imported history",
+        ),
+        HistoryAccessError::Transient => (
+            "history_transient",
+            "temporary history transport or server failure",
+        ),
+        HistoryAccessError::IncompatibleResponse => (
+            "history_incompatible_response",
+            "unsupported history response; import remains incomplete",
+        ),
+        HistoryAccessError::TooLarge => (
+            "history_too_large",
+            "conversation exceeds the retrieval budget; import remains incomplete",
+        ),
+        HistoryAccessError::Decode(_) => (
+            "history_decode_failed",
+            "conversation could not be converted faithfully; import remains incomplete",
+        ),
+    };
+    ServiceResponse::error(code, message)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::history::client::HistoryAccessError;
+
+    #[test]
+    fn retrieval_failures_keep_actionable_categories() {
+        let failures = [
+            (HistoryAccessError::Cancelled, "history_cancelled"),
+            (
+                HistoryAccessError::AuthenticationRequired,
+                "history_auth_required",
+            ),
+            (HistoryAccessError::AccessDenied, "history_access_denied"),
+            (
+                HistoryAccessError::AccessChallenge,
+                "history_access_challenge",
+            ),
+            (
+                HistoryAccessError::RateLimited {
+                    retry_after_seconds: Some(17),
+                },
+                "history_rate_limited",
+            ),
+            (HistoryAccessError::NotFound, "history_not_found"),
+            (HistoryAccessError::Transient, "history_transient"),
+            (
+                HistoryAccessError::IncompatibleResponse,
+                "history_incompatible_response",
+            ),
+            (HistoryAccessError::TooLarge, "history_too_large"),
+        ];
+        for (failure, code) in failures {
+            let response = access_error(failure);
+            let error = response.error.unwrap();
+            assert_eq!(error.code, code);
+            assert!(!error.message.is_empty());
+            assert!(response.payload.is_empty());
+        }
     }
 }
