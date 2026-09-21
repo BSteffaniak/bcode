@@ -1,0 +1,7 @@
+# Adapter conformance tests load the actual native plugin artifacts.
+[[config]]
+os = "ubuntu"
+
+[[config.dependencies]]
+command = "cargo build --locked -p bcode_shell_plugin -p bcode_filesystem_plugin"
+features = ["embedded-plugins"]
