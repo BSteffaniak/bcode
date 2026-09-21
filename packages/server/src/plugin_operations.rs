@@ -375,6 +375,14 @@ pub async fn call_service(
     operation: String,
     payload: Vec<u8>,
 ) -> Result<PluginServiceOperationResult, PublicPluginError> {
+    // Activity identity is scoped to an explicitly selected producer. Interface discovery
+    // alone must not bypass the producer/revision checks in `invoke_service`.
+    if interface_id == bcode_session_models::ACTIVITY_PRESENTATION_INTERFACE_ID {
+        return Err(PublicPluginError {
+            code: "activity_producer_required",
+            message: "activity projection requires an explicitly selected producer",
+        });
+    }
     let labels = plugin_service_metric_labels(None, interface_id, &operation);
     state
         .metrics
@@ -474,6 +482,105 @@ mod tests {
             )
             .is_err()
         );
+    }
+
+    #[tokio::test]
+    async fn activity_round_trip_through_bundled_loop_producer() {
+        let mut state = crate::tests::test_server_state(bcode_session::SessionManager::default());
+        state.plugins = bcode_plugin::PluginRuntimeHost::load_defaults_with_static_bundled(
+            &bcode_plugin::PluginSelection {
+                mode: bcode_plugin::PluginSelectionMode::Explicit,
+                enabled: std::collections::BTreeSet::from(["bcode.loop".into()]),
+                disabled: std::collections::BTreeSet::new(),
+            },
+            &[bcode_bundled_plugins::static_loop_plugin()],
+        )
+        .unwrap();
+        let request = bcode_session_models::ActivityProjectionRequest {
+            stage: "implementation".into(),
+            revision: 7,
+            input: serde_json::json!({"implementation_prompt":"Implement safely", "stop_condition":"Tests pass", "max_iterations":10, "iteration":2, "condition_met":false, "summary":"", "evidence":[]}),
+        };
+        let response = super::invoke_service(
+            &state,
+            "bcode.loop",
+            bcode_session_models::ACTIVITY_PRESENTATION_INTERFACE_ID,
+            "project".into(),
+            serde_json::to_vec(&request).unwrap(),
+        )
+        .await
+        .unwrap();
+        drop(state);
+        assert!(response.error.is_none());
+        let view: bcode_session_models::ActivityPresentation =
+            serde_json::from_slice(&response.payload).unwrap();
+        assert_eq!(view.producer, "bcode.loop");
+        assert_eq!(view.activity_id, "iteration:2");
+        assert_eq!(view.revision, 7);
+        assert_eq!(view.payload["exact_structured_input"], request.input);
+        assert!(view.fallback.contains("Iteration 2 of 10"));
+    }
+
+    #[tokio::test]
+    async fn activity_interface_discovery_cannot_bypass_producer_validation() {
+        let state = crate::tests::test_server_state(bcode_session::SessionManager::default());
+        let result = super::call_service(
+            &state,
+            bcode_session_models::ACTIVITY_PRESENTATION_INTERFACE_ID,
+            "project".into(),
+            Vec::new(),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(result.code, "activity_producer_required");
+        let unrelated =
+            super::call_service(&state, "example.other/v1", "project".into(), Vec::new())
+                .await
+                .unwrap_err();
+        drop(state);
+        assert_eq!(unrelated.code, "plugin_error");
+    }
+
+    #[tokio::test]
+    async fn activity_invocation_validates_before_plugin_lookup() {
+        let state = crate::tests::test_server_state(bcode_session::SessionManager::default());
+        let interface = bcode_session_models::ACTIVITY_PRESENTATION_INTERFACE_ID;
+        let invalid = super::invoke_service(
+            &state,
+            "missing.plugin",
+            interface,
+            "project".into(),
+            b"invalid".to_vec(),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(invalid.code, "invalid_activity_request");
+        let request = bcode_session_models::ActivityProjectionRequest {
+            stage: "producer_stage".into(),
+            revision: 1,
+            input: serde_json::json!({}),
+        };
+        let missing = super::invoke_service(
+            &state,
+            "missing.plugin",
+            interface,
+            "project".into(),
+            serde_json::to_vec(&request).unwrap(),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(missing.code, "plugin_error");
+        let unrelated = super::invoke_service(
+            &state,
+            "missing.plugin",
+            "example.other/v1",
+            "project".into(),
+            b"invalid".to_vec(),
+        )
+        .await
+        .unwrap_err();
+        drop(state);
+        assert_eq!(unrelated.code, "plugin_error");
     }
 
     #[test]
