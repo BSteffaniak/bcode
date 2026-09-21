@@ -808,6 +808,7 @@ impl TurnEventObservability for ContributionObserver {
 #[cfg(unix)]
 #[tokio::test]
 async fn static_and_dynamic_shell_contributions_are_observable_headlessly() {
+    let workspace = tempfile::tempdir().expect("shell workspace");
     for plugins in [static_shell_runtime(), dynamic_shell_runtime()] {
         let observer = Arc::new(ContributionObserver::default());
         let agent = Agent::builder()
@@ -820,7 +821,7 @@ async fn static_and_dynamic_shell_contributions_are_observable_headlessly() {
             .execute_tool_call(&ToolCall {
                 id: "shell-contribution".to_owned(),
                 name: "shell.run".to_owned(),
-                arguments: serde_json::json!({"command": "printf shell-contribution"}),
+                arguments: serde_json::json!({"command": "printf shell-contribution", "cwd": workspace.path()}),
             })
             .await
             .expect("shell contribution invocation");
