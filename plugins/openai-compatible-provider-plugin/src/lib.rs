@@ -8556,6 +8556,13 @@ async fn refresh_openai_codex_token_at(
         .map_err(|error| reqwest_provider_error("token_refresh_failed", &error))?;
     let status = response.status();
     let headers = response.headers().clone();
+    if headers
+        .get("cf-mitigated")
+        .is_some_and(|value| value == "challenge")
+        || matches!(status.as_u16(), 401 | 403 | 429 | 500..=599)
+    {
+        return Err(refresh_error_from_response(status.as_u16(), &headers, ""));
+    }
     let incompatible = || {
         provider_error(
             "token_refresh_decode_failed",
@@ -8593,6 +8600,16 @@ async fn refresh_openai_codex_token_at(
 }
 
 fn refresh_error_from_response(status: u16, headers: &HeaderMap, body: &str) -> ProviderError {
+    if headers
+        .get("cf-mitigated")
+        .is_some_and(|value| value == "challenge")
+    {
+        return provider_error(
+            "token_refresh_access_challenge",
+            ProviderErrorCategory::Auth,
+            "credential refresh encountered an access challenge; retry after resolving provider access",
+        );
+    }
     let invalid_grant = serde_json::from_str::<serde_json::Value>(body)
         .ok()
         .and_then(|value| {
@@ -10286,6 +10303,19 @@ mod tests {
     }
 
     #[test]
+    fn refresh_challenges_do_not_imply_invalid_credentials_or_expose_body() {
+        let mut headers = HeaderMap::new();
+        headers.insert("cf-mitigated", "challenge".parse().unwrap());
+        for status in [200, 401, 403, 429, 503] {
+            let error = refresh_error_from_response(status, &headers, "private-challenge-body");
+            assert_eq!(error.code, "token_refresh_access_challenge");
+            assert!(error.retry.is_none());
+            assert!(error.provider_message.is_none());
+            assert!(!format!("{error:?}").contains("private-challenge-body"));
+        }
+    }
+
+    #[test]
     fn refresh_failures_are_actionable_without_remote_diagnostics() {
         let mut headers = HeaderMap::new();
         headers.insert("retry-after", "7".parse().unwrap());
@@ -10306,6 +10336,82 @@ mod tests {
             assert!(!format!("{error:?}").contains("private-marker"));
             assert!(error.provider_message.is_none());
             if matches!(status, 429 | 503) {
+                assert_eq!(
+                    error.retry.as_ref().and_then(|hint| hint.retry_after_ms),
+                    Some(7000)
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn refresh_transport_classifies_challenge_before_reading_body() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let endpoint = format!("http://{}/token", listener.local_addr().unwrap());
+        let (release, wait) = std::sync::mpsc::channel::<()>();
+        let worker = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            stream
+                .set_write_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            let mut request = [0; 4096];
+            assert!(stream.read(&mut request).unwrap() > 0);
+            stream.write_all(b"HTTP/1.1 200 OK\r\ncf-mitigated: challenge\r\nContent-Length: 999999\r\nConnection: close\r\n\r\n").unwrap();
+            // Deliberately withhold the body until the client has returned.
+            let _ = wait.recv_timeout(Duration::from_secs(5));
+        });
+        let runtime = ProviderRuntime::new().unwrap();
+        let result = runtime
+            .block_on(async move {
+                tokio::time::timeout(
+                    Duration::from_secs(2),
+                    refresh_openai_codex_token_at(&endpoint, "synthetic-refresh"),
+                )
+                .await
+            })
+            .unwrap();
+        let _ = release.send(());
+        worker.join().unwrap();
+        let error = result
+            .expect("challenge must not wait for the body")
+            .unwrap_err();
+        assert_eq!(error.code, "token_refresh_access_challenge");
+    }
+
+    #[test]
+    fn refresh_transport_preserves_status_and_retry_despite_oversized_error_body() {
+        for (status, code) in [
+            ("401 Unauthorized", "token_refresh_requires_reconnect"),
+            ("403 Forbidden", "token_refresh_access_denied"),
+            (
+                "429 Too Many Requests\r\nRetry-After: 7",
+                "token_refresh_rate_limited",
+            ),
+            (
+                "503 Service Unavailable\r\nRetry-After: 7",
+                "token_refresh_transient",
+            ),
+        ] {
+            // Error status and retry headers take precedence over body size.
+            let body = Box::leak("x".repeat(65 * 1024).into_boxed_str());
+            let server = AuthMockServer::start(vec![(status, body)]);
+            let endpoint = server.endpoint("/token");
+            let runtime = ProviderRuntime::new().unwrap();
+            let error = runtime
+                .block_on(async move {
+                    refresh_openai_codex_token_at(&endpoint, "synthetic-refresh").await
+                })
+                .unwrap()
+                .unwrap_err();
+            server.finish();
+            assert_eq!(error.code, code);
+            if matches!(
+                code,
+                "token_refresh_rate_limited" | "token_refresh_transient"
+            ) {
                 assert_eq!(
                     error.retry.as_ref().and_then(|hint| hint.retry_after_ms),
                     Some(7000)
