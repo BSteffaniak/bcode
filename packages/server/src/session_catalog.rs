@@ -208,11 +208,28 @@ impl SessionCatalog {
 
     /// Replace the primary native source with a fresh view from the session manager.
     pub async fn refresh_native_now(&self, state: &ServerState) {
+        let generation = {
+            let mut inner = self.inner.lock().await;
+            let source = inner
+                .sources
+                .entry(native_source_key())
+                .or_insert_with(|| SourceCache {
+                    metadata: native_metadata(),
+                    state: SourceCacheState::Empty,
+                    updated_at_ms: 0,
+                    generation: 0,
+                });
+            source.generation += 1;
+            let generation = source.generation;
+            drop(inner);
+            generation
+        };
         if state.sessions.session_store_root().is_none() {
-            self.apply_source_result(
+            self.publish_source_result(
                 native_source_key(),
                 native_metadata(),
                 load_in_memory_source(state).await,
+                Some(generation),
             )
             .await;
             return;
@@ -224,8 +241,13 @@ impl SessionCatalog {
             return;
         };
         let result = load_native_source(state, &location).await;
-        self.apply_source_result(native_source_key(), native_metadata(), result)
-            .await;
+        self.publish_source_result(
+            native_source_key(),
+            native_metadata(),
+            result,
+            Some(generation),
+        )
+        .await;
     }
 
     /// Mark native sessions dirty so the next snapshot reloads them.
@@ -246,6 +268,7 @@ impl SessionCatalog {
             SourceCacheState::Empty | SourceCacheState::Loading => return,
         };
         if upsert_session(sessions, session) {
+            source.generation += 1;
             source.updated_at_ms = current_unix_millis();
             self.bump_revision(&mut inner);
         }
@@ -266,6 +289,7 @@ impl SessionCatalog {
         let original_len = sessions.len();
         sessions.retain(|session| session.id != session_id);
         if sessions.len() != original_len {
+            source.generation += 1;
             source.updated_at_ms = current_unix_millis();
             self.bump_revision(&mut inner);
         }
@@ -413,7 +437,7 @@ impl SessionCatalog {
         }
     }
 
-    #[allow(clippy::significant_drop_tightening)]
+    #[cfg(test)]
     async fn apply_source_result(
         &self,
         key: CatalogSourceKey,
@@ -1056,6 +1080,58 @@ fn current_unix_millis() -> u64 {
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test]
+    async fn native_mutations_fence_pending_refresh_publication() {
+        let catalog = SessionCatalog::default();
+        let original = summary(SessionId::new(), None);
+        catalog
+            .apply_source_result(
+                super::native_source_key(),
+                super::native_metadata(),
+                Ok(SourceLoadResult {
+                    sessions: vec![original.clone()],
+                    diagnostics: SourceDiagnostics::default(),
+                }),
+            )
+            .await;
+        let generation = catalog.inner.lock().await.sources[&super::native_source_key()].generation;
+        let mut renamed = original.clone();
+        renamed.explicit_name = Some("renamed".to_owned());
+        catalog.upsert_native_session(renamed.clone()).await;
+        catalog
+            .publish_source_result(
+                super::native_source_key(),
+                super::native_metadata(),
+                Ok(SourceLoadResult {
+                    sessions: vec![original.clone()],
+                    diagnostics: SourceDiagnostics::default(),
+                }),
+                Some(generation),
+            )
+            .await;
+        assert_eq!(
+            catalog.inner.lock().await.sources[&super::native_source_key()].sessions(),
+            &[renamed]
+        );
+        let generation = catalog.inner.lock().await.sources[&super::native_source_key()].generation;
+        catalog.remove_native_session(original.id).await;
+        catalog
+            .publish_source_result(
+                super::native_source_key(),
+                super::native_metadata(),
+                Ok(SourceLoadResult {
+                    sessions: vec![original],
+                    diagnostics: SourceDiagnostics::default(),
+                }),
+                Some(generation),
+            )
+            .await;
+        assert!(
+            catalog.inner.lock().await.sources[&super::native_source_key()]
+                .sessions()
+                .is_empty()
+        );
+    }
     #[tokio::test]
     async fn invalidated_source_load_cannot_publish_over_fresh_results() {
         let catalog = SessionCatalog::default();
