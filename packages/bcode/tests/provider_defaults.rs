@@ -14,7 +14,8 @@ use bcode_model::{
 };
 use std::collections::BTreeSet;
 
-#[cfg(unix)]
+// Exercises real SSH recipients, which the deterministic custody backend rejects.
+#[cfg(all(unix, not(feature = "custody-simulation")))]
 #[tokio::test]
 async fn encrypted_custody_reaches_sdk_provider_turn() {
     use bcode_provider_auth::{
