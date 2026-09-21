@@ -30,6 +30,13 @@ use std::str::FromStr;
 use std::time::{SystemTime, UNIX_EPOCH};
 use uuid::Uuid;
 
+mod activity;
+pub use activity::{
+    ACTIVITY_PRESENTATION_INTERFACE_ID, ACTIVITY_PRESENTATION_VERSION, ActivityPresentation,
+    ActivityProjectionRequest, MAX_ACTIVITY_PRESENTATION_BYTES,
+    MAX_ACTIVITY_PROJECTION_REQUEST_BYTES, OP_PROJECT_ACTIVITY,
+};
+
 pub mod context_generation;
 mod storage_admission;
 pub use context_generation::{PrepareContextGeneration, PreparedContextGeneration};

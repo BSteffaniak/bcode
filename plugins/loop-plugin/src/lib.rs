@@ -51,6 +51,7 @@ use serde::{Deserialize, Serialize};
 
 const PLUGIN_ID: &str = "bcode.loop";
 const WORKFLOW_KIND: &str = "bcode.loop";
+mod activity;
 mod goal;
 mod progress;
 
@@ -78,6 +79,28 @@ impl RustPlugin for LoopPlugin {
     }
 
     fn invoke_service(&mut self, context: NativeServiceContext) -> ServiceResponse {
+        if context.request.interface_id == bcode_session_models::ACTIVITY_PRESENTATION_INTERFACE_ID
+            && context.request.operation == bcode_session_models::OP_PROJECT_ACTIVITY
+        {
+            if context.request.payload.len()
+                > bcode_session_models::MAX_ACTIVITY_PROJECTION_REQUEST_BYTES
+            {
+                return ServiceResponse::error(
+                    "invalid_request",
+                    "activity request exceeds byte limit",
+                );
+            }
+            return match context
+                .request
+                .payload_json::<bcode_session_models::ActivityProjectionRequest>()
+            {
+                Ok(request) => match activity::project(request) {
+                    Ok(presentation) => json_response(&presentation),
+                    Err(error) => ServiceResponse::error("invalid_activity", error),
+                },
+                Err(error) => ServiceResponse::error("invalid_request", error.to_string()),
+            };
+        }
         if context.request.interface_id == bcode_plugin_sdk::SESSION_STATUS_INTERFACE_ID
             && context.request.operation == bcode_plugin_sdk::OP_SESSION_STATUS
         {

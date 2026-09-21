@@ -8,6 +8,29 @@ use serde::{Deserialize, Serialize};
 
 const MAX_DOCUMENT_BYTES: usize = 65_536;
 const MAX_TASKS: usize = 1_024;
+const MAX_SUMMARY_SECTIONS: usize = 8;
+
+/// Mechanical checklist state, never an execution outcome.
+#[derive(Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ChecklistState {
+    NoChecklist,
+    Unchecked,
+    PartiallyChecked,
+    AllChecked,
+}
+
+impl Section {
+    fn state(&self) -> ChecklistState {
+        let checked = self.tasks.iter().filter(|task| task.checked).count();
+        match (checked, self.tasks.len()) {
+            (_, 0) => ChecklistState::NoChecklist,
+            (0, _) => ChecklistState::Unchecked,
+            (checked, total) if checked == total => ChecklistState::AllChecked,
+            _ => ChecklistState::PartiallyChecked,
+        }
+    }
+}
 
 /// One actual Markdown task item, in source order.
 #[derive(Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -23,6 +46,9 @@ pub struct Task {
 #[derive(Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Section {
     pub title: String,
+    /// Whether this heading explicitly identifies a phase, not an inferred active stage.
+    #[serde(default)]
+    pub is_phase: bool,
     pub tasks: Vec<Task>,
 }
 
@@ -38,6 +64,7 @@ impl Checklist {
         let mut result = Self {
             sections: vec![Section {
                 title: "Other checklist items".into(),
+                is_phase: false,
                 tasks: Vec::new(),
             }],
             truncated: text.len() > MAX_DOCUMENT_BYTES,
@@ -81,6 +108,7 @@ impl Checklist {
                             phase_level = is_phase.then_some(heading_level);
                             result.sections.push(Section {
                                 title,
+                                is_phase,
                                 tasks: Vec::new(),
                             });
                         }
@@ -127,29 +155,48 @@ impl Checklist {
             .iter()
             .map(|section| section.tasks.len())
             .sum();
-        if total == 0 {
-            return "No checklist yet.".into();
-        }
         let checked = self
             .sections
             .iter()
             .flat_map(|section| &section.tasks)
             .filter(|task| task.checked)
             .count();
-        let mut summary = format!(
-            "{checked}/{total} checked · ~{}% (checklist only, not goal completion)",
-            checked * 100 / total
+        let mut summary = (checked * 100).checked_div(total).map_or_else(
+            || "No checklist yet.".into(),
+            |percentage| format!("{checked}/{total} checked · ~{percentage}% (checklist only, not goal completion)"),
         );
-        for section in &self.sections {
-            if section.tasks.is_empty() {
-                continue;
-            }
+        if let Some(section) = self
+            .sections
+            .iter()
+            .find(|section| section.is_phase && section.tasks.iter().any(|task| !task.checked))
+        {
+            let _ = write!(summary, "\nNext unchecked phase: {}", section.title);
+        }
+        let sections: Vec<_> = self
+            .sections
+            .iter()
+            .filter(|section| section.is_phase || !section.tasks.is_empty())
+            .collect();
+        for section in sections.iter().take(MAX_SUMMARY_SECTIONS) {
             let checked = section.tasks.iter().filter(|task| task.checked).count();
+            let state = match section.state() {
+                ChecklistState::NoChecklist => "no checklist",
+                ChecklistState::Unchecked => "unchecked",
+                ChecklistState::PartiallyChecked => "partially checked",
+                ChecklistState::AllChecked => "all checked",
+            };
             let _ = write!(
                 summary,
-                "\n{}: {checked}/{} checked",
+                "\n{}: {checked}/{} · {state}",
                 section.title,
                 section.tasks.len()
+            );
+        }
+        if sections.len() > MAX_SUMMARY_SECTIONS {
+            let _ = write!(
+                summary,
+                "\n{} more checklist sections; counts above include all sections.",
+                sections.len() - MAX_SUMMARY_SECTIONS
             );
         }
         summary
@@ -159,6 +206,45 @@ impl Checklist {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn empty_phases_are_visible_without_inventing_completion() {
+        let empty = Checklist::parse("## Phase 1\nPlanning prose\n## Phase 2\n").summary();
+        assert!(empty.starts_with("No checklist yet."));
+        assert!(empty.contains("Phase 1: 0/0 · no checklist"));
+        assert!(empty.contains("Phase 2: 0/0 · no checklist"));
+        assert!(!empty.contains('%'));
+        assert!(!empty.contains("Next unchecked phase:"));
+        let mixed = Checklist::parse("## Phase 1\n## Phase 2\n- [x] done\n- [ ] todo\n").summary();
+        assert!(mixed.starts_with("1/2 checked · ~50%"));
+        assert!(mixed.contains("Phase 1: 0/0 · no checklist"));
+        assert!(mixed.contains("Next unchecked phase: Phase 2"));
+    }
+
+    #[test]
+    fn next_unchecked_phase_excludes_prose_groups_and_empty_phases() {
+        let checklist = Checklist::parse(
+            "# Notes\n- [ ] outside\n## Phase 1\nno tasks\n## Phase 2\n- [x] done\n## Phase 3\n### Detail\n- [ ] remaining\n## Phase 4\n- [ ] later\n",
+        );
+        assert!(!checklist.sections[1].is_phase);
+        assert!(checklist.sections[2].is_phase);
+        assert_eq!(checklist.sections[2].state(), ChecklistState::NoChecklist);
+        assert!(
+            checklist
+                .summary()
+                .contains("Next unchecked phase: Phase 3")
+        );
+        let reopened =
+            Checklist::parse("## Phase 2\n- [ ] reopened\n## Phase 3\n- [ ] remaining\n");
+        assert!(reopened.summary().contains("Next unchecked phase: Phase 2"));
+        for text in ["## Phase 1\n- [x] done", "# Notes\n- [ ] outside"] {
+            assert!(
+                !Checklist::parse(text)
+                    .summary()
+                    .contains("Next unchecked phase:")
+            );
+        }
+    }
 
     #[test]
     fn counts_nested_items_but_not_fenced_examples() {
@@ -186,6 +272,27 @@ mod tests {
         assert!(text[tasks[1].source.clone()].contains("child 🦀"));
         assert_eq!(checklist.sections[2].title, "Verification");
         assert_eq!(checklist.sections[2].tasks[0].label, "verify");
+    }
+
+    #[test]
+    fn states_and_summary_limits_do_not_change_total_counts() {
+        for (source, state) in [
+            ("## Empty", ChecklistState::NoChecklist),
+            ("- [ ] open", ChecklistState::Unchecked),
+            ("- [x] done", ChecklistState::AllChecked),
+            ("- [x] done\n- [ ] open", ChecklistState::PartiallyChecked),
+        ] {
+            let checklist = Checklist::parse(source);
+            assert_eq!(checklist.sections.last().unwrap().state(), state);
+        }
+        let mut text = String::new();
+        for index in 0..12 {
+            writeln!(text, "## Phase {index}\n- [x] done").unwrap();
+        }
+        let summary = Checklist::parse(&text).summary();
+        assert!(summary.starts_with("12/12 checked · ~100%"));
+        assert!(summary.contains("4 more checklist sections"));
+        assert_eq!(summary.lines().count(), 10);
     }
 
     #[test]

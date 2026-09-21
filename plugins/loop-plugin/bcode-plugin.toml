@@ -14,6 +14,12 @@ description  = "Active prompt loop session status"
 interface_id = "bcode.session-status/v1"
 name         = "Loop Session Status"
 
+[[services]]
+class        = "service"
+description  = "Read-only loop iteration activity projection"
+interface_id = "bcode.activity-presentation/v1"
+name         = "Loop Activity Presentation"
+
 [[tui_surfaces]]
 description = "Configure and start a deterministic prompt loop"
 kind        = "loop.start"
