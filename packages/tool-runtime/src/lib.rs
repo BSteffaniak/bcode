@@ -439,18 +439,7 @@ const fn configure_command_for_timeout(_command: &mut Command) {}
 const _: fn(&mut Command) = configure_command_for_timeout;
 
 #[cfg(windows)]
-struct ChildProcessGuard(windows_sys::Win32::Foundation::HANDLE);
-
-#[cfg(windows)]
-impl Drop for ChildProcessGuard {
-    fn drop(&mut self) {
-        // SAFETY: this guard exclusively owns the job handle returned by
-        // `CreateJobObjectW` and closes it exactly once.
-        unsafe {
-            windows_sys::Win32::Foundation::CloseHandle(self.0);
-        }
-    }
-}
+struct ChildProcessGuard(std::os::windows::io::OwnedHandle);
 
 #[cfg(windows)]
 fn attach_child_process_guard(child: &Child) -> Result<ChildProcessGuard, std::io::Error> {
@@ -475,7 +464,9 @@ fn attach_child_process_guard(child: &Child) -> Result<ChildProcessGuard, std::i
         if job.is_null() {
             return Err(std::io::Error::last_os_error());
         }
-        let guard = ChildProcessGuard(job);
+        let guard = ChildProcessGuard(
+            <std::os::windows::io::OwnedHandle as std::os::windows::io::FromRawHandle>::from_raw_handle(job),
+        );
         let mut limits: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = std::mem::zeroed();
         limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
         if SetInformationJobObject(
@@ -535,8 +526,12 @@ async fn terminate_child_after_timeout(
     // SAFETY: the guard owns a live job handle configured to contain the
     // spawned process and all descendants. Terminating the job is the Windows
     // equivalent of killing the Unix process group.
-    let terminated =
-        unsafe { windows_sys::Win32::System::JobObjects::TerminateJobObject(process_guard.0, 1) };
+    let terminated = unsafe {
+        windows_sys::Win32::System::JobObjects::TerminateJobObject(
+            std::os::windows::io::AsRawHandle::as_raw_handle(&process_guard.0),
+            1,
+        )
+    };
     if terminated == 0 {
         let error = std::io::Error::last_os_error();
         let _ = child.kill().await;
