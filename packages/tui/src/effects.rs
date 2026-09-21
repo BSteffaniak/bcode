@@ -1286,6 +1286,15 @@ impl TuiEffectQueue {
     }
 
     #[cfg(test)]
+    pub fn queued_agent_id(&self) -> Option<&str> {
+        self.effects.values().find_map(|(_, effect)| match effect {
+            TuiEffect::SubmitMessage { request } => request.agent_id.as_deref(),
+            TuiEffect::SkillAction { request } => request.agent_id.as_deref(),
+            _ => None,
+        })
+    }
+
+    #[cfg(test)]
     pub fn queued_execution_options(&self) -> Option<&bcode_session_models::TurnExecutionOptions> {
         self.effects.values().find_map(|(_, effect)| match effect {
             TuiEffect::SubmitMessage { request } => Some(&request.execution),
@@ -2161,6 +2170,7 @@ async fn skill_action(
         effort: reasoning_effort.clone(),
         summary: reasoning_summary.clone(),
     }));
+    execution.agent_profile.clone_from(&agent_id);
     let (session_id, created_session, event_task, event_stream_release) =
         ensure_session_for_foreground_action(
             client,
@@ -2198,7 +2208,7 @@ async fn skill_action(
                 session_id,
                 provider_plugin_id,
                 model_id,
-                agent_id.clone(),
+                None,
                 reasoning_effort.clone(),
                 reasoning_summary.clone(),
             )
@@ -2397,6 +2407,7 @@ async fn submit_message(
         effort: reasoning_effort.clone(),
         summary: reasoning_summary.clone(),
     }));
+    execution.agent_profile.clone_from(&agent_id);
     let mut message = message;
     let mut created_session = None;
     let mut event_task = None;
@@ -2442,7 +2453,7 @@ async fn submit_message(
         session_id,
         provider_plugin_id,
         model_id,
-        agent_id.clone(),
+        None,
         reasoning_effort.clone(),
         reasoning_summary.clone(),
     )

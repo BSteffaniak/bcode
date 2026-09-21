@@ -65,12 +65,7 @@ pub fn stage_session_message(
             .set_status("slash command pending root navigation migration".to_owned());
         return false;
     }
-    let agent_id = if session_id.is_some() {
-        chat.app.pending_agent_id().map(ToOwned::to_owned)
-    } else {
-        let current = chat.app.current_agent_id().to_owned();
-        (current != "build").then_some(current)
-    };
+    let agent_id = Some(chat.app.display_agent_id().to_owned());
     let draft_provider_plugin_id = session_id
         .is_none()
         .then(|| {
@@ -143,6 +138,7 @@ mod tests {
                 ));
                 assert_eq!(chat.app.daemon_connection(), connection);
                 assert_eq!(chat.app.status(), "sending message…");
+                assert_eq!(chat.pending_effects.queued_agent_id(), Some("build"));
                 assert!(chat.pending_effects.queued_execution_options().is_some());
                 drop(chat);
             }

@@ -445,6 +445,10 @@ pub async fn invoke_skill(
         )
         .await
         .map_err(|error| InvokeSkillError::Ownership(error.into()))?;
+    let mut execution = execution;
+    if execution.agent_profile.is_none() {
+        execution.agent_profile = Some(super::session_agent_selection(state, session_id).await);
+    }
     let command = super::FollowupCommand::SkillInvocation {
         client_id,
         runtime_context: state.client_runtime_context(client_id).await,
@@ -1507,11 +1511,6 @@ pub async fn set_agent(
         .sessions
         .set_current_agent(session_id, resolved_agent_id.clone())
         .await?;
-    state
-        .session_agent_selections
-        .lock()
-        .await
-        .insert(session_id, resolved_agent_id);
     Ok(())
 }
 
@@ -1650,11 +1649,6 @@ pub async fn delete(
     super::session_search::remove_session_from_providers(state, session_id, Some(generation)).await;
     state
         .session_model_selections
-        .lock()
-        .await
-        .remove(&session_id);
-    state
-        .session_agent_selections
         .lock()
         .await
         .remove(&session_id);

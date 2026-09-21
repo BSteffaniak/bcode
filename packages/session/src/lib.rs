@@ -7929,6 +7929,75 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn submitted_agent_survives_release_and_restart_without_change_events() {
+        let root = unique_temp_dir();
+        let session_id;
+        {
+            let manager = SessionManager::persistent(&root).expect("manager");
+            session_id = manager
+                .create_session(None, test_working_directory())
+                .await
+                .expect("session")
+                .id;
+            for agent in ["plan", "build", "build"] {
+                let (_, events) = manager
+                    .admit_turn_with_events(
+                        session_id,
+                        ClientId::new(),
+                        "prompt".to_owned(),
+                        bcode_session_models::TurnAdmissionMetadata {
+                            execution: bcode_session_models::TurnExecutionOptions {
+                                agent_profile: Some(agent.to_owned()),
+                                ..Default::default()
+                            },
+                            ..Default::default()
+                        },
+                    )
+                    .await
+                    .expect("admission");
+                assert!(
+                    !events
+                        .iter()
+                        .any(|event| matches!(event.kind, SessionEventKind::AgentChanged { .. }))
+                );
+                assert_eq!(
+                    manager
+                        .current_agent_selection(session_id)
+                        .await
+                        .expect("agent")
+                        .as_deref(),
+                    Some(agent)
+                );
+                manager
+                    .release_idle_session_resources(session_id)
+                    .await
+                    .expect("release");
+                assert_eq!(
+                    manager
+                        .current_agent_selection(session_id)
+                        .await
+                        .expect("restored agent")
+                        .as_deref(),
+                    Some(agent)
+                );
+            }
+        }
+        let restored = SessionManager::persistent(&root).expect("restored manager");
+        restored
+            .ensure_session_loaded(session_id)
+            .await
+            .expect("open restored session");
+        assert_eq!(
+            restored
+                .current_agent_selection(session_id)
+                .await
+                .expect("agent after restart")
+                .as_deref(),
+            Some("build")
+        );
+    }
+
+    #[tokio::test]
     async fn persisted_idempotent_turn_receipt_survives_manager_restart() {
         let root = unique_temp_dir();
         let session_id;

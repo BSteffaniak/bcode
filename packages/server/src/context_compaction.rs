@@ -1435,9 +1435,7 @@ async fn stream_compaction_summary_inner(
                         process_steering_message_command(
                             state,
                             session_id,
-                            command.client_id,
-                            command.text,
-                            command.completion,
+                            command,
                         )
                         .await;
                     }
@@ -1598,9 +1596,7 @@ pub async fn wait_for_compaction_progress_actor_aware(
                 process_steering_message_command(
                     state,
                     session_id,
-                    command.client_id,
-                    command.text,
-                    command.completion,
+                    command,
                 )
                 .await;
             }

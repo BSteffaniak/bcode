@@ -420,7 +420,6 @@ pub struct ServerState {
     session_model_selection_origins: Mutex<BTreeMap<SessionId, SessionModelSelectionOrigin>>,
     required_skill_model_overrides:
         Mutex<BTreeMap<(SessionId, SkillId), RequiredSkillModelOverride>>,
-    session_agent_selections: Mutex<BTreeMap<SessionId, String>>,
     pending_permissions: Mutex<BTreeMap<String, PendingPermission>>,
     pending_permission_batches: Arc<StdMutex<BTreeMap<String, Arc<PendingPermissionBatch>>>>,
     pending_tool_exchanges: Mutex<BTreeMap<String, PendingToolExchange>>,
@@ -732,6 +731,7 @@ struct SteeringCommand {
     client_id: ClientId,
     text: String,
     completion: Option<oneshot::Sender<ModelTurnCompletion>>,
+    execution: Box<bcode_session_models::TurnExecutionOptions>,
 }
 
 #[derive(Debug)]
@@ -854,6 +854,7 @@ struct RuntimeCurrentTurn {
     turn_id: String,
     cancel_state: Arc<TurnCancelState>,
     model: Option<ModelRequestAttempt>,
+    agent_profile: Option<String>,
 }
 
 impl RuntimeCurrentTurn {
@@ -2037,7 +2038,6 @@ impl ServerState {
             session_model_selections: Mutex::default(),
             session_model_selection_origins: Mutex::default(),
             required_skill_model_overrides: Mutex::default(),
-            session_agent_selections: Mutex::default(),
             pending_permissions: Mutex::default(),
             pending_permission_batches: Arc::new(StdMutex::default()),
             pending_tool_exchanges: Mutex::default(),
@@ -13207,6 +13207,10 @@ async fn admit_turn(
     ),
     bcode_session::SessionError,
 > {
+    let mut admission = admission;
+    if admission.execution.agent_profile.is_none() {
+        admission.execution.agent_profile = Some(session_agent_selection(state, session_id).await);
+    }
     let (admission, events) = state
         .sessions
         .admit_turn_with_events(session_id, client_id, text, admission)
@@ -13235,12 +13239,24 @@ async fn enqueue_user_message_command(
     placement: bcode_ipc::PromptPlacement,
     execution: bcode_session_models::TurnExecutionOptions,
 ) -> Result<MessageQueueStatus, ServerError> {
+    let mut execution = execution;
+    if execution.agent_profile.is_none() {
+        execution.agent_profile = Some(session_agent_selection(state, session_id).await);
+    }
     let automation_lock = turn_admission_lock(state, session_id).await;
     let _automation_guard = automation_lock.lock().await;
     state.sessions.session_summary(session_id).await?;
     let handle = session_runtime_handle(state, session_id).await;
     let phase_snapshot = *handle.phase.lock().await;
-    let steering_window = if placement == bcode_ipc::PromptPlacement::Steering {
+    let active_agent = handle
+        .current_turn
+        .lock()
+        .await
+        .as_ref()
+        .and_then(|turn| turn.agent_profile.clone());
+    let can_steer = !phase_snapshot.has_active_work()
+        || active_agent.as_ref() == execution.agent_profile.as_ref();
+    let steering_window = if placement == bcode_ipc::PromptPlacement::Steering && can_steer {
         Some(steering_window(phase_snapshot, &handle.current_turn).await)
     } else {
         None
@@ -13374,6 +13390,7 @@ async fn enqueue_steering_message_command(
                     client_id,
                     text,
                     completion: None,
+                    execution: Box::new(execution),
                 })
                 .await
                 .is_ok()
@@ -13393,9 +13410,10 @@ async fn enqueue_steering_message_command(
                     bcode_session::SessionOwnershipKind::QueuedCommand,
                 )
                 .await?;
-            let user_event = append_steering_user_message(state, session_id, client_id, text)
-                .await?
-                .ok_or_else(|| bcode_session::SessionError::NotFound(session_id))?;
+            let user_event =
+                append_steering_user_message(state, session_id, client_id, text, execution)
+                    .await?
+                    .ok_or_else(|| bcode_session::SessionError::NotFound(session_id))?;
             let pending_before = handle.queued_followups.fetch_add(1, Ordering::AcqRel);
             handle.queued_steering.fetch_add(1, Ordering::AcqRel);
             let queue_position = Some(usize_to_u32_saturating(pending_before.saturating_add(1)));
@@ -13630,14 +13648,7 @@ async fn run_session_runtime(
         )
         .await;
         while let Ok(command) = steering_commands.try_recv() {
-            process_steering_message_command(
-                &state,
-                permit.session_id(),
-                command.client_id,
-                command.text,
-                command.completion,
-            )
-            .await;
+            process_steering_message_command(&state, permit.session_id(), command).await;
         }
         let Some(command) = next_runtime_queue_command(
             &mut cancel_commands,
@@ -13849,11 +13860,19 @@ fn acknowledge_cancel_command(command: CancelCommand, cancelled: bool) -> Option
 async fn process_steering_message_command(
     state: &ServerState,
     session_id: SessionId,
-    client_id: ClientId,
-    text: String,
-    completion_sender: Option<oneshot::Sender<ModelTurnCompletion>>,
+    command: SteeringCommand,
 ) {
-    let completion = match append_steering_user_message(state, session_id, client_id, text).await {
+    let SteeringCommand {
+        client_id,
+        text,
+        completion: completion_sender,
+        execution,
+    } = command;
+    let completion = match Box::pin(append_steering_user_message(
+        state, session_id, client_id, text, *execution,
+    ))
+    .await
+    {
         Ok(Some(_event)) => ModelTurnCompletion::completed(),
         Ok(None) => {
             let message = "no steering user message event was appended".to_string();
@@ -13944,9 +13963,7 @@ where
                     process_steering_message_command(
                         state,
                         session_id,
-                        command.client_id,
-                        command.text,
-                        command.completion,
+                        command,
                     )
                     .await;
                 }
@@ -13994,9 +14011,7 @@ where
                     process_steering_message_command(
                         state,
                         session_id,
-                        command.client_id,
-                        command.text,
-                        command.completion,
+                        command,
                     )
                     .await;
                 }
@@ -14023,14 +14038,7 @@ async fn service_runtime_priority_commands(
     )
     .await;
     while let Ok(command) = context.steering_commands.try_recv() {
-        process_steering_message_command(
-            state,
-            session_id,
-            command.client_id,
-            command.text,
-            command.completion,
-        )
-        .await;
+        process_steering_message_command(state, session_id, command).await;
     }
 }
 
@@ -14046,6 +14054,7 @@ async fn begin_current_turn(
     client_id: ClientId,
     turn_id: String,
     cancel_state: Arc<TurnCancelState>,
+    agent_profile: Option<String>,
 ) {
     let mut current_turn = context.current_turn.lock().await;
     debug_assert!(
@@ -14054,6 +14063,7 @@ async fn begin_current_turn(
     );
     *current_turn = Some(RuntimeCurrentTurn {
         kind: RuntimeOperationKind::ModelTurn,
+        agent_profile,
         client_id,
         turn_id,
         cancel_state,
@@ -14340,6 +14350,7 @@ async fn process_compact_session_command(
     let cancel_state = Arc::new(TurnCancelState::default());
     *current_turn.lock().await = Some(RuntimeCurrentTurn {
         kind: RuntimeOperationKind::ManualCompaction,
+        agent_profile: None,
         client_id,
         turn_id: format!("{session_id}-manual-compact-{}", uuid::Uuid::new_v4()),
         cancel_state: Arc::clone(&cancel_state),
@@ -14697,11 +14708,20 @@ async fn append_steering_user_message(
     session_id: SessionId,
     client_id: ClientId,
     text: String,
+    execution: bcode_session_models::TurnExecutionOptions,
 ) -> Result<Option<bcode_session_models::SessionEvent>, bcode_session::SessionError> {
     state.sessions.require_write_readiness(session_id).await?;
-    let events = state
+    let (_, events) = state
         .sessions
-        .append_user_message(session_id, client_id, text)
+        .admit_turn_with_events(
+            session_id,
+            client_id,
+            text,
+            bcode_session_models::TurnAdmissionMetadata {
+                execution,
+                ..Default::default()
+            },
+        )
         .await?;
     let user_event = events.last().cloned();
     for event in &events {
@@ -17268,6 +17288,7 @@ async fn run_model_turn(
         client_id,
         turn_id.clone(),
         Arc::clone(&cancel_state),
+        turn_execution_options(trigger_event).agent_profile,
     )
     .await;
     if !recovering {
@@ -19992,9 +20013,7 @@ async fn stream_model_turn_events(
                     process_steering_message_command(
                         state,
                         session_id,
-                        command.client_id,
-                        command.text,
-                        command.completion,
+                        command,
                     )
                     .await;
                 }
@@ -20544,9 +20563,7 @@ async fn wait_for_model_progress_or_timeout(
                 process_steering_message_command(
                     state,
                     session_id,
-                    command.client_id,
-                    command.text,
-                    command.completion,
+                    command,
                 )
                 .await;
             }
@@ -22184,21 +22201,11 @@ async fn resolve_agent_id(state: &ServerState, agent_id: &str) -> Option<String>
 }
 
 async fn session_agent_selection(state: &ServerState, session_id: SessionId) -> String {
-    if let Some(agent_id) = state.session_agent_selections.lock().await.get(&session_id) {
-        return agent_id.clone();
+    if let Ok(Some(agent_id)) = state.sessions.current_agent_selection(session_id).await {
+        agent_id
+    } else {
+        default_agent_id(&list_profiles(state, None).await)
     }
-    let selected =
-        if let Ok(Some(agent_id)) = state.sessions.current_agent_selection(session_id).await {
-            agent_id
-        } else {
-            default_agent_id(&list_profiles(state, None).await)
-        };
-    state
-        .session_agent_selections
-        .lock()
-        .await
-        .insert(session_id, selected.clone());
-    selected
 }
 
 fn default_agent_id(agents: &[AgentInfo]) -> String {
@@ -22640,12 +22647,17 @@ async fn session_runtime_selection_payload(
     state: &ServerState,
     session_id: SessionId,
 ) -> bcode_session_models::SessionRuntimeSelection {
-    let Ok(runtime_selection) = state.sessions.current_runtime_selection(session_id).await else {
+    if state
+        .sessions
+        .current_runtime_selection(session_id)
+        .await
+        .is_err()
+    {
         return bcode_session_models::SessionRuntimeSelection::default();
-    };
+    }
     let resolved = session_model_selection(state, session_id).await;
     bcode_session_models::SessionRuntimeSelection {
-        agent_id: runtime_selection.agent_id,
+        agent_id: Some(session_agent_selection(state, session_id).await),
         provider_plugin_id: resolved.provider_plugin_id,
         requested_model_id: resolved.requested_model_id,
         effective_model_id: resolved.model_id.clone(),
@@ -28747,7 +28759,11 @@ async fn request_tool_permission(
     }
     let permission_id = interaction_operations::next_permission_id(state).await;
     let arguments_json = serde_json::to_string(&call.arguments).unwrap_or_default();
-    let agent_id = session_agent_selection(state, session_id).await;
+    let agent_id = state
+        .session_current_turn(session_id)
+        .await
+        .and_then(|turn| turn.agent_profile)
+        .unwrap_or(session_agent_selection(state, session_id).await);
     let pending = PendingPermission {
         summary: PermissionSummary {
             permission_id: permission_id.clone(),
@@ -29044,10 +29060,31 @@ fn session_events_to_sanitized_model_messages(
 ) -> Vec<ModelMessage> {
     let mut messages = Vec::new();
     let mut seen_tool_call_ids = BTreeSet::new();
+    let mut previous_agent: Option<&str> = None;
     let mut pending_tool_exchange = PendingModelToolExchange::default();
 
     for event in events {
         match &event.kind {
+            SessionEventKind::AgentChanged { agent_id } => {
+                previous_agent = Some(agent_id);
+            }
+            SessionEventKind::UserMessage {
+                text, admission, ..
+            } => {
+                append_pending_tool_exchange(&mut messages, &mut pending_tool_exchange);
+                if let Some(agent) = admission.execution.agent_profile.as_deref() {
+                    if let Some(previous) = previous_agent.filter(|previous| *previous != agent) {
+                        messages.push(ModelMessage {
+                            role: MessageRole::System,
+                            content: vec![ContentBlock::Text {
+                                text: format!("Agent changed from `{previous}` to `{agent}` for the following submission. Earlier agent-specific restrictions describe historical turns; follow the current agent instructions and permission policy."),
+                            }],
+                        });
+                    }
+                    previous_agent = Some(agent);
+                }
+                messages.push(plain_context_message(text.clone()));
+            }
             SessionEventKind::ToolCallRequested {
                 tool_call_id,
                 tool_name,
@@ -43435,6 +43472,7 @@ library = "test"
                     client_id: ClientId::new(),
                     text: steering,
                     completion: None,
+                    execution: Box::default(),
                 })
                 .await
                 .expect("steering should queue");
@@ -49714,6 +49752,54 @@ library = "test"
     }
 
     #[test]
+    fn submitted_agent_notices_only_describe_transitions() {
+        let session_id = SessionId::new();
+        let history = ["plan", "plan", "build", "build", "review"]
+            .into_iter()
+            .enumerate()
+            .map(|(index, agent)| bcode_session_models::SessionEvent {
+                schema_version: CURRENT_SESSION_EVENT_SCHEMA_VERSION,
+                sequence: index as u64,
+                timestamp_ms: 0,
+                session_id,
+                provenance: None,
+                kind: SessionEventKind::UserMessage {
+                    client_id: ClientId::new(),
+                    text: "hello".to_owned(),
+                    admission: bcode_session_models::TurnAdmissionMetadata {
+                        execution: bcode_session_models::TurnExecutionOptions {
+                            agent_profile: Some(agent.to_owned()),
+                            ..Default::default()
+                        },
+                        ..Default::default()
+                    },
+                },
+            })
+            .collect::<Vec<_>>();
+        let messages = session_events_to_model_messages_for_target_with_limits(
+            &history, 4000, None, None, None, None, None, 4000,
+        );
+        let notices = messages
+            .iter()
+            .filter(|message| message.role == MessageRole::System)
+            .collect::<Vec<_>>();
+        assert_eq!(notices.len(), 2);
+        assert!(
+            matches!(&notices[0].content[0], ContentBlock::Text { text } if text.contains("`plan` to `build`"))
+        );
+        assert!(
+            matches!(&notices[1].content[0], ContentBlock::Text { text } if text.contains("`build` to `review`"))
+        );
+        assert_eq!(
+            messages
+                .iter()
+                .filter(|message| message.role == MessageRole::User)
+                .count(),
+            5
+        );
+    }
+
+    #[test]
     #[allow(clippy::too_many_lines)]
     fn presentation_and_exchange_payloads_are_excluded_from_model_context() {
         let session_id = SessionId::new();
@@ -55579,6 +55665,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
             kind: RuntimeOperationKind::ModelTurn,
             client_id,
             turn_id: "provider-active-turn".to_owned(),
+            agent_profile: Some("build".to_owned()),
             cancel_state: Arc::new(TurnCancelState::default()),
             model: Some(ModelRequestAttempt {
                 identity: bcode_session_models::ModelRequestIdentity {
@@ -55638,6 +55725,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
         ));
 
         let follow_up_execution = bcode_session_models::TurnExecutionOptions {
+            agent_profile: Some("build".to_owned()),
             permission_mode: bcode_session_models::TurnPermissionMode::Bypass,
             tools: bcode_session_models::TurnToolPolicy::Disabled,
             reasoning: Some(Box::new(bcode_session_models::TurnReasoningOptions {
@@ -55691,6 +55779,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
         );
 
         let low_execution = bcode_session_models::TurnExecutionOptions {
+            agent_profile: Some("build".to_owned()),
             permission_mode: bcode_session_models::TurnPermissionMode::Enforce,
             tools: bcode_session_models::TurnToolPolicy::Enabled,
             reasoning: Some(Box::new(bcode_session_models::TurnReasoningOptions {
@@ -55738,8 +55827,9 @@ event_symbol = "bcode_plugin_handle_event_v1"
             bcode_session_models::TurnPermissionMode::Enforce
         );
 
+        let active_turn = handle.current_turn.lock().await.clone();
         *handle.phase.lock().await = SessionRuntimePhase::PreparingModelRequest;
-        *handle.current_turn.lock().await = None;
+        *handle.current_turn.lock().await = active_turn;
         let applied = enqueue_user_message_command(
             &state,
             session.id,
@@ -55760,6 +55850,41 @@ event_symbol = "bcode_plugin_handle_event_v1"
             steering_receiver.try_recv(),
             Ok(SteeringCommand { text, .. }) if text == "steer before request"
         ));
+        let changed = enqueue_user_message_command(
+            &state,
+            session.id,
+            client_id,
+            None,
+            "switch to plan".to_owned(),
+            bcode_ipc::PromptPlacement::Steering,
+            bcode_session_models::TurnExecutionOptions {
+                agent_profile: Some("plan".to_owned()),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("changed agent queues separately");
+        assert_eq!(
+            changed.disposition,
+            bcode_ipc::MessageAcceptanceDisposition::QueuedTurn
+        );
+        let Ok(FollowupCommand::ExecuteTurn { user_event, .. }) = followup_receiver.try_recv()
+        else {
+            panic!("agent transition must not steer the current build turn");
+        };
+        assert_eq!(
+            turn_execution_options(&user_event).agent_profile.as_deref(),
+            Some("plan")
+        );
+        assert_eq!(
+            handle
+                .current_turn
+                .lock()
+                .await
+                .as_ref()
+                .and_then(|turn| turn.agent_profile.as_deref()),
+            Some("build")
+        );
         drop(state);
     }
 

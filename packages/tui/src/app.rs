@@ -1597,6 +1597,15 @@ impl BmuxApp {
         Some(agent_id)
     }
 
+    /// Commit only the selection acknowledged by this submission, preserving newer draft choices.
+    pub fn commit_submitted_agent(&mut self, agent_id: &str) {
+        if self.pending_agent_id() == Some(agent_id) {
+            let _ = self.take_pending_agent();
+        } else {
+            self.session_view.set_agent_id(Some(agent_id.to_owned()));
+        }
+    }
+
     /// Return the current reasoning output label.
     #[must_use]
     pub fn thinking_label(&self) -> &str {
@@ -1907,7 +1916,11 @@ impl BmuxApp {
             context_occupancy,
         );
         if let Some(agent_id) = selection.agent_id {
+            let pending = self.pending_agent_id.take();
+            let accent = self.pending_agent_accent.take();
             self.set_current_agent_id(agent_id);
+            self.pending_agent_id = pending;
+            self.pending_agent_accent = accent;
         }
         self.refresh_thinking_label();
     }
@@ -5585,6 +5598,27 @@ mod tests {
             .collect::<Vec<_>>();
         drop(app);
         assert_eq!(transcript_after, transcript_before);
+    }
+
+    #[test]
+    fn runtime_refresh_preserves_unsent_agent_selection() {
+        let mut app = BmuxApp::new_with_history(None, &[], &[], false);
+        app.set_current_agent_id("plan");
+        app.set_pending_agent("build", None);
+        app.apply_runtime_selection(bcode_ipc::SessionRuntimeSelection {
+            agent_id: Some("plan".to_owned()),
+            ..Default::default()
+        });
+        assert_eq!(app.current_agent_id(), "plan");
+        assert_eq!(app.display_agent_id(), "build");
+        app.set_pending_agent("review", None);
+        app.commit_submitted_agent("build");
+        assert_eq!(app.current_agent_id(), "build");
+        assert_eq!(app.display_agent_id(), "review");
+        app.commit_submitted_agent("review");
+        assert_eq!(app.current_agent_id(), "review");
+        assert_eq!(app.pending_agent_id(), None);
+        drop(app);
     }
 
     #[test]

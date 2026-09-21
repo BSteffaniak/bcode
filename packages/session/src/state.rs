@@ -326,7 +326,12 @@ impl SessionState {
                     self.summary.title_source = SessionTitleSource::Imported;
                 }
             }
-            SessionEventKind::UserMessage { text, .. } => {
+            SessionEventKind::UserMessage {
+                text, admission, ..
+            } => {
+                if let Some(agent_id) = &admission.execution.agent_profile {
+                    self.current_agent = Some(agent_id.clone());
+                }
                 self.has_user_message = true;
                 if self.summary.derived_title.is_none() {
                     self.summary.derived_title = Some(title_from_first_prompt(text));

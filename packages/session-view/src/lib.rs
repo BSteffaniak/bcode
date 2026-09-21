@@ -1137,6 +1137,9 @@ impl SessionView {
             SessionEventKind::UserMessage {
                 text, admission, ..
             } => {
+                if let Some(agent_id) = &admission.execution.agent_profile {
+                    self.snapshot.runtime.agent_id = Some(agent_id.clone());
+                }
                 if self.snapshot.title.is_none() {
                     self.snapshot.title = Some(derive_session_title_from_prompt(text));
                 }

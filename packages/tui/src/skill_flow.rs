@@ -197,16 +197,8 @@ pub fn start_skill_action(
     arguments: String,
 ) {
     let session_id = chat.app.session_id();
-    let agent_id = if action == SkillActionKind::Invoke {
-        if session_id.is_some() {
-            chat.app.pending_agent_id().map(ToOwned::to_owned)
-        } else {
-            let current = chat.app.current_agent_id().to_owned();
-            (current != "build").then_some(current)
-        }
-    } else {
-        None
-    };
+    let agent_id =
+        (action == SkillActionKind::Invoke).then(|| chat.app.display_agent_id().to_owned());
     let provider_plugin_id = (action == SkillActionKind::Invoke && session_id.is_none())
         .then(|| {
             chat.app

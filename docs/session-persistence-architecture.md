@@ -99,6 +99,19 @@ This remains fallback delivery, not a
 full revisioned iteration card: lifecycle updates, historical document snapshots and exact-detail
 frontend inspection still require integration. No live provider fragments are persisted by this path.
 
+## Agent selection on submission
+
+Cycling agents is local draft state and does not write a session event. Foreground submissions
+carry the selected agent in `UserMessage.admission.execution.agent_profile`; acceptance commits
+that selection with the message. Queued turns retain their own execution profile. A different
+agent cannot steer an already active turn and is queued as a separate turn instead.
+
+Runtime and view projections derive the committed selection from accepted inputs. Reopen reads
+the latest input metadata with bounded queries, retaining compatibility with historical
+`AgentChanged` events. The server does not retain a second independent agent-selection cache.
+Model context projects transition notices only between differing recorded selections; the notices
+are not additional durable messages and do not authorize execution.
+
 ## Live-only progress boundary
 
 Intermediate provider argument fragments, request previews, execution frames, replaceable progress,

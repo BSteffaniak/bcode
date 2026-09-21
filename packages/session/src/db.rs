@@ -1778,6 +1778,29 @@ impl SessionDb {
             .limit(1)
             .execute_first(&**self.db)
             .await?;
+        let message_row = self
+            .db
+            .select("events")
+            .columns(&["event_seq", "payload"])
+            .where_eq("event_type", "user_message")
+            .sort("event_seq", SortDirection::Desc)
+            .limit(1)
+            .execute_first(&**self.db)
+            .await?;
+        if let Some(message_row) = message_row {
+            let message = strict_event_from_row(&message_row, self.session_id)?;
+            let legacy_sequence = row
+                .as_ref()
+                .map(|row| strict_event_from_row(row, self.session_id))
+                .transpose()?
+                .map(|event| event.sequence);
+            if legacy_sequence.is_none_or(|sequence| message.sequence > sequence)
+                && let SessionEventKind::UserMessage { admission, .. } = message.kind
+                && let Some(agent_id) = admission.execution.agent_profile
+            {
+                return Ok(Some(agent_id));
+            }
+        }
         let Some(row) = row else {
             return Ok(None);
         };

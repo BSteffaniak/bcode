@@ -3670,7 +3670,7 @@ fn apply_root_slash_command_outcome(
                         .selected_provider_plugin_id()
                         .map(ToOwned::to_owned),
                     model_id: chat.app.selected_model_id().map(ToOwned::to_owned),
-                    agent_id: chat.app.pending_agent_id().map(ToOwned::to_owned),
+                    agent_id: Some(chat.app.display_agent_id().to_owned()),
                     reasoning_effort: chat.app.reasoning_effort().map(ToOwned::to_owned),
                     reasoning_summary: chat.app.reasoning_summary().map(ToOwned::to_owned),
                     reasoning_effort_generation: chat.app.pending_reasoning_effort_generation(),
@@ -3829,8 +3829,8 @@ fn apply_submit_message_result(
             {
                 previous_task.abort();
             }
-            if result.committed_agent_id.is_some() {
-                let _committed = chat.app.take_pending_agent();
+            if let Some(agent_id) = result.committed_agent_id.as_deref() {
+                chat.app.commit_submitted_agent(agent_id);
             }
             if let Some(generation) = result.committed_reasoning_effort_generation {
                 chat.app.clear_pending_reasoning_effort(generation);
@@ -3907,8 +3907,8 @@ fn apply_skill_action_result(
             {
                 previous_task.abort();
             }
-            if result.committed_agent_id.is_some() {
-                let _committed = chat.app.take_pending_agent();
+            if let Some(agent_id) = result.committed_agent_id.as_deref() {
+                chat.app.commit_submitted_agent(agent_id);
             }
             if let Some(generation) = result.committed_reasoning_effort_generation {
                 chat.app.clear_pending_reasoning_effort(generation);
