@@ -8351,6 +8351,7 @@ fn persist_refreshed_chatgpt_auth(
             ("account_id".to_owned(), refreshed.account_id),
         ]),
     };
+    let expected_credentials = request.credentials.keys().cloned().collect::<BTreeSet<_>>();
     let payload = serde_json::to_value(request).map_err(|_| {
         provider_error(
             "token_refresh_persist_failed",
@@ -8369,21 +8370,40 @@ fn persist_refreshed_chatgpt_auth(
                 payload,
             },
         ))
-        .map_err(|error| {
+        .map_err(|_| {
             provider_error(
                 "token_refresh_persist_failed",
                 ProviderErrorCategory::Auth,
-                format!("host credential update failed: {error}"),
+                "host credential update transport failed",
             )
         })?;
+    credential_update_result(response, &expected_credentials)
+}
+
+fn credential_update_result(
+    response: ServiceBridgeResponse,
+    expected_credentials: &BTreeSet<String>,
+) -> Result<(), ProviderError> {
     match response {
         ServiceBridgeResponse::Service(
             bcode_tool::ToolInvocationServiceResolution::Responded { payload },
         ) => serde_json::from_value::<bcode_provider_auth_models::AuthCredentialUpdateResponse>(
             payload,
         )
+        .ok()
+        .filter(|response| {
+            response.schema_version
+                == bcode_provider_auth_models::AUTH_CREDENTIAL_UPDATE_SCHEMA_VERSION
+                && response.updated_credentials.len() == expected_credentials.len()
+                && response
+                    .updated_credentials
+                    .iter()
+                    .cloned()
+                    .collect::<BTreeSet<_>>()
+                    == *expected_credentials
+        })
         .map(|_| ())
-        .map_err(|_| {
+        .ok_or_else(|| {
             provider_error(
                 "token_refresh_persist_failed",
                 ProviderErrorCategory::ProviderInternal,
@@ -8392,12 +8412,28 @@ fn persist_refreshed_chatgpt_auth(
         }),
         ServiceBridgeResponse::Service(bcode_tool::ToolInvocationServiceResolution::Failed {
             code,
-            message,
-        }) => Err(provider_error(
-            "token_refresh_persist_failed",
-            ProviderErrorCategory::Auth,
-            format!("host credential update failed ({code}): {message}"),
-        )),
+            ..
+        }) => {
+            let (code, message) = match code.as_str() {
+                "auth_vault_unavailable" => (
+                    "auth_vault_unavailable",
+                    "credential custody is unavailable; unlock or reconnect the profile",
+                ),
+                "auth_device_seal_required" => (
+                    "auth_device_seal_required",
+                    "credential custody requires device-seal authorization",
+                ),
+                "auth_credential_write_failed" => (
+                    "auth_credential_write_failed",
+                    "credential custody could not persist the update",
+                ),
+                _ => (
+                    "token_refresh_persist_failed",
+                    "host credential update failed",
+                ),
+            };
+            Err(provider_error(code, ProviderErrorCategory::Auth, message))
+        }
         ServiceBridgeResponse::Service(bcode_tool::ToolInvocationServiceResolution::Cancelled) => {
             Err(provider_error(
                 "token_refresh_persist_cancelled",
@@ -9883,6 +9919,106 @@ mod tests {
             .expect_err("device timeout");
         assert!(error.contains("timed out"));
         assert!(state.lock().expect("auth state").auth_flows.is_empty());
+    }
+
+    #[test]
+    fn credential_update_acknowledgments_require_supported_schema() {
+        for version in [
+            0,
+            bcode_provider_auth_models::AUTH_CREDENTIAL_UPDATE_SCHEMA_VERSION + 1,
+        ] {
+            let response = ServiceBridgeResponse::Service(
+                bcode_tool::ToolInvocationServiceResolution::Responded {
+                    payload: serde_json::json!({
+                        "schema_version": version,
+                        "updated_credentials": ["access_token"]
+                    }),
+                },
+            );
+            let error =
+                credential_update_result(response, &BTreeSet::from(["access_token".to_owned()]))
+                    .expect_err("unsupported schema");
+            assert_eq!(error.code, "token_refresh_persist_failed");
+            assert_eq!(
+                error.message,
+                "host returned an invalid credential update response"
+            );
+        }
+        assert!(credential_update_result(ServiceBridgeResponse::Service(
+            bcode_tool::ToolInvocationServiceResolution::Responded {
+                payload: serde_json::json!({
+                    "schema_version": bcode_provider_auth_models::AUTH_CREDENTIAL_UPDATE_SCHEMA_VERSION,
+                    "updated_credentials": ["access_token"]
+                }),
+            },
+        ), &BTreeSet::from(["access_token".to_owned()])).is_ok());
+    }
+
+    #[test]
+    fn credential_update_acknowledgments_require_exact_credential_set() {
+        let expected = BTreeSet::from(["access_token".to_owned(), "refresh_token".to_owned()]);
+        for (names, accepted) in [
+            (vec!["refresh_token", "access_token"], true),
+            (vec![], false),
+            (vec!["access_token"], false),
+            (vec!["access_token", "access_token"], false),
+            (vec!["access_token", "refresh_token", "unexpected"], false),
+        ] {
+            let result = credential_update_result(
+                ServiceBridgeResponse::Service(
+                    bcode_tool::ToolInvocationServiceResolution::Responded {
+                        payload: serde_json::json!({
+                            "schema_version": bcode_provider_auth_models::AUTH_CREDENTIAL_UPDATE_SCHEMA_VERSION,
+                            "updated_credentials": names
+                        }),
+                    },
+                ),
+                &expected,
+            );
+            assert_eq!(result.is_ok(), accepted);
+        }
+    }
+
+    #[test]
+    fn credential_update_preserves_safe_custody_categories() {
+        for code in [
+            "auth_vault_unavailable",
+            "auth_device_seal_required",
+            "auth_credential_write_failed",
+        ] {
+            let error = credential_update_result(
+                ServiceBridgeResponse::Service(
+                    bcode_tool::ToolInvocationServiceResolution::Failed {
+                        code: code.to_owned(),
+                        message: "private-host-detail".to_owned(),
+                    },
+                ),
+                &BTreeSet::new(),
+            )
+            .expect_err("custody failure");
+            assert_eq!(error.code, code);
+            assert!(!error.message.contains("private-host-detail"));
+        }
+    }
+
+    #[test]
+    fn credential_update_errors_do_not_expose_host_payloads() {
+        let error = credential_update_result(
+            ServiceBridgeResponse::Service(bcode_tool::ToolInvocationServiceResolution::Failed {
+                code: "private-token-in-code".to_owned(),
+                message: "private-token-in-message".to_owned(),
+            }),
+            &BTreeSet::new(),
+        )
+        .expect_err("host failure");
+        assert_eq!(error.code, "token_refresh_persist_failed");
+        assert_eq!(error.message, "host credential update failed");
+        let cancelled = credential_update_result(
+            ServiceBridgeResponse::Service(bcode_tool::ToolInvocationServiceResolution::Cancelled),
+            &BTreeSet::new(),
+        )
+        .expect_err("cancelled");
+        assert_eq!(cancelled.code, "token_refresh_persist_cancelled");
     }
 
     #[test]

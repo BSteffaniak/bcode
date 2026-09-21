@@ -84,6 +84,30 @@ impl HistoryClient {
         })
     }
 
+    /// Fetch a page using only the host-resolved, explicitly selected profile.
+    ///
+    /// This never resolves environment credentials or falls back to another profile.
+    /// The host must refresh and durably persist expired credentials before invoking it.
+    /// Account attributes are routing claims, not proof of durable remote identity.
+    ///
+    /// # Errors
+    /// Rejects missing profile/scheme/account/token or expired credentials before retrieval,
+    /// then returns the same bounded access errors as [`Self::list`].
+    pub async fn list_for_auth(
+        &self,
+        auth: &bcode_model::ProviderAuthContext,
+        offset: u64,
+        limit: u16,
+        archived: bool,
+    ) -> Result<HistoryPage, HistoryAccessError> {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_err(|_| HistoryAccessError::InvalidRequest)?
+            .as_secs();
+        let (token, account) = history_credentials(auth, now)?;
+        self.list(token, account, offset, limit, archived).await
+    }
+
     /// Fetch one ordinary or archived summary page with explicitly supplied account credentials.
     ///
     /// Dropping this future cancels its network work. No retry or background task is spawned.
@@ -107,6 +131,27 @@ impl HistoryClient {
         );
         let bytes = self.get(token, account, &path).await?;
         decode_page(&bytes, offset, limit)
+    }
+
+    /// Retrieve a snapshot using the explicitly selected, host-resolved profile.
+    ///
+    /// As with [`Self::list_for_auth`], the caller owns refresh and durable custody.
+    /// This operation does not establish verified remote account identity.
+    ///
+    /// # Errors
+    /// Rejects invalid authentication before any request, then returns the bounded
+    /// access and graph validation errors of [`Self::conversation`].
+    pub async fn conversation_for_auth(
+        &self,
+        auth: &bcode_model::ProviderAuthContext,
+        id: &str,
+    ) -> Result<HistorySnapshot, HistoryAccessError> {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_err(|_| HistoryAccessError::InvalidRequest)?
+            .as_secs();
+        let (token, account) = history_credentials(auth, now)?;
+        self.conversation(token, account, id).await
     }
 
     /// Fetch and validate a complete selected-branch snapshot within the response budget.
@@ -149,6 +194,37 @@ impl HistoryClient {
             .map_err(|_| HistoryAccessError::Transient)?;
         read_response(response, self.max_response_bytes).await
     }
+}
+
+fn history_credentials(
+    auth: &bcode_model::ProviderAuthContext,
+    now: u64,
+) -> Result<(&str, &str), HistoryAccessError> {
+    if auth.scheme.as_deref() != Some("chatgpt")
+        || auth
+            .profile
+            .as_deref()
+            .is_none_or(|value| value.trim().is_empty())
+    {
+        return Err(HistoryAccessError::AuthenticationRequired);
+    }
+    if let Some(expiry) = auth.credentials.get("expires_at") {
+        let expiry = expiry
+            .value
+            .parse::<u64>()
+            .map_err(|_| HistoryAccessError::AuthenticationRequired)?;
+        if expiry <= now.saturating_add(60) {
+            return Err(HistoryAccessError::AuthenticationRequired);
+        }
+    }
+    let credential = |name| {
+        auth.credentials
+            .get(name)
+            .map(|credential| credential.value.as_str())
+            .filter(|value| !value.trim().is_empty())
+            .ok_or(HistoryAccessError::AuthenticationRequired)
+    };
+    Ok((credential("access_token")?, credential("account_id")?))
 }
 
 fn valid_id(id: &str) -> bool {
@@ -346,6 +422,58 @@ mod tests {
             read_response(response, 1024).await,
             Err(HistoryAccessError::IncompatibleResponse)
         );
+    }
+
+    #[tokio::test]
+    async fn profile_operations_reject_missing_auth_before_validating_remote_requests() {
+        let client = HistoryClient::new(1024).unwrap();
+        let auth = bcode_model::ProviderAuthContext::default();
+        assert!(matches!(
+            client.list_for_auth(&auth, 0, 0, false).await,
+            Err(HistoryAccessError::AuthenticationRequired)
+        ));
+        assert!(matches!(
+            client.conversation_for_auth(&auth, "../invalid").await,
+            Err(HistoryAccessError::AuthenticationRequired)
+        ));
+    }
+
+    #[test]
+    fn resolved_history_auth_has_no_fallback_and_rejects_expiry() {
+        let mut auth = bcode_model::ProviderAuthContext {
+            profile: Some("selected".to_owned()),
+            scheme: Some("chatgpt".to_owned()),
+            ..Default::default()
+        };
+        for (name, value) in [
+            ("access_token", "synthetic-token"),
+            ("account_id", "account-a"),
+            ("expires_at", "1000"),
+        ] {
+            auth.credentials.insert(
+                name.to_owned(),
+                bcode_model::ProviderAuthCredential {
+                    value: value.to_owned(),
+                    source: None,
+                },
+            );
+        }
+        assert_eq!(
+            history_credentials(&auth, 1),
+            Ok(("synthetic-token", "account-a"))
+        );
+        assert_eq!(
+            history_credentials(&auth, 940),
+            Err(HistoryAccessError::AuthenticationRequired)
+        );
+        auth.profile = None;
+        assert!(history_credentials(&auth, 1).is_err());
+        auth.profile = Some("selected".to_owned());
+        auth.scheme = Some("api_key".to_owned());
+        assert!(history_credentials(&auth, 1).is_err());
+        auth.scheme = Some("chatgpt".to_owned());
+        auth.credentials.remove("account_id");
+        assert!(history_credentials(&auth, 1).is_err());
     }
 
     #[test]

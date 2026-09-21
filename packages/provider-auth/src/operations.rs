@@ -596,10 +596,42 @@ pub fn resolve_credential_update_service_request_with_custody<'registry>(
             },
             |payload| Resolution::Responded { payload },
         ),
-        Err(error) => Resolution::Failed {
-            code: "auth_credential_update_failed".to_owned(),
-            message: error.to_string(),
-        },
+        Err(error) => credential_update_failure(&error),
+    }
+}
+
+fn credential_update_failure(
+    error: &AuthCredentialUpdateError,
+) -> bcode_tool::ToolInvocationServiceResolution {
+    use crate::lifecycle::AuthVaultLifecycleError as Lifecycle;
+    let (code, message) = match error {
+        AuthCredentialUpdateError::InvalidRequest(_) => {
+            ("invalid_request", "invalid credential update request")
+        }
+        AuthCredentialUpdateError::Ownership(_) => (
+            "auth_profile_unavailable",
+            "credential update profile is unavailable",
+        ),
+        AuthCredentialUpdateError::Lifecycle(Lifecycle::VaultUnavailable(_)) => (
+            "auth_vault_unavailable",
+            "credential custody is unavailable; unlock or reconnect the profile",
+        ),
+        AuthCredentialUpdateError::Lifecycle(Lifecycle::WriteFailed(_)) => (
+            "auth_credential_write_failed",
+            "credential custody could not persist the update",
+        ),
+        AuthCredentialUpdateError::Lifecycle(Lifecycle::DeviceSealRequired(_)) => (
+            "auth_device_seal_required",
+            "credential custody requires device-seal authorization",
+        ),
+        AuthCredentialUpdateError::Lifecycle(_) => (
+            "auth_credential_update_failed",
+            "credential update could not be authorized or persisted",
+        ),
+    };
+    bcode_tool::ToolInvocationServiceResolution::Failed {
+        code: code.to_owned(),
+        message: message.to_owned(),
     }
 }
 
@@ -718,6 +750,34 @@ fn validate_resolved_security_owner(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn credential_update_boundary_redacts_custody_errors() {
+        use super::{AuthCredentialUpdateError, credential_update_failure};
+        use crate::lifecycle::AuthVaultLifecycleError;
+        for (error, expected) in [
+            (
+                AuthVaultLifecycleError::VaultUnavailable("private-token".into()),
+                "auth_vault_unavailable",
+            ),
+            (
+                AuthVaultLifecycleError::WriteFailed("private-token".into()),
+                "auth_credential_write_failed",
+            ),
+            (
+                AuthVaultLifecycleError::ProfileUnavailable("private-token".into()),
+                "auth_credential_update_failed",
+            ),
+        ] {
+            let bcode_tool::ToolInvocationServiceResolution::Failed { code, message } =
+                credential_update_failure(&AuthCredentialUpdateError::Lifecycle(error))
+            else {
+                panic!("failure expected")
+            };
+            assert_eq!(code, expected);
+            assert!(!message.contains("private-token"));
+        }
+    }
+
     use super::*;
     use bcode_provider_auth_models::{AuthCredentialStorage, AuthMethodContribution};
     use std::collections::BTreeMap;

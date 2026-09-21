@@ -65,6 +65,30 @@ pub struct HistorySnapshot {
     pub warnings: BTreeSet<HistoryFidelityWarning>,
 }
 
+impl HistorySnapshot {
+    /// Compute a versioned identity for this normalized revision.
+    ///
+    /// This is a content identity, not an account identity or proof of publication.
+    /// Callers must scope it by verified remote account and conversation identity.
+    /// Raw response formatting and discarded upstream fields do not affect it.
+    ///
+    /// # Errors
+    /// Returns an error if the normalized snapshot cannot be serialized.
+    pub fn revision_id(&self) -> Result<String, serde_json::Error> {
+        use sha2::{Digest, Sha256};
+        use std::fmt::Write;
+        let bytes = serde_json::to_vec(self)?;
+        let mut digest = Sha256::new();
+        digest.update(b"bcode.chatgpt.normalized-revision/v1\0");
+        digest.update(bytes);
+        let mut revision = String::from("v1:");
+        for byte in digest.finalize() {
+            write!(revision, "{byte:02x}").expect("writing to a String cannot fail");
+        }
+        Ok(revision)
+    }
+}
+
 /// Secret-safe conversion failure. No source payload or identifiers are interpolated.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HistoryDecodeError {
@@ -262,6 +286,38 @@ mod tests {
 
     fn decode(value: &Value) -> Result<HistorySnapshot, HistoryDecodeError> {
         decode_history(&serde_json::to_vec(value).unwrap(), "api-id", 65536)
+    }
+
+    #[test]
+    fn revision_identity_tracks_normalized_content_not_wire_formatting() {
+        let wire = graph();
+        let snapshot = decode(&wire).unwrap();
+        let original = snapshot.revision_id().unwrap();
+        let pretty = serde_json::to_vec_pretty(&wire).unwrap();
+        assert_eq!(
+            original,
+            decode_history(&pretty, "api-id", 65536)
+                .unwrap()
+                .revision_id()
+                .unwrap()
+        );
+        for change in 0..4 {
+            let mut changed = snapshot.clone();
+            match change {
+                0 => changed.title = Some("Renamed".into()),
+                1 => changed.messages[0].text = "edited".into(),
+                2 => changed.selected_node = "alternative".into(),
+                _ => {
+                    changed
+                        .warnings
+                        .insert(HistoryFidelityWarning::UnsupportedContent);
+                }
+            }
+            assert_ne!(original, changed.revision_id().unwrap());
+        }
+        let mut ignored = wire;
+        ignored["irrelevant_transport_metadata"] = json!("not persisted");
+        assert_eq!(original, decode(&ignored).unwrap().revision_id().unwrap());
     }
 
     #[test]
