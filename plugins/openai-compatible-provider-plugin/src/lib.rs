@@ -1405,7 +1405,7 @@ impl OpenAiCompatibleProviderPlugin {
                 )
             }
             OP_MODELS => self.models_response(&context.request),
-            OP_VALIDATE_CONFIG => self.validate_config(&context.request),
+            OP_VALIDATE_CONFIG => Self::validate_config(&context.request),
             bcode_model::image_upload::OP_VERIFY_IMAGE_UPLOAD => self.verify_image_upload(context),
             OP_VERIFY_MODEL => self.verify_model(&context.request),
             OP_AUTH_USAGE => self.auth_usage(&context.request),
@@ -1603,6 +1603,11 @@ impl OpenAiCompatibleProviderPlugin {
             Err(error) => return invalid_request(&error),
         };
         let mut settings = settings_for_context(&request.provider_context);
+        if !context.bridge.is_available()
+            && let Err(error) = Self::validate_chatgpt_refresh(&settings)
+        {
+            return ServiceResponse::error(error.code, error.message);
+        }
         let refresh = match &self.runtime {
             Ok(runtime) => {
                 let mut refresh_settings = settings.clone();
@@ -2291,8 +2296,8 @@ fn emit_provider_turn_event(context: &NativeServiceContext, event: &ProviderTurn
 async fn native_web_search_inner(
     request: NativeWebSearchRequest,
 ) -> Result<NativeWebSearchResponse, ProviderError> {
-    let mut settings = settings_for_context(&request.provider_context);
-    refresh_chatgpt_auth_if_needed(&mut settings).await?;
+    let settings = settings_for_context(&request.provider_context);
+    OpenAiCompatibleProviderPlugin::validate_chatgpt_refresh(&settings)?;
     let AuthSettings::ApiKey(api_key) = &settings.auth else {
         return Ok(native_search_unavailable(
             "OpenAI Responses API native web search currently requires API-key auth",
@@ -2554,8 +2559,8 @@ struct CodexRateLimitWindowSnapshot {
 async fn auth_usage_inner(
     request: bcode_model::AuthUsageRequest,
 ) -> Result<bcode_model::AuthUsageResponse, ProviderError> {
-    let mut settings = settings_for_context(&request.provider_context);
-    refresh_chatgpt_auth_if_needed(&mut settings).await?;
+    let settings = settings_for_context(&request.provider_context);
+    OpenAiCompatibleProviderPlugin::validate_chatgpt_refresh(&settings)?;
     if !settings.dialect.uses_codex_request_shape() {
         return Ok(bcode_model::AuthUsageResponse {
             supported: false,
@@ -2791,8 +2796,8 @@ fn codex_reset_credit_consume_endpoint(settings: &Settings) -> String {
 async fn auth_reset_credits_inner(
     request: bcode_model::AuthResetCreditsRequest,
 ) -> Result<bcode_model::AuthResetCreditsResponse, ProviderError> {
-    let mut settings = settings_for_context(&request.provider_context);
-    refresh_chatgpt_auth_if_needed(&mut settings).await?;
+    let settings = settings_for_context(&request.provider_context);
+    OpenAiCompatibleProviderPlugin::validate_chatgpt_refresh(&settings)?;
     if !settings.dialect.uses_codex_request_shape() {
         return Ok(bcode_model::AuthResetCreditsResponse {
             supported: false,
@@ -2879,8 +2884,8 @@ async fn auth_reset_credit_consume_inner(
             ..bcode_model::AuthResetCreditConsumeResponse::default()
         });
     }
-    let mut settings = settings_for_context(&request.provider_context);
-    refresh_chatgpt_auth_if_needed(&mut settings).await?;
+    let settings = settings_for_context(&request.provider_context);
+    OpenAiCompatibleProviderPlugin::validate_chatgpt_refresh(&settings)?;
     if !settings.dialect.uses_codex_request_shape() {
         return Ok(bcode_model::AuthResetCreditConsumeResponse {
             status: bcode_model::AuthResetCreditConsumeStatus::Unsupported,
@@ -3960,7 +3965,7 @@ async fn verify_model_inner(
     if let Some(timeout_seconds) = request.timeout_seconds {
         settings.request_timeout = Some(Duration::from_secs(timeout_seconds));
     }
-    refresh_chatgpt_auth_if_needed(&mut settings).await?;
+    OpenAiCompatibleProviderPlugin::validate_chatgpt_refresh(&settings)?;
     if matches!(settings.auth, AuthSettings::Missing) {
         let mut error = provider_error(
             "missing_openai_auth",
@@ -4435,7 +4440,7 @@ async fn stream_chat_completion_attempt(
     request: &ModelTurnRequest,
     turn: &TurnState,
 ) -> Result<StreamOutcome, ProviderError> {
-    let mut settings = settings_for_context(&request.provider_context);
+    let settings = settings_for_context(&request.provider_context);
     // Trace auth resolution before validation so a dialect/auth-gated rejection still leaves a
     // record of how this request resolved.
     turn.push(ProviderTurnEvent::ProviderMetadata {
@@ -4461,7 +4466,7 @@ async fn stream_chat_completion_attempt(
         return Err(annotate_request_resolution(error, &settings, request));
     }
     validate_openai_request(&settings, request)?;
-    refresh_chatgpt_auth_if_needed(&mut settings).await?;
+    OpenAiCompatibleProviderPlugin::validate_chatgpt_refresh(&settings)?;
     let client = model_stream_client(settings.request_timeout).map_err(|error| {
         provider_error(
             "client_build_failed",
@@ -7456,20 +7461,19 @@ async fn fetch_provider_model_items(
 }
 
 impl OpenAiCompatibleProviderPlugin {
-    fn validate_config(&self, request: &ServiceRequest) -> ServiceResponse {
+    fn validate_config(request: &ServiceRequest) -> ServiceResponse {
         let request = match request.payload_json::<bcode_model::ValidateConfigRequest>() {
             Ok(request) => request,
             Err(error) => return invalid_request(&error),
         };
-        json_response(&self.validate_provider_context(&request.provider_context))
+        json_response(&Self::validate_provider_context(&request.provider_context))
     }
 
     fn validate_provider_context(
-        &self,
         provider_context: &ProviderRequestContext,
     ) -> ValidateConfigResponse {
-        let mut settings = settings_for_context(provider_context);
-        let refresh_status = self.validate_chatgpt_refresh(&mut settings);
+        let settings = settings_for_context(provider_context);
+        let refresh_status = Self::validate_chatgpt_refresh(&settings);
         let valid = settings.auth.is_configured() && refresh_status.is_ok();
         let refresh_metadata = match &refresh_status {
             Ok(status) => status.clone(),
@@ -7567,6 +7571,9 @@ fn validation_failure_message(
     refresh_error: Option<&ProviderError>,
 ) -> String {
     if let Some(error) = refresh_error {
+        if error.code == "token_refresh_required" {
+            return "OpenAI-compatible provider authentication requires refresh; validation did not rotate credentials. Refresh this auth profile through a custody-capable provider invocation, or reconnect if refresh is unavailable.".to_owned();
+        }
         return format!(
             "OpenAI-compatible provider authentication refresh failed ({}: {:?}); {}",
             error.code, error.category, error.message
@@ -8160,7 +8167,7 @@ fn saved_chatgpt_auth_settings(saved: &SavedOpenAiAuth) -> (AuthSettings, AuthDi
             expires_at: saved
                 .values
                 .get("BCODE_OPENAI_CODEX_EXPIRES_AT")
-                .and_then(|value| value.parse().ok()),
+                .map(|value| value.parse().unwrap_or(0)),
             account_id,
             profile: saved.profile.clone(),
         },
@@ -8187,7 +8194,7 @@ struct OpenAiOauthTokenResponse {
 }
 
 impl OpenAiCompatibleProviderPlugin {
-    fn validate_chatgpt_refresh(&self, settings: &mut Settings) -> Result<String, ProviderError> {
+    fn validate_chatgpt_refresh(settings: &Settings) -> Result<String, ProviderError> {
         match &settings.auth {
             AuthSettings::Missing | AuthSettings::ApiKey(_) => Ok("not_applicable".to_string()),
             AuthSettings::ChatGpt {
@@ -8215,29 +8222,17 @@ impl OpenAiCompatibleProviderPlugin {
                     )));
                     return Err(error);
                 }
-                let runtime = self.runtime.as_ref().map_err(|error| {
-                    provider_error(
-                        "runtime_unavailable",
-                        ProviderErrorCategory::ProviderInternal,
-                        error.clone(),
-                    )
-                })?;
-                let mut refreshed_settings = settings.clone();
-                refreshed_settings = runtime
-                    .block_on(async move {
-                        refresh_chatgpt_auth_if_needed(&mut refreshed_settings)
-                            .await
-                            .map(|_| refreshed_settings)
-                    })
-                    .map_err(|error| {
-                        provider_error(
-                            "runtime_unavailable",
-                            ProviderErrorCategory::ProviderInternal,
-                            error.to_string(),
-                        )
-                    })??;
-                *settings = refreshed_settings;
-                Ok("refreshed".to_string())
+                let mut error = provider_error(
+                    "token_refresh_required",
+                    ProviderErrorCategory::Auth,
+                    "saved ChatGPT/Codex credentials require refresh through an invocation with durable host credential custody",
+                );
+                error.failure = Some(Box::new(openai_failure_context(
+                    settings,
+                    bcode_model::ProviderFailureCapability::TokenRefresh,
+                    "refresh this auth profile through a custody-capable provider invocation; reconnect if refresh is unavailable",
+                )));
+                Err(error)
             }
         }
     }
@@ -10220,6 +10215,80 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn usage_with_expired_credentials_requires_custody_before_network_work() {
+        let provider_context = ProviderRequestContext {
+            auth: Some(bcode_model::ProviderAuthContext {
+                profile: Some("history-profile".into()),
+                scheme: Some("chatgpt".into()),
+                credentials: [
+                    ("access_token", "expired-access"),
+                    ("refresh_token", "saved-refresh"),
+                    ("expires_at", "1"),
+                ]
+                .into_iter()
+                .map(|(key, value)| {
+                    (
+                        key.into(),
+                        bcode_model::ProviderAuthCredential {
+                            value: value.into(),
+                            source: None,
+                        },
+                    )
+                })
+                .collect(),
+                ..bcode_model::ProviderAuthContext::default()
+            }),
+            ..ProviderRequestContext::default()
+        };
+        let error = tokio::time::timeout(
+            Duration::from_secs(1),
+            auth_usage_inner(bcode_model::AuthUsageRequest {
+                provider_context,
+                meter_ids: Vec::new(),
+            }),
+        )
+        .await
+        .expect("expired usage must not wait for network refresh")
+        .unwrap_err();
+        assert_eq!(error.code, "token_refresh_required");
+        assert_eq!(error.category, ProviderErrorCategory::Auth);
+        assert!(!format!("{error:?}").contains("saved-refresh"));
+        assert!(!format!("{error:?}").contains("expired-access"));
+    }
+
+    #[test]
+    fn validation_requires_refresh_without_rotating_credentials() {
+        let settings = test_settings(
+            AuthSettings::ChatGpt {
+                access_token: "expired-access".into(),
+                refresh_token: Some("saved-refresh".into()),
+                expires_at: Some(1),
+                account_id: None,
+                profile: Some("test-profile".into()),
+            },
+            OpenAiCompatibleDialect::ChatGptCodex,
+        );
+        let error =
+            OpenAiCompatibleProviderPlugin::validate_chatgpt_refresh(&settings).unwrap_err();
+        assert_eq!(error.code, "token_refresh_required");
+        let failures = validation_failures(&settings, Some(&error));
+        assert_eq!(failures.len(), 1);
+        assert_eq!(
+            failures[0].capability,
+            bcode_model::ProviderFailureCapability::TokenRefresh
+        );
+        let message = validation_failure_message(&settings, Some(&error));
+        assert!(message.contains("validation did not rotate credentials"));
+        assert!(!message.contains("expired-access"));
+        assert!(!message.contains("saved-refresh"));
+        assert!(matches!(
+            &settings.auth,
+            AuthSettings::ChatGpt { access_token, refresh_token: Some(refresh), expires_at: Some(1), .. }
+                if access_token == "expired-access" && refresh == "saved-refresh"
+        ));
+    }
+
+    #[tokio::test]
     async fn auth_refresh_cancellation_prevents_dispatch_and_interrupts_pending_work() {
         let cancellation = bcode_plugin_sdk::ServiceCancellation::default();
         cancellation.cancel();
@@ -10364,14 +10433,16 @@ mod tests {
             let mut request = [0; 4096];
             assert!(stream.read(&mut request).unwrap() > 0);
             stream.write_all(b"HTTP/1.1 200 OK\r\ncf-mitigated: challenge\r\nContent-Length: 999999\r\nConnection: close\r\n\r\n").unwrap();
-            // Deliberately withhold the body until the client has returned.
-            let _ = wait.recv_timeout(Duration::from_secs(5));
+            // Deliberately withhold the body longer than the client's deadline.
+            // Allow client setup under full-suite contention without weakening
+            // the assertion that classification finishes before body delivery.
+            let _ = wait.recv_timeout(Duration::from_mins(1));
         });
         let runtime = ProviderRuntime::new().unwrap();
         let result = runtime
             .block_on(async move {
                 tokio::time::timeout(
-                    Duration::from_secs(2),
+                    Duration::from_secs(30),
                     refresh_openai_codex_token_at(&endpoint, "synthetic-refresh"),
                 )
                 .await
@@ -10513,6 +10584,29 @@ mod tests {
             };
             assert_eq!(error.code, "token_refresh_requires_reconnect");
             assert!(!error.message.contains("expired-access"));
+        }
+    }
+
+    #[test]
+    fn malformed_saved_expiry_does_not_become_non_expiring_auth() {
+        for expiry in ["", "not-a-timestamp", "-1", "18446744073709551616"] {
+            let saved = SavedOpenAiAuth {
+                values: BTreeMap::from([
+                    (
+                        "BCODE_OPENAI_CODEX_ACCESS_TOKEN".into(),
+                        "private-access".into(),
+                    ),
+                    ("BCODE_OPENAI_CODEX_EXPIRES_AT".into(), expiry.into()),
+                ]),
+                profile: Some("openai".into()),
+                ..SavedOpenAiAuth::default()
+            };
+            let (auth, _) = saved_chatgpt_auth_settings(&saved);
+            let mut settings = settings_for_context(&ProviderRequestContext::default());
+            settings.auth = auth;
+            let error = OpenAiCompatibleProviderPlugin::validate_chatgpt_refresh(&settings)
+                .expect_err("invalid expiry must require authentication recovery");
+            assert!(!error.message.contains("private-access"));
         }
     }
 
@@ -14938,8 +15032,9 @@ mod tests {
 
     #[test]
     fn missing_auth_validation_is_actionable_and_secret_safe() {
-        let plugin = OpenAiCompatibleProviderPlugin::default();
-        let response = plugin.validate_provider_context(&ProviderRequestContext::default());
+        let response = OpenAiCompatibleProviderPlugin::validate_provider_context(
+            &ProviderRequestContext::default(),
+        );
 
         assert!(!response.valid);
         assert_eq!(response.failures.len(), 1);
