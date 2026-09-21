@@ -159,7 +159,12 @@ jobs:
             if ($LASTEXITCODE -ne 0) {
               throw "failed to create directory reparse-point fixture"
             }
-            if ((Resolve-Path -LiteralPath (Join-Path $link "outside.txt")).Path.StartsWith($resolvedRoot, [StringComparison]::OrdinalIgnoreCase)) {
+            # Resolve-Path normalizes provider paths; it does not dereference junctions.
+            $resolvedTarget = (Get-Item -LiteralPath $link).ResolveLinkTarget($true).FullName
+            if (-not $resolvedTarget.Equals($outside, [StringComparison]::OrdinalIgnoreCase)) {
+              throw "directory reparse-point fixture did not resolve to its external target"
+            }
+            if ($resolvedTarget.StartsWith($resolvedRoot + [IO.Path]::DirectorySeparatorChar, [StringComparison]::OrdinalIgnoreCase)) {
               throw "reparse-point escape unexpectedly resolved inside the authorized root"
             }
           } finally {

@@ -1848,7 +1848,9 @@ const fn utf8_boundary_at_or_after(value: &str, mut index: usize) -> usize {
 
 #[cfg(unix)]
 const fn shell_program() -> &'static str {
-    "sh"
+    // Pipeline failures are part of the shell tool contract. /bin/sh may be dash,
+    // which does not support pipefail; select the shell that implements it.
+    "bash"
 }
 
 #[cfg(windows)]
@@ -3376,6 +3378,26 @@ mod tests {
 
     fn preparation_request(arguments: serde_json::Value) -> ServiceRequest {
         preparation_request_with_context(arguments, Vec::new())
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn unix_shell_propagates_pipeline_failure() {
+        let plan = shell_program_and_args(
+            "false | true",
+            None,
+            ShellToolEnvConfig {
+                mode: ShellToolEnvMode::Inherit,
+                ..ShellToolEnvConfig::default()
+            },
+            "pipeline-failure",
+        )
+        .expect("Unix shell plan");
+        let status = std::process::Command::new(plan.program)
+            .args(plan.args)
+            .status()
+            .expect("run pipeline");
+        assert_eq!(status.code(), Some(1));
     }
 
     #[test]

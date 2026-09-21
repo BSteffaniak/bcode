@@ -159,7 +159,7 @@ impl<'a> StagedFile<'a> {
         }
         // SAFETY: successful fstatat initialized the stat value.
         let named = unsafe { named.assume_init() };
-        Ok(u64::try_from(named.st_dev).ok() == Some(owned.dev()) && named.st_ino == owned.ino())
+        Ok(i128::from(named.st_dev) == i128::from(owned.dev()) && named.st_ino == owned.ino())
     }
 
     pub fn publish(

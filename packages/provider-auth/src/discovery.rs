@@ -174,7 +174,7 @@ fn open_confined(
 }
 
 #[cfg(not(unix))]
-fn open_confined(
+const fn open_confined(
     _home: &Path,
     _relative: &str,
 ) -> Result<Option<std::fs::File>, CredentialSourceStatus> {

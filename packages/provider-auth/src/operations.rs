@@ -79,6 +79,7 @@ pub struct AuthProvisioningIntent {
     pub profile_binding: String,
 }
 
+#[cfg(unix)]
 pub(crate) fn provisioning_binding(
     profile: &ResolvedAuthProfile,
 ) -> Result<String, crate::lifecycle::AuthVaultLifecycleError> {
