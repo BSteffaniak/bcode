@@ -23,6 +23,30 @@ and `outcome` once that terminal event is observed. Only `completed` returns
 success; cancelled, error, idle timeout, tool-round-limit and unavailable-provider
 outcomes return a failing exit status after printing the terminal result.
 
+## Retrying admission safely
+
+For ordinary `send`, supply both a producer namespace and a stable key for one
+logical submission:
+
+```sh
+bcode send SESSION_ID --file prompt.txt --producer ci.example \
+  --idempotency-key job-42 --wait --timeout-secs 600
+```
+
+Within that session, admission identity is the producer/key pair. Reusing it
+returns the original receipt, even when the prompt content has changed. It does
+**not** compare prompt content and reject conflicting payloads. With `--wait`,
+the reported outcome belongs to that original turn; a nonzero exit may simply
+report its original failure, not rejection of the replacement prompt.
+
+Keep the prompt and execution intent unchanged when retrying an uncertain
+submission. Do not reuse a key to request different work. A deliberately new
+request needs a new key, but a timeout or transport failure is not evidence that
+starting new work is safe: first reconcile the original receipt and any committed
+effects. Keys are session-scoped, so creating a new session does not deduplicate
+an earlier job. This mechanism alone does not make workflow reruns or external
+publication idempotent.
+
 ## Targeted cancellation
 
 Scripts can request cancellation of an observed active turn without cancelling a

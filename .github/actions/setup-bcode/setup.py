@@ -21,6 +21,14 @@ def main():
         parent = Path(os.environ["RUNNER_TEMP"])
         if not archive.is_absolute() or not parent.is_absolute():
             raise ValueError("absolute paths required")
+        workspace = Path(os.environ["GITHUB_WORKSPACE"])
+        if not workspace.is_absolute():
+            raise ValueError("absolute workspace required")
+        workspace = workspace.resolve(strict=True)
+        archive = archive.resolve(strict=True)
+        parent = parent.resolve(strict=True)
+        if any(path == workspace or workspace in path.parents for path in (archive, parent)):
+            raise ValueError("runner storage must be outside the checkout")
         if any(character in str(parent) for character in "\r\n"):
             raise ValueError("invalid output path")
         output_path = os.environ["GITHUB_OUTPUT"]

@@ -83,6 +83,9 @@ def install(archive, expected_sha256, parent):
                 if member.size < 0 or total > MAX_EXTRACTED_BYTES:
                     raise ValueError("release contents exceed size limit")
                 members.append((member, path))
+            files = {path for member, path in members if member.isfile()}
+            if any(parent in files for _, path in members for parent in path.parents):
+                raise ValueError("release file conflicts with directory")
             if not any(str(path) == "bcode" and member.isfile()
                        and member.mode & 0o111 for member, path in members):
                 raise ValueError("release lacks executable bcode")

@@ -25,6 +25,12 @@ class InstallTests(unittest.TestCase):
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
         self.root = Path(self.temp.name)
+        workspace = tempfile.TemporaryDirectory()
+        self.addCleanup(workspace.cleanup)
+        self.workspace = Path(workspace.name)
+        environment = patch.dict(os.environ, {"GITHUB_WORKSPACE": str(self.workspace)})
+        environment.start()
+        self.addCleanup(environment.stop)
 
     def archive(self, extra=()):
         archive = self.root / "release.tar.gz"
@@ -65,6 +71,19 @@ class InstallTests(unittest.TestCase):
             with self.subTest(name=name):
                 archive, digest = self.archive([(name, b"bad", kind)])
                 with self.assertRaises(ValueError):
+                    INSTALLER.install(archive, digest, self.root)
+                self.assertEqual(list(self.root.iterdir()), [archive])
+
+    def test_file_directory_collisions_are_rejected_before_installation(self):
+        for entries in [
+                [("plugins", b"file", tarfile.REGTYPE),
+                 ("plugins/provider.so", b"library", tarfile.REGTYPE)],
+                [("plugins/provider.so", b"library", tarfile.REGTYPE),
+                 ("plugins", b"file", tarfile.REGTYPE)],
+                [("bcode/child", b"file", tarfile.REGTYPE)]]:
+            with self.subTest(entries=entries):
+                archive, digest = self.archive(entries)
+                with self.assertRaisesRegex(ValueError, "conflicts with directory"):
                     INSTALLER.install(archive, digest, self.root)
                 self.assertEqual(list(self.root.iterdir()), [archive])
 
@@ -127,6 +146,34 @@ class InstallTests(unittest.TestCase):
         values = dict(line.split("=", 1) for line in output.read_text().splitlines())
         self.assertEqual(Path(values["binary"]).read_bytes(), b"binary")
         self.assertEqual(Path(values["binary"]).parent, Path(values["installation"]))
+
+    def test_action_rejects_checkout_storage_and_symlink_aliases(self):
+        archive, digest = self.archive()
+        checkout_archive = self.workspace / "release.tar.gz"
+        checkout_archive.write_bytes(archive.read_bytes())
+        alias = self.root / "checkout-alias"
+        alias.symlink_to(self.workspace, target_is_directory=True)
+        adapter = Path(__file__).resolve().parents[1] / ".github/actions/setup-bcode/setup.py"
+        for source, parent in [
+                (checkout_archive, self.root),
+                (alias / "release.tar.gz", self.root),
+                (archive, self.workspace),
+                (archive, alias)]:
+            with self.subTest(source=source, parent=parent):
+                output = self.root / "outputs"
+                result = subprocess.run(
+                    [sys.executable, "-I", "-B", str(adapter)],
+                    env={**os.environ, "BCODE_SETUP_ARCHIVE": str(source),
+                         "BCODE_SETUP_SHA256": digest, "RUNNER_TEMP": str(parent),
+                         "GITHUB_OUTPUT": str(output)},
+                    capture_output=True, timeout=5, check=False)
+                self.assertEqual(result.returncode, 1)
+                self.assertEqual(result.stdout, b"")
+                self.assertEqual(result.stderr,
+                                 b"Bcode setup failed; verify the archive, digest and runner storage\n")
+                self.assertFalse(output.exists())
+                self.assertEqual(set(self.root.iterdir()), {archive, alias})
+                self.assertEqual(list(self.workspace.iterdir()), [checkout_archive])
 
     def test_action_ignores_python_startup_injection(self):
         archive, digest = self.archive()
@@ -224,10 +271,11 @@ class InstallTests(unittest.TestCase):
                     INSTALLER.install(archive, digest, self.root)
                 self.assertEqual(list(self.root.iterdir()), [archive])
 
-    def test_file_directory_collision_cleans_partial_installation(self):
-        archive, digest = self.archive([("bcode/child", b"bad", tarfile.REGTYPE)])
-        with self.assertRaises(OSError):
-            INSTALLER.install(archive, digest, self.root)
+    def test_extraction_io_failure_cleans_partial_installation(self):
+        archive, digest = self.archive()
+        with patch.object(INSTALLER.shutil, "copyfileobj", side_effect=OSError("disk full")):
+            with self.assertRaises(OSError):
+                INSTALLER.install(archive, digest, self.root)
         self.assertEqual(list(self.root.iterdir()), [archive])
 
 
