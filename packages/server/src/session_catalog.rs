@@ -265,7 +265,13 @@ impl SessionCatalog {
         let sessions = match &mut source.state {
             SourceCacheState::Loaded { sessions, .. }
             | SourceCacheState::Failed { sessions, .. } => sessions,
-            SourceCacheState::Empty | SourceCacheState::Loading => return,
+            SourceCacheState::Empty | SourceCacheState::Loading => {
+                source.generation += 1;
+                source.state = SourceCacheState::Empty;
+                source.updated_at_ms = current_unix_millis();
+                self.bump_revision(&mut inner);
+                return;
+            }
         };
         if upsert_session(sessions, session) {
             source.generation += 1;
@@ -284,7 +290,13 @@ impl SessionCatalog {
         let sessions = match &mut source.state {
             SourceCacheState::Loaded { sessions, .. }
             | SourceCacheState::Failed { sessions, .. } => sessions,
-            SourceCacheState::Empty | SourceCacheState::Loading => return,
+            SourceCacheState::Empty | SourceCacheState::Loading => {
+                source.generation += 1;
+                source.state = SourceCacheState::Empty;
+                source.updated_at_ms = current_unix_millis();
+                self.bump_revision(&mut inner);
+                return;
+            }
         };
         let original_len = sessions.len();
         sessions.retain(|session| session.id != session_id);
@@ -1080,6 +1092,51 @@ fn current_unix_millis() -> u64 {
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test]
+    async fn native_mutations_during_discovery_require_fresh_load() {
+        for delete in [false, true] {
+            let catalog = SessionCatalog::default();
+            let session = summary(SessionId::new(), None);
+            catalog.inner.lock().await.sources.insert(
+                super::native_source_key(),
+                super::SourceCache {
+                    metadata: super::native_metadata(),
+                    state: super::SourceCacheState::Loading,
+                    updated_at_ms: 0,
+                    generation: 1,
+                },
+            );
+            let revision = catalog.revision();
+            if delete {
+                catalog.remove_native_session(session.id).await;
+            } else {
+                catalog.upsert_native_session(session.clone()).await;
+            }
+            assert!(catalog.revision() > revision);
+            catalog
+                .publish_source_result(
+                    super::native_source_key(),
+                    super::native_metadata(),
+                    Ok(SourceLoadResult {
+                        sessions: vec![session],
+                        diagnostics: SourceDiagnostics::default(),
+                    }),
+                    Some(1),
+                )
+                .await;
+            let inner = catalog.inner.lock().await;
+            assert!(matches!(
+                inner.sources[&super::native_source_key()].state,
+                super::SourceCacheState::Empty
+            ));
+            assert!(
+                inner.sources[&super::native_source_key()]
+                    .sessions()
+                    .is_empty()
+            );
+            drop(inner);
+        }
+    }
     #[tokio::test]
     async fn native_mutations_fence_pending_refresh_publication() {
         let catalog = SessionCatalog::default();
