@@ -207,6 +207,57 @@ pub fn try_resolve_provider_request_context(
     try_resolve_with_registry_loader(request, bcode_config::try_load_runtime_auth_subscriptions)
 }
 
+/// Resolve exactly one profile for a provider-owned, non-generation operation.
+///
+/// This uses canonical credential materialization without inheriting the active
+/// model selection, auth pool, or fallback candidates. It does not refresh tokens
+/// or establish verified remote account identity.
+///
+/// # Errors
+/// Returns a normalized error for blank selection, invalid configuration/runtime
+/// metadata, or failure to materialize the requested profile.
+pub fn resolve_explicit_profile_context(
+    config: &bcode_config::BcodeConfig,
+    provider_plugin_id: &str,
+    profile: &str,
+) -> Result<bcode_model::ProviderRequestContext, &'static str> {
+    if provider_plugin_id.trim().is_empty() || profile.trim().is_empty() {
+        return Err("an explicit provider and auth profile are required");
+    }
+    // Non-generation operations must not inherit the legacy allowance for
+    // unowned declarative credentials. Reject before any materialization.
+    if let Some(declared) = config.auth.profiles.get(profile)
+        && (declared.owner_plugin_id.as_deref() != Some(provider_plugin_id)
+            || declared
+                .provider_id
+                .as_deref()
+                .is_none_or(|id| id.trim().is_empty()))
+    {
+        return Err("selected auth profile ownership cannot be verified");
+    }
+    let context = try_resolve_provider_request_context(ProviderRequestContextResolution {
+        config,
+        selection: bcode_config::ResolvedModelSelection {
+            provider_plugin_id: Some(provider_plugin_id.to_owned()),
+            auth_profile: Some(profile.to_owned()),
+            ..Default::default()
+        },
+    })
+    .map_err(|_| "selected auth profile configuration is unavailable")?;
+    if context.auth_pool.is_some()
+        || !context.auth_candidates.is_empty()
+        || context.auth_profile.as_deref() != Some(profile)
+        || context
+            .auth
+            .as_ref()
+            .and_then(|auth| auth.profile.as_deref())
+            != Some(profile)
+    {
+        return Err("selected auth profile could not be resolved");
+    }
+    Ok(context)
+}
+
 /// Inspect explicit account and pool references without reading credentials or mutating state.
 ///
 /// This checks metadata only; success does not imply remote authentication or model availability.
@@ -770,6 +821,47 @@ pub fn lookup_auth_provider_profile(
         }
         Err(error) => Err(error),
     }
+}
+
+/// Discover profile resolution outcomes without materializing credentials.
+///
+/// Errors remain associated with candidate names instead of silently disappearing.
+/// Callers can isolate invalid sources while continuing with valid profiles.
+/// Declarative precedence and context isolation use the canonical profile resolver.
+#[must_use]
+pub fn discover_provider_profiles(
+    config: &bcode_config::BcodeConfig,
+    provider_id: &str,
+    owner_plugin_id: &str,
+    runtime: &bcode_config::RuntimeAuthSubscriptions,
+) -> BTreeMap<String, Result<ResolvedAuthProfile, AuthProfileResolutionError>> {
+    let mut names = config
+        .auth
+        .profiles
+        .keys()
+        .cloned()
+        .collect::<std::collections::BTreeSet<_>>();
+    if config.active_context.is_none() {
+        names.extend(runtime.profiles.keys().cloned());
+        names.extend(runtime.pools.values().flat_map(|pool| {
+            pool.profiles
+                .iter()
+                .map(|member| member.auth_profile.clone())
+        }));
+    }
+    names
+        .into_iter()
+        .map(|name| {
+            let result = resolve_auth_provider_profile(
+                config,
+                provider_id,
+                owner_plugin_id,
+                Some(&name),
+                runtime,
+            );
+            (name, result)
+        })
+        .collect()
 }
 
 /// Resolve an auth profile for one registered provider with declarative precedence.
@@ -1363,6 +1455,42 @@ fn selected_auth_pool_routing(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn explicit_profile_rejects_blank_selection_before_materialization() {
+        let config = bcode_config::BcodeConfig::default();
+        for (provider, profile) in [("", "profile"), ("provider", ""), ("provider", " \t")] {
+            assert_eq!(
+                super::resolve_explicit_profile_context(&config, provider, profile).unwrap_err(),
+                "an explicit provider and auth profile are required"
+            );
+        }
+    }
+    #[test]
+    fn explicit_profile_rejects_unverifiable_ownership_before_materialization() {
+        for (owner, provider) in [
+            (None, Some("provider")),
+            (Some(""), Some("provider")),
+            (Some("other-plugin"), Some("provider")),
+            (Some("plugin"), None),
+            (Some("plugin"), Some(" \t")),
+        ] {
+            let mut config = bcode_config::BcodeConfig::default();
+            config.auth.profiles.insert(
+                "selected".into(),
+                bcode_config::AuthProfileConfig {
+                    backend: "sshenv".into(),
+                    owner_plugin_id: owner.map(str::to_owned),
+                    provider_id: provider.map(str::to_owned),
+                    ..Default::default()
+                },
+            );
+            assert_eq!(
+                super::resolve_explicit_profile_context(&config, "plugin", "selected").unwrap_err(),
+                "selected auth profile ownership cannot be verified"
+            );
+        }
+    }
+
     #[test]
     fn explicit_preference_updates_only_matching_owned_state() {
         let mut config = bcode_config::BcodeConfig::default();
@@ -2326,6 +2454,57 @@ profiles = ["account"]
                 runtime_pool_candidate_profile(&config, &registry, pool_name, name, None).is_none()
             );
         }
+    }
+
+    #[test]
+    fn profile_discovery_includes_pool_members_and_respects_declarative_shadowing() {
+        let mut config = bcode_config::BcodeConfig::default();
+        let mut runtime = pool_member_runtime(None, Some("bcode.openai-compatible"));
+        runtime.profiles.insert(
+            "other".into(),
+            bcode_config::RuntimeAuthProfile {
+                provider_id: "other-provider".into(),
+                owner_plugin_id: "other-plugin".into(),
+                ..Default::default()
+            },
+        );
+        let profiles = super::discover_provider_profiles(
+            &config,
+            "openai",
+            "bcode.openai-compatible",
+            &runtime,
+        );
+        assert_eq!(profiles.len(), 2);
+        assert_eq!(
+            profiles["openai-2"].as_ref().unwrap().profile_name,
+            "openai-2"
+        );
+        assert!(profiles["other"].is_err());
+        // An invalid declarative override must not fall back to runtime credentials.
+        config.auth.profiles.insert(
+            "openai-2".into(),
+            bcode_config::AuthProfileConfig::default(),
+        );
+        assert!(
+            super::discover_provider_profiles(
+                &config,
+                "openai",
+                "bcode.openai-compatible",
+                &runtime
+            )["openai-2"]
+                .is_err()
+        );
+        config.auth.profiles.clear();
+        config.active_context = Some("isolated".into());
+        assert!(
+            super::discover_provider_profiles(
+                &config,
+                "openai",
+                "bcode.openai-compatible",
+                &runtime
+            )
+            .is_empty()
+        );
     }
 
     #[test]

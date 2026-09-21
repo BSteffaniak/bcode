@@ -563,10 +563,7 @@ pub fn resolve_credential_update_service_request_with_custody<'registry>(
     ) {
         Ok(resolved) => resolved,
         Err(error) => {
-            return Resolution::Failed {
-                code: "auth_profile_unavailable".to_owned(),
-                message: error.to_string(),
-            };
+            return credential_update_failure(&AuthCredentialUpdateError::Ownership(error));
         }
     };
     let Some(method) = registered
@@ -1110,6 +1107,28 @@ mod tests {
             })
             .expect("update payload"),
         }
+    }
+
+    #[test]
+    fn credential_update_service_redacts_unresolved_profile() {
+        let methods = [method()];
+        let result = resolve_credential_update_service_request(
+            &bcode_config::BcodeConfig::default(),
+            &bcode_config::RuntimeAuthSubscriptions::default(),
+            "owner",
+            |_| {
+                Some(RegisteredAuthProviderOwner {
+                    plugin_id: "owner",
+                    methods: &methods,
+                })
+            },
+            update_service_request("openai", "private-profile-marker", "private-token-marker"),
+        );
+        let bcode_tool::ToolInvocationServiceResolution::Failed { code, message } = result else {
+            panic!("unresolved profile must fail before custody");
+        };
+        assert_eq!(code, "auth_profile_unavailable");
+        assert_eq!(message, "credential update profile is unavailable");
     }
 
     fn failed_code(resolution: &bcode_tool::ToolInvocationServiceResolution) -> &str {

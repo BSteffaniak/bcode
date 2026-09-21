@@ -4363,6 +4363,82 @@ impl PluginRuntimeHost {
         Q: Serialize + Sync,
         R: DeserializeOwned,
     {
+        let response = self
+            .invoke_service_json_response_scoped_cancellable(
+                plugin_id,
+                interface_id,
+                operation,
+                request,
+                scope,
+                timeout,
+                cancellation,
+            )
+            .await?;
+        decode_service_response(response)
+    }
+
+    /// Invoke a JSON request while retaining the complete service response envelope.
+    ///
+    /// A successful invocation may contain a service error. Callers must inspect
+    /// `response.error` before decoding content; error payloads may carry typed
+    /// domain metadata and must never be treated as successful content. Neither
+    /// error messages nor payloads are safe to expose without domain normalization.
+    ///
+    /// # Errors
+    /// Returns an error when encoding, admission, invocation, cancellation, or the
+    /// deadline fails. Provider service errors remain in the returned envelope.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn invoke_service_json_response_scoped_cancellable<Q>(
+        &self,
+        plugin_id: &str,
+        interface_id: impl Into<String>,
+        operation: impl Into<String>,
+        request: &Q,
+        scope: PluginInvocationScope,
+        timeout: std::time::Duration,
+        cancellation: &bcode_plugin_sdk::ServiceCancellation,
+    ) -> Result<ServiceResponse, PluginServiceCallError>
+    where
+        Q: Serialize + Sync,
+    {
+        self.invoke_service_json_response_with_bridge_scoped_cancellable(
+            plugin_id,
+            interface_id,
+            operation,
+            request,
+            scope,
+            None,
+            timeout,
+            cancellation,
+        )
+        .await
+    }
+
+    /// Invoke a cancellable JSON service with a host-authorized invocation bridge.
+    ///
+    /// The bridge uses the same admission, deadline and abandonment lifecycle as
+    /// the service. Callers must bind bridge authority to the selected invocation;
+    /// providing a bridge does not itself authorize credential or other mutations.
+    /// Service errors remain in the envelope and require domain normalization.
+    ///
+    /// # Errors
+    /// Returns encoding, admission, invocation, cancellation or deadline failures,
+    /// including bridge kinds unsupported by the selected runtime.
+    #[allow(clippy::too_many_arguments, clippy::significant_drop_tightening)]
+    pub async fn invoke_service_json_response_with_bridge_scoped_cancellable<Q>(
+        &self,
+        plugin_id: &str,
+        interface_id: impl Into<String>,
+        operation: impl Into<String>,
+        request: &Q,
+        scope: PluginInvocationScope,
+        bridge: Option<PluginInvocationBridge>,
+        timeout: std::time::Duration,
+        cancellation: &bcode_plugin_sdk::ServiceCancellation,
+    ) -> Result<ServiceResponse, PluginServiceCallError>
+    where
+        Q: Serialize + Sync,
+    {
         let payload = serde_json::to_vec(request).map_err(PluginServiceCallError::RequestEncode)?;
         let response = tokio::select! {
             biased;
@@ -4381,7 +4457,7 @@ impl PluginRuntimeHost {
                 // Dropping startup or the returned invocation propagates cancellation
                 // through their existing abandonment guards.
                 let mut invocation = self
-                    .invoke_service_with_events_scoped(plugin_id, interface_id, operation, payload, scope)
+                    .invoke_service_with_events_and_bridge_scoped(plugin_id, interface_id, operation, payload, scope, bridge)
                     .await?;
                 loop {
                     if let StreamingServiceInvocationEvent::Response(response) =
@@ -4397,7 +4473,7 @@ impl PluginRuntimeHost {
                 })
             })?,
         };
-        decode_service_response(response)
+        Ok(response)
     }
 
     /// Invoke a service operation by service interface ID with JSON payloads.
@@ -7275,6 +7351,24 @@ library = "libexample_plugin.dylib"
             result,
             Err(PluginLoadError::UnsupportedAsyncBridge { .. })
         ));
+        let json = runtime
+            .invoke_service_json_response_with_bridge_scoped_cancellable(
+                "example.hello",
+                "example-hello/v1",
+                "emit-event",
+                &(),
+                PluginInvocationScope::Global,
+                Some(bridge.clone()),
+                Duration::from_secs(5),
+                &bcode_plugin_sdk::ServiceCancellation::default(),
+            )
+            .await;
+        assert!(matches!(
+            json,
+            Err(PluginServiceCallError::Invoke(
+                PluginLoadError::UnsupportedAsyncBridge { .. }
+            ))
+        ));
         let streaming = runtime
             .invoke_service_with_events_and_bridge_scoped(
                 "example.hello",
@@ -7326,6 +7420,140 @@ library = "libexample_plugin.dylib"
             } if plugin_id == "example.hello"
         ));
         assert!(started.elapsed() < Duration::from_secs(1));
+    }
+
+    #[tokio::test]
+    async fn cancellable_json_response_round_trips_host_bridge() {
+        let manifest = toml::from_str::<PluginManifest>(include_str!(
+            "../../../examples/hello-plugin/bcode-plugin.toml"
+        ))
+        .unwrap();
+        let host =
+            PluginHost::load_static_plugins(&[(manifest, bcode_hello_plugin::static_plugin())])
+                .unwrap();
+        let runtime = PluginRuntimeHost::from(host);
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let observed = Arc::clone(&calls);
+        let bridge = PluginInvocationBridge::new(move |request, cancellation| {
+            assert!(!cancellation.is_cancelled());
+            let ServiceBridgeRequest::Exchange(request) = request else {
+                panic!("unexpected bridge operation")
+            };
+            assert_eq!(request.invocation_id, "hello-invocation");
+            observed.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(ServiceBridgeResponse::Exchange(
+                bcode_tool::ToolExchangeResolution::Responded {
+                    payload: serde_json::json!({"authorized": true}),
+                },
+            ))
+        });
+        let response = runtime
+            .invoke_service_json_response_with_bridge_scoped_cancellable(
+                "example.hello",
+                "example-hello/v1",
+                "bridge-exchange",
+                &(),
+                PluginInvocationScope::Global,
+                Some(bridge),
+                Duration::from_secs(5),
+                &bcode_plugin_sdk::ServiceCancellation::default(),
+            )
+            .await
+            .unwrap();
+        drop(runtime);
+        assert!(response.error.is_none());
+        let decoded: ServiceBridgeResponse = serde_json::from_slice(&response.payload).unwrap();
+        assert!(matches!(
+            decoded,
+            ServiceBridgeResponse::Exchange(bcode_tool::ToolExchangeResolution::Responded { payload })
+                if payload == serde_json::json!({"authorized": true})
+        ));
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn cancelling_json_response_reaches_blocked_host_bridge() {
+        let manifest = toml::from_str::<PluginManifest>(include_str!(
+            "../../../examples/hello-plugin/bcode-plugin.toml"
+        ))
+        .unwrap();
+        let host =
+            PluginHost::load_static_plugins(&[(manifest, bcode_hello_plugin::static_plugin())])
+                .unwrap();
+        let runtime = PluginRuntimeHost::from(host);
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let started = Arc::clone(&entered);
+        let (settled, settlement) = tokio::sync::oneshot::channel();
+        let settled = std::sync::Mutex::new(Some(settled));
+        let bridge = PluginInvocationBridge::new(move |_, cancellation| {
+            started.notify_one();
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while !cancellation.is_cancelled() && Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            let observed = cancellation.is_cancelled();
+            let sender = settled.lock().unwrap().take();
+            if let Some(sender) = sender {
+                let _ = sender.send(observed);
+            }
+            Err("bridge cancelled".into())
+        });
+        let cancellation = bcode_plugin_sdk::ServiceCancellation::default();
+        let call = runtime.invoke_service_json_response_with_bridge_scoped_cancellable(
+            "example.hello",
+            "example-hello/v1",
+            "bridge-exchange",
+            &(),
+            PluginInvocationScope::Global,
+            Some(bridge),
+            Duration::from_secs(5),
+            &cancellation,
+        );
+        let cancel = async {
+            tokio::time::timeout(Duration::from_secs(2), entered.notified())
+                .await
+                .expect("bridge should start before cancellation");
+            cancellation.cancel();
+        };
+        let (result, ()) = tokio::join!(call, cancel);
+        assert!(matches!(
+            result,
+            Err(PluginServiceCallError::Service { code, .. }) if code == "cancelled"
+        ));
+        assert!(
+            tokio::time::timeout(Duration::from_secs(2), settlement)
+                .await
+                .expect("bridge should settle after caller cancellation")
+                .expect("bridge should report cancellation")
+        );
+        drop(runtime);
+    }
+
+    #[tokio::test]
+    async fn cancellable_response_preserves_service_error_envelope() {
+        let manifest = toml::from_str::<PluginManifest>(include_str!(
+            "../../../examples/hello-plugin/bcode-plugin.toml"
+        ))
+        .expect("hello manifest should parse");
+        let host =
+            PluginHost::load_static_plugins(&[(manifest, bcode_hello_plugin::static_plugin())])
+                .expect("static hello host should load");
+        let runtime = PluginRuntimeHost::from(host);
+        let response = runtime
+            .invoke_service_json_response_scoped_cancellable(
+                "example.hello",
+                "example-hello/v1",
+                "unknown-operation",
+                &serde_json::Value::Null,
+                PluginInvocationScope::Global,
+                Duration::from_secs(5),
+                &bcode_plugin_sdk::ServiceCancellation::default(),
+            )
+            .await
+            .expect("invocation should retain service failure");
+        drop(runtime);
+        assert!(response.error.is_some());
+        assert!(decode_service_response::<serde_json::Value>(response).is_err());
     }
 
     #[tokio::test]

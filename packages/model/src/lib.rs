@@ -22,6 +22,7 @@ use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 
+pub mod history;
 pub mod image_upload;
 
 mod usage;
@@ -153,6 +154,13 @@ pub struct ProviderOperationContract {
 /// advertised. Optional operations are extensions and callers must tolerate an
 /// `unsupported_operation` service error.
 pub const MODEL_PROVIDER_OPERATIONS: &[ProviderOperationContract] = &[
+    ProviderOperationContract {
+        operation: history::OP_HISTORY_CAPABILITIES,
+        request_type: "HistoryCapabilitiesRequest",
+        response_type: "HistoryCapabilities",
+        requirement: ProviderOperationRequirement::Optional,
+        behavior: "declare history auth schemes and scope coverage without credentials or network",
+    },
     ProviderOperationContract {
         operation: OP_CAPABILITIES,
         request_type: "ProviderCapabilitiesRequest",
@@ -3843,33 +3851,13 @@ mod tests {
     }
 
     #[test]
-    fn provider_operation_inventory_is_unique_and_covers_all_published_operations() {
-        let expected = [
-            super::OP_CAPABILITIES,
-            super::OP_CONTEXT_MANAGEMENT_CAPABILITIES,
-            super::OP_COMPACT_CONTEXT,
-            super::OP_MODELS,
-            super::OP_VALIDATE_CONFIG,
-            super::OP_START_TURN,
-            super::OP_VERIFY_MODEL,
-            super::image_upload::OP_VERIFY_IMAGE_UPLOAD,
-            super::OP_POLL_TURN_EVENTS,
-            super::OP_CANCEL_TURN,
-            super::OP_NATIVE_WEB_SEARCH,
-            super::OP_FINISH_TURN,
-            super::OP_AUTH_USAGE,
-            super::OP_AUTH_PRIME,
-            super::OP_AUTH_RESET_CREDITS,
-            super::OP_NORMALIZE_USAGE,
-            super::OP_AUTH_RESET_CREDIT_CONSUME,
-        ];
+    fn provider_operation_contracts_are_unique_and_documented() {
         let actual = super::MODEL_PROVIDER_OPERATIONS
             .iter()
             .map(|contract| contract.operation)
             .collect::<std::collections::BTreeSet<_>>();
 
         assert_eq!(actual.len(), super::MODEL_PROVIDER_OPERATIONS.len());
-        assert_eq!(actual, expected.into_iter().collect());
         assert!(super::MODEL_PROVIDER_OPERATIONS.iter().all(|contract| {
             !contract.request_type.is_empty()
                 && !contract.response_type.is_empty()

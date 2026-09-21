@@ -67,6 +67,7 @@ use context_compaction::{
 use context_compaction::{candidate_requires_proactive_compaction, compaction_event_is_progress};
 pub mod session_catalog;
 mod session_import;
+pub use session_import::HistoryRetrievalError;
 pub mod session_search;
 
 use bcode_agent_profile::{
@@ -364,6 +365,7 @@ pub struct ServerState {
     selected_model_id: Option<String>,
     selected_provider_context: bcode_model::ProviderRequestContext,
     startup_config: bcode_config::BcodeConfig,
+    history_auth_gate: Arc<tokio::sync::Semaphore>,
     session_configs: Mutex<BTreeMap<SessionId, bcode_config::BcodeConfig>>,
     session_skills: Mutex<BTreeMap<SessionId, Option<SkillRegistry>>>,
     session_repository_roots: Mutex<BTreeMap<SessionId, (PathBuf, Option<PathBuf>)>>,
@@ -1971,6 +1973,7 @@ impl ServerState {
             selected_model_id: init.selected_model_id,
             selected_provider_context: init.selected_provider_context,
             startup_config: init.startup_config,
+            history_auth_gate: Arc::new(tokio::sync::Semaphore::new(2)),
             session_configs: Mutex::default(),
             session_skills: Mutex::default(),
             session_repository_roots: Mutex::default(),
@@ -26741,7 +26744,10 @@ fn server_model_provider_bridge(
 ) -> PluginInvocationBridge {
     let turn_id = turn_id.to_owned();
     let caller_plugin_id = caller_plugin_id.to_owned();
-    PluginInvocationBridge::new(move |request, _cancellation| match request {
+    PluginInvocationBridge::new(move |request, cancellation| match request {
+        ServiceBridgeRequest::InvokeService(_) if cancellation.is_cancelled() => Ok(
+            ServiceBridgeResponse::Service(ToolInvocationServiceResolution::Cancelled),
+        ),
         ServiceBridgeRequest::InvokeService(request) if request.invocation_id == turn_id => {
             Ok(ServiceBridgeResponse::Service(
                 auth_host_service_resolution(&plugins, &config, &caller_plugin_id, request),
@@ -66034,6 +66040,20 @@ event_symbol = "bcode_plugin_handle_event_v1"
 
     /// The provider-turn bridge only serves `bcode.provider-auth-host` requests, and only when the
     /// request carries the turn's own invocation identity and the caller owns the target provider.
+    fn assert_cancelled_provider_bridge(
+        bridge: &PluginInvocationBridge,
+        request: ServiceBridgeRequest,
+    ) {
+        let cancellation = bcode_plugin_sdk::ServiceCancellation::default();
+        cancellation.cancel();
+        assert!(matches!(
+            bridge
+                .request(request, cancellation)
+                .expect("cancelled bridge"),
+            ServiceBridgeResponse::Service(ToolInvocationServiceResolution::Cancelled)
+        ));
+    }
+
     #[test]
     fn model_provider_bridge_fences_invocation_identity_and_provider_ownership() {
         let state = test_server_state_with_fake_provider(SessionManager::default());
@@ -66082,6 +66102,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
             ),
             "invocation_id_mismatch"
         );
+        assert_cancelled_provider_bridge(&owner_bridge, update_request("turn-1", "fake"));
         // Owned request with a matching turn reaches host resolution; the empty config makes
         // profile resolution fail, proving the request got past the identity and ownership fences.
         assert_eq!(
@@ -78391,6 +78412,30 @@ event_symbol = "bcode_plugin_handle_event_v1"
         });
         assert_eq!(producer_plugin_id, Some(&Some("test.plugin".to_owned())));
         drop(state);
+    }
+
+    #[tokio::test]
+    async fn history_discovery_rejects_cancelled_and_unavailable_sources() {
+        let state = test_server_state(SessionManager::default());
+        let cancellation = bcode_plugin_sdk::ServiceCancellation::default();
+        cancellation.cancel();
+        let error = state
+            .discover_history_profiles("missing-provider", Path::new("/unused"), &cancellation)
+            .await
+            .err()
+            .expect("cancelled discovery must fail");
+        assert_eq!(error.message, "history retrieval cancelled");
+        let error = state
+            .discover_history_profiles(
+                "missing-provider",
+                Path::new("/unused"),
+                &bcode_plugin_sdk::ServiceCancellation::default(),
+            )
+            .await
+            .err()
+            .expect("unregistered provider must fail");
+        drop(state);
+        assert_eq!(error.message, "history provider is unavailable");
     }
 
     #[tokio::test]

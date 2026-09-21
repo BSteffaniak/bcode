@@ -102,6 +102,55 @@ pub struct ImportableSession {
     pub warnings: Vec<ImportWarning>,
 }
 
+/// A complete normalized remote revision returned by a history adapter.
+///
+/// Version 1 is independent of the one-shot session-import interface. Consumers
+/// must reject unsupported versions before publication. This payload does not
+/// attest remote account scope: the host must establish that separately before
+/// associating the revision with a canonical session. Source identifiers are
+/// opaque and must not be converted into website URLs.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ImportableHistorySnapshot {
+    /// Payload compatibility version (currently 1).
+    pub schema_version: u32,
+    /// API conversation identity within a separately verified remote scope.
+    pub conversation_id: String,
+    /// Source title, not trusted instructions.
+    pub title: Option<String>,
+    /// Selected source graph leaf; events follow this ancestry only.
+    pub selected_node: String,
+    /// Adapter-defined versioned identity of the normalized revision.
+    pub revision_id: String,
+    /// Complete selected-branch historical events, never executable authority.
+    /// V1 remote history accepts only user/assistant text events. Tools and privileged
+    /// source roles must be represented as labelled historical text with source metadata,
+    /// not operational tool, agent, model, compaction, reasoning or usage events.
+    pub events: Vec<ImportableSessionEvent>,
+    /// Source message metadata keyed by the event's external node identity.
+    /// Values describe untrusted history, never local model/tool routing.
+    #[serde(default)]
+    pub message_metadata: std::collections::BTreeMap<String, HistoryMessageMetadata>,
+    /// Fidelity limitations that must remain visible with the imported content.
+    pub warnings: Vec<ImportWarning>,
+}
+
+/// Portable source labels retained without granting executable authority.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HistoryMessageMetadata {
+    /// Original message identity, which may differ from its graph node identity.
+    pub message_id: Option<String>,
+    /// Source model label, not a locally resolved model selection.
+    pub model: Option<String>,
+    /// Original source role, not a trusted instruction role.
+    pub role: String,
+    /// Historical author or tool label.
+    pub author: Option<String>,
+    /// Historical destination, never a local routing instruction.
+    pub recipient: Option<String>,
+    /// Source content discriminator, not a claim of attachment preservation.
+    pub content_type: Option<String>,
+}
+
 /// One importable event with source timestamp metadata.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ImportableSessionEvent {

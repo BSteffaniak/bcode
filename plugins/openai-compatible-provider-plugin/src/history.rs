@@ -29,7 +29,7 @@ pub struct HistoryMessage {
     pub role: String,
     /// Source timestamp in seconds, if supplied and valid.
     pub created_at: Option<f64>,
-    /// Source text only; no attachment URLs or fabricated tool executions.
+    /// Source text and explicit omission markers; no attachment URLs or fabricated tool executions.
     pub text: String,
 }
 
@@ -67,6 +67,41 @@ pub struct HistorySnapshot {
 }
 
 impl HistorySnapshot {
+    /// Preserve source provenance alongside the portable historical events.
+    /// The caller must compute the revision identity from this snapshot first.
+    #[must_use]
+    pub(crate) fn import_snapshot(
+        &self,
+        revision_id: String,
+    ) -> bcode_session_import::ImportableHistorySnapshot {
+        bcode_session_import::ImportableHistorySnapshot {
+            schema_version: 1,
+            conversation_id: self.conversation_id.clone(),
+            title: self.title.clone(),
+            selected_node: self.selected_node.clone(),
+            revision_id,
+            events: self.import_events(),
+            message_metadata: self
+                .messages
+                .iter()
+                .map(|message| {
+                    (
+                        message.node_id.clone(),
+                        bcode_session_import::HistoryMessageMetadata {
+                            message_id: message.message_id.clone(),
+                            model: message.model_slug.clone(),
+                            role: message.role.clone(),
+                            author: message.author_name.clone(),
+                            recipient: message.recipient.clone(),
+                            content_type: message.content_type.clone(),
+                        },
+                    )
+                })
+                .collect(),
+            warnings: self.import_warnings(),
+        }
+    }
+
     /// Convert fidelity limitations into portable, secret-safe import warnings.
     ///
     /// These must accompany imported events; an empty list does not establish
@@ -167,6 +202,8 @@ pub enum HistoryDecodeError {
     IdentityMismatch,
     /// Selected ancestry references a missing node or disagrees with embedded identity.
     InvalidGraph,
+    /// Selected source content is still being generated; retry retrieval later.
+    Incomplete,
     /// Selected ancestry contains a cycle.
     Cycle,
 }
@@ -176,7 +213,36 @@ struct WireHistory {
     conversation_id: String,
     title: Option<String>,
     current_node: String,
+    #[serde(deserialize_with = "deserialize_graph_nodes")]
     mapping: BTreeMap<String, Node>,
+}
+
+fn deserialize_graph_nodes<'de, D>(deserializer: D) -> Result<BTreeMap<String, Node>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    struct GraphNodes;
+    impl<'de> serde::de::Visitor<'de> for GraphNodes {
+        type Value = BTreeMap<String, Node>;
+
+        fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            formatter.write_str("a graph with unique node identities")
+        }
+
+        fn visit_map<M>(self, mut map: M) -> Result<Self::Value, M::Error>
+        where
+            M: serde::de::MapAccess<'de>,
+        {
+            let mut nodes = BTreeMap::new();
+            while let Some((id, node)) = map.next_entry::<String, Node>()? {
+                if nodes.insert(id, node).is_some() {
+                    return Err(serde::de::Error::custom("duplicate graph node"));
+                }
+            }
+            Ok(nodes)
+        }
+    }
+    deserializer.deserialize_map(GraphNodes)
 }
 
 #[derive(Deserialize)]
@@ -263,6 +329,16 @@ fn decode_message(
     message: &Value,
     warnings: &mut BTreeSet<HistoryFidelityWarning>,
 ) -> Result<HistoryMessage, HistoryDecodeError> {
+    // Preserve absent status for older payloads, but do not infer completion
+    // from unknown lifecycle values or malformed status fields.
+    match message.get("status") {
+        None => {}
+        Some(Value::String(status)) if status == "finished_successfully" => {}
+        Some(Value::String(status)) if status == "in_progress" => {
+            return Err(HistoryDecodeError::Incomplete);
+        }
+        Some(_) => return Err(HistoryDecodeError::InvalidSchema),
+    }
     let role = message
         .pointer("/author/role")
         .and_then(Value::as_str)
@@ -273,14 +349,14 @@ fn decode_message(
     let timestamp = message.get("create_time");
     let created_at = timestamp
         .and_then(Value::as_f64)
-        .filter(|v| v.is_finite() && *v >= 0.0);
+        .filter(|v| v.is_finite() && *v >= 0.0 && timestamp_ms(*v).is_some());
     if timestamp.is_some_and(|v| !v.is_null()) && created_at.is_none() {
         warnings.insert(HistoryFidelityWarning::InvalidTimestamp);
     }
-    if message
+    let has_attachments = message
         .pointer("/metadata/attachments")
-        .is_some_and(|v| v.as_array().is_none_or(|a| !a.is_empty()))
-    {
+        .is_some_and(|v| !v.is_null() && v.as_array().is_none_or(|a| !a.is_empty()));
+    if has_attachments {
         warnings.insert(HistoryFidelityWarning::AttachmentMetadata);
     }
     let mut text = Vec::new();
@@ -298,6 +374,7 @@ fn decode_message(
                     text.push(value);
                 } else {
                     warnings.insert(HistoryFidelityWarning::AttachmentNotImported);
+                    text.push("[Historical non-text content not imported; no local backup]");
                 }
             }
         }
@@ -310,7 +387,11 @@ fn decode_message(
         }
         _ => {
             warnings.insert(HistoryFidelityWarning::UnsupportedContent);
+            text.push("[Unsupported historical content not imported]");
         }
+    }
+    if has_attachments {
+        text.push("[Historical attachments not imported; no local backup]");
     }
     Ok(HistoryMessage {
         node_id: id.to_owned(),
@@ -339,6 +420,71 @@ fn decode_message(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn omitted_content_has_positioned_markers_without_private_attachment_data() {
+        let message = serde_json::json!({
+            "author": {"role": "user"},
+            "content": {"content_type": "multimodal_text", "parts": [
+                "before", {"image_url": "https://private.invalid/expiring-secret"}, "after"
+            ]},
+            "metadata": {"attachments": [{"name": "private-file", "url": "secret-url"}]}
+        });
+        let mut warnings = std::collections::BTreeSet::new();
+        let decoded = super::decode_message("node", &message, &mut warnings).unwrap();
+        assert_eq!(
+            decoded.text,
+            "before\n[Historical non-text content not imported; no local backup]\nafter\n[Historical attachments not imported; no local backup]"
+        );
+        assert!(warnings.contains(&super::HistoryFidelityWarning::AttachmentNotImported));
+        assert!(warnings.contains(&super::HistoryFidelityWarning::AttachmentMetadata));
+        let encoded = serde_json::to_string(&decoded).unwrap();
+        for private in ["expiring-secret", "private-file", "secret-url"] {
+            assert!(!encoded.contains(private));
+        }
+    }
+
+    #[test]
+    fn unknown_content_is_visible_and_null_attachments_are_not_reported_as_loss() {
+        let message = serde_json::json!({
+            "author": {"role": "assistant"},
+            "content": {"content_type": "future-type", "payload": "private-opaque-data"},
+            "metadata": {"attachments": null}
+        });
+        let mut warnings = std::collections::BTreeSet::new();
+        let decoded = super::decode_message("node", &message, &mut warnings).unwrap();
+        assert_eq!(
+            decoded.text,
+            "[Unsupported historical content not imported]"
+        );
+        assert_eq!(
+            warnings,
+            [super::HistoryFidelityWarning::UnsupportedContent].into()
+        );
+    }
+
+    #[test]
+    fn portable_snapshot_retains_provenance_and_fidelity() {
+        let snapshot = super::HistorySnapshot {
+            conversation_id: "api-id-not-web-id".into(),
+            title: Some("Imported title".into()),
+            selected_node: "leaf".into(),
+            messages: Vec::new(),
+            warnings: [super::HistoryFidelityWarning::AttachmentNotImported].into(),
+        };
+        let revision = snapshot.revision_id().unwrap();
+        let portable = snapshot.import_snapshot(revision.clone());
+        let encoded = serde_json::to_vec(&portable).unwrap();
+        let decoded: bcode_session_import::ImportableHistorySnapshot =
+            serde_json::from_slice(&encoded).unwrap();
+        assert_eq!(decoded, portable);
+        assert_eq!(decoded.conversation_id, snapshot.conversation_id);
+        assert_eq!(decoded.title, snapshot.title);
+        assert_eq!(decoded.selected_node, snapshot.selected_node);
+        assert_eq!(decoded.revision_id, revision);
+        assert_eq!(decoded.warnings, snapshot.import_warnings());
+        assert!(!decoded.warnings.is_empty());
+        assert_eq!(decoded.events, snapshot.import_events());
+    }
     use super::*;
     use serde_json::json;
 
@@ -377,6 +523,38 @@ mod tests {
         };
         assert!(text.contains("tool\\nforged role"));
         assert!(!text.contains("tool\nforged role"));
+    }
+
+    #[test]
+    fn portable_snapshot_retains_message_metadata() {
+        let mut snapshot = decode(&graph()).unwrap();
+        let message = &mut snapshot.messages[0];
+        message.message_id = Some("source-message".into());
+        message.model_slug = Some("source-model".into());
+        message.author_name = Some("historical-tool".into());
+        message.recipient = Some("historical-destination".into());
+        let node = message.node_id.clone();
+        let portable = snapshot.import_snapshot(snapshot.revision_id().unwrap());
+        let wire = serde_json::to_value(&portable).unwrap();
+        let decoded: bcode_session_import::ImportableHistorySnapshot =
+            serde_json::from_value(wire.clone()).unwrap();
+        assert_eq!(decoded, portable);
+        let metadata = &decoded.message_metadata[&node];
+        assert_eq!(metadata.message_id.as_deref(), Some("source-message"));
+        assert_eq!(metadata.model.as_deref(), Some("source-model"));
+        assert_eq!(metadata.author.as_deref(), Some("historical-tool"));
+        assert_eq!(
+            metadata.recipient.as_deref(),
+            Some("historical-destination")
+        );
+        assert_eq!(metadata.role, snapshot.messages[0].role);
+        assert_eq!(metadata.content_type, snapshot.messages[0].content_type);
+        let mut old_wire = wire;
+        old_wire.as_object_mut().unwrap().remove("message_metadata");
+        let old: bcode_session_import::ImportableHistorySnapshot =
+            serde_json::from_value(old_wire).unwrap();
+        assert!(old.message_metadata.is_empty());
+        assert_eq!(old.events, portable.events);
     }
 
     #[test]
@@ -463,6 +641,94 @@ mod tests {
         let mut ignored = wire;
         ignored["irrelevant_transport_metadata"] = json!("not persisted");
         assert_eq!(original, decode(&ignored).unwrap().revision_id().unwrap());
+    }
+
+    #[test]
+    fn unrepresentable_timestamps_surface_fidelity_loss_before_import() {
+        for timestamp in [
+            serde_json::json!(1e30),
+            serde_json::json!(-1),
+            serde_json::json!("unknown"),
+        ] {
+            let mut source = graph();
+            source["mapping"]["answer"]["message"]["create_time"] = timestamp;
+            let snapshot = decode(&source).unwrap();
+            assert!(
+                snapshot
+                    .warnings
+                    .contains(&HistoryFidelityWarning::InvalidTimestamp)
+            );
+            assert!(snapshot.messages.last().unwrap().created_at.is_none());
+            assert!(
+                snapshot
+                    .import_events()
+                    .last()
+                    .unwrap()
+                    .timestamp_ms
+                    .is_none()
+            );
+        }
+        let mut source = graph();
+        source["mapping"]["answer"]["message"]["create_time"] = json!(1.25);
+        let snapshot = decode(&source).unwrap();
+        assert!(
+            !snapshot
+                .warnings
+                .contains(&HistoryFidelityWarning::InvalidTimestamp)
+        );
+        assert_eq!(
+            snapshot.import_events().last().unwrap().timestamp_ms,
+            Some(1250)
+        );
+    }
+
+    #[test]
+    fn duplicate_graph_keys_never_silently_replace_source_nodes() {
+        // Raw JSON is intentional: constructing a Value would already discard duplicates.
+        let bytes = br#"{"conversation_id":"api-id","current_node":"node","mapping":{
+            "node":{"id":"node","parent":null,"message":null},
+            "node":{"id":"node","parent":null,"message":null}
+        }}"#;
+        assert_eq!(
+            decode_history(bytes, "api-id", 65536),
+            Err(HistoryDecodeError::InvalidSchema)
+        );
+        assert_eq!(
+            decode_history_branch(bytes, "api-id", 65536, Some("node")),
+            Err(HistoryDecodeError::InvalidSchema)
+        );
+    }
+
+    #[test]
+    fn selected_in_progress_messages_never_form_complete_snapshots() {
+        let mut source = graph();
+        source["mapping"]["answer"]["message"]["status"] = json!("in_progress");
+        assert_eq!(decode(&source), Err(HistoryDecodeError::Incomplete));
+        let bytes = serde_json::to_vec(&source).unwrap();
+        // An unrelated branch may still be imported without mixing partial output.
+        let alternative =
+            decode_history_branch(&bytes, "api-id", 65536, Some("alternative")).unwrap();
+        assert_eq!(alternative.messages.last().unwrap().text, "other answer");
+        source["mapping"]["answer"]["message"]["status"] = json!("finished_successfully");
+        assert!(decode(&source).is_ok());
+    }
+
+    #[test]
+    fn unknown_or_malformed_message_status_never_implies_completion() {
+        for status in [
+            json!("future_status"),
+            json!(""),
+            json!(null),
+            json!(false),
+            json!(42),
+            json!({}),
+        ] {
+            let mut source = graph();
+            source["mapping"]["answer"]["message"]["status"] = status;
+            assert_eq!(decode(&source), Err(HistoryDecodeError::InvalidSchema));
+        }
+        // Older payloads without lifecycle metadata retain their existing interpretation.
+        assert!(decode(&graph()).is_ok());
     }
 
     #[test]
@@ -568,7 +834,10 @@ mod tests {
         let mut value = graph();
         value["mapping"]["answer"]["message"]["content"] = json!({"content_type":"multimodal_text", "parts":["caption", {"asset_pointer":"secret-url"}]});
         let result = decode(&value).unwrap();
-        assert_eq!(result.messages[1].text, "caption");
+        assert_eq!(
+            result.messages[1].text,
+            "caption\n[Historical non-text content not imported; no local backup]"
+        );
         assert!(
             result
                 .warnings

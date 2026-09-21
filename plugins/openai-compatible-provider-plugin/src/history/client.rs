@@ -15,8 +15,10 @@ pub enum HistoryAccessError {
     Cancelled,
     /// Caller supplied an invalid identifier, page size, or response budget.
     InvalidRequest,
-    /// Credentials need provider-owned refresh or reconnect.
+    /// Credentials are missing, invalid, or require reconnect.
     AuthenticationRequired,
+    /// Expiring credentials have a refresh token; owning custody must refresh first.
+    RefreshRequired,
     /// Authenticated access was denied.
     AccessDenied,
     /// A browser/access challenge prevents automated retrieval.
@@ -36,7 +38,7 @@ pub enum HistoryAccessError {
 }
 
 /// One remote conversation summary; identity is still scoped to the caller's account.
-#[derive(Debug, Deserialize)]
+#[derive(Deserialize)]
 pub struct HistorySummary {
     /// Remote API conversation ID, not a website URL conversion.
     pub id: String,
@@ -44,6 +46,16 @@ pub struct HistorySummary {
     pub title: Option<String>,
     /// Upstream timestamp; not a reliable exclusive incremental cursor.
     pub update_time: Option<f64>,
+}
+
+impl std::fmt::Debug for HistorySummary {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("HistorySummary")
+            .field("id", &"[redacted]")
+            .field("title", &self.title.as_ref().map(|_| "[redacted]"))
+            .finish_non_exhaustive()
+    }
 }
 
 /// A bounded summary page. A short page is not proof that every scope was enumerated.
@@ -109,7 +121,9 @@ impl HistoryClient {
                 .map_err(|_| HistoryAccessError::InvalidRequest)?
                 .as_secs();
             let (token, account) = history_credentials(auth, now)?;
-            self.list(token, account, offset, limit, archived).await
+            self.list(token, account, offset, limit, archived)
+                .await
+                .map_err(|error| auth_access_error(auth, error))
         })
         .await
     }
@@ -153,13 +167,36 @@ impl HistoryClient {
         id: &str,
         cancellation: &bcode_plugin_sdk::ServiceCancellation,
     ) -> Result<HistorySnapshot, HistoryAccessError> {
+        self.conversation_branch_for_auth(auth, id, None, cancellation)
+            .await
+    }
+
+    /// Retrieve one explicit branch without modifying upstream selection.
+    ///
+    /// # Errors
+    /// Returns authentication/access/graph errors, including an absent requested node.
+    pub async fn conversation_branch_for_auth(
+        &self,
+        auth: &bcode_model::ProviderAuthContext,
+        id: &str,
+        selected_node: Option<&str>,
+        cancellation: &bcode_plugin_sdk::ServiceCancellation,
+    ) -> Result<HistorySnapshot, HistoryAccessError> {
         cancellable(cancellation, async {
             let now = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .map_err(|_| HistoryAccessError::InvalidRequest)?
                 .as_secs();
             let (token, account) = history_credentials(auth, now)?;
-            self.conversation(token, account, id).await
+            if !valid_id(id) {
+                return Err(HistoryAccessError::InvalidRequest);
+            }
+            let bytes = self
+                .get(token, account, &format!("conversation/{id}"))
+                .await
+                .map_err(|error| auth_access_error(auth, error))?;
+            super::decode_history_branch(&bytes, id, self.max_response_bytes, selected_node)
+                .map_err(HistoryAccessError::Decode)
         })
         .await
     }
@@ -232,6 +269,25 @@ async fn cancellable<T>(
     }
 }
 
+// A rejected access token can need refresh even when its recorded expiry is in
+// the future. Only the owning coordinator may rotate credentials; this client
+// neither retries nor turns denied/challenged requests into refresh attempts.
+fn auth_access_error(
+    auth: &bcode_model::ProviderAuthContext,
+    error: HistoryAccessError,
+) -> HistoryAccessError {
+    if error == HistoryAccessError::AuthenticationRequired
+        && auth
+            .credentials
+            .get("refresh_token")
+            .is_some_and(|token| !token.value.trim().is_empty())
+    {
+        HistoryAccessError::RefreshRequired
+    } else {
+        error
+    }
+}
+
 fn history_credentials(
     auth: &bcode_model::ProviderAuthContext,
     now: u64,
@@ -250,7 +306,17 @@ fn history_credentials(
             .parse::<u64>()
             .map_err(|_| HistoryAccessError::AuthenticationRequired)?;
         if expiry <= now.saturating_add(60) {
-            return Err(HistoryAccessError::AuthenticationRequired);
+            return Err(
+                if auth
+                    .credentials
+                    .get("refresh_token")
+                    .is_some_and(|token| !token.value.trim().is_empty())
+                {
+                    HistoryAccessError::RefreshRequired
+                } else {
+                    HistoryAccessError::AuthenticationRequired
+                },
+            );
         }
     }
     let credential = |name| {
@@ -330,11 +396,19 @@ async fn read_response(
         .headers()
         .get("cf-mitigated")
         .is_some_and(|v| v == "challenge");
-    let retry = response
-        .headers()
-        .get("retry-after")
-        .and_then(|v| v.to_str().ok())
-        .and_then(|v| v.parse().ok());
+    let retry_headers = ["retry-after", "retry-after-ms"]
+        .into_iter()
+        .filter_map(|name| {
+            response
+                .headers()
+                .get(name)
+                .and_then(|value| value.to_str().ok())
+                .map(|value| (name.to_owned(), value.to_owned()))
+        })
+        .collect();
+    let retry = bcode_model_provider_runtime::retry_hint_from_headers(&retry_headers)
+        .and_then(|hint| hint.retry_after_ms)
+        .map(|milliseconds| milliseconds.div_ceil(1_000));
     classify(response.status(), challenge, retry)?;
     if !response
         .headers()
@@ -372,6 +446,30 @@ async fn read_response(
 mod tests {
     use super::*;
 
+    #[test]
+    fn page_diagnostics_redact_source_identity_and_content() {
+        let page = decode_page(
+            br#"{"items":[{"id":"private-conversation-id","title":"private conversation title","update_time":123456789.0}]}"#,
+            0,
+            10,
+        )
+        .unwrap();
+        let diagnostic = format!("{page:?}");
+        for private in [
+            "private-conversation-id",
+            "private conversation title",
+            "123456789",
+        ] {
+            assert!(!diagnostic.contains(private));
+        }
+        assert_eq!(page.items[0].id, "private-conversation-id");
+        assert_eq!(
+            page.items[0].title.as_deref(),
+            Some("private conversation title")
+        );
+        assert_eq!(page.items[0].update_time, Some(123_456_789.0));
+    }
+
     async fn mock_response(headers: &str, body: &[u8]) -> Response {
         use std::io::{Read, Write};
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
@@ -401,6 +499,28 @@ mod tests {
             .unwrap();
         worker.join().unwrap();
         response
+    }
+
+    #[tokio::test]
+    async fn rate_limit_response_preserves_provider_retry_timing() {
+        for (header, expected) in [
+            ("Retry-After: 120", Some(120)),
+            ("Retry-After-Ms: 1001", Some(2)),
+            ("Retry-After: Wed, 21 Oct 2015 07:28:00 GMT", Some(0)),
+            ("Retry-After: invalid", None),
+        ] {
+            let response = mock_response(
+                &format!("HTTP/1.1 429 Too Many Requests\r\n{header}\r\nContent-Length: 0\r\n\r\n"),
+                b"",
+            )
+            .await;
+            assert_eq!(
+                read_response(response, 1024).await,
+                Err(HistoryAccessError::RateLimited {
+                    retry_after_seconds: expected,
+                })
+            );
+        }
     }
 
     #[tokio::test]
@@ -600,6 +720,22 @@ mod tests {
             history_credentials(&auth, 940),
             Err(HistoryAccessError::AuthenticationRequired)
         );
+        auth.credentials.insert(
+            "refresh_token".into(),
+            bcode_model::ProviderAuthCredential {
+                value: "synthetic-refresh".into(),
+                source: None,
+            },
+        );
+        assert_eq!(
+            history_credentials(&auth, 940),
+            Err(HistoryAccessError::RefreshRequired)
+        );
+        auth.credentials.get_mut("refresh_token").unwrap().value = " ".into();
+        assert_eq!(
+            history_credentials(&auth, 940),
+            Err(HistoryAccessError::AuthenticationRequired)
+        );
         auth.profile = None;
         assert!(history_credentials(&auth, 1).is_err());
         auth.profile = Some("selected".to_owned());
@@ -608,6 +744,39 @@ mod tests {
         auth.scheme = Some("chatgpt".to_owned());
         auth.credentials.remove("account_id");
         assert!(history_credentials(&auth, 1).is_err());
+    }
+
+    #[test]
+    fn rejected_access_tokens_request_refresh_only_when_available() {
+        let mut auth = bcode_model::ProviderAuthContext::default();
+        for value in ["", " ", "synthetic-refresh"] {
+            auth.credentials.insert(
+                "refresh_token".into(),
+                bcode_model::ProviderAuthCredential {
+                    value: value.into(),
+                    source: None,
+                },
+            );
+            assert_eq!(
+                auth_access_error(&auth, HistoryAccessError::AuthenticationRequired),
+                if value.trim().is_empty() {
+                    HistoryAccessError::AuthenticationRequired
+                } else {
+                    HistoryAccessError::RefreshRequired
+                }
+            );
+            for error in [
+                HistoryAccessError::AccessDenied,
+                HistoryAccessError::AccessChallenge,
+                HistoryAccessError::Cancelled,
+                HistoryAccessError::Transient,
+                HistoryAccessError::RateLimited {
+                    retry_after_seconds: Some(30),
+                },
+            ] {
+                assert_eq!(auth_access_error(&auth, error), error);
+            }
+        }
     }
 
     #[test]

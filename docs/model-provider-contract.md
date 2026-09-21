@@ -39,6 +39,67 @@ JSON, unavailable routing, or an unsupported operation. A model/provider failure
 `start_turn` succeeds is represented by normalized `ProviderTurnEvent::Error` followed by
 `TurnFinished(Error)`, not by making later polls fail with an opaque service error.
 
+## Optional remote history retrieval
+
+Imported history snapshots may include `message_metadata`, keyed by external event
+node identity, preserving source message ID, model, role, author, recipient and
+content-type labels. These are historical untrusted data, never local routing or
+instruction authority. Missing metadata defaults to an empty map for older v1
+payloads. Canonical publication must preserve these labels rather than infer them
+from rendered text.
+
+`history_refresh_required` means credentials are expiring and a nonblank refresh
+token is available. It is not a reconnect instruction or permission to retry the
+same credentials. The caller must coordinate provider-owned refresh and durable
+host custody before retrying. `history_auth_required` means credentials are
+missing/invalid or reconnect is needed; an upstream unauthorized response does
+not by itself prove that refresh can succeed. Neither error contains credentials
+or remote response bodies. History retrieval itself does not rotate credentials.
+
+`history_capabilities` accepts `HistoryCapabilitiesRequest` and returns
+`HistoryCapabilities` (schema version 1). This optional operation requires no
+credentials, credential resolution, or network access. It reports adapter auth
+schemes and separate ordinary/archive/project scope coverage. Unsupported
+operations and unknown versions must not be interpreted as support. Static
+capabilities do not establish account authorization, verified identity, or sync
+completion. The OpenAI adapter reports ordinary and archived coverage as
+unverified and project coverage as unsupported until evidence supports stronger
+claims.
+
+`list_history_page` accepts `bcode_model::history::ListHistoryPageRequest` and
+returns `ListHistoryPageResponse`. It applies the same version, explicit-profile,
+and cancellation rules. Entries are metadata-only, not imported/searchable
+content. Offsets require overlap and reconciliation; a short page does not prove
+complete ordinary/archive/project coverage. No lifetime history limit is implied
+by the per-request page budget.
+
+`load_history_snapshot` accepts `bcode_model::history::LoadHistorySnapshotRequest`
+and returns `bcode_session_import::ImportableHistorySnapshot`. This optional
+operation is independent of generation turns and the one-shot import v1 interface.
+Providers without history support return `unsupported_operation`.
+
+Request schema version 1 accepts optional `selected_node` for an explicit source
+graph leaf. Omission retains the upstream selection; missing requested nodes fail
+without fallback. This is local branch selection, never an upstream mutation.
+
+Request schema version 1 requires one explicitly resolved profile with no pool or
+fallback candidates. Unsupported versions fail before network access. Retrieval
+honors service cancellation and returns a complete bounded selected-branch
+snapshot or an error, never a truncated successful snapshot. Source IDs remain
+opaque; API and website identities must not be inferred from each other.
+Credentials are request-only and must not accompany persisted imported content.
+The response is not proof of verified remote scope or canonical publication;
+callers must establish account identity and use the owning session boundary.
+
+The current adapter returns safe `history_*` service errors for retrieval failures.
+A `history_rate_limited` error may carry a JSON
+`bcode_model::history::HistoryRateLimitDetails` payload (version 1), preserving
+`retry_after_seconds` without parsing error messages. The service error remains
+authoritative; its payload must never be interpreted as successful content.
+Missing delay or unsupported metadata version requires normal scheduler backoff,
+not an assumption of zero delay. Older consumers may ignore this additive payload.
+Host coordination and automatic synchronization are not yet connected.
+
 ## Required operations
 
 Every provider implements these operations:

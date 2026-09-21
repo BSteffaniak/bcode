@@ -1363,7 +1363,23 @@ impl OpenAiCompatibleProviderPlugin {
         }
 
         match context.request.operation.as_str() {
-            "load_history_snapshot" => {
+            bcode_model::history::OP_HISTORY_CAPABILITIES => {
+                history::service::capabilities(context)
+            }
+            bcode_model::history::OP_LIST_HISTORY_PAGE => {
+                let Ok(runtime) = &self.runtime else {
+                    return ServiceResponse::error(
+                        "history_runtime_unavailable",
+                        "history runtime unavailable",
+                    );
+                };
+                runtime
+                    .block_on(history::service::list(context.clone()))
+                    .unwrap_or_else(|_| {
+                        ServiceResponse::error("history_runtime_failed", "history runtime failed")
+                    })
+            }
+            bcode_model::history::OP_LOAD_HISTORY_SNAPSHOT => {
                 let Ok(runtime) = &self.runtime else {
                     return ServiceResponse::error(
                         "history_runtime_unavailable",
@@ -1590,8 +1606,13 @@ impl OpenAiCompatibleProviderPlugin {
         let refresh = match &self.runtime {
             Ok(runtime) => {
                 let mut refresh_settings = settings.clone();
+                let cancellation = context.cancellation.clone();
                 runtime.block_on(async move {
-                    let refreshed = refresh_chatgpt_auth_if_needed(&mut refresh_settings).await?;
+                    let refreshed = cancellable_auth_refresh(
+                        &cancellation,
+                        refresh_chatgpt_auth_if_needed(&mut refresh_settings),
+                    )
+                    .await?;
                     Ok::<_, ProviderError>((refresh_settings, refreshed))
                 })
             }
@@ -1631,6 +1652,9 @@ impl OpenAiCompatibleProviderPlugin {
             Ok(Ok((_, None))) => {}
             Ok(Err(error)) => return ServiceResponse::error(error.code, error.message),
             Err(error) => return ServiceResponse::error("runtime_error", error.to_string()),
+        }
+        if context.cancellation.is_cancelled() {
+            return ServiceResponse::error("token_refresh_cancelled", "turn startup was cancelled");
         }
         let mut state = self
             .state
@@ -8259,13 +8283,51 @@ fn apply_settings_auth_to_context(settings: &Settings, context: &mut ProviderReq
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 struct RefreshedChatGptAuth {
     access_token: String,
     refresh_token: String,
     expires_at: u64,
     id_token: Option<String>,
     account_id: Option<String>,
+}
+
+impl std::fmt::Debug for RefreshedChatGptAuth {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("RefreshedChatGptAuth")
+            .finish_non_exhaustive()
+    }
+}
+
+async fn cancellable_auth_refresh<T>(
+    cancellation: &bcode_plugin_sdk::ServiceCancellation,
+    operation: impl std::future::Future<Output = Result<T, ProviderError>>,
+) -> Result<T, ProviderError> {
+    let cancelled = || {
+        provider_error(
+            "token_refresh_cancelled",
+            ProviderErrorCategory::Cancelled,
+            "credential refresh was cancelled",
+        )
+    };
+    if cancellation.is_cancelled() {
+        return Err(cancelled());
+    }
+    tokio::pin!(operation);
+    loop {
+        tokio::select! {
+            // Once rotation completes, the caller must persist its result even
+            // if cancellation arrives concurrently. Never discard rotated tokens.
+            biased;
+            result = &mut operation => return result,
+            () = tokio::time::sleep(std::time::Duration::from_millis(25)) => {
+                if cancellation.is_cancelled() {
+                    return Err(cancelled());
+                }
+            }
+        }
+    }
 }
 
 async fn refresh_chatgpt_auth_if_needed(
@@ -8318,8 +8380,7 @@ async fn refresh_chatgpt_auth_if_needed_at(
         .refresh_token
         .clone()
         .unwrap_or_else(|| refresh_token.to_owned());
-    let next_expires_at =
-        unix_timestamp() + refreshed.expires_in.unwrap_or(3600).saturating_sub(60);
+    let next_expires_at = refreshed_token_expiry(unix_timestamp(), refreshed.expires_in)?;
     let account_id = refreshed
         .id_token
         .as_deref()
@@ -8340,6 +8401,16 @@ async fn refresh_chatgpt_auth_if_needed_at(
         profile: profile.clone(),
     };
     Ok(Some(update))
+}
+
+fn refreshed_token_expiry(now: u64, expires_in: Option<u64>) -> Result<u64, ProviderError> {
+    now.checked_add(expires_in.unwrap_or(3600)).ok_or_else(|| {
+        provider_error(
+            "token_refresh_decode_failed",
+            ProviderErrorCategory::ProviderInternal,
+            "credential refresh returned an invalid expiration",
+        )
+    })
 }
 
 fn persist_refreshed_chatgpt_auth(
@@ -8450,7 +8521,7 @@ fn credential_update_result(
         ServiceBridgeResponse::Service(bcode_tool::ToolInvocationServiceResolution::Cancelled) => {
             Err(provider_error(
                 "token_refresh_persist_cancelled",
-                ProviderErrorCategory::Auth,
+                ProviderErrorCategory::Cancelled,
                 "host credential update was cancelled",
             ))
         }
@@ -8462,6 +8533,8 @@ fn credential_update_result(
     }
 }
 
+const MAX_TOKEN_RESPONSE_BYTES: usize = 64 * 1024;
+
 async fn refresh_openai_codex_token_at(
     token_url: &str,
     refresh_token: &str,
@@ -8471,7 +8544,11 @@ async fn refresh_openai_codex_token_at(
         ("client_id", OPENAI_CODEX_CLIENT_ID),
         ("refresh_token", refresh_token),
     ];
-    let response = Client::new()
+    let mut response = Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .timeout(std::time::Duration::from_secs(30))
+        .build()
+        .map_err(|error| reqwest_provider_error("token_refresh_failed", &error))?
         .post(token_url)
         .form(&params)
         .send()
@@ -8479,24 +8556,116 @@ async fn refresh_openai_codex_token_at(
         .map_err(|error| reqwest_provider_error("token_refresh_failed", &error))?;
     let status = response.status();
     let headers = response.headers().clone();
-    let body = response
-        .text()
-        .await
-        .map_err(|error| reqwest_provider_error("token_refresh_response_failed", &error))?;
-    if !status.is_success() {
-        return Err(error_from_status_and_headers(
-            status.as_u16(),
-            Some(&headers),
-            &body,
-        ));
-    }
-    serde_json::from_str(&body).map_err(|error| {
+    let incompatible = || {
         provider_error(
             "token_refresh_decode_failed",
             ProviderErrorCategory::ProviderInternal,
-            error.to_string(),
+            "credential refresh returned an incompatible response",
         )
-    })
+    };
+    if status.is_redirection()
+        || response
+            .content_length()
+            .is_some_and(|length| length > MAX_TOKEN_RESPONSE_BYTES as u64)
+    {
+        return Err(incompatible());
+    }
+    let mut bytes = Vec::new();
+    while let Some(chunk) = response
+        .chunk()
+        .await
+        .map_err(|error| reqwest_provider_error("token_refresh_response_failed", &error))?
+    {
+        if chunk.len() > MAX_TOKEN_RESPONSE_BYTES.saturating_sub(bytes.len()) {
+            return Err(incompatible());
+        }
+        bytes.extend_from_slice(&chunk);
+    }
+    let body = String::from_utf8(bytes).map_err(|_| incompatible())?;
+    if !status.is_success() {
+        return Err(refresh_error_from_response(
+            status.as_u16(),
+            &headers,
+            &body,
+        ));
+    }
+    decode_refreshed_token_response(&body)
+}
+
+fn refresh_error_from_response(status: u16, headers: &HeaderMap, body: &str) -> ProviderError {
+    let invalid_grant = serde_json::from_str::<serde_json::Value>(body)
+        .ok()
+        .and_then(|value| {
+            value
+                .get("error")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_owned)
+        })
+        .is_some_and(|code| code == "invalid_grant");
+    let (code, category, message) = match status {
+        400 if invalid_grant => (
+            "token_refresh_requires_reconnect",
+            ProviderErrorCategory::Auth,
+            "ChatGPT refresh credentials are no longer valid; reconnect this auth profile",
+        ),
+        401 => (
+            "token_refresh_requires_reconnect",
+            ProviderErrorCategory::Auth,
+            "ChatGPT refresh authentication failed; reconnect this auth profile",
+        ),
+        403 => (
+            "token_refresh_access_denied",
+            ProviderErrorCategory::Auth,
+            "credential refresh access was denied",
+        ),
+        429 => (
+            "token_refresh_rate_limited",
+            ProviderErrorCategory::RateLimit,
+            "credential refresh was rate limited; retry later",
+        ),
+        500..=599 => (
+            "token_refresh_transient",
+            ProviderErrorCategory::Overloaded,
+            "credential refresh service is temporarily unavailable",
+        ),
+        _ => (
+            "token_refresh_failed",
+            ProviderErrorCategory::ProviderInternal,
+            "credential refresh request failed",
+        ),
+    };
+    let mut error = provider_error(code, category, message);
+    if matches!(
+        category,
+        ProviderErrorCategory::RateLimit | ProviderErrorCategory::Overloaded
+    ) {
+        error.retry = retry_hint_from_response(Some(headers), "").map(Box::new);
+    }
+    error
+}
+
+fn decode_refreshed_token_response(body: &str) -> Result<OpenAiOauthTokenResponse, ProviderError> {
+    let response: OpenAiOauthTokenResponse = serde_json::from_str(body).map_err(|_| {
+        provider_error(
+            "token_refresh_decode_failed",
+            ProviderErrorCategory::ProviderInternal,
+            "credential refresh returned an incompatible response",
+        )
+    })?;
+    if response.access_token.trim().is_empty()
+        || response
+            .refresh_token
+            .as_ref()
+            .is_some_and(|token| token.trim().is_empty())
+        || response.expires_in == Some(0)
+    {
+        return Err(provider_error(
+            "token_refresh_decode_failed",
+            ProviderErrorCategory::ProviderInternal,
+            "credential refresh returned unusable credentials",
+        ));
+    }
+    Ok(response)
 }
 
 fn chatgpt_account_id_from_access_token(token: &str) -> Option<String> {
@@ -8510,14 +8679,8 @@ fn chatgpt_account_id_from_access_token(token: &str) -> Option<String> {
                 .get("https://api.openai.com/auth")
                 .and_then(|auth| auth.get("chatgpt_account_id"))
         })
-        .or_else(|| {
-            claims
-                .get("organizations")
-                .and_then(serde_json::Value::as_array)
-                .and_then(|organizations| organizations.first())
-                .and_then(|organization| organization.get("id"))
-        })
         .and_then(serde_json::Value::as_str)
+        .filter(|account| !account.trim().is_empty())
         .map(ToString::to_string)
 }
 
@@ -10032,6 +10195,190 @@ mod tests {
         )
         .expect_err("cancelled");
         assert_eq!(cancelled.code, "token_refresh_persist_cancelled");
+        assert_eq!(cancelled.category, ProviderErrorCategory::Cancelled);
+        assert!(cancelled.retry.is_none());
+    }
+
+    #[tokio::test]
+    async fn auth_refresh_cancellation_prevents_dispatch_and_interrupts_pending_work() {
+        let cancellation = bcode_plugin_sdk::ServiceCancellation::default();
+        cancellation.cancel();
+        let dispatched = std::sync::atomic::AtomicBool::new(false);
+        let result = cancellable_auth_refresh(&cancellation, async {
+            dispatched.store(true, Ordering::SeqCst);
+            Ok::<(), ProviderError>(())
+        })
+        .await
+        .unwrap_err();
+        assert!(!dispatched.load(Ordering::SeqCst));
+        assert_eq!(result.category, ProviderErrorCategory::Cancelled);
+
+        let cancellation = bcode_plugin_sdk::ServiceCancellation::default();
+        let cancel = async {
+            tokio::task::yield_now().await;
+            cancellation.cancel();
+        };
+        let refresh = cancellable_auth_refresh(
+            &cancellation,
+            std::future::pending::<Result<(), ProviderError>>(),
+        );
+        let (result, ()) = tokio::join!(
+            tokio::time::timeout(std::time::Duration::from_secs(1), refresh),
+            cancel
+        );
+        let error = result.expect("bounded cancellation").unwrap_err();
+        assert_eq!(error.category, ProviderErrorCategory::Cancelled);
+        assert!(error.retry.is_none());
+    }
+
+    #[tokio::test]
+    async fn auth_refresh_preserves_completed_rotation_despite_concurrent_cancellation() {
+        let cancellation = bcode_plugin_sdk::ServiceCancellation::default();
+        let result = cancellable_auth_refresh(&cancellation, async {
+            cancellation.cancel();
+            Ok::<_, ProviderError>("rotated credential awaiting custody")
+        })
+        .await
+        .unwrap();
+        assert_eq!(result, "rotated credential awaiting custody");
+    }
+
+    #[test]
+    fn chatgpt_account_claim_never_substitutes_an_organization_identity() {
+        for (claims, expected) in [
+            (
+                serde_json::json!({"organizations": [{"id": "organization"}]}),
+                None,
+            ),
+            (serde_json::json!({"chatgpt_account_id": " "}), None),
+            (
+                serde_json::json!({"chatgpt_account_id": "account"}),
+                Some("account"),
+            ),
+            (
+                serde_json::json!({"https://api.openai.com/auth": {"chatgpt_account_id": "account"}}),
+                Some("account"),
+            ),
+        ] {
+            let token = format!(
+                "header.{}.signature",
+                URL_SAFE_NO_PAD.encode(serde_json::to_vec(&claims).unwrap())
+            );
+            assert_eq!(
+                chatgpt_account_id_from_access_token(&token).as_deref(),
+                expected
+            );
+        }
+    }
+
+    #[test]
+    fn refreshed_token_expiry_preserves_lifetime_and_rejects_overflow() {
+        assert_eq!(refreshed_token_expiry(1000, Some(3600)).unwrap(), 4600);
+        assert_eq!(refreshed_token_expiry(1000, Some(30)).unwrap(), 1030);
+        assert_eq!(refreshed_token_expiry(1000, None).unwrap(), 4600);
+        assert_eq!(
+            refreshed_token_expiry(1000, Some(u64::MAX))
+                .unwrap_err()
+                .code,
+            "token_refresh_decode_failed"
+        );
+        assert!(refreshed_token_expiry(u64::MAX, None).is_err());
+    }
+
+    #[test]
+    fn refresh_failures_are_actionable_without_remote_diagnostics() {
+        let mut headers = HeaderMap::new();
+        headers.insert("retry-after", "7".parse().unwrap());
+        for (status, body, code) in [
+            (
+                400,
+                r#"{"error":"invalid_grant","error_description":"private-marker"}"#,
+                "token_refresh_requires_reconnect",
+            ),
+            (401, "private-marker", "token_refresh_requires_reconnect"),
+            (403, "private-marker", "token_refresh_access_denied"),
+            (429, "private-marker", "token_refresh_rate_limited"),
+            (503, "private-marker", "token_refresh_transient"),
+            (400, r#"{"error":"private-marker"}"#, "token_refresh_failed"),
+        ] {
+            let error = refresh_error_from_response(status, &headers, body);
+            assert_eq!(error.code, code);
+            assert!(!format!("{error:?}").contains("private-marker"));
+            assert!(error.provider_message.is_none());
+            if matches!(status, 429 | 503) {
+                assert_eq!(
+                    error.retry.as_ref().and_then(|hint| hint.retry_after_ms),
+                    Some(7000)
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn refresh_transport_rejects_redirects_and_oversized_responses() {
+        let oversized: &'static str = Box::leak("x".repeat(65 * 1024).into_boxed_str());
+        for (status, body) in [("302 Found", "private-marker"), ("200 OK", oversized)] {
+            let server = AuthMockServer::start(vec![(status, body)]);
+            let endpoint = server.endpoint("/token");
+            let runtime = ProviderRuntime::new().expect("runtime");
+            let error = runtime
+                .block_on(
+                    async move { refresh_openai_codex_token_at(&endpoint, "refresh-token").await },
+                )
+                .expect("runtime")
+                .unwrap_err();
+            server.finish();
+            assert_eq!(error.code, "token_refresh_decode_failed");
+            assert!(!error.message.contains("private-marker"));
+            assert!(!error.message.contains("refresh-token"));
+        }
+    }
+
+    #[test]
+    fn refresh_response_rejects_unusable_credentials_without_exposing_body() {
+        for body in [
+            r#"{"access_token":""}"#,
+            r#"{"access_token":"  "}"#,
+            r#"{"access_token":"private-marker","refresh_token":" "}"#,
+            r#"{"access_token":"private-marker","expires_in":0}"#,
+            r#"{"access_token":"private-marker","expires_in":"private-marker"}"#,
+            r#"{"error":"private-marker"}"#,
+        ] {
+            let error = decode_refreshed_token_response(body).unwrap_err();
+            assert_eq!(error.code, "token_refresh_decode_failed");
+            assert!(!error.message.contains("private-marker"));
+        }
+        let response = decode_refreshed_token_response(
+            r#"{"access_token":"access","refresh_token":"rotated","expires_in":3600}"#,
+        )
+        .unwrap();
+        assert_eq!(response.refresh_token.as_deref(), Some("rotated"));
+        let response = decode_refreshed_token_response(r#"{"access_token":"access"}"#).unwrap();
+        assert!(response.refresh_token.is_none());
+        assert!(response.expires_in.is_none());
+    }
+
+    #[test]
+    fn refreshed_credentials_debug_omits_tokens_and_identity() {
+        let credentials = RefreshedChatGptAuth {
+            access_token: "private-access-token".into(),
+            refresh_token: "private-refresh-token".into(),
+            expires_at: 123_456_789,
+            id_token: Some("private-id-token".into()),
+            account_id: Some("private-account".into()),
+        };
+        for diagnostic in [format!("{credentials:?}"), format!("{credentials:#?}")] {
+            for private in [
+                "private-access-token",
+                "private-refresh-token",
+                "private-id-token",
+                "private-account",
+                "123456789",
+            ] {
+                assert!(!diagnostic.contains(private));
+            }
+        }
+        assert_eq!(credentials.access_token, "private-access-token");
     }
 
     #[test]
@@ -10348,28 +10695,75 @@ mod tests {
     }
 
     #[test]
-    fn history_service_rejects_unknown_version_before_auth_or_network() {
+    fn history_capabilities_are_credential_free_and_do_not_overclaim_coverage() {
+        use bcode_model::history::{
+            HistoryCapabilities, HistoryCapabilitiesRequest, HistoryScopeSupport,
+            OP_HISTORY_CAPABILITIES,
+        };
         let mut invoker = OpenAiPluginInvoker::default();
-        let result: Result<serde_json::Value, String> = invoker.invoke_json(
+        let result: HistoryCapabilities = invoker
+            .invoke_json(
+                None,
+                OP_HISTORY_CAPABILITIES,
+                &HistoryCapabilitiesRequest { schema_version: 1 },
+            )
+            .unwrap();
+        assert_eq!(result.schema_version, 1);
+        assert_eq!(result.auth_schemes, ["chatgpt".to_owned()].into());
+        assert_eq!(result.ordinary, HistoryScopeSupport::Unverified);
+        assert_eq!(result.archived, HistoryScopeSupport::Unverified);
+        assert_eq!(result.projects, HistoryScopeSupport::Unsupported);
+        let result: Result<HistoryCapabilities, String> = invoker.invoke_json(
             None,
-            "load_history_snapshot",
-            &serde_json::json!({
-                "schema_version": 2,
-                "provider_context": {},
-                "conversation_id": "synthetic"
-            }),
+            OP_HISTORY_CAPABILITIES,
+            &HistoryCapabilitiesRequest { schema_version: 2 },
         );
         assert!(result.unwrap_err().contains("history_unsupported_version"));
-        let result: Result<serde_json::Value, String> = invoker.invoke_json(
-            None,
-            "load_history_snapshot",
-            &serde_json::json!({
-                "schema_version": 1,
-                "provider_context": {},
-                "conversation_id": "synthetic"
-            }),
-        );
-        assert!(result.unwrap_err().contains("history_auth_required"));
+    }
+
+    #[test]
+    fn history_page_service_rejects_version_and_missing_auth_before_network() {
+        let mut invoker = OpenAiPluginInvoker::default();
+        for (schema_version, expected) in [
+            (2, "history_unsupported_version"),
+            (1, "history_auth_required"),
+        ] {
+            let request = bcode_model::history::ListHistoryPageRequest {
+                schema_version,
+                provider_context: bcode_model::ProviderRequestContext::default(),
+                offset: 0,
+                limit: 20,
+                archived: false,
+            };
+            let result: Result<bcode_model::history::ListHistoryPageResponse, String> =
+                invoker.invoke_json(None, bcode_model::history::OP_LIST_HISTORY_PAGE, &request);
+            assert!(result.unwrap_err().contains(expected));
+        }
+    }
+
+    #[test]
+    fn history_service_rejects_unknown_version_before_auth_or_network() {
+        let mut invoker = OpenAiPluginInvoker::default();
+        for schema_version in [2, 1] {
+            let request = bcode_model::history::LoadHistorySnapshotRequest {
+                schema_version,
+                provider_context: bcode_model::ProviderRequestContext::default(),
+                conversation_id: "synthetic".into(),
+                selected_node: None,
+            };
+            let result: Result<bcode_session_import::ImportableHistorySnapshot, String> = invoker
+                .invoke_json(
+                    None,
+                    bcode_model::history::OP_LOAD_HISTORY_SNAPSHOT,
+                    &request,
+                );
+            let expected = if schema_version == 1 {
+                "history_auth_required"
+            } else {
+                "history_unsupported_version"
+            };
+            assert!(result.unwrap_err().contains(expected));
+        }
     }
 
     #[derive(Default)]
