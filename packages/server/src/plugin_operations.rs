@@ -276,6 +276,8 @@ pub async fn invoke_service(
     let authorized_session_id =
         super::command_invocation_session(&interface_id, &operation, &payload);
     let (bridge, bridge_requests) = super::server_plugin_bridge();
+    let activity_projection =
+        interface_id == bcode_session_models::ACTIVITY_PRESENTATION_INTERFACE_ID;
     let invocation = state.plugins.invoke_service_with_bridge_scoped(
         &plugin_id,
         interface_id,
@@ -284,14 +286,31 @@ pub async fn invoke_service(
         bcode_plugin::PluginInvocationScope::Global,
         Some(bridge),
     );
-    Box::pin(state.metrics.time_result_async(
+    let result = Box::pin(state.metrics.time_result_async(
         "plugin.service",
         labels,
         drive_service_bridge(state, authorized_session_id, bridge_requests, invocation),
     ))
     .await
     .map(project_service_response)
-    .map_err(|error| normalize_error(&error))
+    .map_err(|error| normalize_error(&error))?;
+    if activity_projection && result.error.is_none() {
+        validate_activity_response(&plugin_id, &result.payload)?;
+    }
+    Ok(result)
+}
+
+fn validate_activity_response(producer: &str, payload: &[u8]) -> Result<(), PublicPluginError> {
+    let invalid = || PublicPluginError {
+        code: "invalid_activity_presentation",
+        message: "activity producer returned an unsupported or invalid presentation",
+    };
+    if payload.len() > bcode_session_models::MAX_ACTIVITY_PRESENTATION_BYTES {
+        return Err(invalid());
+    }
+    let presentation: bcode_session_models::ActivityPresentation =
+        serde_json::from_slice(payload).map_err(|_| invalid())?;
+    presentation.validate(producer).map_err(|_| invalid())
 }
 
 async fn drive_service_bridge<T>(
@@ -390,6 +409,39 @@ mod tests {
                 Err(super::RouteInvocationInputError::TooLarge)
             );
         }
+    }
+
+    #[test]
+    fn activity_response_requires_selected_producer_and_supported_envelope() {
+        let mut view = bcode_session_models::ActivityPresentation {
+            version: bcode_session_models::ACTIVITY_PRESENTATION_VERSION,
+            producer: "example.plugin".into(),
+            activity_id: "activity:1".into(),
+            revision: 1,
+            schema: "unknown.schema".into(),
+            schema_version: 99,
+            fallback: "Readable fallback".into(),
+            payload: serde_json::json!({}),
+        };
+        let bytes = serde_json::to_vec(&view).unwrap();
+        assert!(super::validate_activity_response("example.plugin", &bytes).is_ok());
+        assert!(super::validate_activity_response("other.plugin", &bytes).is_err());
+        view.version = 99;
+        assert!(
+            super::validate_activity_response(
+                "example.plugin",
+                &serde_json::to_vec(&view).unwrap()
+            )
+            .is_err()
+        );
+        assert!(super::validate_activity_response("example.plugin", b"not json").is_err());
+        assert!(
+            super::validate_activity_response(
+                "example.plugin",
+                &vec![b' '; bcode_session_models::MAX_ACTIVITY_PRESENTATION_BYTES + 1]
+            )
+            .is_err()
+        );
     }
 
     #[test]
