@@ -598,6 +598,9 @@ while time.monotonic() < deadline:
             and viewport_check_frames >= 2
             and b"ready" in lower_screen
         ):
+            # Return to the live edge before testing streamed output. The detached
+            # viewport above deliberately stays on earlier user content.
+            os.write(fd, b"\x1b[1;5F")
             os.write(
                 fd,
                 b"\x1b[200~stream-text # ASSISTANTPREFIX report\n\n- first item\n- second item\n\n| Key | Value |\n| --- | --- |\n| A | B |\n\n```rust\nfn main() {}\n```\n\n<details><summary>More</summary>Detail body</details>\n\nFootnote ref[^1].\n\n[^1]: Footnote body.\n\nUnicode \xe6\x9d\xb1\xe4\xba\xac \xf0\x9f\xa7\xaa \xe2\x9c\x93\n\n![image alt](https://example.com/image.png)\n\n```mermaid\ngraph TD; A-->B;\n```\n\n[ASSISTANTSUFFIX](https://example.com)\x1b[201~\r",
