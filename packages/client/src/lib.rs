@@ -8296,6 +8296,105 @@ mod client_timeout_tests {
 
     #[cfg(unix)]
     #[tokio::test]
+    async fn catalog_watcher_delivers_queued_completion_and_closes_on_drop() {
+        let socket_dir =
+            std::path::PathBuf::from(format!("/tmp/bcw-{}", SessionOpenOperationId::new()));
+        std::fs::create_dir_all(&socket_dir).unwrap();
+        let endpoint = bcode_ipc::IpcEndpoint::unix_socket(socket_dir.join("catalog.sock"));
+        let listener = bcode_ipc::LocalIpcListener::bind(&endpoint).unwrap();
+        let server = tokio::spawn(async move {
+            let mut stream = listener.accept().await.unwrap();
+            let hello = bcode_ipc::recv_envelope(&mut stream).await.unwrap();
+            let response = bcode_ipc::Response::Ok(bcode_ipc::ResponsePayload::Hello {
+                protocol_version: bcode_ipc::ProtocolVersion(bcode_ipc::CURRENT_PROTOCOL_VERSION),
+                client_id: bcode_session_models::ClientId::new(),
+                daemon: matching_daemon_status(),
+            });
+            bcode_ipc::send_envelope(
+                &mut stream,
+                &bcode_ipc::response_envelope(hello.request_id, &response).unwrap(),
+            )
+            .await
+            .unwrap();
+            let subscription = bcode_ipc::recv_envelope(&mut stream).await.unwrap();
+            assert!(matches!(
+                bcode_ipc::decode_request(&subscription.payload).unwrap(),
+                bcode_ipc::Request::SubscribeCatalogUpdates
+            ));
+            bcode_ipc::send_envelope(
+                &mut stream,
+                &bcode_ipc::response_envelope(
+                    subscription.request_id,
+                    &bcode_ipc::Response::Ok(bcode_ipc::ResponsePayload::CatalogUpdatesSubscribed),
+                )
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+            for revision in [1, 3] {
+                let request = bcode_ipc::recv_envelope(&mut stream).await.unwrap();
+                assert!(matches!(
+                    bcode_ipc::decode_request(&request.payload).unwrap(),
+                    bcode_ipc::Request::ListSessions { .. }
+                ));
+                if revision == 1 {
+                    for queued in [1, 3] {
+                        bcode_ipc::send_envelope(
+                            &mut stream,
+                            &bcode_ipc::event_envelope(&bcode_ipc::Event::SessionCatalogUpdated {
+                                revision: queued,
+                            })
+                            .unwrap(),
+                        )
+                        .await
+                        .unwrap();
+                    }
+                }
+                let response = bcode_ipc::Response::Ok(bcode_ipc::ResponsePayload::SessionList {
+                    sessions: vec![],
+                    catalog_status: if revision == 1 {
+                        bcode_session_models::SessionCatalogStatus::Loading
+                    } else {
+                        bcode_session_models::SessionCatalogStatus::Loaded
+                    },
+                    catalog_sources: vec![],
+                    catalog_revision: revision,
+                });
+                bcode_ipc::send_envelope(
+                    &mut stream,
+                    &bcode_ipc::response_envelope(request.request_id, &response).unwrap(),
+                )
+                .await
+                .unwrap();
+            }
+            assert!(bcode_ipc::recv_envelope(&mut stream).await.is_err());
+        });
+        let client = BcodeClient::new(endpoint).with_request_timeout(Duration::from_secs(5));
+        let mut watcher = client.watch_session_catalog().await.unwrap();
+        assert_eq!(
+            watcher.initial_snapshot().await.unwrap().catalog_status,
+            bcode_session_models::SessionCatalogStatus::Loading
+        );
+        let completed = tokio::time::timeout(Duration::from_secs(5), watcher.next_snapshot())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(completed.catalog_revision, 3);
+        assert_eq!(
+            completed.catalog_status,
+            bcode_session_models::SessionCatalogStatus::Loaded
+        );
+        drop(watcher);
+        tokio::time::timeout(Duration::from_secs(5), server)
+            .await
+            .unwrap()
+            .unwrap();
+        std::fs::remove_file(socket_dir.join("catalog.sock")).unwrap();
+        std::fs::remove_dir(socket_dir).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
     async fn long_poll_transport_timeout_is_distinct_from_operation_failure() {
         let socket_dir =
             std::path::PathBuf::from(format!("/tmp/bct-{}", SessionOpenOperationId::new()));

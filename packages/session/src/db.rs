@@ -874,6 +874,46 @@ impl GlobalSessionDb {
             .collect()
     }
 
+    /// Read a bounded page of disposable catalog summaries in session-ID order.
+    ///
+    /// Pass the last returned ID as `after` to continue. Pages contain at most 256
+    /// rows; a zero limit returns no rows. These summaries confer no canonical
+    /// validity or ownership authority. Concurrent changes require reconciliation
+    /// by the caller; separate pages do not form a database snapshot.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the query or row conversion fails.
+    pub async fn list_sessions_page(
+        &self,
+        after: Option<SessionId>,
+        limit: usize,
+    ) -> SessionDbResult<Vec<SessionSummary>> {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        self.db
+            .select("sessions")
+            .columns(&[
+                "session_id",
+                "title",
+                "working_directory",
+                "created_at_ms",
+                "updated_at_ms",
+            ])
+            .where_gt(
+                "session_id",
+                after.map_or_else(String::new, |id| id.to_string()),
+            )
+            .sort("session_id", SortDirection::Asc)
+            .limit(limit.min(256))
+            .execute(&**self.db)
+            .await?
+            .iter()
+            .map(session_summary_from_catalog_row)
+            .collect()
+    }
+
     /// Return every authoritative draft-session composer row.
     ///
     /// # Errors
@@ -6006,6 +6046,57 @@ mod tests {
                 (name, bytes)
             })
             .collect()
+    }
+
+    #[tokio::test]
+    async fn catalog_pages_are_bounded_and_visit_equal_timestamp_rows_once() {
+        let root = tempfile::tempdir().unwrap();
+        let catalog = GlobalSessionDb::initialize_turso_in_root(root.path())
+            .await
+            .unwrap();
+        let mut expected = BTreeSet::new();
+        for _ in 0..259 {
+            let id = SessionId::new();
+            expected.insert(id);
+            catalog
+                .database()
+                .insert("sessions")
+                .value("session_id", id.to_string())
+                .value("db_path", "unused")
+                .value("title", "catalog only")
+                .value("working_directory", "/project")
+                .value("created_at_ms", 1_i64)
+                .value("updated_at_ms", 1_i64)
+                .value("state", "active")
+                .value("projection_status", "fresh")
+                .execute(catalog.database())
+                .await
+                .unwrap();
+        }
+        assert!(
+            catalog
+                .list_sessions_page(None, 0)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        let first = catalog.list_sessions_page(None, usize::MAX).await.unwrap();
+        assert_eq!(first.len(), 256);
+        let mut after = None;
+        let mut seen = BTreeSet::new();
+        loop {
+            let page = catalog.list_sessions_page(after, 17).await.unwrap();
+            assert!(page.len() <= 17);
+            if page.is_empty() {
+                break;
+            }
+            for row in &page {
+                assert!(seen.insert(row.id));
+            }
+            after = page.last().map(|row| row.id);
+        }
+        assert_eq!(seen, expected);
+        catalog.close().await.unwrap();
     }
 
     #[tokio::test]

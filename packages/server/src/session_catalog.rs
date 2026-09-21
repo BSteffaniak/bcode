@@ -22,12 +22,17 @@ pub struct SessionCatalog {
     revision_rx: watch::Receiver<u64>,
     notify: Notify,
     import_sources: Mutex<BTreeMap<String, Arc<OnceCell<Vec<String>>>>>,
+    #[cfg(test)]
+    discovery_gate: Mutex<Option<Arc<tokio::sync::Semaphore>>>,
 }
 
 #[derive(Debug, Default)]
 struct SessionCatalogInner {
     revision: u64,
     sources: BTreeMap<CatalogSourceKey, SourceCache>,
+    import_plans: BTreeMap<PathBuf, Option<Vec<CatalogSourcePlan>>>,
+    planning_generation: u64,
+    retry_import_plans: BTreeMap<PathBuf, std::time::Instant>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
@@ -58,12 +63,15 @@ struct SourceCache {
 #[derive(Debug, Clone)]
 enum SourceCacheState {
     Empty,
-    Loading,
+    Loading {
+        sessions: Vec<SessionSummary>,
+    },
     Loaded {
         sessions: Vec<SessionSummary>,
         diagnostics: SourceDiagnostics,
     },
     Failed {
+        retry_at: std::time::Instant,
         message: String,
         sessions: Vec<SessionSummary>,
         diagnostics: SourceDiagnostics,
@@ -146,6 +154,8 @@ impl Default for SessionCatalog {
             revision_rx,
             notify: Notify::new(),
             import_sources: Mutex::default(),
+            #[cfg(test)]
+            discovery_gate: Mutex::default(),
         }
     }
 }
@@ -265,7 +275,7 @@ impl SessionCatalog {
         let sessions = match &mut source.state {
             SourceCacheState::Loaded { sessions, .. }
             | SourceCacheState::Failed { sessions, .. } => sessions,
-            SourceCacheState::Empty | SourceCacheState::Loading => {
+            SourceCacheState::Empty | SourceCacheState::Loading { .. } => {
                 source.generation += 1;
                 source.state = SourceCacheState::Empty;
                 source.updated_at_ms = current_unix_millis();
@@ -290,7 +300,7 @@ impl SessionCatalog {
         let sessions = match &mut source.state {
             SourceCacheState::Loaded { sessions, .. }
             | SourceCacheState::Failed { sessions, .. } => sessions,
-            SourceCacheState::Empty | SourceCacheState::Loading => {
+            SourceCacheState::Empty | SourceCacheState::Loading { .. } => {
                 source.generation += 1;
                 source.state = SourceCacheState::Empty;
                 source.updated_at_ms = current_unix_millis();
@@ -318,6 +328,14 @@ impl SessionCatalog {
         // Source enumeration is cached independently of per-directory session discovery.
         // A refresh must discover newly available sources too. In-flight readers retain
         // their old cell, but cannot repopulate the invalidated cache.
+        {
+            let mut inner = self.inner.lock().await;
+            inner.planning_generation += 1;
+            inner.import_plans.clear();
+            inner.retry_import_plans.clear();
+            self.bump_revision(&mut inner);
+            drop(inner);
+        }
         self.import_sources.lock().await.clear();
         self.invalidate_sources(&working_directory, sources).await;
         self.snapshot(state, &working_directory).await
@@ -341,29 +359,112 @@ impl SessionCatalog {
     }
 
     async fn ensure_sources(&self, state: &Arc<ServerState>, working_directory: &Path) {
-        self.ensure_sources_with_imports(state, source_plans(state, working_directory))
-            .await;
+        let directory = working_directory.to_path_buf();
+        let load_state = Arc::clone(state);
+        let load_directory = directory.clone();
+        self.ensure_sources_with_imports(state, directory, async move {
+            source_plans(&load_state, &load_directory).await
+        })
+        .await;
     }
 
     async fn ensure_sources_with_imports(
         &self,
         state: &Arc<ServerState>,
-        imports: impl std::future::Future<Output = Vec<CatalogSourcePlan>>,
+        working_directory: PathBuf,
+        imports: impl std::future::Future<Output = Vec<CatalogSourcePlan>> + Send + 'static,
     ) {
         for plan in native_source_plans(state) {
             self.ensure_source(state, plan).await;
         }
-        for plan in imports.await {
-            self.ensure_source(state, plan).await;
+        let mut inner = self.inner.lock().await;
+        let retry = inner
+            .retry_import_plans
+            .get(&working_directory)
+            .is_some_and(|deadline| std::time::Instant::now() >= *deadline);
+        if retry {
+            inner.retry_import_plans.remove(&working_directory);
         }
+        if let Some(plans) = inner.import_plans.get(&working_directory) {
+            let plans = plans.clone().unwrap_or_default();
+            let generation = inner.planning_generation;
+            drop(inner);
+            for plan in plans {
+                self.ensure_source_for_generation(state, plan, Some(generation))
+                    .await;
+            }
+            if !retry {
+                return;
+            }
+            inner = self.inner.lock().await;
+            // Another observer may already have started the retry.
+            if inner
+                .import_plans
+                .get(&working_directory)
+                .is_some_and(Option::is_none)
+            {
+                return;
+            }
+        }
+        let generation = inner.planning_generation;
+        inner.import_plans.insert(working_directory.clone(), None);
+        self.bump_revision(&mut inner);
+        drop(inner);
+        let state = Arc::clone(state);
+        tokio::spawn(async move {
+            let plans = imports.await;
+            let catalog = &state.session_catalog;
+            let enumeration_complete = catalog
+                .import_sources
+                .lock()
+                .await
+                .values()
+                .all(|cell| cell.initialized());
+            let mut inner = catalog.inner.lock().await;
+            let mut retry_deadline = None;
+            if inner.planning_generation == generation {
+                if !enumeration_complete {
+                    // Install successful providers' plans before retrying failed enumeration.
+                    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+                    inner
+                        .retry_import_plans
+                        .insert(working_directory.clone(), deadline);
+                    retry_deadline = Some(deadline);
+                }
+                inner
+                    .import_plans
+                    .insert(working_directory.clone(), Some(plans));
+                catalog.bump_revision(&mut inner);
+            }
+            drop(inner);
+            let weak_state = Arc::downgrade(&state);
+            drop(state);
+            if let Some(deadline) = retry_deadline {
+                notify_planning_retry(&weak_state, working_directory, generation, deadline).await;
+            }
+            drop(weak_state);
+        });
+    }
+
+    async fn ensure_source(&self, state: &Arc<ServerState>, plan: CatalogSourcePlan) {
+        self.ensure_source_for_generation(state, plan, None).await;
     }
 
     #[allow(clippy::significant_drop_tightening)]
-    async fn ensure_source(&self, state: &Arc<ServerState>, plan: CatalogSourcePlan) {
+    async fn ensure_source_for_generation(
+        &self,
+        state: &Arc<ServerState>,
+        plan: CatalogSourcePlan,
+        planning_generation: Option<u64>,
+    ) {
         let key = plan.key();
         let metadata = plan.metadata();
         let generation = {
             let mut inner = self.inner.lock().await;
+            if planning_generation.is_some_and(|generation| generation != inner.planning_generation)
+            {
+                return;
+            }
             let source = inner
                 .sources
                 .entry(key.clone())
@@ -375,15 +476,22 @@ impl SessionCatalog {
                 });
             source.metadata = metadata.clone();
             match source.state {
+                SourceCacheState::Failed { retry_at, .. }
+                    if std::time::Instant::now() < retry_at =>
+                {
+                    None
+                }
                 SourceCacheState::Empty | SourceCacheState::Failed { .. } => {
-                    source.state = SourceCacheState::Loading;
+                    source.state = SourceCacheState::Loading {
+                        sessions: source.sessions().to_vec(),
+                    };
                     source.updated_at_ms = current_unix_millis();
                     source.generation += 1;
                     let generation = source.generation;
                     self.bump_revision(&mut inner);
                     Some(generation)
                 }
-                SourceCacheState::Loading | SourceCacheState::Loaded { .. } => None,
+                SourceCacheState::Loading { .. } | SourceCacheState::Loaded { .. } => None,
             }
         };
         let Some(generation) = generation else {
@@ -395,6 +503,38 @@ impl SessionCatalog {
             let key = plan.key();
             let metadata = plan.metadata();
             let labels = catalog_source_metric_labels(&key);
+            if let CatalogSourcePlan::Native { location } = &plan
+                && location.primary
+                && !state.sessions.catalog_loaded()
+            {
+                let store = bcode_session::SessionStore::new(&location.sessions_root);
+                let (mut pages, completion) = store.stream_catalog_pages();
+                while let Some(mut page) = pages.recv().await {
+                    for summary in &mut page {
+                        summary.location = Some(location.summary());
+                    }
+                    let mut inner = catalog.inner.lock().await;
+                    let Some(source) = inner.sources.get_mut(&key) else {
+                        break;
+                    };
+                    if source.generation != generation {
+                        break;
+                    }
+                    let SourceCacheState::Loading { sessions } = &mut source.state else {
+                        break;
+                    };
+                    if !page.is_empty() {
+                        merge_catalog_page(sessions, page);
+                        source.updated_at_ms = current_unix_millis();
+                        catalog.bump_revision(&mut inner);
+                    }
+                }
+                drop(pages);
+                // Missing or damaged disposable catalogs fall back to normal discovery.
+                if let Err(error) = completion.await {
+                    tracing::warn!(%error, "catalog page reader task failed");
+                }
+            }
             let result = state
                 .metrics
                 .time_result_async(
@@ -504,8 +644,11 @@ impl SessionCatalog {
                     diagnostics: result.diagnostics,
                 },
                 Err(message) => SourceCacheState::Failed {
+                    retry_at: std::time::Instant::now() + std::time::Duration::from_secs(5),
                     message,
-                    sessions: Vec::new(),
+                    // A late discovery error does not invalidate already published
+                    // display metadata. Mutations fence and clear it separately.
+                    sessions: source.sessions().to_vec(),
                     diagnostics: SourceDiagnostics::default(),
                 },
             };
@@ -519,6 +662,17 @@ impl SessionCatalog {
         self.revision_tx.send_replace(inner.revision);
         self.notify.notify_waiters();
     }
+}
+
+// Retry pages replace matching retained rows; successful completion replaces the
+// entire source, so rows absent from the final discovery do not survive forever.
+fn merge_catalog_page(sessions: &mut Vec<SessionSummary>, page: Vec<SessionSummary>) {
+    let incoming_ids = page
+        .iter()
+        .map(|summary| summary.id)
+        .collect::<BTreeSet<_>>();
+    sessions.retain(|summary| !incoming_ids.contains(&summary.id));
+    sessions.extend(page);
 }
 
 #[derive(Debug, Clone)]
@@ -704,6 +858,13 @@ async fn load_source(
     state: &ServerState,
     plan: &CatalogSourcePlan,
 ) -> Result<SourceLoadResult, String> {
+    #[cfg(test)]
+    {
+        let gate = state.session_catalog.discovery_gate.lock().await.clone();
+        if let Some(gate) = gate {
+            gate.acquire().await.expect("discovery gate open").forget();
+        }
+    }
     match plan {
         CatalogSourcePlan::InMemory => load_in_memory_source(state).await,
         CatalogSourcePlan::Native { location } => {
@@ -855,7 +1016,24 @@ fn snapshot_locked(
     sort_sessions(&mut sessions);
     mark_ambiguous_locations(&mut sessions);
     SessionCatalogSnapshot {
-        status: aggregate_status(sources.iter().map(|source| &source.status)),
+        status: if inner
+            .import_plans
+            .get(working_directory)
+            .is_some_and(|plans| {
+                plans.as_ref().is_none_or(|plans| {
+                    plans
+                        .iter()
+                        .any(|plan| !inner.sources.contains_key(&plan.key()))
+                })
+            }) {
+            SessionCatalogStatus::Loading
+        } else if inner.retry_import_plans.contains_key(working_directory) {
+            SessionCatalogStatus::Degraded(
+                "Some import sources could not be enumerated; discovery will retry.".to_owned(),
+            )
+        } else {
+            aggregate_status(sources.iter().map(|source| &source.status))
+        },
         sessions,
         sources,
         revision: inner.revision,
@@ -892,7 +1070,7 @@ impl SourceCache {
     fn status(&self) -> SessionCatalogStatus {
         match &self.state {
             SourceCacheState::Empty => SessionCatalogStatus::NotStarted,
-            SourceCacheState::Loading => SessionCatalogStatus::Loading,
+            SourceCacheState::Loading { .. } => SessionCatalogStatus::Loading,
             SourceCacheState::Loaded { .. } => {
                 let status = diagnostic_status(&self.metadata.display_name, self.diagnostics());
                 status.unwrap_or(SessionCatalogStatus::Loaded)
@@ -906,8 +1084,9 @@ impl SourceCache {
     fn sessions(&self) -> &[SessionSummary] {
         match &self.state {
             SourceCacheState::Loaded { sessions, .. }
+            | SourceCacheState::Loading { sessions }
             | SourceCacheState::Failed { sessions, .. } => sessions,
-            SourceCacheState::Empty | SourceCacheState::Loading => &[],
+            SourceCacheState::Empty => &[],
         }
     }
 
@@ -916,7 +1095,7 @@ impl SourceCache {
         match &self.state {
             SourceCacheState::Loaded { diagnostics, .. }
             | SourceCacheState::Failed { diagnostics, .. } => diagnostics,
-            SourceCacheState::Empty | SourceCacheState::Loading => &EMPTY,
+            SourceCacheState::Empty | SourceCacheState::Loading { .. } => &EMPTY,
         }
     }
 }
@@ -1095,6 +1274,26 @@ fn sort_sessions(sessions: &mut [SessionSummary]) {
     });
 }
 
+async fn notify_planning_retry(
+    state: &std::sync::Weak<ServerState>,
+    working_directory: PathBuf,
+    generation: u64,
+    deadline: std::time::Instant,
+) {
+    tokio::time::sleep_until(deadline.into()).await;
+    if let Some(state) = state.upgrade() {
+        let catalog = &state.session_catalog;
+        let mut inner = catalog.inner.lock().await;
+        if inner.planning_generation == generation
+            && inner.retry_import_plans.get(&working_directory) == Some(&deadline)
+        {
+            // Observers perform the retry through normal source planning. No provider
+            // work is started here when the catalog has no active observers.
+            catalog.bump_revision(&mut inner);
+        }
+    }
+}
+
 fn normalize_path(path: &Path) -> PathBuf {
     path.canonicalize().unwrap_or_else(|_| path.to_path_buf())
 }
@@ -1109,6 +1308,361 @@ fn current_unix_millis() -> u64 {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn retry_pages_replace_matching_rows_without_losing_other_results() {
+        let first = summary(SessionId::new(), None);
+        let second = summary(SessionId::new(), None);
+        let mut updated = first.clone();
+        updated.name = Some("updated".to_owned());
+        let mut sessions = vec![first, second.clone()];
+        super::merge_catalog_page(&mut sessions, vec![updated.clone()]);
+        assert_eq!(sessions, vec![second.clone(), updated.clone()]);
+        super::merge_catalog_page(&mut sessions, vec![updated.clone()]);
+        assert_eq!(sessions, vec![second, updated]);
+    }
+
+    #[tokio::test]
+    async fn failed_source_is_observable_and_explicit_refresh_bypasses_backoff() {
+        let root = tempfile::tempdir().unwrap();
+        let state = std::sync::Arc::new(crate::tests::test_server_state(
+            bcode_session::SessionManager::persistent_lazy(root.path()),
+        ));
+        let catalog = &state.session_catalog;
+        let session = summary(SessionId::new(), None);
+        catalog
+            .apply_source_result(
+                super::native_source_key(),
+                super::native_metadata(),
+                Ok(SourceLoadResult {
+                    sessions: vec![session.clone()],
+                    diagnostics: SourceDiagnostics::default(),
+                }),
+            )
+            .await;
+        catalog
+            .apply_source_result(
+                super::native_source_key(),
+                super::native_metadata(),
+                Err("unavailable".to_owned()),
+            )
+            .await;
+        let revision = catalog.revision();
+        catalog
+            .ensure_source(&state, super::CatalogSourcePlan::InMemory)
+            .await;
+        assert_eq!(catalog.revision(), revision);
+        let snapshot = {
+            let inner = catalog.inner.lock().await;
+            super::snapshot_locked(&inner, root.path(), true)
+        };
+        assert!(matches!(
+            snapshot.status,
+            bcode_session_models::SessionCatalogStatus::Failed(_)
+        ));
+        // Display timestamps cannot delay a retry after its monotonic deadline.
+        {
+            let mut inner = catalog.inner.lock().await;
+            let source = inner.sources.get_mut(&super::native_source_key()).unwrap();
+            source.updated_at_ms = u64::MAX;
+            let super::SourceCacheState::Failed { retry_at, .. } = &mut source.state else {
+                panic!("failure must remain visible during backoff");
+            };
+            *retry_at = std::time::Instant::now();
+            drop(inner);
+        }
+        catalog
+            .ensure_source(&state, super::CatalogSourcePlan::InMemory)
+            .await;
+        let inner = catalog.inner.lock().await;
+        assert_eq!(
+            inner.sources[&super::native_source_key()].sessions(),
+            &[session]
+        );
+        assert!(matches!(
+            inner.sources[&super::native_source_key()].state,
+            super::SourceCacheState::Loading { .. }
+        ));
+        drop(inner);
+        catalog
+            .apply_source_result(
+                super::native_source_key(),
+                super::native_metadata(),
+                Err("still unavailable".to_owned()),
+            )
+            .await;
+        catalog.invalidate_native().await;
+        catalog
+            .ensure_source(&state, super::CatalogSourcePlan::InMemory)
+            .await;
+        let inner = catalog.inner.lock().await;
+        let source = inner.sources[&super::native_source_key()].clone();
+        drop(inner);
+        assert!(matches!(
+            source.state,
+            super::SourceCacheState::Loading { .. }
+        ));
+        drop(state);
+    }
+
+    #[tokio::test]
+    async fn loading_snapshot_retains_partial_results_and_mutations_invalidate_them() {
+        let catalog = SessionCatalog::default();
+        let session = summary(SessionId::new(), None);
+        let directory = super::normalize_path(&session.working_directory);
+        {
+            let mut inner = catalog.inner.lock().await;
+            inner.sources.insert(
+                super::native_source_key(),
+                super::SourceCache {
+                    metadata: super::native_metadata(),
+                    state: super::SourceCacheState::Loading {
+                        sessions: vec![session.clone()],
+                    },
+                    generation: 1,
+                    updated_at_ms: 1,
+                },
+            );
+            let snapshot = super::snapshot_locked(&inner, &directory, true);
+            drop(inner);
+            assert_eq!(snapshot.sessions, vec![session.clone()]);
+            assert!(matches!(
+                snapshot.status,
+                bcode_session_models::SessionCatalogStatus::Loading
+            ));
+        }
+        catalog
+            .publish_source_result(
+                super::native_source_key(),
+                super::native_metadata(),
+                Err("discovery unavailable".to_owned()),
+                Some(1),
+            )
+            .await;
+        {
+            let inner = catalog.inner.lock().await;
+            let snapshot = super::snapshot_locked(&inner, &directory, true);
+            drop(inner);
+            assert_eq!(snapshot.sessions, vec![session.clone()]);
+            assert!(!matches!(
+                snapshot.status,
+                bcode_session_models::SessionCatalogStatus::Loaded
+                    | bcode_session_models::SessionCatalogStatus::Loading
+            ));
+        }
+        catalog.remove_native_session(session.id).await;
+        let inner = catalog.inner.lock().await;
+        let source = inner.sources[&super::native_source_key()].clone();
+        drop(inner);
+        assert_eq!(source.generation, 3);
+        assert!(source.sessions().is_empty());
+        assert!(matches!(
+            source.state,
+            super::SourceCacheState::Failed { .. }
+        ));
+        catalog
+            .publish_source_result(
+                super::native_source_key(),
+                super::native_metadata(),
+                Ok(SourceLoadResult {
+                    sessions: vec![session],
+                    diagnostics: SourceDiagnostics::default(),
+                }),
+                Some(1),
+            )
+            .await;
+        let inner = catalog.inner.lock().await;
+        assert!(
+            inner.sources[&super::native_source_key()]
+                .sessions()
+                .is_empty()
+        );
+        drop(inner);
+    }
+
+    #[tokio::test]
+    async fn failed_planning_is_degraded_without_hiding_native_results() {
+        let catalog = SessionCatalog::default();
+        let session = summary(SessionId::new(), None);
+        let directory = super::normalize_path(&session.working_directory);
+        catalog
+            .apply_source_result(
+                super::native_source_key(),
+                super::native_metadata(),
+                Ok(SourceLoadResult {
+                    sessions: vec![session.clone()],
+                    diagnostics: SourceDiagnostics::default(),
+                }),
+            )
+            .await;
+        let mut inner = catalog.inner.lock().await;
+        inner
+            .import_plans
+            .insert(directory.clone(), Some(Vec::new()));
+        inner
+            .retry_import_plans
+            .insert(directory.clone(), std::time::Instant::now());
+        let snapshot = super::snapshot_locked(&inner, &directory, true);
+        assert!(matches!(
+            snapshot.status,
+            bcode_session_models::SessionCatalogStatus::Degraded(_)
+        ));
+        assert_eq!(snapshot.sessions, vec![session.clone()]);
+        inner.import_plans.insert(directory.clone(), None);
+        assert!(matches!(
+            super::snapshot_locked(&inner, &directory, true).status,
+            bcode_session_models::SessionCatalogStatus::Loading
+        ));
+        inner
+            .import_plans
+            .insert(directory.clone(), Some(Vec::new()));
+        inner.retry_import_plans.remove(&directory);
+        let snapshot = super::snapshot_locked(&inner, &directory, true);
+        drop(inner);
+        assert!(matches!(
+            snapshot.status,
+            bcode_session_models::SessionCatalogStatus::Loaded
+        ));
+        assert_eq!(snapshot.sessions, vec![session]);
+    }
+
+    #[tokio::test]
+    async fn retry_deadline_notifies_observers_but_rejects_obsolete_generation() {
+        let root = tempfile::tempdir().unwrap();
+        let state = std::sync::Arc::new(crate::tests::test_server_state(
+            bcode_session::SessionManager::persistent_lazy(root.path()),
+        ));
+        let catalog = &state.session_catalog;
+        let deadline = std::time::Instant::now();
+        catalog
+            .inner
+            .lock()
+            .await
+            .retry_import_plans
+            .insert(root.path().to_path_buf(), deadline);
+        let mut revisions = catalog.subscribe();
+        revisions.borrow_and_update();
+        super::notify_planning_retry(
+            &std::sync::Arc::downgrade(&state),
+            root.path().to_path_buf(),
+            0,
+            deadline,
+        )
+        .await;
+        assert!(revisions.has_changed().unwrap());
+        revisions.borrow_and_update();
+        catalog.inner.lock().await.planning_generation = 1;
+        super::notify_planning_retry(
+            &std::sync::Arc::downgrade(&state),
+            root.path().to_path_buf(),
+            0,
+            deadline,
+        )
+        .await;
+        assert!(!revisions.has_changed().unwrap());
+        super::notify_planning_retry(
+            &std::sync::Arc::downgrade(&state),
+            root.path().to_path_buf(),
+            1,
+            deadline + std::time::Duration::from_millis(1),
+        )
+        .await;
+        assert!(!revisions.has_changed().unwrap());
+        let weak = std::sync::Arc::downgrade(&state);
+        drop(state);
+        assert!(weak.upgrade().is_none());
+        super::notify_planning_retry(&weak, root.path().to_path_buf(), 1, deadline).await;
+        drop(weak);
+    }
+
+    #[tokio::test]
+    async fn stale_planning_generation_cannot_install_source() {
+        let root = tempfile::tempdir().unwrap();
+        let state = std::sync::Arc::new(crate::tests::test_server_state(
+            bcode_session::SessionManager::persistent_lazy(root.path()),
+        ));
+        let catalog = &state.session_catalog;
+        catalog.inner.lock().await.planning_generation = 1;
+        let revision = catalog.revision();
+        catalog
+            .ensure_source_for_generation(&state, super::CatalogSourcePlan::InMemory, Some(0))
+            .await;
+        assert_eq!(catalog.revision(), revision);
+        assert!(catalog.inner.lock().await.sources.is_empty());
+        catalog
+            .ensure_source_for_generation(&state, super::CatalogSourcePlan::InMemory, Some(1))
+            .await;
+        assert!(catalog.revision() > revision);
+        assert!(
+            catalog
+                .inner
+                .lock()
+                .await
+                .sources
+                .contains_key(&super::native_source_key())
+        );
+        drop(state);
+    }
+    #[tokio::test]
+    async fn partial_enumeration_retains_successful_plans_for_retry() {
+        let root = tempfile::tempdir().unwrap();
+        let state = std::sync::Arc::new(crate::tests::test_server_state(
+            bcode_session::SessionManager::persistent_lazy(root.path()),
+        ));
+        let catalog = &state.session_catalog;
+        catalog
+            .import_source_ids("failed", async { Err("unavailable".to_owned()) })
+            .await;
+        let mut revisions = catalog.subscribe();
+        catalog
+            .ensure_sources_with_imports(&state, root.path().to_path_buf(), async {
+                vec![super::CatalogSourcePlan::InMemory]
+            })
+            .await;
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                let complete = {
+                    let inner = catalog.inner.lock().await;
+                    inner.retry_import_plans.contains_key(root.path())
+                };
+                if complete {
+                    break;
+                }
+                revisions.changed().await.unwrap();
+            }
+        })
+        .await
+        .unwrap();
+        let inner = catalog.inner.lock().await;
+        let plans = inner.import_plans[root.path()].as_ref().unwrap();
+        assert_eq!(plans.len(), 1);
+        assert!(matches!(plans[0], super::CatalogSourcePlan::InMemory));
+        drop(inner);
+        catalog
+            .ensure_sources_with_imports(&state, root.path().to_path_buf(), async {
+                panic!("observation must not retry before backoff expires")
+            })
+            .await;
+        tokio::task::yield_now().await;
+        assert!(catalog.inner.lock().await.import_plans[root.path()].is_some());
+        catalog
+            .inner
+            .lock()
+            .await
+            .retry_import_plans
+            .insert(root.path().to_path_buf(), std::time::Instant::now());
+        let (started, received) = tokio::sync::oneshot::channel();
+        catalog
+            .ensure_sources_with_imports(&state, root.path().to_path_buf(), async move {
+                started.send(()).unwrap();
+                Vec::new()
+            })
+            .await;
+        tokio::time::timeout(std::time::Duration::from_secs(5), received)
+            .await
+            .unwrap()
+            .unwrap();
+        drop(state);
+    }
     #[tokio::test]
     async fn native_discovery_starts_before_blocked_import_enumeration() {
         let root = tempfile::tempdir().unwrap();
@@ -1116,30 +1670,82 @@ mod tests {
             bcode_session::SessionManager::persistent_lazy(root.path()),
         ));
         {
-            let planning = state
-                .session_catalog
-                .ensure_sources_with_imports(&state, std::future::pending());
+            let (release, blocked) = tokio::sync::oneshot::channel();
+            let planning = state.session_catalog.ensure_sources_with_imports(
+                &state,
+                root.path().to_path_buf(),
+                async move {
+                    blocked.await.unwrap();
+                    Vec::new()
+                },
+            );
             tokio::pin!(planning);
-            assert!(futures::poll!(&mut planning).is_pending());
+            assert!(futures::poll!(&mut planning).is_ready());
             let inner = state.session_catalog.inner.lock().await;
             assert!(matches!(
                 inner.sources[&super::native_source_key()].state,
-                super::SourceCacheState::Loading
+                super::SourceCacheState::Loading { .. }
             ));
+            assert_eq!(
+                super::snapshot_locked(&inner, root.path(), true).status,
+                bcode_session_models::SessionCatalogStatus::Loading
+            );
             drop(inner);
+            let mut session = summary(SessionId::new(), None);
+            session.working_directory = root.path().canonicalize().unwrap();
+            // Seed useful metadata while provider planning is deliberately blocked.
+            state
+                .session_catalog
+                .apply_source_result(
+                    super::native_source_key(),
+                    super::native_metadata(),
+                    Ok(SourceLoadResult {
+                        sessions: vec![session.clone()],
+                        diagnostics: SourceDiagnostics::default(),
+                    }),
+                )
+                .await;
+            // Use the same normalized scope as the public listing operation.
+            {
+                let mut inner = state.session_catalog.inner.lock().await;
+                let pending = inner.import_plans.remove(root.path()).unwrap();
+                inner
+                    .import_plans
+                    .insert(session.working_directory.clone(), pending);
+            }
+            {
+                let listing = crate::session_operations::list(&state, &session.working_directory);
+                tokio::pin!(listing);
+                let std::task::Poll::Ready(result) = futures::poll!(&mut listing) else {
+                    panic!("useful application results waited for import enumeration");
+                };
+                let snapshot = result.unwrap();
+                assert_eq!(snapshot.sessions, vec![session.clone()]);
+                assert_eq!(
+                    snapshot.status,
+                    bcode_session_models::SessionCatalogStatus::Loading
+                );
+            }
+            release.send(()).unwrap();
         }
         drop(state);
     }
     #[tokio::test]
     async fn native_mutations_during_discovery_require_fresh_load() {
         for delete in [false, true] {
-            let catalog = SessionCatalog::default();
+            let root = tempfile::tempdir().unwrap();
+            let state = std::sync::Arc::new(crate::tests::test_server_state(
+                bcode_session::SessionManager::persistent_lazy(root.path()),
+            ));
+            let catalog = &state.session_catalog;
             let session = summary(SessionId::new(), None);
             catalog.inner.lock().await.sources.insert(
                 super::native_source_key(),
                 super::SourceCache {
                     metadata: super::native_metadata(),
-                    state: super::SourceCacheState::Loading,
+                    state: super::SourceCacheState::Loading {
+                        sessions: Vec::new(),
+                    },
                     updated_at_ms: 0,
                     generation: 1,
                 },
@@ -1173,6 +1779,35 @@ mod tests {
                     .is_empty()
             );
             drop(inner);
+            let mut revisions = catalog.subscribe();
+            catalog
+                .ensure_source(&state, super::CatalogSourcePlan::InMemory)
+                .await;
+            tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                loop {
+                    let loaded = {
+                        let inner = catalog.inner.lock().await;
+                        matches!(
+                            inner.sources[&super::native_source_key()].state,
+                            super::SourceCacheState::Loaded { .. }
+                        )
+                    };
+                    if loaded {
+                        break;
+                    }
+                    revisions.changed().await.unwrap();
+                }
+            })
+            .await
+            .expect("invalidated discovery must complete a fresh load");
+            let inner = catalog.inner.lock().await;
+            assert!(
+                inner.sources[&super::native_source_key()]
+                    .sessions()
+                    .is_empty()
+            );
+            drop(inner);
+            drop(state);
         }
     }
     #[tokio::test]
@@ -1367,6 +2002,162 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn public_watcher_receives_cold_rows_and_discovery_completion_over_ipc() {
+        let root = tempfile::tempdir().unwrap();
+        let directory = std::env::current_dir().unwrap();
+        let writer = bcode_session::SessionManager::persistent_lazy(root.path());
+        let expected = writer
+            .create_session(Some("IPC cold row".to_owned()), directory)
+            .await
+            .unwrap();
+        writer.shutdown_catalog_updates().await;
+        drop(writer);
+        let mut state = std::sync::Arc::new(crate::tests::test_server_state(
+            bcode_session::SessionManager::persistent_lazy(root.path()),
+        ));
+        std::sync::Arc::get_mut(&mut state)
+            .unwrap()
+            .daemon_status
+            .state_location_id = Some(bcode_ipc::state_location_id());
+        let gate = std::sync::Arc::new(tokio::sync::Semaphore::new(0));
+        *state.session_catalog.discovery_gate.lock().await = Some(gate.clone());
+        state.start_catalog_event_forwarder().await;
+        let socket_dir = tempfile::tempdir().unwrap();
+        let endpoint = bcode_ipc::IpcEndpoint::unix_socket(socket_dir.path().join("catalog.sock"));
+        let listener = bcode_ipc::LocalIpcListener::bind(&endpoint).unwrap();
+        let server_state = state.clone();
+        let server = tokio::spawn(async move {
+            let stream = listener.accept().await.unwrap();
+            crate::handle_client(stream, server_state).await.unwrap();
+        });
+        let client = bcode_client::BcodeClient::new(endpoint);
+        let mut watcher = client.watch_session_catalog().await.unwrap();
+        let initial = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            watcher.initial_snapshot(),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(initial.sessions.len(), 1);
+        assert_eq!(initial.sessions[0].id, expected.id);
+        assert_eq!(
+            initial.catalog_status,
+            bcode_session_models::SessionCatalogStatus::Loading
+        );
+        gate.add_permits(1);
+        drop(gate);
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                let next = watcher.next_snapshot().await.unwrap();
+                assert_eq!(next.sessions.len(), 1);
+                assert_eq!(next.sessions[0].id, expected.id);
+                if next.catalog_status == bcode_session_models::SessionCatalogStatus::Loaded {
+                    break;
+                }
+            }
+        })
+        .await
+        .unwrap();
+        drop(watcher);
+        tokio::time::timeout(std::time::Duration::from_secs(5), server)
+            .await
+            .unwrap()
+            .unwrap();
+        state.request_shutdown();
+        state.stop_catalog_workers().await.unwrap();
+        drop(state);
+    }
+
+    #[tokio::test]
+    async fn cold_catalog_round_trip_preserves_persisted_metadata() {
+        let root = tempfile::tempdir().unwrap();
+        let writer = bcode_session::SessionManager::persistent_lazy(root.path());
+        let mut expected = std::collections::BTreeMap::new();
+        for index in 0..259 {
+            let session = writer
+                .create_session(
+                    Some(format!("cold catalog row {index}")),
+                    root.path().to_owned(),
+                )
+                .await
+                .unwrap();
+            expected.insert(session.id, session.name);
+        }
+        writer.flush_catalog_updates().await;
+        drop(writer);
+        let mut state = std::sync::Arc::new(crate::tests::test_server_state(
+            bcode_session::SessionManager::persistent_lazy(root.path()),
+        ));
+        std::sync::Arc::get_mut(&mut state)
+            .unwrap()
+            .daemon_status
+            .state_location_id = Some("cold-location".to_owned());
+        let gate = std::sync::Arc::new(tokio::sync::Semaphore::new(0));
+        *state.session_catalog.discovery_gate.lock().await = Some(gate.clone());
+        let mut revisions = state.session_catalog.subscribe();
+        let started = std::time::Instant::now();
+        let snapshot = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            crate::session_operations::list(&state, root.path()),
+        )
+        .await
+        .expect("cold catalog listing must complete")
+        .unwrap();
+        let first_useful = started.elapsed();
+        assert!(!snapshot.sessions.is_empty());
+        assert!(snapshot.sessions.len() <= expected.len());
+        for session in &snapshot.sessions {
+            assert_eq!(expected.get(&session.id), Some(&session.name));
+        }
+        assert_eq!(
+            snapshot.status,
+            bcode_session_models::SessionCatalogStatus::Loading
+        );
+        assert!(matches!(
+            state.sessions.catalog_status(),
+            bcode_session::CatalogLoadStatus::NotStarted
+        ));
+        gate.add_permits(1);
+        drop(gate);
+        let completed = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                revisions.borrow_and_update();
+                let snapshot = state.session_catalog.snapshot(&state, root.path()).await;
+                if snapshot.status == bcode_session_models::SessionCatalogStatus::Loaded {
+                    break snapshot;
+                }
+                revisions.changed().await.unwrap();
+            }
+        })
+        .await
+        .expect("discovery must finish after release");
+        let completion = started.elapsed();
+        assert_eq!(completed.sessions.len(), expected.len());
+        assert_eq!(
+            completed
+                .sessions
+                .iter()
+                .map(|session| (session.id, session.name.clone()))
+                .collect::<std::collections::BTreeMap<_, _>>(),
+            expected
+        );
+        let warm_started = std::time::Instant::now();
+        let reopened = crate::session_operations::list(&state, root.path())
+            .await
+            .unwrap();
+        let warm = warm_started.elapsed();
+        assert_eq!(reopened.sessions, completed.sessions);
+        eprintln!(
+            "catalog server rows={} first_rows={} first_useful={first_useful:?} completed={completion:?} warm={warm:?}",
+            expected.len(),
+            snapshot.sessions.len()
+        );
+        drop(state);
+    }
+
     #[tokio::test]
     async fn available_catalog_results_do_not_wait_for_unstarted_native_discovery() {
         let root = tempfile::tempdir().unwrap();
@@ -1397,7 +2188,9 @@ mod tests {
                 metadata: super::SourceMetadata {
                     display_name: "Slow source".to_owned(),
                 },
-                state: super::SourceCacheState::Loading,
+                state: super::SourceCacheState::Loading {
+                    sessions: Vec::new(),
+                },
                 updated_at_ms: 0,
                 generation: 0,
             },

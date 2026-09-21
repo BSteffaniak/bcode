@@ -53057,9 +53057,21 @@ library = "test"
         for (directory, expected_id) in
             [(first_dir.path(), first.id), (second_dir.path(), second.id)]
         {
-            let direct = session_operations::list(&state, directory)
-                .await
-                .expect("direct list");
+            // Planning can complete between requests. Compare stable snapshots
+            // rather than requiring separate clients to observe the same instant.
+            let direct = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                loop {
+                    let snapshot = session_operations::list(&state, directory)
+                        .await
+                        .expect("direct list");
+                    if snapshot.status != SessionCatalogStatus::Loading {
+                        break snapshot;
+                    }
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("catalog planning settles");
             assert_eq!(direct.sessions.len(), 1);
             assert_eq!(direct.sessions[0].id, expected_id);
             let listed = client
@@ -53086,7 +53098,11 @@ library = "test"
                 )
                 .await
                 .expect("scoped refresh");
-            assert_eq!(refreshed, listed);
+            assert_eq!(refreshed.sessions, listed.sessions);
+            assert_catalog_source_observations(&listed.catalog_sources, &refreshed.catalog_sources);
+            // Explicit refresh restarts source enumeration, even when no
+            // existing native source was selected for invalidation.
+            assert!(refreshed.catalog_revision >= listed.catalog_revision);
         }
         assert_native_catalog_refresh_completes(&state, &client, first_dir.path(), first.id).await;
         drop(connection);

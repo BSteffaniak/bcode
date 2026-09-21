@@ -8,7 +8,7 @@ use crate::{
 use bcode_metrics::MetricsRegistry;
 use bcode_session_models::{SessionId, SessionSummary};
 use std::{
-    collections::{BTreeMap, BTreeSet},
+    collections::BTreeMap,
     fs,
     path::{Path, PathBuf},
 };
@@ -76,16 +76,8 @@ impl SessionStore {
     pub fn discover_readable_session_summaries(
         &self,
     ) -> Result<Vec<SessionSummary>, SessionStoreError> {
-        let mut summaries = self.load_session_manifests()?;
-        let manifested = summaries
-            .iter()
-            .map(|summary| summary.id)
-            .collect::<BTreeSet<_>>();
-        for summary in self.discover_canonical_session_summaries()? {
-            if !manifested.contains(&summary.id) {
-                summaries.push(summary);
-            }
-        }
+        let (mut summaries, fallback) = self.discover_session_summaries()?;
+        summaries.extend(fallback);
         summaries.sort_by_key(|summary| std::cmp::Reverse(summary.updated_at_ms));
         Ok(summaries)
     }
@@ -123,13 +115,13 @@ impl SessionStore {
         } else {
             Vec::new()
         };
-        let manifests = self
-            .load_session_manifests()?
+        let (manifests, fallback) = self.discover_session_summaries()?;
+        summaries.extend(fallback);
+        let manifests = manifests
             .into_iter()
             .map(|summary| (summary.id, summary))
             .collect::<BTreeMap<_, _>>();
         summaries.extend(manifests.values().cloned());
-        summaries.extend(self.discover_canonical_session_summaries()?);
         summaries.sort_by(|left, right| {
             left.id
                 .cmp(&right.id)
@@ -149,8 +141,8 @@ impl SessionStore {
     }
 
     pub(crate) fn backfill_catalog(&self) -> Result<Vec<SessionSummary>, SessionStoreError> {
-        let mut summaries = self.load_session_manifests()?;
-        summaries.extend(self.discover_canonical_session_summaries()?);
+        let (mut summaries, fallback) = self.discover_session_summaries()?;
+        summaries.extend(fallback);
         summaries.sort_by(|left, right| {
             left.id
                 .cmp(&right.id)
@@ -164,6 +156,7 @@ impl SessionStore {
         Ok(summaries)
     }
 
+    #[cfg(test)]
     fn discover_canonical_session_summaries(
         &self,
     ) -> Result<Vec<SessionSummary>, SessionStoreError> {
@@ -179,28 +172,35 @@ impl SessionStore {
             if !db::session_db_path(&self.root, session_id).exists() {
                 continue;
             }
-            summaries.push(SessionSummary {
-                id: session_id,
-                name: None,
-                explicit_name: None,
-                derived_title: None,
-                title_source: SessionTitleSource::EmptyDraft,
-                client_count: 0,
-                created_at_ms: 0,
-                updated_at_ms: 0,
-                working_directory: self.root.clone(),
-                import: None,
-                execution: None,
-                location: None,
-            });
+            summaries.push(self.canonical_summary(session_id));
         }
         Ok(summaries)
     }
 
-    fn load_session_manifests(&self) -> Result<Vec<SessionSummary>, SessionStoreError> {
+    fn canonical_summary(&self, session_id: SessionId) -> SessionSummary {
+        SessionSummary {
+            id: session_id,
+            name: None,
+            explicit_name: None,
+            derived_title: None,
+            title_source: SessionTitleSource::EmptyDraft,
+            client_count: 0,
+            created_at_ms: 0,
+            updated_at_ms: 0,
+            working_directory: self.root.clone(),
+            import: None,
+            execution: None,
+            location: None,
+        }
+    }
+
+    fn discover_session_summaries(
+        &self,
+    ) -> Result<(Vec<SessionSummary>, Vec<SessionSummary>), SessionStoreError> {
         let mut summaries = Vec::new();
+        let mut fallback = Vec::new();
         if !self.root.exists() {
-            return Ok(summaries);
+            return Ok((summaries, fallback));
         }
         for entry in fs::read_dir(&self.root)? {
             let path = entry?.path();
@@ -208,14 +208,20 @@ impl SessionStore {
                 continue;
             };
             match self.load_session_manifest(session_id) {
-                Ok(Some(summary)) => summaries.push(summary),
+                Ok(Some(summary)) => {
+                    summaries.push(summary);
+                    continue;
+                }
                 Ok(None) => {}
                 Err(error) => {
                     eprintln!("skipping unreadable session manifest {session_id}: {error}");
                 }
             }
+            if db::session_db_path(&self.root, session_id).exists() {
+                fallback.push(self.canonical_summary(session_id));
+            }
         }
-        Ok(summaries)
+        Ok((summaries, fallback))
     }
 
     pub(crate) fn load_session_manifest(
@@ -328,31 +334,107 @@ impl SessionStore {
     }
 
     fn load_global_catalog_summaries(&self) -> Result<Vec<SessionSummary>, SessionStoreError> {
+        let mut summaries = Vec::new();
+        self.visit_catalog_pages(|page| {
+            summaries.extend(page);
+            true
+        })?;
+        Ok(summaries)
+    }
+
+    /// Visit disposable catalog metadata in batches of at most 256 rows.
+    ///
+    /// The consumer runs on the reader thread before the next query. Returning false
+    /// stops reading and closes the catalog. This does not enumerate session directories
+    /// or establish canonical validity; callers must reconcile with discovery. This
+    /// blocking method must not run on an async executor thread.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the existing catalog cannot be opened, queried, decoded or
+    /// closed, or if the reader thread panics. Missing catalogs are not created.
+    pub fn visit_catalog_pages(
+        &self,
+        mut consume: impl FnMut(Vec<SessionSummary>) -> bool + Send,
+    ) -> Result<(), SessionStoreError> {
         let root = self.root.clone();
-        std::thread::spawn(move || {
-            let runtime = tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-                .map_err(|error| SessionStoreError::CatalogLoad(error.to_string()))?;
-            runtime.block_on(async move {
-                let catalog = db::GlobalSessionDb::open_existing_turso_in_root(&root)
-                    .await
-                    .map_err(|error| SessionStoreError::CatalogLoad(error.to_string()))?;
-                let summaries = catalog
-                    .list_sessions()
-                    .await
+        std::thread::scope(|scope| {
+            scope
+                .spawn(move || {
+                    let runtime = tokio::runtime::Builder::new_current_thread()
+                        .enable_all()
+                        .build()
+                        .map_err(|error| SessionStoreError::CatalogLoad(error.to_string()))?;
+                    let catalog = runtime
+                        .block_on(db::GlobalSessionDb::open_existing_turso_in_root(&root))
+                        .map_err(|error| SessionStoreError::CatalogLoad(error.to_string()))?;
+                    let summaries = (|| {
+                        let mut after = None;
+                        loop {
+                            let page = runtime.block_on(catalog.list_sessions_page(after, 256))?;
+                            if page.is_empty() {
+                                break;
+                            }
+                            after = page.last().map(|summary| summary.id);
+                            if !consume(page) {
+                                break;
+                            }
+                        }
+                        Ok::<_, db::SessionDbError>(())
+                    })()
                     .map_err(|error| SessionStoreError::CatalogLoad(error.to_string()));
-                let close = catalog
-                    .close()
-                    .await
-                    .map_err(|error| SessionStoreError::CatalogLoad(error.to_string()));
-                let summaries = summaries?;
-                close?;
-                Ok(summaries)
-            })
+                    let close = runtime
+                        .block_on(catalog.close())
+                        .map_err(|error| SessionStoreError::CatalogLoad(error.to_string()));
+                    summaries?;
+                    close?;
+                    Ok(())
+                })
+                .join()
+                .map_err(|_| {
+                    SessionStoreError::CatalogLoad("global catalog loader panicked".to_string())
+                })?
         })
-        .join()
-        .map_err(|_| SessionStoreError::CatalogLoad("global catalog loader panicked".to_string()))?
+    }
+
+    /// Stream manifest-backed catalog metadata with one queued page of backpressure.
+    ///
+    /// Each page checks canonical file presence and reads bounded manifest metadata;
+    /// missing/damaged sidecars are left to full discovery rather than guessed here.
+    /// Dropping the receiver stops the reader at its next handoff. The completion
+    /// handle reports read/close errors, including missing catalogs. Callers must
+    /// reconcile these display-only summaries with discovery before claiming a
+    /// complete catalog; canonical database contents are never opened or validated.
+    ///
+    /// # Panics
+    ///
+    /// Panics when called outside a Tokio runtime.
+    #[must_use]
+    pub fn stream_catalog_pages(
+        &self,
+    ) -> (
+        tokio::sync::mpsc::Receiver<Vec<SessionSummary>>,
+        tokio::task::JoinHandle<Result<(), SessionStoreError>>,
+    ) {
+        let (sender, receiver) = tokio::sync::mpsc::channel(1);
+        let store = self.clone();
+        let completion = tokio::task::spawn_blocking(move || {
+            store.visit_catalog_pages(|page| {
+                let page = page
+                    .into_iter()
+                    .filter_map(|summary| {
+                        // Only complete sidecar metadata is eligible for early display;
+                        // discovery will represent missing/damaged sidecars later.
+                        if !db::session_db_path(&store.root, summary.id).is_file() {
+                            return None;
+                        }
+                        store.load_session_manifest(summary.id).ok().flatten()
+                    })
+                    .collect();
+                sender.blocking_send(page).is_ok()
+            })
+        });
+        (receiver, completion)
     }
 
     pub(crate) fn root(&self) -> &Path {
@@ -373,6 +455,81 @@ impl SessionStore {
 mod tests {
     use super::SessionStore;
     use bcode_session_models::SessionId;
+
+    #[test]
+    fn catalog_loader_retains_rows_across_database_pages() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = SessionStore::new(temp.path());
+        let mut expected = std::collections::BTreeMap::new();
+        for index in 0..259 {
+            let id = SessionId::new();
+            std::fs::create_dir(temp.path().join(id.to_string())).unwrap();
+            let mut summary = store.canonical_summary(id);
+            summary.name = Some(format!("session {index}"));
+            summary.updated_at_ms = 42;
+            std::fs::write(
+                temp.path().join(id.to_string()).join("session.db"),
+                b"not opened",
+            )
+            .unwrap();
+            store.write_session_manifest(&summary).unwrap();
+            expected.insert(id, summary);
+        }
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let catalog = super::db::GlobalSessionDb::initialize_turso_in_root(temp.path())
+                .await
+                .unwrap();
+            catalog
+                .upsert_sessions(temp.path(), &expected.values().cloned().collect::<Vec<_>>())
+                .await
+                .unwrap();
+            catalog.close().await.unwrap();
+        });
+        let mut pages = Vec::new();
+        store
+            .visit_catalog_pages(|page| {
+                pages.push(page.len());
+                false
+            })
+            .unwrap();
+        assert_eq!(pages, vec![256]);
+        pages.clear();
+        store
+            .visit_catalog_pages(|page| {
+                pages.push(page.len());
+                true
+            })
+            .unwrap();
+        assert_eq!(pages, vec![256, 3]);
+        runtime.block_on(async {
+            let (mut receiver, completion) = store.stream_catalog_pages();
+            assert_eq!(receiver.max_capacity(), 1);
+            let mut count = 0;
+            while let Some(page) = receiver.recv().await {
+                assert!(page.len() <= 256);
+                count += page.len();
+            }
+            completion.await.unwrap().unwrap();
+            assert_eq!(count, 259);
+            let (receiver, completion) = store.stream_catalog_pages();
+            drop(receiver);
+            tokio::time::timeout(std::time::Duration::from_secs(5), completion)
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap();
+        });
+        let loaded = store.load_catalog().unwrap();
+        assert_eq!(loaded.len(), expected.len());
+        for (id, summary) in expected {
+            assert_eq!(loaded[&id].summary.name, summary.name);
+            assert_eq!(loaded[&id].summary.updated_at_ms, summary.updated_at_ms);
+        }
+    }
 
     #[test]
     fn catalog_discovery_preserves_manifest_metadata_and_damaged_neighbors() {
@@ -400,6 +557,19 @@ mod tests {
         let catalog = store.load_catalog().unwrap();
         assert_eq!(catalog.len(), 3);
         assert_eq!(catalog[&ids[0]].summary, summary);
+        let readable = store.discover_readable_session_summaries().unwrap();
+        let backfill = store.backfill_catalog().unwrap();
+        assert_eq!(readable.len(), 3);
+        assert_eq!(backfill.len(), 3);
+        for results in [&readable, &backfill] {
+            assert_eq!(
+                results.iter().find(|entry| entry.id == ids[0]),
+                Some(&summary)
+            );
+            for id in ids {
+                assert_eq!(results.iter().filter(|entry| entry.id == id).count(), 1);
+            }
+        }
         assert_eq!(std::fs::read(damaged).unwrap(), b"broken");
         for id in ids {
             assert_eq!(

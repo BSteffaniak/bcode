@@ -460,26 +460,28 @@ pub async fn invoke_skill(
 /// Return the coherent bounded session catalog for one working directory.
 ///
 /// Available results are returned while other sources load; catalog subscribers receive
-/// completion updates. Empty initial snapshots retain native-load coordination. Discovery
-/// remains best-effort and non-mutating.
+/// completion updates. Empty initial snapshots wait for a catalog revision, allowing
+/// useful pages to return before full discovery. Discovery remains best-effort and non-mutating.
 pub async fn list(
     state: &Arc<ServerState>,
     working_directory: &Path,
 ) -> Result<SessionCatalogSnapshot, bcode_session::SessionStoreError> {
-    let snapshot = state
-        .session_catalog
-        .snapshot(state, working_directory)
-        .await;
-    if !snapshot.sessions.is_empty() || !matches!(snapshot.status, SessionCatalogStatus::Loading) {
-        return Ok(snapshot);
+    let mut revisions = state.session_catalog.subscribe();
+    loop {
+        revisions.borrow_and_update();
+        let snapshot = state
+            .session_catalog
+            .snapshot(state, working_directory)
+            .await;
+        if !snapshot.sessions.is_empty()
+            || !matches!(snapshot.status, SessionCatalogStatus::Loading)
+        {
+            return Ok(snapshot);
+        }
+        revisions.changed().await.map_err(|_| {
+            bcode_session::SessionStoreError::CatalogLoad("catalog subscription closed".to_owned())
+        })?;
     }
-
-    state.sessions.wait_catalog_loaded().await?;
-    state.session_catalog.refresh_native_now(state).await;
-    Ok(state
-        .session_catalog
-        .snapshot(state, working_directory)
-        .await)
 }
 
 /// Refresh selected session catalog sources without transport framing.

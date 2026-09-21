@@ -699,6 +699,13 @@ mod tests {
         app.replace_sessions(sessions);
         assert_eq!(app.selected_session_id(), Some(selected.id));
         assert_eq!(app.list.indices().len(), 302);
+        // Every row remains reachable after a progressive catalog replacement,
+        // including rows beyond the storage page size.
+        app.select_visible(0);
+        for index in 0..302 {
+            assert_eq!(app.selected_session_id(), Some(app.sessions[index].id));
+            app.select_next();
+        }
         app.replace_sessions(vec![]);
         assert_eq!(app.selected_session_id(), None);
     }
