@@ -174,7 +174,7 @@ pub enum TuiEffect {
     /// Load host and plugin command-palette contributions.
     LoadCommandPalette,
     /// Load the bounded session catalog for the root session picker.
-    LoadSessionPicker,
+    LoadSessionPicker { generation: u64 },
     /// Import one external session selected by the root picker.
     ImportSession {
         source_id: String,
@@ -565,6 +565,8 @@ pub enum TuiEffectResult {
     },
     /// Root session-picker catalog load completed.
     SessionPickerLoaded {
+        /// Subscription generation that produced the result.
+        generation: u64,
         /// Bounded catalog result from the application client boundary.
         result: Result<SessionList, ClientError>,
     },
@@ -1121,7 +1123,7 @@ impl TuiEffect {
             | Self::SaveDraft { .. }
             | Self::LoadSlashPalette { .. }
             | Self::LoadCommandPalette
-            | Self::LoadSessionPicker
+            | Self::LoadSessionPicker { .. }
             | Self::ImportSession { .. }
             | Self::RenameSession { .. }
             | Self::DeleteSession { .. }
@@ -1190,7 +1192,7 @@ impl TuiEffect {
             | Self::SaveDraft { .. }
             | Self::LoadSlashPalette { .. }
             | Self::LoadCommandPalette
-            | Self::LoadSessionPicker
+            | Self::LoadSessionPicker { .. }
             | Self::ImportSession { .. }
             | Self::RenameSession { .. }
             | Self::DeleteSession { .. }
@@ -1412,7 +1414,7 @@ impl TuiEffect {
             Self::SaveDraft { .. } => EffectKey::DraftSave,
             Self::LoadSlashPalette { .. } => EffectKey::SlashPalette,
             Self::LoadCommandPalette => EffectKey::CommandPalette,
-            Self::LoadSessionPicker => EffectKey::SessionPicker,
+            Self::LoadSessionPicker { .. } => EffectKey::SessionPicker,
             Self::ImportSession { .. } => EffectKey::ImportSession,
             Self::RenameSession { session_id, .. } => EffectKey::RenameSession(*session_id),
             Self::DeleteSession { session_id } => EffectKey::DeleteSession(*session_id),
@@ -1620,9 +1622,41 @@ impl TuiEffect {
                     .await
                     .map(|contributions| contributions.command_contributions),
             },
-            Self::LoadSessionPicker => TuiEffectResult::SessionPickerLoaded {
-                result: client.list_sessions_with_status().await,
-            },
+            Self::LoadSessionPicker { generation } => {
+                let result = async {
+                    let mut watcher = client.watch_session_catalog().await?;
+                    let initial = watcher.initial_snapshot().await?;
+                    if streaming_sender
+                        .send(TuiEffectResult::SessionPickerLoaded {
+                            result: Ok(initial),
+                            generation,
+                        })
+                        .await
+                        .is_err()
+                    {
+                        return Err(ClientError::Protocol(
+                            "session picker receiver closed".into(),
+                        ));
+                    }
+                    loop {
+                        let snapshot = watcher.next_snapshot().await?;
+                        if streaming_sender
+                            .send(TuiEffectResult::SessionPickerLoaded {
+                                result: Ok(snapshot),
+                                generation,
+                            })
+                            .await
+                            .is_err()
+                        {
+                            return Err(ClientError::Protocol(
+                                "session picker receiver closed".into(),
+                            ));
+                        }
+                    }
+                }
+                .await;
+                TuiEffectResult::SessionPickerLoaded { result, generation }
+            }
             Self::ImportSession {
                 source_id,
                 external_session_id,
@@ -2654,6 +2688,21 @@ async fn load_session_status(client: &BcodeClient, session_id: SessionId) -> Tui
 #[cfg(test)]
 mod progress_routing_tests {
     use super::*;
+
+    #[test]
+    fn session_picker_subscription_replacement_and_cancellation_are_coalesced() {
+        let mut queue = TuiEffectQueue::default();
+        queue.replace(TuiEffect::LoadSessionPicker { generation: 1 });
+        queue.replace(TuiEffect::LoadSessionPicker { generation: 1 });
+        let (effects, _) = queue.drain_runtime();
+        assert_eq!(effects.len(), 1);
+        assert!(matches!(effects[0].0, EffectSchedule::Replace));
+        queue.replace(TuiEffect::LoadSessionPicker { generation: 1 });
+        queue.cancel(TuiEffect::LoadSessionPicker { generation: 1 });
+        let (effects, _) = queue.drain_runtime();
+        assert_eq!(effects.len(), 1);
+        assert!(matches!(effects[0].0, EffectSchedule::Cancel));
+    }
 
     #[test]
     fn application_failures_do_not_claim_the_daemon_is_offline() {

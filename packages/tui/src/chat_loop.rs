@@ -256,6 +256,7 @@ pub struct ChatLoopState {
     interactive_surface_geometry: Option<InteractiveSurfaceGeometry>,
     pinned_interaction_viewport: Option<(String, u16)>,
     session_picker: Option<super::session_picker::SessionPickerApp>,
+    session_picker_generation: u64,
     interactive_surface_queue: InteractiveSurfaceQueue,
     artifact_stream: ArtifactStreamCoordinator,
     markdown_projection: super::markdown_projection_coordinator::MarkdownProjectionCoordinator,
@@ -319,6 +320,7 @@ impl ChatLoopState {
             interactive_surface_geometry: None,
             pinned_interaction_viewport: None,
             session_picker: None,
+            session_picker_generation: 0,
             interactive_surface_queue: InteractiveSurfaceQueue::default(),
             artifact_stream: ArtifactStreamCoordinator::new(passive_client.clone()),
             markdown_projection:
@@ -536,6 +538,13 @@ impl ChatLoopState {
             std::collections::VecDeque<TuiEffect>,
         >,
     ) {
+        // The catalog stream belongs to the modal, not to the chat session. Closing
+        // via any route cancels the keyed effect and drops its client subscription.
+        if !self.has_session_picker() {
+            chat.pending_effects.cancel(TuiEffect::LoadSessionPicker {
+                generation: self.session_picker_generation,
+            });
+        }
         let (effects, notes) = chat.pending_effects.drain_runtime();
         let commands = effects
             .into_iter()
@@ -1648,7 +1657,7 @@ impl ChatLoopState {
             picker.set_loading_status("Loading sessions…".to_owned());
         }
         self.session_picker = Some(picker);
-        chat.replace_effect(TuiEffect::LoadSessionPicker);
+        self.restart_session_picker_subscription(chat);
         chat.app.set_status(if search {
             "session search".to_owned()
         } else {
@@ -1656,19 +1665,42 @@ impl ChatLoopState {
         });
     }
 
+    fn restart_session_picker_subscription(&mut self, chat: &mut ActiveChat) {
+        self.session_picker_generation = self
+            .session_picker_generation
+            .checked_add(1)
+            .expect("picker generation exhausted");
+        chat.replace_effect(TuiEffect::LoadSessionPicker {
+            generation: self.session_picker_generation,
+        });
+    }
+
     pub fn apply_session_picker_result(
         &mut self,
+        generation: u64,
         result: Result<bcode_client::SessionList, bcode_client::ClientError>,
     ) {
+        if generation != self.session_picker_generation {
+            return;
+        }
         let Some(picker) = self.session_picker.as_mut() else {
             return;
         };
         match result {
             Ok(session_list) => {
-                let count = session_list.sessions.len();
+                let previous_mode = picker.mode();
                 picker.replace_sessions(session_list.sessions);
-                picker.set_status(format!("{count} sessions"));
-                picker.set_idle_empty_message();
+                let canceled = matches!(
+                    previous_mode,
+                    super::session_picker::SessionPickerMode::Rename
+                        | super::session_picker::SessionPickerMode::DeleteConfirm
+                ) && picker.mode()
+                    == super::session_picker::SessionPickerMode::Filter;
+                let cancellation = canceled.then(|| picker.status().to_owned());
+                picker.set_catalog_status(&session_list.catalog_status);
+                if let Some(cancellation) = cancellation {
+                    picker.set_status(format!("{cancellation}; {}", picker.status()));
+                }
             }
             Err(error) => picker.set_status(format!("Session catalog unavailable: {error}")),
         }
@@ -2705,8 +2737,8 @@ pub fn apply_effect_result(
                 }
             }
         }
-        TuiEffectResult::SessionPickerLoaded { result } => {
-            loop_state.apply_session_picker_result(result);
+        TuiEffectResult::SessionPickerLoaded { result, generation } => {
+            loop_state.apply_session_picker_result(generation, result);
         }
         TuiEffectResult::SessionImported { result } => {
             if let Some(session_id) = loop_state.apply_session_import_result(result) {
@@ -2721,11 +2753,11 @@ pub fn apply_effect_result(
         }
         TuiEffectResult::SessionRenamed { result } => {
             loop_state.apply_session_mutation_result("renamed", result);
-            chat.replace_effect(TuiEffect::LoadSessionPicker);
+            loop_state.restart_session_picker_subscription(chat);
         }
         TuiEffectResult::SessionDeleted { result } => {
             loop_state.apply_session_mutation_result("deleted", result);
-            chat.replace_effect(TuiEffect::LoadSessionPicker);
+            loop_state.restart_session_picker_subscription(chat);
         }
         TuiEffectResult::SessionsSearched { result } => {
             loop_state.apply_session_search_result(result);
@@ -5808,6 +5840,34 @@ mod scheduler_tests {
             .clone()
             .with_daemon_availability(bcode_client::DaemonAvailability::RequireRunning);
         ChatLoopState::new(&client, &passive, false)
+    }
+
+    #[tokio::test]
+    async fn session_picker_rejects_old_subscription_results() {
+        let mut state = loop_state();
+        state.session_picker_generation = 2;
+        state.session_picker = Some(super::super::session_picker::SessionPickerApp::new(
+            Vec::new(),
+        ));
+        let initial = state.session_picker.as_ref().unwrap().status().to_owned();
+        state.apply_session_picker_result(1, Err(ClientError::Protocol("old connection".into())));
+        assert_eq!(state.session_picker.as_ref().unwrap().status(), initial);
+        state.apply_session_picker_result(
+            2,
+            Err(ClientError::Protocol("current connection".into())),
+        );
+        assert!(
+            state
+                .session_picker
+                .as_ref()
+                .unwrap()
+                .status()
+                .contains("current connection")
+        );
+        state.session_picker = None;
+        state
+            .apply_session_picker_result(2, Err(ClientError::Protocol("closed connection".into())));
+        assert!(state.session_picker.is_none());
     }
 
     fn surface(interaction_id: &str) -> InteractiveSurfaceState {

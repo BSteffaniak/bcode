@@ -123,7 +123,12 @@ impl SessionStore {
         } else {
             Vec::new()
         };
-        summaries.extend(self.load_session_manifests()?);
+        let manifests = self
+            .load_session_manifests()?
+            .into_iter()
+            .map(|summary| (summary.id, summary))
+            .collect::<BTreeMap<_, _>>();
+        summaries.extend(manifests.values().cloned());
         summaries.extend(self.discover_canonical_session_summaries()?);
         summaries.sort_by(|left, right| {
             left.id
@@ -134,17 +139,10 @@ impl SessionStore {
 
         let mut sessions = BTreeMap::new();
         for summary in summaries {
-            let summary = match self.load_session_manifest(summary.id) {
-                Ok(Some(manifest_summary)) => manifest_summary,
-                Ok(None) => summary,
-                Err(error) => {
-                    eprintln!(
-                        "using canonical fallback for session {} with unreadable manifest metadata: {error}",
-                        summary.id
-                    );
-                    summary
-                }
-            };
+            // Manifests carry fields absent from catalog rows and remain preferred even
+            // when their timestamp is older. Reuse the discovery snapshot rather than
+            // reopening and decoding every manifest a second time.
+            let summary = manifests.get(&summary.id).cloned().unwrap_or(summary);
             sessions.insert(summary.id, SessionState::from_catalog_summary(summary));
         }
         Ok(sessions)
@@ -375,6 +373,41 @@ impl SessionStore {
 mod tests {
     use super::SessionStore;
     use bcode_session_models::SessionId;
+
+    #[test]
+    fn catalog_discovery_preserves_manifest_metadata_and_damaged_neighbors() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = SessionStore::new(temp.path());
+        let ids = [SessionId::new(), SessionId::new(), SessionId::new()];
+        for id in ids {
+            let directory = temp.path().join(id.to_string());
+            std::fs::create_dir_all(&directory).unwrap();
+            std::fs::write(directory.join("session.db"), b"never opened").unwrap();
+        }
+        let mut summary = store
+            .discover_canonical_session_summaries()
+            .unwrap()
+            .into_iter()
+            .find(|summary| summary.id == ids[0])
+            .unwrap();
+        summary.name = Some("manifest title".to_owned());
+        summary.updated_at_ms = 1;
+        summary.working_directory = temp.path().join("project");
+        store.write_session_manifest(&summary).unwrap();
+        let damaged = temp.path().join(ids[1].to_string()).join("manifest.json");
+        std::fs::write(&damaged, b"broken").unwrap();
+
+        let catalog = store.load_catalog().unwrap();
+        assert_eq!(catalog.len(), 3);
+        assert_eq!(catalog[&ids[0]].summary, summary);
+        assert_eq!(std::fs::read(damaged).unwrap(), b"broken");
+        for id in ids {
+            assert_eq!(
+                std::fs::read(temp.path().join(id.to_string()).join("session.db")).unwrap(),
+                b"never opened"
+            );
+        }
+    }
 
     #[test]
     fn targeted_manifest_lookup_preserves_summary_without_opening_database() {

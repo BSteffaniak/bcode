@@ -459,8 +459,9 @@ pub async fn invoke_skill(
 
 /// Return the coherent bounded session catalog for one working directory.
 ///
-/// This preserves the existing initial-load coordination while keeping response framing out of
-/// the application operation. Catalog discovery remains best-effort, bounded, and non-mutating.
+/// Available results are returned while other sources load; catalog subscribers receive
+/// completion updates. Empty initial snapshots retain native-load coordination. Discovery
+/// remains best-effort and non-mutating.
 pub async fn list(
     state: &Arc<ServerState>,
     working_directory: &Path,
@@ -469,7 +470,7 @@ pub async fn list(
         .session_catalog
         .snapshot(state, working_directory)
         .await;
-    if !matches!(snapshot.status, SessionCatalogStatus::Loading) {
+    if !snapshot.sessions.is_empty() || !matches!(snapshot.status, SessionCatalogStatus::Loading) {
         return Ok(snapshot);
     }
 

@@ -157,10 +157,74 @@ impl SessionPickerApp {
         self.last_import.as_ref()
     }
 
-    /// Replace sessions.
+    /// Replace session metadata without moving selection to a different session.
     pub fn replace_sessions(&mut self, sessions: Vec<SessionSummary>) {
+        let selected = self
+            .list
+            .selected_source_index()
+            .and_then(|index| self.sessions.get(index))
+            .map(|session| {
+                (
+                    session.id,
+                    session
+                        .location
+                        .as_ref()
+                        .map(|location| location.location_id.clone()),
+                )
+            });
         self.sessions = sessions;
+        // Transcript results have their own ordering, selection and preview. Catalog
+        // updates only supply their canonical titles, not a replacement result list.
+        if self.mode == SessionPickerMode::TranscriptSearch {
+            return;
+        }
         self.refresh_filter();
+        let selected_row = selected.and_then(|selected| {
+            self.list.indices().iter().position(|index| {
+                let session = &self.sessions[*index];
+                session.id == selected.0
+                    && session
+                        .location
+                        .as_ref()
+                        .map(|location| location.location_id.as_str())
+                        == selected.1.as_deref()
+            })
+        });
+        if let Some(row) = selected_row {
+            self.list.select_visible(row);
+        } else if matches!(
+            self.mode,
+            SessionPickerMode::Rename | SessionPickerMode::DeleteConfirm
+        ) {
+            // Never transfer an in-progress mutation to the row that happens to
+            // replace a removed/filtered target in the live catalog.
+            self.mode = SessionPickerMode::Filter;
+            self.rename = super::text_input_flow::empty_state();
+            "Selected session is no longer available; action canceled".clone_into(&mut self.status);
+        }
+    }
+
+    /// Apply discovery status without overwriting an active search or mutation prompt.
+    pub fn set_catalog_status(&mut self, status: &bcode_session_models::SessionCatalogStatus) {
+        use bcode_session_models::SessionCatalogStatus;
+        if self.mode != SessionPickerMode::Filter {
+            return;
+        }
+        let count = self.sessions.len();
+        match status {
+            SessionCatalogStatus::NotStarted | SessionCatalogStatus::Loading => {
+                self.set_loading_status(format!("{count} sessions; discovering more…"));
+            }
+            SessionCatalogStatus::Loaded => {
+                self.set_status(format!("{count} sessions"));
+                self.set_idle_empty_message();
+            }
+            SessionCatalogStatus::Degraded(message) | SessionCatalogStatus::Failed(message) => {
+                self.set_loading_status(format!(
+                    "{count} sessions; catalog unavailable: {message}"
+                ));
+            }
+        }
     }
 
     /// Enter transcript-search query mode.
@@ -622,6 +686,70 @@ mod tests {
     }
 
     #[test]
+    fn catalog_reordering_preserves_selection_and_all_results_remain_reachable() {
+        let first = summary("first", "/tmp/workspace");
+        let selected = summary("selected", "/tmp/workspace");
+        let mut app = SessionPickerApp::new(vec![first.clone(), selected.clone()]);
+        app.select_next();
+        let mut sessions = (0..300)
+            .map(|index| summary(&format!("later {index}"), "/tmp/workspace"))
+            .collect::<Vec<_>>();
+        sessions.insert(17, selected.clone());
+        sessions.push(first);
+        app.replace_sessions(sessions);
+        assert_eq!(app.selected_session_id(), Some(selected.id));
+        assert_eq!(app.list.indices().len(), 302);
+        app.replace_sessions(vec![]);
+        assert_eq!(app.selected_session_id(), None);
+    }
+
+    #[test]
+    fn removed_catalog_target_cancels_mutation_instead_of_retargeting() {
+        for rename in [false, true] {
+            let selected = summary("selected", "/tmp/workspace");
+            let survivor = summary("survivor", "/tmp/workspace");
+            let mut app = SessionPickerApp::new(vec![selected.clone(), survivor.clone()]);
+            assert!(if rename {
+                app.start_rename()
+            } else {
+                app.start_delete_confirmation()
+            });
+            app.replace_sessions(vec![survivor.clone(), selected.clone()]);
+            assert_eq!(app.selected_session_id(), Some(selected.id));
+            assert_eq!(
+                app.mode(),
+                if rename {
+                    SessionPickerMode::Rename
+                } else {
+                    SessionPickerMode::DeleteConfirm
+                }
+            );
+            app.replace_sessions(vec![survivor.clone()]);
+            assert_eq!(app.mode(), SessionPickerMode::Filter);
+            assert_eq!(app.selected_session_id(), Some(survivor.id));
+            assert!(app.status().contains("action canceled"));
+            assert!(app.rename().buffer().text().is_empty());
+        }
+    }
+
+    #[test]
+    fn catalog_status_preserves_loading_errors_and_mutation_prompts() {
+        use bcode_session_models::SessionCatalogStatus;
+        let mut app = SessionPickerApp::new(vec![summary("selected", "/tmp/workspace")]);
+        app.set_catalog_status(&SessionCatalogStatus::Loading);
+        assert!(app.status().contains("discovering"));
+        app.set_catalog_status(&SessionCatalogStatus::Degraded("offline source".to_owned()));
+        assert!(app.status().contains("offline source"));
+        assert!(app.empty_message.contains("offline source"));
+        app.set_catalog_status(&SessionCatalogStatus::Loaded);
+        assert_eq!(app.status(), "1 sessions");
+        app.start_rename();
+        let status = app.status().to_owned();
+        app.set_catalog_status(&SessionCatalogStatus::Loading);
+        assert_eq!(app.status(), status);
+    }
+
+    #[test]
     fn primary_location_is_not_labeled_but_foreign_locations_are() {
         assert_eq!(
             super::session_location_label(&located_summary("a", None, true, false)),
@@ -735,6 +863,11 @@ mod tests {
             Some(2)
         );
         assert!(app.search_preview().contains("second preview"));
+        let selected = app.selected_search_result().cloned();
+        let preview = app.search_preview().to_owned();
+        app.replace_sessions(vec![summary("unrelated metadata", "/tmp/workspace")]);
+        assert_eq!(app.selected_search_result(), selected.as_ref());
+        assert_eq!(app.search_preview(), preview);
     }
 
     #[test]

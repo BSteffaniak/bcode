@@ -9,7 +9,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
-use tokio::sync::{Mutex, Notify, watch};
+use tokio::sync::{Mutex, Notify, OnceCell, watch};
 
 const NATIVE_SOURCE_ID: &str = "native";
 const NATIVE_DISPLAY_NAME: &str = "Native Bcode sessions";
@@ -21,6 +21,7 @@ pub struct SessionCatalog {
     revision_tx: watch::Sender<u64>,
     revision_rx: watch::Receiver<u64>,
     notify: Notify,
+    import_sources: Mutex<BTreeMap<String, Arc<OnceCell<Vec<String>>>>>,
 }
 
 #[derive(Debug, Default)]
@@ -143,6 +144,7 @@ impl Default for SessionCatalog {
             revision_tx,
             revision_rx,
             notify: Notify::new(),
+            import_sources: Mutex::default(),
         }
     }
 }
@@ -276,8 +278,29 @@ impl SessionCatalog {
         sources: Option<&[String]>,
     ) -> SessionCatalogSnapshot {
         let working_directory = normalize_path(working_directory);
+        // Source enumeration is cached independently of per-directory session discovery.
+        // A refresh must discover newly available sources too. In-flight readers retain
+        // their old cell, but cannot repopulate the invalidated cache.
+        self.import_sources.lock().await.clear();
         self.invalidate_sources(&working_directory, sources).await;
         self.snapshot(state, &working_directory).await
+    }
+
+    async fn import_source_ids(
+        &self,
+        plugin_id: &str,
+        load: impl std::future::Future<Output = Result<Vec<String>, String>>,
+    ) -> Vec<String> {
+        let cell = {
+            let mut sources = self.import_sources.lock().await;
+            Arc::clone(sources.entry(plugin_id.to_owned()).or_default())
+        };
+        // OnceCell coalesces concurrent enumeration, releases initialization on
+        // cancellation, and retains only successes so transient failures can retry.
+        cell.get_or_try_init(|| load)
+            .await
+            .cloned()
+            .unwrap_or_default()
     }
 
     async fn ensure_sources(&self, state: &Arc<ServerState>, working_directory: &Path) {
@@ -579,7 +602,11 @@ async fn source_plans(state: &ServerState, working_directory: &Path) -> Vec<Cata
         .cloned()
         .unwrap_or_default();
     for plugin_id in providers {
-        for source_id in import_source_ids(state, &plugin_id).await {
+        for source_id in state
+            .session_catalog
+            .import_source_ids(&plugin_id, Box::pin(import_source_ids(state, &plugin_id)))
+            .await
+        {
             plans.push(CatalogSourcePlan::Import {
                 plugin_id: plugin_id.clone(),
                 source_id,
@@ -864,7 +891,7 @@ fn aggregate_status<'a>(
     }
 }
 
-async fn import_source_ids(state: &ServerState, plugin_id: &str) -> Vec<String> {
+async fn import_source_ids(state: &ServerState, plugin_id: &str) -> Result<Vec<String>, String> {
     state
         .plugins
         .invoke_service_json::<_, bcode_session_import::ListImportSourcesResponse>(
@@ -881,7 +908,7 @@ async fn import_source_ids(state: &ServerState, plugin_id: &str) -> Vec<String> 
                 .map(|source| source.source_id)
                 .collect()
         })
-        .unwrap_or_default()
+        .map_err(|error| error.to_string())
 }
 
 async fn discover_import_source(
@@ -992,6 +1019,194 @@ fn current_unix_millis() -> u64 {
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test]
+    async fn import_enumeration_coalesces_and_warm_reads_skip_provider_work() {
+        let catalog = SessionCatalog::default();
+        let (release, blocked) = tokio::sync::oneshot::channel();
+        let first = catalog.import_source_ids("provider", async {
+            blocked.await.unwrap();
+            Ok(vec!["source".to_owned()])
+        });
+        tokio::pin!(first);
+        assert!(futures::poll!(&mut first).is_pending());
+        let second = catalog.import_source_ids("provider", async {
+            panic!("concurrent enumeration must share initialization")
+        });
+        tokio::pin!(second);
+        assert!(futures::poll!(&mut second).is_pending());
+        release.send(()).unwrap();
+        assert_eq!(first.await, vec!["source"]);
+        assert_eq!(second.await, vec!["source"]);
+        assert_eq!(
+            catalog
+                .import_source_ids("provider", async {
+                    panic!("warm observation must not poll provider")
+                })
+                .await,
+            vec!["source"]
+        );
+    }
+
+    #[tokio::test]
+    async fn import_enumeration_retries_errors_and_cancelled_initialization() {
+        let catalog = SessionCatalog::default();
+        assert!(
+            catalog
+                .import_source_ids("provider", async { Err("offline".to_owned()) })
+                .await
+                .is_empty()
+        );
+        {
+            let pending = catalog.import_source_ids("provider", std::future::pending());
+            tokio::pin!(pending);
+            assert!(futures::poll!(&mut pending).is_pending());
+        }
+        assert_eq!(
+            catalog
+                .import_source_ids("provider", async { Ok(vec!["recovered".to_owned()]) })
+                .await,
+            vec!["recovered"]
+        );
+        catalog.import_sources.lock().await.clear();
+        assert_eq!(
+            catalog
+                .import_source_ids("provider", async { Ok(vec!["new source".to_owned()]) })
+                .await,
+            vec!["new source"]
+        );
+    }
+
+    #[tokio::test]
+    async fn import_refresh_does_not_restore_an_in_flight_old_enumeration() {
+        let catalog = SessionCatalog::default();
+        let (release, blocked) = tokio::sync::oneshot::channel();
+        let old = catalog.import_source_ids("provider", async {
+            blocked.await.unwrap();
+            Ok(vec!["old".to_owned()])
+        });
+        tokio::pin!(old);
+        assert!(futures::poll!(&mut old).is_pending());
+        catalog.import_sources.lock().await.clear();
+        assert_eq!(
+            catalog
+                .import_source_ids("provider", async { Ok(vec!["new".to_owned()]) })
+                .await,
+            vec!["new"]
+        );
+        release.send(()).unwrap();
+        assert_eq!(old.await, vec!["old"]);
+        assert_eq!(
+            catalog
+                .import_source_ids("provider", async {
+                    panic!("fresh cache must survive old completion")
+                })
+                .await,
+            vec!["new"]
+        );
+    }
+
+    #[tokio::test]
+    async fn available_catalog_results_do_not_wait_for_unstarted_native_discovery() {
+        let root = tempfile::tempdir().unwrap();
+        let state = std::sync::Arc::new(crate::tests::test_server_state(
+            bcode_session::SessionManager::persistent_lazy(root.path()),
+        ));
+        let session = summary(SessionId::new(), None);
+        state
+            .session_catalog
+            .apply_source_result(
+                super::native_source_key(),
+                super::native_metadata(),
+                Ok(SourceLoadResult {
+                    sessions: vec![session.clone()],
+                    diagnostics: SourceDiagnostics::default(),
+                }),
+            )
+            .await;
+        // Keep an additional relevant source loading so aggregate status cannot be
+        // mistaken for complete. No task is responsible for completing this source.
+        let key = super::CatalogSourceKey {
+            source_id: "slow".to_owned(),
+            scope: super::CatalogSourceScope::Global,
+        };
+        state.session_catalog.inner.lock().await.sources.insert(
+            key,
+            super::SourceCache {
+                metadata: super::SourceMetadata {
+                    display_name: "Slow source".to_owned(),
+                },
+                state: super::SourceCacheState::Loading,
+                updated_at_ms: 0,
+            },
+        );
+        let snapshot = {
+            let listing = crate::session_operations::list(&state, &session.working_directory);
+            tokio::pin!(listing);
+            match futures::poll!(&mut listing) {
+                std::task::Poll::Ready(result) => result.unwrap(),
+                std::task::Poll::Pending => panic!("available results waited for discovery"),
+            }
+        };
+        assert_eq!(snapshot.sessions, vec![session.clone()]);
+        assert_eq!(
+            snapshot.status,
+            bcode_session_models::SessionCatalogStatus::Loading
+        );
+        assert!(matches!(
+            state.sessions.catalog_status(),
+            bcode_session::CatalogLoadStatus::NotStarted
+        ));
+        drop(state);
+    }
+
+    #[tokio::test]
+    #[ignore = "diagnostic timing run; no machine-dependent latency threshold"]
+    async fn available_catalog_listing_timing() {
+        for count in [100, 1_000, 10_000] {
+            let root = tempfile::tempdir().unwrap();
+            let state = std::sync::Arc::new(crate::tests::test_server_state(
+                bcode_session::SessionManager::persistent_lazy(root.path()),
+            ));
+            let sessions = (0..count)
+                .map(|_| summary(SessionId::new(), None))
+                .collect::<Vec<_>>();
+            let directory = sessions[0].working_directory.clone();
+            state
+                .session_catalog
+                .apply_source_result(
+                    super::native_source_key(),
+                    super::native_metadata(),
+                    Ok(SourceLoadResult {
+                        sessions,
+                        diagnostics: SourceDiagnostics::default(),
+                    }),
+                )
+                .await;
+            let start = std::time::Instant::now();
+            let initial = crate::session_operations::list(&state, &directory)
+                .await
+                .unwrap();
+            let initial_elapsed = start.elapsed();
+            assert_eq!(initial.sessions.len(), count);
+            let start = std::time::Instant::now();
+            for _ in 0..10 {
+                assert_eq!(
+                    crate::session_operations::list(&state, &directory)
+                        .await
+                        .unwrap()
+                        .sessions
+                        .len(),
+                    count
+                );
+            }
+            eprintln!(
+                "available catalog count={count} first={initial_elapsed:?} warm_mean={:?}",
+                start.elapsed() / 10
+            );
+            drop(state);
+        }
+    }
+
     #[test]
     fn native_primary_uses_retained_store_and_identity() {
         let root = tempfile::tempdir().expect("store root");
