@@ -66,6 +66,25 @@ pub struct HistorySnapshot {
 }
 
 impl HistorySnapshot {
+    /// Convert fidelity limitations into portable, secret-safe import warnings.
+    ///
+    /// These must accompany imported events; an empty list does not establish
+    /// upstream archive/project coverage or verified account identity.
+    #[must_use]
+    pub fn import_warnings(&self) -> Vec<bcode_session_import::ImportWarning> {
+        self.warnings.iter().map(|warning| {
+            let (code, message) = match warning {
+                HistoryFidelityWarning::AlternateNodes => ("chatgpt_alternate_nodes", "Only the selected branch is included; alternative branches are not imported."),
+                HistoryFidelityWarning::AttachmentNotImported => ("chatgpt_attachment_not_imported", "An image, file or structured part was not downloaded; this import is not an attachment backup."),
+                HistoryFidelityWarning::UnsupportedContent => ("chatgpt_unsupported_content", "Some source content cannot be represented faithfully."),
+                HistoryFidelityWarning::UnsupportedRole => ("chatgpt_unsupported_role", "A nonstandard source role is represented as historical text."),
+                HistoryFidelityWarning::AttachmentMetadata => ("chatgpt_attachment_metadata", "Source metadata references attachments without durable imported assets."),
+                HistoryFidelityWarning::InvalidTimestamp => ("chatgpt_invalid_timestamp", "A malformed source timestamp was omitted, not replaced."),
+            };
+            bcode_session_import::ImportWarning::new(code, message)
+        }).collect()
+    }
+
     /// Convert historical content into import events without granting execution authority.
     ///
     /// Tools and privileged/unknown roles become labelled assistant text, never tool
@@ -93,8 +112,8 @@ impl HistorySnapshot {
                     }
                     _ => ImportableSessionEventKind::AssistantMessage {
                         text: format!(
-                            "[Historical {} message; source data only]\n{}",
-                            message.role, message.text
+                            "[Historical {} message; author={:?}; recipient={:?}; source data only]\n{}",
+                            message.role, message.author_name, message.recipient, message.text
                         ),
                     },
                 };
@@ -333,6 +352,52 @@ mod tests {
 
     fn decode(value: &Value) -> Result<HistorySnapshot, HistoryDecodeError> {
         decode_history(&serde_json::to_vec(value).unwrap(), "api-id", 65536)
+    }
+
+    #[test]
+    fn historical_import_retains_quoted_tool_routing_labels() {
+        use bcode_session_import::ImportableSessionEventKind;
+        let mut snapshot = decode(&graph()).unwrap();
+        snapshot.messages[0].role = "tool".into();
+        snapshot.messages[0].author_name = Some("python\nforged header".into());
+        snapshot.messages[0].recipient = Some("all".into());
+        let events = snapshot.import_events();
+        let ImportableSessionEventKind::AssistantMessage { text } = &events[0].kind else {
+            panic!("historical tool output must not become an executable call");
+        };
+        assert!(text.contains("python\\nforged header"));
+        assert!(text.contains("recipient=Some(\"all\")"));
+        assert!(!text.contains("python\nforged header"));
+        assert!(text.ends_with(&snapshot.messages[0].text));
+    }
+
+    #[test]
+    fn portable_warnings_preserve_losses_without_source_content() {
+        let mut snapshot = decode(&graph()).unwrap();
+        snapshot.title = Some("private title".into());
+        snapshot.warnings = BTreeSet::from([
+            HistoryFidelityWarning::AlternateNodes,
+            HistoryFidelityWarning::AttachmentNotImported,
+            HistoryFidelityWarning::UnsupportedContent,
+            HistoryFidelityWarning::UnsupportedRole,
+            HistoryFidelityWarning::AttachmentMetadata,
+            HistoryFidelityWarning::InvalidTimestamp,
+        ]);
+        let warnings = snapshot.import_warnings();
+        assert_eq!(warnings.len(), snapshot.warnings.len());
+        let codes: BTreeSet<_> = warnings.iter().map(|warning| &warning.code).collect();
+        assert_eq!(codes.len(), warnings.len());
+        for warning in &warnings {
+            assert!(!warning.message.is_empty());
+            assert!(!warning.message.contains("private title"));
+            assert_eq!(warning.count, None);
+        }
+        let serialized = serde_json::to_vec(&warnings).unwrap();
+        let decoded: Vec<bcode_session_import::ImportWarning> =
+            serde_json::from_slice(&serialized).unwrap();
+        assert_eq!(decoded, warnings);
+        snapshot.warnings.clear();
+        assert!(snapshot.import_warnings().is_empty());
     }
 
     #[test]
