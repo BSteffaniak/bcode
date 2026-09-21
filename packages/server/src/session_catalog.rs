@@ -341,7 +341,19 @@ impl SessionCatalog {
     }
 
     async fn ensure_sources(&self, state: &Arc<ServerState>, working_directory: &Path) {
-        for plan in source_plans(state, working_directory).await {
+        self.ensure_sources_with_imports(state, source_plans(state, working_directory))
+            .await;
+    }
+
+    async fn ensure_sources_with_imports(
+        &self,
+        state: &Arc<ServerState>,
+        imports: impl std::future::Future<Output = Vec<CatalogSourcePlan>>,
+    ) {
+        for plan in native_source_plans(state) {
+            self.ensure_source(state, plan).await;
+        }
+        for plan in imports.await {
             self.ensure_source(state, plan).await;
         }
     }
@@ -644,7 +656,7 @@ async fn load_in_memory_source(state: &ServerState) -> Result<SourceLoadResult, 
     })
 }
 
-async fn source_plans(state: &ServerState, working_directory: &Path) -> Vec<CatalogSourcePlan> {
+fn native_source_plans(state: &ServerState) -> Vec<CatalogSourcePlan> {
     let mut plans = native_locations(state)
         .into_iter()
         .map(|location| CatalogSourcePlan::Native { location })
@@ -652,6 +664,11 @@ async fn source_plans(state: &ServerState, working_directory: &Path) -> Vec<Cata
     if state.sessions.session_store_root().is_none() {
         plans.push(CatalogSourcePlan::InMemory);
     }
+    plans
+}
+
+async fn source_plans(state: &ServerState, working_directory: &Path) -> Vec<CatalogSourcePlan> {
+    let mut plans = Vec::new();
     let imports_enabled = if state.locations.is_some() {
         state.startup_config.session_import.enabled
     } else {
@@ -1092,6 +1109,27 @@ fn current_unix_millis() -> u64 {
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test]
+    async fn native_discovery_starts_before_blocked_import_enumeration() {
+        let root = tempfile::tempdir().unwrap();
+        let state = std::sync::Arc::new(crate::tests::test_server_state(
+            bcode_session::SessionManager::persistent_lazy(root.path()),
+        ));
+        {
+            let planning = state
+                .session_catalog
+                .ensure_sources_with_imports(&state, std::future::pending());
+            tokio::pin!(planning);
+            assert!(futures::poll!(&mut planning).is_pending());
+            let inner = state.session_catalog.inner.lock().await;
+            assert!(matches!(
+                inner.sources[&super::native_source_key()].state,
+                super::SourceCacheState::Loading
+            ));
+            drop(inner);
+        }
+        drop(state);
+    }
     #[tokio::test]
     async fn native_mutations_during_discovery_require_fresh_load() {
         for delete in [false, true] {
