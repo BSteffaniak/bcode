@@ -33,6 +33,7 @@ bmux_tui_components = { workspace = true, features = [
     "status-bar",
     "text-input-box",
 ] }
+pulldown-cmark = { workspace = true }
 schemars = { workspace = true }
 serde = { workspace = true, features = ["derive", "std"] }
 serde_json = { workspace = true }

@@ -52,6 +52,7 @@ use serde::{Deserialize, Serialize};
 const PLUGIN_ID: &str = "bcode.loop";
 const WORKFLOW_KIND: &str = "bcode.loop";
 mod goal;
+mod progress;
 
 const START_COMMAND: &str = "loop";
 const STATUS_COMMAND: &str = "loop.status";

@@ -179,8 +179,10 @@ pub fn progress_response(session_id: SessionId) -> InvokeCommandResponse {
     });
     match result {
         Ok(Some(document)) => status_response(&format!(
-            "Progress document: {}\n\n{}",
-            document.path, document.text
+            "Progress document (current): {}\n\n{}\n\n{}",
+            document.path,
+            crate::progress::Checklist::parse(&document.text).summary(),
+            document.text
         )),
         Ok(None) => status_response("No progress document for the associated loop"),
         Err(error) => status_response(&format!("Progress document unavailable: {error}")),
