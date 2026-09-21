@@ -926,6 +926,7 @@ mod tests {
 
     #[test]
     #[allow(clippy::too_many_lines)]
+    #[cfg(not(feature = "custody-simulation"))]
     fn update_is_owner_bound_and_rejects_undeclared_credentials_before_mutation() {
         let temp = tempfile::tempdir().expect("tempdir");
         let vault = temp.path().join("vault");
@@ -1080,6 +1081,7 @@ mod tests {
         assert!(!invalid_vault.exists());
     }
 
+    #[cfg(not(feature = "custody-simulation"))]
     fn update_service_request(
         provider_id: &str,
         profile: &str,
@@ -1132,6 +1134,7 @@ mod tests {
         assert_eq!(message, "credential update profile is unavailable");
     }
 
+    #[cfg(not(feature = "custody-simulation"))]
     fn failed_code(resolution: &bcode_tool::ToolInvocationServiceResolution) -> &str {
         match resolution {
             bcode_tool::ToolInvocationServiceResolution::Failed { code, .. } => code,
@@ -1141,6 +1144,7 @@ mod tests {
 
     #[test]
     #[allow(clippy::too_many_lines)]
+    #[cfg(not(feature = "custody-simulation"))]
     fn credential_update_service_request_binds_registry_ownership_and_persists_to_vault() {
         let temp = tempfile::tempdir().expect("tempdir");
         let vault = temp.path().join("vault");

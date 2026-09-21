@@ -173,8 +173,13 @@ jobs:
 
       - name: Build and verify Windows release artifact
         run: |
-          cargo xtask release --target x86_64-pc-windows-msvc --version ci
-          $verification = cargo xtask verify-release --target x86_64-pc-windows-msvc --version ci 2>&1
+          $metadata = cargo metadata --no-deps --format-version 1 | ConvertFrom-Json
+          if ($LASTEXITCODE -ne 0) { throw "Cargo metadata failed" }
+          $version = ($metadata.packages | Where-Object name -eq 'bcode').version
+          "BCODE_CI_VERSION=$version" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          cargo xtask release --target x86_64-pc-windows-msvc --version $version
+          if ($LASTEXITCODE -ne 0) { throw "Windows release build failed" }
+          $verification = cargo xtask verify-release --target x86_64-pc-windows-msvc --version $version 2>&1
           $verification | Write-Output
           if ($LASTEXITCODE -ne 0) {
             throw "Windows release verification failed"
@@ -205,7 +210,7 @@ jobs:
         shell: pwsh
         run: |
           Add-Type -AssemblyName System.IO.Compression.FileSystem
-          $archive = "target/dist/bcode-ci-x86_64-pc-windows-msvc.zip"
+          $archive = "target/dist/bcode-$env:BCODE_CI_VERSION-x86_64-pc-windows-msvc.zip"
           $checksum = "$archive.sha256"
           if (-not (Test-Path -LiteralPath $archive) -or -not (Test-Path -LiteralPath $checksum)) {
             throw "Windows CI release archive or checksum is missing"
@@ -238,7 +243,7 @@ jobs:
         with:
           name: bcode-windows-ci-${{ github.run_id }}
           path: |
-            target/dist/bcode-ci-x86_64-pc-windows-msvc.*
+            target/dist/bcode-${{ env.BCODE_CI_VERSION }}-x86_64-pc-windows-msvc.*
           if-no-files-found: error
           retention-days: 14
           include-hidden-files: false

@@ -328,8 +328,7 @@ fn default_branch_ref(repo_root: &Path) -> Result<String, WorktreeError> {
 }
 
 fn current_head_ref(cwd: &Path) -> Option<String> {
-    run_git(cwd, &["rev-parse", "--abbrev-ref", "HEAD"])
-        .and_then(|value| if value == "HEAD" { None } else { Some(value) })
+    run_git(cwd, &["rev-parse", "--abbrev-ref", "HEAD"]).filter(|value| value != "HEAD")
 }
 
 fn worktree_is_dirty(cwd: &Path) -> bool {

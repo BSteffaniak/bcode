@@ -1779,6 +1779,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(not(feature = "custody-simulation"))]
     fn legacy_openai_api_key_round_trips_through_host_custody() {
         let temp = tempfile::tempdir().expect("tempdir");
         let auth = bcode_config::AuthProviderConfig {
@@ -1821,6 +1822,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(not(feature = "custody-simulation"))]
     fn legacy_openai_chatgpt_round_trips_through_host_custody() {
         let temp = tempfile::tempdir().expect("tempdir");
         let auth = bcode_config::AuthProviderConfig {

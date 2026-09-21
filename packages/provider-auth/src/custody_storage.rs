@@ -351,8 +351,11 @@ mod tests {
     #[test]
     fn encrypted_owner_conflicts_release_and_incompatible_envelope() {
         let temp = tempfile::tempdir().unwrap();
+        #[cfg(not(feature = "custody-simulation"))]
         let public =
             crate::security::ensure_vault_recipient_key(&temp.path().join("source")).unwrap();
+        #[cfg(feature = "custody-simulation")]
+        let public = "sim-age:storage-owner".to_owned();
         let (vault, key) = sshenv_vault::Vault::create(&public).unwrap();
         let mut ciphertext = Vec::new();
         vault

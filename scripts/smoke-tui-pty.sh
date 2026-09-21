@@ -510,7 +510,6 @@ while time.monotonic() < deadline:
                 filesystem_final_after_draft
                 and b"ready" in lower_screen
                 and not filesystem_edit_request_sent
-                and b"tool-write" not in lower_screen
             ):
                 os.write(fd, b"\x15")
                 os.write(
@@ -572,7 +571,6 @@ while time.monotonic() < deadline:
             and not viewport_detached
             and not assistant_request_sent
             and b"ready" in lower_screen
-            and b"tool-edit" not in lower_screen
         ):
             os.write(fd, b"\x1b[5~")
             viewport_detached = True
@@ -599,7 +597,6 @@ while time.monotonic() < deadline:
             and viewport_anchor is not None
             and viewport_check_frames >= 2
             and b"ready" in lower_screen
-            and b"tool-edit" not in lower_screen
         ):
             os.write(
                 fd,
@@ -661,7 +658,6 @@ while time.monotonic() < deadline:
             cancellation_responsive
             and not reasoning_request_sent
             and b"ready" in screen.lower()
-            and b"stream-text" not in screen.lower()
         ):
             os.write(fd, b"\x15")
             os.write(fd, b"stream-reasoning REASONINGFIRSTREASONINGSECOND\r")
