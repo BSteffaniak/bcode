@@ -26,6 +26,8 @@ bmux_text_edit             = { workspace = true, optional = true }
 bmux_tui                   = { workspace = true, optional = true }
 bmux_tui_components        = { workspace = true, optional = true }
 clap                       = { workspace = true, features = ["std"] }
+# BMUX's keyboard backend requires Crossterm's Windows support when TUI is enabled.
+crossterm                  = { workspace = true, optional = true }
 schemars                   = { workspace = true }
 serde                      = { workspace = true, features = ["derive", "std"] }
 serde_json                 = { workspace = true }
@@ -43,5 +45,6 @@ tui = [
     "dep:bmux_text_edit",
     "dep:bmux_tui",
     "dep:bmux_tui_components",
+    "dep:crossterm",
     "dep:tokio",
 ]
