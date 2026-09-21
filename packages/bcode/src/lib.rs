@@ -4181,6 +4181,7 @@ async fn execute_plugin_tool(
                 }
             }
             bcode_plugin::StreamingServiceInvocationEvent::Response(response) => {
+                drop(invocation);
                 let response = response.map_err(|error| RuntimeError::ToolExecution {
                     tool_name: descriptor.tool_name.clone(),
                     message: error.to_string(),
