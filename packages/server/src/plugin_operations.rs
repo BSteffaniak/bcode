@@ -276,8 +276,12 @@ pub async fn invoke_service(
     let authorized_session_id =
         super::command_invocation_session(&interface_id, &operation, &payload);
     let (bridge, bridge_requests) = super::server_plugin_bridge();
-    let activity_projection =
-        interface_id == bcode_session_models::ACTIVITY_PRESENTATION_INTERFACE_ID;
+    let activity_revision =
+        if interface_id == bcode_session_models::ACTIVITY_PRESENTATION_INTERFACE_ID {
+            Some(validate_activity_request(&operation, &payload)?)
+        } else {
+            None
+        };
     let invocation = state.plugins.invoke_service_with_bridge_scoped(
         &plugin_id,
         interface_id,
@@ -294,13 +298,35 @@ pub async fn invoke_service(
     .await
     .map(project_service_response)
     .map_err(|error| normalize_error(&error))?;
-    if activity_projection && result.error.is_none() {
-        validate_activity_response(&plugin_id, &result.payload)?;
+    if let Some(revision) = activity_revision.filter(|_| result.error.is_none()) {
+        validate_activity_response(&plugin_id, revision, &result.payload)?;
     }
     Ok(result)
 }
 
-fn validate_activity_response(producer: &str, payload: &[u8]) -> Result<(), PublicPluginError> {
+fn validate_activity_request(operation: &str, payload: &[u8]) -> Result<u64, PublicPluginError> {
+    let invalid = || PublicPluginError {
+        code: "invalid_activity_request",
+        message: "activity projection request is unsupported or invalid",
+    };
+    if operation != bcode_session_models::OP_PROJECT_ACTIVITY
+        || payload.len() > bcode_session_models::MAX_ACTIVITY_PROJECTION_REQUEST_BYTES
+    {
+        return Err(invalid());
+    }
+    let request: bcode_session_models::ActivityProjectionRequest =
+        serde_json::from_slice(payload).map_err(|_| invalid())?;
+    if request.revision == 0 {
+        return Err(invalid());
+    }
+    Ok(request.revision)
+}
+
+fn validate_activity_response(
+    producer: &str,
+    revision: u64,
+    payload: &[u8],
+) -> Result<(), PublicPluginError> {
     let invalid = || PublicPluginError {
         code: "invalid_activity_presentation",
         message: "activity producer returned an unsupported or invalid presentation",
@@ -310,6 +336,9 @@ fn validate_activity_response(producer: &str, payload: &[u8]) -> Result<(), Publ
     }
     let presentation: bcode_session_models::ActivityPresentation =
         serde_json::from_slice(payload).map_err(|_| invalid())?;
+    if presentation.revision != revision {
+        return Err(invalid());
+    }
     presentation.validate(producer).map_err(|_| invalid())
 }
 
@@ -424,21 +453,52 @@ mod tests {
             payload: serde_json::json!({}),
         };
         let bytes = serde_json::to_vec(&view).unwrap();
-        assert!(super::validate_activity_response("example.plugin", &bytes).is_ok());
-        assert!(super::validate_activity_response("other.plugin", &bytes).is_err());
+        assert!(super::validate_activity_response("example.plugin", 1, &bytes).is_ok());
+        assert!(super::validate_activity_response("other.plugin", 1, &bytes).is_err());
+        assert!(super::validate_activity_response("example.plugin", 2, &bytes).is_err());
         view.version = 99;
         assert!(
             super::validate_activity_response(
                 "example.plugin",
+                1,
                 &serde_json::to_vec(&view).unwrap()
             )
             .is_err()
         );
-        assert!(super::validate_activity_response("example.plugin", b"not json").is_err());
+        assert!(super::validate_activity_response("example.plugin", 1, b"not json").is_err());
         assert!(
             super::validate_activity_response(
                 "example.plugin",
+                1,
                 &vec![b' '; bcode_session_models::MAX_ACTIVITY_PRESENTATION_BYTES + 1]
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn activity_request_is_bounded_and_requires_nonzero_revision() {
+        let mut request = bcode_session_models::ActivityProjectionRequest {
+            stage: "producer_defined".into(),
+            revision: 3,
+            input: serde_json::json!({}),
+        };
+        let bytes = serde_json::to_vec(&request).unwrap();
+        assert_eq!(
+            super::validate_activity_request("project", &bytes).unwrap(),
+            3
+        );
+        assert!(super::validate_activity_request("unknown", &bytes).is_err());
+        assert!(super::validate_activity_request("project", b"invalid").is_err());
+        request.revision = 0;
+        assert!(
+            super::validate_activity_request("project", &serde_json::to_vec(&request).unwrap())
+                .is_err()
+        );
+        assert!(
+            super::validate_activity_request(
+                "project",
+                &vec![b' '; bcode_session_models::MAX_ACTIVITY_PROJECTION_REQUEST_BYTES + 1]
             )
             .is_err()
         );
