@@ -12,6 +12,7 @@ use bcode_session_models::{
     StorageCompressionTier,
 };
 
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 pub async fn admission_report(
     state: &ServerState,
     id: bcode_session_models::SessionId,
@@ -32,6 +33,15 @@ pub async fn admission_report(
     tokio::task::spawn_blocking(move || bcode_session::storage_admission::StorageAdmissionRegistry::session_report(&root, id, apply))
         .await.map_err(|_| "admission inspection task failed")?
         .map_err(|_| "admission inspection/recovery refused: storage is missing, unsafe, busy, or unavailable; evidence was preserved")
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+pub async fn admission_report(
+    _state: &ServerState,
+    _id: bcode_session_models::SessionId,
+    _apply: bool,
+) -> Result<bcode_session_models::StorageAdmissionReport, &'static str> {
+    Err("storage admission inspection is unsupported on this platform")
 }
 
 pub async fn compress_page(
@@ -248,6 +258,7 @@ fn failed(mut result: StorageCompressionResult, reason: Failure) -> StorageCompr
 fn admission_failure(error: &std::io::Error) -> Failure {
     match error.kind() {
         std::io::ErrorKind::WouldBlock => Failure::AdmissionBusy,
+        #[cfg(any(target_os = "macos", target_os = "linux"))]
         std::io::ErrorKind::PermissionDenied
             if error.get_ref().is_some_and(|e| {
                 e.is::<bcode_session::storage_admission::UnacknowledgedStorageDaemon>()

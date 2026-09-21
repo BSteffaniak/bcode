@@ -1330,7 +1330,7 @@ fn git_commit_timestamp() -> Option<String> {
         .output()
         .ok()?;
     let timestamp = String::from_utf8(output.stdout).ok()?.trim().to_owned();
-    (output.status.success() && timestamp.parse::<u64>().ok().is_some_and(|value| value > 0))
+    (output.status.success() && timestamp.parse::<u64>().is_ok_and(|value| value > 0))
         .then_some(timestamp)
 }
 

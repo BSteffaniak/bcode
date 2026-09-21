@@ -741,7 +741,7 @@ mod tests {
         let task_cancellation = cancellation.clone();
         let task = tokio::spawn(async move {
             task_runtime
-                .run_process_with_cancellation(
+                .run_process_cancellable(
                     ProcessExecutionRequest {
                         program: "cmd.exe".to_owned(),
                         args: vec![
