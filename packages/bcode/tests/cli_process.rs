@@ -755,6 +755,156 @@ fn config_only_bypasses_malformed_repository_config_in_process() {
     assert!(!String::from_utf8_lossy(&output.stderr).contains("invalid TOML"));
 }
 
+#[test]
+fn config_only_rejects_missing_or_malformed_trusted_file_without_fallback() {
+    for trusted_contents in [
+        None,
+        Some("invalid TOML !!!"),
+        Some("credential = \"private-config-canary"),
+        Some("[model]\nmax_tool_rounds = \"private-config-canary\"\n"),
+        Some("[composition]\nactive_profile = \"private-config-canary\"\n"),
+    ] {
+        let root = tempfile::tempdir().expect("isolated configuration directory");
+        // Discovered configuration would otherwise permit daemon startup.
+        std::fs::write(
+            root.path().join("bcode.toml"),
+            "[plugins]\ndefault = \"none\"\n",
+        )
+        .unwrap();
+        if let Some(contents) = trusted_contents {
+            std::fs::write(root.path().join("trusted.toml"), contents).unwrap();
+        }
+        let output = run_cli_at_root(
+            root.path(),
+            &["--config-only", "trusted.toml", "server", "run"],
+            Stdio::piped(),
+            Stdio::null(),
+        );
+        assert!(
+            !output.status.success(),
+            "invalid trusted config was accepted"
+        );
+        assert!(output.stdout.is_empty());
+        let diagnostic = String::from_utf8_lossy(&output.stderr);
+        assert!(diagnostic.contains("invalid exclusive configuration"));
+        assert!(!diagnostic.contains("private-config-canary"));
+        assert!(
+            !root.path().join("bcode-state").exists(),
+            "configuration rejection must precede daemon state creation"
+        );
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn config_only_rejects_fifo_without_waiting_for_writer() {
+    let output = run_cli_with_fixture(
+        &["--config-only", "trusted.fifo", "server", "run"],
+        false,
+        Stdio::piped(),
+        |root| {
+            assert!(
+                Command::new("mkfifo")
+                    .arg(root.join("trusted.fifo"))
+                    .status()
+                    .expect("create configuration FIFO")
+                    .success()
+            );
+        },
+    );
+    assert!(!output.status.success());
+    assert!(output.stdout.is_empty());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("regular file"));
+}
+
+#[test]
+fn config_only_ignores_malformed_environment_configuration_in_process() {
+    let root = tempfile::tempdir().unwrap();
+    std::fs::write(root.path().join("trusted.toml"), "").unwrap();
+    let mut command = isolated_cli(root.path());
+    command
+        .env("BCODE_CONFIG_TOML", "private-environment-canary = [invalid")
+        .env(
+            "BCODE_CONFIG",
+            root.path().join("missing-environment-config.toml"),
+        );
+    let output = run_cli_command(
+        command,
+        &[
+            "--config-only",
+            "trusted.toml",
+            "send",
+            "00000000-0000-0000-0000-000000000001",
+            "--file",
+            "missing-prompt.txt",
+            "--wait",
+        ],
+        Stdio::piped(),
+        Stdio::null(),
+    );
+    assert!(!output.status.success());
+    let value: serde_json::Value = serde_json::from_slice(&output.stdout)
+        .expect("exclusive configuration reaches bounded prompt validation");
+    assert_eq!(value["observation"], "unverified");
+    assert!(value["receipt"].is_null());
+    let diagnostic = String::from_utf8_lossy(&output.stderr);
+    assert!(!diagnostic.contains("private-environment-canary"));
+    assert!(!diagnostic.contains("invalid exclusive configuration"));
+}
+
+#[test]
+fn config_only_starts_daemon_without_parsing_repository_config() {
+    let root = tempfile::tempdir().expect("isolated daemon directory");
+    std::fs::write(
+        root.path().join("trusted.toml"),
+        "[plugins]\ndefault = \"none\"\n",
+    )
+    .unwrap();
+    std::fs::write(root.path().join("bcode.toml"), "invalid TOML !!!").unwrap();
+    let log_path = root.path().join("daemon.log");
+    let mut daemon = ForegroundDaemon(
+        isolated_cli(root.path())
+            .env(
+                "BCODE_CONFIG_TOML",
+                "private-daemon-config-canary = [invalid",
+            )
+            .env("BCODE_CONFIG", root.path().join("bcode.toml"))
+            .args(["--config-only", "trusted.toml", "server", "run"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(std::fs::File::create(&log_path).unwrap())
+            .spawn()
+            .expect("start exclusively configured daemon"),
+    );
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        assert!(
+            daemon.0.try_wait().unwrap().is_none(),
+            "daemon exited: {}",
+            std::fs::read_to_string(&log_path).unwrap()
+        );
+        let output = run_cli_at_root(
+            root.path(),
+            &["--config-only", "trusted.toml", "server", "status"],
+            Stdio::piped(),
+            Stdio::null(),
+        );
+        if output.status.success() {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "daemon never became ready: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    drop(daemon);
+    let log = std::fs::read_to_string(&log_path).unwrap();
+    assert!(!log.contains("private-daemon-config-canary"));
+    assert!(!log.contains("invalid exclusive configuration"));
+}
+
 fn run_cli(arguments: &[&str]) -> Output {
     run_cli_with_state(arguments, false)
 }
@@ -811,7 +961,16 @@ fn run_cli_at_root(
     stdout: Stdio,
     stdin: Stdio,
 ) -> Output {
-    let mut child = isolated_cli(root)
+    run_cli_command(isolated_cli(root), arguments, stdout, stdin)
+}
+
+fn run_cli_command(
+    mut command: Command,
+    arguments: &[&str],
+    stdout: Stdio,
+    stdin: Stdio,
+) -> Output {
+    let mut child = command
         .args(arguments)
         .stdin(stdin)
         .stdout(stdout)

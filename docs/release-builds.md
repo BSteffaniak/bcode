@@ -11,7 +11,9 @@ Consumers must pin the Action repository to a reviewed full commit SHA, provide
 an absolute archive path in trusted runner storage, and use an ephemeral Unix
 runner with Python 3. The adapter requires `GITHUB_WORKSPACE` to identify an
 existing absolute checkout directory, and rejects archive or installation storage
-inside that directory after resolving symlinks. This is a configuration check,
+inside that directory after resolving symlinks. `GITHUB_OUTPUT` must also be an
+absolute path outside the checkout; relative or checkout-contained output paths
+are rejected before installation. This is a configuration check,
 not an OS sandbox against concurrent same-user processes.
 
 The supported input format is **tar.gz only**, matching Linux release artifacts.

@@ -33,7 +33,12 @@ def main():
             raise ValueError("runner storage must be outside the checkout")
         if any(character in str(parent) for character in "\r\n"):
             raise ValueError("invalid output path")
-        output_path = os.environ["GITHUB_OUTPUT"]
+        output_path = Path(os.environ["GITHUB_OUTPUT"])
+        if not output_path.is_absolute():
+            raise ValueError("absolute output path required")
+        resolved_output = output_path.resolve()
+        if resolved_output == workspace or workspace in resolved_output.parents:
+            raise ValueError("output must be outside the checkout")
         destination = installer.install(archive, os.environ["BCODE_SETUP_SHA256"], parent)
         descriptor = os.open(
             output_path,

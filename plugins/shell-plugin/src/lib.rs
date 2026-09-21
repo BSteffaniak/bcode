@@ -60,6 +60,13 @@ const DAEMON_PRIVATE_ENV_VARS: &[&str] = &[
     "BCODE_IPC_ENDPOINT_NAMESPACE",
     "BCODE_DAEMON_LOG",
     "BCODE_EXECUTABLE_DIGEST",
+    // GitHub's request token grants OIDC minting authority, not model access.
+    // Never pass that authority to repository or model-generated commands.
+    "ACTIONS_ID_TOKEN_REQUEST_TOKEN",
+    "ACTIONS_ID_TOKEN_REQUEST_URL",
+    // Publication belongs outside repository/model-generated shell execution.
+    "GITHUB_TOKEN",
+    "GH_TOKEN",
 ];
 
 /// shell plugin.
@@ -1141,7 +1148,22 @@ fn run_shell_tool(
             metadata: serde_json::Value::Null,
         },
     );
-    run_terminal_shell_command(
+    let explicit_shell_config = match context.config.config.get("shell") {
+        Some(value) => match serde_json::from_value::<ShellToolConfig>(value.clone()) {
+            Ok(config) => Some(config),
+            Err(_) => {
+                return ToolInvocationResponse {
+                    output: "invalid host-delivered shell configuration".to_string(),
+                    is_error: true,
+                    content: Vec::new(),
+                    full_output: None,
+                    result: None,
+                };
+            }
+        },
+        None => None,
+    };
+    run_terminal_shell_command_with_config(
         events,
         &context.cancellation,
         context.transient_progress_limits,
@@ -1152,6 +1174,7 @@ fn run_shell_tool(
             session_cwd,
             ..paths
         },
+        explicit_shell_config.as_ref(),
     )
 }
 
@@ -1372,6 +1395,7 @@ struct TerminalRunPaths<'a> {
     primary_presentation: Option<Arc<StdMutex<PrimaryPresentationPublisher>>>,
 }
 
+#[cfg(test)]
 fn run_terminal_shell_command(
     events: ServiceEventEmitter,
     cancellation: &bcode_plugin_sdk::ServiceCancellation,
@@ -1393,6 +1417,38 @@ fn run_terminal_shell_command(
     )
 }
 
+#[allow(clippy::too_many_arguments)]
+fn run_terminal_shell_command_with_config(
+    events: ServiceEventEmitter,
+    cancellation: &bcode_plugin_sdk::ServiceCancellation,
+    progress_limits: bcode_plugin_sdk::TransientProgressLimits,
+    tool_call_id: &str,
+    arguments: &ShellRunArguments,
+    arguments_json: serde_json::Value,
+    paths: TerminalRunPaths<'_>,
+    config: Option<&ShellToolConfig>,
+) -> ToolInvocationResponse {
+    let result = run_terminal_shell_command_inner(
+        events,
+        cancellation,
+        progress_limits,
+        tool_call_id,
+        arguments,
+        arguments_json,
+        paths,
+        &bcode_config::ProcessConfigEnvironment,
+        config,
+    );
+    result.unwrap_or_else(|error| ToolInvocationResponse {
+        output: error,
+        is_error: true,
+        content: Vec::new(),
+        full_output: None,
+        result: None,
+    })
+}
+
+#[cfg(test)]
 #[allow(clippy::too_many_arguments)] // Testable environment boundary keeps execution inputs explicit.
 fn run_terminal_shell_command_with_environment(
     events: ServiceEventEmitter,
@@ -1413,6 +1469,7 @@ fn run_terminal_shell_command_with_environment(
         arguments_json,
         paths,
         environment,
+        None,
     ) {
         Ok(response) => response,
         Err(error) => ToolInvocationResponse {
@@ -1648,6 +1705,12 @@ fn encode_terminal_output(
     Ok((encoded, full_encoded, inline_output))
 }
 
+fn remove_private_shell_environment(command: &mut portable_pty::CommandBuilder) {
+    for name in DAEMON_PRIVATE_ENV_VARS {
+        command.env_remove(name);
+    }
+}
+
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 fn run_terminal_shell_command_inner(
     events: ServiceEventEmitter,
@@ -1658,10 +1721,14 @@ fn run_terminal_shell_command_inner(
     mut arguments_json: serde_json::Value,
     paths: TerminalRunPaths<'_>,
     environment: &impl bcode_config::ConfigEnvironment,
+    explicit_config: Option<&ShellToolConfig>,
 ) -> Result<ToolInvocationResponse, String> {
     let timeout = Duration::from_millis(arguments.timeout_ms.unwrap_or(DEFAULT_SHELL_TIMEOUT_MS));
     let cwd = resolve_effective_cwd(arguments, paths.session_cwd);
-    let shell_config = shell_config_with_environment(cwd.as_deref(), environment)?;
+    let shell_config = explicit_config.map_or_else(
+        || shell_config_with_environment(cwd.as_deref(), environment),
+        |config| Ok(config.clone()),
+    )?;
     let format_commands =
         shell_format_commands(arguments, &shell_config.output, &mut arguments_json);
     let env_config = shell_config.env;
@@ -1699,9 +1766,7 @@ fn run_terminal_shell_command_inner(
     }
     command.env("TERM", "xterm-256color");
     command.env("COLORTERM", "truecolor");
-    for name in DAEMON_PRIVATE_ENV_VARS {
-        command.env_remove(name);
-    }
+    remove_private_shell_environment(&mut command);
 
     let mut child = pair
         .slave
@@ -2908,6 +2973,161 @@ mod tests {
         );
         assert!(advanced_plan.commands[0].continue_on_unaccepted_exit);
         assert_eq!(advanced_plan.output.preview_bytes, 4096);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn shell_child_does_not_receive_github_oidc_minting_authority() {
+        let pair = portable_pty::native_pty_system()
+            .openpty(portable_pty::PtySize {
+                rows: 24,
+                cols: 80,
+                pixel_width: 0,
+                pixel_height: 0,
+            })
+            .unwrap();
+        let mut command = portable_pty::CommandBuilder::new("/bin/sh");
+        command.args([
+            "-c",
+            "test -z \"${GITHUB_TOKEN+x}\" && test -z \"${GH_TOKEN+x}\" && test -z \"${ACTIONS_ID_TOKEN_REQUEST_TOKEN+x}\" && test -z \"${ACTIONS_ID_TOKEN_REQUEST_URL+x}\" && test \"$BCODE_TEST_PUBLIC\" = retained",
+        ]);
+        command.env("ACTIONS_ID_TOKEN_REQUEST_TOKEN", "test-only-minting-token");
+        command.env(
+            "ACTIONS_ID_TOKEN_REQUEST_URL",
+            "https://example.invalid/oidc",
+        );
+        command.env("GITHUB_TOKEN", "synthetic-publication-token");
+        command.env("GH_TOKEN", "synthetic-cli-token");
+        command.env("BCODE_TEST_PUBLIC", "retained");
+        remove_private_shell_environment(&mut command);
+        let mut child = pair.slave.spawn_command(command).unwrap();
+        assert!(child.wait().unwrap().success());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn host_shell_configuration_bypasses_repository_and_fails_closed() {
+        let workspace = tempfile::tempdir().unwrap();
+        std::fs::write(workspace.path().join("bcode.toml"), "invalid TOML !!!").unwrap();
+        let (invocation, _) = workflow_command_plan(workspace.path(), Vec::new());
+        let mut context = workflow_context(
+            &invocation,
+            bcode_plugin_sdk::ServiceCancellation::default(),
+        );
+        let input_state = TestResizeInputState {
+            next: std::sync::atomic::AtomicUsize::new(4),
+        };
+        let invoke = |context: &NativeServiceContext, _id: &str| {
+            let request = ToolInvocationRequest {
+                tool_call_id: "test-active-resize".to_string(),
+                name: "shell.run".to_string(),
+                arguments: json!({"command": "printf executed > marker"}),
+                preparation_descriptor: serde_json::to_value(ShellPreparationDescriptor {
+                    workspace_root: Some(workspace.path().to_path_buf()),
+                    artifact_root: Some(workspace.path().to_path_buf()),
+                    timeout_ms: 5_000,
+                })
+                .unwrap(),
+            };
+            let mut service_context = context.clone();
+            service_context.request = ServiceRequest {
+                interface_id: TOOL_SERVICE_INTERFACE_ID.to_string(),
+                operation: OP_INVOKE_TOOL.to_string(),
+                payload: serde_json::to_vec(&request).unwrap(),
+            };
+            let encoded = serde_json::to_vec(&service_context).unwrap();
+            let mut decoded: NativeServiceContext = serde_json::from_slice(&encoded).unwrap();
+            // Runtime callbacks are deliberately not serialized in the portable context.
+            decoded.bridge = ServiceBridge::new(
+                Some(test_resize_input_bridge),
+                std::ptr::from_ref(&input_state).cast_mut().cast(),
+                bcode_plugin_sdk::ServiceCancellation::default(),
+            );
+            ShellPlugin
+                .invoke_service_concurrent(decoded)
+                .payload_json::<ToolInvocationResponse>()
+                .unwrap()
+        };
+        for invalid in [
+            json!(null),
+            json!("private-invalid-value"),
+            json!({"env": {"mode": "private-invalid-value"}}),
+        ] {
+            context.config.config = json!({"shell": invalid});
+            let response = invoke(&context, "invalid-config");
+            assert!(response.is_error);
+            assert_eq!(
+                response.output,
+                "invalid host-delivered shell configuration"
+            );
+            assert!(!workspace.path().join("marker").exists());
+        }
+        context.config.config = json!({"shell": {"env": {"mode": "inherit"}}});
+        let response = invoke(&context, "trusted-config");
+        assert!(!response.is_error, "{}", response.output);
+        assert_eq!(
+            std::fs::read(workspace.path().join("marker")).unwrap(),
+            b"executed"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn workflow_commands_strip_inherited_github_oidc_authority() {
+        const CHILD: &str = "BCODE_TEST_OIDC_WORKFLOW_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let output = Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "tests::workflow_commands_strip_inherited_github_oidc_authority",
+                ])
+                .env(CHILD, "1")
+                .env("ACTIONS_ID_TOKEN_REQUEST_TOKEN", "synthetic-test-token")
+                .env(
+                    "ACTIONS_ID_TOKEN_REQUEST_URL",
+                    "https://example.invalid/oidc",
+                )
+                .env("GITHUB_TOKEN", "synthetic-publication-token")
+                .env("GH_TOKEN", "synthetic-cli-token")
+                .env("BCODE_TEST_PUBLIC", "retained")
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "child test failed: {} {}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
+        assert!(std::env::var_os("ACTIONS_ID_TOKEN_REQUEST_TOKEN").is_some());
+        assert!(std::env::var_os("ACTIONS_ID_TOKEN_REQUEST_URL").is_some());
+        let workspace = tempfile::tempdir().unwrap();
+        let (invocation, mut plan) = workflow_command_plan(
+            workspace.path(),
+            vec![contracts::ShellWorkflowCommand {
+                argv: vec![
+                    "/bin/sh".to_string(),
+                    "-c".to_string(),
+                    "test -z \"${GITHUB_TOKEN+x}\" && test -z \"${GH_TOKEN+x}\" && test -z \"${ACTIONS_ID_TOKEN_REQUEST_TOKEN+x}\" && test -z \"${ACTIONS_ID_TOKEN_REQUEST_URL+x}\" && test \"$BCODE_TEST_PUBLIC\" = retained".to_string(),
+                ],
+                timeout_ms: 5_000,
+                accepted_exit_codes: None,
+                continue_on_unaccepted_exit: false,
+            }],
+        );
+        plan.environment.inherit = true;
+        let result = execute_workflow_command_plan(
+            &workflow_context(
+                &invocation,
+                bcode_plugin_sdk::ServiceCancellation::default(),
+            ),
+            &invocation,
+            &plan,
+        )
+        .unwrap();
+        assert!(result.passed);
+        assert_eq!(result.commands[0].exit_code, Some(0));
     }
 
     #[test]

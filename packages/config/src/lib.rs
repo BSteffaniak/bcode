@@ -968,7 +968,7 @@ pub fn config_launch_context(cwd: &Path) -> ConfigLaunchContext {
 }
 
 /// Config loading overrides layered above discovered config files.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Clone, Default, PartialEq, Eq)]
 pub struct ConfigLoadOverrides {
     /// Load only this required file, bypassing discovered and environment layers.
     /// Explicit CLI TOML remains applicable above this file.
@@ -983,6 +983,23 @@ pub struct ConfigLoadOverrides {
     pub cli_config_path: Option<PathBuf>,
     /// Raw TOML config data synthesized from CLI arguments.
     pub cli_config_toml: Option<String>,
+}
+
+impl std::fmt::Debug for ConfigLoadOverrides {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ConfigLoadOverrides")
+            .field(
+                "exclusive_config_path",
+                &self.exclusive_config_path.is_some(),
+            )
+            .field("base_config_path", &self.base_config_path.is_some())
+            .field("env_config_path", &self.env_config_path.is_some())
+            .field("env_config_toml", &self.env_config_toml.is_some())
+            .field("cli_config_path", &self.cli_config_path.is_some())
+            .field("cli_config_toml", &self.cli_config_toml.is_some())
+            .finish()
+    }
 }
 
 impl ConfigLoadOverrides {
@@ -9315,16 +9332,30 @@ fn load_config_from_paths_with_overrides_and_environment(
     overrides: &ConfigLoadOverrides,
     environment: &impl ConfigEnvironment,
 ) -> Result<BcodeConfig, ConfigError> {
-    let raw = merged_raw_config_value_with_overrides(paths, overrides)?;
-    let (mut resolved, _resolution) = resolve_composed_config_value(&raw)?;
-    contexts::apply_profile_override(&mut resolved, overrides)?;
-    let mut config = validate_config_value(resolved, "composed config")?;
-    // Optional domain damage does not block core startup. Onboarding inspects the typed
-    // startup::load API and must obtain explicit repair before replacing invalid bytes.
-    if let Ok(Some(selection)) = startup::load_from(&startup::path_with_environment(environment)) {
-        let _ = startup::apply_fallback(&mut config, &selection, environment);
+    let result = (|| {
+        let raw = merged_raw_config_value_with_overrides(paths, overrides)?;
+        let (mut resolved, _resolution) = resolve_composed_config_value(&raw)?;
+        contexts::apply_profile_override(&mut resolved, overrides)?;
+        let mut config = validate_config_value(resolved, "composed config")?;
+        // Optional domain damage does not block core startup. Onboarding inspects the typed
+        // startup::load API and must obtain explicit repair before replacing invalid bytes.
+        if let Ok(Some(selection)) =
+            startup::load_from(&startup::path_with_environment(environment))
+        {
+            let _ = startup::apply_fallback(&mut config, &selection, environment);
+        }
+        Ok(config)
+    })();
+    if overrides.exclusive_config_path.is_some() {
+        // Parser and schema errors can contain credential values or source excerpts.
+        // Exclusive configuration is commonly generated with CI credentials; never
+        // carry those errors (including their Debug representation) to callers.
+        result.map_err(|_| ConfigError::Composition {
+            message: "invalid exclusive configuration: supply a readable regular file with valid configuration".to_owned(),
+        })
+    } else {
+        result
     }
-    Ok(config)
 }
 
 fn merged_raw_config_value_with_overrides(
@@ -9332,6 +9363,15 @@ fn merged_raw_config_value_with_overrides(
     overrides: &ConfigLoadOverrides,
 ) -> Result<toml::Value, ConfigError> {
     if let Some(path) = &overrides.exclusive_config_path {
+        let metadata = std::fs::metadata(path).map_err(|source| ConfigError::Io {
+            path: path.clone(),
+            source,
+        })?;
+        if !metadata.is_file() {
+            return Err(ConfigError::Composition {
+                message: "exclusive configuration must be a regular file".to_owned(),
+            });
+        }
         let mut merged = load_toml_file(path)?;
         if let Some(raw) = overrides.cli_config_toml.as_deref() {
             merge_toml_value(&mut merged, parse_raw_toml_config(raw, "cli")?);
@@ -13645,6 +13685,69 @@ extends = ["a"]
         std::fs::remove_file(trusted).expect("remove trusted config");
         assert!(load_config_from_paths_with_overrides(&[], &overrides).is_err());
         std::fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn config_override_debug_reports_presence_without_values() {
+        let secret = "private-override-canary";
+        let overrides = ConfigLoadOverrides {
+            exclusive_config_path: Some(secret.into()),
+            base_config_path: Some(secret.into()),
+            env_config_path: Some(secret.into()),
+            env_config_toml: Some(secret.to_owned()),
+            cli_config_path: Some(secret.into()),
+            cli_config_toml: Some(secret.to_owned()),
+        };
+        for rendered in [format!("{overrides:?}"), format!("{overrides:#?}")] {
+            assert!(!rendered.contains(secret));
+            assert!(rendered.contains("true"));
+        }
+        assert!(!format!("{:?}", ConfigLoadOverrides::default()).contains("true"));
+        // Construct without changing global overrides; the guard's Debug must also
+        // redact its retained prior configuration.
+        let guard = super::ConfigOverrideGuard {
+            previous: Some(overrides),
+        };
+        let guard = std::mem::ManuallyDrop::new(guard);
+        assert!(!format!("{guard:?}").contains(secret));
+    }
+
+    #[test]
+    fn exclusive_config_errors_do_not_retain_secret_values() {
+        let root = unique_temp_dir();
+        std::fs::create_dir_all(&root).unwrap();
+        let trusted = root.join("private-config-canary.toml");
+        for (contents, overlay) in [
+            ("credential = \"private-config-canary", None),
+            ("[model]\nmax_tool_rounds = \"private-config-canary\"", None),
+            ("", Some("credential = \"private-config-canary")),
+            (
+                "",
+                Some("[model]\nmax_tool_rounds = \"private-config-canary\""),
+            ),
+            (
+                "[composition]\nactive_profile = \"private-config-canary\"",
+                None,
+            ),
+        ] {
+            std::fs::write(&trusted, contents).unwrap();
+            let overrides = ConfigLoadOverrides {
+                exclusive_config_path: Some(trusted.clone()),
+                cli_config_toml: overlay.map(str::to_owned),
+                ..ConfigLoadOverrides::default()
+            };
+            let error = load_config_from_paths_with_overrides(&[], &overrides)
+                .expect_err("invalid exclusive configuration");
+            assert!(
+                error
+                    .to_string()
+                    .contains("invalid exclusive configuration")
+            );
+            assert!(!error.to_string().contains("private-config-canary"));
+            assert!(!format!("{error:?}").contains("private-config-canary"));
+            assert!(std::error::Error::source(&error).is_none());
+        }
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

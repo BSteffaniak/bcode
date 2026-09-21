@@ -59,6 +59,21 @@ for example, the shell plugin discovers configuration from its effective working
 directory. A client input-validation test does not prove those loads exclude
 repository configuration.
 
+The shell plugin can instead consume explicit host-delivered configuration:
+
+```toml
+[plugins.config."bcode.shell".shell.env]
+mode = "inherit"
+```
+
+When the `shell` value is present, shell tool execution uses it instead of loading
+configuration from the command's working directory. Malformed supplied values
+fail without executing the command; omitted fields use shell configuration
+defaults. Without this value, legacy discovery remains. This does not configure
+other plugins, isolate credentials or establish compatibility with an existing
+daemon. `inherit` disables direnv activation; it is not an environment allowlist
+or an OS sandbox.
+
 Before enabling untrusted repository execution, the integration must establish
 trusted daemon and plugin configuration through the supported application and
 lifecycle boundaries, and verify it with actual tool execution. Merely placing
@@ -83,8 +98,13 @@ original receipt; do not resubmit work based on this acknowledgement.
 
 Use the global `--config-only FILE` option to load a required trusted config file
 without merging discovered user/repository config or environment config layers.
-Explicit CLI configuration overrides still apply. A missing or malformed file
-fails rather than falling back to ambient configuration.
+Explicit CLI configuration overrides still apply. A missing, malformed or
+non-regular file fails rather than falling back to ambient configuration. The
+file-type precheck prevents ordinary FIFO/device reads, but is not race-proof
+path isolation; keep the file in trusted private storage. Exclusive-configuration
+errors use a fixed diagnostic rather than parser excerpts or invalid values,
+which may contain credentials. Validate generated configuration before supplying
+secrets when more detailed troubleshooting is needed.
 
 This controls configuration composition only: it does not sanitize process
 credentials, disable every discovery mechanism, isolate state, or sandbox tools.

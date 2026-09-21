@@ -215,6 +215,29 @@ class InstallTests(unittest.TestCase):
         self.assertFalse(marker.exists())
         self.assertTrue(output.is_file())
 
+    def test_action_rejects_checkout_and_relative_output_paths(self):
+        archive, digest = self.archive()
+        workspace = self.root / "checkout"
+        workspace.mkdir()
+        output = workspace / "output"
+        output.write_bytes(b"preserve\n")
+        adapter = Path(__file__).resolve().parents[1] / ".github/actions/setup-bcode/setup.py"
+        for output_path in [str(output), "relative-output"]:
+            with self.subTest(output_path=output_path):
+                result = subprocess.run(
+                    [sys.executable, "-I", "-B", str(adapter)],
+                    env={**os.environ, "BCODE_SETUP_ARCHIVE": str(archive),
+                         "BCODE_SETUP_SHA256": digest, "RUNNER_TEMP": str(self.root),
+                         "GITHUB_WORKSPACE": str(workspace), "GITHUB_OUTPUT": output_path},
+                    cwd=workspace, capture_output=True, timeout=5, check=False)
+                self.assertEqual(result.returncode, 1)
+                self.assertEqual(result.stdout, b"")
+                self.assertEqual(result.stderr,
+                                 b"Bcode setup failed; verify the archive, digest and runner storage\n")
+                self.assertEqual(output.read_bytes(), b"preserve\n")
+                self.assertEqual(set(workspace.iterdir()), {output})
+                self.assertEqual(set(self.root.iterdir()), {archive, workspace})
+
     def test_action_output_failure_removes_installation(self):
         archive, digest = self.archive()
         adapter = Path(__file__).resolve().parents[1] / ".github/actions/setup-bcode/setup.py"
