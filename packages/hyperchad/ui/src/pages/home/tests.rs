@@ -2258,7 +2258,7 @@ fn filesystem_image_adapter_uses_guarded_context_resource() {
 
 #[test]
 fn registered_adapters_reject_missing_required_fields_and_unsupported_versions() {
-    for ((schema, schema_version), _adapter) in VISUAL_ADAPTERS.iter() {
+    for (schema, schema_version) in VISUAL_ADAPTERS.keys() {
         let missing = bcode_session_models::ToolContributionEvent {
             invocation_id: "missing-call".to_owned(),
             contribution_id: "missing-contribution".to_owned(),
@@ -2289,7 +2289,7 @@ fn registered_adapters_reject_missing_required_fields_and_unsupported_versions()
         assert!(container_text_all(&rendered).contains("tool request"));
     }
 
-    for ((schema, schema_version), _adapter) in ARTIFACT_ADAPTERS.iter() {
+    for (schema, schema_version) in ARTIFACT_ADAPTERS.keys() {
         let missing = ToolArtifactView::from(ToolArtifact {
             artifact_id: "missing-artifact".to_owned(),
             producer_plugin_id: "fixture-plugin".to_owned(),

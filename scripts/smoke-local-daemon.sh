@@ -31,6 +31,7 @@ cleanup() {
     fi
 }
 trap cleanup EXIT
+trap 'status=$?; echo "smoke-local-daemon: command failed at line ${LINENO} (status ${status})" >&2; for log in "$workdir"/*.log; do [[ ! -f "$log" ]] || { echo "--- $log ---" >&2; tail -100 "$log" >&2; }; done; exit "$status"' ERR
 
 cd "${root}"
 
