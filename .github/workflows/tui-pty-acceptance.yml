@@ -137,6 +137,40 @@ jobs:
           assert not os.environ["SETUP_BINARY"]
           assert not os.environ["SETUP_INSTALLATION"]
           PY
+      - name: Prepare checkout-contained archive rejection
+        shell: bash
+        env:
+          SETUP_ARCHIVE: ${{ steps.setup-fixture.outputs.archive }}
+        run: |
+          python3 -I -B - <<'PY'
+          import os
+          from pathlib import Path
+          import shutil
+
+          shutil.copyfile(os.environ["SETUP_ARCHIVE"],
+                          Path(os.environ["GITHUB_WORKSPACE"]) / "setup-rejected.tar.gz")
+          PY
+      - name: Reject checkout-contained distribution
+        id: setup-checkout-rejected
+        continue-on-error: true
+        uses: ./.github/actions/setup-bcode
+        with:
+          archive: ${{ github.workspace }}/setup-rejected.tar.gz
+          sha256: ${{ steps.setup-fixture.outputs.sha256 }}
+      - name: Verify checkout rejection has no usable outputs
+        shell: bash
+        env:
+          SETUP_OUTCOME: ${{ steps.setup-checkout-rejected.outcome }}
+          SETUP_BINARY: ${{ steps.setup-checkout-rejected.outputs.binary }}
+          SETUP_INSTALLATION: ${{ steps.setup-checkout-rejected.outputs.installation }}
+        run: |
+          python3 -I -B - <<'PY'
+          import os
+
+          assert os.environ["SETUP_OUTCOME"] == "failure"
+          assert not os.environ["SETUP_BINARY"]
+          assert not os.environ["SETUP_INSTALLATION"]
+          PY
       - name: Exercise non-interactive CLI process boundaries
         run: cargo test -p bcode --features app --test cli_process
       - name: Exercise targeted cancellation through the real CLI and daemon

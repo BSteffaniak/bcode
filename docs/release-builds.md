@@ -9,7 +9,17 @@ The composite Action at `.github/actions/setup-bcode` exposes this installer wit
 required `archive` and `sha256` inputs and `installation` / `binary` outputs.
 Consumers must pin the Action repository to a reviewed full commit SHA, provide
 an absolute archive path in trusted runner storage, and use an ephemeral Unix
-runner with Python 3. It does not download a release, execute Bcode, alter PATH,
+runner with Python 3. The adapter requires `GITHUB_WORKSPACE` to identify an
+existing absolute checkout directory, and rejects archive or installation storage
+inside that directory after resolving symlinks. This is a configuration check,
+not an OS sandbox against concurrent same-user processes.
+
+The supported input format is **tar.gz only**, matching Linux release artifacts.
+Native macOS and Windows releases are ZIP files and cannot currently be installed
+with this Action. The macOS CI fixture tests tar extraction on that host; it does
+not demonstrate installation of a native macOS release.
+
+It does not download a release, execute Bcode, alter PATH,
 accept credentials, or run prompts. Installation files remain in `RUNNER_TEMP`
 for the job; runner disposal is responsible for final cleanup. This setup Action
 is not the still-required prompt-execution Action.

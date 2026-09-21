@@ -25,6 +25,8 @@ def main():
         if not workspace.is_absolute():
             raise ValueError("absolute workspace required")
         workspace = workspace.resolve(strict=True)
+        if not workspace.is_dir():
+            raise ValueError("workspace must be a directory")
         archive = archive.resolve(strict=True)
         parent = parent.resolve(strict=True)
         if any(path == workspace or workspace in path.parents for path in (archive, parent)):

@@ -47,6 +47,23 @@ effects. Keys are session-scoped, so creating a new session does not deduplicate
 an earlier job. This mechanism alone does not make workflow reruns or external
 publication idempotent.
 
+## Configuration isolation limitation
+
+Do not treat `--config-only FILE` on a sending client as an end-to-end CI
+security boundary. It selects a process-local configuration override. Automatic
+daemon startup currently forwards resolved state/config directories, but not
+that exclusive-file override to `server run`. An already-running daemon also
+has its own configuration. Tool plugins may load configuration in the daemon;
+for example, the shell plugin discovers configuration from its effective working
+directory. A client input-validation test does not prove those loads exclude
+repository configuration.
+
+Before enabling untrusted repository execution, the integration must establish
+trusted daemon and plugin configuration through the supported application and
+lifecycle boundaries, and verify it with actual tool execution. Merely placing
+the release outside the checkout or disabling credential discovery does not
+provide that guarantee.
+
 ## Targeted cancellation
 
 Scripts can request cancellation of an observed active turn without cancelling a

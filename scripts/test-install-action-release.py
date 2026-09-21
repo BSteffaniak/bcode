@@ -175,6 +175,27 @@ class InstallTests(unittest.TestCase):
                 self.assertEqual(set(self.root.iterdir()), {archive, alias})
                 self.assertEqual(list(self.workspace.iterdir()), [checkout_archive])
 
+    def test_action_rejects_invalid_workspace_without_installing(self):
+        archive, digest = self.archive()
+        output = self.root / "outputs"
+        adapter = Path(__file__).resolve().parents[1] / ".github/actions/setup-bcode/setup.py"
+        for workspace in [None, "", "relative", str(self.root / "missing"), str(archive)]:
+            with self.subTest(workspace=workspace):
+                environment = {**os.environ, "BCODE_SETUP_ARCHIVE": str(archive),
+                               "BCODE_SETUP_SHA256": digest, "RUNNER_TEMP": str(self.root),
+                               "GITHUB_OUTPUT": str(output)}
+                environment.pop("GITHUB_WORKSPACE", None)
+                if workspace is not None:
+                    environment["GITHUB_WORKSPACE"] = workspace
+                result = subprocess.run(
+                    [sys.executable, "-I", "-B", str(adapter)], env=environment,
+                    capture_output=True, timeout=5, check=False)
+                self.assertEqual(result.returncode, 1)
+                self.assertEqual(result.stdout, b"")
+                self.assertEqual(result.stderr,
+                                 b"Bcode setup failed; verify the archive, digest and runner storage\n")
+                self.assertEqual(list(self.root.iterdir()), [archive])
+
     def test_action_ignores_python_startup_injection(self):
         archive, digest = self.archive()
         output = self.root / "outputs"
