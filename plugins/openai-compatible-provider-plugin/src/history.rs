@@ -4,6 +4,7 @@
 
 /// Bounded provider-owned remote history access.
 pub mod client;
+pub(crate) mod service;
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;

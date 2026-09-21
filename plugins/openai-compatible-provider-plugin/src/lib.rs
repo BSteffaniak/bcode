@@ -1363,6 +1363,19 @@ impl OpenAiCompatibleProviderPlugin {
         }
 
         match context.request.operation.as_str() {
+            "load_history_snapshot" => {
+                let Ok(runtime) = &self.runtime else {
+                    return ServiceResponse::error(
+                        "history_runtime_unavailable",
+                        "history runtime unavailable",
+                    );
+                };
+                runtime
+                    .block_on(history::service::load(context.clone()))
+                    .unwrap_or_else(|_| {
+                        ServiceResponse::error("history_runtime_failed", "history runtime failed")
+                    })
+            }
             OP_CAPABILITIES => Self::capabilities_response(&context.request),
             OP_CONTEXT_MANAGEMENT_CAPABILITIES => {
                 Self::context_management_capabilities(&context.request)
@@ -10332,6 +10345,31 @@ mod tests {
             assert_eq!(fields[0].credential_id, "api_key");
             assert_eq!(fields[0].storage_key, storage_key);
         }
+    }
+
+    #[test]
+    fn history_service_rejects_unknown_version_before_auth_or_network() {
+        let mut invoker = OpenAiPluginInvoker::default();
+        let result: Result<serde_json::Value, String> = invoker.invoke_json(
+            None,
+            "load_history_snapshot",
+            &serde_json::json!({
+                "schema_version": 2,
+                "provider_context": {},
+                "conversation_id": "synthetic"
+            }),
+        );
+        assert!(result.unwrap_err().contains("history_unsupported_version"));
+        let result: Result<serde_json::Value, String> = invoker.invoke_json(
+            None,
+            "load_history_snapshot",
+            &serde_json::json!({
+                "schema_version": 1,
+                "provider_context": {},
+                "conversation_id": "synthetic"
+            }),
+        );
+        assert!(result.unwrap_err().contains("history_auth_required"));
     }
 
     #[derive(Default)]
