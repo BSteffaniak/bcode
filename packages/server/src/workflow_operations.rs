@@ -234,6 +234,7 @@ fn workflow_start_diagnostics_do_not_expose_error_payloads() {
     clippy::unused_async,
     reason = "application trait is async for remote implementations; local store operations are synchronous"
 )]
+#[allow(unknown_lints, clippy::unused_async_trait_impl)]
 impl bcode_workflow::WorkflowRunApplication for WorkflowAuthoringApplication<'_> {
     async fn start_workflow_template(
         &self,
@@ -624,6 +625,7 @@ impl bcode_workflow::WorkflowRunApplication for WorkflowAuthoringApplication<'_>
     clippy::unused_async,
     reason = "application trait is async for remote implementations; local store operations are synchronous"
 )]
+#[allow(unknown_lints, clippy::unused_async_trait_impl)]
 impl bcode_workflow::WorkflowAuthoringApplication for WorkflowAuthoringApplication<'_> {
     async fn instantiate_workflow_template(
         &self,

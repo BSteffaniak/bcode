@@ -3530,11 +3530,7 @@ impl BmuxApp {
                 new_working_directory: _,
             } => self.apply_working_directory_changed(event.sequence, old_working_directory),
             SessionEventKind::SessionRenamed { .. } => self.apply_shared_session_renamed(),
-            SessionEventKind::SkillSuggested {
-                skill_id,
-                reason: _,
-                ..
-            } => {
+            SessionEventKind::SkillSuggested { skill_id, .. } => {
                 self.status = format!("suggested skill: {skill_id}");
             }
             SessionEventKind::SkillActivated { skill_id, .. } => {

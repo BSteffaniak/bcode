@@ -142,6 +142,11 @@ impl FenwickRows {
     }
 }
 
+#[allow(
+    unknown_lints,
+    clippy::manual_isolate_lowest_one,
+    reason = "isolate_lowest_one is unstable on the supported local Rust 1.95 toolchain"
+)]
 const fn lowbit(value: usize) -> usize {
     value & value.wrapping_neg()
 }
