@@ -274,7 +274,7 @@ impl ServerState {
         let page: bcode_model::history::ListHistoryPageResponse =
             decode_history_response(response)?;
         validate_history_page(&page, offset, request.limit)?;
-        Ok(page)
+        finish_history_retrieval(page, cancellation)
     }
 
     /// Retrieve one unpublished history revision using an explicitly selected profile.
@@ -322,7 +322,18 @@ impl ServerState {
             .map_err(|error| history_retrieval_error(&error))?;
         let snapshot = decode_history_response(response)?;
         validate_history_snapshot(&snapshot, conversation_id, selected_node)?;
-        Ok(snapshot)
+        finish_history_retrieval(snapshot, cancellation)
+    }
+}
+
+fn finish_history_retrieval<T>(
+    value: T,
+    cancellation: &bcode_plugin_sdk::ServiceCancellation,
+) -> Result<T, HistoryRetrievalError> {
+    if cancellation.is_cancelled() {
+        Err("history retrieval cancelled".into())
+    } else {
+        Ok(value)
     }
 }
 
@@ -1235,6 +1246,18 @@ mod tests {
         .unwrap_err();
         assert_eq!(error.message, "history configuration is unavailable");
         assert!(!format!("{error:?}").contains("private"));
+    }
+
+    #[test]
+    fn history_cancellation_discards_completed_content() {
+        let cancellation = bcode_plugin_sdk::ServiceCancellation::default();
+        assert_eq!(super::finish_history_retrieval(42, &cancellation), Ok(42));
+        let content = std::sync::Arc::new("private content".to_owned());
+        cancellation.cancel();
+        let error = super::finish_history_retrieval(content.clone(), &cancellation).unwrap_err();
+        assert_eq!(error.message, "history retrieval cancelled");
+        assert!(!format!("{error:?}").contains("private content"));
+        assert_eq!(std::sync::Arc::strong_count(&content), 1);
     }
 
     #[test]

@@ -401,7 +401,10 @@ async fn upgrade_worker_fixture(state: &Arc<ServerState>, root: &std::path::Path
     let db = bcode_session::db::SessionDb::open_existing_turso_in_root(id, root)
         .await
         .expect("upgraded db");
-    assert_eq!(db.storage_writer_epoch().await.expect("writer epoch"), 10);
+    assert_eq!(
+        db.storage_writer_epoch().await.expect("writer epoch"),
+        u64::from(bcode_session_models::CURRENT_SESSION_STORAGE_WRITER_EPOCH)
+    );
     db.database().close().await.expect("close upgraded db");
 }
 

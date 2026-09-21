@@ -8404,13 +8404,16 @@ async fn refresh_chatgpt_auth_if_needed_at(
 }
 
 fn refreshed_token_expiry(now: u64, expires_in: Option<u64>) -> Result<u64, ProviderError> {
-    now.checked_add(expires_in.unwrap_or(3600)).ok_or_else(|| {
-        provider_error(
-            "token_refresh_decode_failed",
-            ProviderErrorCategory::ProviderInternal,
-            "credential refresh returned an invalid expiration",
-        )
-    })
+    expires_in
+        .filter(|lifetime| *lifetime > 0)
+        .and_then(|lifetime| now.checked_add(lifetime))
+        .ok_or_else(|| {
+            provider_error(
+                "token_refresh_decode_failed",
+                ProviderErrorCategory::ProviderInternal,
+                "credential refresh returned an invalid expiration",
+            )
+        })
 }
 
 fn persist_refreshed_chatgpt_auth(
@@ -10292,7 +10295,8 @@ mod tests {
     fn refreshed_token_expiry_preserves_lifetime_and_rejects_overflow() {
         assert_eq!(refreshed_token_expiry(1000, Some(3600)).unwrap(), 4600);
         assert_eq!(refreshed_token_expiry(1000, Some(30)).unwrap(), 1030);
-        assert_eq!(refreshed_token_expiry(1000, None).unwrap(), 4600);
+        assert!(refreshed_token_expiry(1000, None).is_err());
+        assert!(refreshed_token_expiry(1000, Some(0)).is_err());
         assert_eq!(
             refreshed_token_expiry(1000, Some(u64::MAX))
                 .unwrap_err()
