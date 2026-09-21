@@ -5415,7 +5415,7 @@ async fn handle_registered_client(
         };
         let envelope = match received {
             Ok(envelope) => envelope,
-            Err(CodecError::Io(error)) if error.kind() == std::io::ErrorKind::UnexpectedEof => {
+            Err(error) if is_expected_disconnect(&error) => {
                 break;
             }
             Err(error) => return Err(error.into()),

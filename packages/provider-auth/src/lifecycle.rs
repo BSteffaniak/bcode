@@ -1092,10 +1092,13 @@ fn initialize_vault(
 
 #[cfg(test)]
 mod tests {
+    // Native SSH recipient tests run in the default/simulation profiles. The
+    // custody-simulation profile deliberately rejects real SSH keys and exercises
+    // synthetic identities in deterministic_retained_custody instead.
     use super::*;
-    use bcode_provider_auth_models::{
-        AuthCredentialStorage, AuthSecretField, AuthSecretValidation,
-    };
+    #[cfg(not(feature = "custody-simulation"))]
+    use bcode_provider_auth_models::AuthCredentialStorage;
+    use bcode_provider_auth_models::{AuthSecretField, AuthSecretValidation};
 
     fn resolved(vault: &Path) -> ResolvedAuthProfile {
         ResolvedAuthProfile {
@@ -1411,6 +1414,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(not(feature = "custody-simulation"))]
     fn required_seal_failure_preserves_credentials_for_updates_and_replacement() {
         let temp = tempfile::tempdir().unwrap();
         let path = temp.path().join("vault");
@@ -1455,6 +1459,7 @@ mod tests {
 
     #[test]
     #[cfg(unix)]
+    #[cfg(not(feature = "custody-simulation"))]
     fn retained_policy_rejects_unprovisioned_required_and_preferred() {
         let root = tempfile::tempdir().unwrap();
         let public = crate::security::ensure_vault_recipient_key(&root.path().join("key")).unwrap();
@@ -1481,6 +1486,7 @@ mod tests {
 
     #[test]
     #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[cfg(not(feature = "custody-simulation"))]
     fn protected_custody_update_preserves_factor_and_rejects_failed_retrieval() {
         use crate::operations::{AuthCredentialCustody as _, AuthRequestCustody as _};
         struct Device(std::sync::atomic::AtomicBool);
@@ -1565,6 +1571,7 @@ mod tests {
 
     #[test]
     #[cfg(unix)]
+    #[cfg(not(feature = "custody-simulation"))]
     fn provisioned_factor_must_be_retrievable_before_policy_changes() {
         struct MismatchedDevice;
         impl crate::operations::AuthDeviceFactorSource for MismatchedDevice {
@@ -1630,8 +1637,10 @@ mod tests {
     }
 
     #[cfg(unix)]
+    #[cfg(not(feature = "custody-simulation"))]
     struct UnavailableDevice(std::sync::atomic::AtomicUsize);
     #[cfg(unix)]
+    #[cfg(not(feature = "custody-simulation"))]
     impl crate::operations::AuthDeviceFactorSource for UnavailableDevice {
         fn provisioning_identity(
             &self,
@@ -1682,6 +1691,7 @@ mod tests {
 
     #[test]
     #[cfg(unix)]
+    #[cfg(not(feature = "custody-simulation"))]
     fn selected_key_source_failure_preserves_ciphertext_and_retry_uses_source() {
         use crate::operations::{AuthCredentialCustody as _, AuthRequestCustody as _};
         struct Keys(std::sync::atomic::AtomicUsize);
@@ -1779,6 +1789,7 @@ mod tests {
     }
 
     #[cfg(unix)]
+    #[cfg(not(feature = "custody-simulation"))]
     fn selected_test_storage(
         custody: crate::custody_storage::CredentialCustodyStorage,
         bytes: &[u8],
@@ -1799,6 +1810,7 @@ mod tests {
 
     #[test]
     #[cfg(unix)]
+    #[cfg(not(feature = "custody-simulation"))]
     fn retained_custody_reads_canonical_credentials_without_native_fallback() {
         use crate::operations::{AuthCredentialCustody as _, AuthRequestCustody as _};
         let directory = tempfile::tempdir().unwrap();
@@ -1962,6 +1974,7 @@ mod tests {
         assert!(!vault.exists());
     }
 
+    #[cfg(not(feature = "custody-simulation"))]
     fn interactive_method() -> AuthMethodContribution {
         AuthMethodContribution::Interactive {
             method_id: "browser".to_owned(),
@@ -1982,6 +1995,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(not(feature = "custody-simulation"))]
     fn import_uses_declared_key_and_never_overwrites() {
         let temp = tempfile::tempdir().expect("tempdir");
         let resolved = resolved(&temp.path().join("vault"));
@@ -2003,6 +2017,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(not(feature = "custody-simulation"))]
     fn interactive_credentials_use_declared_storage_and_reject_undeclared_values() {
         let temp = tempfile::tempdir().expect("tempdir");
         let vault = temp.path().join("vault");
@@ -2063,6 +2078,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(not(feature = "custody-simulation"))]
     fn upsert_read_targeted_delete_and_status_preserve_unrelated_values() {
         let temp = tempfile::tempdir().expect("tempdir");
         let vault = temp.path().join("vault");
@@ -2110,6 +2126,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(not(feature = "custody-simulation"))]
     fn required_local_file_device_seal_is_applied_and_reported() {
         let temp = tempfile::tempdir().expect("tempdir");
         let vault = temp.path().join("vault");

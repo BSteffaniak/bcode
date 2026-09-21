@@ -194,9 +194,13 @@ mod tests {
 
     #[test]
     fn ownership_fences_and_publication_survive_release_without_native_fallback() {
+        #[cfg(not(feature = "custody-simulation"))]
         let root = tempfile::tempdir().unwrap();
+        #[cfg(not(feature = "custody-simulation"))]
         let public =
             crate::security::ensure_vault_recipient_key(&root.path().join("identity")).unwrap();
+        #[cfg(feature = "custody-simulation")]
+        let public = "sim-age:storage-owner".to_owned();
         let (vault, key) = sshenv_vault::Vault::create(&public).unwrap();
         let mut bytes = Vec::new();
         vault

@@ -694,7 +694,7 @@ impl TurnControl {
     /// Return whether normal work and output remain accepted.
     #[must_use]
     pub fn accepts_normal_output(&self) -> bool {
-        self.lifecycle() == TurnLifecycle::Running
+        self.lifecycle() == TurnLifecycle::Running && !self.cancellation.is_cancelled()
     }
 
     /// Atomically close local progression and synchronously signal every registered opaque handle.
