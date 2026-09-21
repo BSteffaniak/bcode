@@ -894,39 +894,15 @@ mod tests {
         drop(host);
     }
 
-    #[cfg(not(any(
-        feature = "static-bundled-bedrock-provider-plugin",
-        feature = "static-bundled-blims-plugin",
-        feature = "static-bundled-code-review-plugin",
-        feature = "static-bundled-default-agents-plugin",
-        feature = "static-bundled-prompt-profile-plugin",
-        feature = "static-bundled-document-plugin",
-        feature = "static-bundled-eval-plugin",
-        feature = "static-bundled-fake-provider-plugin",
-        feature = "static-bundled-filesystem-plugin",
-        feature = "static-bundled-git-plugin",
-        feature = "static-bundled-github-review-publisher-plugin",
-        feature = "static-bundled-loop-plugin",
-        feature = "static-bundled-model-plugin",
-        feature = "static-bundled-ocr-plugin",
-        feature = "static-bundled-openai-compatible-provider-plugin",
-        feature = "static-bundled-opencode-session-import-plugin",
-        feature = "static-bundled-pi-session-import-plugin",
-        feature = "static-bundled-question-plugin",
-        feature = "static-bundled-read-plugin",
-        feature = "static-bundled-shell-plugin",
-        feature = "static-bundled-skills-plugin",
-        feature = "static-bundled-vim-edit-plugin",
-        feature = "static-bundled-web-search-plugin",
-        feature = "static-bundled-worktree-plugin"
-    )))]
     #[test]
-    fn bundled_plugins_are_opt_in() {
-        assert!(super::static_bundled_plugins().is_empty());
-        assert!(super::tui_registry("bcode.filesystem").is_none());
-        assert!(super::interaction_registry("bcode.question").is_none());
-        assert!(super::interaction_adapter("bcode.question", "request", 1, "tui").is_none());
-        assert!(super::interaction_adapters("tui").is_empty());
+    fn bundled_plugins_can_all_be_disabled() {
+        let plugins = super::static_bundled_plugins();
+        let selected = bcode_plugin::filter_selected_static_plugins(
+            &plugins,
+            &bcode_plugin::PluginSelection::default(),
+        )
+        .expect("explicit empty selection");
+        assert!(selected.is_empty());
     }
 
     #[cfg(feature = "static-bundled-question-plugin")]

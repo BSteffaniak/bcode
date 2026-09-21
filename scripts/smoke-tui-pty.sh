@@ -600,7 +600,7 @@ while time.monotonic() < deadline:
         ):
             os.write(
                 fd,
-                b"stream-text # ASSISTANTPREFIX report\n\n- first item\n- second item\n\n| Key | Value |\n| --- | --- |\n| A | B |\n\n```rust\nfn main() {}\n```\n\n<details><summary>More</summary>Detail body</details>\n\nFootnote ref[^1].\n\n[^1]: Footnote body.\n\nUnicode \xe6\x9d\xb1\xe4\xba\xac \xf0\x9f\xa7\xaa \xe2\x9c\x93\n\n![image alt](https://example.com/image.png)\n\n```mermaid\ngraph TD; A-->B;\n```\n\n[ASSISTANTSUFFIX](https://example.com)\r",
+                b"\x1b[200~stream-text # ASSISTANTPREFIX report\n\n- first item\n- second item\n\n| Key | Value |\n| --- | --- |\n| A | B |\n\n```rust\nfn main() {}\n```\n\n<details><summary>More</summary>Detail body</details>\n\nFootnote ref[^1].\n\n[^1]: Footnote body.\n\nUnicode \xe6\x9d\xb1\xe4\xba\xac \xf0\x9f\xa7\xaa \xe2\x9c\x93\n\n![image alt](https://example.com/image.png)\n\n```mermaid\ngraph TD; A-->B;\n```\n\n[ASSISTANTSUFFIX](https://example.com)\x1b[201~\r",
             )
             assistant_request_sent = True
         if viewport_detached and assistant_request_sent and viewport_anchor is not None:

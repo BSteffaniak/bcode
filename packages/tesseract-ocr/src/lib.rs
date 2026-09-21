@@ -1045,9 +1045,9 @@ pub fn resolve_tessdata_dir() -> PathBuf {
 
 #[cfg(test)]
 mod runtime_root_tests {
-    use super::{
-        Error, bundled_runtime_root, dynamic_library_name, resolve_confined_runtime_paths,
-    };
+    use super::{Error, bundled_runtime_root};
+    #[cfg(unix)]
+    use super::{dynamic_library_name, resolve_confined_runtime_paths};
     use std::sync::{Mutex, OnceLock};
 
     fn environment_lock() -> std::sync::MutexGuard<'static, ()> {
