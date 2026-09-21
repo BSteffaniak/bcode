@@ -662,7 +662,7 @@ fn configure_worker_memory_limit(command: &mut std::process::Command) {
         rlim_max: 0,
     };
     // SAFETY: `existing` points to writable storage for the duration of the call.
-    if unsafe { libc::getrlimit(libc::RLIMIT_AS, &mut existing) } != 0 {
+    if unsafe { libc::getrlimit(libc::RLIMIT_AS, &raw mut existing) } != 0 {
         return;
     }
     let limit = libc::rlimit {
@@ -675,7 +675,7 @@ fn configure_worker_memory_limit(command: &mut std::process::Command) {
     // error from the OS error code when it fails.
     unsafe {
         command.pre_exec(move || {
-            if libc::setrlimit(libc::RLIMIT_AS, &limit) == 0 {
+            if libc::setrlimit(libc::RLIMIT_AS, &raw const limit) == 0 {
                 Ok(())
             } else {
                 Err(std::io::Error::last_os_error())

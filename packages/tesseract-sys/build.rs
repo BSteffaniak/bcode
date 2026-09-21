@@ -153,6 +153,7 @@ mod vendored {
             .define("DISABLED_LEGACY_ENGINE", "OFF")
             .define("USE_OPENCL", "OFF")
             .define("OPENMP_BUILD", "OFF")
+            .define("SW_BUILD", "OFF")
             .define("Leptonica_INCLUDE_DIRS", &leptonica_include)
             .define(
                 "Leptonica_LIBRARIES",
@@ -377,6 +378,7 @@ mod bundled {
         );
 
         let leptonica_install = cmake::Config::new(leptonica_source)
+            .out_dir(out_dir().join(format!("leptonica-build-{}", tesseract.leptonica)))
             .define("CMAKE_POLICY_VERSION_MINIMUM", "3.5")
             .define("CMAKE_BUILD_TYPE", "Release")
             .define("BUILD_PROG", "OFF")
@@ -403,6 +405,7 @@ mod bundled {
         };
 
         let tesseract_install = cmake::Config::new(tesseract_source)
+            .out_dir(out_dir().join(format!("tesseract-build-{}", tesseract.version)))
             .define("CMAKE_POLICY_VERSION_MINIMUM", "3.5")
             .define("CMAKE_BUILD_TYPE", "Release")
             .define("BUILD_SHARED_LIBS", "ON")
@@ -412,7 +415,14 @@ mod bundled {
             .define("DISABLED_LEGACY_ENGINE", "OFF")
             .define("USE_OPENCL", "OFF")
             .define("OPENMP_BUILD", "OFF")
+            .define("SW_BUILD", "OFF")
             .define("CMAKE_INSTALL_RPATH", runtime_rpath())
+            .define(
+                "Leptonica_DIR",
+                leptonica_install.join("lib/cmake/leptonica"),
+            )
+            // Clear a cached pkg-config failure when reconfiguring after discovery.
+            .configure_arg("-ULeptonica_FOUND")
             .define("Leptonica_INCLUDE_DIRS", &leptonica_include)
             .define("Leptonica_LIBRARIES", &leptonica_library)
             .build();

@@ -803,7 +803,7 @@ const fn is_identifier_byte(byte: u8) -> bool {
     byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-')
 }
 
-fn assignment_value_span(bytes: &[u8], cursor: usize) -> (usize, usize) {
+const fn assignment_value_span(bytes: &[u8], cursor: usize) -> (usize, usize) {
     if matches!(bytes[cursor], b'\'' | b'"') {
         let quote = bytes[cursor];
         let mut end = cursor + 1;

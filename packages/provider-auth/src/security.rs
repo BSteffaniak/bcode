@@ -1118,7 +1118,7 @@ mod tests {
         assert_eq!(&*created, &*loaded);
         assert_eq!(
             metadata.params.get("backend").map(String::as_str),
-            Some("windows-dpapi-current-user")
+            Some("windows-dpapi")
         );
     }
 

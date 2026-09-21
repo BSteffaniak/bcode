@@ -1,5 +1,6 @@
 use std::io::{Read, Write};
 use std::process::{Command, Stdio};
+#[cfg(unix)]
 use std::sync::{Arc, Barrier};
 use std::time::Duration;
 
@@ -64,6 +65,7 @@ fn response(mut child: std::process::Child, request: &[u8]) -> (bool, Vec<u8>, b
     (success, response[11..].to_vec(), status.success())
 }
 
+#[cfg(unix)]
 fn scripted_worker(script: &str) -> tempfile::NamedTempFile {
     use std::os::unix::fs::PermissionsExt;
 

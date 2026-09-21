@@ -24,7 +24,11 @@ cleanup() {
         kill "${server_pid}" 2>/dev/null || true
         wait "${server_pid}" 2>/dev/null || true
     fi
-    rm -rf "${workdir}"
+    if [[ "${BCODE_SMOKE_KEEP_WORKDIR:-0}" == "1" ]]; then
+        echo "smoke-local-daemon: retained ${workdir}" >&2
+    else
+        rm -rf "${workdir}"
+    fi
 }
 trap cleanup EXIT
 
@@ -95,6 +99,14 @@ if ! "${root}/target/debug/bcode" session history "${session_id}" --json | grep 
     exit 1
 fi
 
+# The reconnecting attach client must retire before testing an idle daemon.
+# Otherwise it can restart the old configuration between stop and start.
+if [[ -n "${attach_pid}" ]]; then
+    kill "${attach_pid}" 2>/dev/null || true
+    wait "${attach_pid}" 2>/dev/null || true
+    attach_pid=""
+fi
+
 "${root}/target/debug/bcode" server stop
 wait "${server_pid}"
 server_pid=""
@@ -133,9 +145,28 @@ if [[ "${restarted_executable}" != "${daemon_executable}" ]]; then
     exit 1
 fi
 "${root}/target/debug/bcode" server stop >/dev/null
+# Stop acknowledges the request before teardown completes. Wait for retirement
+# before starting with a different config, otherwise acquisition can reuse the
+# old daemon (which has idle shutdown disabled).
+for _ in {1..300}; do
+    records=("${BCODE_STATE_DIR}"/daemons/*.json)
+    if [[ ! -e "${records[0]}" ]]; then
+        break
+    fi
+    sleep 0.1
+done
+records=("${BCODE_STATE_DIR}"/daemons/*.json)
+if [[ -e "${records[0]}" ]]; then
+    echo "daemon did not retire after explicit stop" >&2
+    exit 1
+fi
 
 idle_config="${workdir}/idle-bcode.toml"
 cat >"${idle_config}" <<'EOF'
+# This phase tests idle lifecycle, not remote provider discovery or model work.
+[plugins]
+default = "none"
+
 [daemon]
 idle_shutdown = true
 idle_shutdown_after_secs = 1
@@ -160,6 +191,8 @@ for _ in {1..100}; do
 done
 if kill -0 "${idle_pid}" 2>/dev/null; then
     echo "daemon did not shut down after configured idle interval" >&2
+    ps -p "${idle_pid}" -o pid,ppid,state,command >&2 || true
+    cat "${BCODE_STATE_DIR}"/logs/*.log >&2 || true
     exit 1
 fi
 "${root}/target/debug/bcode" session list >/dev/null

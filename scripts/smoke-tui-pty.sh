@@ -93,7 +93,8 @@ Path(destination_path).write_text(manifest)
 PY
 cat >"${BCODE_CONFIG}" <<'EOF'
 [plugins]
-enabled = ["bcode.fake-provider", "bcode.shell"]
+default = "none"
+enabled = ["bcode.fake-provider", "bcode.shell", "bcode.filesystem", "bcode.default-agents"]
 
 [model]
 provider_plugin_id = "bcode.fake-provider"
@@ -258,6 +259,8 @@ checks = {
 }
 failures = [name for name, passed in checks.items() if not passed]
 if failures:
+    with open(os.path.join(os.environ["BCODE_STATE_DIR"], "cold-start-capture.bin"), "wb") as output:
+        output.write(capture)
     print("cold TUI auto-start acceptance failed: " + ", ".join(failures), file=sys.stderr)
     print(repr(bytes(capture[-2000:])), file=sys.stderr)
     sys.exit(1)
