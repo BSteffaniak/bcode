@@ -11,6 +11,8 @@ use std::time::Duration;
 /// Safe categories for source status, without remote error bodies or credentials.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HistoryAccessError {
+    /// The owning service cancelled this retrieval; no snapshot was published.
+    Cancelled,
     /// Caller supplied an invalid identifier, page size, or response budget.
     InvalidRequest,
     /// Credentials need provider-owned refresh or reconnect.
@@ -99,13 +101,17 @@ impl HistoryClient {
         offset: u64,
         limit: u16,
         archived: bool,
+        cancellation: &bcode_plugin_sdk::ServiceCancellation,
     ) -> Result<HistoryPage, HistoryAccessError> {
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map_err(|_| HistoryAccessError::InvalidRequest)?
-            .as_secs();
-        let (token, account) = history_credentials(auth, now)?;
-        self.list(token, account, offset, limit, archived).await
+        cancellable(cancellation, async {
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_err(|_| HistoryAccessError::InvalidRequest)?
+                .as_secs();
+            let (token, account) = history_credentials(auth, now)?;
+            self.list(token, account, offset, limit, archived).await
+        })
+        .await
     }
 
     /// Fetch one ordinary or archived summary page with explicitly supplied account credentials.
@@ -145,13 +151,17 @@ impl HistoryClient {
         &self,
         auth: &bcode_model::ProviderAuthContext,
         id: &str,
+        cancellation: &bcode_plugin_sdk::ServiceCancellation,
     ) -> Result<HistorySnapshot, HistoryAccessError> {
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map_err(|_| HistoryAccessError::InvalidRequest)?
-            .as_secs();
-        let (token, account) = history_credentials(auth, now)?;
-        self.conversation(token, account, id).await
+        cancellable(cancellation, async {
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_err(|_| HistoryAccessError::InvalidRequest)?
+                .as_secs();
+            let (token, account) = history_credentials(auth, now)?;
+            self.conversation(token, account, id).await
+        })
+        .await
     }
 
     /// Fetch and validate a complete selected-branch snapshot within the response budget.
@@ -193,6 +203,32 @@ impl HistoryClient {
             .await
             .map_err(|_| HistoryAccessError::Transient)?;
         read_response(response, self.max_response_bytes).await
+    }
+}
+
+async fn cancellable<T>(
+    cancellation: &bcode_plugin_sdk::ServiceCancellation,
+    operation: impl std::future::Future<Output = Result<T, HistoryAccessError>>,
+) -> Result<T, HistoryAccessError> {
+    if cancellation.is_cancelled() {
+        return Err(HistoryAccessError::Cancelled);
+    }
+    tokio::pin!(operation);
+    loop {
+        tokio::select! {
+            result = &mut operation => {
+                return if cancellation.is_cancelled() {
+                    Err(HistoryAccessError::Cancelled)
+                } else {
+                    result
+                };
+            }
+            () = tokio::time::sleep(Duration::from_millis(25)) => {
+                if cancellation.is_cancelled() {
+                    return Err(HistoryAccessError::Cancelled);
+                }
+            }
+        }
     }
 }
 
@@ -429,13 +465,60 @@ mod tests {
         let client = HistoryClient::new(1024).unwrap();
         let auth = bcode_model::ProviderAuthContext::default();
         assert!(matches!(
-            client.list_for_auth(&auth, 0, 0, false).await,
+            client
+                .list_for_auth(
+                    &auth,
+                    0,
+                    0,
+                    false,
+                    &bcode_plugin_sdk::ServiceCancellation::default()
+                )
+                .await,
             Err(HistoryAccessError::AuthenticationRequired)
         ));
         assert!(matches!(
-            client.conversation_for_auth(&auth, "../invalid").await,
+            client
+                .conversation_for_auth(
+                    &auth,
+                    "../invalid",
+                    &bcode_plugin_sdk::ServiceCancellation::default()
+                )
+                .await,
             Err(HistoryAccessError::AuthenticationRequired)
         ));
+    }
+
+    #[tokio::test]
+    async fn cancellation_prevents_dispatch_and_drops_in_flight_work() {
+        struct DropGuard(std::sync::Arc<std::sync::atomic::AtomicBool>);
+        impl Drop for DropGuard {
+            fn drop(&mut self) {
+                self.0.store(true, std::sync::atomic::Ordering::SeqCst);
+            }
+        }
+        let cancellation = bcode_plugin_sdk::ServiceCancellation::default();
+        cancellation.cancel();
+        let result = cancellable::<()>(&cancellation, async {
+            panic!("cancelled work must not be polled")
+        })
+        .await;
+        assert_eq!(result, Err(HistoryAccessError::Cancelled));
+
+        let cancellation = bcode_plugin_sdk::ServiceCancellation::default();
+        let dropped = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let operation = async {
+            let _guard = DropGuard(dropped.clone());
+            cancellation.cancel();
+            std::future::pending::<Result<(), HistoryAccessError>>().await
+        };
+        let result = tokio::time::timeout(
+            Duration::from_secs(1),
+            cancellable(&cancellation, operation),
+        )
+        .await
+        .unwrap();
+        assert_eq!(result, Err(HistoryAccessError::Cancelled));
+        assert!(dropped.load(std::sync::atomic::Ordering::SeqCst));
     }
 
     #[test]
