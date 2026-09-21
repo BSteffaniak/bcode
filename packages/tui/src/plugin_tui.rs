@@ -1708,12 +1708,23 @@ library = "libdynamic_visual_test.dylib"
         let plugin_dir = root.path().join("hello");
         std::fs::create_dir_all(&plugin_dir).expect("plugin directory");
         let manifest_path = plugin_dir.join("bcode-plugin.toml");
+        let mut manifest: toml::Value = toml::from_str(include_str!(
+            "../../../examples/hello-plugin/bcode-plugin.toml"
+        ))
+        .expect("hello manifest");
+        let library = hello_dynamic_library_path();
+        manifest["runtime"]["library"] = toml::Value::String(
+            library
+                .file_name()
+                .expect("library name")
+                .to_string_lossy()
+                .into_owned(),
+        );
         std::fs::write(
             &manifest_path,
-            include_str!("../../../examples/hello-plugin/bcode-plugin.toml"),
+            toml::to_string(&manifest).expect("manifest TOML"),
         )
         .expect("plugin manifest");
-        let library = hello_dynamic_library_path();
         std::fs::copy(
             &library,
             plugin_dir.join(

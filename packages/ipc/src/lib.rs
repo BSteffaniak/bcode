@@ -3617,7 +3617,7 @@ mod tests {
             .as_windows_named_pipe()
             .expect("Windows default endpoint must be a named pipe");
         assert!(name.starts_with(r"\\.\pipe\bcode-"));
-        assert!(name.ends_with(&daemon_namespace()));
+        assert!(name.ends_with(&format!("{}-{}", daemon_namespace(), state_location_id())));
         let username = env::var("USERNAME")
             .unwrap_or_default()
             .trim()
