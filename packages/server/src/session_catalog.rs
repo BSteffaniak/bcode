@@ -52,6 +52,7 @@ struct SourceCache {
     metadata: SourceMetadata,
     state: SourceCacheState,
     updated_at_ms: u64,
+    generation: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -313,7 +314,7 @@ impl SessionCatalog {
     async fn ensure_source(&self, state: &Arc<ServerState>, plan: CatalogSourcePlan) {
         let key = plan.key();
         let metadata = plan.metadata();
-        let should_spawn = {
+        let generation = {
             let mut inner = self.inner.lock().await;
             let source = inner
                 .sources
@@ -322,21 +323,24 @@ impl SessionCatalog {
                     metadata: metadata.clone(),
                     state: SourceCacheState::Empty,
                     updated_at_ms: 0,
+                    generation: 0,
                 });
             source.metadata = metadata.clone();
             match source.state {
                 SourceCacheState::Empty | SourceCacheState::Failed { .. } => {
                     source.state = SourceCacheState::Loading;
                     source.updated_at_ms = current_unix_millis();
+                    source.generation += 1;
+                    let generation = source.generation;
                     self.bump_revision(&mut inner);
-                    true
+                    Some(generation)
                 }
-                SourceCacheState::Loading | SourceCacheState::Loaded { .. } => false,
+                SourceCacheState::Loading | SourceCacheState::Loaded { .. } => None,
             }
         };
-        if !should_spawn {
+        let Some(generation) = generation else {
             return;
-        }
+        };
         let state = Arc::clone(state);
         let catalog = Arc::clone(&state.session_catalog);
         tokio::spawn(async move {
@@ -358,7 +362,9 @@ impl SessionCatalog {
                     labels,
                 );
             }
-            catalog.apply_source_result(key, metadata, result).await;
+            catalog
+                .publish_source_result(key, metadata, result, Some(generation))
+                .await;
         });
     }
 
@@ -375,6 +381,7 @@ impl SessionCatalog {
                 let in_scope = matches!(key.scope, CatalogSourceScope::Global)
                     || matches!(&key.scope, CatalogSourceScope::WorkingDirectory(path) if path == working_directory);
                 if in_scope && should_refresh(&key.source_id) {
+                    source.generation += 1;
                     source.state = SourceCacheState::Empty;
                     source.updated_at_ms = current_unix_millis();
                     changed = true;
@@ -393,6 +400,7 @@ impl SessionCatalog {
             let mut inner = self.inner.lock().await;
             for (key, source) in &mut inner.sources {
                 if key.source_id == source_id {
+                    source.generation += 1;
                     source.state = SourceCacheState::Empty;
                     source.updated_at_ms = current_unix_millis();
                     changed = true;
@@ -412,13 +420,34 @@ impl SessionCatalog {
         metadata: SourceMetadata,
         result: Result<SourceLoadResult, String>,
     ) {
+        self.publish_source_result(key, metadata, result, None)
+            .await;
+    }
+
+    async fn publish_source_result(
+        &self,
+        key: CatalogSourceKey,
+        metadata: SourceMetadata,
+        result: Result<SourceLoadResult, String>,
+        expected_generation: Option<u64>,
+    ) {
         {
             let mut inner = self.inner.lock().await;
+            if let Some(expected) = expected_generation
+                && inner
+                    .sources
+                    .get(&key)
+                    .is_none_or(|source| source.generation != expected)
+            {
+                return;
+            }
             let source = inner.sources.entry(key).or_insert_with(|| SourceCache {
                 metadata: metadata.clone(),
                 state: SourceCacheState::Empty,
                 updated_at_ms: 0,
+                generation: 0,
             });
+            source.generation += 1;
             source.metadata = metadata;
             source.updated_at_ms = current_unix_millis();
             source.state = match result {
@@ -433,6 +462,7 @@ impl SessionCatalog {
                 },
             };
             self.bump_revision(&mut inner);
+            drop(inner);
         }
     }
 
@@ -715,6 +745,9 @@ fn snapshot_locked(
     let native_imports = native_import_identities(native_sessions);
     let mut sessions = Vec::new();
     let mut sources = Vec::new();
+    // Resolve each distinct directory once per snapshot, not once per session.
+    // Keep this cache local so symlink changes are observed on subsequent reads.
+    let mut normalized_directories = BTreeMap::new();
 
     for (key, source) in &inner.sources {
         if !source_relevant_to_working_directory(key, working_directory) {
@@ -740,7 +773,11 @@ fn snapshot_locked(
                         if is_foreign && session.updated_at_ms == 0 {
                             return true;
                         }
-                        normalize_path(&session.working_directory) == working_directory
+                        normalized_directories
+                            .entry(session.working_directory.clone())
+                            .or_insert_with(|| normalize_path(&session.working_directory))
+                            .as_path()
+                            == working_directory
                     })
                     .cloned(),
             ),
@@ -1020,6 +1057,60 @@ fn current_unix_millis() -> u64 {
 #[cfg(test)]
 mod tests {
     #[tokio::test]
+    async fn invalidated_source_load_cannot_publish_over_fresh_results() {
+        let catalog = SessionCatalog::default();
+        let session = summary(SessionId::new(), None);
+        catalog
+            .apply_source_result(
+                super::native_source_key(),
+                super::native_metadata(),
+                Ok(SourceLoadResult {
+                    sessions: vec![session.clone()],
+                    diagnostics: SourceDiagnostics::default(),
+                }),
+            )
+            .await;
+        let generation = catalog.inner.lock().await.sources[&super::native_source_key()].generation;
+        catalog.invalidate_source_id(super::NATIVE_SOURCE_ID).await;
+        let revision = catalog.revision();
+        catalog
+            .publish_source_result(
+                super::native_source_key(),
+                super::native_metadata(),
+                Err("stale failure".to_owned()),
+                Some(generation),
+            )
+            .await;
+        assert_eq!(catalog.revision(), revision);
+        catalog
+            .apply_source_result(
+                super::native_source_key(),
+                super::native_metadata(),
+                Ok(SourceLoadResult {
+                    sessions: vec![session.clone()],
+                    diagnostics: SourceDiagnostics::default(),
+                }),
+            )
+            .await;
+        let revision = catalog.revision();
+        catalog
+            .publish_source_result(
+                super::native_source_key(),
+                super::native_metadata(),
+                Ok(SourceLoadResult {
+                    sessions: Vec::new(),
+                    diagnostics: SourceDiagnostics::default(),
+                }),
+                Some(generation),
+            )
+            .await;
+        assert_eq!(catalog.revision(), revision);
+        assert_eq!(
+            catalog.inner.lock().await.sources[&super::native_source_key()].sessions(),
+            &[session]
+        );
+    }
+    #[tokio::test]
     async fn import_enumeration_coalesces_and_warm_reads_skip_provider_work() {
         let catalog = SessionCatalog::default();
         let (release, blocked) = tokio::sync::oneshot::channel();
@@ -1137,6 +1228,7 @@ mod tests {
                 },
                 state: super::SourceCacheState::Loading,
                 updated_at_ms: 0,
+                generation: 0,
             },
         );
         let snapshot = {
@@ -1205,6 +1297,54 @@ mod tests {
             );
             drop(state);
         }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn snapshot_directory_resolution_observes_symlink_changes() {
+        let root = tempfile::tempdir().unwrap();
+        let first = root.path().join("first");
+        let second = root.path().join("second");
+        std::fs::create_dir(&first).unwrap();
+        std::fs::create_dir(&second).unwrap();
+        let alias = root.path().join("alias");
+        std::os::unix::fs::symlink(&first, &alias).unwrap();
+        let catalog = SessionCatalog::default();
+        let mut session = summary(SessionId::new(), None);
+        session.working_directory = alias.clone();
+        catalog
+            .apply_source_result(
+                super::native_source_key(),
+                super::native_metadata(),
+                Ok(SourceLoadResult {
+                    sessions: vec![session],
+                    diagnostics: SourceDiagnostics::default(),
+                }),
+            )
+            .await;
+        {
+            let inner = catalog.inner.lock().await;
+            assert_eq!(
+                super::snapshot_locked(&inner, &first.canonicalize().unwrap(), true)
+                    .sessions
+                    .len(),
+                1
+            );
+        }
+        std::fs::remove_file(&alias).unwrap();
+        std::os::unix::fs::symlink(&second, &alias).unwrap();
+        let inner = catalog.inner.lock().await;
+        assert!(
+            super::snapshot_locked(&inner, &first.canonicalize().unwrap(), true)
+                .sessions
+                .is_empty()
+        );
+        assert_eq!(
+            super::snapshot_locked(&inner, &second.canonicalize().unwrap(), true)
+                .sessions
+                .len(),
+            1
+        );
     }
 
     #[test]
