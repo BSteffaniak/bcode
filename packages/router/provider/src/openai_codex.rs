@@ -17,7 +17,6 @@ use bytes::Bytes;
 use futures_util::{StreamExt, stream};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use zeroize::Zeroizing;
 
 use crate::{
     ProviderError, ProviderResponse, ProviderStreamResponse, RequestTimeoutScope,
@@ -653,59 +652,74 @@ fn store_refreshed_auth(
 ) -> Result<(), ProviderError> {
     let store =
         sshenv_vault::SshenvStore::new(sshenv_vault::SshenvStoreConfig::new(auth.vault.clone()));
-    set_secret(
-        &store,
+    let (mut vault, data_key) =
+        store
+            .load_and_unlock_profile(&auth.profile)
+            .map_err(|_| ProviderError::Auth {
+                provider_id: model.provider.to_string(),
+                message: "failed to unlock ChatGPT/Codex credential storage".to_string(),
+            })?;
+    let values = vault
+        .profiles
+        .profiles
+        .get_mut(&auth.profile)
+        .ok_or_else(|| ProviderError::Auth {
+            provider_id: model.provider.to_string(),
+            message: "ChatGPT/Codex credential profile disappeared during refresh".to_string(),
+        })?;
+    update_refreshed_values(
+        values,
         auth,
-        "CODEX_ACCESS_TOKEN",
-        refreshed.access_token.clone(),
+        refreshed,
+        next_refresh_token,
+        next_expires_at,
+        account_id,
         model,
     )?;
-    if let Some(id_token) = &refreshed.id_token {
-        set_secret(&store, auth, "CODEX_ID_TOKEN", id_token.clone(), model)?;
-    }
-    set_secret(
-        &store,
-        auth,
-        "CODEX_REFRESH_TOKEN",
-        next_refresh_token.to_string(),
-        model,
-    )?;
-    set_secret(
-        &store,
-        auth,
-        "CODEX_EXPIRES_AT",
-        next_expires_at.to_string(),
-        model,
-    )?;
-    if let Some(account_id) = account_id {
-        set_secret(
-            &store,
-            auth,
-            "CODEX_ACCOUNT_ID",
-            account_id.to_string(),
-            model,
-        )?;
-    }
-    Ok(())
+    // One encrypted snapshot preserves profile policies and unrelated credentials. The vault
+    // rejects a stale snapshot if another writer commits between unlock and save.
+    vault
+        .save(&auth.vault, &data_key)
+        .map_err(|_| ProviderError::Auth {
+            provider_id: model.provider.to_string(),
+            message: "failed to persist rotated ChatGPT/Codex credentials; recovery required"
+                .to_string(),
+        })
 }
 
-fn set_secret(
-    store: &sshenv_vault::SshenvStore,
+fn update_refreshed_values(
+    values: &mut BTreeMap<String, String>,
     auth: &CodexAuth,
-    key: &str,
-    value: String,
+    refreshed: &OpenAiOauthTokenResponse,
+    next_refresh_token: &str,
+    next_expires_at: u64,
+    account_id: Option<&str>,
     model: &RouteableModel,
 ) -> Result<(), ProviderError> {
-    store
-        .set_secret(
-            &auth.profile,
-            &format!("{BROUTER_PREFIX}_{key}"),
-            Zeroizing::new(value),
-        )
-        .map_err(|error| ProviderError::Auth {
+    let key = |name: &str| format!("{BROUTER_PREFIX}_CODEX_{name}");
+    // Do not overwrite credentials re-enrolled or rotated since this request read them.
+    // This detects stale results, but does not serialize remote refresh requests.
+    if values.get(&key("ACCESS_TOKEN")) != Some(&auth.access_token)
+        || values.get(&key("REFRESH_TOKEN")) != auth.refresh_token.as_ref()
+    {
+        return Err(ProviderError::Auth {
             provider_id: model.provider.to_string(),
-            message: format!("failed to store refreshed ChatGPT/Codex token: {error}"),
-        })
+            message: "ChatGPT/Codex credentials changed during refresh; recovery required"
+                .to_string(),
+        });
+    }
+    values.insert(key("ACCESS_TOKEN"), refreshed.access_token.clone());
+    values.insert(key("REFRESH_TOKEN"), next_refresh_token.to_string());
+    values.insert(key("EXPIRES_AT"), next_expires_at.to_string());
+    if let Some(id_token) = &refreshed.id_token {
+        values.insert(key("ID_TOKEN"), id_token.clone());
+    }
+    if let Some(account_id) = account_id {
+        values.insert(key("ACCOUNT_ID"), account_id.to_string());
+    } else {
+        values.remove(&key("ACCOUNT_ID"));
+    }
+    Ok(())
 }
 
 async fn send_codex_request(
@@ -1250,6 +1264,67 @@ mod tests {
             assert!(!error.to_string().contains("secret-canary"));
             assert!(!format!("{error:?}").contains("secret-canary"));
         }
+    }
+
+    #[test]
+    fn rotated_values_preserve_unrelated_secrets_and_reject_stale_results() {
+        let auth = CodexAuth {
+            access_token: "old-access".to_string(),
+            refresh_token: Some("old-refresh".to_string()),
+            expires_at: Some(1),
+            account_id: None,
+            profile: "test".to_string(),
+            vault: PathBuf::new(),
+        };
+        let refreshed = OpenAiOauthTokenResponse {
+            access_token: "new-access".to_string(),
+            refresh_token: Some("new-refresh".to_string()),
+            id_token: None,
+            expires_in: Some(3600),
+        };
+        let mut values = BTreeMap::from([
+            (
+                "BROUTER_OPENAI_CODEX_ACCESS_TOKEN".to_string(),
+                "old-access".to_string(),
+            ),
+            (
+                "BROUTER_OPENAI_CODEX_REFRESH_TOKEN".to_string(),
+                "old-refresh".to_string(),
+            ),
+            (
+                "BROUTER_OPENAI_CODEX_ACCOUNT_ID".to_string(),
+                "stale-account".to_string(),
+            ),
+            ("UNRELATED".to_string(), "preserved".to_string()),
+        ]);
+        update_refreshed_values(
+            &mut values,
+            &auth,
+            &refreshed,
+            "new-refresh",
+            3601,
+            None,
+            &routeable_model(),
+        )
+        .unwrap();
+        assert_eq!(values["BROUTER_OPENAI_CODEX_ACCESS_TOKEN"], "new-access");
+        assert_eq!(values["BROUTER_OPENAI_CODEX_REFRESH_TOKEN"], "new-refresh");
+        assert_eq!(values["BROUTER_OPENAI_CODEX_EXPIRES_AT"], "3601");
+        assert!(!values.contains_key("BROUTER_OPENAI_CODEX_ACCOUNT_ID"));
+        assert_eq!(values["UNRELATED"], "preserved");
+        let before = values.clone();
+        let error = update_refreshed_values(
+            &mut values,
+            &auth,
+            &refreshed,
+            "stale",
+            42,
+            Some("wrong"),
+            &routeable_model(),
+        )
+        .unwrap_err();
+        assert_eq!(values, before);
+        assert!(!error.to_string().contains("new-refresh"));
     }
 
     #[test]
