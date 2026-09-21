@@ -107,7 +107,7 @@ provider_plugin_id = "bcode.fake-provider"
 model_id = "fake-echo"
 
 [model.profiles.pty-smoke.settings]
-fake_stream_delta_delay_ms = "500"
+fake_stream_delta_delay_ms = "2000"
 fake_tool_delta_delay_ms = "500"
 
 # Shared stream presentation is enabled explicitly in PTY acceptance so fake-provider
@@ -324,7 +324,7 @@ pid, fd = pty.fork()
 if pid == 0:
     os.execv(binary, [binary, "tui", session_id])
 
-fcntl.ioctl(fd, termios.TIOCSWINSZ, struct.pack("HHHH", 30, 120, 0, 0))
+fcntl.ioctl(fd, termios.TIOCSWINSZ, struct.pack("HHHH", 100, 120, 0, 0))
 capture = bytearray()
 deadline = time.monotonic() + int(os.environ.get("BCODE_TUI_PTY_TIMEOUT_SECS", "120"))
 exit_deadline = None
@@ -420,7 +420,7 @@ def screen_text():
         check=True,
         capture_output=True,
     )
-    return result.stdout
+    return b"\n".join(line.rstrip() for line in result.stdout.splitlines())
 
 while time.monotonic() < deadline:
     now = time.monotonic()
@@ -613,6 +613,7 @@ while time.monotonic() < deadline:
             # later stages explicitly exercise narrow, wide, and tiny terminals.
             fcntl.ioctl(fd, termios.TIOCSWINSZ, struct.pack("HHHH", 100, 120, 0, 0))
             os.kill(pid, signal.SIGWINCH)
+            time.sleep(0.5)
             # Return to the live edge before testing streamed output. The detached
             # viewport above deliberately stays on earlier user content.
             os.write(fd, b"\x1b[1;5F")
@@ -628,10 +629,12 @@ while time.monotonic() < deadline:
         if assistant_request_sent:
             if not assistant_final_after_prefix:
                 os.write(fd, b"\x1b[1;5F")
-            assistant_response = screen.rsplit(b"\nBcode\n", 1)
+            assistant_response = screen.rsplit(b"\nBcode", 1)
             assistant_text = assistant_response[1] if len(assistant_response) == 2 else b""
             prefix_visible = assistant_prefix_marker in assistant_text
-            suffix_visible = assistant_suffix_marker in screen
+            suffix_visible = assistant_suffix_marker in assistant_text or (
+                assistant_prefix_before_finish and assistant_suffix_marker in screen
+            )
             if prefix_visible and not suffix_visible and not assistant_composer_edit_responsive:
                 os.write(fd, b"composer-remains-responsive")
                 assistant_composer_edit_responsive = True
@@ -675,7 +678,7 @@ while time.monotonic() < deadline:
             os.write(fd, b"\x1b[1;5F")
             # The submitted user message contains both markers. Only the assistant
             # block can establish partial delivery before the final suffix.
-            cancel_response = screen.rsplit(b"\nBcode\n", 1)
+            cancel_response = screen.rsplit(b"\nBcode", 1)
             cancel_text = cancel_response[1] if len(cancel_response) == 2 else b""
             cancel_prefix = b"CANCELPREFIX" in cancel_text
             cancel_suffix = b"CANCELSUFFIX" in cancel_text
