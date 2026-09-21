@@ -5,7 +5,9 @@
 //! authoritative artifact content, not a disposable sidecar or a session-history replacement.
 
 use crate::artifact_compression::ArtifactCompression;
-use crate::artifact_reader::{ArtifactEncoding, ArtifactReader, prepare_artifact_transition};
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+use crate::artifact_reader::prepare_artifact_transition;
+use crate::artifact_reader::{ArtifactEncoding, ArtifactReader};
 use bcode_session_models::{MAX_SESSION_ARTIFACT_RANGE_BYTES, SessionId};
 use std::fs::{self, File};
 use std::io::{self, Read as _, Seek as _, SeekFrom};
@@ -381,6 +383,13 @@ pub async fn compress_finalized_artifact_with_age(
     .await
 }
 
+#[cfg_attr(
+    not(any(target_os = "macos", target_os = "linux")),
+    allow(
+        clippy::unused_async,
+        reason = "portable async admission interface rejects unsupported platforms"
+    )
+)]
 pub(crate) async fn acquire_tracking_admission(
     root: &Path,
     id: SessionId,
@@ -396,7 +405,7 @@ pub(crate) async fn acquire_tracking_admission(
     }
     #[cfg(not(any(target_os = "macos", target_os = "linux")))]
     {
-        let _ = root;
+        let _ = (root, id);
         Err(io::Error::new(
             io::ErrorKind::Unsupported,
             "automatic artifact maintenance unavailable",
@@ -867,14 +876,6 @@ fn exchange(parent: &File, parent_path: &Path, left: &Path, right: &Path) -> io:
     } else {
         Err(io::Error::last_os_error())
     }
-}
-
-#[cfg(not(any(target_os = "macos", target_os = "linux")))]
-fn exchange(_parent: &File, _parent_path: &Path, _left: &Path, _right: &Path) -> io::Result<()> {
-    Err(io::Error::new(
-        io::ErrorKind::Unsupported,
-        "atomic artifact exchange is unavailable",
-    ))
 }
 
 #[cfg(all(test, any(target_os = "macos", target_os = "linux")))]

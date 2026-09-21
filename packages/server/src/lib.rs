@@ -60699,8 +60699,12 @@ event_symbol = "bcode_plugin_handle_event_v1"
     #[allow(clippy::too_many_lines)]
     async fn server_shell_input_route_resizes_active_invocation_without_jsonl_control() {
         let sessions = SessionManager::default();
+        let working_directory = tempfile::tempdir().expect("shell working directory");
         let summary = sessions
-            .create_session(Some("shell input".to_string()), test_working_directory())
+            .create_session(
+                Some("shell input".to_string()),
+                working_directory.path().to_path_buf(),
+            )
             .await
             .expect("shell input session");
         let session_id = summary.id;
@@ -64962,7 +64966,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
                     .append_assistant_response_segment(
                         parent.id,
                         turn_id.clone(),
-                        "output".into(),
+                        "output".to_string(),
                         0,
                         serde_json::json!({"condition_met": false}).to_string(),
                     )
@@ -65924,7 +65928,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
             } else {
                 assert!(
                     matches!(error, ServerError::WorkflowOwnedByLiveDaemon { .. }),
-                    "unexpected repair rejection: {error:?}"
+                    "unexpected ownership rejection: {error:?}"
                 );
             }
             (

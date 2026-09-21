@@ -107,6 +107,14 @@ fn validate_active_record(file: &mut File) -> io::Result<()> {
 /// Health failure invalidates every outstanding token; callers must recheck before publication.
 #[derive(Clone, Debug)]
 pub struct StorageDaemonAcknowledgement {
+    // Retained on every platform to keep the registration's liveness lock held.
+    #[cfg_attr(
+        not(any(target_os = "macos", target_os = "linux")),
+        allow(
+            dead_code,
+            reason = "ownership retains the registration lock until the last acknowledgement drops"
+        )
+    )]
     file: Arc<File>,
     failed: Arc<AtomicBool>,
 }
