@@ -311,12 +311,14 @@ pub fn initialize(root: &Path, started: Instant, artifact: String) -> io::Result
 }
 
 fn safe_options() -> OpenOptions {
-    let mut options = OpenOptions::new();
+    let options = OpenOptions::new();
     #[cfg(unix)]
-    {
+    let options = {
         use std::os::unix::fs::OpenOptionsExt as _;
+        let mut options = options;
         options.custom_flags(libc::O_NOFOLLOW).mode(0o600);
-    }
+        options
+    };
     options
 }
 

@@ -66,7 +66,7 @@ fn response(mut child: std::process::Child, request: &[u8]) -> (bool, Vec<u8>, b
 }
 
 #[cfg(unix)]
-fn scripted_worker(script: &str) -> tempfile::NamedTempFile {
+fn scripted_worker(script: &str) -> tempfile::TempPath {
     use std::os::unix::fs::PermissionsExt;
 
     let mut worker = tempfile::NamedTempFile::new().unwrap();
@@ -74,7 +74,8 @@ fn scripted_worker(script: &str) -> tempfile::NamedTempFile {
     let mut permissions = worker.as_file().metadata().unwrap().permissions();
     permissions.set_mode(0o700);
     worker.as_file().set_permissions(permissions).unwrap();
-    worker
+    // Linux refuses exec while a writable descriptor remains open (ETXTBSY).
+    worker.into_temp_path()
 }
 
 #[test]
@@ -88,7 +89,7 @@ fn public_worker_adapter_enforces_address_space_limit() {
 
     assert!(matches!(
         render_mermaid_with_worker(
-            worker.path(),
+            worker.as_ref(),
             &request,
             &MermaidCancellationToken::default()
         ),
@@ -106,7 +107,7 @@ fn public_worker_adapter_forcefully_terminates_timed_out_worker() {
 
     assert_eq!(
         render_mermaid_with_worker(
-            worker.path(),
+            worker.as_ref(),
             &request,
             &MermaidCancellationToken::default()
         ),
@@ -133,7 +134,7 @@ fn public_worker_adapter_forcefully_terminates_cancelled_worker() {
     let started = std::time::Instant::now();
 
     assert_eq!(
-        render_mermaid_with_worker(worker.path(), &request, &cancellation),
+        render_mermaid_with_worker(worker.as_ref(), &request, &cancellation),
         Err(MermaidRenderError::Cancelled)
     );
     thread.join().unwrap();
@@ -147,7 +148,7 @@ fn public_worker_adapter_rejects_malformed_and_oversized_responses() {
     let request = MermaidRenderRequest::svg("flowchart LR\nA --> B", 800, 600);
     assert!(matches!(
         render_mermaid_with_worker(
-            malformed.path(),
+            malformed.as_ref(),
             &request,
             &MermaidCancellationToken::default()
         ),
@@ -161,7 +162,7 @@ fn public_worker_adapter_rejects_malformed_and_oversized_responses() {
     request.limits.max_output_bytes = 4096;
     assert!(matches!(
         render_mermaid_with_worker(
-            oversized.path(),
+            oversized.as_ref(),
             &request,
             &MermaidCancellationToken::default()
         ),
@@ -177,7 +178,7 @@ fn public_worker_adapter_maps_worker_crash_to_typed_protocol_failure() {
 
     assert!(matches!(
         render_mermaid_with_worker(
-            crashed.path(),
+            crashed.as_ref(),
             &request,
             &MermaidCancellationToken::default()
         ),

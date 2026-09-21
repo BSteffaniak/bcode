@@ -2954,7 +2954,7 @@ async fn endpoint_has_listener(endpoint: &IpcEndpoint) -> bool {
 }
 
 #[cfg(not(unix))]
-const async fn endpoint_has_listener(_endpoint: &IpcEndpoint) -> bool {
+async fn endpoint_has_listener(_endpoint: &IpcEndpoint) -> bool {
     false
 }
 

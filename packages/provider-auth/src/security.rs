@@ -194,7 +194,11 @@ fn restrict_dir_permissions(path: &Path) -> Result<(), AuthIdentityError> {
 }
 
 #[cfg(not(unix))]
-fn restrict_dir_permissions(_path: &Path) -> Result<(), AuthIdentityError> {
+#[allow(
+    clippy::unnecessary_wraps,
+    reason = "same fallible interface as Unix permission enforcement"
+)]
+const fn restrict_dir_permissions(_path: &Path) -> Result<(), AuthIdentityError> {
     Ok(())
 }
 
@@ -212,7 +216,11 @@ fn restrict_private_key_permissions(path: &Path) -> Result<(), AuthIdentityError
 }
 
 #[cfg(not(unix))]
-fn restrict_private_key_permissions(_path: &Path) -> Result<(), AuthIdentityError> {
+#[allow(
+    clippy::unnecessary_wraps,
+    reason = "same fallible interface as Unix permission enforcement"
+)]
+const fn restrict_private_key_permissions(_path: &Path) -> Result<(), AuthIdentityError> {
     Ok(())
 }
 
@@ -230,7 +238,11 @@ fn restrict_public_key_permissions(path: &Path) -> Result<(), AuthIdentityError>
 }
 
 #[cfg(not(unix))]
-fn restrict_public_key_permissions(_path: &Path) -> Result<(), AuthIdentityError> {
+#[allow(
+    clippy::unnecessary_wraps,
+    reason = "same fallible interface as Unix permission enforcement"
+)]
+const fn restrict_public_key_permissions(_path: &Path) -> Result<(), AuthIdentityError> {
     Ok(())
 }
 
@@ -963,6 +975,7 @@ pub(crate) fn prepare_retained_device_policy(
 
 /// Verify that retained custody can preserve an already-satisfied device policy.
 /// No migration, factor creation, or native discovery occurs here.
+#[cfg(unix)]
 pub(crate) fn validate_retained_device_policy(
     vault: &sshenv_vault::Vault,
     profile: &str,

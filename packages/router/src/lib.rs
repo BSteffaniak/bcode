@@ -821,7 +821,7 @@ fn apply_objective(
 ) {
     match objective {
         RoutingObjective::Cheapest => {
-            *score -= estimated_cost * weights.cheapest_cost_weight;
+            *score = estimated_cost.mul_add(-weights.cheapest_cost_weight, *score);
             reasons.push("cheapest objective penalized cost".to_string());
         }
         RoutingObjective::Fastest => {
@@ -831,7 +831,7 @@ fn apply_objective(
             }
         }
         RoutingObjective::Strongest => {
-            *score += f64::from(model.quality) * weights.strongest_quality_weight;
+            *score = f64::from(model.quality).mul_add(weights.strongest_quality_weight, *score);
             reasons.push("strongest objective boosted quality".to_string());
         }
         RoutingObjective::LocalOnly => {
@@ -839,7 +839,7 @@ fn apply_objective(
             reasons.push("local-only objective matched local model".to_string());
         }
         RoutingObjective::Balanced => {
-            *score -= estimated_cost * weights.balanced_cost_weight;
+            *score = estimated_cost.mul_add(-weights.balanced_cost_weight, *score);
             reasons.push("balanced objective considered cost".to_string());
         }
     }

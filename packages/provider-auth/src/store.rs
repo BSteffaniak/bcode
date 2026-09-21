@@ -134,12 +134,14 @@ impl AuthStore {
         if !directory.is_absolute() {
             return Err(AuthStoreError::OwnershipUnavailable);
         }
-        let mut builder = fs::DirBuilder::new();
+        let builder = fs::DirBuilder::new();
         #[cfg(unix)]
-        {
+        let builder = {
             use std::os::unix::fs::DirBuilderExt as _;
+            let mut builder = builder;
             builder.mode(0o700);
-        }
+            builder
+        };
         builder.create(directory).map_err(AuthStoreError::Io)?;
         let store = Self::acquire(directory, true)?;
         store.commit(&AuthState::default())?;

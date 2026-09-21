@@ -952,6 +952,8 @@ if failures:
     except OSError:
         pass
     print(screen_text().decode(errors="replace"), file=sys.stderr)
+    with open(os.path.join(os.environ["BCODE_STATE_DIR"], "acceptance-capture.bin"), "wb") as output:
+        output.write(capture)
     print(repr(bytes(capture[-2_000:])), file=sys.stderr)
     sys.exit(1)
 PY

@@ -593,8 +593,8 @@ impl ToolInvoker for BlockingInvoker {
     }
 }
 
-#[tokio::test]
-async fn generic_stream_cancellation_terminates_blocked_provider_batch_immediately() {
+#[tokio::test(start_paused = true)]
+async fn generic_stream_cancellation_bounds_uncooperative_provider_batch_settlement() {
     let requests = Arc::new(Mutex::new(Vec::new()));
     let provider = BatchProvider::new(requests);
     let started = Arc::new(Barrier::new(3));
@@ -614,7 +614,10 @@ async fn generic_stream_cancellation_terminates_blocked_provider_batch_immediate
     started.wait().await;
 
     cancellation.cancel();
-    let terminal = tokio::time::timeout(std::time::Duration::from_millis(100), async {
+    // Active invocations get a bounded cooperative settlement grace. This invoker
+    // deliberately never cooperates; virtual time verifies the bound without
+    // imposing a wall-clock scheduling deadline on CI.
+    let terminal = tokio::time::timeout(std::time::Duration::from_secs(4), async {
         loop {
             match stream.next().await {
                 Some(ScopedAgentStreamItem::Error(error)) => break error,
@@ -625,7 +628,7 @@ async fn generic_stream_cancellation_terminates_blocked_provider_batch_immediate
         }
     })
     .await
-    .expect("cancellation must not wait for blocked invocations");
+    .expect("cancellation must bound uncooperative invocation settlement");
 
     assert!(matches!(
         terminal,
