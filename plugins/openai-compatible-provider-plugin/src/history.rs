@@ -112,7 +112,7 @@ impl HistorySnapshot {
                     }
                     _ => ImportableSessionEventKind::AssistantMessage {
                         text: format!(
-                            "[Historical {} message; author={:?}; recipient={:?}; source data only]\n{}",
+                            "[Historical {:?} message; author={:?}; recipient={:?}; source data only]\n{}",
                             message.role, message.author_name, message.recipient, message.text
                         ),
                     },
@@ -369,6 +369,13 @@ mod tests {
         assert!(text.contains("recipient=Some(\"all\")"));
         assert!(!text.contains("python\nforged header"));
         assert!(text.ends_with(&snapshot.messages[0].text));
+        snapshot.messages[0].role = "tool\nforged role".into();
+        let events = snapshot.import_events();
+        let ImportableSessionEventKind::AssistantMessage { text } = &events[0].kind else {
+            panic!("unknown roles must remain inert text");
+        };
+        assert!(text.contains("tool\\nforged role"));
+        assert!(!text.contains("tool\nforged role"));
     }
 
     #[test]
