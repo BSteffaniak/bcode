@@ -404,6 +404,57 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn cancellation_interrupts_a_stalled_response_body() {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let (release, released) = std::sync::mpsc::channel::<()>();
+        let worker = std::thread::spawn(move || {
+            let (mut socket, _) = listener.accept().unwrap();
+            socket
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            socket
+                .set_write_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            let mut request = Vec::new();
+            while !request.ends_with(b"\r\n\r\n") {
+                let mut byte = [0];
+                socket.read_exact(&mut byte).unwrap();
+                request.push(byte[0]);
+                assert!(request.len() <= 4096);
+            }
+            // Send valid headers and an incomplete JSON body, keeping the connection open.
+            socket.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 100\r\n\r\n{").unwrap();
+            let _ = released.recv_timeout(Duration::from_secs(5));
+        });
+        let client = Client::builder()
+            .no_proxy()
+            .timeout(Duration::from_secs(5))
+            .build()
+            .unwrap();
+        let response = client
+            .get(format!("http://{address}"))
+            .send()
+            .await
+            .unwrap();
+        let cancellation = bcode_plugin_sdk::ServiceCancellation::default();
+        let cancel = async {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            cancellation.cancel();
+        };
+        let operation = cancellable(&cancellation, read_response(response, 1024));
+        let (result, ()) = tokio::join!(
+            tokio::time::timeout(Duration::from_secs(1), operation),
+            cancel
+        );
+        // Always release and join the fixture before asserting, even on a regression.
+        let _ = release.send(());
+        worker.join().unwrap();
+        assert_eq!(result.unwrap(), Err(HistoryAccessError::Cancelled));
+    }
+
+    #[tokio::test]
     async fn bounded_response_reader_accepts_json_and_rejects_large_chunked_body() {
         let response = mock_response("HTTP/1.1 200 OK\r\nContent-Type: application/json; charset=utf-8\r\nContent-Length: 2\r\nConnection: close\r\n\r\n", b"{}").await;
         assert_eq!(read_response(response, 2).await.unwrap(), b"{}");

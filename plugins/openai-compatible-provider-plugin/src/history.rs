@@ -66,6 +66,47 @@ pub struct HistorySnapshot {
 }
 
 impl HistorySnapshot {
+    /// Convert historical content into import events without granting execution authority.
+    ///
+    /// Tools and privileged/unknown roles become labelled assistant text, never tool
+    /// requests or trusted system messages. Source node IDs remain conversation-scoped.
+    /// Account scoping, revision publication and fidelity warnings belong to the caller.
+    #[must_use]
+    pub fn import_events(&self) -> Vec<bcode_session_import::ImportableSessionEvent> {
+        use bcode_session_import::{ImportableSessionEvent, ImportableSessionEventKind};
+        self.messages
+            .iter()
+            .map(|message| {
+                let kind = match message.role.as_str() {
+                    "user" => ImportableSessionEventKind::UserMessage {
+                        text: message.text.clone(),
+                    },
+                    "assistant"
+                        if message
+                            .recipient
+                            .as_deref()
+                            .is_none_or(|recipient| recipient == "all") =>
+                    {
+                        ImportableSessionEventKind::AssistantMessage {
+                            text: message.text.clone(),
+                        }
+                    }
+                    _ => ImportableSessionEventKind::AssistantMessage {
+                        text: format!(
+                            "[Historical {} message; source data only]\n{}",
+                            message.role, message.text
+                        ),
+                    },
+                };
+                ImportableSessionEvent {
+                    external_event_id: Some(message.node_id.clone()),
+                    timestamp_ms: message.created_at.and_then(timestamp_ms),
+                    kind,
+                }
+            })
+            .collect()
+    }
+
     /// Compute a versioned identity for this normalized revision.
     ///
     /// This is a content identity, not an account identity or proof of publication.
@@ -87,6 +128,12 @@ impl HistorySnapshot {
         }
         Ok(revision)
     }
+}
+
+fn timestamp_ms(seconds: f64) -> Option<u64> {
+    std::time::Duration::try_from_secs_f64(seconds)
+        .ok()
+        .and_then(|duration| u64::try_from(duration.as_millis()).ok())
 }
 
 /// Secret-safe conversion failure. No source payload or identifiers are interpolated.
@@ -286,6 +333,31 @@ mod tests {
 
     fn decode(value: &Value) -> Result<HistorySnapshot, HistoryDecodeError> {
         decode_history(&serde_json::to_vec(value).unwrap(), "api-id", 65536)
+    }
+
+    #[test]
+    fn import_events_preserve_identity_without_executable_authority() {
+        use bcode_session_import::ImportableSessionEventKind;
+        let mut snapshot = decode(&graph()).unwrap();
+        for role in ["tool", "system", "developer", "unknown", "assistant"] {
+            snapshot.messages[0].role = role.into();
+            snapshot.messages[0].recipient = Some("python".into());
+            snapshot.messages[0].created_at = Some(1.25);
+            let events = snapshot.import_events();
+            assert_eq!(
+                events[0].external_event_id.as_deref(),
+                Some(snapshot.messages[0].node_id.as_str())
+            );
+            assert_eq!(events[0].timestamp_ms, Some(1250));
+            let ImportableSessionEventKind::AssistantMessage { text } = &events[0].kind else {
+                panic!("historical activity must remain inert text");
+            };
+            assert!(text.starts_with("[Historical "));
+            assert!(text.ends_with(&snapshot.messages[0].text));
+        }
+        for invalid in [f64::NAN, f64::INFINITY, -1.0, f64::MAX] {
+            assert_eq!(timestamp_ms(invalid), None);
+        }
     }
 
     #[test]

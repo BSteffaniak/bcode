@@ -23,6 +23,7 @@ bcode_openai_responses = { workspace = true }
 bcode_plugin_sdk = { workspace = true }
 bcode_provider_auth = { workspace = true }
 bcode_provider_auth_models = { workspace = true }
+bcode_session_import = { workspace = true }
 bcode_session_models = { workspace = true }
 bcode_tool = { workspace = true }
 flate2 = { workspace = true }
