@@ -1495,6 +1495,24 @@ struct TerminalShellStatus {
     cancelled: bool,
 }
 
+fn terminate_terminal_process(
+    child: &mut Box<dyn portable_pty::Child + Send + Sync>,
+) -> io::Result<()> {
+    #[cfg(unix)]
+    if let Some(pid) = child.process_id().and_then(|pid| i32::try_from(pid).ok()) {
+        // SAFETY: portable-pty creates a dedicated session/process group for this
+        // still-unreaped child. Descendants must not retain terminal output pipes.
+        if unsafe { libc::kill(-pid, libc::SIGKILL) } != 0 {
+            let error = io::Error::last_os_error();
+            if error.raw_os_error() != Some(libc::ESRCH) {
+                return Err(error);
+            }
+        }
+        return Ok(());
+    }
+    child.kill()
+}
+
 #[allow(clippy::too_many_arguments)]
 fn wait_for_terminal_shell_status(
     child: &mut Box<dyn portable_pty::Child + Send + Sync>,
@@ -1527,7 +1545,7 @@ fn wait_for_terminal_shell_status(
                     metadata: serde_json::Value::Null,
                 },
             );
-            child.kill().map_err(|error| error.to_string())?;
+            terminate_terminal_process(child).map_err(|error| error.to_string())?;
             break child.wait().map_err(|error| error.to_string())?;
         }
         if started.elapsed() >= timeout {
@@ -1542,7 +1560,7 @@ fn wait_for_terminal_shell_status(
                     metadata: serde_json::Value::Null,
                 },
             );
-            child.kill().map_err(|error| error.to_string())?;
+            terminate_terminal_process(child).map_err(|error| error.to_string())?;
             break child.wait().map_err(|error| error.to_string())?;
         }
         std::thread::sleep(Duration::from_millis(10));
@@ -4404,6 +4422,17 @@ mod tests {
     #[test]
     #[allow(clippy::too_many_lines)] // One lifecycle matrix shares the full invocation/reopen path.
     fn terminal_recordings_preserve_timeout_cancellation_and_nonzero_status() {
+        let signal_name = |signal| {
+            // portable-pty records the platform's strsignal spelling.
+            let status: std::process::ExitStatus =
+                std::os::unix::process::ExitStatusExt::from_raw(signal);
+            portable_pty::ExitStatus::from(status)
+                .signal()
+                .expect("signal status")
+                .to_owned()
+        };
+        let terminated = signal_name(libc::SIGTERM);
+        let killed = signal_name(libc::SIGKILL);
         let environment = isolated_config_environment("recording-terminal-status");
         for (
             name,
@@ -4431,7 +4460,7 @@ mod tests {
                 5_000,
                 false,
                 Some(1),
-                Some("Terminated: 15"),
+                Some(terminated.as_str()),
                 false,
                 false,
             ),
@@ -4441,7 +4470,7 @@ mod tests {
                 0,
                 false,
                 Some(1),
-                Some("Hangup: 1"),
+                Some(killed.as_str()),
                 true,
                 false,
             ),
@@ -4451,7 +4480,7 @@ mod tests {
                 5_000,
                 true,
                 Some(1),
-                Some("Hangup: 1"),
+                Some(killed.as_str()),
                 false,
                 true,
             ),

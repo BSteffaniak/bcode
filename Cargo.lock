@@ -2830,6 +2830,7 @@ dependencies = [
  "bmux_terminal_grid",
  "bmux_tui",
  "hex",
+ "libc",
  "portable-pty",
  "serde",
  "serde_json",
