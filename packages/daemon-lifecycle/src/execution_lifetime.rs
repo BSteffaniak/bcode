@@ -174,7 +174,7 @@ impl ExecutionLifetime {
             .write(true)
             .create_new(true)
             .open(path)?;
-        file.try_lock().map_err(|_| invalid())?;
+        try_lock_evidence(&file).map_err(|_| invalid())?;
         let bytes = serde_json::to_vec(&evidence).map_err(|_| invalid())?;
         if bytes.len() as u64 > MAX_BYTES {
             return Err(invalid());
@@ -206,6 +206,56 @@ pub fn execution_lifetime_status(
         Ok(status) => status,
         Err(error) if error.kind() == io::ErrorKind::NotFound => ExecutionLifetimeStatus::Missing,
         Err(_) => ExecutionLifetimeStatus::Unverifiable,
+    }
+}
+
+#[cfg(not(windows))]
+fn try_lock_evidence(file: &File) -> Result<(), fs::TryLockError> {
+    file.try_lock()
+}
+
+#[cfg(windows)]
+fn try_lock_evidence(file: &File) -> Result<(), fs::TryLockError> {
+    use std::os::windows::io::AsRawHandle as _;
+    use windows_sys::Win32::Storage::FileSystem::{
+        LOCKFILE_EXCLUSIVE_LOCK, LOCKFILE_FAIL_IMMEDIATELY, LockFileEx,
+    };
+    // Windows locks deny reads of the locked bytes. Lock beyond the maximum
+    // evidence payload, retaining exclusive lifetime fencing without hiding identity.
+    let mut overlapped = windows_sys::Win32::System::IO::OVERLAPPED {
+        Anonymous: windows_sys::Win32::System::IO::OVERLAPPED_0 {
+            Anonymous: windows_sys::Win32::System::IO::OVERLAPPED_0_0 {
+                Offset: u32::try_from(MAX_BYTES).expect("bounded evidence"),
+                OffsetHigh: 0,
+            },
+        },
+        ..Default::default()
+    };
+    // SAFETY: the live file handle and initialized OVERLAPPED remain valid for this
+    // synchronous, nonblocking call. Closing the file releases the one-byte lock.
+    let locked = unsafe {
+        LockFileEx(
+            file.as_raw_handle(),
+            LOCKFILE_EXCLUSIVE_LOCK | LOCKFILE_FAIL_IMMEDIATELY,
+            0,
+            1,
+            0,
+            &raw mut overlapped,
+        )
+    };
+    if locked != 0 {
+        return Ok(());
+    }
+    let error = io::Error::last_os_error();
+    if error.raw_os_error()
+        == Some(
+            i32::try_from(windows_sys::Win32::Foundation::ERROR_LOCK_VIOLATION)
+                .expect("Win32 error fits i32"),
+        )
+    {
+        Err(fs::TryLockError::WouldBlock)
+    } else {
+        Err(fs::TryLockError::Error(error))
     }
 }
 
@@ -242,7 +292,7 @@ fn observe(
     {
         return Err(invalid());
     }
-    match file.try_lock() {
+    match try_lock_evidence(&file) {
         Ok(()) => Ok(ExecutionLifetimeStatus::Released),
         Err(fs::TryLockError::WouldBlock) => Ok(ExecutionLifetimeStatus::Live),
         Err(fs::TryLockError::Error(error)) => Err(error),
