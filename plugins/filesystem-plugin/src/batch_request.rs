@@ -1145,8 +1145,7 @@ mod tests {
 
     #[test]
     fn descriptor_rejects_unknown_versions_and_fields() {
-        let target =
-            json!({"path":"/target","device":1,"inode":2,"parent_device":1,"parent_inode":3});
+        let target = json!({"path":std::env::temp_dir().join("target"),"device":1,"inode":2,"parent_device":1,"parent_inode":3});
         for count in [0, MAX_FILES + 1] {
             assert!(
                 serde_json::from_value::<PreparedBatch>(json!({
