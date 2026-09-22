@@ -928,7 +928,11 @@ impl LoopSurface {
             return Err("maximum iterations must be a number".to_owned());
         };
         let input = LoopWorkflowInput::new(prompt, condition, max_iterations)?;
-        let spec = loop_workflow_spec(&input)?;
+        let spec = if self.progress_document.is_some() {
+            goal_workflow_spec(&input)?
+        } else {
+            loop_workflow_spec(&input)?
+        };
         let initial = loop_workflow_initial_value(&input);
         let mut request = PluginWorkflowStartRequest::typed(
             &spec,
@@ -945,11 +949,11 @@ impl LoopSurface {
         )
         .map_err(|error| format!("invalid durable loop request: {error}"))?;
         request.limits.cycle_cap = input.max_iterations;
-        // Both agent nodes may consume every permitted attempt in every iteration.
-        // Control nodes do not dispatch attempts. Use a wide budget so the supported
-        // iteration range cannot overflow or introduce another hidden ceiling.
-        request.limits.node_execution_cap =
-            u64::from(input.max_iterations) * 2 * (u64::from(request.limits.retry_cap) + 1);
+        // Reserve initialization attempts as well as both agents in each implementation
+        // iteration. Blocker-resolution retries remain subject to the ordinary run budgets.
+        let initialization = u64::from(self.progress_document.is_some());
+        request.limits.node_execution_cap = (u64::from(input.max_iterations) * 2 + initialization)
+            * (u64::from(request.limits.retry_cap) + 1);
         Ok(request)
     }
 
@@ -1776,6 +1780,8 @@ struct LoopWorkflowIteration {
     implementation_prompt: String,
     stop_condition: String,
     max_iterations: u32,
+    #[serde(default)]
+    planning_ready: bool,
     iteration: u32,
     condition_met: bool,
     evidence: Vec<String>,
@@ -2022,11 +2028,87 @@ fn loop_workflow_spec(
     bcode_workflow::WorkflowSpec::new(WORKFLOW_KIND, &workflow).map_err(|error| error.to_string())
 }
 
+fn goal_workflow_spec(
+    input: &LoopWorkflowInput,
+) -> Result<bcode_workflow::WorkflowSpec<LoopWorkflowIteration>, String> {
+    let mut definition = loop_workflow_spec(input)?.definition().clone();
+    let mut configuration = loop_agent_configuration::<LoopWorkflowIteration>(
+        include_str!("../prompts/goal-initialization.md"),
+        "build",
+        false,
+    );
+    // Planning has its own durable activation; it is not implementation iteration one.
+    configuration.activity_producer = None;
+    let initialization = bcode_workflow::WorkflowBuilder::new(
+        "goal.initialization",
+        bcode_workflow::Step::configured_task(
+            "goal.initialization",
+            bcode_workflow::NodeKind::Agent,
+            serde_json::to_value(configuration).map_err(|error| error.to_string())?,
+            |state: LoopWorkflowIteration, _context| async move { Ok(state) },
+        )
+        .branch(
+            "goal.readiness",
+            bcode_workflow::field::<LoopWorkflowIteration>("planning_ready").eq(true),
+            bcode_workflow::Step::<LoopWorkflowIteration, LoopWorkflowIteration>::input(
+                "goal.ready",
+            ),
+            bcode_workflow::Step::<LoopWorkflowIteration, LoopWorkflowIteration>::input(
+                "goal.blocked",
+            ),
+        ),
+    )
+    .build()
+    .map_err(|error| error.to_string())?;
+    let mut planning = initialization.definition().clone();
+    // A ready assessment dispatches directly into the existing loop, without a human gate.
+    planning.nodes.remove("goal.ready");
+    let branch = planning
+        .nodes
+        .get_mut("goal.readiness")
+        .expect("readiness branch");
+    branch.configuration["true_entries"] = serde_json::json!(definition.entries);
+    branch.configuration["true_nodes"] =
+        serde_json::json!(definition.nodes.keys().collect::<Vec<_>>());
+    for edge in &mut planning.edges {
+        if edge.to == "goal.ready" {
+            edge.to.clone_from(&definition.entries[0]);
+        }
+    }
+    let retry = bcode_workflow::WorkflowBuilder::new(
+        "goal.research",
+        bcode_workflow::Step::<LoopWorkflowIteration, LoopWorkflowIteration>::input("goal.blocked")
+            .repeat_while(
+                "goal.research-again",
+                bcode_workflow::field::<LoopWorkflowIteration>("max_iterations")
+                    .eq(input.max_iterations),
+                u32::MAX,
+            ),
+    )
+    .build()
+    .map_err(|error| error.to_string())?;
+    planning.nodes.extend(retry.definition().nodes.clone());
+    for mut edge in retry.definition().edges.clone() {
+        if matches!(edge.kind, bcode_workflow::EdgeKind::Back { .. }) {
+            edge.to = "goal.initialization".into();
+            // Research retries do not consume an implementation iteration ordinal.
+            edge.transform = None;
+        }
+        planning.edges.push(edge);
+    }
+    definition.entries = planning.entries;
+    definition.nodes.extend(planning.nodes);
+    definition.edges.extend(planning.edges);
+    bcode_workflow::WorkflowSpec::from_definition(WORKFLOW_KIND, definition)
+        .map_err(|error| error.to_string())
+}
+
 fn loop_workflow_initial_value(input: &LoopWorkflowInput) -> LoopWorkflowIteration {
     LoopWorkflowIteration {
         implementation_prompt: input.implementation_prompt.clone(),
         stop_condition: input.stop_condition.clone(),
         max_iterations: input.max_iterations,
+        planning_ready: false,
         iteration: 1,
         condition_met: false,
         evidence: Vec::new(),
@@ -2425,6 +2507,148 @@ mod tests {
         );
         let encoded = serde_json::to_value(&state).expect("state serializes");
         assert_eq!(encoded["outcome"], "implementing");
+    }
+
+    #[test]
+    fn goal_initialization_is_durable_and_gates_implementation() {
+        for ready in [false, true] {
+            let temp = tempfile::tempdir().expect("temp");
+            let mut store =
+                bcode_workflow_store::WorkflowStore::open_in_state_dir(temp.path()).expect("store");
+            let input =
+                LoopWorkflowInput::new("implement".into(), "done".into(), 3).expect("input");
+            let spec = goal_workflow_spec(&input).expect("goal spec");
+            let admission = spec
+                .definition()
+                .production_admission(&bcode_workflow::WorkflowProductionCapabilities::current())
+                .expect("admission");
+            assert!(admission.is_supported(), "{:?}", admission.diagnostics);
+            let identity = spec.identity();
+            store
+                .persist_definition(
+                    &identity.definition_id,
+                    identity.definition_version,
+                    spec.definition(),
+                )
+                .expect("definition");
+            store
+                .create_run(&bcode_workflow_store::NewWorkflowRun {
+                    run_id: "goal-test".into(),
+                    definition_id: identity.definition_id.clone(),
+                    definition_version: identity.definition_version,
+                    workspace_snapshot: temp.path().to_string_lossy().into_owned(),
+                    parent_session_id: Some(SessionId::new().to_string()),
+                    parent_session_generation: None,
+                    binding: None,
+                    authored_provenance: None,
+                    input: Some(
+                        serde_json::to_value(loop_workflow_initial_value(&input)).expect("input"),
+                    ),
+                    execution_authority: None,
+                    created_at_ms: 10,
+                    authorization_profile: bcode_workflow::WorkflowAuthorizationProfileIdentity {
+                        version: 1,
+                        provider_id: "test-policy".into(),
+                        profile_id: "build".into(),
+                        policy_digest_sha256: "a".repeat(64),
+                    },
+                    authorization_ceiling: bcode_workflow::WorkflowToolCapability::Mutating,
+                    limits: bcode_workflow_store::WorkflowRunLimits::default(),
+                })
+                .expect("run");
+            let pending = store.pending_activations(10).expect("pending");
+            assert_eq!(pending.len(), 1);
+            let planning = &pending[0];
+            assert_eq!(planning.node_id, "goal.initialization");
+            drop(store);
+            let mut store = bcode_workflow_store::WorkflowStore::open_in_state_dir(temp.path())
+                .expect("reopen");
+            assert_eq!(
+                store.pending_activations(10).expect("resumed")[0].activation_id,
+                planning.activation_id
+            );
+            let mut state = loop_workflow_initial_value(&input);
+            state.planning_ready = ready;
+            state.summary = if ready {
+                "Ready"
+            } else {
+                "Need scope clarification"
+            }
+            .into();
+            store
+                .persist_validated_output(&bcode_workflow_store::ValidatedOutput {
+                    output_id: "planning-output".into(),
+                    run_id: "goal-test".into(),
+                    node_id: planning.node_id.clone(),
+                    activation_id: planning.activation_id.clone(),
+                    schema_id: planning.node.output.type_name.clone(),
+                    schema_version: 1,
+                    value: serde_json::to_value(state).expect("state"),
+                    artifact_reference: None,
+                    created_at_ms: 11,
+                })
+                .expect("planning result");
+            store
+                .settle_pending_control_nodes("goal-test", 10, 12)
+                .expect("readiness");
+            let pending = store.pending_activations(10).expect("next");
+            if ready {
+                assert_eq!(pending.len(), 1);
+                assert_eq!(pending[0].node_id, "loop.implementation");
+            } else {
+                assert!(pending.is_empty());
+                assert_blocker_resolution_researches(&mut store, &input);
+            }
+        }
+    }
+
+    fn assert_blocker_resolution_researches(
+        store: &mut bcode_workflow_store::WorkflowStore,
+        input: &LoopWorkflowInput,
+    ) {
+        let waiting = store.waiting_activations("goal-test", 10).expect("blocked");
+        assert_eq!(waiting.len(), 1);
+        assert_eq!(waiting[0].node_id, "goal.blocked");
+        let mut resolved = loop_workflow_initial_value(input);
+        resolved.planning_ready = true;
+        store
+            .provide_input(
+                "goal-test",
+                &waiting[0].node_id,
+                &waiting[0].activation_id,
+                serde_json::to_value(resolved).expect("resolution"),
+                13,
+            )
+            .expect("resolve blocker");
+        store
+            .settle_pending_control_nodes("goal-test", 10, 14)
+            .expect("research again");
+        let pending = store.pending_activations(10).expect("research");
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].node_id, "goal.initialization");
+        assert_eq!(pending[0].input.as_ref().expect("input")["iteration"], 1);
+        let mut ready = loop_workflow_initial_value(input);
+        ready.planning_ready = true;
+        let research = &pending[0];
+        store
+            .persist_validated_output(&bcode_workflow_store::ValidatedOutput {
+                output_id: "research-output".into(),
+                run_id: "goal-test".into(),
+                node_id: research.node_id.clone(),
+                activation_id: research.activation_id.clone(),
+                schema_id: research.node.output.type_name.clone(),
+                schema_version: 1,
+                value: serde_json::to_value(ready).expect("ready"),
+                artifact_reference: None,
+                created_at_ms: 15,
+            })
+            .expect("researched");
+        store
+            .settle_pending_control_nodes("goal-test", 10, 16)
+            .expect("ready");
+        let pending = store.pending_activations(10).expect("implementation");
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].node_id, "loop.implementation");
     }
 
     #[test]

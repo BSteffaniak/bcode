@@ -111,7 +111,7 @@ pub fn attach_document(
         include_str!("../prompts/goal-progress-document.md")
     );
     input.stop_condition = format!(
-        "{}\n\nRead the living progress document at this path (JSON string): {path}. Use its phases, checkboxes, decisions and evidence to locate remaining work. Independently verify claims against the original objective and current state. Checked boxes or a Done heading are not proof. Do not edit the document; report discrepancies through the normal evaluation result. Missing or unreadable notes are an explicit verification gap, not success.",
+        "{}\n\nRead the living progress document at this path (JSON string): {path}. Read the current phases, checkboxes, blockers and next actions, not merely the opening status lines. Use them to locate remaining work. Independently verify claims against the original objective and current state. Checked boxes or a Done heading are not proof. Do not edit the document; report discrepancies through the normal evaluation result. Missing or unreadable notes are an explicit verification gap, not success.",
         input.stop_condition
     );
     LoopWorkflowInput::new(

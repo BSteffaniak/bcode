@@ -83,14 +83,29 @@ is added: agent updates use ordinary authorized tools.
 The initial scaffold is explicitly unresearched. Bundled `goal-progress-document.md` and
 `goal-progress-template.md` adapt the local-progress-doc skill and its shared completion
 contract without depending on a user skill, Nix configuration, or interactive skill invocation.
-The first implementation iteration researches and refines the plan into goal-specific phases
-with **checkboxes**, dependencies, exit criteria, evidence and validation expectations. It
-keeps product closure and architectural integrity as separate completion gates.
+With progress notes enabled, the lifecycle is prompt generation → repository research and
+document initialization → LLM readiness assessment → implementation. A separate durable
+agent activation receives the source conversation and loop input, researches the repository,
+and updates only the progress document. It does not implement the product. Guidance asks for
+goal-specific phases with **checkboxes**, dependencies, exit criteria, evidence and validation,
+but the LLM owns their organization and readiness; there is no document-shape validator or
+extra approval on the ready path. Product closure and architectural integrity remain distinct.
+
+A concrete unresolved blocker waits through the existing workflow input mechanism. Resolving
+that input reruns research against the same document before implementation; input alone is
+not readiness. Ordinary cancellation, permissions and durable activation recovery apply.
+Interrupted initialization retains useful edits rather than replacing them with a scaffold.
+Initialization does not consume an implementation iteration. Plain loops and goals with
+progress notes disabled retain their existing execution flow. Existing runs retain their
+persisted definitions and instructions; upgrading does not silently rewrite an active goal.
+Reconcile an old document through an explicitly authorized planning-only turn before resuming.
 
 The plan remains mutable throughout execution: add/split/reorder/refine/remove planned work,
 record significant decisions, preserve completed evidence and reopen disproven checkboxes.
-Read it each iteration, check current state, and leave next actions and blockers. Do not narrow
-the original objective. Keep notes compact and below 64 KiB rather than appending a transcript.
+Read its current phases and next actions each iteration, not just the opening status lines;
+check current state, and update affected sections in place. Do not narrow the original objective.
+Keep the current plan prominent, compact and below 64 KiB. Summarize historical evidence rather
+than accumulating prior-status or previous-increment narration.
 The evaluator reads but does not edit; checked boxes and a Done heading are not proof.
 
 These files are mutable working notes, not canonical event history or finalized artifact
