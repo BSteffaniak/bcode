@@ -592,16 +592,18 @@ fn write_owner_metadata(path: &Path, owner: &SessionLeaseOwner) -> Result<File, 
             path: temp_path.clone(),
             source,
         })?;
-    lock_file_exclusive(&file).map_err(|source| SessionLeaseError::Io {
-        path: temp_path.clone(),
-        source,
-    })?;
     file.write_all(&contents)
         .and_then(|()| file.sync_all())
         .map_err(|source| SessionLeaseError::Io {
             path: temp_path.clone(),
             source,
         })?;
+    // Publish complete immutable metadata under a shared liveness lock. Windows
+    // byte-range locks otherwise prevent observers from reading the owner record.
+    file.lock_shared().map_err(|source| SessionLeaseError::Io {
+        path: temp_path.clone(),
+        source,
+    })?;
     #[cfg(test)]
     abort_before_owner_metadata_publish();
     fs::rename(&temp_path, path).map_err(|source| SessionLeaseError::Io {
@@ -791,6 +793,7 @@ fn try_lock_file_exclusive(file: &File) -> io::Result<bool> {
     }
 }
 
+#[cfg(test)]
 fn lock_file_exclusive(file: &File) -> io::Result<()> {
     file.lock()
 }
