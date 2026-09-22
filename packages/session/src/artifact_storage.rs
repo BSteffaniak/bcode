@@ -822,7 +822,7 @@ fn compress_artifact_with_maintenance(
     ))
 }
 
-#[cfg(test)]
+#[cfg(all(test, any(target_os = "macos", target_os = "linux")))]
 fn crash_boundary(phase: &str) {
     if std::env::var("BCODE_ARTIFACT_CRASH_PHASE").as_deref() == Ok(phase) {
         // Exit without unwinding: neither local cleanup nor lease destructors may run.
