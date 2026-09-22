@@ -806,6 +806,7 @@ impl ArtifactBootstrap {
         Ok(digest)
     }
 
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     fn clone_to(&self, target: &Path) -> Result<bool, DaemonLifecycleError> {
         let source = self.source.lock().map_err(|_| DaemonLifecycleError::Io {
             path: self.source_path.clone(),
@@ -903,11 +904,6 @@ fn try_clone_file_from_handle(source: &fs::File, target: &Path) -> std::io::Resu
         return Ok(false);
     }
     Err(error)
-}
-
-#[cfg(not(any(target_os = "macos", target_os = "linux")))]
-fn try_clone_file_from_handle(_source: &fs::File, _target: &Path) -> std::io::Result<bool> {
-    Ok(false)
 }
 
 fn sha256_reader(mut reader: impl Read, path: &Path) -> Result<String, DaemonLifecycleError> {
@@ -1161,7 +1157,12 @@ fn materialize_verified_daemon_image(
     source: &Path,
     temp: &Path,
 ) -> Result<(String, bool), DaemonLifecycleError> {
+    #[cfg(not(unix))]
+    let _ = source;
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     let cloned = bootstrap.clone_to(temp)?;
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    let cloned = false;
     tracing::debug!(
         target: "bcode_daemon_lifecycle::startup",
         cloned,
@@ -1189,6 +1190,7 @@ fn materialize_verified_daemon_image(
         cloned,
         "daemon image bytes verified and synchronized"
     );
+    #[cfg(unix)]
     preserve_executable_permissions(source, temp)?;
     Ok((digest, cloned))
 }
@@ -1291,14 +1293,6 @@ fn preserve_executable_permissions(
         path: target.to_path_buf(),
         source: source_error,
     })
-}
-
-#[cfg(not(unix))]
-fn preserve_executable_permissions(
-    _source: &Path,
-    _target: &Path,
-) -> Result<(), DaemonLifecycleError> {
-    Ok(())
 }
 
 fn daemon_image_cleanup_lock_path(state_dir: &Path) -> PathBuf {
@@ -2602,6 +2596,7 @@ where
         print_daemon_status(options, "server already running");
         return Ok(());
     };
+    #[cfg(unix)]
     if endpoint_has_listener(&options.endpoint).await {
         if wait_for_existing_daemon(&options.endpoint).await {
             drop(lock);
@@ -2613,6 +2608,7 @@ where
         });
     }
     let image_use_guard = DaemonImageUseGuard::acquire(&bcode_config::default_state_dir())?;
+    #[cfg(unix)]
     cleanup_stale_endpoint(&options.endpoint)?;
     if ping_ready(&options.endpoint).await {
         drop(image_use_guard);
@@ -2932,6 +2928,7 @@ fn daemon_status_matches_current_executable(status: &bcode_ipc::DaemonStatus) ->
             == Some(bcode_session_models::CURRENT_SESSION_EVENT_SCHEMA_VERSION)
 }
 
+#[cfg(unix)]
 async fn wait_for_existing_daemon(endpoint: &IpcEndpoint) -> bool {
     for delay in [50, 100, 200, 400, 800, 1_000] {
         if ping_ready(endpoint).await {
@@ -2951,11 +2948,6 @@ async fn endpoint_has_listener(endpoint: &IpcEndpoint) -> bool {
     tokio::task::spawn_blocking(move || unix_socket_has_listener(&path))
         .await
         .unwrap_or(true)
-}
-
-#[cfg(not(unix))]
-async fn endpoint_has_listener(_endpoint: &IpcEndpoint) -> bool {
-    false
 }
 
 fn remove_stale_plugin_state(
@@ -3029,11 +3021,6 @@ fn cleanup_stale_endpoint(endpoint: &IpcEndpoint) -> Result<(), DaemonLifecycleE
     if let Some(path) = endpoint.as_unix_socket() {
         remove_stale_unix_socket_path(path)?;
     }
-    Ok(())
-}
-
-#[cfg(not(unix))]
-const fn cleanup_stale_endpoint(_endpoint: &IpcEndpoint) -> Result<(), DaemonLifecycleError> {
     Ok(())
 }
 
