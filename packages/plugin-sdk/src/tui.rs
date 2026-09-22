@@ -324,6 +324,45 @@ pub struct PluginStructuredGenerationResult {
     pub source: Option<bcode_session_models::SessionDerivationSourceSnapshot>,
 }
 
+/// Observation and cancellation handle for a structured generation operation.
+/// Dropping or hiding a view does not request cancellation.
+#[derive(Debug, Clone, Default)]
+pub struct PluginStructuredGenerationControl {
+    session: Arc<std::sync::Mutex<Option<SessionId>>>,
+    cancelled: Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl PluginStructuredGenerationControl {
+    /// Return the generation session once the host has prepared it.
+    #[allow(clippy::must_use_candidate)] // Option already carries must-use semantics.
+    pub fn session_id(&self) -> Option<SessionId> {
+        *self
+            .session
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// Publish the host-owned session identity for semantic session-view observation.
+    pub fn set_session_id(&self, session_id: SessionId) {
+        *self
+            .session
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(session_id);
+    }
+
+    /// Request cancellation, including while the session is still being prepared.
+    pub fn cancel(&self) {
+        self.cancelled
+            .store(true, std::sync::atomic::Ordering::Release);
+    }
+
+    /// Whether cancellation has been requested. This is not terminal acknowledgement.
+    #[must_use]
+    pub fn is_cancelled(&self) -> bool {
+        self.cancelled.load(std::sync::atomic::Ordering::Acquire)
+    }
+}
+
 /// Async structured model-generation result.
 pub type PluginStructuredGenerationFuture = Pin<
     Box<
@@ -778,6 +817,20 @@ pub trait PluginTuiHost: Send + Sync {
         Box::pin(async {
             Err(PluginTuiHostError::Unsupported(
                 "structured generation is not available from this host".to_string(),
+            ))
+        })
+    }
+
+    /// Run structured generation with explicit observation and cancellation.
+    /// Hosts without live support reject this request rather than silently ignoring cancellation.
+    fn generate_observable_structured_output(
+        &self,
+        _request: PluginStructuredGenerationRequest,
+        _control: PluginStructuredGenerationControl,
+    ) -> PluginStructuredGenerationFuture {
+        Box::pin(async {
+            Err(PluginTuiHostError::Unsupported(
+                "observable generation is unavailable".into(),
             ))
         })
     }

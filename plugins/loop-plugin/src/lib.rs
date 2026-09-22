@@ -53,6 +53,8 @@ const PLUGIN_ID: &str = "bcode.loop";
 const WORKFLOW_KIND: &str = "bcode.loop";
 mod activity;
 mod goal;
+mod goal_document_view;
+mod goal_live;
 mod progress;
 
 const START_COMMAND: &str = "loop";
@@ -608,6 +610,7 @@ pub fn tui_registry() -> PluginTuiRegistry {
     let mut registry = PluginTuiRegistry::default();
     registry.register_factory(Box::new(LoopSurfaceFactory));
     registry.register_factory(Box::new(goal::GoalSurfaceFactory));
+    registry.register_factory(Box::new(goal_document_view::Factory));
     registry
 }
 
@@ -2038,7 +2041,10 @@ fn goal_workflow_spec(
         false,
     );
     // Planning has its own durable activation; it is not implementation iteration one.
-    configuration.activity_producer = None;
+    configuration.activity_producer = Some(bcode_workflow::WorkflowActivityProducer {
+        plugin: PLUGIN_ID.into(),
+        stage: "initialization".into(),
+    });
     let initialization = bcode_workflow::WorkflowBuilder::new(
         "goal.initialization",
         bcode_workflow::Step::configured_task(

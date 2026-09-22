@@ -4308,7 +4308,7 @@ impl BmuxApp {
             );
         }
         if application.live_activity() {
-            self.set_activity(ActivityState::Idle);
+            self.apply_shared_runtime_work_activity();
         }
     }
 
@@ -7990,6 +7990,40 @@ mod tests {
         let status = app.status().to_owned();
         drop(app);
         assert_eq!(status, "cancellation requested");
+    }
+
+    #[test]
+    fn workflow_remains_visible_after_model_turn_finishes() {
+        let session_id = SessionId::new();
+        let mut app = BmuxApp::new_with_history(Some(session_id), &[], &[], false);
+        app.absorb_session_event(&shared_projection_adapter_event(
+            session_id,
+            1,
+            SessionEventKind::RuntimeWorkStarted {
+                work_id: bcode_session_models::WorkId::new("workflow-live"),
+                kind: bcode_session_models::RuntimeWorkKind::Workflow,
+                label: "Checking completion".into(),
+                tool_call_id: None,
+                plugin_id: None,
+                service_interface: None,
+                operation: None,
+                parent_work_id: None,
+                started_at_ms: Some(1),
+                cancellable: true,
+            },
+        ));
+        app.absorb_session_event(&shared_projection_adapter_event(
+            session_id,
+            2,
+            SessionEventKind::ModelTurnFinished {
+                turn_id: "evaluation".into(),
+                outcome: ModelTurnOutcome::Completed,
+                message: None,
+            },
+        ));
+        let active = matches!(app.activity(), ActivityState::RuntimeWork { .. });
+        drop(app);
+        assert!(active);
     }
 
     #[test]

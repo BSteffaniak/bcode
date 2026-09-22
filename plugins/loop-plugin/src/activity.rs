@@ -20,13 +20,43 @@ fn preview(value: &str) -> String {
     format!("{}…", &value[..end])
 }
 
-pub fn project(request: ActivityProjectionRequest) -> Result<ActivityPresentation, String> {
-    if !matches!(
-        request.stage.as_str(),
-        "implementation" | "implementation_complete" | "evaluation" | "evaluation_complete"
-    ) {
-        return Err("unsupported loop activity stage".into());
+fn activity_heading(
+    initialization: bool,
+    state: &LoopWorkflowIteration,
+    phase: &str,
+    prompt: &str,
+    stop: &str,
+) -> String {
+    if initialization {
+        format!(
+            "Goal initialization · Researching and preparing progress document\nPrompt: {prompt}\nStop when: {stop}"
+        )
+    } else {
+        format!(
+            "Loop · Iteration {} of {} · {phase}\nPrompt: {prompt}\nStop when: {stop}",
+            state.iteration, state.max_iterations
+        )
     }
+}
+
+fn validate_stage(stage: &str) -> Result<(), String> {
+    if matches!(
+        stage,
+        "initialization"
+            | "initialization_complete"
+            | "implementation"
+            | "implementation_complete"
+            | "evaluation"
+            | "evaluation_complete"
+    ) {
+        Ok(())
+    } else {
+        Err("unsupported loop activity stage".into())
+    }
+}
+
+pub fn project(request: ActivityProjectionRequest) -> Result<ActivityPresentation, String> {
+    validate_stage(&request.stage)?;
     // Bound encoded details independently of previews, including JSON escaping. Retain the
     // original value rather than reserializing the typed state, which could drop extra fields.
     let encoded_input = serde_json::to_vec(&request.input).map_err(|error| error.to_string())?;
@@ -51,9 +81,13 @@ pub fn project(request: ActivityProjectionRequest) -> Result<ActivityPresentatio
         .take(8)
         .map(|item| preview(item))
         .collect();
-    let mut fallback = format!(
-        "Loop · Iteration {} of {} · {}\nPrompt: {prompt}\nStop when: {stop_condition}",
-        state.iteration, state.max_iterations, request.stage
+    let initialization = request.stage.starts_with("initialization");
+    let mut fallback = activity_heading(
+        initialization,
+        &state,
+        &request.stage,
+        &prompt,
+        &stop_condition,
     );
     let evaluation_complete = request.stage == "evaluation_complete";
     if !summary.trim().is_empty() {
@@ -78,7 +112,11 @@ pub fn project(request: ActivityProjectionRequest) -> Result<ActivityPresentatio
     let mut presentation = ActivityPresentation {
         version: ACTIVITY_PRESENTATION_VERSION,
         producer: PLUGIN_ID.into(),
-        activity_id: format!("iteration:{}", state.iteration),
+        activity_id: if initialization {
+            "initialization".into()
+        } else {
+            format!("iteration:{}", state.iteration)
+        },
         revision: request.revision,
         schema: "bcode.loop.iteration".into(),
         schema_version: 1,
@@ -151,6 +189,15 @@ mod tests {
             bridge: bcode_plugin_sdk::ServiceBridge::default(),
             transient_progress_limits: bcode_plugin_sdk::TransientProgressLimits::default(),
         })
+    }
+
+    #[test]
+    fn initialization_has_separate_identity_and_does_not_claim_iteration_completion() {
+        let view = project(request("initialization")).unwrap();
+        let iteration = project(request("implementation")).unwrap();
+        assert_ne!(view.activity_id, iteration.activity_id);
+        assert!(view.fallback.contains("Researching"));
+        assert!(view.payload.get("condition_met").is_none());
     }
 
     #[test]

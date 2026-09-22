@@ -15,7 +15,7 @@ kind        = "usage-dashboard"
 title       = "Usage"
 
 [runtime]
-abi_version  = 4
+abi_version  = 5
 event_symbol = "bcode_plugin_handle_event_v1"
 library      = "libbcode_usage_plugin.dylib"
 type         = "native"

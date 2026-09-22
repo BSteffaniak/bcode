@@ -40667,7 +40667,7 @@ type = "concurrent"
 
 [runtime]
 type = "native"
-abi_version = 4
+abi_version = 5
 library = "libbcode_test_preparing_workflow_block.dylib"
 event_symbol = "bcode_plugin_handle_event_v1"
 "#
@@ -40717,7 +40717,7 @@ type = "concurrent"
 
 [runtime]
 type = "native"
-abi_version = 4
+abi_version = 5
 library = "libbcode_test_workflow_block.dylib"
 event_symbol = "bcode_plugin_handle_event_v1"
 "#
@@ -41092,7 +41092,7 @@ type = "exclusive"
 
 [runtime]
 type = "native"
-abi_version = 4
+abi_version = 5
 library = "test"
 "#;
         bcode_plugin::StaticBundledPlugin::new(
@@ -41234,7 +41234,7 @@ type = "exclusive"
 
 [runtime]
 type = "native"
-abi_version = 4
+abi_version = 5
 library = "test"
 "#;
         bcode_plugin::StaticBundledPlugin::new(
@@ -54490,7 +54490,7 @@ type = "concurrent"
 
 [runtime]
 type = "native"
-abi_version = 4
+abi_version = 5
 library = "libbcode_shell_plugin.dylib"
 event_symbol = "bcode_plugin_handle_event_v1"
 "#;
@@ -65675,7 +65675,7 @@ type = "concurrent"
 
 [runtime]
 type = "native"
-abi_version = 4
+abi_version = 5
 library = "libbcode_test_workflow_block.dylib"
 event_symbol = "bcode_plugin_handle_event_v1"
 "#;
@@ -65846,7 +65846,7 @@ type = "concurrent"
 
 [runtime]
 type = "native"
-abi_version = 4
+abi_version = 5
 library = "libbcode_test_workflow_block.dylib"
 event_symbol = "bcode_plugin_handle_event_v1"
 "#;

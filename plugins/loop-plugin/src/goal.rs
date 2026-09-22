@@ -160,32 +160,17 @@ pub fn progress_status(session_id: SessionId) -> InvokeCommandResponse {
 }
 
 pub fn progress_response(session_id: SessionId) -> InvokeCommandResponse {
-    let result = run_async(async move {
-        let client = BcodeClient::default_endpoint();
-        let Some(run) = client
-            .associated_workflow_run(workflow_binding_key(session_id))
-            .await?
-        else {
-            return Ok(None);
-        };
-        client
-            .session_working_document(bcode_session_models::SessionWorkingDocumentRequest {
-                version: 1,
-                session_id,
-                scope_id: run.run_id,
-                initial_text: None,
-            })
-            .await
-    });
-    match result {
-        Ok(Some(document)) => status_response(&format!(
-            "Progress document (current): {}\n\n{}\n\n{}",
-            document.path,
-            crate::progress::Checklist::parse(&document.text).summary(),
-            document.text
-        )),
-        Ok(None) => status_response("No progress document for the associated loop"),
-        Err(error) => status_response(&format!("Progress document unavailable: {error}")),
+    InvokeCommandResponse {
+        success: true,
+        message: None,
+        updated_model: None,
+        updated_provider: None,
+        updated_thinking: None,
+        effects: vec![CommandEffect::OpenPluginSurface {
+            surface_kind: crate::goal_document_view::SURFACE.into(),
+            instance_id: "goal-progress".into(),
+            options: serde_json::json!({"session_id":session_id}),
+        }],
     }
 }
 
@@ -230,9 +215,22 @@ struct GoalSurface {
     pending_review: Option<bool>,
     source: Option<(String, String, u64)>,
     completion: Arc<Mutex<Option<GenerationResult>>>,
+    live: Option<crate::goal_live::GenerationView>,
 }
 
 impl GoalSurface {
+    fn cancelled_generation(&mut self, result: GenerationResult) -> PluginTuiAction {
+        self.phase = GoalPhase::Draft;
+        self.source = None;
+        self.editor.status = match result {
+            Ok(_) => {
+                "Generation finished after cancellation; result discarded. Goal not started.".into()
+            }
+            Err(error) => format!("Generation stopped: {error}"),
+        };
+        PluginTuiAction::Redraw
+    }
+
     fn new(session: Option<SessionId>) -> Self {
         let mut editor = LoopSurface::new(session);
         editor.setup_kind = SetupKind::Goal;
@@ -244,6 +242,7 @@ impl GoalSurface {
             pending_review: None,
             source: None,
             completion: Arc::default(),
+            live: None,
         }
     }
 
@@ -405,14 +404,16 @@ impl GoalSurface {
         }
         self.source = Some((objective.clone(), guidance.clone(), limit));
         self.phase = GoalPhase::Generating { review };
-        self.editor.status = "Generating instructions… Goal has not started. Esc closes.".into();
+        self.editor.status = "Preparing source context… Esc cancels generation.".into();
         let mut request = generation_request(
             &objective,
             &guidance,
             self.editor.progress_document.is_some(),
         );
         request.source_session_id = self.editor.session_id;
-        let future = host.generate_structured_output(request);
+        let live = crate::goal_live::GenerationView::default();
+        let future = host.generate_observable_structured_output(request, live.control.clone());
+        self.live = Some(live);
         let completion = Arc::clone(&self.completion);
         host.spawn(Box::pin(async move {
             *completion.lock().expect("goal generation completion") =
@@ -422,8 +423,69 @@ impl GoalSurface {
     }
 }
 
+pub fn paint_generation(
+    live: &mut crate::goal_live::GenerationView,
+    area: Rect,
+    frame: &mut PaintCx<'_, '_>,
+) {
+    use bmux_tui_components::text_view::{TextViewComponent, TextViewPolicy};
+    let modal = ModalFrame::new(
+        ModalSizing::new(Size::new(40, 12), Size::new(100, 32), Insets::all(1)),
+        ModalTheme::dark(Color::Cyan),
+    )
+    .title(live.title)
+    .padding(Insets::all(1));
+    let content = modal.content_area(area).intersection(area);
+    let shell = ModalFrameComponent::new("goal.live", modal, TextBlock::new(""));
+    let layout = shell.layout(Constraints::tight(area.size()), &mut LayoutCx::new());
+    frame.with_child(
+        i32::from(area.x),
+        i64::from(area.y),
+        LocalRect::new(0, 0, area.width, area.height),
+        |cx| shell.paint(&layout, cx),
+    );
+    let status = TextBlock::new(live.status());
+    let status_area = Rect::new(content.x, content.y, content.width, content.height.min(4));
+    let layout = status.layout(Constraints::tight(status_area.size()), &mut LayoutCx::new());
+    frame.with_child(
+        i32::from(status_area.x),
+        i64::from(status_area.y),
+        LocalRect::new(0, 0, status_area.width, status_area.height),
+        |cx| status.paint(&layout, cx),
+    );
+    live.layout = None;
+    if !live.collapsed {
+        let body = Rect::new(
+            content.x,
+            content.y.saturating_add(status_area.height),
+            content.width,
+            content.height.saturating_sub(status_area.height),
+        );
+        let view = TextViewComponent::new("goal.live.output", &live.lines, &live.scroll)
+            .policy(TextViewPolicy::scrollable());
+        let layout = view.layout(Constraints::tight(body.size()), &mut LayoutCx::new());
+        frame.with_child(
+            i32::from(body.x),
+            i64::from(body.y),
+            LocalRect::new(0, 0, body.width, body.height),
+            |cx| view.paint(&layout, cx),
+        );
+        live.layout = Some((body, layout));
+    }
+}
+
 impl PluginTuiSurface for GoalSurface {
     fn session_navigation_finished(&mut self, session_id: SessionId, result: Result<(), String>) {
+        if self
+            .live
+            .as_ref()
+            .is_some_and(|live| live.control.session_id() == Some(session_id))
+        {
+            if let Err(error) = result {
+                self.editor.status = error;
+            }
+            return;
+        }
         self.editor.session_navigation_finished(session_id, result);
     }
 
@@ -438,7 +500,11 @@ impl PluginTuiSurface for GoalSurface {
     }
     fn render(&mut self, area: Rect, frame: &mut PaintCx<'_, '_>) {
         self.prepare_controls();
-        self.editor.render(area, frame);
+        if let Some(live) = &mut self.live {
+            paint_generation(live, area, frame);
+        } else {
+            self.editor.render(area, frame);
+        }
     }
     fn render_with_theme(
         &mut self,
@@ -446,8 +512,8 @@ impl PluginTuiSurface for GoalSurface {
         frame: &mut PaintCx<'_, '_>,
         theme: Option<&PluginTuiTheme>,
     ) {
-        self.prepare_controls();
-        self.editor.render_with_theme(area, frame, theme);
+        self.editor.theme = theme.copied();
+        self.render(area, frame);
     }
     fn poll(&mut self, host: &dyn PluginTuiHost) -> PluginTuiAction {
         if self.phase == GoalPhase::Closed {
@@ -459,6 +525,9 @@ impl PluginTuiSurface for GoalSurface {
                 return self.generate(host, review);
             }
         }
+        if let Some(live) = &mut self.live {
+            live.poll(host);
+        }
         let action = self.editor.poll(host);
         let result = self
             .completion
@@ -466,8 +535,19 @@ impl PluginTuiSurface for GoalSurface {
             .expect("goal generation completion")
             .take();
         let Some(result) = result else {
-            return action;
+            return if self.live.is_some() {
+                PluginTuiAction::Redraw
+            } else {
+                action
+            };
         };
+        let cancelled = self
+            .live
+            .take()
+            .is_some_and(|live| live.control.is_cancelled());
+        if cancelled {
+            return self.cancelled_generation(result);
+        }
         let review = matches!(self.phase, GoalPhase::Generating { review: true });
         self.phase = GoalPhase::Draft;
         let Some((objective, guidance, limit)) = self.source.take() else {
@@ -535,6 +615,29 @@ impl PluginTuiSurface for GoalSurface {
         PluginTuiAction::Redraw
     }
     fn handle_event(&mut self, event: &Event, host: &dyn PluginTuiHost) -> PluginTuiAction {
+        if let Some(live) = &mut self.live {
+            if let Event::Key(stroke) = event {
+                if stroke.key == KeyCode::Escape {
+                    live.control.cancel();
+                } else if stroke.key == KeyCode::Char('h')
+                    && let Some(session_id) = live.control.session_id()
+                {
+                    return PluginTuiAction::OpenSession { session_id };
+                } else if stroke.key == KeyCode::Tab {
+                    live.collapsed = !live.collapsed;
+                    live.layout = None;
+                }
+            }
+            if !live.collapsed
+                && let Some((area, layout)) = &live.layout
+            {
+                use bmux_tui_components::text_view::{TextViewComponent, TextViewPolicy};
+                let _ = TextViewComponent::new("goal.live.output", &live.lines, &live.scroll)
+                    .policy(TextViewPolicy::scrollable())
+                    .handle_event(*area, layout, event);
+            }
+            return PluginTuiAction::Redraw;
+        }
         if let Event::Key(stroke) = event {
             if stroke.key == KeyCode::Escape && stroke.modifiers.is_empty() {
                 self.phase = GoalPhase::Closed;
@@ -623,6 +726,14 @@ mod tests {
         }
         fn spawn_blocking(&self, _: Box<dyn FnOnce() + Send + 'static>) {}
         fn request_redraw(&self) {}
+        fn generate_observable_structured_output(
+            &self,
+            request: PluginStructuredGenerationRequest,
+            _control: bcode_plugin_sdk::tui::PluginStructuredGenerationControl,
+        ) -> bcode_plugin_sdk::tui::PluginStructuredGenerationFuture {
+            self.generate_structured_output(request)
+        }
+
         fn generate_structured_output(
             &self,
             request: PluginStructuredGenerationRequest,
@@ -939,6 +1050,35 @@ mod tests {
                 assert_eq!(hit, hit.intersection(area));
             }
         }
+    }
+
+    #[test]
+    fn live_generation_survives_resize_and_hiding_does_not_cancel() {
+        let key = |key| {
+            Event::Key(bmux_keyboard::KeyStroke {
+                key,
+                modifiers: bmux_keyboard::Modifiers::default(),
+            })
+        };
+        let host = Host::default();
+        let mut surface = GoalSurface::new(Some(SessionId::new()));
+        let mut live = crate::goal_live::GenerationView::default();
+        live.lines = vec![bmux_tui::prelude::Line::from(
+            "日本語 👩‍💻 e\u{301}".repeat(40),
+        )];
+        surface.live = Some(live);
+        for (width, height) in [(100, 32), (1, 1), (0, 0), (8, 5), (80, 28)] {
+            let area = Rect::new(0, 0, width, height);
+            let mut buffer = bmux_tui::buffer::Buffer::empty(area);
+            surface.render(area, &mut PaintCx::new(&mut Frame::new(&mut buffer)));
+            if let Some((hit, _)) = &surface.live.as_ref().unwrap().layout {
+                assert_eq!(*hit, hit.intersection(area));
+            }
+        }
+        surface.handle_event(&key(KeyCode::Tab), &host);
+        assert!(!surface.live.as_ref().unwrap().control.is_cancelled());
+        surface.handle_event(&key(KeyCode::Escape), &host);
+        assert!(surface.live.as_ref().unwrap().control.is_cancelled());
     }
 
     #[test]

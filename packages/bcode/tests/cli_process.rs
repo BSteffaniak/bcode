@@ -3220,7 +3220,7 @@ class = "service"
 interface_id = "test.unnamed/v1"
 [runtime]
 type = "native"
-abi_version = 4
+abi_version = 5
 library = "deliberately-absent.dylib"
 "#,
     )
@@ -3409,7 +3409,7 @@ fn plugin_check_rejects_future_abi_before_native_loading() {
             let manifest = std::fs::read_to_string(&path).unwrap();
             std::fs::write(
                 path,
-                manifest.replace("abi_version = 4", "abi_version = 65535"),
+                manifest.replace("abi_version = 5", "abi_version = 65535"),
             )
             .unwrap();
         });

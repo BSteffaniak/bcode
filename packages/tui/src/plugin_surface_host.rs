@@ -108,6 +108,32 @@ impl GenerationAssistantOutput {
     }
 }
 
+async fn prepare_observable_generation(
+    client: &BcodeClient,
+    request: &PluginStructuredGenerationRequest,
+    control: &bcode_plugin_sdk::tui::PluginStructuredGenerationControl,
+) -> Result<
+    (
+        SessionId,
+        Option<bcode_session_models::PreparedContextGeneration>,
+    ),
+    PluginTuiHostError,
+> {
+    if request.timeout_ms == 0 {
+        return Err(PluginTuiHostError::InvalidRequest(
+            "structured generation timeout must be positive".into(),
+        ));
+    }
+    let prepared = prepare_generation_session(client, request).await?;
+    control.set_session_id(prepared.0);
+    if control.is_cancelled() {
+        return Err(PluginTuiHostError::Internal(
+            "generation cancelled before submission".into(),
+        ));
+    }
+    Ok(prepared)
+}
+
 async fn prepare_generation_session(
     client: &BcodeClient,
     request: &PluginStructuredGenerationRequest,
@@ -420,14 +446,21 @@ impl PluginTuiHost for BcodePluginTuiHost {
         &self,
         request: PluginStructuredGenerationRequest,
     ) -> PluginStructuredGenerationFuture {
+        self.generate_observable_structured_output(
+            request,
+            bcode_plugin_sdk::tui::PluginStructuredGenerationControl::default(),
+        )
+    }
+
+    fn generate_observable_structured_output(
+        &self,
+        request: PluginStructuredGenerationRequest,
+        control: bcode_plugin_sdk::tui::PluginStructuredGenerationControl,
+    ) -> PluginStructuredGenerationFuture {
         let client = self.client.clone();
         Box::pin(async move {
-            if request.timeout_ms == 0 {
-                return Err(PluginTuiHostError::InvalidRequest(
-                    "structured generation timeout must be positive".to_string(),
-                ));
-            }
-            let (session_id, prepared) = prepare_generation_session(&client, &request).await?;
+            let (session_id, prepared) =
+                prepare_observable_generation(&client, &request, &control).await?;
             let prompt = format!("{}\n\n{}", request.system_prompt, request.prompt);
             client
                 .send_user_message_with_execution(
@@ -455,7 +488,15 @@ impl PluginTuiHost for BcodePluginTuiHost {
             let started = std::time::Instant::now();
             let mut cursor = None;
             let mut assistant = GenerationAssistantOutput::default();
+            let mut cancellation_sent = false;
             loop {
+                if control.is_cancelled() && !cancellation_sent {
+                    client
+                        .cancel_session_turn(session_id)
+                        .await
+                        .map_err(|error| PluginTuiHostError::Internal(error.to_string()))?;
+                    cancellation_sent = true;
+                }
                 let page = client
                     .session_history_page(
                         session_id,
@@ -1127,7 +1168,16 @@ async fn stream_plugin_session_view_inner(
 
     let mut reconnect_delay = std::time::Duration::from_millis(100);
     loop {
-        let needs_resync = match connection.recv_event().await {
+        let needs_resync = match match tokio::time::timeout(
+            std::time::Duration::from_millis(250),
+            connection.recv_event(),
+        )
+        .await
+        {
+            Ok(event) => event,
+            Err(_) if sender.is_closed() => return Ok(()),
+            Err(_) => continue,
+        } {
             Ok(BcodeEvent::SessionViewResyncRequired {
                 session_id: required,
             }) if required == session_id => true,

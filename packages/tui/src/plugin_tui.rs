@@ -1324,7 +1324,7 @@ type = "concurrent"
 
 [runtime]
 type = "native"
-abi_version = 4
+abi_version = 5
 library = "libdynamic_visual_test.dylib"
 "#;
 

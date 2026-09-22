@@ -63,6 +63,26 @@ question without launching work. Host-verified source session/generation/cutoff 
 separate from model output and is retained in accepted prompts and progress-document setup.
 A fresh generation captures fresh context; workflow-start retries reuse accepted prompts.
 
+## Live goal activity
+
+Prompt generation observes the generation session through shared semantic snapshots, including
+provider-exposed reasoning and assistant output. Draft output is not accepted instructions.
+The setup view shows elapsed time and time since its last semantic update. Scroll with the
+normal text-view keys or mouse wheel; Tab folds the output. `h` opens the ordinary live session
+viewer and returns to the retained setup on exit. Esc requests cancellation and waits for the
+operation outcome; it does not silently start a goal from a late result. Hiding output or opening
+the session viewer does not cancel the operation. Providers may expose no intermediate text.
+
+Initialization publishes a plugin-owned activity distinct from implementation iterations.
+Model-turn completion retains active workflow/runtime-work status instead of flashing idle.
+`/goal.progress` opens a read-only, scrollable saved-document view, refreshing bounded reads
+at most once every two seconds while open. It pins the selected run; closing and reopening
+selects the current association. Saved notes and checklist counts are not readiness or completion.
+Errors retain the previous preview with an unavailable notice; they never reconstruct notes.
+
+Native plugins must be rebuilt against plugin ABI 5, which adds the observable generation
+host method and explicit observation/cancellation handle. ABI 4 libraries are rejected.
+
 ## Living progress document
 
 By default, starting a goal prepares a Markdown document under the owning session

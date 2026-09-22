@@ -1520,7 +1520,7 @@ unsafe impl Send for ServiceBridge {}
 unsafe impl Sync for ServiceBridge {}
 
 /// Current stable native plugin ABI version.
-pub const CURRENT_PLUGIN_ABI_VERSION: u16 = 4;
+pub const CURRENT_PLUGIN_ABI_VERSION: u16 = 5;
 
 /// Default manifest export symbol for native plugins.
 pub const DEFAULT_NATIVE_MANIFEST_SYMBOL: &str = "bcode_plugin_manifest_v1";
