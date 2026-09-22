@@ -620,6 +620,7 @@ mod tests {
     }
 
     use super::*;
+    use std::path::Path;
 
     fn line_text(line: &Line) -> String {
         line.spans
@@ -832,7 +833,10 @@ mod tests {
         );
         let rendered = rows.iter().map(line_text).collect::<Vec<_>>().join("\n");
 
-        assert!(rendered.contains("src/lib.rs"), "{rendered}");
+        assert!(
+            rendered.contains(&Path::new("src").join("lib.rs").display().to_string()),
+            "{rendered}"
+        );
         assert!(rendered.contains("before"), "{rendered}");
         assert!(rendered.contains("after"), "{rendered}");
     }

@@ -2921,6 +2921,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn service_batch_validation_failure_preserves_every_target() {
         let root = temp_dir("batch-service-invalid-tail");
         let first = root.join("first.txt");
@@ -2946,6 +2947,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn batch_and_independent_single_edits_produce_identical_bytes() {
         let root = temp_dir("batch-single-comparison");
         // Representative source, escaped configuration, and mixed-newline Unicode text.
@@ -2998,6 +3000,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn listed_multi_edit_prepares_and_invokes_with_batch_presentation() {
         let response = list_tools(&ServiceRequest {
             interface_id: bcode_tool::TOOL_SERVICE_INTERFACE_ID.to_owned(),
@@ -3371,6 +3374,8 @@ mod tests {
 
     #[test]
     fn filesystem_owner_prepares_path_operations_without_generic_extractors() {
+        let workspace = std::env::temp_dir();
+        let path = workspace.join("src/lib.rs");
         let operation = |definition: ToolDefinition, arguments| {
             let request = bcode_tool::ToolPreparationRequest {
                 invocation: bcode_tool::ToolInvocationDescriptor {
@@ -3378,7 +3383,7 @@ mod tests {
                     tool_name: definition.name.clone(),
                     arguments,
                 },
-                host_context: workspace_context(Path::new("/tmp/workspace")),
+                host_context: workspace_context(&workspace),
             };
             filesystem_policy_operation(&request, &definition).expect("filesystem policy")
         };
@@ -3390,7 +3395,7 @@ mod tests {
         assert_eq!(
             read.operation,
             bcode_plugin_sdk::ToolPolicyOperation::Read {
-                paths: vec!["/tmp/workspace/src/lib.rs".to_owned()],
+                paths: vec![path.display().to_string()],
             }
         );
         let write = operation(write_tool_definition(), json!({"path": "src/lib.rs"}));
@@ -3401,7 +3406,7 @@ mod tests {
         assert_eq!(
             write.operation,
             bcode_plugin_sdk::ToolPolicyOperation::Write {
-                paths: vec!["/tmp/workspace/src/lib.rs".to_owned()],
+                paths: vec![path.display().to_string()],
                 category: "write".to_owned(),
             }
         );
@@ -3409,8 +3414,8 @@ mod tests {
             serde_json::from_value::<FilesystemPreparationDescriptor>(write.descriptor)
                 .expect("Filesystem descriptor"),
             FilesystemPreparationDescriptor {
-                workspace_root: Some(PathBuf::from("/tmp/workspace")),
-                path: Some(PathBuf::from("/tmp/workspace/src/lib.rs")),
+                workspace_root: Some(workspace),
+                path: Some(path),
             }
         );
     }
@@ -3741,6 +3746,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn external_command_timeout_kills_process_group() {
         let mut command = Command::new("sh");
         configure_command_for_timeout(&mut command);
