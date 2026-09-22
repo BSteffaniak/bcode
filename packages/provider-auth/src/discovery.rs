@@ -220,6 +220,22 @@ mod tests {
     }
 
     #[test]
+    #[cfg(not(unix))]
+    fn unsupported_confinement_preserves_source_and_refuses_discovery() {
+        let home = tempfile::tempdir().unwrap();
+        let path = home.path().join("auth.json");
+        let contents = r#"{"provider":{"type":"api","key":"test-value"}}"#;
+        std::fs::write(&path, contents).unwrap();
+        assert_eq!(
+            discover(true, home.path(), &field()),
+            vec![(0, CredentialSourceStatus::Unavailable)]
+        );
+        assert!(read_selected(home.path(), &field(), 0).is_err());
+        assert_eq!(std::fs::read_to_string(path).unwrap(), contents);
+    }
+
+    #[test]
+    #[cfg(unix)]
     fn reads_only_compatible_static_keys_and_preserves_source() {
         let home = tempfile::tempdir().unwrap();
         let path = home.path().join("auth.json");
