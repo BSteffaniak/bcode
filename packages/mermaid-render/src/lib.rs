@@ -519,8 +519,8 @@ pub fn render_mermaid_with_worker(
         .write_all(&request_bytes);
     if let Err(error) = write_result {
         terminate_worker(&mut child, &memory_guard);
-        return Err(MermaidRenderError::WorkerUnavailable {
-            message: error.to_string(),
+        return Err(MermaidRenderError::InvalidWorkerResponse {
+            message: format!("worker stopped accepting its request: {error}"),
         });
     }
     let stdout = child.stdout.take().ok_or_else(|| {
