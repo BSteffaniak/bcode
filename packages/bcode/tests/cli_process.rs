@@ -1633,7 +1633,7 @@ fn workflow_template_cli_instantiates_and_starts_external_document() {
         std::fs::write(plugins.join("template.json"), &source).unwrap();
         let manifest = plugins.join("bcode-plugin.toml");
         let mut contents = std::fs::read_to_string(&manifest).unwrap();
-        write!(contents, "\n[[workflow_templates]]\ncontribution_version = 1\ntemplate_id = \"cli-input\"\ntemplate_version = 1\ntitle = \"CLI input\"\ndescription = \"CLI acceptance\"\n[workflow_templates.document_source]\npath = \"template.json\"\nsha256 = \"{:x}\"\n", sha2::Sha256::digest(source.as_bytes())).unwrap();
+        write!(contents, "\n[[workflow_templates]]\ncontribution_version = 1\ntemplate_id = \"cli-input\"\ntemplate_version = 1\ntitle = \"CLI input\"\ndescription = \"CLI acceptance\"\n[workflow_templates.document_source]\npath = \"template.json\"\nsha256 = \"{}\"\n", hex::encode(sha2::Sha256::digest(source.as_bytes()))).unwrap();
         std::fs::write(manifest, contents).unwrap();
     });
     let request = serde_json::json!({"owner_plugin_id":"bcode.default-agents", "template_id":"cli-input", "template_version":1, "workflow_id":"cli/template", "draft_id":"cli-draft"});
