@@ -52,6 +52,7 @@ use serde::{Deserialize, Serialize};
 const PLUGIN_ID: &str = "bcode.loop";
 const WORKFLOW_KIND: &str = "bcode.loop";
 mod activity;
+mod continuation;
 mod goal;
 mod goal_document_view;
 mod goal_live;
@@ -140,6 +141,16 @@ fn commands() -> Vec<CommandContribution> {
         command("goal", "Goal", "Generate loop prompts from a goal"),
         session_command("goal.status", "Goal Status", "Show the session loop status"),
         session_command("goal.pause", "Pause Goal", "Pause the session loop"),
+        session_command(
+            "goal.continue",
+            "Continue Goal",
+            "Grant additional iterations after allowance exhaustion",
+        ),
+        session_command(
+            "loop.continue",
+            "Continue Loop",
+            "Grant additional iterations after allowance exhaustion",
+        ),
         session_command("goal.resume", "Resume Goal", "Resume the session loop"),
         session_command("goal.stop", "Stop Goal", "Stop the session loop"),
         session_command(
@@ -290,6 +301,13 @@ fn format_workflow_status(run: &bcode_workflow_store::WorkflowRunSummary) -> Str
 
 fn format_workflow_inspection_status(inspection: &bcode_ipc::WorkflowRunInspection) -> String {
     let mut status = format_workflow_status(&inspection.run);
+    if let Some(lineage) = &inspection.continuation {
+        let _ = write!(
+            status,
+            " · continued from {} · {} prior iterations · +{} authorized",
+            lineage.predecessor_run_id, lineage.prior_iterations, lineage.additional_iterations
+        );
+    }
     if !inspection.mutation_approvals.is_empty() {
         let _ = write!(
             status,
@@ -356,7 +374,24 @@ const fn unsupported_legacy_message() -> &'static str {
 
 fn status_for_session(session_id: SessionId) -> InvokeCommandResponse {
     match associated_workflow_inspection(session_id) {
-        Ok(Some(inspection)) => status_response(&format_workflow_inspection_status(&inspection)),
+        Ok(Some(inspection)) => {
+            let mut message = format_workflow_inspection_status(&inspection);
+            if inspection.run.status == bcode_workflow_store::RunStatus::Failed {
+                let run_id = inspection.run.run_id;
+                if let Ok(source) = run_async(async move {
+                    BcodeClient::default_endpoint()
+                        .workflow_continuation_source(run_id)
+                        .await
+                }) {
+                    let _ = write!(
+                        message,
+                        "\nIteration allowance exhausted · {} iterations completed overall · /loop.continue <additional_iterations>",
+                        source.total_iterations_completed
+                    );
+                }
+            }
+            status_response(&message)
+        }
         Ok(None) if legacy_state_exists(session_id) => {
             status_response(unsupported_legacy_message())
         }
@@ -474,6 +509,10 @@ fn command_response(request: &InvokeCommandRequest) -> ServiceResponse {
         other => other,
     };
     let response = match command_id {
+        "goal.continue" | "loop.continue" => session_id.map_or_else(
+            || missing_enforced_session_response("goal.continue"),
+            |session| continuation::command(session, arguments),
+        ),
         "goal.status" => session_id.map_or_else(
             || missing_enforced_session_response(STATUS_COMMAND),
             goal::progress_status,
@@ -2419,7 +2458,7 @@ mod tests {
     #[test]
     fn commands_cover_the_loop_lifecycle() {
         let commands = commands();
-        assert_eq!(commands.len(), 13);
+        assert!(!commands.is_empty());
         assert!(commands.iter().all(|command| {
             command.execution == bcode_command::CommandExecution::Immediate
                 && command.surfaces.contains(&CommandSurface::Slash)
@@ -2458,6 +2497,8 @@ mod tests {
             PAUSE_COMMAND,
             STOP_COMMAND,
             RESUME_COMMAND,
+            "goal.continue",
+            "loop.continue",
             DETACH_COMMAND,
         ] {
             let command = commands

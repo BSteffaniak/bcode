@@ -364,6 +364,24 @@ pub trait WorkflowRunApplication: Sync {
         request: WorkflowReplacementRequest,
     ) -> impl std::future::Future<Output = Result<WorkflowReplacementResponse, Self::Error>> + Send;
 
+    /// Read a verified exhausted-repeat checkpoint without replay or mutation.
+    ///
+    /// # Errors
+    /// Rejects ineligible, damaged, or ambiguous execution state.
+    fn workflow_continuation_source(
+        &self,
+        run_id: String,
+    ) -> impl std::future::Future<Output = Result<WorkflowContinuationSource, Self::Error>> + Send;
+
+    /// Admit an explicitly authorized successor without reopening the predecessor.
+    ///
+    /// # Errors
+    /// Rejects stale checkpoints, ownership conflicts, invalid grants, and conflicting retries.
+    fn continue_workflow(
+        &self,
+        request: WorkflowContinuationRequest,
+    ) -> impl std::future::Future<Output = Result<WorkflowRunStartResponse, Self::Error>> + Send;
+
     /// Admit a run of an exact registered definition through normal admission checks.
     ///
     /// # Errors
@@ -915,6 +933,41 @@ pub struct WorkflowRunStartRequest {
     pub input: Option<serde_json::Value>,
     #[serde(default)]
     pub limits: WorkflowRunLimits,
+}
+
+/// Verified, bounded checkpoint for an exhausted repeat. Reading never acquires execution authority.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkflowContinuationSource {
+    pub run: WorkflowRunSummary,
+    pub definition: crate::WorkflowDefinition,
+    pub input: serde_json::Value,
+    pub repeat_node_id: String,
+    pub graph_revision: u64,
+    pub output_checksum: String,
+    pub iterations_completed: u64,
+    pub total_iterations_completed: u64,
+    pub document_scope_id: String,
+    pub limits: WorkflowRunLimits,
+}
+
+/// Explicit, retry-safe admission of a successor to an exhausted repeat.
+/// The successor run ID is the idempotency key; conflicting content is rejected.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkflowContinuationRequest {
+    pub source_run_id: String,
+    pub expected_graph_revision: u64,
+    pub expected_output_checksum: String,
+    pub additional_iterations: u32,
+    pub successor: WorkflowStartRequest,
+}
+
+/// Durable continuation lineage, independent of mutable presentation or model output.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkflowContinuationLineage {
+    pub predecessor_run_id: String,
+    pub document_scope_id: String,
+    pub prior_iterations: u64,
+    pub additional_iterations: u32,
 }
 
 /// Request a durable replacement of one exact run. A pending response is not admission
@@ -1692,6 +1745,9 @@ pub struct WorkflowHistoryEvent {
 /// Bounded aggregate workflow inspection snapshot.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WorkflowRunInspection {
+    /// Explicit lineage; absent on original runs and older senders.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub continuation: Option<WorkflowContinuationLineage>,
     /// Replacement blockers observed without acquiring control. Missing in older senders
     /// means unknown, not readiness or authorization to execute.
     #[serde(default, skip_serializing_if = "Option::is_none")]

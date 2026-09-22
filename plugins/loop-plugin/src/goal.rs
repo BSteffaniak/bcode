@@ -126,18 +126,34 @@ pub fn attach_document(
 pub fn progress_status(session_id: SessionId) -> InvokeCommandResponse {
     let result = run_async(async move {
         let client = BcodeClient::default_endpoint();
-        let Some(run) = client
-            .associated_workflow_run(workflow_binding_key(session_id))
+        let Some(inspection) = client
+            .inspect_associated_workflow_run(workflow_binding_key(session_id), 10)
             .await?
         else {
             return Ok("No associated loop".into());
         };
-        let mut status = format_workflow_status(&run);
+        let run = &inspection.run;
+        let mut status = format_workflow_inspection_status(&inspection);
+        if run.status == bcode_workflow_store::RunStatus::Failed
+            && let Ok(source) = client
+                .workflow_continuation_source(run.run_id.clone())
+                .await
+        {
+            let _ = write!(
+                status,
+                "\nIteration allowance exhausted · {} iterations completed overall · /goal.continue <additional_iterations>",
+                source.total_iterations_completed
+            );
+        }
+        let document_scope = inspection.continuation.as_ref().map_or_else(
+            || run.run_id.clone(),
+            |lineage| lineage.document_scope_id.clone(),
+        );
         match client
             .session_working_document(bcode_session_models::SessionWorkingDocumentRequest {
                 version: 1,
                 session_id,
-                scope_id: run.run_id,
+                scope_id: document_scope,
                 initial_text: None,
             })
             .await?

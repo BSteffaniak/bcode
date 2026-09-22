@@ -5459,6 +5459,7 @@ const fn request_session_id(request: &Request) -> Option<SessionId> {
         | Request::RuntimeWorkHistory { session_id, .. }
         | Request::SubscribeRuntimeWork { session_id }
         | Request::AttachSessionProjectionWindow { session_id, .. } => Some(*session_id),
+        Request::ContinueWorkflow(request) => Some(request.successor.parent_session_id),
         Request::RequestWorkflowReplacement(request) => Some(request.successor.parent_session_id),
         Request::StartWorkflowRun(request) => Some(request.parent_session_id),
         Request::StartWorkflowPackageExport(request) => Some(request.parent_session_id),
@@ -5611,6 +5612,8 @@ const fn request_kind(request: &Request) -> &'static str {
         Request::InstantiateWorkflowTemplate(_) => "instantiate_workflow_template",
         Request::StartWorkflowTemplate(_) => "start_workflow_template",
         Request::RegisterWorkflowDefinition(_) => "register_workflow_definition",
+        Request::WorkflowContinuationSource { .. } => "workflow_continuation_source",
+        Request::ContinueWorkflow(_) => "continue_workflow",
         Request::StartWorkflow(_) => "start_workflow",
         Request::RequestWorkflowReplacement(_) => "request_workflow_replacement",
         Request::StartWorkflowRun(_) => "start_workflow_run",
@@ -7297,6 +7300,32 @@ async fn handle_workflow_validation_request(
                 Err(failure) => {
                     Response::Err(ErrorResponse::new(failure.code(), failure.to_string()))
                 }
+            };
+            send_response(writer, request_id, response).await
+        }
+        WorkflowDefinitionRequest::WorkflowContinuationSource { run_id } => {
+            let result = bcode_workflow::WorkflowRunApplication::workflow_continuation_source(
+                &workflow_operations::WorkflowAuthoringApplication::new(state, client_id),
+                run_id,
+            )
+            .await;
+            let response = match result {
+                Ok(source) => Response::Ok(ResponsePayload::WorkflowContinuationSource(Box::new(
+                    source,
+                ))),
+                Err(failure) => Response::Err(ErrorResponse::new(failure.code, failure.message)),
+            };
+            send_response(writer, request_id, response).await
+        }
+        WorkflowDefinitionRequest::ContinueWorkflow(request) => {
+            let result = bcode_workflow::WorkflowRunApplication::continue_workflow(
+                &workflow_operations::WorkflowAuthoringApplication::new(state, client_id),
+                request,
+            )
+            .await;
+            let response = match result {
+                Ok(started) => Response::Ok(ResponsePayload::WorkflowRunStarted(started)),
+                Err(failure) => Response::Err(ErrorResponse::new(failure.code, failure.message)),
             };
             send_response(writer, request_id, response).await
         }

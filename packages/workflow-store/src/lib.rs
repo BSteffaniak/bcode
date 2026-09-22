@@ -25,6 +25,7 @@ use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use thiserror::Error;
 
+mod continuation;
 mod offline_recovery;
 mod recovery;
 mod run_graph;
@@ -40,7 +41,7 @@ const RESET_BACKUP_DIRECTORY: &str = "reset-backups";
 /// Stable destructive confirmation required by public workflow-store reset surfaces.
 pub const WORKFLOW_STORE_RESET_CONFIRMATION: &str = "DELETE-INCOMPATIBLE-WORKFLOW-STATE";
 /// Current clean-break workflow store schema version.
-pub const WORKFLOW_STORE_SCHEMA_VERSION: u32 = 39;
+pub const WORKFLOW_STORE_SCHEMA_VERSION: u32 = 40;
 /// Current bounded workflow-store reset receipt version.
 pub const WORKFLOW_STORE_RESET_RECEIPT_VERSION: u32 = 1;
 /// Current explicit workflow-store migration receipt contract.
@@ -1170,7 +1171,7 @@ impl WorkflowStore {
                         match Self::open_with_ownership(&path, ownership) {
                             Ok(store) => return Ok(store),
                             Err(WorkflowStoreError::UnsupportedStore {
-                                actual: Some(14..=38),
+                                actual: Some(14..=39),
                                 ..
                             }) => {}
                             Err(error) => return Err(error),
@@ -1205,7 +1206,7 @@ impl WorkflowStore {
                         match Self::open_with_ownership(&path, probe) {
                             Ok(store) => return Ok(store),
                             Err(WorkflowStoreError::UnsupportedStore {
-                                actual: Some(14..=38),
+                                actual: Some(14..=39),
                                 ..
                             }) => {}
                             Err(error) => return Err(error),
@@ -1368,7 +1369,7 @@ impl WorkflowStore {
                 "workflow store migration cannot read the source schema".to_string(),
             )
         })?;
-        if !matches!(previous_schema_version, 14..=38) {
+        if !matches!(previous_schema_version, 14..=39) {
             return Err(WorkflowStoreError::UnsupportedStore {
                 actual: Some(previous_schema_version),
                 expected: WORKFLOW_STORE_SCHEMA_VERSION,
@@ -1419,6 +1420,7 @@ impl WorkflowStore {
         }
         run_graph::initialize_edit_candidates(&transaction)?;
         migrate_run_package_bindings(&transaction)?;
+        continuation::initialize(&transaction)?;
         recovery::initialize(&transaction)?;
         transaction.execute(
             "UPDATE workflow_store_contract SET schema_version = ?1 WHERE contract_id = 1",
@@ -18178,6 +18180,7 @@ fn initialize_schema(connection: &mut Connection) -> Result<(), WorkflowStoreErr
          CREATE INDEX IF NOT EXISTS idx_workflow_authoring_events_identity \
              ON workflow_authoring_events(workflow_id, event_seq);",
     )?;
+    continuation::initialize(&transaction)?;
     run_graph::initialize(&transaction)?;
     run_graph::initialize_edit_candidates(&transaction)?;
     recovery::initialize(&transaction)?;
@@ -18213,6 +18216,7 @@ fn verify_store_schema(connection: &Connection) -> Result<(), WorkflowStoreError
     connection.prepare(
         "SELECT run_id, source_artifact_id, created_at_ms FROM workflow_recovery_barriers LIMIT 0",
     )?;
+    connection.prepare("SELECT successor_run_id, predecessor_run_id, request_json, lineage_json FROM workflow_continuations LIMIT 0")?;
     connection
         .prepare("SELECT run_id, package_id, lock_digest FROM workflow_run_packages LIMIT 0")?;
     Ok(())

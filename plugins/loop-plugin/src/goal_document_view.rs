@@ -105,10 +105,12 @@ impl PluginTuiSurface for DocumentView {
                     let run_id = match run_id {
                         Some(run_id) => run_id,
                         None => match client
-                            .associated_workflow_run(workflow_binding_key(session_id))
+                            .inspect_associated_workflow_run(workflow_binding_key(session_id), 1)
                             .await?
                         {
-                            Some(run) => run.run_id,
+                            Some(inspection) => inspection
+                                .continuation
+                                .map_or(inspection.run.run_id, |lineage| lineage.document_scope_id),
                             None => return Ok((None, None)),
                         },
                     };

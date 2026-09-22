@@ -40,6 +40,40 @@ it is not cancelled merely to generate prompts. Exhausting the iteration allowan
 is not evidence that the goal was achieved. Generated stop conditions and evaluator
 claims remain fallible and should be checked against current evidence.
 
+## Continuing after the iteration allowance is exhausted
+
+Use `/goal.continue <additional_iterations>` (or `/loop.continue`) to authorize more work:
+
+```text
+/goal.continue 10
+```
+
+This grants **up to ten additional implementation/evaluation iterations**, stopping early when
+the existing condition is met. It preserves accepted prompts, session context, evidence, and the
+progress document; it does not regenerate instructions or rerun goal initialization. `/goal.resume`
+remains the control for a paused run.
+
+Continuation requires the exact associated run to have a verified, settled repeat-limit failure.
+Success, cancellation, unrelated failure, ambiguous operations, foreign/unverifiable ownership,
+and pending replacement are not restart shortcuts. Damaged or unsupported historical checkpoints
+fail closed. The initial implementation supports bounded leaf-run graphs (at most 1,000 nodes and
+1,000 edges); composed execution requires a separate continuation policy.
+
+Each grant creates a linked successor with new activation identities. The predecessor remains
+terminal with its original history. Runtime counters record per-run completion and cumulative prior
+iterations; status shows lineage and the new grant. The original run UUID remains the explicitly
+inherited progress-document scope across successors. Missing documents are reported, not recreated.
+
+Admission atomically checks source ownership, graph/output identity, and the current association,
+then records the grant, successor, and lineage. Exact request retries return the same successor;
+conflicting or competing grants are rejected. A lost command response is retried once with the same
+request identity. Inspect status after a transport failure rather than assuming no grant committed.
+Dispatch recovery uses the ordinary workflow runtime. Existing absolute deadlines, concurrency,
+retry policy, authorization ceilings, and session-wide limits are not reset by an iteration grant.
+
+Workflow-store schema 40 adds continuation lineage and an indexed exhaustion lookup. Existing
+stores upgrade through the normal exclusive-owner, backup-preserving initialization path.
+
 ## Conversation-aware generation
 
 The daemon captures a generation-pinned source model-context view, checks that the source
@@ -88,7 +122,8 @@ host method and explicit observation/cancellation handle. ABI 4 libraries are re
 By default, starting a goal prepares a Markdown document under the owning session
 store's `session-artifacts/<session-id>/working-documents/<workflow-run-id>/progress.md`.
 The application resolves the path; the modal never guesses a state root. The existing
-workflow run UUID is the document scope. New runs get distinct documents; pause/resume
+workflow run UUID is the document scope. Independent new runs get distinct documents; explicit
+continuation successors inherit their original run's document scope. Pause/resume
 and start retries retain the same document. Read-only `/goal.progress` displays a bounded
 snapshot and `/goal.status` includes its path. Missing documents are reported, not repaired.
 

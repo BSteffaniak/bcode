@@ -688,6 +688,10 @@ pub enum Request {
     RegisterWorkflowDefinition(WorkflowDefinitionRegistrationRequest),
     /// Register an exact definition and start its bound durable run through one retry-safe request.
     StartWorkflow(WorkflowStartRequest),
+    WorkflowContinuationSource {
+        run_id: String,
+    },
+    ContinueWorkflow(bcode_workflow::WorkflowContinuationRequest),
     /// Start one durable workflow from an existing exact definition.
     RequestWorkflowReplacement(bcode_workflow::WorkflowReplacementRequest),
     StartWorkflowRun(WorkflowRunStartRequest),
@@ -2151,6 +2155,7 @@ pub enum ResponsePayload {
     },
     WorkflowReplacementRequested(bcode_workflow::WorkflowReplacementResponse),
     WorkflowRunStarted(WorkflowRunStartResponse),
+    WorkflowContinuationSource(Box<bcode_workflow::WorkflowContinuationSource>),
     WorkflowDefinitionList {
         definitions: Vec<bcode_workflow::StoredWorkflowDefinition>,
     },

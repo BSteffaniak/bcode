@@ -567,6 +567,18 @@ impl bcode_workflow::WorkflowRunApplication for BcodeClient {
     ) -> Result<bcode_workflow::WaitingResolutionResult, Self::Error> {
         Self::resolve_workflow_approval(self, run_id, node_id, activation_id, approved).await
     }
+    async fn workflow_continuation_source(
+        &self,
+        run_id: String,
+    ) -> Result<bcode_workflow::WorkflowContinuationSource, Self::Error> {
+        Self::workflow_continuation_source(self, run_id).await
+    }
+    async fn continue_workflow(
+        &self,
+        request: bcode_workflow::WorkflowContinuationRequest,
+    ) -> Result<bcode_workflow::WorkflowRunStartResponse, Self::Error> {
+        Self::continue_workflow(self, request).await
+    }
     async fn request_workflow_replacement(
         &self,
         request: bcode_workflow::WorkflowReplacementRequest,
@@ -4945,6 +4957,40 @@ impl BcodeClient {
             .await?
         {
             ResponsePayload::WorkflowPackageExportRunStarted(response) => Ok(*response),
+            _ => Err(ClientError::UnexpectedResponse),
+        }
+    }
+
+    /// Read a bounded, verified exhausted-repeat checkpoint.
+    ///
+    /// # Errors
+    /// Returns transport errors or rejects ineligible/damaged state.
+    pub async fn workflow_continuation_source(
+        &self,
+        run_id: String,
+    ) -> Result<bcode_workflow::WorkflowContinuationSource, ClientError> {
+        match self
+            .send_request(Request::WorkflowContinuationSource { run_id })
+            .await?
+        {
+            ResponsePayload::WorkflowContinuationSource(source) => Ok(*source),
+            _ => Err(ClientError::UnexpectedResponse),
+        }
+    }
+
+    /// Explicitly admit a retry-safe successor without reopening terminal execution.
+    ///
+    /// # Errors
+    /// Returns transport errors, denied admission, or ownership/checkpoint conflicts.
+    pub async fn continue_workflow(
+        &self,
+        request: bcode_workflow::WorkflowContinuationRequest,
+    ) -> Result<bcode_workflow::WorkflowRunStartResponse, ClientError> {
+        match self
+            .send_request(Request::ContinueWorkflow(request))
+            .await?
+        {
+            ResponsePayload::WorkflowRunStarted(response) => Ok(response),
             _ => Err(ClientError::UnexpectedResponse),
         }
     }

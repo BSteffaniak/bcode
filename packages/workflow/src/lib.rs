@@ -21,6 +21,7 @@ pub use run_contracts::{
     WorkflowActivationInputSummary, WorkflowActivationObservation, WorkflowActivationSummary,
     WorkflowApprovalContinuation, WorkflowAttemptAdmissionObservation,
     WorkflowAttemptPreparationObservation, WorkflowAuthorityTransferObservation,
+    WorkflowContinuationLineage, WorkflowContinuationRequest, WorkflowContinuationSource,
     WorkflowCoordinatorStatus, WorkflowDecision, WorkflowDecisionInspection,
     WorkflowDecisionValueDisclosure, WorkflowDefinitionRepresentation, WorkflowDefinitionSnapshot,
     WorkflowDescendantRunSummary, WorkflowDoctorIssue, WorkflowDoctorReport,

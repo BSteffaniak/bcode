@@ -393,6 +393,31 @@ impl bcode_workflow::WorkflowRunApplication for WorkflowAuthoringApplication<'_>
             .await
             .map_err(run_operation_failure)
     }
+    async fn workflow_continuation_source(
+        &self,
+        run_id: String,
+    ) -> Result<bcode_workflow::WorkflowContinuationSource, Self::Error> {
+        self.state
+            .require_workflow_store()
+            .map_err(run_operation_failure)?;
+        self.state
+            .workflow_store
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .continuation_source(&run_id)
+            .map_err(|error| run_operation_failure(error.into()))
+    }
+    async fn continue_workflow(
+        &self,
+        request: bcode_workflow::WorkflowContinuationRequest,
+    ) -> Result<bcode_workflow::WorkflowRunStartResponse, Self::Error> {
+        self.state
+            .require_workflow_store()
+            .map_err(run_operation_failure)?;
+        continue_run(self.state, request)
+            .await
+            .map_err(run_operation_failure)
+    }
     async fn request_workflow_replacement(
         &self,
         request: bcode_workflow::WorkflowReplacementRequest,
@@ -6827,6 +6852,132 @@ async fn start_run_with_stage(
     })
 }
 
+fn persist_continuation_definition(
+    state: &ServerState,
+    request: &bcode_workflow::WorkflowStartRequest,
+) -> Result<bcode_workflow::WorkflowDefinitionIdentity, super::ServerError> {
+    validate_workflow_definition_for_production(state, &request.definition)?;
+    let identity = bcode_workflow::WorkflowDefinitionIdentity::for_definition(
+        request.identity.kind.clone(),
+        &request.definition,
+    )
+    .map_err(|error| bcode_workflow_store::WorkflowStoreError::InvalidData(error.to_string()))?;
+    if identity != request.identity || identity.kind != request.binding.workflow_kind {
+        return Err(bcode_workflow_store::WorkflowStoreError::InvalidData(
+            "continuation definition identity mismatch".into(),
+        )
+        .into());
+    }
+    state
+        .workflow_store
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .persist_definition(
+            &identity.definition_id,
+            identity.definition_version,
+            &request.definition,
+        )?;
+    Ok(identity)
+}
+
+async fn continue_run(
+    state: &std::sync::Arc<ServerState>,
+    request: bcode_workflow::WorkflowContinuationRequest,
+) -> Result<bcode_workflow::WorkflowRunStartResponse, super::ServerError> {
+    let retry = state
+        .workflow_store
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .continuation_retry(&request)?;
+    if let Some(run) = retry {
+        // Observation-only retries must not register phantom work or acquire a foreign owner.
+        let runtime_work_id = bcode_session_models::WorkId::new(format!("workflow:{}", run.run_id));
+        return Ok(bcode_workflow::WorkflowRunStartResponse {
+            run,
+            runtime_work_id,
+        });
+    }
+    // Validate eligibility before any ownership transfer or definition publication.
+    state
+        .workflow_store
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .continuation_source(&request.source_run_id)?;
+    let authority = execution_authority(state, &request.source_run_id)
+        .await?
+        .ok_or_else(|| {
+            bcode_workflow_store::WorkflowStoreError::InvalidData(
+                "continuation source has no execution authority".into(),
+            )
+        })?;
+    let identity = persist_continuation_definition(state, &request.successor)?;
+    let (mut successor, ownership) = prepare_workflow_run(
+        state,
+        bcode_workflow::WorkflowRunStartRequest {
+            definition_id: identity.definition_id,
+            definition_version: identity.definition_version,
+            run_id: request.successor.run_id.clone(),
+            workspace_snapshot: request
+                .successor
+                .workspace_snapshot
+                .clone()
+                .unwrap_or_default(),
+            parent_session_id: request.successor.parent_session_id,
+            parent_session_generation: None,
+            binding: Some(request.successor.binding.clone()),
+            input: Some(request.successor.input.clone()),
+            limits: request.successor.limits.clone(),
+        },
+        None,
+        &mut "prepare_continuation",
+    )
+    .await?;
+    // Association ordering must remain monotonic even within a clock tick.
+    {
+        let mut store = state
+            .workflow_store
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let source = store.run_summary(&request.source_run_id)?.ok_or_else(|| {
+            bcode_workflow_store::WorkflowStoreError::InvalidData(
+                "continuation source missing".into(),
+            )
+        })?;
+        successor.created_at_ms =
+            successor
+                .created_at_ms
+                .max(source.updated_at_ms.checked_add(1).ok_or_else(|| {
+                    bcode_workflow_store::WorkflowStoreError::InvalidData(
+                        "continuation timestamp overflow".into(),
+                    )
+                })?);
+        store.continue_run_owned(&request, &successor, &authority.authority)?;
+    }
+    let run = state
+        .workflow_store
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .run_summary(&successor.run_id)?
+        .expect("admitted successor");
+    let runtime_work_id = super::register_workflow_runtime_work(
+        state,
+        request.successor.parent_session_id,
+        &successor.run_id,
+        "workflow continuation".into(),
+    )
+    .await;
+    // Admission is committed: dispatch failure must not invite another grant.
+    if let Err(error) = super::drive_workflow_run(state, &successor.run_id).await {
+        tracing::warn!(run_id = %successor.run_id, %error, "continuation admitted; dispatch deferred to recovery");
+    }
+    drop(ownership);
+    drop(authority);
+    Ok(bcode_workflow::WorkflowRunStartResponse {
+        run,
+        runtime_work_id,
+    })
+}
+
 /// Validate, persist, and admit one exact workflow definition.
 pub async fn start(
     state: &std::sync::Arc<ServerState>,
@@ -10917,6 +11068,11 @@ pub async fn inspect_run(
             .replacement_readiness(run_id)?,
     );
     Ok(bcode_workflow::WorkflowRunInspection {
+        continuation: state
+            .workflow_store
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .continuation_lineage(run_id)?,
         replacement_readiness,
         run,
         graph: Some(graph),

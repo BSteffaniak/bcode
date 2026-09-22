@@ -672,8 +672,15 @@ damaged or stale.
 ## Schema upgrades and explicit reset
 
 The workflow database has one current schema version. A missing database is initialized directly
-at that version. Domain-owned startup coordination automatically upgrades supported schemas 14–33
-under the migration safety contract in `INVARIANTS.md`. Schema 34 adds durable recovery barriers
+at that version. Domain-owned startup coordination automatically upgrades supported schemas 14–39
+under the migration safety contract in `INVARIANTS.md`. Schema 40 adds atomic successor-continuation
+lineage and an indexed lookup of structured exhaustion events. A continuation never reopens its
+terminal predecessor: source ownership, exact output/graph checkpoint, current association,
+quiescence, and explicit allowance are checked in the same transaction as successor admission.
+Lineage retains cumulative prior iterations and the original working-document scope without
+walking predecessor chains. Request identity defines exact retry/conflicting-duplicate behavior.
+Normal inspection reads bounded lineage/checkpoints; it does not replay or repair history.
+Schema 34 adds durable recovery barriers
 and dispatch/resume triggers; current-schema opens fail closed when required barriers are missing.
 Schema 33 supplies the run-package binding
 table omitted by earlier upgrades. If that table is absent, automatic creation requires an empty
