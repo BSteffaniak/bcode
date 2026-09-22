@@ -1,22 +1,29 @@
 # Workflow Persistence Architecture
 
-## Cross-artifact workflow coexistence (implementation gap)
+## Clean-break baseline and workflow coexistence
 
-Workflow availability must satisfy the cross-artifact coexistence invariant in `INVARIANTS.md`. The current exact-schema open contract and lifetime shared ownership locks can block another artifact’s required upgrade, leaving its workflow domain unavailable. This is an implementation gap, not the intended operational contract.
+The supported baseline starts at storage compatibility contract 1 (schema 41).
+Pre-contract binaries are outside the supported coexistence set. This work does not
+engineer an online legacy bridge or a new production migration coordinator. Existing
+backup-verified maintenance remains separate; no data deletion or daemon shutdown is
+authorized by the clean-break decision.
 
-The replacement must support concurrent independent runs across daemon artifacts through explicit storage compatibility, coexistence-preserving evolution, and run-scoped execution fencing. Removing ownership checks, creating per-artifact canonical stores, or requiring other daemons to stop is not a conforming fix. Legacy-binary transition constraints must be documented separately from steady-state behavior.
+Baseline daemon instances share one canonical workflow database. Idle shared handles
+protect destructive maintenance, not admission or execution by other baseline owners.
+Execution authority remains per run, with foreign and stale owners fenced out.
 
-## Approved compatibility-floor transition (not yet implemented)
+A server regression admits independent agent workflows through production `start_run`
+using two distinct daemon instance identities and store handles, then runs both existing
+drivers to completion. It uses the fake provider and one process; it is not yet a
+multi-process daemon/IPC acceptance test. Storage subprocess tests separately cover
+retained-handle writes and interruption safety. Neither claim includes old binaries.
 
-The initial transition may make a clean break with pre-contract daemon and client binaries.
-The operator will stop those processes and restart on the new architecture after the changes
-are installed. This is a one-time rollout decision, not permission for routine upgrades to
-require stopping other daemons, and not permission to delete or reset existing workflow data.
-The new implementation must preserve supported canonical data during initialization, reject
-unknown or unsafe state, and establish an explicit compatibility contract under which subsequent
-supported artifacts coexist. An online compatibility bridge for pre-contract binaries is not
-required. Migration and maintenance must still verify their required ownership; an operator's
-intention to stop old processes is not evidence that ownership has been released.
+## Existing historical-state handling
+
+Known historical storage retains the existing exclusive, backup-verified initialization
+path. Unknown or unsafe storage is preserved and refused. No online transition machinery
+is a prerequisite for baseline coexistence. Future incompatible changes require their own
+explicit architectural decision, not an assumption that old writers are safe.
 
 ## Storage compatibility boundary (partial implementation)
 
@@ -30,9 +37,9 @@ are refused. Retaining the contract across a future revision is a writer-semanti
 not merely a claim that its DDL is additive; incompatible semantics require a new boundary.
 Reset refuses a structurally valid compatible higher revision as well as the current one.
 
-This is not yet the complete coexistence implementation: production additive migration
-coordination, full goal diagnostics and actual mixed-version acceptance remain outstanding.
-Existing shared handles still protect destructive maintenance.
+Remaining verification concerns baseline multi-process daemon admission/execution and full
+goal diagnostics, not a new additive migration coordinator or pre-contract mixed-version
+acceptance. Existing shared handles still protect destructive maintenance.
 
 Workflow requests can retry transient store initialization under a workflow-local mutex.
 Contending callers receive a retryable-unavailable diagnostic immediately instead of queuing

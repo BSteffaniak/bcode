@@ -71239,6 +71239,100 @@ event_symbol = "bcode_plugin_handle_event_v1"
         drop(state);
     }
 
+    // Both states deliberately retain store handles through admission and driver completion.
+    // The lint does not track their moves into Arc and the vector across these awaits.
+    #[allow(clippy::significant_drop_tightening)]
+    #[tokio::test]
+    async fn baseline_daemon_owners_admit_and_execute_independent_runs_in_one_store() {
+        let root = tempfile::tempdir().expect("canonical workflow location");
+        let mut states = Vec::new();
+        let mut requests = Vec::new();
+        for index in 0..2 {
+            let sessions = SessionManager::default();
+            let session = sessions
+                .create_session(None, PathBuf::from("."))
+                .await
+                .expect("session");
+            let store =
+                bcode_workflow_store::WorkflowStore::initialize_in_state_dir(root.path(), 1)
+                    .expect("open while other daemon retains its handle");
+            let mut state = test_server_state_with_workflow_authorization(sessions, store);
+            state.selected_provider_plugin_id = Some("bcode.fake-provider".into());
+            state.selected_model_id = Some("fake-echo".into());
+            state
+                .selected_provider_context
+                .settings
+                .insert("fake_structured_output_json".into(), "1".into());
+            state.daemon_status.instance_id = format!("baseline-daemon-{index}");
+            state.state_root = root.path().to_path_buf();
+            let definition = bcode_workflow::WorkflowBuilder::new(
+                "baseline-coexistence",
+                bcode_workflow::Step::<u32, u32>::agent(
+                    "node",
+                    &test_workflow_prompt_contract(
+                        bcode_workflow::ValueSchema::of::<u32>(),
+                        bcode_workflow::PromptContextTarget::SharedParentSequential,
+                    ),
+                )
+                .expect("agent"),
+            )
+            .build()
+            .expect("definition")
+            .definition()
+            .clone();
+            state
+                .workflow_store
+                .lock()
+                .unwrap()
+                .persist_definition("baseline-coexistence", 1, &definition)
+                .expect("persist");
+            requests.push(bcode_workflow::WorkflowRunStartRequest {
+                definition_id: "baseline-coexistence".into(),
+                definition_version: 1,
+                run_id: Some(format!("baseline-run-{index}")),
+                workspace_snapshot: "snapshot".into(),
+                parent_session_id: session.id,
+                parent_session_generation: None,
+                binding: None,
+                input: Some(serde_json::json!(index)),
+                limits: bcode_workflow_store::WorkflowRunLimits::default(),
+            });
+            states.push(Arc::new(state));
+        }
+        let (first, second) = tokio::join!(
+            workflow_operations::start_run(&states[0], requests[0].clone(), None),
+            workflow_operations::start_run(&states[1], requests[1].clone(), None),
+        );
+        first.expect("first daemon admission");
+        second.expect("second daemon admission");
+        for state in &states {
+            state.start_workflow_driver().await;
+        }
+        tokio::time::timeout(Duration::from_secs(15), async {
+            loop {
+                let complete = {
+                    let store = states[0].workflow_store.lock().unwrap();
+                    ["baseline-run-0", "baseline-run-1"].iter().all(|id| {
+                        store.run_summary(id).unwrap().is_some_and(|run| {
+                            run.status == bcode_workflow_store::RunStatus::Completed
+                        })
+                    })
+                };
+                if complete {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("both daemon-owned runs complete");
+        for state in states {
+            let task = state.workflow_driver_task.lock().await.take().unwrap();
+            task.abort();
+            let _ = task.await;
+        }
+    }
+
     #[tokio::test]
     async fn workflow_start_with_stable_identity_is_idempotent_and_conflicts_fail_closed() {
         let sessions = SessionManager::default();
