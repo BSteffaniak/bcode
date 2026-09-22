@@ -394,6 +394,29 @@ const WORKER_RESPONSE_MAGIC: &[u8; 4] = b"BCMR";
 const WORKER_PROTOCOL_VERSION: u16 = 1;
 const WORKER_RESPONSE_HEADER_BYTES: usize = 11;
 
+fn spawn_worker_command(
+    command: &mut std::process::Command,
+) -> std::io::Result<std::process::Child> {
+    // Concurrent fork/exec can briefly inherit a just-closed executable writer.
+    // Retry only ETXTBSY, before any worker exists, with a bounded startup budget.
+    #[cfg(unix)]
+    let started = std::time::Instant::now();
+    #[cfg(not(unix))]
+    return command.spawn();
+    #[cfg(unix)]
+    loop {
+        match command.spawn() {
+            Err(error)
+                if error.raw_os_error() == Some(libc::ETXTBSY)
+                    && started.elapsed() < Duration::from_millis(100) =>
+            {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            result => return result,
+        }
+    }
+}
+
 fn spawn_worker(
     worker_path: &std::path::Path,
 ) -> Result<(std::process::Child, WorkerMemoryGuard), MermaidRenderError> {
@@ -404,14 +427,15 @@ fn spawn_worker(
         use std::os::unix::process::CommandExt as _;
         command.process_group(0);
     }
-    let mut child = command
+    command
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::null())
-        .spawn()
-        .map_err(|error| MermaidRenderError::WorkerUnavailable {
+        .stderr(std::process::Stdio::null());
+    let mut child = spawn_worker_command(&mut command).map_err(|error| {
+        MermaidRenderError::WorkerUnavailable {
             message: error.to_string(),
-        })?;
+        }
+    })?;
     let guard = attach_worker_memory_limit(&mut child).map_err(|error| {
         terminate_uncontained_worker(&mut child);
         MermaidRenderError::WorkerUnavailable {
