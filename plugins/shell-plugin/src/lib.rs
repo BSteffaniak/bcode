@@ -3858,10 +3858,12 @@ mod tests {
             });
     }
 
+    #[cfg(unix)]
     struct TestResizeInputState {
         next: std::sync::atomic::AtomicUsize,
     }
 
+    #[cfg(unix)]
     extern "C" fn test_resize_input_bridge(
         request_ptr: *const u8,
         request_len: usize,

@@ -8,9 +8,8 @@ struct State {
 }
 
 fn main() {
-    let step = Step::map("work", |state: State| Ok(state)).repeat_while(
-        "unbounded",
-        field::<State>("repeat").eq(true),
-    );
+    let step = Step::map("work", |state: State| Ok(state));
+    let condition = field::<State>("repeat").eq(true);
+    let step = step.repeat_while("unbounded", condition);
     let _workflow = WorkflowBuilder::new("bad", step);
 }

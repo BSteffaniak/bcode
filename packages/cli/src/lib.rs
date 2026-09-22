@@ -11926,6 +11926,19 @@ fn check_plugins(roots: &[std::path::PathBuf], json: bool) -> Result<(), CliErro
     Ok(())
 }
 
+fn load_plugin_service_host(roots: &[PathBuf]) -> Result<bcode_plugin::PluginHost, CliError> {
+    let config = bcode_config::load_config()?;
+    let selection = plugin_selection_for_config(&config);
+    Ok(
+        bcode_plugin::PluginHost::load_discovered_with_static_bundled_and_config(
+            &selection,
+            discover_plugins_for_cli(roots)?,
+            &static_bundled_plugins(),
+            BTreeMap::new(),
+        )?,
+    )
+}
+
 async fn invoke_plugin_service(
     roots: &[std::path::PathBuf],
     plugin_id: &str,
@@ -11949,11 +11962,7 @@ async fn invoke_plugin_service(
         return print_service_response(response, json);
     }
 
-    let config = bcode_config::load_config()?;
-    let selection = plugin_selection_for_config(&config);
-    let plugins =
-        bcode_plugin::filter_selected_plugins(discover_plugins_for_cli(roots)?, &selection);
-    let mut host = bcode_plugin::PluginHost::load_registered_plugins(&plugins)?;
+    let mut host = load_plugin_service_host(roots)?;
     let response = host.invoke_service(plugin_id, interface_id, operation, payload);
     let deactivation = host.deactivate_all();
     let response = response?;
@@ -11978,11 +11987,7 @@ async fn call_plugin_service(
         return print_service_response(response, json);
     }
 
-    let config = bcode_config::load_config()?;
-    let selection = plugin_selection_for_config(&config);
-    let plugins =
-        bcode_plugin::filter_selected_plugins(discover_plugins_for_cli(roots)?, &selection);
-    let mut host = bcode_plugin::PluginHost::load_registered_plugins(&plugins)?;
+    let mut host = load_plugin_service_host(roots)?;
     let response = host.invoke_service_by_interface(interface_id, operation, payload);
     let deactivation = host.deactivate_all();
     let response = response?;
