@@ -42,6 +42,7 @@ const DEFAULT_FIND_MAX_RESULTS: usize = 1_000;
 const DEFAULT_LIST_MAX_ENTRIES: usize = 1_000;
 const MAX_EXTERNAL_OUTPUT_BYTES: usize = 4 * 1024 * 1024;
 const MAX_RUST_GREP_FILE_BYTES: u64 = 4 * 1024 * 1024;
+#[cfg(unix)]
 const TERMINATION_GRACE_MS: u64 = 500;
 const DEFAULT_READ_MAX_LINES: usize = 1_000;
 const DEFAULT_READ_MAX_BYTES: usize = 256 * 1024;
@@ -2497,7 +2498,7 @@ fn configure_command_for_timeout(command: &mut Command) {
 }
 
 #[cfg(not(unix))]
-fn configure_command_for_timeout(_command: &mut Command) {}
+const fn configure_command_for_timeout(_command: &mut Command) {}
 
 #[cfg(unix)]
 fn terminate_child_after_timeout(child: &mut Child) -> Result<ExitStatus, std::io::Error> {

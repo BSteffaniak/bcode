@@ -165,13 +165,13 @@ fn request_digest(arguments: &Value) -> [u8; 32] {
 
 /// Verify request binding and reopen prepared identities without mutating files.
 /// Publication must still recheck identities and snapshots under coordination.
-#[cfg(test)]
+#[cfg(all(test, unix))]
 pub fn verify(arguments: &Value, descriptor: &PreparedBatch) -> Result<(), String> {
     verify_cancellable(arguments, descriptor, &|| false)
 }
 
 /// Screen a batch while observing cancellation between bounded read chunks.
-#[cfg(test)]
+#[cfg(all(test, unix))]
 pub fn verify_cancellable(
     arguments: &Value,
     descriptor: &PreparedBatch,
@@ -262,8 +262,10 @@ pub fn execute_with_changes(
             ("cancelled", None)
         } else {
             match snapshot.publish(target, cancelled) {
+                #[cfg(unix)]
                 Ok(PublicationOutcome::Committed) => ("committed", None),
                 Ok(PublicationOutcome::Unchanged) => ("unchanged", None),
+                #[cfg(unix)]
                 Ok(PublicationOutcome::Unknown(error)) => {
                     stopped = true;
                     ("unknown", Some(error))
@@ -372,9 +374,13 @@ fn check_cancelled(cancelled: &impl Fn() -> bool) -> Result<(), String> {
 struct Snapshot {
     source: String,
     output: String,
+    #[cfg(unix)]
     parent: std::fs::File,
+    #[cfg(unix)]
     file: std::fs::File,
+    #[cfg(unix)]
     permissions: std::fs::Permissions,
+    #[cfg(unix)]
     metadata: std::fs::Metadata,
 }
 
@@ -396,7 +402,9 @@ fn metadata_unchanged(before: &std::fs::Metadata, after: &std::fs::Metadata) -> 
 
 enum PublicationOutcome {
     Unchanged,
+    #[cfg(unix)]
     Committed,
+    #[cfg(unix)]
     Unknown(String),
 }
 
@@ -509,7 +517,7 @@ impl Snapshot {
         }
         #[cfg(not(unix))]
         {
-            let _ = target;
+            let _ = (self, target);
             Err("snapshot recheck unsupported".to_owned())
         }
     }
