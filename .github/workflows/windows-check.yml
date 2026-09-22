@@ -97,8 +97,10 @@ jobs:
           $global:LASTEXITCODE = 0
 
       - name: Validate Windows dependency portability
-        shell: bash
-        run: scripts/check-windows-dependency-portability.sh
+        shell: pwsh
+        run: |
+          & "$env:ProgramFiles\Git\bin\bash.exe" --noprofile --norc -e -o pipefail scripts/check-windows-dependency-portability.sh
+          if ($LASTEXITCODE -ne 0) { throw "Windows dependency portability guard failed" }
 
       - name: Run Windows-specific contract tests
         run: |
