@@ -974,29 +974,13 @@ mod tests {
     use super::*;
     use bcode_settings::OnboardingSection;
 
-    struct ConfigEnvGuard;
-
-    impl Drop for ConfigEnvGuard {
-        fn drop(&mut self) {
-            unsafe {
-                std::env::remove_var("BCODE_CONFIG");
-            }
-        }
-    }
-
-    fn isolated_config_store() -> (
-        tempfile::TempDir,
-        SettingsStore,
-        std::path::PathBuf,
-        ConfigEnvGuard,
-    ) {
+    fn isolated_config_store() -> (tempfile::TempDir, SettingsStore, std::path::PathBuf) {
         let temp = tempfile::tempdir().expect("temp dir should be created");
-        let config_path = temp.path().join("bcode.toml");
-        unsafe {
-            std::env::set_var("BCODE_CONFIG", &config_path);
-        }
+        let config_path = std::path::PathBuf::from(
+            std::env::var_os("BCODE_CONFIG").expect("isolated child config"),
+        );
         let store = SettingsStore::from_settings_db_path(temp.path().join("settings.db"));
-        (temp, store, config_path, ConfigEnvGuard)
+        (temp, store, config_path)
     }
 
     #[test]
@@ -1031,7 +1015,27 @@ mod tests {
 
     #[test]
     fn shell_handles_actions_and_builds_render_model() {
-        let (_temp, store, config_path, _guard) = isolated_config_store();
+        if std::env::var_os("BCODE_ONBOARDING_CONFIG_TEST_CHILD").is_none() {
+            let root = tempfile::tempdir().expect("child config root");
+            let status =
+                std::process::Command::new(std::env::current_exe().expect("test executable"))
+                    .args([
+                        "--exact",
+                        "onboarding::tests::shell_handles_actions_and_builds_render_model",
+                        "--nocapture",
+                    ])
+                    .env("BCODE_ONBOARDING_CONFIG_TEST_CHILD", "1")
+                    .env("BCODE_CONFIG", root.path().join("bcode.toml"))
+                    .status()
+                    .expect("isolated onboarding test");
+            assert!(status.success());
+            return;
+        }
+        check_shell_actions_and_render_model();
+    }
+
+    fn check_shell_actions_and_render_model() {
+        let (_temp, store, config_path) = isolated_config_store();
         let summary = SetupConfigSummary::default();
         let mut shell = OnboardingShell::load(&store, &summary).expect("shell should load");
 
