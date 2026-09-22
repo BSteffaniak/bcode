@@ -233,7 +233,7 @@ fn collect_snapshots(
 
 /// Execute an authorized batch while the caller holds mutation coordination.
 /// Validation failures publish nothing; later failures never undo prior commits.
-#[cfg(test)]
+#[cfg(all(test, unix))]
 pub fn execute(
     arguments: &Value,
     descriptor: &PreparedBatch,
