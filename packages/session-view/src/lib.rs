@@ -8,6 +8,7 @@
 //! terminal, web, and future renderers can consume without inheriting terminal layout concerns.
 
 mod actions;
+pub mod presentation;
 
 pub use actions::execute_session_view_action;
 

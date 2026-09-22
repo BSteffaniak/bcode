@@ -187,16 +187,6 @@ pub(super) fn message_content(message: &ChatMessageView) -> Containers {
                         "Canonical instructions: session event " (activity.source_sequence.to_string())
                         ". The compact message is a preview, not the exact submitted instructions."
                     }
-                    @if let Some(instructions) = &activity.exact_instructions {
-                        (disclosure("Exact submitted instructions", &container! {
-                            div white-space="preserve-wrap" color=(color::TEXT) { (instructions) }
-                        }))
-                    } @else {
-                        div color=(color::MUTED) {
-                            "Exact instructions unavailable inline; retrieve the canonical event."
-                        }
-                    }
-                    (json_panel("Producer presentation and available structured input", &serde_json::to_value(&activity.presentation).unwrap_or(serde_json::Value::Null)))
                 }))
             }
         }
@@ -266,8 +256,13 @@ fn transcript_item_body_with_context(
     context: &impl PresentationContext,
 ) -> Containers {
     match kind {
-        TranscriptViewItemKind::UserMessage { message }
-        | TranscriptViewItemKind::AssistantMessage { message } => message_content(message),
+        TranscriptViewItemKind::UserMessage { message } => message_content(message),
+        TranscriptViewItemKind::AssistantMessage { message } => {
+            let mut readable = message.clone();
+            readable.text =
+                bcode_session_view::presentation::model_output_text(&message.text).into_owned();
+            message_content(&readable)
+        }
         TranscriptViewItemKind::ReasoningMessage { message } => container! {
             details {
                 summary color=(color::REASONING) { "Reasoning" }

@@ -2017,6 +2017,7 @@ version = "0.0.1-alpha.0"
 dependencies = [
  "bcode_plugin_sdk",
  "bcode_session_models",
+ "bcode_session_view",
  "bcode_session_view_models",
  "hyperchad",
  "hyperchad_transformer",
@@ -2071,6 +2072,7 @@ dependencies = [
  "bcode_model_schema",
  "bcode_plugin_sdk",
  "bcode_session_models",
+ "bcode_session_view",
  "bcode_session_view_models",
  "bcode_workflow",
  "bcode_workflow_store",
@@ -2744,6 +2746,7 @@ dependencies = [
  "bcode_session_view_models",
  "bcode_skill_models",
  "bcode_tool",
+ "partial-json-fixer",
  "serde_json",
  "unicode-segmentation",
 ]

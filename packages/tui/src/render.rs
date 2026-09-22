@@ -5280,7 +5280,15 @@ fn statusline_spans(app: &BmuxApp, width: usize, theme: TuiTheme) -> Vec<Span> {
         line = line.optional(token_segment, muted, priority, false);
     }
 
+    let persistent_activity =
+        bcode_session_view::presentation::persistent_activity_text(app.session_view_snapshot());
+    if let Some(text) = &persistent_activity {
+        line = line.required(text.clone(), theme.info, true);
+    }
     for contribution in app.plugin_status() {
+        if persistent_activity.is_some() && contribution.metadata.contains_key("run_id") {
+            continue;
+        }
         line = line.optional(
             contribution.text.clone(),
             theme.info,

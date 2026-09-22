@@ -97,6 +97,20 @@ question without launching work. Host-verified source session/generation/cutoff 
 separate from model output and is retained in accepted prompts and progress-document setup.
 A fresh generation captures fresh context; workflow-start retries reuse accepted prompts.
 
+## Shared activity and readable output
+
+The existing persistent status chrome consumes renderer-neutral activity presentation from
+`bcode_session_view::presentation`, correlated with the existing plugin run-status contribution.
+It does not maintain another goal tracker. The latest correlated activity supplies stage and
+iteration context; run status remains authoritative. Without a current contribution, historical
+transcript activity cannot recreate a persistent active goal. Narrow-terminal layout remains BMUX-owned.
+
+Setup, terminal assistant output and web assistant output share a bounded structured-output
+formatter. Partial prompt strings are readable implementation/stop-condition fields; they remain
+provisional and never change execution inputs. Malformed or unsupported object output shows a
+receiving/unavailable notice instead of a raw JSON fallback. Internal producer envelopes are not
+shown in normal web activity details. Canonical model output is retained unchanged.
+
 ## Live goal activity
 
 Prompt generation observes the generation session through shared semantic snapshots, including

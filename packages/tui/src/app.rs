@@ -1716,8 +1716,7 @@ impl BmuxApp {
         TextInputControl::new(&composer_policy()).handle_paste(&mut self.composer, text);
     }
 
-    /// Return renderer-neutral semantic session state used for parity migration.
-    #[cfg(test)]
+    /// Return the shared renderer-neutral semantic session state.
     #[must_use]
     pub const fn session_view_snapshot(&self) -> &bcode_session_view_models::SessionViewSnapshot {
         self.session_view.snapshot()

@@ -138,8 +138,13 @@ fn snapshot_lines(snapshot: &SessionViewSnapshot) -> Vec<Line> {
     let mut text = String::new();
     for item in &snapshot.transcript.items {
         match &item.kind {
-            TranscriptViewItemKind::AssistantMessage { message }
-            | TranscriptViewItemKind::ReasoningMessage { message } => {
+            TranscriptViewItemKind::AssistantMessage { message } => {
+                append(
+                    &mut text,
+                    &bcode_session_view::presentation::model_output_text(&message.text),
+                );
+            }
+            TranscriptViewItemKind::ReasoningMessage { message } => {
                 append(&mut text, &message.text);
             }
             TranscriptViewItemKind::ReasoningActivity { activity } => {

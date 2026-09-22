@@ -17,6 +17,7 @@ bcode_session_models      = { workspace = true }
 bcode_session_view_models = { workspace = true }
 bcode_skill_models        = { workspace = true }
 bcode_tool                = { workspace = true }
+partial-json-fixer        = { workspace = true }
 serde_json                = { workspace = true, features = ["std"] }
 unicode-segmentation      = { workspace = true }
 

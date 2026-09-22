@@ -943,8 +943,12 @@ fn message_text_item(
     streaming: bool,
     kind: TranscriptItemKind,
 ) -> TranscriptItem {
-    let item =
-        TranscriptItem::with_identity(role, message.text.clone(), streaming, message.format, kind);
+    let text = if matches!(kind, TranscriptItemKind::AssistantMessage) {
+        bcode_session_view::presentation::model_output_text(&message.text).into_owned()
+    } else {
+        message.text.clone()
+    };
+    let item = TranscriptItem::with_identity(role, text, streaming, message.format, kind);
     if let Some(label) = &message.display_label {
         item.with_display_label(label.clone())
     } else {
