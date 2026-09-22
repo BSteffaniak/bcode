@@ -2497,6 +2497,7 @@ fn smoke_test_release_archive(
 ) -> Result<()> {
     let extraction = verification_extraction_path(archive);
     recreate_dir(&extraction)?;
+    let extraction = fs::canonicalize(extraction)?;
     let result = smoke_test_release_archive_in(
         archive,
         target_kind,

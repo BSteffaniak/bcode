@@ -18,6 +18,9 @@ pub fn resolve_artifact_reference(
     if uri.is_empty() {
         return Err("artifact storage URI is empty");
     }
+    if Path::new(uri).is_absolute() {
+        return Ok(PathBuf::from(uri));
+    }
     if let Ok(url) = url::Url::parse(uri) {
         if url.scheme() == "bcode-artifact" {
             if url.host_str() != Some("invocation")
@@ -110,13 +113,15 @@ mod tests {
             resolve_artifact_reference("recordings/run.bin", root).expect("relative"),
             root.join("recordings/run.bin")
         );
+        let legacy = std::env::temp_dir().join("old.bin");
+        let uri = url::Url::from_file_path(&legacy).expect("file URI");
         assert_eq!(
-            resolve_artifact_reference("file:///tmp/old.bin", root).expect("file"),
-            PathBuf::from("/tmp/old.bin")
+            resolve_artifact_reference(uri.as_str(), root).expect("file"),
+            legacy
         );
         assert_eq!(
-            resolve_artifact_reference("/tmp/old.bin", root).expect("absolute"),
-            PathBuf::from("/tmp/old.bin")
+            resolve_artifact_reference(legacy.to_str().expect("path"), root).expect("absolute"),
+            legacy
         );
         for bad in [
             "",
