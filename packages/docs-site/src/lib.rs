@@ -63,12 +63,16 @@ pub static SITE: LazyLock<DocsSite> = LazyLock::new(|| {
 /// Panics if the bundled docs-site static asset route cannot be registered.
 #[must_use]
 pub fn init() -> AppBuilder {
-    let mut app = SITE.clone().init();
+    let app = SITE.clone().init();
 
     #[cfg(feature = "assets")]
-    for assets in ASSETS.iter().cloned() {
-        app.static_asset_route_result(assets).unwrap();
-    }
+    let app = {
+        let mut app = app;
+        for assets in ASSETS.iter().cloned() {
+            app.static_asset_route_result(assets).unwrap();
+        }
+        app
+    };
 
     app
 }
