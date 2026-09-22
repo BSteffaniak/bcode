@@ -2,6 +2,13 @@
 [[config]]
 os = "ubuntu"
 
+# The SDK example requires explicit clock inputs; random billion-ms steps
+# otherwise turn scheduling progress into product deadline expiry.
+[config.env]
+SIMULATOR_SEED = "1"
+SIMULATOR_EPOCH_OFFSET = "1700000000000"
+SIMULATOR_STEP_MULTIPLIER = "1"
+
 [[config.dependencies]]
 command = "cargo build --locked -p bcode_shell_plugin -p bcode_filesystem_plugin"
 features = ["embedded-plugins"]
