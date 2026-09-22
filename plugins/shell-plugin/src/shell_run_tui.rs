@@ -1861,6 +1861,9 @@ pub(crate) fn decode_recording_replay(
 
 #[cfg(test)]
 fn local_recording_path(uri: &str) -> Result<std::path::PathBuf, String> {
+    if std::path::Path::new(uri).is_absolute() {
+        return Ok(std::path::PathBuf::from(uri));
+    }
     if let Ok(url) = url::Url::parse(uri) {
         if url.scheme() != "file" {
             return Err(format!(

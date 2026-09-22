@@ -156,10 +156,15 @@ mod tests {
     #[test]
     fn failure_requires_no_further_durable_write() {
         let file = tempfile::NamedTempFile::new().expect("file");
-        let fence = StorageTrackingFence::begin(file.reopen().expect("open")).expect("begin");
-        assert_eq!(std::fs::read(file.path()).expect("pre-failure"), DIRTY);
+        let mut fence = StorageTrackingFence::begin(file.reopen().expect("open")).expect("begin");
+        let mut bytes = [0; DIRTY.len()];
+        fence.file.seek(SeekFrom::Start(0)).expect("rewind");
+        fence.file.read_exact(&mut bytes).expect("pre-failure");
+        assert_eq!(&bytes, DIRTY);
         fence.fail();
-        assert_eq!(std::fs::read(file.path()).expect("post-failure"), DIRTY);
+        fence.file.seek(SeekFrom::Start(0)).expect("rewind");
+        fence.file.read_exact(&mut bytes).expect("post-failure");
+        assert_eq!(&bytes, DIRTY);
         drop(fence);
         assert!(StorageTrackingFence::begin(file.reopen().expect("restart")).is_err());
     }

@@ -237,7 +237,11 @@ mod tests {
             let file = tempfile::NamedTempFile::new().expect("file");
             let daemon =
                 StorageDaemonRegistration::begin(file.reopen().expect("open")).expect("begin");
-            std::fs::write(file.path(), bytes).expect("damage fixture");
+            let mut owned_file = daemon.file.as_deref().expect("owned file");
+            std::io::Seek::seek(&mut owned_file, std::io::SeekFrom::Start(0))
+                .expect("rewind fixture");
+            owned_file.set_len(0).expect("truncate fixture");
+            owned_file.write_all(bytes).expect("damage fixture");
             assert!(daemon.finish().is_err());
             assert_eq!(std::fs::read(file.path()).expect("preserved"), bytes);
             let probe = file.reopen().expect("probe");
