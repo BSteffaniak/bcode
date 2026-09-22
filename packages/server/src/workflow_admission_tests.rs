@@ -1,6 +1,87 @@
 //! Admission handoff and live recovery regressions.
 use super::*;
 
+#[tokio::test]
+async fn transient_storage_recovery_drives_canonical_run_once() {
+    let (root, mut state, _session_id) = admission_fixture().await;
+    let placeholder = tempfile::tempdir().unwrap();
+    let canonical_path = state.workflow_store.lock().unwrap().path().to_path_buf();
+    {
+        let state = Arc::get_mut(&mut state).unwrap();
+        state.state_root = root.path().to_path_buf();
+        state.startup_config.workflows.admission_timeout_ms =
+            std::num::NonZeroU64::new(5_000).unwrap();
+        state.workflow_store = StdMutex::new(
+            bcode_workflow_store::WorkflowStore::open_in_state_dir(placeholder.path()).unwrap(),
+        )
+        .into();
+    }
+    let ownership = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(canonical_path.parent().unwrap().join("workflow.lock"))
+        .unwrap();
+    ownership.try_lock().expect("exclusive maintenance owner");
+    let error = bcode_workflow_store::WorkflowStore::initialize_in_state_dir(root.path(), 4)
+        .expect_err("real initialization contention");
+    assert!(error.is_transient_initialization_failure());
+    Arc::get_mut(&mut state).unwrap().workflow_store_unavailable = StdMutex::new(Some(
+        WorkflowInitializationFailure::from_store_error(&error),
+    ));
+    state.start_workflow_driver().await;
+    // A request while maintenance still owns the store fails without admitting a run.
+    assert!(state.require_workflow_store().is_err());
+    assert!(!state.workflow_restore_pending.load(Ordering::SeqCst));
+    drop(ownership);
+    let mut retries = tokio::task::JoinSet::new();
+    for _ in 0..8 {
+        let state = Arc::clone(&state);
+        retries.spawn_blocking(move || state.require_workflow_store());
+    }
+    while let Some(result) = retries.join_next().await {
+        let result = result.unwrap();
+        assert!(
+            result.is_ok() || matches!(result, Err(ServerError::WorkflowStorageUnavailable(_)))
+        );
+    }
+    state
+        .require_workflow_store()
+        .expect("recovered after contenders joined");
+    // Starting again must reuse the original singleton, not replace it after recovery.
+    state.start_workflow_driver().await;
+    let completed = tokio::time::timeout(Duration::from_secs(15), async {
+        loop {
+            let status = state
+                .workflow_store
+                .lock()
+                .unwrap()
+                .run_summary("admission-run")
+                .unwrap()
+                .unwrap()
+                .status;
+            if status == bcode_workflow_store::RunStatus::Completed {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await;
+    let task = state.workflow_driver_task.lock().await.take().unwrap();
+    task.abort();
+    let _ = task.await;
+    completed.expect("canonical run restored by existing driver");
+    let attempts = state
+        .workflow_store
+        .lock()
+        .unwrap()
+        .attempt_history("admission-run", None, 10)
+        .unwrap();
+    assert_eq!(attempts.len(), 1);
+    assert_eq!(attempts[0].status, "succeeded");
+    assert!(!state.workflow_restore_pending.load(Ordering::SeqCst));
+    drop(state);
+}
+
 async fn admission_fixture() -> (tempfile::TempDir, Arc<ServerState>, SessionId) {
     admission_fixture_with_capability(false).await
 }

@@ -6,6 +6,44 @@ Workflow availability must satisfy the cross-artifact coexistence invariant in `
 
 The replacement must support concurrent independent runs across daemon artifacts through explicit storage compatibility, coexistence-preserving evolution, and run-scoped execution fencing. Removing ownership checks, creating per-artifact canonical stores, or requiring other daemons to stop is not a conforming fix. Legacy-binary transition constraints must be documented separately from steady-state behavior.
 
+## Approved compatibility-floor transition (not yet implemented)
+
+The initial transition may make a clean break with pre-contract daemon and client binaries.
+The operator will stop those processes and restart on the new architecture after the changes
+are installed. This is a one-time rollout decision, not permission for routine upgrades to
+require stopping other daemons, and not permission to delete or reset existing workflow data.
+The new implementation must preserve supported canonical data during initialization, reject
+unknown or unsafe state, and establish an explicit compatibility contract under which subsequent
+supported artifacts coexist. An online compatibility bridge for pre-contract binaries is not
+required. Migration and maintenance must still verify their required ownership; an operator's
+intention to stop old processes is not evidence that ownership has been released.
+
+## Storage compatibility boundary (partial implementation)
+
+Schema 41 establishes compatibility contract 1 in `workflow_storage_compatibility`.
+Fresh stores create it atomically; known historical stores through schema 40 enter it
+through the existing exclusive, backup-verified transition. Normal opens require the
+known compatibility contract, a revision of at least 41, and the required recovery,
+continuation and package-binding structures. Higher revisions with that same contract
+are not automatically incompatible and are not downgraded. Missing or unknown contracts
+are refused. Retaining the contract across a future revision is a writer-semantics promise,
+not merely a claim that its DDL is additive; incompatible semantics require a new boundary.
+Reset refuses a structurally valid compatible higher revision as well as the current one.
+
+This is not yet the complete coexistence implementation: production additive migration
+coordination, full goal diagnostics and actual mixed-version acceptance remain outstanding.
+Existing shared handles still protect destructive maintenance.
+
+Workflow requests can retry transient store initialization under a workflow-local mutex.
+Contending callers receive a retryable-unavailable diagnostic immediately instead of queuing
+behind the blocking initialization attempt; periodic driver discovery skips a busy initializer.
+Successful initialization installs canonical storage before clearing unavailability and signals
+the existing singleton driver to restore work. Startup restoration itself does not retry
+initialization: this avoids restoring once during startup and again from the pending signal.
+Permanent failures remain unavailable; startup and retry diagnostics use the same secret-safe
+mapping. Concurrent retry publication is tested, but production admission, cancellation and
+exactly-once restoration still require acceptance evidence.
+
 ## Package-local execution binding (partial implementation)
 
 Schema 32 adds `workflow_run_packages`. Package export startup supplies an exact

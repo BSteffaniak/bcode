@@ -41,7 +41,9 @@ const RESET_BACKUP_DIRECTORY: &str = "reset-backups";
 /// Stable destructive confirmation required by public workflow-store reset surfaces.
 pub const WORKFLOW_STORE_RESET_CONFIRMATION: &str = "DELETE-INCOMPATIBLE-WORKFLOW-STATE";
 /// Current clean-break workflow store schema version.
-pub const WORKFLOW_STORE_SCHEMA_VERSION: u32 = 40;
+pub const WORKFLOW_STORE_SCHEMA_VERSION: u32 = 41;
+// Changes only when existing readers/writers would become unsafe, not for additive DDL.
+const WORKFLOW_STORE_COMPATIBILITY: u32 = 1;
 /// Current bounded workflow-store reset receipt version.
 pub const WORKFLOW_STORE_RESET_RECEIPT_VERSION: u32 = 1;
 /// Current explicit workflow-store migration receipt contract.
@@ -934,6 +936,19 @@ pub struct WorkflowStoreResetReceipt {
     pub reset_at_ms: u64,
 }
 
+impl WorkflowStoreError {
+    /// Whether a failed storage initialization may be retried without repair.
+    ///
+    /// This classifies initialization only; it never authorizes replay of an admission
+    /// or another operation whose effects may already have committed.
+    #[must_use]
+    pub const fn is_transient_initialization_failure(&self) -> bool {
+        matches!(self, Self::UpgradeOwnershipUnavailable)
+            || matches!(self, Self::Database(rusqlite::Error::SqliteFailure(error, _))
+                if matches!(error.code, rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked))
+    }
+}
+
 /// Compatibility export of the workflow-owned registered definition value.
 pub use bcode_workflow::StoredWorkflowDefinition;
 
@@ -1171,7 +1186,7 @@ impl WorkflowStore {
                         match Self::open_with_ownership(&path, ownership) {
                             Ok(store) => return Ok(store),
                             Err(WorkflowStoreError::UnsupportedStore {
-                                actual: Some(14..=39),
+                                actual: Some(14..=40),
                                 ..
                             }) => {}
                             Err(error) => return Err(error),
@@ -1206,7 +1221,7 @@ impl WorkflowStore {
                         match Self::open_with_ownership(&path, probe) {
                             Ok(store) => return Ok(store),
                             Err(WorkflowStoreError::UnsupportedStore {
-                                actual: Some(14..=39),
+                                actual: Some(14..=40),
                                 ..
                             }) => {}
                             Err(error) => return Err(error),
@@ -1266,7 +1281,19 @@ impl WorkflowStore {
         })?;
         std::fs::create_dir_all(root)?;
         let ownership = open_ownership_file(root)?;
-        ownership.lock_shared()?;
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            match ownership.try_lock_shared() {
+                Ok(()) => break,
+                Err(std::fs::TryLockError::WouldBlock) if std::time::Instant::now() < deadline => {
+                    std::thread::sleep(std::time::Duration::from_millis(25));
+                }
+                Err(std::fs::TryLockError::WouldBlock) => {
+                    return Err(WorkflowStoreError::UpgradeOwnershipUnavailable);
+                }
+                Err(std::fs::TryLockError::Error(error)) => return Err(error.into()),
+            }
+        }
         Self::open_with_ownership(path, ownership)
     }
 
@@ -1369,7 +1396,7 @@ impl WorkflowStore {
                 "workflow store migration cannot read the source schema".to_string(),
             )
         })?;
-        if !matches!(previous_schema_version, 14..=39) {
+        if !matches!(previous_schema_version, 14..=40) {
             return Err(WorkflowStoreError::UnsupportedStore {
                 actual: Some(previous_schema_version),
                 expected: WORKFLOW_STORE_SCHEMA_VERSION,
@@ -1422,6 +1449,7 @@ impl WorkflowStore {
         migrate_run_package_bindings(&transaction)?;
         continuation::initialize(&transaction)?;
         recovery::initialize(&transaction)?;
+        initialize_compatibility_contract(&transaction)?;
         transaction.execute(
             "UPDATE workflow_store_contract SET schema_version = ?1 WHERE contract_id = 1",
             [WORKFLOW_STORE_SCHEMA_VERSION],
@@ -1482,7 +1510,9 @@ impl WorkflowStore {
         let source = Connection::open(&path)?;
         source.busy_timeout(std::time::Duration::ZERO)?;
         let previous_schema_version = detected_store_schema(&source);
-        if previous_schema_version == Some(WORKFLOW_STORE_SCHEMA_VERSION) {
+        if previous_schema_version == Some(WORKFLOW_STORE_SCHEMA_VERSION)
+            || verify_store_schema(&source).is_ok()
+        {
             return Err(WorkflowStoreError::InvalidData(
                 "refusing to reset a current workflow store".to_string(),
             ));
@@ -18184,6 +18214,7 @@ fn initialize_schema(connection: &mut Connection) -> Result<(), WorkflowStoreErr
     run_graph::initialize(&transaction)?;
     run_graph::initialize_edit_candidates(&transaction)?;
     recovery::initialize(&transaction)?;
+    initialize_compatibility_contract(&transaction)?;
     transaction.execute(
         "INSERT INTO workflow_store_contract (contract_id, schema_version) VALUES (1, ?1)",
         [WORKFLOW_STORE_SCHEMA_VERSION],
@@ -18192,19 +18223,57 @@ fn initialize_schema(connection: &mut Connection) -> Result<(), WorkflowStoreErr
     Ok(())
 }
 
+fn initialize_compatibility_contract(connection: &Connection) -> Result<(), WorkflowStoreError> {
+    connection.execute_batch(
+        "CREATE TABLE IF NOT EXISTS workflow_storage_compatibility (
+             contract_id INTEGER PRIMARY KEY CHECK (contract_id = 1),
+             compatibility INTEGER NOT NULL CHECK (compatibility > 0)
+         );",
+    )?;
+    connection.execute(
+        "INSERT INTO workflow_storage_compatibility(contract_id, compatibility) VALUES (1, ?1)
+         ON CONFLICT(contract_id) DO NOTHING",
+        [WORKFLOW_STORE_COMPATIBILITY],
+    )?;
+    Ok(())
+}
+
+// Missing or malformed contracts remain unsupported, but lock contention must retain
+// its transient classification so a later initialization request can retry safely.
+fn read_storage_contract_value(
+    connection: &Connection,
+    query: &str,
+) -> Result<Option<u32>, WorkflowStoreError> {
+    match connection
+        .query_row(query, [], |row| row.get::<_, u32>(0))
+        .optional()
+    {
+        Ok(value) => Ok(value),
+        Err(error) => {
+            let error = WorkflowStoreError::Database(error);
+            if error.is_transient_initialization_failure() {
+                Err(error)
+            } else {
+                Ok(None)
+            }
+        }
+    }
+}
+
 fn verify_store_schema(connection: &Connection) -> Result<(), WorkflowStoreError> {
     let version_phase = bcode_metrics::startup::phase("workflow_store.schema_version_query");
-    let actual = connection
-        .query_row(
-            "SELECT schema_version FROM workflow_store_contract WHERE contract_id = 1",
-            [],
-            |row| row.get::<_, u32>(0),
-        )
-        .optional()
-        .ok()
-        .flatten();
+    let actual = read_storage_contract_value(
+        connection,
+        "SELECT schema_version FROM workflow_store_contract WHERE contract_id = 1",
+    )?;
     version_phase.finish();
-    if actual != Some(WORKFLOW_STORE_SCHEMA_VERSION) {
+    let compatibility = read_storage_contract_value(
+        connection,
+        "SELECT compatibility FROM workflow_storage_compatibility WHERE contract_id = 1",
+    )?;
+    if actual.is_none_or(|revision| revision < WORKFLOW_STORE_SCHEMA_VERSION)
+        || compatibility != Some(WORKFLOW_STORE_COMPATIBILITY)
+    {
         return Err(WorkflowStoreError::UnsupportedStore {
             actual,
             expected: WORKFLOW_STORE_SCHEMA_VERSION,
@@ -26431,6 +26500,9 @@ mod tests {
         let path = workflow_database_path(temp.path());
         let connection = Connection::open(&path).expect("fixture");
         connection
+            .execute_batch("DROP TABLE workflow_storage_compatibility")
+            .expect("unknown compatibility");
+        connection
             .execute(
                 "UPDATE workflow_store_contract SET schema_version = ?1",
                 [999],
@@ -26597,6 +26669,373 @@ mod tests {
         let store =
             WorkflowStore::initialize_in_state_dir(temp.path(), 906).expect("recover upgrade");
         assert!(store.run_graph_revision("run-1").expect("graph").is_some());
+    }
+
+    /// Exercise an independent writer while the parent retains its store handle.
+    #[test]
+    fn coexistence_writer_child() {
+        let Ok(root) = std::env::var("BCODE_TEST_WORKFLOW_COEXISTENCE_ROOT") else {
+            return;
+        };
+        let mut store = WorkflowStore::open_in_state_dir(Path::new(&root)).expect("child store");
+        let mut run = new_run();
+        run.run_id = "child-run".into();
+        store.create_run(&run).expect("independent admission");
+        assert!(store.pause_run("child-run", 20).expect("child pause"));
+        assert_eq!(
+            store
+                .run_summary("run-1")
+                .expect("parent summary")
+                .expect("parent run")
+                .status,
+            RunStatus::Running
+        );
+    }
+
+    #[test]
+    fn independent_process_writer_preserves_open_store_usability() {
+        let (temp, mut store) = initialized_store();
+        let status = std::process::Command::new(std::env::current_exe().expect("test executable"))
+            .args(["--exact", "tests::coexistence_writer_child"])
+            .env("BCODE_TEST_WORKFLOW_COEXISTENCE_ROOT", temp.path())
+            .status()
+            .expect("child");
+        assert!(status.success());
+        assert!(store.pause_run("run-1", 21).expect("parent still writable"));
+        assert_eq!(
+            store
+                .run_summary("child-run")
+                .expect("child summary")
+                .expect("child run")
+                .status,
+            RunStatus::Paused
+        );
+        let reopened = WorkflowStore::open_in_state_dir(temp.path()).expect("reopen");
+        for id in ["run-1", "child-run"] {
+            assert_eq!(
+                reopened
+                    .run_summary(id)
+                    .expect("summary")
+                    .expect("run")
+                    .status,
+                RunStatus::Paused
+            );
+        }
+    }
+
+    #[test]
+    fn continuation_upgrade_preserves_schema_39_while_legacy_owner_is_present() {
+        let (temp, store) = initialized_store();
+        store
+            .connection
+            .execute_batch(
+                "DROP TABLE workflow_continuations; DROP INDEX workflow_events_kind_sequence;
+             UPDATE workflow_store_contract SET schema_version = 39;",
+            )
+            .expect("schema 39 fixture");
+        let path = store.path().to_path_buf();
+        drop(store);
+        // Historical schema-39 binaries retain this shared lock for the store lifetime.
+        // This is legacy refusal coverage, not a substitute for mixed-version acceptance.
+        let owner = open_ownership_file(path.parent().expect("root")).expect("legacy owner");
+        owner.lock_shared().expect("legacy shared ownership");
+        assert!(matches!(
+            WorkflowStore::initialize_in_state_dir(temp.path(), 907),
+            Err(WorkflowStoreError::UpgradeOwnershipUnavailable)
+        ));
+        let connection = Connection::open(&path).expect("inspect preserved fixture");
+        assert_eq!(detected_store_schema(&connection), Some(39));
+        let status: String = connection
+            .query_row(
+                "SELECT status FROM workflow_runs WHERE run_id = 'run-1'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("preserved run");
+        assert_eq!(status, "running");
+        drop(connection);
+        drop(owner);
+        let upgraded = WorkflowStore::initialize_in_state_dir(temp.path(), 908)
+            .expect("upgrade after release");
+        assert_eq!(
+            upgraded
+                .run_summary("run-1")
+                .expect("summary")
+                .expect("run")
+                .status,
+            RunStatus::Running
+        );
+        assert!(
+            upgraded
+                .continuation_lineage("run-1")
+                .expect("lineage")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn auxiliary_open_refuses_retained_exclusive_ownership_without_mutation() {
+        let (temp, store) = initialized_store();
+        let path = store.path().to_path_buf();
+        drop(store);
+        let owner = open_ownership_file(path.parent().expect("root")).expect("owner");
+        owner.lock().expect("exclusive owner");
+        let before = std::fs::read(&path).expect("database before");
+        assert!(matches!(
+            WorkflowStore::open_at_path(&path),
+            Err(WorkflowStoreError::UpgradeOwnershipUnavailable)
+        ));
+        assert_eq!(std::fs::read(&path).expect("database after"), before);
+        drop(owner);
+        let store = WorkflowStore::open_in_state_dir(temp.path()).expect("open after release");
+        assert_eq!(
+            store
+                .run_summary("run-1")
+                .expect("summary")
+                .expect("run")
+                .status,
+            RunStatus::Running
+        );
+    }
+
+    #[test]
+    fn additive_revision_child() {
+        let Ok(root) = std::env::var("BCODE_TEST_ADDITIVE_REVISION_ROOT") else {
+            return;
+        };
+        let mut store = WorkflowStore::open_in_state_dir(Path::new(&root)).expect("child open");
+        let tx = store
+            .connection
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .expect("write reservation");
+        verify_store_schema(&tx).expect("recheck contract under reservation");
+        tx.execute_batch("CREATE TABLE additive_extension (id INTEGER PRIMARY KEY);")
+            .expect("additive DDL");
+        tx.execute(
+            "UPDATE workflow_store_contract SET schema_version = ?1",
+            [WORKFLOW_STORE_SCHEMA_VERSION + 1],
+        )
+        .expect("revision");
+        if std::env::var_os("BCODE_TEST_ADDITIVE_REVISION_INTERRUPT").is_some() {
+            // Exit without Rust destructors to exercise SQLite's interruption recovery.
+            std::process::exit(73);
+        }
+        tx.commit().expect("atomic revision");
+        let mut run = new_run();
+        run.run_id = "additive-child".into();
+        store
+            .create_run(&run)
+            .expect("child admission after upgrade");
+        assert!(store.pause_run(&run.run_id, 20).expect("child progress"));
+    }
+
+    #[test]
+    fn additive_revision_process_preserves_retained_writer_after_commit_or_interruption() {
+        for interrupted in [false, true] {
+            let (temp, mut store) = initialized_store();
+            let mut child =
+                std::process::Command::new(std::env::current_exe().expect("test binary"));
+            child
+                .args(["--exact", "tests::additive_revision_child"])
+                .env("BCODE_TEST_ADDITIVE_REVISION_ROOT", temp.path());
+            if interrupted {
+                child.env("BCODE_TEST_ADDITIVE_REVISION_INTERRUPT", "1");
+            } else {
+                child.env_remove("BCODE_TEST_ADDITIVE_REVISION_INTERRUPT");
+            }
+            let status = child.status().expect("child process");
+            assert_eq!(status.code(), Some(if interrupted { 73 } else { 0 }));
+            assert!(store.pause_run("run-1", 21).expect("retained writer"));
+            let expected = WORKFLOW_STORE_SCHEMA_VERSION + u32::from(!interrupted);
+            assert_eq!(detected_store_schema(&store.connection), Some(expected));
+            let extension_exists: bool = store.connection.query_row(
+                "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'additive_extension')",
+                [], |row| row.get(0)).expect("DDL state");
+            assert_eq!(extension_exists, !interrupted);
+            let reopened = WorkflowStore::initialize_in_state_dir(temp.path(), 914)
+                .expect("reopen while retained");
+            assert_eq!(
+                reopened
+                    .run_summary("run-1")
+                    .expect("summary")
+                    .expect("run")
+                    .status,
+                RunStatus::Paused
+            );
+            assert_eq!(
+                reopened
+                    .run_summary("additive-child")
+                    .expect("child summary")
+                    .is_some(),
+                !interrupted
+            );
+        }
+    }
+
+    #[test]
+    fn compatible_additive_revision_remains_writable_with_retained_handles() {
+        let (temp, mut original) = initialized_store();
+        let mut upgraded = WorkflowStore::open_in_state_dir(temp.path()).expect("second handle");
+        let tx = upgraded
+            .connection
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .expect("migration transaction");
+        tx.execute_batch("CREATE TABLE additive_extension (id INTEGER PRIMARY KEY);")
+            .expect("additive migration");
+        tx.execute(
+            "UPDATE workflow_store_contract SET schema_version = ?1",
+            [WORKFLOW_STORE_SCHEMA_VERSION + 1],
+        )
+        .expect("revision");
+        tx.commit().expect("commit");
+        assert!(original.pause_run("run-1", 20).expect("retained writer"));
+        assert!(upgraded.resume_run("run-1", 21).expect("second writer"));
+        drop(original);
+        drop(upgraded);
+        let reopened =
+            WorkflowStore::initialize_in_state_dir(temp.path(), 910).expect("compatible reopen");
+        assert_eq!(
+            reopened
+                .run_summary("run-1")
+                .expect("summary")
+                .expect("run")
+                .status,
+            RunStatus::Running
+        );
+        assert_eq!(
+            detected_store_schema(&reopened.connection),
+            Some(WORKFLOW_STORE_SCHEMA_VERSION + 1)
+        );
+        drop(reopened);
+        assert!(WorkflowStore::reset_incompatible_store_in_state_dir(temp.path(), 911).is_err());
+    }
+
+    #[test]
+    fn schema_probe_retains_transient_lock_failure() {
+        let (temp, store) = initialized_store();
+        let path = store.path().to_path_buf();
+        drop(store);
+        let mut owner = Connection::open(&path).expect("owner");
+        owner
+            .pragma_update(None, "journal_mode", "DELETE")
+            .expect("rollback journal");
+        let observer = Connection::open(&path).expect("observer");
+        observer
+            .busy_timeout(std::time::Duration::ZERO)
+            .expect("no wait");
+        let transaction = owner
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Exclusive)
+            .expect("exclusive transaction");
+        let error = verify_store_schema(&observer).expect_err("locked schema");
+        assert!(error.is_transient_initialization_failure(), "{error}");
+        transaction.rollback().expect("release");
+        verify_store_schema(&observer).expect("same observer recovers");
+        drop(observer);
+        WorkflowStore::initialize_in_state_dir(temp.path(), 913).expect("canonical reopen");
+    }
+
+    #[test]
+    fn unknown_compatibility_preserves_current_and_future_revisions() {
+        for revision in [
+            WORKFLOW_STORE_SCHEMA_VERSION,
+            WORKFLOW_STORE_SCHEMA_VERSION + 1,
+        ] {
+            let (temp, store) = initialized_store();
+            store
+                .connection
+                .execute(
+                    "UPDATE workflow_store_contract SET schema_version = ?1",
+                    [revision],
+                )
+                .expect("revision");
+            store
+                .connection
+                .execute(
+                    "UPDATE workflow_storage_compatibility SET compatibility = 999",
+                    [],
+                )
+                .expect("unknown contract");
+            let path = store.path().to_path_buf();
+            drop(store);
+            let before = std::fs::read(&path).expect("before");
+            assert!(matches!(
+                WorkflowStore::initialize_in_state_dir(temp.path(), 912),
+                Err(WorkflowStoreError::UnsupportedStore { .. })
+            ));
+            assert_eq!(std::fs::read(path).expect("after"), before);
+        }
+    }
+
+    #[test]
+    fn initialization_retry_classification_is_limited_to_contention() {
+        assert!(
+            WorkflowStoreError::UpgradeOwnershipUnavailable.is_transient_initialization_failure()
+        );
+        for code in [rusqlite::ffi::SQLITE_BUSY, rusqlite::ffi::SQLITE_LOCKED] {
+            let error = WorkflowStoreError::Database(rusqlite::Error::SqliteFailure(
+                rusqlite::ffi::Error::new(code),
+                None,
+            ));
+            assert!(error.is_transient_initialization_failure());
+        }
+        for error in [
+            WorkflowStoreError::UnsupportedStore {
+                actual: Some(999),
+                expected: WORKFLOW_STORE_SCHEMA_VERSION,
+            },
+            WorkflowStoreError::InvalidData("damaged state".into()),
+            WorkflowStoreError::Database(rusqlite::Error::SqliteFailure(
+                rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_CORRUPT),
+                None,
+            )),
+            WorkflowStoreError::Database(rusqlite::Error::QueryReturnedNoRows),
+        ] {
+            assert!(!error.is_transient_initialization_failure());
+        }
+    }
+
+    #[test]
+    fn clean_break_transition_preserves_schema_40_runs_and_authority() {
+        let (temp, store) = initialized_store();
+        let before = store.run_summary("run-1").expect("summary");
+        let authority = store.execution_authority("run-1").expect("authority");
+        store
+            .connection
+            .execute_batch(
+                "DROP TABLE workflow_storage_compatibility;
+             UPDATE workflow_store_contract SET schema_version = 40;",
+            )
+            .expect("pre-contract fixture");
+        drop(store);
+        assert!(matches!(
+            WorkflowStore::open_in_state_dir(temp.path()),
+            Err(WorkflowStoreError::UnsupportedStore {
+                actual: Some(40),
+                ..
+            })
+        ));
+        let upgraded =
+            WorkflowStore::initialize_in_state_dir(temp.path(), 920).expect("transition");
+        assert_eq!(upgraded.run_summary("run-1").expect("summary"), before);
+        assert_eq!(
+            upgraded.execution_authority("run-1").expect("authority"),
+            authority
+        );
+        assert_eq!(
+            detected_store_schema(&upgraded.connection),
+            Some(WORKFLOW_STORE_SCHEMA_VERSION)
+        );
+        assert!(
+            upgraded
+                .path()
+                .parent()
+                .expect("root")
+                .join(MIGRATION_BACKUP_DIRECTORY)
+                .is_dir()
+        );
+        drop(upgraded);
+        let reopened = WorkflowStore::open_in_state_dir(temp.path()).expect("reopen");
+        assert_eq!(reopened.run_summary("run-1").expect("summary"), before);
     }
 
     #[test]
