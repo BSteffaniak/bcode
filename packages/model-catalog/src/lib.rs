@@ -3433,7 +3433,7 @@ mod tests {
     }
 
     #[test]
-    fn openai_fallback_prefers_gpt_6_astra_then_gpt_5_6_sol_then_terra() {
+    fn openai_fallback_prefers_gpt_6_astra_then_sol_then_luna() {
         let catalog = ModelCatalog::load_bundled().expect("catalog should load");
         let provider = catalog.provider("openai").expect("openai provider exists");
 
@@ -3443,7 +3443,7 @@ mod tests {
                 .iter()
                 .take(3)
                 .collect::<Vec<_>>(),
-            vec!["gpt-6-astra", "gpt-5.6-sol", "gpt-5.6-terra"]
+            vec!["gpt-6-astra", "gpt-6-sol", "gpt-6-luna"]
         );
     }
 

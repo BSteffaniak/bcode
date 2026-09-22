@@ -6,6 +6,8 @@ default_model_id = "gpt-4.1-mini"
 default_codex_model_id = "gpt-6-astra"
 fallback_model_ids = [
   "gpt-6-astra",
+  "gpt-6-sol",
+  "gpt-6-luna",
   "gpt-5.6-sol",
   "gpt-5.6-terra",
   "gpt-5.5",
@@ -547,6 +549,208 @@ effort_values = ["low", "medium", "high", "xhigh", "max"]
 default_effort = "medium"
 summary_values = ["auto", "concise", "detailed"]
 default_summary = "auto"
+
+[models."gpt-6-sol"]
+model_id = "gpt-6-sol"
+display_name = "GPT-6 Sol"
+aliases = ["gpt-6-sol*"]
+status = "stable"
+bcode_support = "supported"
+family = "gpt-6"
+context_window = 1050000
+max_output_tokens = 128000
+documentation_url = "https://developers.openai.com/api/docs/models/gpt-6-sol"
+notes = "Maximum API input: 922,000 tokens. Chat Completions function calling requires reasoning effort none; use Responses for reasoning with tools. Codex subscription availability and limits are not verified. Pricing rules cover Standard processing; regional, Batch, Flex, and Fast adjustments are not represented."
+
+[[models."gpt-6-sol".deployments]]
+provider = "openai"
+auth_mode = "api_key"
+api_surface = "responses_api"
+integration = "bcode"
+context_window = 1050000
+max_output_tokens = 128000
+
+[models."gpt-6-sol".pricing]
+# OpenAI model documentation, 2026-09-22. Above 272K input tokens,
+# the whole request bills 2x input/cache rates and 1.5x output.
+currency = "USD"
+unit = "per_million_tokens"
+context_threshold_tokens = 272000
+input_micros = 2000000
+cached_input_micros = 200000
+cache_write_input_micros = 2500000
+output_micros = 10000000
+
+[[models."gpt-6-sol".pricing.rules]]
+bucket = "input"
+modality = "text"
+invocation_class = "on_demand"
+max_request_input_tokens = 272000
+price_micros = 2000000
+
+[[models."gpt-6-sol".pricing.rules]]
+bucket = "input"
+modality = "text"
+invocation_class = "on_demand"
+min_request_input_tokens = 272001
+price_micros = 4000000
+
+[[models."gpt-6-sol".pricing.rules]]
+bucket = "cache_read_input"
+modality = "text"
+invocation_class = "on_demand"
+max_request_input_tokens = 272000
+price_micros = 200000
+
+[[models."gpt-6-sol".pricing.rules]]
+bucket = "cache_read_input"
+modality = "text"
+invocation_class = "on_demand"
+min_request_input_tokens = 272001
+price_micros = 400000
+
+[[models."gpt-6-sol".pricing.rules]]
+bucket = "cache_write_input"
+modality = "text"
+invocation_class = "on_demand"
+max_request_input_tokens = 272000
+price_micros = 2500000
+
+[[models."gpt-6-sol".pricing.rules]]
+bucket = "cache_write_input"
+modality = "text"
+invocation_class = "on_demand"
+min_request_input_tokens = 272001
+price_micros = 5000000
+
+[[models."gpt-6-sol".pricing.rules]]
+bucket = "output"
+modality = "text"
+invocation_class = "on_demand"
+max_request_input_tokens = 272000
+price_micros = 10000000
+
+[[models."gpt-6-sol".pricing.rules]]
+bucket = "output"
+modality = "text"
+invocation_class = "on_demand"
+min_request_input_tokens = 272001
+price_micros = 15000000
+
+[models."gpt-6-sol".capabilities]
+text_input = true
+image_input = true
+text_output = true
+tool_use = true
+structured_outputs = true
+reasoning = true
+prompt_cache = true
+native_web_search = true
+
+[models."gpt-6-sol".reasoning]
+effort_values = ["none", "low", "medium", "high", "xhigh", "max"]
+default_effort = "medium"
+
+[models."gpt-6-luna"]
+model_id = "gpt-6-luna"
+display_name = "GPT-6 Luna"
+aliases = ["gpt-6-luna*"]
+status = "stable"
+bcode_support = "supported"
+family = "gpt-6"
+context_window = 1050000
+max_output_tokens = 128000
+documentation_url = "https://developers.openai.com/api/docs/models/gpt-6-luna"
+notes = "Maximum API input: 922,000 tokens. Chat Completions function calling requires reasoning effort none; use Responses for reasoning with tools. Codex subscription availability and limits are not verified. Pricing rules cover Standard processing; regional, Batch, Flex, and Fast adjustments are not represented."
+
+[[models."gpt-6-luna".deployments]]
+provider = "openai"
+auth_mode = "api_key"
+api_surface = "responses_api"
+integration = "bcode"
+context_window = 1050000
+max_output_tokens = 128000
+
+[models."gpt-6-luna".pricing]
+# OpenAI model documentation, 2026-09-22. Above 272K input tokens,
+# the whole request bills 2x input/cache rates and 1.5x output.
+currency = "USD"
+unit = "per_million_tokens"
+context_threshold_tokens = 272000
+input_micros = 100000
+cached_input_micros = 10000
+cache_write_input_micros = 125000
+output_micros = 500000
+
+[[models."gpt-6-luna".pricing.rules]]
+bucket = "input"
+modality = "text"
+invocation_class = "on_demand"
+max_request_input_tokens = 272000
+price_micros = 100000
+
+[[models."gpt-6-luna".pricing.rules]]
+bucket = "input"
+modality = "text"
+invocation_class = "on_demand"
+min_request_input_tokens = 272001
+price_micros = 200000
+
+[[models."gpt-6-luna".pricing.rules]]
+bucket = "cache_read_input"
+modality = "text"
+invocation_class = "on_demand"
+max_request_input_tokens = 272000
+price_micros = 10000
+
+[[models."gpt-6-luna".pricing.rules]]
+bucket = "cache_read_input"
+modality = "text"
+invocation_class = "on_demand"
+min_request_input_tokens = 272001
+price_micros = 20000
+
+[[models."gpt-6-luna".pricing.rules]]
+bucket = "cache_write_input"
+modality = "text"
+invocation_class = "on_demand"
+max_request_input_tokens = 272000
+price_micros = 125000
+
+[[models."gpt-6-luna".pricing.rules]]
+bucket = "cache_write_input"
+modality = "text"
+invocation_class = "on_demand"
+min_request_input_tokens = 272001
+price_micros = 250000
+
+[[models."gpt-6-luna".pricing.rules]]
+bucket = "output"
+modality = "text"
+invocation_class = "on_demand"
+max_request_input_tokens = 272000
+price_micros = 500000
+
+[[models."gpt-6-luna".pricing.rules]]
+bucket = "output"
+modality = "text"
+invocation_class = "on_demand"
+min_request_input_tokens = 272001
+price_micros = 750000
+
+[models."gpt-6-luna".capabilities]
+text_input = true
+image_input = true
+text_output = true
+tool_use = true
+structured_outputs = true
+reasoning = true
+prompt_cache = true
+native_web_search = true
+
+[models."gpt-6-luna".reasoning]
+effort_values = ["none", "low", "medium", "high", "xhigh", "max"]
+default_effort = "medium"
 
 [models."gpt-5.6-sol"]
 model_id = "gpt-5.6-sol"
