@@ -64,7 +64,6 @@ jobs:
     timeout-minutes: 90
     strategy:
       fail-fast: false
-      max-parallel: 6
       matrix:
         package: ${{ fromJson(needs.analyze.outputs.matrix) }}
     steps:
