@@ -6,6 +6,7 @@
 
 use bcode_agent_profile::{AgentInfo, PolicyStatusResponse};
 use bcode_metrics::MetricsSnapshot;
+#[cfg(unix)]
 use bcode_plugin_sdk::path::display_from_current_dir;
 use bcode_session_models::{
     ClientId, ProjectionWindowRequest, SessionDerivationPromptPage, SessionDerivationPromptQuery,
@@ -25,6 +26,7 @@ use sha2::{Digest as _, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 use std::env;
 use std::fmt;
+#[cfg(unix)]
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
@@ -49,12 +51,14 @@ impl LocalIpcListener {
     /// endpoint appears to already have a live listener, stale endpoint cleanup
     /// fails, or the listener cannot be created.
     pub fn bind(endpoint: &IpcEndpoint) -> Result<Self, IpcTransportError> {
+        #[cfg(unix)]
         prepare_endpoint_for_bind(endpoint)?;
         match bmux_ipc::transport::LocalIpcListener::bind(endpoint) {
             Ok(inner) => Ok(Self { inner }),
             Err(IpcTransportError::Io(error))
                 if error.kind() == std::io::ErrorKind::AlreadyExists =>
             {
+                #[cfg(unix)]
                 prepare_endpoint_for_bind(endpoint)?;
                 Ok(Self {
                     inner: bmux_ipc::transport::LocalIpcListener::bind(endpoint)?,
@@ -3004,11 +3008,6 @@ fn prepare_endpoint_for_bind(endpoint: &IpcEndpoint) -> Result<(), IpcTransportE
     if let Some(path) = endpoint.as_unix_socket() {
         prepare_unix_socket_path_for_bind(path)?;
     }
-    Ok(())
-}
-
-#[cfg(not(unix))]
-const fn prepare_endpoint_for_bind(_endpoint: &IpcEndpoint) -> Result<(), IpcTransportError> {
     Ok(())
 }
 
