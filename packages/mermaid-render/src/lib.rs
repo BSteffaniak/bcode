@@ -399,6 +399,11 @@ fn spawn_worker(
 ) -> Result<(std::process::Child, WorkerMemoryGuard), MermaidRenderError> {
     let mut command = std::process::Command::new(worker_path);
     configure_worker_memory_limit(&mut command);
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt as _;
+        command.process_group(0);
+    }
     let mut child = command
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
@@ -771,6 +776,12 @@ fn terminate_worker(child: &mut std::process::Child, guard: &WorkerMemoryGuard) 
 
 #[cfg(not(windows))]
 fn terminate_worker(child: &mut std::process::Child, _guard: &WorkerMemoryGuard) {
+    #[cfg(unix)]
+    if let Ok(pid) = i32::try_from(child.id()) {
+        // SAFETY: the unreaped child leads the dedicated group created at spawn.
+        // Kill descendants too so inherited response pipes cannot keep the reader blocked.
+        unsafe { libc::kill(-pid, libc::SIGKILL) };
+    }
     let _ = child.kill();
     let _ = child.wait();
 }
