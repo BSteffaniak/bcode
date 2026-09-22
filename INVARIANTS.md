@@ -11,6 +11,7 @@ An invariant is a durable condition of a valid product or architecture. Contribu
 * **Clients use defined application boundaries.** Frontends and integrations must not acquire private daemon, persistence, or provider implementation details to perform application behavior.
 * **Daemon artifact versions are isolated.** A client may connect only to the exact daemon artifact identity it targets; when no matching daemon is available, startup coordination launches one matching daemon without replacing, blocking, or depending on other artifact versions.
 * **Daemon state locations are isolated.** A client may connect only to a daemon serving the state location it resolved; daemons serving different state locations coexist without sharing endpoints, registries, or coordination state.
+* **Workflow availability is independent of daemon artifact identity.** Multiple daemon instances, including different artifact versions, must be able to concurrently admit and execute independent workflows within the same state location. A daemon’s presence or lifetime must not reserve the workflow domain, prevent another daemon from using it, or require stopping other daemons for ordinary workflow use. Execution authority is scoped to individual runs, not the workflow domain, and is transferable through verified handoff rather than permanently bound to an artifact. Cross-version storage evolution must preserve this coexistence without bypassing compatibility checks or execution fencing.
 
 ## Package and dependency ownership
 

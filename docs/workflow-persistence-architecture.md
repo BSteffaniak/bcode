@@ -1,5 +1,11 @@
 # Workflow Persistence Architecture
 
+## Cross-artifact workflow coexistence (implementation gap)
+
+Workflow availability must satisfy the cross-artifact coexistence invariant in `INVARIANTS.md`. The current exact-schema open contract and lifetime shared ownership locks can block another artifact’s required upgrade, leaving its workflow domain unavailable. This is an implementation gap, not the intended operational contract.
+
+The replacement must support concurrent independent runs across daemon artifacts through explicit storage compatibility, coexistence-preserving evolution, and run-scoped execution fencing. Removing ownership checks, creating per-artifact canonical stores, or requiring other daemons to stop is not a conforming fix. Legacy-binary transition constraints must be documented separately from steady-state behavior.
+
 ## Package-local execution binding (partial implementation)
 
 Schema 32 adds `workflow_run_packages`. Package export startup supplies an exact
