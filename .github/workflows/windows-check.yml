@@ -97,8 +97,8 @@ jobs:
           $global:LASTEXITCODE = 0
 
       - name: Validate Windows dependency portability
-        shell: pwsh
-        run: bash scripts/check-windows-dependency-portability.sh
+        shell: bash
+        run: scripts/check-windows-dependency-portability.sh
 
       - name: Run Windows-specific contract tests
         run: |
