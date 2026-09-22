@@ -3444,12 +3444,12 @@ mod tests {
                 bcode_tool::ToolHostContextEntry {
                     schema: bcode_tool::TOOL_WORKSPACE_CONTEXT_SCHEMA.to_owned(),
                     schema_version: bcode_tool::TOOL_WORKSPACE_CONTEXT_SCHEMA_VERSION,
-                    payload: serde_json::json!({"working_directory": "/tmp/workspace"}),
+                    payload: serde_json::json!({"working_directory": std::env::temp_dir().join("workspace")}),
                 },
                 bcode_tool::ToolHostContextEntry {
                     schema: bcode_tool::TOOL_ARTIFACT_CONTEXT_SCHEMA.to_owned(),
                     schema_version: bcode_tool::TOOL_ARTIFACT_CONTEXT_SCHEMA_VERSION,
-                    payload: serde_json::json!({"root": "/tmp/artifacts/session-1"}),
+                    payload: serde_json::json!({"root": std::env::temp_dir().join("artifacts/session-1")}),
                 },
             ],
         ));
@@ -3462,8 +3462,8 @@ mod tests {
             serde_json::from_value::<ShellPreparationDescriptor>(prepared.descriptor)
                 .expect("Shell descriptor"),
             ShellPreparationDescriptor {
-                workspace_root: Some(PathBuf::from("/tmp/workspace")),
-                artifact_root: Some(PathBuf::from("/tmp/artifacts/session-1")),
+                workspace_root: Some(std::env::temp_dir().join("workspace")),
+                artifact_root: Some(std::env::temp_dir().join("artifacts/session-1")),
                 timeout_ms: DEFAULT_SHELL_TIMEOUT_MS,
             }
         );
@@ -3507,7 +3507,7 @@ mod tests {
                     activation_id: "activation".to_string(),
                     attempt: 0,
                     preparation_identity: "workflow-preparation:run:node:activation".to_string(),
-                    workspace_root: PathBuf::from("/tmp/workspace"),
+                    workspace_root: std::env::temp_dir().join("workspace"),
                 },
                 input: serde_json::json!("git status --short"),
             })
@@ -5400,6 +5400,7 @@ mod tests {
 
     #[test]
     fn terminal_response_uses_replay_pty_artifact_when_direnv_prelude_was_suppressed() {
+        let replay_path = std::env::temp_dir().join("replay.txt");
         let raw = LimitedOutput {
             text: "direnv: loading\n__BCODE_DIRENV_READY_call__\n\u{1b}[31mhello\u{1b}[0m\n"
                 .to_string(),
@@ -5444,7 +5445,7 @@ mod tests {
                     replay,
                     clean,
                     raw_artifact_path: Some(PathBuf::from("/tmp/raw.txt")),
-                    replay_artifact_path: Some(PathBuf::from("/tmp/replay.txt")),
+                    replay_artifact_path: Some(replay_path),
                     clean_artifact_path: Some(PathBuf::from("/tmp/clean.txt")),
                     recording_path: None,
                     recording_writer: None,
@@ -5481,8 +5482,12 @@ mod tests {
             .find(|reference| reference.key == TERMINAL_PTY_STREAM_REF_KEY)
             .expect("replay pty ref should exist");
         assert_eq!(
-            replay_ref.storage_uri.as_deref(),
-            Some("file:///tmp/replay.txt")
+            replay_ref.storage_uri,
+            Some(
+                url::Url::from_file_path(std::env::temp_dir().join("replay.txt"))
+                    .expect("absolute path")
+                    .to_string()
+            )
         );
     }
 
