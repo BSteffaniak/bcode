@@ -1081,7 +1081,6 @@ mod tests {
         assert!(!invalid_vault.exists());
     }
 
-    #[cfg(not(feature = "custody-simulation"))]
     fn update_service_request(
         provider_id: &str,
         profile: &str,
