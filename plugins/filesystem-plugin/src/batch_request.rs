@@ -792,6 +792,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn omitted_committed_changes_retain_exact_sources_without_changing_outcome() {
         let root = crate::tests::temp_dir("batch-retained-change");
         let path = root.join("large");
@@ -1131,6 +1132,18 @@ mod tests {
     }
 
     #[test]
+    #[cfg(not(unix))]
+    fn multi_edit_refuses_unsupported_identity_checks_without_mutation() {
+        let home = crate::tests::temp_dir("unsupported-batch");
+        let path = home.join("source.txt");
+        std::fs::write(&path, "original").unwrap();
+        let request =
+            json!({"files":[{"path":path,"edits":[{"old_text":"original","new_text":"changed"}]}]});
+        assert!(prepare(&request, None).unwrap_err().contains("unsupported"));
+        assert_eq!(std::fs::read_to_string(path).unwrap(), "original");
+    }
+
+    #[test]
     fn descriptor_rejects_unknown_versions_and_fields() {
         let target =
             json!({"path":"/target","device":1,"inode":2,"parent_device":1,"parent_inode":3});
@@ -1145,7 +1158,7 @@ mod tests {
         assert!(
             serde_json::from_value::<PreparedBatch>(json!({
                 "version":1,"request_digest":vec![0u8;32],"targets":(0..MAX_FILES).map(|index| json!({
-                    "path":format!("/target-{index}"),"device":1,"inode":index,
+                    "path":std::env::temp_dir().join(format!("target-{index}")),"device":1,"inode":index,
                     "parent_device":1,"parent_inode":3
                 })).collect::<Vec<_>>()
             }))

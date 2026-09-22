@@ -1134,6 +1134,7 @@ mod tests {
         }
     }
     use super::*;
+    use std::path::Path;
 
     fn terminal_native_syntax_theme() -> bcode_plugin_sdk::tui::PluginTuiTheme {
         use bcode_plugin_sdk::tui::{
@@ -1712,7 +1713,10 @@ mod tests {
         );
         let rendered = rows.iter().map(line_text).collect::<Vec<_>>().join("\n");
         assert!(rendered.contains("Text matches (1)"), "{rendered}");
-        assert!(rendered.contains("src/lib.rs"), "{rendered}");
+        assert!(
+            rendered.contains(&Path::new("src").join("lib.rs").display().to_string()),
+            "{rendered}"
+        );
         assert!(rendered.contains("  7 │ needle here"), "{rendered}");
     }
 
@@ -1846,8 +1850,20 @@ mod tests {
         );
         let rendered = rows.iter().map(line_text).collect::<Vec<_>>().join("\n");
 
-        assert_eq!(rendered.matches("src/lib.rs").count(), 1, "{rendered}");
-        assert_eq!(rendered.matches("src/main.rs").count(), 1, "{rendered}");
+        assert_eq!(
+            rendered
+                .matches(&Path::new("src").join("lib.rs").display().to_string())
+                .count(),
+            1,
+            "{rendered}"
+        );
+        assert_eq!(
+            rendered
+                .matches(&Path::new("src").join("main.rs").display().to_string())
+                .count(),
+            1,
+            "{rendered}"
+        );
         assert!(rendered.contains("    7 │ pub fn first() {}"), "{rendered}");
         assert!(
             rendered.contains("  123 │ pub fn second() {}"),
