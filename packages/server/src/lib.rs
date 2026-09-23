@@ -62003,9 +62003,9 @@ event_symbol = "bcode_plugin_handle_event_v1"
         let url = format!("http://{}", listener.local_addr().expect("address"));
         let http = std::thread::spawn(move || {
             for (method, body) in [
-                ("GET /v1/models", r#"{"models":[{"name":"jev-1"}]}"#),
+                ("GET /api/v1/models", r#"{"models":[{"name":"jev-1"}]}"#),
                 (
-                    "POST /v1/systemone",
+                    "POST /api/v1/decide",
                     r#"{"model":"jev-1","answers":{"is_true":{"type":"noul","noul":0.8}},"usage":{"input_tokens":4,"output_tokens":2}}"#,
                 ),
             ] {
@@ -62106,6 +62106,106 @@ event_symbol = "bcode_plugin_handle_event_v1"
             .expect("server task");
         http.join().expect("fake Jev finished");
         drop(state);
+    }
+
+    #[tokio::test]
+    #[ignore = "requires a temporary BCODE_JEV_LIVE_KEY and makes a billed network request"]
+    #[allow(clippy::significant_drop_tightening)] // The test owns the server state until shutdown.
+    async fn judgement_client_ipc_live_jev() {
+        assert!(
+            std::env::var("BCODE_JEV_LIVE_KEY").is_ok(),
+            "supply an ephemeral key"
+        );
+        let plugin = bcode_plugin::StaticBundledPlugin::new(
+            include_str!("../../../plugins/jev-provider-plugin/bcode-plugin.toml"),
+            bcode_jev_provider_plugin::static_plugin(),
+        );
+        let plugins = bcode_plugin::PluginRuntimeHost::load_defaults_with_static_bundled(
+            &bcode_plugin::PluginSelection {
+                mode: bcode_plugin::PluginSelectionMode::Explicit,
+                enabled: BTreeSet::from(["bcode.jev".into()]),
+                disabled: BTreeSet::new(),
+            },
+            &[plugin],
+        )
+        .expect("load Jev");
+        let mut server_state = test_server_state(SessionManager::default());
+        server_state.plugins = plugins;
+        server_state.startup_config.auth.profiles.insert(
+            "jev-live".into(),
+            bcode_config::AuthProfileConfig {
+                backend: "aws".into(),
+                owner_plugin_id: Some("bcode.jev".into()),
+                provider_id: Some("bcode.jev".into()),
+                scheme: Some("api_key".into()),
+                map: BTreeMap::from([(
+                    "api_key".into(),
+                    bcode_config::AuthCredentialMapping {
+                        env: Some("BCODE_JEV_LIVE_KEY".into()),
+                        key: None,
+                    },
+                )]),
+                settings: BTreeMap::from([(
+                    "env.BCODE_JEV_LIVE_KEY".into(),
+                    std::env::var("BCODE_JEV_LIVE_KEY").expect("ephemeral key"),
+                )]),
+            },
+        );
+        let state = Arc::new(server_state);
+        let resolved = bcode_provider_auth::resolve_explicit_profile_context(
+            &state.startup_config,
+            "bcode.jev",
+            "jev-live",
+        )
+        .expect("resolve live auth profile");
+        assert!(
+            resolved
+                .auth
+                .as_ref()
+                .and_then(|auth| auth.credentials.get("api_key"))
+                .is_some(),
+            "missing live credential"
+        );
+        assert_eq!(resolved.settings.get("base_url"), None);
+        let socket_dir = tempfile::tempdir().expect("IPC directory");
+        let endpoint = bcode_ipc::IpcEndpoint::unix_socket(socket_dir.path().join("server.sock"));
+        let listener = LocalIpcListener::bind(&endpoint).expect("IPC listener");
+        let (shutdown, stopped) = tokio::sync::oneshot::channel();
+        let server = tokio::spawn(serve_runtime_test_clients(
+            listener,
+            Arc::clone(&state),
+            stopped,
+        ));
+        let client = bcode_client::BcodeClient::new(endpoint);
+        let result = client
+            .judge(
+                "bcode.jev".into(),
+                "jev-live".into(),
+                bcode_model::judgement::Request {
+                    model_id: "jev-latest".into(),
+                    state: bcode_model::judgement::State::Text(
+                        "Customer asks for a refund.".into(),
+                    ),
+                    questions: BTreeMap::from([(
+                        "refund_requested".into(),
+                        bcode_model::judgement::Question::YesNo {
+                            instructions: "Does the customer request a refund?".into(),
+                        },
+                    )]),
+                },
+            )
+            .await;
+        shutdown.send(()).expect("stop server");
+        tokio::time::timeout(Duration::from_secs(5), server)
+            .await
+            .expect("shutdown deadline")
+            .expect("server task");
+        let response = result.expect("live judgement through application route");
+        assert!(matches!(
+            response.answers["refund_requested"],
+            bcode_model::judgement::Answer::YesNo { probability } if (0.0..=1.0).contains(&probability)
+        ));
+        assert!(response.usage.expect("usage").input_tokens > 0);
     }
 
     #[tokio::test]

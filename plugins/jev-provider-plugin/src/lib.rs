@@ -15,7 +15,9 @@ use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 use std::time::Duration;
 
-const DEFAULT_BASE_URL: &str = "https://api.typesafe.ai";
+const DEFAULT_BASE_URL: &str = "https://jevtypesafeai.com";
+const VERIFIED_MODEL_ID: &str = "jev-1.13.0";
+const MODEL_ALIAS: &str = "jev-latest";
 
 /// `TypeSafe` Jev judgement provider.
 #[derive(Default)]
@@ -168,8 +170,24 @@ fn supported_kinds() -> BTreeSet<QuestionKind> {
 }
 
 async fn discover_models(context: &ProviderRequestContext) -> Result<ModelList, &'static str> {
+    if base_url(context)? == DEFAULT_BASE_URL {
+        // This API currently exposes no authenticated model-list route. Advertise only the
+        // alias and concrete model observed on its decision endpoint, not another host's list.
+        credential(context)?;
+        return Ok(ModelList {
+            provider_id: "bcode.jev".into(),
+            question_kinds: supported_kinds(),
+            models: [MODEL_ALIAS, VERIFIED_MODEL_ID]
+                .into_iter()
+                .map(|id| Model {
+                    model_id: id.into(),
+                    question_kinds: supported_kinds(),
+                })
+                .collect(),
+        });
+    }
     let key = credential(context)?;
-    let url = format!("{}/v1/models", base_url(context)?);
+    let url = format!("{}/api/v1/models", base_url(context)?);
     let response = http_client()?
         .get(url)
         .bearer_auth(key)
@@ -225,7 +243,7 @@ async fn judge(envelope: &ProviderRequest) -> Result<Response, &'static str> {
             return Err("score rubric exceeds provider limit");
         }
     }
-    let url = format!("{}/v1/systemone", base_url(&envelope.provider_context)?);
+    let url = format!("{}/api/v1/decide", base_url(&envelope.provider_context)?);
     let questions = envelope.judgement.questions.iter().map(|(id, question)| {
         let wire = match question {
             Question::Choice { instructions, options } => serde_json::json!({"type":"choice", "instructions":instructions, "criteria":options}),
@@ -261,14 +279,7 @@ async fn judge(envelope: &ProviderRequest) -> Result<Response, &'static str> {
         serde_json::from_slice(&bytes).map_err(|_| "invalid judgement provider response")?;
     if wire.model.is_empty()
         || (wire.model != envelope.judgement.model_id
-            && !matches!(
-                envelope.judgement.model_id.as_str(),
-                "jev-latest" | "jev-preview"
-            ))
-        || (matches!(
-            envelope.judgement.model_id.as_str(),
-            "jev-latest" | "jev-preview"
-        ) && !wire.model.starts_with("jev-"))
+            && !(envelope.judgement.model_id == MODEL_ALIAS && wire.model == VERIFIED_MODEL_ID))
     {
         return Err("invalid judgement provider model identity");
     }
@@ -491,10 +502,34 @@ mod tests {
     }
 
     #[test]
+    fn default_endpoint_advertises_only_verified_decision_models() {
+        let provider_context = context(DEFAULT_BASE_URL.into());
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let list = runtime
+            .block_on(discover_models(&provider_context))
+            .unwrap();
+        assert_eq!(list.provider_id, "bcode.jev");
+        assert_eq!(list.models.len(), 2);
+        assert_eq!(list.models[0].model_id, MODEL_ALIAS);
+        assert_eq!(list.models[1].model_id, VERIFIED_MODEL_ID);
+        assert!(
+            list.models
+                .iter()
+                .all(|model| model.question_kinds == supported_kinds())
+        );
+        let mut unauthenticated = provider_context;
+        unauthenticated.auth = None;
+        assert!(runtime.block_on(discover_models(&unauthenticated)).is_err());
+    }
+
+    #[test]
     fn authenticated_discovery_and_judgement_over_http() {
         let (url, handle) = fake_http(vec![
-            ("GET /v1/models".into(), r#"{"models":[{"name":"jev-1"}]}"#.into()),
-            ("POST /v1/systemone".into(), r#"{"model":"jev-1","answers":{"q":{"type":"noul","noul":0.7}},"usage":{"input_tokens":11,"output_tokens":3}}"#.into()),
+            ("GET /api/v1/models".into(), r#"{"models":[{"name":"jev-1"}]}"#.into()),
+            ("POST /api/v1/decide".into(), r#"{"model":"jev-1","answers":{"q":{"type":"noul","noul":0.7}},"usage":{"input_tokens":11,"output_tokens":3}}"#.into()),
         ]);
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -530,7 +565,7 @@ mod tests {
     #[test]
     fn upstream_auth_failure_does_not_expose_body_or_secret() {
         let (url, handle) = fake_http_with_status(vec![(
-            "GET /v1/models".into(),
+            "GET /api/v1/models".into(),
             "test-only-credential private provider error".into(),
             401,
         )]);
@@ -550,7 +585,7 @@ mod tests {
     #[test]
     fn oversized_http_discovery_is_rejected() {
         let (url, handle) = fake_http(vec![(
-            "GET /v1/models".into(),
+            "GET /api/v1/models".into(),
             "x".repeat(judgement::MAX_RESPONSE_BYTES + 1),
         )]);
         let runtime = tokio::runtime::Builder::new_current_thread()
@@ -585,7 +620,7 @@ mod tests {
             ),
         ] {
             let (url, handle) =
-                fake_http_with_status(vec![("POST /v1/systemone".into(), body.into(), status)]);
+                fake_http_with_status(vec![("POST /api/v1/decide".into(), body.into(), status)]);
             let envelope = ProviderRequest {
                 judgement: judgement::Request {
                     model_id: "jev-1".into(),
@@ -649,7 +684,7 @@ mod tests {
                 input.extend_from_slice(&buffer[..len]);
                 assert!(input.len() < judgement::MAX_REQUEST_BYTES);
             }
-            assert!(String::from_utf8_lossy(&input).starts_with("GET /v1/models"));
+            assert!(String::from_utf8_lossy(&input).starts_with("GET /api/v1/models"));
             stream
                 .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 100\r\n\r\n{")
                 .expect("write partial reply");
