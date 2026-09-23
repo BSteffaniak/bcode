@@ -2565,6 +2565,7 @@ impl SessionDb {
             .select("session_usage_requests")
             .columns(&[
                 "request_key",
+                "event_seq",
                 "first_observed_at_ms",
                 "usage_json",
                 "cost_json",
@@ -2593,10 +2594,27 @@ impl SessionDb {
                 .map(|json| serde_json::from_str(&json))
                 .transpose()?;
             usage.validate().map_err(invalid)?;
+            let canonical = self
+                .db
+                .select("events")
+                .columns(&["payload"])
+                .where_eq("event_seq", required_i64(&row, "event_seq")?)
+                .execute_first(&**self.db)
+                .await?
+                .ok_or_else(|| invalid("missing canonical usage evidence".into()))?;
+            let evidence =
+                crate::persisted::original_usage(&required_string(&canonical, "payload")?)
+                    .map_err(invalid)?
+                    .map(|original| bcode_session_models::SessionUsageEvidence {
+                        complete: original.complete,
+                        report_count: original.reports.len(),
+                        capture_issue: original.capture_issue,
+                    });
             entries.push(SessionUsageEntry {
                 key,
                 first_observed_at_ms,
                 usage,
+                evidence,
             });
         }
         let after = self.session_usage_summary().await?;
@@ -9485,6 +9503,26 @@ mod tests {
         assert!(!serde_json::to_string(&decoded).unwrap().contains("future"));
     }
 
+    async fn assert_usage_evidence_is_private(db: &SessionDb) {
+        let page = db
+            .usage_page(&bcode_session_models::SessionUsageQuery {
+                range: bcode_session_models::SessionCostRange {
+                    from_timestamp_ms: 0,
+                    to_timestamp_ms: 101,
+                },
+                after: None,
+                limit: 1,
+                generation: None,
+            })
+            .await
+            .unwrap();
+        let evidence = page.entries[0].evidence.as_ref().unwrap();
+        assert!(evidence.complete);
+        assert_eq!(evidence.report_count, 1);
+        assert_eq!(evidence.capture_issue, None);
+        assert!(!serde_json::to_string(&page).unwrap().contains("future"));
+    }
+
     #[tokio::test]
     async fn original_usage_survives_reopen_and_corrected_normalization() {
         let root = tempfile::tempdir().unwrap();
@@ -9537,6 +9575,7 @@ mod tests {
             .await
             .unwrap();
         let prior_summary = db.session_usage_summary().await.unwrap();
+        assert_usage_evidence_is_private(&db).await;
         let rejected: crate::actor::UsageNormalizer =
             Arc::new(|_| Box::pin(async { Err("normalizer unavailable".into()) }));
         assert!(

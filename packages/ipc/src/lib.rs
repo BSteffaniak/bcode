@@ -1213,6 +1213,11 @@ pub enum Request {
         session_id: SessionId,
         apply: bool,
     },
+    /// Read bounded accounting contributions without collecting or repairing them.
+    SessionUsage {
+        session_id: SessionId,
+        query: bcode_session_models::SessionUsageQuery,
+    },
 }
 
 /// Server stop request policy.
@@ -2382,6 +2387,9 @@ pub enum ResponsePayload {
     },
     SessionAdmission {
         report: bcode_session_models::StorageAdmissionReport,
+    },
+    SessionUsage {
+        page: bcode_session_models::SessionUsagePage,
     },
 }
 

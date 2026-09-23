@@ -60,8 +60,8 @@ pub use original_usage::{
 
 mod usage_query;
 pub use usage_query::{
-    MAX_SESSION_USAGE_PAGE_SIZE, SessionUsageEntry, SessionUsageGeneration, SessionUsagePage,
-    SessionUsageQuery,
+    MAX_SESSION_USAGE_PAGE_SIZE, SessionUsageEntry, SessionUsageEvidence, SessionUsageGeneration,
+    SessionUsagePage, SessionUsageQuery,
 };
 mod cost;
 pub use cost::{SessionCostRange, SessionRepriceReport, SessionUsageSource, SessionUsageValuation};

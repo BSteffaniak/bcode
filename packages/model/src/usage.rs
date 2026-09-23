@@ -36,6 +36,38 @@ pub trait UsageDecoder: Send + Sync {
         self.normalize(original)
     }
 
+    /// Decode a borrowed billing object independently of its retention budget.
+    /// Implementations may decode selected fields without retaining unknown provider data.
+    /// The default preserves the bounded original-report path for existing decoders.
+    ///
+    /// # Errors
+    /// Returns an error for unsupported or oversized billing data.
+    fn observe_json(
+        &self,
+        previous: Option<&TokenUsage>,
+        usage_json: &str,
+        source: &str,
+        requested: &std::collections::BTreeMap<String, String>,
+        confirmed: &std::collections::BTreeMap<String, String>,
+    ) -> Result<TokenUsage, String> {
+        if usage_json.len() > bcode_session_models::MAX_ORIGINAL_USAGE_BYTES {
+            return Err("usage exceeds decoder budget".into());
+        }
+        self.observe(
+            previous,
+            &OriginalUsage {
+                api_shape: self.capture_spec().api_shape.into(),
+                requested: requested.clone(),
+                reports: vec![bcode_session_models::OriginalUsageReport {
+                    source: source.into(),
+                    usage_json: usage_json.into(),
+                    confirmed: confirmed.clone(),
+                }],
+                ..OriginalUsage::default()
+            },
+        )
+    }
+
     /// Interpret ordered, validated billing reports. Never performs I/O.
     ///
     /// # Errors

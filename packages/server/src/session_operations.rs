@@ -898,6 +898,41 @@ pub async fn inspect(
     Ok(page)
 }
 
+/// Read bounded source accounting without changing the reporting index.
+/// # Errors
+/// Rejects ambiguous locations, unavailable projections, and changed generations.
+pub async fn session_usage(
+    state: &ServerState,
+    session_id: bcode_session_models::SessionId,
+    query: bcode_session_models::SessionUsageQuery,
+) -> Result<bcode_session_models::SessionUsagePage, &'static str> {
+    query.validate().map_err(|_| "invalid usage query")?;
+    if !state
+        .session_catalog
+        .ambiguous_location_ids(session_id)
+        .await
+        .is_empty()
+    {
+        return Err("session storage location is ambiguous");
+    }
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    let mut admission =
+        super::storage_read_admission::RegisteredStorageRead::for_session(state, session_id)
+            .await
+            .map_err(|_| "usage storage read admission unavailable")?;
+    let page = state.sessions.session_usage_page(session_id, query).await;
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    let page =
+        super::storage_read_admission::RegisteredStorageRead::finish_failed(&mut admission, page)
+            .await;
+    let page = page.map_err(|_| "usage projection unavailable or changed; restart query")?;
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    if let Some(admission) = admission {
+        admission.finish_history(state, session_id).await;
+    }
+    Ok(page)
+}
+
 /// Explicitly collect one bounded usage projection page for reporting.
 /// # Errors
 /// Rejects ambiguous locations, partial collection ranges, unsafe reads, and changed generations.

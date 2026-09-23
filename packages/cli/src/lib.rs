@@ -5703,6 +5703,13 @@ enum SessionCommand {
         #[arg(long)]
         json: bool,
     },
+    /// Inspect one bounded, generation-fenced accounting page as JSON; never collects or repairs.
+    Usage {
+        session_id: SessionId,
+        /// JSON `SessionUsageQuery` (range, limit, and optional continuation/generation).
+        #[arg(long)]
+        query: String,
+    },
     /// Recalculate derived cost for a request timestamp range from a JSON catalog snapshot.
     Reprice {
         session_id: SessionId,
@@ -7519,6 +7526,16 @@ async fn dispatch_session_command(command: Box<SessionCommand>) -> Result<(), Cl
                 output: repair_cli_output(json),
             }))
             .await?;
+        }
+        SessionCommand::Usage { session_id, query } => {
+            let query: bcode_session_models::SessionUsageQuery = serde_json::from_str(&query)
+                .map_err(|_| CliError::InvalidArguments("invalid SessionUsageQuery JSON".into()))?;
+            query.validate().map_err(CliError::InvalidArguments)?;
+            print_json(
+                &BcodeClient::default_endpoint()
+                    .session_usage(session_id, query)
+                    .await?,
+            )?;
         }
         SessionCommand::Reprice {
             session_id,

@@ -4840,9 +4840,15 @@ impl TokenUsageMeter {
             || cost.observed_usage_count > cost.estimated_usage_count
         {
             parts.push(if cost.estimated_usage_count > 0 {
-                "cost partial".to_string()
+                format!(
+                    "cost partial: {}/{} requests priced",
+                    cost.estimated_usage_count, cost.observed_usage_count
+                )
             } else {
-                "cost unavailable".to_string()
+                format!(
+                    "cost unavailable: {} requests unpriced",
+                    cost.observed_usage_count
+                )
             });
         }
         parts.join(" · ")
@@ -7649,6 +7655,7 @@ mod tests {
         };
         let partial = bcode_session_view_models::SessionCostSummary {
             unavailable_usage_count: 1,
+            observed_usage_count: 3,
             ..complete.clone()
         };
         let unavailable = bcode_session_view_models::SessionCostSummary {
@@ -7664,12 +7671,12 @@ mod tests {
         assert!(
             meter
                 .footer_summary(None, 0, &partial)
-                .contains("cost partial")
+                .contains("cost partial: 2/3 requests priced")
         );
         assert!(
             meter
                 .footer_summary(None, 0, &unavailable)
-                .contains("cost unavailable")
+                .contains("cost unavailable: 1 requests unpriced")
         );
     }
 

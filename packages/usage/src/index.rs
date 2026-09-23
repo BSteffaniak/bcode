@@ -485,6 +485,7 @@ mod tests {
                 key: key.into(),
                 first_observed_at_ms: 1,
                 usage: SessionTokenUsage::default(),
+                evidence: None,
             }],
             next_after: next.map(str::to_owned),
         }

@@ -177,6 +177,10 @@ pub enum SessionLifecycleRequest {
     UsageReport {
         query: bcode_usage_models::UsageQuery,
     },
+    SessionUsage {
+        session_id: SessionId,
+        query: bcode_session_models::SessionUsageQuery,
+    },
     UsageCollect {
         session_id: SessionId,
         query: bcode_session_models::SessionUsageQuery,
@@ -901,6 +905,12 @@ impl RoutedRequest {
             }
             Request::UsageReport { query } => {
                 Self::SessionLifecycle(Box::new(SessionLifecycleRequest::UsageReport { query }))
+            }
+            Request::SessionUsage { session_id, query } => {
+                Self::SessionLifecycle(Box::new(SessionLifecycleRequest::SessionUsage {
+                    session_id,
+                    query,
+                }))
             }
             Request::UsageCollect { session_id, query } => {
                 Self::SessionLifecycle(Box::new(SessionLifecycleRequest::UsageCollect {

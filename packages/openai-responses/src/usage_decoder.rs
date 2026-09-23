@@ -42,35 +42,55 @@ impl UsageDecoder for ResponsesUsageDialect {
             },
         }
     }
+    fn observe_json(
+        &self,
+        _previous: Option<&TokenUsage>,
+        usage_json: &str,
+        source: &str,
+        requested: &std::collections::BTreeMap<String, String>,
+        confirmed: &std::collections::BTreeMap<String, String>,
+    ) -> Result<TokenUsage, String> {
+        self.decode(usage_json, source, requested, confirmed)
+    }
+
     fn normalize(&self, original: &OriginalUsage) -> Result<TokenUsage, String> {
         let report = original.reports.last().ok_or("missing usage report")?;
-        if !self
-            .capture_spec()
-            .complete_sources
-            .contains(&report.source.as_str())
-            && report.source != "usage"
-        {
+        self.decode(
+            &report.usage_json,
+            &report.source,
+            &original.requested,
+            &report.confirmed,
+        )
+    }
+}
+
+impl ResponsesUsageDialect {
+    fn decode(
+        self,
+        usage_json: &str,
+        source: &str,
+        requested: &std::collections::BTreeMap<String, String>,
+        confirmed: &std::collections::BTreeMap<String, String>,
+    ) -> Result<TokenUsage, String> {
+        if !self.capture_spec().complete_sources.contains(&source) && source != "usage" {
             return Err("unsupported usage source".into());
         }
         let mut usage: OpenAiUsage =
-            serde_json::from_str(&report.usage_json).map_err(|_| "invalid usage report")?;
-        if let Some(tier) = report.confirmed.get("service_tier") {
+            serde_json::from_str(usage_json).map_err(|_| "invalid usage report")?;
+        if let Some(tier) = confirmed.get("service_tier") {
             usage.service_tier = Some(tier.clone());
         }
-        let model = report
-            .confirmed
+        let model = confirmed
             .get("model")
-            .or_else(|| original.requested.get("model"))
+            .or_else(|| requested.get("model"))
             .cloned();
-        let retention = report
-            .confirmed
+        let retention = confirmed
             .get("prompt_cache_retention")
-            .or_else(|| original.requested.get("prompt_cache_retention"));
-        let tier = report
-            .confirmed
+            .or_else(|| requested.get("prompt_cache_retention"));
+        let tier = confirmed
             .get("service_tier")
             .or_else(|| {
-                original.requested.get("service_tier").filter(|tier| {
+                requested.get("service_tier").filter(|tier| {
                     matches!(self, Self::Bedrock) || matches!(tier.as_str(), "default" | "standard")
                 })
             })

@@ -97,7 +97,53 @@ impl<'a> UsageRecorder<'a> {
         }
         match extract_usage_report(json, self.decoder.capture_spec()) {
             Ok(None) => UsageObservation::Absent,
-            Ok(Some(report)) => self.observe_report(report),
+            Ok(Some(report)) => {
+                self.original.complete |= self
+                    .decoder
+                    .capture_spec()
+                    .complete_sources
+                    .contains(&report.source.as_str());
+                if let Ok(usage) = self.decoder.observe_json(
+                    self.normalized.as_ref(),
+                    report.usage_json,
+                    &report.source,
+                    &self.original.requested,
+                    &report.confirmed,
+                ) {
+                    self.normalized = Some(usage);
+                    self.normalization_failed = false;
+                } else {
+                    self.normalized = None;
+                    self.normalization_failed = true;
+                }
+                if report.usage_json.len() > bcode_session_models::MAX_ORIGINAL_USAGE_BYTES {
+                    self.original.capture_issue = self
+                        .original
+                        .capture_issue
+                        .or(Some(UsageCaptureIssue::LimitExceeded));
+                    return UsageObservation::Rejected;
+                }
+                let incoming = OriginalUsage {
+                    provider_id: self.original.provider_id.clone(),
+                    api_shape: self.original.api_shape.clone(),
+                    requested: self.original.requested.clone(),
+                    complete: self.original.complete,
+                    reports: vec![OriginalUsageReport {
+                        source: report.source,
+                        usage_json: report.usage_json.into(),
+                        confirmed: report.confirmed,
+                    }],
+                    ..Default::default()
+                };
+                let mut current = Some(std::mem::take(&mut self.original));
+                super::append_usage_capture(&mut current, incoming);
+                self.original = current.unwrap_or_default();
+                if self.original.capture_issue.is_some() {
+                    UsageObservation::Rejected
+                } else {
+                    UsageObservation::Captured
+                }
+            }
             Err(issue) => {
                 self.normalization_failed = true;
                 self.normalized = None;
@@ -300,11 +346,17 @@ fn apply_finality(usage: &mut TokenUsage, complete: bool) {
     }
 }
 
-/// Returns a protocol extraction result without interpreting provider identity.
+struct BorrowedUsageReport<'a> {
+    source: String,
+    usage_json: &'a str,
+    confirmed: BTreeMap<String, String>,
+}
+
+/// Extract borrowed billing data; retention policy must not suppress normalization.
 fn extract_usage_report(
     json: &str,
     spec: UsageCaptureSpec,
-) -> Result<Option<OriginalUsageReport>, UsageCaptureIssue> {
+) -> Result<Option<BorrowedUsageReport<'_>>, UsageCaptureIssue> {
     let event: BTreeMap<&str, &serde_json::value::RawValue> =
         serde_json::from_str(json).map_err(|_| UsageCaptureIssue::UnsafeOrMalformed)?;
     let source = event
@@ -333,10 +385,6 @@ fn extract_usage_report(
         if raw.get() == "null" {
             return Ok(None);
         }
-        // Bound the owned copy and typed normalization before allocating provider-controlled data.
-        if raw.get().len() > bcode_session_models::MAX_ORIGINAL_USAGE_BYTES {
-            return Err(UsageCaptureIssue::LimitExceeded);
-        }
         let confirmed = spec
             .confirmed_fields
             .iter()
@@ -353,9 +401,9 @@ fn extract_usage_report(
                     .map_err(|_| UsageCaptureIssue::UnsafeOrMalformed)
             })
             .collect::<Result<BTreeMap<_, _>, _>>()?;
-        return Ok(Some(OriginalUsageReport {
+        return Ok(Some(BorrowedUsageReport {
             source,
-            usage_json: raw.get().into(),
+            usage_json: raw.get(),
             confirmed,
         }));
     }

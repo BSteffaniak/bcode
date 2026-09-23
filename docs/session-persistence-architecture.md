@@ -662,7 +662,20 @@ stores upgrade through exclusive migration coordination, retaining canonical eve
 attach never scans history or reprices. Explicit reindex discards range-specific valuations; rerun
 repricing with the desired supplied snapshot afterward.
 
-Bounded accounting reads are available through `SessionManager::session_usage_page`. They return
+Bounded accounting reads are available through `SessionManager::session_usage_page` and
+`bcode session usage SESSION_ID --query '<SessionUsageQuery JSON>'`. The CLI prints one page;
+continuations supply both `next_after` and the returned generation. No collection or repair runs.
+Each entry includes secret-safe evidence availability (completion, report count, capture issue),
+not raw reports or a promise of recoverability. Reads look up at most one canonical usage envelope
+per matching contribution; a missing envelope fails closed.
+
+Provider capture budgets limit retention, not billing interpretation. OpenAI usage decoding reads
+known fields from borrowed JSON before applying the original-evidence byte budget. Oversized or
+unsafe evidence remains explicitly incomplete even when normalized accounting succeeds. Responses
+context observations reuse this normalized result rather than independently decoding usage.
+An empty retained report set cannot be recovered by repricing; missing counters are never guessed.
+
+Bounded accounting reads return
 normalized request contributions and separately stored valuations, never private billing evidence
 or historical embedded-cost fallbacks. Reads use the existing primary-key index with a maximum of
 256 examined contributions per call, then apply the first-observed timestamp range. An empty page

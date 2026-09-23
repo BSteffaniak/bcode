@@ -5806,6 +5806,7 @@ const fn request_kind(request: &Request) -> &'static str {
         Request::SessionCompress { .. } => "session_compress",
         Request::SessionAdmission { .. } => "session_admission",
         Request::UsageReport { .. } => "usage_report",
+        Request::SessionUsage { .. } => "session_usage",
         Request::UsageCollect { .. } => "usage_collect",
         Request::SetSessionAgent { .. } => "set_session_agent",
     }
@@ -6205,11 +6206,20 @@ async fn handle_request_inner(
             );
             send_response(writer, request_id, response).await
         }
+        SessionLifecycleRequest::SessionUsage { session_id, query } => {
+            let response =
+                match Box::pin(session_operations::session_usage(state, session_id, query)).await {
+                    Ok(page) => Response::Ok(ResponsePayload::SessionUsage { page }),
+                    Err(message) => Response::Err(ErrorResponse::new("usage_unavailable", message)),
+                };
+            send_response(writer, request_id, response).await
+        }
         SessionLifecycleRequest::UsageCollect { session_id, query } => {
-            let response = match session_operations::collect_usage(state, session_id, query).await {
-                Ok(page) => Response::Ok(ResponsePayload::UsageCollected { page }),
-                Err(message) => Response::Err(ErrorResponse::new("usage_unavailable", message)),
-            };
+            let response =
+                match Box::pin(session_operations::collect_usage(state, session_id, query)).await {
+                    Ok(page) => Response::Ok(ResponsePayload::UsageCollected { page }),
+                    Err(message) => Response::Err(ErrorResponse::new("usage_unavailable", message)),
+                };
             send_response(writer, request_id, response).await
         }
         SessionLifecycleRequest::SessionAdmission { session_id, apply } => {
@@ -6223,7 +6233,8 @@ async fn handle_request_inner(
             send_response(writer, request_id, response).await
         }
         SessionLifecycleRequest::SessionCompress { request } => {
-            let response = match session_compression::compress_page(state, request).await {
+            let response = match Box::pin(session_compression::compress_page(state, request)).await
+            {
                 Ok(result) => Response::Ok(ResponsePayload::SessionCompressed { result }),
                 Err(message) => Response::Err(ErrorResponse::new(
                     "session_compression_unavailable",

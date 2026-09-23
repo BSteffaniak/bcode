@@ -38,7 +38,9 @@ use bcode_model_provider_runtime::{
     ProviderOutputPositionAllocator, ProviderRuntime, retry_hint_from_json_value,
     retry_hint_from_response_parts, sanitize_provider_diagnostic,
 };
-use bcode_openai_responses::usage::{OpenAiUsage, OpenAiUsageContext};
+#[cfg(test)]
+use bcode_openai_responses::usage::OpenAiUsage;
+use bcode_openai_responses::usage::OpenAiUsageContext;
 use bcode_openai_responses::{
     ReasoningItemAccumulator, ResponsesContextManagement, ResponsesEventSink, ResponsesInputItem,
     ResponsesNativeSearchBody, ResponsesReasoningOptions, ResponsesReasoningSummary,
@@ -5182,8 +5184,15 @@ fn process_responses_stream_line(
     if matches!(
         event_type,
         "response.completed" | "response.done" | "response.incomplete" | "response.failed"
-    ) {
-        processor.sink.0.finish_usage(true);
+    ) && let Some(usage) = processor.sink.0.finish_usage(true)
+        && !processor.uses_previous_response
+        && let Some(tokens) = usage.input_tokens
+    {
+        processor
+            .sink
+            .push(ProviderTurnEvent::ExactRequestInputTokens {
+                tokens: bcode_model::ExactRequestInputTokens::new(u64::from(tokens)),
+            });
     }
     match event_type {
         "response.output_text.delta" | "response.refusal.delta" => {
@@ -5300,18 +5309,6 @@ fn process_responses_stream_line(
             process_responses_function_arguments_done(&event, tool_calls);
         }
         "response.completed" | "response.done" => {
-            if let Some(usage) = openai_usage_from_responses_event(&event) {
-                let exact_input = (!processor.uses_previous_response)
-                    .then(|| usage.prompt_tokens.or(usage.input_tokens))
-                    .flatten();
-                if let Some(tokens) = exact_input {
-                    processor
-                        .sink
-                        .push(ProviderTurnEvent::ExactRequestInputTokens {
-                            tokens: bcode_model::ExactRequestInputTokens::new(u64::from(tokens)),
-                        });
-                }
-            }
             let outcome = if *saw_tool_call {
                 finish_tool_calls(
                     &processor.sink,
@@ -5344,20 +5341,6 @@ fn process_responses_stream_line(
         }
         "response.incomplete" => {
             if responses_incomplete_reason(&event) == "max_output_tokens" {
-                if let Some(usage) = openai_usage_from_responses_event(&event) {
-                    let exact_input = (!processor.uses_previous_response)
-                        .then(|| usage.prompt_tokens.or(usage.input_tokens))
-                        .flatten();
-                    if let Some(tokens) = exact_input {
-                        processor
-                            .sink
-                            .push(ProviderTurnEvent::ExactRequestInputTokens {
-                                tokens: bcode_model::ExactRequestInputTokens::new(u64::from(
-                                    tokens,
-                                )),
-                            });
-                    }
-                }
                 if processor.dialect.supports_previous_response_id()
                     && !processor.suppress_provider_reuse_state
                     && let Some(response_id) = event
@@ -5651,6 +5634,7 @@ fn token_usage_from_openai_usage(
     normalize_usage_with_context(usage, dialect, OpenAiUsageContext::default())
 }
 
+#[cfg(test)]
 fn openai_usage_from_responses_event(event: &serde_json::Value) -> Option<OpenAiUsage> {
     let usage = event
         .get("response")
@@ -12919,6 +12903,32 @@ mod tests {
         assert!(response.error.is_none());
         let normalized: TokenUsage = serde_json::from_slice(&response.payload).unwrap();
         assert_eq!(normalized.cache_write_input_tokens, Some(100));
+    }
+
+    #[test]
+    fn oversized_billing_evidence_does_not_disable_accounting_or_context() {
+        let turn = TurnState::default();
+        let name_map = BTreeMap::new();
+        let processor = test_responses_stream_processor(&turn, &name_map);
+        let frame = format!(
+            r#"data: {{"type":"response.completed","response":{{"usage":{{"input_tokens":100942,"output_tokens":200,"input_tokens_details":{{"cached_tokens":90000,"cache_write_tokens":0}},"unknown":"{}"}}}}}}"#,
+            "x".repeat(bcode_session_models::MAX_ORIGINAL_USAGE_BYTES + 1)
+        );
+        let _ = process_responses_stream_line(
+            &frame,
+            &processor,
+            &mut BTreeMap::new(),
+            &mut BTreeMap::new(),
+            &mut false,
+        );
+        let events = turn.drain();
+        assert!(events.iter().any(|event| matches!(event, ProviderTurnEvent::Usage { usage } if usage.input_tokens == Some(100_942) && usage.output_tokens == Some(200))));
+        assert!(
+            events
+                .iter()
+                .any(|event| matches!(event, ProviderTurnEvent::ExactRequestInputTokens { .. }))
+        );
+        assert!(events.iter().any(|event| matches!(event, ProviderTurnEvent::OriginalUsage { original } if original.reports.is_empty() && original.capture_issue == Some(bcode_session_models::UsageCaptureIssue::LimitExceeded))));
     }
 
     #[test]

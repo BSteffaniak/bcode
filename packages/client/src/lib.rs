@@ -3063,6 +3063,24 @@ impl BcodeClient {
         }
     }
 
+    /// Read one generation-fenced accounting page without collecting or repairing state.
+    ///
+    /// # Errors
+    /// Returns an error for unavailable projections, changed generations, or transport failure.
+    pub async fn session_usage(
+        &self,
+        session_id: SessionId,
+        query: bcode_session_models::SessionUsageQuery,
+    ) -> Result<bcode_session_models::SessionUsagePage, ClientError> {
+        match self
+            .send_request(Request::SessionUsage { session_id, query })
+            .await?
+        {
+            ResponsePayload::SessionUsage { page } => Ok(page),
+            _ => Err(ClientError::UnexpectedResponse),
+        }
+    }
+
     /// Explicitly collect one source accounting page into the disposable reporting index.
     /// Empty initial acknowledgements either confirm an unchanged published generation or
     /// provide a cursor for matching durable staging. Always follow a returned cursor.

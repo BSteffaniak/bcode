@@ -63,6 +63,20 @@ pub struct SessionUsageEntry {
     pub first_observed_at_ms: u64,
     /// Latest normalized usage and independently stored valuation.
     pub usage: SessionTokenUsage,
+    /// Retained evidence availability, not a guarantee that offline decoding will succeed.
+    #[serde(default)]
+    pub evidence: Option<SessionUsageEvidence>,
+}
+
+/// Secret-safe billing capture diagnostics; raw reports remain session-private.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionUsageEvidence {
+    /// Whether the provider declared reporting complete.
+    pub complete: bool,
+    /// Number of retained billing reports.
+    pub report_count: usize,
+    /// Explicit capture damage, if any.
+    pub capture_issue: Option<crate::UsageCaptureIssue>,
 }
 
 /// One coherent bounded page of accounting contributions.
