@@ -1099,6 +1099,44 @@ pub async fn history_page(
     Ok(page)
 }
 
+/// Return one non-mutating bounded projection-selected history page through the session owner.
+pub async fn projection_history_page(
+    state: &ServerState,
+    client_id: bcode_session_models::ClientId,
+    session_id: bcode_session_models::SessionId,
+    request: bcode_session_models::ProjectionWindowRequest,
+) -> Result<bcode_session_models::ProjectionHistoryPage, ReadHistoryError> {
+    if let Some(namespace) = state
+        .active_session_namespace_mismatch(session_id, client_id)
+        .await
+    {
+        return Err(ReadHistoryError::IncompatibleActiveNamespace(namespace));
+    }
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    let mut admission =
+        super::storage_read_admission::RegisteredStorageRead::for_session(state, session_id)
+            .await?;
+    let page = state
+        .sessions
+        .session_projection_history_page(session_id, request)
+        .await;
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    let page =
+        super::storage_read_admission::RegisteredStorageRead::finish_failed(&mut admission, page)
+            .await?;
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    let page = page?;
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    if let Some(admission) = admission {
+        admission.finish_history(state, session_id).await;
+    } else {
+        record_history_access(state, session_id).await;
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    record_history_access(state, session_id).await;
+    Ok(page)
+}
+
 /// Return one bounded history window around a sequence without transport framing.
 pub async fn history_around(
     state: &ServerState,

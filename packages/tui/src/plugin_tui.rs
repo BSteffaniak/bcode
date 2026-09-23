@@ -1954,8 +1954,13 @@ library = "libdynamic_visual_test.dylib"
         );
 
         let during_refresh = dynamic_test_visual(&presentation, "call-owner")
-            .expect("native fallback during dynamic refresh");
-        assert_eq!(during_refresh.route.plugin_id, "bcode.shell");
+            .expect("native fallback or refreshed dynamic visual");
+        // The adapter worker may finish the replacement between the artifact
+        // completion and this read. Both states are valid; stale artifact-0 is not.
+        assert!(
+            during_refresh.route.plugin_id == "bcode.shell"
+                || routed_text(&during_refresh) == "dynamic:success:artifact-1"
+        );
         let refreshed =
             wait_for_dynamic_text(&presentation, "call-owner", "dynamic:success:artifact-1");
         assert_eq!(routed_text(&refreshed), "dynamic:success:artifact-1");

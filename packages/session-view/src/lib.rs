@@ -950,8 +950,94 @@ impl SessionView {
     /// pending checkpoints, runtime work, plugin status, skills, and composer state remain
     /// available until newer authoritative data replaces them.
     pub fn rebuild_history_window(&mut self, events: &[SessionEvent]) {
+        // Live-only stream items (including terminal tombstones awaiting a durable event)
+        // are not part of the resident history window. Reapply them after replay so an older
+        // durable message cannot finish a newer stream, while a matching canonical item wins.
+        let live_items = self
+            .snapshot
+            .transcript
+            .items
+            .iter()
+            .filter(|item| item.sequence.is_none())
+            .cloned()
+            .collect::<Vec<_>>();
+        let live_streams = live_items
+            .iter()
+            .filter_map(|item| {
+                self.snapshot
+                    .text_streams
+                    .get(&item.id)
+                    .cloned()
+                    .map(|stream| (item.id.clone(), stream))
+            })
+            .collect::<BTreeMap<_, _>>();
+        let pending_presentations = std::mem::take(&mut self.pending_text_presentations);
+        let last_updates = std::mem::take(&mut self.last_text_stream_updates);
+        let live_reasoning = std::mem::take(&mut self.live_reasoning);
         self.clear_history_window();
         self.apply_history(events);
+        let finished_turns = events
+            .iter()
+            .filter_map(|event| match &event.kind {
+                SessionEventKind::ModelTurnFinished { turn_id, .. } => Some(turn_id.as_str()),
+                _ => None,
+            })
+            .collect::<BTreeSet<_>>();
+        for item in live_items {
+            if finished_turns.iter().any(|turn_id| {
+                item.id
+                    .get()
+                    .starts_with(&format!("assistant-turn:{turn_id}:segment:"))
+                    || item
+                        .id
+                        .get()
+                        .starts_with(&format!("reasoning-turn:{turn_id}:"))
+            }) {
+                // A durable turn completion supersedes live-only presentation even when
+                // the bounded window does not include a matching durable segment.
+                continue;
+            }
+            if self
+                .snapshot
+                .transcript
+                .items
+                .iter()
+                .any(|durable| durable.id == item.id)
+            {
+                continue;
+            }
+            if let Some(stream) = live_streams.get(&item.id) {
+                self.snapshot
+                    .text_streams
+                    .insert(item.id.clone(), stream.clone());
+            }
+            if let Some(pending) = pending_presentations.get(&item.id) {
+                self.pending_text_presentations
+                    .insert(item.id.clone(), pending.clone());
+            }
+            if let Some(update) = last_updates.get(&item.id) {
+                self.last_text_stream_updates
+                    .insert(item.id.clone(), update.clone());
+            }
+            self.snapshot.transcript.items.push(item);
+            self.snapshot.transcript.revision = self.snapshot.transcript.revision.saturating_add(1);
+            self.bump_revision();
+        }
+        // Keep canonical reasoning reconstructed by replay; restore only live activities
+        // that have neither been durably replaced nor durably terminalized.
+        for (key, activity) in live_reasoning {
+            let id = TranscriptViewItemId::reasoning(&key.0, &key.1);
+            if !finished_turns.contains(key.0.as_str())
+                && !self
+                    .snapshot
+                    .transcript
+                    .items
+                    .iter()
+                    .any(|item| item.id == id && item.sequence.is_some())
+            {
+                self.live_reasoning.insert(key, activity);
+            }
+        }
     }
 
     /// Clear bounded history projection while retaining authoritative hydrated session state.
@@ -5835,7 +5921,7 @@ mod tests {
     }
 
     #[test]
-    fn history_window_rebuild_discards_pending_presentation_and_preserves_policy() {
+    fn history_window_rebuild_preserves_pending_presentation_and_policy() {
         let session_id = SessionId::new();
         let mut view = SessionView::new();
         assert!(!view.set_streaming_presentation_policy(StreamingPresentationPolicy::default()));
@@ -5858,12 +5944,15 @@ mod tests {
         view.rebuild_history_window(&[]);
         assert!(
             view.next_streaming_presentation_deadline(Instant::now())
-                .is_none()
+                .is_some()
         );
         assert_eq!(
             view.streaming_presentation_policy,
             StreamingPresentationPolicy::default()
         );
+        assert!(view.set_streaming_presentation_policy(StreamingPresentationPolicy::immediate()));
+        let id = TranscriptViewItemId::new("assistant-turn:turn-1:segment:segment-1");
+        assert_eq!(transcript_item_text(view.snapshot(), &id), Some("pending"));
     }
 
     #[test]
@@ -10416,6 +10505,205 @@ mod tests {
 
         assert_eq!(rebuilt.snapshot().transcript, expected.transcript);
         assert_eq!(rebuilt.snapshot().contributions, expected.contributions);
+    }
+
+    #[test]
+    fn history_window_rebuild_does_not_revive_superseded_reasoning_parts() {
+        let session_id = SessionId::new();
+        let mut view = SessionView::new();
+        let id = TranscriptViewItemId::reasoning("turn-1", "activity-1");
+        let part = bcode_session_models::ReasoningActivityEvent::PartDelta {
+            activity_id: "activity-1".to_owned(),
+            activity_order: 0,
+            part_id: "part-1".to_owned(),
+            kind: bcode_session_models::ReasoningContentKind::Summary,
+            role: bcode_session_models::ReasoningContentRole::Detail,
+            part_order: 0,
+            text: "live partial".to_owned(),
+        };
+        let live = |event| SessionLiveEvent {
+            session_id,
+            kind: SessionLiveEventKind::AssistantReasoningActivity {
+                output_position: None,
+                turn_id: "turn-1".to_owned(),
+                event,
+            },
+        };
+        view.apply_live_event(&live(part));
+        view.apply_live_event(&live(
+            bcode_session_models::ReasoningActivityEvent::Finished {
+                activity_id: "activity-1".to_owned(),
+                activity_order: 0,
+                status: bcode_session_models::ReasoningActivityStatus::Completed,
+            },
+        ));
+        assert_eq!(view.live_reasoning.len(), 1);
+        assert!(
+            view.snapshot()
+                .transcript
+                .items
+                .iter()
+                .any(|item| item.id == id)
+        );
+        view.rebuild_history_window(&[event(
+            session_id,
+            10,
+            SessionEventKind::ModelTurnFinished {
+                turn_id: "turn-1".to_owned(),
+                outcome: bcode_session_models::ModelTurnOutcome::Completed,
+                message: None,
+            },
+        )]);
+        assert!(
+            view.snapshot()
+                .transcript
+                .items
+                .iter()
+                .all(|item| item.id != id)
+        );
+        view.set_reasoning_visible(true);
+        assert!(view.live_reasoning.is_empty());
+        assert!(
+            view.snapshot()
+                .transcript
+                .items
+                .iter()
+                .all(|item| item.id != id)
+        );
+    }
+
+    #[test]
+    fn history_window_rebuild_does_not_reopen_a_durably_finished_live_turn() {
+        let session_id = SessionId::new();
+        let id = TranscriptViewItemId::new("assistant-turn:turn-1:segment:segment-1");
+        let mut view = SessionView::new();
+        view.apply_live_event(&ordered_assistant_update(
+            session_id,
+            bcode_session_models::TextStreamUpdate {
+                generation: 0,
+                first_revision: 1,
+                revision: 1,
+                operation: bcode_session_models::TextStreamOperation::Append {
+                    expected_offset: 0,
+                    text: "partial".to_owned(),
+                },
+            },
+        ));
+        view.rebuild_history_window(&[event(
+            session_id,
+            5,
+            SessionEventKind::ModelTurnFinished {
+                turn_id: "turn-1".to_owned(),
+                outcome: bcode_session_models::ModelTurnOutcome::Completed,
+                message: None,
+            },
+        )]);
+        assert_eq!(transcript_item_text(view.snapshot(), &id), None);
+    }
+
+    #[test]
+    fn history_window_rebuild_preserves_terminal_live_stream_tombstone() {
+        let session_id = SessionId::new();
+        let mut view = SessionView::new();
+        view.apply_live_event(&ordered_assistant_update(
+            session_id,
+            bcode_session_models::TextStreamUpdate {
+                generation: 0,
+                first_revision: 1,
+                revision: 1,
+                operation: bcode_session_models::TextStreamOperation::Append {
+                    expected_offset: 0,
+                    text: "complete".to_owned(),
+                },
+            },
+        ));
+        view.apply_live_event(&ordered_assistant_update(
+            session_id,
+            bcode_session_models::TextStreamUpdate {
+                generation: 0,
+                first_revision: 2,
+                revision: 2,
+                operation: bcode_session_models::TextStreamOperation::Terminal {
+                    status: bcode_session_models::TextStreamTerminalStatus::Completed,
+                },
+            },
+        ));
+        view.rebuild_history_window(&[event(
+            session_id,
+            3,
+            SessionEventKind::AssistantMessage {
+                text: "older".to_owned(),
+            },
+        )]);
+        let id = TranscriptViewItemId::new("assistant-turn:turn-1:segment:segment-1");
+        assert_eq!(transcript_item_text(view.snapshot(), &id), Some("complete"));
+        view.apply_live_event(&ordered_assistant_update(
+            session_id,
+            bcode_session_models::TextStreamUpdate {
+                generation: 0,
+                first_revision: 3,
+                revision: 3,
+                operation: bcode_session_models::TextStreamOperation::Append {
+                    expected_offset: 8,
+                    text: " stale".to_owned(),
+                },
+            },
+        ));
+        assert_eq!(transcript_item_text(view.snapshot(), &id), Some("complete"));
+    }
+
+    #[test]
+    fn history_window_rebuild_keeps_live_text_and_durable_replacement_wins() {
+        let session_id = SessionId::new();
+        let live = |text: &str| SessionLiveEvent {
+            session_id,
+            kind: SessionLiveEventKind::AssistantTextDelta {
+                turn_id: "active".to_owned(),
+                segment_id: "segment".to_owned(),
+                segment_order: 0,
+                text: text.to_owned(),
+            },
+        };
+        let durable = |sequence, kind| event(session_id, sequence, kind);
+        let mut view = SessionView::new();
+        view.apply_history(&[durable(
+            10,
+            SessionEventKind::AssistantMessage {
+                text: "recent".to_owned(),
+            },
+        )]);
+        view.apply_live_event(&live("partial"));
+        view.rebuild_history_window(&[
+            durable(
+                1,
+                SessionEventKind::AssistantMessage {
+                    text: "older".to_owned(),
+                },
+            ),
+            durable(
+                10,
+                SessionEventKind::AssistantMessage {
+                    text: "recent".to_owned(),
+                },
+            ),
+        ]);
+        view.apply_live_event(&live(" continuation"));
+        assert!(view.snapshot().transcript.items.iter().any(|item| {
+            matches!(&item.kind, TranscriptViewItemKind::AssistantMessage { message }
+                if message.text == "partial continuation")
+        }));
+        view.rebuild_history_window(&[durable(
+            11,
+            SessionEventKind::AssistantResponseSegment {
+                turn_id: "active".to_owned(),
+                segment_id: "segment".to_owned(),
+                segment_order: 0,
+                text: "canonical".to_owned(),
+            },
+        )]);
+        assert_eq!(view.snapshot().transcript.items.len(), 1);
+        assert!(matches!(&view.snapshot().transcript.items[0].kind,
+            TranscriptViewItemKind::AssistantMessage { message } if message.text == "canonical"));
     }
 
     #[test]

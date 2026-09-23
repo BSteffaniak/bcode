@@ -12,8 +12,9 @@ use crate::db::{MaterializedProjection, SessionDb, SessionDbError};
 use crate::lease::SessionLeaseGuard;
 use bcode_metrics::MetricsContext;
 use bcode_session_models::{
-    ProjectionWindowAnchor, SessionHistoryAroundQuery, SessionHistoryPage, SessionHistoryQuery,
-    SessionHistoryWindow, SessionInspectionPage, SessionInspectionQuery,
+    ProjectionWindowAnchor, SessionHistoryAroundQuery, SessionHistoryCursor,
+    SessionHistoryDirection, SessionHistoryPage, SessionHistoryQuery, SessionHistoryWindow,
+    SessionInspectionPage, SessionInspectionQuery,
 };
 use std::collections::BTreeMap;
 use std::sync::RwLock;
@@ -3013,22 +3014,30 @@ impl SessionActor {
         &mut self,
         request: &ProjectionWindowRequest,
     ) -> Result<ProjectionWindow, SessionError> {
-        let max_events = request.limits.max_events_scanned.max(1);
-        let max_events_u64 = u64::try_from(max_events).unwrap_or(u64::MAX);
-        let (start_sequence, end_sequence) = match request.anchor {
+        let max_events = request
+            .limits
+            .max_events_scanned
+            .clamp(1, bcode_session_models::MAX_SESSION_HISTORY_READ_EVENTS);
+        let (direction, cursor) = match request.anchor {
             ProjectionWindowAnchor::BeforeSequence(sequence) => (
-                sequence.saturating_sub(max_events_u64),
-                sequence.saturating_sub(1),
+                SessionHistoryDirection::Backward,
+                Some(SessionHistoryCursor {
+                    sequence: sequence.saturating_sub(1),
+                }),
             ),
             ProjectionWindowAnchor::AfterSequence(sequence) => (
-                sequence.saturating_add(1),
-                sequence.saturating_add(max_events_u64),
+                SessionHistoryDirection::Forward,
+                Some(SessionHistoryCursor {
+                    sequence: sequence.saturating_add(1),
+                }),
             ),
             ProjectionWindowAnchor::AroundSequence(sequence) => {
-                let half_scan = max_events_u64 / 2;
+                let half_scan = u64::try_from(max_events / 2).unwrap_or(u64::MAX);
                 (
-                    sequence.saturating_sub(half_scan),
-                    sequence.saturating_add(half_scan),
+                    SessionHistoryDirection::Forward,
+                    Some(SessionHistoryCursor {
+                        sequence: sequence.saturating_sub(half_scan),
+                    }),
                 )
             }
             ProjectionWindowAnchor::Latest => {
@@ -3036,8 +3045,13 @@ impl SessionActor {
             }
         };
         let events = self
-            .events_range(start_sequence, end_sequence, max_events)
-            .await?;
+            .history_page(SessionHistoryQuery {
+                cursor,
+                limit: max_events,
+                direction,
+            })
+            .await?
+            .events;
         let (first_event_sequence, last_event_sequence) =
             if let Some(db) = self.existing_session_db().await? {
                 (

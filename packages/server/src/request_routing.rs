@@ -218,6 +218,10 @@ pub enum SessionLifecycleRequest {
         session_id: SessionId,
         query: SessionHistoryQuery,
     },
+    SessionProjectionHistoryPage {
+        session_id: SessionId,
+        request: Box<bcode_session_models::ProjectionWindowRequest>,
+    },
     SessionHistoryAround {
         session_id: SessionId,
         query: SessionHistoryAroundQuery,
@@ -1035,6 +1039,15 @@ impl RoutedRequest {
                     query,
                 }))
             }
+            Request::SessionProjectionHistoryPage {
+                session_id,
+                request,
+            } => Self::SessionLifecycle(Box::new(
+                SessionLifecycleRequest::SessionProjectionHistoryPage {
+                    session_id,
+                    request,
+                },
+            )),
             Request::AttachSession { session_id } => {
                 Self::SessionSearchAttach(SessionSearchAttachRequest::AttachSession { session_id })
             }

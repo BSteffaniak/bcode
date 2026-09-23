@@ -3408,6 +3408,27 @@ impl BcodeClient {
         }
     }
 
+    /// Read one non-mutating bounded projection-selected history page.
+    ///
+    /// # Errors
+    /// Returns an error if the daemon cannot read the page or rejects the request.
+    pub async fn session_projection_history_page(
+        &self,
+        session_id: SessionId,
+        request: bcode_session_models::ProjectionWindowRequest,
+    ) -> Result<bcode_session_models::ProjectionHistoryPage, ClientError> {
+        match self
+            .send_request(Request::SessionProjectionHistoryPage {
+                session_id,
+                request: Box::new(request),
+            })
+            .await?
+        {
+            ResponsePayload::SessionProjectionHistoryPage { page } => Ok(page),
+            _ => Err(ClientError::UnexpectedResponse),
+        }
+    }
+
     /// Return a bounded canonical history window around one event sequence.
     ///
     /// # Errors

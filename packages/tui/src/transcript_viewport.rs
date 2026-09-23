@@ -223,8 +223,8 @@ impl TranscriptViewport {
             let boundary = self.previous_total_rows.saturating_sub(viewport_height);
             let next = current_top.saturating_add(rows);
             let previous_request = history.newer_reveal_request();
-            if next >= boundary {
-                history.request_load_newer(next.saturating_sub(boundary).max(1));
+            if next > boundary {
+                history.request_load_newer(next.saturating_sub(boundary));
             }
             self.follow_anchor(next.min(boundary));
             return *self != previous || previous_request != history.newer_reveal_request();
@@ -303,10 +303,12 @@ impl TranscriptViewport {
         &mut self,
         bounds: (usize, usize, usize, u16),
         anchor: Option<usize>,
+        older_page_rows: usize,
+        newer_page_rows: usize,
         history: &mut OlderHistoryState,
     ) {
         let previous_top = self.top_row(self.previous_total_rows, self.viewport_height);
-        let (older_ready, newer_ready) = history.take_ready_pages();
+        let (older_ready, newer_ready, newer_has_content) = history.take_ready_pages();
         // A missing item anchor cannot distinguish prepended content from a
         // concurrent layout change elsewhere. Never infer a prepend from the
         // difference in total row counts; the caller must supply correspondence
@@ -327,7 +329,9 @@ impl TranscriptViewport {
             let requested = history.reveal_request().unwrap_or(0);
             let top = self.top_row(bounds.2, bounds.3);
             let movement = if anchor.is_some() {
-                requested.min(top.saturating_sub(previous_top))
+                requested
+                    .min(top.saturating_sub(previous_top))
+                    .min(older_page_rows)
             } else {
                 0
             };
@@ -343,8 +347,8 @@ impl TranscriptViewport {
                 .2
                 .saturating_sub(usize::from(bounds.3))
                 .saturating_sub(top);
-            let movement = if anchor.is_some() {
-                requested.min(available)
+            let movement = if anchor.is_some() && newer_has_content {
+                requested.min(available).min(newer_page_rows)
             } else {
                 0
             };
@@ -442,7 +446,7 @@ mod tests {
             assert_eq!(viewport.start_follow_anchor_animation(top), None);
             assert!(viewport.allows_reveal());
             assert_eq!(viewport.allows_overflow(), !sticky);
-            viewport.sync_with_anchor((30, 9, 40, 10), None, &mut history);
+            viewport.sync_with_anchor((30, 9, 40, 10), None, 0, 0, &mut history);
             let allowed = viewport.allows_overflow();
             viewport.reconcile_overflow(30, allowed, &mut history);
             assert_eq!(viewport.follows_bottom(), !sticky);
@@ -456,7 +460,7 @@ mod tests {
         viewport.sync_max(20, 9, 30, 10, false, &mut history);
         viewport.scroll_down(4, &mut history);
         assert!(!viewport.allows_reveal());
-        viewport.sync_with_anchor((25, 9, 35, 10), None, &mut history);
+        viewport.sync_with_anchor((25, 9, 35, 10), None, 10, 0, &mut history);
         assert!(viewport.follows_bottom());
         assert!(viewport.allows_reveal());
     }
@@ -484,7 +488,7 @@ mod tests {
         viewport.sync_max(20, 9, 30, 10, false, &mut history);
         viewport.scroll_down(4, &mut history);
         // Ten rows inserted above the reading position do not consume tail space.
-        viewport.sync_with_anchor((30, 9, 40, 10), Some(34), &mut history);
+        viewport.sync_with_anchor((30, 9, 40, 10), Some(34), 10, 0, &mut history);
         assert!(!viewport.follows_bottom());
         assert_eq!(viewport.bottom_overscroll(), 4);
         assert_eq!(viewport.top_row(40, 10), 34);
@@ -638,21 +642,155 @@ mod tests {
         };
         history.update_cursor(&[event(20)], true);
         history.set_loading(false);
-        viewport.sync_with_anchor((25, 0, 35, 10), Some(5), &mut history);
+        viewport.sync_with_anchor((25, 0, 35, 10), Some(5), 10, 0, &mut history);
         assert_eq!(viewport.top_row(35, 10), 0);
         assert_eq!(history.reveal_request(), Some(8));
         // Re-preparing the same accepted page cannot spend the movement twice.
-        viewport.sync_with_anchor((25, 0, 35, 10), Some(5), &mut history);
+        viewport.sync_with_anchor((25, 0, 35, 10), Some(5), 10, 0, &mut history);
         assert_eq!(history.reveal_request(), Some(8));
         assert!(history.should_load());
         history.set_loading(true);
         history.update_cursor(&[], false);
         history.set_loading(false);
-        viewport.sync_with_anchor((38, 0, 48, 10), Some(18), &mut history);
+        viewport.sync_with_anchor((38, 0, 48, 10), Some(18), 10, 0, &mut history);
         assert_eq!(viewport.top_row(48, 10), 10);
         assert_eq!(history.reveal_request(), None);
-        viewport.sync_with_anchor((38, 0, 48, 10), Some(10), &mut history);
+        viewport.sync_with_anchor((38, 0, 48, 10), Some(10), 10, 0, &mut history);
         assert_eq!(viewport.top_row(48, 10), 10);
+    }
+
+    #[test]
+    fn scrolling_to_centered_newer_boundary_does_not_request_an_extra_row() {
+        let mut viewport = TranscriptViewport::default();
+        let mut history = older_history();
+        let session_id = bcode_session_models::SessionId::new();
+        let event = bcode_session_models::SessionEvent {
+            schema_version: bcode_session_models::CURRENT_SESSION_EVENT_SCHEMA_VERSION,
+            sequence: 10,
+            timestamp_ms: 10,
+            session_id,
+            provenance: None,
+            kind: bcode_session_models::SessionEventKind::AssistantMessage {
+                text: "resident".to_owned(),
+            },
+        };
+        history.replace_centered(std::slice::from_ref(&event), false, true, 10);
+        viewport.sync_max(20, 0, 30, 10, false, &mut history);
+        viewport.follow_anchor(15);
+        assert!(viewport.scroll_down(5, &mut history));
+        assert_eq!(viewport.top_row(30, 10), 20);
+        assert_eq!(history.newer_reveal_request(), None);
+        assert!(!history.should_load_newer());
+        assert!(viewport.scroll_down(1, &mut history));
+        assert_eq!(history.newer_reveal_request(), Some(1));
+        assert!(history.should_load_newer());
+    }
+
+    #[test]
+    fn exhausted_newer_page_does_not_spend_pending_movement_on_unrelated_growth() {
+        let mut viewport = TranscriptViewport::default();
+        let mut history = older_history();
+        let session_id = bcode_session_models::SessionId::new();
+        let event = bcode_session_models::SessionEvent {
+            schema_version: bcode_session_models::CURRENT_SESSION_EVENT_SCHEMA_VERSION,
+            sequence: 10,
+            timestamp_ms: 10,
+            session_id,
+            provenance: None,
+            kind: bcode_session_models::SessionEventKind::AssistantMessage {
+                text: "resident".to_owned(),
+            },
+        };
+        history.replace_centered(std::slice::from_ref(&event), false, true, 10);
+        viewport.sync_max(20, 0, 30, 10, false, &mut history);
+        viewport.follow_anchor(15);
+        viewport.scroll_down(8, &mut history);
+        assert_eq!(history.newer_reveal_request(), Some(3));
+        history.set_loading_newer(true);
+        history.update_newer_cursor(&[], false);
+        history.set_loading_newer(false);
+        // Existing content reflows below the reader at the same time as
+        // exhaustion. No page rows were added; only correspondence is restored.
+        viewport.sync_with_anchor((30, 0, 40, 10), Some(20), 10, 0, &mut history);
+        assert_eq!(viewport.top_row(40, 10), 20);
+        assert_eq!(history.newer_reveal_request(), None);
+        viewport.sync_with_anchor((30, 0, 40, 10), Some(20), 10, 0, &mut history);
+        assert_eq!(viewport.top_row(40, 10), 20);
+    }
+
+    #[test]
+    fn terminal_newer_page_can_reveal_its_own_rows_once() {
+        let mut viewport = TranscriptViewport::default();
+        let mut history = older_history();
+        let session_id = bcode_session_models::SessionId::new();
+        let event = bcode_session_models::SessionEvent {
+            schema_version: bcode_session_models::CURRENT_SESSION_EVENT_SCHEMA_VERSION,
+            sequence: 10,
+            timestamp_ms: 10,
+            session_id,
+            provenance: None,
+            kind: bcode_session_models::SessionEventKind::AssistantMessage {
+                text: "resident".to_owned(),
+            },
+        };
+        history.replace_centered(std::slice::from_ref(&event), false, true, 10);
+        viewport.sync_max(20, 0, 30, 10, false, &mut history);
+        viewport.follow_anchor(15);
+        viewport.scroll_down(8, &mut history);
+        assert_eq!(history.newer_reveal_request(), Some(3));
+        history.set_loading_newer(true);
+        history.update_newer_cursor(
+            &[bcode_session_models::SessionEvent {
+                sequence: 11,
+                ..event
+            }],
+            false,
+        );
+        history.set_loading_newer(false);
+        viewport.sync_with_anchor((30, 0, 40, 10), Some(20), 0, 10, &mut history);
+        assert_eq!(viewport.top_row(40, 10), 23);
+        assert_eq!(history.newer_reveal_request(), None);
+        viewport.sync_with_anchor((30, 0, 40, 10), Some(23), 10, 0, &mut history);
+        assert_eq!(viewport.top_row(40, 10), 23);
+    }
+
+    #[test]
+    fn newer_page_only_spends_measured_page_rows_during_concurrent_reflow() {
+        let mut viewport = TranscriptViewport::default();
+        let mut history = older_history();
+        let session_id = bcode_session_models::SessionId::new();
+        let event = bcode_session_models::SessionEvent {
+            schema_version: bcode_session_models::CURRENT_SESSION_EVENT_SCHEMA_VERSION,
+            sequence: 10,
+            timestamp_ms: 10,
+            session_id,
+            provenance: None,
+            kind: bcode_session_models::SessionEventKind::AssistantMessage {
+                text: "resident".to_owned(),
+            },
+        };
+        history.replace_centered(std::slice::from_ref(&event), false, true, 10);
+        viewport.sync_max(20, 0, 30, 10, false, &mut history);
+        viewport.follow_anchor(15);
+        viewport.scroll_down(8, &mut history);
+        assert_eq!(history.newer_reveal_request(), Some(3));
+        history.set_loading_newer(true);
+        history.update_newer_cursor(
+            &[bcode_session_models::SessionEvent {
+                sequence: 11,
+                ..event
+            }],
+            true,
+        );
+        history.set_loading_newer(false);
+        // Most of the new geometry came from a width change to existing rows.
+        // Only two of those rows belong to the accepted source page.
+        viewport.sync_with_anchor((35, 0, 45, 10), Some(25), 0, 2, &mut history);
+        assert_eq!(viewport.top_row(45, 10), 27);
+        assert_eq!(history.newer_reveal_request(), Some(1));
+        viewport.sync_with_anchor((35, 0, 45, 10), Some(27), 0, 2, &mut history);
+        assert_eq!(viewport.top_row(45, 10), 27);
+        assert_eq!(history.newer_reveal_request(), Some(1));
     }
 
     #[test]
@@ -686,10 +824,10 @@ mod tests {
         history.set_loading_newer(false);
         // The accepted page contains only non-presenting events. Existing rows
         // below the reader must not satisfy movement requested at the boundary.
-        viewport.sync_with_anchor((20, 0, 30, 10), Some(20), &mut history);
+        viewport.sync_with_anchor((20, 0, 30, 10), Some(20), 10, 0, &mut history);
         assert_eq!(viewport.top_row(30, 10), 20);
         assert_eq!(history.newer_reveal_request(), Some(1));
-        viewport.sync_with_anchor((20, 0, 30, 10), Some(20), &mut history);
+        viewport.sync_with_anchor((20, 0, 30, 10), Some(20), 10, 0, &mut history);
         assert_eq!(viewport.top_row(30, 10), 20);
         assert_eq!(history.newer_reveal_request(), Some(1));
     }
@@ -708,9 +846,29 @@ mod tests {
         history.update_cursor(&[], true);
         history.mark_dropped_history_before(9);
         history.set_loading(false);
-        viewport.sync_with_anchor((20, 0, 30, 10), Some(0), &mut history);
+        viewport.sync_with_anchor((20, 0, 30, 10), Some(0), 10, 0, &mut history);
         assert_eq!(viewport.top_row(30, 10), 0);
         assert_eq!(history.reveal_request(), Some(3));
+    }
+
+    #[test]
+    fn older_page_does_not_spend_reflow_above_reader_as_page_rows() {
+        let mut viewport = TranscriptViewport::default();
+        let mut history = older_history();
+        history.mark_dropped_history_before(10);
+        viewport.sync_max(20, 0, 30, 10, false, &mut history);
+        viewport.follow_anchor(5);
+        viewport.scroll_up(9, &mut history);
+        assert_eq!(history.reveal_request(), Some(4));
+        history.update_cursor(&[], true);
+        history.mark_dropped_history_before(9);
+        // Existing rows above the anchor gained eight rows during reflow, but
+        // the accepted page introduced only two source-backed rows.
+        viewport.sync_with_anchor((30, 0, 40, 10), Some(10), 2, 0, &mut history);
+        assert_eq!(viewport.top_row(40, 10), 8);
+        assert_eq!(history.reveal_request(), Some(2));
+        viewport.sync_with_anchor((30, 0, 40, 10), Some(8), 0, 0, &mut history);
+        assert_eq!(history.reveal_request(), Some(2));
     }
 
     #[test]
@@ -727,7 +885,7 @@ mod tests {
         history.set_loading(false);
         // Only two rows were added above the preserved anchor; the other 18
         // were caused by content below it changing before the frame was accepted.
-        viewport.sync_with_anchor((40, 0, 50, 10), Some(2), &mut history);
+        viewport.sync_with_anchor((40, 0, 50, 10), Some(2), 10, 0, &mut history);
         assert_eq!(viewport.top_row(50, 10), 0);
         assert_eq!(history.reveal_request(), Some(1));
     }
@@ -745,7 +903,7 @@ mod tests {
         history.mark_dropped_history_before(9);
         history.set_loading(false);
         // Two rows above the old viewport, eighteen rows below it.
-        viewport.sync_with_anchor((40, 0, 50, 10), None, &mut history);
+        viewport.sync_with_anchor((40, 0, 50, 10), None, 10, 0, &mut history);
         assert_eq!(viewport.top_row(50, 10), 0);
         // Without a surviving item anchor we cannot prove how much was prepended,
         // so keep the movement pending instead of guessing from total growth.
@@ -764,11 +922,11 @@ mod tests {
         assert_eq!(history.reveal_request(), Some(1));
         history.set_loading(true);
         viewport.scroll_up(2, &mut history);
-        viewport.sync_with_anchor((20, 9, 30, 10), Some(0), &mut history);
+        viewport.sync_with_anchor((20, 9, 30, 10), Some(0), 10, 0, &mut history);
         assert_eq!(history.reveal_request(), Some(3));
         history.update_cursor(&[], false);
         history.set_loading(false);
-        viewport.sync_with_anchor((30, 9, 40, 10), Some(10), &mut history);
+        viewport.sync_with_anchor((30, 9, 40, 10), Some(10), 10, 0, &mut history);
         assert_eq!(viewport.top_row(40, 10), 7);
         assert_eq!(history.reveal_request(), None);
     }
@@ -783,7 +941,7 @@ mod tests {
         viewport.scroll_up(3, &mut history);
         viewport.scroll_down(2, &mut history);
         history.update_cursor(&[], false);
-        viewport.sync_with_anchor((30, 9, 40, 10), Some(12), &mut history);
+        viewport.sync_with_anchor((30, 9, 40, 10), Some(12), 10, 0, &mut history);
         assert_eq!(viewport.top_row(40, 10), 12);
     }
 
@@ -795,7 +953,7 @@ mod tests {
         viewport.scroll_up(8, &mut older);
         // Unsolicited prepend preserves the reader; it is not a request to move.
         older.update_cursor(&[], false);
-        viewport.sync_with_anchor((24, 0, 34, 10), Some(16), &mut older);
+        viewport.sync_with_anchor((24, 0, 34, 10), Some(16), 10, 0, &mut older);
 
         assert_eq!(viewport.top_row(34, 10), 16);
     }

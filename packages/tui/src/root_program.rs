@@ -249,6 +249,9 @@ pub struct BcodeRuntimeModel {
     selection_session: Option<bcode_session_models::SessionId>,
     selection_policy: (bool, bool, u64),
     transcript_clipboard: fn(&str) -> Result<(), String>,
+    /// Source identity of the latest outstanding timeline request within a
+    /// resident-window generation; two jumps need not replace the window between them.
+    pending_timeline_jump: Option<(bcode_session_models::SessionId, u64, u64)>,
 }
 
 enum RootTimer {
@@ -372,6 +375,7 @@ impl BcodeRuntimeModel {
             child_refresh_cursor: None,
             scheduled_deadlines: BTreeMap::new(),
             temporal_registry: TemporalRegistry::default(),
+            pending_timeline_jump: None,
         }
     }
 
@@ -1671,9 +1675,19 @@ impl BcodeRuntimeModel {
     }
 
     fn apply_root_timeline_jump(&mut self, entry: &super::timeline_dialog::TimelineEntry) {
-        if let Some(index) = entry.transcript_index()
+        // A timeline entry can outlive a history prepend/eviction while its
+        // dialog is open. Resolve its stable source sequence against the
+        // current resident window before choosing local or remote navigation.
+        if let Some(index) = self
+            .chat
+            .app
+            .transcript_index_for_sequence(entry.sequence())
             && self.chat.app.jump_to_transcript_index(index)
         {
+            // A resident jump supersedes a still-running remote selection too.
+            // Both can target the same session and window generation, so the
+            // generation fence alone cannot reject the older completion.
+            self.pending_timeline_jump = None;
             self.chat
                 .app
                 .set_status("jumped to timeline message".to_owned());
@@ -1685,10 +1699,14 @@ impl BcodeRuntimeModel {
                 .set_status("timeline requires an active session".to_owned());
             return;
         };
+        let generation = self.chat.app.history_window_generation();
+        let sequence = entry.sequence();
+        self.pending_timeline_jump = Some((session_id, generation, sequence));
         self.chat
             .replace_effect(super::effects::TuiEffect::LoadTimelineJump {
                 session_id,
-                sequence: entry.sequence(),
+                generation,
+                sequence,
             });
         self.chat
             .app
@@ -2019,6 +2037,7 @@ impl BcodeRuntimeModel {
         self.clear_transcript_selection();
         self.selection_session = self.chat.app.session_id();
         self.committed_selection = bmux_tui::selection::SelectionScene::new();
+        self.pending_timeline_jump = None;
         self.loop_state
             .session_changed(self.chat.viewing_session_id());
         self.draft_autosave.reset_for_session_change();
@@ -3508,6 +3527,18 @@ impl bmux_tui_runtime::Program for BcodeRuntimeModel {
                 }
                 let previous_frame_interval = self.settings.bmux_runtime_config().frame_interval;
                 let previous_session_id = self.chat.viewing_session_id();
+                if let TuiEffectResult::TimelineJumpLoaded {
+                    session_id,
+                    generation,
+                    sequence,
+                    ..
+                } = result.as_ref()
+                {
+                    if self.pending_timeline_jump != Some((*session_id, *generation, *sequence)) {
+                        return Ok(bmux_tui_runtime::Update::default());
+                    }
+                    self.pending_timeline_jump = None;
+                }
                 let observation = result.daemon_observation();
                 self.loop_state.observe_daemon(&mut self.chat, &observation);
                 super::chat_loop::apply_effect_result(
@@ -3835,6 +3866,7 @@ mod tests {
                 session_id,
                 cursor,
                 generation: model.chat.app.history_window_generation(),
+                width_columns: 40,
             }
         ));
         assert!(model.chat.app.loading_older_history());
@@ -3858,13 +3890,18 @@ mod tests {
                 session_id,
                 cursor: newer_cursor,
                 generation: model.chat.app.history_window_generation(),
+                width_columns: 40,
             }
         ));
         drop(model);
     }
 
     #[tokio::test]
+    #[allow(clippy::too_many_lines)]
     async fn history_completion_respects_replacement_and_reuses_current_boundary() {
+        use super::super::frame_sequence_harness::{
+            TranscriptFrameInput, TranscriptFrameSequence, TranscriptFrameStep,
+        };
         use bcode_session_models::{
             SessionEvent, SessionEventKind, SessionHistoryCursor, SessionHistoryPage,
         };
@@ -3904,6 +3941,7 @@ mod tests {
                 session_id,
                 cursor,
                 generation: old_generation,
+                width_columns: 40,
             }
         ));
         model.chat.pending_effects = super::super::effects::TuiEffectQueue::default();
@@ -3925,13 +3963,16 @@ mod tests {
             session_id,
             cursor,
             generation,
-            result: Ok(SessionHistoryPage {
-                session_id,
-                events: vec![event(9)],
-                compatibility_issues: vec![],
-                next_cursor: Some(SessionHistoryCursor { sequence: 8 }),
-                has_more: true,
-            }),
+            result: Ok((
+                SessionHistoryPage {
+                    session_id,
+                    events: vec![event(9)],
+                    compatibility_issues: vec![],
+                    next_cursor: Some(SessionHistoryCursor { sequence: 8 }),
+                    has_more: true,
+                },
+                Vec::new(),
+            )),
         };
         bmux_tui_runtime::Program::update(
             &mut model,
@@ -3942,6 +3983,35 @@ mod tests {
         .expect("stale completion");
         assert!(model.chat.app.loading_older_history());
         assert_eq!(model.chat.app.older_history_cursor(), Some(cursor));
+        // A late failure from the replaced request must not clear the new
+        // request or steal its retry/navigation state either.
+        bmux_tui_runtime::Program::update(
+            &mut model,
+            bmux_tui_runtime::RuntimeEvent::Message(super::BcodeRuntimeMessage::EffectCompleted(
+                Box::new(super::super::effects::TuiEffectResult::OlderHistoryLoaded {
+                    session_id,
+                    cursor,
+                    generation: old_generation,
+                    result: Err(bcode_client::ClientError::UnexpectedResponse),
+                }),
+            )),
+        )
+        .expect("stale failure completion");
+        assert!(model.chat.app.loading_older_history());
+        assert_eq!(model.chat.app.older_history_cursor(), Some(cursor));
+        let stale = TranscriptFrameSequence::new(&mut model.chat.app, 40, 12).run([
+            TranscriptFrameStep {
+                label: "replacement frame after stale page",
+                input: TranscriptFrameInput::Observe,
+            },
+            TranscriptFrameStep {
+                label: "stable replacement frame",
+                input: TranscriptFrameInput::Observe,
+            },
+        ]);
+        assert_eq!(stale[0].observation, stale[1].observation);
+        assert!(!stale[0].observation.semantic_items.is_empty());
+        let stale_items = stale[0].observation.semantic_items.clone();
         bmux_tui_runtime::Program::update(
             &mut model,
             bmux_tui_runtime::RuntimeEvent::Message(super::BcodeRuntimeMessage::EffectCompleted(
@@ -3954,7 +4024,2353 @@ mod tests {
             model.chat.app.older_history_cursor(),
             Some(SessionHistoryCursor { sequence: 8 })
         );
+        let accepted = TranscriptFrameSequence::new(&mut model.chat.app, 40, 12).run([
+            TranscriptFrameStep {
+                label: "accepted replacement page",
+                input: TranscriptFrameInput::Observe,
+            },
+            TranscriptFrameStep {
+                label: "accepted replacement page stable",
+                input: TranscriptFrameInput::Observe,
+            },
+        ]);
+        assert_eq!(accepted[0].observation, accepted[1].observation);
+        assert!(accepted[0].observation.semantic_items.len() > stale_items.len());
         drop(model);
+    }
+
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)]
+    async fn timeline_completion_cannot_replace_a_newer_window_or_session() {
+        use super::super::effects::TuiEffectResult;
+        use super::super::frame_sequence_harness::{
+            TranscriptFrameInput, TranscriptFrameSequence, TranscriptFrameStep,
+        };
+        let session_id = bcode_session_models::SessionId::new();
+        let history = [root_test_history_event(session_id, 10)];
+        let mut model = root_test_model_with_history(session_id, &history);
+        let generation = model.chat.app.history_window_generation();
+        model.pending_timeline_jump = Some((session_id, generation, 9));
+        model
+            .chat
+            .app
+            .replace_latest_transcript_window(&history, true);
+        let replacement_generation = model.chat.app.history_window_generation();
+        model.pending_timeline_jump = Some((session_id, replacement_generation, 9));
+        let before =
+            TranscriptFrameSequence::new(&mut model.chat.app, 80, 12).run([TranscriptFrameStep {
+                label: "replacement",
+                input: TranscriptFrameInput::Observe,
+            }]);
+        let complete =
+            |model: &mut super::BcodeRuntimeModel, session_id, generation, sequence, result| {
+                bmux_tui_runtime::Program::update(
+                    model,
+                    bmux_tui_runtime::RuntimeEvent::Message(
+                        super::BcodeRuntimeMessage::EffectCompleted(Box::new(
+                            TuiEffectResult::TimelineJumpLoaded {
+                                session_id,
+                                generation,
+                                sequence,
+                                result,
+                            },
+                        )),
+                    ),
+                )
+                .expect("timeline completion");
+            };
+        complete(
+            &mut model,
+            session_id,
+            generation,
+            9,
+            Ok((
+                vec![root_test_history_event(session_id, 9)],
+                true,
+                true,
+                Vec::new(),
+            )),
+        );
+        complete(
+            &mut model,
+            bcode_session_models::SessionId::new(),
+            replacement_generation,
+            9,
+            Ok((
+                vec![root_test_history_event(session_id, 9)],
+                true,
+                true,
+                Vec::new(),
+            )),
+        );
+        complete(
+            &mut model,
+            session_id,
+            generation,
+            9,
+            Err(super::TuiError::Client(
+                bcode_client::ClientError::UnexpectedResponse,
+            )),
+        );
+        let stale =
+            TranscriptFrameSequence::new(&mut model.chat.app, 80, 12).run([TranscriptFrameStep {
+                label: "stale completion",
+                input: TranscriptFrameInput::Observe,
+            }]);
+        assert_eq!(stale[0].observation, before[0].observation);
+        for (sequence, events, has_older, has_newer) in [
+            (9, vec![root_test_history_event(session_id, 8)], true, true),
+            (
+                9,
+                vec![root_test_history_event(
+                    bcode_session_models::SessionId::new(),
+                    9,
+                )],
+                true,
+                true,
+            ),
+            (
+                9,
+                vec![
+                    root_test_history_event(session_id, 9),
+                    root_test_history_event(session_id, 9),
+                ],
+                true,
+                true,
+            ),
+            (0, vec![root_test_history_event(session_id, 0)], true, false),
+        ] {
+            model.pending_timeline_jump = Some((session_id, replacement_generation, sequence));
+            complete(
+                &mut model,
+                session_id,
+                replacement_generation,
+                sequence,
+                Ok((events, has_older, has_newer, Vec::new())),
+            );
+        }
+        let rejected = TranscriptFrameSequence::new(&mut model.chat.app, 80, 12).run([
+            TranscriptFrameStep {
+                label: "invalid current timeline results rejected",
+                input: TranscriptFrameInput::Observe,
+            },
+            TranscriptFrameStep {
+                label: "unchanged replacement",
+                input: TranscriptFrameInput::Observe,
+            },
+        ]);
+        assert_eq!(rejected[0].observation, rejected[1].observation);
+        assert_eq!(
+            rejected[0].observation.semantic_items,
+            before[0].observation.semantic_items
+        );
+        model.pending_timeline_jump = Some((session_id, replacement_generation, 9));
+        complete(
+            &mut model,
+            session_id,
+            replacement_generation,
+            9,
+            Ok((
+                vec![root_test_history_event(session_id, 9)],
+                true,
+                true,
+                Vec::new(),
+            )),
+        );
+        let accepted = TranscriptFrameSequence::new(&mut model.chat.app, 80, 12).run([
+            TranscriptFrameStep {
+                label: "current completion",
+                input: TranscriptFrameInput::Observe,
+            },
+            TranscriptFrameStep {
+                label: "settled",
+                input: TranscriptFrameInput::Observe,
+            },
+        ]);
+        assert_eq!(accepted[0].observation, accepted[1].observation);
+        assert_ne!(
+            accepted[0].observation.semantic_items,
+            before[0].observation.semantic_items
+        );
+        assert!(model.chat.app.transcript_index_for_sequence(9).is_some());
+        drop(model);
+    }
+
+    #[tokio::test]
+    async fn timeline_jump_replacement_in_same_window_ignores_prior_completion() {
+        use super::super::effects::TuiEffectResult;
+        use super::super::frame_sequence_harness::{
+            TranscriptFrameInput, TranscriptFrameSequence, TranscriptFrameStep,
+        };
+        let session_id = bcode_session_models::SessionId::new();
+        let history = [root_test_history_event(session_id, 10)];
+        let mut model = root_test_model_with_history(session_id, &history);
+        let generation = model.chat.app.history_window_generation();
+        model.pending_timeline_jump = Some((session_id, generation, 9));
+        // A second timeline selection starts before the first request completes;
+        // both still target the same resident generation.
+        model.pending_timeline_jump = Some((session_id, generation, 8));
+        let before =
+            TranscriptFrameSequence::new(&mut model.chat.app, 80, 12).run([TranscriptFrameStep {
+                label: "before completions",
+                input: TranscriptFrameInput::Observe,
+            }]);
+        for result in [
+            Ok((
+                vec![root_test_history_event(session_id, 9)],
+                true,
+                true,
+                Vec::new(),
+            )),
+            Err(super::TuiError::Client(
+                bcode_client::ClientError::UnexpectedResponse,
+            )),
+        ] {
+            bmux_tui_runtime::Program::update(
+                &mut model,
+                bmux_tui_runtime::RuntimeEvent::Message(
+                    super::BcodeRuntimeMessage::EffectCompleted(Box::new(
+                        TuiEffectResult::TimelineJumpLoaded {
+                            session_id,
+                            generation,
+                            sequence: 9,
+                            result,
+                        },
+                    )),
+                ),
+            )
+            .expect("superseded completion");
+        }
+        let stale =
+            TranscriptFrameSequence::new(&mut model.chat.app, 80, 12).run([TranscriptFrameStep {
+                label: "superseded success and failure",
+                input: TranscriptFrameInput::Observe,
+            }]);
+        assert_eq!(before[0].observation, stale[0].observation);
+        assert_eq!(
+            model.pending_timeline_jump,
+            Some((session_id, generation, 8))
+        );
+        bmux_tui_runtime::Program::update(
+            &mut model,
+            bmux_tui_runtime::RuntimeEvent::Message(super::BcodeRuntimeMessage::EffectCompleted(
+                Box::new(TuiEffectResult::TimelineJumpLoaded {
+                    session_id,
+                    generation,
+                    sequence: 8,
+                    result: Ok((
+                        vec![root_test_history_event(session_id, 8)],
+                        true,
+                        true,
+                        Vec::new(),
+                    )),
+                }),
+            )),
+        )
+        .expect("current completion");
+        let accepted = TranscriptFrameSequence::new(&mut model.chat.app, 80, 12).run([
+            TranscriptFrameStep {
+                label: "current timeline jump",
+                input: TranscriptFrameInput::Observe,
+            },
+            TranscriptFrameStep {
+                label: "settled",
+                input: TranscriptFrameInput::Observe,
+            },
+        ]);
+        assert_eq!(accepted[0].observation, accepted[1].observation);
+        assert_ne!(
+            accepted[0].observation.semantic_items,
+            before[0].observation.semantic_items
+        );
+        assert!(model.chat.app.transcript_index_for_sequence(8).is_some());
+        assert_eq!(model.pending_timeline_jump, None);
+        drop(model);
+    }
+
+    #[tokio::test]
+    async fn timeline_entry_resolves_source_sequence_after_window_replacement() {
+        use super::super::effects::TuiEffect;
+        use super::super::frame_sequence_harness::{
+            TranscriptFrameInput, TranscriptFrameSequence, TranscriptFrameStep,
+        };
+        let session_id = bcode_session_models::SessionId::new();
+        let initial = [root_test_history_event(session_id, 10)];
+        let mut model = root_test_model_with_history(session_id, &initial);
+        let _ =
+            TranscriptFrameSequence::new(&mut model.chat.app, 80, 12).run([TranscriptFrameStep {
+                label: "initial window",
+                input: TranscriptFrameInput::Observe,
+            }]);
+        let stale =
+            super::super::timeline_dialog::TimelineEntry::new(10, 10, "older resident message");
+        let replacement = [root_test_history_event(session_id, 20)];
+        model
+            .chat
+            .app
+            .replace_latest_transcript_window(&replacement, true);
+        let _ =
+            TranscriptFrameSequence::new(&mut model.chat.app, 80, 12).run([TranscriptFrameStep {
+                label: "replacement window",
+                input: TranscriptFrameInput::Observe,
+            }]);
+        model.apply_root_timeline_jump(&stale);
+        let generation = model.chat.app.history_window_generation();
+        assert_eq!(
+            model.pending_timeline_jump,
+            Some((session_id, generation, 10))
+        );
+        assert!(
+            model
+                .chat
+                .pending_effects
+                .contains_effect(&TuiEffect::LoadTimelineJump {
+                    session_id,
+                    generation,
+                    sequence: 10,
+                })
+        );
+        let after =
+            TranscriptFrameSequence::new(&mut model.chat.app, 80, 12).run([TranscriptFrameStep {
+                label: "stale index did not jump to replacement",
+                input: TranscriptFrameInput::Observe,
+            }]);
+        assert_eq!(after[0].observation.semantic_items.len(), 1);
+        assert!(after[0].text.contains("message 20"));
+        assert!(model.chat.app.transcript_index_for_sequence(10).is_none());
+        drop(model);
+    }
+
+    #[tokio::test]
+    async fn resident_timeline_jump_supersedes_pending_remote_selection() {
+        use super::super::effects::TuiEffectResult;
+        use super::super::frame_sequence_harness::{
+            TranscriptFrameInput, TranscriptFrameSequence, TranscriptFrameStep,
+        };
+        let session_id = bcode_session_models::SessionId::new();
+        let history = [root_test_history_event(session_id, 10)];
+        let mut model = root_test_model_with_history(session_id, &history);
+        let _ =
+            TranscriptFrameSequence::new(&mut model.chat.app, 80, 12).run([TranscriptFrameStep {
+                label: "layout resident entry",
+                input: TranscriptFrameInput::Observe,
+            }]);
+        let generation = model.chat.app.history_window_generation();
+        model.apply_root_timeline_jump(&super::super::timeline_dialog::TimelineEntry::new(
+            9,
+            9,
+            "remote message",
+        ));
+        assert_eq!(
+            model.pending_timeline_jump,
+            Some((session_id, generation, 9))
+        );
+        model.apply_root_timeline_jump(&super::super::timeline_dialog::TimelineEntry::new(
+            10,
+            10,
+            "resident message",
+        ));
+        assert_eq!(model.pending_timeline_jump, None);
+        let before =
+            TranscriptFrameSequence::new(&mut model.chat.app, 80, 12).run([TranscriptFrameStep {
+                label: "resident selection",
+                input: TranscriptFrameInput::Observe,
+            }]);
+        for result in [
+            Ok((
+                vec![root_test_history_event(session_id, 9)],
+                true,
+                true,
+                Vec::new(),
+            )),
+            Err(super::TuiError::Client(
+                bcode_client::ClientError::UnexpectedResponse,
+            )),
+        ] {
+            bmux_tui_runtime::Program::update(
+                &mut model,
+                bmux_tui_runtime::RuntimeEvent::Message(
+                    super::BcodeRuntimeMessage::EffectCompleted(Box::new(
+                        TuiEffectResult::TimelineJumpLoaded {
+                            session_id,
+                            generation,
+                            sequence: 9,
+                            result,
+                        },
+                    )),
+                ),
+            )
+            .expect("stale remote completion");
+        }
+        let after =
+            TranscriptFrameSequence::new(&mut model.chat.app, 80, 12).run([TranscriptFrameStep {
+                label: "resident selection after stale completions",
+                input: TranscriptFrameInput::Observe,
+            }]);
+        assert_eq!(before[0].observation, after[0].observation);
+        assert!(model.chat.app.transcript_index_for_sequence(10).is_some());
+        assert!(model.chat.app.transcript_index_for_sequence(9).is_none());
+        drop(model);
+    }
+
+    #[tokio::test]
+    async fn newer_completion_cannot_change_a_replaced_centered_window() {
+        use super::super::effects::{TuiEffect, TuiEffectResult};
+        use super::super::frame_sequence_harness::{
+            TranscriptFrameInput, TranscriptFrameSequence, TranscriptFrameStep,
+        };
+        use bcode_session_models::{SessionHistoryCursor, SessionHistoryPage};
+
+        let session_id = bcode_session_models::SessionId::new();
+        let initial = [root_test_history_event(session_id, 10)];
+        let replacement = [root_test_history_event(session_id, 20)];
+        let mut model = root_test_model_with_history(session_id, &initial);
+        model
+            .chat
+            .app
+            .replace_transcript_window(&initial, false, true, 10);
+        let cursor = model.chat.app.newer_history_cursor().expect("newer cursor");
+        model.chat.app.request_newer_history_for_test(2);
+        let stale_generation = model.chat.app.history_window_generation();
+        model
+            .loop_state
+            .prepare_runtime_work(&mut model.chat, bmux_tui::geometry::Rect::new(0, 0, 80, 12));
+        assert!(
+            model
+                .chat
+                .pending_effects
+                .contains_effect(&TuiEffect::LoadNewerHistory {
+                    session_id,
+                    cursor,
+                    generation: stale_generation,
+                    width_columns: 80,
+                })
+        );
+        model
+            .chat
+            .app
+            .replace_transcript_window(&replacement, false, true, 20);
+        let before =
+            TranscriptFrameSequence::new(&mut model.chat.app, 80, 12).run([TranscriptFrameStep {
+                label: "replacement",
+                input: TranscriptFrameInput::Observe,
+            }]);
+        for result in [
+            Ok((
+                SessionHistoryPage {
+                    session_id,
+                    events: vec![root_test_history_event(session_id, 11)],
+                    compatibility_issues: vec![],
+                    next_cursor: None,
+                    has_more: false,
+                },
+                Vec::new(),
+            )),
+            Err(bcode_client::ClientError::UnexpectedResponse),
+        ] {
+            bmux_tui_runtime::Program::update(
+                &mut model,
+                bmux_tui_runtime::RuntimeEvent::Message(
+                    super::BcodeRuntimeMessage::EffectCompleted(Box::new(
+                        TuiEffectResult::NewerHistoryLoaded {
+                            session_id,
+                            cursor,
+                            generation: stale_generation,
+                            result,
+                        },
+                    )),
+                ),
+            )
+            .expect("ignore stale newer completion");
+        }
+        let after = TranscriptFrameSequence::new(&mut model.chat.app, 80, 12).run([
+            TranscriptFrameStep {
+                label: "stale page ignored",
+                input: TranscriptFrameInput::Observe,
+            },
+            TranscriptFrameStep {
+                label: "stable",
+                input: TranscriptFrameInput::Observe,
+            },
+        ]);
+        assert_eq!(before[0].observation, after[0].observation);
+        assert_eq!(after[0].observation, after[1].observation);
+        assert_eq!(
+            model.chat.app.newer_history_cursor(),
+            Some(SessionHistoryCursor { sequence: 21 })
+        );
+        drop(model);
+    }
+
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)]
+    async fn newer_completion_after_resynchronization_does_not_reopen_the_old_window() {
+        use super::super::effects::{TuiEffect, TuiEffectResult};
+        use super::super::frame_sequence_harness::{
+            TranscriptFrameInput, TranscriptFrameSequence, TranscriptFrameStep,
+        };
+        use bcode_session_models::{SessionHistoryPage, SessionSummary, SessionTitleSource};
+
+        let session_id = bcode_session_models::SessionId::new();
+        let initial = [root_test_history_event(session_id, 10)];
+        let mut model = root_test_model_with_history(session_id, &initial);
+        model
+            .chat
+            .app
+            .replace_transcript_window(&initial, false, true, 10);
+        model.chat.app.request_newer_history_for_test(2);
+        let cursor = model.chat.app.newer_history_cursor().expect("newer cursor");
+        let generation = model.chat.app.history_window_generation();
+        model
+            .loop_state
+            .prepare_runtime_work(&mut model.chat, bmux_tui::geometry::Rect::new(0, 0, 80, 12));
+        assert!(
+            model
+                .chat
+                .pending_effects
+                .contains_effect(&TuiEffect::LoadNewerHistory {
+                    session_id,
+                    cursor,
+                    generation,
+                    width_columns: 80,
+                })
+        );
+
+        let session = SessionSummary {
+            id: session_id,
+            parent_id: None,
+            name: Some("reconnected".to_owned()),
+            explicit_name: Some("reconnected".to_owned()),
+            derived_title: None,
+            title_source: SessionTitleSource::Explicit,
+            client_count: 1,
+            created_at_ms: 1,
+            updated_at_ms: 2,
+            working_directory: "/tmp/bcode-tui-test".into(),
+            import: None,
+            execution: None,
+            location: None,
+        };
+        let attached = bcode_client::AttachedSessionHistory {
+            session,
+            history: vec![root_test_history_event(session_id, 20)],
+            submissions: vec![],
+            input_history: vec![],
+            usage_summary: bcode_session_models::SessionUsageSummary::default(),
+            import_warnings: vec![],
+            draft: None,
+            runtime_selection: bcode_ipc::SessionRuntimeSelection::default(),
+            projection_window: None,
+        };
+        for update in [
+            super::super::history_flow::SessionStreamUpdate::ResyncStarted { session_id },
+            super::super::history_flow::SessionStreamUpdate::Resynchronized {
+                session_id,
+                attached: Box::new(attached),
+            },
+        ] {
+            bmux_tui_runtime::Program::update(
+                &mut model,
+                bmux_tui_runtime::RuntimeEvent::Message(super::BcodeRuntimeMessage::SessionStream(
+                    Box::new(update),
+                )),
+            )
+            .expect("stream update");
+        }
+        assert_ne!(model.chat.app.history_window_generation(), generation);
+        let before =
+            TranscriptFrameSequence::new(&mut model.chat.app, 80, 12).run([TranscriptFrameStep {
+                label: "resynchronized",
+                input: TranscriptFrameInput::Observe,
+            }]);
+        for result in [
+            Ok((
+                SessionHistoryPage {
+                    session_id,
+                    events: vec![root_test_history_event(session_id, 11)],
+                    compatibility_issues: vec![],
+                    next_cursor: None,
+                    has_more: false,
+                },
+                Vec::new(),
+            )),
+            Err(bcode_client::ClientError::UnexpectedResponse),
+        ] {
+            bmux_tui_runtime::Program::update(
+                &mut model,
+                bmux_tui_runtime::RuntimeEvent::Message(
+                    super::BcodeRuntimeMessage::EffectCompleted(Box::new(
+                        TuiEffectResult::NewerHistoryLoaded {
+                            session_id,
+                            cursor,
+                            generation,
+                            result,
+                        },
+                    )),
+                ),
+            )
+            .expect("late newer completion");
+        }
+        let after = TranscriptFrameSequence::new(&mut model.chat.app, 80, 12).run([
+            TranscriptFrameStep {
+                label: "stale newer page ignored",
+                input: TranscriptFrameInput::Observe,
+            },
+            TranscriptFrameStep {
+                label: "stable",
+                input: TranscriptFrameInput::Observe,
+            },
+        ]);
+        assert_eq!(before[0].observation, after[0].observation);
+        assert_eq!(after[0].observation, after[1].observation);
+        assert!(model.chat.app.transcript_index_for_sequence(20).is_some());
+        assert!(model.chat.app.transcript_index_for_sequence(11).is_none());
+        drop(model);
+    }
+
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)]
+    async fn reconnect_replaces_window_and_rejects_old_history_completion() {
+        use super::super::effects::{TuiEffect, TuiEffectResult};
+        use super::super::frame_sequence_harness::{
+            TranscriptFrameInput, TranscriptFrameSequence, TranscriptFrameStep,
+        };
+        use bcode_session_models::{
+            SessionEvent, SessionEventKind, SessionHistoryCursor, SessionHistoryPage,
+            SessionSummary, SessionTitleSource,
+        };
+        let session_id = bcode_session_models::SessionId::new();
+        let event = |sequence| SessionEvent {
+            schema_version: bcode_session_models::CURRENT_SESSION_EVENT_SCHEMA_VERSION,
+            sequence,
+            timestamp_ms: sequence,
+            session_id,
+            provenance: None,
+            kind: SessionEventKind::AssistantMessage {
+                text: format!("message {sequence}"),
+            },
+        };
+        let history = [event(10)];
+        let mut model = root_test_model_with_history(session_id, &history);
+        model
+            .chat
+            .app
+            .replace_latest_transcript_window(&history, true);
+        model.chat.app.request_older_history_for_test(2);
+        let cursor = model
+            .chat
+            .app
+            .older_history_cursor()
+            .expect("older boundary");
+        let generation = model.chat.app.history_window_generation();
+        model
+            .loop_state
+            .prepare_runtime_work(&mut model.chat, bmux_tui::geometry::Rect::new(0, 0, 40, 12));
+        assert!(
+            model
+                .chat
+                .pending_effects
+                .contains_effect(&TuiEffect::LoadOlderHistory {
+                    session_id,
+                    cursor,
+                    generation,
+                    width_columns: 40,
+                })
+        );
+        let session = SessionSummary {
+            id: session_id,
+            parent_id: None,
+            name: Some("reconnected".to_owned()),
+            explicit_name: Some("reconnected".to_owned()),
+            derived_title: None,
+            title_source: SessionTitleSource::Explicit,
+            client_count: 1,
+            created_at_ms: 1,
+            updated_at_ms: 2,
+            working_directory: "/tmp/bcode-tui-test".into(),
+            import: None,
+            execution: None,
+            location: None,
+        };
+        let attached = bcode_client::AttachedSessionHistory {
+            session,
+            history: vec![event(20)],
+            submissions: vec![],
+            input_history: vec![],
+            usage_summary: bcode_session_models::SessionUsageSummary::default(),
+            import_warnings: vec![],
+            draft: None,
+            runtime_selection: bcode_ipc::SessionRuntimeSelection::default(),
+            projection_window: None,
+        };
+        for update in [
+            super::super::history_flow::SessionStreamUpdate::ResyncStarted { session_id },
+            super::super::history_flow::SessionStreamUpdate::Resynchronized {
+                session_id,
+                attached: Box::new(attached),
+            },
+        ] {
+            bmux_tui_runtime::Program::update(
+                &mut model,
+                bmux_tui_runtime::RuntimeEvent::Message(super::BcodeRuntimeMessage::SessionStream(
+                    Box::new(update),
+                )),
+            )
+            .expect("stream update");
+        }
+        assert_ne!(model.chat.app.history_window_generation(), generation);
+        let before =
+            TranscriptFrameSequence::new(&mut model.chat.app, 40, 12).run([TranscriptFrameStep {
+                label: "reconnected",
+                input: TranscriptFrameInput::Observe,
+            }]);
+        bmux_tui_runtime::Program::update(
+            &mut model,
+            bmux_tui_runtime::RuntimeEvent::Message(super::BcodeRuntimeMessage::EffectCompleted(
+                Box::new(TuiEffectResult::OlderHistoryLoaded {
+                    session_id,
+                    cursor,
+                    generation,
+                    result: Ok((
+                        SessionHistoryPage {
+                            session_id,
+                            events: vec![event(9)],
+                            compatibility_issues: vec![],
+                            next_cursor: Some(SessionHistoryCursor { sequence: 8 }),
+                            has_more: true,
+                        },
+                        Vec::new(),
+                    )),
+                }),
+            )),
+        )
+        .expect("late completion");
+        bmux_tui_runtime::Program::update(
+            &mut model,
+            bmux_tui_runtime::RuntimeEvent::Message(super::BcodeRuntimeMessage::EffectCompleted(
+                Box::new(TuiEffectResult::OlderHistoryLoaded {
+                    session_id,
+                    cursor,
+                    generation,
+                    result: Err(bcode_client::ClientError::UnexpectedResponse),
+                }),
+            )),
+        )
+        .expect("late failure completion");
+        let after = TranscriptFrameSequence::new(&mut model.chat.app, 40, 12).run([
+            TranscriptFrameStep {
+                label: "late page ignored",
+                input: TranscriptFrameInput::Observe,
+            },
+            TranscriptFrameStep {
+                label: "settled",
+                input: TranscriptFrameInput::Observe,
+            },
+        ]);
+        assert_eq!(before[0].observation, after[0].observation);
+        assert_eq!(after[0].observation, after[1].observation);
+        assert!(model.chat.app.transcript_index_for_sequence(20).is_some());
+        assert!(model.chat.app.transcript_index_for_sequence(9).is_none());
+        drop(model);
+    }
+
+    #[tokio::test]
+    async fn resumed_boundary_effect_completion_preserves_reader_in_accepted_frame() {
+        use super::super::frame_sequence_harness::{
+            TranscriptFrameInput, TranscriptFrameSequence, TranscriptFrameStep,
+        };
+        use bcode_session_models::{SessionEvent, SessionEventKind};
+        let session_id = bcode_session_models::SessionId::new();
+        let event = |sequence| SessionEvent {
+            schema_version: bcode_session_models::CURRENT_SESSION_EVENT_SCHEMA_VERSION,
+            sequence,
+            timestamp_ms: sequence,
+            session_id,
+            provenance: None,
+            kind: SessionEventKind::AssistantMessage {
+                text: format!("message {sequence}"),
+            },
+        };
+        let recent = (30..42).map(event).collect::<Vec<_>>();
+        let mut model = root_test_model_with_history(session_id, &recent);
+        model
+            .chat
+            .app
+            .replace_latest_transcript_window(&recent, true);
+        let initial =
+            TranscriptFrameSequence::new(&mut model.chat.app, 80, 12).run([TranscriptFrameStep {
+                label: "resume",
+                input: TranscriptFrameInput::Observe,
+            }]);
+        let before = TranscriptFrameSequence::new(&mut model.chat.app, 80, 12).run([
+            TranscriptFrameStep {
+                label: "reach history boundary",
+                input: TranscriptFrameInput::ScrollUp(initial[0].observation.viewport_top + 2),
+            },
+            TranscriptFrameStep {
+                label: "repeat input while loading",
+                input: TranscriptFrameInput::ScrollUp(2),
+            },
+        ]);
+        let reader = &before[1].observation;
+        let cursor = model.chat.app.older_history_cursor().expect("older cursor");
+        let generation = model.chat.app.history_window_generation();
+        assert_eq!(
+            model.loop_state.prepare_runtime_work(
+                &mut model.chat,
+                bmux_tui::geometry::Rect::new(0, 0, 80, 12),
+            ),
+            super::super::invalidation::UiInvalidation::Structural
+        );
+        assert!(model.chat.pending_effects.contains_effect(
+            &super::super::effects::TuiEffect::LoadOlderHistory {
+                session_id,
+                cursor,
+                generation,
+                width_columns: 80,
+            }
+        ));
+        complete_older_history_root_test(
+            &mut model,
+            session_id,
+            cursor,
+            generation,
+            (1..30).map(event).collect(),
+        );
+        let after = TranscriptFrameSequence::new(&mut model.chat.app, 80, 12).run([
+            TranscriptFrameStep {
+                label: "page accepted",
+                input: TranscriptFrameInput::Observe,
+            },
+            TranscriptFrameStep {
+                label: "same page accepted again",
+                input: TranscriptFrameInput::Observe,
+            },
+        ]);
+        let loaded = &after[0].observation;
+        let anchor = reader.anchor.as_ref().expect("source anchor before page");
+        let source = reader
+            .terminal_rows
+            .get(reader.viewport_top + anchor.viewport_row_offset)
+            .and_then(|(source, _)| source.as_ref())
+            .expect("source row before page");
+        let previous_row = loaded
+            .terminal_rows
+            .iter()
+            .position(|(id, row)| id.as_ref() == Some(source) && *row == anchor.row_in_item)
+            .expect("reader source row survives page");
+        assert!(previous_row >= loaded.viewport_top);
+        assert!(
+            previous_row - loaded.viewport_top <= 5,
+            "reader moved {} rows; before top {}, after top {}, anchor {:?}",
+            previous_row - loaded.viewport_top,
+            reader.viewport_top,
+            loaded.viewport_top,
+            anchor
+        );
+        assert_eq!(loaded, &after[1].observation);
+        drop(model);
+    }
+
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)]
+    async fn resumed_boundary_real_ipc_effect_keeps_reader_across_non_presenting_page() {
+        use super::super::effects::TuiEffect;
+        use super::super::frame_sequence_harness::{
+            TranscriptFrameInput, TranscriptFrameSequence, TranscriptFrameStep,
+        };
+        use bcode_session_models::{
+            ClientId, ProjectionHistoryPage, ProjectionSourceRange, ProjectionWindow, SessionEvent,
+            SessionEventKind,
+        };
+        let session_id = bcode_session_models::SessionId::new();
+        let event = move |sequence, kind| SessionEvent {
+            schema_version: bcode_session_models::CURRENT_SESSION_EVENT_SCHEMA_VERSION,
+            sequence,
+            timestamp_ms: sequence,
+            session_id,
+            provenance: None,
+            kind,
+        };
+        let recent = (30..42)
+            .map(|sequence| {
+                event(
+                    sequence,
+                    SessionEventKind::UserMessage {
+                        client_id: ClientId::new(),
+                        text: format!("message {sequence}"),
+                        admission: bcode_session_models::TurnAdmissionMetadata::default(),
+                    },
+                )
+            })
+            .collect::<Vec<_>>();
+        let mut model = root_test_model_with_history(session_id, &recent);
+        model
+            .chat
+            .app
+            .replace_latest_transcript_window(&recent, true);
+        let before = TranscriptFrameSequence::new(&mut model.chat.app, 80, 12).run([
+            TranscriptFrameStep {
+                label: "resume",
+                input: TranscriptFrameInput::Observe,
+            },
+            TranscriptFrameStep {
+                label: "load boundary",
+                input: TranscriptFrameInput::ScrollUp(100),
+            },
+            TranscriptFrameStep {
+                label: "repeat while pending",
+                input: TranscriptFrameInput::ScrollUp(2),
+            },
+        ]);
+        let reader = &before[2].observation;
+        let cursor = model.chat.app.older_history_cursor().expect("older cursor");
+        let generation = model.chat.app.history_window_generation();
+        model
+            .loop_state
+            .prepare_runtime_work(&mut model.chat, bmux_tui::geometry::Rect::new(0, 0, 80, 12));
+        let effect = TuiEffect::LoadOlderHistory {
+            session_id,
+            cursor,
+            generation,
+            width_columns: 80,
+        };
+        assert!(model.chat.pending_effects.contains_effect(&effect));
+        let (scheduled, _) = model.chat.pending_effects.drain_runtime();
+        assert!(scheduled.into_iter().any(|(_, queued)| matches!(queued, TuiEffect::LoadOlderHistory { session_id: queued_session, cursor: queued_cursor, generation: queued_generation, .. } if queued_session == session_id && queued_cursor == cursor && queued_generation == generation)));
+        let socket_dir = tempfile::tempdir().expect("IPC directory");
+        let endpoint = bcode_ipc::IpcEndpoint::unix_socket(socket_dir.path().join("page.sock"));
+        let listener = bcode_ipc::LocalIpcListener::bind(&endpoint).expect("listener");
+        let responder = tokio::spawn(async move {
+            let mut stream = listener.accept().await.expect("client");
+            loop {
+                let envelope = bcode_ipc::recv_envelope(&mut stream)
+                    .await
+                    .expect("request");
+                let request = bcode_ipc::decode_request(&envelope.payload).expect("decode");
+                let done = matches!(
+                    request,
+                    bcode_ipc::Request::SessionProjectionHistoryPage { .. }
+                );
+                let response = match request {
+                    bcode_ipc::Request::Hello { .. } => {
+                        bcode_ipc::Response::Ok(bcode_ipc::ResponsePayload::Hello {
+                            protocol_version: bcode_ipc::ProtocolVersion::current(),
+                            client_id: ClientId::new(),
+                            daemon: bcode_ipc::DaemonStatus {
+                                namespace: bcode_ipc::daemon_namespace(),
+                                protocol_version: u32::from(
+                                    bcode_ipc::ProtocolVersion::current().0,
+                                ),
+                                artifact_id: Some(bcode_ipc::ArtifactId::current()),
+                                executable_digest: Some(
+                                    bcode_daemon_lifecycle::current_executable_identity()
+                                        .expect("test executable identity")
+                                        .1,
+                                ),
+                                build_fingerprint: bcode_ipc::BUILD_FINGERPRINT.to_owned(),
+                                storage_writer_epoch: Some(
+                                    bcode_ipc::CURRENT_SESSION_STORAGE_WRITER_EPOCH,
+                                ),
+                                session_event_schema_version: Some(
+                                    bcode_session_models::CURRENT_SESSION_EVENT_SCHEMA_VERSION,
+                                ),
+                                state_location_id: Some(bcode_ipc::state_location_id()),
+                                ..bcode_ipc::DaemonStatus::default()
+                            },
+                        })
+                    }
+                    bcode_ipc::Request::SessionProjectionHistoryPage {
+                        session_id: requested,
+                        request,
+                    } => {
+                        assert_eq!(requested, session_id);
+                        assert!(request.limits.max_events_scanned <= 512);
+                        bcode_ipc::Response::Ok(
+                            bcode_ipc::ResponsePayload::SessionProjectionHistoryPage {
+                                page: ProjectionHistoryPage {
+                                    session_id,
+                                    window: ProjectionWindow {
+                                        projection:
+                                            bcode_session_models::SessionProjectionKind::Transcript,
+                                        transcript_items: vec![],
+                                        source_range: Some(ProjectionSourceRange {
+                                            start_sequence: 25,
+                                            end_sequence: 29,
+                                        }),
+                                        has_older: true,
+                                        has_newer: true,
+                                        scanned_events: 5,
+                                    },
+                                    events: (25..30)
+                                        .map(|sequence| {
+                                            event(
+                                                sequence,
+                                                SessionEventKind::ClientAttached {
+                                                    client_id: ClientId::new(),
+                                                },
+                                            )
+                                        })
+                                        .collect(),
+                                },
+                            },
+                        )
+                    }
+                    other => panic!("unexpected request: {other:?}"),
+                };
+                let reply = bcode_ipc::response_envelope(envelope.request_id, &response)
+                    .expect("response envelope");
+                bcode_ipc::send_envelope(&mut stream, &reply)
+                    .await
+                    .expect("send response");
+                if done {
+                    break;
+                }
+            }
+        });
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            effect.run_for_test(bcode_client::BcodeClient::new(endpoint)),
+        )
+        .await
+        .expect("effect timeout");
+        responder.await.expect("responder");
+        bmux_tui_runtime::Program::update(
+            &mut model,
+            bmux_tui_runtime::RuntimeEvent::Message(super::BcodeRuntimeMessage::EffectCompleted(
+                Box::new(result),
+            )),
+        )
+        .expect("deliver effect");
+        let after = TranscriptFrameSequence::new(&mut model.chat.app, 80, 12).run([
+            TranscriptFrameStep {
+                label: "accepted empty semantic page",
+                input: TranscriptFrameInput::Observe,
+            },
+            TranscriptFrameStep {
+                label: "repeat",
+                input: TranscriptFrameInput::Observe,
+            },
+        ]);
+        assert_eq!(reader.anchor, after[0].observation.anchor);
+        assert_eq!(reader.viewport_top, after[0].observation.viewport_top);
+        assert_eq!(after[0].observation, after[1].observation);
+        assert_eq!(
+            model
+                .chat
+                .app
+                .older_history_cursor()
+                .map(|cursor| cursor.sequence),
+            Some(24)
+        );
+        model
+            .loop_state
+            .prepare_runtime_work(&mut model.chat, bmux_tui::geometry::Rect::new(0, 0, 80, 12));
+        let (next_scheduled, _) = model.chat.pending_effects.drain_runtime();
+        assert!(next_scheduled.iter().any(|(_, queued)| matches!(queued, TuiEffect::LoadOlderHistory { session_id: queued_session, cursor: queued_cursor, generation: queued_generation, .. } if *queued_session == session_id && queued_cursor.sequence == 24 && *queued_generation == generation)));
+        model.chat.app.scroll_transcript_up(1);
+        assert!(model.chat.app.loading_older_history());
+        let next_page = vec![event(
+            23,
+            SessionEventKind::UserMessage {
+                client_id: ClientId::new(),
+                text: "earlier message".to_owned(),
+                admission: bcode_session_models::TurnAdmissionMetadata::default(),
+            },
+        )];
+        deliver_older_history_root_test(
+            &mut model,
+            session_id,
+            bcode_session_models::SessionHistoryCursor { sequence: 24 },
+            generation,
+            Ok(bcode_session_models::SessionHistoryPage {
+                session_id,
+                events: next_page,
+                compatibility_issues: vec![],
+                next_cursor: None,
+                has_more: false,
+            }),
+        );
+        let presenting = TranscriptFrameSequence::new(&mut model.chat.app, 80, 12).run([
+            TranscriptFrameStep {
+                label: "presenting page",
+                input: TranscriptFrameInput::Observe,
+            },
+            TranscriptFrameStep {
+                label: "presenting page settled",
+                input: TranscriptFrameInput::Observe,
+            },
+        ]);
+        assert_eq!(presenting[0].observation, presenting[1].observation);
+        assert_eq!(model.chat.app.older_history_cursor(), None);
+        assert!(
+            presenting[0].observation.semantic_items.len()
+                > after[0].observation.semantic_items.len()
+        );
+        let reader_anchor = reader.anchor.as_ref().expect("reader anchor");
+        let reader_source = reader.terminal_rows
+            [reader.viewport_top + reader_anchor.viewport_row_offset]
+            .0
+            .as_ref()
+            .expect("source-backed reader");
+        let source_row = presenting[0]
+            .observation
+            .terminal_rows
+            .iter()
+            .position(|(id, row)| {
+                id.as_ref() == Some(reader_source) && *row == reader_anchor.row_in_item
+            })
+            .expect("source survives page");
+        let reader_offset = source_row.saturating_sub(presenting[0].observation.viewport_top);
+        assert!(
+            reader_offset > reader_anchor.viewport_row_offset,
+            "presenting page must reveal requested movement: reader_offset={reader_offset}, prior_offset={}, source_row={source_row}, top={}",
+            reader_anchor.viewport_row_offset,
+            presenting[0].observation.viewport_top
+        );
+        assert_eq!(
+            reader_offset - reader_anchor.viewport_row_offset,
+            2,
+            "only the newly navigable rows are revealed, once"
+        );
+        drop(model);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)]
+    async fn persisted_resume_reverses_across_naturally_evicted_newer_history() {
+        use super::super::effects::TuiEffect;
+        use super::super::frame_sequence_harness::{
+            TranscriptFrameInput, TranscriptFrameSequence, TranscriptFrameStep,
+        };
+        use bcode_session_models::{ClientId, SessionHistoryDirection, SessionHistoryQuery};
+
+        let directory = tempfile::tempdir().expect("isolated state");
+        let state_root = directory.path().join("state");
+        std::fs::create_dir(&state_root).expect("state directory");
+        let locations = bcode_config::resolve_state_location_set_with_environment(
+            &bcode_config::StateConfig::default(),
+            &bcode_config::StateLocationSelection {
+                root: Some(state_root),
+                profile: None,
+            },
+            &bcode_config::ConfigEnvironmentSnapshot::new(
+                BTreeMap::new(),
+                directory.path().to_path_buf(),
+            ),
+        )
+        .expect("resolve isolated state");
+        let sessions =
+            bcode_session::SessionManager::persistent(locations.primary().sessions_root())
+                .expect("persistent sessions");
+        let session = sessions
+            .create_session(None, directory.path().to_path_buf())
+            .await
+            .expect("session");
+        let client_id = ClientId::new();
+        for index in 0..1_100 {
+            sessions
+                .append_user_message(session.id, client_id, format!("archived {index}"))
+                .await
+                .expect("persist user message");
+        }
+        let recent = sessions
+            .session_history_page(
+                session.id,
+                SessionHistoryQuery {
+                    cursor: None,
+                    limit: 12,
+                    direction: SessionHistoryDirection::Backward,
+                },
+            )
+            .await
+            .expect("recent bounded history")
+            .events;
+        drop(sessions);
+        let mut model = root_test_model_with_history(session.id, &recent);
+        model
+            .chat
+            .app
+            .replace_latest_transcript_window(&recent, true);
+        let resume = TranscriptFrameSequence::new(&mut model.chat.app, 80, 12).run([
+            TranscriptFrameStep {
+                label: "persisted resume",
+                input: TranscriptFrameInput::Observe,
+            },
+            TranscriptFrameStep {
+                label: "scroll to older boundary",
+                input: TranscriptFrameInput::ScrollUp(usize::MAX / 4),
+            },
+        ]);
+        assert!(resume[0].observation.semantic_items.len() <= 12);
+        let endpoint = bcode_ipc::IpcEndpoint::unix_socket(directory.path().join("server.sock"));
+        let shutdown = bcode_agent_runtime::CancellationToken::new();
+        let client =
+            bcode_client::BcodeClient::for_state_location(endpoint.clone(), locations.primary());
+        let server = bcode_server::run_embedded_with_locations_and_shutdown(
+            endpoint,
+            bcode_config::BcodeConfig::default(),
+            bcode_plugin::PluginRuntimeHost::load_defaults_with_static_bundled(
+                &bcode_plugin::PluginSelection {
+                    mode: bcode_plugin::PluginSelectionMode::Explicit,
+                    enabled: std::collections::BTreeSet::new(),
+                    disabled: std::collections::BTreeSet::new(),
+                },
+                &[],
+            )
+            .expect("empty plugin host"),
+            bcode_model_catalog::ModelCatalogResolver::embedded(),
+            Vec::new(),
+            shutdown.clone(),
+            Some(locations),
+        );
+        let exercise = async {
+            tokio::time::timeout(std::time::Duration::from_secs(10), async {
+                loop {
+                    if client.verified_server_status().await.is_ok() {
+                        break;
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .expect("server ready");
+            for _ in 0..72 {
+                if model.chat.app.newer_history_cursor().is_some() {
+                    break;
+                }
+                let before_page = model.chat.app.frame_observation();
+                let prior_anchor = before_page.anchor.as_ref().expect("older source reader");
+                let prior_reader_source = before_page.terminal_rows
+                    [before_page.viewport_top + prior_anchor.viewport_row_offset]
+                    .clone();
+                let cursor = model.chat.app.older_history_cursor().expect("older cursor");
+                let generation = model.chat.app.history_window_generation();
+                model.loop_state.prepare_runtime_work(
+                    &mut model.chat,
+                    bmux_tui::geometry::Rect::new(0, 0, 80, 12),
+                );
+                let (scheduled, _) = model.chat.pending_effects.drain_runtime();
+                let effect = scheduled.into_iter().find_map(|(_, effect)| {
+                    matches!(&effect, TuiEffect::LoadOlderHistory { session_id, cursor: requested, generation: current, .. }
+                        if *session_id == session.id && *requested == cursor && *current == generation)
+                    .then_some(effect)
+                }).expect("scheduled older page");
+                let result = effect.run_for_test(client.clone()).await;
+                if let super::super::effects::TuiEffectResult::OlderHistoryLoaded {
+                    result: page,
+                    ..
+                } = &result
+                {
+                    let (page, _) = page.as_ref().expect("canonical older page");
+                    assert!(!page.events.is_empty());
+                    assert!(page.events.len() <= 512);
+                } else {
+                    panic!("expected older page");
+                }
+                bmux_tui_runtime::Program::update(
+                    &mut model,
+                    bmux_tui_runtime::RuntimeEvent::Message(
+                        super::BcodeRuntimeMessage::EffectCompleted(Box::new(result)),
+                    ),
+                )
+                .expect("accept older page");
+                let frame = TranscriptFrameSequence::new(&mut model.chat.app, 80, 12).run([
+                    TranscriptFrameStep {
+                        label: "older accepted",
+                        input: TranscriptFrameInput::Observe,
+                    },
+                    TranscriptFrameStep {
+                        label: "older settled",
+                        input: TranscriptFrameInput::Observe,
+                    },
+                    TranscriptFrameStep {
+                        label: "continue upward",
+                        input: TranscriptFrameInput::ScrollUp(usize::MAX / 4),
+                    },
+                ]);
+                assert_eq!(frame[0].observation, frame[1].observation);
+                let prior_row = before_page
+                    .terminal_rows
+                    .iter()
+                    .position(|row| row == &prior_reader_source)
+                    .expect("reader source before older page");
+                let accepted_row = frame[0]
+                    .observation
+                    .terminal_rows
+                    .iter()
+                    .position(|row| row == &prior_reader_source)
+                    .expect("reader source after older page");
+                let prior_offset = i128::try_from(prior_row).expect("row fits i128")
+                    - i128::try_from(before_page.viewport_top).expect("top fits i128");
+                let accepted_offset = i128::try_from(accepted_row).expect("row fits i128")
+                    - i128::try_from(frame[0].observation.viewport_top).expect("top fits i128");
+                let requested_movement = accepted_offset - prior_offset;
+                assert!(requested_movement >= 0);
+                let prior_rows = before_page
+                    .terminal_rows
+                    .iter()
+                    .collect::<std::collections::BTreeSet<_>>();
+                // Trimming a distant newer suffix can make net row growth
+                // negative. Count the actual newly navigable source rows
+                // preceding this reader instead of subtracting total extents.
+                let page_rows_above_reader = frame[0]
+                    .observation
+                    .terminal_rows
+                    .iter()
+                    .take(accepted_row)
+                    .filter(|row| row.0.is_some() && !prior_rows.contains(row))
+                    .count();
+                assert!(
+                    requested_movement
+                        <= i128::try_from(page_rows_above_reader).expect("rows fit i128"),
+                    "older page may reveal only newly navigable rows: movement={requested_movement}, new_rows_above_reader={page_rows_above_reader}"
+                );
+            }
+            assert!(model.chat.app.resident_transcript_event_count() <= 1_024);
+            assert!(
+                model.chat.app.newer_history_cursor().is_some(),
+                "natural eviction: resident={}, oldest={:?}, follows={}",
+                model.chat.app.resident_transcript_event_count(),
+                model.chat.app.resident_transcript_oldest_sequence(),
+                model.chat.app.frame_observation().scroll_mode,
+            );
+            let evicted = model
+                .chat
+                .app
+                .newer_history_cursor()
+                .expect("naturally evicted newer suffix");
+            let at_older_boundary = model.chat.app.frame_observation();
+            let anchor = at_older_boundary
+                .anchor
+                .as_ref()
+                .expect("source-backed older reader");
+            let reader_source = at_older_boundary.terminal_rows
+                [at_older_boundary.viewport_top + anchor.viewport_row_offset]
+                .clone();
+            assert!(reader_source.0.is_some());
+            let forward = TranscriptFrameSequence::new(&mut model.chat.app, 80, 12).run([
+                TranscriptFrameStep {
+                    label: "reverse to newer boundary",
+                    input: TranscriptFrameInput::ScrollDown(usize::MAX / 4),
+                },
+                TranscriptFrameStep {
+                    label: "boundary settled",
+                    input: TranscriptFrameInput::Observe,
+                },
+            ]);
+            assert_eq!(forward[0].observation, forward[1].observation);
+            assert!(
+                forward[0]
+                    .observation
+                    .terminal_rows
+                    .contains(&reader_source)
+            );
+            assert!(model.chat.app.should_load_newer_history());
+            // Re-request at the actual resident boundary, not while traversing
+            // rows already present below the older reader.
+            let requested = TranscriptFrameSequence::new(&mut model.chat.app, 80, 12).run([
+                TranscriptFrameStep {
+                    label: "reverse one row to cancel outstanding forward movement",
+                    input: TranscriptFrameInput::ScrollUp(1),
+                },
+                TranscriptFrameStep {
+                    label: "request three rows past newer boundary",
+                    input: TranscriptFrameInput::ScrollDown(3),
+                },
+                TranscriptFrameStep {
+                    label: "forward request settled",
+                    input: TranscriptFrameInput::Observe,
+                },
+            ]);
+            assert_eq!(requested[1].observation, requested[2].observation);
+            assert!(model.chat.app.should_load_newer_history());
+            assert!(
+                model
+                    .chat
+                    .app
+                    .newer_history_cursor()
+                    .expect("forward cursor")
+                    .sequence
+                    >= evicted.sequence
+            );
+            let mut fetched = 0;
+            while model.chat.app.newer_history_cursor().is_some() {
+                assert!(fetched < 96, "forward pages must make bounded progress");
+                let before_page = model.chat.app.frame_observation();
+                let prior_anchor = before_page.anchor.as_ref().expect("forward source reader");
+                let prior_reader_source = before_page.terminal_rows
+                    [before_page.viewport_top + prior_anchor.viewport_row_offset]
+                    .clone();
+                let cursor = model
+                    .chat
+                    .app
+                    .newer_history_cursor()
+                    .expect("forward cursor");
+                let generation = model.chat.app.history_window_generation();
+                model.loop_state.prepare_runtime_work(
+                    &mut model.chat,
+                    bmux_tui::geometry::Rect::new(0, 0, 80, 12),
+                );
+                let (scheduled, _) = model.chat.pending_effects.drain_runtime();
+                let effect = scheduled.into_iter().find_map(|(_, effect)| {
+                    matches!(&effect, TuiEffect::LoadNewerHistory { session_id, cursor: requested, generation: current, .. }
+                        if *session_id == session.id && *requested == cursor && *current == generation)
+                    .then_some(effect)
+                }).expect("scheduled newer page");
+                let result = effect.run_for_test(client.clone()).await;
+                if let super::super::effects::TuiEffectResult::NewerHistoryLoaded {
+                    result: page,
+                    ..
+                } = &result
+                {
+                    let (page, _) = page.as_ref().expect("canonical newer page");
+                    assert!(!page.events.is_empty());
+                    assert!(page.events.len() <= 512);
+                } else {
+                    panic!("expected newer page");
+                }
+                bmux_tui_runtime::Program::update(
+                    &mut model,
+                    bmux_tui_runtime::RuntimeEvent::Message(
+                        super::BcodeRuntimeMessage::EffectCompleted(Box::new(result)),
+                    ),
+                )
+                .expect("accept newer page");
+                let frame = TranscriptFrameSequence::new(&mut model.chat.app, 80, 12).run([
+                    TranscriptFrameStep {
+                        label: "newer accepted",
+                        input: TranscriptFrameInput::Observe,
+                    },
+                    TranscriptFrameStep {
+                        label: "newer settled",
+                        input: TranscriptFrameInput::Observe,
+                    },
+                    TranscriptFrameStep {
+                        label: "continue forward",
+                        input: TranscriptFrameInput::ScrollDown(usize::MAX / 4),
+                    },
+                ]);
+                assert_eq!(frame[0].observation, frame[1].observation);
+                if fetched == 0 {
+                    assert!(frame[0].observation.terminal_rows.contains(&reader_source));
+                    let prior_row = before_page
+                        .terminal_rows
+                        .iter()
+                        .position(|row| row == &prior_reader_source)
+                        .expect("reader before first forward page");
+                    let accepted_row = frame[0]
+                        .observation
+                        .terminal_rows
+                        .iter()
+                        .position(|row| row == &prior_reader_source)
+                        .expect("reader survives first forward page");
+                    // Compare the same source row in signed viewport coordinates:
+                    // it may legitimately move off-screen when the reader asked
+                    // for more rows than fit in the visible viewport.
+                    let prior_offset = i128::try_from(prior_row).expect("row fits i128")
+                        - i128::try_from(before_page.viewport_top).expect("top fits i128");
+                    let accepted_offset = i128::try_from(accepted_row).expect("row fits i128")
+                        - i128::try_from(frame[0].observation.viewport_top).expect("top fits i128");
+                    let displacement = prior_offset - accepted_offset;
+                    let page_rows = frame[0]
+                        .observation
+                        .terminal_rows
+                        .len()
+                        .saturating_sub(before_page.terminal_rows.len());
+                    assert!(
+                        displacement >= 0
+                            && displacement <= i128::try_from(page_rows).expect("rows fit i128"),
+                        "page movement must use only newly navigable rows"
+                    );
+                    assert_eq!(
+                        displacement, 3,
+                        "the first page spends three requested rows exactly once"
+                    );
+                    assert_eq!(frame[0].observation, frame[1].observation);
+                }
+                assert!(model.chat.app.resident_transcript_event_count() <= 1_024);
+                fetched += 1;
+            }
+            let tail = TranscriptFrameSequence::new(&mut model.chat.app, 80, 12).run([
+                TranscriptFrameStep {
+                    label: "return to live tail",
+                    input: TranscriptFrameInput::ScrollToBottom,
+                },
+                TranscriptFrameStep {
+                    label: "tail settled",
+                    input: TranscriptFrameInput::Observe,
+                },
+            ]);
+            assert_eq!(tail[0].observation, tail[1].observation);
+            assert_eq!(tail[0].observation.scroll_mode, "bottom_follow");
+            shutdown.cancel();
+        };
+        let (server_result, ()) = Box::pin(tokio::time::timeout(
+            std::time::Duration::from_secs(90),
+            async { tokio::join!(server, exercise) },
+        ))
+        .await
+        .expect("server and traversal complete");
+        server_result.expect("server shutdown");
+        drop(model);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)]
+    async fn persisted_history_page_reaches_scheduled_effect_and_accepted_frame() {
+        use super::super::effects::TuiEffect;
+        use super::super::frame_sequence_harness::{
+            TranscriptFrameInput, TranscriptFrameSequence, TranscriptFrameStep,
+        };
+        use bcode_session_models::{ClientId, SessionEventKind};
+
+        let directory = tempfile::tempdir().expect("isolated state");
+        let state_root = directory.path().join("state");
+        std::fs::create_dir(&state_root).expect("state directory");
+        let locations = bcode_config::resolve_state_location_set_with_environment(
+            &bcode_config::StateConfig::default(),
+            &bcode_config::StateLocationSelection {
+                root: Some(state_root),
+                profile: None,
+            },
+            &bcode_config::ConfigEnvironmentSnapshot::new(
+                BTreeMap::new(),
+                directory.path().to_path_buf(),
+            ),
+        )
+        .expect("resolve isolated state");
+        let sessions =
+            bcode_session::SessionManager::persistent(locations.primary().sessions_root())
+                .expect("persistent sessions");
+        let session = sessions
+            .create_session(None, directory.path().to_path_buf())
+            .await
+            .expect("session");
+        let client_id = ClientId::new();
+        for index in 0..30 {
+            sessions
+                .append_user_message(session.id, client_id, format!("persisted {index}"))
+                .await
+                .expect("persist user message");
+            if index == 17 {
+                // Exceed one bounded scan so the first fetched page contains no
+                // presenting items; the next page must carry pending movement.
+                for _ in 0..520 {
+                    sessions
+                        .append_event(session.id, SessionEventKind::ClientAttached { client_id })
+                        .await
+                        .expect("persist non-presenting event");
+                }
+            }
+        }
+        let recent = sessions
+            .session_history_page(
+                session.id,
+                bcode_session_models::SessionHistoryQuery {
+                    cursor: None,
+                    limit: 12,
+                    direction: bcode_session_models::SessionHistoryDirection::Backward,
+                },
+            )
+            .await
+            .expect("recent bounded history")
+            .events;
+        drop(sessions);
+
+        let mut model = root_test_model_with_history(session.id, &recent);
+        model
+            .chat
+            .app
+            .replace_latest_transcript_window(&recent, true);
+        let resume =
+            TranscriptFrameSequence::new(&mut model.chat.app, 80, 12).run([TranscriptFrameStep {
+                label: "resume",
+                input: TranscriptFrameInput::Observe,
+            }]);
+        let before = TranscriptFrameSequence::new(&mut model.chat.app, 80, 12).run([
+            TranscriptFrameStep {
+                label: "reach older boundary with two outstanding rows",
+                input: TranscriptFrameInput::ScrollUp(resume[0].observation.viewport_top + 2),
+            },
+            TranscriptFrameStep {
+                label: "repeat upward input during fetch",
+                input: TranscriptFrameInput::ScrollUp(1),
+            },
+        ]);
+        let reader = &before[1].observation;
+        assert_eq!(before[0].observation.viewport_top, reader.viewport_top);
+        let cursor = model.chat.app.older_history_cursor().expect("older cursor");
+        let generation = model.chat.app.history_window_generation();
+        model
+            .loop_state
+            .prepare_runtime_work(&mut model.chat, bmux_tui::geometry::Rect::new(0, 0, 80, 12));
+        let (scheduled, _) = model.chat.pending_effects.drain_runtime();
+        let effect = scheduled.into_iter().find_map(|(_, effect)| {
+            matches!(&effect, TuiEffect::LoadOlderHistory { session_id, cursor: expected, generation: current, .. }
+                if *session_id == session.id && *expected == cursor && *current == generation)
+                .then_some(effect)
+        }).expect("scheduled older-history effect");
+
+        let endpoint = bcode_ipc::IpcEndpoint::unix_socket(directory.path().join("server.sock"));
+        let shutdown = bcode_agent_runtime::CancellationToken::new();
+        let client =
+            bcode_client::BcodeClient::for_state_location(endpoint.clone(), locations.primary());
+        let server = bcode_server::run_embedded_with_locations_and_shutdown(
+            endpoint,
+            bcode_config::BcodeConfig::default(),
+            bcode_plugin::PluginRuntimeHost::load_defaults_with_static_bundled(
+                &bcode_plugin::PluginSelection {
+                    mode: bcode_plugin::PluginSelectionMode::Explicit,
+                    enabled: std::collections::BTreeSet::default(),
+                    disabled: std::collections::BTreeSet::default(),
+                },
+                &[],
+            )
+            .expect("empty plugin host"),
+            bcode_model_catalog::ModelCatalogResolver::embedded(),
+            Vec::new(),
+            shutdown.clone(),
+            Some(locations),
+        );
+        let server = Box::pin(server);
+        let exercise = async {
+            tokio::time::timeout(std::time::Duration::from_secs(10), async {
+                loop {
+                    if client.verified_server_status().await.is_ok() {
+                        break;
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .expect("server ready");
+            let result = effect.run_for_test(client.clone()).await;
+            if let super::super::effects::TuiEffectResult::OlderHistoryLoaded {
+                result: page, ..
+            } = &result
+            {
+                let (page, _) = page.as_ref().expect("persisted first page");
+                assert!(page.events.len() <= 512);
+                assert!(
+                    page.events.iter().all(|event| matches!(
+                        &event.kind,
+                        SessionEventKind::ClientAttached { .. }
+                    ))
+                );
+                assert!(page.has_more);
+            } else {
+                panic!("expected older-history completion");
+            }
+            bmux_tui_runtime::Program::update(
+                &mut model,
+                bmux_tui_runtime::RuntimeEvent::Message(
+                    super::BcodeRuntimeMessage::EffectCompleted(Box::new(result)),
+                ),
+            )
+            .expect("accept fetched page");
+            let after = TranscriptFrameSequence::new(&mut model.chat.app, 80, 12).run([
+                TranscriptFrameStep {
+                    label: "persisted page",
+                    input: TranscriptFrameInput::Observe,
+                },
+                TranscriptFrameStep {
+                    label: "repeat",
+                    input: TranscriptFrameInput::Observe,
+                },
+            ]);
+            assert_eq!(after[0].observation.semantic_items, reader.semantic_items);
+            assert_eq!(after[0].observation.viewport_top, reader.viewport_top);
+            assert_eq!(after[0].observation, after[1].observation);
+            let empty_page_layout = model.chat.app.transcript_layout_mut().drain_sync_stats();
+            assert!(empty_page_layout.iter().all(|stats| stats.entries_scanned
+                <= model.chat.app.resident_transcript_event_count() + 1));
+            model
+                .loop_state
+                .prepare_runtime_work(&mut model.chat, bmux_tui::geometry::Rect::new(0, 0, 80, 12));
+            let (scheduled, _) = model.chat.pending_effects.drain_runtime();
+            let next_cursor = model
+                .chat
+                .app
+                .older_history_cursor()
+                .expect("advanced source cursor");
+            assert!(next_cursor.sequence < cursor.sequence);
+            let effect = scheduled.into_iter().find_map(|(_, effect)| {
+                matches!(&effect, TuiEffect::LoadOlderHistory { session_id, cursor: expected, generation: current, .. }
+                    if *session_id == session.id && *expected == next_cursor && *current == generation)
+                    .then_some(effect)
+            }).expect("second scheduled history page");
+            let result = effect.run_for_test(client.clone()).await;
+            if let super::super::effects::TuiEffectResult::OlderHistoryLoaded {
+                result: page, ..
+            } = &result
+            {
+                assert!(page.is_ok(), "second persisted projection effect: {page:?}");
+            } else {
+                panic!("expected older-history completion");
+            }
+            bmux_tui_runtime::Program::update(
+                &mut model,
+                bmux_tui_runtime::RuntimeEvent::Message(
+                    super::BcodeRuntimeMessage::EffectCompleted(Box::new(result)),
+                ),
+            )
+            .expect("accept presenting page");
+            let presenting = TranscriptFrameSequence::new(&mut model.chat.app, 80, 12).run([
+                TranscriptFrameStep {
+                    label: "persisted presenting page",
+                    input: TranscriptFrameInput::Observe,
+                },
+                TranscriptFrameStep {
+                    label: "presenting page settled",
+                    input: TranscriptFrameInput::Observe,
+                },
+            ]);
+            assert!(presenting[0].observation.semantic_items.len() > reader.semantic_items.len());
+            assert_eq!(presenting[0].observation, presenting[1].observation);
+            let presenting_layout = model.chat.app.transcript_layout_mut().drain_sync_stats();
+            let resident = model.chat.app.resident_transcript_event_count();
+            assert!(
+                presenting_layout
+                    .iter()
+                    .all(|stats| stats.entries_scanned <= resident + 1)
+            );
+            assert!(
+                presenting_layout
+                    .iter()
+                    .map(|stats| stats.rows_regenerated)
+                    .sum::<usize>()
+                    <= presenting[0].observation.terminal_rows.len() * 2
+            );
+            let anchor = reader.anchor.as_ref().expect("reader anchor");
+            let source = &reader.terminal_rows[reader.viewport_top + anchor.viewport_row_offset];
+            let row = presenting[0]
+                .observation
+                .terminal_rows
+                .iter()
+                .position(|candidate| candidate == source)
+                .expect("reader source survives fetched pages");
+            assert!(row >= presenting[0].observation.viewport_top);
+            let offset = row - presenting[0].observation.viewport_top;
+            assert_eq!(
+                offset.saturating_sub(anchor.viewport_row_offset),
+                3,
+                "non-presenting page must not spend three outstanding rows; presenting page reveals them once"
+            );
+            // Two pages do not cross the 1,024-event resident eviction threshold.
+            // Center on a bounded canonical source range to exercise the
+            // independent newer-history request through this persisted server.
+            assert!(model.chat.app.newer_history_cursor().is_none());
+            let centered = (5..=25)
+                .map(|index| root_test_history_event(session.id, index))
+                .collect::<Vec<_>>();
+            model
+                .chat
+                .app
+                .replace_transcript_window(&centered, true, true, 17);
+            let center = TranscriptFrameSequence::new(&mut model.chat.app, 80, 12).run([
+                TranscriptFrameStep {
+                    label: "centered window",
+                    input: TranscriptFrameInput::Observe,
+                },
+                TranscriptFrameStep {
+                    label: "centered settled",
+                    input: TranscriptFrameInput::Observe,
+                },
+            ]);
+            assert_eq!(center[0].observation, center[1].observation);
+            let newer_cursor = model
+                .chat
+                .app
+                .newer_history_cursor()
+                .expect("newer cursor from centered window");
+            let centered_rows = center[0].observation.terminal_rows.len();
+            let boundary_top = centered_rows.saturating_sub(12);
+            let to_boundary = boundary_top.saturating_sub(center[0].observation.viewport_top);
+            let at_boundary = TranscriptFrameSequence::new(&mut model.chat.app, 80, 12).run([
+                TranscriptFrameStep {
+                    label: "move across centered resident rows",
+                    input: TranscriptFrameInput::ScrollDown(to_boundary),
+                },
+                TranscriptFrameStep {
+                    label: "newer boundary settled",
+                    input: TranscriptFrameInput::Observe,
+                },
+            ]);
+            assert_eq!(at_boundary[0].observation, at_boundary[1].observation);
+            let before_forward = &at_boundary[1].observation;
+            let previous_anchor = before_forward
+                .anchor
+                .as_ref()
+                .expect("newer-boundary reader");
+            let previous_source = before_forward.terminal_rows
+                [before_forward.viewport_top + previous_anchor.viewport_row_offset]
+                .clone();
+            model.chat.app.request_newer_history_for_test(2);
+            let generation = model.chat.app.history_window_generation();
+            model
+                .loop_state
+                .prepare_runtime_work(&mut model.chat, bmux_tui::geometry::Rect::new(0, 0, 80, 12));
+            let (scheduled, _) = model.chat.pending_effects.drain_runtime();
+            let effect = scheduled.into_iter().find_map(|(_, effect)| {
+                matches!(&effect, TuiEffect::LoadNewerHistory { session_id, cursor, generation: current, .. }
+                    if *session_id == session.id && *cursor == newer_cursor && *current == generation)
+                    .then_some(effect)
+            }).expect("scheduled newer history page");
+            let result = effect.run_for_test(client.clone()).await;
+            if let super::super::effects::TuiEffectResult::NewerHistoryLoaded {
+                result: page, ..
+            } = &result
+            {
+                let (page, _) = page.as_ref().expect("persisted newer projection page");
+                assert!(page.events.len() <= 512);
+                assert!(
+                    page.events.iter().all(|event| matches!(
+                        &event.kind,
+                        SessionEventKind::ClientAttached { .. }
+                    ))
+                );
+                assert!(page.has_more);
+            } else {
+                panic!("expected newer-history completion");
+            }
+            bmux_tui_runtime::Program::update(
+                &mut model,
+                bmux_tui_runtime::RuntimeEvent::Message(
+                    super::BcodeRuntimeMessage::EffectCompleted(Box::new(result)),
+                ),
+            )
+            .expect("accept newer page");
+            let forward = TranscriptFrameSequence::new(&mut model.chat.app, 80, 12).run([
+                TranscriptFrameStep {
+                    label: "persisted newer page",
+                    input: TranscriptFrameInput::Observe,
+                },
+                TranscriptFrameStep {
+                    label: "newer page settled",
+                    input: TranscriptFrameInput::Observe,
+                },
+            ]);
+            assert_eq!(forward[0].observation, forward[1].observation);
+            assert_eq!(
+                forward[0].observation.semantic_items,
+                center[0].observation.semantic_items
+            );
+            assert_eq!(
+                forward[0].observation.viewport_top,
+                before_forward.viewport_top
+            );
+            assert!(
+                forward[0]
+                    .observation
+                    .terminal_rows
+                    .contains(&previous_source)
+            );
+            let second_newer_before = TranscriptFrameSequence::new(&mut model.chat.app, 80, 12)
+                .run([
+                    TranscriptFrameStep {
+                        label: "request newer rows across non-presenting gap",
+                        input: TranscriptFrameInput::ScrollDown(2),
+                    },
+                    TranscriptFrameStep {
+                        label: "newer request settled",
+                        input: TranscriptFrameInput::Observe,
+                    },
+                ]);
+            assert_eq!(
+                second_newer_before[0].observation,
+                second_newer_before[1].observation
+            );
+            assert!(
+                second_newer_before[0].observation.viewport_top
+                    - forward[0].observation.viewport_top
+                    <= 2,
+                "manual movement stays within the two requested rows"
+            );
+            let next_cursor = model
+                .chat
+                .app
+                .newer_history_cursor()
+                .expect("advanced newer cursor");
+            assert!(next_cursor.sequence > newer_cursor.sequence);
+            let newer_reader_at_boundary = forward[0]
+                .observation
+                .anchor
+                .as_ref()
+                .expect("reader at newer edge");
+            let source_after_nonpresenting =
+                &forward[0].observation.terminal_rows[forward[0].observation.viewport_top
+                    + newer_reader_at_boundary.viewport_row_offset];
+            assert_eq!(source_after_nonpresenting, &previous_source);
+            model
+                .loop_state
+                .prepare_runtime_work(&mut model.chat, bmux_tui::geometry::Rect::new(0, 0, 80, 12));
+            let (scheduled, _) = model.chat.pending_effects.drain_runtime();
+            let effect = scheduled.into_iter().find_map(|(_, effect)| {
+                matches!(&effect, TuiEffect::LoadNewerHistory { session_id, cursor, generation: current, .. }
+                    if *session_id == session.id && *cursor == next_cursor && *current == generation)
+                    .then_some(effect)
+            }).expect("second scheduled newer page");
+            let result = effect.run_for_test(client.clone()).await;
+            if let super::super::effects::TuiEffectResult::NewerHistoryLoaded {
+                result: page, ..
+            } = &result
+            {
+                assert!(page.is_ok(), "second newer page: {page:?}");
+            } else {
+                panic!("expected second newer completion");
+            }
+            bmux_tui_runtime::Program::update(
+                &mut model,
+                bmux_tui_runtime::RuntimeEvent::Message(
+                    super::BcodeRuntimeMessage::EffectCompleted(Box::new(result)),
+                ),
+            )
+            .expect("accept presenting newer page");
+            let presenting_newer = TranscriptFrameSequence::new(&mut model.chat.app, 80, 12).run([
+                TranscriptFrameStep {
+                    label: "persisted presenting newer page",
+                    input: TranscriptFrameInput::Observe,
+                },
+                TranscriptFrameStep {
+                    label: "newer page stable",
+                    input: TranscriptFrameInput::Observe,
+                },
+            ]);
+            assert_eq!(
+                presenting_newer[0].observation,
+                presenting_newer[1].observation
+            );
+            assert!(
+                presenting_newer[0].observation.semantic_items.len()
+                    > forward[0].observation.semantic_items.len()
+            );
+            let reader_row = presenting_newer[0]
+                .observation
+                .terminal_rows
+                .iter()
+                .position(|row| row == &previous_source)
+                .expect("centered reader source survives newer pages");
+            let earlier_row = forward[0]
+                .observation
+                .terminal_rows
+                .iter()
+                .position(|row| row == &previous_source)
+                .expect("reader before presenting newer page");
+            let prior_top = second_newer_before[1].observation.viewport_top;
+            let moved_after_page = presenting_newer[0]
+                .observation
+                .viewport_top
+                .saturating_sub(prior_top)
+                .saturating_sub(reader_row.saturating_sub(earlier_row));
+            assert_eq!(
+                moved_after_page, 2,
+                "the page reveals exactly the two outstanding rows once"
+            );
+            let centered_reader = center[0]
+                .observation
+                .anchor
+                .as_ref()
+                .expect("centered source reader");
+            let centered_source = center[0].observation.terminal_rows
+                [center[0].observation.viewport_top + centered_reader.viewport_row_offset]
+                .clone();
+            assert!(
+                presenting_newer[0]
+                    .observation
+                    .terminal_rows
+                    .contains(&centered_source)
+            );
+            let tail = TranscriptFrameSequence::new(&mut model.chat.app, 80, 12).run([
+                TranscriptFrameStep {
+                    label: "return to live tail",
+                    input: TranscriptFrameInput::ScrollToBottom,
+                },
+                TranscriptFrameStep {
+                    label: "live tail settled",
+                    input: TranscriptFrameInput::Observe,
+                },
+            ]);
+            assert_eq!(tail[0].observation, tail[1].observation);
+            assert_eq!(tail[0].observation.scroll_mode, "bottom_follow");
+            shutdown.cancel();
+        };
+        let (server_result, ()) = Box::pin(tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            async { tokio::join!(server, exercise) },
+        ))
+        .await
+        .expect("server and effect complete");
+        server_result.expect("server shutdown");
+        drop(model);
+    }
+
+    #[tokio::test]
+    async fn failed_and_empty_older_pages_do_not_reveal_or_reopen_reading_position() {
+        use super::super::frame_sequence_harness::{
+            TranscriptFrameInput, TranscriptFrameSequence, TranscriptFrameStep,
+        };
+        let session_id = bcode_session_models::SessionId::new();
+        let recent = (30..42)
+            .map(|sequence| root_test_history_event(session_id, sequence))
+            .collect::<Vec<_>>();
+        let mut model = root_test_model_with_history(session_id, &recent);
+        model
+            .chat
+            .app
+            .replace_latest_transcript_window(&recent, true);
+        let initial = TranscriptFrameSequence::new(&mut model.chat.app, 80, 12).run([
+            TranscriptFrameStep {
+                label: "resume",
+                input: TranscriptFrameInput::Observe,
+            },
+            TranscriptFrameStep {
+                label: "reach boundary",
+                input: TranscriptFrameInput::ScrollUp(100),
+            },
+        ]);
+        let first = &initial[1].observation;
+        let cursor = model.chat.app.older_history_cursor().expect("older cursor");
+        let generation = model.chat.app.history_window_generation();
+        model
+            .loop_state
+            .prepare_runtime_work(&mut model.chat, bmux_tui::geometry::Rect::new(0, 0, 80, 12));
+        deliver_older_history_root_test(
+            &mut model,
+            session_id,
+            cursor,
+            generation,
+            Err(bcode_client::ClientError::UnexpectedResponse),
+        );
+        let failed = TranscriptFrameSequence::new(&mut model.chat.app, 80, 12).run([
+            TranscriptFrameStep {
+                label: "failure",
+                input: TranscriptFrameInput::Observe,
+            },
+            TranscriptFrameStep {
+                label: "retry",
+                input: TranscriptFrameInput::ScrollUp(2),
+            },
+        ]);
+        assert_eq!(first.terminal_rows, failed[0].observation.terminal_rows);
+        assert_eq!(first.viewport_top, failed[0].observation.viewport_top);
+        assert!(!model.chat.app.loading_older_history());
+        assert!(model.chat.app.older_history_cursor().is_some());
+        model.chat.pending_effects = super::super::effects::TuiEffectQueue::default();
+        model.chat.app.request_older_history_for_test(1);
+        model
+            .loop_state
+            .prepare_runtime_work(&mut model.chat, bmux_tui::geometry::Rect::new(0, 0, 80, 12));
+        assert!(
+            model.chat.app.loading_older_history(),
+            "retry must be scheduled"
+        );
+        complete_older_history_root_test(&mut model, session_id, cursor, generation, Vec::new());
+        let exhausted = TranscriptFrameSequence::new(&mut model.chat.app, 80, 12).run([
+            TranscriptFrameStep {
+                label: "exhausted",
+                input: TranscriptFrameInput::Observe,
+            },
+            TranscriptFrameStep {
+                label: "again",
+                input: TranscriptFrameInput::Observe,
+            },
+        ]);
+        assert_eq!(
+            failed[0].observation.terminal_items,
+            exhausted[0].observation.terminal_items
+        );
+        assert_eq!(
+            failed[0].observation.viewport_top,
+            exhausted[0].observation.viewport_top
+        );
+        assert_eq!(exhausted[0].observation, exhausted[1].observation);
+        assert!(model.chat.app.older_history_cursor().is_none());
+        drop(model);
+    }
+
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)]
+    async fn failed_and_empty_newer_pages_preserve_reader_and_stop_retrying() {
+        use super::super::effects::TuiEffectResult;
+        use super::super::frame_sequence_harness::{
+            TranscriptFrameInput, TranscriptFrameSequence, TranscriptFrameStep,
+        };
+        let session_id = bcode_session_models::SessionId::new();
+        let centered = (30..42)
+            .map(|sequence| root_test_history_event(session_id, sequence))
+            .collect::<Vec<_>>();
+        let mut model = root_test_model_with_history(session_id, &centered);
+        model
+            .chat
+            .app
+            .replace_transcript_window(&centered, true, true, 35);
+        let initial = TranscriptFrameSequence::new(&mut model.chat.app, 80, 12).run([
+            TranscriptFrameStep {
+                label: "centered window",
+                input: TranscriptFrameInput::Observe,
+            },
+            TranscriptFrameStep {
+                label: "reach newer boundary",
+                input: TranscriptFrameInput::ScrollDown(100),
+            },
+        ]);
+        let boundary = &initial[1].observation;
+        let cursor = model.chat.app.newer_history_cursor().expect("newer cursor");
+        let generation = model.chat.app.history_window_generation();
+        model
+            .loop_state
+            .prepare_runtime_work(&mut model.chat, bmux_tui::geometry::Rect::new(0, 0, 80, 12));
+        assert!(
+            model
+                .chat
+                .app
+                .accepts_history_page(generation, cursor, false)
+        );
+        let complete = |model: &mut super::BcodeRuntimeModel, result| {
+            bmux_tui_runtime::Program::update(
+                model,
+                bmux_tui_runtime::RuntimeEvent::Message(
+                    super::BcodeRuntimeMessage::EffectCompleted(Box::new(
+                        TuiEffectResult::NewerHistoryLoaded {
+                            session_id,
+                            cursor,
+                            generation,
+                            result,
+                        },
+                    )),
+                ),
+            )
+            .expect("newer history effect completion");
+        };
+        complete(
+            &mut model,
+            Err(bcode_client::ClientError::UnexpectedResponse),
+        );
+        let failed = TranscriptFrameSequence::new(&mut model.chat.app, 80, 12).run([
+            TranscriptFrameStep {
+                label: "newer page failure",
+                input: TranscriptFrameInput::Observe,
+            },
+            TranscriptFrameStep {
+                label: "failure settled",
+                input: TranscriptFrameInput::Observe,
+            },
+        ]);
+        assert_eq!(failed[0].observation, failed[1].observation);
+        assert_eq!(failed[0].observation.terminal_rows, boundary.terminal_rows);
+        assert_eq!(failed[0].observation.viewport_top, boundary.viewport_top);
+        assert!(
+            !model
+                .chat
+                .app
+                .accepts_history_page(generation, cursor, false)
+        );
+        assert_eq!(model.chat.app.newer_history_cursor(), Some(cursor));
+
+        model.chat.pending_effects = super::super::effects::TuiEffectQueue::default();
+        model.chat.app.request_newer_history_for_test(1);
+        model
+            .loop_state
+            .prepare_runtime_work(&mut model.chat, bmux_tui::geometry::Rect::new(0, 0, 80, 12));
+        assert!(
+            model
+                .chat
+                .app
+                .accepts_history_page(generation, cursor, false),
+            "retry must start"
+        );
+        complete(
+            &mut model,
+            Ok((
+                bcode_session_models::SessionHistoryPage {
+                    session_id,
+                    events: Vec::new(),
+                    compatibility_issues: Vec::new(),
+                    next_cursor: None,
+                    has_more: false,
+                },
+                Vec::new(),
+            )),
+        );
+        let exhausted = TranscriptFrameSequence::new(&mut model.chat.app, 80, 12).run([
+            TranscriptFrameStep {
+                label: "newer history exhausted",
+                input: TranscriptFrameInput::Observe,
+            },
+            TranscriptFrameStep {
+                label: "exhausted settled",
+                input: TranscriptFrameInput::Observe,
+            },
+        ]);
+        assert_eq!(exhausted[0].observation, exhausted[1].observation);
+        assert_eq!(
+            exhausted[0].observation.terminal_items,
+            boundary.terminal_items
+        );
+        assert_eq!(exhausted[0].observation.viewport_top, boundary.viewport_top);
+        assert!(model.chat.app.newer_history_cursor().is_none());
+        assert!(
+            !model
+                .chat
+                .app
+                .accepts_history_page(generation, cursor, false)
+        );
+        drop(model);
+    }
+
+    #[tokio::test]
+    async fn older_history_loading_banner_keeps_source_reader_stable() {
+        use super::super::frame_sequence_harness::{
+            TranscriptFrameInput, TranscriptFrameSequence, TranscriptFrameStep,
+        };
+        let session_id = bcode_session_models::SessionId::new();
+        let recent = (30..54)
+            .map(|sequence| root_test_history_event(session_id, sequence))
+            .collect::<Vec<_>>();
+        let mut model = root_test_model_with_history(session_id, &recent);
+        model
+            .chat
+            .app
+            .replace_latest_transcript_window(&recent, true);
+        let initial = TranscriptFrameSequence::new(&mut model.chat.app, 80, 12).run([
+            TranscriptFrameStep {
+                label: "resume",
+                input: TranscriptFrameInput::Observe,
+            },
+            TranscriptFrameStep {
+                label: "near older boundary",
+                input: TranscriptFrameInput::ScrollUp(100),
+            },
+        ]);
+        let before = &initial[1].observation;
+        let anchor = before.anchor.as_ref().expect("source-backed reader");
+        let source = before.terminal_rows[before.viewport_top + anchor.viewport_row_offset].clone();
+        let cursor = model
+            .chat
+            .app
+            .older_history_cursor()
+            .expect("older boundary");
+        let generation = model.chat.app.history_window_generation();
+        model
+            .loop_state
+            .prepare_runtime_work(&mut model.chat, bmux_tui::geometry::Rect::new(0, 0, 80, 12));
+        assert!(
+            model
+                .chat
+                .app
+                .accepts_history_page(generation, cursor, true)
+        );
+        let loading = TranscriptFrameSequence::new(&mut model.chat.app, 80, 12).run([
+            TranscriptFrameStep {
+                label: "loading banner",
+                input: TranscriptFrameInput::Observe,
+            },
+            TranscriptFrameStep {
+                label: "loading banner settled",
+                input: TranscriptFrameInput::Observe,
+            },
+        ]);
+        assert_eq!(loading[0].observation, loading[1].observation);
+        let position = loading[0]
+            .observation
+            .terminal_rows
+            .iter()
+            .position(|row| row == &source)
+            .expect("reader retained during loading");
+        assert_eq!(
+            position.saturating_sub(loading[0].observation.viewport_top),
+            anchor.viewport_row_offset
+        );
+        complete_older_history_root_test(&mut model, session_id, cursor, generation, Vec::new());
+        let exhausted = TranscriptFrameSequence::new(&mut model.chat.app, 80, 12).run([
+            TranscriptFrameStep {
+                label: "banner removed after exhaustion",
+                input: TranscriptFrameInput::Observe,
+            },
+            TranscriptFrameStep {
+                label: "banner removal settled",
+                input: TranscriptFrameInput::Observe,
+            },
+        ]);
+        assert_eq!(exhausted[0].observation, exhausted[1].observation);
+        let position = exhausted[0]
+            .observation
+            .terminal_rows
+            .iter()
+            .position(|row| row == &source)
+            .expect("reader retained after exhaustion");
+        let exhausted_offset = position.saturating_sub(exhausted[0].observation.viewport_top);
+        // Once the banner disappears at the absolute start of history there is
+        // no preceding row with which to preserve its old screen offset.
+        assert_eq!(exhausted[0].observation.viewport_top, 0);
+        assert_eq!(
+            exhausted_offset,
+            anchor.viewport_row_offset.saturating_sub(1)
+        );
+        assert!(model.chat.app.older_history_cursor().is_none());
+        drop(model);
+    }
+
+    fn root_test_history_event(
+        session_id: bcode_session_models::SessionId,
+        sequence: u64,
+    ) -> bcode_session_models::SessionEvent {
+        bcode_session_models::SessionEvent {
+            schema_version: bcode_session_models::CURRENT_SESSION_EVENT_SCHEMA_VERSION,
+            sequence,
+            timestamp_ms: sequence,
+            session_id,
+            provenance: None,
+            kind: bcode_session_models::SessionEventKind::AssistantMessage {
+                text: format!("message {sequence}"),
+            },
+        }
+    }
+
+    fn deliver_older_history_root_test(
+        model: &mut super::BcodeRuntimeModel,
+        session_id: bcode_session_models::SessionId,
+        cursor: bcode_session_models::SessionHistoryCursor,
+        generation: u64,
+        result: Result<bcode_session_models::SessionHistoryPage, bcode_client::ClientError>,
+    ) {
+        bmux_tui_runtime::Program::update(
+            model,
+            bmux_tui_runtime::RuntimeEvent::Message(super::BcodeRuntimeMessage::EffectCompleted(
+                Box::new(super::super::effects::TuiEffectResult::OlderHistoryLoaded {
+                    session_id,
+                    cursor,
+                    generation,
+                    result: result.map(|page| (page, Vec::new())),
+                }),
+            )),
+        )
+        .expect("history effect completion");
+    }
+
+    fn complete_older_history_root_test(
+        model: &mut super::BcodeRuntimeModel,
+        session_id: bcode_session_models::SessionId,
+        cursor: bcode_session_models::SessionHistoryCursor,
+        generation: u64,
+        events: Vec<bcode_session_models::SessionEvent>,
+    ) {
+        deliver_older_history_root_test(
+            model,
+            session_id,
+            cursor,
+            generation,
+            Ok(bcode_session_models::SessionHistoryPage {
+                session_id,
+                events,
+                compatibility_issues: vec![],
+                next_cursor: None,
+                has_more: false,
+            }),
+        );
     }
 
     struct FailingSelectionOutput {

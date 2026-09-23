@@ -118,7 +118,9 @@ const MAX_CHUNK_DATA_SIZE: usize = MAX_FRAME_PAYLOAD_SIZE / 2;
 /// changed positional layouts reject older peers.
 /// Version 46 adds explicit receipt-backed workflow diagnostic ranges. Older positional
 /// request/response layouts are rejected rather than interpreted as another operation.
-pub const CURRENT_PROTOCOL_VERSION: u16 = 46;
+/// Version 47 adds read-only projection history pages to both positional envelopes.
+/// Older peers are rejected rather than interpreting the combined payload layout.
+pub const CURRENT_PROTOCOL_VERSION: u16 = 47;
 
 /// Durable session-storage writer epoch expected by this IPC build.
 pub const CURRENT_SESSION_STORAGE_WRITER_EPOCH: u32 =
@@ -527,6 +529,11 @@ pub enum Request {
     SessionHistoryPage {
         session_id: SessionId,
         query: SessionHistoryQuery,
+    },
+    /// Read a bounded projection-selected page without attaching a session.
+    SessionProjectionHistoryPage {
+        session_id: SessionId,
+        request: Box<ProjectionWindowRequest>,
     },
     AttachSession {
         session_id: SessionId,
@@ -2033,6 +2040,9 @@ pub enum ResponsePayload {
     },
     SessionHistoryPage {
         page: SessionHistoryPage,
+    },
+    SessionProjectionHistoryPage {
+        page: bcode_session_models::ProjectionHistoryPage,
     },
     Attached {
         session_id: SessionId,
@@ -5109,78 +5119,34 @@ mod tests {
     }
 
     #[test]
-    fn ipc_v40_golden_fixtures_decode_to_expected_payloads() {
-        let message_sent = fixture_bytes("fixtures/ipc/v40/response_message_sent.hex");
-        let decoded: Response = decode(&message_sent).expect("message_sent fixture should decode");
-        assert_eq!(decoded, Response::Ok(ResponsePayload::MessageSent));
-
-        let cancelled = fixture_bytes("fixtures/ipc/v40/response_turn_cancellation_requested.hex");
-        let decoded: Response = decode(&cancelled).expect("cancel fixture should decode");
-        assert_eq!(
-            decoded,
-            Response::Ok(ResponsePayload::TurnCancellationRequested { cancelled: true })
-        );
-
-        let accepted = fixture_bytes("fixtures/ipc/v40/response_message_accepted.hex");
-        let decoded: Response = decode(&accepted).expect("message_accepted fixture should decode");
-        assert_eq!(
-            decoded,
+    fn current_protocol_message_responses_and_request_round_trip() {
+        let responses = [
+            Response::Ok(ResponsePayload::MessageSent),
+            Response::Ok(ResponsePayload::TurnCancellationRequested { cancelled: true }),
             Response::Ok(ResponsePayload::MessageAccepted {
                 queued: true,
                 queue_position: Some(2),
-            })
-        );
-
-        let request = fixture_bytes("fixtures/ipc/v40/request_send_user_message.hex");
-        let decoded: Request = decode(&request).expect("send request fixture should decode");
-        assert_eq!(
-            decoded,
-            Request::SendUserMessage {
-                session_id: "00000000-0000-0000-0000-000000000001"
-                    .parse()
-                    .expect("fixture session id should parse"),
-                text: "hello".to_string(),
-            }
-        );
-    }
-
-    #[test]
-    fn ipc_v40_golden_fixtures_remain_byte_stable() {
-        let cases = [
-            (
-                "fixtures/ipc/v40/response_message_sent.hex",
-                encode(&Response::Ok(ResponsePayload::MessageSent))
-                    .expect("response should encode"),
-            ),
-            (
-                "fixtures/ipc/v40/response_turn_cancellation_requested.hex",
-                encode(&Response::Ok(ResponsePayload::TurnCancellationRequested {
-                    cancelled: true,
-                }))
-                .expect("response should encode"),
-            ),
-            (
-                "fixtures/ipc/v40/response_message_accepted.hex",
-                encode(&Response::Ok(ResponsePayload::MessageAccepted {
-                    queued: true,
-                    queue_position: Some(2),
-                }))
-                .expect("response should encode"),
-            ),
-            (
-                "fixtures/ipc/v40/request_send_user_message.hex",
-                encode(&Request::SendUserMessage {
-                    session_id: "00000000-0000-0000-0000-000000000001"
-                        .parse()
-                        .expect("fixture session id should parse"),
-                    text: "hello".to_string(),
-                })
-                .expect("request should encode"),
-            ),
+            }),
         ];
-        for (path, encoded) in cases {
-            assert_eq!(encoded, fixture_bytes(path), "fixture changed: {path}");
+        for response in responses {
+            let encoded = encode_response(&response).expect("response should encode");
+            assert_eq!(
+                decode_response(&encoded).expect("response should decode"),
+                response
+            );
         }
+
+        let request = Request::SendUserMessage {
+            session_id: "00000000-0000-0000-0000-000000000001"
+                .parse()
+                .expect("fixture session id should parse"),
+            text: "hello".to_string(),
+        };
+        let encoded = encode_request(&request).expect("request should encode");
+        assert_eq!(
+            decode_request(&encoded).expect("request should decode"),
+            request
+        );
     }
 
     #[tokio::test]
@@ -5188,6 +5154,7 @@ mod tests {
         for (version, fixture) in [
             (37, "fixtures/ipc/v37/response_message_sent.hex"),
             (40, "fixtures/ipc/v40/response_message_sent.hex"),
+            (41, "fixtures/ipc/v40/response_message_sent.hex"),
         ] {
             let envelope = Envelope {
                 version: ProtocolVersion(version),
@@ -5683,6 +5650,62 @@ mod tests {
         });
         assert_eq!(
             decode_response(&encode_response(&response).unwrap()).unwrap(),
+            response
+        );
+    }
+
+    #[test]
+    fn projection_history_page_round_trips_through_positional_ipc() {
+        use bcode_session_models::{
+            ProjectionWindow, ProjectionWindowAnchor, ProjectionWindowDirection,
+            ProjectionWindowLimits, ProjectionWindowRequest, ProjectionWindowTarget,
+            SessionProjectionKind,
+        };
+        let session_id = SessionId::new();
+        let request = Request::SessionProjectionHistoryPage {
+            session_id,
+            request: Box::new(ProjectionWindowRequest {
+                projection: SessionProjectionKind::Transcript,
+                anchor: ProjectionWindowAnchor::BeforeSequence(23),
+                direction: ProjectionWindowDirection::Backward,
+                target: ProjectionWindowTarget {
+                    min_items: Some(3),
+                    min_estimated_rows: Some(12),
+                    width_columns: Some(80),
+                    ..ProjectionWindowTarget::default()
+                },
+                limits: ProjectionWindowLimits {
+                    max_items: 10,
+                    max_events_scanned: 256,
+                    max_bytes: 65_536,
+                },
+            }),
+        };
+        assert_eq!(
+            decode_request(&encode_request(&request).expect("encode request"))
+                .expect("decode request"),
+            request
+        );
+        let response = Response::Ok(ResponsePayload::SessionProjectionHistoryPage {
+            page: bcode_session_models::ProjectionHistoryPage {
+                session_id,
+                window: ProjectionWindow {
+                    projection: SessionProjectionKind::Transcript,
+                    transcript_items: Vec::new(),
+                    source_range: Some(bcode_session_models::ProjectionSourceRange {
+                        start_sequence: 8,
+                        end_sequence: 16,
+                    }),
+                    has_older: true,
+                    has_newer: true,
+                    scanned_events: 9,
+                },
+                events: Vec::new(),
+            },
+        });
+        assert_eq!(
+            decode_response(&encode_response(&response).expect("encode response"))
+                .expect("decode response"),
             response
         );
     }

@@ -94,11 +94,15 @@ webbrowser = { workspace = true }
 zeroize = { workspace = true }
 
 [dev-dependencies]
-bcode_daemon_lifecycle = { workspace = true }
+bcode_agent_runtime     = { workspace = true }
+bcode_daemon_lifecycle  = { workspace = true }
 bcode_filesystem_plugin = { workspace = true, features = ["static-bundled"] }
 bcode_git_plugin        = { workspace = true, features = ["static-bundled"] }
 bcode_hello_plugin      = { workspace = true }
+bcode_model_catalog     = { workspace = true }
 bcode_question_plugin   = { workspace = true, features = ["static-bundled"] }
+bcode_server            = { workspace = true }
+bcode_session           = { workspace = true }
 bcode_shell_plugin      = { workspace = true, features = ["static-bundled"] }
 bcode_vim_edit_plugin   = { workspace = true, features = ["static-bundled"] }
 insta                   = { workspace = true }

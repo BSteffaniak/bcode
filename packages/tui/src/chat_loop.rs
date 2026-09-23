@@ -1519,8 +1519,8 @@ impl ChatLoopState {
             .app
             .plugin_presentation()
             .is_some_and(crate::plugin_tui::PluginTuiPresentation::poll_dynamic_visuals)
-            | maybe_start_older_history_load(chat, self)
-            | maybe_start_newer_history_load(chat, self);
+            | maybe_start_older_history_load(chat, self, frame_area.width)
+            | maybe_start_newer_history_load(chat, self, frame_area.width);
         if changed {
             super::invalidation::UiInvalidation::Structural
         } else {
@@ -2485,7 +2485,11 @@ impl TuiRuntimeSettings {
     }
 }
 
-fn maybe_start_older_history_load(chat: &mut ActiveChat, _loop_state: &mut ChatLoopState) -> bool {
+fn maybe_start_older_history_load(
+    chat: &mut ActiveChat,
+    _loop_state: &mut ChatLoopState,
+    width_columns: u16,
+) -> bool {
     if !chat.app.should_load_older_history() {
         return false;
     }
@@ -2500,6 +2504,7 @@ fn maybe_start_older_history_load(chat: &mut ActiveChat, _loop_state: &mut ChatL
         session_id,
         cursor,
         generation,
+        width_columns,
     };
     let started = !chat.pending_effects.contains_effect(&effect);
     // A replacement window can request the same direction while the old effect
@@ -2511,7 +2516,11 @@ fn maybe_start_older_history_load(chat: &mut ActiveChat, _loop_state: &mut ChatL
     started
 }
 
-fn maybe_start_newer_history_load(chat: &mut ActiveChat, _loop_state: &mut ChatLoopState) -> bool {
+fn maybe_start_newer_history_load(
+    chat: &mut ActiveChat,
+    _loop_state: &mut ChatLoopState,
+    width_columns: u16,
+) -> bool {
     if !chat.app.should_load_newer_history() {
         return false;
     }
@@ -2526,6 +2535,7 @@ fn maybe_start_newer_history_load(chat: &mut ActiveChat, _loop_state: &mut ChatL
         session_id,
         cursor,
         generation,
+        width_columns,
     };
     let started = !chat.pending_effects.contains_effect(&effect);
     chat.replace_effect(effect);
@@ -3092,22 +3102,37 @@ pub fn apply_effect_result(
                 report_nonfatal_client_error(chat, "Reasoning output settings unavailable", &error);
             }
         },
-        TuiEffectResult::TimelineJumpLoaded { sequence, result } => match result {
-            Ok((events, has_older, has_newer, submissions)) => {
-                chat.app
-                    .replace_transcript_window(&events, has_older, has_newer, sequence);
-                chat.app.apply_submission_records(&submissions);
-                if chat.app.transcript_index_for_sequence(sequence).is_some() {
+        TuiEffectResult::TimelineJumpLoaded {
+            session_id,
+            generation,
+            sequence,
+            result,
+        } => {
+            if chat.viewing_session_id() != Some(session_id)
+                || chat.app.history_window_generation() != generation
+            {
+                return;
+            }
+            match result {
+                Ok((events, has_older, has_newer, submissions)) => {
+                    if !super::history_flow::valid_timeline_window(
+                        session_id, sequence, &events, has_older, has_newer,
+                    ) {
+                        chat.app.set_status(
+                            "Timeline history window inconsistent; retry or inspect session history"
+                                .to_owned(),
+                        );
+                        return;
+                    }
+                    chat.app
+                        .replace_transcript_window(&events, has_older, has_newer, sequence);
+                    chat.app.apply_submission_records(&submissions);
                     chat.app.request_transcript_top_anchor_sequence(sequence);
                     chat.app.set_status("jumped to timeline message".to_owned());
-                } else {
-                    chat.app.set_status(format!(
-                        "timeline message seq {sequence} was not in the loaded window"
-                    ));
                 }
+                Err(error) => report_nonfatal_tui_error(chat, "Timeline jump unavailable", &error),
             }
-            Err(error) => report_nonfatal_tui_error(chat, "Timeline jump unavailable", &error),
-        },
+        }
         TuiEffectResult::PluginCommandInvoked { plugin_id, result } => match result {
             Ok(response) => {
                 if let Some(message) = response.message {

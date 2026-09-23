@@ -30,6 +30,9 @@ pub struct OlderHistoryState {
     newer_reveal_request: Option<usize>,
     older_page_ready: PageAcceptance,
     newer_page_ready: PageAcceptance,
+    newer_page_has_content: bool,
+    newer_page_source_range: Option<(u64, u64)>,
+    older_page_source_range: Option<(u64, u64)>,
     loading_older: bool,
     loading_newer: bool,
     mode: TranscriptWindowMode,
@@ -46,6 +49,9 @@ impl OlderHistoryState {
             newer_reveal_request: None,
             older_page_ready: PageAcceptance::Pending,
             newer_page_ready: PageAcceptance::Pending,
+            newer_page_has_content: false,
+            newer_page_source_range: None,
+            older_page_source_range: None,
             loading_older: false,
             loading_newer: false,
             mode: TranscriptWindowMode::Tail,
@@ -94,6 +100,8 @@ impl OlderHistoryState {
     pub const fn set_loading_newer(&mut self, loading: bool) {
         self.loading_newer = loading;
         if !loading && matches!(self.newer_page_ready, PageAcceptance::Pending) {
+            self.newer_page_has_content = false;
+            self.newer_page_source_range = None;
             self.newer_reveal_request = None;
         }
     }
@@ -132,12 +140,21 @@ impl OlderHistoryState {
     pub fn update_cursor(&mut self, events: &[SessionEvent], has_more: bool) {
         self.older_cursor = oldest_history_cursor(events, has_more);
         self.older_page_ready = PageAcceptance::Ready;
+        self.older_page_source_range = events
+            .first()
+            .zip(events.last())
+            .map(|(first, last)| (first.sequence, last.sequence));
     }
 
     /// Set cursor based on a loaded newer page.
     pub fn update_newer_cursor(&mut self, events: &[SessionEvent], has_more: bool) {
         self.newer_cursor = newest_history_cursor(events, has_more);
         self.newer_page_ready = PageAcceptance::Ready;
+        self.newer_page_has_content = !events.is_empty();
+        self.newer_page_source_range = events
+            .first()
+            .zip(events.last())
+            .map(|(first, last)| (first.sequence, last.sequence));
         if self.newer_cursor.is_none() {
             self.mode = TranscriptWindowMode::Tail;
         }
@@ -157,6 +174,9 @@ impl OlderHistoryState {
         self.newer_reveal_request = None;
         self.older_page_ready = PageAcceptance::Pending;
         self.newer_page_ready = PageAcceptance::Pending;
+        self.newer_page_has_content = false;
+        self.newer_page_source_range = None;
+        self.older_page_source_range = None;
         self.loading_older = false;
         self.loading_newer = false;
         self.mode = if has_newer {
@@ -175,6 +195,18 @@ impl OlderHistoryState {
                 sequence: oldest_resident_sequence.saturating_sub(1),
             })
         };
+    }
+
+    /// Mark trimmed off-screen newer events as reloadable from the resident end.
+    pub const fn mark_dropped_history_after(&mut self, first_dropped_sequence: u64) {
+        self.newer_cursor = Some(SessionHistoryCursor {
+            sequence: first_dropped_sequence,
+        });
+        if matches!(self.mode, TranscriptWindowMode::Tail) {
+            self.mode = TranscriptWindowMode::Centered {
+                anchor_sequence: first_dropped_sequence,
+            };
+        }
     }
 
     /// Mark newly arrived content as available below a centered historical window.
@@ -219,14 +251,32 @@ impl OlderHistoryState {
         self.newer_reveal_request = None;
     }
 
+    /// Return the event source range of a ready older page, if nonempty.
+    #[must_use]
+    pub const fn ready_older_source_range(&self) -> Option<(u64, u64)> {
+        self.older_page_source_range
+    }
+
+    /// Return the event source range of a ready newer page, if nonempty.
+    #[must_use]
+    pub const fn ready_newer_source_range(&self) -> Option<(u64, u64)> {
+        self.newer_page_source_range
+    }
+
     /// Consume page acceptance separately from the fetch request and navigation intent.
-    pub const fn take_ready_pages(&mut self) -> (bool, bool) {
+    /// Return whether each direction has a ready page and whether the newer page
+    /// contains source events. The content marker is consumed with readiness.
+    pub const fn take_ready_pages(&mut self) -> (bool, bool, bool) {
         let ready = (
             matches!(self.older_page_ready, PageAcceptance::Ready),
             matches!(self.newer_page_ready, PageAcceptance::Ready),
+            self.newer_page_has_content,
         );
         self.older_page_ready = PageAcceptance::Pending;
         self.newer_page_ready = PageAcceptance::Pending;
+        self.newer_page_has_content = false;
+        self.newer_page_source_range = None;
+        self.older_page_source_range = None;
         ready
     }
 

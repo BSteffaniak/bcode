@@ -171,7 +171,6 @@ fn terminal_area() -> io::Result<Rect> {
 }
 
 const CURSOR_BLINK_INTERVAL: std::time::Duration = std::time::Duration::from_millis(250);
-const OLDER_HISTORY_EVENT_LIMIT: usize = 256;
 
 fn markdown_activation_adapter_linkage() {
     let activate: fn(

@@ -79,8 +79,8 @@ use bcode_metrics::{MetricLabels, MetricsRegistry};
 use bcode_session_models::{
     ClientId, EXECUTION_SESSION_PROVENANCE_VERSION, ExecutionSessionContextMode,
     ExecutionSessionProvenance, MAX_SESSION_DERIVATION_PROMPT_CANDIDATES,
-    MAX_SESSION_DERIVATION_PROMPT_PREVIEW_BYTES, ProjectionWindow, ProjectionWindowRequest,
-    SESSION_DERIVATION_CONTRACT_VERSION, SessionDerivationPromptCandidate,
+    MAX_SESSION_DERIVATION_PROMPT_PREVIEW_BYTES, ProjectionHistoryPage, ProjectionWindow,
+    ProjectionWindowRequest, SESSION_DERIVATION_CONTRACT_VERSION, SessionDerivationPromptCandidate,
     SessionDerivationPromptPage, SessionDerivationPromptQuery, SessionDerivationSourceSnapshot,
     SessionEvent, SessionEventKind, SessionEventProvenance, SessionHistoryAroundQuery,
     SessionHistoryDirection, SessionHistoryPage, SessionHistoryQuery, SessionHistoryWindow,
@@ -2477,50 +2477,75 @@ impl SessionManager {
             .limits
             .max_events_scanned
             .clamp(1, bcode_session_models::MAX_SESSION_HISTORY_READ_EVENTS);
-        if matches!(
+        if !matches!(
             request.anchor,
             bcode_session_models::ProjectionWindowAnchor::Latest
         ) {
-            let page = self
-                .session_history_page(
-                    session_id,
-                    SessionHistoryQuery {
-                        cursor: None,
-                        limit,
-                        direction: SessionHistoryDirection::Backward,
-                    },
-                )
-                .await?;
-            let mut window =
-                crate::projection::projection_window_from_events(&page.events, &request)
-                    .ok_or(SessionError::UnsupportedProjectionWindow)?;
-            if let Some(range) = window.source_range.as_mut() {
-                range.end_sequence = page.events.last().map_or(range.end_sequence, |event| {
-                    event.sequence.max(range.end_sequence)
-                });
-            }
-            window.has_newer = false;
-            return Ok(window);
+            return Err(SessionError::UnsupportedProjectionWindow);
         }
-        let handle = self.session_handle(session_id).await?;
-        let mut window = handle.projection_window(request).await?;
-        if let Some(range) = window.source_range.as_mut() {
-            let last = handle
-                .events_range(
-                    range.end_sequence,
-                    range
-                        .end_sequence
-                        .saturating_add(u64::try_from(limit).unwrap_or(u64::MAX)),
+        let page = self
+            .session_history_page(
+                session_id,
+                SessionHistoryQuery {
+                    cursor: None,
                     limit,
-                )
-                .await?
-                .last()
-                .map(|event| event.sequence);
-            if let Some(last) = last {
-                range.end_sequence = range.end_sequence.max(last);
-            }
-        }
+                    direction: SessionHistoryDirection::Backward,
+                },
+            )
+            .await?;
+        let mut window = crate::projection::projection_window_from_events(&page.events, &request)
+            .ok_or(SessionError::UnsupportedProjectionWindow)?;
+        window.has_older = window.has_older || page.has_more;
+        window.has_newer = false;
         Ok(window)
+    }
+
+    /// Return one read-only bounded projection page with its canonical source events.
+    ///
+    /// # Errors
+    /// Returns an error for missing or incompatible storage, unsupported projection requests,
+    /// or a canonical read that cannot be verified against the selected source range.
+    pub async fn session_projection_history_page(
+        &self,
+        session_id: SessionId,
+        request: ProjectionWindowRequest,
+    ) -> Result<ProjectionHistoryPage, SessionError> {
+        let window = self.session_projection_window(session_id, request).await?;
+        let Some(range) = window.source_range else {
+            return Ok(ProjectionHistoryPage {
+                session_id,
+                window,
+                events: Vec::new(),
+            });
+        };
+        let page = self
+            .session_history_page(
+                session_id,
+                SessionHistoryQuery {
+                    cursor: Some(bcode_session_models::SessionHistoryCursor {
+                        sequence: range.start_sequence,
+                    }),
+                    limit: window.scanned_events.max(1),
+                    direction: SessionHistoryDirection::Forward,
+                },
+            )
+            .await?;
+        let events = page
+            .events
+            .into_iter()
+            .take_while(|event| event.sequence <= range.end_sequence)
+            .collect::<Vec<_>>();
+        if !page.compatibility_issues.is_empty()
+            || events.first().map(|event| event.sequence) != Some(range.start_sequence)
+            || events.last().map(|event| event.sequence) != Some(range.end_sequence)
+        {
+            return Err(SessionError::UnsupportedProjectionWindow);
+        }
+        Ok(ProjectionHistoryPage {
+            session_id,
+            window,
+            events,
+        })
     }
 
     /// Return source events in an inclusive sequence range.
@@ -7396,6 +7421,150 @@ mod tests {
         assert!(newer.has_older);
         assert!(!newer.has_newer);
 
+        std::fs::remove_dir_all(root).expect("temp dir should clean up");
+    }
+
+    #[tokio::test]
+    async fn restored_projection_history_pages_preserve_unselected_events() {
+        let root = unique_temp_dir();
+        let manager = SessionManager::persistent(&root).expect("manager should initialize");
+        let session = manager
+            .create_session(Some("source events".to_string()), test_working_directory())
+            .await
+            .expect("session should create");
+        for index in 0..5 {
+            manager
+                .append_user_message(session.id, ClientId::new(), format!("message {index}"))
+                .await
+                .expect("message should append");
+        }
+        let restored = SessionManager::persistent(&root).expect("manager should restore");
+        let request = |anchor, direction| ProjectionWindowRequest {
+            projection: SessionProjectionKind::Transcript,
+            anchor,
+            direction,
+            target: ProjectionWindowTarget {
+                min_items: Some(1),
+                min_estimated_rows: None,
+                min_bytes: None,
+                width_columns: Some(80),
+            },
+            limits: ProjectionWindowLimits {
+                max_items: 1,
+                max_events_scanned: 5,
+                max_bytes: 4096,
+            },
+        };
+        let latest = restored
+            .session_projection_history_page(
+                session.id,
+                request(
+                    ProjectionWindowAnchor::Latest,
+                    ProjectionWindowDirection::Backward,
+                ),
+            )
+            .await
+            .expect("latest page");
+        assert_eq!(latest.window.transcript_items.len(), 1);
+        assert_eq!(latest.events.len(), 1);
+        assert_eq!(
+            latest
+                .window
+                .source_range
+                .expect("latest range")
+                .start_sequence,
+            latest.events[0].sequence
+        );
+        let older = restored
+            .session_projection_history_page(
+                session.id,
+                request(
+                    ProjectionWindowAnchor::BeforeSequence(latest.events[0].sequence),
+                    ProjectionWindowDirection::Backward,
+                ),
+            )
+            .await
+            .expect("older page");
+        assert_eq!(older.events.len(), 1);
+        assert_eq!(older.events[0].sequence + 1, latest.events[0].sequence);
+        std::fs::remove_dir_all(root).expect("temp dir should clean up");
+    }
+
+    #[tokio::test]
+    async fn restored_projection_pages_use_bounded_adjacent_scans() {
+        let root = unique_temp_dir();
+        let manager = SessionManager::persistent(&root).expect("manager should initialize");
+        let session = manager
+            .create_session(Some("projection gap".to_string()), test_working_directory())
+            .await
+            .expect("session should create");
+        for index in 0..12 {
+            manager
+                .append_user_message(session.id, ClientId::new(), format!("message {index}"))
+                .await
+                .expect("message should append");
+        }
+        // Adjacent windows should advance their source cursor without scanning
+        // more than the requested event budget in either direction.
+        let restored = SessionManager::persistent(&root).expect("manager should restore");
+        let request = |anchor, direction| ProjectionWindowRequest {
+            projection: SessionProjectionKind::Transcript,
+            anchor,
+            direction,
+            target: ProjectionWindowTarget {
+                min_items: Some(1),
+                min_estimated_rows: None,
+                min_bytes: None,
+                width_columns: Some(80),
+            },
+            limits: ProjectionWindowLimits {
+                max_items: 1,
+                max_events_scanned: 3,
+                max_bytes: 4096,
+            },
+        };
+        let latest = restored
+            .session_projection_window(
+                session.id,
+                request(
+                    ProjectionWindowAnchor::Latest,
+                    ProjectionWindowDirection::Backward,
+                ),
+            )
+            .await
+            .expect("latest window");
+        let latest_range = latest.source_range.expect("source range");
+        let older = restored
+            .session_projection_window(
+                session.id,
+                request(
+                    ProjectionWindowAnchor::BeforeSequence(latest_range.start_sequence),
+                    ProjectionWindowDirection::Backward,
+                ),
+            )
+            .await
+            .expect("older window");
+        let older_range = older.source_range.expect("older source range");
+        assert!(older.scanned_events <= 3);
+        assert!(older_range.end_sequence < latest_range.start_sequence);
+        let newer = restored
+            .session_projection_window(
+                session.id,
+                request(
+                    ProjectionWindowAnchor::AfterSequence(older_range.end_sequence),
+                    ProjectionWindowDirection::Forward,
+                ),
+            )
+            .await
+            .expect("newer window");
+        assert!(newer.scanned_events <= 3);
+        assert!(
+            newer
+                .source_range
+                .expect("newer source range")
+                .start_sequence
+                > older_range.end_sequence
+        );
         std::fs::remove_dir_all(root).expect("temp dir should clean up");
     }
 

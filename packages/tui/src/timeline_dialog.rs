@@ -18,33 +18,20 @@ pub enum TimelineDialogOutcome {
 /// One selectable user-message timeline row.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TimelineEntry {
-    transcript_index: Option<usize>,
     sequence: u64,
     timestamp_ms: u64,
     text: String,
 }
 
 impl TimelineEntry {
-    /// Create a timeline entry for a loaded transcript item.
+    /// Create a timeline entry identified by its source event sequence.
     #[must_use]
-    pub fn new(
-        transcript_index: Option<usize>,
-        sequence: u64,
-        timestamp_ms: u64,
-        text: impl Into<String>,
-    ) -> Self {
+    pub fn new(sequence: u64, timestamp_ms: u64, text: impl Into<String>) -> Self {
         Self {
-            transcript_index,
             sequence,
             timestamp_ms,
             text: text.into(),
         }
-    }
-
-    /// Return the committed transcript item index to jump to, when loaded.
-    #[must_use]
-    pub const fn transcript_index(&self) -> Option<usize> {
-        self.transcript_index
     }
 
     /// Return the source event sequence.
@@ -199,8 +186,8 @@ mod tests {
 
     fn state() -> TimelineDialogState {
         TimelineDialogState::new(vec![
-            TimelineEntry::new(Some(0), 1, 10, "first"),
-            TimelineEntry::new(Some(1), 2, 20, "second"),
+            TimelineEntry::new(1, 10, "first"),
+            TimelineEntry::new(2, 20, "second"),
         ])
     }
 

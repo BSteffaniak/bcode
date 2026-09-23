@@ -6176,6 +6176,7 @@ const fn request_session_id(request: &Request) -> Option<SessionId> {
         | Request::RepriceSession { session_id, .. }
         | Request::SessionStorageUsage { session_id, .. }
         | Request::SessionHistoryPage { session_id, .. }
+        | Request::SessionProjectionHistoryPage { session_id, .. }
         | Request::SessionHistoryAround { session_id, .. }
         | Request::SessionCategorization { session_id }
         | Request::SessionInspection { session_id, .. }
@@ -6251,6 +6252,7 @@ const fn request_kind(request: &Request) -> &'static str {
         Request::RepriceSession { .. } => "session_reprice",
         Request::SessionStorageUsage { .. } => "session_storage_usage",
         Request::SessionHistoryPage { .. } => "session_history_page",
+        Request::SessionProjectionHistoryPage { .. } => "session_projection_history_page",
         Request::SessionHistoryAround { .. } => "session_history_around",
         Request::SessionCategorization { .. } => "session_categorization",
         Request::SessionInspection { .. } => "session_inspection",
@@ -6955,6 +6957,15 @@ async fn handle_request_inner(
         SessionLifecycleRequest::SessionHistoryPage { session_id, query } => {
             handle_session_history_page(request_id, client_id, state, writer, session_id, query)
                 .await
+        }
+        SessionLifecycleRequest::SessionProjectionHistoryPage {
+            session_id,
+            request,
+        } => {
+            Box::pin(handle_session_projection_history_page(
+                request_id, client_id, state, writer, session_id, *request,
+            ))
+            .await
         }
         SessionLifecycleRequest::SessionHistoryAround { session_id, query } => {
             handle_session_history_around(request_id, client_id, state, writer, session_id, query)
@@ -13335,6 +13346,37 @@ async fn handle_session_history_page(
                 writer,
                 request_id,
                 Response::Ok(ResponsePayload::SessionHistoryPage { page }),
+            )
+            .await
+        }
+        Err(session_operations::ReadHistoryError::IncompatibleActiveNamespace(namespace)) => {
+            send_incompatible_active_session_response(writer, request_id, &namespace).await
+        }
+        Err(session_operations::ReadHistoryError::Session(error)) => {
+            send_response(
+                writer,
+                request_id,
+                Response::Err(session_error_response(&error)),
+            )
+            .await
+        }
+    }
+}
+
+async fn handle_session_projection_history_page(
+    request_id: u64,
+    client_id: ClientId,
+    state: &ServerState,
+    writer: &SharedWriter,
+    session_id: SessionId,
+    request: bcode_session_models::ProjectionWindowRequest,
+) -> Result<(), ServerError> {
+    match session_operations::projection_history_page(state, client_id, session_id, request).await {
+        Ok(page) => {
+            send_response(
+                writer,
+                request_id,
+                Response::Ok(ResponsePayload::SessionProjectionHistoryPage { page }),
             )
             .await
         }
@@ -40585,6 +40627,9 @@ const fn response_payload_kind(response: &Response) -> &'static str {
             ResponsePayload::SessionAdmission { .. } => "session_admission",
             ResponsePayload::SessionCompressed { .. } => "session_compressed",
             ResponsePayload::SessionStorageUsage { .. } => "session_storage_usage",
+            ResponsePayload::SessionProjectionHistoryPage { .. } => {
+                "session_projection_history_page"
+            }
             ResponsePayload::SessionHistoryPage { .. } => "session_history_page",
             ResponsePayload::SessionHistoryAround { .. } => "session_history_around",
             ResponsePayload::SessionInspection { .. } => "session_inspection",

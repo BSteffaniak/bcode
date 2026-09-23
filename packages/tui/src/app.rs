@@ -1262,19 +1262,15 @@ impl BmuxApp {
     }
 
     /// Return timeline entries for committed user messages.
+    ///
+    /// Store source sequences, not resident indexes: the dialog can remain open
+    /// while pagination or reconnect replaces its transcript window.
     #[must_use]
     pub fn timeline_entries(&self) -> Vec<TimelineEntry> {
         self.input_history
             .entries()
             .iter()
-            .map(|entry| {
-                TimelineEntry::new(
-                    self.transcript_index_for_sequence(entry.sequence),
-                    entry.sequence,
-                    entry.timestamp_ms,
-                    entry.text.clone(),
-                )
-            })
+            .map(|entry| TimelineEntry::new(entry.sequence, entry.timestamp_ms, entry.text.clone()))
             .collect()
     }
 
@@ -1294,7 +1290,7 @@ impl BmuxApp {
         self.latest_history_sequence = events.last().map(|event| event.sequence);
         self.transcript_window.replace_window(events);
         self.older_history = OlderHistoryState::new(events, has_older_history);
-        self.rebuild_transcript_from_history();
+        self.rebuild_transcript_from_history(false);
         self.pending_visual_overflow_bottom = None;
     }
 
@@ -1311,7 +1307,7 @@ impl BmuxApp {
         self.transcript_window.replace_window(events);
         self.older_history
             .replace_centered(events, has_older, has_newer, anchor_sequence);
-        self.rebuild_transcript_from_history();
+        self.rebuild_transcript_from_history(false);
         self.pending_visual_overflow_bottom = None;
     }
 
@@ -2798,6 +2794,8 @@ impl BmuxApp {
                 height,
             ),
             anchor,
+            self.older_history_page_rows(),
+            self.newer_history_page_rows(),
             &mut history,
         );
         let bottom = viewport.bottom_row(total_rows);
@@ -2946,6 +2944,13 @@ impl BmuxApp {
     #[cfg(test)]
     pub fn latest_user_message_start_row_for_test(&self) -> Option<usize> {
         self.latest_user_message_start_row()
+    }
+
+    /// Return the last measured transcript viewport height for frame-level tests.
+    #[cfg(test)]
+    #[must_use]
+    pub const fn transcript_viewport_height_for_test(&self) -> u16 {
+        self.viewport.height()
     }
 
     /// Return the transcript row that should render at the top of the viewport.
@@ -3873,6 +3878,8 @@ impl BmuxApp {
                 self.transcript_scroll_animation = Some(animation);
             }
         }
+        let newer_page_rows = self.newer_history_page_rows();
+        let older_page_rows = self.older_history_page_rows();
         let anchor = self.resolve_pending_transcript_anchor();
         self.pending_stable_transcript_anchor = None;
         self.viewport.sync_with_anchor(
@@ -3883,12 +3890,53 @@ impl BmuxApp {
                 viewport_height,
             ),
             anchor,
+            older_page_rows,
+            newer_page_rows,
             &mut self.older_history,
         );
         if let Some(top_row) = animated_top {
             self.viewport.materialize_top_row(top_row);
         }
         self.resolve_visual_overflow_follow(total_rows, now);
+    }
+
+    fn older_history_page_rows(&self) -> usize {
+        let Some((first, last)) = self.older_history.ready_older_source_range() else {
+            return 0;
+        };
+        self.transcript
+            .iter()
+            .enumerate()
+            .filter(|(_, item)| {
+                item.event_sequence()
+                    .is_some_and(|sequence| first <= sequence && sequence <= last)
+            })
+            .filter_map(|(index, _)| {
+                self.transcript_layout
+                    .entry_row_count(VisibleTranscriptSource::Transcript, index)
+            })
+            .sum()
+    }
+
+    fn newer_history_page_rows(&self) -> usize {
+        let Some((first, last)) = self.older_history.ready_newer_source_range() else {
+            return 0;
+        };
+        // The newest source item can be updated in place by events in a page.
+        // Only entries whose source identity starts inside the accepted page
+        // are new navigable rows; existing entries may have reflowed.
+        self.transcript
+            .iter()
+            .enumerate()
+            .filter(|(_, item)| {
+                item.event_sequence()
+                    .is_some_and(|sequence| first <= sequence && sequence <= last)
+            })
+            .filter_map(|(index, _)| {
+                self.transcript_layout
+                    .entry_row_count(VisibleTranscriptSource::Transcript, index)
+            })
+            .sum()
     }
 
     fn resolve_visual_overflow_follow(&mut self, _total_rows: usize, now: Instant) {
@@ -4210,15 +4258,100 @@ impl BmuxApp {
         self.trim_resident_transcript_window_if_needed();
     }
 
-    fn rebuild_transcript_from_history(&mut self) {
+    fn rebuild_transcript_from_history(&mut self, preserve_live: bool) {
         let events = self.transcript_window.events().to_vec();
-        self.session_view.clear_history_window();
+        if preserve_live {
+            self.session_view.rebuild_history_window(&events);
+        } else {
+            self.session_view.clear_history_window();
+            self.session_view.apply_history(&events);
+        }
         self.session_view_terminal_adapter.reset();
         for event in &events {
-            self.session_view.apply_event(event);
             self.apply_session_event(event, SessionEventApplication::Replay);
         }
         self.apply_session_view_terminal_adapter();
+    }
+
+    /// Drop complete older turns only when all visible sources and their
+    /// preceding scrolling buffer survive the cut.
+    fn trim_offscreen_older_transcript_if_needed(&mut self) {
+        if self.transcript_window.events().len() <= RESIDENT_TRANSCRIPT_MAX_EVENTS
+            || self.transcript_selection_pinned
+            || self.transcript_scroll_animation.is_some()
+            || self.older_history.loading()
+            || self.viewport.follows_bottom()
+        {
+            return;
+        }
+        let top = self
+            .viewport
+            .top_row(self.transcript_layout.total_rows(), self.viewport.height());
+        let Some(first_visible_sequence) = self
+            .transcript_layout
+            .visible_lines_from_top(top, self.viewport.height().max(1))
+            .iter()
+            .filter(|line| line.source == VisibleTranscriptSource::Transcript)
+            .filter_map(|line| self.transcript.get(line.entry_index))
+            .filter_map(super::transcript::TranscriptItem::event_sequence)
+            .min()
+        else {
+            return;
+        };
+        if let Some(new_oldest_sequence) = self.transcript_window.trim_older_offscreen(
+            RESIDENT_TRANSCRIPT_MAX_EVENTS,
+            RESIDENT_TRANSCRIPT_TARGET_EVENTS,
+            first_visible_sequence,
+            usize::from(self.viewport.height()).saturating_mul(4),
+        ) {
+            self.capture_stable_transcript_anchor();
+            self.older_history
+                .mark_dropped_history_before(new_oldest_sequence);
+            self.rebuild_transcript_from_history(true);
+            self.pending_visual_overflow_bottom = None;
+        }
+    }
+
+    /// Drop complete off-screen newer turns after an older page has been accepted.
+    /// The retained reader identity is resolved again at the next presentation.
+    fn trim_offscreen_newer_transcript_if_needed(&mut self) {
+        if self.transcript_window.events().len() <= RESIDENT_TRANSCRIPT_MAX_EVENTS
+            || self.transcript_selection_pinned
+            || self.transcript_scroll_animation.is_some()
+            || self.older_history.loading_newer()
+            || self.viewport.follows_bottom()
+        {
+            return;
+        }
+        let top = self
+            .viewport
+            .top_row(self.transcript_layout.total_rows(), self.viewport.height());
+        let visible = self
+            .transcript_layout
+            .visible_lines_from_top(top, self.viewport.height().max(1));
+        let Some(last_visible_sequence) = visible
+            .iter()
+            .filter(|line| line.source == VisibleTranscriptSource::Transcript)
+            .filter_map(|line| self.transcript.get(line.entry_index))
+            .filter_map(super::transcript::TranscriptItem::event_sequence)
+            .max()
+        else {
+            return;
+        };
+        // The last visible source must survive even when a single event wraps
+        // to many rows. Keep additional complete events for ordinary scrolling.
+        let first_dropped = self.transcript_window.trim_newer_offscreen(
+            RESIDENT_TRANSCRIPT_MAX_EVENTS,
+            RESIDENT_TRANSCRIPT_TARGET_EVENTS,
+            last_visible_sequence,
+            usize::from(self.viewport.height()).saturating_mul(4),
+        );
+        if let Some(first_dropped) = first_dropped {
+            self.capture_stable_transcript_anchor();
+            self.older_history.mark_dropped_history_after(first_dropped);
+            self.rebuild_transcript_from_history(true);
+            self.pending_visual_overflow_bottom = None;
+        }
     }
 
     fn trim_resident_transcript_window_if_needed(&mut self) {
@@ -4232,7 +4365,7 @@ impl BmuxApp {
             self.older_history
                 .mark_dropped_history_before(new_oldest_sequence);
         }
-        self.rebuild_transcript_from_history();
+        self.rebuild_transcript_from_history(true);
         self.viewport.scroll_to_bottom(&mut self.older_history);
         self.pending_visual_overflow_bottom = None;
     }
@@ -4288,9 +4421,10 @@ impl BmuxApp {
         if self.latest_history_sequence.is_none() {
             self.latest_history_sequence = events.last().map(|event| event.sequence);
         }
-        self.rebuild_transcript_from_history();
+        self.rebuild_transcript_from_history(true);
         self.older_history.update_cursor(events, has_more);
         self.older_history.set_loading(false);
+        self.trim_offscreen_newer_transcript_if_needed();
         if self.older_history.has_older_history() {
             "loaded older history".clone_into(&mut self.status);
         } else {
@@ -4310,9 +4444,10 @@ impl BmuxApp {
 
         self.latest_history_sequence = events.last().map(|event| event.sequence);
         self.transcript_window.append_history(events);
-        self.rebuild_transcript_from_history();
+        self.rebuild_transcript_from_history(true);
         self.older_history.update_newer_cursor(events, has_more);
         self.older_history.set_loading_newer(false);
+        self.trim_offscreen_older_transcript_if_needed();
         if self.older_history.has_newer_history() {
             "loaded newer history".clone_into(&mut self.status);
         } else {
@@ -4976,10 +5111,23 @@ impl BmuxApp {
     pub fn commit_transcript_presentation(&mut self) {
         self.transcript_layout.clear_content_changes();
         self.navigation_checkpoint = None;
-        self.presented_transcript_anchor = None;
+        let previous_anchor = self.presented_transcript_anchor.take();
         self.pending_stable_transcript_anchor = None;
         self.capture_stable_transcript_anchor();
-        self.presented_transcript_anchor = self.pending_stable_transcript_anchor.take();
+        let mut accepted = self.pending_stable_transcript_anchor.take();
+        if let (Some(previous), Some(current)) = (&previous_anchor, &mut accepted)
+            && previous.item_id == current.item_id
+            && previous.viewport_row_offset == current.viewport_row_offset
+            && let Some(position) = previous.source_position
+            && let Some(index) = self.transcript.presentation_index(current.item_id)
+            && self.transcript_layout.source_row(index, position) == Some(current.row_in_item)
+        {
+            // Reflow changes the first byte of a visual row, not the source
+            // position the reader was following. Keep it until manual input
+            // moves to another row (which clears the presented anchor).
+            current.source_position = Some(position);
+        }
+        self.presented_transcript_anchor = accepted;
     }
 
     pub(crate) fn capture_stable_transcript_anchor(&mut self) {
@@ -6238,13 +6386,15 @@ mod tests {
         app.older_history.set_loading_newer(true);
         assert!(app.scroll_transcript_down(2));
         app.viewport
-            .sync_with_anchor((20, 9, 30, 10), Some(20), &mut app.older_history);
+            .sync_with_anchor((20, 9, 30, 10), Some(20), 10, 0, &mut app.older_history);
         assert_eq!(app.older_history.newer_reveal_request(), Some(3));
         app.older_history.update_newer_cursor(&[], false);
         app.older_history.set_loading_newer(false);
         app.viewport
-            .sync_with_anchor((30, 9, 40, 10), Some(20), &mut app.older_history);
-        assert_eq!(app.viewport.top_row(40, 10), 23);
+            .sync_with_anchor((30, 9, 40, 10), Some(20), 10, 0, &mut app.older_history);
+        // The terminal empty page adds no navigable rows. Unrelated layout
+        // growth cannot satisfy the outstanding boundary movement.
+        assert_eq!(app.viewport.top_row(40, 10), 20);
         assert_eq!(app.older_history.newer_reveal_request(), None);
         drop(app);
     }
@@ -6286,12 +6436,12 @@ mod tests {
         let before = app.viewport;
         app.begin_transcript_presentation();
         app.viewport
-            .sync_with_anchor((30, 9, 40, 10), None, &mut app.older_history);
+            .sync_with_anchor((30, 9, 40, 10), None, 10, 0, &mut app.older_history);
         assert!(app.viewport.follows_bottom());
         app.begin_transcript_presentation();
         assert_eq!(app.viewport, before);
         app.viewport
-            .sync_with_anchor((30, 9, 40, 10), None, &mut app.older_history);
+            .sync_with_anchor((30, 9, 40, 10), None, 10, 0, &mut app.older_history);
         app.commit_transcript_presentation();
         app.begin_transcript_presentation();
         assert!(app.viewport.follows_bottom());
@@ -8160,6 +8310,113 @@ mod tests {
         let has_older_history = app.has_older_history();
         drop(app);
         assert!(has_older_history);
+    }
+
+    #[test]
+    fn older_page_keeps_terminal_live_stream_and_blocks_stale_updates() {
+        let session_id = bcode_session_models::SessionId::new();
+        let event = |sequence, text: &str| bcode_session_models::SessionEvent {
+            schema_version: bcode_session_models::CURRENT_SESSION_EVENT_SCHEMA_VERSION,
+            sequence,
+            timestamp_ms: sequence,
+            session_id,
+            provenance: None,
+            kind: bcode_session_models::SessionEventKind::AssistantMessage {
+                text: text.to_owned(),
+            },
+        };
+        let stream = |revision, operation| bcode_session_models::SessionLiveEvent {
+            session_id,
+            kind: bcode_session_models::SessionLiveEventKind::AssistantTextStreamUpdated {
+                output_position: None,
+                turn_id: "active-turn".to_owned(),
+                segment_id: "segment-0".to_owned(),
+                segment_order: 0,
+                update: bcode_session_models::TextStreamUpdate {
+                    generation: 0,
+                    first_revision: revision,
+                    revision,
+                    operation,
+                },
+            },
+        };
+        let mut app = BmuxApp::new_with_history(Some(session_id), &[event(2, "recent")], &[], true);
+        app.absorb_session_live_event(&stream(
+            1,
+            bcode_session_models::TextStreamOperation::Append {
+                expected_offset: 0,
+                text: "finished live text".to_owned(),
+            },
+        ));
+        app.absorb_session_live_event(&stream(
+            2,
+            bcode_session_models::TextStreamOperation::Terminal {
+                status: bcode_session_models::TextStreamTerminalStatus::Completed,
+            },
+        ));
+        app.prepend_older_history(&[event(1, "older")], false);
+        app.absorb_session_live_event(&stream(
+            3,
+            bcode_session_models::TextStreamOperation::Append {
+                expected_offset: "finished live text".len(),
+                text: " stale".to_owned(),
+            },
+        ));
+        assert_eq!(
+            app.transcript()
+                .iter()
+                .filter(|item| item.text() == "finished live text")
+                .count(),
+            1
+        );
+        assert!(
+            !app.transcript()
+                .iter()
+                .any(|item| item.text().contains("stale"))
+        );
+        drop(app);
+    }
+
+    #[test]
+    fn older_history_page_preserves_live_stream_in_shared_and_terminal_views() {
+        let session_id = bcode_session_models::SessionId::new();
+        let event = |sequence, text: &str| bcode_session_models::SessionEvent {
+            schema_version: bcode_session_models::CURRENT_SESSION_EVENT_SCHEMA_VERSION,
+            sequence,
+            timestamp_ms: sequence,
+            session_id,
+            provenance: None,
+            kind: bcode_session_models::SessionEventKind::AssistantMessage {
+                text: text.to_owned(),
+            },
+        };
+        let mut app = BmuxApp::new_with_history(Some(session_id), &[event(2, "recent")], &[], true);
+        app.absorb_session_live_event(&bcode_session_models::SessionLiveEvent {
+            session_id,
+            kind: bcode_session_models::SessionLiveEventKind::AssistantTextDelta {
+                turn_id: "active-turn".to_owned(),
+                segment_id: "segment-0".to_owned(),
+                segment_order: 0,
+                text: "still streaming".to_owned(),
+            },
+        });
+        assert!(
+            app.transcript()
+                .iter()
+                .any(|item| item.text() == "still streaming")
+        );
+
+        app.prepend_older_history(&[event(1, "older")], false);
+        assert!(app.session_view_snapshot().transcript.items.iter().any(|item| {
+            matches!(&item.kind, bcode_session_view_models::TranscriptViewItemKind::AssistantMessage { message }
+                if message.text == "still streaming")
+        }));
+        assert!(
+            app.transcript()
+                .iter()
+                .any(|item| item.text() == "still streaming")
+        );
+        drop(app);
     }
 
     #[test]

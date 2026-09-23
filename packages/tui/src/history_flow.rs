@@ -117,17 +117,97 @@ pub async fn load_timeline_jump_events(
             },
         )
         .await?;
-    let mut events = older.events;
-    events.extend(
-        newer
-            .events
-            .into_iter()
-            .filter(|event| event.sequence != sequence),
-    );
-    events.sort_by_key(|event| event.sequence);
-    events.dedup_by_key(|event| event.sequence);
+    let (events, has_older, has_newer) =
+        merge_timeline_history_pages(session_id, sequence, older, newer)?;
     let submissions = client.submissions_for_history(session_id, &events).await?;
-    Ok((events, older.has_more, newer.has_more, submissions))
+    Ok((events, has_older, has_newer, submissions))
+}
+
+fn merge_timeline_history_pages(
+    session_id: SessionId,
+    sequence: u64,
+    older: bcode_session_models::SessionHistoryPage,
+    newer: bcode_session_models::SessionHistoryPage,
+) -> Result<(Vec<bcode_session_models::SessionEvent>, bool, bool), TuiError> {
+    let valid = |page: &bcode_session_models::SessionHistoryPage| {
+        page.session_id == session_id
+            && page.compatibility_issues.is_empty()
+            && (!page.has_more || !page.events.is_empty())
+            && page
+                .events
+                .iter()
+                .all(|event| event.session_id == session_id)
+            && page
+                .events
+                .windows(2)
+                .all(|pair| pair[0].sequence < pair[1].sequence)
+    };
+    let older_boundary = older.events.first().map(|event| event.sequence);
+    let newer_boundary = newer.events.last().map(|event| event.sequence);
+    if !valid(&older)
+        || !valid(&newer)
+        || older.next_cursor.is_some_and(|cursor| {
+            !older.has_more || older_boundary.is_none_or(|boundary| cursor.sequence >= boundary)
+        })
+        || newer.next_cursor.is_some_and(|cursor| {
+            !newer.has_more || newer_boundary.is_none_or(|boundary| cursor.sequence <= boundary)
+        })
+        || older
+            .events
+            .last()
+            .is_some_and(|event| event.sequence > sequence)
+        || newer
+            .events
+            .first()
+            .is_some_and(|event| event.sequence <= sequence)
+        || older
+            .events
+            .last()
+            .zip(newer.events.first())
+            .is_some_and(|(before, after)| before.sequence >= after.sequence)
+        || !older
+            .events
+            .iter()
+            .chain(&newer.events)
+            .any(|event| event.sequence == sequence)
+    {
+        return Err(TuiError::SessionUnavailable {
+            session_id,
+            reason: "timeline history cannot verify the selected source range; repair or retry the session".to_owned(),
+        });
+    }
+    let has_older = older.has_more;
+    let has_newer = newer.has_more;
+    let mut events = older.events;
+    events.extend(newer.events);
+    Ok((events, has_older, has_newer))
+}
+
+/// Verify a completed timeline jump before replacing the active resident window.
+///
+/// The async result is untrusted even when the requester and window generation
+/// match: it may have been produced by an incompatible or damaged history read.
+#[must_use]
+pub fn valid_timeline_window(
+    session_id: SessionId,
+    sequence: u64,
+    events: &[bcode_session_models::SessionEvent],
+    has_older: bool,
+    has_newer: bool,
+) -> bool {
+    let Some(first) = events.first() else {
+        return false;
+    };
+    let Some(last) = events.last() else {
+        return false;
+    };
+    (!has_older || first.sequence > 0)
+        && (!has_newer || last.sequence < u64::MAX)
+        && events.iter().all(|event| event.session_id == session_id)
+        && events
+            .windows(2)
+            .all(|pair| pair[0].sequence < pair[1].sequence)
+        && events.iter().any(|event| event.sequence == sequence)
 }
 
 /// Attach to a session, but hold live event forwarding until the receiver is released.
@@ -615,6 +695,92 @@ async fn reconnecting_event_stream<F>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn timeline_pages_fail_closed_on_incompatible_or_unrelated_history() {
+        use bcode_session_models::{
+            CURRENT_SESSION_EVENT_SCHEMA_VERSION, SessionEvent, SessionEventCompatibilityIssue,
+            SessionEventCompatibilityKind, SessionEventKind, SessionHistoryPage,
+        };
+        let session_id = SessionId::new();
+        let event = |sequence, session_id| SessionEvent {
+            schema_version: CURRENT_SESSION_EVENT_SCHEMA_VERSION,
+            sequence,
+            timestamp_ms: sequence,
+            session_id,
+            provenance: None,
+            kind: SessionEventKind::AssistantMessage {
+                text: format!("message {sequence}"),
+            },
+        };
+        let older = SessionHistoryPage {
+            session_id,
+            events: vec![event(9, session_id), event(10, session_id)],
+            compatibility_issues: Vec::new(),
+            next_cursor: Some(SessionHistoryCursor { sequence: 8 }),
+            has_more: true,
+        };
+        let newer = SessionHistoryPage {
+            session_id,
+            events: vec![event(11, session_id)],
+            compatibility_issues: Vec::new(),
+            next_cursor: None,
+            has_more: false,
+        };
+        let (events, has_older, has_newer) =
+            merge_timeline_history_pages(session_id, 10, older.clone(), newer.clone())
+                .expect("contiguous source");
+        assert_eq!(
+            events
+                .iter()
+                .map(|event| event.sequence)
+                .collect::<Vec<_>>(),
+            vec![9, 10, 11]
+        );
+        assert!(has_older);
+        assert!(!has_newer);
+
+        let mut damaged = older.clone();
+        damaged
+            .compatibility_issues
+            .push(SessionEventCompatibilityIssue {
+                sequence: 9,
+                event_kind: "future".to_owned(),
+                schema_version: u16::MAX,
+                compatibility: SessionEventCompatibilityKind::FutureSchema,
+                remediation: "upgrade".to_owned(),
+            });
+        assert!(merge_timeline_history_pages(session_id, 10, damaged, newer.clone()).is_err());
+        let mut wrong_session = newer.clone();
+        wrong_session.events[0].session_id = SessionId::new();
+        assert!(
+            merge_timeline_history_pages(session_id, 10, older.clone(), wrong_session).is_err()
+        );
+        let mut overlap = newer.clone();
+        overlap.events[0].sequence = 10;
+        assert!(merge_timeline_history_pages(session_id, 10, older.clone(), overlap).is_err());
+        assert!(
+            merge_timeline_history_pages(
+                session_id,
+                10,
+                older.clone(),
+                SessionHistoryPage {
+                    events: Vec::new(),
+                    has_more: true,
+                    ..newer.clone()
+                }
+            )
+            .is_err()
+        );
+        let mut invalid_cursor = older.clone();
+        invalid_cursor.next_cursor = Some(SessionHistoryCursor { sequence: 9 });
+        assert!(
+            merge_timeline_history_pages(session_id, 10, invalid_cursor, newer.clone()).is_err()
+        );
+        let mut missing = older;
+        missing.events.pop();
+        assert!(merge_timeline_history_pages(session_id, 10, missing, newer).is_err());
+    }
 
     #[tokio::test]
     async fn progress_flush_preserves_partial_ipc_frame() {

@@ -127,7 +127,7 @@ pub(crate) fn projection_window_from_events_with_source_bounds(
         return None;
     }
 
-    let (mut items, scanned_events) = match request.anchor {
+    let (mut items, scanned_events, scanned_source_range) = match request.anchor {
         ProjectionWindowAnchor::Latest => {
             if request.direction != ProjectionWindowDirection::Backward {
                 return None;
@@ -139,6 +139,13 @@ pub(crate) fn projection_window_from_events_with_source_bounds(
             (
                 build_transcript_projection(scanned, request.target.width_columns),
                 events.len().saturating_sub(scan_start),
+                scanned
+                    .first()
+                    .zip(scanned.last())
+                    .map(|(first, last)| ProjectionSourceRange {
+                        start_sequence: first.sequence,
+                        end_sequence: last.sequence,
+                    }),
             )
         }
         ProjectionWindowAnchor::BeforeSequence(_)
@@ -146,6 +153,13 @@ pub(crate) fn projection_window_from_events_with_source_bounds(
         | ProjectionWindowAnchor::AroundSequence(_) => (
             build_transcript_projection(events, request.target.width_columns),
             events.len(),
+            events
+                .first()
+                .zip(events.last())
+                .map(|(first, last)| ProjectionSourceRange {
+                    start_sequence: first.sequence,
+                    end_sequence: last.sequence,
+                }),
         ),
     };
     items.sort_by_key(|item| {
@@ -171,7 +185,8 @@ pub(crate) fn projection_window_from_events_with_source_bounds(
         }
         _ => return None,
     };
-    let source_range = source_range_for_items(&selected_items);
+    let source_range =
+        projection_page_source_range(&items, &selected_items, scanned_source_range, request);
     let has_older = source_range.is_some_and(|range| {
         first_event_sequence.is_some_and(|first| first < range.start_sequence)
     });
@@ -186,6 +201,45 @@ pub(crate) fn projection_window_from_events_with_source_bounds(
         has_newer,
         scanned_events,
     })
+}
+
+fn projection_page_source_range(
+    items: &[TranscriptProjectionItem],
+    selected_items: &[TranscriptProjectionItem],
+    scanned_source_range: Option<ProjectionSourceRange>,
+    request: &ProjectionWindowRequest,
+) -> Option<ProjectionSourceRange> {
+    // Empty projections still own their scanned source interval. Otherwise
+    // non-presenting pages could never advance to content beyond the gap.
+    let mut range = source_range_for_items(selected_items).or(scanned_source_range)?;
+    let scanned = scanned_source_range?;
+    // Do not claim source events belonging to other presenting items in the
+    // bounded scan: those items must remain available to the next page.
+    match (request.anchor, request.direction) {
+        (
+            ProjectionWindowAnchor::BeforeSequence(_) | ProjectionWindowAnchor::Latest,
+            ProjectionWindowDirection::Backward,
+        ) => {
+            let next_item_start = items
+                .iter()
+                .filter(|item| item.source_range.start_sequence > range.end_sequence)
+                .map(|item| item.source_range.start_sequence)
+                .min();
+            range.end_sequence =
+                next_item_start.map_or(scanned.end_sequence, |start| start.saturating_sub(1));
+        }
+        (ProjectionWindowAnchor::AfterSequence(_), ProjectionWindowDirection::Forward) => {
+            let previous_item_end = items
+                .iter()
+                .filter(|item| item.source_range.end_sequence < range.start_sequence)
+                .map(|item| item.source_range.end_sequence)
+                .max();
+            range.start_sequence =
+                previous_item_end.map_or(scanned.start_sequence, |end| end.saturating_add(1));
+        }
+        _ => {}
+    }
+    Some(range)
 }
 
 /// Build first-pass transcript projection metadata from chronological session events.
@@ -1393,6 +1447,380 @@ mod tests {
         assert_eq!(window.scanned_events, 1);
         assert_eq!(window.transcript_items.len(), 1);
         assert!(window.has_older);
+    }
+
+    #[test]
+    fn capped_projection_pages_leave_unselected_items_for_next_page() {
+        use bcode_session_models::{CURRENT_SESSION_EVENT_SCHEMA_VERSION, SessionId};
+        let session_id = SessionId::new();
+        let events = (1..=5)
+            .map(|sequence| SessionEvent {
+                schema_version: CURRENT_SESSION_EVENT_SCHEMA_VERSION,
+                sequence,
+                timestamp_ms: 1,
+                session_id,
+                provenance: None,
+                kind: SessionEventKind::AssistantMessage {
+                    text: format!("visible {sequence}"),
+                },
+            })
+            .collect::<Vec<_>>();
+        let request = |anchor, direction| ProjectionWindowRequest {
+            projection: SessionProjectionKind::Transcript,
+            anchor,
+            direction,
+            target: bcode_session_models::ProjectionWindowTarget {
+                min_items: Some(1),
+                min_estimated_rows: None,
+                min_bytes: None,
+                width_columns: Some(80),
+            },
+            limits: bcode_session_models::ProjectionWindowLimits {
+                max_items: 1,
+                max_events_scanned: 5,
+                max_bytes: 4096,
+            },
+        };
+        for (anchor, direction, expected) in [
+            (
+                ProjectionWindowAnchor::BeforeSequence(6),
+                ProjectionWindowDirection::Backward,
+                ProjectionSourceRange {
+                    start_sequence: 5,
+                    end_sequence: 5,
+                },
+            ),
+            (
+                ProjectionWindowAnchor::AfterSequence(0),
+                ProjectionWindowDirection::Forward,
+                ProjectionSourceRange {
+                    start_sequence: 1,
+                    end_sequence: 1,
+                },
+            ),
+        ] {
+            let page = projection_window_from_events_with_source_bounds(
+                &events,
+                Some(1),
+                Some(5),
+                &request(anchor, direction),
+            )
+            .expect("projection page");
+            assert_eq!(page.source_range, Some(expected));
+            assert_eq!(page.transcript_items.len(), 1);
+        }
+    }
+
+    #[test]
+    fn forward_non_presenting_pages_advance_to_visible_content() {
+        use bcode_session_models::{CURRENT_SESSION_EVENT_SCHEMA_VERSION, ClientId, SessionId};
+        let session_id = SessionId::new();
+        let events = (1..=12)
+            .map(|sequence| SessionEvent {
+                schema_version: CURRENT_SESSION_EVENT_SCHEMA_VERSION,
+                sequence,
+                timestamp_ms: 1,
+                session_id,
+                provenance: None,
+                kind: if sequence == 11 {
+                    SessionEventKind::AssistantMessage {
+                        text: "visible after gap".into(),
+                    }
+                } else {
+                    SessionEventKind::ClientAttached {
+                        client_id: ClientId::new(),
+                    }
+                },
+            })
+            .collect::<Vec<_>>();
+        let mut cursor = 0;
+        let mut scanned = 0;
+        loop {
+            let start = usize::try_from(cursor).expect("bounded start");
+            let end = start.saturating_add(3).min(events.len());
+            let page = projection_window_from_events_with_source_bounds(
+                &events[start..end],
+                Some(1),
+                Some(12),
+                &ProjectionWindowRequest {
+                    projection: SessionProjectionKind::Transcript,
+                    anchor: ProjectionWindowAnchor::AfterSequence(cursor),
+                    direction: ProjectionWindowDirection::Forward,
+                    target: bcode_session_models::ProjectionWindowTarget {
+                        min_items: Some(1),
+                        min_estimated_rows: None,
+                        min_bytes: None,
+                        width_columns: Some(80),
+                    },
+                    limits: bcode_session_models::ProjectionWindowLimits {
+                        max_items: 1,
+                        max_events_scanned: 3,
+                        max_bytes: 4096,
+                    },
+                },
+            )
+            .expect("bounded page");
+            assert!(page.scanned_events <= 3);
+            let range = page
+                .source_range
+                .expect("even empty pages advance the cursor");
+            assert_eq!(range.start_sequence, cursor + 1);
+            assert!(range.end_sequence > cursor);
+            scanned += page.scanned_events;
+            cursor = range.end_sequence;
+            if cursor >= 11 {
+                assert_eq!(page.transcript_items.len(), 1);
+                assert!(page.has_newer);
+                break;
+            }
+            assert!(page.transcript_items.is_empty());
+            assert!(page.has_newer);
+        }
+        assert!(scanned > 3);
+    }
+
+    #[test]
+    fn non_presenting_page_advances_across_multiple_bounded_scans() {
+        use bcode_session_models::{CURRENT_SESSION_EVENT_SCHEMA_VERSION, ClientId, SessionId};
+        let session_id = SessionId::new();
+        let events = (1..=12)
+            .map(|sequence| SessionEvent {
+                schema_version: CURRENT_SESSION_EVENT_SCHEMA_VERSION,
+                sequence,
+                timestamp_ms: 1,
+                session_id,
+                provenance: None,
+                kind: if sequence == 2 {
+                    SessionEventKind::AssistantMessage {
+                        text: "visible before gap".into(),
+                    }
+                } else {
+                    SessionEventKind::ClientAttached {
+                        client_id: ClientId::new(),
+                    }
+                },
+            })
+            .collect::<Vec<_>>();
+        let mut cursor = 13;
+        let mut scanned = 0;
+        while cursor > 1 {
+            let end = usize::try_from(cursor - 1).expect("bounded end");
+            let start = end.saturating_sub(3);
+            let request = ProjectionWindowRequest {
+                projection: SessionProjectionKind::Transcript,
+                anchor: ProjectionWindowAnchor::BeforeSequence(cursor),
+                direction: ProjectionWindowDirection::Backward,
+                target: bcode_session_models::ProjectionWindowTarget {
+                    min_items: Some(1),
+                    min_estimated_rows: None,
+                    min_bytes: None,
+                    width_columns: Some(80),
+                },
+                limits: bcode_session_models::ProjectionWindowLimits {
+                    max_items: 1,
+                    max_events_scanned: 3,
+                    max_bytes: 4096,
+                },
+            };
+            let page = projection_window_from_events_with_source_bounds(
+                &events[start..end],
+                Some(1),
+                Some(12),
+                &request,
+            )
+            .expect("bounded page");
+            assert!(page.scanned_events <= 3);
+            let range = page
+                .source_range
+                .expect("even empty pages advance the cursor");
+            assert_eq!(range.end_sequence + 1, cursor);
+            assert!(range.start_sequence < cursor);
+            scanned += page.scanned_events;
+            cursor = range.start_sequence;
+            if cursor <= 2 {
+                assert_eq!(page.transcript_items.len(), 1);
+                break;
+            }
+            assert!(page.transcript_items.is_empty());
+            assert!(page.has_older);
+        }
+        assert!(scanned > 3);
+    }
+
+    #[test]
+    fn latest_bounded_projection_does_not_claim_unscanned_source_events() {
+        use bcode_session_models::{CURRENT_SESSION_EVENT_SCHEMA_VERSION, ClientId, SessionId};
+        let session_id = SessionId::new();
+        let events = (1..=5)
+            .map(|sequence| SessionEvent {
+                schema_version: CURRENT_SESSION_EVENT_SCHEMA_VERSION,
+                sequence,
+                timestamp_ms: 1,
+                session_id,
+                provenance: None,
+                kind: SessionEventKind::ClientAttached {
+                    client_id: ClientId::new(),
+                },
+            })
+            .collect::<Vec<_>>();
+        let window = projection_window_from_events(
+            &events,
+            &ProjectionWindowRequest {
+                projection: SessionProjectionKind::Transcript,
+                anchor: ProjectionWindowAnchor::Latest,
+                direction: ProjectionWindowDirection::Backward,
+                target: bcode_session_models::ProjectionWindowTarget::default(),
+                limits: bcode_session_models::ProjectionWindowLimits {
+                    max_items: 1,
+                    max_events_scanned: 2,
+                    max_bytes: 4096,
+                },
+            },
+        )
+        .expect("bounded latest projection");
+        assert!(window.transcript_items.is_empty());
+        assert_eq!(window.scanned_events, 2);
+        assert_eq!(
+            window.source_range,
+            Some(ProjectionSourceRange {
+                start_sequence: 4,
+                end_sequence: 5,
+            })
+        );
+        assert!(window.has_older);
+        assert!(!window.has_newer);
+    }
+
+    #[test]
+    fn projection_page_includes_non_presenting_events_between_item_and_cursor() {
+        use bcode_session_models::{CURRENT_SESSION_EVENT_SCHEMA_VERSION, ClientId, SessionId};
+        let session_id = SessionId::new();
+        let events = (11..=15)
+            .map(|sequence| SessionEvent {
+                schema_version: CURRENT_SESSION_EVENT_SCHEMA_VERSION,
+                sequence,
+                timestamp_ms: 1,
+                session_id,
+                provenance: None,
+                kind: if sequence == 13 {
+                    SessionEventKind::AssistantMessage {
+                        text: "visible".into(),
+                    }
+                } else {
+                    SessionEventKind::ClientAttached {
+                        client_id: ClientId::new(),
+                    }
+                },
+            })
+            .collect::<Vec<_>>();
+        let request = |anchor, direction| ProjectionWindowRequest {
+            projection: SessionProjectionKind::Transcript,
+            anchor,
+            direction,
+            target: bcode_session_models::ProjectionWindowTarget {
+                min_items: Some(1),
+                min_estimated_rows: None,
+                min_bytes: None,
+                width_columns: Some(80),
+            },
+            limits: bcode_session_models::ProjectionWindowLimits {
+                max_items: 1,
+                max_events_scanned: 5,
+                max_bytes: 4096,
+            },
+        };
+        for (anchor, direction, expected_range) in [
+            (
+                ProjectionWindowAnchor::BeforeSequence(16),
+                ProjectionWindowDirection::Backward,
+                ProjectionSourceRange {
+                    start_sequence: 13,
+                    end_sequence: 15,
+                },
+            ),
+            (
+                ProjectionWindowAnchor::AfterSequence(10),
+                ProjectionWindowDirection::Forward,
+                ProjectionSourceRange {
+                    start_sequence: 11,
+                    end_sequence: 13,
+                },
+            ),
+        ] {
+            let window = projection_window_from_events_with_source_bounds(
+                &events,
+                Some(1),
+                Some(20),
+                &request(anchor, direction),
+            )
+            .expect("supported projection");
+            assert_eq!(window.transcript_items.len(), 1);
+            assert_eq!(window.source_range, Some(expected_range));
+            assert!(window.has_older && window.has_newer);
+        }
+    }
+
+    #[test]
+    fn non_presenting_projection_scan_advances_without_claiming_exhaustion() {
+        use bcode_session_models::{CURRENT_SESSION_EVENT_SCHEMA_VERSION, ClientId, SessionId};
+        let session_id = SessionId::new();
+        let events = (11..=13)
+            .map(|sequence| SessionEvent {
+                schema_version: CURRENT_SESSION_EVENT_SCHEMA_VERSION,
+                sequence,
+                timestamp_ms: 1,
+                session_id,
+                provenance: None,
+                kind: SessionEventKind::ClientAttached {
+                    client_id: ClientId::new(),
+                },
+            })
+            .collect::<Vec<_>>();
+        let request = |anchor, direction| ProjectionWindowRequest {
+            projection: SessionProjectionKind::Transcript,
+            anchor,
+            direction,
+            target: bcode_session_models::ProjectionWindowTarget {
+                min_items: Some(2),
+                min_estimated_rows: None,
+                min_bytes: None,
+                width_columns: Some(80),
+            },
+            limits: bcode_session_models::ProjectionWindowLimits {
+                max_items: 2,
+                max_events_scanned: 3,
+                max_bytes: 4096,
+            },
+        };
+        for (anchor, direction) in [
+            (
+                ProjectionWindowAnchor::BeforeSequence(14),
+                ProjectionWindowDirection::Backward,
+            ),
+            (
+                ProjectionWindowAnchor::AfterSequence(10),
+                ProjectionWindowDirection::Forward,
+            ),
+        ] {
+            let window = projection_window_from_events_with_source_bounds(
+                &events,
+                Some(1),
+                Some(20),
+                &request(anchor, direction),
+            )
+            .expect("supported projection");
+            assert!(window.transcript_items.is_empty());
+            assert_eq!(
+                window.source_range,
+                Some(ProjectionSourceRange {
+                    start_sequence: 11,
+                    end_sequence: 13,
+                })
+            );
+            assert!(window.has_older);
+            assert!(window.has_newer);
+            assert_eq!(window.scanned_events, 3);
+        }
     }
 
     #[test]

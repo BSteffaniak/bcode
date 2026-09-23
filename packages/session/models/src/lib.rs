@@ -3061,6 +3061,20 @@ pub struct ProjectionWindow {
     pub scanned_events: usize,
 }
 
+/// One read-only bounded canonical event page selected by a semantic projection.
+///
+/// The source range is the exact interval owned by `events`, including intervening
+/// non-presenting events. Empty projections can still advance that range.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProjectionHistoryPage {
+    /// Session owning the canonical events.
+    pub session_id: SessionId,
+    /// Projection selection and continuation metadata.
+    pub window: ProjectionWindow,
+    /// Canonical events within `window.source_range`, in source order.
+    pub events: Vec<SessionEvent>,
+}
+
 /// Typed semantic data returned by a tool invocation.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]

@@ -5,8 +5,9 @@ use std::collections::{BTreeMap, VecDeque};
 use bcode_client::{BcodeClient, ClientError, MessageAcceptance, SessionList};
 use bcode_ipc::{ComposerDraftScope, PermissionSummary, PromptPlacement};
 use bcode_session_models::{
-    ProjectionWindowRequest, SessionHistoryCursor, SessionHistoryDirection, SessionHistoryPage,
-    SessionHistoryQuery, SessionId, SessionSummary, WorkId,
+    ProjectionWindowAnchor, ProjectionWindowDirection, ProjectionWindowLimits,
+    ProjectionWindowRequest, ProjectionWindowTarget, SessionHistoryCursor, SessionHistoryPage,
+    SessionId, SessionProjectionKind, SessionSummary, WorkId,
 };
 use bcode_session_view::execute_session_view_action;
 use bcode_session_view_models::{SessionViewAction, SessionViewActionOutcome};
@@ -21,6 +22,115 @@ use super::{
     session_flow::{self, AgentCatalog},
     slash_palette,
 };
+
+const TRANSCRIPT_PAGE_TARGET_ITEMS: usize = 4;
+const TRANSCRIPT_PAGE_MAX_ITEMS: usize = 16;
+const TRANSCRIPT_PAGE_TARGET_ROWS: usize = 24;
+const TRANSCRIPT_PAGE_MAX_EVENTS_SCANNED: usize = 512;
+const TRANSCRIPT_PAGE_MAX_BYTES: usize = 512 * 1024;
+
+async fn load_transcript_history_page(
+    client: &BcodeClient,
+    session_id: SessionId,
+    cursor: SessionHistoryCursor,
+    width_columns: u16,
+    older: bool,
+) -> Result<
+    (
+        SessionHistoryPage,
+        Vec<bcode_session_models::SubmissionRecord>,
+    ),
+    ClientError,
+> {
+    let (anchor, direction) = if older {
+        (
+            ProjectionWindowAnchor::BeforeSequence(cursor.sequence.saturating_add(1)),
+            ProjectionWindowDirection::Backward,
+        )
+    } else {
+        (
+            ProjectionWindowAnchor::AfterSequence(cursor.sequence.saturating_sub(1)),
+            ProjectionWindowDirection::Forward,
+        )
+    };
+    let page = client
+        .session_projection_history_page(
+            session_id,
+            ProjectionWindowRequest {
+                projection: SessionProjectionKind::Transcript,
+                anchor,
+                direction,
+                target: ProjectionWindowTarget {
+                    min_items: Some(TRANSCRIPT_PAGE_TARGET_ITEMS),
+                    min_estimated_rows: Some(TRANSCRIPT_PAGE_TARGET_ROWS),
+                    min_bytes: None,
+                    width_columns: Some(width_columns.max(1)),
+                },
+                limits: ProjectionWindowLimits {
+                    max_items: TRANSCRIPT_PAGE_MAX_ITEMS,
+                    max_events_scanned: TRANSCRIPT_PAGE_MAX_EVENTS_SCANNED,
+                    max_bytes: TRANSCRIPT_PAGE_MAX_BYTES,
+                },
+            },
+        )
+        .await?;
+    let page = projection_page_as_history_page(session_id, cursor, older, page)?;
+    let records = client
+        .submissions_for_history(session_id, &page.events)
+        .await?;
+    Ok((page, records))
+}
+
+fn projection_page_as_history_page(
+    session_id: SessionId,
+    cursor: SessionHistoryCursor,
+    older: bool,
+    page: bcode_session_models::ProjectionHistoryPage,
+) -> Result<SessionHistoryPage, ClientError> {
+    let has_more = if older {
+        page.window.has_older
+    } else {
+        page.window.has_newer
+    };
+    let expected_boundary = page.window.source_range.map(|range| {
+        if older {
+            // The request anchors at cursor + 1, so a canonical contiguous
+            // page ends at cursor itself (not cursor - 1).
+            range.end_sequence == cursor.sequence
+        } else {
+            range.start_sequence == cursor.sequence
+        }
+    });
+    if page.session_id != session_id
+        || page.window.projection != SessionProjectionKind::Transcript
+        || page.events.is_empty() && has_more
+        || page.window.source_range.is_some() == page.events.is_empty()
+        || expected_boundary == Some(false)
+        || page.window.source_range.is_some_and(|range| {
+            page.events.first().map(|event| event.sequence) != Some(range.start_sequence)
+                || page.events.last().map(|event| event.sequence) != Some(range.end_sequence)
+                || page
+                    .events
+                    .iter()
+                    .any(|event| event.session_id != session_id)
+                || page
+                    .events
+                    .windows(2)
+                    .any(|pair| pair[0].sequence >= pair[1].sequence)
+        })
+    {
+        return Err(ClientError::Protocol(
+            "inconsistent projection history page boundary".to_owned(),
+        ));
+    }
+    Ok(SessionHistoryPage {
+        session_id,
+        events: page.events,
+        compatibility_issues: Vec::new(),
+        next_cursor: None,
+        has_more,
+    })
+}
 
 /// Submit-message effect request payload.
 pub struct SubmitMessageRequest {
@@ -151,6 +261,8 @@ pub enum TuiEffect {
         cursor: SessionHistoryCursor,
         /// Resident window generation at request time.
         generation: u64,
+        /// Width used for semantic row estimation (not terminal layout).
+        width_columns: u16,
     },
     /// Load a newer history page after the currently displayed timeline.
     LoadNewerHistory {
@@ -160,6 +272,8 @@ pub enum TuiEffect {
         cursor: SessionHistoryCursor,
         /// Resident window generation at request time.
         generation: u64,
+        /// Width used for semantic row estimation (not terminal layout).
+        width_columns: u16,
     },
     /// Load the bounded pending-permission snapshot during attach/reconnect.
     ListPermissions,
@@ -306,6 +420,8 @@ pub enum TuiEffect {
     LoadTimelineJump {
         /// Active session.
         session_id: SessionId,
+        /// Resident window generation when the jump was requested.
+        generation: u64,
         /// Selected event sequence.
         sequence: u64,
     },
@@ -728,6 +844,10 @@ pub enum TuiEffectResult {
     },
     /// Bounded timeline jump history loaded.
     TimelineJumpLoaded {
+        /// Session for which the jump was requested.
+        session_id: SessionId,
+        /// Resident window generation when the jump was requested.
+        generation: u64,
         /// Selected source sequence.
         sequence: u64,
         /// Loaded events and bounded-window flags.
@@ -1429,6 +1549,12 @@ impl TuiEffectQueue {
 const TUI_EFFECT_STREAM_CAPACITY: usize = 64;
 
 impl TuiEffect {
+    #[cfg(test)]
+    pub(super) async fn run_for_test(self, client: BcodeClient) -> TuiEffectResult {
+        let (streaming_sender, _streaming_receiver) = mpsc::channel(1);
+        self.run(client, streaming_sender).await
+    }
+
     pub(super) fn command_key(&self) -> bmux_tui_runtime::CommandKey {
         let key = match self {
             Self::AppendPresentationNote { session_id, .. } => {
@@ -1711,15 +1837,17 @@ impl TuiEffect {
                 session_id,
                 cursor,
                 generation,
+                width_columns,
             } => TuiEffectResult::OlderHistoryLoaded {
                 session_id,
                 cursor,
                 generation,
-                result: load_hydrated_history(
+                result: load_transcript_history_page(
                     &client,
                     session_id,
                     cursor,
-                    SessionHistoryDirection::Backward,
+                    width_columns,
+                    true,
                 )
                 .await,
             },
@@ -1727,15 +1855,17 @@ impl TuiEffect {
                 session_id,
                 cursor,
                 generation,
+                width_columns,
             } => TuiEffectResult::NewerHistoryLoaded {
                 session_id,
                 cursor,
                 generation,
-                result: load_hydrated_history(
+                result: load_transcript_history_page(
                     &client,
                     session_id,
                     cursor,
-                    SessionHistoryDirection::Forward,
+                    width_columns,
+                    false,
                 )
                 .await,
             },
@@ -1990,8 +2120,11 @@ impl TuiEffect {
             }
             Self::LoadTimelineJump {
                 session_id,
+                generation,
                 sequence,
             } => TuiEffectResult::TimelineJumpLoaded {
+                session_id,
+                generation,
                 sequence,
                 result: super::history_flow::load_timeline_jump_events(
                     &client, session_id, sequence,
@@ -2388,34 +2521,6 @@ async fn skill_action(
             .flatten(),
         event_stream_release,
     })
-}
-
-async fn load_hydrated_history(
-    client: &BcodeClient,
-    session_id: SessionId,
-    cursor: SessionHistoryCursor,
-    direction: SessionHistoryDirection,
-) -> Result<
-    (
-        SessionHistoryPage,
-        Vec<bcode_session_models::SubmissionRecord>,
-    ),
-    ClientError,
-> {
-    let page = client
-        .session_history_page(
-            session_id,
-            SessionHistoryQuery {
-                cursor: Some(cursor),
-                limit: super::OLDER_HISTORY_EVENT_LIMIT,
-                direction,
-            },
-        )
-        .await?;
-    let records = client
-        .submissions_for_history(session_id, &page.events)
-        .await?;
-    Ok((page, records))
 }
 
 async fn run_submit_message(
@@ -2875,6 +2980,220 @@ async fn load_session_status(client: &BcodeClient, session_id: SessionId) -> Tui
                 .or(interactions_error)
                 .or(plugin_error),
         }),
+    }
+}
+
+#[cfg(test)]
+mod projection_paging_tests {
+    use super::*;
+    use bcode_session_models::{
+        CURRENT_SESSION_EVENT_SCHEMA_VERSION, ClientId, ProjectionSourceRange, ProjectionWindow,
+        SessionEvent, SessionEventKind,
+    };
+
+    fn projection_page(
+        session_id: SessionId,
+        start: u64,
+        end: u64,
+        has_more: bool,
+    ) -> bcode_session_models::ProjectionHistoryPage {
+        bcode_session_models::ProjectionHistoryPage {
+            session_id,
+            window: ProjectionWindow {
+                projection: SessionProjectionKind::Transcript,
+                transcript_items: Vec::new(),
+                source_range: Some(ProjectionSourceRange {
+                    start_sequence: start,
+                    end_sequence: end,
+                }),
+                has_older: has_more,
+                has_newer: has_more,
+                scanned_events: usize::try_from(end - start + 1).expect("small test page"),
+            },
+            events: (start..=end)
+                .map(|sequence| SessionEvent {
+                    schema_version: CURRENT_SESSION_EVENT_SCHEMA_VERSION,
+                    sequence,
+                    timestamp_ms: sequence,
+                    session_id,
+                    provenance: None,
+                    kind: SessionEventKind::ClientAttached {
+                        client_id: ClientId::new(),
+                    },
+                })
+                .collect(),
+        }
+    }
+
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)]
+    async fn scheduled_history_effect_fetches_bounded_page_over_ipc() {
+        use bcode_session_models::{ProjectionHistoryPage, ProjectionWindow};
+
+        let session_id = SessionId::new();
+        let socket_dir = tempfile::tempdir().expect("socket directory");
+        let endpoint = bcode_ipc::IpcEndpoint::unix_socket(socket_dir.path().join("history.sock"));
+        let listener = bcode_ipc::LocalIpcListener::bind(&endpoint).expect("IPC listener");
+        let responder = tokio::spawn(async move {
+            let mut stream = listener.accept().await.expect("history client");
+            let mut observed_request = None;
+            loop {
+                let envelope = bcode_ipc::recv_envelope(&mut stream)
+                    .await
+                    .expect("client request");
+                let request = bcode_ipc::decode_request(&envelope.payload).expect("decode request");
+                let response = match request {
+                    bcode_ipc::Request::Hello { .. } => {
+                        bcode_ipc::Response::Ok(bcode_ipc::ResponsePayload::Hello {
+                            protocol_version: bcode_ipc::ProtocolVersion::current(),
+                            client_id: ClientId::new(),
+                            daemon: bcode_ipc::DaemonStatus {
+                                namespace: bcode_ipc::daemon_namespace(),
+                                protocol_version: u32::from(
+                                    bcode_ipc::ProtocolVersion::current().0,
+                                ),
+                                artifact_id: Some(bcode_ipc::ArtifactId::current()),
+                                executable_digest: Some(
+                                    bcode_daemon_lifecycle::current_executable_identity()
+                                        .expect("test executable identity")
+                                        .1,
+                                ),
+                                build_fingerprint: bcode_ipc::BUILD_FINGERPRINT.to_owned(),
+                                storage_writer_epoch: Some(
+                                    bcode_ipc::CURRENT_SESSION_STORAGE_WRITER_EPOCH,
+                                ),
+                                session_event_schema_version: Some(
+                                    CURRENT_SESSION_EVENT_SCHEMA_VERSION,
+                                ),
+                                state_location_id: Some(bcode_ipc::state_location_id()),
+                                ..bcode_ipc::DaemonStatus::default()
+                            },
+                        })
+                    }
+                    bcode_ipc::Request::SessionProjectionHistoryPage {
+                        session_id: requested,
+                        request,
+                    } => {
+                        assert_eq!(requested, session_id);
+                        assert_eq!(request.anchor, ProjectionWindowAnchor::BeforeSequence(11));
+                        assert_eq!(request.direction, ProjectionWindowDirection::Backward);
+                        assert_eq!(request.projection, SessionProjectionKind::Transcript);
+                        assert!(
+                            request.limits.max_events_scanned <= TRANSCRIPT_PAGE_MAX_EVENTS_SCANNED
+                        );
+                        observed_request = Some(request);
+                        bcode_ipc::Response::Ok(
+                            bcode_ipc::ResponsePayload::SessionProjectionHistoryPage {
+                                page: ProjectionHistoryPage {
+                                    session_id,
+                                    window: ProjectionWindow {
+                                        projection: SessionProjectionKind::Transcript,
+                                        transcript_items: Vec::new(),
+                                        source_range: Some(ProjectionSourceRange {
+                                            start_sequence: 7,
+                                            end_sequence: 10,
+                                        }),
+                                        has_older: true,
+                                        has_newer: true,
+                                        scanned_events: 4,
+                                    },
+                                    events: projection_page(session_id, 7, 10, true).events,
+                                },
+                            },
+                        )
+                    }
+                    other => panic!("unexpected history request: {other:?}"),
+                };
+                let reply = bcode_ipc::response_envelope(envelope.request_id, &response)
+                    .expect("encode response");
+                bcode_ipc::send_envelope(&mut stream, &reply)
+                    .await
+                    .expect("send response");
+                if observed_request.is_some() {
+                    break;
+                }
+            }
+            observed_request.expect("projection request")
+        });
+        let effect = TuiEffect::LoadOlderHistory {
+            session_id,
+            cursor: SessionHistoryCursor { sequence: 10 },
+            generation: 42,
+            width_columns: 80,
+        };
+        let (sender, _receiver) = tokio::sync::mpsc::channel(1);
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            effect.run(BcodeClient::new(endpoint), sender),
+        )
+        .await
+        .expect("history fetch timeout");
+        let request = responder.await.expect("IPC responder");
+        assert_eq!(request.target.min_items, Some(TRANSCRIPT_PAGE_TARGET_ITEMS));
+        match result {
+            TuiEffectResult::OlderHistoryLoaded {
+                session_id: returned,
+                cursor,
+                generation,
+                result,
+            } => {
+                assert_eq!(returned, session_id);
+                assert_eq!(cursor.sequence, 10);
+                assert_eq!(generation, 42);
+                let (page, _) = result.expect("bounded history page");
+                assert_eq!(page.events.len(), 4);
+                assert_eq!(page.events.first().map(|event| event.sequence), Some(7));
+                assert!(page.has_more);
+            }
+            _ => panic!("unexpected effect result"),
+        }
+    }
+
+    #[test]
+    fn projection_pages_preserve_non_presenting_source_progress_in_both_directions() {
+        let session_id = SessionId::new();
+        let older = projection_page_as_history_page(
+            session_id,
+            SessionHistoryCursor { sequence: 10 },
+            true,
+            projection_page(session_id, 7, 10, true),
+        )
+        .expect("older non-presenting page");
+        assert_eq!(older.events.len(), 4);
+        assert!(older.has_more);
+        let newer = projection_page_as_history_page(
+            session_id,
+            SessionHistoryCursor { sequence: 12 },
+            false,
+            projection_page(session_id, 12, 15, false),
+        )
+        .expect("newer non-presenting page");
+        assert_eq!(newer.events.len(), 4);
+        assert!(!newer.has_more);
+    }
+
+    #[test]
+    fn projection_pages_reject_wrong_boundary_or_stale_session() {
+        let session_id = SessionId::new();
+        let page = projection_page(session_id, 7, 10, true);
+        assert!(
+            projection_page_as_history_page(
+                session_id,
+                SessionHistoryCursor { sequence: 11 },
+                true,
+                page.clone(),
+            )
+            .is_err()
+        );
+        assert!(
+            projection_page_as_history_page(
+                SessionId::new(),
+                SessionHistoryCursor { sequence: 10 },
+                true,
+                page,
+            )
+            .is_err()
+        );
     }
 }
 

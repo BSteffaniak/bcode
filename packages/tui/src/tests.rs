@@ -5551,6 +5551,198 @@ fn shared_streaming_updates_remain_one_resident_terminal_item() {
 }
 
 #[test]
+fn oversized_history_turn_keeps_reader_and_reuses_accepted_layout_on_repeat_frame() {
+    let session_id = SessionId::new();
+    let text = "a long source-backed line with words and spaces\n".repeat(512);
+    let history = [
+        event(
+            session_id,
+            1,
+            SessionEventKind::UserMessage {
+                client_id: ClientId::new(),
+                text: "request".to_owned(),
+                admission: bcode_session_models::TurnAdmissionMetadata::default(),
+            },
+        ),
+        event(session_id, 2, SessionEventKind::AssistantMessage { text }),
+    ];
+    let mut app = BmuxApp::new_with_history(Some(session_id), &history, &[], true);
+    let _ = render_app_text(&mut app);
+    let first_rows = app.transcript_layout().total_rows();
+    assert!(first_rows > 20, "oversized source has {first_rows} rows");
+    let first = app.transcript_layout_mut().drain_sync_stats();
+    assert!(first.iter().any(|stats| stats.rows_regenerated > 20));
+    assert!(
+        first
+            .iter()
+            .all(|stats| stats.entries_scanned <= app.transcript().len() + 1),
+        "initial layout must visit only resident entries"
+    );
+    assert!(
+        first
+            .iter()
+            .map(|stats| stats.rows_regenerated)
+            .sum::<usize>()
+            <= first_rows.saturating_mul(2),
+        "initial layout must not regenerate the whole turn for each viewport row"
+    );
+    let _ = render_app_text(&mut app);
+    let again = app.transcript_layout_mut().drain_sync_stats();
+    assert_eq!(app.transcript_layout().total_rows(), first_rows);
+    assert!(again.iter().all(|stats| stats.rows_regenerated == 0));
+    app.scroll_transcript_up(8);
+    let _ = render_app_text(&mut app);
+    let scrolled = app.transcript_layout_mut().drain_sync_stats();
+    assert!(scrolled.iter().all(|stats| stats.rows_regenerated == 0));
+    assert_eq!(app.transcript_layout().total_rows(), first_rows);
+    drop(app);
+}
+
+#[test]
+#[ignore = "requires incremental BMUX/Markdown projection and sparse transcript row retention"]
+fn giant_source_backed_turn_projects_only_a_bounded_first_frame() {
+    let session_id = SessionId::new();
+    let history = [event(
+        session_id,
+        1,
+        SessionEventKind::AssistantMessage {
+            text: "a source-backed paragraph with stable words\n".repeat(4_096),
+        },
+    )];
+    let mut app = BmuxApp::new_with_history(Some(session_id), &history, &[], false);
+    let _ = render_app_text(&mut app);
+    let generated_rows = app
+        .transcript_layout_mut()
+        .drain_sync_stats()
+        .iter()
+        .map(|stats| stats.rows_regenerated)
+        .sum::<usize>();
+    assert!(
+        generated_rows <= 128,
+        "first frame generated {generated_rows} rows for one item instead of a bounded viewport window"
+    );
+    assert_eq!(app.resident_transcript_event_count(), 1);
+    drop(app);
+}
+
+#[test]
+fn giant_source_backed_turn_retains_all_rows_on_first_frame_and_reuses_them() {
+    let session_id = SessionId::new();
+    let text = "a source-backed paragraph with stable words\n".repeat(4_096);
+    let history = [event(
+        session_id,
+        1,
+        SessionEventKind::AssistantMessage { text: text.clone() },
+    )];
+    let mut app = BmuxApp::new_with_history(Some(session_id), &history, &[], false);
+    let _ = render_app_text(&mut app);
+    let rows = app.transcript_layout().total_rows();
+    let initial = app.transcript_layout_mut().drain_sync_stats();
+    assert!(rows > 1_000, "the source yields {rows} navigable rows");
+    assert!(initial.iter().any(|stats| stats.rows_regenerated > 1_000));
+    assert!(
+        initial
+            .iter()
+            .all(|stats| stats.entries_scanned <= app.transcript().len() + 1)
+    );
+    assert_eq!(app.resident_transcript_event_count(), 1);
+    assert_eq!(app.transcript()[0].text(), text);
+    let _ = render_app_text(&mut app);
+    let repeat = app.transcript_layout_mut().drain_sync_stats();
+    assert!(repeat.iter().all(|stats| stats.rows_regenerated == 0));
+    app.scroll_transcript_up(rows / 2);
+    let _ = render_app_text(&mut app);
+    let middle = app.transcript_layout_mut().drain_sync_stats();
+    assert!(middle.iter().all(|stats| stats.rows_regenerated == 0));
+    assert_eq!(app.transcript_layout().total_rows(), rows);
+    drop(app);
+}
+
+#[test]
+fn giant_source_backed_item_round_trip_reflow_preserves_source_position() {
+    use crate::frame_sequence_harness::{
+        TranscriptFrameInput, TranscriptFrameSequence, TranscriptFrameStep,
+    };
+    let session_id = SessionId::new();
+    let text = "source-backed words wrap across narrow screens and stay selectable\n".repeat(2_048);
+    let history = [event(
+        session_id,
+        1,
+        SessionEventKind::AssistantMessage { text },
+    )];
+    let mut app = BmuxApp::new_with_history(Some(session_id), &history, &[], false);
+    let frames = TranscriptFrameSequence::new(&mut app, 80, 12).run([
+        TranscriptFrameStep {
+            label: "initial tail",
+            input: TranscriptFrameInput::Observe,
+        },
+        TranscriptFrameStep {
+            label: "navigate into giant item",
+            input: TranscriptFrameInput::ScrollUp(600),
+        },
+        TranscriptFrameStep {
+            label: "wider viewport",
+            input: TranscriptFrameInput::Resize(100, 12),
+        },
+        TranscriptFrameStep {
+            label: "stable wider viewport",
+            input: TranscriptFrameInput::Observe,
+        },
+        TranscriptFrameStep {
+            label: "original width",
+            input: TranscriptFrameInput::Resize(80, 12),
+        },
+        TranscriptFrameStep {
+            label: "stable restored viewport",
+            input: TranscriptFrameInput::Observe,
+        },
+    ]);
+    assert_eq!(frames[2].observation, frames[3].observation);
+    assert_eq!(frames[4].observation, frames[5].observation);
+    let before = frames[1]
+        .observation
+        .anchor
+        .as_ref()
+        .expect("source-backed reader");
+    let after = frames[5]
+        .observation
+        .anchor
+        .as_ref()
+        .expect("source after reflow");
+    assert_eq!(after.item_id, before.item_id);
+    let original_source = before.source_position.expect("mapped original source");
+    let final_row = app
+        .transcript_layout()
+        .source_row(0, original_source)
+        .expect("original source remains mapped");
+    assert_eq!(after.row_in_item, final_row);
+    assert_eq!(after.source_position, before.source_position);
+    assert_eq!(after.viewport_row_offset, before.viewport_row_offset);
+    let moved = TranscriptFrameSequence::new(&mut app, 80, 12).run([
+        TranscriptFrameStep {
+            label: "manually move after reflow",
+            input: TranscriptFrameInput::ScrollUp(2),
+        },
+        TranscriptFrameStep {
+            label: "manual position settled",
+            input: TranscriptFrameInput::Observe,
+        },
+    ]);
+    assert_eq!(moved[0].observation, moved[1].observation);
+    assert_ne!(
+        moved[0]
+            .observation
+            .anchor
+            .as_ref()
+            .unwrap()
+            .source_position,
+        before.source_position,
+        "manual input must replace the preserved source position"
+    );
+    drop(app);
+}
+
+#[test]
 fn large_rich_history_remains_bounded_in_resident_events_rows_and_payload() {
     let session_id = SessionId::new();
     let mut app = BmuxApp::new_with_history(Some(session_id), &[], &[], false);
@@ -5592,6 +5784,55 @@ fn large_rich_history_remains_bounded_in_resident_events_rows_and_payload() {
     assert!(sync[0].entries_scanned <= app.transcript().len().saturating_add(1));
     assert!(sync[0].rows_regenerated <= app.transcript_layout().total_rows());
     assert!(app.has_older_history());
+    drop(app);
+}
+
+#[test]
+fn live_tail_trims_complete_turns_before_an_oversized_final_turn() {
+    let session_id = SessionId::new();
+    let mut events = (1..=600_u64)
+        .map(|sequence| {
+            event(
+                session_id,
+                sequence,
+                SessionEventKind::UserMessage {
+                    client_id: ClientId::new(),
+                    text: format!("user {sequence}"),
+                    admission: bcode_session_models::TurnAdmissionMetadata::default(),
+                },
+            )
+        })
+        .collect::<Vec<_>>();
+    events.extend((601..=1200).map(|sequence| {
+        event(
+            session_id,
+            sequence,
+            SessionEventKind::AssistantResponseSegment {
+                turn_id: "long-final-turn".to_owned(),
+                segment_id: format!("segment-{sequence}"),
+                segment_order: u32::try_from(sequence - 601).expect("test sequence fits"),
+                text: format!("assistant {sequence}"),
+            },
+        )
+    }));
+    let mut app = BmuxApp::new_with_history(Some(session_id), &[], &[], false);
+    app.absorb_history(&events);
+    let _ = render_app_text(&mut app);
+    assert_eq!(app.resident_transcript_oldest_sequence(), Some(600));
+    assert_eq!(app.resident_transcript_event_count(), 601);
+    assert_eq!(
+        app.older_history_cursor().map(|cursor| cursor.sequence),
+        Some(599)
+    );
+    assert!(
+        app.transcript()
+            .iter()
+            .any(|item| item.text().contains("assistant 1200"))
+    );
+    let before = app.frame_observation();
+    let settled = render_app_text(&mut app);
+    assert_eq!(app.frame_observation(), before);
+    assert!(settled.contains("assistant 1200"));
     drop(app);
 }
 

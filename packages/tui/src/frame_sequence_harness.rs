@@ -81,6 +81,7 @@ pub enum TranscriptFrameInput {
     Resize(u16, u16),
     ScrollUp(usize),
     ScrollDown(usize),
+    ScrollToBottom,
     ReasoningDisplayMode(bcode_config::TuiThinkingMode),
     ThinkingConfig(bcode_config::TuiThinkingConfig),
     AdvanceStreaming(std::time::Duration),
@@ -168,6 +169,9 @@ impl<'a> TranscriptFrameSequence<'a> {
                 }
                 TranscriptFrameInput::ScrollDown(rows) => {
                     self.app.scroll_transcript_down(rows);
+                }
+                TranscriptFrameInput::ScrollToBottom => {
+                    self.app.scroll_transcript_to_bottom();
                 }
                 TranscriptFrameInput::ScrollUp(rows) => {
                     let _ = self.app.scroll_transcript_up(rows);
@@ -259,6 +263,256 @@ mod tests {
     use std::sync::Arc;
 
     #[test]
+    fn newer_page_updating_existing_item_does_not_spend_unearned_movement() {
+        let session_id = SessionId::new();
+        let message = |sequence| {
+            durable(
+                session_id,
+                sequence,
+                SessionEventKind::AssistantMessage {
+                    text: format!("message {sequence}"),
+                },
+            )
+        };
+        let centered = (10..18).map(message).collect::<Vec<_>>();
+        let mut app = BmuxApp::new_with_history(Some(session_id), &centered, &[], true);
+        let before = TranscriptFrameSequence::new(&mut app, 80, 12).run([
+            TranscriptFrameStep {
+                label: "centered",
+                input: TranscriptFrameInput::CenterHistory {
+                    events: centered,
+                    anchor_sequence: 14,
+                    has_older: false,
+                    has_newer: true,
+                },
+            },
+            TranscriptFrameStep {
+                label: "request more",
+                input: TranscriptFrameInput::ScrollDown(200),
+            },
+        ]);
+        assert!(app.should_load_newer_history());
+        let previous_items = before[1].observation.semantic_items.len();
+        let previous_anchor = before[1].observation.anchor.clone();
+        let frames = TranscriptFrameSequence::new(&mut app, 80, 12).run([
+            TranscriptFrameStep {
+                label: "non-presenting newer",
+                input: TranscriptFrameInput::AppendHistory {
+                    events: vec![durable(
+                        session_id,
+                        18,
+                        SessionEventKind::ClientAttached {
+                            client_id: ClientId::new(),
+                        },
+                    )],
+                    has_more: true,
+                },
+            },
+            TranscriptFrameStep {
+                label: "repeat",
+                input: TranscriptFrameInput::Observe,
+            },
+            TranscriptFrameStep {
+                label: "presenting newer",
+                input: TranscriptFrameInput::AppendHistory {
+                    events: vec![message(19)],
+                    has_more: false,
+                },
+            },
+            TranscriptFrameStep {
+                label: "settled",
+                input: TranscriptFrameInput::Observe,
+            },
+        ]);
+        drop(app);
+        assert_eq!(frames[0].observation.semantic_items.len(), previous_items);
+        assert_eq!(
+            frames[0].observation.viewport_top,
+            before[1].observation.viewport_top
+        );
+        assert_eq!(frames[0].observation, frames[1].observation);
+        assert_eq!(frames[0].observation.anchor, previous_anchor);
+        assert_eq!(
+            frames[2].observation.semantic_items.len(),
+            previous_items + 1
+        );
+        assert_eq!(frames[2].observation, frames[3].observation);
+    }
+
+    #[test]
+    fn centered_newer_boundary_waits_for_actual_beyond_window_input() {
+        let session_id = SessionId::new();
+        let event = |sequence| {
+            durable(
+                session_id,
+                sequence,
+                SessionEventKind::AssistantMessage {
+                    text: format!("message {sequence}"),
+                },
+            )
+        };
+        let centered = (10..18).map(event).collect::<Vec<_>>();
+        let mut app = BmuxApp::new_with_history(Some(session_id), &centered, &[], true);
+        let first = TranscriptFrameSequence::new(&mut app, 80, 12).run([TranscriptFrameStep {
+            label: "centered",
+            input: TranscriptFrameInput::CenterHistory {
+                events: centered,
+                anchor_sequence: 14,
+                has_older: false,
+                has_newer: true,
+            },
+        }]);
+        let total_rows = first[0].observation.terminal_rows.len();
+        let viewport_height = usize::from(app.transcript_viewport_height_for_test());
+        let boundary = total_rows.saturating_sub(viewport_height);
+        let remaining = boundary
+            .saturating_sub(first[0].observation.viewport_top)
+            .saturating_sub(2);
+        assert!(
+            remaining > 0,
+            "the centered window must have resident rows below"
+        );
+        let frames = TranscriptFrameSequence::new(&mut app, 80, 12).run([
+            TranscriptFrameStep {
+                label: "near newer boundary",
+                input: TranscriptFrameInput::ScrollDown(remaining),
+            },
+            TranscriptFrameStep {
+                label: "settled near boundary",
+                input: TranscriptFrameInput::Observe,
+            },
+        ]);
+        assert_eq!(
+            frames[0].observation.viewport_top,
+            boundary.saturating_sub(2)
+        );
+        assert_eq!(frames[0].observation, frames[1].observation);
+        assert!(!app.should_load_newer_history());
+        // The latest-bar height can change near the resident bottom; use an
+        // accepted frame to resolve the geometry before requesting another row.
+        let beyond = TranscriptFrameSequence::new(&mut app, 80, 12).run([
+            TranscriptFrameStep {
+                label: "finish resident rows",
+                input: TranscriptFrameInput::ScrollDown(1),
+            },
+            TranscriptFrameStep {
+                label: "one row beyond",
+                input: TranscriptFrameInput::ScrollDown(1),
+            },
+            TranscriptFrameStep {
+                label: "waiting for newer page",
+                input: TranscriptFrameInput::Observe,
+            },
+        ]);
+        assert_eq!(
+            beyond[0].observation.viewport_top,
+            boundary.saturating_sub(1)
+        );
+        assert!(app.should_load_newer_history());
+        assert_eq!(beyond[1].observation, beyond[2].observation);
+        drop(app);
+    }
+
+    #[test]
+    fn accepted_newer_page_counts_presenting_rows_not_reflowed_existing_rows() {
+        let session_id = SessionId::new();
+        let event = |sequence, text: String| {
+            durable(
+                session_id,
+                sequence,
+                SessionEventKind::AssistantMessage { text },
+            )
+        };
+        let centered = (10..18)
+            .map(|sequence| {
+                event(
+                    sequence,
+                    format!("message {sequence}: {}", "long line ".repeat(12)),
+                )
+            })
+            .collect::<Vec<_>>();
+        let mut app = BmuxApp::new_with_history(Some(session_id), &centered, &[], true);
+        let frames = TranscriptFrameSequence::new(&mut app, 80, 12).run([
+            TranscriptFrameStep {
+                label: "centered",
+                input: TranscriptFrameInput::CenterHistory {
+                    events: centered,
+                    anchor_sequence: 14,
+                    has_older: false,
+                    has_newer: true,
+                },
+            },
+            TranscriptFrameStep {
+                label: "newer boundary",
+                input: TranscriptFrameInput::ScrollDown(200),
+            },
+        ]);
+        let before = &frames[1].observation;
+        assert!(app.should_load_newer_history());
+        let page = vec![event(18, "newer page".to_owned())];
+        let after = TranscriptFrameSequence::new(&mut app, 24, 12).run([
+            TranscriptFrameStep {
+                label: "accepted at narrower width",
+                input: TranscriptFrameInput::AppendHistory {
+                    events: page,
+                    has_more: false,
+                },
+            },
+            TranscriptFrameStep {
+                label: "repeat",
+                input: TranscriptFrameInput::Observe,
+            },
+        ]);
+        let accepted = &after[0].observation;
+        let anchor = before.anchor.as_ref().expect("reader anchor before page");
+        let old_source = before
+            .terminal_rows
+            .get(before.viewport_top + anchor.viewport_row_offset)
+            .and_then(|(source, _)| source.as_ref())
+            .expect("source row before page");
+        let corresponding_row = app
+            .transcript()
+            .iter()
+            .enumerate()
+            .find(|(_, item)| item.source_view_item_id() == Some(old_source))
+            .and_then(|(index, _)| {
+                app.transcript_layout()
+                    .entry_start_row(
+                        super::super::transcript_layout::VisibleTranscriptSource::Transcript,
+                        index,
+                    )
+                    .zip(app.transcript_layout().source_row(
+                        index,
+                        anchor.source_position.expect("mapped source position"),
+                    ))
+            })
+            .map(|(start, row)| start + row)
+            .expect("reader source survives reflow");
+        let movement = accepted.viewport_top.saturating_sub(corresponding_row);
+        let pending_request = app.should_load_newer_history();
+        assert_eq!(accepted, &after[1].observation);
+        let page_rows = app
+            .transcript()
+            .iter()
+            .enumerate()
+            .filter(|(_, item)| item.event_sequence() == Some(18))
+            .filter_map(|(index, _)| {
+                app.transcript_layout().entry_row_count(
+                    super::super::transcript_layout::VisibleTranscriptSource::Transcript,
+                    index,
+                )
+            })
+            .sum::<usize>();
+        drop(app);
+        assert!(page_rows > 0);
+        assert!(!pending_request);
+        assert!(
+            movement <= page_rows + anchor.viewport_row_offset,
+            "reader moved {movement} rows; page {page_rows} rows"
+        );
+    }
+
+    #[test]
     fn centered_newer_page_preserves_reader_and_reaches_tail() {
         let session_id = SessionId::new();
         let event = |sequence| {
@@ -302,6 +556,775 @@ mod tests {
         assert!(after.viewport_top >= before.viewport_top);
         assert_eq!(after, &frames[3].observation);
         assert!(after.terminal_rows.iter().any(|(id, _)| id.is_some()));
+        let tail = TranscriptFrameSequence::new(&mut app, 80, 12).run([
+            TranscriptFrameStep {
+                label: "return to live tail",
+                input: TranscriptFrameInput::ScrollToBottom,
+            },
+            TranscriptFrameStep {
+                label: "new live event after history navigation",
+                input: TranscriptFrameInput::Durable(Box::new(event(40))),
+            },
+            TranscriptFrameStep {
+                label: "live tail settled",
+                input: TranscriptFrameInput::Observe,
+            },
+        ]);
+        assert_eq!(tail[1].observation, tail[2].observation);
+        assert!(
+            tail[1].observation.semantic_items.len() > tail[0].observation.semantic_items.len()
+        );
+        assert!(tail[1].observation.viewport_top >= tail[0].observation.viewport_top);
+    }
+
+    #[test]
+    fn non_presenting_older_page_does_not_spend_boundary_movement() {
+        let session_id = SessionId::new();
+        let message = |sequence| {
+            durable(
+                session_id,
+                sequence,
+                SessionEventKind::AssistantMessage {
+                    text: format!("message {sequence}"),
+                },
+            )
+        };
+        let recent = (30..42).map(message).collect::<Vec<_>>();
+        let mut app = BmuxApp::new_with_history(Some(session_id), &recent, &[], true);
+        let initial = TranscriptFrameSequence::new(&mut app, 80, 12).run([TranscriptFrameStep {
+            label: "resumed tail",
+            input: TranscriptFrameInput::Observe,
+        }]);
+        let top = initial[0].observation.viewport_top;
+        let frames = TranscriptFrameSequence::new(&mut app, 80, 12).run([
+            TranscriptFrameStep {
+                label: "reach boundary",
+                input: TranscriptFrameInput::ScrollUp(top),
+            },
+            TranscriptFrameStep {
+                label: "request rows",
+                input: TranscriptFrameInput::ScrollUp(3),
+            },
+            TranscriptFrameStep {
+                label: "only non-presenting events arrive",
+                input: TranscriptFrameInput::PrependHistory {
+                    events: (20..30)
+                        .map(|sequence| {
+                            durable(
+                                session_id,
+                                sequence,
+                                SessionEventKind::ClientAttached {
+                                    client_id: ClientId::new(),
+                                },
+                            )
+                        })
+                        .collect(),
+                    has_more: true,
+                },
+            },
+            TranscriptFrameStep {
+                label: "repeat",
+                input: TranscriptFrameInput::Observe,
+            },
+            TranscriptFrameStep {
+                label: "next presenting page",
+                input: TranscriptFrameInput::PrependHistory {
+                    events: (1..20).map(message).collect(),
+                    has_more: false,
+                },
+            },
+            TranscriptFrameStep {
+                label: "settled",
+                input: TranscriptFrameInput::Observe,
+            },
+        ]);
+        assert_eq!(frames[1].observation.anchor, frames[2].observation.anchor);
+        assert_eq!(frames[2].observation, frames[3].observation);
+        let reader = frames[2]
+            .observation
+            .anchor
+            .as_ref()
+            .expect("reader at boundary");
+        let source = frames[2]
+            .observation
+            .terminal_rows
+            .get(frames[2].observation.viewport_top + reader.viewport_row_offset)
+            .and_then(|(source, _)| source.as_ref())
+            .expect("reader source");
+        let corresponding_row = frames[4]
+            .observation
+            .terminal_rows
+            .iter()
+            .position(|(id, row)| id.as_ref() == Some(source) && *row == reader.row_in_item)
+            .expect("reader survives next page");
+        assert!(corresponding_row >= frames[4].observation.viewport_top);
+        assert!(corresponding_row - frames[4].observation.viewport_top <= 4);
+        assert_eq!(frames[4].observation, frames[5].observation);
+        assert!(frames[4].observation.viewport_top > frames[2].observation.viewport_top);
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn newer_page_eviction_keeps_source_row_and_reloadable_older_cursor() {
+        let session_id = SessionId::new();
+        let event = |sequence| {
+            durable(
+                session_id,
+                sequence,
+                SessionEventKind::UserMessage {
+                    client_id: bcode_session_models::ClientId::new(),
+                    text: format!("message {sequence}"),
+                    admission: bcode_session_models::TurnAdmissionMetadata::default(),
+                },
+            )
+        };
+        let initial = (1..=1001).map(event).collect::<Vec<_>>();
+        let mut app = BmuxApp::new_with_history(Some(session_id), &initial, &[], true);
+        let at_tail = TranscriptFrameSequence::new(&mut app, 80, 12).run([
+            TranscriptFrameStep {
+                label: "start at tail",
+                input: TranscriptFrameInput::Observe,
+            },
+            TranscriptFrameStep {
+                label: "detach near tail",
+                input: TranscriptFrameInput::ScrollUp(2),
+            },
+        ]);
+        let anchor = at_tail[1].observation.anchor.as_ref().expect("reader");
+        let source = at_tail[1].observation.terminal_rows
+            [at_tail[1].observation.viewport_top + anchor.viewport_row_offset]
+            .0
+            .clone()
+            .expect("source");
+        let row = anchor.row_in_item;
+        let offset = anchor.viewport_row_offset;
+        let page = TranscriptFrameSequence::new(&mut app, 80, 12).run([
+            TranscriptFrameStep {
+                label: "newer page crosses trim threshold",
+                input: TranscriptFrameInput::AppendHistory {
+                    events: (1002..=1100).map(event).collect(),
+                    has_more: false,
+                },
+            },
+            TranscriptFrameStep {
+                label: "settled after prefix eviction",
+                input: TranscriptFrameInput::Observe,
+            },
+        ]);
+        assert!(app.resident_transcript_oldest_sequence().expect("oldest") > 1);
+        assert!(app.resident_transcript_event_count() <= 1024);
+        assert!(app.older_history_cursor().is_some());
+        assert_eq!(page[0].observation, page[1].observation);
+        let reader = &page[0].observation;
+        let source_row = reader
+            .terminal_rows
+            .iter()
+            .position(|(id, index)| id.as_ref() == Some(&source) && *index == row)
+            .expect("reader survives trim");
+        assert_eq!(source_row.saturating_sub(reader.viewport_top), offset);
+        let cursor = app.older_history_cursor().expect("evicted older cursor");
+        let reloaded = TranscriptFrameSequence::new(&mut app, 80, 12).run([
+            TranscriptFrameStep {
+                label: "reload evicted older prefix",
+                input: TranscriptFrameInput::PrependHistory {
+                    events: (1..=cursor.sequence).map(event).collect(),
+                    has_more: false,
+                },
+            },
+            TranscriptFrameStep {
+                label: "settled older reload",
+                input: TranscriptFrameInput::Observe,
+            },
+        ]);
+        assert_eq!(app.resident_transcript_oldest_sequence(), Some(1));
+        assert_eq!(reloaded[0].observation, reloaded[1].observation);
+        let reload_anchor = reloaded[0]
+            .observation
+            .anchor
+            .as_ref()
+            .expect("reader after reload");
+        let reload_source = reloaded[0].observation.terminal_rows
+            [reloaded[0].observation.viewport_top + reload_anchor.viewport_row_offset]
+            .0
+            .clone()
+            .expect("source after reload");
+        let resized = TranscriptFrameSequence::new(&mut app, 52, 12).run([
+            TranscriptFrameStep {
+                label: "narrower after older prefix reload",
+                input: TranscriptFrameInput::Resize(52, 12),
+            },
+            TranscriptFrameStep {
+                label: "settled narrower reload",
+                input: TranscriptFrameInput::Observe,
+            },
+        ]);
+        assert_eq!(resized[0].observation, resized[1].observation);
+        assert!(
+            resized[0]
+                .observation
+                .terminal_rows
+                .iter()
+                .any(|(id, _)| id.as_ref() == Some(&reload_source))
+        );
+        drop(app);
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn evicted_newer_boundary_reveals_only_loaded_rows_once() {
+        let session_id = SessionId::new();
+        let event = |sequence| {
+            durable(
+                session_id,
+                sequence,
+                SessionEventKind::UserMessage {
+                    client_id: bcode_session_models::ClientId::new(),
+                    text: format!("message {sequence}"),
+                    admission: bcode_session_models::TurnAdmissionMetadata::default(),
+                },
+            )
+        };
+        let recent = (500..=1500).map(event).collect::<Vec<_>>();
+        let mut app = BmuxApp::new_with_history(Some(session_id), &recent, &[], true);
+        TranscriptFrameSequence::new(&mut app, 80, 12).run([
+            TranscriptFrameStep {
+                label: "initial frame",
+                input: TranscriptFrameInput::Observe,
+            },
+            TranscriptFrameStep {
+                label: "older boundary",
+                input: TranscriptFrameInput::ScrollUp(usize::MAX / 4),
+            },
+            TranscriptFrameStep {
+                label: "evict newer suffix",
+                input: TranscriptFrameInput::PrependHistory {
+                    events: (450..500).map(event).collect(),
+                    has_more: true,
+                },
+            },
+        ]);
+        let cursor = app.newer_history_cursor().expect("evicted suffix cursor");
+        let boundary = TranscriptFrameSequence::new(&mut app, 80, 12).run([
+            TranscriptFrameStep {
+                label: "move to newer boundary",
+                input: TranscriptFrameInput::ScrollDown(usize::MAX / 4),
+            },
+            TranscriptFrameStep {
+                label: "queue additional newer rows",
+                input: TranscriptFrameInput::ScrollDown(3),
+            },
+        ]);
+        assert!(app.should_load_newer_history());
+        let before = &boundary[1].observation;
+        let page = TranscriptFrameSequence::new(&mut app, 80, 12).run([
+            TranscriptFrameStep {
+                label: "newer page",
+                input: TranscriptFrameInput::AppendHistory {
+                    events: (cursor.sequence..cursor.sequence + 8).map(event).collect(),
+                    has_more: true,
+                },
+            },
+            TranscriptFrameStep {
+                label: "newer page settled",
+                input: TranscriptFrameInput::Observe,
+            },
+        ]);
+        let after = &page[0].observation;
+        assert_eq!(after, &page[1].observation);
+        assert!(after.viewport_top >= before.viewport_top);
+        assert!(after.viewport_top - before.viewport_top <= 8 * 4);
+        let previous = before.anchor.as_ref().expect("source-backed reader");
+        let source = before.terminal_rows[before.viewport_top + previous.viewport_row_offset]
+            .0
+            .as_ref()
+            .expect("reader source");
+        let corresponding_row = after
+            .terminal_rows
+            .iter()
+            .position(|(id, row)| id.as_ref() == Some(source) && *row == previous.row_in_item)
+            .expect("reader survives page");
+        let movement = after
+            .viewport_top
+            .saturating_sub(corresponding_row.saturating_sub(previous.viewport_row_offset));
+        assert!(
+            movement > 0 && movement <= 8 * 4,
+            "newer page moved {movement} rows"
+        );
+        assert_eq!(
+            app.newer_history_cursor().map(|cursor| cursor.sequence),
+            Some(cursor.sequence + 8)
+        );
+        assert!(app.should_load_newer_history());
+        assert_eq!(
+            app.newer_history_cursor().map(|cursor| cursor.sequence),
+            Some(cursor.sequence + 8)
+        );
+        let older_before = app.older_history_cursor();
+        let next_cursor = app.newer_history_cursor().expect("next newer page");
+        let next_page = TranscriptFrameSequence::new(&mut app, 80, 12).run([
+            TranscriptFrameStep {
+                label: "second newer page",
+                input: TranscriptFrameInput::AppendHistory {
+                    events: (next_cursor.sequence..next_cursor.sequence + 8)
+                        .map(event)
+                        .collect(),
+                    has_more: true,
+                },
+            },
+            TranscriptFrameStep {
+                label: "second newer page settled",
+                input: TranscriptFrameInput::Observe,
+            },
+        ]);
+        assert_eq!(next_page[0].observation, next_page[1].observation);
+        assert!(next_page[0].observation.viewport_top >= after.viewport_top);
+        assert!(next_page[0].observation.viewport_top - after.viewport_top <= 8 * 4);
+        assert_eq!(app.older_history_cursor(), older_before);
+        for _ in 0..3 {
+            let cursor = app.newer_history_cursor().expect("further newer page");
+            let at_boundary = TranscriptFrameSequence::new(&mut app, 80, 12).run([
+                TranscriptFrameStep {
+                    label: "reach next newer boundary",
+                    input: TranscriptFrameInput::ScrollDown(usize::MAX / 4),
+                },
+                TranscriptFrameStep {
+                    label: "request rows at newer edge",
+                    input: TranscriptFrameInput::ScrollDown(3),
+                },
+            ]);
+            let previous = at_boundary[1].observation.anchor.as_ref().expect("reader");
+            let source = at_boundary[1].observation.terminal_rows
+                [at_boundary[1].observation.viewport_top + previous.viewport_row_offset]
+                .0
+                .clone()
+                .expect("reader source");
+            let page = TranscriptFrameSequence::new(&mut app, 80, 12).run([
+                TranscriptFrameStep {
+                    label: "another newer page",
+                    input: TranscriptFrameInput::AppendHistory {
+                        events: (cursor.sequence..cursor.sequence + 50).map(event).collect(),
+                        has_more: true,
+                    },
+                },
+                TranscriptFrameStep {
+                    label: "settled newer page",
+                    input: TranscriptFrameInput::Observe,
+                },
+            ]);
+            assert_eq!(page[0].observation, page[1].observation);
+            assert!(
+                page[0]
+                    .observation
+                    .terminal_rows
+                    .iter()
+                    .any(|(id, _)| id.as_ref() == Some(&source))
+            );
+            assert!(app.resident_transcript_event_count() <= 1024);
+            assert!(app.older_history_cursor().is_some());
+        }
+        drop(app);
+    }
+
+    #[test]
+    fn repeated_bidirectional_pages_keep_reader_and_residency_bounded() {
+        let session_id = SessionId::new();
+        let event = |sequence| {
+            durable(
+                session_id,
+                sequence,
+                SessionEventKind::UserMessage {
+                    client_id: bcode_session_models::ClientId::new(),
+                    text: format!("message {sequence}"),
+                    admission: bcode_session_models::TurnAdmissionMetadata::default(),
+                },
+            )
+        };
+        let recent = (1_001..=1_040).map(event).collect::<Vec<_>>();
+        let mut app = BmuxApp::new_with_history(Some(session_id), &recent, &[], true);
+        TranscriptFrameSequence::new(&mut app, 80, 12).run([
+            TranscriptFrameStep {
+                label: "resume",
+                input: TranscriptFrameInput::Observe,
+            },
+            TranscriptFrameStep {
+                label: "reach old edge",
+                input: TranscriptFrameInput::ScrollUp(usize::MAX / 4),
+            },
+        ]);
+        let mut upper = 1_001_u64;
+        for _ in 0..20 {
+            let lower = upper - 50;
+            let frames = TranscriptFrameSequence::new(&mut app, 80, 12).run([
+                TranscriptFrameStep {
+                    label: "load older page",
+                    input: TranscriptFrameInput::PrependHistory {
+                        events: (lower..upper).map(event).collect(),
+                        has_more: lower > 1,
+                    },
+                },
+                TranscriptFrameStep {
+                    label: "continue to older edge",
+                    input: TranscriptFrameInput::ScrollUp(usize::MAX / 4),
+                },
+            ]);
+            assert!(frames[1].observation.semantic_items.len() <= 1_024);
+            assert!(app.resident_transcript_event_count() <= 1_024);
+            let sync = app.transcript_layout_mut().drain_sync_stats();
+            assert!(
+                sync.iter()
+                    .all(|stats| stats.entries_scanned <= app.transcript().len() + 1)
+            );
+            upper = lower;
+        }
+        assert!(app.newer_history_cursor().is_some());
+        for _ in 0..15 {
+            let cursor = app
+                .newer_history_cursor()
+                .expect("reloadable newer history");
+            let frames = TranscriptFrameSequence::new(&mut app, 80, 12).run([
+                TranscriptFrameStep {
+                    label: "move to newer edge",
+                    input: TranscriptFrameInput::ScrollDown(usize::MAX / 4),
+                },
+                TranscriptFrameStep {
+                    label: "load newer page",
+                    input: TranscriptFrameInput::AppendHistory {
+                        events: (cursor.sequence..cursor.sequence + 50).map(event).collect(),
+                        has_more: true,
+                    },
+                },
+            ]);
+            assert!(frames[1].observation.semantic_items.len() <= 1_024);
+            assert!(app.resident_transcript_event_count() <= 1_024);
+            let sync = app.transcript_layout_mut().drain_sync_stats();
+            assert!(
+                sync.iter()
+                    .all(|stats| stats.entries_scanned <= app.transcript().len() + 1)
+            );
+        }
+        let settled = TranscriptFrameSequence::new(&mut app, 80, 12).run([
+            TranscriptFrameStep {
+                label: "return to live tail",
+                input: TranscriptFrameInput::ScrollToBottom,
+            },
+            TranscriptFrameStep {
+                label: "tail settled",
+                input: TranscriptFrameInput::Observe,
+            },
+        ]);
+        assert_eq!(settled[0].observation, settled[1].observation);
+        assert!(!app.loading_older_history());
+        drop(app);
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn naturally_evicted_newer_boundary_survives_reversal_and_repeated_frames() {
+        let session_id = SessionId::new();
+        let event = |sequence| {
+            durable(
+                session_id,
+                sequence,
+                SessionEventKind::UserMessage {
+                    client_id: bcode_session_models::ClientId::new(),
+                    text: format!("message {sequence}"),
+                    admission: bcode_session_models::TurnAdmissionMetadata::default(),
+                },
+            )
+        };
+        let initial = (500..=1_500).map(event).collect::<Vec<_>>();
+        let mut app = BmuxApp::new_with_history(Some(session_id), &initial, &[], true);
+        TranscriptFrameSequence::new(&mut app, 80, 12).run([TranscriptFrameStep {
+            label: "reach older boundary",
+            input: TranscriptFrameInput::ScrollUp(usize::MAX / 4),
+        }]);
+        let older = TranscriptFrameSequence::new(&mut app, 80, 12).run([
+            TranscriptFrameStep {
+                label: "accept older page and evict newer suffix",
+                input: TranscriptFrameInput::PrependHistory {
+                    events: (450..500).map(event).collect(),
+                    has_more: true,
+                },
+            },
+            TranscriptFrameStep {
+                label: "older frame settled",
+                input: TranscriptFrameInput::Observe,
+            },
+        ]);
+        assert_eq!(older[0].observation, older[1].observation);
+        let reader = older[0].observation.anchor.as_ref().expect("older reader");
+        let reader_source = older[0].observation.terminal_rows
+            [older[0].observation.viewport_top + reader.viewport_row_offset]
+            .clone();
+        assert!(
+            reader_source.0.is_some(),
+            "reader has canonical source identity"
+        );
+        let first_cursor = app.newer_history_cursor().expect("evicted newer suffix");
+        let forward = TranscriptFrameSequence::new(&mut app, 80, 12).run([
+            TranscriptFrameStep {
+                label: "reverse toward newer boundary",
+                input: TranscriptFrameInput::ScrollDown(usize::MAX / 4),
+            },
+            TranscriptFrameStep {
+                label: "forward frame settled",
+                input: TranscriptFrameInput::Observe,
+            },
+        ]);
+        assert_eq!(forward[0].observation, forward[1].observation);
+        assert!(
+            forward[0]
+                .observation
+                .terminal_rows
+                .contains(&reader_source)
+        );
+        assert!(app.should_load_newer_history());
+        let cursor = app
+            .newer_history_cursor()
+            .expect("newer boundary after reversal");
+        assert!(cursor.sequence >= first_cursor.sequence);
+        assert!(app.resident_transcript_event_count() <= 1_024);
+        assert_eq!(
+            app.resident_transcript_oldest_sequence(),
+            Some(450),
+            "the forward boundary retains the older resident source"
+        );
+        let first_page_end = cursor.sequence.saturating_add(511).min(1_500);
+        let first_page = TranscriptFrameSequence::new(&mut app, 80, 12).run([
+            TranscriptFrameStep {
+                label: "first bounded newer page",
+                input: TranscriptFrameInput::AppendHistory {
+                    events: (cursor.sequence..=first_page_end).map(event).collect(),
+                    has_more: first_page_end < 1_500,
+                },
+            },
+            TranscriptFrameStep {
+                label: "first newer page settled",
+                input: TranscriptFrameInput::Observe,
+            },
+        ]);
+        assert_eq!(first_page[0].observation, first_page[1].observation);
+        assert!(
+            first_page[0]
+                .observation
+                .terminal_rows
+                .contains(&reader_source)
+        );
+        assert!(app.resident_transcript_event_count() <= 1_024);
+        if first_page_end < 1_500 {
+            let next = app.newer_history_cursor().expect("remaining newer page");
+            assert_eq!(next.sequence, first_page_end + 1);
+        }
+        let last = if first_page_end < 1_500 {
+            TranscriptFrameSequence::new(&mut app, 80, 12).run([
+                TranscriptFrameStep {
+                    label: "restore remaining newer history",
+                    input: TranscriptFrameInput::AppendHistory {
+                        events: (first_page_end + 1..=1_500).map(event).collect(),
+                        has_more: false,
+                    },
+                },
+                TranscriptFrameStep {
+                    label: "restored frame settled",
+                    input: TranscriptFrameInput::Observe,
+                },
+            ])
+        } else {
+            first_page
+        };
+        assert_eq!(last[0].observation, last[1].observation);
+        assert!(
+            last[0].observation.terminal_rows.len() >= forward[0].observation.terminal_rows.len()
+        );
+        let tail = TranscriptFrameSequence::new(&mut app, 80, 12).run([
+            TranscriptFrameStep {
+                label: "return to live tail",
+                input: TranscriptFrameInput::ScrollToBottom,
+            },
+            TranscriptFrameStep {
+                label: "tail settled",
+                input: TranscriptFrameInput::Observe,
+            },
+        ]);
+        assert_eq!(tail[0].observation, tail[1].observation);
+        assert_eq!(tail[0].observation.scroll_mode, "bottom_follow");
+        drop(app);
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn older_page_eviction_keeps_reader_frame_and_reloadable_newer_boundary() {
+        let session_id = SessionId::new();
+        let event = |sequence| {
+            durable(
+                session_id,
+                sequence,
+                SessionEventKind::UserMessage {
+                    client_id: bcode_session_models::ClientId::new(),
+                    text: format!("message {sequence}"),
+                    admission: bcode_session_models::TurnAdmissionMetadata::default(),
+                },
+            )
+        };
+        let initial = (500..=1500).map(event).collect::<Vec<_>>();
+        let mut app = BmuxApp::new_with_history(Some(session_id), &initial, &[], true);
+        let before = TranscriptFrameSequence::new(&mut app, 80, 12).run([
+            TranscriptFrameStep {
+                label: "initial",
+                input: TranscriptFrameInput::Observe,
+            },
+            TranscriptFrameStep {
+                label: "reader near oldest",
+                input: TranscriptFrameInput::ScrollUp(usize::MAX / 4),
+            },
+        ]);
+        assert!(app.should_load_older_history());
+        let reader = before[1].observation.anchor.as_ref().expect("reader");
+        let reader_source = before[1].observation.terminal_rows
+            [before[1].observation.viewport_top + reader.viewport_row_offset]
+            .0
+            .clone()
+            .expect("reader source");
+        let reader_row = reader.row_in_item;
+        let frames = TranscriptFrameSequence::new(&mut app, 80, 12).run([
+            TranscriptFrameStep {
+                label: "older page and eviction",
+                input: TranscriptFrameInput::PrependHistory {
+                    events: (450..500).map(event).collect(),
+                    has_more: true,
+                },
+            },
+            TranscriptFrameStep {
+                label: "stable repeat",
+                input: TranscriptFrameInput::Observe,
+            },
+        ]);
+        assert!(app.resident_transcript_event_count() <= 1024);
+        assert!(app.newer_history_cursor().is_some());
+        assert_eq!(frames[0].observation, frames[1].observation);
+        assert!(frames[0].observation.anchor.is_some());
+        assert_eq!(
+            frames[0].observation.terminal_items.len(),
+            app.transcript().len()
+        );
+        assert!(frames[0].observation.terminal_items.len() <= 1024);
+        assert!(
+            frames[0]
+                .observation
+                .terminal_rows
+                .iter()
+                .any(|(source, row)| source.as_ref() == Some(&reader_source) && *row == reader_row)
+        );
+        let cursor = app.newer_history_cursor().expect("evicted newer boundary");
+        let older = app.resident_transcript_oldest_sequence();
+        let newer = (cursor.sequence..=1500).map(event).collect::<Vec<_>>();
+        let reloaded = TranscriptFrameSequence::new(&mut app, 80, 12).run([
+            TranscriptFrameStep {
+                label: "reload newer",
+                input: TranscriptFrameInput::AppendHistory {
+                    events: newer,
+                    has_more: false,
+                },
+            },
+            TranscriptFrameStep {
+                label: "repeat reload",
+                input: TranscriptFrameInput::Observe,
+            },
+        ]);
+        assert!(app.newer_history_cursor().is_none());
+        assert_eq!(app.resident_transcript_oldest_sequence(), older);
+        assert_eq!(reloaded[0].observation, reloaded[1].observation);
+        // Repeat the same traversal after restoring the suffix. Each older
+        // page evicts a complete off-screen suffix, without losing the reader.
+        for start in [400, 350, 300] {
+            let at_boundary =
+                TranscriptFrameSequence::new(&mut app, 80, 12).run([TranscriptFrameStep {
+                    label: "scroll to next older boundary",
+                    input: TranscriptFrameInput::ScrollUp(usize::MAX / 4),
+                }]);
+            let anchor = at_boundary[0]
+                .observation
+                .anchor
+                .as_ref()
+                .expect("reader before page");
+            let source = at_boundary[0].observation.terminal_rows
+                [at_boundary[0].observation.viewport_top + anchor.viewport_row_offset]
+                .0
+                .clone()
+                .expect("reader source before page");
+            let row = anchor.row_in_item;
+            let page = TranscriptFrameSequence::new(&mut app, 80, 12).run([
+                TranscriptFrameStep {
+                    label: "next older page",
+                    input: TranscriptFrameInput::PrependHistory {
+                        events: (start..start + 50).map(event).collect(),
+                        has_more: true,
+                    },
+                },
+                TranscriptFrameStep {
+                    label: "settled older page",
+                    input: TranscriptFrameInput::Observe,
+                },
+            ]);
+            assert_eq!(page[0].observation, page[1].observation);
+            assert!(
+                page[0]
+                    .observation
+                    .terminal_rows
+                    .iter()
+                    .any(|(id, index)| id.as_ref() == Some(&source) && *index == row)
+            );
+            assert!(app.resident_transcript_event_count() <= 1024);
+            assert!(page[0].observation.terminal_items.len() <= 1024);
+            let cursor = app.newer_history_cursor().expect("reloadable suffix");
+            let reload = TranscriptFrameSequence::new(&mut app, 80, 12).run([
+                TranscriptFrameStep {
+                    label: "restore suffix",
+                    input: TranscriptFrameInput::AppendHistory {
+                        events: (cursor.sequence..=1500).map(event).collect(),
+                        has_more: false,
+                    },
+                },
+                TranscriptFrameStep {
+                    label: "settled restored suffix",
+                    input: TranscriptFrameInput::Observe,
+                },
+            ]);
+            assert_eq!(reload[0].observation, reload[1].observation);
+        }
+        assert!(app.newer_history_cursor().is_none());
+        let down = TranscriptFrameSequence::new(&mut app, 80, 12).run([
+            TranscriptFrameStep {
+                label: "navigate forward through restored resident rows",
+                input: TranscriptFrameInput::ScrollDown(18),
+            },
+            TranscriptFrameStep {
+                label: "settled forward navigation",
+                input: TranscriptFrameInput::Observe,
+            },
+        ]);
+        assert_eq!(down[0].observation, down[1].observation);
+        assert!(down[0].observation.viewport_top > 0);
+        let tail = TranscriptFrameSequence::new(&mut app, 80, 12).run([
+            TranscriptFrameStep {
+                label: "return to live tail",
+                input: TranscriptFrameInput::ScrollDown(usize::MAX / 4),
+            },
+            TranscriptFrameStep {
+                label: "stable live tail",
+                input: TranscriptFrameInput::Observe,
+            },
+        ]);
+        assert_eq!(tail[0].observation, tail[1].observation);
+        // Explicitly pin the live tail after paging; virtual bottom space can
+        // leave an ordinary large scroll detached even with no newer cursor.
+        app.scroll_transcript_to_bottom();
+        let pinned = TranscriptFrameSequence::new(&mut app, 80, 12).run([TranscriptFrameStep {
+            label: "pinned live tail",
+            input: TranscriptFrameInput::Observe,
+        }]);
+        assert_eq!(pinned[0].observation.scroll_mode, "bottom_follow");
+        drop(app);
     }
 
     #[test]
