@@ -202,6 +202,10 @@ static-bundled-github-review-publisher-plugin = [
     "bundled-plugins",
     "bcode_bundled_plugins/static-bundled-github-review-publisher-plugin",
 ]
+static-bundled-jev-provider-plugin = [
+    "bundled-plugins",
+    "bcode_bundled_plugins/static-bundled-jev-provider-plugin",
+]
 static-bundled-model-plugin = [
     "bundled-plugins",
     "bcode_bundled_plugins/static-bundled-model-plugin",
@@ -229,6 +233,7 @@ static-bundled-plugins = [
     "static-bundled-compressed-session-search-plugin",
     "static-bundled-tantivy-session-search-plugin",
     "static-bundled-session-derivation-plugin",
+    "static-bundled-jev-provider-plugin",
     "bcode_bundled_plugins/static-bundled-plugins",
     "bcode_cli/static-bundled-plugins",
 ]

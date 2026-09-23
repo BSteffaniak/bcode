@@ -22,6 +22,7 @@ bcode_fake_provider_plugin              = { workspace = true, optional = true }
 bcode_filesystem_plugin                 = { workspace = true, optional = true }
 bcode_git_plugin                        = { workspace = true, optional = true }
 bcode_github_review_publisher_plugin    = { workspace = true, optional = true }
+bcode_jev_provider_plugin               = { workspace = true, optional = true }
 bcode_loop_plugin                       = { workspace = true, optional = true }
 bcode_metrics_plugin                    = { workspace = true, optional = true }
 bcode_model_plugin                      = { workspace = true, optional = true }
@@ -118,6 +119,10 @@ static-bundled-github-review-publisher-plugin = [
     "dep:bcode_github_review_publisher_plugin",
     "bcode_github_review_publisher_plugin/static-bundled",
 ]
+static-bundled-jev-provider-plugin = [
+    "dep:bcode_jev_provider_plugin",
+    "bcode_jev_provider_plugin/static-bundled",
+]
 static-bundled-loop-plugin = [
     "dep:bcode_loop_plugin",
     "bcode_loop_plugin/static-bundled",
@@ -163,6 +168,7 @@ static-bundled-plugins = [
     "static-bundled-git-plugin",
     "static-bundled-github-review-publisher-plugin",
     "static-bundled-model-plugin",
+    "static-bundled-jev-provider-plugin",
     "static-bundled-openai-compatible-provider-plugin",
     "static-bundled-opencode-session-import-plugin",
     "static-bundled-pi-session-import-plugin",

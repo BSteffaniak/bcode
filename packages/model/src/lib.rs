@@ -24,6 +24,7 @@ use std::fmt;
 
 pub mod history;
 pub mod image_upload;
+pub mod judgement;
 
 mod usage;
 pub use usage::{UsageCaptureSpec, UsageDecoder};

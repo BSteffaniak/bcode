@@ -15,6 +15,7 @@ pub(crate) mod context_compaction;
 mod image_input;
 mod interaction_operations;
 mod invariant_guidance;
+mod judgement;
 mod model_ignores;
 mod model_request_target;
 mod plugin_operations;
@@ -41,6 +42,7 @@ pub use workflow_operations::{
 mod worktree_creation;
 mod worktree_operations;
 
+use judgement::invoke_judgement_model;
 use model_request_target::{ModelRequestTargetInput, resolve_model_request_target};
 use request_routing::{
     AgentSkillPluginRequest, CoreRuntimeRequest, PermissionInteractionRequest, RoutedRequest,
@@ -5370,6 +5372,48 @@ async fn read_client_envelopes(
     }
 }
 
+async fn run_client_operation(
+    request: Request,
+    request_id: u64,
+    client_id: ClientId,
+    state: &Arc<ServerState>,
+    writer: &SharedWriter,
+    attached_session: &mut Option<SessionId>,
+) -> Option<Result<(), ServerError>> {
+    let cancel_on_disconnect = matches!(&request, Request::Judge { .. });
+    let operation = Box::pin(handle_request(
+        request,
+        request_id,
+        client_id,
+        state,
+        writer,
+        attached_session,
+    ));
+    if !cancel_on_disconnect {
+        return Some(operation.await);
+    }
+    // Judgement is transient: dropping the operation cancels its provider invocation.
+    cancel_judgement_on_disconnect(operation, writer.request_end.subscribe()).await
+}
+
+async fn cancel_judgement_on_disconnect<T>(
+    operation: impl std::future::Future<Output = T>,
+    mut request_end: tokio::sync::watch::Receiver<bool>,
+) -> Option<T> {
+    tokio::pin!(operation);
+    tokio::select! {
+        biased;
+        () = async {
+            while !*request_end.borrow() {
+                if request_end.changed().await.is_err() {
+                    break;
+                }
+            }
+        } => None,
+        result = operation => Some(result),
+    }
+}
+
 async fn handle_registered_client(
     stream: LocalIpcStream,
     state: &Arc<ServerState>,
@@ -5445,15 +5489,18 @@ async fn handle_registered_client(
                 continue;
             }
         };
-        let operation = Box::pin(handle_request(
+        let Some(result) = run_client_operation(
             request,
             envelope.request_id,
             client_id,
             state,
             &writer,
             &mut attached_session,
-        ));
-        let result = operation.await;
+        )
+        .await
+        else {
+            break;
+        };
         if let Err(error) = result {
             if matches!(error, ServerError::Transport(_) | ServerError::Codec(_)) {
                 if *writer.request_end.borrow() {
@@ -5747,6 +5794,7 @@ const fn request_kind(request: &Request) -> &'static str {
         Request::SessionModelStatus { .. } => "session_model_status",
         Request::DefaultModelStatus => "default_model_status",
         Request::SessionModelList { .. } => "session_model_list",
+        Request::Judge { .. } => "judge",
         Request::ListAgents => "list_agents",
         Request::ListSkills => "list_skills",
         Request::DescribeSkill { .. } => "describe_skill",
@@ -8021,6 +8069,35 @@ async fn handle_core_runtime_request(
         CoreRuntimeRequest::SessionModelList { provider_plugin_id } => {
             handle_session_model_list(request_id, client_id, state, writer, provider_plugin_id)
                 .await
+        }
+        CoreRuntimeRequest::Judge {
+            provider_plugin_id,
+            auth_profile,
+            request_json,
+        } => {
+            let invocation =
+                match serde_json::from_str::<bcode_model::judgement::Request>(&request_json) {
+                    Ok(request)
+                        if request_json.len() <= bcode_model::judgement::MAX_REQUEST_BYTES =>
+                    {
+                        invoke_judgement_model(state, &provider_plugin_id, &auth_profile, request)
+                            .await
+                    }
+                    _ => Err("invalid judgement request"),
+                };
+            let response = match invocation {
+                Ok(result) => serde_json::to_string(&result).map_or_else(
+                    |_| {
+                        Response::Err(ErrorResponse::new(
+                            "judgement_unavailable",
+                            "judgement response could not be encoded",
+                        ))
+                    },
+                    |result_json| Response::Ok(ResponsePayload::Judgement { result_json }),
+                ),
+                Err(message) => Response::Err(ErrorResponse::new("judgement_unavailable", message)),
+            };
+            send_response(writer, request_id, response).await
         }
         CoreRuntimeRequest::AuthPoolList => {
             let response = match server_operations::auth_pools() {
@@ -61842,6 +61919,355 @@ event_symbol = "bcode_plugin_handle_event_v1"
         state.plugins = plugins;
         state.workflow_store = StdMutex::new(workflow_store).into();
         state
+    }
+
+    #[tokio::test]
+    async fn in_flight_judgement_operation_is_dropped_on_disconnect() {
+        struct DropSignal(Option<tokio::sync::oneshot::Sender<()>>);
+        impl Drop for DropSignal {
+            fn drop(&mut self) {
+                if let Some(signal) = self.0.take() {
+                    let _ = signal.send(());
+                }
+            }
+        }
+        let (request_end, receiver) = tokio::sync::watch::channel(false);
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (dropped_tx, dropped_rx) = tokio::sync::oneshot::channel();
+        let operation = async move {
+            let _on_drop = DropSignal(Some(dropped_tx));
+            started_tx.send(()).expect("operation polled");
+            std::future::pending::<()>().await;
+        };
+        let task = tokio::spawn(cancel_judgement_on_disconnect(operation, receiver));
+        started_rx.await.expect("operation started");
+        request_end.send_replace(true);
+        assert!(
+            tokio::time::timeout(Duration::from_secs(1), task)
+                .await
+                .expect("cancel before deadline")
+                .expect("task completed")
+                .is_none()
+        );
+        dropped_rx.await.expect("in-flight provider future dropped");
+    }
+
+    #[tokio::test]
+    async fn judgement_operation_stops_when_client_disconnects() {
+        let state = Arc::new(test_server_state(SessionManager::default()));
+        let (request_end, _) = tokio::sync::watch::channel(false);
+        let socket_dir = tempfile::tempdir().expect("IPC socket directory");
+        let endpoint = bcode_ipc::IpcEndpoint::unix_socket(socket_dir.path().join("server.sock"));
+        let listener = LocalIpcListener::bind(&endpoint).expect("IPC listener");
+        let connecting =
+            tokio::spawn(async move { bcode_ipc::LocalIpcStream::connect(&endpoint).await });
+        let stream = listener.accept().await.expect("client connection");
+        let peer = connecting
+            .await
+            .expect("connect task")
+            .expect("connect client");
+        let (_, stream_writer) = split(stream);
+        let writer = Arc::new(ResponseWriter {
+            writer: Mutex::new(stream_writer),
+            metrics: state.metrics.clone(),
+            disconnect: Notify::new(),
+            request_end: request_end.clone(),
+        });
+        let request = Request::Judge {
+            provider_plugin_id: "bcode.fake-provider".into(),
+            auth_profile: "missing".into(),
+            request_json: "{}".into(),
+        };
+        request_end.send_replace(true);
+        let mut attached_session = None;
+        let result = run_client_operation(
+            request,
+            1,
+            ClientId::new(),
+            &state,
+            &writer,
+            &mut attached_session,
+        )
+        .await;
+        assert!(result.is_none());
+        drop(peer);
+        drop(writer);
+        drop(state);
+    }
+
+    #[tokio::test]
+    #[allow(clippy::significant_drop_tightening, clippy::too_many_lines)] // The fixture owns server state and two transports until shutdown.
+    async fn judgement_client_ipc_calls_jev_over_authenticated_loopback_http() {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind fake Jev");
+        let url = format!("http://{}", listener.local_addr().expect("address"));
+        let http = std::thread::spawn(move || {
+            for (method, body) in [
+                ("GET /v1/models", r#"{"models":[{"name":"jev-1"}]}"#),
+                (
+                    "POST /v1/systemone",
+                    r#"{"model":"jev-1","answers":{"is_true":{"type":"noul","noul":0.8}},"usage":{"input_tokens":4,"output_tokens":2}}"#,
+                ),
+            ] {
+                let (mut stream, _) = listener.accept().expect("accept fake Jev");
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(3)))
+                    .expect("timeout");
+                let mut data = Vec::new();
+                let mut buffer = [0_u8; 4096];
+                while !data.windows(4).any(|bytes| bytes == b"\r\n\r\n") {
+                    let n = stream.read(&mut buffer).expect("read request");
+                    assert!(n > 0);
+                    data.extend_from_slice(&buffer[..n]);
+                    assert!(data.len() < bcode_model::judgement::MAX_REQUEST_BYTES);
+                }
+                let header = String::from_utf8_lossy(&data).to_ascii_lowercase();
+                assert!(header.starts_with(&method.to_ascii_lowercase()));
+                assert!(header.contains("authorization: bearer test-only"));
+                let reply = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                stream.write_all(reply.as_bytes()).expect("reply");
+            }
+        });
+        let plugin = bcode_plugin::StaticBundledPlugin::new(
+            include_str!("../../../plugins/jev-provider-plugin/bcode-plugin.toml"),
+            bcode_jev_provider_plugin::static_plugin(),
+        );
+        let plugins = bcode_plugin::PluginRuntimeHost::load_defaults_with_static_bundled(
+            &bcode_plugin::PluginSelection {
+                mode: bcode_plugin::PluginSelectionMode::Explicit,
+                enabled: BTreeSet::from(["bcode.jev".into()]),
+                disabled: BTreeSet::new(),
+            },
+            &[plugin],
+        )
+        .expect("load Jev");
+        let mut server_state = test_server_state(SessionManager::default());
+        server_state.plugins = plugins;
+        server_state.startup_config.auth.profiles.insert(
+            "jev-fixture".into(),
+            bcode_config::AuthProfileConfig {
+                backend: "aws".into(),
+                owner_plugin_id: Some("bcode.jev".into()),
+                provider_id: Some("bcode.jev".into()),
+                scheme: Some("api_key".into()),
+                map: BTreeMap::from([(
+                    "api_key".into(),
+                    bcode_config::AuthCredentialMapping {
+                        env: Some("JEV_TEST_KEY".into()),
+                        key: None,
+                    },
+                )]),
+                settings: BTreeMap::from([
+                    ("env.JEV_TEST_KEY".into(), "test-only".into()),
+                    ("base_url".into(), url),
+                ]),
+            },
+        );
+        let state = Arc::new(server_state);
+        let socket_dir = tempfile::tempdir().expect("IPC directory");
+        let endpoint = bcode_ipc::IpcEndpoint::unix_socket(socket_dir.path().join("server.sock"));
+        let listener = LocalIpcListener::bind(&endpoint).expect("IPC listener");
+        let (shutdown, stopped) = tokio::sync::oneshot::channel();
+        let server = tokio::spawn(serve_runtime_test_clients(
+            listener,
+            Arc::clone(&state),
+            stopped,
+        ));
+        let client = bcode_client::BcodeClient::new(endpoint);
+        let result = client
+            .judge(
+                "bcode.jev".into(),
+                "jev-fixture".into(),
+                bcode_model::judgement::Request {
+                    model_id: "jev-1".into(),
+                    state: bcode_model::judgement::State::Text("example".into()),
+                    questions: BTreeMap::from([(
+                        "is_true".into(),
+                        bcode_model::judgement::Question::YesNo {
+                            instructions: "true?".into(),
+                        },
+                    )]),
+                },
+            )
+            .await
+            .expect("client Jev judgement");
+        assert!(matches!(
+            result.answers["is_true"],
+            bcode_model::judgement::Answer::YesNo { probability: 0.8 }
+        ));
+        assert_eq!(result.usage.expect("usage").input_tokens, 4);
+        shutdown.send(()).expect("stop server");
+        tokio::time::timeout(Duration::from_secs(5), server)
+            .await
+            .expect("shutdown deadline")
+            .expect("server task");
+        http.join().expect("fake Jev finished");
+        drop(state);
+    }
+
+    #[tokio::test]
+    #[allow(clippy::significant_drop_tightening)] // The test server owns the state until shutdown.
+    async fn judgement_client_ipc_resolves_owned_profile_and_returns_typed_answers() {
+        let mut server_state = test_server_state_with_fake_provider(SessionManager::default());
+        server_state.startup_config.auth.profiles.insert(
+            "judgement-fixture".into(),
+            bcode_config::AuthProfileConfig {
+                backend: "aws".into(),
+                owner_plugin_id: Some("bcode.fake-provider".into()),
+                provider_id: Some("bcode.fake-provider".into()),
+                scheme: Some("api_key".into()),
+                map: BTreeMap::from([(
+                    "api_key".into(),
+                    bcode_config::AuthCredentialMapping {
+                        env: Some("FAKE_JUDGEMENT_KEY".into()),
+                        key: None,
+                    },
+                )]),
+                settings: BTreeMap::from([("env.FAKE_JUDGEMENT_KEY".into(), "test-only".into())]),
+            },
+        );
+        let state = Arc::new(server_state);
+        let socket_dir = tempfile::tempdir().expect("IPC socket directory");
+        let endpoint = bcode_ipc::IpcEndpoint::unix_socket(socket_dir.path().join("server.sock"));
+        let listener = LocalIpcListener::bind(&endpoint).expect("IPC listener");
+        let (shutdown, stopped) = tokio::sync::oneshot::channel();
+        let server = tokio::spawn(serve_runtime_test_clients(
+            listener,
+            Arc::clone(&state),
+            stopped,
+        ));
+        let client = bcode_client::BcodeClient::new(endpoint);
+        let request = bcode_model::judgement::Request {
+            model_id: "fake-judgement".into(),
+            state: bcode_model::judgement::State::Text("example".into()),
+            questions: BTreeMap::from([(
+                "is_true".into(),
+                bcode_model::judgement::Question::YesNo {
+                    instructions: "Is it true?".into(),
+                },
+            )]),
+        };
+        let result = client
+            .judge(
+                "bcode.fake-provider".into(),
+                "judgement-fixture".into(),
+                request.clone(),
+            )
+            .await
+            .expect("client judgement response");
+        assert!(matches!(
+            result.answers["is_true"],
+            bcode_model::judgement::Answer::YesNo { probability: 0.75 }
+        ));
+        assert_eq!(result.usage.expect("usage").input_tokens, 1);
+        let denied = client
+            .judge("bcode.jev".into(), "judgement-fixture".into(), request)
+            .await;
+        assert!(
+            matches!(denied, Err(bcode_client::ClientError::Server { code, .. }) if code == "judgement_unavailable")
+        );
+        shutdown.send(()).expect("stop test listener");
+        tokio::time::timeout(Duration::from_secs(5), server)
+            .await
+            .expect("test listener shutdown deadline")
+            .expect("test listener shutdown");
+        drop(state);
+    }
+
+    #[tokio::test]
+    async fn judgement_route_resolves_owned_profile_and_returns_typed_fake_answers() {
+        let mut state = test_server_state_with_fake_provider(SessionManager::default());
+        state.startup_config.auth.profiles.insert(
+            "judgement-fixture".into(),
+            bcode_config::AuthProfileConfig {
+                backend: "aws".into(),
+                owner_plugin_id: Some("bcode.fake-provider".into()),
+                provider_id: Some("bcode.fake-provider".into()),
+                scheme: Some("api_key".into()),
+                map: BTreeMap::from([(
+                    "api_key".into(),
+                    bcode_config::AuthCredentialMapping {
+                        env: Some("FAKE_JUDGEMENT_KEY".into()),
+                        key: None,
+                    },
+                )]),
+                settings: BTreeMap::from([("env.FAKE_JUDGEMENT_KEY".into(), "test-only".into())]),
+            },
+        );
+        let request = bcode_model::judgement::Request {
+            model_id: "fake-judgement".into(),
+            state: bcode_model::judgement::State::Text("example".into()),
+            questions: BTreeMap::from([(
+                "is_true".into(),
+                bcode_model::judgement::Question::YesNo {
+                    instructions: "Is it true?".into(),
+                },
+            )]),
+        };
+        let result = crate::judgement::invoke_judgement_model(
+            &state,
+            "bcode.fake-provider",
+            "judgement-fixture",
+            request.clone(),
+        )
+        .await
+        .expect("judge with an explicitly owned profile");
+        assert!(matches!(
+            result.answers["is_true"],
+            bcode_model::judgement::Answer::YesNo { probability: 0.75 }
+        ));
+        assert_eq!(result.usage.expect("usage").input_tokens, 1);
+        assert!(
+            crate::judgement::invoke_judgement_model(
+                &state,
+                "bcode.jev",
+                "judgement-fixture",
+                request,
+            )
+            .await
+            .is_err()
+        );
+        drop(state);
+    }
+
+    #[tokio::test]
+    async fn judgement_route_fails_closed_for_disabled_provider_and_missing_profile() {
+        let request = bcode_model::judgement::Request {
+            model_id: "fake-judgement".into(),
+            state: bcode_model::judgement::State::Text("example".into()),
+            questions: BTreeMap::from([(
+                "is_true".into(),
+                bcode_model::judgement::Question::YesNo {
+                    instructions: "Is it true?".into(),
+                },
+            )]),
+        };
+        let disabled = test_server_state(SessionManager::default());
+        assert_eq!(
+            crate::judgement::invoke_judgement_model(
+                &disabled,
+                "bcode.fake-provider",
+                "missing",
+                request.clone(),
+            )
+            .await,
+            Err("judgement provider is not available")
+        );
+        let enabled = test_server_state_with_fake_provider(SessionManager::default());
+        assert!(
+            crate::judgement::invoke_judgement_model(
+                &enabled,
+                "bcode.fake-provider",
+                "missing",
+                request,
+            )
+            .await
+            .is_err(),
+            "an enabled judgement provider must not bypass auth ownership"
+        );
     }
 
     pub fn test_server_state_with_fake_provider(sessions: SessionManager) -> ServerState {

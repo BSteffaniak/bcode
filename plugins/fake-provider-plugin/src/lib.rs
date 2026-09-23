@@ -4,6 +4,7 @@
 
 //! Fake model provider plugin for deterministic tests and smoke flows.
 
+mod judgement;
 pub mod prompt_cache;
 mod vision;
 
@@ -370,6 +371,9 @@ fn configured_structured_output_execution(
 
 impl FakeProviderPlugin {
     fn invoke_provider_service(&self, context: &NativeServiceContext) -> ServiceResponse {
+        if context.request.interface_id == bcode_model::judgement::INTERFACE_ID {
+            return judgement::invoke(&context.request);
+        }
         if !matches!(
             context.request.interface_id.as_str(),
             MODEL_PROVIDER_INTERFACE_ID

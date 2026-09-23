@@ -20,6 +20,7 @@ members = [
     "plugins/default-agents-plugin",
     "plugins/prompt-profile-plugin",
     "plugins/fake-provider-plugin",
+    "plugins/jev-provider-plugin",
     "plugins/openai-compatible-provider-plugin",
     "plugins/opencode-session-import-plugin",
     "plugins/pi-session-import-plugin",
@@ -191,6 +192,7 @@ bcode_hello_plugin                      = { version = "0.0.1-alpha.0", default-f
 bcode_hyperchad                         = { version = "0.0.1-alpha.0", default-features = false, path = "packages/hyperchad" }
 bcode_hyperchad_ui                      = { version = "0.0.1-alpha.0", default-features = false, path = "packages/hyperchad/ui" }
 bcode_ipc                               = { version = "0.0.1-alpha.0", default-features = false, path = "packages/ipc" }
+bcode_jev_provider_plugin               = { version = "0.0.1-alpha.0", default-features = false, path = "plugins/jev-provider-plugin" }
 bcode_loop_plugin                       = { version = "0.0.1-alpha.0", default-features = false, path = "plugins/loop-plugin" }
 bcode_markdown_render                   = { version = "0.0.1-alpha.0", default-features = false, path = "packages/markdown-render" }
 bcode_mermaid_render                    = { version = "0.0.1-alpha.0", default-features = false, path = "packages/mermaid-render" }

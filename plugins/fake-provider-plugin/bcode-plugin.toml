@@ -20,6 +20,11 @@ interface_id          = "bcode.model-provider/v1"
 invocation_operations = ["native_web_search"]
 name                  = "Fake Model Provider v1"
 
+[[services]]
+description  = "Deterministic non-conversational judgement model for contract tests"
+interface_id = "bcode.judgement-model-provider/v1"
+name         = "Fake Judgement Model Provider"
+
 [concurrency]
 type = "concurrent"
 

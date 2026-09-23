@@ -3674,6 +3674,42 @@ impl BcodeClient {
         }
     }
 
+    /// Evaluate named questions with a non-conversational model and an explicitly owned auth
+    /// profile. This does not create a session or select a chat turn model.
+    ///
+    /// # Errors
+    /// Returns a client error if the daemon is unavailable or rejects the invocation.
+    pub async fn judge(
+        &self,
+        provider_plugin_id: String,
+        auth_profile: String,
+        request: bcode_model::judgement::Request,
+    ) -> Result<bcode_model::judgement::Response, ClientError> {
+        bcode_model::judgement::validate_request(&request)
+            .map_err(|_| ClientError::UnexpectedResponse)?;
+        let request_json =
+            serde_json::to_string(&request).map_err(|_| ClientError::UnexpectedResponse)?;
+        if request_json.len() > bcode_model::judgement::MAX_REQUEST_BYTES {
+            return Err(ClientError::UnexpectedResponse);
+        }
+        match self
+            .send_request(Request::Judge {
+                provider_plugin_id,
+                auth_profile,
+                request_json,
+            })
+            .await?
+        {
+            ResponsePayload::Judgement { result_json } => {
+                if result_json.len() > bcode_model::judgement::MAX_RESPONSE_BYTES {
+                    return Err(ClientError::UnexpectedResponse);
+                }
+                serde_json::from_str(&result_json).map_err(|_| ClientError::UnexpectedResponse)
+            }
+            _ => Err(ClientError::UnexpectedResponse),
+        }
+    }
+
     /// Check whether an exact resolved model is visible in the application's provider catalog.
     ///
     /// This is a read-only discovery check, not proof that a remote inference request will succeed.

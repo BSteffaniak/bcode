@@ -244,6 +244,8 @@ fn append_static_bundled_plugins(plugins: &mut Vec<bcode_plugin::StaticBundledPl
     plugins.push(github_review_publisher_plugin());
     #[cfg(feature = "static-bundled-model-plugin")]
     plugins.push(model_plugin());
+    #[cfg(feature = "static-bundled-jev-provider-plugin")]
+    plugins.push(jev_provider_plugin());
     #[cfg(feature = "static-bundled-openai-compatible-provider-plugin")]
     plugins.push(openai_compatible_provider_plugin());
     #[cfg(feature = "static-bundled-opencode-session-import-plugin")]
@@ -385,6 +387,14 @@ fn model_plugin() -> bcode_plugin::StaticBundledPlugin {
     bcode_plugin::StaticBundledPlugin::new(
         include_str!("../../../plugins/model-plugin/bcode-plugin.toml"),
         bcode_model_plugin::static_plugin(),
+    )
+}
+
+#[cfg(feature = "static-bundled-jev-provider-plugin")]
+fn jev_provider_plugin() -> bcode_plugin::StaticBundledPlugin {
+    bcode_plugin::StaticBundledPlugin::new(
+        include_str!("../../../plugins/jev-provider-plugin/bcode-plugin.toml"),
+        bcode_jev_provider_plugin::static_plugin(),
     )
 }
 

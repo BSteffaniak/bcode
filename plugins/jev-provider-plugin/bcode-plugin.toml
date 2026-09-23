@@ -1,0 +1,17 @@
+id      = "bcode.jev"
+name    = "TypeSafe Jev Judgement Provider"
+version = "0.0.1"
+
+[[services]]
+description  = "Typed, non-conversational judgement model provider"
+interface_id = "bcode.judgement-model-provider/v1"
+name         = "TypeSafe Jev Judgement Model Provider"
+
+[concurrency]
+type = "concurrent"
+
+[runtime]
+abi_version  = 5
+event_symbol = "bcode_plugin_handle_event_v1"
+library      = "libbcode_jev_provider_plugin.dylib"
+type         = "native"

@@ -434,6 +434,61 @@ impl ModelCatalogResolver {
         Some(identity)
     }
 
+    /// Resolve an advertised judgement model through the central catalog's identity and alias
+    /// rules. Provider discovery is authoritative for question kinds: catalog metadata cannot
+    /// invent a supported operation. Never fall back to a different model implicitly.
+    ///
+    /// # Errors
+    /// Returns an error if the provider did not advertise the selected model or if either
+    /// provider or model lacks a requested question kind.
+    pub async fn resolve_judgement_model(
+        &self,
+        provider_id: &str,
+        request: &bcode_model::judgement::Request,
+        listing: &bcode_model::judgement::ModelList,
+    ) -> std::result::Result<bcode_model::judgement::Model, &'static str> {
+        bcode_model::judgement::validate_request(request)?;
+        if listing.provider_id != provider_id {
+            return Err("judgement provider identity mismatch");
+        }
+        let resolved_id = {
+            let catalog = self.catalog.read().await;
+            catalog
+                .model(provider_id, &request.model_id)
+                .map_or_else(|| request.model_id.clone(), |entry| entry.model_id.clone())
+        };
+        let model = listing
+            .models
+            .iter()
+            .find(|model| model.model_id == resolved_id)
+            .ok_or("judgement model is not available")?;
+        if request.questions.values().any(|question| {
+            !listing.question_kinds.contains(&question.kind())
+                || !model.question_kinds.contains(&question.kind())
+        }) {
+            return Err("judgement model does not support requested questions");
+        }
+        Ok(model.clone())
+    }
+
+    /// Model supported for normalized judgement after central alias resolution.
+    ///
+    /// # Errors
+    /// Fails closed on a missing model, mismatched provider identity or unsupported primitive.
+    pub async fn resolve_judgement_request(
+        &self,
+        provider_id: &str,
+        request: &bcode_model::judgement::Request,
+        listing: &bcode_model::judgement::ModelList,
+    ) -> std::result::Result<bcode_model::judgement::Request, &'static str> {
+        let model = self
+            .resolve_judgement_model(provider_id, request, listing)
+            .await?;
+        let mut resolved = request.clone();
+        resolved.model_id = model.model_id;
+        Ok(resolved)
+    }
+
     /// Resolve the catalog-known output-token limit for one model.
     ///
     /// This bounded lookup keeps request construction aligned with catalog identity when a live
@@ -2280,6 +2335,80 @@ pub fn default_source_dir() -> PathBuf {
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test]
+    async fn judgement_resolution_uses_catalog_identity_and_advertised_capabilities() {
+        use bcode_model::judgement::{Model, ModelList, Question, QuestionKind, Request, State};
+        use std::collections::{BTreeMap, BTreeSet};
+
+        let resolver = super::ModelCatalogResolver::embedded();
+        let catalog = resolver.catalog_snapshot().await;
+        let canonical = "anthropic.claude-fable-5-1";
+        let alias = "global.anthropic.claude-fable-5-1";
+        assert_eq!(
+            catalog
+                .model("bedrock", alias)
+                .map(|entry| entry.model_id.as_str()),
+            Some(canonical)
+        );
+        let request = Request {
+            model_id: alias.into(),
+            state: State::Text("a document".into()),
+            questions: BTreeMap::from([(
+                "topic".into(),
+                Question::YesNo {
+                    instructions: "Is this relevant?".into(),
+                },
+            )]),
+        };
+        let mut list = ModelList {
+            provider_id: "bedrock".into(),
+            question_kinds: BTreeSet::from([QuestionKind::YesNo]),
+            models: vec![Model {
+                model_id: canonical.into(),
+                question_kinds: BTreeSet::from([QuestionKind::YesNo]),
+            }],
+        };
+        assert_eq!(
+            resolver
+                .resolve_judgement_model("bedrock", &request, &list)
+                .await
+                .unwrap()
+                .model_id,
+            canonical
+        );
+        assert_eq!(
+            resolver
+                .resolve_judgement_request("bedrock", &request, &list)
+                .await
+                .unwrap()
+                .model_id,
+            canonical
+        );
+        list.question_kinds.clear();
+        assert!(
+            resolver
+                .resolve_judgement_model("bedrock", &request, &list)
+                .await
+                .is_err()
+        );
+        list.question_kinds.insert(QuestionKind::YesNo);
+        list.models[0].question_kinds.clear();
+        assert!(
+            resolver
+                .resolve_judgement_model("bedrock", &request, &list)
+                .await
+                .is_err()
+        );
+        list.models[0].question_kinds.insert(QuestionKind::YesNo);
+        list.provider_id = "wrong".into();
+        assert!(
+            resolver
+                .resolve_judgement_model("bedrock", &request, &list)
+                .await
+                .is_err()
+        );
+    }
+
     #[test]
     fn public_diagnostics_normalize_cache_states_and_timestamps() {
         use super::remote::CatalogCacheState;

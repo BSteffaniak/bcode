@@ -1563,6 +1563,7 @@ dependencies = [
  "bcode_filesystem_plugin",
  "bcode_git_plugin",
  "bcode_github_review_publisher_plugin",
+ "bcode_jev_provider_plugin",
  "bcode_loop_plugin",
  "bcode_metrics_plugin",
  "bcode_model_plugin",
@@ -2059,6 +2060,18 @@ dependencies = [
  "thiserror 2.0.20",
  "tokio",
  "windows-sys 0.61.2",
+]
+
+[[package]]
+name = "bcode_jev_provider_plugin"
+version = "0.0.1-alpha.0"
+dependencies = [
+ "bcode_model",
+ "bcode_plugin_sdk",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "tokio",
 ]
 
 [[package]]
@@ -2573,6 +2586,7 @@ dependencies = [
  "bcode_hyperchad",
  "bcode_hyperchad_ui",
  "bcode_ipc",
+ "bcode_jev_provider_plugin",
  "bcode_metrics",
  "bcode_model",
  "bcode_model_catalog",

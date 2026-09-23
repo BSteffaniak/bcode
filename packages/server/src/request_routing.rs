@@ -728,6 +728,11 @@ pub enum CoreRuntimeRequest {
     SessionModelList {
         provider_plugin_id: Option<String>,
     },
+    Judge {
+        provider_plugin_id: String,
+        auth_profile: String,
+        request_json: String,
+    },
     AuthPoolList,
     SetAuthPoolPreference {
         pool: String,
@@ -1464,6 +1469,15 @@ impl RoutedRequest {
                     provider_plugin_id,
                 }))
             }
+            Request::Judge {
+                provider_plugin_id,
+                auth_profile,
+                request_json,
+            } => Self::CoreRuntime(Box::new(CoreRuntimeRequest::Judge {
+                provider_plugin_id,
+                auth_profile,
+                request_json,
+            })),
             Request::ListAgents => Self::AgentSkillPlugin(AgentSkillPluginRequest::ListAgents),
             Request::ListSkills => Self::AgentSkillPlugin(AgentSkillPluginRequest::ListSkills),
             Request::DescribeSkill { skill_id } => {

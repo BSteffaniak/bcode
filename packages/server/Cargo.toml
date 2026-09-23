@@ -98,6 +98,7 @@ bcode_hyperchad = { workspace = true, features = [
     "static-bundled-question-plugin",
 ] }
 bcode_hyperchad_ui = { workspace = true }
+bcode_jev_provider_plugin = { workspace = true, features = ["static-bundled"] }
 bcode_prompt_profile_plugin = { workspace = true, features = [
     "static-bundled",
 ] }

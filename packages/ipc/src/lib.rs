@@ -872,6 +872,13 @@ pub enum Request {
     SessionModelList {
         provider_plugin_id: Option<String>,
     },
+    /// Invoke a judgement model without creating or modifying a session turn.
+    Judge {
+        provider_plugin_id: String,
+        auth_profile: String,
+        /// Bounded JSON encoding of the portable judgement request (codec-safe).
+        request_json: String,
+    },
     ListAgents,
     ListSkills,
     DescribeSkill {
@@ -1935,6 +1942,11 @@ pub enum ResponsePayload {
     SessionModelList {
         provider_plugin_id: Option<String>,
         models: bcode_model::ModelList,
+    },
+    /// Normalized judgement answers; no provider context or secret material.
+    Judgement {
+        /// Bounded JSON encoding of the validated portable judgement response.
+        result_json: String,
     },
     ClientRuntimeContextUpdated,
     SessionWorkingDirectoryChanged {
@@ -5068,6 +5080,35 @@ mod tests {
             panic!("decoded response should be attached");
         };
         assert_eq!(session, summary);
+    }
+
+    #[test]
+    fn judgement_request_and_response_round_trip_without_provider_secrets() {
+        let request = Request::Judge {
+            provider_plugin_id: "example.provider".into(),
+            auth_profile: "example".into(),
+            request_json: serde_json::to_string(&bcode_model::judgement::Request {
+                model_id: "example.model".into(),
+                state: bcode_model::judgement::State::Text("state".into()),
+                questions: std::collections::BTreeMap::from([(
+                    "check".into(),
+                    bcode_model::judgement::Question::YesNo {
+                        instructions: "Is it relevant?".into(),
+                    },
+                )]),
+            })
+            .expect("serialize judgement request"),
+        };
+        let encoded = encode(&request).expect("encode judgement request");
+        let decoded: Request = decode(&encoded).expect("decode judgement request");
+        assert_eq!(decoded, request);
+        let result = Response::Ok(ResponsePayload::Judgement {
+            result_json:
+                r#"{"answers":{"check":{"kind":"yes_no","probability":0.8}},"usage":null}"#.into(),
+        });
+        let encoded = encode(&result).expect("encode judgement response");
+        let decoded: Response = decode(&encoded).expect("decode judgement response");
+        assert_eq!(decoded, result);
     }
 
     #[test]
