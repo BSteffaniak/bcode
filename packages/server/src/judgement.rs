@@ -33,16 +33,24 @@ pub async fn invoke_judgement_model(
     {
         return Err("judgement provider is not available");
     }
+    let mut auth_providers = state
+        .plugins
+        .auth_provider_registry()
+        .providers()
+        .into_iter()
+        .filter(|entry| entry.plugin_id == provider_plugin_id);
+    let registered = auth_providers
+        .next()
+        .ok_or("judgement provider authentication is unavailable")?;
+    if auth_providers.next().is_some() {
+        return Err("judgement provider authentication is ambiguous");
+    }
     let provider_context = if auth_profile.is_empty() {
-        let registered = state
-            .plugins
-            .auth_provider(provider_plugin_id)
-            .filter(|entry| entry.plugin_id == provider_plugin_id)
-            .ok_or("judgement provider environment authentication is unavailable")?;
         bcode_provider_auth::resolve_declared_environment_context(&registered.contribution)?
     } else {
-        bcode_provider_auth::resolve_explicit_profile_context(
+        bcode_provider_auth::resolve_owned_profile_context(
             &state.startup_config,
+            &registered.contribution.provider_id,
             provider_plugin_id,
             auth_profile,
         )?

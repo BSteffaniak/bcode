@@ -258,6 +258,60 @@ pub fn resolve_explicit_profile_context(
     Ok(context)
 }
 
+/// Resolve exactly one named, registered-provider-owned profile for a non-generation operation.
+///
+/// Provider identity and plugin ownership are checked before any credential materialization;
+/// no model selection, auth pool, or alternate profile is inherited.
+///
+/// # Errors
+/// Returns a secret-safe error for missing, conflicting, or unverifiable ownership or
+/// unavailable credentials.
+pub fn resolve_owned_profile_context(
+    config: &bcode_config::BcodeConfig,
+    provider_id: &str,
+    owner_plugin_id: &str,
+    profile: &str,
+) -> Result<bcode_model::ProviderRequestContext, &'static str> {
+    if provider_id.trim().is_empty()
+        || owner_plugin_id.trim().is_empty()
+        || profile.trim().is_empty()
+    {
+        return Err("an explicit provider and auth profile are required");
+    }
+    let runtime = if config.auth.profiles.contains_key(profile) || config.active_context.is_some() {
+        bcode_config::RuntimeAuthSubscriptions::default()
+    } else {
+        bcode_config::try_load_runtime_auth_subscriptions()
+            .map_err(|_| "selected auth profile configuration is unavailable")?
+    };
+    resolve_owned_profile_context_with(config, &runtime, provider_id, owner_plugin_id, profile)
+}
+
+fn resolve_owned_profile_context_with(
+    config: &bcode_config::BcodeConfig,
+    runtime: &bcode_config::RuntimeAuthSubscriptions,
+    provider_id: &str,
+    owner_plugin_id: &str,
+    profile: &str,
+) -> Result<bcode_model::ProviderRequestContext, &'static str> {
+    let resolved =
+        resolve_auth_provider_profile(config, provider_id, owner_plugin_id, Some(profile), runtime)
+            .map_err(|_| "selected auth profile ownership cannot be verified")?;
+    if resolved.profile_name != profile {
+        return Err("selected auth profile could not be resolved");
+    }
+    let auth = resolve_auth_profile(&resolved.profile_name, &resolved.profile);
+    if auth.auth.credentials.is_empty() {
+        return Err("selected auth profile credentials are unavailable");
+    }
+    Ok(bcode_model::ProviderRequestContext {
+        auth_profile: Some(resolved.profile_name),
+        auth: Some(auth.auth),
+        env: auth.env,
+        ..Default::default()
+    })
+}
+
 /// Inspect explicit account and pool references without reading credentials or mutating state.
 ///
 /// This checks metadata only; success does not imply remote authentication or model availability.
@@ -1662,6 +1716,45 @@ mod tests {
             assert_eq!(
                 super::resolve_explicit_profile_context(&config, "plugin", "selected").unwrap_err(),
                 "selected auth profile ownership cannot be verified"
+            );
+        }
+    }
+
+    #[test]
+    fn owned_judgement_profile_distinguishes_provider_id_from_plugin_id() {
+        let mut config = bcode_config::BcodeConfig::default();
+        config.auth.profiles.insert(
+            "jev".into(),
+            bcode_config::AuthProfileConfig {
+                backend: "aws".into(),
+                owner_plugin_id: Some("bcode.jev".into()),
+                provider_id: Some("jev".into()),
+                scheme: Some("api_key".into()),
+                map: BTreeMap::from([(
+                    "api_key".into(),
+                    bcode_config::AuthCredentialMapping {
+                        env: Some("BCODE_JEV_API_KEY".into()),
+                        key: None,
+                    },
+                )]),
+                settings: BTreeMap::from([("env.BCODE_JEV_API_KEY".into(), "test-only".into())]),
+            },
+        );
+        let runtime = bcode_config::RuntimeAuthSubscriptions::default();
+        let context =
+            super::resolve_owned_profile_context_with(&config, &runtime, "jev", "bcode.jev", "jev")
+                .unwrap();
+        assert_eq!(context.auth_profile.as_deref(), Some("jev"));
+        assert_eq!(
+            context.auth.unwrap().credentials["api_key"].value,
+            "test-only"
+        );
+        for (provider, owner) in [("other", "bcode.jev"), ("jev", "bcode.other")] {
+            assert!(
+                super::resolve_owned_profile_context_with(
+                    &config, &runtime, provider, owner, "jev",
+                )
+                .is_err()
             );
         }
     }

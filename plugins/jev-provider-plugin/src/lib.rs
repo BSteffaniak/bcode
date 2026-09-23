@@ -57,7 +57,7 @@ fn jev_auth_contribution() -> bcode_provider_auth_models::AuthProviderContributi
     };
     bcode_provider_auth_models::AuthProviderContribution {
         schema_version: AUTH_PROVIDER_CONTRIBUTION_SCHEMA_VERSION,
-        provider_id: "bcode.jev".into(),
+        provider_id: "jev".into(),
         display_name: "TypeSafe Jev".into(),
         methods: vec![AuthMethodContribution::SecretFields {
             method_id: "api_key".into(),
@@ -553,7 +553,7 @@ mod tests {
     fn jev_registration_declares_ambient_keys_and_owned_auth_method() {
         let auth = jev_auth_contribution();
         auth.validate().unwrap();
-        assert_eq!(auth.provider_id, "bcode.jev");
+        assert_eq!(auth.provider_id, "jev");
         let bcode_provider_auth_models::AuthMethodContribution::SecretFields { fields, .. } =
             &auth.methods[0]
         else {

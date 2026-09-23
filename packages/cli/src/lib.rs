@@ -19810,6 +19810,21 @@ auth_profile = "openai"
     }
 
     #[test]
+    fn cli_shape_accepts_short_jev_auth_provider() {
+        use clap::{CommandFactory as _, FromArgMatches as _};
+        let matches = Cli::command()
+            .try_get_matches_from(["bcode", "auth", "login", "jev"])
+            .expect("Jev login parses");
+        let cli = Cli::from_arg_matches(&matches).expect("Jev login decodes");
+        assert!(matches!(
+            cli.command,
+            Some(Commands::Auth {
+                command: AuthCommand::Login { provider: Some(provider), .. }
+            }) if provider == "jev"
+        ));
+    }
+
+    #[test]
     fn cli_shape_accepts_generic_device_seal_opt_out() {
         use clap::{CommandFactory as _, FromArgMatches as _};
         let matches = Cli::command()

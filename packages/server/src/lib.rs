@@ -62197,7 +62197,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
             bcode_config::AuthProfileConfig {
                 backend: "aws".into(),
                 owner_plugin_id: Some("bcode.jev".into()),
-                provider_id: Some("bcode.jev".into()),
+                provider_id: Some("jev".into()),
                 scheme: Some("api_key".into()),
                 map: BTreeMap::from([(
                     "api_key".into(),
@@ -62339,9 +62339,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
             &[plugin],
         )
         .expect("load Jev");
-        let registered = host
-            .auth_provider("bcode.jev")
-            .expect("Jev auth contribution");
+        let registered = host.auth_provider("jev").expect("Jev auth contribution");
         assert_eq!(registered.plugin_id, "bcode.jev");
         assert!(matches!(
             registered.contribution.methods[0],
@@ -62365,7 +62363,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
             bcode_config::AuthProfileConfig {
                 backend: "aws".into(),
                 owner_plugin_id: Some("bcode.fake-provider".into()),
-                provider_id: Some("bcode.fake-provider".into()),
+                provider_id: Some("fake".into()),
                 scheme: Some("api_key".into()),
                 map: BTreeMap::from([(
                     "api_key".into(),
@@ -62443,7 +62441,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
             bcode_config::AuthProfileConfig {
                 backend: "aws".into(),
                 owner_plugin_id: Some("bcode.fake-provider".into()),
-                provider_id: Some("bcode.fake-provider".into()),
+                provider_id: Some("fake".into()),
                 scheme: Some("api_key".into()),
                 map: BTreeMap::from([(
                     "api_key".into(),
@@ -66961,7 +66959,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
             bcode_config::AuthProfileConfig {
                 backend: "aws".into(),
                 owner_plugin_id: Some("bcode.fake-provider".into()),
-                provider_id: Some("bcode.fake-provider".into()),
+                provider_id: Some("fake".into()),
                 scheme: Some("api_key".into()),
                 map: BTreeMap::from([(
                     "api_key".into(),
