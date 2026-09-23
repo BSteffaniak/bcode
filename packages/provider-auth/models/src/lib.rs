@@ -447,6 +447,13 @@ pub struct AuthSecretField {
     /// they never grant authority to read or import credentials.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub discovery_sources: Vec<AuthCredentialSource>,
+    /// Exact environment names allowed for request-local use without an imported profile.
+    /// Unlike discovery hints these grant invocation authority only for the owning plugin;
+    /// the host never searches arbitrary process variables or persists their values.
+    /// This optional field is additive within registration schema v1: older declarations
+    /// default to no ambient invocation authority.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub invocation_env: Vec<String>,
 }
 
 impl AuthSecretField {
@@ -494,6 +501,21 @@ impl AuthSecretField {
                         validate_text("discriminator_value", value, MAX_AUTH_LABEL_BYTES)?;
                     }
                 }
+            }
+        }
+        validate_count(
+            "invocation_env",
+            self.invocation_env.len(),
+            MAX_AUTH_SECRET_FIELDS,
+        )?;
+        let mut names = std::collections::BTreeSet::new();
+        for name in &self.invocation_env {
+            validate_storage_key(name)?;
+            if !names.insert(name) {
+                return Err(AuthContractError::DuplicateId {
+                    field: "invocation_env",
+                    id: name.clone(),
+                });
             }
         }
         self.validation.validate()
@@ -1158,6 +1180,7 @@ mod tests {
                 method_id: "api_key".to_owned(),
                 display_name: "API key".to_owned(),
                 fields: vec![AuthSecretField {
+                    invocation_env: Vec::new(),
                     discovery_sources: Vec::new(),
                     credential_id: "api_key".to_owned(),
                     storage_key: "PROVIDER_API_KEY".to_owned(),
@@ -1238,6 +1261,35 @@ mod tests {
         let decoded = serde_json::from_slice::<AuthProviderContribution>(&encoded)
             .expect("deserialize contribution");
         assert_eq!(decoded, contribution);
+    }
+
+    #[test]
+    fn ambient_env_declaration_is_additive_and_validated() {
+        let mut contribution = exa_contribution();
+        let AuthMethodContribution::SecretFields { fields, .. } = &mut contribution.methods[0]
+        else {
+            panic!("expected secret fields");
+        };
+        fields[0].invocation_env = vec!["EXA_API_KEY".into()];
+        let encoded = serde_json::to_vec(&contribution).unwrap();
+        let decoded: AuthProviderContribution = serde_json::from_slice(&encoded).unwrap();
+        assert_eq!(decoded, contribution);
+        decoded.validate().unwrap();
+        let mut legacy: serde_json::Value = serde_json::from_slice(&encoded).unwrap();
+        legacy["methods"][0]["fields"][0]
+            .as_object_mut()
+            .unwrap()
+            .remove("invocation_env");
+        let legacy: AuthProviderContribution = serde_json::from_value(legacy).unwrap();
+        assert!(
+            matches!(&legacy.methods[0], AuthMethodContribution::SecretFields { fields, .. } if fields[0].invocation_env.is_empty())
+        );
+        let AuthMethodContribution::SecretFields { fields, .. } = &mut contribution.methods[0]
+        else {
+            panic!("expected secret fields");
+        };
+        fields[0].invocation_env = vec!["EXA_API_KEY".into(), "EXA_API_KEY".into()];
+        assert!(contribution.validate().is_err());
     }
 
     #[test]

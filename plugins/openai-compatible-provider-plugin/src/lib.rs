@@ -501,11 +501,22 @@ fn api_key_discovery_sources(
     sources
 }
 
+fn api_key_invocation_env(storage_key: &str) -> Vec<String> {
+    let conventional = match storage_key {
+        "BCODE_OPENAI_API_KEY" => "OPENAI_API_KEY",
+        "BCODE_OPENROUTER_API_KEY" => "OPENROUTER_API_KEY",
+        "BCODE_XAI_API_KEY" => "XAI_API_KEY",
+        _ => return vec![storage_key.to_owned()],
+    };
+    vec![storage_key.to_owned(), conventional.to_owned()]
+}
+
 fn api_key_auth_method(storage_key: &str, prompt: &str) -> AuthMethodContribution {
     AuthMethodContribution::SecretFields {
         method_id: "api_key".to_owned(),
         display_name: "API key".to_owned(),
         fields: vec![AuthSecretField {
+            invocation_env: api_key_invocation_env(storage_key),
             discovery_sources: api_key_discovery_sources(storage_key),
             credential_id: "api_key".to_owned(),
             storage_key: storage_key.to_owned(),
@@ -10895,6 +10906,10 @@ mod tests {
             assert_eq!(method_id, "api_key");
             assert_eq!(fields[0].credential_id, "api_key");
             assert_eq!(fields[0].storage_key, storage_key);
+            assert_eq!(
+                fields[0].invocation_env,
+                api_key_invocation_env(storage_key)
+            );
         }
     }
 

@@ -24,14 +24,62 @@ const MODEL_ALIAS: &str = "jev-latest";
 pub struct JevProviderPlugin;
 
 impl ConcurrentRustPlugin for JevProviderPlugin {
+    fn register_auth_providers_concurrent(
+        &self,
+        registrar: AuthRegistrar,
+    ) -> Result<(), PluginError> {
+        registrar
+            .register(&jev_auth_contribution())
+            .map_err(|_| PluginError::failed("failed to register Jev auth"))
+    }
+
     fn invoke_service_concurrent(&self, context: NativeServiceContext) -> ServiceResponse {
         invoke(&context.request, &context.cancellation)
     }
 }
 
 impl RustPlugin for JevProviderPlugin {
+    fn register_auth_providers(&mut self, registrar: AuthRegistrar) -> Result<(), PluginError> {
+        registrar
+            .register(&jev_auth_contribution())
+            .map_err(|_| PluginError::failed("failed to register Jev auth"))
+    }
+
     fn invoke_service(&mut self, context: NativeServiceContext) -> ServiceResponse {
         invoke(&context.request, &context.cancellation)
+    }
+}
+
+fn jev_auth_contribution() -> bcode_provider_auth_models::AuthProviderContribution {
+    use bcode_provider_auth_models::{
+        AUTH_PROVIDER_CONTRIBUTION_SCHEMA_VERSION, AuthCredentialSource, AuthMethodContribution,
+        AuthSecretField, AuthSecretValidation,
+    };
+    bcode_provider_auth_models::AuthProviderContribution {
+        schema_version: AUTH_PROVIDER_CONTRIBUTION_SCHEMA_VERSION,
+        provider_id: "bcode.jev".into(),
+        display_name: "TypeSafe Jev".into(),
+        methods: vec![AuthMethodContribution::SecretFields {
+            method_id: "api_key".into(),
+            display_name: "API key".into(),
+            fields: vec![AuthSecretField {
+                credential_id: "api_key".into(),
+                storage_key: "BCODE_JEV_API_KEY".into(),
+                prompt: "Jev API key".into(),
+                optional: false,
+                validation: AuthSecretValidation {
+                    min_bytes: Some(1),
+                    max_bytes: Some(512),
+                    required_prefix: None,
+                },
+                discovery_sources: vec![AuthCredentialSource::Environment {
+                    name: "JEV_API_KEY".into(),
+                }],
+                invocation_env: vec!["BCODE_JEV_API_KEY".into(), "JEV_API_KEY".into()],
+            }],
+            supports_verification: false,
+            supports_revocation: false,
+        }],
     }
 }
 
@@ -499,6 +547,24 @@ mod tests {
                 .map(|(path, body)| (path, body, 200))
                 .collect(),
         )
+    }
+
+    #[test]
+    fn jev_registration_declares_ambient_keys_and_owned_auth_method() {
+        let auth = jev_auth_contribution();
+        auth.validate().unwrap();
+        assert_eq!(auth.provider_id, "bcode.jev");
+        let bcode_provider_auth_models::AuthMethodContribution::SecretFields { fields, .. } =
+            &auth.methods[0]
+        else {
+            panic!("Jev auth must use a static key");
+        };
+        assert_eq!(fields[0].credential_id, "api_key");
+        assert_eq!(
+            fields[0].invocation_env,
+            ["BCODE_JEV_API_KEY", "JEV_API_KEY"]
+        );
+        assert!(fields[0].discovery_sources.iter().any(|source| matches!(source, bcode_provider_auth_models::AuthCredentialSource::Environment { name } if name == "JEV_API_KEY")));
     }
 
     #[test]

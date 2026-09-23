@@ -139,6 +139,7 @@ fn exa_auth_provider_contribution() -> AuthProviderContribution {
             method_id: "api_key".to_owned(),
             display_name: "API key".to_owned(),
             fields: vec![AuthSecretField {
+                invocation_env: vec!["EXA_API_KEY".to_owned()],
                 discovery_sources: vec![
                     bcode_provider_auth_models::AuthCredentialSource::Environment {
                         name: "EXA_API_KEY".to_owned(),
@@ -2817,6 +2818,16 @@ bcode_plugin_sdk::export_plugin!(WebSearchPlugin, include_str!("../bcode-plugin.
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn exa_auth_registration_declares_conventional_environment_source() {
+        let contribution = exa_auth_provider_contribution();
+        contribution.validate().unwrap();
+        let AuthMethodContribution::SecretFields { fields, .. } = &contribution.methods[0] else {
+            panic!("Exa requires an API key");
+        };
+        assert_eq!(fields[0].invocation_env, ["EXA_API_KEY"]);
+    }
 
     #[test]
     fn deactivation_releases_runtime_work() {

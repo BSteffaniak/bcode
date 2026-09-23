@@ -19417,6 +19417,7 @@ mod auth_cli_tests {
             method_id: method_id.to_owned(),
             display_name: method_id.to_owned(),
             fields: vec![bcode_provider_auth_models::AuthSecretField {
+                invocation_env: Vec::new(),
                 discovery_sources: Vec::new(),
                 credential_id: "api_key".to_owned(),
                 storage_key: "TEST_PROVIDER_API_KEY".to_owned(),

@@ -33,11 +33,20 @@ pub async fn invoke_judgement_model(
     {
         return Err("judgement provider is not available");
     }
-    let provider_context = bcode_provider_auth::resolve_explicit_profile_context(
-        &state.startup_config,
-        provider_plugin_id,
-        auth_profile,
-    )?;
+    let provider_context = if auth_profile.is_empty() {
+        let registered = state
+            .plugins
+            .auth_provider(provider_plugin_id)
+            .filter(|entry| entry.plugin_id == provider_plugin_id)
+            .ok_or("judgement provider environment authentication is unavailable")?;
+        bcode_provider_auth::resolve_declared_environment_context(&registered.contribution)?
+    } else {
+        bcode_provider_auth::resolve_explicit_profile_context(
+            &state.startup_config,
+            provider_plugin_id,
+            auth_profile,
+        )?
+    };
     if provider_context.auth.is_none() {
         return Err("judgement provider credentials are unavailable");
     }

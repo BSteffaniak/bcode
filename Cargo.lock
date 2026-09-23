@@ -2068,6 +2068,7 @@ version = "0.0.1-alpha.0"
 dependencies = [
  "bcode_model",
  "bcode_plugin_sdk",
+ "bcode_provider_auth_models",
  "reqwest",
  "serde",
  "serde_json",

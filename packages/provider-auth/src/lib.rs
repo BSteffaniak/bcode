@@ -1135,6 +1135,102 @@ pub struct ResolvedProviderAuth {
     pub env: BTreeMap<String, String>,
 }
 
+/// Resolve only provider-declared process environment credentials for one enabled plugin.
+///
+/// This is request-local: it does not import secrets, select a chat model, or mutate profiles.
+/// Callers must verify the contribution belongs to the selected enabled plugin before calling.
+/// Multiple populated names for one field must agree; ambiguous keys fail closed.
+///
+/// # Errors
+/// Returns a secret-safe error when the declaration or credential is ambiguous.
+pub fn resolve_declared_environment_context(
+    contribution: &bcode_provider_auth_models::AuthProviderContribution,
+) -> Result<bcode_model::ProviderRequestContext, &'static str> {
+    resolve_declared_environment_context_with(contribution, |name| std::env::var(name).ok())
+}
+
+fn resolve_declared_environment_context_with(
+    contribution: &bcode_provider_auth_models::AuthProviderContribution,
+    mut read_env: impl FnMut(&str) -> Option<String>,
+) -> Result<bcode_model::ProviderRequestContext, &'static str> {
+    use bcode_provider_auth_models::AuthMethodContribution;
+    contribution
+        .validate()
+        .map_err(|_| "invalid provider auth declaration")?;
+    let mut selected = None;
+    for method in &contribution.methods {
+        if let AuthMethodContribution::SecretFields {
+            fields, method_id, ..
+        } = method
+            && fields.iter().any(|field| !field.invocation_env.is_empty())
+        {
+            if selected.is_some() {
+                return Err("provider environment method is unavailable or ambiguous");
+            }
+            selected = Some((method_id, fields));
+        }
+    }
+    let (method_id, fields) =
+        selected.ok_or("provider environment method is unavailable or ambiguous")?;
+    let mut credentials = BTreeMap::new();
+    for field in fields {
+        if field.invocation_env.is_empty() {
+            if !field.optional {
+                return Err("provider environment credentials are incomplete");
+            }
+            continue;
+        }
+        let mut selected: Option<(String, String)> = None;
+        for name in &field.invocation_env {
+            if let Some(value) = read_env(name) {
+                if value.is_empty() {
+                    return Err("provider environment credential is invalid");
+                }
+                field
+                    .validation
+                    .validate_secret(&value)
+                    .map_err(|_| "provider environment credential is invalid")?;
+                if selected
+                    .as_ref()
+                    .is_some_and(|(_, previous)| previous != &value)
+                {
+                    return Err("provider environment credentials conflict");
+                }
+                if selected.is_none() {
+                    selected = Some((name.clone(), value));
+                }
+            }
+        }
+        match selected {
+            Some((source, value)) => {
+                credentials.insert(
+                    field.credential_id.clone(),
+                    bcode_model::ProviderAuthCredential {
+                        value,
+                        source: Some(source),
+                    },
+                );
+            }
+            None if !field.optional => {
+                return Err("provider environment credentials are unavailable");
+            }
+            None => {}
+        }
+    }
+    let auth = bcode_model::ProviderAuthContext {
+        profile: Some("environment".into()),
+        backend: Some("environment".into()),
+        scheme: Some(method_id.clone()),
+        credentials,
+        ..Default::default()
+    };
+    Ok(bcode_model::ProviderRequestContext {
+        auth_profile: Some("environment".into()),
+        auth: Some(auth),
+        ..Default::default()
+    })
+}
+
 /// Resolve one configured auth profile.
 #[must_use]
 pub fn resolve_auth_profile(
@@ -1456,6 +1552,85 @@ fn selected_auth_pool_routing(
 #[cfg(test)]
 mod tests {
     #[test]
+    fn environment_invocation_requires_declaration_and_unambiguous_keys() {
+        use bcode_provider_auth_models::{
+            AUTH_PROVIDER_CONTRIBUTION_SCHEMA_VERSION, AuthMethodContribution,
+            AuthProviderContribution, AuthSecretField, AuthSecretValidation,
+        };
+        let contribution = AuthProviderContribution {
+            schema_version: AUTH_PROVIDER_CONTRIBUTION_SCHEMA_VERSION,
+            provider_id: "test-provider".into(),
+            display_name: "Test provider".into(),
+            methods: vec![AuthMethodContribution::SecretFields {
+                method_id: "api_key".into(),
+                display_name: "API key".into(),
+                fields: vec![AuthSecretField {
+                    credential_id: "api_key".into(),
+                    storage_key: "BCODE_TEST_KEY".into(),
+                    prompt: "API key".into(),
+                    optional: false,
+                    validation: AuthSecretValidation {
+                        min_bytes: Some(1),
+                        max_bytes: Some(64),
+                        required_prefix: None,
+                    },
+                    discovery_sources: Vec::new(),
+                    invocation_env: vec!["BCODE_TEST_KEY".into(), "TEST_KEY".into()],
+                }],
+                supports_verification: false,
+                supports_revocation: false,
+            }],
+        };
+        let context = super::resolve_declared_environment_context_with(&contribution, |name| {
+            (name == "TEST_KEY").then(|| "secret".into())
+        })
+        .unwrap();
+        assert_eq!(
+            context.auth.unwrap().credentials["api_key"]
+                .source
+                .as_deref(),
+            Some("TEST_KEY")
+        );
+        assert!(super::resolve_declared_environment_context_with(&contribution, |_| None).is_err());
+        assert_eq!(
+            super::resolve_declared_environment_context_with(
+                &contribution,
+                |_| Some(String::new())
+            )
+            .unwrap_err(),
+            "provider environment credential is invalid"
+        );
+        assert_eq!(
+            super::resolve_declared_environment_context_with(&contribution, |name| Some(
+                name.into()
+            ))
+            .unwrap_err(),
+            "provider environment credentials conflict"
+        );
+        let mut undeclared = contribution.clone();
+        if let AuthMethodContribution::SecretFields { fields, .. } = &mut undeclared.methods[0] {
+            fields[0].invocation_env.clear();
+        }
+        assert!(
+            super::resolve_declared_environment_context_with(&undeclared, |_| Some(
+                "secret".into()
+            ))
+            .is_err()
+        );
+        let mut ambiguous = contribution;
+        ambiguous.methods.push(ambiguous.methods[0].clone());
+        assert!(
+            super::resolve_declared_environment_context_with(&ambiguous, |_| Some("secret".into()))
+                .is_err()
+        );
+        let mut invalid = ambiguous;
+        if let AuthMethodContribution::SecretFields { fields, .. } = &mut invalid.methods[0] {
+            fields[0].invocation_env = vec!["TEST_KEY".into(), "TEST_KEY".into()];
+        }
+        assert!(invalid.validate().is_err());
+    }
+
+    #[test]
     fn explicit_profile_rejects_blank_selection_before_materialization() {
         let config = bcode_config::BcodeConfig::default();
         for (provider, profile) in [("", "profile"), ("provider", ""), ("provider", " \t")] {
@@ -1551,6 +1726,7 @@ mod tests {
                     method_id: "api_key".to_owned(),
                     display_name: "API key".to_owned(),
                     fields: vec![bcode_provider_auth_models::AuthSecretField {
+                        invocation_env: Vec::new(),
                         discovery_sources: Vec::new(),
                         credential_id: "api_key".to_owned(),
                         storage_key: "BCODE_OPENAI_API_KEY".to_owned(),

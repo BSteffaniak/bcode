@@ -82,6 +82,7 @@ async fn encrypted_custody_reaches_sdk_provider_turn() {
             prompt: "API key".into(),
             optional: false,
             validation: AuthSecretValidation::default(),
+            invocation_env: Vec::new(),
             discovery_sources: Vec::new(),
         }],
         supports_verification: false,

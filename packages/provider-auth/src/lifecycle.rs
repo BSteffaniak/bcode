@@ -1398,6 +1398,7 @@ mod tests {
             method_id: "api_key".to_owned(),
             display_name: "API key".to_owned(),
             fields: vec![AuthSecretField {
+                invocation_env: Vec::new(),
                 discovery_sources: Vec::new(),
                 credential_id: "api_key".to_owned(),
                 storage_key: "TEST_PROVIDER_API_KEY".to_owned(),

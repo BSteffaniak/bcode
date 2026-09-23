@@ -204,6 +204,7 @@ mod tests {
             prompt: "API key".to_owned(),
             optional: false,
             validation: bcode_provider_auth_models::AuthSecretValidation::default(),
+            invocation_env: Vec::new(),
             discovery_sources: vec![AuthCredentialSource::JsonFile {
                 application: "Test".to_owned(),
                 relative_path: "auth.json".to_owned(),

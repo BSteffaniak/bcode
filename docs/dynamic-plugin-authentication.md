@@ -157,6 +157,12 @@ Interactive flows are bounded and explicit. Pending responses must provide resum
 
 Missing plugins/providers, duplicate registrations, ownership mismatches, damaged vaults, missing profiles, and unavailable sealing backends produce actionable errors. Damaged vault state is not silently reset, repaired, or replaced during normal status, login, logout, or invocation.
 
+## Provider-owned ambient credentials
+
+`AuthSecretField.invocation_env` is an additive, version-compatible declaration of exact environment variable names permitted for request-local invocation. It is separate from `discovery_sources`: an import hint does not authorize ambient use. The selected enabled plugin's registered provider and secret-field method must match the requested provider; the host reads only those declared names. Missing/invalid values and conflicting names fail closed; no value enters configuration, a vault, session history, or public diagnostics. A named auth profile stays authoritative and never falls back to ambient keys. For judgement calls, an empty auth profile explicitly selects this path; it does not select a chat provider or turn model. Values must exist in the daemon's process environment, not merely in a client shell. Registration schema v1 contributions without this optional field have no ambient invocation authority.
+
+Bundled providers currently declare OpenAI/OpenRouter/xAI (`BCODE_*_API_KEY` and conventional `*_API_KEY`), Exa (`EXA_API_KEY`), and Jev (`BCODE_JEV_API_KEY` and `JEV_API_KEY`). Bedrock continues to use the AWS SDK credential chain rather than a generic API-key declaration. Existing chat/web-search compatibility fallbacks remain until their callers use the normalized host path; registering declarations alone does not silently reroute those callers.
+
 ## Compatibility
 
 Legacy environment-backed profiles and conventional provider environment variables remain supported where the owning integration documents them. Deprecated top-level provider login commands may translate arguments into canonical registered methods during migration, but they are not extension points and must not retain independent credential/OAuth implementations.

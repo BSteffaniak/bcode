@@ -3674,11 +3674,14 @@ impl BcodeClient {
         }
     }
 
-    /// Evaluate named questions with a non-conversational model and an explicitly owned auth
-    /// profile. This does not create a session or select a chat turn model.
+    /// Evaluate named questions with a non-conversational model. A named auth profile must be
+    /// owned by the provider; an empty name explicitly selects its declared environment keys.
+    /// This does not create a session or select a chat turn model.
     ///
     /// # Errors
     /// Returns a client error if the daemon is unavailable or rejects the invocation.
+    /// An empty `auth_profile` explicitly selects provider-declared daemon environment keys;
+    /// a named profile never falls back to ambient keys.
     pub async fn judge(
         &self,
         provider_plugin_id: String,

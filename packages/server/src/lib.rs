@@ -62109,12 +62109,16 @@ event_symbol = "bcode_plugin_handle_event_v1"
     }
 
     #[tokio::test]
-    #[ignore = "requires a temporary BCODE_JEV_LIVE_KEY and makes a billed network request"]
+    #[ignore = "requires a temporary JEV_API_KEY and makes a billed network request"]
     #[allow(clippy::significant_drop_tightening)] // The test owns the server state until shutdown.
     async fn judgement_client_ipc_live_jev() {
         assert!(
-            std::env::var("BCODE_JEV_LIVE_KEY").is_ok(),
-            "supply an ephemeral key"
+            std::env::var("JEV_API_KEY").is_ok(),
+            "supply an ephemeral JEV_API_KEY"
+        );
+        assert!(
+            std::env::var_os("BCODE_JEV_API_KEY").is_none(),
+            "unset alternate Jev key for this live test"
         );
         let plugin = bcode_plugin::StaticBundledPlugin::new(
             include_str!("../../../plugins/jev-provider-plugin/bcode-plugin.toml"),
@@ -62131,42 +62135,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
         .expect("load Jev");
         let mut server_state = test_server_state(SessionManager::default());
         server_state.plugins = plugins;
-        server_state.startup_config.auth.profiles.insert(
-            "jev-live".into(),
-            bcode_config::AuthProfileConfig {
-                backend: "aws".into(),
-                owner_plugin_id: Some("bcode.jev".into()),
-                provider_id: Some("bcode.jev".into()),
-                scheme: Some("api_key".into()),
-                map: BTreeMap::from([(
-                    "api_key".into(),
-                    bcode_config::AuthCredentialMapping {
-                        env: Some("BCODE_JEV_LIVE_KEY".into()),
-                        key: None,
-                    },
-                )]),
-                settings: BTreeMap::from([(
-                    "env.BCODE_JEV_LIVE_KEY".into(),
-                    std::env::var("BCODE_JEV_LIVE_KEY").expect("ephemeral key"),
-                )]),
-            },
-        );
         let state = Arc::new(server_state);
-        let resolved = bcode_provider_auth::resolve_explicit_profile_context(
-            &state.startup_config,
-            "bcode.jev",
-            "jev-live",
-        )
-        .expect("resolve live auth profile");
-        assert!(
-            resolved
-                .auth
-                .as_ref()
-                .and_then(|auth| auth.credentials.get("api_key"))
-                .is_some(),
-            "missing live credential"
-        );
-        assert_eq!(resolved.settings.get("base_url"), None);
         let socket_dir = tempfile::tempdir().expect("IPC directory");
         let endpoint = bcode_ipc::IpcEndpoint::unix_socket(socket_dir.path().join("server.sock"));
         let listener = LocalIpcListener::bind(&endpoint).expect("IPC listener");
@@ -62180,7 +62149,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
         let result = client
             .judge(
                 "bcode.jev".into(),
-                "jev-live".into(),
+                String::new(),
                 bcode_model::judgement::Request {
                     model_id: "jev-latest".into(),
                     state: bcode_model::judgement::State::Text(
@@ -62206,6 +62175,39 @@ event_symbol = "bcode_plugin_handle_event_v1"
             bcode_model::judgement::Answer::YesNo { probability } if (0.0..=1.0).contains(&probability)
         ));
         assert!(response.usage.expect("usage").input_tokens > 0);
+    }
+
+    #[tokio::test]
+    #[allow(clippy::significant_drop_tightening)] // The server owns the registered provider until shutdown.
+    async fn judgement_jev_environment_auth_is_owned_and_does_not_select_chat() {
+        let plugin = bcode_plugin::StaticBundledPlugin::new(
+            include_str!("../../../plugins/jev-provider-plugin/bcode-plugin.toml"),
+            bcode_jev_provider_plugin::static_plugin(),
+        );
+        let host = bcode_plugin::PluginRuntimeHost::load_defaults_with_static_bundled(
+            &bcode_plugin::PluginSelection {
+                mode: bcode_plugin::PluginSelectionMode::Explicit,
+                enabled: BTreeSet::from(["bcode.jev".into()]),
+                disabled: BTreeSet::new(),
+            },
+            &[plugin],
+        )
+        .expect("load Jev");
+        let registered = host
+            .auth_provider("bcode.jev")
+            .expect("Jev auth contribution");
+        assert_eq!(registered.plugin_id, "bcode.jev");
+        assert!(matches!(
+            registered.contribution.methods[0],
+            bcode_provider_auth_models::AuthMethodContribution::SecretFields { .. }
+        ));
+        assert!(host.auth_provider("bcode.openai-compatible").is_none());
+        assert!(
+            !host.registry().manifests()["bcode.jev"]
+                .services
+                .iter()
+                .any(|service| service.interface_id.starts_with("bcode.model-provider/"))
+        );
     }
 
     #[tokio::test]
@@ -62264,10 +62266,20 @@ event_symbol = "bcode_plugin_handle_event_v1"
         ));
         assert_eq!(result.usage.expect("usage").input_tokens, 1);
         let denied = client
-            .judge("bcode.jev".into(), "judgement-fixture".into(), request)
+            .judge(
+                "bcode.jev".into(),
+                "judgement-fixture".into(),
+                request.clone(),
+            )
             .await;
         assert!(
             matches!(denied, Err(bcode_client::ClientError::Server { code, .. }) if code == "judgement_unavailable")
+        );
+        let denied_env = client
+            .judge("bcode.jev".into(), String::new(), request)
+            .await;
+        assert!(
+            matches!(denied_env, Err(bcode_client::ClientError::Server { code, .. }) if code == "judgement_unavailable")
         );
         shutdown.send(()).expect("stop test listener");
         tokio::time::timeout(Duration::from_secs(5), server)
