@@ -3505,6 +3505,57 @@ mod tests {
     }
 
     #[test]
+    fn openai_fast_pricing_uses_confirmed_tiers_and_context_thresholds() {
+        let catalog = ModelCatalog::load_bundled().expect("bundled catalog");
+        for model_id in [
+            "gpt-6-astra",
+            "gpt-6-sol",
+            "gpt-6-luna",
+            "gpt-5.6-sol",
+            "gpt-5.6-terra",
+            "gpt-5.6-luna",
+        ] {
+            let pricing = catalog
+                .enrich_model("openai", test_model_info(model_id))
+                .pricing
+                .expect("catalog pricing");
+            for input in [272_000, 272_001] {
+                let mut usage = bcode_model::TokenUsage {
+                    input_tokens: Some(input),
+                    output_tokens: Some(10_000),
+                    cached_input_tokens: Some(1_000),
+                    cache_write_input_tokens: Some(1_000),
+                    pricing_context: Box::new(bcode_model::ModelPricingContext {
+                        request_input_tokens: Some(u64::from(input)),
+                        invocation_class: Some(bcode_model::ModelInvocationClass::OnDemand),
+                        service_tier: Some("standard".to_string()),
+                        ..bcode_model::ModelPricingContext::default()
+                    }),
+                    ..bcode_model::TokenUsage::default()
+                };
+                let standard = pricing.estimate_cost(&usage).expect("standard pricing");
+                for tier in ["priority", "fast"] {
+                    usage.pricing_context.service_tier =
+                        Some(bcode_model::normalize_model_service_tier(tier));
+                    let fast = pricing.estimate_cost(&usage).expect("fast pricing");
+                    assert_eq!(
+                        fast.total_micros,
+                        standard.total_micros * 2,
+                        "{model_id} {input} {tier}"
+                    );
+                }
+                for tier in [None, Some("unknown"), Some("flex")] {
+                    usage.pricing_context.service_tier = tier.map(str::to_string);
+                    assert!(
+                        pricing.estimate_cost(&usage).is_none(),
+                        "{model_id} {tier:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
     fn openai_gpt_6_astra_uses_catalog_owned_long_context_rules() {
         let catalog = ModelCatalog::load_bundled().expect("bundled catalog");
         let model = catalog
@@ -3520,6 +3571,7 @@ mod tests {
             cache_write_input_tokens: Some(0),
             pricing_context: Box::new(bcode_model::ModelPricingContext {
                 request_input_tokens: Some(300_000),
+                service_tier: Some("standard".to_string()),
                 invocation_class: Some(bcode_model::ModelInvocationClass::OnDemand),
                 ..bcode_model::ModelPricingContext::default()
             }),
@@ -3530,7 +3582,6 @@ mod tests {
             .expect("long-context estimate");
         // 300K input at 2x ($20/M) plus 10K output at 1.5x ($75/M).
         assert_eq!(estimate.total_micros, 6_750_000);
-        assert_eq!(pricing.rules.len(), 8);
     }
 
     #[test]
@@ -3549,6 +3600,7 @@ mod tests {
             cache_write_input_tokens: Some(0),
             pricing_context: Box::new(bcode_model::ModelPricingContext {
                 request_input_tokens: Some(300_000),
+                service_tier: Some("standard".to_string()),
                 invocation_class: Some(bcode_model::ModelInvocationClass::OnDemand),
                 ..bcode_model::ModelPricingContext::default()
             }),
@@ -3558,7 +3610,6 @@ mod tests {
             .estimate_cost(&usage)
             .expect("long-context estimate");
         assert_eq!(estimate.total_micros, 1_380_000);
-        assert_eq!(pricing.rules.len(), 8);
     }
 
     #[test]

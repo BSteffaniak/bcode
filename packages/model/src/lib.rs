@@ -1379,13 +1379,14 @@ pub enum ModelPricingSource {
 
 /// Normalize a provider service-tier label to the model-catalog vocabulary.
 ///
-/// Provider defaults (`default` and `auto`) are represented as `standard`. Other labels are
-/// trimmed and ASCII-lowercased so catalog rule matching is stable across provider wire formats.
+/// Provider defaults (`default` and `auto`) are represented as `standard`, and `fast` as
+/// `priority`. Other labels are trimmed and ASCII-lowercased for stable catalog rule matching.
 #[must_use]
 pub fn normalize_model_service_tier(service_tier: &str) -> String {
     let normalized = service_tier.trim().to_ascii_lowercase();
     match normalized.as_str() {
         "auto" | "default" => "standard".to_string(),
+        "fast" => "priority".to_string(),
         _ => normalized,
     }
 }
@@ -4361,6 +4362,7 @@ mod tests {
         assert_eq!(normalize_model_service_tier("default"), "standard");
         assert_eq!(normalize_model_service_tier(" AUTO "), "standard");
         assert_eq!(normalize_model_service_tier("Priority"), "priority");
+        assert_eq!(normalize_model_service_tier(" FAST "), "priority");
         assert_eq!(normalize_model_service_tier("flex"), "flex");
     }
 
