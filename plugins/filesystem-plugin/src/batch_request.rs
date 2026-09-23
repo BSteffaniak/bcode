@@ -291,9 +291,52 @@ pub fn execute_with_changes(
         if change["omitted"] == true {
             change["retained"] = retain(index, &snapshot.source, &snapshot.output);
         }
-        outcomes.push(serde_json::json!({"path": target.path, "status": status, "error": error, "change": change}));
+        let edits = matches!(status, "committed" | "unchanged")
+            .then(|| verified_edit_previews(&snapshot.source, &arguments["files"][index]["edits"]));
+        outcomes.push(serde_json::json!({"path": target.path, "status": status, "error": error, "change": change, "edit_previews": edits}));
     }
     Ok(serde_json::json!({"version": 1, "is_error": stopped, "files": outcomes}))
+}
+
+/// Per-edit fragments from the validated immutable snapshot, in request order.
+/// The request's aggregate text bound applies; unchanged gaps consume no space.
+fn verified_edit_previews(source: &str, edits: &Value) -> Value {
+    let edits = edits.as_array().expect("validated edits");
+    let mut ordered: Vec<_> = edits
+        .iter()
+        .enumerate()
+        .map(|(index, edit)| {
+            let old = edit["old_text"].as_str().expect("validated search");
+            let start = source.find(old).expect("verified unique match");
+            (
+                start,
+                index,
+                old,
+                edit["new_text"].as_str().expect("validated replacement"),
+            )
+        })
+        .collect();
+    ordered.sort_unstable_by_key(|&(start, ..)| start);
+    let mut previews = vec![Value::Null; edits.len()];
+    let mut source_offset = 0;
+    let mut old_line = 1;
+    let mut new_line = 1;
+    for (start, index, old, new) in ordered {
+        let gap_lines = source[source_offset..start]
+            .bytes()
+            .filter(|&byte| byte == b'\n')
+            .count();
+        old_line += gap_lines;
+        new_line += gap_lines;
+        previews[index] = serde_json::json!({
+            "old_text": old, "new_text": new,
+            "old_start_line": old_line, "new_start_line": new_line
+        });
+        old_line += old.bytes().filter(|&byte| byte == b'\n').count();
+        new_line += new.bytes().filter(|&byte| byte == b'\n').count();
+        source_offset = start + old.len();
+    }
+    serde_json::json!({"version": 1, "edits": previews})
 }
 
 /// Produce an exact whole-file unified diff in linear time and bounded space.
@@ -1141,6 +1184,40 @@ mod tests {
             json!({"files":[{"path":path,"edits":[{"old_text":"original","new_text":"changed"}]}]});
         assert!(prepare(&request, None).unwrap_err().contains("unsupported"));
         assert_eq!(std::fs::read_to_string(path).unwrap(), "original");
+    }
+
+    #[test]
+    fn verified_fragments_preserve_request_order_and_adjust_line_numbers() {
+        let source = format!("first\n{}last\n", "unchanged\n".repeat(20_000));
+        let previews = super::verified_edit_previews(
+            &source,
+            &serde_json::json!([
+                {"old_text":"last", "new_text":"最後 👩‍💻"},
+                {"old_text":"first", "new_text":"one\ntwo"}
+            ]),
+        );
+        let edits = previews["edits"].as_array().unwrap();
+        assert_eq!(edits.len(), 2);
+        assert_eq!(edits[0]["old_text"], "last");
+        assert_eq!(edits[0]["old_start_line"], 20_002);
+        assert_eq!(edits[0]["new_start_line"], 20_003);
+        assert_eq!(edits[1]["old_start_line"], 1);
+        assert_eq!(edits[1]["new_start_line"], 1);
+        assert!(!previews.to_string().contains("unchanged"));
+    }
+
+    #[test]
+    fn verified_fragments_do_not_apply_the_legacy_inline_diff_budget() {
+        let old = "x".repeat(20_000);
+        let new = "y".repeat(20_000);
+        let previews = super::verified_edit_previews(
+            &old,
+            &serde_json::json!([
+                {"old_text":old, "new_text":new}
+            ]),
+        );
+        assert_eq!(previews["edits"][0]["old_text"], old);
+        assert_eq!(previews["edits"][0]["new_text"], new);
     }
 
     #[test]

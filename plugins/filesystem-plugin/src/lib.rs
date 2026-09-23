@@ -3033,6 +3033,12 @@ mod tests {
         assert_eq!(updates.len(), 2);
         assert_eq!(updates[1].schema, "bcode.filesystem.batch");
         assert_eq!(updates[1].payload["files"][1]["status"], "committed");
+        let previews = &updates[1].payload["files"][0]["edit_previews"];
+        assert_eq!(previews["version"], 1);
+        assert_eq!(previews["edits"][0]["old_text"], "beta");
+        assert_eq!(previews["edits"][0]["new_text"], "B");
+        assert_eq!(previews["edits"][1]["old_text"], "alpha");
+        assert!(!response.output.contains("edit_previews"));
     }
 
     #[test]

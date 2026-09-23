@@ -129,7 +129,7 @@ impl bcode_plugin_sdk::tui::PluginTuiVisualAdapter for FileChangeTuiVisualAdapte
             ) && let Some(files) = payload["files"].as_array_mut()
             {
                 for (index, file) in files.iter_mut().enumerate().take(64) {
-                    if file["change"]["omitted"] != true {
+                    if !file["edit_previews"].is_null() || file["change"]["omitted"] != true {
                         continue;
                     }
                     let sources: Option<Vec<_>> = ["old", "new"]
@@ -180,7 +180,32 @@ fn batch_files(payload: &serde_json::Value) -> Option<&Vec<serde_json::Value>> {
         return None;
     }
     let mut remaining: usize = 64 * 1024;
+    let mut edit_bytes_remaining = 4 * 1024 * 1024;
+    let mut edits_remaining = 1024;
     for file in files {
+        if !file["edit_previews"].is_null() {
+            if !matches!(file["status"].as_str()?, "committed" | "unchanged")
+                || file["edit_previews"]["version"].as_u64()? != 1
+            {
+                return None;
+            }
+            let edits = file["edit_previews"]["edits"].as_array()?;
+            if edits.is_empty() {
+                return None;
+            }
+            edits_remaining = usize::checked_sub(edits_remaining, edits.len())?;
+            for edit in edits {
+                for side in ["old_text", "new_text"] {
+                    edit_bytes_remaining =
+                        usize::checked_sub(edit_bytes_remaining, edit[side].as_str()?.len())?;
+                }
+                for side in ["old_start_line", "new_start_line"] {
+                    if edit[side].as_u64()? == 0 {
+                        return None;
+                    }
+                }
+            }
+        }
         if file["path"].as_str()?.len() > 4096 {
             return None;
         }
@@ -296,6 +321,26 @@ fn batch_layout(
     let mut rows = Vec::new();
     let mut anchors = Vec::new();
     for (index, file) in files.iter().enumerate() {
+        if let Some(edits) = file["edit_previews"]["edits"].as_array() {
+            for (edit_index, edit) in edits.iter().enumerate() {
+                let mut preview = edit.clone();
+                preview["path"] = file["path"].clone();
+                preview["title"] = serde_json::json!(format!(
+                    "Edit {} · {}",
+                    edit_index + 1,
+                    file["status"].as_str().unwrap_or_default()
+                ));
+                let (edit_rows, edit_anchors) = file_change_layout(&preview, context);
+                let offset = rows.len();
+                anchors.extend(edit_anchors.into_iter().map(|mut anchor| {
+                    anchor.key = format!("batch:{index}:{edit_index}:{}", anchor.key);
+                    anchor.row += offset;
+                    anchor
+                }));
+                rows.extend(edit_rows);
+            }
+            continue;
+        }
         let change = &file["change"];
         let mut preview = if change["omitted"] == false || change["preview_loaded"] == true {
             change.clone()
@@ -659,6 +704,37 @@ mod tests {
         assert!(batch_files(&payload).is_none());
         payload["version"] = serde_json::json!(1);
         payload["files"][0]["status"] = serde_json::json!("future");
+        assert!(batch_files(&payload).is_none());
+    }
+
+    #[test]
+    fn completed_edits_render_separately_without_legacy_budget_warning() {
+        use bcode_plugin_sdk::tui::{PluginTuiDiffLayout, PluginTuiVisualRenderContext};
+        let mut payload = serde_json::json!({"version":1,"files":[{
+            "path":"一.rs", "status":"committed", "change":{"omitted":true},
+            "edit_previews":{"version":1,"edits":[
+                {"old_text":"before", "new_text":"after 👩‍💻 e\u{301}", "old_start_line":1,"new_start_line":1},
+                {"old_text":"distant", "new_text":"最後", "old_start_line":20000,"new_start_line":20000}
+            ]}
+        }]});
+        for width in [0, 1, 2, 20, 100] {
+            let context =
+                PluginTuiVisualRenderContext::new(width, PluginTuiDiffLayout::Unified, None);
+            let (rows, anchors) = batch_layout(&payload, &context);
+            bcode_plugin_sdk::tui_visual::validate_visual_anchors(&anchors, rows.len()).unwrap();
+            assert!(rows.iter().all(|row| row.width() <= usize::from(width)));
+            if width == 100 {
+                let text = rows.iter().map(line_text).collect::<Vec<_>>().join("\n");
+                assert!(text.contains("Edit 1 · committed"));
+                assert!(text.contains("Edit 2 · committed"));
+                assert!(text.contains("distant"));
+                assert!(!text.contains("budget"));
+            }
+        }
+        payload["files"][0]["edit_previews"]["version"] = serde_json::json!(2);
+        assert!(batch_files(&payload).is_none());
+        payload["files"][0]["edit_previews"]["version"] = serde_json::json!(1);
+        payload["files"][0]["status"] = serde_json::json!("unknown");
         assert!(batch_files(&payload).is_none());
     }
 

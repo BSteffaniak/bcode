@@ -431,6 +431,21 @@ the generic runtime/render gate. Both enforce the documented 100 ms p99 ceiling;
 enforces its RSS budget. Generated artifacts contain workload, environment, revision, distribution,
 and gate metadata.
 
+## Filesystem multi-edit results
+
+New batch outcomes include an optional `edit_previews` envelope (version 1) per
+committed or unchanged file. It contains verified replacement fragments in request
+order with original and resulting line numbers. The TUI renders one card per edit,
+matching the live proposal's grouping rather than combining distant edits into a
+single region. Unknown preview versions or previews attached to unsuccessful
+outcomes fail closed. Absent envelopes retain the historical batch presentation.
+
+Preview text is bounded by the tool's existing 4 MiB aggregate request-text and
+1,024-edit limits, not the legacy 16 KiB/file and 64 KiB/batch combined-diff limits.
+Unchanged gaps are not included. Legacy change metadata and retained sources remain
+available for compatibility; preview text is excluded from the compact model-facing
+result. This does not change live draft limits or introduce artifact pagination.
+
 ## Interactive tool presentation
 
 `[tui.interactions]` controls terminal presentation for active plugin-owned interactions.
