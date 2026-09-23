@@ -5,7 +5,7 @@ use bmux_tui::prelude::{Line, Span, Style};
 use bmux_tui::style::Modifier;
 
 use super::picker_render::{
-    picker_list_area, render_picker_chrome, render_picker_list, render_picker_status,
+    picker_list_area, render_picker_chrome, render_picker_list_with_selection, render_picker_status,
 };
 use super::render::TuiTheme;
 use super::session_picker::{SessionPickerApp, SessionPickerMode};
@@ -71,12 +71,15 @@ pub fn render_picker(app: &mut SessionPickerApp, frame: &mut PaintCx<'_, '_>, th
         return;
     };
     let items = app.list_items(theme.muted);
-    render_picker_list(
+    render_picker_list_with_selection(
         &items,
         app.list_render_state(list_area.height),
         list_area,
         frame,
         theme,
+        // Keep the row on the raised surface; the BMUX selection marker and
+        // accent text identify it without a competing full-width color block.
+        theme.raised.patch(theme.focused),
     );
 }
 
@@ -91,16 +94,16 @@ const fn input_placeholder(mode: SessionPickerMode) -> &'static str {
 fn header_line(mode: SessionPickerMode) -> Line {
     let help = match mode {
         SessionPickerMode::Filter => {
-            "  Enter selects/imports  Ctrl-F searches transcripts (deep:/content:/provider:)  Ctrl-N creates  Ctrl-R renames  Ctrl-D deletes  Esc cancels"
+            "  ↑↓ browse  ·  Enter open  ·  Ctrl-F search  ·  Ctrl-N new  ·  Ctrl-R rename  ·  Ctrl-D delete  ·  Esc close"
         }
-        SessionPickerMode::Rename => "  Enter saves rename  Esc cancels",
-        SessionPickerMode::DeleteConfirm => "  Y confirms delete  N/Esc cancels",
+        SessionPickerMode::Rename => "  Rename  ·  Enter save  ·  Esc cancel",
+        SessionPickerMode::DeleteConfirm => "  Delete session?  ·  Y confirm  ·  N/Esc cancel",
         SessionPickerMode::TranscriptSearch => {
-            "  Enter searches/opens  Up/Down select  Alt-M mode  Alt-D deep  Alt-S sort  Alt-N next  Alt-I inventory  Alt-G migrate  Alt-B backfill  Alt-X cancel  ? details  Esc sessions"
+            "  Enter search/open  ·  ↑↓ browse  ·  Alt-M mode  ·  Alt-D deep  ·  Alt-S sort  ·  Alt-N next  ·  Alt-I inventory  ·  Alt-G migrate  ·  Alt-B backfill  ·  Alt-X cancel  ·  ? details  ·  Esc sessions"
         }
     };
     Line::from_spans(vec![
-        Span::styled("Bcode sessions", Style::new().add_modifier(Modifier::BOLD)),
+        Span::styled("SESSIONS", Style::new().add_modifier(Modifier::BOLD)),
         Span::raw(help),
     ])
 }
@@ -139,11 +142,12 @@ fn format_import_warnings(
 mod tests {
     use bmux_tui::buffer::Buffer;
     use bmux_tui::frame::Frame;
-    use bmux_tui::geometry::Rect;
+    use bmux_tui::geometry::{Point, Rect};
 
     use super::{header_line, render_picker};
     use crate::render::TuiTheme;
     use crate::session_picker::{SessionPickerApp, SessionPickerMode};
+    use bcode_session_models::{SessionId, SessionSummary, SessionTitleSource};
 
     fn buffer_text(buffer: &Buffer, area: Rect) -> String {
         (area.y..area.y.saturating_add(area.height))
@@ -172,6 +176,45 @@ mod tests {
             "Alt-X cancel",
         ] {
             assert!(text.contains(expected), "missing {expected}: {text}");
+        }
+    }
+
+    #[test]
+    fn selected_session_uses_accent_on_raised_surface_across_themes() {
+        for theme_id in ["terminal-native", "bcode-dark", "bcode-light"] {
+            let theme = TuiTheme::for_theme_id(theme_id);
+            let session = SessionSummary {
+                id: SessionId::new(),
+                name: Some("Design review".to_owned()),
+                explicit_name: None,
+                derived_title: None,
+                title_source: SessionTitleSource::Explicit,
+                client_count: 0,
+                created_at_ms: 1,
+                updated_at_ms: 1,
+                working_directory: "/tmp/project".into(),
+                import: None,
+                execution: None,
+                location: None,
+            };
+            let mut app = SessionPickerApp::new(vec![session]);
+            let area = Rect::new(0, 0, 90, 15);
+            let mut buffer = Buffer::empty(area);
+            let mut frame = Frame::new(&mut buffer);
+            render_picker(
+                &mut app,
+                &mut bmux_tui::paint::PaintCx::new(&mut frame),
+                theme,
+            );
+            let text = buffer_text(frame.buffer(), area);
+            assert!(text.contains("Design review"), "{theme_id}");
+            assert!(text.contains("/tmp/project"), "{theme_id}");
+            let marker = frame
+                .buffer()
+                .get(Point::new(2, 6))
+                .expect("selection marker");
+            assert_eq!(marker.style.bg, theme.raised.bg, "{theme_id}");
+            assert_eq!(marker.style.fg, theme.focused.fg, "{theme_id}");
         }
     }
 

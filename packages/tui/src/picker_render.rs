@@ -163,6 +163,18 @@ pub fn render_picker_list(
     frame: &mut PaintCx<'_, '_>,
     theme: TuiTheme,
 ) {
+    render_picker_list_with_selection(items, state, area, frame, theme, theme.selection);
+}
+
+/// Render a selectable list with caller-owned selection treatment.
+pub fn render_picker_list_with_selection(
+    items: &[Line],
+    state: &SelectableListState,
+    area: Rect,
+    frame: &mut PaintCx<'_, '_>,
+    theme: TuiTheme,
+    selection: Style,
+) {
     let rows = items
         .iter()
         .enumerate()
@@ -171,10 +183,10 @@ pub fn render_picker_list(
     SelectableList::new(&rows)
         .styles(SelectableListStyles {
             normal: theme.text,
-            focused: theme.selection,
-            selected: theme.selection,
+            focused: selection,
+            selected: selection,
             hovered: theme.focused,
-            pressed: theme.selection,
+            pressed: selection,
             disabled: theme.muted,
             background: theme.raised,
             scrollbar: bmux_tui_components::scrollbar::ScrollbarStyles::default(),

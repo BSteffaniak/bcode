@@ -582,15 +582,15 @@ fn session_item(session: &SessionSummary, muted: Style) -> ListItem {
     let cwd = display_from_current_dir(&session.working_directory).to_string();
     let mut spans = vec![
         Span::styled(display_name, Style::new().add_modifier(Modifier::BOLD)),
-        Span::raw("  "),
-        Span::styled(id, muted),
-        Span::raw("  "),
+        Span::raw("  ·  "),
         Span::styled(cwd, muted),
     ];
     if let Some(label) = session_location_label(session) {
-        spans.push(Span::raw("  "));
+        spans.push(Span::raw("  ·  "));
         spans.push(Span::styled(label, muted));
     }
+    spans.push(Span::raw("  ·  "));
+    spans.push(Span::styled(format!("#{}", &id[..8]), muted));
     Line::from_spans(spans)
 }
 
