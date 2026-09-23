@@ -114,9 +114,15 @@ impl RustPlugin for WebSearchPlugin {
         Ok(())
     }
     fn register_auth_providers(&mut self, registrar: AuthRegistrar) -> Result<(), PluginError> {
-        registrar
-            .register(&exa_auth_provider_contribution())
-            .map_err(|error| PluginError::failed(format!("failed to register Exa auth: {error}")))
+        for contribution in web_auth_provider_contributions() {
+            registrar.register(&contribution).map_err(|error| {
+                PluginError::failed(format!(
+                    "failed to register {} auth: {error}",
+                    contribution.display_name
+                ))
+            })?;
+        }
+        Ok(())
     }
 
     fn invoke_service(&mut self, context: NativeServiceContext) -> ServiceResponse {
@@ -128,6 +134,61 @@ impl RustPlugin for WebSearchPlugin {
             ),
         }
     }
+}
+
+const WEB_API_KEY_PROVIDERS: &[(&str, &str, &[&str])] = &[
+    (
+        "brave",
+        "Brave Search",
+        &["BCODE_WEB_SEARCH_API_KEY", "BRAVE_SEARCH_API_KEY"],
+    ),
+    ("tavily", "Tavily", &["TAVILY_API_KEY"]),
+    (
+        "perplexity",
+        "Perplexity",
+        &["PERPLEXITY_API_KEY", "PPLX_API_KEY"],
+    ),
+    ("gemini", "Gemini", &["GEMINI_API_KEY", "GOOGLE_API_KEY"]),
+    ("serper", "Serper", &["SERPER_API_KEY"]),
+    ("serpapi", "SerpAPI", &["SERPAPI_API_KEY"]),
+];
+
+fn web_auth_provider_contributions() -> Vec<AuthProviderContribution> {
+    let mut providers = vec![exa_auth_provider_contribution()];
+    for &(provider_id, display_name, names) in WEB_API_KEY_PROVIDERS {
+        providers.push(AuthProviderContribution {
+            schema_version: AUTH_PROVIDER_CONTRIBUTION_SCHEMA_VERSION,
+            provider_id: provider_id.to_owned(),
+            display_name: display_name.to_owned(),
+            methods: vec![AuthMethodContribution::SecretFields {
+                method_id: "api_key".to_owned(),
+                display_name: "API key".to_owned(),
+                fields: vec![AuthSecretField {
+                    credential_id: "api_key".to_owned(),
+                    storage_key: names[0].to_owned(),
+                    prompt: format!("{display_name} API key"),
+                    optional: false,
+                    validation: AuthSecretValidation {
+                        min_bytes: Some(1),
+                        max_bytes: Some(512),
+                        required_prefix: None,
+                    },
+                    discovery_sources: names
+                        .iter()
+                        .map(
+                            |name| bcode_provider_auth_models::AuthCredentialSource::Environment {
+                                name: (*name).to_owned(),
+                            },
+                        )
+                        .collect(),
+                    invocation_env: names.iter().map(|name| (*name).to_owned()).collect(),
+                }],
+                supports_verification: false,
+                supports_revocation: false,
+            }],
+        });
+    }
+    providers
 }
 
 fn exa_auth_provider_contribution() -> AuthProviderContribution {
@@ -215,6 +276,7 @@ impl WebSearchPlugin {
             ),
             "web.fetch" => self.invoke_fetch(
                 &context.config,
+                ProviderCredentials::new(context.credentials()),
                 &context.cancellation,
                 &invocation,
                 context.events,
@@ -279,6 +341,7 @@ impl WebSearchPlugin {
     fn invoke_fetch(
         &self,
         config: &bcode_plugin_sdk::PluginConfigContext,
+        credentials: ProviderCredentials,
         cancellation: &bcode_plugin_sdk::ServiceCancellation,
         invocation: &ToolInvocationRequest,
         events: ServiceEventEmitter,
@@ -298,7 +361,7 @@ impl WebSearchPlugin {
         let progress = ProgressReporter::new(events, invocation.tool_call_id.clone());
         progress.emit(format!("fetch: requesting {}", request.url));
         match runtime.block_on(run_cancellable(
-            fetch_async(request, plugin_config, Some(progress)),
+            fetch_async(request, plugin_config, credentials, Some(progress)),
             cancellation.clone(),
         )) {
             Ok(Ok(response)) => json_tool_response_with_artifact(
@@ -493,20 +556,28 @@ impl CredentialSource {
 
 #[derive(Clone)]
 struct ProviderCredentials {
-    exa_api_key: Option<String>,
+    keys: std::collections::BTreeMap<String, String>,
 }
 
 impl ProviderCredentials {
     fn new(credentials: bcode_plugin_sdk::PluginCredentials<'_>) -> Self {
-        Self {
-            exa_api_key: credentials
-                .get(EXA_PROVIDER_ID, EXA_CREDENTIAL_ID)
-                .map(str::to_owned),
-        }
+        let keys = std::iter::once(EXA_PROVIDER_ID)
+            .chain(WEB_API_KEY_PROVIDERS.iter().map(|(id, _, _)| *id))
+            .filter_map(|provider| {
+                credentials
+                    .get(provider, "api_key")
+                    .map(|value| (provider.to_owned(), value.to_owned()))
+            })
+            .collect();
+        Self { keys }
+    }
+
+    fn key(&self, provider_id: &str) -> Option<&str> {
+        self.keys.get(provider_id).map(String::as_str)
     }
 
     fn exa(&self, config: &ProviderConfig) -> Option<(&str, CredentialSource)> {
-        if let Some(value) = self.exa_api_key.as_deref() {
+        if let Some(value) = self.key(EXA_PROVIDER_ID) {
             let source = match config.api_key.as_ref() {
                 Some(SecretRef::Env { name }) if env_value(&[name.as_str()]).is_some() => {
                     CredentialSource::ExplicitReference
@@ -520,8 +591,8 @@ impl ProviderCredentials {
     }
 
     fn exa_key(&self, _config: &ProviderConfig) -> Result<String, WebError> {
-        if let Some(value) = &self.exa_api_key {
-            return Ok(value.clone());
+        if let Some(value) = self.key(EXA_PROVIDER_ID) {
+            return Ok(value.to_owned());
         }
         env_value(&[EXA_STORAGE_KEY]).ok_or(WebError::MissingProvider)
     }
@@ -835,13 +906,13 @@ async fn search_async(
         progress.emit(format!("search: provider selected: {provider}"));
     }
     let response = match provider.as_str() {
-        "brave" => search_brave(request, &config).await,
-        "tavily" => search_tavily(request, &config).await,
+        "brave" => search_brave(request, &config, &credentials).await,
+        "tavily" => search_tavily(request, &config, &credentials).await,
         "exa" => search_exa(request, &config, &credentials).await,
-        "perplexity" | "pplx" => search_perplexity(request, &config).await,
-        "gemini" | "google_gemini" => search_gemini(request, &config).await,
-        "serper" => search_serper(request, &config).await,
-        "serpapi" | "serp_api" => search_serpapi(request, &config).await,
+        "perplexity" | "pplx" => search_perplexity(request, &config, &credentials).await,
+        "gemini" | "google_gemini" => search_gemini(request, &config, &credentials).await,
+        "serper" => search_serper(request, &config, &credentials).await,
+        "serpapi" | "serp_api" => search_serpapi(request, &config, &credentials).await,
         "model_native" => {
             search_model_native(&request, &bridge, &invocation_id, &preparation_descriptor)
         }
@@ -1026,9 +1097,12 @@ fn search_model_native(
 async fn search_brave(
     request: SearchRequest,
     config: &WebSearchConfig,
+    credentials: &ProviderCredentials,
 ) -> Result<SearchResponse, WebError> {
     let api_key = provider_key(
         &config.providers.brave,
+        "brave",
+        credentials,
         &["BCODE_WEB_SEARCH_API_KEY", "BRAVE_SEARCH_API_KEY"],
     )?;
     let max_results = max_results(&request, config);
@@ -1071,8 +1145,14 @@ async fn search_brave(
 async fn search_tavily(
     request: SearchRequest,
     config: &WebSearchConfig,
+    credentials: &ProviderCredentials,
 ) -> Result<SearchResponse, WebError> {
-    let api_key = provider_key(&config.providers.tavily, &["TAVILY_API_KEY"])?;
+    let api_key = provider_key(
+        &config.providers.tavily,
+        "tavily",
+        credentials,
+        &["TAVILY_API_KEY"],
+    )?;
     let max_results = max_results(&request, config);
     let client = client(request.timeout_ms.or(config.timeout_ms))?;
     let body = json!({
@@ -1143,9 +1223,12 @@ async fn search_exa(
 async fn search_perplexity(
     request: SearchRequest,
     config: &WebSearchConfig,
+    credentials: &ProviderCredentials,
 ) -> Result<SearchResponse, WebError> {
     let api_key = provider_key(
         &config.providers.perplexity,
+        "perplexity",
+        credentials,
         &["PERPLEXITY_API_KEY", "PPLX_API_KEY"],
     )?;
     let max_results = max_results(&request, config);
@@ -1202,9 +1285,12 @@ async fn search_perplexity(
 async fn search_gemini(
     request: SearchRequest,
     config: &WebSearchConfig,
+    credentials: &ProviderCredentials,
 ) -> Result<SearchResponse, WebError> {
     let api_key = provider_key(
         &config.providers.gemini,
+        "gemini",
+        credentials,
         &["GEMINI_API_KEY", "GOOGLE_API_KEY"],
     )?;
     let max_results = max_results(&request, config);
@@ -1257,8 +1343,14 @@ async fn search_gemini(
 async fn search_serper(
     request: SearchRequest,
     config: &WebSearchConfig,
+    credentials: &ProviderCredentials,
 ) -> Result<SearchResponse, WebError> {
-    let api_key = provider_key(&config.providers.serper, &["SERPER_API_KEY"])?;
+    let api_key = provider_key(
+        &config.providers.serper,
+        "serper",
+        credentials,
+        &["SERPER_API_KEY"],
+    )?;
     let max_results = max_results(&request, config);
     let client = client(request.timeout_ms.or(config.timeout_ms))?;
     let body = json!({ "q": scoped_query(&request), "num": max_results });
@@ -1292,8 +1384,14 @@ async fn search_serper(
 async fn search_serpapi(
     request: SearchRequest,
     config: &WebSearchConfig,
+    credentials: &ProviderCredentials,
 ) -> Result<SearchResponse, WebError> {
-    let api_key = provider_key(&config.providers.serpapi, &["SERPAPI_API_KEY"])?;
+    let api_key = provider_key(
+        &config.providers.serpapi,
+        "serpapi",
+        credentials,
+        &["SERPAPI_API_KEY"],
+    )?;
     let max_results = max_results(&request, config);
     let client = client(request.timeout_ms.or(config.timeout_ms))?;
     let text = checked_text(
@@ -1433,6 +1531,7 @@ fn percent_decode(input: &str) -> String {
 async fn fetch_async(
     request: FetchRequest,
     config: WebSearchConfig,
+    credentials: ProviderCredentials,
     progress: Option<ProgressReporter>,
 ) -> Result<FetchResponse, WebError> {
     validate_url(&request.url)?;
@@ -1441,7 +1540,7 @@ async fn fetch_async(
             progress.emit("fetch: using rendered fetch adapter");
         }
         let mut response = fetch_rendered(&request, &config)?;
-        apply_prompt_extraction(&mut response, &request, &config).await?;
+        apply_prompt_extraction(&mut response, &request, &config, &credentials).await?;
         return Ok(response);
     }
     let fallbacks = fetch_fallbacks(&config);
@@ -1457,7 +1556,7 @@ async fn fetch_async(
     } else {
         plain_result?
     };
-    apply_prompt_extraction(&mut response, &request, &config).await?;
+    apply_prompt_extraction(&mut response, &request, &config, &credentials).await?;
     if let Some(progress) = &progress {
         progress.emit(format!(
             "fetch: extracted {} bytes via {}",
@@ -1472,6 +1571,7 @@ async fn apply_prompt_extraction(
     response: &mut FetchResponse,
     request: &FetchRequest,
     config: &WebSearchConfig,
+    credentials: &ProviderCredentials,
 ) -> Result<(), WebError> {
     let Some(prompt) = request
         .prompt
@@ -1481,11 +1581,13 @@ async fn apply_prompt_extraction(
     else {
         return Ok(());
     };
-    let provider = fetch_extraction_provider(request, config);
+    let provider = fetch_extraction_provider(request, config, credentials);
     let extracted = match provider.as_str() {
-        "perplexity" | "pplx" => extract_with_perplexity(prompt, response, request, config).await?,
+        "perplexity" | "pplx" => {
+            extract_with_perplexity(prompt, response, request, config, credentials).await?
+        }
         "gemini" | "google_gemini" => {
-            extract_with_gemini(prompt, response, request, config).await?
+            extract_with_gemini(prompt, response, request, config, credentials).await?
         }
         "none" | "content" => prompt_response(request, &response.text).unwrap_or_default(),
         _ => {
@@ -1499,7 +1601,11 @@ async fn apply_prompt_extraction(
     Ok(())
 }
 
-fn fetch_extraction_provider(request: &FetchRequest, config: &WebSearchConfig) -> String {
+fn fetch_extraction_provider(
+    request: &FetchRequest,
+    config: &WebSearchConfig,
+    credentials: &ProviderCredentials,
+) -> String {
     let provider = request
         .provider
         .clone()
@@ -1512,6 +1618,8 @@ fn fetch_extraction_provider(request: &FetchRequest, config: &WebSearchConfig) -
     }
     if provider_key(
         &config.providers.gemini,
+        "gemini",
+        credentials,
         &["GEMINI_API_KEY", "GOOGLE_API_KEY"],
     )
     .is_ok()
@@ -1520,6 +1628,8 @@ fn fetch_extraction_provider(request: &FetchRequest, config: &WebSearchConfig) -
     }
     if provider_key(
         &config.providers.perplexity,
+        "perplexity",
+        credentials,
         &["PERPLEXITY_API_KEY", "PPLX_API_KEY"],
     )
     .is_ok()
@@ -1534,9 +1644,12 @@ async fn extract_with_perplexity(
     response: &FetchResponse,
     request: &FetchRequest,
     config: &WebSearchConfig,
+    credentials: &ProviderCredentials,
 ) -> Result<String, WebError> {
     let api_key = provider_key(
         &config.providers.perplexity,
+        "perplexity",
+        credentials,
         &["PERPLEXITY_API_KEY", "PPLX_API_KEY"],
     )?;
     let client = client(request.timeout_ms.or(config.timeout_ms))?;
@@ -1571,9 +1684,12 @@ async fn extract_with_gemini(
     response: &FetchResponse,
     request: &FetchRequest,
     config: &WebSearchConfig,
+    credentials: &ProviderCredentials,
 ) -> Result<String, WebError> {
     let api_key = provider_key(
         &config.providers.gemini,
+        "gemini",
+        credentials,
         &["GEMINI_API_KEY", "GOOGLE_API_KEY"],
     )?;
     let client = client(request.timeout_ms.or(config.timeout_ms))?;
@@ -2042,10 +2158,41 @@ fn status_response(
     let available = provider
         .as_deref()
         .is_some_and(|provider| search_provider_available(provider, config, credentials));
-    let credential = provider
-        .as_deref()
-        .filter(|provider| *provider == EXA_PROVIDER_ID)
-        .and_then(|_| credentials.exa(&config.providers.exa));
+    let credential = provider.as_deref().and_then(|provider| {
+        if provider == EXA_PROVIDER_ID {
+            return credentials
+                .exa(&config.providers.exa)
+                .map(|(_, source)| source);
+        }
+        if !available {
+            return None;
+        }
+        let configured = match provider {
+            "brave" => &config.providers.brave,
+            "tavily" => &config.providers.tavily,
+            "perplexity" | "pplx" => &config.providers.perplexity,
+            "gemini" | "google_gemini" => &config.providers.gemini,
+            "serper" => &config.providers.serper,
+            "serpapi" | "serp_api" => &config.providers.serpapi,
+            _ => return None,
+        };
+        if configured
+            .api_key
+            .as_ref()
+            .and_then(SecretRef::resolve_legacy)
+            .is_some()
+        {
+            return None; // Preserve legacy status for explicit non-Exa references.
+        }
+        credentials
+            .key(match provider {
+                "pplx" => "perplexity",
+                "google_gemini" => "gemini",
+                "serp_api" => "serpapi",
+                provider => provider,
+            })
+            .map(|_| CredentialSource::IntegratedAuth)
+    });
     let quality = provider
         .as_deref()
         .filter(|_| available)
@@ -2073,7 +2220,7 @@ fn status_response(
             available,
             provider,
             quality,
-            credential_source: credential.map(|(_, source)| source.as_str().to_owned()),
+            credential_source: credential.map(|source| source.as_str().to_owned()),
             credential_owner: credential.map(|_| WEB_SEARCH_PLUGIN_ID.to_owned()),
             configured_providers: configured,
             recommended,
@@ -2103,25 +2250,47 @@ fn search_provider_available(
     match provider {
         "brave" => provider_key(
             &config.providers.brave,
+            "brave",
+            credentials,
             &["BCODE_WEB_SEARCH_API_KEY", "BRAVE_SEARCH_API_KEY"],
         )
         .is_ok(),
-        "tavily" => provider_key(&config.providers.tavily, &["TAVILY_API_KEY"]).is_ok(),
+        "tavily" => provider_key(
+            &config.providers.tavily,
+            "tavily",
+            credentials,
+            &["TAVILY_API_KEY"],
+        )
+        .is_ok(),
         "exa" => credentials.exa(&config.providers.exa).is_some(),
         "perplexity" | "pplx" => provider_key(
             &config.providers.perplexity,
+            "perplexity",
+            credentials,
             &["PERPLEXITY_API_KEY", "PPLX_API_KEY"],
         )
         .is_ok(),
         "gemini" | "google_gemini" => provider_key(
             &config.providers.gemini,
+            "gemini",
+            credentials,
             &["GEMINI_API_KEY", "GOOGLE_API_KEY"],
         )
         .is_ok(),
-        "serper" => provider_key(&config.providers.serper, &["SERPER_API_KEY"]).is_ok(),
-        "serpapi" | "serp_api" => {
-            provider_key(&config.providers.serpapi, &["SERPAPI_API_KEY"]).is_ok()
-        }
+        "serper" => provider_key(
+            &config.providers.serper,
+            "serper",
+            credentials,
+            &["SERPER_API_KEY"],
+        )
+        .is_ok(),
+        "serpapi" | "serp_api" => provider_key(
+            &config.providers.serpapi,
+            "serpapi",
+            credentials,
+            &["SERPAPI_API_KEY"],
+        )
+        .is_ok(),
         "model_native" => config.model_native_available,
         "duckduckgo_html" => config.allow_best_effort_no_key,
         _ => false,
@@ -2148,6 +2317,7 @@ fn configured_search_providers(
         .as_ref()
         .and_then(SecretRef::resolve_legacy)
         .is_some()
+        || credentials.key("brave").is_some()
         || env_value(&["BCODE_WEB_SEARCH_API_KEY", "BRAVE_SEARCH_API_KEY"]).is_some()
     {
         providers.push("brave".to_string());
@@ -2159,6 +2329,7 @@ fn configured_search_providers(
         .as_ref()
         .and_then(SecretRef::resolve_legacy)
         .is_some()
+        || credentials.key("tavily").is_some()
         || env_value(&["TAVILY_API_KEY"]).is_some()
     {
         providers.push("tavily".to_string());
@@ -2173,6 +2344,7 @@ fn configured_search_providers(
         .as_ref()
         .and_then(SecretRef::resolve_legacy)
         .is_some()
+        || credentials.key("perplexity").is_some()
         || env_value(&["PERPLEXITY_API_KEY", "PPLX_API_KEY"]).is_some()
     {
         providers.push("perplexity".to_string());
@@ -2184,6 +2356,7 @@ fn configured_search_providers(
         .as_ref()
         .and_then(SecretRef::resolve_legacy)
         .is_some()
+        || credentials.key("gemini").is_some()
         || env_value(&["GEMINI_API_KEY", "GOOGLE_API_KEY"]).is_some()
     {
         providers.push("gemini".to_string());
@@ -2195,6 +2368,7 @@ fn configured_search_providers(
         .as_ref()
         .and_then(SecretRef::resolve_legacy)
         .is_some()
+        || credentials.key("serper").is_some()
         || env_value(&["SERPER_API_KEY"]).is_some()
     {
         providers.push("serper".to_string());
@@ -2206,6 +2380,7 @@ fn configured_search_providers(
         .as_ref()
         .and_then(SecretRef::resolve_legacy)
         .is_some()
+        || credentials.key("serpapi").is_some()
         || env_value(&["SERPAPI_API_KEY"]).is_some()
     {
         providers.push("serpapi".to_string());
@@ -2306,6 +2481,7 @@ fn search_provider(
         .as_ref()
         .and_then(SecretRef::resolve_legacy)
         .is_some()
+        || credentials.key("brave").is_some()
         || env_value(&["BCODE_WEB_SEARCH_API_KEY", "BRAVE_SEARCH_API_KEY"]).is_some()
     {
         return Ok("brave".to_string());
@@ -2317,6 +2493,7 @@ fn search_provider(
         .as_ref()
         .and_then(SecretRef::resolve_legacy)
         .is_some()
+        || credentials.key("tavily").is_some()
         || env_value(&["TAVILY_API_KEY"]).is_some()
     {
         return Ok("tavily".to_string());
@@ -2331,6 +2508,7 @@ fn search_provider(
         .as_ref()
         .and_then(SecretRef::resolve_legacy)
         .is_some()
+        || credentials.key("perplexity").is_some()
         || env_value(&["PERPLEXITY_API_KEY", "PPLX_API_KEY"]).is_some()
     {
         return Ok("perplexity".to_string());
@@ -2342,6 +2520,7 @@ fn search_provider(
         .as_ref()
         .and_then(SecretRef::resolve_legacy)
         .is_some()
+        || credentials.key("gemini").is_some()
         || env_value(&["GEMINI_API_KEY", "GOOGLE_API_KEY"]).is_some()
     {
         return Ok("gemini".to_string());
@@ -2353,6 +2532,7 @@ fn search_provider(
         .as_ref()
         .and_then(SecretRef::resolve_legacy)
         .is_some()
+        || credentials.key("serper").is_some()
         || env_value(&["SERPER_API_KEY"]).is_some()
     {
         return Ok("serper".to_string());
@@ -2364,6 +2544,7 @@ fn search_provider(
         .as_ref()
         .and_then(SecretRef::resolve_legacy)
         .is_some()
+        || credentials.key("serpapi").is_some()
         || env_value(&["SERPAPI_API_KEY"]).is_some()
     {
         return Ok("serpapi".to_string());
@@ -2403,11 +2584,19 @@ fn urls_from_text(text: &str) -> Vec<String> {
         .collect()
 }
 
-fn provider_key(config: &ProviderConfig, names: &[&str]) -> Result<String, WebError> {
+fn provider_key(
+    config: &ProviderConfig,
+    provider_id: &str,
+    credentials: &ProviderCredentials,
+    names: &[&str],
+) -> Result<String, WebError> {
+    // Material is resolved only for the invoking plugin and requested provider.
+    // Never attempt a different provider's key after the caller has selected a provider.
     config
         .api_key
         .as_ref()
         .and_then(SecretRef::resolve_legacy)
+        .or_else(|| credentials.key(provider_id).map(str::to_owned))
         .or_else(|| env_value(names))
         .ok_or(WebError::MissingProvider)
 }
@@ -2436,6 +2625,26 @@ async fn checked_text(response: reqwest::Response) -> Result<String, WebError> {
 }
 
 fn env_value(names: &[&str]) -> Option<String> {
+    // Use the provider-owned declarations for conventional keys. Explicitly configured
+    // arbitrary environment references retain their original first-nonblank behavior.
+    static DECLARED: std::sync::OnceLock<Vec<AuthProviderContribution>> =
+        std::sync::OnceLock::new();
+    for provider in DECLARED.get_or_init(web_auth_provider_contributions) {
+        let AuthMethodContribution::SecretFields { fields, .. } = &provider.methods[0] else {
+            continue;
+        };
+        let field = &fields[0];
+        if field
+            .invocation_env
+            .iter()
+            .map(String::as_str)
+            .eq(names.iter().copied())
+        {
+            return field
+                .first_invocation_env_value(|name| env::var(name).ok())
+                .map(|(_, value)| value);
+        }
+    }
     names.iter().find_map(|name| match env::var(name) {
         Ok(value) if !value.trim().is_empty() => Some(value),
         _ => None,
@@ -2820,6 +3029,40 @@ mod tests {
     use super::*;
 
     #[test]
+    fn registered_web_provider_keys_preserve_conventional_order() {
+        for (provider, expected) in [
+            (
+                "brave",
+                &["BCODE_WEB_SEARCH_API_KEY", "BRAVE_SEARCH_API_KEY"][..],
+            ),
+            ("tavily", &["TAVILY_API_KEY"][..]),
+            ("exa", &["EXA_API_KEY"][..]),
+            ("perplexity", &["PERPLEXITY_API_KEY", "PPLX_API_KEY"][..]),
+            ("gemini", &["GEMINI_API_KEY", "GOOGLE_API_KEY"][..]),
+            ("serper", &["SERPER_API_KEY"][..]),
+            ("serpapi", &["SERPAPI_API_KEY"][..]),
+        ] {
+            let contribution = web_auth_provider_contributions()
+                .into_iter()
+                .find(|entry| entry.provider_id == provider)
+                .expect("provider registered");
+            contribution.validate().expect("valid provider");
+            let AuthMethodContribution::SecretFields { fields, .. } = &contribution.methods[0]
+            else {
+                panic!("API-key provider");
+            };
+            assert_eq!(
+                fields[0]
+                    .invocation_env
+                    .iter()
+                    .map(String::as_str)
+                    .collect::<Vec<_>>(),
+                expected
+            );
+        }
+    }
+
+    #[test]
     fn exa_auth_registration_declares_conventional_environment_source() {
         let contribution = exa_auth_provider_contribution();
         contribution.validate().unwrap();
@@ -2940,11 +3183,16 @@ mod tests {
         let registrations = AUTH_REGISTRATIONS
             .lock()
             .expect("auth registration collector");
-        assert_eq!(registrations.len(), 1);
-        let contribution: AuthProviderContribution =
-            serde_json::from_slice(&registrations[0]).expect("registration decodes");
+        assert_eq!(registrations.len(), web_auth_provider_contributions().len());
+        for (payload, expected) in registrations.iter().zip(web_auth_provider_contributions()) {
+            let contribution: AuthProviderContribution =
+                serde_json::from_slice(payload).expect("registration decodes");
+            assert_eq!(contribution, expected);
+            contribution
+                .validate()
+                .expect("registered provider is valid");
+        }
         drop(registrations);
-        assert_eq!(contribution, exa_auth_provider_contribution());
     }
 
     #[test]
@@ -2969,6 +3217,131 @@ mod tests {
         assert_eq!(fields.len(), 1);
         assert_eq!(fields[0].credential_id, EXA_CREDENTIAL_ID);
         assert_eq!(fields[0].storage_key, EXA_STORAGE_KEY);
+    }
+
+    #[test]
+    fn web_key_source_precedence_keeps_explicit_reference_above_stored_key() {
+        let _env = ExaEnvGuard::set(None);
+        let name = "BCODE_TEST_WEB_EXPLICIT_REFERENCE";
+        let previous = std::env::var_os(name);
+        unsafe { std::env::set_var(name, "explicit-value") };
+        let config = ProviderConfig {
+            api_key: Some(SecretRef::Env { name: name.into() }),
+        };
+        let mut context = bcode_plugin_sdk::PluginConfigContext::default();
+        context.secrets.insert(
+            format!("{WEB_SEARCH_PLUGIN_ID}/tavily/api_key"),
+            "stored-value".into(),
+        );
+        let credentials = provider_credentials(&context);
+        assert_eq!(
+            provider_key(&config, "tavily", &credentials, &["BCODE_UNUSED_KEY"]).unwrap(),
+            "explicit-value"
+        );
+        match previous {
+            Some(value) => unsafe { std::env::set_var(name, value) },
+            None => unsafe { std::env::remove_var(name) },
+        }
+    }
+
+    #[test]
+    fn every_registered_web_provider_consumes_only_its_owned_key() {
+        for &(provider, _, names) in WEB_API_KEY_PROVIDERS {
+            let mut context = bcode_plugin_sdk::PluginConfigContext::default();
+            context.secrets.insert(
+                format!("{WEB_SEARCH_PLUGIN_ID}/{provider}/api_key"),
+                format!("stored-{provider}"),
+            );
+            let credentials = provider_credentials(&context);
+            let config = WebSearchConfig::default();
+            assert_eq!(
+                provider_key(&ProviderConfig::default(), provider, &credentials, names).unwrap(),
+                format!("stored-{provider}")
+            );
+            assert!(search_provider_available(provider, &config, &credentials));
+            assert!(
+                configured_search_providers(&config, &credentials).contains(&provider.to_owned())
+            );
+            let other = WEB_API_KEY_PROVIDERS
+                .iter()
+                .map(|(id, _, _)| *id)
+                .find(|id| *id != provider)
+                .unwrap();
+            assert!(credentials.key(other).is_none());
+        }
+    }
+
+    #[test]
+    fn saved_non_exa_provider_key_is_used_for_selection_search_and_fetch_without_env() {
+        let mut context = bcode_plugin_sdk::PluginConfigContext::default();
+        context.secrets.insert(
+            format!("{WEB_SEARCH_PLUGIN_ID}/gemini/api_key"),
+            "integrated-gemini".into(),
+        );
+        let credentials = provider_credentials(&context);
+        let config = WebSearchConfig::default();
+        assert_eq!(
+            search_provider(None, &config, &credentials).unwrap(),
+            "gemini"
+        );
+        assert_eq!(
+            fetch_extraction_provider(
+                &FetchRequest {
+                    url: "https://example.com".into(),
+                    max_bytes: None,
+                    timeout_ms: None,
+                    render: false,
+                    prompt: None,
+                    provider: None,
+                },
+                &config,
+                &credentials
+            ),
+            "gemini"
+        );
+        assert_eq!(
+            provider_key(
+                &config.providers.gemini,
+                "gemini",
+                &credentials,
+                &["BCODE_UNUSED_KEY"]
+            )
+            .unwrap(),
+            "integrated-gemini"
+        );
+        let status = status_response(&config, &credentials);
+        assert_eq!(
+            status.search.credential_source.as_deref(),
+            Some("integrated_auth")
+        );
+        assert_eq!(
+            status.search.credential_owner.as_deref(),
+            Some(WEB_SEARCH_PLUGIN_ID)
+        );
+        assert!(
+            !serde_json::to_string(&status)
+                .unwrap()
+                .contains("integrated-gemini")
+        );
+        let other = provider_credentials(&bcode_plugin_sdk::PluginConfigContext::default());
+        assert!(
+            provider_key(
+                &config.providers.gemini,
+                "gemini",
+                &other,
+                &["BCODE_UNUSED_KEY"]
+            )
+            .is_err()
+        );
+        assert!(
+            provider_key(
+                &config.providers.brave,
+                "brave",
+                &credentials,
+                &["BCODE_UNUSED_KEY"]
+            )
+            .is_err()
+        );
     }
 
     #[test]

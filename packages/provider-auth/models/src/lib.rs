@@ -457,6 +457,24 @@ pub struct AuthSecretField {
 }
 
 impl AuthSecretField {
+    /// Resolve the first nonblank invocation-time environment value in declaration order.
+    ///
+    /// The caller supplies a scoped reader (for example a client request's transient process
+    /// environment). This does not read global state, import credentials, or enforce a policy
+    /// about conflicting values; callers requiring strict agreement must check that separately.
+    /// Use only after the owning provider's contribution has been validated and selected.
+    #[must_use]
+    pub fn first_invocation_env_value(
+        &self,
+        mut read: impl FnMut(&str) -> Option<String>,
+    ) -> Option<(String, String)> {
+        self.invocation_env.iter().find_map(|name| {
+            read(name)
+                .filter(|value| !value.trim().is_empty())
+                .map(|value| (name.clone(), value))
+        })
+    }
+
     /// Validate this field.
     ///
     /// # Errors
@@ -1261,6 +1279,28 @@ mod tests {
         let decoded = serde_json::from_slice::<AuthProviderContribution>(&encoded)
             .expect("deserialize contribution");
         assert_eq!(decoded, contribution);
+    }
+
+    #[test]
+    fn first_invocation_env_value_obeys_declared_order_and_reader_scope() {
+        let mut contribution = exa_contribution();
+        let AuthMethodContribution::SecretFields { fields, .. } = &mut contribution.methods[0]
+        else {
+            panic!("expected secret fields");
+        };
+        let field = &mut fields[0];
+        field.invocation_env = vec!["BCODE_EXA_API_KEY".into(), "EXA_API_KEY".into()];
+        assert_eq!(
+            field.first_invocation_env_value(
+                |name| (name == "EXA_API_KEY").then(|| "fallback".into())
+            ),
+            Some(("EXA_API_KEY".into(), "fallback".into()))
+        );
+        assert_eq!(
+            field.first_invocation_env_value(|name| Some(name.into())),
+            Some(("BCODE_EXA_API_KEY".into(), "BCODE_EXA_API_KEY".into()))
+        );
+        assert_eq!(field.first_invocation_env_value(|_| None), None);
     }
 
     #[test]

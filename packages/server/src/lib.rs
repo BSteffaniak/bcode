@@ -37048,6 +37048,66 @@ mod tests {
     }
 
     #[test]
+    fn runtime_invocation_secret_resolution_supports_other_web_providers_without_leaking_owner() {
+        let runtime = bcode_config::RuntimeAuthSubscriptions {
+            bindings: BTreeMap::from([(
+                "tavily".into(),
+                bcode_config::RuntimeAuthBinding {
+                    profile: "tavily-profile".into(),
+                    owner_plugin_id: "bcode.web-search".into(),
+                },
+            )]),
+            profiles: BTreeMap::from([(
+                "tavily-profile".into(),
+                bcode_config::RuntimeAuthProfile {
+                    provider_id: "tavily".into(),
+                    owner_plugin_id: "bcode.web-search".into(),
+                    backend: "env".into(),
+                    scheme: "api_key".into(),
+                    storage_profile: "tavily-profile".into(),
+                    vault: PathBuf::from("unused"),
+                    map: BTreeMap::from([(
+                        "api_key".into(),
+                        bcode_config::AuthCredentialMapping {
+                            env: Some("BCODE_TEST_RUNTIME_TAVILY_KEY".into()),
+                            key: None,
+                        },
+                    )]),
+                    device_seal: None,
+                },
+            )]),
+            ..Default::default()
+        };
+        let previous = std::env::var_os("BCODE_TEST_RUNTIME_TAVILY_KEY");
+        unsafe { std::env::set_var("BCODE_TEST_RUNTIME_TAVILY_KEY", "tavily-fixture") };
+        let owned = resolve_invocation_secrets_with_runtime(
+            "bcode.web-search",
+            &bcode_config::BcodeConfig::default(),
+            &serde_json::Value::Null,
+            &runtime,
+        )
+        .expect("owned credential");
+        let other = resolve_invocation_secrets_with_runtime(
+            "bcode.unrelated",
+            &bcode_config::BcodeConfig::default(),
+            &serde_json::Value::Null,
+            &runtime,
+        )
+        .expect("unrelated plugin");
+        match previous {
+            Some(value) => unsafe { std::env::set_var("BCODE_TEST_RUNTIME_TAVILY_KEY", value) },
+            None => unsafe { std::env::remove_var("BCODE_TEST_RUNTIME_TAVILY_KEY") },
+        }
+        assert_eq!(
+            owned
+                .get("bcode.web-search/tavily/api_key")
+                .map(String::as_str),
+            Some("tavily-fixture")
+        );
+        assert!(other.is_empty());
+    }
+
+    #[test]
     fn runtime_invocation_secret_resolution_is_owner_scoped_and_fail_closed() {
         let temp = tempfile::tempdir().expect("tempdir");
         let vault = temp.path().join("vault");

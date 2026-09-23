@@ -511,6 +511,18 @@ fn api_key_invocation_env(storage_key: &str) -> Vec<String> {
     vec![storage_key.to_owned(), conventional.to_owned()]
 }
 
+fn declared_api_key_env_value(
+    context: &ProviderRequestContext,
+    storage_key: &str,
+) -> Option<(String, String)> {
+    let AuthMethodContribution::SecretFields { fields, .. } =
+        api_key_auth_method(storage_key, "API key")
+    else {
+        return None;
+    };
+    fields[0].first_invocation_env_value(|name| context_auth_env_value(context, name))
+}
+
 fn api_key_auth_method(storage_key: &str, prompt: &str) -> AuthMethodContribution {
     AuthMethodContribution::SecretFields {
         method_id: "api_key".to_owned(),
@@ -7874,23 +7886,13 @@ fn openai_auth_settings(
         }
     }
     // XAI takes precedence for generic OpenAI-compatible usage (xAI, Grok, etc.)
-    if let Some(api_key) = context_auth_env_value(context, "BCODE_XAI_API_KEY") {
+    if let Some((source, api_key)) = declared_api_key_env_value(context, "BCODE_XAI_API_KEY") {
         return (
             AuthSettings::ApiKey(api_key),
             AuthDiagnostics {
                 source: "environment".to_string(),
                 mode: "api_key (xai)".to_string(),
-                detail: "environment variable BCODE_XAI_API_KEY".to_string(),
-            },
-        );
-    }
-    if let Some(api_key) = context_auth_env_value(context, "XAI_API_KEY") {
-        return (
-            AuthSettings::ApiKey(api_key),
-            AuthDiagnostics {
-                source: "environment".to_string(),
-                mode: "api_key (xai)".to_string(),
-                detail: "environment variable XAI_API_KEY".to_string(),
+                detail: format!("environment variable {source}"),
             },
         );
     }
@@ -7910,23 +7912,13 @@ fn openai_auth_settings(
             saved_auth_diagnostics(saved, "api_key (xai)", "saved sshenv API key XAI_API_KEY"),
         );
     }
-    if let Some(api_key) = context_auth_env_value(context, "BCODE_OPENAI_API_KEY") {
+    if let Some((source, api_key)) = declared_api_key_env_value(context, "BCODE_OPENAI_API_KEY") {
         return (
             AuthSettings::ApiKey(api_key),
             AuthDiagnostics {
                 source: "environment".to_string(),
                 mode: "api_key".to_string(),
-                detail: "environment variable BCODE_OPENAI_API_KEY".to_string(),
-            },
-        );
-    }
-    if let Some(api_key) = context_auth_env_value(context, "OPENAI_API_KEY") {
-        return (
-            AuthSettings::ApiKey(api_key),
-            AuthDiagnostics {
-                source: "environment".to_string(),
-                mode: "api_key".to_string(),
-                detail: "environment variable OPENAI_API_KEY".to_string(),
+                detail: format!("environment variable {source}"),
             },
         );
     }
@@ -12248,6 +12240,35 @@ mod tests {
 
     fn test_api_key_auth() -> AuthSettings {
         AuthSettings::ApiKey("token".to_string())
+    }
+
+    #[test]
+    fn declared_api_key_selection_preserves_provider_and_source_precedence() {
+        let mut context = ProviderRequestContext {
+            env: BTreeMap::from([
+                ("BCODE_XAI_API_KEY".into(), "xai-primary".into()),
+                ("XAI_API_KEY".into(), "xai-fallback".into()),
+                ("BCODE_OPENAI_API_KEY".into(), "openai-primary".into()),
+                ("OPENAI_API_KEY".into(), "openai-fallback".into()),
+            ]),
+            ..ProviderRequestContext::default()
+        };
+        let saved = SavedOpenAiAuth::default();
+        let (auth, diagnostics) = openai_auth_settings(&saved, &context);
+        assert!(matches!(auth, AuthSettings::ApiKey(value) if value == "xai-primary"));
+        assert!(diagnostics.detail.contains("BCODE_XAI_API_KEY"));
+        context.env.remove("BCODE_XAI_API_KEY");
+        let (auth, diagnostics) = openai_auth_settings(&saved, &context);
+        assert!(matches!(auth, AuthSettings::ApiKey(value) if value == "xai-fallback"));
+        assert!(diagnostics.detail.contains("XAI_API_KEY"));
+        context.env.remove("XAI_API_KEY");
+        let (auth, diagnostics) = openai_auth_settings(&saved, &context);
+        assert!(matches!(auth, AuthSettings::ApiKey(value) if value == "openai-primary"));
+        assert!(diagnostics.detail.contains("BCODE_OPENAI_API_KEY"));
+        context.env.remove("BCODE_OPENAI_API_KEY");
+        let (auth, diagnostics) = openai_auth_settings(&saved, &context);
+        assert!(matches!(auth, AuthSettings::ApiKey(value) if value == "openai-fallback"));
+        assert!(diagnostics.detail.contains("OPENAI_API_KEY"));
     }
 
     #[test]
