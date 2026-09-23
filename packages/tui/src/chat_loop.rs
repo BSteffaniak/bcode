@@ -5308,8 +5308,8 @@ fn apply_session_stream_resynchronization(
         .replace_latest_transcript_window(&attached.history, has_older);
     chat.app.apply_session_summary(&attached.session);
     chat.app.apply_usage_summary(&attached.usage_summary);
-    chat.app
-        .apply_runtime_selection(attached.runtime_selection.clone());
+    chat.agents
+        .apply_runtime_selection(&mut chat.app, attached.runtime_selection.clone());
 
     loop_state
         .artifact_stream

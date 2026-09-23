@@ -1885,7 +1885,11 @@ impl BmuxApp {
     }
 
     /// Apply restored session runtime selection to the app.
-    pub fn apply_runtime_selection(&mut self, selection: bcode_ipc::SessionRuntimeSelection) {
+    pub fn apply_runtime_selection(
+        &mut self,
+        selection: bcode_ipc::SessionRuntimeSelection,
+        agent_accent: Option<String>,
+    ) {
         let provider_plugin_id = selection
             .provider_plugin_id
             .or_else(|| self.selected_provider_plugin_id().map(ToOwned::to_owned));
@@ -1915,11 +1919,9 @@ impl BmuxApp {
             context_occupancy,
         );
         if let Some(agent_id) = selection.agent_id {
-            let pending = self.pending_agent_id.take();
-            let accent = self.pending_agent_accent.take();
-            self.set_current_agent_id(agent_id);
-            self.pending_agent_id = pending;
-            self.pending_agent_accent = accent;
+            self.session_view.set_agent_id(Some(agent_id));
+            self.current_agent_accent = agent_accent;
+            self.sync_theme_target(Instant::now());
         }
         self.refresh_thinking_label();
     }
@@ -5665,10 +5667,14 @@ mod tests {
         let mut app = BmuxApp::new_with_history(None, &[], &[], false);
         app.set_current_agent_id("plan");
         app.set_pending_agent("build", None);
-        app.apply_runtime_selection(bcode_ipc::SessionRuntimeSelection {
-            agent_id: Some("plan".to_owned()),
-            ..Default::default()
-        });
+        app.apply_runtime_selection(
+            bcode_ipc::SessionRuntimeSelection {
+                agent_id: Some("plan".to_owned()),
+                ..Default::default()
+            },
+            Some("#6b7280".to_owned()),
+        );
+        assert_eq!(app.current_agent_accent(), Some("#6b7280"));
         assert_eq!(app.current_agent_id(), "plan");
         assert_eq!(app.display_agent_id(), "build");
         app.set_pending_agent("review", None);

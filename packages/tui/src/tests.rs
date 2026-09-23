@@ -1172,6 +1172,72 @@ fn agent_catalog_applies_configured_accent() {
 }
 
 #[test]
+fn runtime_restore_resolves_agent_accent_and_preserves_pending_selection() {
+    use bmux_tui::style::Color;
+
+    let catalog = super::session_flow::AgentCatalog::from_agents(agent_infos_with_accents(&[
+        ("plan", false, Some("#6b7280")),
+        ("build", true, Some("#22d3ee")),
+    ]));
+    let mut app = BmuxApp::new_with_history(None, &[], &[], false);
+    let mut config = bcode_config::TuiConfig::default();
+    config.theme.accent_transition = bcode_config::TuiAccentTransitionMode::Immediate;
+    app.apply_tui_config(config);
+    catalog.apply_agent_to_app(&mut app, "build");
+
+    for agent_id in ["plan", "build", "plan"] {
+        catalog.apply_runtime_selection(
+            &mut app,
+            bcode_ipc::SessionRuntimeSelection {
+                agent_id: Some(agent_id.to_owned()),
+                ..Default::default()
+            },
+        );
+        assert_eq!(app.current_agent_id(), agent_id);
+        let expected = if agent_id == "plan" {
+            Color::Rgb(107, 114, 128)
+        } else {
+            Color::Rgb(34, 211, 238)
+        };
+        assert_eq!(app.presented_theme().accent, expected);
+    }
+
+    app.set_pending_agent("build", Some("#22d3ee".to_owned()));
+    catalog.apply_runtime_selection(
+        &mut app,
+        bcode_ipc::SessionRuntimeSelection {
+            agent_id: Some("plan".to_owned()),
+            ..Default::default()
+        },
+    );
+    assert_eq!(app.current_agent_accent(), Some("#6b7280"));
+    assert_eq!(app.display_agent_id(), "build");
+    assert_eq!(app.display_agent_accent(), Some("#22d3ee"));
+    assert_eq!(app.presented_theme().accent, Color::Rgb(34, 211, 238));
+    drop(app);
+}
+
+#[test]
+fn runtime_restore_without_agent_preserves_accent_but_unknown_agent_clears_it() {
+    let catalog = super::session_flow::AgentCatalog::default();
+    let mut app = BmuxApp::new_with_history(None, &[], &[], false);
+    app.set_current_agent("plan", Some("#6b7280".to_owned()));
+    catalog.apply_runtime_selection(&mut app, bcode_ipc::SessionRuntimeSelection::default());
+    assert_eq!(app.current_agent_id(), "plan");
+    assert_eq!(app.current_agent_accent(), Some("#6b7280"));
+    catalog.apply_runtime_selection(
+        &mut app,
+        bcode_ipc::SessionRuntimeSelection {
+            agent_id: Some("unknown".to_owned()),
+            ..Default::default()
+        },
+    );
+    assert_eq!(app.current_agent_id(), "unknown");
+    assert_eq!(app.current_agent_accent(), None);
+    drop(app);
+}
+
+#[test]
 fn next_agent_preserves_list_order_and_wraps() {
     let agents = agent_infos(&[("plan", false), ("review", false), ("build", true)]);
 
@@ -2408,8 +2474,13 @@ async fn async_session_open_preserves_typed_draft() {
         pending_effects: super::effects::TuiEffectQueue::default(),
     };
     chat.app.replace_composer_with("draft while opening");
+    chat.agents = super::session_flow::AgentCatalog::from_agents(agent_infos_with_accents(&[(
+        "plan",
+        false,
+        Some("#6b7280"),
+    )]));
     let (_event_sender, event_receiver) = tokio::sync::broadcast::channel::<SessionEvent>(1);
-    let attached = AttachedSessionHistory {
+    let mut attached = AttachedSessionHistory {
         session: session_summary(session_id),
         history: vec![event(
             session_id,
@@ -2430,6 +2501,7 @@ async fn async_session_open_preserves_typed_draft() {
         projection_window: None,
     };
 
+    attached.runtime_selection.agent_id = Some("plan".to_owned());
     super::session_flow::complete_switch_session(
         &mut chat,
         session_id,
@@ -2442,8 +2514,11 @@ async fn async_session_open_preserves_typed_draft() {
         )),
     );
 
+    assert_eq!(chat.app.current_agent_id(), "plan");
+    assert_eq!(chat.app.current_agent_accent(), Some("#6b7280"));
     assert_eq!(chat.app.composer().text(), "draft while opening");
     assert_eq!(chat.app.status(), "session writable and attached");
+    drop(chat);
 }
 
 #[tokio::test]

@@ -232,6 +232,20 @@ impl AgentCatalog {
         self.apply_agent_to_app(app, agent_id);
     }
 
+    /// Restore runtime selection with the restored agent's configured presentation metadata.
+    pub fn apply_runtime_selection(
+        &self,
+        app: &mut BmuxApp,
+        selection: bcode_ipc::SessionRuntimeSelection,
+    ) {
+        let accent = selection
+            .agent_id
+            .as_ref()
+            .and_then(|id| self.by_id.get(id))
+            .and_then(|agent| agent.accent.clone());
+        app.apply_runtime_selection(selection, accent);
+    }
+
     /// Return true when the catalog has no agent profiles.
     #[must_use]
     pub const fn is_empty(&self) -> bool {
@@ -377,8 +391,8 @@ pub fn complete_switch_session(
             }
             chat.app.apply_session_summary(&attached.session);
             chat.app.apply_usage_summary(&attached.usage_summary);
-            chat.app
-                .apply_runtime_selection(attached.runtime_selection.clone());
+            chat.agents
+                .apply_runtime_selection(&mut chat.app, attached.runtime_selection.clone());
             chat.app
                 .set_status("session writable and attached".to_owned());
             if let Some(sequence) = anchor_sequence {
