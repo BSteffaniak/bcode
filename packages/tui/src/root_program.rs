@@ -3863,6 +3863,100 @@ mod tests {
         drop(model);
     }
 
+    #[tokio::test]
+    async fn history_completion_respects_replacement_and_reuses_current_boundary() {
+        use bcode_session_models::{
+            SessionEvent, SessionEventKind, SessionHistoryCursor, SessionHistoryPage,
+        };
+        let session_id = bcode_session_models::SessionId::new();
+        let event = |sequence| SessionEvent {
+            schema_version: bcode_session_models::CURRENT_SESSION_EVENT_SCHEMA_VERSION,
+            sequence,
+            timestamp_ms: sequence,
+            session_id,
+            provenance: None,
+            kind: SessionEventKind::AssistantMessage {
+                text: format!("message {sequence}"),
+            },
+        };
+        let history = [event(10)];
+        let mut model = root_test_model_with_history(session_id, &history);
+        model
+            .chat
+            .app
+            .replace_latest_transcript_window(&history, true);
+        model.chat.app.request_older_history_for_test(2);
+        let cursor = model
+            .chat
+            .app
+            .older_history_cursor()
+            .expect("older boundary");
+        let old_generation = model.chat.app.history_window_generation();
+        assert_eq!(
+            model.loop_state.prepare_runtime_work(
+                &mut model.chat,
+                bmux_tui::geometry::Rect::new(0, 0, 40, 12),
+            ),
+            super::super::invalidation::UiInvalidation::Structural
+        );
+        assert!(model.chat.pending_effects.contains_effect(
+            &super::super::effects::TuiEffect::LoadOlderHistory {
+                session_id,
+                cursor,
+                generation: old_generation,
+            }
+        ));
+        model.chat.pending_effects = super::super::effects::TuiEffectQueue::default();
+        model
+            .chat
+            .app
+            .replace_latest_transcript_window(&history, true);
+        model.chat.app.request_older_history_for_test(2);
+        let new_generation = model.chat.app.history_window_generation();
+        assert_ne!(new_generation, old_generation);
+        assert_eq!(
+            model.loop_state.prepare_runtime_work(
+                &mut model.chat,
+                bmux_tui::geometry::Rect::new(0, 0, 40, 12),
+            ),
+            super::super::invalidation::UiInvalidation::Structural
+        );
+        let result = |generation| super::super::effects::TuiEffectResult::OlderHistoryLoaded {
+            session_id,
+            cursor,
+            generation,
+            result: Ok(SessionHistoryPage {
+                session_id,
+                events: vec![event(9)],
+                compatibility_issues: vec![],
+                next_cursor: Some(SessionHistoryCursor { sequence: 8 }),
+                has_more: true,
+            }),
+        };
+        bmux_tui_runtime::Program::update(
+            &mut model,
+            bmux_tui_runtime::RuntimeEvent::Message(super::BcodeRuntimeMessage::EffectCompleted(
+                Box::new(result(old_generation)),
+            )),
+        )
+        .expect("stale completion");
+        assert!(model.chat.app.loading_older_history());
+        assert_eq!(model.chat.app.older_history_cursor(), Some(cursor));
+        bmux_tui_runtime::Program::update(
+            &mut model,
+            bmux_tui_runtime::RuntimeEvent::Message(super::BcodeRuntimeMessage::EffectCompleted(
+                Box::new(result(new_generation)),
+            )),
+        )
+        .expect("current completion");
+        assert!(!model.chat.app.loading_older_history());
+        assert_eq!(
+            model.chat.app.older_history_cursor(),
+            Some(SessionHistoryCursor { sequence: 8 })
+        );
+        drop(model);
+    }
+
     struct FailingSelectionOutput {
         fail: std::rc::Rc<std::cell::Cell<bool>>,
     }

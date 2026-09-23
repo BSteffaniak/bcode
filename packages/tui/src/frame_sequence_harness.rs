@@ -452,6 +452,68 @@ mod tests {
     }
 
     #[test]
+    fn resumed_boundary_multiple_pages_preserve_newer_navigation_and_tail() {
+        let session_id = SessionId::new();
+        let event = |sequence| {
+            durable(
+                session_id,
+                sequence,
+                SessionEventKind::AssistantMessage {
+                    text: format!("message {sequence}"),
+                },
+            )
+        };
+        let recent = (60..72).map(event).collect::<Vec<_>>();
+        let mut app = BmuxApp::new_with_history(Some(session_id), &recent, &[], true);
+        let initial = TranscriptFrameSequence::new(&mut app, 80, 12).run([TranscriptFrameStep {
+            label: "resumed tail",
+            input: TranscriptFrameInput::Observe,
+        }]);
+        let frames = TranscriptFrameSequence::new(&mut app, 80, 12).run([
+            TranscriptFrameStep {
+                label: "first older boundary",
+                input: TranscriptFrameInput::ScrollUp(initial[0].observation.viewport_top + 3),
+            },
+            TranscriptFrameStep {
+                label: "first page",
+                input: TranscriptFrameInput::PrependHistory {
+                    events: (40..60).map(event).collect(),
+                    has_more: true,
+                },
+            },
+            TranscriptFrameStep {
+                label: "first page again",
+                input: TranscriptFrameInput::Observe,
+            },
+            TranscriptFrameStep {
+                label: "second older boundary",
+                input: TranscriptFrameInput::ScrollUp(usize::MAX / 4),
+            },
+            TranscriptFrameStep {
+                label: "second page",
+                input: TranscriptFrameInput::PrependHistory {
+                    events: (20..40).map(event).collect(),
+                    has_more: false,
+                },
+            },
+            TranscriptFrameStep {
+                label: "reverse to live tail",
+                input: TranscriptFrameInput::ScrollDown(usize::MAX / 4),
+            },
+            TranscriptFrameStep {
+                label: "tail accepted again",
+                input: TranscriptFrameInput::Observe,
+            },
+        ]);
+        assert_eq!(frames[1].observation, frames[2].observation);
+        let after_second_page = &frames[4].observation;
+        assert!(after_second_page.anchor.is_some());
+        assert_eq!(frames[5].observation, frames[6].observation);
+        assert!(frames[5].observation.viewport_top > after_second_page.viewport_top);
+        assert!(frames[5].observation.terminal_items.len() >= recent.len());
+    }
+
+    #[test]
     fn ephemeral_notice_remains_between_durable_frames_after_resize() {
         let session_id = SessionId::new();
         let frames = TranscriptFrameSequence::new(

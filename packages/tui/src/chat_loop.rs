@@ -2502,7 +2502,9 @@ fn maybe_start_older_history_load(chat: &mut ActiveChat, _loop_state: &mut ChatL
         generation,
     };
     let started = !chat.pending_effects.contains_effect(&effect);
-    chat.start_effect(effect);
+    // A replacement window can request the same direction while the old effect
+    // is still running. Replace it; generation/cursor checks fence late results.
+    chat.replace_effect(effect);
     if started {
         chat.app.set_loading_older_history(true);
     }
@@ -2526,7 +2528,7 @@ fn maybe_start_newer_history_load(chat: &mut ActiveChat, _loop_state: &mut ChatL
         generation,
     };
     let started = !chat.pending_effects.contains_effect(&effect);
-    chat.start_effect(effect);
+    chat.replace_effect(effect);
     if started {
         chat.app.set_loading_newer_history(true);
     }

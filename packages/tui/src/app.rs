@@ -3083,6 +3083,19 @@ impl BmuxApp {
     ) -> bool {
         Some(page.session_id) == self.session_id
             && page.compatibility_issues.is_empty()
+            && (!page.has_more || !page.events.is_empty())
+            && page.next_cursor.is_none_or(|next| {
+                page.has_more
+                    && if older {
+                        page.events
+                            .first()
+                            .is_some_and(|first| next.sequence < first.sequence)
+                    } else {
+                        page.events
+                            .last()
+                            .is_some_and(|last| next.sequence > last.sequence)
+                    }
+            })
             && self.accepts_history_page_events(cursor, older, &page.events, page.has_more)
     }
 
@@ -6141,10 +6154,18 @@ mod tests {
             session_id,
             events: vec![event(8)],
             compatibility_issues: Vec::new(),
-            next_cursor: None,
+            next_cursor: Some(bcode_session_models::SessionHistoryCursor { sequence: 7 }),
             has_more: true,
         };
         assert!(app.accepts_history_page_payload(older, true, &page));
+        page.next_cursor = None;
+        assert!(app.accepts_history_page_payload(older, true, &page));
+        page.next_cursor = Some(bcode_session_models::SessionHistoryCursor { sequence: 8 });
+        assert!(!app.accepts_history_page_payload(older, true, &page));
+        page.next_cursor = Some(bcode_session_models::SessionHistoryCursor { sequence: 7 });
+        page.has_more = false;
+        assert!(!app.accepts_history_page_payload(older, true, &page));
+        page.has_more = true;
         page.session_id = bcode_session_models::SessionId::new();
         assert!(!app.accepts_history_page_payload(older, true, &page));
         page.session_id = session_id;
