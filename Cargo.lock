@@ -2084,11 +2084,14 @@ dependencies = [
  "bcode_command",
  "bcode_config",
  "bcode_ipc",
+ "bcode_model",
  "bcode_model_schema",
+ "bcode_plugin",
  "bcode_plugin_sdk",
  "bcode_session_models",
  "bcode_session_view",
  "bcode_session_view_models",
+ "bcode_tool",
  "bcode_workflow",
  "bcode_workflow_store",
  "bmux_keyboard",
@@ -2102,6 +2105,7 @@ dependencies = [
  "serde_json",
  "tempfile",
  "tokio",
+ "toml 1.1.4+spec-1.1.0",
  "uuid",
 ]
 

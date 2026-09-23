@@ -56,6 +56,7 @@ mod continuation;
 mod goal;
 mod goal_document_view;
 mod goal_live;
+mod judgement_evaluation;
 mod progress;
 
 const START_COMMAND: &str = "loop";
@@ -82,6 +83,9 @@ impl RustPlugin for LoopPlugin {
     }
 
     fn invoke_service(&mut self, context: NativeServiceContext) -> ServiceResponse {
+        if context.request.interface_id == bcode_workflow::WORKFLOW_BLOCK_INTERFACE_ID {
+            return judgement_evaluation::invoke(&context);
+        }
         if context.request.interface_id == bcode_session_models::ACTIVITY_PRESENTATION_INTERFACE_ID
             && context.request.operation == bcode_session_models::OP_PROJECT_ACTIVITY
         {
@@ -677,6 +681,7 @@ enum Field {
     Prompt,
     Condition,
     Limit,
+    Evaluation,
 }
 
 impl Field {
@@ -684,15 +689,17 @@ impl Field {
         match self {
             Self::Prompt => Self::Condition,
             Self::Condition => Self::Limit,
-            Self::Limit => Self::Prompt,
+            Self::Limit => Self::Evaluation,
+            Self::Evaluation => Self::Prompt,
         }
     }
 
     const fn previous(self) -> Self {
         match self {
-            Self::Prompt => Self::Limit,
+            Self::Prompt => Self::Evaluation,
             Self::Condition => Self::Prompt,
             Self::Limit => Self::Condition,
+            Self::Evaluation => Self::Limit,
         }
     }
 }
@@ -762,6 +769,7 @@ struct LoopSurface {
     prompt: TextInputState,
     condition: TextInputState,
     limit: TextInputState,
+    evaluation: TextInputState,
     field: Field,
     pending_workflow_start: Option<PluginWorkflowStartRequest>,
     failed_workflow_start: Option<PluginWorkflowStartRequest>,
@@ -777,6 +785,7 @@ struct LoopSurface {
     prompt_area: Rect,
     condition_area: Rect,
     limit_area: Rect,
+    evaluation_area: Rect,
     setup_kind: SetupKind,
     launch_state: LaunchState,
     progress_document: Option<goal::ProgressDocumentSetup>,
@@ -797,6 +806,7 @@ impl LoopSurface {
             prompt: text_state(""),
             condition: text_state(""),
             limit: text_state(&DEFAULT_MAX_ITERATIONS.to_string()),
+            evaluation: text_state(""),
             field: Field::Prompt,
             pending_workflow_start: None,
             failed_workflow_start: None,
@@ -810,6 +820,7 @@ impl LoopSurface {
             prompt_area: Rect::new(0, 0, 0, 0),
             condition_area: Rect::new(0, 0, 0, 0),
             limit_area: Rect::new(0, 0, 0, 0),
+            evaluation_area: Rect::new(0, 0, 0, 0),
             setup_kind: SetupKind::Loop,
             launch_state: LaunchState::Ready,
             progress_document: None,
@@ -825,11 +836,28 @@ impl LoopSurface {
         }
     }
 
+    fn paint_evaluation_field(&mut self, content: Rect, area: Rect, frame: &mut PaintCx<'_, '_>) {
+        let top = self.limit_area.bottom().saturating_add(1);
+        self.evaluation_area = Rect::new(content.x, top, content.width, 4)
+            .intersection(content)
+            .intersection(area);
+        Self::render_input(
+            self.evaluation_area,
+            frame,
+            "Judgement (optional: provider/model/profile/threshold/failure)",
+            &mut self.evaluation,
+            self.field == Field::Evaluation && self.goal_option_focus.is_none(),
+            1,
+            self.theme.as_ref(),
+        );
+    }
+
     const fn active_state_mut(&mut self) -> &mut TextInputState {
         match self.field {
             Field::Prompt => &mut self.prompt,
             Field::Condition => &mut self.condition,
             Field::Limit => &mut self.limit,
+            Field::Evaluation => &mut self.evaluation,
         }
     }
 
@@ -838,6 +866,7 @@ impl LoopSurface {
             Field::Prompt => self.prompt_area,
             Field::Condition => self.condition_area,
             Field::Limit => self.limit_area,
+            Field::Evaluation => self.evaluation_area,
         }
     }
 
@@ -848,6 +877,8 @@ impl LoopSurface {
             self.field = Field::Condition;
         } else if event_click_in(event, self.limit_area) {
             self.field = Field::Limit;
+        } else if event_click_in(event, self.evaluation_area) {
+            self.field = Field::Evaluation;
         }
     }
 
@@ -969,7 +1000,12 @@ impl LoopSurface {
             self.field = Field::Limit;
             return Err("maximum iterations must be a number".to_owned());
         };
-        let input = LoopWorkflowInput::new(prompt, condition, max_iterations)?;
+        let evaluation = input_text(&self.evaluation);
+        let mut input = LoopWorkflowInput::new(prompt, condition, max_iterations)?;
+        input.judgement_evaluation =
+            judgement_evaluation::parse_config(&evaluation).inspect_err(|_| {
+                self.field = Field::Evaluation;
+            })?;
         let spec = if self.progress_document.is_some() {
             goal_workflow_spec(&input)?
         } else {
@@ -991,11 +1027,19 @@ impl LoopSurface {
         )
         .map_err(|error| format!("invalid durable loop request: {error}"))?;
         request.limits.cycle_cap = input.max_iterations;
-        // Reserve initialization attempts as well as both agents in each implementation
-        // iteration. Blocker-resolution retries remain subject to the ordinary run budgets.
+        // Reserve initialization attempts and every node of each implementation iteration.
+        // Blocker-resolution retries remain subject to the ordinary run budgets.
         let initialization = u64::from(self.progress_document.is_some());
-        request.limits.node_execution_cap = (u64::from(input.max_iterations) * 2 + initialization)
-            * (u64::from(request.limits.retry_cap) + 1);
+        let per_iteration = if input.judgement_evaluation.is_some() {
+            3
+        } else {
+            2
+        };
+        request.limits.node_execution_cap = u64::from(input.max_iterations)
+            .checked_mul(per_iteration)
+            .and_then(|count| count.checked_add(initialization))
+            .and_then(|count| count.checked_mul(u64::from(request.limits.retry_cap) + 1))
+            .ok_or("loop node allowance overflow")?;
         Ok(request)
     }
 
@@ -1340,7 +1384,7 @@ impl LoopSurface {
     }
 
     fn paint_footer(&self, content: Rect, frame: &mut PaintCx<'_, '_>) {
-        let status_y = self.limit_area.bottom().saturating_add(1);
+        let status_y = self.evaluation_area.bottom().saturating_add(1);
         if status_y < content.bottom() {
             let status = [StatusSegment::new(&self.status).severity(StatusSeverity::Muted)];
             let status = StatusBarComponent::new("loop.status")
@@ -1460,7 +1504,7 @@ impl PluginTuiSurface for LoopSurface {
     }
 
     fn preferred_height(&mut self, _width: u16) -> u16 {
-        24
+        28
     }
 
     fn render(&mut self, area: Rect, frame: &mut PaintCx<'_, '_>) {
@@ -1478,7 +1522,7 @@ impl PluginTuiSurface for LoopSurface {
             },
         );
         let modal = ModalFrame::new(
-            ModalSizing::new(Size::new(64, 22), Size::new(100, 32), Insets::all(2)),
+            ModalSizing::new(Size::new(64, 26), Size::new(100, 36), Insets::all(2)),
             modal_theme,
         )
         .title(if self.setup_kind == SetupKind::Goal {
@@ -1498,7 +1542,7 @@ impl PluginTuiSurface for LoopSurface {
             |cx| shell.paint(&layout, cx),
         );
         let content = self.paint_goal_options(content.intersection(area), frame);
-        let available = content.height.saturating_sub(8);
+        let available = content.height.saturating_sub(12);
         let prompt_rows = available.saturating_mul(3) / 5;
         let condition_rows = available.saturating_sub(prompt_rows).max(3);
         self.prompt_area = Rect::new(content.x, content.y, content.width, prompt_rows.max(4));
@@ -1556,6 +1600,7 @@ impl PluginTuiSurface for LoopSurface {
             1,
             self.theme.as_ref(),
         );
+        self.paint_evaluation_field(content, area, frame);
         self.paint_footer(content, frame);
     }
 
@@ -1613,11 +1658,15 @@ impl PluginTuiSurface for LoopSurface {
                 self.begin_pending_host_work(host);
                 return action;
             }
-            if stroke.key == KeyCode::Enter && self.field != Field::Limit {
+            if stroke.key == KeyCode::Enter
+                && !matches!(self.field, Field::Limit | Field::Evaluation)
+            {
                 self.active_state_mut().buffer_mut().insert_char('\n');
                 return PluginTuiAction::Redraw;
             }
-            if stroke.key == KeyCode::Enter && self.field == Field::Limit {
+            if stroke.key == KeyCode::Enter
+                && matches!(self.field, Field::Limit | Field::Evaluation)
+            {
                 let action = self.submit(host);
                 self.begin_pending_host_work(host);
                 return action;
@@ -1628,7 +1677,7 @@ impl PluginTuiSurface for LoopSurface {
         }
         self.begin_pending_host_work(host);
         self.focus_from_click(event);
-        if self.field != Field::Limit
+        if !matches!(self.field, Field::Limit | Field::Evaluation)
             && matches!(event, Event::Mouse(mouse) if mouse.position.x >= self.active_area().x && mouse.position.x < self.active_area().right() && mouse.position.y >= self.active_area().y && mouse.position.y < self.active_area().bottom() && matches!(mouse.kind, MouseEventKind::ScrollUp | MouseEventKind::ScrollDown))
         {
             let motion = match event {
@@ -1780,6 +1829,8 @@ struct LoopWorkflowInput {
     implementation_prompt: String,
     stop_condition: String,
     max_iterations: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    judgement_evaluation: Option<judgement_evaluation::EvaluationConfig>,
 }
 
 impl LoopWorkflowInput {
@@ -1813,6 +1864,7 @@ impl LoopWorkflowInput {
             implementation_prompt,
             stop_condition,
             max_iterations,
+            judgement_evaluation: None,
         })
     }
 }
@@ -1824,6 +1876,8 @@ struct LoopWorkflowIteration {
     max_iterations: u32,
     #[serde(default)]
     planning_ready: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    judgement_evaluation: Option<judgement_evaluation::EvaluationConfig>,
     iteration: u32,
     condition_met: bool,
     evidence: Vec<String>,
@@ -1835,6 +1889,8 @@ struct LoopWorkflowEvaluation {
     implementation_prompt: String,
     stop_condition: String,
     max_iterations: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    judgement_evaluation: Option<judgement_evaluation::EvaluationConfig>,
     iteration: u32,
     condition_met: bool,
     #[schemars(length(min = 1), inner(length(min = 1)))]
@@ -2029,6 +2085,9 @@ fn loop_agent_configuration<O: JsonSchema>(
 fn loop_workflow_spec(
     input: &LoopWorkflowInput,
 ) -> Result<bcode_workflow::WorkflowSpec<LoopWorkflowIteration>, String> {
+    if let Some(config) = &input.judgement_evaluation {
+        config.validate().map_err(str::to_string)?;
+    }
     let mut implementation_configuration = loop_agent_configuration::<LoopWorkflowIteration>(
         "Implement the requested work. Complete the authorized work, then report ordinary completion; workflow state is preserved by the host.",
         "build",
@@ -2046,14 +2105,43 @@ fn loop_workflow_spec(
         "loop.evaluation",
         bcode_workflow::NodeKind::Agent,
         serde_json::to_value(loop_agent_configuration::<LoopWorkflowEvaluation>(
-            "Read-only loop completion evaluation. Inspect repository/session state against stop_condition. Preserve implementation_prompt, stop_condition, max_iterations, and iteration. Return condition_met, non-empty concrete evidence, and a concise non-empty summary in the exact structured schema.",
+            "Read-only loop completion evaluation. Inspect repository/session state against stop_condition. Preserve implementation_prompt, stop_condition, max_iterations, iteration, and judgement_evaluation unchanged. Return condition_met, non-empty concrete evidence, and a concise non-empty summary in the exact structured schema. If a judgement evaluator is selected, your condition_met is provisional: gather concrete bounded evidence for that evaluator; do not change its configuration.",
             "plan",
             true,
         ))
         .expect("loop evaluation configuration should serialize"),
         |state: LoopWorkflowIteration, _context| async move { Ok(state) },
     );
-    let cycle =
+    let cycle = if input.judgement_evaluation.is_some() {
+        let block = judgement_evaluation::manifest_block();
+        block.validate().map_err(|error| error.to_string())?;
+        let schema = bcode_workflow::ValueSchema::of::<LoopWorkflowIteration>();
+        if block.input != schema || block.output != schema {
+            return Err("loop judgement block schema does not match workflow state".into());
+        }
+        if block.plugin_id != PLUGIN_ID || block.operation != "loop.judgement.evaluate" {
+            return Err("loop judgement block ownership mismatch".into());
+        }
+        let step = bcode_workflow::Step::configured_task(
+            "loop.judgement.evaluate",
+            bcode_workflow::NodeKind::PluginBlock,
+            serde_json::to_value(block).map_err(|error| error.to_string())?,
+            |state: LoopWorkflowIteration, _context| async move { Ok(state) },
+        );
+        // The agent gathers bounded repository evidence; the block supplies the final verdict.
+        // A false agent verdict may still be independently examined by the judgement model.
+        implementation
+            .agent_execution_target(bcode_workflow::PromptContextTarget::SharedParentSequential)
+            .then(evaluation.agent_execution_target(
+                bcode_workflow::PromptContextTarget::SharedParentSequential,
+            ))
+            .then(step)
+            .repeat_while(
+                "loop.repeat",
+                bcode_workflow::field::<LoopWorkflowIteration>("condition_met").eq(false),
+                input.max_iterations,
+            )
+    } else {
         implementation
             .agent_execution_target(bcode_workflow::PromptContextTarget::SharedParentSequential)
             .then(evaluation.agent_execution_target(
@@ -2063,11 +2151,22 @@ fn loop_workflow_spec(
                 "loop.repeat",
                 bcode_workflow::field::<LoopWorkflowIteration>("condition_met").eq(false),
                 input.max_iterations,
-            );
-    let workflow = bcode_workflow::WorkflowBuilder::new(WORKFLOW_KIND, cycle)
+            )
+    };
+    let mut definition = bcode_workflow::WorkflowBuilder::new(WORKFLOW_KIND, cycle)
         .build()
-        .map_err(|error| error.to_string())?;
-    bcode_workflow::WorkflowSpec::new(WORKFLOW_KIND, &workflow).map_err(|error| error.to_string())
+        .map_err(|error| error.to_string())?
+        .definition()
+        .clone();
+    if input.judgement_evaluation.is_some() {
+        for edge in &mut definition.edges {
+            if edge.from == "loop.evaluation" && edge.to == "loop.judgement.evaluate" {
+                edge.transform = Some(judgement_evaluation::pinned_input_transform());
+            }
+        }
+    }
+    bcode_workflow::WorkflowSpec::from_definition(WORKFLOW_KIND, definition)
+        .map_err(|error| error.to_string())
 }
 
 fn goal_workflow_spec(
@@ -2153,6 +2252,7 @@ fn loop_workflow_initial_value(input: &LoopWorkflowInput) -> LoopWorkflowIterati
         implementation_prompt: input.implementation_prompt.clone(),
         stop_condition: input.stop_condition.clone(),
         max_iterations: input.max_iterations,
+        judgement_evaluation: input.judgement_evaluation.clone(),
         planning_ready: false,
         iteration: 1,
         condition_met: false,
@@ -2530,6 +2630,81 @@ mod tests {
     }
 
     #[test]
+    fn judgement_loop_declares_admitted_plugin_block() {
+        let mut input = LoopWorkflowInput::new("implement".into(), "done".into(), 2).unwrap();
+        input.judgement_evaluation = Some(judgement_evaluation::EvaluationConfig {
+            provider_plugin_id: "bcode.jev".into(),
+            model_id: "jev-1.13.0".into(),
+            auth_profile: String::new(),
+            threshold_percent: 90,
+            on_failure: judgement_evaluation::FailurePolicy::Pause,
+        });
+        let spec = loop_workflow_spec(&input).unwrap();
+        let node = &spec.definition().nodes["loop.judgement.evaluate"];
+        assert_eq!(node.kind, bcode_workflow::NodeKind::PluginBlock);
+        let evaluation_edge = spec
+            .definition()
+            .edges
+            .iter()
+            .find(|edge| edge.from == "loop.evaluation" && edge.to == "loop.judgement.evaluate")
+            .unwrap();
+        let transform = evaluation_edge.transform.as_ref().unwrap();
+        let mut model_output = serde_json::to_value(loop_workflow_initial_value(&input)).unwrap();
+        model_output["judgement_evaluation"]["provider_plugin_id"] =
+            serde_json::json!("bcode.other");
+        model_output["stop_condition"] = serde_json::json!("weaker condition");
+        let pinned = serde_json::to_value(loop_workflow_initial_value(&input)).unwrap();
+        let adapted = transform
+            .evaluate(&[
+                bcode_workflow::WorkflowTransformInput {
+                    name: bcode_workflow::WORKFLOW_TRANSFORM_SOURCE_CURRENT,
+                    value: &model_output,
+                },
+                bcode_workflow::WorkflowTransformInput {
+                    name: bcode_workflow::WORKFLOW_TRANSFORM_SOURCE_STATE,
+                    value: &pinned,
+                },
+            ])
+            .unwrap();
+        assert_eq!(
+            adapted["judgement_evaluation"],
+            pinned["judgement_evaluation"]
+        );
+        assert_eq!(adapted["stop_condition"], pinned["stop_condition"]);
+        assert_eq!(adapted["evidence"], model_output["evidence"]);
+        assert_eq!(
+            node.configuration,
+            serde_json::to_value(judgement_evaluation::manifest_block()).unwrap()
+        );
+        let schema = bcode_workflow::ValueSchema::of::<LoopWorkflowIteration>();
+        assert_eq!(judgement_evaluation::manifest_block().input, schema);
+        assert_eq!(judgement_evaluation::manifest_block().output, schema);
+        let goal = goal_workflow_spec(&input).unwrap();
+        let goal_admission = goal
+            .definition()
+            .production_admission(&bcode_workflow::WorkflowProductionCapabilities::current())
+            .unwrap();
+        assert!(
+            goal_admission.is_supported(),
+            "{:?}",
+            goal_admission.diagnostics
+        );
+        assert_eq!(
+            goal.definition().nodes["goal.readiness"].kind,
+            bcode_workflow::NodeKind::Branch
+        );
+        assert_eq!(
+            goal.definition().nodes["loop.judgement.evaluate"].kind,
+            bcode_workflow::NodeKind::PluginBlock
+        );
+        let admission = spec
+            .definition()
+            .production_admission(&bcode_workflow::WorkflowProductionCapabilities::current())
+            .unwrap();
+        assert!(admission.is_supported(), "{:?}", admission.diagnostics);
+    }
+
+    #[test]
     fn reference_workflow_state_envelope_is_versioned_bounded_and_explicit() {
         let state = ReferenceWorkflowState {
             version: REFERENCE_WORKFLOW_STATE_VERSION,
@@ -2881,6 +3056,7 @@ mod tests {
             implementation_prompt: "continue implementation".to_string(),
             stop_condition: "all work complete".to_string(),
             max_iterations: 20,
+            judgement_evaluation: None,
         };
         let spec = loop_workflow_spec(&input).expect("loop workflow");
         let definition = spec.definition();

@@ -26978,6 +26978,78 @@ fn server_model_provider_bridge(
     })
 }
 
+fn server_workflow_judgement_resolution(
+    state: &Arc<ServerState>,
+    runtime: &tokio::runtime::Handle,
+    request: bcode_tool::ToolInvocationServiceRequest,
+    cancellation: &bcode_plugin_sdk::ServiceCancellation,
+) -> ToolInvocationServiceResolution {
+    if request.operation != bcode_model::judgement::OP_WORKFLOW_JUDGE
+        || request.route_id.as_deref()
+            != Some(bcode_model::judgement::WORKFLOW_APPLICATION_INTERFACE_ID)
+    {
+        return ToolInvocationServiceResolution::Unsupported;
+    }
+    if cancellation.is_cancelled() {
+        return ToolInvocationServiceResolution::Cancelled;
+    }
+    let input_bytes = serde_json::to_vec(&request.payload).map_or(usize::MAX, |bytes| bytes.len());
+    if input_bytes > bcode_model::judgement::MAX_REQUEST_BYTES + 1024 {
+        return ToolInvocationServiceResolution::Failed {
+            code: "invalid_request".into(),
+            message: "workflow judgement request exceeds size limit".into(),
+        };
+    }
+    let Ok(input) =
+        serde_json::from_value::<bcode_model::judgement::WorkflowJudgementRequest>(request.payload)
+    else {
+        return ToolInvocationServiceResolution::Failed {
+            code: "invalid_request".into(),
+            message: "invalid workflow judgement request".into(),
+        };
+    };
+    // The bridge callback runs on the plugin's blocking invocation thread. Never block a
+    // Tokio worker waiting for a task on that same runtime; poll a bounded channel instead.
+    let state = Arc::clone(state);
+    let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+    let task = runtime.spawn(async move {
+        let result = invoke_judgement_model(
+            &state,
+            &input.provider_plugin_id,
+            &input.auth_profile,
+            input.request,
+        )
+        .await;
+        let _ = sender.send(result);
+    });
+    let outcome = loop {
+        if cancellation.wait_cancelled(Duration::from_millis(25)) {
+            task.abort();
+            break None;
+        }
+        match receiver.try_recv() {
+            Ok(result) => break Some(result),
+            Err(std::sync::mpsc::TryRecvError::Empty) => {}
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => break None,
+        }
+    };
+    match outcome {
+        Some(Ok(_)) if cancellation.is_cancelled() => ToolInvocationServiceResolution::Cancelled,
+        Some(Ok(response)) => serde_json::to_value(response).map_or_else(
+            |_| ToolInvocationServiceResolution::Failed {
+                code: "invalid_result".into(),
+                message: "judgement result cannot be encoded".into(),
+            },
+            |payload| ToolInvocationServiceResolution::Responded { payload },
+        ),
+        Some(Err(message)) => ToolInvocationServiceResolution::Failed {
+            code: "judgement_failed".into(),
+            message: message.into(),
+        },
+        None => ToolInvocationServiceResolution::Cancelled,
+    }
+}
+
 fn server_workflow_plugin_bridge(
     state: Arc<ServerState>,
     config: bcode_config::BcodeConfig,
@@ -26987,6 +27059,7 @@ fn server_workflow_plugin_bridge(
 ) -> PluginInvocationBridge {
     let dispatch_identity = dispatch_identity.to_string();
     let caller_plugin_id = caller_plugin_id.to_owned();
+    let runtime = tokio::runtime::Handle::current();
     PluginInvocationBridge::new(move |request, cancellation| match request {
         ServiceBridgeRequest::WriteArtifact(artifact)
             if artifact.invocation_id == dispatch_identity =>
@@ -27023,6 +27096,15 @@ fn server_workflow_plugin_bridge(
         ServiceBridgeRequest::ReceiveInput { .. } => Ok(ServiceBridgeResponse::Input(
             ToolInvocationInputResolution::Closed,
         )),
+        ServiceBridgeRequest::InvokeService(request)
+            if request.invocation_id == dispatch_identity
+                && request.interface_id
+                    == bcode_model::judgement::WORKFLOW_APPLICATION_INTERFACE_ID =>
+        {
+            Ok(ServiceBridgeResponse::Service(
+                server_workflow_judgement_resolution(&state, &runtime, request, &cancellation),
+            ))
+        }
         ServiceBridgeRequest::InvokeService(request)
             if request.invocation_id == dispatch_identity =>
         {
@@ -66867,6 +66949,119 @@ event_symbol = "bcode_plugin_handle_event_v1"
         .await
         .expect_err("wrong preparation input");
         assert!(error.to_string().contains("owner or input checksum"));
+        drop(state);
+    }
+
+    #[tokio::test]
+    #[allow(clippy::significant_drop_tightening, clippy::too_many_lines)] // Plugin host stays active through scoped bridge invocations and fixture setup.
+    async fn workflow_judgement_bridge_uses_application_route_and_fails_closed() {
+        let mut state = test_server_state_with_fake_provider(SessionManager::default());
+        state.startup_config.auth.profiles.insert(
+            "judgement-fixture".into(),
+            bcode_config::AuthProfileConfig {
+                backend: "aws".into(),
+                owner_plugin_id: Some("bcode.fake-provider".into()),
+                provider_id: Some("bcode.fake-provider".into()),
+                scheme: Some("api_key".into()),
+                map: BTreeMap::from([(
+                    "api_key".into(),
+                    bcode_config::AuthCredentialMapping {
+                        env: Some("FAKE_JUDGEMENT_KEY".into()),
+                        key: None,
+                    },
+                )]),
+                settings: BTreeMap::from([("env.FAKE_JUDGEMENT_KEY".into(), "test-only".into())]),
+            },
+        );
+        let state = Arc::new(state);
+        let request = || bcode_tool::ToolInvocationServiceRequest {
+            invocation_id: "judgement-workflow".into(),
+            request_id: "completion".into(),
+            route_id: Some(bcode_model::judgement::WORKFLOW_APPLICATION_INTERFACE_ID.into()),
+            interface_id: bcode_model::judgement::WORKFLOW_APPLICATION_INTERFACE_ID.into(),
+            operation: bcode_model::judgement::OP_WORKFLOW_JUDGE.into(),
+            payload: serde_json::to_value(bcode_model::judgement::WorkflowJudgementRequest {
+                provider_plugin_id: "bcode.fake-provider".into(),
+                auth_profile: "judgement-fixture".into(),
+                request: bcode_model::judgement::Request {
+                    model_id: "fake-judgement".into(),
+                    state: bcode_model::judgement::State::Text("tests passed".into()),
+                    questions: BTreeMap::from([(
+                        "completion".into(),
+                        bcode_model::judgement::Question::YesNo {
+                            instructions: "Is work complete?".into(),
+                        },
+                    )]),
+                },
+            })
+            .unwrap(),
+        };
+        let bridge = server_workflow_plugin_bridge(
+            Arc::clone(&state),
+            state.startup_config.clone(),
+            SessionId::new(),
+            "judgement-workflow",
+            "bcode.loop",
+        );
+        let resolved = tokio::task::spawn_blocking(move || {
+            bridge.request(
+                ServiceBridgeRequest::InvokeService(request()),
+                bcode_plugin_sdk::ServiceCancellation::default(),
+            )
+        })
+        .await
+        .unwrap()
+        .unwrap();
+        let ServiceBridgeResponse::Service(ToolInvocationServiceResolution::Responded { payload }) =
+            resolved
+        else {
+            panic!("expected scoped judgement response");
+        };
+        let response: bcode_model::judgement::Response = serde_json::from_value(payload).unwrap();
+        assert!(matches!(
+            response.answers["completion"],
+            bcode_model::judgement::Answer::YesNo { probability: 0.75 }
+        ));
+        let mismatch = server_workflow_plugin_bridge(
+            Arc::clone(&state),
+            state.startup_config.clone(),
+            SessionId::new(),
+            "other-workflow",
+            "bcode.loop",
+        );
+        let failed = tokio::task::spawn_blocking(move || {
+            mismatch.request(
+                ServiceBridgeRequest::InvokeService(request()),
+                bcode_plugin_sdk::ServiceCancellation::default(),
+            )
+        })
+        .await
+        .unwrap()
+        .unwrap();
+        assert!(
+            matches!(failed, ServiceBridgeResponse::Service(ToolInvocationServiceResolution::Failed { code, .. }) if code == "invocation_id_mismatch")
+        );
+        let denied = server_workflow_plugin_bridge(
+            Arc::clone(&state),
+            state.startup_config.clone(),
+            SessionId::new(),
+            "judgement-workflow",
+            "bcode.loop",
+        );
+        let disabled = tokio::task::spawn_blocking(move || {
+            let mut request = request();
+            request.payload["provider_plugin_id"] = serde_json::json!("bcode.disabled");
+            denied.request(
+                ServiceBridgeRequest::InvokeService(request),
+                bcode_plugin_sdk::ServiceCancellation::default(),
+            )
+        })
+        .await
+        .unwrap()
+        .unwrap();
+        assert!(
+            matches!(disabled, ServiceBridgeResponse::Service(ToolInvocationServiceResolution::Failed { code, .. }) if code == "judgement_failed")
+        );
         drop(state);
     }
 

@@ -14,6 +14,23 @@ pub const OP_MODELS: &str = "models";
 /// Evaluate a batch of named questions against a single state.
 pub const OP_JUDGE: &str = "judge";
 
+/// Host application service for bounded, non-conversational judgement from authorized workflow
+/// blocks. This is not a provider plugin interface and must not be routed to providers directly.
+pub const WORKFLOW_APPLICATION_INTERFACE_ID: &str = "bcode.judgement-application/v1";
+/// Evaluate one request through the application's catalog and credential resolution.
+pub const OP_WORKFLOW_JUDGE: &str = "judge";
+
+/// Workflow-owned request. No credentials or provider wire payloads belong in this contract.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkflowJudgementRequest {
+    /// Enabled judgement provider plugin ID.
+    pub provider_plugin_id: String,
+    /// Explicit owned profile, or empty to select provider-declared daemon environment keys.
+    pub auth_profile: String,
+    /// State and questions to evaluate.
+    pub request: Request,
+}
+
 /// The semantic operation supported by a judgement model.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]

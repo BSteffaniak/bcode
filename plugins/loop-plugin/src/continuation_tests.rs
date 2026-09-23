@@ -50,6 +50,7 @@ fn source(progress: bool) -> bcode_workflow::WorkflowContinuationSource {
             implementation_prompt: input.implementation_prompt,
             stop_condition: input.stop_condition,
             max_iterations: 2,
+            judgement_evaluation: None,
             iteration: 2,
             planning_ready: true,
             condition_met: false,
@@ -68,6 +69,36 @@ fn source(progress: bool) -> bcode_workflow::WorkflowContinuationSource {
             ..Default::default()
         },
     }
+}
+
+#[test]
+fn continuation_reserves_judgement_node_and_keeps_selected_config() {
+    let mut source = source(false);
+    let config = crate::judgement_evaluation::parse_config("bcode.jev/jev-1.13.0/-/90/pause")
+        .unwrap()
+        .unwrap();
+    let mut input = LoopWorkflowInput::new(
+        "accepted implementation".into(),
+        "accepted stop condition".into(),
+        2,
+    )
+    .unwrap();
+    input.judgement_evaluation = Some(config.clone());
+    source.definition = loop_workflow_spec(&input).unwrap().definition().clone();
+    source.input["judgement_evaluation"] = serde_json::to_value(config).unwrap();
+    let continued = request(source, 3).unwrap();
+    assert_eq!(continued.successor.limits.node_execution_cap, 36);
+    assert!(
+        continued
+            .successor
+            .definition
+            .nodes
+            .contains_key("loop.judgement.evaluate")
+    );
+    assert_eq!(
+        continued.successor.input["judgement_evaluation"]["model_id"],
+        "jev-1.13.0"
+    );
 }
 
 #[test]

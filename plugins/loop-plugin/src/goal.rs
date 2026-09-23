@@ -297,23 +297,27 @@ impl GoalSurface {
                 editor.field,
                 stroke.modifiers.shift,
             ) {
-                (Some(GoalOption::Review), _, true)
+                (None, Field::Limit, false) | (Some(GoalOption::Review), _, true)
                     if editor.goal_phase == GoalPhase::Generated =>
                 {
-                    editor.field = Field::Limit;
+                    editor.field = Field::Evaluation;
                     None
                 }
-                (None, Field::Limit, false) if editor.goal_phase == GoalPhase::Generated => {
+                (None, Field::Evaluation, false) if editor.goal_phase == GoalPhase::Generated => {
                     Some(GoalOption::Review)
                 }
                 (Some(GoalOption::Progress), _, false) | (None, Field::Prompt, true) => {
                     Some(GoalOption::Review)
                 }
-                (Some(GoalOption::Review), _, true) | (None, Field::Limit, false) => {
+                (Some(GoalOption::Review), _, true) | (None, Field::Evaluation, false) => {
                     Some(GoalOption::Progress)
                 }
                 (Some(_), _, reverse) => {
-                    editor.field = if reverse { Field::Limit } else { Field::Prompt };
+                    editor.field = if reverse {
+                        Field::Evaluation
+                    } else {
+                        Field::Prompt
+                    };
                     None
                 }
 
@@ -371,6 +375,7 @@ impl GoalSurface {
             if event_click_in(event, editor.prompt_area)
                 || event_click_in(event, editor.condition_area)
                 || event_click_in(event, editor.limit_area)
+                || event_click_in(event, editor.evaluation_area)
             {
                 editor.goal_option_focus = None;
             }
@@ -1211,7 +1216,7 @@ mod tests {
         assert!(surface.editor.progress_document.is_none());
         surface.handle_event(&key(KeyCode::Tab, true), &host);
         assert!(surface.editor.goal_option_focus.is_none());
-        assert_eq!(surface.editor.field, Field::Limit);
+        assert_eq!(surface.editor.field, Field::Evaluation);
         surface.handle_event(&key(KeyCode::Tab, false), &host);
         surface.handle_event(&key(KeyCode::Tab, false), &host);
         surface.handle_event(&key(KeyCode::Enter, false), &host);

@@ -98,8 +98,13 @@ fn request(
             .map_err(|error| error.to_string())?;
     let mut limits = source.limits;
     limits.cycle_cap = additional;
+    let nodes_per_iteration = if definition.nodes.contains_key("loop.judgement.evaluate") {
+        3
+    } else {
+        2
+    };
     limits.node_execution_cap = u64::from(additional)
-        .checked_mul(2)
+        .checked_mul(nodes_per_iteration)
         .and_then(|value| value.checked_mul(u64::from(limits.retry_cap) + 1))
         .ok_or("Node allowance overflow")?;
     let session = source
