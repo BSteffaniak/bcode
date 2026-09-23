@@ -305,14 +305,12 @@ impl TranscriptViewport {
         anchor: Option<usize>,
         history: &mut OlderHistoryState,
     ) {
-        let previous_total = self.previous_total_rows;
-        let previous_top = self.top_row(previous_total, self.viewport_height);
+        let previous_top = self.top_row(self.previous_total_rows, self.viewport_height);
         let (older_ready, newer_ready) = history.take_ready_pages();
-        let inserted_rows = bounds.2.saturating_sub(previous_total);
-        let anchor = anchor.or_else(|| {
-            (older_ready && !self.follows_bottom())
-                .then_some(previous_top.saturating_add(inserted_rows))
-        });
+        // A missing item anchor cannot distinguish prepended content from a
+        // concurrent layout change elsewhere. Never infer a prepend from the
+        // difference in total row counts; the caller must supply correspondence
+        // measured against a surviving item before revealing loaded history.
         if let Some(top_row) = anchor {
             self.mode = match self.mode {
                 TranscriptViewportMode::FollowBottom => TranscriptViewportMode::FollowBottom,
@@ -328,7 +326,11 @@ impl TranscriptViewport {
         if older_ready {
             let requested = history.reveal_request().unwrap_or(0);
             let top = self.top_row(bounds.2, bounds.3);
-            let movement = requested.min(top);
+            let movement = if anchor.is_some() {
+                requested.min(top.saturating_sub(previous_top))
+            } else {
+                0
+            };
             if requested > 0 {
                 self.follow_anchor(top.saturating_sub(movement));
             }
@@ -341,7 +343,11 @@ impl TranscriptViewport {
                 .2
                 .saturating_sub(usize::from(bounds.3))
                 .saturating_sub(top);
-            let movement = requested.min(available);
+            let movement = if anchor.is_some() {
+                requested.min(available)
+            } else {
+                0
+            };
             if requested > 0 {
                 self.follow_anchor(top.saturating_add(movement));
             }
@@ -606,6 +612,144 @@ mod tests {
         viewport.sync_max(21, 0, 30, 9, false, &mut older);
 
         assert_eq!(viewport.top_row(30, 9), top_row);
+    }
+
+    #[test]
+    fn successive_older_pages_reveal_only_outstanding_boundary_movement() {
+        let mut viewport = TranscriptViewport::default();
+        let mut history = older_history();
+        history.mark_dropped_history_before(30);
+        viewport.sync_max(20, 0, 30, 10, false, &mut history);
+        viewport.follow_anchor(0);
+        viewport.scroll_up(9, &mut history);
+        viewport.scroll_up(4, &mut history);
+        assert_eq!(history.reveal_request(), Some(13));
+        history.set_loading(true);
+        let session_id = bcode_session_models::SessionId::new();
+        let event = |sequence| bcode_session_models::SessionEvent {
+            schema_version: bcode_session_models::CURRENT_SESSION_EVENT_SCHEMA_VERSION,
+            sequence,
+            timestamp_ms: sequence,
+            session_id,
+            provenance: None,
+            kind: bcode_session_models::SessionEventKind::AssistantMessage {
+                text: "older".to_owned(),
+            },
+        };
+        history.update_cursor(&[event(20)], true);
+        history.set_loading(false);
+        viewport.sync_with_anchor((25, 0, 35, 10), Some(5), &mut history);
+        assert_eq!(viewport.top_row(35, 10), 0);
+        assert_eq!(history.reveal_request(), Some(8));
+        // Re-preparing the same accepted page cannot spend the movement twice.
+        viewport.sync_with_anchor((25, 0, 35, 10), Some(5), &mut history);
+        assert_eq!(history.reveal_request(), Some(8));
+        assert!(history.should_load());
+        history.set_loading(true);
+        history.update_cursor(&[], false);
+        history.set_loading(false);
+        viewport.sync_with_anchor((38, 0, 48, 10), Some(18), &mut history);
+        assert_eq!(viewport.top_row(48, 10), 10);
+        assert_eq!(history.reveal_request(), None);
+        viewport.sync_with_anchor((38, 0, 48, 10), Some(10), &mut history);
+        assert_eq!(viewport.top_row(48, 10), 10);
+    }
+
+    #[test]
+    fn newer_page_without_new_visible_rows_keeps_requested_movement_pending() {
+        let mut viewport = TranscriptViewport::default();
+        let mut history = older_history();
+        let session_id = bcode_session_models::SessionId::new();
+        let event = bcode_session_models::SessionEvent {
+            schema_version: bcode_session_models::CURRENT_SESSION_EVENT_SCHEMA_VERSION,
+            sequence: 10,
+            timestamp_ms: 10,
+            session_id,
+            provenance: None,
+            kind: bcode_session_models::SessionEventKind::AssistantMessage {
+                text: "resident".to_owned(),
+            },
+        };
+        history.replace_centered(std::slice::from_ref(&event), false, true, 10);
+        viewport.sync_max(20, 0, 30, 10, false, &mut history);
+        viewport.follow_anchor(15);
+        viewport.scroll_down(6, &mut history);
+        assert_eq!(history.newer_reveal_request(), Some(1));
+        history.set_loading_newer(true);
+        history.update_newer_cursor(
+            &[bcode_session_models::SessionEvent {
+                sequence: 11,
+                ..event
+            }],
+            true,
+        );
+        history.set_loading_newer(false);
+        // The accepted page contains only non-presenting events. Existing rows
+        // below the reader must not satisfy movement requested at the boundary.
+        viewport.sync_with_anchor((20, 0, 30, 10), Some(20), &mut history);
+        assert_eq!(viewport.top_row(30, 10), 20);
+        assert_eq!(history.newer_reveal_request(), Some(1));
+        viewport.sync_with_anchor((20, 0, 30, 10), Some(20), &mut history);
+        assert_eq!(viewport.top_row(30, 10), 20);
+        assert_eq!(history.newer_reveal_request(), Some(1));
+    }
+
+    #[test]
+    fn older_page_without_new_visible_rows_does_not_reveal_existing_content() {
+        let mut viewport = TranscriptViewport::default();
+        let mut history = older_history();
+        history.mark_dropped_history_before(10);
+        viewport.sync_max(20, 0, 30, 10, false, &mut history);
+        viewport.follow_anchor(0);
+        viewport.scroll_up(3, &mut history);
+        history.set_loading(true);
+        // A page of non-presenting events replaces the loading banner, but contributes
+        // no navigable rows above the reader.
+        history.update_cursor(&[], true);
+        history.mark_dropped_history_before(9);
+        history.set_loading(false);
+        viewport.sync_with_anchor((20, 0, 30, 10), Some(0), &mut history);
+        assert_eq!(viewport.top_row(30, 10), 0);
+        assert_eq!(history.reveal_request(), Some(3));
+    }
+
+    #[test]
+    fn older_page_does_not_count_rows_added_below_reader() {
+        let mut viewport = TranscriptViewport::default();
+        let mut history = older_history();
+        history.mark_dropped_history_before(10);
+        viewport.sync_max(20, 0, 30, 10, false, &mut history);
+        viewport.follow_anchor(0);
+        viewport.scroll_up(3, &mut history);
+        history.set_loading(true);
+        history.update_cursor(&[], true);
+        history.mark_dropped_history_before(9);
+        history.set_loading(false);
+        // Only two rows were added above the preserved anchor; the other 18
+        // were caused by content below it changing before the frame was accepted.
+        viewport.sync_with_anchor((40, 0, 50, 10), Some(2), &mut history);
+        assert_eq!(viewport.top_row(50, 10), 0);
+        assert_eq!(history.reveal_request(), Some(1));
+    }
+
+    #[test]
+    fn missing_item_anchor_does_not_treat_growth_below_as_prepend() {
+        let mut viewport = TranscriptViewport::default();
+        let mut history = older_history();
+        history.mark_dropped_history_before(10);
+        viewport.sync_max(20, 0, 30, 10, false, &mut history);
+        viewport.follow_anchor(0); // The loading banner has no item anchor.
+        viewport.scroll_up(3, &mut history);
+        history.set_loading(true);
+        history.update_cursor(&[], true);
+        history.mark_dropped_history_before(9);
+        history.set_loading(false);
+        // Two rows above the old viewport, eighteen rows below it.
+        viewport.sync_with_anchor((40, 0, 50, 10), None, &mut history);
+        assert_eq!(viewport.top_row(50, 10), 0);
+        // Without a surviving item anchor we cannot prove how much was prepended,
+        // so keep the movement pending instead of guessing from total growth.
+        assert_eq!(history.reveal_request(), Some(3));
     }
 
     #[test]

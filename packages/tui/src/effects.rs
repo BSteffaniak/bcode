@@ -149,6 +149,8 @@ pub enum TuiEffect {
         session_id: SessionId,
         /// Pagination cursor.
         cursor: SessionHistoryCursor,
+        /// Resident window generation at request time.
+        generation: u64,
     },
     /// Load a newer history page after the currently displayed timeline.
     LoadNewerHistory {
@@ -156,6 +158,8 @@ pub enum TuiEffect {
         session_id: SessionId,
         /// Pagination cursor.
         cursor: SessionHistoryCursor,
+        /// Resident window generation at request time.
+        generation: u64,
     },
     /// Load the bounded pending-permission snapshot during attach/reconnect.
     ListPermissions,
@@ -553,6 +557,10 @@ pub enum TuiEffectResult {
     OlderHistoryLoaded {
         /// Session that was requested.
         session_id: SessionId,
+        /// Requested boundary cursor.
+        cursor: SessionHistoryCursor,
+        /// Resident window generation at request time.
+        generation: u64,
         /// History page result.
         result: Result<
             (
@@ -566,6 +574,10 @@ pub enum TuiEffectResult {
     NewerHistoryLoaded {
         /// Session that was requested.
         session_id: SessionId,
+        /// Requested boundary cursor.
+        cursor: SessionHistoryCursor,
+        /// Resident window generation at request time.
+        generation: u64,
         /// History page result.
         result: Result<
             (
@@ -1695,8 +1707,14 @@ impl TuiEffect {
                     .await
                     .map_err(|error| error.to_string()),
             },
-            Self::LoadOlderHistory { session_id, cursor } => TuiEffectResult::OlderHistoryLoaded {
+            Self::LoadOlderHistory {
                 session_id,
+                cursor,
+                generation,
+            } => TuiEffectResult::OlderHistoryLoaded {
+                session_id,
+                cursor,
+                generation,
                 result: load_hydrated_history(
                     &client,
                     session_id,
@@ -1705,8 +1723,14 @@ impl TuiEffect {
                 )
                 .await,
             },
-            Self::LoadNewerHistory { session_id, cursor } => TuiEffectResult::NewerHistoryLoaded {
+            Self::LoadNewerHistory {
                 session_id,
+                cursor,
+                generation,
+            } => TuiEffectResult::NewerHistoryLoaded {
+                session_id,
+                cursor,
+                generation,
                 result: load_hydrated_history(
                     &client,
                     session_id,

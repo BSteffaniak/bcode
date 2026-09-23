@@ -45,6 +45,7 @@ use super::transcript_document::{
     TranscriptPresentationEntryId,
 };
 use super::transcript_layout::{TranscriptLayoutCache, VisibleTranscriptSource};
+use super::transcript_markdown_cache::TranscriptMarkdownCache;
 use super::transcript_resident_window::{TranscriptResidentWindow, TranscriptWindowPolicy};
 use super::transcript_viewport::TranscriptViewport;
 
@@ -308,6 +309,8 @@ pub struct StableTranscriptAnchor {
     pub content: Option<(String, usize)>,
     pub fallback_index: usize,
     pub source_position: Option<usize>,
+    /// Rows between the viewport top and the anchored content (e.g. a history banner).
+    pub viewport_row_offset: usize,
 }
 
 impl PartialEq for StableTranscriptAnchor {
@@ -316,6 +319,7 @@ impl PartialEq for StableTranscriptAnchor {
             && self.row_in_item == other.row_in_item
             && self.content == other.content
             && self.source_position == other.source_position
+            && self.viewport_row_offset == other.viewport_row_offset
     }
 }
 impl Eq for StableTranscriptAnchor {}
@@ -444,6 +448,7 @@ pub struct BmuxApp {
     pending_assistant_stream_anchor: bool,
     pending_transcript_top_anchor_sequence: Option<u64>,
     older_history: OlderHistoryState,
+    history_window_generation: u64,
     activity: ActivityState,
     activity_started_at: Instant,
     daemon_connection: DaemonConnectionState,
@@ -623,8 +628,7 @@ impl BmuxApp {
             latest_history_sequence: None,
             pending_submissions: PendingSubmissions::default(),
             transcript_layout: TranscriptLayoutCache::default(),
-            transcript_markdown_cache:
-                crate::transcript_markdown_cache::TranscriptMarkdownCache::default(),
+            transcript_markdown_cache: TranscriptMarkdownCache::default(),
             elapsed_layout_revision: 0,
             elapsed_dirty_visuals: BTreeSet::new(),
             transcript_dirty_items: BTreeSet::new(),
@@ -648,6 +652,7 @@ impl BmuxApp {
             pending_assistant_stream_anchor: false,
             pending_transcript_top_anchor_sequence: None,
             older_history,
+            history_window_generation: 0,
             activity: ActivityState::Idle,
             activity_started_at: now,
             daemon_connection: DaemonConnectionState::Connecting,
@@ -761,6 +766,7 @@ impl BmuxApp {
             item_id,
             fallback_index: index,
             row_in_item: position.row_in_item,
+            viewport_row_offset: 0,
             source_position: position.source_position,
             content: position.content,
         });
@@ -1009,32 +1015,33 @@ impl BmuxApp {
         self.viewport.top_row(total_rows, viewport_height)
     }
 
+    /// Capture the visible reader's position, including a banner row when it
+    /// precedes the first source-backed transcript item.
     #[cfg(test)]
     pub(crate) fn frame_observation(&self) -> TranscriptFrameObservation {
         let total_rows = self.transcript_layout.total_rows();
         let viewport_top = self.viewport.top_row(total_rows, self.viewport.height());
         let anchor = self
             .transcript_layout
-            .line_at_row(viewport_top)
+            .visible_lines_from_top(viewport_top, self.viewport.height().max(1))
+            .into_iter()
+            .find(|line| line.source == VisibleTranscriptSource::Transcript)
             .and_then(|line| {
-                (line.source == VisibleTranscriptSource::Transcript)
-                    .then(|| {
-                        self.transcript
-                            .presentation_id(line.entry_index)
-                            .map(|item_id| StableTranscriptAnchor {
-                                item_id,
-                                fallback_index: line.entry_index,
-                                source_position: self
-                                    .transcript_layout
-                                    .source_position(line.entry_index, line.row_in_entry),
-                                row_in_item: line.row_in_entry,
-                                content: self
-                                    .transcript_layout
-                                    .content_anchor(line.entry_index, line.row_in_entry)
-                                    .map(|(key, offset)| (key.to_owned(), offset)),
-                            })
+                self.transcript
+                    .presentation_id(line.entry_index)
+                    .map(|item_id| StableTranscriptAnchor {
+                        item_id,
+                        fallback_index: line.entry_index,
+                        source_position: self
+                            .transcript_layout
+                            .source_position(line.entry_index, line.row_in_entry),
+                        row_in_item: line.row_in_entry,
+                        viewport_row_offset: line.row_index.saturating_sub(viewport_top),
+                        content: self
+                            .transcript_layout
+                            .content_anchor(line.entry_index, line.row_in_entry)
+                            .map(|(key, offset)| (key.to_owned(), offset)),
                     })
-                    .flatten()
             });
         TranscriptFrameObservation {
             semantic_items: self
@@ -1283,6 +1290,7 @@ impl BmuxApp {
         events: &[SessionEvent],
         has_older_history: bool,
     ) {
+        self.history_window_generation = self.history_window_generation.wrapping_add(1);
         self.latest_history_sequence = events.last().map(|event| event.sequence);
         self.transcript_window.replace_window(events);
         self.older_history = OlderHistoryState::new(events, has_older_history);
@@ -1298,6 +1306,7 @@ impl BmuxApp {
         has_newer: bool,
         anchor_sequence: u64,
     ) {
+        self.history_window_generation = self.history_window_generation.wrapping_add(1);
         self.latest_history_sequence = events.last().map(|event| event.sequence);
         self.transcript_window.replace_window(events);
         self.older_history
@@ -2768,7 +2777,11 @@ impl BmuxApp {
         } else {
             0
         };
-        Some(start.saturating_add(row))
+        Some(
+            start
+                .saturating_add(row)
+                .saturating_sub(anchor.viewport_row_offset),
+        )
     }
 
     /// Measure latest-content chrome without consuming navigation state.
@@ -3032,6 +3045,89 @@ impl BmuxApp {
     #[must_use]
     pub const fn has_older_history(&self) -> bool {
         self.older_history.has_older_history()
+    }
+
+    /// Identify the current resident window across replacements of the same session.
+    #[must_use]
+    pub const fn history_window_generation(&self) -> u64 {
+        self.history_window_generation
+    }
+
+    /// Check that a completed page still belongs to this window and boundary.
+    #[must_use]
+    pub const fn accepts_history_page(
+        &self,
+        generation: u64,
+        cursor: SessionHistoryCursor,
+        older: bool,
+    ) -> bool {
+        if generation != self.history_window_generation {
+            return false;
+        }
+        if older {
+            self.older_history.loading()
+                && matches!(self.older_history.cursor(), Some(current) if current.sequence == cursor.sequence)
+        } else {
+            self.older_history.loading_newer()
+                && matches!(self.older_history.newer_cursor(), Some(current) if current.sequence == cursor.sequence)
+        }
+    }
+
+    /// Validate canonical page identity and compatibility before artifact hydration.
+    #[must_use]
+    pub fn accepts_history_page_payload(
+        &self,
+        cursor: SessionHistoryCursor,
+        older: bool,
+        page: &bcode_session_models::SessionHistoryPage,
+    ) -> bool {
+        Some(page.session_id) == self.session_id
+            && page.compatibility_issues.is_empty()
+            && self.accepts_history_page_events(cursor, older, &page.events, page.has_more)
+    }
+
+    /// Validate a fetched canonical page before changing resident history or artifact state.
+    /// History queries include their cursor, while resident windows may omit events that
+    /// do not contribute transcript rows; adjacency of sequence numbers is not assumed.
+    #[must_use]
+    pub fn accepts_history_page_events(
+        &self,
+        cursor: SessionHistoryCursor,
+        older: bool,
+        events: &[SessionEvent],
+        has_more: bool,
+    ) -> bool {
+        if events.is_empty() {
+            return !has_more;
+        }
+        let valid = events
+            .iter()
+            .all(|event| Some(event.session_id) == self.session_id)
+            && events
+                .windows(2)
+                .all(|pair| pair[0].sequence < pair[1].sequence);
+        if !valid {
+            return false;
+        }
+        if older {
+            events
+                .last()
+                .is_some_and(|last| last.sequence <= cursor.sequence)
+                && self.transcript_window.events().first().is_none_or(|first| {
+                    events
+                        .last()
+                        .is_some_and(|last| last.sequence < first.sequence)
+                })
+        } else {
+            events
+                .first()
+                .is_some_and(|first| first.sequence >= cursor.sequence)
+                && self.transcript_window.events().last().is_none_or(|last| {
+                    events
+                        .first()
+                        .is_some_and(|first| first.sequence > last.sequence)
+                })
+        }
     }
 
     /// Return whether an older-history request is in flight.
@@ -4901,21 +4997,19 @@ impl BmuxApp {
             .top_row(self.transcript_layout.total_rows(), self.viewport.height());
         let Some(line) = self
             .transcript_layout
-            .visible_lines_from_top(top_row, 1)
-            .first()
-            .copied()
+            .visible_lines_from_top(top_row, self.viewport.height().max(1))
+            .into_iter()
+            .find(|line| line.source == VisibleTranscriptSource::Transcript)
         else {
             return;
         };
-        if line.source != VisibleTranscriptSource::Transcript {
-            return;
-        }
         let Some(item_id) = self.transcript.presentation_id(line.entry_index) else {
             return;
         };
         self.pending_stable_transcript_anchor = Some(StableTranscriptAnchor {
             item_id,
             fallback_index: line.entry_index,
+            viewport_row_offset: line.row_index.saturating_sub(top_row),
             source_position: self
                 .transcript_layout
                 .source_position(line.entry_index, line.row_in_entry),
@@ -6015,6 +6109,87 @@ mod tests {
         assert_eq!(app.pending_submissions.items()[0].text(), "pending");
         app.pending_submissions.stage("later".to_owned());
         assert!(app.pending_submissions.reveals_on_acceptance("later"));
+        drop(app);
+    }
+
+    #[test]
+    fn pages_must_progress_without_overlapping_the_resident_window() {
+        let session_id = bcode_session_models::SessionId::new();
+        let event = |sequence| bcode_session_models::SessionEvent {
+            schema_version: bcode_session_models::CURRENT_SESSION_EVENT_SCHEMA_VERSION,
+            sequence,
+            timestamp_ms: sequence,
+            session_id,
+            provenance: None,
+            kind: bcode_session_models::SessionEventKind::AssistantMessage {
+                text: format!("message {sequence}"),
+            },
+        };
+        let mut app = super::BmuxApp::new_with_history(Some(session_id), &[event(10)], &[], true);
+        let older = bcode_session_models::SessionHistoryCursor { sequence: 9 };
+        assert!(app.accepts_history_page_events(older, true, &[event(2), event(8)], true));
+        for invalid in [
+            vec![event(2), event(10)],
+            vec![event(8), event(2)],
+            vec![event(11)],
+        ] {
+            assert!(!app.accepts_history_page_events(older, true, &invalid, true));
+        }
+        assert!(!app.accepts_history_page_events(older, true, &[], true));
+        assert!(app.accepts_history_page_events(older, true, &[], false));
+        let mut page = bcode_session_models::SessionHistoryPage {
+            session_id,
+            events: vec![event(8)],
+            compatibility_issues: Vec::new(),
+            next_cursor: None,
+            has_more: true,
+        };
+        assert!(app.accepts_history_page_payload(older, true, &page));
+        page.session_id = bcode_session_models::SessionId::new();
+        assert!(!app.accepts_history_page_payload(older, true, &page));
+        page.session_id = session_id;
+        page.compatibility_issues
+            .push(bcode_session_models::SessionEventCompatibilityIssue {
+                sequence: 7,
+                event_kind: "future".to_owned(),
+                schema_version: u16::MAX,
+                compatibility: bcode_session_models::SessionEventCompatibilityKind::FutureSchema,
+                remediation: "upgrade Bcode".to_owned(),
+            });
+        assert!(!app.accepts_history_page_payload(older, true, &page));
+        app.replace_transcript_window(&[event(10)], true, true, 10);
+        let newer = bcode_session_models::SessionHistoryCursor { sequence: 11 };
+        assert!(app.accepts_history_page_events(newer, false, &[event(12), event(14)], false));
+        assert!(!app.accepts_history_page_events(newer, false, &[event(10)], true));
+        assert!(!app.accepts_history_page_events(newer, false, &[event(14), event(12)], true));
+        drop(app);
+    }
+
+    #[test]
+    fn replacement_rejects_in_flight_pages_for_same_session() {
+        let session_id = bcode_session_models::SessionId::new();
+        let event = |sequence| bcode_session_models::SessionEvent {
+            schema_version: bcode_session_models::CURRENT_SESSION_EVENT_SCHEMA_VERSION,
+            sequence,
+            timestamp_ms: sequence,
+            session_id,
+            provenance: None,
+            kind: bcode_session_models::SessionEventKind::AssistantMessage {
+                text: format!("message {sequence}"),
+            },
+        };
+        let mut app = super::BmuxApp::new_with_history(Some(session_id), &[event(10)], &[], true);
+        let generation = app.history_window_generation();
+        let cursor = app.older_history_cursor().expect("older boundary");
+        app.set_loading_older_history(true);
+        assert!(app.accepts_history_page(generation, cursor, true));
+        app.replace_latest_transcript_window(&[event(10)], true);
+        app.set_loading_older_history(true);
+        // Even an identical cursor and session after reconnect are a new window.
+        assert!(!app.accepts_history_page(generation, cursor, true));
+        assert!(app.accepts_history_page(app.history_window_generation(), cursor, true));
+        app.replace_transcript_window(&[event(10)], true, true, 10);
+        assert!(!app.accepts_history_page(generation, cursor, true));
         drop(app);
     }
 

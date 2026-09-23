@@ -67,6 +67,16 @@ pub enum TranscriptFrameInput {
         events: Vec<SessionEvent>,
         has_more: bool,
     },
+    AppendHistory {
+        events: Vec<SessionEvent>,
+        has_more: bool,
+    },
+    CenterHistory {
+        events: Vec<SessionEvent>,
+        anchor_sequence: u64,
+        has_older: bool,
+        has_newer: bool,
+    },
     DurableBatch(Vec<SessionEvent>),
     Resize(u16, u16),
     ScrollUp(usize),
@@ -128,6 +138,24 @@ impl<'a> TranscriptFrameSequence<'a> {
                 TranscriptFrameInput::Live(event) => self.app.absorb_session_live_event(&event),
                 TranscriptFrameInput::PrependHistory { events, has_more } => {
                     self.app.prepend_older_history(&events, has_more);
+                }
+                TranscriptFrameInput::AppendHistory { events, has_more } => {
+                    self.app.append_newer_history(&events, has_more);
+                }
+                TranscriptFrameInput::CenterHistory {
+                    events,
+                    anchor_sequence,
+                    has_older,
+                    has_newer,
+                } => {
+                    self.app.replace_transcript_window(
+                        &events,
+                        has_older,
+                        has_newer,
+                        anchor_sequence,
+                    );
+                    self.app
+                        .request_transcript_top_anchor_sequence(anchor_sequence);
                 }
                 TranscriptFrameInput::DurableBatch(events) => {
                     for event in events {
@@ -229,6 +257,199 @@ mod tests {
         SessionTokenUsage, TextStreamOperation, TextStreamUpdate, ToolInvocationResult, WorkId,
     };
     use std::sync::Arc;
+
+    #[test]
+    fn centered_newer_page_preserves_reader_and_reaches_tail() {
+        let session_id = SessionId::new();
+        let event = |sequence| {
+            durable(
+                session_id,
+                sequence,
+                SessionEventKind::AssistantMessage {
+                    text: format!("message {sequence}"),
+                },
+            )
+        };
+        let mut app = BmuxApp::new_with_history(Some(session_id), &[event(40)], &[], true);
+        let frames = TranscriptFrameSequence::new(&mut app, 80, 12).run([
+            TranscriptFrameStep {
+                label: "centered",
+                input: TranscriptFrameInput::CenterHistory {
+                    events: (10..22).map(event).collect(),
+                    anchor_sequence: 17,
+                    has_older: true,
+                    has_newer: true,
+                },
+            },
+            TranscriptFrameStep {
+                label: "toward newer edge",
+                input: TranscriptFrameInput::ScrollDown(usize::MAX / 4),
+            },
+            TranscriptFrameStep {
+                label: "page of newer history",
+                input: TranscriptFrameInput::AppendHistory {
+                    events: (22..40).map(event).collect(),
+                    has_more: false,
+                },
+            },
+            TranscriptFrameStep {
+                label: "accepted again",
+                input: TranscriptFrameInput::Observe,
+            },
+        ]);
+        let before = &frames[1].observation;
+        let after = &frames[2].observation;
+        assert!(after.viewport_top >= before.viewport_top);
+        assert_eq!(after, &frames[3].observation);
+        assert!(after.terminal_rows.iter().any(|(id, _)| id.is_some()));
+    }
+
+    #[test]
+    fn resumed_history_page_reveals_only_requested_rows_once() {
+        let session_id = SessionId::new();
+        let event = |sequence| {
+            durable(
+                session_id,
+                sequence,
+                SessionEventKind::AssistantMessage {
+                    text: format!("message {sequence}"),
+                },
+            )
+        };
+        let recent = (30..42).map(event).collect::<Vec<_>>();
+        let older = (1..30).map(event).collect::<Vec<_>>();
+        let mut app = BmuxApp::new_with_history(Some(session_id), &recent, &[], true);
+        let initial = TranscriptFrameSequence::new(&mut app, 80, 12).run([TranscriptFrameStep {
+            label: "resumed tail",
+            input: TranscriptFrameInput::Observe,
+        }]);
+        let to_near_top = initial[0].observation.viewport_top.saturating_sub(1);
+        let frames = TranscriptFrameSequence::new(&mut app, 80, 12).run([
+            TranscriptFrameStep {
+                label: "near boundary",
+                input: TranscriptFrameInput::ScrollUp(to_near_top),
+            },
+            TranscriptFrameStep {
+                label: "loading at boundary",
+                input: TranscriptFrameInput::ScrollUp(2),
+            },
+            TranscriptFrameStep {
+                label: "older history accepted",
+                input: TranscriptFrameInput::PrependHistory {
+                    events: older,
+                    has_more: false,
+                },
+            },
+            TranscriptFrameStep {
+                label: "next accepted frame",
+                input: TranscriptFrameInput::Observe,
+            },
+        ]);
+        let before = &frames[0].observation;
+        let after = &frames[2].observation;
+        // Boundary input asks to reveal the newly available older item; the
+        // accepted frame must not stay on the former first resident message.
+        assert_ne!(
+            before.anchor.as_ref().map(|anchor| anchor.item_id),
+            after.anchor.as_ref().map(|anchor| anchor.item_id)
+        );
+        let source = before
+            .terminal_rows
+            .get(
+                before
+                    .viewport_top
+                    .saturating_add(before.anchor.as_ref().expect("anchor").viewport_row_offset),
+            )
+            .and_then(|(source, _)| source.as_ref())
+            .expect("source identity before boundary");
+        let previous_row = after
+            .terminal_rows
+            .iter()
+            .position(|(id, row)| {
+                id.as_ref() == Some(source)
+                    && *row == before.anchor.as_ref().expect("anchor").row_in_item
+            })
+            .expect("previous item survives prepend");
+        assert!(previous_row >= after.viewport_top);
+        assert!(previous_row - after.viewport_top <= 2);
+        assert_eq!(after, &frames[3].observation);
+    }
+
+    #[test]
+    fn resumed_boundary_reversal_preserves_reader_across_large_page_and_resize() {
+        let session_id = SessionId::new();
+        let event = |sequence| {
+            durable(
+                session_id,
+                sequence,
+                SessionEventKind::AssistantMessage {
+                    text: format!("message {sequence}: {}", "wide content ".repeat(8)),
+                },
+            )
+        };
+        let recent = (30..42).map(event).collect::<Vec<_>>();
+        let mut app = BmuxApp::new_with_history(Some(session_id), &recent, &[], true);
+        let initial = TranscriptFrameSequence::new(&mut app, 80, 12).run([TranscriptFrameStep {
+            label: "resumed tail",
+            input: TranscriptFrameInput::Observe,
+        }]);
+        let top = initial[0].observation.viewport_top;
+        let frames = TranscriptFrameSequence::new(&mut app, 80, 12).run([
+            TranscriptFrameStep {
+                label: "reach boundary",
+                input: TranscriptFrameInput::ScrollUp(top),
+            },
+            TranscriptFrameStep {
+                label: "ask for older rows",
+                input: TranscriptFrameInput::ScrollUp(5),
+            },
+            TranscriptFrameStep {
+                label: "more input while loading",
+                input: TranscriptFrameInput::ScrollUp(3),
+            },
+            TranscriptFrameStep {
+                label: "reverse before page arrives",
+                input: TranscriptFrameInput::ScrollDown(2),
+            },
+            TranscriptFrameStep {
+                label: "large older page arrives",
+                input: TranscriptFrameInput::PrependHistory {
+                    events: (1..30).map(event).collect(),
+                    has_more: false,
+                },
+            },
+            TranscriptFrameStep {
+                label: "rerender at same width",
+                input: TranscriptFrameInput::Observe,
+            },
+            TranscriptFrameStep {
+                label: "reflow at narrower width",
+                input: TranscriptFrameInput::Resize(52, 12),
+            },
+        ]);
+        let before = &frames[3].observation;
+        let after = &frames[4].observation;
+        let anchor = before.anchor.as_ref().expect("reader has source anchor");
+        let source = before
+            .terminal_rows
+            .get(before.viewport_top + anchor.viewport_row_offset)
+            .and_then(|(source, _)| source.as_ref())
+            .expect("reading source before page");
+        let source_row_after = after
+            .terminal_rows
+            .iter()
+            .position(|(id, row)| id.as_ref() == Some(source) && *row == anchor.row_in_item)
+            .expect("same source row survives large page");
+        assert_eq!(
+            source_row_after - after.viewport_top,
+            anchor.viewport_row_offset
+        );
+        assert_eq!(after, &frames[5].observation);
+        assert_eq!(
+            frames[6].observation.anchor.as_ref().map(|a| a.item_id),
+            Some(anchor.item_id)
+        );
+    }
 
     #[test]
     fn ephemeral_notice_remains_between_durable_frames_after_resize() {

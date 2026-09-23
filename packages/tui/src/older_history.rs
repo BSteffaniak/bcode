@@ -84,6 +84,12 @@ impl OlderHistoryState {
         }
     }
 
+    /// Return whether a newer-history request is in flight.
+    #[must_use]
+    pub const fn loading_newer(&self) -> bool {
+        self.loading_newer
+    }
+
     /// Mark newer history as loading or idle.
     pub const fn set_loading_newer(&mut self, loading: bool) {
         self.loading_newer = loading;

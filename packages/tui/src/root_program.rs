@@ -3831,7 +3831,11 @@ mod tests {
             super::super::invalidation::UiInvalidation::Structural
         );
         assert!(model.chat.pending_effects.contains_effect(
-            &super::super::effects::TuiEffect::LoadOlderHistory { session_id, cursor }
+            &super::super::effects::TuiEffect::LoadOlderHistory {
+                session_id,
+                cursor,
+                generation: model.chat.app.history_window_generation(),
+            }
         ));
         assert!(model.chat.app.loading_older_history());
 
@@ -3853,6 +3857,7 @@ mod tests {
             &super::super::effects::TuiEffect::LoadNewerHistory {
                 session_id,
                 cursor: newer_cursor,
+                generation: model.chat.app.history_window_generation(),
             }
         ));
         drop(model);

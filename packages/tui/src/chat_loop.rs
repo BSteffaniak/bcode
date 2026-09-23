@@ -2495,10 +2495,14 @@ fn maybe_start_older_history_load(chat: &mut ActiveChat, _loop_state: &mut ChatL
     let Some(session_id) = chat.attached_session_id() else {
         return false;
     };
-    let started = !chat
-        .pending_effects
-        .contains_effect(&TuiEffect::LoadOlderHistory { session_id, cursor });
-    chat.start_effect(TuiEffect::LoadOlderHistory { session_id, cursor });
+    let generation = chat.app.history_window_generation();
+    let effect = TuiEffect::LoadOlderHistory {
+        session_id,
+        cursor,
+        generation,
+    };
+    let started = !chat.pending_effects.contains_effect(&effect);
+    chat.start_effect(effect);
     if started {
         chat.app.set_loading_older_history(true);
     }
@@ -2515,10 +2519,14 @@ fn maybe_start_newer_history_load(chat: &mut ActiveChat, _loop_state: &mut ChatL
     let Some(session_id) = chat.attached_session_id() else {
         return false;
     };
-    let started = !chat
-        .pending_effects
-        .contains_effect(&TuiEffect::LoadNewerHistory { session_id, cursor });
-    chat.start_effect(TuiEffect::LoadNewerHistory { session_id, cursor });
+    let generation = chat.app.history_window_generation();
+    let effect = TuiEffect::LoadNewerHistory {
+        session_id,
+        cursor,
+        generation,
+    };
+    let started = !chat.pending_effects.contains_effect(&effect);
+    chat.start_effect(effect);
     if started {
         chat.app.set_loading_newer_history(true);
     }
@@ -2792,11 +2800,21 @@ pub fn apply_effect_result(
         TuiEffectResult::AgentCatalogLoaded { agents } => {
             apply_agent_catalog_result(chat, agents);
         }
-        TuiEffectResult::OlderHistoryLoaded { session_id, result } => {
-            apply_older_history_result(chat, loop_state, session_id, result);
+        TuiEffectResult::OlderHistoryLoaded {
+            session_id,
+            cursor,
+            generation,
+            result,
+        } => {
+            apply_older_history_result(chat, loop_state, session_id, cursor, generation, result);
         }
-        TuiEffectResult::NewerHistoryLoaded { session_id, result } => {
-            apply_newer_history_result(chat, loop_state, session_id, result);
+        TuiEffectResult::NewerHistoryLoaded {
+            session_id,
+            cursor,
+            generation,
+            result,
+        } => {
+            apply_newer_history_result(chat, loop_state, session_id, cursor, generation, result);
         }
         TuiEffectResult::PermissionList { result } => {
             apply_permission_list_result(chat, loop_state, result);
@@ -3447,6 +3465,8 @@ fn apply_older_history_result(
     chat: &mut ActiveChat,
     loop_state: &mut ChatLoopState,
     session_id: bcode_session_models::SessionId,
+    cursor: bcode_session_models::SessionHistoryCursor,
+    generation: u64,
     result: Result<
         (
             bcode_session_models::SessionHistoryPage,
@@ -3455,17 +3475,25 @@ fn apply_older_history_result(
         ClientError,
     >,
 ) {
+    if Some(session_id) != chat.viewing_session_id()
+        || !chat.app.accepts_history_page(generation, cursor, true)
+    {
+        return;
+    }
     match result {
-        Ok((page, submissions)) if Some(session_id) == chat.viewing_session_id() => {
+        Ok((page, submissions)) if chat.app.accepts_history_page_payload(cursor, true, &page) => {
             hydrate_history_artifacts(chat, loop_state, &page.events);
             chat.app.prepend_older_history(&page.events, page.has_more);
             chat.app.apply_submission_records(&submissions);
         }
-        Ok(_stale) => {}
+        Ok(_) => {
+            chat.app.set_loading_older_history(false);
+            chat.app.set_status(
+                "Older history page inconsistent; retry or inspect session history".to_owned(),
+            );
+        }
         Err(error) => {
-            if Some(session_id) == chat.viewing_session_id() {
-                chat.app.set_loading_older_history(false);
-            }
+            chat.app.set_loading_older_history(false);
             report_nonfatal_client_error(chat, "Older history unavailable", &error);
         }
     }
@@ -3475,6 +3503,8 @@ fn apply_newer_history_result(
     chat: &mut ActiveChat,
     loop_state: &mut ChatLoopState,
     session_id: bcode_session_models::SessionId,
+    cursor: bcode_session_models::SessionHistoryCursor,
+    generation: u64,
     result: Result<
         (
             bcode_session_models::SessionHistoryPage,
@@ -3483,17 +3513,25 @@ fn apply_newer_history_result(
         ClientError,
     >,
 ) {
+    if Some(session_id) != chat.viewing_session_id()
+        || !chat.app.accepts_history_page(generation, cursor, false)
+    {
+        return;
+    }
     match result {
-        Ok((page, submissions)) if Some(session_id) == chat.viewing_session_id() => {
+        Ok((page, submissions)) if chat.app.accepts_history_page_payload(cursor, false, &page) => {
             hydrate_history_artifacts(chat, loop_state, &page.events);
             chat.app.append_newer_history(&page.events, page.has_more);
             chat.app.apply_submission_records(&submissions);
         }
-        Ok(_stale) => {}
+        Ok(_) => {
+            chat.app.set_loading_newer_history(false);
+            chat.app.set_status(
+                "Newer history page inconsistent; retry or inspect session history".to_owned(),
+            );
+        }
         Err(error) => {
-            if Some(session_id) == chat.viewing_session_id() {
-                chat.app.set_loading_newer_history(false);
-            }
+            chat.app.set_loading_newer_history(false);
             report_nonfatal_client_error(chat, "Newer history unavailable", &error);
         }
     }
