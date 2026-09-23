@@ -201,6 +201,24 @@ mod tests {
     }
 
     #[test]
+    fn picker_title_leaves_remaining_top_border_visible() {
+        let theme = TuiTheme::for_theme_id("terminal-native");
+        let mut buffer = Buffer::empty(Rect::new(0, 0, 24, 8));
+        let mut frame = Frame::new(&mut buffer);
+        let area = frame.area();
+        render_picker_panel(
+            " Picker ",
+            area,
+            &mut bmux_tui::paint::PaintCx::new(&mut frame),
+            theme,
+        );
+        assert_eq!(
+            frame.buffer().row_symbols(0).as_deref(),
+            Some("┌ Picker ──────────────┐")
+        );
+    }
+
+    #[test]
     fn picker_panel_chrome_tracks_terminal_native_dark_and_light_themes() {
         let mut observed = Vec::new();
         for theme_id in ["terminal-native", "bcode-dark", "bcode-light"] {

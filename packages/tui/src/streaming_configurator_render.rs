@@ -222,14 +222,17 @@ fn render_preview(
         u16::try_from(child.node.size.height).unwrap_or(u16::MAX),
     );
     paint_component(&shell, area, frame);
+    let title = Line::from_spans(vec![Span::styled(title, theme.focused)]);
     frame.write_line(
         LocalRect::new(
-            i32::from(area.x + 1),
+            i32::from(area.x.saturating_add(1)),
             i64::from(area.y),
-            area.width.saturating_sub(2),
+            u16::try_from(title.width())
+                .unwrap_or(u16::MAX)
+                .min(area.width.saturating_sub(2)),
             1,
         ),
-        &Line::from_spans(vec![Span::styled(title, theme.focused)]),
+        &title,
     );
     let preview_text = preview_text(text);
     let base_scroll =
@@ -491,6 +494,33 @@ mod tests {
         (0..area.height)
             .filter_map(|row| buffer.row_symbols(row))
             .collect::<String>()
+    }
+
+    #[test]
+    fn preview_border_remains_after_short_title_and_clips_long_title() {
+        let theme = TuiTheme::for_theme_id("bcode-dark");
+        for (title, width, expected) in [
+            ("Preview", 24, "╭Preview───────────────╮"),
+            ("A very long title", 10, "╭A very l╮"),
+            ("界", 4, "╭界╮"),
+        ] {
+            let area = Rect::new(0, 0, width, 6);
+            let mut buffer = Buffer::empty(area);
+            render_preview(
+                title,
+                "",
+                0,
+                true,
+                area,
+                &mut bmux_tui::paint::PaintCx::new(&mut Frame::new(&mut buffer)),
+                theme,
+            );
+            assert_eq!(
+                buffer.row_symbols(0).as_deref(),
+                Some(expected),
+                "{title:?}"
+            );
+        }
     }
 
     #[test]

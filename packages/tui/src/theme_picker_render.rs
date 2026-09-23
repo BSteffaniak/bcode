@@ -275,6 +275,36 @@ mod tests {
     }
 
     #[test]
+    fn titled_theme_modal_keeps_border_after_title() {
+        let theme = TuiTheme::for_theme_id("terminal-native");
+        let area = Rect::new(0, 0, 120, 24);
+        let mut buffer = Buffer::empty(area);
+        render_theme_picker(
+            &mut picker(),
+            &mut bmux_tui::paint::PaintCx::new(&mut Frame::new(&mut buffer)),
+            theme,
+        );
+        let panel = theme_picker_modal(theme).panel_area(area);
+        let row = buffer.row_symbols(panel.y).expect("modal top row");
+        assert!(row.contains(" Themes · ↑/↓ preview · enter apply · esc cancel "));
+        assert!(row.contains("─╮"), "title erased border: {row}");
+        assert_eq!(
+            buffer
+                .get(Point::new(panel.x, panel.y))
+                .expect("left corner")
+                .symbol,
+            "╭"
+        );
+        assert_eq!(
+            buffer
+                .get(Point::new(panel.right() - 1, panel.y))
+                .expect("right corner")
+                .symbol,
+            "╮"
+        );
+    }
+
+    #[test]
     fn opaque_picker_frame_exercises_modal_surface_and_selection_hierarchy() {
         let theme = TuiTheme::for_theme_id("bcode-dark");
         let area = Rect::new(0, 0, 120, 24);

@@ -711,6 +711,44 @@ impl PluginTuiSurface for GoalSurface {
 mod tests {
     use super::*;
 
+    #[test]
+    fn generation_modal_keeps_top_border_after_short_title() {
+        use bmux_tui::buffer::Buffer;
+        use bmux_tui::frame::Frame;
+        use bmux_tui::geometry::Point;
+
+        let area = Rect::new(0, 0, 80, 24);
+        let mut buffer = Buffer::empty(area);
+        let mut live = crate::goal_live::GenerationView::default();
+        paint_generation(
+            &mut live,
+            area,
+            &mut PaintCx::new(&mut Frame::new(&mut buffer)),
+        );
+        let panel = ModalFrame::new(
+            ModalSizing::new(Size::new(40, 12), Size::new(100, 32), Insets::all(1)),
+            ModalTheme::dark(Color::Cyan),
+        )
+        .panel_area(area);
+        let row = buffer.row_symbols(panel.y).expect("modal top row");
+        assert!(row.contains(live.title), "missing title: {row}");
+        assert!(row.contains("─╮"), "title erased top border: {row}");
+        assert_eq!(
+            buffer
+                .get(Point::new(panel.x, panel.y))
+                .expect("left corner")
+                .symbol,
+            "╭"
+        );
+        assert_eq!(
+            buffer
+                .get(Point::new(panel.right() - 1, panel.y))
+                .expect("right corner")
+                .symbol,
+            "╮"
+        );
+    }
+
     #[derive(Default)]
     struct Host {
         tasks: Mutex<Vec<bcode_plugin_sdk::tui::PluginTask>>,
