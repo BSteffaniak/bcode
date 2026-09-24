@@ -179,7 +179,8 @@ Changes within the hidden continuation of a visible entry can activate the lates
 Automatic navigation admits nonempty presentation items once by stable identity, retaining only
 resident identities. Reordering, revisions, or removing the tail cannot re-admit older items.
 A new assistant item smoothly reveals its top and holds it while that item grows; a new
-non-assistant item smoothly returns to tail following. Manual navigation consumes arrivals without
+non-assistant item releases the hold into overflow following without moving fitting content.
+Only content extending past the viewport bottom triggers bottom alignment. Manual navigation consumes arrivals without
 scheduling movement. Admissions are checkpointed with navigation so failed presentations do not
 consume them. Stream events do not maintain a second deferred assistant reveal queue.
 

@@ -4224,6 +4224,11 @@ fn tool_activity_after_submitted_user_message_resumes_following_latest_rows() {
         &mut app,
         &mut bmux_tui::paint::PaintCx::new(&mut Frame::new(&mut buffer)),
     );
+    assert_eq!(
+        output_line_y(&buffer, "You"),
+        Some(1),
+        "fitting tool content must not bottom-align the submission"
+    );
     app.absorb_session_event(&event(
         session_id,
         14,

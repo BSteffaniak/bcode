@@ -3148,9 +3148,7 @@ impl BmuxApp {
                     }
                 } else {
                     self.automatic_item = Some(id);
-                    let checkpoint = self.navigation_checkpoint.take();
-                    self.transition_transcript_to_bottom();
-                    self.navigation_checkpoint = checkpoint;
+                    self.release_item_hold_for_overflow();
                 }
                 return;
             }
@@ -3195,6 +3193,17 @@ impl BmuxApp {
             self.submitted_user_message_following = SubmittedUserMessageFollowing::Anchored;
             self.viewport.reveal(false);
             self.start_transcript_scroll_animation(top_row);
+        }
+    }
+
+    /// Enable overflow following without consuming the space below a short item.
+    fn release_item_hold_for_overflow(&mut self) {
+        self.viewport.release_sticky_reveal();
+        let total = self.transcript_layout.total_rows();
+        if total > self.viewport.bottom_row(total) {
+            let checkpoint = self.navigation_checkpoint.take();
+            self.transition_transcript_to_bottom();
+            self.navigation_checkpoint = checkpoint;
         }
     }
 
