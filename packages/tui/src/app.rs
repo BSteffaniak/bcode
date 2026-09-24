@@ -2767,6 +2767,12 @@ impl BmuxApp {
 
     /// Store the current composer text as a pending submission and clear input.
     pub fn stage_submission(&mut self) {
+        self.restore_uncommitted_navigation();
+        // Freeze the displayed top before clearing the composer changes body height.
+        // This is an automatic hold, not a manual detach; acceptance owns its reveal.
+        if self.viewport.allows_reveal() {
+            self.viewport.reveal(true);
+        }
         let text = self.composer.buffer().text().to_owned();
         self.submitted_user_message_following = SubmittedUserMessageFollowing::Idle;
         self.assistant_scroll_anchor = AssistantScrollAnchorState::Idle;
@@ -3047,13 +3053,17 @@ impl BmuxApp {
         {
             self.record_latest_hidden_activity(now, 1);
         }
-        let allowed = !self.manual_transcript_scroll_active()
+        let allowed = self.submitted_user_message_following
+            != SubmittedUserMessageFollowing::PendingAnchor
+            && !self.manual_transcript_scroll_active()
             && self.transcript_scroll_animation.is_none()
             && self.viewport.allows_overflow();
-        if self
-            .viewport
-            .reconcile_overflow(previous_bottom, allowed, &mut self.older_history)
-        {
+        if self.viewport.reconcile_overflow(
+            self.viewport
+                .bottom_row(self.transcript_layout.total_rows()),
+            allowed,
+            &mut self.older_history,
+        ) {
             self.viewport.scroll_to_bottom(&mut self.older_history);
         }
         if !self.newer_transcript_content_below() {
@@ -3153,6 +3163,10 @@ impl BmuxApp {
                 return;
             }
         }
+        self.sync_submission_anchor_requests();
+    }
+
+    fn sync_submission_anchor_requests(&mut self) {
         if self.manual_transcript_scroll_active() || self.transcript_scroll_animation.is_some() {
             return;
         }
@@ -3164,13 +3178,13 @@ impl BmuxApp {
             {
                 self.pending_transcript_top_anchor_sequence = None;
                 self.transcript_scroll_animation = None;
-                self.viewport.detach();
-                self.viewport.follow_anchor(top_row);
                 if self.submitted_user_message_following
                     == SubmittedUserMessageFollowing::PendingAnchor
                 {
                     self.submitted_user_message_following = SubmittedUserMessageFollowing::Anchored;
                     self.viewport.reveal(false);
+                    self.start_transcript_scroll_animation(top_row);
+                    self.set_animation_item_target(index);
                     self.admitted_items.extend(
                         self.transcript
                             .iter()
@@ -3181,6 +3195,9 @@ impl BmuxApp {
                         .transcript
                         .get(index)
                         .map(super::transcript::TranscriptItem::id);
+                } else {
+                    self.viewport.detach();
+                    self.viewport.follow_anchor(top_row);
                 }
                 self.presented_transcript_anchor = None;
                 self.pending_stable_transcript_anchor = None;
@@ -3196,11 +3213,20 @@ impl BmuxApp {
         }
     }
 
+    fn set_animation_item_target(&mut self, index: usize) {
+        if let Some(animation) = &mut self.transcript_scroll_animation {
+            animation.target = self.transcript.presentation_id(index).map_or(
+                TranscriptAnimationTarget::Row,
+                TranscriptAnimationTarget::ItemTop,
+            );
+        }
+    }
+
     /// Enable overflow following without consuming the space below a short item.
     fn release_item_hold_for_overflow(&mut self) {
         self.viewport.release_sticky_reveal();
         let total = self.transcript_layout.total_rows();
-        if total > self.viewport.bottom_row(total) {
+        if self.transcript_scroll_animation.is_none() && total > self.viewport.bottom_row(total) {
             let checkpoint = self.navigation_checkpoint.take();
             self.transition_transcript_to_bottom();
             self.navigation_checkpoint = checkpoint;
