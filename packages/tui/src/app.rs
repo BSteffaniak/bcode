@@ -97,10 +97,18 @@ pub enum TemporalDamage {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TranscriptAnimationTarget {
+    LatestBottom,
+    ItemTop(TranscriptPresentationEntryId),
+    /// Retain the requested position if no item correspondence is available.
+    Row,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct TranscriptScrollAnimation {
     start_top_row: usize,
     target_top_row: usize,
-    target_item: Option<TranscriptPresentationEntryId>,
+    target: TranscriptAnimationTarget,
     started_at: Instant,
     duration: Duration,
     next_frame_at: Instant,
@@ -111,7 +119,7 @@ impl TranscriptScrollAnimation {
         Self {
             start_top_row,
             target_top_row,
-            target_item: None,
+            target: TranscriptAnimationTarget::Row,
             started_at,
             duration: TRANSCRIPT_SCROLL_ANIMATION_DURATION,
             next_frame_at: started_at + TRANSCRIPT_SCROLL_ANIMATION_FRAME,
@@ -2929,11 +2937,10 @@ impl BmuxApp {
         if start_top_row == target_top_row {
             return self.scroll_transcript_to_bottom();
         }
-        self.transcript_scroll_animation = Some(TranscriptScrollAnimation::new(
-            start_top_row,
-            target_top_row,
-            Instant::now(),
-        ));
+        let mut animation =
+            TranscriptScrollAnimation::new(start_top_row, target_top_row, Instant::now());
+        animation.target = TranscriptAnimationTarget::LatestBottom;
+        self.transcript_scroll_animation = Some(animation);
         true
     }
 
@@ -2989,24 +2996,24 @@ impl BmuxApp {
         let now = Instant::now();
         let mut animated_top = None;
         if let Some(mut animation) = self.transcript_scroll_animation {
-            if let Some(id) = animation.target_item
+            if let TranscriptAnimationTarget::ItemTop(id) = animation.target
                 && let Some(index) = self.transcript.presentation_index(id)
                 && let Some(row) = self
                     .transcript_layout
                     .entry_start_row(VisibleTranscriptSource::Transcript, index)
             {
                 animation.target_top_row = row;
-            } else if self.viewport.follows_bottom() {
+            } else if animation.target == TranscriptAnimationTarget::LatestBottom {
                 animation.target_top_row = total_rows.saturating_sub(usize::from(viewport_height));
             }
             let top_row = animation.top_row_at(now);
             if animation.finished(now) {
                 self.transcript_scroll_animation = None;
-                let follows_tail = animation.target_item.is_none();
+                let follows_tail = animation.target == TranscriptAnimationTarget::LatestBottom;
                 if follows_tail {
                     self.viewport.scroll_to_bottom(&mut self.older_history);
                 } else {
-                    self.viewport.materialize_top_row(animation.target_top_row);
+                    animated_top = Some(animation.target_top_row);
                 }
             } else {
                 animated_top = Some(top_row);
@@ -3123,12 +3130,7 @@ impl BmuxApp {
                         .transcript_layout
                         .entry_start_row(VisibleTranscriptSource::Transcript, index)
                     {
-                        self.automatic_item = Some(id);
-                        self.transcript_scroll_animation = None;
-                        self.start_transcript_scroll_animation(top);
-                        self.viewport.reveal(true);
-                        self.assistant_scroll_anchor =
-                            AssistantScrollAnchorState::Anchored { index };
+                        self.reveal_assistant_item(index, top);
                     }
                 } else {
                     self.automatic_item = Some(id);
@@ -3181,11 +3183,30 @@ impl BmuxApp {
                 .transcript_layout
                 .entry_start_row(VisibleTranscriptSource::Transcript, index)
         {
-            self.start_transcript_scroll_animation(top_row);
-            self.viewport.reveal(true);
-            self.assistant_scroll_anchor = AssistantScrollAnchorState::Anchored { index };
-            self.pending_assistant_stream_anchor = false;
+            self.reveal_assistant_item(index, top_row);
         }
+    }
+
+    /// Install one assistant hold, superseding every earlier automatic reveal.
+    fn reveal_assistant_item(&mut self, index: usize, top_row: usize) {
+        self.pending_transcript_top_anchor_sequence = None;
+        self.submitted_user_message_following = SubmittedUserMessageFollowing::Idle;
+        self.pending_assistant_stream_anchor = false;
+        self.automatic_item = self
+            .transcript
+            .get(index)
+            .map(super::transcript::TranscriptItem::id);
+        self.transcript_scroll_animation = None;
+        self.start_transcript_scroll_animation(top_row);
+        // Use the semantic target, never reverse-map animated/clamped coordinates.
+        if let Some(animation) = &mut self.transcript_scroll_animation {
+            animation.target = self.transcript.presentation_id(index).map_or(
+                TranscriptAnimationTarget::Row,
+                TranscriptAnimationTarget::ItemTop,
+            );
+        }
+        self.viewport.reveal(true);
+        self.assistant_scroll_anchor = AssistantScrollAnchorState::Anchored { index };
     }
 
     const fn downgrade_sticky_entry_anchor(&mut self) {
@@ -3275,11 +3296,15 @@ impl BmuxApp {
         {
             let mut animation =
                 TranscriptScrollAnimation::new(start_top_row, target_top_row, Instant::now());
-            animation.target_item = self
+            animation.target = self
                 .transcript_layout
                 .line_at_row(target_top_row)
                 .filter(|line| line.source == VisibleTranscriptSource::Transcript)
-                .and_then(|line| self.transcript.presentation_id(line.entry_index));
+                .and_then(|line| self.transcript.presentation_id(line.entry_index))
+                .map_or(
+                    TranscriptAnimationTarget::Row,
+                    TranscriptAnimationTarget::ItemTop,
+                );
             self.transcript_scroll_animation = Some(animation);
         }
     }
@@ -5121,6 +5146,27 @@ const fn event_affects_transcript_rows(event: &SessionEvent) -> bool {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn completed_row_animation_preserves_hold_without_item_correspondence() {
+        let mut app = super::BmuxApp::new_with_history(None, &[], &[], false);
+        app.viewport
+            .sync_max(20, 9, 30, 10, false, &mut app.older_history);
+        app.viewport.reveal(true);
+        let now = std::time::Instant::now();
+        let mut animation = super::TranscriptScrollAnimation::new(0, 12, now);
+        // Missing correspondence remains a row target, not a tail command.
+        animation.started_at = now
+            .checked_sub(std::time::Duration::from_secs(1))
+            .expect("clock permits test offset");
+        app.transcript_scroll_animation = Some(animation);
+        app.sync_transcript_scroll_max(20, 9, 30, 10);
+        assert_eq!(app.viewport.top_row(30, 10), 12);
+        assert!(!app.viewport.allows_overflow());
+        app.sync_transcript_scroll_max(25, 9, 35, 10);
+        assert_eq!(app.viewport.top_row(35, 10), 12);
+        drop(app);
+    }
+
     #[test]
     fn manual_scroll_cancels_deferred_sequence_and_submission_reveals() {
         let mut app = super::BmuxApp::new_with_history(None, &[], &[], false);

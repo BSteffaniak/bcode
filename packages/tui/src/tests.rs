@@ -4429,6 +4429,53 @@ fn streaming_assistant_response_anchors_at_top_when_following() {
 }
 
 #[test]
+fn assistant_hold_survives_completion_and_later_presentations() {
+    let session_id = SessionId::new();
+    let history = [event(
+        session_id,
+        0,
+        SessionEventKind::UserMessage {
+            client_id: ClientId::new(),
+            text: "prompt".to_owned(),
+            admission: bcode_session_models::TurnAdmissionMetadata::default(),
+        },
+    )];
+    let mut app = BmuxApp::new_with_history(Some(session_id), &history, &[], false);
+    let paint = |app: &mut BmuxApp| {
+        let mut buffer = Buffer::empty(Rect::new(0, 0, 80, 20));
+        render::render(
+            app,
+            &mut bmux_tui::paint::PaintCx::new(&mut Frame::new(&mut buffer)),
+        );
+        buffer
+    };
+    paint(&mut app);
+    app.absorb_session_event(&event(
+        session_id,
+        1,
+        SessionEventKind::AssistantDelta {
+            text: "short reply".to_owned(),
+        },
+    ));
+    paint(&mut app);
+    std::thread::sleep(Duration::from_millis(220));
+    let buffer = paint(&mut app);
+    assert_eq!(output_line_y(&buffer, "short reply"), Some(2));
+    app.absorb_session_event(&event(
+        session_id,
+        2,
+        SessionEventKind::AssistantMessage {
+            text: "short reply".to_owned(),
+        },
+    ));
+    for _ in 0..4 {
+        let buffer = paint(&mut app);
+        assert_eq!(output_line_y(&buffer, "short reply"), Some(2));
+    }
+    drop(app);
+}
+
+#[test]
 fn manual_scroll_from_stream_anchor_preserves_visual_position() {
     let session_id = SessionId::new();
     let history = [event(

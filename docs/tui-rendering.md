@@ -181,6 +181,11 @@ item smoothly reveals its top and holds it while that item grows; the next non-a
 smoothly returns to tail following. Manual navigation disables these transitions. Candidate identity
 transitions are checkpointed with navigation so failed presentations do not consume them.
 
+Animation targets distinguish item-top, latest-bottom, and unmapped row positions explicitly;
+missing correspondence never implies tail following. Both assistant reveal entry points use one
+superseding transition that clears earlier submission requests. At animation completion, the target
+position is applied after layout correspondence so an older reading anchor cannot overwrite it.
+
 Latest-content chrome is measured against the full body using a copy of viewport/history state.
 The bar cannot create its own visibility condition by reducing the viewport. Layout preparation
 then synchronizes the actual viewport once. Stable item anchors are captured before layout
