@@ -74,6 +74,18 @@ active presentations, and terminal tombstones remain bounded actor-owned state a
 
 ## Admitted workflow activity display
 
+When registered workflow runtime work terminates, the host appends a presentation-only
+transcript note before releasing its runtime ownership. Completion explanations are requested
+from the bound owner plugin through the existing versioned activity service, using stage
+`workflow_completed` and checksum-verified canonical terminal output. The same bounded request,
+validated response, and two-second timeout rules apply. Unsupported stages, disabled producers,
+or unavailable output yield an explicit generic completion notice, not an inferred goal verdict.
+Failure and cancellation notices use authoritative runtime outcomes. Duplicate settlement of
+already released work does not append another notice. These notes do not enter model context,
+alter workflow execution, or retrofit historical runs. Loop/goal explanations distinguish an
+evaluator-approved stop condition from exhausted iteration allowance and label approval as an
+evaluator judgment rather than independent proof.
+
 Workflow prompt configuration may explicitly select an activity producer and stage. At dispatch,
 the host requests a bounded versioned projection with a two-second deadline. Missing producers,
 invalid responses and timeouts omit the display projection; canonical prompt construction and

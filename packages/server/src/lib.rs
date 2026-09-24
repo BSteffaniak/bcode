@@ -16754,11 +16754,40 @@ fn workflow_terminal_failure_message(state: &ServerState, run_id: &str) -> Optio
         })
 }
 
-/// Reconcile the run-level runtime work registration with the run's durable status.
-///
-/// Terminal runs finish their work with the matching terminal status. Paused runs suspend their
-/// work so the daemon can become quiescent without losing the durable run. Running runs leave the
-/// registration untouched.
+/// Ask the bound producer to explain verified canonical completion; presentation never controls it.
+async fn workflow_completion_message(
+    state: &ServerState,
+    run: &bcode_workflow::WorkflowRunSummary,
+) -> String {
+    let fallback = format!(
+        "Workflow completed. Run: {}. Detailed completion evaluation unavailable; completion alone does not establish that a product goal was satisfied.",
+        run.run_id
+    );
+    let Some(binding) = &run.binding else {
+        return fallback;
+    };
+    let output = state
+        .workflow_store
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .canonical_terminal_output(&run.run_id);
+    let Ok(Some(output)) = output else {
+        return fallback;
+    };
+    let Some(presentation) = project_workflow_activity(
+        state,
+        &binding.owner_plugin_id,
+        "workflow_completed",
+        &output.value,
+    )
+    .await
+    else {
+        return fallback;
+    };
+    format!("{}\nRun: {}", presentation.fallback, run.run_id)
+}
+
+/// Terminal runs finish their work; paused runs suspend it without losing durable state.
 async fn settle_workflow_runtime_work(
     state: &ServerState,
     run_id: &str,
@@ -16789,7 +16818,10 @@ async fn settle_workflow_runtime_work(
             RuntimeWorkStatus::Suspended,
             Some("workflow run is paused; resume or cancel it to continue".to_string()),
         ),
-        bcode_workflow_store::RunStatus::Completed => (RuntimeWorkStatus::Completed, None),
+        bcode_workflow_store::RunStatus::Completed => (
+            RuntimeWorkStatus::Completed,
+            Some(workflow_completion_message(state, &run).await),
+        ),
         bcode_workflow_store::RunStatus::Failed => (
             RuntimeWorkStatus::Failed,
             workflow_terminal_failure_message(state, run_id).or_else(|| {
@@ -32975,17 +33007,29 @@ async fn workflow_prompt_activity(
     input: &serde_json::Value,
 ) -> Option<bcode_session_models::ActivityPresentation> {
     let producer = configuration.activity_producer.as_ref()?;
+    project_workflow_activity(state, &producer.plugin, &producer.stage, input).await
+}
+
+async fn project_workflow_activity(
+    state: &ServerState,
+    plugin: &str,
+    activity_stage: &str,
+    input: &serde_json::Value,
+) -> Option<bcode_session_models::ActivityPresentation> {
     let request = bcode_session_models::ActivityProjectionRequest {
-        stage: producer.stage.clone(),
+        stage: activity_stage.to_owned(),
         revision: 1,
         input: input.clone(),
     };
     let payload = serde_json::to_vec(&request).ok()?;
+    if payload.len() > bcode_session_models::MAX_ACTIVITY_PROJECTION_REQUEST_BYTES {
+        return None;
+    }
     let response = tokio::time::timeout(
         Duration::from_secs(2),
         plugin_operations::invoke_service(
             state,
-            &producer.plugin,
+            plugin,
             bcode_session_models::ACTIVITY_PRESENTATION_INTERFACE_ID,
             bcode_session_models::OP_PROJECT_ACTIVITY.into(),
             payload,
@@ -32997,7 +33041,10 @@ async fn workflow_prompt_activity(
     if response.error.is_some() {
         return None;
     }
-    serde_json::from_slice(&response.payload).ok()
+    let presentation: bcode_session_models::ActivityPresentation =
+        serde_json::from_slice(&response.payload).ok()?;
+    presentation.validate(plugin).ok()?;
+    Some(presentation)
 }
 
 struct WorkflowPromptAdmission<'a> {
@@ -34385,6 +34432,31 @@ async fn finish_registered_runtime_work(
         tracing::debug!(%session_id, work_id = %work_id, "runtime work already reached a terminal state");
         return;
     };
+    if owned_work.kind == RuntimeWorkKind::Workflow && status.is_terminal() {
+        let outcome = match status {
+            RuntimeWorkStatus::Completed => "Workflow completed",
+            RuntimeWorkStatus::Cancelled => {
+                "Workflow cancelled — goal completion was not established"
+            }
+            _ => "Workflow stopped with a failure — goal completion was not established",
+        };
+        let text = message.as_ref().map_or_else(
+            || format!("{outcome}.\nWork: {work_id}"),
+            |message| format!("{outcome}.\n{message}"),
+        );
+        if let Err(error) = session_operations::append_presentation_note(
+            state,
+            session_id,
+            "bcode.workflow".into(),
+            format!("{work_id}:outcome"),
+            text,
+            bcode_command::CommandTextFormat::PlainText,
+        )
+        .await
+        {
+            tracing::warn!(%session_id, %work_id, %error, "failed to persist workflow outcome presentation");
+        }
+    }
     append_runtime_work_finished_event(state, session_id, work_id, status, message).await;
     drop(owned_work);
     state.release_session_resources_if_idle(session_id).await;
@@ -73200,7 +73272,72 @@ event_symbol = "bcode_plugin_handle_event_v1"
                             && *status == RuntimeWorkStatus::Completed
                 ))
         );
+        settle_workflow_runtime_work(&state, "terminal-work-run")
+            .await
+            .expect("duplicate settlement");
+        let history = state
+            .sessions
+            .session_history(session.id)
+            .await
+            .expect("history");
+        let notices: Vec<_> = history
+            .iter()
+            .filter_map(|event| match &event.kind {
+                SessionEventKind::PluginStatusNote {
+                    plugin_id,
+                    text,
+                    metadata,
+                    ..
+                } if plugin_id == "bcode.workflow" => Some((text, metadata)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(notices.len(), 1);
+        assert!(notices[0].0.contains("Workflow completed"));
+        assert!(notices[0].0.contains("does not establish"));
+        assert_eq!(notices[0].1["presentation_only"], true);
         drop(state);
+    }
+
+    #[tokio::test]
+    async fn workflow_failure_and_cancellation_publish_durable_notices() {
+        let sessions = SessionManager::default();
+        let session = sessions
+            .create_session(Some("outcomes".into()), PathBuf::from("."))
+            .await
+            .expect("session");
+        let root = tempfile::tempdir().expect("root");
+        let store =
+            bcode_workflow_store::WorkflowStore::open_in_state_dir(root.path()).expect("store");
+        let state = test_server_state_with_fake_provider_and_workflow_store(sessions, store);
+        for (id, status) in [
+            ("failed", RuntimeWorkStatus::Failed),
+            ("cancelled", RuntimeWorkStatus::Cancelled),
+        ] {
+            let work_id = register_workflow_runtime_work(&state, session.id, id, id.into()).await;
+            finish_registered_runtime_work(&state, session.id, work_id, status, None).await;
+        }
+        let history = state
+            .sessions
+            .session_history(session.id)
+            .await
+            .expect("history");
+        drop(state);
+        let texts: Vec<_> = history
+            .iter()
+            .filter_map(|event| match &event.kind {
+                SessionEventKind::PluginStatusNote { text, .. } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(texts.len(), 2);
+        assert!(texts[0].contains("stopped with a failure"));
+        assert!(texts[1].contains("cancelled"));
+        assert!(
+            texts
+                .iter()
+                .all(|text| text.contains("goal completion was not established"))
+        );
     }
 
     #[tokio::test]

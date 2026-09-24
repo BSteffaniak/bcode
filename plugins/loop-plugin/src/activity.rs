@@ -27,6 +27,9 @@ fn activity_heading(
     prompt: &str,
     stop: &str,
 ) -> String {
+    if phase == "workflow_completed" {
+        return completion_text(state, &preview(&state.summary));
+    }
     if initialization {
         format!(
             "Goal initialization · Researching and preparing progress document\nPrompt: {prompt}\nStop when: {stop}"
@@ -48,11 +51,26 @@ fn validate_stage(stage: &str) -> Result<(), String> {
             | "implementation_complete"
             | "evaluation"
             | "evaluation_complete"
+            | "workflow_completed"
     ) {
         Ok(())
     } else {
         Err("unsupported loop activity stage".into())
     }
+}
+
+fn completion_text(state: &LoopWorkflowIteration, summary: &str) -> String {
+    let outcome = if state.condition_met {
+        "Goal completed — evaluator marked the stop condition satisfied."
+    } else if state.iteration >= state.max_iterations {
+        "Goal stopped — iteration allowance exhausted; stop condition not satisfied."
+    } else {
+        "Goal stopped — evaluator did not mark the stop condition satisfied."
+    };
+    format!(
+        "{outcome}\nIteration {} of {}.\nEvaluator summary: {summary}\nThis is the evaluator's judgment, not independent proof of correctness.\nUse /goal.status to inspect the run; evaluation evidence is in the preceding transcript.",
+        state.iteration, state.max_iterations
+    )
 }
 
 pub fn project(request: ActivityProjectionRequest) -> Result<ActivityPresentation, String> {
@@ -90,7 +108,7 @@ pub fn project(request: ActivityProjectionRequest) -> Result<ActivityPresentatio
         &stop_condition,
     );
     let evaluation_complete = request.stage == "evaluation_complete";
-    if !summary.trim().is_empty() {
+    if !summary.trim().is_empty() && request.stage != "workflow_completed" {
         let label = if evaluation_complete {
             "Evaluation summary"
         } else {
@@ -161,6 +179,25 @@ pub fn project(request: ActivityProjectionRequest) -> Result<ActivityPresentatio
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn terminal_presentation_distinguishes_approval_from_exhaustion() {
+        let mut input = request("workflow_completed");
+        input.input["condition_met"] = true.into();
+        let approved = project(input.clone()).expect("approved presentation");
+        assert!(
+            approved
+                .fallback
+                .contains("evaluator marked the stop condition satisfied")
+        );
+        assert!(approved.fallback.contains("Iteration 2 of 10"));
+        assert!(approved.fallback.contains("not independent proof"));
+        input.input["condition_met"] = false.into();
+        input.input["iteration"] = 10.into();
+        let exhausted = project(input).expect("exhausted presentation");
+        assert!(exhausted.fallback.contains("iteration allowance exhausted"));
+        assert!(exhausted.fallback.contains("stop condition not satisfied"));
+    }
 
     fn request(stage: &str) -> ActivityProjectionRequest {
         ActivityProjectionRequest {
