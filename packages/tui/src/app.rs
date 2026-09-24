@@ -345,6 +345,7 @@ struct TranscriptNavigationCheckpoint {
     assistant: AssistantScrollAnchorState,
     pending_assistant: bool,
     pending_sequence: Option<u64>,
+    automatic_item: Option<super::transcript::TranscriptItemId>,
     history: OlderHistoryState,
     hidden_activity_at: Option<Instant>,
     hidden_activity_burst: u8,
@@ -402,6 +403,7 @@ pub struct BmuxApp {
     pending_stable_transcript_anchor: Option<StableTranscriptAnchor>,
     presented_transcript_anchor: Option<StableTranscriptAnchor>,
     navigation_checkpoint: Option<TranscriptNavigationCheckpoint>,
+    automatic_item: Option<super::transcript::TranscriptItemId>,
     latest_hidden_activity_at: Option<Instant>,
     latest_hidden_activity_burst: u8,
     latest_bar_animation_started_at: Instant,
@@ -589,6 +591,7 @@ impl BmuxApp {
             pending_stable_transcript_anchor: None,
             presented_transcript_anchor: None,
             navigation_checkpoint: None,
+            automatic_item: None,
             latest_hidden_activity_at: None,
             latest_hidden_activity_burst: 0,
             latest_bar_animation_started_at: now,
@@ -2110,10 +2113,12 @@ impl BmuxApp {
         );
         let bottom = viewport.bottom_row(total_rows);
         bottom < total_rows
-            && self
-                .transcript_layout
-                .first_entry_start_at_or_after_row(bottom)
-                .is_some()
+            && (self.transcript_layout.changed_content_below(bottom)
+                || self.latest_hidden_activity_at.is_some()
+                || self
+                    .transcript_layout
+                    .first_entry_start_at_or_after_row(bottom)
+                    .is_some())
     }
 
     fn hidden_entry_start_row_below_viewport(&self) -> Option<usize> {
@@ -2122,8 +2127,16 @@ impl BmuxApp {
         if viewport_bottom >= total_rows {
             return None;
         }
-        self.transcript_layout
-            .first_entry_start_at_or_after_row(viewport_bottom)
+        if self
+            .transcript_layout
+            .changed_content_below(viewport_bottom)
+            || self.latest_hidden_activity_at.is_some()
+        {
+            Some(viewport_bottom)
+        } else {
+            self.transcript_layout
+                .first_entry_start_at_or_after_row(viewport_bottom)
+        }
     }
 
     /// Return the most recent time hidden transcript content changed.
@@ -3018,7 +3031,7 @@ impl BmuxApp {
         self.resolve_visual_overflow_follow(total_rows, now);
     }
 
-    fn resolve_visual_overflow_follow(&mut self, total_rows: usize, now: Instant) {
+    fn resolve_visual_overflow_follow(&mut self, _total_rows: usize, now: Instant) {
         let Some(previous_bottom) = self.pending_visual_overflow_bottom.take() else {
             if !self.newer_transcript_content_below() {
                 self.latest_hidden_activity_at = None;
@@ -3027,12 +3040,11 @@ impl BmuxApp {
             }
             return;
         };
-        let hidden_entry_start = self.hidden_entry_start_row_below_viewport();
-        let changed_hidden_entry_rows = hidden_entry_start.map_or(0, |entry_start| {
-            total_rows.saturating_sub(previous_bottom.max(entry_start))
-        });
-        if changed_hidden_entry_rows > 0 {
-            self.record_latest_hidden_activity(now, changed_hidden_entry_rows);
+        if self
+            .transcript_layout
+            .changed_content_below(previous_bottom)
+        {
+            self.record_latest_hidden_activity(now, 1);
         }
         let allowed = !self.manual_transcript_scroll_active()
             && self.transcript_scroll_animation.is_none()
@@ -3083,6 +3095,46 @@ impl BmuxApp {
 
     /// Resolve deferred user-message and live-stream top anchoring against the latest cached layout.
     pub fn sync_transcript_anchor_requests(&mut self) {
+        let newest = self
+            .transcript
+            .iter()
+            .last()
+            .filter(|item| item.role() != "Assistant" || !item.text().is_empty())
+            .map(|item| (item.id(), item.role() == "Assistant"));
+        if let Some((id, assistant)) = newest {
+            let changed = self
+                .automatic_item
+                .replace(id)
+                .is_some_and(|previous| previous != id);
+            if changed
+                && self.viewport.allows_reveal()
+                && !self.manual_transcript_scroll_active()
+                && self.submitted_user_message_following
+                    != SubmittedUserMessageFollowing::PendingAnchor
+            {
+                self.pending_transcript_top_anchor_sequence = None;
+                self.submitted_user_message_following = SubmittedUserMessageFollowing::Idle;
+                self.pending_assistant_stream_anchor = false;
+                if assistant {
+                    let index = self.transcript.items().len().saturating_sub(1);
+                    if let Some(top) = self
+                        .transcript_layout
+                        .entry_start_row(VisibleTranscriptSource::Transcript, index)
+                    {
+                        self.transcript_scroll_animation = None;
+                        self.start_transcript_scroll_animation(top);
+                        self.viewport.reveal(true);
+                        self.assistant_scroll_anchor =
+                            AssistantScrollAnchorState::Anchored { index };
+                    }
+                } else {
+                    let checkpoint = self.navigation_checkpoint.take();
+                    self.transition_transcript_to_bottom();
+                    self.navigation_checkpoint = checkpoint;
+                }
+                return;
+            }
+        }
         if self.manual_transcript_scroll_active() || self.transcript_scroll_animation.is_some() {
             return;
         }
@@ -3946,6 +3998,7 @@ impl BmuxApp {
             self.assistant_scroll_anchor = checkpoint.assistant;
             self.pending_assistant_stream_anchor = checkpoint.pending_assistant;
             self.pending_transcript_top_anchor_sequence = checkpoint.pending_sequence;
+            self.automatic_item = checkpoint.automatic_item;
             self.older_history = checkpoint.history;
             self.latest_hidden_activity_at = checkpoint.hidden_activity_at;
             self.latest_hidden_activity_burst = checkpoint.hidden_activity_burst;
@@ -3960,6 +4013,7 @@ impl BmuxApp {
         // it. A retry must not recapture old coordinates from the new layout.
         self.capture_stable_transcript_anchor();
         self.navigation_checkpoint = Some(TranscriptNavigationCheckpoint {
+            automatic_item: self.automatic_item,
             viewport: self.viewport,
             animation: self.transcript_scroll_animation,
             anchor: self.pending_stable_transcript_anchor.clone(),
@@ -3977,6 +4031,7 @@ impl BmuxApp {
 
     /// Advance correspondence only after the terminal presenter acknowledges a frame.
     pub fn commit_transcript_presentation(&mut self) {
+        self.transcript_layout.clear_content_changes();
         self.navigation_checkpoint = None;
         self.presented_transcript_anchor = None;
         self.pending_stable_transcript_anchor = None;

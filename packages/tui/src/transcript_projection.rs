@@ -130,6 +130,7 @@ fn sync_layout(app: &mut BmuxApp, width: u16) {
         app.drain_elapsed_dirty_visuals_bounded(MAX_DIRTY_VISUALS_PER_LAYOUT_SYNC);
     let transcript_dirty_items = app.drain_transcript_dirty_items();
     let mut transcript_layout = std::mem::take(app.transcript_layout_mut());
+    let elapsed_only;
     {
         let input = TranscriptLayoutInput::from_app(app, width);
         let fingerprint = input.fingerprint();
@@ -137,18 +138,6 @@ fn sync_layout(app: &mut BmuxApp, width: u16) {
         if transcript_layout.is_current(&fingerprint) {
             transcript_layout
                 .record_cache_hit(u64::try_from(started.elapsed().as_micros()).unwrap_or(u64::MAX));
-            *app.transcript_layout_mut() = transcript_layout;
-            return;
-        }
-        if !transcript_dirty_items.is_empty()
-            && transcript_layout.structure_is_current(&structural_fingerprint)
-        {
-            transcript_layout.sync_transcript_entries(
-                fingerprint,
-                &transcript_dirty_items,
-                |index| transcript_item_signature(&input.transcript[index], &input),
-                |index| transcript_item_rows(app, &input.transcript[index], &input),
-            );
             *app.transcript_layout_mut() = transcript_layout;
             return;
         }
@@ -161,16 +150,36 @@ fn sync_layout(app: &mut BmuxApp, width: u16) {
                             .saturating_sub(elapsed_dirty_visuals.len()),
                     )
                 });
+        elapsed_only = elapsed_dirty_visuals
+            .difference(&dirty_visuals)
+            .filter(|invocation| {
+                !transcript_dirty_items.iter().any(|&index| {
+                    input.transcript[index].visual_invocation_id() == Some(invocation.as_str())
+                })
+            })
+            .cloned()
+            .collect();
         dirty_visuals.extend(elapsed_dirty_visuals);
-        if !dirty_visuals.is_empty()
+        if (!dirty_visuals.is_empty() || !transcript_dirty_items.is_empty())
             && transcript_layout.structure_is_current(&structural_fingerprint)
         {
-            transcript_layout.sync_visuals(
-                fingerprint,
-                &dirty_visuals,
-                |index| transcript_item_signature(&input.transcript[index], &input),
-                |index| transcript_item_rows(app, &input.transcript[index], &input),
-            );
+            if !transcript_dirty_items.is_empty() {
+                transcript_layout.sync_transcript_entries(
+                    fingerprint.clone(),
+                    &transcript_dirty_items,
+                    |index| transcript_item_signature(&input.transcript[index], &input),
+                    |index| transcript_item_rows(app, &input.transcript[index], &input),
+                );
+            }
+            if !dirty_visuals.is_empty() {
+                transcript_layout.sync_visuals(
+                    fingerprint,
+                    &dirty_visuals,
+                    |index| transcript_item_signature(&input.transcript[index], &input),
+                    |index| transcript_item_rows(app, &input.transcript[index], &input),
+                );
+            }
+            transcript_layout.suppress_visual_content_changes(&elapsed_only);
             *app.transcript_layout_mut() = transcript_layout;
             return;
         }
@@ -206,6 +215,7 @@ fn sync_layout(app: &mut BmuxApp, width: u16) {
             reset: || false,
         });
     }
+    transcript_layout.suppress_visual_content_changes(&elapsed_only);
     *app.transcript_layout_mut() = transcript_layout;
 }
 

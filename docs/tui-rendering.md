@@ -170,6 +170,17 @@ blank rows from the current geometry. New content fills that space regardless of
 grace timer; reaching the viewport boundary resumes bottom-follow. Alternating growth and shrinkage
 must not accumulate scroll drift.
 
+Latest-content activity compares retained rows only when entries are regenerated; cache hits,
+scrolling and repeated preparations do not generate activity. Timer-only visual refreshes retain
+any pending content damage without adding activity. Successful presentation acknowledges the bounded
+dirty-entry set. Width reflow establishes fresh geometry rather than reporting output activity.
+Changes within the hidden continuation of a visible entry can activate the latest-content bar.
+
+Automatic navigation tracks the newest nonempty presentation item by stable identity. A new assistant
+item smoothly reveals its top and holds it while that item grows; the next non-assistant item
+smoothly returns to tail following. Manual navigation disables these transitions. Candidate identity
+transitions are checkpointed with navigation so failed presentations do not consume them.
+
 Latest-content chrome is measured against the full body using a copy of viewport/history state.
 The bar cannot create its own visibility condition by reducing the viewport. Layout preparation
 then synchronizes the actual viewport once. Stable item anchors are captured before layout

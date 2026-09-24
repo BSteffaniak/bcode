@@ -199,6 +199,22 @@ pub enum VisibleTranscriptSource {
 }
 
 impl TranscriptLayoutCache {
+    /// Whether newly accepted rows changed below the viewport.
+    #[must_use]
+    pub fn changed_content_below(&self, bottom: usize) -> bool {
+        self.entries.changed_content_below(bottom)
+    }
+
+    /// Exclude timer-only visual updates from activity.
+    pub fn suppress_visual_content_changes(&mut self, invocations: &BTreeSet<String>) {
+        self.entries.suppress_visual_content_changes(invocations);
+    }
+
+    /// Acknowledge content changes after successful presentation.
+    pub fn clear_content_changes(&mut self) {
+        self.entries.clear_content_changes();
+    }
+
     /// Resolve a visible row to its accepted Markdown source position.
     pub fn source_position(&self, index: usize, row: usize) -> Option<usize> {
         self.entries.source_position(index, row)
@@ -368,6 +384,9 @@ impl TranscriptLayoutCache {
         let rows_regenerated = history_rows
             .saturating_add(transcript_rows)
             .saturating_add(pending_rows);
+        if width_changed || explicit_reset {
+            self.entries.clear_content_changes();
+        }
         self.fingerprint = Some(spec.fingerprint);
         self.structural_fingerprint = Some(spec.structural_fingerprint);
         let stats = TranscriptLayoutSyncStats {

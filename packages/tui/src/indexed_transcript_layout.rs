@@ -19,6 +19,8 @@ struct IndexedEntry {
     )>,
     selection: BTreeMap<usize, bcode_plugin_sdk::tui::PluginTuiSelectionRow>,
     anchors: Vec<bcode_plugin_sdk::tui_visual::TuiVisualAnchor>,
+    changed_end: usize,
+    previous_changed_end: usize,
 }
 
 impl IndexedEntry {
@@ -56,7 +58,24 @@ impl IndexedEntry {
             markdown,
             selection,
             anchors,
+            changed_end: row_count,
+            previous_changed_end: 0,
         }
+    }
+
+    fn replace(&mut self, signature: TranscriptLayoutSignature, rows: TranscriptLayoutRows) {
+        let mut next = Self::new(signature, rows);
+        next.previous_changed_end = self.changed_end;
+        next.changed_end = if self.row_count == next.row_count {
+            (0..self.rows.len().max(next.rows.len()))
+                .rev()
+                .find(|&row| self.rows.get(row) != next.rows.get(row))
+                .map_or(0, |row| row.saturating_add(1))
+        } else {
+            self.row_count.max(next.row_count)
+        }
+        .max(self.changed_end);
+        *self = next;
     }
 
     fn line(&self, row: usize) -> Option<&Line> {
@@ -161,6 +180,7 @@ const fn highest_power_of_two(value: usize) -> usize {
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 struct IndexedSection {
+    changed_entries: BTreeSet<usize>,
     entries: Vec<IndexedEntry>,
     rows: FenwickRows,
 }
@@ -168,6 +188,7 @@ struct IndexedSection {
 impl IndexedSection {
     fn clear(&mut self) {
         self.entries.clear();
+        self.changed_entries.clear();
         self.rows.tree.clear();
     }
 
@@ -176,6 +197,7 @@ impl IndexedSection {
         S: Fn(usize) -> TranscriptLayoutSignature,
         R: FnMut(usize) -> TranscriptLayoutRows,
     {
+        self.changed_entries.retain(|&index| index < len);
         self.entries.truncate(len);
         let mut changed = 0_usize;
         let mut rows_regenerated = 0_usize;
@@ -187,13 +209,17 @@ impl IndexedSection {
                     let rows = render_rows(index);
                     changed = changed.saturating_add(1);
                     rows_regenerated = rows_regenerated.saturating_add(rows.len());
-                    *entry = IndexedEntry::new(signature, rows);
+                    entry.replace(signature, rows);
+                    if entry.changed_end > 0 {
+                        self.changed_entries.insert(index);
+                    }
                 }
                 None => {
                     let rows = render_rows(index);
                     changed = changed.saturating_add(1);
                     rows_regenerated = rows_regenerated.saturating_add(rows.len());
                     self.entries.push(IndexedEntry::new(signature, rows));
+                    self.changed_entries.insert(index);
                 }
             }
         }
@@ -224,7 +250,10 @@ impl IndexedSection {
             let rows = render_rows(index);
             let old_rows = entry.row_count;
             let new_rows = rows.len();
-            *entry = IndexedEntry::new(signature, rows);
+            entry.replace(signature, rows);
+            if entry.changed_end > 0 {
+                self.changed_entries.insert(index);
+            }
             self.rows.replace(index, old_rows, new_rows);
             changed = changed.saturating_add(1);
             rows_regenerated = rows_regenerated.saturating_add(new_rows);
@@ -295,6 +324,46 @@ pub struct IndexedTranscriptLayout {
 }
 
 impl IndexedTranscriptLayout {
+    pub fn changed_content_below(&self, bottom: usize) -> bool {
+        [&self.transcript, &self.pending]
+            .into_iter()
+            .enumerate()
+            .any(|(section, entries)| {
+                let base = self.history.total_rows()
+                    + if section == 1 {
+                        self.transcript.total_rows()
+                    } else {
+                        0
+                    };
+                entries.changed_entries.iter().any(|&index| {
+                    let entry = &entries.entries[index];
+                    entry.changed_end > 0
+                        && base + entries.rows.prefix(index) + entry.changed_end > bottom
+                })
+            })
+    }
+
+    pub fn suppress_visual_content_changes(&mut self, invocations: &BTreeSet<String>) {
+        for invocation in invocations {
+            if let Some(indexes) = self.invocation_entries.get(invocation) {
+                for &index in indexes {
+                    if let Some(entry) = self.transcript.entries.get_mut(index) {
+                        entry.changed_end = entry.previous_changed_end;
+                    }
+                }
+            }
+        }
+    }
+
+    pub fn clear_content_changes(&mut self) {
+        for section in [&mut self.transcript, &mut self.pending] {
+            for index in std::mem::take(&mut section.changed_entries) {
+                section.entries[index].changed_end = 0;
+                section.entries[index].previous_changed_end = 0;
+            }
+        }
+    }
+
     pub fn source_position(&self, index: usize, row: usize) -> Option<usize> {
         let (projection, body_start) = self.transcript.entries.get(index)?.markdown.as_ref()?;
         let row = row.checked_sub(*body_start)?;
@@ -601,6 +670,38 @@ impl IndexedTranscriptLayout {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn content_changes_compare_rows_and_survive_timer_only_replacement() {
+        let signature = |n| TranscriptLayoutSignature::new(format!("revision-{n}"));
+        let rows = |body: &str| {
+            TranscriptLayoutRows::Rendered(vec![Line::from("header"), Line::from(body)])
+        };
+        let mut entry = IndexedEntry::new(signature(0), rows("old"));
+        entry.changed_end = 0;
+        entry.replace(signature(1), rows("old"));
+        assert_eq!(entry.changed_end, 0, "invalidation is not visual activity");
+        entry.replace(signature(2), rows("new"));
+        assert_eq!(entry.changed_end, 2, "same-height output changes count");
+        entry.replace(
+            signature(3),
+            TranscriptLayoutRows::Rendered(vec![Line::from("timer"), Line::from("new")]),
+        );
+        entry.changed_end = entry.previous_changed_end;
+        assert_eq!(
+            entry.changed_end, 2,
+            "timer suppression retains unpresented output changes"
+        );
+        entry.changed_end = 0;
+        entry.replace(
+            signature(4),
+            TranscriptLayoutRows::Rendered(vec![Line::from("later timer"), Line::from("new")]),
+        );
+        assert_eq!(
+            entry.changed_end, 1,
+            "header changes do not mark the body changed"
+        );
+    }
+
     #[test]
     fn selection_geometry_belongs_to_each_retained_projection() {
         let mut narrow = IndexedTranscriptLayout::default();

@@ -3778,6 +3778,15 @@ fn latest_bar_shows_for_distinct_hidden_entry_below_visible_message() {
     render::render(&mut app, &mut bmux_tui::paint::PaintCx::new(&mut frame));
 
     assert!(app.newer_transcript_content_below());
+    assert_eq!(app.latest_hidden_activity_at(), None);
+    for _ in 0..3 {
+        let mut buffer = Buffer::empty(Rect::new(0, 0, 80, 12));
+        render::render(
+            &mut app,
+            &mut bmux_tui::paint::PaintCx::new(&mut Frame::new(&mut buffer)),
+        );
+        assert_eq!(app.latest_hidden_activity_at(), None);
+    }
     drop(app);
     assert!(rendered_text(&buffer).contains("New messages below"));
 }
@@ -4527,6 +4536,32 @@ fn tool_activity_after_assistant_preamble_resumes_following_latest_rows() {
 
     assert!(rendered_text(&buffer).contains("shell.run"));
     assert_eq!(app.scroll_offset(), anchored_scroll_offset);
+    std::thread::sleep(Duration::from_millis(220));
+    app.absorb_session_event(&event(
+        session_id,
+        3,
+        SessionEventKind::SystemMessage {
+            text: (0..30)
+                .map(|row| format!("new output {row}"))
+                .collect::<Vec<_>>()
+                .join("\n"),
+        },
+    ));
+    render::render(
+        &mut app,
+        &mut bmux_tui::paint::PaintCx::new(&mut Frame::new(&mut buffer)),
+    );
+    std::thread::sleep(Duration::from_millis(220));
+    render::render(
+        &mut app,
+        &mut bmux_tui::paint::PaintCx::new(&mut Frame::new(&mut buffer)),
+    );
+    assert_eq!(
+        app.scroll_offset(),
+        0,
+        "next item leaves assistant hold and follows overflowing output"
+    );
+    assert!(rendered_text(&buffer).contains("new output 29"));
     drop(app);
 }
 
