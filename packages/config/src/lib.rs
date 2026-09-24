@@ -663,6 +663,56 @@ impl BcodeConfig {
         }
     }
 
+    /// Resolve a presentation-only label for the active model selection.
+    ///
+    /// Only the active profile participates; unrelated profiles for the same model do not.
+    /// Explicit aliases take precedence unless they are the active profile's selected model.
+    #[must_use]
+    pub fn model_selection_display_name(
+        &self,
+        provider: Option<&str>,
+        model: Option<&str>,
+        requested_model: Option<&str>,
+    ) -> Option<String> {
+        let active = self.resolved_model_selection();
+        let matches_active = active.provider_plugin_id.as_deref() == provider
+            && active.model_id.as_deref() == model
+            && requested_model
+                .is_none_or(|requested| Some(requested) == active.selected_model_id.as_deref());
+        if matches_active
+            && let Some(profile) = self
+                .model
+                .profile
+                .as_ref()
+                .and_then(|name| self.model.profiles.get(name))
+            && let Some(label) = profile
+                .display_name
+                .as_ref()
+                .filter(|name| !name.trim().is_empty())
+        {
+            return Some(label.clone());
+        }
+        let selected = requested_model.or_else(|| {
+            matches_active
+                .then_some(active.selected_model_id.as_deref())
+                .flatten()
+        })?;
+        let alias = self.model.aliases.get(selected)?;
+        if Some(alias.model_id.as_str()) != model
+            || alias
+                .provider_plugin_id
+                .as_deref()
+                .is_some_and(|id| Some(id) != provider)
+        {
+            return None;
+        }
+        alias
+            .display_name
+            .as_ref()
+            .filter(|name| !name.trim().is_empty())
+            .cloned()
+    }
+
     fn apply_model_alias(&self, selection: &mut ResolvedModelSelection) {
         let Some(selected_model_id) = selection.model_id.clone() else {
             return;
@@ -4168,6 +4218,9 @@ const fn default_conversation_reuse_mode() -> bcode_model::ConversationReuseMode
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, ConfigDoc)]
 #[config_doc(section = "model_profile")]
 pub struct ModelProfileConfig {
+    /// Optional presentation label for this configured model profile.
+    #[serde(default)]
+    pub display_name: Option<String>,
     /// Provider plugin id for this profile.
     pub provider_plugin_id: String,
     /// Provider-specific model id for this profile.
@@ -4200,6 +4253,9 @@ pub struct ModelProfileConfig {
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, ConfigDoc)]
 #[config_doc(section = "model_alias")]
 pub struct ModelAliasConfig {
+    /// Optional presentation label for this model alias.
+    #[serde(default)]
+    pub display_name: Option<String>,
     /// Provider plugin id selected by the alias.
     #[serde(default)]
     pub provider_plugin_id: Option<String>,
@@ -4844,6 +4900,7 @@ pub fn set_openai_compatible_sshenv_auth_method(
                 .profiles
                 .entry(profile.clone())
                 .or_insert_with(|| ModelProfileConfig {
+                    display_name: None,
                     provider_plugin_id: "bcode.openai-compatible".to_string(),
                     model_id: Some(model_id),
                     auth_profile: Some(profile),
@@ -4925,6 +4982,7 @@ pub fn add_openai_chatgpt_subscription_auth(
                     model_profile.auth_pool = Some(pool.to_string());
                 })
                 .or_insert_with(|| ModelProfileConfig {
+                    display_name: None,
                     provider_plugin_id: "bcode.openai-compatible".to_string(),
                     model_id: Some(model_id),
                     auth_profile: None,
@@ -5032,6 +5090,7 @@ pub fn set_bedrock_model_profile(
         config.model.profiles.insert(
             profile.to_string(),
             ModelProfileConfig {
+                display_name: None,
                 provider_plugin_id: "bcode.bedrock".to_string(),
                 model_id: Some(model_id),
                 auth_profile: Some(auth_profile.clone()),

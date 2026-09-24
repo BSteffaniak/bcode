@@ -28,6 +28,23 @@ A selected context replaces global model/auth configuration rather than inheriti
 
 Resolved context identity crosses effective-config transport. Model profile names remain local. Local account names supplied to auth lookup resolve within the selected context; global default provider bindings are not consulted. Missing contexts fail rather than selecting another context. Existing configurations without `contexts` retain their behavior.
 
+## Model presentation labels
+
+Model profiles and aliases accept an optional `display_name`:
+
+```toml
+[model.profiles.astra-full-fast]
+provider_plugin_id = "bcode.openai-compatible"
+model_id = "gpt-6-astra"
+display_name = "Astra · Full · Fast"
+```
+
+The active profile's nonblank label takes precedence over its alias label. Otherwise,
+explicitly selected aliases may supply their own label. Unlabeled selections retain the
+catalog/provider display name. Labels apply only while the provider and model match the
+selection; they do not change provider request IDs or confirm provider billing behavior.
+The existing model-status display name carries the label to clients, including the TUI header.
+
 ## Discovered model selection
 
 In onboarding, `M` discovers models using the selected model profile's account, the context's explicitly selected account, or its sole declared account. Preparation uses one configuration snapshot without reloading ambient layers; results are rejected if configuration changes during discovery. The account's registered plugin supplies the catalog through the application client. Up/Down selects a returned model; Enter reviews and confirms an atomic context-local provider/model/account edit. No global model default is changed. Missing or ambiguous account selection is reported instead of guessing. Use `A` in onboarding to choose any declared account in the active context. Its reviewed edit selects the account and provider together and clears previous model/profile/pool overrides; then `M` discovers models for that selection. Configured model profiles remain available through `m`.
