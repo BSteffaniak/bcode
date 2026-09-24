@@ -1145,11 +1145,29 @@ pub struct WorkflowPublicationReadFence {
 pub struct WorkflowStore {
     path: PathBuf,
     connection: Connection,
-    _ownership: File,
+    _ownership: Option<File>,
     read_identity: std::sync::Arc<()>,
 }
 
 impl WorkflowStore {
+    /// Create an isolated, noncanonical store for an unavailable workflow service.
+    ///
+    /// Hosts must gate all workflow operations until canonical initialization succeeds.
+    /// This store has no durable path or execution authority.
+    ///
+    /// # Errors
+    /// Returns an error if the in-memory schema cannot be initialized.
+    pub fn unavailable_placeholder() -> Result<Self, WorkflowStoreError> {
+        let mut connection = Connection::open_in_memory()?;
+        initialize_schema(&mut connection)?;
+        Ok(Self {
+            path: PathBuf::new(),
+            connection,
+            _ownership: None,
+            read_identity: std::sync::Arc::new(()),
+        })
+    }
+
     /// Open or create the canonical workflow database below an explicit Bcode state directory.
     ///
     /// # Errors
@@ -1161,8 +1179,8 @@ impl WorkflowStore {
 
     /// Initialize workflow storage, upgrading known schemas under exclusive ownership.
     ///
-    /// Ordinary reads must use [`Self::open_in_state_dir`] instead. Coordination waits at most
-    /// five seconds for other store owners; it never revokes their ownership or resets state.
+    /// Ordinary reads must use [`Self::open_in_state_dir`] instead. Ownership contention
+    /// returns immediately; initialization never revokes another owner's authority or resets state.
     ///
     /// # Errors
     /// Returns an error for unavailable ownership, unsupported or damaged storage, or a failed
@@ -1183,63 +1201,36 @@ impl WorkflowStore {
                 open_ownership_file(root)
             })?;
         let shared_wait = bcode_metrics::startup::phase("workflow_store.shared_ownership_wait");
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-        loop {
-            match ownership.try_lock_shared() {
-                Ok(()) => {
-                    shared_wait.finish();
-                    if path.is_file() {
-                        match Self::open_with_ownership(&path, ownership) {
-                            Ok(store) => return Ok(store),
-                            Err(WorkflowStoreError::UnsupportedStore {
-                                actual: Some(14..=41),
-                                ..
-                            }) => {}
-                            Err(error) => return Err(error),
-                        }
-                    } else {
-                        drop(ownership);
+        match ownership.try_lock_shared() {
+            Ok(()) => {
+                shared_wait.finish();
+                if path.is_file() {
+                    match Self::open_with_ownership(&path, ownership) {
+                        Ok(store) => return Ok(store),
+                        Err(WorkflowStoreError::UnsupportedStore {
+                            actual: Some(14..=41),
+                            ..
+                        }) => {}
+                        Err(error) => return Err(error),
                     }
-                    break;
+                } else {
+                    drop(ownership);
                 }
-                Err(std::fs::TryLockError::WouldBlock) if std::time::Instant::now() < deadline => {
-                    std::thread::sleep(std::time::Duration::from_millis(25));
-                }
-                Err(std::fs::TryLockError::WouldBlock) => {
-                    return Err(WorkflowStoreError::UpgradeOwnershipUnavailable);
-                }
-                Err(std::fs::TryLockError::Error(error)) => return Err(error.into()),
             }
+            Err(std::fs::TryLockError::WouldBlock) => {
+                return Err(WorkflowStoreError::UpgradeOwnershipUnavailable);
+            }
+            Err(std::fs::TryLockError::Error(error)) => return Err(error.into()),
         }
         let ownership = open_ownership_file(root)?;
         let exclusive_wait =
             bcode_metrics::startup::phase("workflow_store.exclusive_ownership_wait");
-        loop {
-            match ownership.try_lock() {
-                Ok(()) => {
-                    exclusive_wait.finish();
-                    break;
-                }
-                Err(std::fs::TryLockError::WouldBlock) if std::time::Instant::now() < deadline => {
-                    // A competing initializer may already have completed and retained a reader.
-                    let probe = open_ownership_file(root)?;
-                    if probe.try_lock_shared().is_ok() && path.is_file() {
-                        match Self::open_with_ownership(&path, probe) {
-                            Ok(store) => return Ok(store),
-                            Err(WorkflowStoreError::UnsupportedStore {
-                                actual: Some(14..=41),
-                                ..
-                            }) => {}
-                            Err(error) => return Err(error),
-                        }
-                    }
-                    std::thread::sleep(std::time::Duration::from_millis(25));
-                }
-                Err(std::fs::TryLockError::WouldBlock) => {
-                    return Err(WorkflowStoreError::UpgradeOwnershipUnavailable);
-                }
-                Err(std::fs::TryLockError::Error(error)) => return Err(error.into()),
+        match ownership.try_lock() {
+            Ok(()) => exclusive_wait.finish(),
+            Err(std::fs::TryLockError::WouldBlock) => {
+                return Err(WorkflowStoreError::UpgradeOwnershipUnavailable);
             }
+            Err(std::fs::TryLockError::Error(error)) => return Err(error.into()),
         }
         if path.is_file() {
             let connection = Connection::open(&path)?;
@@ -1287,18 +1278,12 @@ impl WorkflowStore {
         })?;
         std::fs::create_dir_all(root)?;
         let ownership = open_ownership_file(root)?;
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-        loop {
-            match ownership.try_lock_shared() {
-                Ok(()) => break,
-                Err(std::fs::TryLockError::WouldBlock) if std::time::Instant::now() < deadline => {
-                    std::thread::sleep(std::time::Duration::from_millis(25));
-                }
-                Err(std::fs::TryLockError::WouldBlock) => {
-                    return Err(WorkflowStoreError::UpgradeOwnershipUnavailable);
-                }
-                Err(std::fs::TryLockError::Error(error)) => return Err(error.into()),
+        match ownership.try_lock_shared() {
+            Ok(()) => {}
+            Err(std::fs::TryLockError::WouldBlock) => {
+                return Err(WorkflowStoreError::UpgradeOwnershipUnavailable);
             }
+            Err(std::fs::TryLockError::Error(error)) => return Err(error.into()),
         }
         Self::open_with_ownership(path, ownership)
     }
@@ -1325,7 +1310,7 @@ impl WorkflowStore {
         Ok(Self {
             path: path.to_path_buf(),
             connection,
-            _ownership: ownership,
+            _ownership: Some(ownership),
             read_identity: std::sync::Arc::new(()),
         })
     }
@@ -27952,10 +27937,13 @@ mod tests {
                 let path = temp.path();
                 scope.spawn(move || {
                     barrier.wait();
-                    let store = WorkflowStore::initialize_in_state_dir(path, 902)
-                        .expect("concurrent upgrade");
+                    let result = WorkflowStore::initialize_in_state_dir(path, 902);
                     barrier.wait();
-                    assert!(store.run_summary("run-1").expect("run").is_some());
+                    match result {
+                        Ok(store) => assert!(store.run_summary("run-1").expect("run").is_some()),
+                        Err(WorkflowStoreError::UpgradeOwnershipUnavailable) => {}
+                        Err(error) => panic!("unexpected initialization failure: {error}"),
+                    }
                 });
             }
         });
@@ -28544,10 +28532,12 @@ mod tests {
         let path = workflow_database_path(temp.path());
         let owner = open_ownership_file(path.parent().expect("root")).expect("owner");
         owner.lock_shared().expect("old owner");
+        let started = std::time::Instant::now();
         assert!(matches!(
             WorkflowStore::initialize_in_state_dir(temp.path(), 905),
             Err(WorkflowStoreError::UpgradeOwnershipUnavailable)
         ));
+        assert!(started.elapsed() < std::time::Duration::from_secs(1));
         let connection = Connection::open(&path).expect("schema");
         assert_eq!(detected_store_schema(&connection), Some(15));
         drop(connection);

@@ -392,6 +392,13 @@ pub struct ServerState {
     workflow_prompt_admissions: StdMutex<BTreeMap<String, std::sync::Weak<Mutex<()>>>>,
     workflow_store: Arc<StdMutex<bcode_workflow_store::WorkflowStore>>,
     workflow_store_unavailable: StdMutex<Option<WorkflowInitializationFailure>>,
+    workflow_initialization: StdMutex<
+        Option<
+            tokio::sync::oneshot::Receiver<
+                Result<bcode_workflow_store::WorkflowStore, WorkflowStoreError>,
+            >,
+        >,
+    >,
     workflow_restore_pending: std::sync::atomic::AtomicBool,
     workflow_run_graph_edit_policy: Option<workflow_operations::WorkflowRunGraphEditPolicy>,
     workflow_run_graph_publication_policy:
@@ -1465,6 +1472,24 @@ impl WorkflowInitializationFailure {
     }
 }
 
+fn start_workflow_initialization(
+    state_root: PathBuf,
+) -> tokio::sync::oneshot::Receiver<Result<bcode_workflow_store::WorkflowStore, WorkflowStoreError>>
+{
+    let (sender, receiver) = tokio::sync::oneshot::channel();
+    tokio::task::spawn_blocking(move || {
+        let phase = bcode_metrics::startup::phase("server.workflow_store_initialize");
+        let result = bcode_workflow_store::WorkflowStore::initialize_in_state_dir(
+            &state_root,
+            current_time_ms(),
+        );
+        phase.finish();
+        // Dropping the receiver on shutdown releases any newly opened store here.
+        let _ = sender.send(result);
+    });
+    receiver
+}
+
 fn workflow_store_or_degraded(
     store: Result<bcode_workflow_store::WorkflowStore, WorkflowStoreError>,
     degraded_root: &Path,
@@ -1512,8 +1537,11 @@ impl Drop for ServerState {
 
 impl ServerState {
     fn require_workflow_store(&self) -> Result<(), ServerError> {
-        // Do not queue async request/driver threads behind a blocking storage open.
-        // One caller owns the bounded attempt; contenders can retry their request later.
+        self.poll_workflow_initialization(true)
+    }
+
+    fn poll_workflow_initialization(&self, retry: bool) -> Result<(), ServerError> {
+        // Readiness probes never wait for storage work or another caller.
         let mut failure = match self.workflow_store_unavailable.try_lock() {
             Ok(failure) => failure,
             Err(std::sync::TryLockError::Poisoned(error)) => error.into_inner(),
@@ -1527,15 +1555,44 @@ impl ServerState {
         let Some(reason) = failure.as_ref() else {
             return Ok(());
         };
-        if !reason.retryable || self.shutdown_requested.load(Ordering::SeqCst) {
+        let mut initialization = self
+            .workflow_initialization
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if initialization.is_none()
+            && retry
+            && reason.retryable
+            && !self.shutdown_requested.load(Ordering::SeqCst)
+        {
+            *initialization = Some(start_workflow_initialization(self.state_root.clone()));
+        }
+        let Some(receiver) = initialization.as_mut() else {
             return Err(ServerError::WorkflowStorageUnavailable(
                 reason.message.clone(),
             ));
-        }
-        match bcode_workflow_store::WorkflowStore::initialize_in_state_dir(
-            &self.state_root,
-            current_time_ms(),
-        ) {
+        };
+        let result = match receiver.try_recv() {
+            Ok(result) => result,
+            Err(tokio::sync::oneshot::error::TryRecvError::Empty) => {
+                return Err(ServerError::WorkflowStorageUnavailable(
+                    "workflow storage initialization is in progress; retry the workflow request"
+                        .into(),
+                ));
+            }
+            Err(tokio::sync::oneshot::error::TryRecvError::Closed) => {
+                *initialization = None;
+                let message =
+                    "workflow storage initialization worker failed; retry the workflow request";
+                *failure = Some(WorkflowInitializationFailure {
+                    message: message.into(),
+                    retryable: true,
+                });
+                return Err(ServerError::WorkflowStorageUnavailable(message.into()));
+            }
+        };
+        *initialization = None;
+        drop(initialization);
+        match result {
             Ok(store) => {
                 // Initialization may wait for another process. Shutdown can begin during that
                 // wait; do not publish new execution capability or schedule restoration then.
@@ -2233,6 +2290,7 @@ impl ServerState {
             workflow_prompt_admissions: StdMutex::default(),
             workflow_store: StdMutex::new(workflow_store).into(),
             workflow_store_unavailable: StdMutex::new(workflow_store_unavailable),
+            workflow_initialization: StdMutex::new(None),
             workflow_restore_pending: std::sync::atomic::AtomicBool::new(false),
             workflow_run_graph_publication_policy: (run_publication_local_clients
                 || !run_publication_plugins.is_empty())
@@ -2890,12 +2948,15 @@ impl ServerState {
                         }
                     }
                     _ = recovery_tick.tick(), if workers.len() < capacity => {
-                        if state.workflow_store_unavailable.try_lock().map_or(true, |failure| failure.is_some()) {
+                        if state.poll_workflow_initialization(false).is_err() {
                             recovery_tick.reset();
                             continue;
                         }
-                        if state.workflow_restore_pending.swap(false, Ordering::SeqCst) {
+                        if state.workflow_restore_pending.load(Ordering::SeqCst) {
+                            state.start_workflow_event_forwarder().await;
                             restore_workflow_runtime_work(&state).await;
+                            settle_restored_quiescent_workflow_runtime_work(&state).await;
+                            state.workflow_restore_pending.store(false, Ordering::SeqCst);
                         }
                         let page = state.workflow_store.lock()
                             .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -2922,7 +2983,13 @@ impl ServerState {
                     run_id = receiver.recv(), if workers.len() < capacity => {
                         let Some(run_id) = run_id else { break };
                         if state.shutdown_requested.load(Ordering::SeqCst) { break; }
-                        if state.require_workflow_store().is_err() { continue; }
+                        if state.poll_workflow_initialization(false).is_err() { continue; }
+                        if state.workflow_restore_pending.load(Ordering::SeqCst) {
+                            state.start_workflow_event_forwarder().await;
+                            restore_workflow_runtime_work(&state).await;
+                            settle_restored_quiescent_workflow_runtime_work(&state).await;
+                            state.workflow_restore_pending.store(false, Ordering::SeqCst);
+                        }
                         if active.insert(run_id.clone()) {
                             let state = Arc::clone(&state);
                             workers.spawn(async move {
@@ -2937,6 +3004,9 @@ impl ServerState {
     }
 
     async fn start_workflow_event_forwarder(self: &Arc<Self>) {
+        if self.poll_workflow_initialization(false).is_err() {
+            return;
+        }
         let mut task = self.workflow_event_forwarder.lock().await;
         if self.shutdown_requested.load(Ordering::SeqCst) {
             return;
@@ -4750,6 +4820,7 @@ async fn run_with_services(
         .map_or_else(bcode_config::default_state_dir, |locations| {
             locations.primary().root().to_path_buf()
         });
+    let workflow_initialization = start_workflow_initialization(state_root.clone());
     let mut stage_started_at = Instant::now();
     let startup_resources = (|| {
         let phase = bcode_metrics::startup::phase("server.historical_storage_recovery");
@@ -4913,17 +4984,12 @@ async fn run_with_services(
         },
     );
     auth_phase.finish();
-    let workflow_phase = bcode_metrics::startup::phase("server.workflow_store_initialize");
-    let (workflow_store, workflow_store_unavailable) = workflow_store_or_degraded(
-        bcode_workflow_store::WorkflowStore::initialize_in_state_dir(
-            &state_root,
-            current_time_ms(),
-        ),
-        &state_root
-            .join("degraded-domains")
-            .join(format!("workflow-{}", std::process::id())),
-    );
-    workflow_phase.finish();
+    let workflow_store = bcode_workflow_store::WorkflowStore::unavailable_placeholder()?;
+    let workflow_store_unavailable = Some(WorkflowInitializationFailure {
+        message: "workflow storage initialization is in progress; retry the workflow request"
+            .into(),
+        retryable: true,
+    });
     let construction_phase = bcode_metrics::startup::phase("server.state_construction");
     let construction_started_at = Instant::now();
     let state = Arc::new(ServerState::new_with_workflow_status(
@@ -4971,6 +5037,10 @@ async fn run_with_services(
         total_elapsed_ms = startup_started_at.elapsed().as_millis(),
         "server state constructed"
     );
+    *state
+        .workflow_initialization
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(workflow_initialization);
     if let Some(lifetime) = execution_lifetime {
         state
             .execution_lifetime
@@ -5020,29 +5090,51 @@ async fn run_constructed_server(
     start_catalog_refresh(&state).await;
     interrupt_stale_ralph_runs_best_effort(&state);
     background_phase.finish();
-    let workflow_recovery_started_at = Instant::now();
-    let phase = bcode_metrics::startup::phase("server.workflow_restore");
-    restore_workflow_runtime_work(&state).await;
-    phase.finish();
-    if state.shutdown_requested.load(Ordering::SeqCst) || host_shutdown.is_cancelled() {
-        drop(listener);
-        return shutdown_constructed_server(state, Ok(())).await;
+    if workflow_ready.is_some() {
+        // Embedded workflow hosts explicitly require workflow readiness before their callback.
+        let receiver = state
+            .workflow_initialization
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
+        if let Some(mut receiver) = receiver {
+            let (sender, completed) = tokio::sync::oneshot::channel();
+            let mut workflow_shutdown = state.subscribe_shutdown();
+            let result = tokio::select! {
+                biased;
+                () = host_shutdown.cancelled() => None,
+                _ = workflow_shutdown.recv() => None,
+                result = &mut receiver => Some(result),
+            };
+            let Some(result) = result else {
+                drop(listener);
+                return shutdown_constructed_server(state, Ok(())).await;
+            };
+            if let Ok(result) = result {
+                let _ = sender.send(result);
+            }
+            *state
+                .workflow_initialization
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(completed);
+            let _ = state.poll_workflow_initialization(false);
+        }
+        state.start_workflow_event_forwarder().await;
+        restore_workflow_runtime_work(&state).await;
+        settle_restored_quiescent_workflow_runtime_work(&state).await;
+        state
+            .workflow_restore_pending
+            .store(false, Ordering::SeqCst);
+    } else if state
+        .workflow_store_unavailable
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .is_none()
+    {
+        state.workflow_restore_pending.store(true, Ordering::SeqCst);
     }
-    let phase = bcode_metrics::startup::phase("server.workflow_settle");
-    settle_restored_quiescent_workflow_runtime_work(&state).await;
-    phase.finish();
-    if state.shutdown_requested.load(Ordering::SeqCst) || host_shutdown.is_cancelled() {
-        drop(listener);
-        return shutdown_constructed_server(state, Ok(())).await;
-    }
-    tracing::debug!(
-        target: "bcode_server::startup",
-        elapsed_ms = workflow_recovery_started_at.elapsed().as_millis(),
-        total_elapsed_ms = startup_started_at.elapsed().as_millis(),
-        "workflow runtime recovery complete"
-    );
-    // Prepared-attempt recovery must finish before notification-independent dispatch
-    // starts; otherwise a fresh admission gap could be mistaken for abandoned work.
+    // The driver restores ready storage before discovery or queued dispatch, independently
+    // of daemon readiness. Unavailable storage never reaches recovery or execution.
     state.start_workflow_driver().await;
     if daemon.idle_shutdown {
         state
@@ -5202,6 +5294,12 @@ async fn shutdown_constructed_server(
     accept_result: Result<(), ServerError>,
 ) -> Result<(), ServerError> {
     state.request_shutdown();
+    // The blocking worker may finish safely, but cannot publish a store after shutdown.
+    state
+        .workflow_initialization
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .take();
     if state.storage_worker.stop().await.is_err() {
         tracing::warn!("storage maintenance worker failed during shutdown");
     }
@@ -71586,8 +71684,58 @@ event_symbol = "bcode_plugin_handle_event_v1"
         assert!(state.workflow_event_clients.lock().await.is_empty());
     }
 
-    #[test]
-    fn transient_workflow_initialization_recovers_canonical_store_once() {
+    #[tokio::test]
+    async fn initializing_workflow_does_not_block_connection_or_session_listing() {
+        let mut state = Arc::new(test_server_state(SessionManager::default()));
+        Arc::get_mut(&mut state)
+            .expect("unique")
+            .workflow_store_unavailable = StdMutex::new(Some(
+            "workflow storage initialization is in progress".into(),
+        ));
+        let (sender, receiver) = tokio::sync::oneshot::channel();
+        *state
+            .workflow_initialization
+            .lock()
+            .expect("initialization") = Some(receiver);
+        let socket_dir = tempfile::tempdir().expect("socket directory");
+        let endpoint = bcode_ipc::IpcEndpoint::unix_socket(socket_dir.path().join("server.sock"));
+        let listener = LocalIpcListener::bind(&endpoint).expect("listener");
+        let server_state = Arc::clone(&state);
+        let server = tokio::spawn(async move {
+            let stream = listener.accept().await.expect("connection");
+            handle_client(stream, server_state)
+                .await
+                .expect("client handler");
+        });
+        tokio::time::timeout(Duration::from_secs(2), async {
+            let client = bcode_client::BcodeClient::new(endpoint);
+            let mut connection = client
+                .connect("initializing-workflow")
+                .await
+                .expect("connect");
+            connection
+                .list_sessions_with_status()
+                .await
+                .expect("session listing");
+            assert!(
+                connection
+                    .subscribe_workflow_runs()
+                    .await
+                    .expect_err("initializing")
+                    .to_string()
+                    .contains("initialization is in progress")
+            );
+        })
+        .await
+        .expect("unrelated operations do not wait for initialization");
+        assert!(state.workflow_event_clients.lock().await.is_empty());
+        // The initializer is deliberately still pending throughout client handling.
+        drop(sender);
+        server.await.expect("server");
+    }
+
+    #[tokio::test]
+    async fn transient_workflow_initialization_recovers_canonical_store_once() {
         let root = tempfile::tempdir().expect("root");
         let mut state = test_server_state(SessionManager::default());
         state.state_root = root.path().to_path_buf();
@@ -71595,7 +71743,14 @@ event_symbol = "bcode_plugin_handle_event_v1"
             message: "temporary contention".into(),
             retryable: true,
         }));
-        state.require_workflow_store().expect("recover");
+        assert!(state.require_workflow_store().is_err());
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while state.poll_workflow_initialization(false).is_err() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("background initialization completes");
         assert!(
             state
                 .workflow_store
@@ -71651,6 +71806,42 @@ event_symbol = "bcode_plugin_handle_event_v1"
         drop(state);
     }
 
+    #[tokio::test]
+    async fn workflow_initialization_completion_after_shutdown_is_not_published() {
+        let root = tempfile::tempdir().expect("root");
+        let mut state = test_server_state(SessionManager::default());
+        state.workflow_store_unavailable = StdMutex::new(Some("initializing".into()));
+        let placeholder = state
+            .workflow_store
+            .lock()
+            .expect("store")
+            .path()
+            .to_path_buf();
+        let receiver = start_workflow_initialization(root.path().to_path_buf());
+        let result = receiver.await.expect("worker");
+        let (sender, receiver) = tokio::sync::oneshot::channel();
+        sender.send(result).expect("publish completion");
+        *state
+            .workflow_initialization
+            .lock()
+            .expect("initialization") = Some(receiver);
+        state.request_shutdown();
+        assert!(state.poll_workflow_initialization(false).is_err());
+        assert_eq!(
+            state.workflow_store.lock().expect("store").path(),
+            placeholder
+        );
+        assert!(!state.workflow_restore_pending.load(Ordering::SeqCst));
+        // The completed worker's canonical handle was dropped, not installed in the host.
+        let ownership = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(root.path().join("workflows/workflow.lock"))
+            .expect("ownership");
+        ownership.try_lock().expect("canonical ownership released");
+        drop(state);
+    }
+
     #[test]
     fn workflow_initialization_contender_does_not_wait_for_owner() {
         let state = test_server_state(SessionManager::default());
@@ -71665,8 +71856,8 @@ event_symbol = "bcode_plugin_handle_event_v1"
         drop(state);
     }
 
-    #[test]
-    fn concurrent_workflow_initialization_publishes_one_store() {
+    #[tokio::test]
+    async fn concurrent_workflow_initialization_publishes_one_store() {
         let root = tempfile::tempdir().expect("root");
         let mut state = Arc::new(test_server_state(SessionManager::default()));
         Arc::get_mut(&mut state).expect("unique").state_root = root.path().to_path_buf();
@@ -71677,9 +71868,11 @@ event_symbol = "bcode_plugin_handle_event_v1"
             retryable: true,
         }));
         let barrier = std::sync::Barrier::new(8);
+        let runtime = tokio::runtime::Handle::current();
         std::thread::scope(|scope| {
             for _ in 0..8 {
                 scope.spawn(|| {
+                    let _runtime = runtime.enter();
                     barrier.wait();
                     let result = state.require_workflow_store();
                     assert!(
@@ -71689,6 +71882,13 @@ event_symbol = "bcode_plugin_handle_event_v1"
                 });
             }
         });
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while state.poll_workflow_initialization(false).is_err() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("background initialization completes");
         assert!(state.workflow_restore_pending.swap(false, Ordering::SeqCst));
         assert!(
             state

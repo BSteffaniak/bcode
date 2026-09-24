@@ -44,9 +44,13 @@ async fn transient_storage_recovery_drives_canonical_run_once() {
             result.is_ok() || matches!(result, Err(ServerError::WorkflowStorageUnavailable(_)))
         );
     }
-    state
-        .require_workflow_store()
-        .expect("recovered after contenders joined");
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while state.require_workflow_store().is_err() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("background retry completes");
     // Starting again must reuse the original singleton, not replace it after recovery.
     state.start_workflow_driver().await;
     let completed = tokio::time::timeout(Duration::from_secs(15), async {

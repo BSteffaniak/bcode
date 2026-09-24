@@ -783,9 +783,14 @@ maintenance. Existing binding rows are preserved. Current-schema opens validate 
 without creating it. Ordinary store opens and status/history
 reads never migrate. Unsupported, malformed, or future contracts fail closed without reset.
 
-Startup waits at most five seconds for verified exclusive workflow-store ownership, rechecks the
-schema after acquiring it, and retains ownership through migration and reopening. Competing
-initializers can share the completed current-format store. Existing owners are never terminated
+Workflow initialization starts eagerly on a blocking worker, independently of daemon readiness.
+Connection and ordinary session operations never await it; workflow requests receive an immediate
+initializing or unavailable result until the canonical store is ready. A workflow request may
+schedule one background retry of a transient failure; concurrent callers do not queue behind it.
+Ownership acquisition is nonblocking: contention returns immediately, without sleeping or polling.
+Initialization rechecks the schema after acquiring exclusive ownership and retains ownership through
+migration and reopening. Competing initializers may retry and share the completed current-format
+store. Existing owners are never terminated
 or revoked to obtain migration access. A SQLite write reservation spans the verified backup and
 transactional schema/data conversion, preventing an uncoordinated writer from changing the source
 between backup and commit. Integrity is verified before commit. Interrupted transactions roll back;
@@ -800,8 +805,11 @@ unsupported older or damaged stores require reviewed maintenance or future migra
 model, auth, and session requests use separate typed routing and never pass through workflow
 availability gates. Passive plugin session-status hydration treats an unavailable optional workflow
 domain as no contribution rather than a session or skill failure. The unavailable domain uses only
-an isolated process-local scratch store to satisfy internal construction; it is not canonical and no
-workflow request or restoration path may reach it.
+an isolated noncanonical placeholder to satisfy internal construction (in-memory during daemon
+startup); no workflow request or restoration path may reach it. Recovery and continuation discovery
+are performed by the workflow driver after initialization, not by the daemon's readiness path.
+Embedded workflow hosts explicitly await initialization and restoration before their workflow-ready
+callback because that callback directly requires the capability.
 
 Destructive reset is a separate maintenance operation. It acquires the workflow ownership lock
 exclusively (proving no workflow store handles are active), obtains an immediate exclusive SQLite
