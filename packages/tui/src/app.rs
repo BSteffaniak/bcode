@@ -354,6 +354,7 @@ struct TranscriptNavigationCheckpoint {
     pending_assistant: bool,
     pending_sequence: Option<u64>,
     automatic_item: Option<super::transcript::TranscriptItemId>,
+    admitted_items: BTreeSet<super::transcript::TranscriptItemId>,
     history: OlderHistoryState,
     hidden_activity_at: Option<Instant>,
     hidden_activity_burst: u8,
@@ -412,6 +413,7 @@ pub struct BmuxApp {
     presented_transcript_anchor: Option<StableTranscriptAnchor>,
     navigation_checkpoint: Option<TranscriptNavigationCheckpoint>,
     automatic_item: Option<super::transcript::TranscriptItemId>,
+    admitted_items: BTreeSet<super::transcript::TranscriptItemId>,
     latest_hidden_activity_at: Option<Instant>,
     latest_hidden_activity_burst: u8,
     latest_bar_animation_started_at: Instant,
@@ -477,9 +479,6 @@ enum SubmittedUserMessageFollowing {
 enum AssistantScrollAnchorState {
     #[default]
     Idle,
-    Pending {
-        index: usize,
-    },
     Anchored {
         index: usize,
     },
@@ -492,14 +491,8 @@ impl AssistantScrollAnchorState {
     const fn index(self) -> Option<usize> {
         match self {
             Self::Idle => None,
-            Self::Pending { index } | Self::Anchored { index } | Self::Interrupted { index } => {
-                Some(index)
-            }
+            Self::Anchored { index } | Self::Interrupted { index } => Some(index),
         }
-    }
-
-    const fn is_pending(self) -> bool {
-        matches!(self, Self::Pending { .. })
     }
 }
 
@@ -600,6 +593,7 @@ impl BmuxApp {
             presented_transcript_anchor: None,
             navigation_checkpoint: None,
             automatic_item: None,
+            admitted_items: BTreeSet::new(),
             latest_hidden_activity_at: None,
             latest_hidden_activity_burst: 0,
             latest_bar_animation_started_at: now,
@@ -3102,16 +3096,30 @@ impl BmuxApp {
 
     /// Resolve deferred user-message and live-stream top anchoring against the latest cached layout.
     pub fn sync_transcript_anchor_requests(&mut self) {
+        let resident = self
+            .transcript
+            .iter()
+            .map(super::transcript::TranscriptItem::id)
+            .collect::<BTreeSet<_>>();
+        self.admitted_items.retain(|id| resident.contains(id));
         let newest = self
             .transcript
             .iter()
-            .last()
-            .filter(|item| item.role() != "Assistant" || !item.text().is_empty())
-            .map(|item| (item.id(), item.role() == "Assistant"));
-        if let Some((id, assistant)) = newest {
-            let changed = self.automatic_item.is_some_and(|previous| previous != id);
-            // Deferred automatic reveals must remain pending, but manual reading
-            // deliberately consumes updates without scheduling later navigation.
+            .enumerate()
+            .filter(|(_, item)| item.role() != "Assistant" || !item.text().is_empty())
+            .filter(|(_, item)| !self.admitted_items.contains(&item.id()))
+            .map(|(index, item)| (index, item.id(), item.role() == "Assistant"))
+            .next_back();
+        if self.automatic_item.is_none() || !self.viewport.allows_reveal() {
+            self.admitted_items.extend(
+                self.transcript
+                    .iter()
+                    .filter(|item| item.role() != "Assistant" || !item.text().is_empty())
+                    .map(super::transcript::TranscriptItem::id),
+            );
+        }
+        if let Some((index, id, assistant)) = newest {
+            let changed = self.automatic_item.is_some();
             if self.automatic_item.is_none() || !self.viewport.allows_reveal() {
                 self.automatic_item = Some(id);
             }
@@ -3124,8 +3132,14 @@ impl BmuxApp {
                 self.pending_transcript_top_anchor_sequence = None;
                 self.submitted_user_message_following = SubmittedUserMessageFollowing::Idle;
                 self.pending_assistant_stream_anchor = false;
+                self.admitted_items.extend(
+                    self.transcript
+                        .iter()
+                        .take(index + 1)
+                        .filter(|item| item.role() != "Assistant" || !item.text().is_empty())
+                        .map(super::transcript::TranscriptItem::id),
+                );
                 if assistant {
-                    let index = self.transcript.items().len().saturating_sub(1);
                     if let Some(top) = self
                         .transcript_layout
                         .entry_start_row(VisibleTranscriptSource::Transcript, index)
@@ -3159,6 +3173,12 @@ impl BmuxApp {
                 {
                     self.submitted_user_message_following = SubmittedUserMessageFollowing::Anchored;
                     self.viewport.reveal(false);
+                    self.admitted_items.extend(
+                        self.transcript
+                            .iter()
+                            .take(index + 1)
+                            .map(super::transcript::TranscriptItem::id),
+                    );
                     self.automatic_item = self
                         .transcript
                         .get(index)
@@ -3169,21 +3189,12 @@ impl BmuxApp {
             }
             return;
         }
-        if self.submitted_user_message_following == SubmittedUserMessageFollowing::PendingAnchor {
-            if let Some(top_row) = self.latest_user_message_start_row() {
-                self.submitted_user_message_following = SubmittedUserMessageFollowing::Anchored;
-                self.viewport.reveal(false);
-                self.start_transcript_scroll_animation(top_row);
-            }
-            return;
-        }
-        if self.pending_assistant_stream_anchor
-            && let AssistantScrollAnchorState::Pending { index } = self.assistant_scroll_anchor
-            && let Some(top_row) = self
-                .transcript_layout
-                .entry_start_row(VisibleTranscriptSource::Transcript, index)
+        if self.submitted_user_message_following == SubmittedUserMessageFollowing::PendingAnchor
+            && let Some(top_row) = self.latest_user_message_start_row()
         {
-            self.reveal_assistant_item(index, top_row);
+            self.submitted_user_message_following = SubmittedUserMessageFollowing::Anchored;
+            self.viewport.reveal(false);
+            self.start_transcript_scroll_animation(top_row);
         }
     }
 
@@ -3224,31 +3235,6 @@ impl BmuxApp {
         } else {
             self.assistant_scroll_anchor = AssistantScrollAnchorState::Idle;
         }
-    }
-
-    fn should_anchor_new_assistant_stream(&self) -> bool {
-        self.viewport.allows_reveal()
-            && !self.manual_transcript_scroll_active()
-            && self.transcript_scroll_animation.is_none()
-            && self.submitted_user_message_following != SubmittedUserMessageFollowing::PendingAnchor
-            && !self.assistant_scroll_anchor.is_pending()
-    }
-
-    fn maybe_request_assistant_stream_anchor(&mut self, should_anchor: bool) {
-        let Some(index) = self.transcript.iter().rposition(|item| {
-            item.role() == "Assistant" && item.streaming() && !item.text().is_empty()
-        }) else {
-            return;
-        };
-        if self.assistant_scroll_anchor.index() == Some(index) {
-            return;
-        }
-        self.assistant_scroll_anchor = AssistantScrollAnchorState::Idle;
-        if !should_anchor || self.active_tool_loop() {
-            return;
-        }
-        self.assistant_scroll_anchor = AssistantScrollAnchorState::Pending { index };
-        self.pending_assistant_stream_anchor = true;
     }
 
     fn finish_assistant_stream_anchor(&mut self) {
@@ -3484,21 +3470,16 @@ impl BmuxApp {
 
     fn apply_session_live_event_side_effects(&mut self, event: &SessionLiveEvent) {
         match &event.kind {
-            SessionLiveEventKind::AssistantTextStreamUpdated { .. } => {
-                let should_anchor = self.should_anchor_new_assistant_stream();
-                self.maybe_request_assistant_stream_anchor(should_anchor);
-            }
             SessionLiveEventKind::AssistantTextDelta { text, .. } => {
-                let should_anchor = self.should_anchor_new_assistant_stream();
                 self.add_streaming_delta(text, SessionEventApplication::Live);
-                self.maybe_request_assistant_stream_anchor(should_anchor);
             }
             SessionLiveEventKind::UsageSummaryChanged { .. } => {
                 if let Some(usage) = &self.session_view.snapshot().runtime.latest_usage {
                     self.token_usage.absorb(usage);
                 }
             }
-            SessionLiveEventKind::AssistantReasoningDelta { .. }
+            SessionLiveEventKind::AssistantTextStreamUpdated { .. }
+            | SessionLiveEventKind::AssistantReasoningDelta { .. }
             | SessionLiveEventKind::AssistantReasoningTextStreamUpdated { .. }
             | SessionLiveEventKind::AssistantReasoningActivity { .. }
             | SessionLiveEventKind::ToolContributionPlaced { .. }
@@ -3521,7 +3502,6 @@ impl BmuxApp {
         if event_breaks_sticky_entry_anchor(event) {
             self.downgrade_sticky_entry_anchor();
         }
-        let should_anchor = self.should_anchor_new_assistant_stream();
         match &event.kind {
             SessionEventKind::UserMessage { text, .. } => {
                 self.assistant_scroll_anchor = AssistantScrollAnchorState::Idle;
@@ -3535,7 +3515,6 @@ impl BmuxApp {
             }
             SessionEventKind::AssistantDelta { text } => {
                 self.add_streaming_delta(text, application);
-                self.maybe_request_assistant_stream_anchor(should_anchor);
             }
             SessionEventKind::AssistantMessage { .. }
             | SessionEventKind::AssistantResponseSegment { .. } => {
@@ -4038,6 +4017,7 @@ impl BmuxApp {
             self.pending_assistant_stream_anchor = checkpoint.pending_assistant;
             self.pending_transcript_top_anchor_sequence = checkpoint.pending_sequence;
             self.automatic_item = checkpoint.automatic_item;
+            self.admitted_items = checkpoint.admitted_items;
             self.older_history = checkpoint.history;
             self.latest_hidden_activity_at = checkpoint.hidden_activity_at;
             self.latest_hidden_activity_burst = checkpoint.hidden_activity_burst;
@@ -4053,6 +4033,7 @@ impl BmuxApp {
         self.capture_stable_transcript_anchor();
         self.navigation_checkpoint = Some(TranscriptNavigationCheckpoint {
             automatic_item: self.automatic_item,
+            admitted_items: self.admitted_items.clone(),
             viewport: self.viewport,
             animation: self.transcript_scroll_animation,
             anchor: self.pending_stable_transcript_anchor.clone(),
@@ -5146,6 +5127,33 @@ const fn event_affects_transcript_rows(event: &SessionEvent) -> bool {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn older_item_becoming_tail_cannot_supersede_assistant_hold() {
+        let mut app = super::BmuxApp::new_with_history(None, &[], &[], false);
+        let old = super::super::transcript::TranscriptItem::new("You", "old prompt".to_owned());
+        let assistant =
+            super::super::transcript::TranscriptItem::new("Assistant", "reply".to_owned());
+        app.transcript
+            .push_ephemeral("test".to_owned(), old.clone());
+        app.transcript
+            .push_ephemeral("test".to_owned(), assistant.clone());
+        app.automatic_item = Some(assistant.id());
+        app.admitted_items.extend([old.id(), assistant.id()]);
+        app.viewport
+            .sync_max(20, 9, 30, 10, false, &mut app.older_history);
+        app.viewport.reveal(true);
+        app.viewport.materialize_top_row(10);
+        // Reconciliation removes the tail; the previously admitted user item is
+        // now last. This is not a newly arrived user message or a tail request.
+        app.transcript = super::super::transcript_document::TranscriptDocument::default();
+        app.transcript.push_ephemeral("test".to_owned(), old);
+        app.sync_transcript_anchor_requests();
+        assert!(app.transcript_scroll_animation.is_none());
+        assert!(!app.viewport.allows_overflow());
+        assert_eq!(app.viewport.top_row(30, 10), 10);
+        drop(app);
+    }
+
     #[test]
     fn completed_row_animation_preserves_hold_without_item_correspondence() {
         let mut app = super::BmuxApp::new_with_history(None, &[], &[], false);

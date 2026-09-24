@@ -176,13 +176,15 @@ any pending content damage without adding activity. Successful presentation ackn
 dirty-entry set. Width reflow establishes fresh geometry rather than reporting output activity.
 Changes within the hidden continuation of a visible entry can activate the latest-content bar.
 
-Automatic navigation tracks the newest nonempty presentation item by stable identity. A new assistant
-item smoothly reveals its top and holds it while that item grows; the next non-assistant item
-smoothly returns to tail following. Manual navigation disables these transitions. Candidate identity
-transitions are checkpointed with navigation so failed presentations do not consume them.
+Automatic navigation admits nonempty presentation items once by stable identity, retaining only
+resident identities. Reordering, revisions, or removing the tail cannot re-admit older items.
+A new assistant item smoothly reveals its top and holds it while that item grows; a new
+non-assistant item smoothly returns to tail following. Manual navigation consumes arrivals without
+scheduling movement. Admissions are checkpointed with navigation so failed presentations do not
+consume them. Stream events do not maintain a second deferred assistant reveal queue.
 
 Animation targets distinguish item-top, latest-bottom, and unmapped row positions explicitly;
-missing correspondence never implies tail following. Both assistant reveal entry points use one
+missing correspondence never implies tail following. Assistant admission uses one
 superseding transition that clears earlier submission requests. At animation completion, the target
 position is applied after layout correspondence so an older reading anchor cannot overwrite it.
 
