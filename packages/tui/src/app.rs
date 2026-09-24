@@ -3102,10 +3102,12 @@ impl BmuxApp {
             .filter(|item| item.role() != "Assistant" || !item.text().is_empty())
             .map(|item| (item.id(), item.role() == "Assistant"));
         if let Some((id, assistant)) = newest {
-            let changed = self
-                .automatic_item
-                .replace(id)
-                .is_some_and(|previous| previous != id);
+            let changed = self.automatic_item.is_some_and(|previous| previous != id);
+            // Deferred automatic reveals must remain pending, but manual reading
+            // deliberately consumes updates without scheduling later navigation.
+            if self.automatic_item.is_none() || !self.viewport.allows_reveal() {
+                self.automatic_item = Some(id);
+            }
             if changed
                 && self.viewport.allows_reveal()
                 && !self.manual_transcript_scroll_active()
@@ -3121,6 +3123,7 @@ impl BmuxApp {
                         .transcript_layout
                         .entry_start_row(VisibleTranscriptSource::Transcript, index)
                     {
+                        self.automatic_item = Some(id);
                         self.transcript_scroll_animation = None;
                         self.start_transcript_scroll_animation(top);
                         self.viewport.reveal(true);
@@ -3128,6 +3131,7 @@ impl BmuxApp {
                             AssistantScrollAnchorState::Anchored { index };
                     }
                 } else {
+                    self.automatic_item = Some(id);
                     let checkpoint = self.navigation_checkpoint.take();
                     self.transition_transcript_to_bottom();
                     self.navigation_checkpoint = checkpoint;
@@ -3148,6 +3152,16 @@ impl BmuxApp {
                 self.transcript_scroll_animation = None;
                 self.viewport.detach();
                 self.viewport.follow_anchor(top_row);
+                if self.submitted_user_message_following
+                    == SubmittedUserMessageFollowing::PendingAnchor
+                {
+                    self.submitted_user_message_following = SubmittedUserMessageFollowing::Anchored;
+                    self.viewport.reveal(false);
+                    self.automatic_item = self
+                        .transcript
+                        .get(index)
+                        .map(super::transcript::TranscriptItem::id);
+                }
                 self.presented_transcript_anchor = None;
                 self.pending_stable_transcript_anchor = None;
             }

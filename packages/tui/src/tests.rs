@@ -4210,10 +4210,42 @@ fn tool_activity_after_submitted_user_message_resumes_following_latest_rows() {
     let mut buffer = Buffer::empty(Rect::new(0, 0, 80, 20));
     let mut frame = Frame::new(&mut buffer);
     render::render(&mut app, &mut bmux_tui::paint::PaintCx::new(&mut frame));
-    drop(app);
-
     assert!(rendered_text(&buffer).contains("shell.run"));
     assert_eq!(output_line_y(&buffer, "You"), Some(1));
+
+    // Settle the submission before more content arrives: this used to run a
+    // zero-distance reveal that silently detached automatic navigation.
+    render::render(
+        &mut app,
+        &mut bmux_tui::paint::PaintCx::new(&mut Frame::new(&mut buffer)),
+    );
+    std::thread::sleep(Duration::from_millis(220));
+    render::render(
+        &mut app,
+        &mut bmux_tui::paint::PaintCx::new(&mut Frame::new(&mut buffer)),
+    );
+    app.absorb_session_event(&event(
+        session_id,
+        14,
+        SessionEventKind::SystemMessage {
+            text: (0..40)
+                .map(|row| format!("overflow output {row}"))
+                .collect::<Vec<_>>()
+                .join("\n"),
+        },
+    ));
+    render::render(
+        &mut app,
+        &mut bmux_tui::paint::PaintCx::new(&mut Frame::new(&mut buffer)),
+    );
+    std::thread::sleep(Duration::from_millis(220));
+    render::render(
+        &mut app,
+        &mut bmux_tui::paint::PaintCx::new(&mut Frame::new(&mut buffer)),
+    );
+    assert_eq!(app.scroll_offset(), 0);
+    assert!(rendered_text(&buffer).contains("overflow output 39"));
+    drop(app);
 }
 
 #[test]

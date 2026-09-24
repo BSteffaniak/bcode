@@ -166,7 +166,7 @@ impl TranscriptViewport {
         let target_top_row = target_top_row.min(self.previous_total_rows);
         let start_top_row = self.top_row(self.previous_total_rows, self.viewport_height);
         if start_top_row == target_top_row {
-            self.follow_anchor(target_top_row);
+            self.materialize_top_row(target_top_row);
             None
         } else {
             Some((start_top_row, target_top_row))
@@ -423,6 +423,24 @@ mod tests {
 
     fn older_history() -> OlderHistoryState {
         OlderHistoryState::new(&[], false)
+    }
+
+    #[test]
+    fn zero_distance_animation_preserves_reveal_and_overflow_policy() {
+        for sticky in [false, true] {
+            let mut viewport = TranscriptViewport::default();
+            let mut history = older_history();
+            viewport.sync_max(20, 9, 30, 10, false, &mut history);
+            viewport.reveal(sticky);
+            let top = viewport.top_row(30, 10);
+            assert_eq!(viewport.start_follow_anchor_animation(top), None);
+            assert!(viewport.allows_reveal());
+            assert_eq!(viewport.allows_overflow(), !sticky);
+            viewport.sync_with_anchor((30, 9, 40, 10), None, &mut history);
+            let allowed = viewport.allows_overflow();
+            viewport.reconcile_overflow(30, allowed, &mut history);
+            assert_eq!(viewport.follows_bottom(), !sticky);
+        }
     }
 
     #[test]
