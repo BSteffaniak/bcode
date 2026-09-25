@@ -20,6 +20,12 @@ history. It does not rerun tools or rewrite earlier snapshots.
 Snapshot content is limited to the enabled environment/repository sections and their existing
 field/command-output bounds; no credential values or arbitrary environment dump are captured.
 Paths, branch names and repository status are nevertheless potentially private session content.
+Runtime labels and scalar environment values are bounded to 80 characters and control characters
+are replaced with spaces, including when truncated. This is data-shaping, not a secret detector:
+users must treat enabled repository paths/status as retained private content. Application policy
+remains in the current static instructions; historical observations do not grant permission or
+change execution policy. Recovery facts follow historical snapshots and retry guidance follows
+them; request-builder tests verify that order and an unchanged static prompt.
 Each capture adds history and consequently some cached-input cost until ordinary compaction
 removes it from active context. Recovery recapture and long-lived growth require dedicated
 verification; successful cache measurements alone do not establish those lifecycle properties.
