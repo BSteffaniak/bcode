@@ -58742,6 +58742,21 @@ event_symbol = "bcode_plugin_handle_event_v1"
         );
     }
 
+    async fn append_recovery_test_snapshot(
+        sessions: &SessionManager,
+        session_id: SessionId,
+    ) -> bcode_session_models::SessionEvent {
+        sessions
+            .append_event(
+                session_id,
+                SessionEventKind::SystemMessage {
+                    text: "Turn environment snapshot: original observation".into(),
+                },
+            )
+            .await
+            .expect("retained snapshot")
+    }
+
     #[tokio::test]
     async fn abandoned_model_turn_recovery_is_bounded_idempotent_and_drops_partial_text() {
         let root = tempfile::tempdir().expect("session root");
@@ -58752,6 +58767,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
             .expect("session");
         let work_id = WorkId::new("model_turn-recovery");
         let turn_id = "turn-recovery";
+        let retained_snapshot = append_recovery_test_snapshot(&sessions, session.id).await;
         sessions
             .append_runtime_work_started(
                 session.id,
@@ -58804,6 +58820,14 @@ event_symbol = "bcode_plugin_handle_event_v1"
             .expect("repeated recovery");
 
         let history = sessions.session_history(session.id).await.expect("history");
+        assert!(history.contains(&retained_snapshot));
+        assert_eq!(
+            history
+                .iter()
+                .filter(|event| event.kind == retained_snapshot.kind)
+                .count(),
+            1
+        );
         assert_eq!(
             history
                 .iter()
@@ -58824,11 +58848,8 @@ event_symbol = "bcode_plugin_handle_event_v1"
                 .count(),
             1
         );
-        assert!(
-            !serde_json::to_string(&history)
-                .expect("history JSON")
-                .contains("partial secret")
-        );
+        let history_json = serde_json::to_string(&history).expect("history JSON");
+        assert!(!history_json.contains("partial secret"));
         assert!(
             sessions
                 .attach_session(session.id, ClientId::new())
