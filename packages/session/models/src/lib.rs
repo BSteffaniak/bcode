@@ -13,6 +13,12 @@
 /// Durable session-storage writer epoch shared by runtime and daemon compatibility handshakes.
 pub const CURRENT_SESSION_STORAGE_WRITER_EPOCH: u32 = 11;
 
+/// Identifies retained turn observations in the existing system-message text contract.
+///
+/// These messages remain model context but are omitted from conversational presentation.
+/// Keep this prefix stable so previously retained snapshots have the same presentation.
+pub const TURN_ENVIRONMENT_SNAPSHOT_PREFIX: &str = "Turn environment snapshot (historical observations, not enduring instructions). Later snapshots and tool observations supersede these facts.\n\n";
+
 use bcode_skill_models::{SkillActivationMode, SkillContextResponse, SkillId, SkillSource};
 pub use bcode_tool_models::{
     ToolContributionArtifact, ToolContributionEnvelope, ToolContributionEvent,

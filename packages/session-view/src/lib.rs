@@ -1600,6 +1600,12 @@ impl SessionView {
                     Some(event.timestamp_ms),
                 );
             }
+            SessionEventKind::SystemMessage { text }
+                if text.starts_with(bcode_session_models::TURN_ENVIRONMENT_SNAPSHOT_PREFIX) =>
+            {
+                // Retained model context is not a conversational status message.
+                // Leave canonical history and provider context untouched.
+            }
             SessionEventKind::SystemMessage { text } => {
                 self.push_item(
                     TranscriptViewItemId::event(event.sequence),
@@ -13174,6 +13180,62 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec!["first", "second", "third"]
         );
+    }
+
+    #[test]
+    fn environment_snapshots_are_context_only_in_incremental_and_replayed_views() {
+        let session_id = SessionId::new();
+        let snapshot = format!(
+            "{}Current directory: /workspace",
+            bcode_session_models::TURN_ENVIRONMENT_SNAPSHOT_PREFIX
+        );
+        let durable = [
+            event(
+                session_id,
+                1,
+                SessionEventKind::SystemMessage {
+                    text: "visible status".to_owned(),
+                },
+            ),
+            event(
+                session_id,
+                2,
+                SessionEventKind::SystemMessage {
+                    text: snapshot.clone(),
+                },
+            ),
+            event(
+                session_id,
+                3,
+                SessionEventKind::SystemMessage {
+                    text: "Turn environment snapshot troubleshooting failed".to_owned(),
+                },
+            ),
+        ];
+        let mut incremental = SessionView::new();
+        for event in &durable {
+            incremental.apply_history(std::slice::from_ref(event));
+        }
+        let mut replayed = SessionView::new();
+        replayed.apply_history(&durable);
+        for view in [&incremental, &replayed] {
+            let snapshot = view.snapshot();
+            assert_eq!(snapshot.transcript.items.len(), 2);
+            assert!(matches!(
+                &snapshot.transcript.items[0].kind,
+                TranscriptViewItemKind::SystemMessage { message }
+                    if message.text == "visible status"
+            ));
+            assert!(matches!(
+                &snapshot.transcript.items[1].kind,
+                TranscriptViewItemKind::SystemMessage { message }
+                    if message.text == "Turn environment snapshot troubleshooting failed"
+            ));
+        }
+        assert!(matches!(
+            &durable[1].kind,
+            SessionEventKind::SystemMessage { text } if text == &snapshot
+        ));
     }
 
     #[test]

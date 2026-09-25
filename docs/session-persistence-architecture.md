@@ -7,7 +7,10 @@ measurement command and the remaining transparent-compression design.
 
 Turn preparation explicitly records enabled dynamic environment and repository facts as a
 `SystemMessage` before provider execution. This uses the existing model-visible event contract;
-no schema conversion or historical backfill occurs. The snapshot labels its contents as historical
+no schema conversion or historical backfill occurs. The stable session-model snapshot prefix
+identifies these messages as context-only in the shared session-view projection, so both live
+updates and replay omit them from the conversation without changing provider input or history.
+The snapshot labels its contents as historical
 observations superseded by later snapshots and tool observations. Ordinary bounded context reads
 and compaction treat it like other canonical system context. Static application instructions,
 request-only skill context, invariant reminders and retry guidance are not included in this capture.

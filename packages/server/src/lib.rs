@@ -23828,7 +23828,8 @@ async fn prepare_static_model_turn_context(
     let mut recovery_context = None;
     if !facts.is_empty() {
         let text = format!(
-            "Turn environment snapshot (historical observations, not enduring instructions). Later snapshots and tool observations supersede these facts.\n\n{facts}"
+            "{}{facts}",
+            bcode_session_models::TURN_ENVIRONMENT_SNAPSHOT_PREFIX
         );
         if retain_environment_snapshot {
             state
