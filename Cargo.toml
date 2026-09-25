@@ -328,7 +328,9 @@ chrono = { version = "0.4.45", default-features = false, features = [
 ] }
 clap = { version = "4.5.40", default-features = false }
 cmake = { version = "0.1.54", default-features = false }
-crossterm = { version = "0.29.0", default-features = false, features = ["windows"] }
+crossterm = { version = "0.29.0", default-features = false, features = [
+    "windows",
+] }
 devicons = { version = "0.6.12", default-features = false }
 flate2 = { version = "1.1.10", default-features = false, features = [
     "rust_backend",
@@ -426,7 +428,7 @@ switchy_database = { git = "https://github.com/MoosicBox/MoosicBox.git", branch 
 switchy_database_connection = { git = "https://github.com/MoosicBox/MoosicBox.git", branch = "master", default-features = false, features = [
     "sqlite-rusqlite",
 ] }
-switchy_fs = { git = "https://github.com/MoosicBox/MoosicBox.git", rev = "236ceefc2f11454aa7aca3739e48ebdc5584b8d1", default-features = false }
+switchy_fs = { git = "https://github.com/MoosicBox/MoosicBox.git", branch = "master", default-features = false }
 syntect = { version = "5.3.0", default-features = false, features = [
     "default-syntaxes",
     "default-themes",
