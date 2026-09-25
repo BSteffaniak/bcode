@@ -1567,6 +1567,11 @@ impl RuntimeWorkView {
 }
 
 /// Renderer-neutral aggregate of fixed canonical session cost estimates.
+///
+/// Totals are valuations of recorded usage, not evidence of provider billing or
+/// charges against a subscription. Complete coverage means every observation
+/// has an estimate; it does not make that estimate an actual billed amount.
+/// Consumers must retain this distinction when presenting monetary totals.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SessionCostSummary {
     /// Whether the last original-usage capture was explicitly incomplete.

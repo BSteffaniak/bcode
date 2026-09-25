@@ -236,6 +236,19 @@ fn record_measurements(analysis: &mut PromptCacheAnalysis, rounds: &[CacheRoundO
         0.0
     };
 
+    // A tiny cached prefix can make every round a "hit" while nearly all input is
+    // reprocessed at the user-turn boundary. Keep this separate from tool-loop ratios.
+    if let Some(first) = rounds.first()
+        && first.valid_input_breakdown
+        && let (Some(input), Some(cached)) = (first.input_tokens, first.cached_input_tokens)
+        && input > 0
+        && cached <= input
+    {
+        analysis.measure(
+            measurement::FIRST_REQUEST_READ_RATIO,
+            f64::from(cached) / f64::from(input),
+        );
+    }
     analysis.measure(measurement::ROUND_COUNT, usize_f64(rounds.len()));
     analysis.measure(measurement::ELIGIBLE_ROUND_COUNT, usize_f64(eligible.len()));
     analysis.measure(measurement::HIT_ROUND_COUNT, usize_f64(hits));
@@ -300,6 +313,42 @@ mod tests {
             valid_input_breakdown: cached.saturating_add(written) <= input,
             dropped_cache_points: Some(0),
             ..CacheRoundObservation::default()
+        }
+    }
+
+    #[test]
+    fn first_request_coverage_is_not_hidden_by_healthy_tool_rounds() {
+        let rounds = vec![
+            round(0, 192_000, 2_048, 0),
+            round(1, 193_000, 192_000, 0),
+            round(2, 194_000, 193_000, 0),
+        ];
+        let measurements = measure_rounds(&rounds);
+        assert_close(measurements[measurement::HIT_ROUND_RATIO], 1.0);
+        assert_close(
+            measurements[measurement::FIRST_REQUEST_READ_RATIO],
+            2_048.0 / 192_000.0,
+        );
+        let warm = measure_rounds(&[round(0, 193_000, 192_000, 0)]);
+        assert_close(
+            warm[measurement::FIRST_REQUEST_READ_RATIO],
+            192_000.0 / 193_000.0,
+        );
+    }
+
+    #[test]
+    fn first_request_coverage_does_not_guess_missing_or_invalid_usage() {
+        for rounds in [
+            vec![],
+            vec![CacheRoundObservation::default()],
+            vec![round(0, 0, 0, 0)],
+            vec![round(0, 10, 11, 0)],
+            vec![CacheRoundObservation {
+                cached_input_tokens: None,
+                ..round(0, 100, 0, 0)
+            }],
+        ] {
+            assert!(!measure_rounds(&rounds).contains_key(measurement::FIRST_REQUEST_READ_RATIO));
         }
     }
 

@@ -10,8 +10,19 @@ tmp_root="${TMPDIR:-/tmp}"
 workdir="$(mktemp -d "${tmp_root%/}/bcode-prompt-cache-eval.XXXXXX")"
 model="${BCODE_PROMPT_CACHE_EVAL_MODEL:-fake-cache-explicit}"
 
-cargo build -p bcode --bin bcode --features app,static-bundled-plugins,static-bundled-fake-provider-plugin
-bcode="${root}/target/debug/bcode"
+# An explicit binary lets callers validate an identified release artifact. Do not
+# rebuild a different binary and then accidentally report that build as tested.
+if [[ -n "${BCODE_PROMPT_CACHE_EVAL_BINARY:-}" ]]; then
+    bcode="${BCODE_PROMPT_CACHE_EVAL_BINARY}"
+    if [[ "${bcode}" != /* || ! -x "${bcode}" ]]; then
+        echo "BCODE_PROMPT_CACHE_EVAL_BINARY must name an executable absolute path" >&2
+        exit 1
+    fi
+else
+    cargo build -p bcode --bin bcode --features app,static-bundled-plugins,static-bundled-fake-provider-plugin
+    bcode="${root}/target/debug/bcode"
+fi
+printf 'prompt cache eval binary: %s\n' "${bcode}"
 
 cat >"${workdir}/bcode.toml" <<EOF
 [plugins]
@@ -36,12 +47,20 @@ run() {
         "${bcode}" "$@"
 }
 
-run eval validate "${root}/fixtures/evals/prompt-cache/suite.toml"
-if run eval run "${root}/fixtures/evals/prompt-cache/suite.toml" \
+suite="${root}/fixtures/evals/prompt-cache/suite.toml"
+if [[ "${model}" == "fake-cache-prefix" ]]; then
+    suite="${root}/fixtures/evals/prompt-cache/prefix.toml"
+fi
+run eval validate "${suite}"
+if run eval run "${suite}" \
     --output-root "${workdir}/runs" \
     --run-id ci-prompt-cache \
     --fail-under-pass-rate 1.0; then
-    rm -rf "${workdir}"
+    if [[ "${BCODE_PROMPT_CACHE_EVAL_KEEP_ARTIFACTS:-0}" == "1" ]]; then
+        echo "prompt cache eval artifacts: ${workdir}/runs/ci-prompt-cache"
+    else
+        rm -rf "${workdir}"
+    fi
     echo "prompt cache eval passed (${model})"
 else
     echo "prompt cache eval failed (${model}); artifacts kept at ${workdir}/runs/ci-prompt-cache" >&2

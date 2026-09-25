@@ -1681,9 +1681,13 @@ impl HyperChadAppState {
         sessions: &[SessionSummary],
         catalog_status: bcode_session_view_models::SessionCatalogViewStatus,
     ) -> hyperchad::template::Containers {
+        // Finish the initial bounded attach before the watcher opens its own
+        // connection. The watcher attaches independently to current session state.
+        let rendered = self
+            .render_session_with_status(session_id, sessions, catalog_status, "connected")
+            .await;
         self.ensure_session_watcher(session_id);
-        self.render_session_with_status(session_id, sessions, catalog_status, "connected")
-            .await
+        rendered
     }
 
     async fn render_session_with_status(

@@ -286,6 +286,9 @@ pub mod measurement {
     pub const LATE_UNCACHED_RATIO: &str = "prompt_cache.late_uncached_ratio";
     /// `total cache writes / final round input`.
     pub const WRITE_AMPLIFICATION: &str = "prompt_cache.write_amplification";
+    /// Fraction of the first observed request's input served from cache.
+    /// Absent when its input/cache usage is missing, invalid, or input is zero.
+    pub const FIRST_REQUEST_READ_RATIO: &str = "prompt_cache.first_request_read_ratio";
     /// `cached / input` on the warm same-prefix repeat.
     pub const WARM_READ_RATIO: &str = "prompt_cache.warm_read_ratio";
     /// Total cache points dropped by the provider across rounds.

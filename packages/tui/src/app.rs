@@ -4940,10 +4940,13 @@ impl TokenUsageMeter {
         }
         for (currency, cost_micros) in &cost.totals_micros {
             if currency == "USD" {
-                parts.push(format_usd_micros(*cost_micros));
+                parts.push(format!(
+                    "estimated {} (not billed)",
+                    format_usd_micros(*cost_micros)
+                ));
             } else {
                 parts.push(format!(
-                    "{currency} {}",
+                    "estimated {currency} {} (not billed)",
                     format_decimal_micros(*cost_micros)
                 ));
             }
@@ -7652,7 +7655,7 @@ mod tests {
         assert!(
             TokenUsageMeter::default()
                 .footer_summary(None, 0, &cost)
-                .ends_with("spent 0 tok · $0.02")
+                .ends_with("spent 0 tok · estimated $0.02 (not billed)")
         );
     }
 
@@ -7807,6 +7810,50 @@ mod tests {
     }
 
     #[test]
+    fn subscription_and_api_estimates_are_never_presented_as_billed_charges() {
+        let usages = ["chatgpt_subscription", "api_key"].map(|auth_mode| {
+            bcode_session_models::SessionTokenUsage {
+                pricing_target: Some(Box::new(bcode_session_models::SessionPricingTarget {
+                    provider: "openai".into(),
+                    auth_mode: auth_mode.into(),
+                    api_surface: if auth_mode == "chatgpt_subscription" {
+                        "chatgpt_codex"
+                    } else {
+                        "responses"
+                    }
+                    .into(),
+                    integration: Some("bcode".into()),
+                })),
+                cost: Some(bcode_session_models::SessionCostEstimate::Estimated {
+                    currency: "USD".into(),
+                    total_micros: 1_115_980_451,
+                    components: Vec::new(),
+                    source: "remote_catalog".into(),
+                    revision: None,
+                }),
+                ..bcode_session_models::SessionTokenUsage::default()
+            }
+        });
+        let meter = TokenUsageMeter::default();
+        for usage in &usages {
+            let cost =
+                bcode_session_view_models::SessionCostSummary::rebuild(std::iter::once(usage));
+            assert!(cost.has_complete_coverage());
+            assert!(
+                meter
+                    .footer_summary(None, 0, &cost)
+                    .contains("estimated $1115.98 (not billed)")
+            );
+        }
+        let mixed = bcode_session_view_models::SessionCostSummary::rebuild(usages.iter());
+        assert!(
+            meter
+                .footer_summary(None, 0, &mixed)
+                .contains("estimated $2231.96 (not billed)")
+        );
+    }
+
+    #[test]
     fn footer_renders_cost_currency_coverage_and_zero_semantics() {
         let meter = TokenUsageMeter::default();
         let complete = bcode_session_view_models::SessionCostSummary {
@@ -7829,8 +7876,8 @@ mod tests {
         };
 
         let complete_text = meter.footer_summary(None, 0, &complete);
-        assert!(complete_text.contains("$0.00"));
-        assert!(complete_text.contains("EUR 2.000000"));
+        assert!(complete_text.contains("estimated $0.00 (not billed)"));
+        assert!(complete_text.contains("estimated EUR 2.000000 (not billed)"));
         assert!(!complete_text.contains('~'));
         assert!(
             meter

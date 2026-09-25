@@ -6148,8 +6148,12 @@ fn responses_projection(
     dialect: OpenAiCompatibleDialect,
     previous_response_id: Option<&str>,
 ) -> ResponsesProjection {
-    let instruction_bundle =
-        response_instruction_bundle(request.system_prompt.as_deref(), &request.messages);
+    let inline_instructions = dialect == OpenAiCompatibleDialect::ChatGptCodex;
+    let instruction_bundle = if inline_instructions {
+        request.system_prompt.clone()
+    } else {
+        response_instruction_bundle(request.system_prompt.as_deref(), &request.messages)
+    };
     let input = model_messages_to_responses_input(request, project_reused_history, dialect);
     // xAI (and public Responses API) forbid sending both `instructions` and `previous_response_id`.
     // When reusing a prior response, the instructions are already attached to it.
@@ -6243,6 +6247,15 @@ fn prepend_provider_reasoning_state(
 }
 
 fn provider_reasoning_insert_index(input: &[ResponsesInputItem]) -> usize {
+    // Request-only instruction messages must not hide the trailing tool exchange
+    // when placing the provider's corresponding reasoning item.
+    let conversation_end = input
+        .iter()
+        .rposition(
+            |item| !matches!(item, ResponsesInputItem::Message { role, .. } if role == "developer"),
+        )
+        .map_or(0, |index| index + 1);
+    let input = &input[..conversation_end];
     if input.is_empty() {
         return 0;
     }
@@ -6277,6 +6290,36 @@ fn model_messages_to_responses_input(
         })
         .flatten()
         .unwrap_or_default();
+    if dialect == OpenAiCompatibleDialect::ChatGptCodex {
+        // Preserve application instruction positions while using the same tool
+        // protocol sanitizer as ordinary Responses projection.
+        let mut input = Vec::new();
+        let mut seen = BTreeSet::new();
+        let mut pending = BTreeSet::new();
+        for message in request
+            .messages
+            .iter()
+            .skip(start.min(request.messages.len()))
+        {
+            let items = if message.role == MessageRole::System {
+                bcode_openai_responses::responses_message("developer", message, true)
+            } else {
+                bcode_openai_responses::model_message_to_responses_input(message, &|name| {
+                    provider_tool_name(name, dialect)
+                })
+            };
+            for item in items {
+                bcode_openai_responses::push_sanitized_responses_input_item(
+                    &mut input,
+                    &mut seen,
+                    &mut pending,
+                    item,
+                );
+            }
+        }
+        bcode_openai_responses::append_missing_responses_tool_outputs(&mut input, &mut pending);
+        return input;
+    }
     bcode_openai_responses::model_messages_to_responses_input(&request.messages, start, &|name| {
         provider_tool_name(name, dialect)
     })
@@ -13135,6 +13178,188 @@ mod tests {
     }
 
     #[test]
+    fn codex_tool_continuation_preserves_full_instruction_prefix() {
+        let settings = test_settings(test_chatgpt_auth(), OpenAiCompatibleDialect::ChatGptCodex);
+        let mut request = test_request(vec![
+            text_message(MessageRole::User, "inspect the repository"),
+            text_message(MessageRole::System, "Current turn repository context"),
+        ]);
+        let first = build_responses_request(&settings, &request, "model").unwrap();
+        request.messages.extend([
+            ModelMessage {
+                role: MessageRole::Assistant,
+                content: vec![ContentBlock::ToolCall {
+                    call: bcode_model::ToolCall {
+                        id: "prefix-call".into(),
+                        name: "lookup".into(),
+                        arguments: serde_json::json!({}),
+                    },
+                }],
+            },
+            ModelMessage {
+                role: MessageRole::Tool,
+                content: vec![ContentBlock::ToolResult {
+                    result: bcode_model::ToolResult {
+                        call_id: "prefix-call".into(),
+                        output: "repository contents".into(),
+                        content: Vec::new(),
+                        is_error: false,
+                    },
+                }],
+            },
+        ]);
+        let next = build_responses_request(&settings, &request, "model").unwrap();
+        let prefix = first["input"].as_array().unwrap();
+        let input = next["input"].as_array().unwrap();
+        assert_eq!(&input[..prefix.len()], prefix);
+        assert_eq!(input[1]["role"], "developer");
+        assert_eq!(input[2]["type"], "function_call");
+        assert_eq!(input[3]["type"], "function_call_output");
+        assert_eq!(input[2]["call_id"], input[3]["call_id"]);
+        assert_eq!(first["instructions"], next["instructions"]);
+    }
+
+    #[test]
+    fn codex_growing_history_keeps_prior_items_without_accumulating_context() {
+        let settings = test_settings(test_chatgpt_auth(), OpenAiCompatibleDialect::ChatGptCodex);
+        let mut request = test_request(vec![text_message(MessageRole::User, "start")]);
+        request.system_prompt = Some("stable application instructions".into());
+        let mut previous_history = Vec::new();
+        for round in 0..12 {
+            let context = format!("Current round facts: {round}");
+            request
+                .messages
+                .push(text_message(MessageRole::System, &context));
+            let encoded = build_responses_request(&settings, &request, "model").unwrap();
+            let input = encoded["input"].as_array().unwrap();
+            assert_eq!(
+                &input[..previous_history.len()],
+                previous_history.as_slice()
+            );
+            assert_eq!(
+                input
+                    .iter()
+                    .filter(|item| item["role"] == "developer")
+                    .count(),
+                1
+            );
+            assert!(input.last().unwrap().to_string().contains(&context));
+            assert_eq!(encoded["instructions"], "stable application instructions");
+            previous_history = input[..input.len() - 1].to_vec();
+            request.messages.pop();
+            request
+                .messages
+                .push(text_message(MessageRole::Assistant, "done"));
+            request
+                .messages
+                .push(text_message(MessageRole::User, "continue"));
+        }
+    }
+
+    #[test]
+    fn codex_preserves_system_only_instructions_without_top_level_prompt() {
+        let settings = test_settings(test_chatgpt_auth(), OpenAiCompatibleDialect::ChatGptCodex);
+        let request = test_request(vec![
+            text_message(MessageRole::User, "hello"),
+            text_message(MessageRole::System, "Do not modify files"),
+        ]);
+        let encoded = build_responses_request(&settings, &request, "model").unwrap();
+        let input = encoded["input"].as_array().unwrap();
+        assert_eq!(input.len(), 2);
+        assert_eq!(input[0]["role"], "user");
+        assert_eq!(input[1]["role"], "developer");
+        assert!(input[1].to_string().contains("Do not modify files"));
+        assert!(
+            encoded
+                .get("instructions")
+                .is_none_or(serde_json::Value::is_null)
+        );
+    }
+
+    #[test]
+    fn codex_instruction_tail_preserves_tool_pairs_and_current_facts() {
+        let settings = test_settings(test_chatgpt_auth(), OpenAiCompatibleDialect::ChatGptCodex);
+        let mut request = test_request_with_tool(vec![
+            text_message(MessageRole::User, "Read the file"),
+            ModelMessage {
+                role: MessageRole::Assistant,
+                content: vec![ContentBlock::ToolCall {
+                    call: ToolCall {
+                        id: "call-1".into(),
+                        name: "lookup".into(),
+                        arguments: serde_json::json!({}),
+                    },
+                }],
+            },
+            ModelMessage {
+                role: MessageRole::Tool,
+                content: vec![ContentBlock::ToolResult {
+                    result: bcode_model::ToolResult {
+                        call_id: "call-1".into(),
+                        output: "file contents".into(),
+                        content: Vec::new(),
+                        is_error: false,
+                    },
+                }],
+            },
+            text_message(MessageRole::System, "Current repository status: modified"),
+        ]);
+        request.system_prompt = Some("Application instructions".into());
+        request.conversation_reuse.provider_state = Some(serde_json::json!({
+            "reasoning_items": [{"id":"rs_1", "summary":[], "encrypted_content":"opaque-test-state"}]
+        }));
+        let encoded = build_responses_request(&settings, &request, "model").unwrap();
+        let input = encoded["input"].as_array().unwrap();
+        assert_eq!(input[1]["type"], "reasoning");
+        assert_eq!(input[2]["type"], "function_call");
+        assert_eq!(input[3]["type"], "function_call_output");
+        assert_eq!(input[2]["call_id"], input[3]["call_id"]);
+        assert_eq!(input.last().unwrap()["role"], "developer");
+        assert!(
+            input
+                .last()
+                .unwrap()
+                .to_string()
+                .contains("Current repository status: modified")
+        );
+    }
+
+    #[test]
+    fn codex_dynamic_context_preserves_instructions_and_history_prefix() {
+        let settings = test_settings(test_chatgpt_auth(), OpenAiCompatibleDialect::ChatGptCodex);
+        let history = "Stable conversation content. ".repeat(4_096);
+        let mut request = test_request(vec![
+            text_message(MessageRole::User, &history),
+            text_message(MessageRole::Assistant, "Previous answer"),
+            text_message(MessageRole::User, "Continue"),
+            text_message(
+                MessageRole::System,
+                "Current date: 2026-09-24T10:00:00\nGit status: clean",
+            ),
+        ]);
+        request.system_prompt = Some("Stable application instructions".into());
+        let before = build_responses_request(&settings, &request, "model").unwrap();
+        request.messages[3] = text_message(
+            MessageRole::System,
+            "Current date: 2026-09-24T10:01:00\nGit status: modified src/lib.rs",
+        );
+        let after = build_responses_request(&settings, &request, "model").unwrap();
+
+        // Fresh request-only facts follow the unchanged canonical history.
+        let before_input = before["input"].as_array().unwrap();
+        let after_input = after["input"].as_array().unwrap();
+        assert_eq!(&before_input[..3], &after_input[..3]);
+        assert_eq!(before["prompt_cache_key"], after["prompt_cache_key"]);
+        assert!(before["prompt_cache_key"].is_string());
+        assert_eq!(before["instructions"], after["instructions"]);
+        assert_eq!(after_input[3]["role"], "developer");
+        let context = after_input[3].to_string();
+        assert!(context.contains("modified src/lib.rs"));
+        assert!(context.contains("10:01:00"));
+        assert_eq!(before_input.len(), 4);
+    }
+
+    #[test]
     fn responses_top_level_strategy_omits_system_messages_and_uses_instructions() {
         let request = ModelTurnRequest {
             session_id: "00000000-0000-0000-0000-000000000000"
@@ -13181,8 +13406,9 @@ mod tests {
             serde_json::to_value(&projection.input).expect("input should serialize");
 
         assert!(instructions.contains("top-level"));
-        assert!(instructions.contains("dynamic system"));
-        assert_eq!(projection.input.len(), 1);
+        assert!(!instructions.contains("dynamic system"));
+        assert_eq!(projection.input.len(), 2);
+        assert!(encoded_items.to_string().contains("dynamic system"));
         assert!(!encoded_items.to_string().contains(r#""role":"system""#));
     }
 
@@ -13236,7 +13462,7 @@ mod tests {
             encoded
                 .get("instructions")
                 .and_then(serde_json::Value::as_str)
-                .is_some_and(|text| text.contains("top-level") && text.contains("dynamic system"))
+                .is_some_and(|text| text.contains("top-level") && !text.contains("dynamic system"))
         );
         assert!(!encoded_text.contains(r#""role":"system""#));
         assert!(encoded.get("instructions").is_some());

@@ -131,6 +131,15 @@ min = 1
 required = true
 variants = ["cached"]
 
+# A small stable system prefix is not evidence of conversation reuse. Measure the
+# first follow-up request independently of the subsequent tool-loop hit ratio.
+[[cases.judges]]
+type = "metric_threshold"
+metric = "follow_up.prompt_cache.first_request_read_ratio"
+min = 0.5
+required = true
+variants = ["cached"]
+
 # With caching disabled no round may claim cached input.
 [[cases.judges]]
 type = "metric_threshold"

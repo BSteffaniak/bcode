@@ -113,6 +113,56 @@ fn astra_session_requires_the_reported_cache_write_bucket() {
 }
 
 #[test]
+fn subscription_estimate_discounts_cached_input_at_both_context_tiers() {
+    let catalog = ModelCatalog::load_bundled().unwrap();
+    for (input, cached, output, expected_micros) in [
+        (192_259, 191_744, 657, 229_744),
+        (523_364, 522_880, 3_352, 1_306_840),
+    ] {
+        let usage: SessionTokenUsage = serde_json::from_value(serde_json::json!({
+            "catalog_provider_id": "openai", "catalog_entry_id": "gpt-6-astra",
+            "pricing_target": {"provider":"openai", "auth_mode":"chatgpt_subscription",
+                "api_surface":"chatgpt_codex", "integration":"bcode"},
+            "input_tokens": input, "cached_input_tokens": cached,
+            "cache_write_input_tokens": 0, "output_tokens": output,
+            "pricing_context": {"service_tier":"standard", "invocation_class":"ondemand",
+                "billing_scope":"in_region", "request_input_tokens":input, "cache_ttl_seconds":86400}
+        })).unwrap();
+        let SessionCostEstimate::Estimated {
+            currency,
+            total_micros,
+            components,
+            ..
+        } = price_session_usage(&catalog, &usage)
+        else {
+            panic!("recorded normalized usage must have an estimate");
+        };
+        assert_eq!(currency, "USD");
+        assert_eq!(total_micros, expected_micros);
+        assert_eq!(
+            components.iter().map(|part| part.cost_micros).sum::<u64>(),
+            total_micros
+        );
+        assert_eq!(
+            components
+                .iter()
+                .find(|part| part.bucket == "input")
+                .unwrap()
+                .tokens,
+            input - cached
+        );
+        assert_eq!(
+            components
+                .iter()
+                .find(|part| part.bucket == "cache_read_input")
+                .unwrap()
+                .tokens,
+            cached
+        );
+    }
+}
+
+#[test]
 fn supplied_snapshot_prices_recorded_model_not_embedded_cost() {
     let mut document = ModelCatalog::load_bundled().unwrap().document().clone();
     let entry = document

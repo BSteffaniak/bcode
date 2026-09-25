@@ -23805,15 +23805,23 @@ async fn prepare_static_model_turn_context(
         system_prompt_timer.elapsed_ms(),
         setup_labels,
     );
-    let mut system_messages = Vec::new();
-    for context in [dynamic_system_context, repository_system_context] {
-        if !context.is_empty() {
-            system_messages.push(ModelMessage {
-                role: MessageRole::System,
-                content: vec![ContentBlock::Text { text: context }],
-            });
-        }
+    // These bounded factual snapshots are explicitly retained as session context.
+    // They are not instruction-policy snapshots: skills, invariant reminders and
+    // retry guidance below remain request-only. Later snapshots supersede earlier
+    // observations without rewriting the historical prefix.
+    let facts = [dynamic_system_context, repository_system_context]
+        .into_iter()
+        .filter(|context| !context.is_empty())
+        .collect::<Vec<_>>()
+        .join("\n\n");
+    if !facts.is_empty() {
+        state.sessions.append_event(session_id, SessionEventKind::SystemMessage {
+            text: format!(
+                "Turn environment snapshot (historical observations, not enduring instructions). Later snapshots and tool observations supersede these facts.\n\n{facts}"
+            ),
+        }).await?;
     }
+    let mut system_messages = Vec::new();
     if matches!(
         invariant_mode,
         Some(bcode_config::InvariantGuidanceMode::Relevant)
@@ -23968,7 +23976,7 @@ async fn build_model_turn_request(
         .as_ref()
         .and_then(|capabilities| capabilities.context_format.as_ref());
     let convert_timer = state.metrics.timer();
-    let mut messages = session_events_to_model_messages_for_target_with_limits(
+    let mut messages = session_events_to_model_messages_with_turn_context(
         &history,
         config.model.tool_output.context_chars,
         provider_plugin_id,
@@ -23977,6 +23985,7 @@ async fn build_model_turn_request(
         context_format.map(|format| format.version),
         context_format.map(|format| format.compatibility_key.as_str()),
         config.model.tool_output.fallback_argument_chars.get(),
+        Some((trigger_event.sequence, &static_context.system_messages)),
     );
     if let Some(source) = context_generation::events(state, session_id, execution).await? {
         let mut preceding = session_events_to_model_messages_for_target_with_limits(
@@ -24010,23 +24019,16 @@ async fn build_model_turn_request(
             .sum::<usize>() as u64,
         metric_labels.clone(),
     );
-    let mut system_prefix_len = 0;
-    for message in static_context.system_messages.iter().cloned() {
-        messages.insert(system_prefix_len, message);
-        system_prefix_len += 1;
-    }
+    // Retry guidance is new information for this request, unlike turn context.
     if let Some(instruction) = retry_instruction
         && !instruction.trim().is_empty()
     {
-        messages.insert(
-            system_prefix_len,
-            ModelMessage {
-                role: MessageRole::System,
-                content: vec![ContentBlock::Text {
-                    text: instruction.to_string(),
-                }],
-            },
-        );
+        messages.push(ModelMessage {
+            role: MessageRole::System,
+            content: vec![ContentBlock::Text {
+                text: instruction.to_string(),
+            }],
+        });
     }
     let system_prompt = static_context.system_prompt.clone();
     let tools = static_context.tools.clone();
@@ -29807,6 +29809,31 @@ fn session_events_to_model_messages_for_target_with_limits(
     compatibility_key: Option<&str>,
     fallback_tool_argument_chars: usize,
 ) -> Vec<ModelMessage> {
+    session_events_to_model_messages_with_turn_context(
+        history,
+        tool_output_context_chars,
+        provider_plugin_id,
+        model_id,
+        auth_profile,
+        format_version,
+        compatibility_key,
+        fallback_tool_argument_chars,
+        None,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn session_events_to_model_messages_with_turn_context(
+    history: &[bcode_session_models::SessionEvent],
+    tool_output_context_chars: usize,
+    provider_plugin_id: Option<&str>,
+    model_id: Option<&str>,
+    auth_profile: Option<&str>,
+    format_version: Option<u16>,
+    compatibility_key: Option<&str>,
+    fallback_tool_argument_chars: usize,
+    turn_context: Option<(u64, &[ModelMessage])>,
+) -> Vec<ModelMessage> {
     let history = compact_attach_history(history.to_vec());
     let latest_compaction =
         history
@@ -29849,6 +29876,7 @@ fn session_events_to_model_messages_for_target_with_limits(
         format_version,
         compatibility_key,
         fallback_tool_argument_chars,
+        turn_context,
     )
 }
 
@@ -29908,6 +29936,7 @@ fn session_events_to_sanitized_model_messages(
     format_version: Option<u16>,
     compatibility_key: Option<&str>,
     fallback_tool_argument_chars: usize,
+    mut turn_context: Option<(u64, &[ModelMessage])>,
 ) -> Vec<ModelMessage> {
     let mut messages = Vec::new();
     let mut seen_tool_call_ids = BTreeSet::new();
@@ -29915,6 +29944,15 @@ fn session_events_to_sanitized_model_messages(
     let mut pending_tool_exchange = PendingModelToolExchange::default();
 
     for event in events {
+        // When compaction removed the trigger, anchor before the retained
+        // continuation. Otherwise insert after the trigger below, preserving
+        // its potentially large user content across refreshed turns.
+        if turn_context.is_some_and(|(sequence, _)| event.sequence > sequence) {
+            append_pending_tool_exchange(&mut messages, &mut pending_tool_exchange);
+            if let Some((_, context)) = turn_context.take() {
+                messages.extend_from_slice(context);
+            }
+        }
         match &event.kind {
             SessionEventKind::AgentChanged { agent_id } => {
                 previous_agent = Some(agent_id);
@@ -30051,9 +30089,18 @@ fn session_events_to_sanitized_model_messages(
                 }
             }
         }
+        if turn_context.is_some_and(|(sequence, _)| event.sequence == sequence) {
+            append_pending_tool_exchange(&mut messages, &mut pending_tool_exchange);
+            if let Some((_, context)) = turn_context.take() {
+                messages.extend_from_slice(context);
+            }
+        }
     }
 
     append_pending_tool_exchange(&mut messages, &mut pending_tool_exchange);
+    if let Some((_, context)) = turn_context {
+        messages.extend_from_slice(context);
+    }
     messages
 }
 
@@ -48522,6 +48569,124 @@ library = "test"
     }
 
     #[test]
+    fn retained_snapshot_history_grows_linearly_and_compacts() {
+        let session_id = SessionId::new();
+        let mut history = Vec::new();
+        let mut previous = Vec::new();
+        for turn in 0..64_u64 {
+            history.push(session_event(
+                session_id,
+                turn * 2,
+                SessionEventKind::UserMessage {
+                    client_id: ClientId::new(),
+                    text: format!("request {turn}"),
+                    admission: bcode_session_models::TurnAdmissionMetadata::default(),
+                },
+            ));
+            history.push(session_event(session_id, turn * 2 + 1, SessionEventKind::SystemMessage {
+                text: format!("Turn environment snapshot: observation {turn}; later observations supersede this"),
+            }));
+            let messages = session_events_to_model_messages(&history);
+            assert_eq!(&messages[..previous.len()], previous.as_slice());
+            assert_eq!(messages.len(), 2 * (usize::try_from(turn).unwrap() + 1));
+            previous = messages;
+        }
+        history.push(session_event(
+            session_id,
+            128,
+            SessionEventKind::ContextCompacted {
+                summary: "Latest observations retained in summary".into(),
+                compacted_through_sequence: 127,
+            },
+        ));
+        let messages = session_events_to_model_messages(&history);
+        assert_eq!(messages.len(), 1);
+        assert!(
+            matches!(&messages[0].content[0], ContentBlock::Text { text }
+            if text.contains("Latest observations retained in summary"))
+        );
+        assert_eq!(
+            history.len(),
+            129,
+            "projection must not rewrite canonical history"
+        );
+    }
+
+    #[test]
+    fn turn_context_survives_compacted_trigger_without_splitting_exchange() {
+        let session_id = SessionId::new();
+        let history = vec![
+            session_event(
+                session_id,
+                4,
+                SessionEventKind::ContextCompacted {
+                    summary: "retained summary".into(),
+                    compacted_through_sequence: 2,
+                },
+            ),
+            session_event(
+                session_id,
+                5,
+                SessionEventKind::ToolCallRequested {
+                    tool_call_id: "retained-call".into(),
+                    producer_plugin_id: None,
+                    working_directory: None,
+                    tool_name: "lookup".into(),
+                    arguments_json: "{}".into(),
+                },
+            ),
+            session_event(
+                session_id,
+                6,
+                SessionEventKind::ToolInvocationResultRecorded {
+                    record: bcode_session_models::ToolInvocationResultRecord {
+                        invocation_id: "retained-call".into(),
+                        model_output: "retained result".into(),
+                        is_error: false,
+                        presentation: None,
+                        result: None,
+                        content: Vec::new(),
+                    },
+                },
+            ),
+        ];
+        let context = prefix_test_context();
+        let project = || {
+            session_events_to_model_messages_with_turn_context(
+                &history,
+                1000,
+                None,
+                None,
+                None,
+                None,
+                None,
+                1000,
+                Some((2, &context.system_messages)),
+            )
+        };
+        let messages = project();
+        assert_eq!(messages, project(), "reconstruction must be deterministic");
+        assert_eq!(messages.len(), 4);
+        assert_eq!(messages[0], context.system_messages[0]);
+        assert!(
+            matches!(&messages[1].content[0], ContentBlock::Text { text } if text.contains("retained summary"))
+        );
+        assert_eq!(messages[2].role, MessageRole::Assistant);
+        assert_eq!(messages[3].role, MessageRole::Tool);
+        assert!(
+            matches!(&messages[3].content[0], ContentBlock::ToolResult { result }
+            if result.call_id == "retained-call" && result.output == "retained result" && !result.is_error)
+        );
+        assert_eq!(
+            messages
+                .iter()
+                .filter(|message| **message == context.system_messages[0])
+                .count(),
+            1
+        );
+    }
+
+    #[test]
     fn session_projection_uses_latest_context_compaction() {
         let session_id = SessionId::new();
         let history = vec![
@@ -51866,6 +52031,29 @@ library = "test"
         assert!(dynamic.contains("Dynamic repository context:"));
         assert!(!stable.contains("Current date and time:"));
         assert!(!stable.contains("Git status:"));
+    }
+
+    #[test]
+    fn long_context_capacity_respects_output_reserve_and_explicit_policy() {
+        let capacity = context_compaction::compaction_capacity_tokens(
+            1_050_000,
+            bcode_config::ProactiveCompactionThreshold::Percent(90),
+            None,
+            Some(128_000),
+        );
+        assert_eq!(capacity.output_reserve_tokens, 128_000);
+        assert_eq!(capacity.safety_margin_tokens, 21_000);
+        assert_eq!(capacity.threshold_tokens, 901_000);
+        assert_eq!(capacity.available_input_tokens, 901_000);
+        let explicit = context_compaction::compaction_capacity_tokens(
+            1_050_000,
+            bcode_config::ProactiveCompactionThreshold::Tokens(272_000),
+            Some(8_000),
+            Some(128_000),
+        );
+        assert_eq!(explicit.threshold_tokens, 272_000);
+        assert_eq!(explicit.output_reserve_tokens, 8_000);
+        assert_eq!(explicit.available_input_tokens, 1_021_000);
     }
 
     #[test]
@@ -70734,6 +70922,11 @@ event_symbol = "bcode_plugin_handle_event_v1"
 
     #[test]
     fn workflow_plugin_artifact_bridge_writes_bounded_opaque_reference() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("bridge runtime");
+        let _runtime_guard = runtime.enter();
         let artifact_store = tempfile::tempdir().expect("artifact session store");
         let session_id = SessionId::new();
         let invocation_id = "workflow-artifact-test";
@@ -83527,6 +83720,16 @@ event_symbol = "bcode_plugin_handle_event_v1"
                 .iter()
                 .any(|block| matches!(block, ContentBlock::Text { text } if text == &context))
         }));
+        let history = state
+            .sessions
+            .model_context_events(session_id)
+            .await
+            .unwrap();
+        assert!(history.iter().any(|event| matches!(&event.kind,
+            SessionEventKind::SystemMessage { text }
+                if text.starts_with("Turn environment snapshot") && text.contains("Later snapshots"))));
+        assert!(!history.iter().any(|event| matches!(&event.kind,
+            SessionEventKind::SystemMessage { text } if text.contains(&context))));
         drop(state);
     }
 
@@ -85298,6 +85501,183 @@ event_symbol = "bcode_plugin_handle_event_v1"
 
         assert_eq!(selection.reasoning_effort.as_deref(), Some("low"));
         assert_eq!(selection.reasoning_summary, None);
+    }
+
+    fn prefix_test_context() -> StaticModelTurnContext {
+        StaticModelTurnContext {
+            system_prompt: "stable instructions".into(),
+            system_messages: vec![ModelMessage {
+                role: MessageRole::System,
+                content: vec![ContentBlock::Text {
+                    text: "timestamp and repository snapshot A".into(),
+                }],
+            }],
+            tools: Vec::new(),
+            prompt_profile_layers: Vec::new(),
+            prompt_profile_diagnostics: Vec::new(),
+            tool_description_overrides: Vec::new(),
+        }
+    }
+
+    fn prefix_test_selection() -> SessionModelSelection {
+        SessionModelSelection {
+            provider_plugin_id: Some("bcode.fake-provider".into()),
+            requested_model_id: Some("fake-echo".into()),
+            model_id: Some("fake-echo".into()),
+            ..SessionModelSelection::default()
+        }
+    }
+
+    async fn append_prefix_user(
+        state: &ServerState,
+        session_id: SessionId,
+        text: &str,
+    ) -> bcode_session_models::SessionEvent {
+        state
+            .sessions
+            .append_event(
+                session_id,
+                SessionEventKind::UserMessage {
+                    client_id: ClientId::new(),
+                    text: text.into(),
+                    admission: bcode_session_models::TurnAdmissionMetadata::default(),
+                },
+            )
+            .await
+            .unwrap()
+    }
+
+    async fn append_prefix_exchange(state: &ServerState, session_id: SessionId, round: u32) {
+        let call_id = format!("prefix-call-{round}");
+        state
+            .sessions
+            .append_event(
+                session_id,
+                SessionEventKind::ToolCallRequested {
+                    tool_call_id: call_id.clone(),
+                    producer_plugin_id: None,
+                    working_directory: None,
+                    tool_name: "lookup".into(),
+                    arguments_json: "{}".into(),
+                },
+            )
+            .await
+            .unwrap();
+        state
+            .sessions
+            .append_event(
+                session_id,
+                SessionEventKind::ToolInvocationResultRecorded {
+                    record: bcode_session_models::ToolInvocationResultRecord {
+                        invocation_id: call_id,
+                        model_output: "repository contents".into(),
+                        is_error: false,
+                        presentation: None,
+                        result: None,
+                        content: Vec::new(),
+                    },
+                },
+            )
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn ordinary_turn_request_keeps_context_before_tool_continuations() {
+        let sessions = SessionManager::default();
+        let summary = sessions
+            .create_session(Some("prefix".into()), PathBuf::from("."))
+            .await
+            .unwrap();
+        let state = test_server_state_with_fake_provider(sessions);
+        let trigger = append_prefix_user(&state, summary.id, "inspect repository").await;
+        let selection = prefix_test_selection();
+        let mut context = prefix_test_context();
+        let policy =
+            automatic_compaction_policy(&state, &selection, &state.startup_config.model.compaction)
+                .await;
+        let execution = bcode_session_models::TurnExecutionOptions::default();
+        let config = bcode_config::BcodeConfig::default();
+        let build = async |trigger: &bcode_session_models::SessionEvent,
+                           round,
+                           context: &StaticModelTurnContext,
+                           retry: Option<&str>| {
+            build_model_turn_request(
+                &state,
+                summary.id,
+                trigger,
+                &execution,
+                round,
+                selection.provider_plugin_id.as_deref(),
+                selection.model_id.as_deref(),
+                retry,
+                &selection,
+                &policy,
+                context,
+                &config,
+            )
+            .await
+            .unwrap()
+            .request
+        };
+        let first = build(&trigger, 0, &context, None).await;
+        let mut previous = first.clone();
+        for round in 1..=3 {
+            append_prefix_exchange(&state, summary.id, round).await;
+            let next = build(&trigger, round, &context, None).await;
+            assert_eq!(
+                &next.messages[..previous.messages.len()],
+                previous.messages.as_slice()
+            );
+            assert_eq!(
+                next.messages.len(),
+                first.messages.len() + 2 * round as usize
+            );
+            assert_eq!(next.messages[0].role, MessageRole::User);
+            assert_eq!(next.messages[1].role, MessageRole::System);
+            assert!(matches!(&next.messages.last().unwrap().content[0],
+                ContentBlock::ToolResult { result } if !result.is_error && result.output == "repository contents"));
+            previous = next;
+        }
+        let next_trigger = state
+            .sessions
+            .append_event(
+                summary.id,
+                SessionEventKind::UserMessage {
+                    client_id: ClientId::new(),
+                    text: "continue with fresh facts".into(),
+                    admission: bcode_session_models::TurnAdmissionMetadata::default(),
+                },
+            )
+            .await
+            .unwrap();
+        context.system_messages[0].content = vec![ContentBlock::Text {
+            text: "timestamp and repository snapshot B".into(),
+        }];
+        let fresh = build(&next_trigger, 0, &context, Some("retry guidance")).await;
+        assert_eq!(fresh.messages[0].role, MessageRole::User);
+        assert_eq!(
+            fresh
+                .messages
+                .iter()
+                .filter(|message| message.role == MessageRole::System)
+                .count(),
+            2
+        );
+        assert!(fresh.messages.contains(&context.system_messages[0]));
+        assert!(!fresh.messages.contains(&first.messages[1]));
+        assert_eq!(fresh.messages[0], first.messages[0]);
+        let history = state
+            .sessions
+            .model_context_events(summary.id)
+            .await
+            .unwrap();
+        drop(state);
+        assert!(
+            !serde_json::to_string(&history)
+                .unwrap()
+                .contains("repository snapshot")
+        );
     }
 
     #[tokio::test]

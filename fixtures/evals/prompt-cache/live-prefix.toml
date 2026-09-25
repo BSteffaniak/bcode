@@ -1,0 +1,79 @@
+schema_version = 1
+id = "prompt-cache-live-prefix"
+name = "Live Automatic Prefix Tool Loop"
+description = "Live production-session workload, not the fake provider read-files protocol. Requires configured automatic-prefix provider credentials; consumes provider quota."
+
+[run]
+repetitions = 1
+timeout_ms = 300000
+isolation = "temp_copy"
+randomize_case_order = false
+fail_fast = false
+
+[score]
+correctness = 1.0
+efficiency = 0.0
+speed = 0.0
+cost = 0.0
+stability = 0.0
+correctness_required = true
+
+[[variants]]
+id = "live"
+name = "Sequential live reads"
+executor = "agent"
+allowed_tools = ["filesystem.read"]
+metadata = { agent_id = "build", permission_mode = "approve" }
+# Explicit diagnostic capture in isolated eval state, never normal user sessions.
+# Requests contain fixture content; treat resulting artifacts as private evidence.
+config_toml = """
+[observability]
+level = "debug"
+persist_model_requests = true
+"""
+
+[variants.follow_up]
+prompt = "Reply with exactly: follow-up complete."
+restart_daemon = true
+
+[[cases]]
+id = "sequential-read-loop"
+name = "Twelve sequential provider rounds"
+fixture = "workspace"
+prompt = "Read probe-00.txt through probe-11.txt in numerical order using filesystem.read. Make exactly ONE tool call per response, wait for its result, then request the next file. Do not batch or parallelize. Do not use shell or modify files. After reading all twelve files, reply with exactly: reads complete."
+
+[[cases.judges]]
+type = "metric_threshold"
+metric = "tool_call_count"
+min = 12
+required = true
+
+[[cases.judges]]
+type = "metric_threshold"
+metric = "tool_error_count"
+max = 0
+required = true
+
+[[cases.judges]]
+type = "metric_threshold"
+metric = "prompt_cache.round_count"
+min = 13
+required = true
+
+[[cases.judges]]
+type = "metric_threshold"
+metric = "prompt_cache.hit_round_ratio"
+min = 0.9
+required = true
+
+[[cases.judges]]
+type = "metric_threshold"
+metric = "prompt_cache.late_uncached_ratio"
+max = 0.15
+required = true
+
+[[cases.judges]]
+type = "metric_threshold"
+metric = "follow_up.prompt_cache.first_request_read_ratio"
+min = 0.5
+required = true

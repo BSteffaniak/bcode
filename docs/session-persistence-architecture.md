@@ -3,6 +3,24 @@
 See [Session storage tiering](session-storage-tiering.md) for the implemented bounded storage
 measurement command and the remaining transparent-compression design.
 
+## Turn environment snapshots
+
+Turn preparation explicitly records enabled dynamic environment and repository facts as a
+`SystemMessage` before provider execution. This uses the existing model-visible event contract;
+no schema conversion or historical backfill occurs. The snapshot labels its contents as historical
+observations superseded by later snapshots and tool observations. Ordinary bounded context reads
+and compaction treat it like other canonical system context. Static application instructions,
+request-only skill context, invariant reminders and retry guidance are not included in this capture.
+
+Capture currently occurs on each turn preparation, including preparation after recovery, rather
+than promising once-per-turn idempotency. It does not rerun tools or rewrite earlier snapshots.
+Snapshot content is limited to the enabled environment/repository sections and their existing
+field/command-output bounds; no credential values or arbitrary environment dump are captured.
+Paths, branch names and repository status are nevertheless potentially private session content.
+Each capture adds history and consequently some cached-input cost until ordinary compaction
+removes it from active context. Recovery recapture and long-lived growth require dedicated
+verification; successful cache measurements alone do not establish those lifecycle properties.
+
 ## Canonical storage and authority
 
 A Bcode session id maps to exactly one canonical database within the state location that owns it:

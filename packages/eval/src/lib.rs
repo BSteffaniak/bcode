@@ -1774,7 +1774,11 @@ fn session_telemetry(events: &[bcode_session_models::SessionEvent]) -> SessionTe
     let mut turn_finished = false;
     let mut cache_rounds: Vec<(Option<String>, bcode_session_models::SessionTokenUsage)> =
         Vec::new();
+    let mut observed_events = std::collections::BTreeSet::new();
     for event in events {
+        if !observed_events.insert((event.session_id, event.sequence)) {
+            continue;
+        }
         match &event.kind {
             bcode_session_models::SessionEventKind::ToolCallRequested { tool_name, .. }
             | bcode_session_models::SessionEventKind::PositionedToolCallRequested {
@@ -1792,17 +1796,6 @@ fn session_telemetry(events: &[bcode_session_models::SessionEvent]) -> SessionTe
                 permissions += 1;
             }
             bcode_session_models::SessionEventKind::ModelUsage { usage, .. } => {
-                input_tokens = input_tokens.saturating_add(usage.input_tokens.unwrap_or_default());
-                output_tokens =
-                    output_tokens.saturating_add(usage.output_tokens.unwrap_or_default());
-                total_tokens =
-                    total_tokens.saturating_add(usage.metered_total_tokens().unwrap_or_default());
-                cached_input_tokens = cached_input_tokens
-                    .saturating_add(usage.cached_input_tokens.unwrap_or_default());
-                cache_write_input_tokens = cache_write_input_tokens
-                    .saturating_add(usage.cache_write_input_tokens.unwrap_or_default());
-                reasoning_tokens =
-                    reasoning_tokens.saturating_add(usage.reasoning_tokens.unwrap_or_default());
                 record_cache_round(&mut cache_rounds, usage);
             }
             bcode_session_models::SessionEventKind::ModelTurnFinished {
@@ -1822,10 +1815,24 @@ fn session_telemetry(events: &[bcode_session_models::SessionEvent]) -> SessionTe
             _ => {}
         }
     }
+    // Usage observations are cumulative per request, not incremental charges.
+    // Use the same selected observations as cache ratios for headline totals.
+    for (_, usage) in &cache_rounds {
+        input_tokens = input_tokens.saturating_add(usage.input_tokens.unwrap_or_default());
+        output_tokens = output_tokens.saturating_add(usage.output_tokens.unwrap_or_default());
+        total_tokens =
+            total_tokens.saturating_add(usage.metered_total_tokens().unwrap_or_default());
+        cached_input_tokens =
+            cached_input_tokens.saturating_add(usage.cached_input_tokens.unwrap_or_default());
+        cache_write_input_tokens = cache_write_input_tokens
+            .saturating_add(usage.cache_write_input_tokens.unwrap_or_default());
+        reasoning_tokens =
+            reasoning_tokens.saturating_add(usage.reasoning_tokens.unwrap_or_default());
+    }
     telemetry.timed_out = !turn_finished;
     telemetry
         .measurements
-        .insert("session_event_count".into(), events.len() as f64);
+        .insert("session_event_count".into(), observed_events.len() as f64);
     telemetry.measurements.insert(
         "tool_call_count".into(),
         tool_counts.values().copied().sum::<u32>().into(),
@@ -1886,7 +1893,7 @@ fn record_cache_round(
             .iter_mut()
             .find(|(existing_id, _)| existing_id.as_deref() == Some(request_id.as_str()))
     {
-        if usage.observation_ordinal >= existing.1.observation_ordinal {
+        if !existing.1.terminal && usage.observation_ordinal > existing.1.observation_ordinal {
             existing.1 = usage.clone();
         }
         return;
@@ -4512,6 +4519,9 @@ required = false
             usage_event(2, "r1", 0, 1_200, 0, None),
             usage_event(3, "r1", 1, 1_200, 1_000, Some(200)),
             usage_event(4, "r2", 0, 1_400, 1_200, Some(200)),
+            // Duplicate delivery and stale cumulative observations must not add tokens.
+            usage_event(4, "r2", 0, 1_400, 1_200, Some(200)),
+            usage_event(2, "r1", 0, 1_200, 0, None),
         ];
         let telemetry = session_telemetry(&events);
         let measurements = &telemetry.measurements;
@@ -4527,8 +4537,47 @@ required = false
             (measurements[bcode_prompt_cache::measurement::UNCACHED_INPUT_TOKENS] - 0.0).abs()
                 < 1e-9
         );
-        // Legacy aggregate counters still sum every observation as before.
+        assert!((measurements["input_tokens"] - 3_600.0).abs() < 1e-9);
+        assert!((measurements["output_tokens"] - 15.0).abs() < 1e-9);
+        assert!((measurements["total_tokens"] - 3_615.0).abs() < 1e-9);
+        assert!((measurements["cache_write_input_tokens"] - 1_400.0).abs() < 1e-9);
         assert!((measurements["cached_input_tokens"] - 2_200.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn telemetry_terminal_usage_cannot_be_reopened_by_later_snapshots() {
+        let mut terminal = usage_event(2, "request", 1, 100, 80, None);
+        if let bcode_session_models::SessionEventKind::ModelUsage { usage, .. } = &mut terminal.kind
+        {
+            usage.terminal = true;
+        }
+        let events = [
+            usage_event(1, "request", 0, 50, 0, None),
+            terminal,
+            usage_event(3, "request", 2, 200, 0, None),
+        ];
+        let measurements = session_telemetry(&events).measurements;
+        assert!((measurements["input_tokens"] - 100.0).abs() < 1e-9);
+        assert!((measurements["cached_input_tokens"] - 80.0).abs() < 1e-9);
+        assert!((measurements[bcode_prompt_cache::measurement::ROUND_COUNT] - 1.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn session_telemetry_deduplicates_canonical_delivery_not_distinct_sessions() {
+        let mut event = usage_event(1, "request", 1, 100, 80, None);
+        event.kind = bcode_session_models::SessionEventKind::ToolCallRequested {
+            tool_call_id: "call".into(),
+            producer_plugin_id: None,
+            tool_name: "filesystem.read".into(),
+            arguments_json: r#"{"path":"fixture.txt"}"#.into(),
+            working_directory: None,
+        };
+        let duplicate = event.clone();
+        let mut other = event.clone();
+        other.session_id = bcode_session_models::SessionId::new();
+        let measurements = session_telemetry(&[event, duplicate, other]).measurements;
+        assert!((measurements["tool_call_count"] - 2.0).abs() < 1e-9);
+        assert!((measurements["session_event_count"] - 2.0).abs() < 1e-9);
     }
 
     #[test]
