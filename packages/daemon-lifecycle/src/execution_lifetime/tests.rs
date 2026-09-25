@@ -19,6 +19,110 @@ fn status(root: &Path, record: &DaemonRecord) -> ExecutionLifetimeStatus {
     )
 }
 
+#[cfg(unix)]
+struct ForkChild {
+    pid: libc::pid_t,
+    release_fd: libc::c_int,
+}
+
+#[cfg(unix)]
+impl ForkChild {
+    fn reap(&mut self) -> io::Result<i32> {
+        // SAFETY: this guard exclusively owns the descriptor and unreaped child.
+        unsafe {
+            if self.release_fd >= 0 {
+                libc::close(self.release_fd);
+                self.release_fd = -1;
+            }
+            let mut status = 0;
+            loop {
+                if libc::waitpid(self.pid, &raw mut status, 0) == self.pid {
+                    self.pid = 0;
+                    return Ok(status);
+                }
+                let error = io::Error::last_os_error();
+                if error.kind() != io::ErrorKind::Interrupted {
+                    return Err(error);
+                }
+            }
+        }
+    }
+}
+
+#[cfg(unix)]
+impl Drop for ForkChild {
+    fn drop(&mut self) {
+        if self.pid > 0 {
+            let _ = self.reap();
+        }
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn release_is_not_delayed_by_unrelated_fork_child() {
+    let root = tempfile::tempdir().unwrap();
+    let record = record(root.path());
+    let guard = ExecutionLifetime::begin(root.path(), &record).unwrap();
+    let store = bcode_workflow_store::WorkflowStore::open_in_state_dir(root.path()).unwrap();
+    let ownership = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(root.path().join("workflows/workflow.lock"))
+        .unwrap();
+    assert!(
+        ownership.try_lock().is_err(),
+        "live store retains ownership"
+    );
+    let mut pipe = [0; 2];
+    // SAFETY: valid output buffer; the child executes only async-signal-safe
+    // libc calls and exits without running inherited Rust destructors.
+    unsafe {
+        assert_eq!(libc::pipe(pipe.as_mut_ptr()), 0);
+        let pid = libc::fork();
+        assert!(pid >= 0);
+        if pid == 0 {
+            libc::close(pipe[1]);
+            libc::alarm(10);
+            let mut byte = 0_u8;
+            let read = libc::read(pipe[0], std::ptr::from_mut(&mut byte).cast(), 1);
+            libc::_exit(i32::from(read != 0));
+        }
+        libc::close(pipe[0]);
+        let mut child = ForkChild {
+            pid,
+            release_fd: pipe[1],
+        };
+        drop(guard);
+        drop(store);
+        let store_released = ownership.try_lock();
+        let observed = status(root.path(), &record);
+        let maintenance = ExecutionMaintenance::acquire(root.path());
+        let mut child_status = 0;
+        let waited = libc::waitpid(pid, &raw mut child_status, libc::WNOHANG);
+        let still_alive = waited == 0;
+        if waited == pid {
+            // WNOHANG may already have reaped an unexpectedly exited child.
+            child.pid = 0;
+            libc::close(child.release_fd);
+            child.release_fd = -1;
+        }
+        assert!(still_alive, "child exited before release observations");
+        let child_status = child.reap().expect("reap fork child");
+        assert!(libc::WIFEXITED(child_status));
+        assert_eq!(libc::WEXITSTATUS(child_status), 0);
+        assert!(
+            store_released.is_ok(),
+            "store fence released before child exit"
+        );
+        assert_eq!(observed, ExecutionLifetimeStatus::Released);
+        assert!(
+            maintenance.is_ok(),
+            "released execution must permit maintenance"
+        );
+    }
+}
+
 #[test]
 fn release_survives_discovery_cleanup_and_cannot_be_reopened() {
     let root = tempfile::tempdir().unwrap();

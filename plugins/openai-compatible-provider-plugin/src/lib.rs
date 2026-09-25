@@ -12585,6 +12585,36 @@ mod tests {
     }
 
     #[test]
+    fn responses_cache_routing_options_preserve_input_and_default_compatibility() {
+        let mut request = test_request(vec![text_message(MessageRole::User, "hello")]);
+        let settings = test_settings(test_api_key_auth(), OpenAiCompatibleDialect::ResponsesApi);
+        let baseline = build_responses_request(&settings, &request, "gpt-6-astra").unwrap();
+        assert!(baseline.get("prompt_cache_key").is_none());
+        assert!(baseline.get("prompt_cache_options").is_none());
+        request.provider_context.request = BTreeMap::from([
+            (
+                "prompt_cache_key".into(),
+                bcode_model::ProviderRequestValue::from(serde_json::json!("stable-workflow")),
+            ),
+            (
+                "prompt_cache_options".into(),
+                bcode_model::ProviderRequestValue::from(
+                    serde_json::json!({"mode":"implicit", "ttl":"30m"}),
+                ),
+            ),
+        ]);
+        let configured = build_responses_request(&settings, &request, "gpt-6-astra").unwrap();
+        assert_eq!(configured["prompt_cache_key"], "stable-workflow");
+        assert_eq!(
+            configured["prompt_cache_options"],
+            serde_json::json!({"mode":"implicit", "ttl":"30m"})
+        );
+        assert_eq!(configured["input"], baseline["input"]);
+        assert_eq!(configured["instructions"], baseline["instructions"]);
+        assert_eq!(configured["tools"], baseline["tools"]);
+    }
+
+    #[test]
     fn responses_request_rejects_reserved_provider_options() {
         let mut request = test_request(vec![text_message(MessageRole::User, "hello")]);
         let settings = test_settings(test_chatgpt_auth(), OpenAiCompatibleDialect::ChatGptCodex);

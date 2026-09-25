@@ -1140,12 +1140,29 @@ pub struct WorkflowPublicationReadFence {
     total_changes: u64,
 }
 
+#[derive(Debug)]
+struct StoreOwnership {
+    file: File,
+    owner_pid: u32,
+}
+
+impl Drop for StoreOwnership {
+    fn drop(&mut self) {
+        // Release the fence even if an unrelated fork temporarily inherited
+        // this open file description. A child must not unlock its parent's fence.
+        if self.owner_pid == std::process::id() {
+            let _ = self.file.unlock();
+        }
+    }
+}
+
 /// Durable workflow database.
 #[derive(Debug)]
 pub struct WorkflowStore {
     path: PathBuf,
     connection: Connection,
-    _ownership: Option<File>,
+    // Declared after the connection so the database closes before fence release.
+    _ownership: Option<StoreOwnership>,
     read_identity: std::sync::Arc<()>,
 }
 
@@ -1310,7 +1327,10 @@ impl WorkflowStore {
         Ok(Self {
             path: path.to_path_buf(),
             connection,
-            _ownership: Some(ownership),
+            _ownership: Some(StoreOwnership {
+                file: ownership,
+                owner_pid: std::process::id(),
+            }),
             read_identity: std::sync::Arc::new(()),
         })
     }

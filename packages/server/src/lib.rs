@@ -58862,6 +58862,179 @@ event_symbol = "bcode_plugin_handle_event_v1"
     }
 
     #[tokio::test]
+    async fn process_interruption_snapshot_child() {
+        let Ok(root) = std::env::var("BCODE_SNAPSHOT_RECOVERY_TEST_ROOT") else {
+            return;
+        };
+        let root = PathBuf::from(root);
+        let sessions = SessionManager::persistent(root.join("sessions")).expect("sessions");
+        let session = sessions
+            .create_session(Some("interrupted".into()), test_working_directory())
+            .await
+            .expect("session");
+        append_recovery_test_snapshot(&sessions, session.id).await;
+        sessions
+            .append_runtime_work_started(
+                session.id,
+                SessionEventKind::RuntimeWorkStarted {
+                    work_id: WorkId::new("model_interrupted-turn"),
+                    kind: RuntimeWorkKind::ModelTurn,
+                    label: "model turn interrupted-turn".into(),
+                    tool_call_id: None,
+                    plugin_id: None,
+                    service_interface: None,
+                    operation: None,
+                    parent_work_id: None,
+                    started_at_ms: Some(1),
+                    cancellable: true,
+                },
+            )
+            .await
+            .expect("runtime work");
+        sessions
+            .append_model_turn_started(session.id, "interrupted-turn".into())
+            .await
+            .expect("active turn");
+        let call = bcode_model::ToolCall {
+            id: "interrupted-tool".into(),
+            name: "shell.run".into(),
+            // The marker proves invocation began; the release barrier keeps it
+            // in flight until the parent has killed the owning server process.
+            arguments: serde_json::json!({
+                "command": "sh -c 'printf effect >> effect.txt; n=0; while [ ! -f release ] && [ $n -lt 200 ]; do sleep 0.05; n=$((n + 1)); done'",
+                "cwd": root,
+                "timeout_ms": 10000,
+            }),
+        };
+        sessions
+            .append_tool_call_requested(
+                session.id,
+                bcode_session::AppendToolCallRequestedInput {
+                    tool_call_id: call.id.clone(),
+                    producer_plugin_id: None,
+                    tool_name: call.name.clone(),
+                    arguments_json: call.arguments.to_string(),
+                    working_directory: Some(root.clone()),
+                },
+            )
+            .await
+            .expect("admitted tool");
+        std::fs::write(
+            root.join("ready.json"),
+            serde_json::to_vec(&session.id).expect("session id"),
+        )
+        .expect("ready marker");
+        let state = test_server_state_with_shell_plugin(sessions);
+        let (tool, preparation) = prepare_server_tool(&state, session.id, &call)
+            .await
+            .expect("prepared shell");
+        let result = execute_model_tool(
+            &state,
+            session.id,
+            call,
+            root,
+            tool,
+            preparation,
+            Arc::new(TurnCancelState::default()),
+        )
+        .await;
+        drop(state);
+        panic!(
+            "invocation completed before interruption: {:?}",
+            result.map(|result| result.result)
+        );
+    }
+
+    #[tokio::test]
+    async fn killed_process_retains_snapshot_once_after_repeated_recovery() {
+        struct ChildGuard(std::process::Child);
+        impl Drop for ChildGuard {
+            fn drop(&mut self) {
+                let _ = self.0.kill();
+                let _ = self.0.wait();
+            }
+        }
+        let root = tempfile::tempdir().expect("isolated root");
+        let mut child = ChildGuard(
+            std::process::Command::new(std::env::current_exe().expect("test executable"))
+                .args([
+                    "--exact",
+                    "tests::process_interruption_snapshot_child",
+                    "--nocapture",
+                ])
+                .env("BCODE_SNAPSHOT_RECOVERY_TEST_ROOT", root.path())
+                .spawn()
+                .expect("child process"),
+        );
+        let ready = root.path().join("ready.json");
+        let deadline = std::time::Instant::now() + Duration::from_secs(30);
+        while !ready.exists() || !root.path().join("effect.txt").exists() {
+            assert!(child.0.try_wait().expect("child status").is_none());
+            assert!(
+                std::time::Instant::now() < deadline,
+                "child readiness timeout"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        child.0.kill().expect("interrupt owned child");
+        child.0.wait().expect("reap child");
+        std::fs::write(root.path().join("release"), "").expect("release orphaned shell");
+        let effect = root.path().join("effect.txt");
+        assert_eq!(std::fs::read_to_string(&effect).expect("effect"), "effect");
+        let session_id: SessionId =
+            serde_json::from_slice(&std::fs::read(ready).expect("ready marker"))
+                .expect("session id");
+        let sessions = SessionManager::persistent(root.path().join("sessions"))
+            .expect("reopen after interruption");
+        let state = Arc::new(test_server_state(sessions.clone()));
+        recover_abandoned_session_runtime_work(&state, session_id)
+            .await
+            .expect("first recovery");
+        recover_abandoned_session_runtime_work(&state, session_id)
+            .await
+            .expect("repeated recovery");
+        let history = sessions.session_history(session_id).await.expect("history");
+        let results = history
+            .iter()
+            .filter_map(|event| match &event.kind {
+                SessionEventKind::ToolInvocationResultRecorded { record }
+                    if record.invocation_id == "interrupted-tool" =>
+                {
+                    Some(record)
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(results.len(), 1);
+        assert!(results[0].is_error);
+        assert!(results[0].model_output.contains("did not execute it again"));
+        assert_eq!(
+            std::fs::read_to_string(effect).expect("effect after recovery"),
+            "effect"
+        );
+        assert_eq!(
+            history
+                .iter()
+                .filter(|event| matches!(
+                    &event.kind, SessionEventKind::SystemMessage { text }
+                        if text == "Turn environment snapshot: original observation"
+                ))
+                .count(),
+            1
+        );
+        assert_eq!(
+            history
+                .iter()
+                .filter(|event| matches!(
+                    &event.kind, SessionEventKind::ModelTurnFinished { turn_id, .. }
+                        if turn_id == "interrupted-turn"
+                ))
+                .count(),
+            1
+        );
+    }
+
+    #[tokio::test]
     async fn abandoned_mutating_workflow_turn_observes_unknown_for_explicit_repair() {
         let sessions = SessionManager::default();
         let session_id = sessions
@@ -73067,10 +73240,23 @@ event_symbol = "bcode_plugin_handle_event_v1"
             .await
             .expect("parent");
         let (mut state,) = (test_server_state_with_fake_provider(sessions),);
-        state
-            .selected_provider_context
-            .settings
-            .insert("fake_turn_delay_ms".to_string(), "750".to_string());
+        let cancellation_script = bcode_fake_provider_plugin::FakeProviderEventScript {
+            steps: vec![bcode_fake_provider_plugin::FakeProviderEventScriptStep {
+                gate: Some(format!("cancel-only-{}", parent.id)),
+                delay_ms: None,
+                event: bcode_model::ProviderTurnEvent::output(
+                    bcode_model::TurnOutputPosition::new(0),
+                    bcode_model::ProviderOutputEvent::ToolCallDelta {
+                        call_id: "unreleased".into(),
+                        delta: String::new(),
+                    },
+                ),
+            }],
+        };
+        state.selected_provider_context.settings.insert(
+            "fake_event_script".into(),
+            serde_json::to_string(&cancellation_script).expect("cancellation script"),
+        );
         let state = Arc::new(state);
         let schema = bcode_workflow::ValueSchema {
             type_name: "u32".to_string(),
@@ -77293,7 +77479,10 @@ event_symbol = "bcode_plugin_handle_event_v1"
                         .await
                         .expect("status")
                         .expect("run");
-                    if observed.status == bcode_workflow::RunStatus::Cancelled {
+                    if matches!(
+                        observed.status,
+                        bcode_workflow::RunStatus::Cancelled | bcode_workflow::RunStatus::Completed
+                    ) {
                         break;
                     }
                     assert_eq!(
@@ -77393,8 +77582,11 @@ event_symbol = "bcode_plugin_handle_event_v1"
             .await
             .expect("terminal status")
             .expect("run");
+        // Completion may win the race with cleanup cancellation. Cancelling
+        // an already completed run must not rewrite its terminal outcome.
         assert!(
-            terminal.cancellation_requested_at_ms.is_some(),
+            terminal.cancellation_requested_at_ms.is_some()
+                || terminal.status == bcode_workflow_store::RunStatus::Completed,
             "{terminal:?}"
         );
         drive_template_cancellations(&state, &client).await;
@@ -81995,6 +82187,59 @@ event_symbol = "bcode_plugin_handle_event_v1"
             1
         );
         assert_eq!(permit.turn_entries, 1);
+
+        // Continue through the production turn path after the replacement-context
+        // boundary, rather than proving only that a compaction marker was emitted.
+        let compacted_context = state
+            .sessions
+            .model_context_events(session_id)
+            .await
+            .expect("compacted context");
+        let compacted_bytes = serde_json::to_vec(&compacted_context)
+            .expect("context encoding")
+            .len();
+        // The seeded exchanges alone contain 28,000 payload bytes.
+        assert!(compacted_bytes < 28_000);
+        for index in 0..3 {
+            let prompt = format!("post-compaction continuation {index}");
+            let next = state
+                .sessions
+                .append_event(
+                    session_id,
+                    SessionEventKind::UserMessage {
+                        client_id: ClientId::new(),
+                        text: prompt.clone(),
+                        admission: bcode_session_models::TurnAdmissionMetadata::default(),
+                    },
+                )
+                .await
+                .expect("continuation");
+            let completion = run_model_turn(
+                &state,
+                &mut permit,
+                &next,
+                ClientId::new(),
+                None,
+                &mut command_context,
+                &phase,
+                None,
+                false,
+            )
+            .await;
+            assert_eq!(completion.outcome, ModelTurnOutcome::Completed);
+            let context = state
+                .sessions
+                .model_context_events(session_id)
+                .await
+                .expect("continued context");
+            assert!(
+                context.iter().any(|event| matches!(
+                    &event.kind, SessionEventKind::UserMessage { text, .. } if text == &prompt
+                )),
+                "active user prompt missing after continuation {index}"
+            );
+        }
+        assert_eq!(permit.turn_entries, 4);
         drop(state);
     }
 

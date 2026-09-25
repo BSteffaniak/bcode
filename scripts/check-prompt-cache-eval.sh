@@ -23,6 +23,18 @@ else
     bcode="${root}/target/debug/bcode"
 fi
 printf 'prompt cache eval binary: %s\n' "${bcode}"
+# Preserve the tested executable's identity beside the reports, including when
+# an externally supplied release is older than the checkout driving the suite.
+{
+    printf 'binary: %s\n' "${bcode}"
+    "${bcode}" --version
+    printf 'fixture revision: '
+    git -C "${root}" rev-parse HEAD
+    printf 'fixture checkout status:\n'
+    git -C "${root}" status --short
+    printf 'model: %s\n' "${model}"
+} >"${workdir}/artifact-identity.txt"
+cat "${workdir}/artifact-identity.txt"
 
 cat >"${workdir}/bcode.toml" <<EOF
 [plugins]
@@ -56,6 +68,15 @@ if run eval run "${suite}" \
     --output-root "${workdir}/runs" \
     --run-id ci-prompt-cache \
     --fail-under-pass-rate 1.0; then
+    compaction_suite="${root}/fixtures/evals/prompt-cache/compaction.toml"
+    run eval validate "${compaction_suite}"
+    if ! run eval run "${compaction_suite}" \
+        --output-root "${workdir}/runs" \
+        --run-id ci-prompt-cache-compaction \
+        --fail-under-pass-rate 1.0; then
+        echo "compaction cache eval failed (${model}); artifacts kept at ${workdir}/runs/ci-prompt-cache-compaction" >&2
+        exit 1
+    fi
     if [[ "${BCODE_PROMPT_CACHE_EVAL_KEEP_ARTIFACTS:-0}" == "1" ]]; then
         echo "prompt cache eval artifacts: ${workdir}/runs/ci-prompt-cache"
     else

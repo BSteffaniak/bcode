@@ -30,8 +30,26 @@ struct Evidence {
 /// not permission to execute as that instance. Files are intentionally retained after release.
 #[derive(Debug)]
 pub struct ExecutionLifetime {
-    _file: File,
-    _execution_admission: File,
+    file: File,
+    execution_admission: File,
+    owns_admission_lock: bool,
+    owner_pid: u32,
+}
+
+impl Drop for ExecutionLifetime {
+    fn drop(&mut self) {
+        // Forked children can temporarily retain the same open file description
+        // before exec. Closing only our descriptor would leave its locks live.
+        // Only the publishing process may explicitly relinquish this authority.
+        // Maintenance coordinators borrow an admission descriptor: unlocking
+        // that clone would prematurely release the maintenance owner's fence.
+        if self.owner_pid == std::process::id() {
+            let _ = self.file.unlock();
+            if self.owns_admission_lock {
+                let _ = self.execution_admission.unlock();
+            }
+        }
+    }
 }
 
 /// Exclusive state-location execution admission for explicit offline maintenance.
@@ -75,7 +93,7 @@ impl ExecutionMaintenance {
         if root.canonicalize()? != self.root {
             return Err(invalid());
         }
-        let _lifetime = ExecutionLifetime::publish(root, record, self.file.try_clone()?)?;
+        let _lifetime = ExecutionLifetime::publish(root, record, self.file.try_clone()?, false)?;
         Ok(())
     }
 
@@ -154,10 +172,15 @@ impl ExecutionLifetime {
         execution_admission
             .try_lock_shared()
             .map_err(io::Error::from)?;
-        Self::publish(root, record, execution_admission)
+        Self::publish(root, record, execution_admission, true)
     }
 
-    fn publish(root: &Path, record: &DaemonRecord, execution_admission: File) -> io::Result<Self> {
+    fn publish(
+        root: &Path,
+        record: &DaemonRecord,
+        execution_admission: File,
+        owns_admission_lock: bool,
+    ) -> io::Result<Self> {
         let root = directory(root, true)?;
         let evidence = Evidence {
             version: VERSION,
@@ -184,8 +207,10 @@ impl ExecutionLifetime {
         #[cfg(unix)]
         File::open(root.join("daemon-execution-lifetimes"))?.sync_all()?;
         Ok(Self {
-            _file: file,
-            _execution_admission: execution_admission,
+            file,
+            execution_admission,
+            owns_admission_lock,
+            owner_pid: std::process::id(),
         })
     }
 }

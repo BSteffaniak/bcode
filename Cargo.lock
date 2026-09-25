@@ -1777,6 +1777,7 @@ dependencies = [
  "bcode_metrics",
  "bcode_plugin_sdk",
  "bcode_session_models",
+ "bcode_workflow_store",
  "hex",
  "libc",
  "serde",

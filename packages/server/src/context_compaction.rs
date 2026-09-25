@@ -1832,11 +1832,13 @@ pub fn conversational_units(
             || starts_orphan_assistant_unit
             || units.is_empty()
             || (pending_tool_calls.is_empty()
-                && matches!(
-                    event.kind,
-                    SessionEventKind::SystemMessage { .. }
-                        | SessionEventKind::WorkingDirectoryChanged { .. }
-                ));
+                && match &event.kind {
+                    SessionEventKind::SystemMessage { text } => {
+                        !text.starts_with(bcode_session_models::TURN_ENVIRONMENT_SNAPSHOT_PREFIX)
+                    }
+                    SessionEventKind::WorkingDirectoryChanged { .. } => true,
+                    _ => false,
+                });
         if starts_unit {
             units.push(ConversationalUnit {
                 events: Vec::new(),

@@ -1765,6 +1765,7 @@ fn session_telemetry(events: &[bcode_session_models::SessionEvent]) -> SessionTe
     let mut tool_counts: BTreeMap<String, u32> = BTreeMap::new();
     let mut tool_errors = 0_u32;
     let mut permissions = 0_u32;
+    let mut compactions = 0_u32;
     let mut input_tokens = 0_u32;
     let mut output_tokens = 0_u32;
     let mut total_tokens = 0_u32;
@@ -1791,6 +1792,9 @@ fn session_telemetry(events: &[bcode_session_models::SessionEvent]) -> SessionTe
                 if record.is_error =>
             {
                 tool_errors += 1;
+            }
+            bcode_session_models::SessionEventKind::ContextCompacted { .. } => {
+                compactions += 1;
             }
             bcode_session_models::SessionEventKind::PermissionRequested { .. } => {
                 permissions += 1;
@@ -1842,6 +1846,9 @@ fn session_telemetry(events: &[bcode_session_models::SessionEvent]) -> SessionTe
             .measurements
             .insert(format!("tool_call_count.{tool}"), f64::from(count));
     }
+    telemetry
+        .measurements
+        .insert("context_compaction_count".into(), f64::from(compactions));
     telemetry
         .measurements
         .insert("tool_error_count".into(), f64::from(tool_errors));
@@ -4578,6 +4585,21 @@ required = false
         let measurements = session_telemetry(&[event, duplicate, other]).measurements;
         assert!((measurements["tool_call_count"] - 2.0).abs() < 1e-9);
         assert!((measurements["session_event_count"] - 2.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn compaction_measurement_counts_canonical_boundaries_once() {
+        let mut event = usage_event(1, "request", 1, 100, 80, None);
+        event.kind = bcode_session_models::SessionEventKind::ContextCompacted {
+            summary: "retained task context".into(),
+            compacted_through_sequence: 0,
+        };
+        let duplicate = event.clone();
+        let mut next = event.clone();
+        next.sequence = 2;
+        let measurements = session_telemetry(&[event, duplicate, next]).measurements;
+        assert!((measurements["context_compaction_count"] - 2.0).abs() < 1e-9);
+        assert!(session_telemetry(&[]).measurements["context_compaction_count"].abs() < 1e-9);
     }
 
     #[test]

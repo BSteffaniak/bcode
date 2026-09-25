@@ -283,6 +283,8 @@ pub fn serve_turn(
     let completed_calls = request
         .messages
         .iter()
+        .rev()
+        .take_while(|message| message.role != MessageRole::User)
         .flat_map(|message| &message.content)
         .filter(|block| matches!(block, ContentBlock::ToolCall { .. }))
         .count();
@@ -295,7 +297,7 @@ pub fn serve_turn(
             .split_whitespace()
             .nth(completed_calls)
             .map(|path| ToolCall {
-                id: format!("fake-cache-read-{completed_calls}"),
+                id: format!("fake-cache-read-{}-{completed_calls}", request.turn_id),
                 name: request.tools[0].name.clone(),
                 arguments: serde_json::json!({ "path": path }),
             })
@@ -398,6 +400,57 @@ mod tests {
             conversation_reuse: bcode_model::ConversationReuseHints::default(),
             metadata: std::collections::BTreeMap::default(),
         }
+    }
+
+    #[test]
+    fn read_files_restarts_for_new_user_turn_without_reusing_call_identity() {
+        let mut request = request();
+        request.tools.push(bcode_model::ToolDefinition {
+            name: "filesystem.read".into(),
+            description: "read".into(),
+            input_schema: serde_json::json!({"type":"object"}),
+        });
+        let user = || bcode_model::ModelMessage {
+            role: MessageRole::User,
+            content: vec![ContentBlock::Text {
+                text: "read-files first.txt second.txt".into(),
+            }],
+        };
+        request.messages.push(user());
+        let profile = profile_for(FAKE_CACHE_PREFIX_MODEL_ID).unwrap();
+        let store = CacheStore::default();
+        let next_call = |request: &ModelTurnRequest| {
+            let events = std::sync::Mutex::new(Vec::new());
+            serve_turn(
+                &profile,
+                request,
+                &|event| events.lock().unwrap().push(event),
+                &store,
+                None,
+            );
+            events
+                .into_inner()
+                .unwrap()
+                .into_iter()
+                .find_map(|event| match event {
+                    ProviderTurnEvent::ToolCallFinished { call } => Some(call),
+                    _ => None,
+                })
+                .expect("tool call")
+        };
+        let first = next_call(&request);
+        request.messages.push(bcode_model::ModelMessage {
+            role: MessageRole::Assistant,
+            content: vec![ContentBlock::ToolCall {
+                call: first.clone(),
+            }],
+        });
+        assert_eq!(next_call(&request).arguments["path"], "second.txt");
+        request.turn_id = "next-user-turn".into();
+        request.messages.push(user());
+        let next = next_call(&request);
+        assert_eq!(next.arguments["path"], "first.txt");
+        assert_ne!(first.id, next.id);
     }
 
     #[test]

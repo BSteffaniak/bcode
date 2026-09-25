@@ -11,6 +11,21 @@ The workflow store remains the canonical authority for definitions, runs, activa
 outputs, decisions, waits, receipts, resources, and terminal state. Source and package formats lower
 to canonical definitions; they do not define another scheduler or store.
 
+## Execution ownership release
+
+Daemon execution-lifetime evidence remains held until the last execution-capable server reference
+is dropped. Its publishing process explicitly unlocks the evidence file on release: closing a file
+alone can leave its lock retained by an unrelated forked child before exec. The guard records its
+publishing PID so an inherited guard cannot explicitly unlock the parent's authority. Normal
+execution admission is released the same way; a maintenance coordinator borrows its admission
+handle and must not unlock the maintenance owner's exclusive fence.
+
+Workflow-store ownership uses a separate process-owned guard. The SQLite connection is dropped
+before that guard releases its lock, preserving the storage compatibility fence through database
+cleanup. These changes do not transfer authority to forked children, alter persisted identity or
+schema, authorize replay, or bypass verified per-run handoff. Abrupt process loss still relies on
+OS handle cleanup and the existing fail-closed ownership observation protocol.
+
 ## Approved architecture direction and current gaps
 
 The workflow execution invariants in [`../INVARIANTS.md`](../INVARIANTS.md) require dynamically

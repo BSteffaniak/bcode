@@ -8802,6 +8802,42 @@ mod tests {
     }
 
     #[test]
+    fn environment_context_is_hidden_in_terminal_updates_and_reopen() {
+        let session_id = SessionId::new();
+        let events = [
+            shared_projection_adapter_event(
+                session_id,
+                1,
+                SessionEventKind::SystemMessage {
+                    text: format!(
+                        "{}Current directory: /workspace",
+                        bcode_session_models::TURN_ENVIRONMENT_SNAPSHOT_PREFIX
+                    ),
+                },
+            ),
+            shared_projection_adapter_event(
+                session_id,
+                2,
+                SessionEventKind::SystemMessage {
+                    text: "ordinary visible status".into(),
+                },
+            ),
+        ];
+        let mut live = BmuxApp::new_with_history(Some(session_id), &[], &[], false);
+        for event in &events {
+            live.absorb_session_event(event);
+        }
+        let replayed = BmuxApp::new_with_history(Some(session_id), &events, &[], false);
+        for app in [&live, &replayed] {
+            let items = app.transcript().iter().collect::<Vec<_>>();
+            assert_eq!(items.len(), 1);
+            assert_eq!(items[0].text(), "ordinary visible status");
+        }
+        drop(live);
+        drop(replayed);
+    }
+
+    #[test]
     fn generic_terminal_items_are_adapted_from_shared_projection() {
         let mut app = BmuxApp::new_with_history(None, &[], &[], false);
         let events = shared_projection_terminal_adapter_events(SessionId::new());
