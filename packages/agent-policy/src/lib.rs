@@ -921,31 +921,38 @@ mod tests {
     }
 
     #[test]
-    fn git_reviewed_alias_uses_specificity_without_hiding_original_denies() {
+    fn canonical_words_do_not_drop_options_or_override_more_specific_original_rules() {
         let config = AgentConfig {
             accent: None,
             tools: BTreeMap::from([("shell.run".to_owned(), true)]),
             permission: PermissionConfig {
                 command: BTreeMap::from([
-                    ("git *".to_owned(), Action::Deny),
-                    ("git diff *".to_owned(), Action::Allow),
+                    ("*".to_owned(), Action::Allow),
+                    ("git diff *".to_owned(), Action::Deny),
                 ]),
                 ..PermissionConfig::default()
             },
         };
+        let denied = evaluate_tool_call(
+            &config,
+            &request(BUILD_AGENT, "git 'diff' --stat"),
+            Path::new("/tmp/project"),
+        );
+        assert_eq!(denied.response.decision, AgentDecision::Deny);
+        assert_eq!(denied.matched_rule.as_deref(), Some("git diff *"));
+
         let allowed = evaluate_tool_call(
             &config,
             &request(BUILD_AGENT, "git --no-pager diff --stat"),
             Path::new("/tmp/project"),
         );
         assert_eq!(allowed.response.decision, AgentDecision::Allow);
-        assert_eq!(allowed.matched_rule.as_deref(), Some("git diff *"));
 
         let config = AgentConfig {
             permission: PermissionConfig {
                 command: BTreeMap::from([
-                    ("git *".to_owned(), Action::Allow),
-                    ("git --no-pager diff --stat".to_owned(), Action::Deny),
+                    ("*".to_owned(), Action::Allow),
+                    ("git 'diff' --stat".to_owned(), Action::Deny),
                     ("git diff *".to_owned(), Action::Allow),
                 ]),
                 ..PermissionConfig::default()
@@ -954,14 +961,49 @@ mod tests {
         };
         let denied = evaluate_tool_call(
             &config,
-            &request(BUILD_AGENT, "git --no-pager diff --stat"),
+            &request(BUILD_AGENT, "git 'diff' --stat"),
             Path::new("/tmp/project"),
         );
         assert_eq!(denied.response.decision, AgentDecision::Deny);
-        assert_eq!(
-            denied.matched_rule.as_deref(),
-            Some("git --no-pager diff --stat")
+        assert_eq!(denied.matched_rule.as_deref(), Some("git 'diff' --stat"));
+    }
+
+    #[test]
+    fn configured_denials_match_quoted_static_arguments_for_any_command() {
+        let config = AgentConfig {
+            accent: None,
+            tools: BTreeMap::new(),
+            permission: PermissionConfig {
+                command: BTreeMap::from([
+                    ("*".to_owned(), Action::Allow),
+                    ("git stash".to_owned(), Action::Deny),
+                    ("git stash pop".to_owned(), Action::Deny),
+                    ("docker run *".to_owned(), Action::Deny),
+                ]),
+                ..PermissionConfig::default()
+            },
+        };
+        for source in [
+            "git stash",
+            "git 'stash'",
+            "git st\"ash\"",
+            "git 'stash' pop",
+            "docker 'run' image",
+        ] {
+            let result = evaluate_tool_call(
+                &config,
+                &request(BUILD_AGENT, source),
+                Path::new("/tmp/project"),
+            );
+            assert_eq!(result.response.decision, AgentDecision::Deny, "{source}");
+        }
+        // An exact rule does not cover unlisted subcommands under glob semantics.
+        let result = evaluate_tool_call(
+            &config,
+            &request(BUILD_AGENT, "git stash push"),
+            Path::new("/tmp/project"),
         );
+        assert_eq!(result.response.decision, AgentDecision::Allow);
     }
 
     #[test]

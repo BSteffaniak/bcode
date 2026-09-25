@@ -182,7 +182,7 @@ fn corpus_covers_confirmed_failure_classes() {
         "quoted-semicolon-git-format",
         "quoted-semicolon-interpreter-argument",
         "heredoc-body-is-data",
-        "git-no-pager-reviewed-alias",
+        "git-global-option-retained",
         "environment-assignment-prefix",
         "missing-printf-policy",
         "command-v-policy-gap",

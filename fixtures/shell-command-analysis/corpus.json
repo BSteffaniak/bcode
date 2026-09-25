@@ -87,12 +87,12 @@
       "expected": {"commands": ["python3 - <<'PY'"], "redirections": [{"kind": "heredoc", "target": "PY", "dynamic": false}], "completeness": "complete", "policy": "allow"}
     },
     {
-      "id": "git-no-pager-reviewed-alias",
+      "id": "git-global-option-retained",
       "classification": "canonicalization_defect",
       "source": "git --no-pager diff --stat",
       "policy": {"rules": [{"pattern": "git diff *", "action": "allow"}, {"pattern": "git *", "action": "deny"}], "default_action": "deny"},
-      "expected": {"commands": ["git --no-pager diff --stat"], "aliases": ["git diff --stat"], "redirections": [], "completeness": "complete", "policy": "allow"},
-      "notes": "The reviewed behavior-neutral alias competes by normal wildcard specificity while retaining the original candidate; a more specific restrictive original match would still win."
+      "expected": {"commands": ["git --no-pager diff --stat"], "redirections": [], "completeness": "complete", "policy": "deny"},
+      "notes": "Generic shell canonicalization retains executable options; command-domain option stripping is not part of shell permission matching."
     },
     {
       "id": "environment-assignment-prefix",

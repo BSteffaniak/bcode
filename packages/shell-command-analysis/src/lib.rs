@@ -897,53 +897,38 @@ fn command_match_candidates(
         kind: ShellCommandMatchCandidateKind::Original,
         transformation: None,
     }];
-    let Some("git") = executable else {
+    let Some(executable) = executable else {
         return candidates;
     };
+    // An assignment prefix can change execution semantics; do not silently drop it.
     if !assignments.is_empty() {
         return candidates;
     }
-    let static_arguments = arguments
+    let Some(arguments) = arguments
         .iter()
         .map(static_word_value)
-        .collect::<Option<Vec<_>>>();
-    let Some(arguments) = static_arguments else {
+        .collect::<Option<Vec<_>>>()
+    else {
         return candidates;
     };
-    let mut index = 0;
-    let mut removed = Vec::new();
-    while index < arguments.len() {
-        match arguments[index] {
-            "--no-pager"
-            | "--no-replace-objects"
-            | "--literal-pathspecs"
-            | "--no-optional-locks" => {
-                removed.push(arguments[index]);
-                index += 1;
-            }
-            argument if argument.starts_with("--color=") => {
-                removed.push(argument);
-                index += 1;
-            }
-            _ => break,
-        }
-    }
-    if removed.is_empty() || index == arguments.len() {
+    // Joining words containing whitespace (or empty words) would lose their boundaries.
+    if std::iter::once(executable)
+        .chain(arguments.iter().copied())
+        .any(|word| word.is_empty() || word.chars().any(char::is_whitespace))
+    {
         return candidates;
     }
-    let mut subject = String::from("git");
-    for argument in &arguments[index..] {
-        subject.push(' ');
-        subject.push_str(argument);
+    let canonical = std::iter::once(executable)
+        .chain(arguments)
+        .collect::<Vec<_>>()
+        .join(" ");
+    if canonical != source {
+        candidates.push(ShellCommandMatchCandidate {
+            subject: canonical,
+            kind: ShellCommandMatchCandidateKind::Canonical,
+            transformation: Some("normalized static shell words".to_owned()),
+        });
     }
-    candidates.push(ShellCommandMatchCandidate {
-        subject,
-        kind: ShellCommandMatchCandidateKind::DomainAlias,
-        transformation: Some(format!(
-            "removed reviewed behavior-neutral Git global option(s): {}",
-            removed.join(", ")
-        )),
-    });
     candidates
 }
 
@@ -1250,29 +1235,30 @@ mod tests {
     }
 
     #[test]
-    fn adds_only_reviewed_git_global_option_aliases() {
-        let analysis = analyze(&ShellAnalysisRequest::posix("git --no-pager diff --stat")).unwrap();
-        assert_eq!(analysis.commands[0].match_candidates.len(), 2);
-        assert_eq!(
-            analysis.commands[0].match_candidates[1].subject,
-            "git diff --stat"
-        );
-
+    fn canonical_candidates_normalize_only_unambiguous_static_words() {
+        for (source, canonical) in [
+            ("git 'stash' pop", "git stash pop"),
+            ("docker \"run\" image", "docker run image"),
+            ("git\tstatus", "git status"),
+            ("git --no-pager 'diff' --stat", "git --no-pager diff --stat"),
+        ] {
+            let analysis = analyze(&ShellAnalysisRequest::posix(source)).unwrap();
+            assert_eq!(analysis.commands[0].match_candidates[0].subject, source);
+            assert_eq!(analysis.commands[0].match_candidates[1].subject, canonical);
+        }
         for source in [
+            "git --no-pager diff --stat",
             "git -C elsewhere diff",
-            "git -c core.pager=cat diff",
-            "git --config-env=x=y diff",
-            "git --git-dir=.git diff",
-            "git --work-tree=. diff",
-            "git --exec-path=/tmp diff",
-            "git --namespace=test diff",
-            "PATH=/tmp git --no-pager diff",
+            "PATH=/tmp git 'stash'",
+            "git 'stash pop'",
+            "git '' stash",
+            "git \"$subcommand\"",
         ] {
             let analysis = analyze(&ShellAnalysisRequest::posix(source)).unwrap();
             assert_eq!(
                 analysis.commands[0].match_candidates.len(),
                 1,
-                "unsafe alias for {source}"
+                "unsafe canonicalization for {source}"
             );
         }
     }

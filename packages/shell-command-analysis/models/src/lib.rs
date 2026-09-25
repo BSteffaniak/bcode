@@ -221,7 +221,7 @@ pub enum ShellCommandMatchCandidateKind {
     Original,
     /// Conservatively canonicalized syntax.
     Canonical,
-    /// Reviewed command-domain alias.
+    /// Command-domain alias (reserved for explicit, compatibility-defined adapters).
     DomainAlias,
 }
 
