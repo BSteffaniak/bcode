@@ -180,6 +180,7 @@ pub fn allow_all_agent_policy() -> AgentPermissionPolicy {
     let config = AgentConfig {
         permission: PermissionConfig {
             command: BTreeMap::from([("*".to_string(), Action::Allow)]),
+            command_patterns: BTreeMap::new(),
             read: BTreeMap::from([("*".to_string(), Action::Allow)]),
             write: BTreeMap::from([("*".to_string(), Action::Allow)]),
             edit: BTreeMap::from([("*".to_string(), Action::Allow)]),

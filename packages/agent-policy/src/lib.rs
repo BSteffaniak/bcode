@@ -4,6 +4,8 @@
 
 //! Pi/OpenCode-style agent policy parsing and evaluation.
 
+mod word_patterns;
+
 pub use bcode_agent_policy_models::{
     Action, AgentConfig, AgentPermissionConfig, PermissionConfig, default_external_directory_action,
 };
@@ -385,6 +387,12 @@ fn evaluate_shell(config: &AgentConfig, request: &EvaluateToolCallRequest) -> Po
     }
 
     let rules = compile_rules(config);
+    let word_rules = match word_patterns::compile(&config.permission.command_patterns) {
+        Ok(rules) => rules,
+        Err(error) => {
+            return shell_fact_denied(request, &format!("invalid command pattern: {error}"));
+        }
+    };
     let mut results = Vec::new();
     for subject in &analysis.commands {
         if subject.match_candidates.is_empty() {
@@ -403,7 +411,11 @@ fn evaluate_shell(config: &AgentConfig, request: &EvaluateToolCallRequest) -> Po
                 winning = Some((rule.action, rule, candidate.subject.as_str()));
             }
         }
-        let (action, rule, candidate) = winning.unwrap_or_else(|| {
+        let exact_legacy_deny = matches!(
+            &winning,
+            Some((Action::Deny, legacy_rule, _)) if !legacy_rule.pattern.contains('*')
+        );
+        let (mut action, mut rule, mut candidate) = winning.unwrap_or_else(|| {
             (
                 Action::Deny,
                 Rule {
@@ -414,6 +426,28 @@ fn evaluate_shell(config: &AgentConfig, request: &EvaluateToolCallRequest) -> Po
                 subject.source.as_str(),
             )
         });
+        if let Some(word_rule) = word_patterns::matching(&word_rules, subject) {
+            // A structured rule can refine a legacy wildcard, but cannot
+            // override an exact legacy denial.
+            if !exact_legacy_deny {
+                action = word_rule.action;
+                rule = Rule {
+                    pattern: word_rule.pattern.clone(),
+                    action,
+                    specificity: usize::MAX,
+                };
+                candidate = subject.source.as_str();
+            }
+        }
+        if let Some(uncertain_deny) = word_patterns::uncertain_deny(&word_rules, subject) {
+            action = Action::Deny;
+            rule = Rule {
+                pattern: uncertain_deny.pattern.clone(),
+                action,
+                specificity: usize::MAX,
+            };
+            candidate = subject.source.as_str();
+        }
         results.push(ShellSubjectDecision {
             action,
             rule,
@@ -1004,6 +1038,274 @@ mod tests {
             Path::new("/tmp/project"),
         );
         assert_eq!(result.response.decision, AgentDecision::Allow);
+    }
+
+    #[test]
+    fn word_patterns_match_static_words_with_explicit_precedence() {
+        let config = AgentConfig {
+            accent: None,
+            tools: BTreeMap::new(),
+            permission: PermissionConfig {
+                command: BTreeMap::from([("*".to_owned(), Action::Allow)]),
+                command_patterns: BTreeMap::from([
+                    ("git stash ...".to_owned(), Action::Deny),
+                    ("git [--no-pager] diff ...".to_owned(), Action::Allow),
+                    ("git [--no-pager] stash ...".to_owned(), Action::Deny),
+                ]),
+                ..PermissionConfig::default()
+            },
+        };
+        for source in [
+            "git stash",
+            "git stash push",
+            "git 'stash' pop",
+            "git --no-pager stash",
+        ] {
+            assert_eq!(
+                evaluate_tool_call(
+                    &config,
+                    &request(BUILD_AGENT, source),
+                    Path::new("/tmp/project")
+                )
+                .response
+                .decision,
+                AgentDecision::Deny,
+                "{source}"
+            );
+        }
+        for source in [
+            "git diff",
+            "git --no-pager diff --stat",
+            "git 'diff' --stat",
+        ] {
+            assert_eq!(
+                evaluate_tool_call(
+                    &config,
+                    &request(BUILD_AGENT, source),
+                    Path::new("/tmp/project")
+                )
+                .response
+                .decision,
+                AgentDecision::Allow,
+                "{source}"
+            );
+        }
+        let config = AgentConfig {
+            permission: PermissionConfig {
+                command: BTreeMap::from([("*".to_owned(), Action::Deny)]),
+                command_patterns: BTreeMap::from([(
+                    "git [--no-pager] diff ...".to_owned(),
+                    Action::Allow,
+                )]),
+                ..PermissionConfig::default()
+            },
+            ..config
+        };
+        assert_eq!(
+            evaluate_tool_call(
+                &config,
+                &request(BUILD_AGENT, "git --no-pager diff --stat"),
+                Path::new("/tmp/project")
+            )
+            .response
+            .decision,
+            AgentDecision::Allow
+        );
+        assert_eq!(
+            evaluate_tool_call(
+                &config,
+                &request(BUILD_AGENT, "git -C elsewhere diff"),
+                Path::new("/tmp/project")
+            )
+            .response
+            .decision,
+            AgentDecision::Deny
+        );
+    }
+
+    #[test]
+    fn exact_legacy_denial_cannot_be_overridden_by_word_allow() {
+        let legacy_rule = "git --no-pager diff --stat";
+        let config = AgentConfig {
+            accent: None,
+            tools: BTreeMap::new(),
+            permission: PermissionConfig {
+                command: BTreeMap::from([(legacy_rule.to_owned(), Action::Deny)]),
+                command_patterns: BTreeMap::from([(
+                    "git [--no-pager] diff ...".to_owned(),
+                    Action::Allow,
+                )]),
+                ..PermissionConfig::default()
+            },
+        };
+        assert_eq!(
+            evaluate_tool_call(
+                &config,
+                &request(BUILD_AGENT, "git --no-pager diff --stat"),
+                Path::new("/tmp/project")
+            )
+            .response
+            .decision,
+            AgentDecision::Deny
+        );
+    }
+
+    #[test]
+    fn word_patterns_do_not_match_dynamic_arguments_or_assignments() {
+        let config = AgentConfig {
+            accent: None,
+            tools: BTreeMap::new(),
+            permission: PermissionConfig {
+                command: BTreeMap::from([("*".to_owned(), Action::Deny)]),
+                command_patterns: BTreeMap::from([("printf ...".to_owned(), Action::Allow)]),
+                ..PermissionConfig::default()
+            },
+        };
+        for source in ["printf \"$VALUE\"", "X=1 printf literal"] {
+            assert_eq!(
+                evaluate_tool_call(
+                    &config,
+                    &request(BUILD_AGENT, source),
+                    Path::new("/tmp/project")
+                )
+                .response
+                .decision,
+                AgentDecision::Deny,
+                "{source}"
+            );
+        }
+    }
+
+    #[test]
+    fn word_pattern_optional_words_do_not_require_greedy_matching() {
+        let config = AgentConfig {
+            accent: None,
+            tools: BTreeMap::new(),
+            permission: PermissionConfig {
+                command: BTreeMap::from([("*".to_owned(), Action::Deny)]),
+                command_patterns: BTreeMap::from([("cmd [x] x".to_owned(), Action::Allow)]),
+                ..PermissionConfig::default()
+            },
+        };
+        for source in ["cmd x", "cmd x x"] {
+            assert_eq!(
+                evaluate_tool_call(
+                    &config,
+                    &request(BUILD_AGENT, source),
+                    Path::new("/tmp/project")
+                )
+                .response
+                .decision,
+                AgentDecision::Allow,
+                "{source}"
+            );
+        }
+        assert_eq!(
+            evaluate_tool_call(
+                &config,
+                &request(BUILD_AGENT, "cmd x x x"),
+                Path::new("/tmp/project")
+            )
+            .response
+            .decision,
+            AgentDecision::Deny
+        );
+    }
+
+    #[test]
+    fn word_pattern_configuration_decodes_from_toml() {
+        let config: AgentPermissionConfig = toml::from_str(
+            "[agent.build.permission.command]\n\"*\" = \"allow\"\n[agent.build.permission.command_patterns]\n\"git stash ...\" = \"deny\"\n",
+        )
+        .expect("word patterns decode alongside legacy globs");
+        let build = agent_config(&config, BUILD_AGENT);
+        assert_eq!(build.permission.command.get("*"), Some(&Action::Allow));
+        assert_eq!(
+            build.permission.command_patterns.get("git stash ..."),
+            Some(&Action::Deny)
+        );
+    }
+
+    #[test]
+    fn potential_dynamic_blacklist_match_denies_under_allow_fallback() {
+        let config = AgentConfig {
+            accent: None,
+            tools: BTreeMap::new(),
+            permission: PermissionConfig {
+                command: BTreeMap::from([("*".to_owned(), Action::Allow)]),
+                command_patterns: BTreeMap::from([("git stash ...".to_owned(), Action::Deny)]),
+                ..PermissionConfig::default()
+            },
+        };
+        for source in [
+            "git \"$operation\"",
+            "git stash \"$options\"",
+            "git diff \"$options\"",
+        ] {
+            let result = evaluate_tool_call(
+                &config,
+                &request(BUILD_AGENT, source),
+                Path::new("/tmp/project"),
+            );
+            assert_eq!(
+                result.response.decision,
+                if source.starts_with("git diff") {
+                    AgentDecision::Allow
+                } else {
+                    AgentDecision::Deny
+                },
+                "{source}"
+            );
+        }
+    }
+
+    #[test]
+    fn overlapping_word_denies_win_even_when_allow_is_more_specific() {
+        let config = AgentConfig {
+            accent: None,
+            tools: BTreeMap::new(),
+            permission: PermissionConfig {
+                command: BTreeMap::from([("*".to_owned(), Action::Allow)]),
+                command_patterns: BTreeMap::from([
+                    ("cmd dangerous ...".to_owned(), Action::Deny),
+                    ("cmd dangerous reviewed ...".to_owned(), Action::Allow),
+                ]),
+                ..PermissionConfig::default()
+            },
+        };
+        let result = evaluate_tool_call(
+            &config,
+            &request(BUILD_AGENT, "cmd dangerous reviewed"),
+            Path::new("/tmp/project"),
+        );
+        assert_eq!(result.response.decision, AgentDecision::Deny);
+        assert_eq!(result.matched_rule.as_deref(), Some("cmd dangerous ..."));
+    }
+
+    #[test]
+    fn malformed_word_patterns_fail_closed() {
+        for pattern in ["[git] diff", "git ... diff", "git [oops", "git *", "git []"] {
+            let config = AgentConfig {
+                accent: None,
+                tools: BTreeMap::new(),
+                permission: PermissionConfig {
+                    command: BTreeMap::from([("*".to_owned(), Action::Allow)]),
+                    command_patterns: BTreeMap::from([(pattern.to_owned(), Action::Allow)]),
+                    ..PermissionConfig::default()
+                },
+            };
+            assert_eq!(
+                evaluate_tool_call(
+                    &config,
+                    &request(BUILD_AGENT, "git diff"),
+                    Path::new("/tmp/project")
+                )
+                .response
+                .decision,
+                AgentDecision::Deny,
+                "{pattern}"
+            );
+        }
     }
 
     #[test]

@@ -1446,6 +1446,7 @@ dependencies = [
  "proptest",
  "serde",
  "serde_json",
+ "toml 1.1.4+spec-1.1.0",
 ]
 
 [[package]]

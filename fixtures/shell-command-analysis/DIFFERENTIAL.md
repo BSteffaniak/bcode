@@ -18,7 +18,7 @@ These differences close authorization bypasses or fail-closed gaps.
 * Quoted `;` in `printf`, SQL, AWK, Git formats, and interpreter arguments when policy allows the command.
 * Heredoc body text that resembles shell source.
 * POSIX loops and conditionals whose executable leaves are allowed.
-* Reviewed `git --no-pager` aliases when the more-specific intended subcommand rule wins.
+* Explicit shell word rules can allow reviewed forms while retaining executable options as policy facts.
 * Static input redirections allowed by read policy.
 
 Automatic allows are enabled only where the corpus supplies complete analysis and explicit allowing rules. Assignment-prefixed commands remain conservative and do not receive aliases.

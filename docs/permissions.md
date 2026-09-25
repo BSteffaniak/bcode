@@ -48,7 +48,19 @@ edit  = { "**" = "deny" }
 
 ## Categories
 
-* `command` — Pi/OpenCode-style command globs matched independently against every executable subject extracted from `shell.run` POSIX syntax. Rules are not matched against a naively split raw string.
+* `command` — legacy Pi/OpenCode-style text globs matched against each shell command subject.
+* `command_patterns` — word patterns matched against parsed, static shell words. A rule such as `"git [--no-pager] diff ..." = "allow"` accepts the optional **literal** `--no-pager` word and any number of remaining arguments; `"git stash ..." = "deny"` covers both `git stash` and its subcommands. `...` must be final and matches zero or more words. Quotes around a word do not change the matched word. No option is removed or interpreted by Bcode.
+
+`command_patterns` is separate from `command`: existing globs retain their original meaning. A matching word pattern wins over legacy globs unless an exact legacy deny matches; the exact deny remains effective. A word-pattern allow can refine a legacy `* = deny`, and a word-pattern deny can refine `* = allow`. If no word pattern matches, legacy glob resolution applies unchanged. Among word patterns, `deny > ask > allow` wins when multiple patterns match; within the same action, more required literal words win, then more optional words, then lexical order. An invalid word pattern fails shell authorization closed, even if a legacy `* = allow` would otherwise match. The executable must be static and no assignment prefix may be present for a word pattern to match. Uncertain argument words cannot satisfy a word-pattern allow; if they could match a word-pattern deny once expanded, authorization denies rather than falling through to `* = allow`. Normal analysis completeness checks still apply.
+
+For example, add this under `[agent.plan.permission.command_patterns]` to allow a reviewed no-pager form without a Git-specific parser exception:
+
+```toml
+"git [--no-pager] diff ..." = "allow"
+```
+
+`command_patterns` does **not** inspect arbitrary interpreter scripts (`sh -c`, `python -c`) or infer program-specific options. Such commands require separate policy decisions; matching a wrapper does not authorize the enclosed operation automatically.
+
 * `read` — path globs for read-only filesystem tools (`filesystem.read`, `filesystem.list`, `filesystem.find`, `filesystem.grep`, `filesystem.stat`, `filesystem.exists`).
 * `write` — path globs for `filesystem.write`.
 * `edit` — path globs for `filesystem.edit`.
