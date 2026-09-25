@@ -12,8 +12,11 @@ observations superseded by later snapshots and tool observations. Ordinary bound
 and compaction treat it like other canonical system context. Static application instructions,
 request-only skill context, invariant reminders and retry guidance are not included in this capture.
 
-Capture currently occurs on each turn preparation, including preparation after recovery, rather
-than promising once-per-turn idempotency. It does not rerun tools or rewrite earlier snapshots.
+Capture occurs once during initial turn preparation. Recovery keeps existing canonical snapshots
+and supplies fresh observations only as request-time context after historical messages, so repeated
+recovery does not append duplicate snapshots and older observations do not follow the refresh.
+If interrupted before the initial capture, recovery still supplies current facts without backfilling
+history. It does not rerun tools or rewrite earlier snapshots.
 Snapshot content is limited to the enabled environment/repository sections and their existing
 field/command-output bounds; no credential values or arbitrary environment dump are captured.
 Paths, branch names and repository status are nevertheless potentially private session content.

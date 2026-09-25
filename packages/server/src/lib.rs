@@ -18054,6 +18054,7 @@ async fn run_model_turn(
         Arc::clone(&cancel_state),
         command_context,
         phase,
+        recovering,
     ))
     .await;
     state
@@ -18122,7 +18123,11 @@ const fn model_turn_outcome_metric_label(outcome: ModelTurnOutcome) -> &'static 
     }
 }
 
-#[allow(clippy::too_many_lines, clippy::large_stack_frames)]
+#[allow(
+    clippy::too_many_lines,
+    clippy::large_stack_frames,
+    clippy::too_many_arguments
+)]
 async fn run_model_turn_inner(
     state: &ServerState,
     session_id: SessionId,
@@ -18131,6 +18136,7 @@ async fn run_model_turn_inner(
     cancel_state: Arc<TurnCancelState>,
     command_context: &mut RuntimeCommandContext<'_>,
     phase: &Arc<Mutex<SessionRuntimePhase>>,
+    recovering: bool,
 ) -> ModelTurnCompletion {
     let execution = turn_execution_options(trigger_event);
     let turn_config = state.session_config(session_id).await;
@@ -18209,6 +18215,7 @@ async fn run_model_turn_inner(
                 &execution,
                 &turn_config,
                 &target,
+                !recovering,
             )
             .await
         }
@@ -23673,6 +23680,7 @@ struct PreparedModelRequest {
 struct StaticModelTurnContext {
     system_prompt: String,
     system_messages: Vec<ModelMessage>,
+    recovery_context: Option<ModelMessage>,
     tools: Vec<bcode_model::ToolDefinition>,
     prompt_profile_layers: Vec<String>,
     prompt_profile_diagnostics: Vec<String>,
@@ -23730,6 +23738,7 @@ async fn session_repository_root(
 }
 
 #[allow(clippy::too_many_lines)]
+#[allow(clippy::too_many_arguments)]
 async fn prepare_static_model_turn_context(
     state: &ServerState,
     session_id: SessionId,
@@ -23738,6 +23747,7 @@ async fn prepare_static_model_turn_context(
     execution: &bcode_session_models::TurnExecutionOptions,
     config: &bcode_config::BcodeConfig,
     model_target: &model_request_target::ResolvedModelRequestTarget,
+    retain_environment_snapshot: bool,
 ) -> Result<StaticModelTurnContext, bcode_session::SessionError> {
     let setup_labels = model_turn_metric_labels(session_id, turn_id);
     let agent_timer = state.metrics.timer();
@@ -23814,14 +23824,26 @@ async fn prepare_static_model_turn_context(
         .filter(|context| !context.is_empty())
         .collect::<Vec<_>>()
         .join("\n\n");
-    if !facts.is_empty() {
-        state.sessions.append_event(session_id, SessionEventKind::SystemMessage {
-            text: format!(
-                "Turn environment snapshot (historical observations, not enduring instructions). Later snapshots and tool observations supersede these facts.\n\n{facts}"
-            ),
-        }).await?;
-    }
     let mut system_messages = Vec::new();
+    let mut recovery_context = None;
+    if !facts.is_empty() {
+        let text = format!(
+            "Turn environment snapshot (historical observations, not enduring instructions). Later snapshots and tool observations supersede these facts.\n\n{facts}"
+        );
+        if retain_environment_snapshot {
+            state
+                .sessions
+                .append_event(session_id, SessionEventKind::SystemMessage { text })
+                .await?;
+        } else {
+            // Recovery refreshes facts without appending another durable snapshot
+            // for the same admitted turn. Existing canonical observations remain.
+            recovery_context = Some(ModelMessage {
+                role: MessageRole::System,
+                content: vec![ContentBlock::Text { text }],
+            });
+        }
+    }
     if matches!(
         invariant_mode,
         Some(bcode_config::InvariantGuidanceMode::Relevant)
@@ -23896,6 +23918,7 @@ async fn prepare_static_model_turn_context(
     Ok(StaticModelTurnContext {
         system_prompt,
         system_messages,
+        recovery_context,
         tools,
         prompt_profile_layers: profile.applied_layers,
         prompt_profile_diagnostics: profile.diagnostics,
@@ -24019,6 +24042,10 @@ async fn build_model_turn_request(
             .sum::<usize>() as u64,
         metric_labels.clone(),
     );
+    // Recovery observations must follow historical snapshots to supersede them.
+    if let Some(context) = &static_context.recovery_context {
+        messages.push(context.clone());
+    }
     // Retry guidance is new information for this request, unlike turn context.
     if let Some(instruction) = retry_instruction
         && !instruction.trim().is_empty()
@@ -83646,6 +83673,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
     }
 
     #[tokio::test]
+    #[allow(clippy::too_many_lines)] // Exercises initial preparation and repeated recovery together.
     async fn disabled_tools_preserve_explicit_skill_context() {
         let sessions = SessionManager::default();
         let session_id = sessions
@@ -83708,6 +83736,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
             &execution,
             &state.session_config(session_id).await,
             &model_target,
+            true,
         )
         .await
         .expect("static turn context");
@@ -83730,6 +83759,37 @@ event_symbol = "bcode_plugin_handle_event_v1"
                 if text.starts_with("Turn environment snapshot") && text.contains("Later snapshots"))));
         assert!(!history.iter().any(|event| matches!(&event.kind,
             SessionEventKind::SystemMessage { text } if text.contains(&context))));
+        for _ in 0..3 {
+            let recovered = prepare_static_model_turn_context(
+                &state,
+                session_id,
+                &turn_id.to_string(),
+                trigger.sequence,
+                &execution,
+                &state.session_config(session_id).await,
+                &model_target,
+                false,
+            )
+            .await
+            .unwrap();
+            assert!(recovered.recovery_context.is_some());
+        }
+        let recovered_history = state
+            .sessions
+            .model_context_events(session_id)
+            .await
+            .unwrap();
+        let snapshots = |events: Vec<bcode_session_models::SessionEvent>| {
+            events
+                .into_iter()
+                .filter(|event| matches!(event.kind, SessionEventKind::SystemMessage { .. }))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            snapshots(history),
+            snapshots(recovered_history),
+            "recovery must not duplicate durable snapshots"
+        );
         drop(state);
     }
 
@@ -85505,6 +85565,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
 
     fn prefix_test_context() -> StaticModelTurnContext {
         StaticModelTurnContext {
+            recovery_context: None,
             system_prompt: "stable instructions".into(),
             system_messages: vec![ModelMessage {
                 role: MessageRole::System,
@@ -85717,6 +85778,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
             ..SessionModelSelection::default()
         };
         let static_context = StaticModelTurnContext {
+            recovery_context: None,
             system_prompt: String::new(),
             system_messages: Vec::new(),
             tools: Vec::new(),
