@@ -585,9 +585,16 @@ fn command_response(request: &InvokeCommandRequest) -> ServiceResponse {
             |session_id| control_loop(session_id, bcode_ipc::WorkflowRunControlAction::Resume),
         ),
         START_COMMAND => {
-            status_response("unknown /loop action; use status, pause, stop, resume, or detach")
+            let mut response =
+                status_response("unknown /loop action; use status, pause, stop, resume, or detach");
+            response.success = false;
+            response
         }
-        _ => status_response("unsupported loop command"),
+        _ => {
+            let mut response = status_response("unsupported loop command");
+            response.success = false;
+            response
+        }
     };
     json_response(&response)
 }
@@ -2966,6 +2973,28 @@ mod tests {
         assert!(message.contains("outcome remains unknown"));
         assert!(message.contains("Use /loop"));
         assert!(format_workflow_status(&run).contains("/loop detach"));
+    }
+
+    #[test]
+    fn unsupported_commands_and_actions_report_failure_without_launch_effects() {
+        for (command_id, arguments) in [("unknown.command", ""), (START_COMMAND, "unknown")] {
+            let request = InvokeCommandRequest {
+                command_id: command_id.into(),
+                args: std::collections::BTreeMap::from([("arguments".into(), arguments.into())]),
+                context: None,
+            };
+            let response = command_response(&request);
+            let response: InvokeCommandResponse =
+                serde_json::from_slice(&response.payload).unwrap();
+            assert!(!response.success);
+            assert!(response.message.is_some());
+            assert!(
+                response
+                    .effects
+                    .iter()
+                    .all(|effect| matches!(effect, CommandEffect::AppendText { .. }))
+            );
+        }
     }
 
     #[test]

@@ -600,7 +600,13 @@ async fn handle_cli(cli: Cli) -> Result<(), CliError> {
         }
         Commands::Server { command } => handle_server_command(command).await?,
         Commands::Session { command } => handle_session_command(Box::new(command)).await?,
-        Commands::State { command } => handle_state_command(command)?,
+        Commands::State { command } => handle_state_command(
+            command,
+            &bcode_config::StateLocationSelection {
+                root: cli.state_root,
+                profile: cli.state_profile,
+            },
+        )?,
         #[cfg(feature = "web-renderer")]
         Commands::Web {
             bind,
@@ -7635,18 +7641,20 @@ fn parse_reprice_datetime(value: &str) -> Result<u64, String> {
 ///
 /// Resolution never substitutes a different location, so an unavailable location is reported
 /// rather than silently replaced.
-fn resolve_current_state_locations() -> Result<bcode_config::StateLocationSet, CliError> {
+fn resolve_current_state_locations(
+    selection: &bcode_config::StateLocationSelection,
+) -> Result<bcode_config::StateLocationSet, CliError> {
     let config = bcode_config::load_config()?;
-    bcode_config::resolve_state_location_set(
-        &config.state,
-        &bcode_config::StateLocationSelection::default(),
-    )
-    .map_err(|error| CliError::InvalidArguments(error.to_string()))
+    bcode_config::resolve_state_location_set(&config.state, selection)
+        .map_err(|error| CliError::InvalidArguments(error.to_string()))
 }
 
-fn handle_state_command(command: StateCommand) -> Result<(), CliError> {
+fn handle_state_command(
+    command: StateCommand,
+    selection: &bcode_config::StateLocationSelection,
+) -> Result<(), CliError> {
     match command {
-        StateCommand::Locations { json } => list_state_locations(json),
+        StateCommand::Locations { json } => list_state_locations(json, selection),
         StateCommand::PruneStaging { root, apply, json } => {
             prune_relocation_staging_command(root, apply, json)
         }
@@ -7725,8 +7733,11 @@ fn prune_relocation_staging_command(
 ///
 /// This is read-only: it resolves configuration and reports availability without creating,
 /// migrating, or repairing anything.
-fn list_state_locations(json: bool) -> Result<(), CliError> {
-    let resolved = resolve_current_state_locations()?;
+fn list_state_locations(
+    json: bool,
+    selection: &bcode_config::StateLocationSelection,
+) -> Result<(), CliError> {
+    let resolved = resolve_current_state_locations(selection)?;
     let primary_id = resolved.primary().id().as_str().to_owned();
     let rows = resolved
         .readable()
@@ -27103,6 +27114,24 @@ mod client_timeout_cli_tests {
         );
         assert!(apply);
         assert!(json);
+    }
+
+    #[test]
+    fn state_locations_inventory_honors_explicit_root() {
+        let root = tempfile::tempdir().unwrap();
+        let selection = bcode_config::StateLocationSelection {
+            root: Some(root.path().to_path_buf()),
+            profile: None,
+        };
+        let locations = super::resolve_current_state_locations(&selection).unwrap();
+        assert_eq!(
+            locations.primary().root(),
+            root.path().canonicalize().unwrap()
+        );
+        assert_eq!(
+            locations.primary().provenance(),
+            bcode_config::StateLocationProvenance::Cli
+        );
     }
 
     #[test]

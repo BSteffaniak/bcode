@@ -1,2 +1,6 @@
 [worktree]
 root = "../wt-bcode"
+
+[workflows]
+run_edit_plugins = ["bcode.workflow"]
+run_publication_plugins = ["bcode.workflow"]
