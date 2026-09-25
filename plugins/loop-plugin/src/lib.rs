@@ -143,6 +143,11 @@ fn commands() -> Vec<CommandContribution> {
             "Read the session loop's living progress document",
         ),
         command("goal", "Goal", "Generate loop prompts from a goal"),
+        command(
+            "goal.preflight",
+            "Goal Delegation Preflight",
+            "Inspect configured delegation prerequisites without granting authority",
+        ),
         session_command("goal.status", "Goal Status", "Show the session loop status"),
         session_command("goal.pause", "Pause Goal", "Pause the session loop"),
         session_command(
@@ -513,6 +518,7 @@ fn command_response(request: &InvokeCommandRequest) -> ServiceResponse {
         other => other,
     };
     let response = match command_id {
+        "goal.preflight" => delegation_preflight_response(),
         "goal.continue" | "loop.continue" => session_id.map_or_else(
             || missing_enforced_session_response("goal.continue"),
             |session| continuation::command(session, arguments),
@@ -604,6 +610,67 @@ fn command_response(request: &InvokeCommandRequest) -> ServiceResponse {
 fn missing_enforced_session_response(command_id: &str) -> InvokeCommandResponse {
     status_response(&format!(
         "{command_id} requires an active session but the host dispatched it without one"
+    ))
+}
+
+fn delegation_preflight_response() -> InvokeCommandResponse {
+    match run_async(async {
+        BcodeClient::default_endpoint()
+            .workflow_delegation_preflight("bcode.workflow".into())
+            .await
+    }) {
+        Ok(result) => delegation_preflight_command_result(&result),
+        Err(error) => {
+            let mut response = status_response(&format!(
+                "Delegation prerequisites could not be verified: {error}. No workflow started or authority changed."
+            ));
+            response.success = false;
+            response
+        }
+    }
+}
+
+fn delegation_preflight_command_result(
+    result: &bcode_workflow::WorkflowDelegationPreflight,
+) -> InvokeCommandResponse {
+    match delegation_preflight_message(result) {
+        Ok(message) => {
+            let mut response = status_response(&message);
+            response.success =
+                result.plugin_loaded && result.staging_configured && result.publication_configured;
+            response
+        }
+        Err(error) => {
+            let mut response = status_response(&error);
+            response.success = false;
+            response
+        }
+    }
+}
+
+fn delegation_preflight_message(
+    result: &bcode_workflow::WorkflowDelegationPreflight,
+) -> Result<String, String> {
+    if result.version != 1 || result.plugin_id != "bcode.workflow" {
+        return Err("Delegation prerequisites could not be verified: unsupported response version or mismatched plugin identity. Update compatible plugins/client and retry. No workflow started or authority changed.".into());
+    }
+    let mut missing = Vec::new();
+    if !result.plugin_loaded {
+        missing.push("Enable the bundled bcode.workflow plugin.");
+    }
+    if !result.staging_configured {
+        missing.push("Explicitly authorize bcode.workflow in workflows.run_edit_plugins.");
+    }
+    if !result.publication_configured {
+        missing.push("Explicitly authorize bcode.workflow in workflows.run_publication_plugins.");
+    }
+    let status = if missing.is_empty() {
+        "Configured delegation prerequisites are present.".to_owned()
+    } else {
+        format!("Delegation prerequisites missing:\n{}", missing.join("\n"))
+    };
+    Ok(format!(
+        "{status}\nNo configuration was changed. This is not an execution grant: graph publication, worker capabilities and tool permissions are checked independently. Model/workspace readiness and end-to-end goal collaboration are not verified by this check."
     ))
 }
 
@@ -1030,11 +1097,9 @@ impl LoopSurface {
         // Reserve initialization attempts and every node of each implementation iteration.
         // Blocker-resolution retries remain subject to the ordinary run budgets.
         let initialization = u64::from(self.progress_document.is_some());
-        let per_iteration = if input.judgement_evaluation.is_some() {
-            3
-        } else {
-            2
-        };
+        let per_iteration = continuation::executable_node_count(&request.definition)?
+            .checked_sub(initialization)
+            .ok_or("initialization node allowance mismatch")?;
         request.limits.node_execution_cap = u64::from(input.max_iterations)
             .checked_mul(per_iteration)
             .and_then(|count| count.checked_add(initialization))
@@ -1418,11 +1483,14 @@ impl LoopSurface {
         }
         let hints_y = status_y.saturating_add(1);
         if hints_y < content.bottom() {
-            let hints = [
+            let mut hints = vec![
                 KeyHint::new("Tab/Shift-Tab", "field"),
                 KeyHint::new("Ctrl-Enter", "start"),
                 KeyHint::new("Esc", "close"),
             ];
+            if self.setup_kind == SetupKind::Goal {
+                hints.push(KeyHint::new("Ctrl-D", "delegation check"));
+            }
             let hints = KeyHintBarComponent::new("loop.hints", &hints)
                 .styles(loop_hint_styles(self.theme.as_ref()));
             let layout = hints.layout(
@@ -2295,6 +2363,49 @@ fn legacy_state_root() -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn delegation_preflight_reports_each_missing_prerequisite_without_granting_authority() {
+        for loaded in [false, true] {
+            for staging in [false, true] {
+                for publication in [false, true] {
+                    let result = bcode_workflow::WorkflowDelegationPreflight {
+                        version: 1,
+                        plugin_id: "bcode.workflow".into(),
+                        plugin_loaded: loaded,
+                        staging_configured: staging,
+                        publication_configured: publication,
+                    };
+                    let response = delegation_preflight_command_result(&result);
+                    assert_eq!(response.success, loaded && staging && publication);
+                    let message = response.message.expect("preflight message");
+                    assert_eq!(message.contains("Enable the bundled"), !loaded);
+                    assert_eq!(message.contains("workflows.run_edit_plugins"), !staging);
+                    assert_eq!(
+                        message.contains("workflows.run_publication_plugins"),
+                        !publication
+                    );
+                    assert!(message.contains("not an execution grant"));
+                    assert!(message.contains("No configuration was changed"));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn delegation_preflight_rejects_unknown_versions_and_wrong_plugin() {
+        for (version, plugin_id) in [(0, "bcode.workflow"), (2, "bcode.workflow"), (1, "other")] {
+            let response = bcode_workflow::WorkflowDelegationPreflight {
+                version,
+                plugin_id: plugin_id.into(),
+                plugin_loaded: true,
+                staging_configured: true,
+                publication_configured: true,
+            };
+            assert!(delegation_preflight_message(&response).is_err());
+            assert!(!delegation_preflight_command_result(&response).success);
+        }
+    }
 
     fn bedrock_schema_dialect_for_test() -> bcode_model_schema::SchemaDialect {
         use bcode_model_schema::{ObjectPropertyPolicy, SchemaDialect, UnsupportedKeywordPolicy};

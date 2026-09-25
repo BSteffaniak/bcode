@@ -32,6 +32,29 @@ fn retain_reachable(definition: &mut bcode_workflow::WorkflowDefinition) {
 #[path = "continuation_tests.rs"]
 mod tests;
 
+/// Count executable nodes for loop launch and continuation allowance planning.
+/// Returns an error if the graph count cannot be represented by the durable allowance type.
+pub fn executable_node_count(
+    definition: &bcode_workflow::WorkflowDefinition,
+) -> Result<u64, String> {
+    u64::try_from(
+        definition
+            .nodes
+            .values()
+            .filter(|node| {
+                matches!(
+                    node.kind,
+                    bcode_workflow::NodeKind::Task
+                        | bcode_workflow::NodeKind::Agent
+                        | bcode_workflow::NodeKind::PluginBlock
+                        | bcode_workflow::NodeKind::WorkflowCall
+                )
+            })
+            .count(),
+    )
+    .map_err(|_| "Executable node count exceeds supported range".into())
+}
+
 fn request(
     source: bcode_workflow::WorkflowContinuationSource,
     additional: u32,
@@ -98,11 +121,7 @@ fn request(
             .map_err(|error| error.to_string())?;
     let mut limits = source.limits;
     limits.cycle_cap = additional;
-    let nodes_per_iteration = if definition.nodes.contains_key("loop.judgement.evaluate") {
-        3
-    } else {
-        2
-    };
+    let nodes_per_iteration = executable_node_count(&definition)?;
     limits.node_execution_cap = u64::from(additional)
         .checked_mul(nodes_per_iteration)
         .and_then(|value| value.checked_mul(u64::from(limits.retry_cap) + 1))

@@ -479,6 +479,15 @@ pub type PluginWorkflowAuthoringValidationFuture = Pin<
     >,
 >;
 
+/// Async advisory delegation-prerequisite inspection; never an execution grant.
+pub type PluginWorkflowDelegationPreflightFuture = Pin<
+    Box<
+        dyn Future<Output = Result<bcode_workflow::WorkflowDelegationPreflight, PluginTuiHostError>>
+            + Send
+            + 'static,
+    >,
+>;
+
 /// Async workflow-source apply result.
 pub type PluginWorkflowAuthoringApplyFuture = Pin<
     Box<
@@ -700,6 +709,19 @@ pub trait PluginTuiHost: Send + Sync {
     /// Return whether a key stroke is configured to submit composer-like input.
     fn text_submit(&self, _stroke: KeyStroke) -> bool {
         false
+    }
+
+    /// Inspect configured delegation prerequisites through the application boundary.
+    /// This is advisory and never grants graph-edit or tool execution authority.
+    fn workflow_delegation_preflight(
+        &self,
+        _plugin_id: String,
+    ) -> PluginWorkflowDelegationPreflightFuture {
+        Box::pin(async {
+            Err(PluginTuiHostError::Unsupported(
+                "workflow delegation preflight is not available from this host".into(),
+            ))
+        })
     }
 
     /// Start one durable workflow through the host's generic workflow service.
@@ -2196,6 +2218,17 @@ mod typed_interaction_surface_tests {
         fn spawn_blocking(&self, _task: Box<dyn FnOnce() + Send + 'static>) {}
 
         fn request_redraw(&self) {}
+    }
+
+    #[test]
+    fn delegation_preflight_fails_closed_on_hosts_without_support() {
+        let mut future = TestHost.workflow_delegation_preflight("bcode.workflow".into());
+        let waker = std::task::Waker::noop();
+        let mut context = std::task::Context::from_waker(waker);
+        assert!(matches!(
+            future.as_mut().poll(&mut context),
+            std::task::Poll::Ready(Err(PluginTuiHostError::Unsupported(_)))
+        ));
     }
 
     #[derive(Default)]

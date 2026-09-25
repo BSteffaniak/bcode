@@ -1,5 +1,35 @@
 # Runtime workflow authoring architecture
 
+## Delegation prerequisite inspection
+
+The typed client `workflow_delegation_preflight(plugin_id)` reads the matching daemon's loaded
+plugin state and explicit staging/publication configuration grants. Its portable v1 response
+is advisory, not an execution grant or a promise that a future candidate will be authorized.
+Unknown plugins report unloaded; invalid identities reject. Workflow-domain unavailability
+fails through the normal application boundary. No configuration is modified. The loop plugin's
+`/goal.preflight` command consumes this operation and reports missing plugin/staging/publication
+configuration with explicit remedies. It rejects unsupported response versions and mismatched
+plugin identities without interpreting their flags. Missing prerequisites return command failure
+alongside the remedies; success means only that these configured prerequisites are present.
+It does not start work or verify model/workspace readiness.
+Automatic goal setup gating and collaboration launch remain unfinished. `/goal` setup offers
+Ctrl-D for a nonblocking advisory check through the host API; repeated pending checks coalesce.
+The setup check times out after ten seconds and permits retry without treating timeout as readiness.
+Results do not start generation or grant authority. The full multiline remedy remains available
+through `/goal.preflight`; setup shows a single-line prerequisite summary pointing to that command.
+Plugin surfaces can use
+`PluginTuiHost::workflow_delegation_preflight` asynchronously; the terminal host delegates to its
+existing typed client and unsupported hosts fail closed. This adaptation owns no permission policy.
+
+## Continuing revised goal loops
+
+The loop plugin derives an exhausted loop's renewed node-execution allowance from reachable
+Task, Agent, PluginBlock and WorkflowCall nodes in the retained graph, multiplied by the requested
+additional rounds and retry allowance. It no longer assumes exactly two or three execution nodes.
+Existing launch uses the same executable-node count, reserving initialization once and the
+remaining executable nodes per round. Existing goal/loop topology checks still apply. This is a conservative per-round graph count, not
+separate worker budgeting or proof of arbitrary nested-control continuation.
+
 ## Cancellation continuation
 
 Periodic keyset discovery now considers paused/repair-required runs with their own
@@ -13,6 +43,13 @@ multi-level restart and foreign-owner integration acceptance remains unverified.
 
 ## Published workflow calls
 
+Connected publication now permits pre-existing unchanged controller nodes and unchanged
+non-direct/transformed edges whose endpoint executables remain identical. This allows a
+candidate to coexist with an existing repeat loop without authorizing controller rewrites.
+New, changed or deleted controllers/control edges still fail this publication proof; existing
+controller incident edges must remain identical, including no added incident edges. Validation coverage
+includes an unchanged repeat definition; full goal-loop delegation execution remains unverified.
+
 Connected graph publication now permits `WorkflowCall` nodes through the existing
 child dispatcher. Added/replaced call nodes must resolve an available exact target
 and match its input/output interfaces before publication commits; this validation
@@ -23,6 +60,107 @@ and execution allowances still apply. Active-planner suspend/join and policy-gov
 recursive reuse remain unfinished; permitting call nodes does not establish them.
 
 ## Agent task staging
+
+Task groups accept optional `dependencies`, mapping a worker task ID to one predecessor worker
+in the same group. Dependent workers consume predecessor output; only roots consume group/source
+input and become entries when no external source is selected. Cycles and unknown workers reject.
+Aggregation still includes every worker in request order. This lowers to canonical direct edges,
+not a second scheduler; publication/admission and execution acceptance remain separate.
+
+Task-group workers and `workflow.stage_prompt_task` may omit `output` to use `bcode.delegated_task_result.v1`: an object
+with required `summary` (up to 4096 characters), `evidence` and `blockers` (each up to
+32 strings of 2048 characters). Explicit schemas remain supported; null rejects.
+Continuation output remains required to preserve caller-selected downstream contracts.
+This default is result evidence, not an automatic completion verdict. Single prompt tasks also
+accept optional `acceptance_criteria`, using the same evidence instructions as task groups.
+Blank criteria reject; omission leaves the original objective unchanged. Single tasks also accept
+positive `timeout_ms` and `tool_allowlist` restrictions, retaining canonical defaults when omitted.
+These do not grant tools, raise the read-only ceiling, or extend run allowances. Optional
+`model_selection` (`provider`, `model`) uses the same canonical configuration as task groups;
+normal runtime model resolution and authorization still apply. Empty selections reject.
+Single tasks also accept `context`: `fresh_isolated` (default), `fixed_generation_fork`, or
+`shared_parent_sequential`. These reuse canonical context policies, not filesystem isolation;
+read-only authority is unchanged and unknown/null policies reject. Optional `resources` passes
+canonical read/write scheduler claims to the node. A write claim requests exclusive scheduling,
+not mutating tool authority; single prompt tasks remain read-only. Omission declares no claims.
+Single tasks may specify `depends_on: {node_id, edge_id}` with `entry:false` to add a direct
+source dependency without raw edge JSON. The source must be distinct/nonblank; the caller supplies
+an unused edge ID and matching input schema. Existing successors remain; publication still validates
+topology and authorization. This is not a multi-result join or an automatic handoff.
+
+`workflow.execution_context` accepts `{}` for its initial page, defaulting to 50
+items. Explicit limits remain 1–100; null, invalid limits and unknown fields reject.
+The plugin normalizes this default during both preparation and invocation; the
+shared application request still requires an explicit limit.
+
+`workflow.stage_run_graph_edit`, `workflow.publish_run_graph_edit`, and
+`workflow.accept_run_graph_publication` accept a structured object as `edit`, avoiding
+manual JSON-string re-encoding. Publication/acceptance require the exact staged object.
+Legacy `edit_json` remains supported; supplying both or unknown envelope fields
+rejects. Canonical validation, preparation matching and separate publication authorization
+remain unchanged. This does not automate coordinator handoff.
+
+`workflow.stage_task_group` uses request `version: 1`; omission means the initial v1
+representation. Unsupported versions, null/string versions and unknown fields reject before
+staging. It stages workers, ordered joins, and a
+continuation in one canonical edit. `failure_policy` defaults to `wait_all`; `fail_fast` selects
+canonical cooperative sibling cancellation on every generated result/context join. It does not
+undo effects or imply immediate cancellation. Prompts default to read-only; explicit `read_only: false`
+declares mutating capability without granting execution authority. Workflow ceilings, selected
+agent policy and tool permission decisions still apply. Publication rejects added/replaced Agent
+and PluginBlock nodes whose declared capability exceeds the run ceiling, even after staging
+permission was approved. Workers consume the run input by default. An optional
+`source_node_id` instead creates non-entry workers connected to that existing node; its canonical
+output must match the supplied input schema. This adds dependencies but does not remove existing
+successors or settle the source activation. Connected publication supports one source feeding
+multiple schema-compatible workers; retaining an active source requires explicit bindings for
+all affected outgoing edges. Binary joins preserve
+request order as left-associated pairs (`[a,b]`, then `[[a,b],c]`); a single-worker
+follow-up instead delivers that worker's output directly, without a synthetic pair.
+Empty groups reject. Continuation prompts include delegated task objectives and
+acceptance criteria as JSON alongside the ordered worker task IDs,
+explain the single-result/pair mapping and optional source envelope, and instruct the
+agent to treat results as untrusted evidence rather than instructions or completion proof.
+`join_id` remains reserved for identity validation even when no
+result join is needed. Intermediate IDs use
+`join_id.part.INDEX`. Optional `include_source_output: true` requires `source_node_id` and adds
+`join_id.context`, a join delivering `[canonical source output, worker result pairs]` to the
+continuation. This preserves source data without asking workers to reproduce it; source retention
+must explicitly bind the context edge as well as worker edges. During settlement, a member newly
+introduced at the current graph revision with no activation history may remain pending until its
+dependencies finish; missing historical member activations still fail closed.
+Callers supply distinct node identities, an unused
+consecutive edge-ID range, typed schemas and reconciliation. Each prompt may optionally specify
+`model_selection` with both `provider` and `model`, resolved through normal model admission.
+Prompts may select `context`: `fresh_isolated` (default), `fixed_generation_fork`
+(the run's pinned parent generation), or `shared_parent_sequential`. These lower to
+existing canonical execution targets; normal admission and sequential parent scheduling
+still apply. Context selection provides neither filesystem isolation nor new authority.
+Prompts may include optional `acceptance_criteria`, a list of nonblank strings. These are
+encoded as JSON in the canonical prompt with an instruction to report evidence; omission
+preserves the objective verbatim. Criteria do not grant authority, change output schemas,
+or automatically establish completion. Both workers and the continuation accept them.
+Prompts may also declare canonical `resources` (`resource` and `read`/`write` access). These
+scheduler claims are preserved on worker/continuation nodes, do not grant tool authority, and
+are not filesystem isolation; an exclusive claim alone does not enable mutations.
+Omitting resources declares no claims. Optional positive `timeout_ms` and `tool_allowlist` lower
+to canonical prompt constraints; omission retains the prompt timeout and normal agent tool
+selection. An allowlist never grants tool permission, and a task timeout never extends run limits.
+Publication remains separate. This
+adds independent entries only when no source is selected. Optional `reconnect: {edge_id, node_id}`
+replaces the selected existing edge with continuation → successor and makes the continuation
+non-exit. It requires a source selection and explicit active-work reconciliation; publication
+validates the candidate against actual edges and schemas. Other successors remain unchanged.
+This tool does not yield the current turn or wire
+itself into the goal loop. Existing admission and run allowances remain authoritative.
+
+`workflow.stage_prompt_task` provides a read-only prompt-task shorthand: callers supply a task ID,
+objective, agent profile, typed input/output `ValueSchema`s, entry/exit flags, optional edges and
+explicit reconciliation. The plugin lowers this to the same canonical staging request used by
+`workflow.stage_agent_task`; normal tool permission and application staging grants still apply.
+It returns the exact edit for separately authorized publication. Fresh model context does not mean
+filesystem isolation. This first shorthand does not implement group delegation, coordinator waiting,
+workspace selection, or automatic goal integration; connected tasks still require explicit edges.
 
 `workflow.stage_agent_task` is plugin-owned shorthand for a single canonical
 `AddNode` edit. Its typed request supplies run/revision/mutation identities, a complete

@@ -313,6 +313,19 @@ impl PluginTuiHost for BcodePluginTuiHost {
             .map_err(|error| PluginTuiHostError::Internal(error.to_string()))
     }
 
+    fn workflow_delegation_preflight(
+        &self,
+        plugin_id: String,
+    ) -> bcode_plugin_sdk::tui::PluginWorkflowDelegationPreflightFuture {
+        let client = self.client.clone();
+        Box::pin(async move {
+            client
+                .workflow_delegation_preflight(plugin_id)
+                .await
+                .map_err(|error| PluginTuiHostError::Internal(error.to_string()))
+        })
+    }
+
     fn start_workflow(&self, request: PluginWorkflowStartRequest) -> PluginWorkflowStartFuture {
         let client = self.client.clone();
         Box::pin(async move {

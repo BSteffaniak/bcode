@@ -5210,6 +5210,29 @@ impl BcodeClient {
         }
     }
 
+    /// Inspect daemon-configured plugin delegation prerequisites; this grants no authority.
+    ///
+    /// # Errors
+    /// Returns transport, unavailable-domain, invalid-identity or incompatible-response errors.
+    pub async fn workflow_delegation_preflight(
+        &self,
+        plugin_id: String,
+    ) -> Result<bcode_workflow::WorkflowDelegationPreflight, ClientError> {
+        match self
+            .send_request(Request::WorkflowDelegationPreflight {
+                plugin_id: plugin_id.clone(),
+            })
+            .await?
+        {
+            ResponsePayload::WorkflowDelegationPreflight { result }
+                if result.version == 1 && result.plugin_id == plugin_id =>
+            {
+                Ok(result)
+            }
+            _ => Err(ClientError::UnexpectedResponse),
+        }
+    }
+
     /// Accept a staged publication; pending acceptance is not a committed revision.
     ///
     /// # Errors

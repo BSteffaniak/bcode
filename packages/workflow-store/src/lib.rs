@@ -14688,14 +14688,30 @@ fn settle_parallel_failure(
                 )));
             }
             if graph_revision != 1 {
-                let (member_activation, _) =
-                    activation_at_generation(transaction, run_id, member, generation)?.ok_or_else(
-                        || {
-                            WorkflowStoreError::InvalidData(format!(
-                                "parallel member activation is missing: {member}"
-                            ))
-                        },
+                let Some((member_activation, _)) =
+                    activation_at_generation(transaction, run_id, member, generation)?
+                else {
+                    let record = WorkflowStore::current_run_graph_node_in_snapshot(
+                        transaction,
+                        run_id,
+                        member,
+                    )?
+                    .ok_or_else(|| {
+                        WorkflowStoreError::InvalidData("parallel member is missing".into())
+                    })?;
+                    let previously_activated: bool = transaction.query_row(
+                        "SELECT EXISTS(SELECT 1 FROM workflow_activations WHERE run_id = ?1 AND node_id = ?2)",
+                        (run_id, member), |row| row.get(0),
                     )?;
+                    // A newly published dependency may not be ready yet (for example a
+                    // nested join). Its absence is pending work, not historical retention.
+                    if record.revision == graph_revision && !previously_activated {
+                        continue;
+                    }
+                    return Err(WorkflowStoreError::InvalidData(format!(
+                        "parallel member activation is missing: {member}"
+                    )));
+                };
                 let admitted: Option<u64> = transaction
                     .query_row(
                         "SELECT graph_revision FROM workflow_activation_graph_bindings
@@ -43567,6 +43583,217 @@ mod tests {
                 assert_eq!(result.activated[0].node_id, "second");
             }
         }
+    }
+
+    #[test]
+    fn connected_publication_preserves_existing_repeat_controller() {
+        let temp = tempfile::tempdir().expect("temp");
+        let mut store = WorkflowStore::open_in_state_dir(temp.path()).expect("store");
+        let definition = repeat_definition();
+        store
+            .persist_definition("repeat-edit", 1, &definition)
+            .expect("definition");
+        let mut run = new_run();
+        run.definition_id = "repeat-edit".into();
+        store.create_run(&run).expect("run");
+        let node = definition.nodes["body"].clone();
+        let mut added = node;
+        added.id = "additional".into();
+        let request = bcode_workflow::WorkflowRunGraphEditBatch {
+            version: bcode_workflow::WORKFLOW_RUN_GRAPH_EDIT_VERSION,
+            run_id: run.run_id.clone(),
+            mutation_id: "repeat-preserved".into(),
+            expected_revision: 1,
+            edits: vec![bcode_workflow::WorkflowRunGraphEdit::AddNode {
+                node: added,
+                entry: true,
+                exit: true,
+            }],
+            reconciliation: Vec::new(),
+        };
+        store
+            .validate_connected_publication(&request)
+            .expect("unchanged repeat permitted");
+        for edit in [
+            bcode_workflow::WorkflowRunGraphEdit::RemoveNode {
+                node_id: "repeat-control".into(),
+            },
+            bcode_workflow::WorkflowRunGraphEdit::RemoveEdge { edge_id: 1 },
+        ] {
+            let mut deleted = request.clone();
+            deleted.edits.push(edit);
+            assert!(store.validate_connected_publication(&deleted).is_err());
+        }
+        let mut changed = request;
+        let mut controller = definition.nodes["repeat-control"].clone();
+        controller.configuration["max_iterations"] = serde_json::json!(99);
+        changed
+            .edits
+            .push(bcode_workflow::WorkflowRunGraphEdit::ReplaceNode {
+                node: controller,
+                entry: false,
+                exit: true,
+            });
+        assert!(store.validate_connected_publication(&changed).is_err());
+    }
+
+    #[test]
+    fn publication_inside_repeat_survives_reopen_and_advances_iteration() {
+        let temp = tempfile::tempdir().expect("temp");
+        let mut store = WorkflowStore::open_in_state_dir(temp.path()).expect("store");
+        let mut definition = repeat_definition();
+        let mut evaluation = definition.nodes["body"].clone();
+        evaluation.id = "evaluation".into();
+        definition.nodes.insert(evaluation.id.clone(), evaluation);
+        definition.edges[0].to = "evaluation".into();
+        definition.edges.push(bcode_workflow::EdgeDefinition {
+            from: "evaluation".into(),
+            to: "repeat-control".into(),
+            kind: bcode_workflow::EdgeKind::Direct,
+            transform: None,
+        });
+        store
+            .persist_definition("example", 1, &definition)
+            .expect("definition");
+        let mut run = new_run();
+        run.input = Some(serde_json::json!({"condition_met":false,"iteration":1}));
+        store.create_run(&run).expect("run");
+        store
+            .connection
+            .execute_batch(
+                "UPDATE workflow_runs SET target_artifact_id = 'artifact-a',
+            coordinator_daemon_instance_id = 'daemon-a', coordinator_generation = 1,
+            coordinator_fencing_token = 'token-a' WHERE run_id = 'run-1';",
+            )
+            .expect("owner");
+        let authority = store
+            .execution_authority(&run.run_id)
+            .expect("authority")
+            .expect("owner");
+        let body = store
+            .pending_activations(10)
+            .expect("pending")
+            .pop()
+            .expect("body");
+        let mut added = definition.nodes["body"].clone();
+        added.id = "additional".into();
+        let request = bcode_workflow::WorkflowRunGraphEditBatch {
+            version: bcode_workflow::WORKFLOW_RUN_GRAPH_EDIT_VERSION,
+            run_id: run.run_id.clone(),
+            mutation_id: "repeat-transaction".into(),
+            expected_revision: 1,
+            edits: vec![
+                bcode_workflow::WorkflowRunGraphEdit::AddNode {
+                    node: added,
+                    entry: false,
+                    exit: false,
+                },
+                bcode_workflow::WorkflowRunGraphEdit::ReplaceEdge {
+                    edge_id: 0,
+                    edge: bcode_workflow::EdgeDefinition {
+                        from: "body".into(),
+                        to: "additional".into(),
+                        kind: bcode_workflow::EdgeKind::Direct,
+                        transform: None,
+                    },
+                },
+                bcode_workflow::WorkflowRunGraphEdit::AddEdge {
+                    edge_id: 3,
+                    edge: bcode_workflow::EdgeDefinition {
+                        from: "additional".into(),
+                        to: "evaluation".into(),
+                        kind: bcode_workflow::EdgeKind::Direct,
+                        transform: None,
+                    },
+                },
+            ],
+            reconciliation: vec![
+                bcode_workflow::WorkflowRunGraphReconciliation::RetainWithBindings {
+                    activation_id: body.activation_id.clone(),
+                    edge_ids: vec![0],
+                },
+            ],
+        };
+        store
+            .stage_run_graph_edit(&request, &authority, 20)
+            .expect("stage");
+        store
+            .publish_retained_leaf_run_graph_edit(&run.run_id, &request.mutation_id, &authority, 21)
+            .expect("publish");
+        drop(store);
+        let mut store = WorkflowStore::open_in_state_dir(temp.path()).expect("reopen");
+        store
+            .persist_validated_output(&ValidatedOutput {
+                output_id: "body-after-edit".into(),
+                run_id: run.run_id.clone(),
+                node_id: body.node_id,
+                activation_id: body.activation_id,
+                schema_id: body.node.output.type_name,
+                schema_version: 1,
+                value: run.input.expect("input"),
+                artifact_reference: None,
+                created_at_ms: 22,
+            })
+            .expect("body output");
+        settle_inserted_repeat_successors(&mut store, &run.run_id);
+    }
+
+    fn settle_inserted_repeat_successors(store: &mut WorkflowStore, run_id: &str) {
+        for expected in ["additional", "evaluation"] {
+            store
+                .settle_pending_control_nodes(run_id, 10, 23)
+                .expect("no early repeat");
+            assert!(
+                store
+                    .activation_admitted_graph_revision(
+                        run_id,
+                        "body",
+                        &activation_identity(run_id, "body", 1)
+                    )
+                    .expect("next iteration absent")
+                    .is_none()
+            );
+            let pending = store
+                .pending_activations(10)
+                .expect("pending")
+                .pop()
+                .expect("successor");
+            assert_eq!(pending.node_id, expected);
+            store
+                .persist_validated_output(&ValidatedOutput {
+                    output_id: format!("{expected}-output"),
+                    run_id: run_id.into(),
+                    node_id: pending.node_id,
+                    activation_id: pending.activation_id,
+                    schema_id: pending.node.output.type_name,
+                    schema_version: 1,
+                    value: pending.input.expect("successor input"),
+                    artifact_reference: None,
+                    created_at_ms: 24,
+                })
+                .expect("successor output");
+        }
+        store
+            .settle_pending_control_nodes(run_id, 10, 25)
+            .expect("repeat settlement");
+        assert_eq!(
+            store
+                .activation_admitted_graph_revision(
+                    run_id,
+                    "body",
+                    &activation_identity(run_id, "body", 1)
+                )
+                .expect("next iteration"),
+            Some(2)
+        );
+        assert_eq!(
+            store
+                .run_summary(run_id)
+                .expect("summary")
+                .expect("run")
+                .status,
+            RunStatus::Running
+        );
     }
 
     fn connected_publication_fixture() -> (

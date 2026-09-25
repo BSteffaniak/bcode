@@ -551,6 +551,9 @@ pub enum WorkflowDefinitionRequest {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RuntimeAndModelRequest {
     /// Accept exact cancellation intents using publication-specific authorization.
+    WorkflowDelegationPreflight {
+        plugin_id: String,
+    },
     AcceptWorkflowRunGraphPublication {
         request: bcode_workflow::WorkflowRunGraphEditBatch,
     },
@@ -1277,6 +1280,9 @@ impl RoutedRequest {
                     definition_id,
                     version,
                 },
+            )),
+            Request::WorkflowDelegationPreflight { plugin_id } => Self::RuntimeAndModel(Box::new(
+                RuntimeAndModelRequest::WorkflowDelegationPreflight { plugin_id },
             )),
             Request::AcceptWorkflowRunGraphPublication { request } => Self::RuntimeAndModel(
                 Box::new(RuntimeAndModelRequest::AcceptWorkflowRunGraphPublication { request }),

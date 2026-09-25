@@ -8,6 +8,19 @@ use std::collections::BTreeSet;
 
 const GRAPH_PAGE_LIMIT: usize = 100;
 
+const fn editable_connected_kind(kind: bcode_workflow::NodeKind) -> bool {
+    matches!(
+        kind,
+        bcode_workflow::NodeKind::Task
+            | bcode_workflow::NodeKind::Agent
+            | bcode_workflow::NodeKind::PluginBlock
+            | bcode_workflow::NodeKind::Input
+            | bcode_workflow::NodeKind::Approval
+            | bcode_workflow::NodeKind::Parallel
+            | bcode_workflow::NodeKind::WorkflowCall
+    )
+}
+
 #[cfg(test)]
 mod reconciliation_tests {
     use super::*;
@@ -990,6 +1003,7 @@ impl WorkflowStore {
              OR EXISTS(SELECT 1 FROM workflow_graph_edit_edges WHERE run_id = ?1 AND mutation_id = ?2 AND edge_json IS NOT NULL)",
             (run_id, mutation_id), |row| row.get(0),
         )?;
+        self.validate_published_capabilities(&request)?;
         self.validate_published_call_targets(&request)?;
         if connected {
             self.validate_connected_publication(&request)?;
@@ -997,6 +1011,41 @@ impl WorkflowStore {
         let revision =
             persist_graph_publication(transaction, &request, &retentions, created_at_ms)?;
         Ok(revision)
+    }
+
+    fn validate_published_capabilities(
+        &self,
+        request: &bcode_workflow::WorkflowRunGraphEditBatch,
+    ) -> Result<(), WorkflowStoreError> {
+        let run = self
+            .run_summary(&request.run_id)?
+            .ok_or_else(|| WorkflowStoreError::InvalidData("publication run missing".into()))?;
+        for edit in &request.edits {
+            let (bcode_workflow::WorkflowRunGraphEdit::AddNode { node, .. }
+            | bcode_workflow::WorkflowRunGraphEdit::ReplaceNode { node, .. }) = edit
+            else {
+                continue;
+            };
+            let capability = match node.kind {
+                bcode_workflow::NodeKind::Agent => {
+                    let config: bcode_workflow::WorkflowPromptConfiguration =
+                        serde_json::from_value(node.configuration.clone())?;
+                    config.tool_capability
+                }
+                bcode_workflow::NodeKind::PluginBlock => {
+                    let block: bcode_workflow::WorkflowBlockDefinition =
+                        serde_json::from_value(node.configuration.clone())?;
+                    block.authorization.capability
+                }
+                _ => bcode_workflow::WorkflowToolCapability::Disabled,
+            };
+            if capability > run.authorization_ceiling {
+                return Err(WorkflowStoreError::InvalidData(
+                    "published node requirements exceed run authorization ceiling".into(),
+                ));
+            }
+        }
+        Ok(())
     }
 
     fn validate_published_call_targets(
@@ -1035,11 +1084,12 @@ impl WorkflowStore {
         Ok(())
     }
 
-    // Connected publication admits direct chains with new targets or explicitly
-    // retained active targets behind unchanged incoming edges. Historical inputs and
-    // executables remain immutable; parallel controllers require further reconciliation.
+    // Connected publication admits direct dependencies, including one output feeding
+    // multiple new targets. Retained targets require unchanged incoming edges.
+    // Historical inputs and executables remain immutable; admitted parallel joins
+    // retain their executable and incoming-edge identities.
     #[allow(clippy::too_many_lines)]
-    fn validate_connected_publication(
+    pub(super) fn validate_connected_publication(
         &self,
         request: &bcode_workflow::WorkflowRunGraphEditBatch,
     ) -> Result<(), WorkflowStoreError> {
@@ -1055,6 +1105,8 @@ impl WorkflowStore {
                 "publication requires incremental graph validation".to_string(),
             ));
         }
+        let original_nodes = page.nodes.clone();
+        let original_edges = page.edges.clone();
         let mut nodes = page
             .nodes
             .into_iter()
@@ -1084,22 +1136,51 @@ impl WorkflowStore {
         }
         let invalid = || {
             WorkflowStoreError::InvalidData(
-            "connected publication requires direct chains with new or explicitly retained targets and no controllers".to_string(),
+            "connected publication requires direct schema-compatible dependencies and reconciled targets".to_string(),
         )
         };
-        if nodes.values().any(|(node, _)| {
-            !matches!(
-                node.kind,
-                bcode_workflow::NodeKind::Task
-                    | bcode_workflow::NodeKind::Agent
-                    | bcode_workflow::NodeKind::PluginBlock
-                    | bcode_workflow::NodeKind::Input
-                    | bcode_workflow::NodeKind::Approval
-                    | bcode_workflow::NodeKind::Parallel
-                    | bcode_workflow::NodeKind::WorkflowCall
-            )
+        for previous in original_nodes
+            .iter()
+            .filter(|record| !editable_connected_kind(record.node.kind))
+        {
+            if nodes
+                .get(&previous.node.id)
+                .is_none_or(|(node, entry)| node != &previous.node || *entry != previous.entry)
+            {
+                return Err(invalid());
+            }
+            for edge in original_edges.iter().filter(|edge| {
+                edge.edge.from == previous.node.id || edge.edge.to == previous.node.id
+            }) {
+                if edges.get(&edge.edge_id) != Some(&edge.edge) {
+                    return Err(invalid());
+                }
+            }
+            if edges.iter().any(|(id, edge)| {
+                (edge.from == previous.node.id || edge.to == previous.node.id)
+                    && !original_edges
+                        .iter()
+                        .any(|old| old.edge_id == *id && old.edge == *edge)
+            }) {
+                return Err(invalid());
+            }
+        }
+        for previous in original_edges.iter().filter(|record| {
+            record.edge.kind != bcode_workflow::EdgeKind::Direct || record.edge.transform.is_some()
         }) {
-            return Err(invalid());
+            if edges.get(&previous.edge_id) != Some(&previous.edge) {
+                return Err(invalid());
+            }
+        }
+        for (node, entry) in nodes.values() {
+            if !editable_connected_kind(node.kind) {
+                let previous = self
+                    .current_run_graph_node(&request.run_id, &node.id)?
+                    .ok_or_else(invalid)?;
+                if previous.node != *node || previous.entry != *entry {
+                    return Err(invalid());
+                }
+            }
         }
         let added = request
             .edits
@@ -1173,16 +1254,28 @@ impl WorkflowStore {
                 return Err(invalid());
             }
         }
-        let mut sources = BTreeSet::new();
         for (edge_id, edge) in &edges {
             let (source, _) = nodes.get(&edge.from).ok_or_else(invalid)?;
             let (target, entry) = nodes.get(&edge.to).ok_or_else(invalid)?;
-            if edge.kind != bcode_workflow::EdgeKind::Direct
-                || edge.transform.is_some()
-                || (target.kind != bcode_workflow::NodeKind::Parallel
-                    && source.output != target.input)
+            if edge.kind != bcode_workflow::EdgeKind::Direct || edge.transform.is_some() {
+                let previous = self
+                    .current_run_graph_edge(&request.run_id, *edge_id)?
+                    .ok_or_else(invalid)?;
+                if previous.edge != *edge {
+                    return Err(invalid());
+                }
+                for node in [source, target] {
+                    let previous = self
+                        .current_run_graph_node(&request.run_id, &node.id)?
+                        .ok_or_else(invalid)?;
+                    if previous.node != *node {
+                        return Err(invalid());
+                    }
+                }
+                continue;
+            }
+            if (target.kind != bcode_workflow::NodeKind::Parallel && source.output != target.input)
                 || *entry
-                || !sources.insert(&edge.from)
             {
                 return Err(invalid());
             }

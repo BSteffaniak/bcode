@@ -232,6 +232,35 @@ struct GoalSurface {
     source: Option<(String, String, u64)>,
     completion: Arc<Mutex<Option<GenerationResult>>>,
     live: Option<crate::goal_live::GenerationView>,
+    preflight_pending: bool,
+    preflight_completion: Arc<Mutex<Option<String>>>,
+}
+
+fn preflight_setup_summary(result: &bcode_workflow::WorkflowDelegationPreflight) -> String {
+    if delegation_preflight_message(result).is_err() {
+        return "Delegation check incompatible; /goal.preflight for details. No authority changed."
+            .into();
+    }
+    if result.plugin_loaded && result.staging_configured && result.publication_configured {
+        "Delegation prerequisites present (not an execution grant); /goal.preflight for details."
+            .into()
+    } else {
+        "Delegation prerequisites missing; /goal.preflight for remedies. No authority changed."
+            .into()
+    }
+}
+
+async fn preflight_message_with_timeout(
+    future: bcode_plugin_sdk::tui::PluginWorkflowDelegationPreflightFuture,
+    timeout: std::time::Duration,
+) -> String {
+    match tokio::time::timeout(timeout, future).await {
+        Ok(Ok(result)) => preflight_setup_summary(&result),
+        Ok(Err(error)) => format!(
+            "Delegation prerequisites could not be verified: {error}. No authority changed."
+        ),
+        Err(_) => "Delegation prerequisites could not be verified: check timed out; retry with Ctrl-D. No authority changed.".into(),
+    }
 }
 
 impl GoalSurface {
@@ -259,6 +288,8 @@ impl GoalSurface {
             source: None,
             completion: Arc::default(),
             live: None,
+            preflight_pending: false,
+            preflight_completion: Arc::default(),
         }
     }
 
@@ -385,6 +416,38 @@ impl GoalSurface {
             return Some(PluginTuiAction::None);
         }
         None
+    }
+
+    fn poll_preflight(&mut self) -> bool {
+        let result = self
+            .preflight_completion
+            .lock()
+            .expect("preflight completion")
+            .take();
+        if let Some(message) = result {
+            self.preflight_pending = false;
+            if matches!(self.phase, GoalPhase::Draft | GoalPhase::Generated) {
+                self.editor.status = message;
+                return true;
+            }
+        }
+        false
+    }
+
+    fn check_delegation(&mut self, host: &dyn PluginTuiHost) -> PluginTuiAction {
+        if self.preflight_pending {
+            return PluginTuiAction::None;
+        }
+        self.preflight_pending = true;
+        self.editor.status = "Checking delegation prerequisites… (advisory only)".into();
+        let future = host.workflow_delegation_preflight("bcode.workflow".into());
+        let completion = self.preflight_completion.clone();
+        host.spawn(Box::pin(async move {
+            let message =
+                preflight_message_with_timeout(future, std::time::Duration::from_secs(10)).await;
+            *completion.lock().expect("preflight completion") = Some(message);
+        }));
+        PluginTuiAction::Redraw
     }
 
     fn generate(&mut self, host: &dyn PluginTuiHost, review: bool) -> PluginTuiAction {
@@ -550,13 +613,16 @@ impl PluginTuiSurface for GoalSurface {
             live.poll(host);
         }
         let action = self.editor.poll(host);
+        let preflight_changed = self.poll_preflight();
         let result = self
             .completion
             .lock()
             .expect("goal generation completion")
             .take();
         let Some(result) = result else {
-            return if self.live.is_some() {
+            return if (self.live.is_some() || preflight_changed)
+                && matches!(action, PluginTuiAction::None | PluginTuiAction::Redraw)
+            {
                 PluginTuiAction::Redraw
             } else {
                 action
@@ -660,6 +726,12 @@ impl PluginTuiSurface for GoalSurface {
             return PluginTuiAction::Redraw;
         }
         if let Event::Key(stroke) = event {
+            if matches!(self.phase, GoalPhase::Draft | GoalPhase::Generated)
+                && stroke.key == KeyCode::Char('d')
+                && stroke.modifiers.ctrl
+            {
+                return self.check_delegation(host);
+            }
             if stroke.key == KeyCode::Escape && stroke.modifiers.is_empty() {
                 self.phase = GoalPhase::Closed;
                 return PluginTuiAction::Close { outcome: None };
@@ -854,6 +926,73 @@ mod tests {
         }
     }
 
+    #[test]
+    fn setup_preflight_summary_points_to_remedies_without_claiming_execution() {
+        for loaded in [false, true] {
+            for staging in [false, true] {
+                for publication in [false, true] {
+                    let result = bcode_workflow::WorkflowDelegationPreflight {
+                        version: 1,
+                        plugin_id: "bcode.workflow".into(),
+                        plugin_loaded: loaded,
+                        staging_configured: staging,
+                        publication_configured: publication,
+                    };
+                    let summary = preflight_setup_summary(&result);
+                    assert!(!summary.contains('\n'));
+                    assert!(summary.contains("/goal.preflight"));
+                    assert_eq!(
+                        summary.contains("present"),
+                        loaded && staging && publication
+                    );
+                    assert_eq!(
+                        summary.contains("missing"),
+                        !(loaded && staging && publication)
+                    );
+                    let mut incompatible = result;
+                    incompatible.version = 2;
+                    assert!(preflight_setup_summary(&incompatible).contains("incompatible"));
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn setup_preflight_times_out_without_claiming_readiness() {
+        let message = preflight_message_with_timeout(
+            Box::pin(std::future::pending()),
+            std::time::Duration::ZERO,
+        )
+        .await;
+        assert!(message.contains("timed out"));
+        assert!(message.contains("No authority changed"));
+        let mut surface = GoalSurface::new(None);
+        surface.preflight_pending = true;
+        *surface.preflight_completion.lock().unwrap() = Some(message);
+        assert!(surface.poll_preflight());
+        assert!(!surface.preflight_pending);
+        let host = Host::default();
+        surface.check_delegation(&host);
+        assert_eq!(host.tasks.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn setup_preflight_is_nonblocking_deduplicated_and_advisory() {
+        let host = Host::default();
+        let mut surface = GoalSurface::new(None);
+        surface.check_delegation(&host);
+        surface.check_delegation(&host);
+        assert_eq!(host.tasks.lock().unwrap().len(), 1);
+        assert!(surface.preflight_pending);
+        host.finish().await;
+        surface.poll(&host);
+        assert!(!surface.preflight_pending);
+        assert!(surface.editor.status.contains("could not be verified"));
+        assert_eq!(*host.generations.lock().unwrap(), 0);
+        assert_eq!(*host.created_sessions.lock().unwrap(), 0);
+        assert!(surface.phase == GoalPhase::Draft);
+    }
+
     #[tokio::test]
     async fn fresh_goal_creates_once_and_waits_for_attachment() {
         let host = Host::default();
@@ -882,6 +1021,27 @@ mod tests {
         surface.session_navigation_finished(session_id, Ok(()));
         surface.poll(&host);
         assert_eq!(*host.created_sessions.lock().unwrap(), 1);
+        assert_eq!(*host.generations.lock().unwrap(), 1);
+    }
+
+    #[tokio::test]
+    async fn preflight_completion_preserves_pending_session_navigation() {
+        let host = Host::default();
+        let mut surface = GoalSurface::new(None);
+        surface.editor.prompt = text_state("Implement a feature");
+        surface.generate(&host, false);
+        host.finish().await;
+        surface.poll(&host);
+        surface.poll(&host);
+        surface.check_delegation(&host);
+        host.finish().await;
+        let PluginTuiAction::OpenSession { session_id } = surface.poll(&host) else {
+            panic!("preflight redraw must not consume navigation");
+        };
+        assert!(!surface.preflight_pending);
+        assert_eq!(*host.generations.lock().unwrap(), 0);
+        surface.session_navigation_finished(session_id, Ok(()));
+        surface.poll(&host);
         assert_eq!(*host.generations.lock().unwrap(), 1);
     }
 

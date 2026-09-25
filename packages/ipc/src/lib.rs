@@ -1223,6 +1223,10 @@ pub enum Request {
     AcceptWorkflowRunGraphPublication {
         request: bcode_workflow::WorkflowRunGraphEditBatch,
     },
+    /// Inspect configured delegation prerequisites without granting execution authority.
+    WorkflowDelegationPreflight {
+        plugin_id: String,
+    },
 }
 
 /// Server stop request policy.
@@ -2402,6 +2406,10 @@ pub enum ResponsePayload {
     /// Lifecycle outcome of an accepted graph publication.
     WorkflowRunGraphPublicationAccepted {
         status: bcode_workflow::WorkflowRunGraphPublicationStatus,
+    },
+    /// Configured prerequisites only; not an execution grant.
+    WorkflowDelegationPreflight {
+        result: bcode_workflow::WorkflowDelegationPreflight,
     },
 }
 

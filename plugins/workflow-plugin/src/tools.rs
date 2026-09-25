@@ -8,18 +8,38 @@ use bcode_tool::{
 use bcode_workflow::{WORKFLOW_APPLICATION_INTERFACE_ID, WorkflowRunGraphEditBatch};
 use serde_json::json;
 
+mod task_group;
+const GROUP_NAME: &str = "workflow.stage_task_group";
+
 const CONTEXT_NAME: &str = "workflow.execution_context";
 const CONTEXT_OPERATION: &str = "execution_context";
+
+fn parse_context(
+    mut arguments: serde_json::Value,
+) -> Result<bcode_workflow::WorkflowExecutionContextRequest, String> {
+    arguments
+        .as_object_mut()
+        .ok_or("execution context request must be an object")?
+        .entry("limit")
+        .or_insert(json!(50));
+    let context: bcode_workflow::WorkflowExecutionContextRequest =
+        serde_json::from_value(arguments)
+            .map_err(|_| "invalid execution context request".to_owned())?;
+    if !(1..=100).contains(&context.limit) {
+        return Err("invalid execution context limit".into());
+    }
+    Ok(context)
+}
 
 fn context_definition() -> ToolDefinition {
     ToolDefinition {
         name: CONTEXT_NAME.to_owned(),
         description: "Read this active workflow execution's authenticated identity and bounded graph page. Omit revision and cursors initially; continue with the returned revision and last node/edge identities. Restart on revision conflict. This grants no mutation authority.".to_owned(),
         input_schema: json!({"type":"object", "additionalProperties":false,
-            "required":["limit"], "properties": {
+            "properties": {
                 "after_output_id":{"type":["string","null"], "description":"Exclusive last output ID. Outputs arriving behind the cursor require a fresh scan; this is not a durable event stream."},
                 "output_id":{"type":["string","null"], "description":"Exact canonical output identity from this run; returns checksum-verified value without opening artifacts."},
-                "limit":{"type":"integer", "minimum":1, "maximum":100},
+                "limit":{"type":"integer", "minimum":1, "maximum":100, "default":50},
                 "expected_revision":{"type":["integer","null"], "minimum":1},
                 "after_node_id":{"type":["string","null"]},
                 "after_edge_id":{"type":["integer","null"]}
@@ -28,6 +48,136 @@ fn context_definition() -> ToolDefinition {
 }
 
 const TASK_NAME: &str = "workflow.stage_agent_task";
+const PROMPT_TASK_NAME: &str = "workflow.stage_prompt_task";
+
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PromptTaskRequest {
+    run_id: String,
+    expected_revision: u64,
+    mutation_id: String,
+    task_id: String,
+    objective: String,
+    #[serde(default)]
+    acceptance_criteria: Vec<String>,
+    #[serde(default)]
+    tool_allowlist: Vec<String>,
+    #[serde(default)]
+    timeout_ms: Option<std::num::NonZeroU64>,
+    #[serde(default)]
+    model_selection: Option<task_group::ModelSelection>,
+    #[serde(default)]
+    context: bcode_workflow::PromptContextTarget,
+    #[serde(default)]
+    resources: Vec<bcode_workflow::ResourceClaim>,
+    agent_profile: String,
+    input: bcode_workflow::ValueSchema,
+    #[serde(default = "task_group::default_worker_output")]
+    output: bcode_workflow::ValueSchema,
+    entry: bool,
+    exit: bool,
+    #[serde(default)]
+    edges: Vec<AgentTaskEdge>,
+    #[serde(default)]
+    depends_on: Option<PromptTaskDependency>,
+    reconciliation: Vec<bcode_workflow::WorkflowRunGraphReconciliation>,
+}
+
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PromptTaskDependency {
+    node_id: String,
+    edge_id: u64,
+}
+
+fn prompt_task_definition() -> ToolDefinition {
+    ToolDefinition {
+        name: PROMPT_TASK_NAME.into(),
+        description: "Stage a read-only prompt task in this active workflow. Supply an objective, agent profile and typed input/output schemas, not a NodeDefinition. Defaults to a fresh model context in the run workspace; optional context selects pinned fork or sequential parent (never filesystem isolation). Entry tasks consume run input; other tasks require explicit dependency edges. Returns the exact candidate for separate authorized publication; does not dispatch or wait.".into(),
+        input_schema: json!({"type":"object","additionalProperties":false,
+            "required":["run_id","expected_revision","mutation_id","task_id","objective",
+                "agent_profile","input","entry","exit","reconciliation"],
+            "properties":{
+                "run_id":{"type":"string"},"expected_revision":{"type":"integer","minimum":1},
+                "mutation_id":{"type":"string"},"task_id":{"type":"string"},
+                "acceptance_criteria":{"type":"array","items":{"type":"string","minLength":1},"description":"Evidence requirements included in the task prompt; not an automatic completion verdict. Blank criteria reject."},
+                "timeout_ms":{"type":"integer","minimum":1,"description":"Positive per-task timeout; omission retains canonical default. Does not extend run allowances."},
+                "tool_allowlist":{"type":"array","items":{"type":"string","minLength":1},"description":"Restricts tools without granting authority. Empty retains normal agent-policy selection; blank entries reject."},
+                "model_selection":{"type":"object","additionalProperties":false,"required":["provider","model"],"properties":{"provider":{"type":"string","minLength":1},"model":{"type":"string","minLength":1}},"description":"Optional selection through normal model resolution; grants no capability or permission."},
+                "context":{"type":"string","enum":["fresh_isolated","fixed_generation_fork","shared_parent_sequential"],"default":"fresh_isolated","description":"Model context only, not filesystem isolation or authority. Fork uses pinned parent generation; shared parent executes sequentially."},
+                "resources":{"type":"array","description":"Canonical scheduler claims, not tool authority or filesystem isolation. Omission declares no claims.","items":{"type":"object","additionalProperties":false,"required":["resource","access"],"properties":{"resource":{"type":"string","minLength":1},"access":{"type":"string","enum":["read","write"]}}}},
+                "depends_on":{"type":"object","additionalProperties":false,"required":["node_id","edge_id"],"properties":{"node_id":{"type":"string","minLength":1},"edge_id":{"type":"integer","minimum":0}},"description":"Direct dependency on one existing source; requires entry:false. Input must match its output. Supply an unused edge ID. Does not remove existing successors or publish."},
+                "objective":{"type":"string","minLength":1},"agent_profile":{"type":"string","minLength":1},
+                "input":{"type":"object","description":"ValueSchema with type_name and schema"},
+                "output":{"type":"object","description":"Optional ValueSchema; omission uses bounded bcode.delegated_task_result.v1 with summary, evidence and blockers. Explicit null rejects."},
+                "entry":{"type":"boolean"},"exit":{"type":"boolean"},
+                "edges":{"type":"array"},"reconciliation":{"type":"array"}
+            }}),
+    }
+}
+
+fn parse_prompt_task(arguments: &serde_json::Value) -> Result<AgentTaskRequest, String> {
+    let mut task: PromptTaskRequest = serde_json::from_value(arguments.clone())
+        .map_err(|_| "invalid prompt task request".to_owned())?;
+    if let Some(dependency) = task.depends_on.take() {
+        if task.entry || dependency.node_id.trim().is_empty() || dependency.node_id == task.task_id
+        {
+            return Err("depends_on requires a non-entry task and distinct nonblank source".into());
+        }
+        task.edges.push(AgentTaskEdge {
+            edge_id: dependency.edge_id,
+            edge: bcode_workflow::EdgeDefinition {
+                from: dependency.node_id,
+                to: task.task_id.clone(),
+                kind: bcode_workflow::EdgeKind::Direct,
+                transform: None,
+            },
+        });
+    }
+    if task.objective.trim().is_empty() || task.agent_profile.trim().is_empty() {
+        return Err("prompt task requires an objective and agent profile".into());
+    }
+    let mut configuration = bcode_workflow::WorkflowPromptConfiguration::structured(
+        task.agent_profile,
+        task.output.clone(),
+        task_group::task_instructions(task.objective, &task.acceptance_criteria)?,
+    );
+    if task
+        .tool_allowlist
+        .iter()
+        .any(|tool| tool.trim().is_empty())
+    {
+        return Err("tool allowlist entries must not be empty".into());
+    }
+    configuration.execution_target = task.context;
+    configuration.tool_allowlist = task.tool_allowlist;
+    if let Some(timeout) = task.timeout_ms {
+        configuration.timeout_ms = timeout.get();
+    }
+    if let Some(selection) = task.model_selection {
+        configuration = selection.apply(configuration)?;
+    }
+    Ok(AgentTaskRequest {
+        run_id: task.run_id,
+        expected_revision: task.expected_revision,
+        mutation_id: task.mutation_id,
+        node: bcode_workflow::NodeDefinition {
+            id: task.task_id.clone(),
+            name: task.task_id,
+            kind: bcode_workflow::NodeKind::Agent,
+            dataflow: bcode_workflow::WorkflowNodeDataflowPolicy::Direct,
+            input: task.input,
+            output: task.output,
+            resources: task.resources,
+            configuration: serde_json::to_value(configuration)
+                .map_err(|error| error.to_string())?,
+        },
+        entry: task.entry,
+        exit: task.exit,
+        edges: task.edges,
+        reconciliation: task.reconciliation,
+    })
+}
 
 /// Plugin-owned shorthand; canonical graph publication still owns admission.
 #[derive(serde::Deserialize)]
@@ -71,11 +221,18 @@ fn parse_tool_edit(
     name: &str,
     arguments: &serde_json::Value,
 ) -> Result<WorkflowRunGraphEditBatch, String> {
-    if name != TASK_NAME {
+    if name == GROUP_NAME {
+        return task_group::parse(arguments);
+    }
+    if name != TASK_NAME && name != PROMPT_TASK_NAME {
         return parse_edit(arguments);
     }
-    let task: AgentTaskRequest = serde_json::from_value(arguments.clone())
-        .map_err(|_| "invalid agent task request".to_owned())?;
+    let task: AgentTaskRequest = if name == PROMPT_TASK_NAME {
+        parse_prompt_task(arguments)?
+    } else {
+        serde_json::from_value(arguments.clone())
+            .map_err(|_| "invalid agent task request".to_owned())?
+    };
     if task.node.kind != bcode_workflow::NodeKind::Agent {
         return Err("agent task requires an Agent node".to_owned());
     }
@@ -117,21 +274,21 @@ fn acceptance_definition() -> ToolDefinition {
     ToolDefinition {
         name: ACCEPT_NAME.to_owned(),
         description: "Accept an exact staged workflow edit requiring cancellation of receipt-backed work. Requires publication authorization. Acceptance durably requests cancellation; it does not mean the graph is published. Retry the identical candidate to observe its status while this execution remains active. A conflict preserves cancellation already requested and requires an explicitly revised candidate, never a silent rebase.".to_owned(),
-        input_schema: definition().input_schema,
+        input_schema: edit_input_schema(),
     }
 }
 
 fn publication_definition() -> ToolDefinition {
     ToolDefinition {
         name: PUBLISH_NAME.to_owned(),
-        description: "Publish an exact previously staged workflow edit for this active execution. Requires separate publication authorization and explicit active-work reconciliation. Preserve the staged edit and mutation_id exactly when retrying; unsupported topology is rejected.".to_owned(),
-        input_schema: definition().input_schema,
+        description: "Publish the exact edit returned by staging for this active execution, using edit directly (or legacy edit_json). Requires separate publication authorization and explicit active-work reconciliation. Preserve the staged edit and mutation_id exactly when retrying; unsupported topology is rejected.".to_owned(),
+        input_schema: edit_input_schema(),
     }
 }
 
 fn operation(name: &str) -> Result<&'static str, String> {
     match name {
-        NAME | TASK_NAME => Ok(OPERATION),
+        NAME | TASK_NAME | PROMPT_TASK_NAME | GROUP_NAME => Ok(OPERATION),
         PUBLISH_NAME => Ok(PUBLISH_OPERATION),
         ACCEPT_NAME => Ok(ACCEPT_OPERATION),
         _ => Err("unsupported workflow tool".to_owned()),
@@ -141,20 +298,35 @@ fn operation(name: &str) -> Result<&'static str, String> {
 fn definition() -> ToolDefinition {
     ToolDefinition {
         name: NAME.to_owned(),
-        description: "Stage a revision-checked edit for the workflow run owning this active execution. Requires workflow application authorization. Does not publish or execute topology. Supply a serialized WorkflowRunGraphEditBatch as edit_json; preserve mutation_id when retrying.".to_owned(),
-        input_schema: json!({"type":"object", "additionalProperties":false,
-            "required":["edit_json"], "properties":{"edit_json":{"type":"string",
-            "description":"JSON WorkflowRunGraphEditBatch: version, run_id, mutation_id, expected_revision, edits, reconciliation."}}}),
+        description: "Stage a revision-checked edit for the workflow run owning this active execution. Requires workflow application authorization. Does not publish or execute topology. Supply a WorkflowRunGraphEditBatch as edit (or legacy edit_json); preserve mutation_id when retrying.".to_owned(),
+        input_schema: edit_input_schema(),
     }
 }
 
+fn edit_input_schema() -> serde_json::Value {
+    json!({"type":"object","additionalProperties":false,
+        "properties":{"edit":{"type":"object","description":"Exact edit object returned by staging; do not modify it."},
+        "edit_json":{"type":"string","description":"Legacy JSON-encoded WorkflowRunGraphEditBatch."}},
+        "oneOf":[{"required":["edit"]},{"required":["edit_json"]}]})
+}
+
 fn parse_edit(arguments: &serde_json::Value) -> Result<WorkflowRunGraphEditBatch, String> {
-    let text = arguments
-        .get("edit_json")
-        .and_then(serde_json::Value::as_str)
-        .ok_or_else(|| "edit_json must be a string".to_owned())?;
-    let edit: WorkflowRunGraphEditBatch = serde_json::from_str(text)
-        .map_err(|_| "invalid workflow edit representation".to_owned())?;
+    let envelope = arguments
+        .as_object()
+        .ok_or("workflow edit request must be an object")?;
+    if envelope
+        .keys()
+        .any(|key| key != "edit" && key != "edit_json")
+    {
+        return Err("unknown workflow edit request field".into());
+    }
+    let edit: WorkflowRunGraphEditBatch = match (arguments.get("edit"), arguments.get("edit_json"))
+    {
+        (Some(edit), None) => serde_json::from_value(edit.clone()),
+        (None, Some(serde_json::Value::String(text))) => serde_json::from_str(text),
+        _ => return Err("supply exactly one of edit or edit_json".into()),
+    }
+    .map_err(|_| "invalid workflow edit representation".to_owned())?;
     edit.validate()
         .map_err(|_| "invalid workflow edit facts".to_owned())?;
     Ok(edit)
@@ -170,6 +342,8 @@ pub fn invoke(context: &NativeServiceContext) -> ServiceResponse {
                 acceptance_definition(),
                 context_definition(),
                 task_definition(),
+                prompt_task_definition(),
+                task_group::definition(),
             ],
         }),
         bcode_tool::OP_PREPARE_TOOL => prepare_tool_service_response(
@@ -180,6 +354,8 @@ pub fn invoke(context: &NativeServiceContext) -> ServiceResponse {
                 acceptance_definition(),
                 context_definition(),
                 task_definition(),
+                prompt_task_definition(),
+                task_group::definition(),
             ],
             |request, _| {
                 let is_context = request.invocation.tool_name == CONTEXT_NAME;
@@ -189,12 +365,7 @@ pub fn invoke(context: &NativeServiceContext) -> ServiceResponse {
                     operation(&request.invocation.tool_name)?
                 };
                 let payload = if is_context {
-                    let context: bcode_workflow::WorkflowExecutionContextRequest =
-                        serde_json::from_value(request.invocation.arguments.clone())
-                            .map_err(|_| "invalid execution context request".to_owned())?;
-                    if !(1..=100).contains(&context.limit) {
-                        return Err("invalid execution context limit".to_owned());
-                    }
+                    let context = parse_context(request.invocation.arguments.clone())?;
                     serde_json::to_value(context).map_err(|error| error.to_string())?
                 } else {
                     serde_json::to_value(parse_tool_edit(
@@ -264,9 +435,7 @@ fn invoke_context(
     context: &NativeServiceContext,
     request: ToolInvocationRequest,
 ) -> ServiceResponse {
-    let Ok(query) = serde_json::from_value::<bcode_workflow::WorkflowExecutionContextRequest>(
-        request.arguments,
-    ) else {
+    let Ok(query) = parse_context(request.arguments) else {
         return ServiceResponse::error("invalid_request", "invalid execution context request");
     };
     let Ok(payload) = serde_json::to_value(query) else {
@@ -397,7 +566,10 @@ fn invoke_edit(context: &NativeServiceContext) -> ServiceResponse {
                 acceptance_response(payload)
             } else if operation == PUBLISH_OPERATION {
                 publication_response(&payload)
-            } else if request.name == TASK_NAME {
+            } else if matches!(
+                request.name.as_str(),
+                TASK_NAME | PROMPT_TASK_NAME | GROUP_NAME
+            ) {
                 task_staging_response(payload, &edit)
             } else {
                 staging_response(payload)
@@ -518,6 +690,238 @@ mod tests {
     use super::*;
 
     #[test]
+    fn prompt_task_defaults_output_without_changing_explicit_contracts() {
+        let mut arguments = json!({"run_id":"run","expected_revision":1,"mutation_id":"proposal",
+            "task_id":"review","objective":"Review correctness.","agent_profile":"plan",
+            "input":{"type_name":"bool","schema":{"type":"boolean"}},
+            "entry":true,"exit":true,"reconciliation":[]});
+        let default = parse_prompt_task(&arguments).expect("default output");
+        assert_eq!(default.node.output, task_group::default_worker_output());
+        arguments["output"] = json!(task_group::default_worker_output());
+        assert_eq!(default.node, parse_prompt_task(&arguments).unwrap().node);
+        arguments["output"] = serde_json::Value::Null;
+        assert!(parse_prompt_task(&arguments).is_err());
+    }
+
+    #[test]
+    fn prompt_task_delivers_acceptance_criteria_and_rejects_blank_entries() {
+        let mut arguments = json!({"run_id":"run","expected_revision":1,"mutation_id":"proposal",
+            "task_id":"review","objective":"Review correctness.","agent_profile":"plan",
+            "input":{"type_name":"bool","schema":{"type":"boolean"}},
+            "entry":true,"exit":true,"reconciliation":[],
+            "acceptance_criteria":["Verify 日本語", "Quote \"evidence\""]});
+        let task = parse_prompt_task(&arguments).unwrap();
+        let config: bcode_workflow::WorkflowPromptConfiguration =
+            serde_json::from_value(task.node.configuration).unwrap();
+        assert_eq!(
+            config.system_prompt,
+            task_group::task_instructions(
+                "Review correctness.".into(),
+                &["Verify 日本語".into(), "Quote \"evidence\"".into()]
+            )
+            .unwrap()
+        );
+        assert!(config.read_only);
+        for invalid in [json!([" "]), json!([null]), json!(null)] {
+            arguments["acceptance_criteria"] = invalid;
+            assert!(parse_prompt_task(&arguments).is_err());
+        }
+    }
+
+    #[test]
+    fn prompt_task_preserves_restrictions_without_elevating_authority() {
+        let mut arguments = json!({"run_id":"run","expected_revision":1,"mutation_id":"proposal",
+            "task_id":"review","objective":"Review correctness.","agent_profile":"plan",
+            "input":{"type_name":"bool","schema":{"type":"boolean"}},
+            "entry":true,"exit":true,"reconciliation":[],
+            "timeout_ms":1234,"tool_allowlist":["filesystem.read"]});
+        let task = parse_prompt_task(&arguments).unwrap();
+        let config: bcode_workflow::WorkflowPromptConfiguration =
+            serde_json::from_value(task.node.configuration).unwrap();
+        assert_eq!(config.timeout_ms, 1234);
+        assert_eq!(config.tool_allowlist, vec!["filesystem.read"]);
+        assert!(config.read_only);
+        assert_eq!(
+            config.tool_capability,
+            bcode_workflow::WorkflowToolCapability::ReadOnly
+        );
+        for (field, value) in [
+            ("timeout_ms", json!(0)),
+            ("timeout_ms", json!(-1)),
+            ("tool_allowlist", json!([" "])),
+            ("tool_allowlist", json!(null)),
+        ] {
+            let mut invalid = arguments.clone();
+            invalid[field] = value;
+            assert!(parse_prompt_task(&invalid).is_err());
+        }
+        arguments.as_object_mut().unwrap().remove("timeout_ms");
+        arguments.as_object_mut().unwrap().remove("tool_allowlist");
+        let task = parse_prompt_task(&arguments).unwrap();
+        let config: bcode_workflow::WorkflowPromptConfiguration =
+            serde_json::from_value(task.node.configuration).unwrap();
+        assert!(config.timeout_ms > 0);
+        assert!(config.tool_allowlist.is_empty());
+    }
+
+    #[test]
+    fn prompt_task_model_selection_lowers_without_local_resolution() {
+        let mut arguments = json!({"run_id":"run","expected_revision":1,"mutation_id":"proposal",
+            "task_id":"review","objective":"Review correctness.","agent_profile":"plan",
+            "input":{"type_name":"bool","schema":{"type":"boolean"}},
+            "entry":true,"exit":true,"reconciliation":[],
+            "model_selection":{"provider":"selected-provider","model":"selected-model"}});
+        let task = parse_prompt_task(&arguments).unwrap();
+        let config: bcode_workflow::WorkflowPromptConfiguration =
+            serde_json::from_value(task.node.configuration).unwrap();
+        assert_eq!(config.provider.as_deref(), Some("selected-provider"));
+        assert_eq!(config.model.as_deref(), Some("selected-model"));
+        assert!(config.read_only);
+        for invalid in [
+            json!({"provider":"", "model":"m"}),
+            json!({"provider":"p", "model":" "}),
+            json!({"provider":"p"}),
+            json!({"provider":"p","model":"m","secret":"x"}),
+        ] {
+            arguments["model_selection"] = invalid;
+            assert!(parse_prompt_task(&arguments).is_err());
+        }
+    }
+
+    #[test]
+    fn prompt_task_context_selection_preserves_read_only_authority() {
+        let mut arguments = json!({"run_id":"run","expected_revision":1,"mutation_id":"proposal",
+            "task_id":"review","objective":"Review correctness.","agent_profile":"plan",
+            "input":{"type_name":"bool","schema":{"type":"boolean"}},
+            "entry":true,"exit":true,"reconciliation":[]});
+        for context in [
+            bcode_workflow::PromptContextTarget::FreshIsolated,
+            bcode_workflow::PromptContextTarget::FixedGenerationFork,
+            bcode_workflow::PromptContextTarget::SharedParentSequential,
+        ] {
+            arguments["context"] = json!(context);
+            let task = parse_prompt_task(&arguments).unwrap();
+            let config: bcode_workflow::WorkflowPromptConfiguration =
+                serde_json::from_value(task.node.configuration).unwrap();
+            assert_eq!(config.execution_target, context);
+            assert!(config.read_only);
+            assert_eq!(
+                config.tool_capability,
+                bcode_workflow::WorkflowToolCapability::ReadOnly
+            );
+        }
+        for invalid in [json!("future"), json!(null)] {
+            arguments["context"] = invalid;
+            assert!(parse_prompt_task(&arguments).is_err());
+        }
+    }
+
+    #[test]
+    fn prompt_task_resource_claims_do_not_grant_mutation() {
+        let mut arguments = json!({"run_id":"run","expected_revision":1,"mutation_id":"proposal",
+            "task_id":"review","objective":"Review correctness.","agent_profile":"plan",
+            "input":{"type_name":"bool","schema":{"type":"boolean"}},
+            "entry":true,"exit":true,"reconciliation":[],
+            "resources":[{"resource":"repository","access":"write"}]});
+        let edit = parse_tool_edit(PROMPT_TASK_NAME, &arguments).unwrap();
+        let bcode_workflow::WorkflowRunGraphEdit::AddNode { node, .. } = &edit.edits[0] else {
+            panic!("agent node");
+        };
+        assert_eq!(
+            node.resources,
+            vec![bcode_workflow::ResourceClaim::write("repository")]
+        );
+        let config: bcode_workflow::WorkflowPromptConfiguration =
+            serde_json::from_value(node.configuration.clone()).unwrap();
+        assert!(config.read_only);
+        assert_eq!(
+            config.tool_capability,
+            bcode_workflow::WorkflowToolCapability::ReadOnly
+        );
+        arguments["resources"][0]["access"] = json!("future");
+        assert!(parse_tool_edit(PROMPT_TASK_NAME, &arguments).is_err());
+        arguments.as_object_mut().unwrap().remove("resources");
+        assert!(
+            parse_prompt_task(&arguments)
+                .unwrap()
+                .node
+                .resources
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn prompt_task_dependency_lowers_to_direct_edge() {
+        let mut arguments = json!({"run_id":"run","expected_revision":1,"mutation_id":"proposal",
+            "task_id":"review","objective":"Review correctness.","agent_profile":"plan",
+            "input":{"type_name":"bool","schema":{"type":"boolean"}},
+            "entry":false,"exit":true,"reconciliation":[],
+            "depends_on":{"node_id":"planner","edge_id":42}});
+        let edit = parse_tool_edit(PROMPT_TASK_NAME, &arguments).unwrap();
+        assert_eq!(
+            edit.edits[1],
+            bcode_workflow::WorkflowRunGraphEdit::AddEdge {
+                edge_id: 42,
+                edge: bcode_workflow::EdgeDefinition {
+                    from: "planner".into(),
+                    to: "review".into(),
+                    kind: bcode_workflow::EdgeKind::Direct,
+                    transform: None,
+                }
+            }
+        );
+        arguments["entry"] = json!(true);
+        assert!(parse_tool_edit(PROMPT_TASK_NAME, &arguments).is_err());
+        arguments["entry"] = json!(false);
+        for source in [" ", "review"] {
+            arguments["depends_on"]["node_id"] = json!(source);
+            assert!(parse_tool_edit(PROMPT_TASK_NAME, &arguments).is_err());
+        }
+    }
+
+    #[test]
+    fn prompt_task_lowers_to_read_only_canonical_agent() {
+        let arguments = json!({"run_id":"run","expected_revision":1,"mutation_id":"proposal",
+            "task_id":"review","objective":"Review correctness and return findings.",
+            "agent_profile":"plan", "input":{"type_name":"bool","schema":{"type":"boolean"}},
+            "output":{"type_name":"bool","schema":{"type":"boolean"}},
+            "entry":true,"exit":true,"reconciliation":[]});
+        let edit = parse_tool_edit(PROMPT_TASK_NAME, &arguments).expect("lower task");
+        assert_eq!(
+            edit,
+            parse_tool_edit(PROMPT_TASK_NAME, &arguments).expect("retry")
+        );
+        assert_eq!(operation(PROMPT_TASK_NAME).expect("route"), OPERATION);
+        let bcode_workflow::WorkflowRunGraphEdit::AddNode { node, entry, exit } = &edit.edits[0]
+        else {
+            panic!("agent addition");
+        };
+        assert!(*entry && *exit);
+        assert_eq!(node.id, "review");
+        let config: bcode_workflow::WorkflowPromptConfiguration =
+            serde_json::from_value(node.configuration.clone()).expect("prompt config");
+        assert!(config.read_only);
+        assert_eq!(config.agent_profile, "plan");
+        assert_eq!(
+            config.execution_target,
+            bcode_workflow::PromptContextTarget::FreshIsolated
+        );
+        assert_eq!(
+            config.tool_capability,
+            bcode_workflow::WorkflowToolCapability::ReadOnly
+        );
+        for (field, value) in [
+            ("objective", json!("  ")),
+            ("agent_profile", json!("")),
+            ("read_only", json!(false)),
+        ] {
+            let mut invalid = arguments.clone();
+            invalid[field] = value;
+            assert!(parse_tool_edit(PROMPT_TASK_NAME, &invalid).is_err());
+        }
+    }
+
+    #[test]
     fn acceptance_response_preserves_lifecycle_semantics() {
         for (payload, expected) in [
             (
@@ -571,6 +975,31 @@ mod tests {
     }
 
     #[test]
+    fn execution_context_default_is_bounded_and_strict() {
+        assert_eq!(
+            parse_context(json!({})).expect("default"),
+            parse_context(json!({"limit":50})).expect("explicit")
+        );
+        for limit in [1, 100] {
+            assert_eq!(
+                parse_context(json!({"limit":limit}))
+                    .expect("bounded")
+                    .limit,
+                limit
+            );
+        }
+        for invalid in [
+            json!([]),
+            json!({"limit":null}),
+            json!({"limit":0}),
+            json!({"limit":101}),
+            json!({"future":true}),
+        ] {
+            assert!(parse_context(invalid).is_err());
+        }
+    }
+
+    #[test]
     fn staging_tool_validates_current_edit_contract() {
         let batch = WorkflowRunGraphEditBatch {
             version: bcode_workflow::WORKFLOW_RUN_GRAPH_EDIT_VERSION,
@@ -580,6 +1009,25 @@ mod tests {
             edits: vec![bcode_workflow::WorkflowRunGraphEdit::RemoveEdge { edge_id: 0 }],
             reconciliation: vec![],
         };
+        assert_eq!(
+            parse_edit(&json!({"edit": batch.clone()})).expect("structured edit"),
+            batch
+        );
+        assert!(
+            parse_edit(
+                &json!({"edit": batch, "edit_json": serde_json::to_string(&batch).expect("batch")})
+            )
+            .is_err()
+        );
+        assert!(parse_edit(&json!({"edit": null})).is_err());
+        assert!(parse_edit(&json!({"edit": batch, "authorize": true})).is_err());
+        assert!(
+            parse_edit(
+                &json!({"edit_json": serde_json::to_string(&batch).expect("batch"), "future": {}})
+            )
+            .is_err()
+        );
+        assert!(parse_edit(&json!([])).is_err());
         let arguments = json!({"edit_json": serde_json::to_string(&batch).expect("batch")});
         assert_eq!(parse_edit(&arguments).expect("valid edit"), batch);
         assert!(parse_edit(&json!({"edit_json":"not json"})).is_err());

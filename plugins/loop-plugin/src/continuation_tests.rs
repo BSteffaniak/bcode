@@ -72,6 +72,57 @@ fn source(progress: bool) -> bcode_workflow::WorkflowContinuationSource {
 }
 
 #[test]
+fn graph_allowance_counts_initialization_once_and_excludes_controls() {
+    let input = LoopWorkflowInput::new("implement".into(), "done".into(), 2).unwrap();
+    let plain = loop_workflow_spec(&input).unwrap();
+    let goal = goal_workflow_spec(&input).unwrap();
+    assert_eq!(executable_node_count(plain.definition()).unwrap(), 2);
+    assert_eq!(executable_node_count(goal.definition()).unwrap(), 3);
+    let mut revised = goal.definition().clone();
+    let mut worker = revised.nodes["loop.implementation"].clone();
+    worker.id = "worker".into();
+    revised.nodes.insert(worker.id.clone(), worker);
+    assert_eq!(executable_node_count(&revised).unwrap(), 4);
+}
+
+#[test]
+fn continuation_budgets_reachable_delegated_agents() {
+    let mut source = source(false);
+    let mut worker = source.definition.nodes["loop.implementation"].clone();
+    worker.id = "delegated-worker".into();
+    source.definition.nodes.insert(worker.id.clone(), worker);
+    let edge = source
+        .definition
+        .edges
+        .iter_mut()
+        .find(|edge| edge.from == "loop.implementation" && edge.to == "loop.evaluation")
+        .expect("evaluation edge");
+    edge.to = "delegated-worker".into();
+    source
+        .definition
+        .edges
+        .push(bcode_workflow::EdgeDefinition {
+            from: "delegated-worker".into(),
+            to: "loop.evaluation".into(),
+            kind: bcode_workflow::EdgeKind::Direct,
+            transform: None,
+        });
+    let retry_allowance = u64::from(source.limits.retry_cap) + 1;
+    let continued = request(source, 3).expect("continue revised loop");
+    assert_eq!(
+        continued.successor.limits.node_execution_cap,
+        3 * 3 * retry_allowance
+    );
+    assert!(
+        continued
+            .successor
+            .definition
+            .nodes
+            .contains_key("delegated-worker")
+    );
+}
+
+#[test]
 fn continuation_reserves_judgement_node_and_keeps_selected_config() {
     let mut source = source(false);
     let config = crate::judgement_evaluation::parse_config("bcode.jev/jev-1.13.0/-/90/pause")

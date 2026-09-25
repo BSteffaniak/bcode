@@ -6019,6 +6019,7 @@ const fn request_kind(request: &Request) -> &'static str {
         Request::StartWorkflowRun(_) => "start_workflow_run",
         Request::ListWorkflowDefinitions { .. } => "list_workflow_definitions",
         Request::DescribeWorkflowDefinition { .. } => "describe_workflow_definition",
+        Request::WorkflowDelegationPreflight { .. } => "workflow_delegation_preflight",
         Request::AcceptWorkflowRunGraphPublication { .. } => {
             "accept_workflow_run_graph_publication"
         }
@@ -7838,6 +7839,38 @@ async fn handle_workflow_run_request(
 ) -> Result<(), ServerError> {
     state.require_workflow_store()?;
     match request {
+        RuntimeAndModelRequest::WorkflowDelegationPreflight { plugin_id } => {
+            if plugin_id.is_empty() || plugin_id.len() > 128 {
+                return Err(ServerError::WorkflowApplicationOperationUnauthorized(
+                    "invalid plugin identity".into(),
+                ));
+            }
+            let result = bcode_workflow::WorkflowDelegationPreflight {
+                version: 1,
+                plugin_loaded: state
+                    .plugins
+                    .registry()
+                    .manifests()
+                    .contains_key(&plugin_id),
+                staging_configured: state
+                    .startup_config
+                    .workflows
+                    .run_edit_plugins
+                    .contains(&plugin_id),
+                publication_configured: state
+                    .startup_config
+                    .workflows
+                    .run_publication_plugins
+                    .contains(&plugin_id),
+                plugin_id,
+            };
+            send_response(
+                writer,
+                request_id,
+                Response::Ok(ResponsePayload::WorkflowDelegationPreflight { result }),
+            )
+            .await
+        }
         RuntimeAndModelRequest::AcceptWorkflowRunGraphPublication { request } => {
             let status =
                 Box::pin(state.accept_workflow_run_graph_publication(client_id, request)).await?;
@@ -39024,9 +39057,20 @@ mod tests {
         let workflow_root = tempfile::tempdir().expect("workflow root");
         let store = bcode_workflow_store::WorkflowStore::open_in_state_dir(workflow_root.path())
             .expect("workflow store");
-        let state = Arc::new(test_server_state_with_fake_provider_and_workflow_store(
+        let mut state = Arc::new(test_server_state_with_fake_provider_and_workflow_store(
             sessions, store,
         ));
+        Arc::get_mut(&mut state)
+            .expect("exclusive state")
+            .startup_config
+            .workflows
+            .run_edit_plugins = BTreeSet::from(["staging.only".into(), "both.grants".into()]);
+        Arc::get_mut(&mut state)
+            .expect("exclusive state")
+            .startup_config
+            .workflows
+            .run_publication_plugins =
+            BTreeSet::from(["publication.only".into(), "both.grants".into()]);
         let socket_dir = tempfile::tempdir().expect("IPC socket directory");
         let endpoint = bcode_ipc::IpcEndpoint::unix_socket(socket_dir.path().join("server.sock"));
         let listener = LocalIpcListener::bind(&endpoint).expect("IPC listener");
@@ -39041,6 +39085,40 @@ mod tests {
             }
         });
         let client = bcode_client::BcodeClient::new(endpoint);
+        let preflight = client
+            .workflow_delegation_preflight("bcode.fake-provider".into())
+            .await
+            .expect("preflight");
+        assert!(preflight.plugin_loaded);
+        assert!(!preflight.staging_configured);
+        assert!(!preflight.publication_configured);
+        let missing = client
+            .workflow_delegation_preflight("missing.plugin".into())
+            .await
+            .expect("missing plugin");
+        assert!(!missing.plugin_loaded);
+        assert!(
+            client
+                .workflow_delegation_preflight(String::new())
+                .await
+                .is_err()
+        );
+        for (plugin, staging, publication) in [
+            ("staging.only", true, false),
+            ("publication.only", false, true),
+            ("both.grants", true, true),
+        ] {
+            let result = client
+                .workflow_delegation_preflight(plugin.into())
+                .await
+                .expect("configured preflight");
+            assert!(
+                !result.plugin_loaded,
+                "configuration does not load a plugin"
+            );
+            assert_eq!(result.staging_configured, staging);
+            assert_eq!(result.publication_configured, publication);
+        }
         let document = test_workflow_authoring_document();
         let workflow_id = document.workflow_id.clone();
         let catalog = client.workflow_authoring_catalog().await.expect("catalog");
@@ -53219,6 +53297,19 @@ library = "test"
         effect: bcode_workflow_store::DispatchSideEffect,
         connected: bool,
     ) -> (ServerState, SessionId, tempfile::TempDir) {
+        active_edit_execution_fixture_with_ceiling(
+            effect,
+            connected,
+            bcode_workflow::WorkflowToolCapability::Mutating,
+        )
+        .await
+    }
+
+    async fn active_edit_execution_fixture_with_ceiling(
+        effect: bcode_workflow_store::DispatchSideEffect,
+        connected: bool,
+        ceiling: bcode_workflow::WorkflowToolCapability,
+    ) -> (ServerState, SessionId, tempfile::TempDir) {
         let root = tempfile::tempdir().expect("root");
         let sessions = publication_fixture_sessions(root.path(), connected);
         let parent = sessions
@@ -53249,7 +53340,7 @@ library = "test"
                     profile_id: "build".to_owned(),
                     policy_digest_sha256: "a".repeat(64),
                 },
-                authorization_ceiling: bcode_workflow::WorkflowToolCapability::Mutating,
+                authorization_ceiling: ceiling,
                 limits: bcode_workflow_store::WorkflowRunLimits::default(),
             })
             .expect("run");
@@ -53405,16 +53496,34 @@ library = "test"
 
     #[tokio::test]
     async fn registered_workflow_tool_reads_authenticated_execution_context() {
+        Box::pin(assert_registered_execution_context(
+            serde_json::json!({"limit":1}),
+            1,
+        ))
+        .await;
+    }
+
+    #[tokio::test]
+    async fn registered_workflow_tool_defaults_authenticated_execution_context() {
+        Box::pin(assert_registered_execution_context(
+            serde_json::json!({}),
+            50,
+        ))
+        .await;
+    }
+
+    async fn assert_registered_execution_context(arguments: serde_json::Value, limit: usize) {
         let (mut state, child_id, _root) = active_edit_execution_fixture().await;
         register_workflow_publication_tool(&mut state);
         let call = bcode_model::ToolCall {
             id: "context-read".to_owned(),
             name: "workflow.execution_context".to_owned(),
-            arguments: serde_json::json!({"limit":1}),
+            arguments,
         };
         let (tool, preparation) = prepare_server_tool(&state, child_id, &call)
             .await
             .expect("prepare context");
+        assert_eq!(preparation.descriptor["edit"]["limit"], limit);
         let metadata = tool_policy_authorization_metadata(&preparation.authorization, &call.name)
             .expect("read facts");
         assert!(!metadata.requires_permission);
@@ -53439,7 +53548,7 @@ library = "test"
             serde_json::from_str(&response.output).expect("typed context");
         assert_eq!(context.run_id, "edit-run");
         assert_eq!(context.graph.revision, 1);
-        assert!(context.graph.nodes.len() <= 1);
+        assert!(context.graph.nodes.len() <= limit);
         assert!(
             serde_json::from_value::<bcode_workflow::WorkflowExecutionContextRequest>(
                 serde_json::json!({"limit":1,"run_id":"foreign-run"})
@@ -53450,6 +53559,20 @@ library = "test"
 
     #[tokio::test]
     async fn registered_workflow_tool_stages_agent_task_candidate() {
+        Box::pin(assert_registered_task_staging(false, true)).await;
+    }
+
+    #[tokio::test]
+    async fn registered_workflow_tool_stages_prompt_task_candidate() {
+        Box::pin(assert_registered_task_staging(true, true)).await;
+    }
+
+    #[tokio::test]
+    async fn registered_workflow_tool_denies_prompt_task_without_staging() {
+        Box::pin(assert_registered_task_staging(true, false)).await;
+    }
+
+    async fn assert_registered_task_staging(prompt: bool, allow: bool) {
         let (mut state, child_id, _root) = active_edit_execution_fixture().await;
         register_workflow_publication_tool(&mut state);
         let provenance = state
@@ -53460,63 +53583,24 @@ library = "test"
             .execution
             .expect("execution")
             .provenance;
-        let edit = publication_leaf_edit(provenance.activation_id.expect("activation"));
-        let bcode_workflow::WorkflowRunGraphEdit::AddNode { node, entry, exit } = &edit.edits[0]
-        else {
-            panic!("agent task");
-        };
-        let call = bcode_model::ToolCall {
-            id: "stage-task".to_owned(),
-            name: "workflow.stage_agent_task".to_owned(),
-            arguments: serde_json::json!({"run_id":edit.run_id,"expected_revision":edit.expected_revision,
-                "mutation_id":edit.mutation_id,"node":node,"entry":entry,"exit":exit,
-                "reconciliation":edit.reconciliation}),
-        };
-        let (tool, preparation) = prepare_server_tool(&state, child_id, &call)
-            .await
-            .expect("prepare task");
-        let metadata = tool_policy_authorization_metadata(&preparation.authorization, &call.name)
-            .expect("facts");
-        assert!(metadata.requires_permission);
-        let cancel = TurnCancelState::default();
-        let approve = async {
-            loop {
-                let pending = state
-                    .pending_permissions
-                    .lock()
-                    .await
-                    .values()
-                    .next()
-                    .cloned();
-                if let Some(pending) = pending {
-                    state
-                        .pending_permissions
-                        .lock()
-                        .await
-                        .remove(&pending.summary.permission_id);
-                    *pending.decision.lock().await = Some(true);
-                    pending.notify.notify_waiters();
-                    break;
-                }
-                tokio::task::yield_now().await;
-            }
-        };
-        let (response, ()) = tokio::time::timeout(Duration::from_secs(10), async {
-            tokio::join!(
-                invoke_prepared_tool_for_test(
-                    &state,
-                    child_id,
-                    &call,
-                    tool,
-                    preparation,
-                    &metadata,
-                    &cancel
-                ),
-                approve
-            )
-        })
-        .await
-        .expect("deadline");
+        let (edit, call) = task_staging_call(provenance.activation_id.expect("activation"), prompt);
+        let response = invoke_task_with_permission(&state, child_id, &call, allow).await;
+        if !allow {
+            assert!(response.is_err() || response.as_ref().is_ok_and(|result| result.is_error));
+            let store = state.workflow_store.lock().expect("store");
+            let authority = store
+                .execution_authority("edit-run")
+                .expect("authority")
+                .expect("owner");
+            assert!(
+                store
+                    .staged_run_graph_edit("edit-run", &edit.mutation_id, &authority)
+                    .expect("candidate lookup")
+                    .is_none()
+            );
+            drop(store);
+            return;
+        }
         let response = response.expect("transport");
         assert!(!response.is_error, "{}", response.output);
         let result: serde_json::Value =
@@ -53541,6 +53625,199 @@ library = "test"
         assert_eq!(staged, Some(edit));
     }
 
+    async fn invoke_task_with_permission(
+        state: &ServerState,
+        session_id: SessionId,
+        call: &bcode_model::ToolCall,
+        allow: bool,
+    ) -> Result<ToolInvocationResponse, String> {
+        let (tool, preparation) = prepare_server_tool(state, session_id, call)
+            .await
+            .expect("prepare task");
+        let metadata = tool_policy_authorization_metadata(&preparation.authorization, &call.name)
+            .expect("facts");
+        assert!(metadata.requires_permission);
+        let cancel = TurnCancelState::default();
+        let decide = async {
+            loop {
+                let pending = state
+                    .pending_permissions
+                    .lock()
+                    .await
+                    .values()
+                    .next()
+                    .cloned();
+                if let Some(pending) = pending {
+                    state
+                        .pending_permissions
+                        .lock()
+                        .await
+                        .remove(&pending.summary.permission_id);
+                    *pending.decision.lock().await = Some(allow);
+                    pending.notify.notify_waiters();
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        };
+        let (result, ()) = tokio::time::timeout(Duration::from_secs(10), async {
+            tokio::join!(
+                invoke_prepared_tool_for_test(
+                    state,
+                    session_id,
+                    call,
+                    tool,
+                    preparation,
+                    &metadata,
+                    &cancel
+                ),
+                decide
+            )
+        })
+        .await
+        .expect("permission deadline");
+        result
+    }
+
+    fn task_staging_call(
+        activation_id: String,
+        prompt: bool,
+    ) -> (
+        bcode_workflow::WorkflowRunGraphEditBatch,
+        bcode_model::ToolCall,
+    ) {
+        let mut edit = publication_leaf_edit(activation_id);
+        let bcode_workflow::WorkflowRunGraphEdit::AddNode { node, entry, exit } =
+            &mut edit.edits[0]
+        else {
+            panic!("agent task");
+        };
+        let (name, arguments) = if prompt {
+            node.configuration =
+                serde_json::to_value(bcode_workflow::WorkflowPromptConfiguration::structured(
+                    "plan",
+                    node.output.clone(),
+                    "Review the supplied evidence.",
+                ))
+                .expect("configuration");
+            (
+                "workflow.stage_prompt_task",
+                serde_json::json!({
+                    "run_id":edit.run_id,"expected_revision":edit.expected_revision,
+                    "mutation_id":edit.mutation_id,"task_id":node.id,
+                    "objective":"Review the supplied evidence.","agent_profile":"plan",
+                    "input":node.input,"output":node.output,"entry":entry,"exit":exit,
+                    "reconciliation":edit.reconciliation
+                }),
+            )
+        } else {
+            (
+                "workflow.stage_agent_task",
+                serde_json::json!({
+                    "run_id":edit.run_id,"expected_revision":edit.expected_revision,
+                    "mutation_id":edit.mutation_id,"node":node,"entry":entry,"exit":exit,
+                    "reconciliation":edit.reconciliation
+                }),
+            )
+        };
+        (
+            edit,
+            bcode_model::ToolCall {
+                id: "stage-task".into(),
+                name: name.into(),
+                arguments,
+            },
+        )
+    }
+
+    #[tokio::test]
+    async fn mutating_group_publication_respects_read_only_run_ceiling() {
+        let (mut state, session, _root) = Box::pin(active_edit_execution_fixture_with_ceiling(
+            bcode_workflow_store::DispatchSideEffect::ReadOnly,
+            false,
+            bcode_workflow::WorkflowToolCapability::ReadOnly,
+        ))
+        .await;
+        register_workflow_publication_tool(&mut state);
+        let (sender, _receiver) = mpsc::channel(4);
+        state.workflow_driver_sender.set(sender).expect("queue");
+        let activation = state
+            .sessions
+            .session_summary(session)
+            .await
+            .expect("session")
+            .execution
+            .expect("execution")
+            .provenance
+            .activation_id
+            .expect("activation");
+        let schema = serde_json::json!({"type_name":"boolean","schema":{"type":"boolean"}});
+        let task = |id| {
+            serde_json::json!({"task_id":id,"objective":"Implement task","agent_profile":"build",
+            "output":schema,"read_only":false})
+        };
+        let call = bcode_model::ToolCall {
+            id: "mutating-group".into(),
+            name: "workflow.stage_task_group".into(),
+            arguments: serde_json::json!({"run_id":"edit-run","expected_revision":1,"mutation_id":"mutating-group",
+                "input":schema,"tasks":[task("a"),task("b")],"join_id":"join","continuation":task("resume"),
+                "first_edge_id":0,"reconciliation":[{"kind":"retain","activation_id":activation}]}),
+        };
+        let mut call = call;
+        call.arguments["reconciliation"] = serde_json::to_value(vec![
+            bcode_workflow::WorkflowRunGraphReconciliation::Retain {
+                activation_id: activation,
+            },
+        ])
+        .expect("retention");
+        let response = Box::pin(invoke_task_with_permission(&state, session, &call, true))
+            .await
+            .expect("staging");
+        assert!(!response.is_error, "{}", response.output);
+        let result: serde_json::Value = serde_json::from_str(&response.output).expect("result");
+        let edit = serde_json::from_value(result["edit"].clone()).expect("candidate");
+        let publication = state
+            .publish_workflow_run_graph_edit_from_invocation(
+                session,
+                "bcode.workflow",
+                edit,
+                &TurnCancelState::default(),
+            )
+            .await;
+        assert!(
+            publication.is_err(),
+            "read-only ceiling must reject mutating publication"
+        );
+        let store = state.workflow_store.lock().expect("store");
+        assert_eq!(
+            store.run_graph_revision("edit-run").expect("revision"),
+            Some(1)
+        );
+        assert_eq!(
+            store
+                .attempt_history("edit-run", None, 10)
+                .expect("attempts")
+                .len(),
+            1
+        );
+        drop(store);
+    }
+
+    fn staging_publication_arguments(
+        edit: &bcode_workflow::WorkflowRunGraphEditBatch,
+    ) -> [(&'static str, serde_json::Value); 2] {
+        [
+            (
+                "workflow.stage_run_graph_edit",
+                serde_json::json!({"edit_json": serde_json::to_string(edit).expect("edit")}),
+            ),
+            (
+                "workflow.publish_run_graph_edit",
+                serde_json::json!({"edit": edit}),
+            ),
+        ]
+    }
+
     #[tokio::test]
     async fn registered_workflow_tool_stages_active_execution() {
         let (mut state, child_id, _root) = active_edit_execution_fixture().await;
@@ -53556,14 +53833,11 @@ library = "test"
             .expect("execution")
             .provenance;
         let edit = publication_leaf_edit(provenance.activation_id.expect("activation"));
-        for name in [
-            "workflow.stage_run_graph_edit",
-            "workflow.publish_run_graph_edit",
-        ] {
+        for (name, arguments) in staging_publication_arguments(&edit) {
             let call = bcode_model::ToolCall {
                 id: name.to_owned(),
                 name: name.to_owned(),
-                arguments: serde_json::json!({"edit_json":serde_json::to_string(&edit).expect("edit")}),
+                arguments,
             };
             let (tool, preparation) = tokio::time::timeout(
                 Duration::from_secs(10),
@@ -53695,12 +53969,12 @@ library = "test"
 
     #[tokio::test]
     async fn local_publication_uses_configured_grant_at_application_boundary() {
-        assert_local_publication_worker(false).await;
+        Box::pin(assert_local_publication_worker(false, false)).await;
     }
 
     #[tokio::test]
     async fn connected_local_publication_executes_chain_after_lost_wake() {
-        assert_local_publication_worker(true).await;
+        Box::pin(assert_local_publication_worker(true, false)).await;
     }
 
     fn add_publication_chain(edit: &mut bcode_workflow::WorkflowRunGraphEditBatch) {
@@ -53757,8 +54031,392 @@ library = "test"
         drop(store);
     }
 
-    async fn assert_local_publication_worker(connected: bool) {
-        let (mut state, child_id, _root) = active_edit_execution_fixture().await;
+    #[tokio::test]
+    async fn published_workers_join_before_coordinator_resumes() {
+        Box::pin(assert_local_publication_worker(false, true)).await;
+    }
+
+    #[tokio::test]
+    async fn published_single_worker_resumes_coordinator() {
+        Box::pin(assert_local_publication_worker(true, true)).await;
+    }
+
+    fn add_publication_workers(edit: &mut bcode_workflow::WorkflowRunGraphEditBatch) {
+        use bcode_workflow::{NodeKind, WorkflowRunGraphEdit};
+        let WorkflowRunGraphEdit::AddNode { node, exit, .. } = &mut edit.edits[0] else {
+            panic!("worker entry");
+        };
+        *exit = false;
+        let mut right = node.clone();
+        right.id = "right".into();
+        right.name = "right".into();
+        let mut coordinator = node.clone();
+        coordinator.id = "coordinator".into();
+        coordinator.name = "coordinator".into();
+        let pair = bcode_workflow::ValueSchema {
+            type_name: "boolean-pair".into(),
+            schema: serde_json::json!({"type":"array", "prefixItems":[
+                {"type":"boolean"},{"type":"boolean"}], "minItems":2,"maxItems":2}),
+        };
+        coordinator.input = pair.clone();
+        let mut join = coordinator.clone();
+        join.id = "join".into();
+        join.name = "join".into();
+        join.kind = NodeKind::Parallel;
+        join.output = pair;
+        join.configuration = serde_json::json!({"failure_policy":"wait_all",
+            "left_exits":["next"],"right_exits":["right"]});
+        for (node, entry, exit) in [
+            (right, true, false),
+            (join, false, false),
+            (coordinator, false, true),
+        ] {
+            edit.edits
+                .push(WorkflowRunGraphEdit::AddNode { node, entry, exit });
+        }
+        for (edge_id, from, to) in [
+            (0, "next", "join"),
+            (1, "right", "join"),
+            (2, "join", "coordinator"),
+        ] {
+            edit.edits.push(WorkflowRunGraphEdit::AddEdge {
+                edge_id,
+                edge: bcode_workflow::EdgeDefinition {
+                    from: from.into(),
+                    to: to.into(),
+                    kind: bcode_workflow::EdgeKind::Direct,
+                    transform: None,
+                },
+            });
+        }
+    }
+
+    async fn stage_group_through_tool(
+        state: &ServerState,
+        session_id: SessionId,
+        source: &bcode_workflow::WorkflowRunGraphEditBatch,
+        single_worker: bool,
+        serialized: bool,
+    ) -> bcode_workflow::WorkflowRunGraphEditBatch {
+        let schema = serde_json::json!({"type_name":"boolean","schema":{"type":"boolean"}});
+        let task = |id| {
+            serde_json::json!({"task_id":id,"objective":"Return true.","agent_profile":"plan","output":schema,
+                "model_selection":{"provider":"bcode.fake-provider","model":"fake-echo"}})
+        };
+        let mut arguments = serde_json::json!({"run_id":source.run_id,"expected_revision":source.expected_revision,
+                "mutation_id":source.mutation_id,"input":schema,"tasks":[task("next"),task("right"),task("third")],
+                "join_id":"join","continuation":task("coordinator"),"first_edge_id":1,"source_node_id":"agent",
+                "reconnect":{"edge_id":0,"node_id":"waiting-successor"},"include_source_output":true});
+        if serialized {
+            for task in arguments["tasks"].as_array_mut().expect("tasks") {
+                task["resources"] =
+                    serde_json::json!([{"resource":"shared-workspace", "access":"write"}]);
+            }
+        }
+        if single_worker {
+            arguments["tasks"]
+                .as_array_mut()
+                .expect("tasks")
+                .truncate(1);
+        }
+        let bcode_workflow::WorkflowRunGraphReconciliation::Retain { activation_id } =
+            &source.reconciliation[0]
+        else {
+            panic!("retained source");
+        };
+        arguments["reconciliation"] = serde_json::to_value(vec![
+            bcode_workflow::WorkflowRunGraphReconciliation::RetainWithBindings {
+                activation_id: activation_id.clone(),
+                edge_ids: if single_worker {
+                    vec![1, 2]
+                } else {
+                    vec![1, 2, 3, 8]
+                },
+            },
+        ])
+        .expect("bindings");
+        let call = bcode_model::ToolCall {
+            id: "stage-group".into(),
+            name: "workflow.stage_task_group".into(),
+            arguments,
+        };
+        let denied = invoke_task_with_permission(state, session_id, &call, false).await;
+        assert!(denied.is_err() || denied.as_ref().is_ok_and(|response| response.is_error));
+        {
+            let store = state.workflow_store.lock().expect("store");
+            let authority = store
+                .execution_authority(&source.run_id)
+                .expect("authority")
+                .expect("owner");
+            assert!(
+                store
+                    .staged_run_graph_edit(&source.run_id, &source.mutation_id, &authority)
+                    .expect("candidate lookup")
+                    .is_none(),
+                "denial must not stage a task group"
+            );
+            drop(store);
+        }
+        let response = invoke_task_with_permission(state, session_id, &call, true)
+            .await
+            .expect("invoke");
+        assert!(!response.is_error, "{}", response.output);
+        let result: serde_json::Value = serde_json::from_str(&response.output).expect("response");
+        assert_eq!(result["published"], false);
+        serde_json::from_value(result["edit"].clone()).expect("exact candidate")
+    }
+
+    fn configure_publication_tasks(
+        edit: &mut bcode_workflow::WorkflowRunGraphEditBatch,
+        connected: bool,
+        parallel: bool,
+    ) -> &'static str {
+        if parallel {
+            add_publication_workers(edit);
+            "coordinator"
+        } else if connected {
+            add_publication_chain(edit);
+            "last"
+        } else {
+            "next"
+        }
+    }
+
+    #[tokio::test]
+    async fn published_workers_serialize_exclusive_resource_claims() {
+        Box::pin(assert_local_publication_worker_with_resources(
+            false, true, true,
+        ))
+        .await;
+    }
+
+    async fn assert_local_publication_worker(connected: bool, parallel: bool) {
+        Box::pin(assert_local_publication_worker_with_resources(
+            connected, parallel, false,
+        ))
+        .await;
+    }
+
+    #[tokio::test]
+    async fn replacement_owner_executes_single_worker_followup() {
+        Box::pin(assert_local_publication_worker_with_replacement(
+            true,
+            true,
+            false,
+            PublicationOwner::Replacement,
+        ))
+        .await;
+    }
+
+    #[tokio::test]
+    async fn replacement_owner_serializes_published_task_group() {
+        Box::pin(assert_local_publication_worker_with_replacement(
+            false,
+            true,
+            true,
+            PublicationOwner::Replacement,
+        ))
+        .await;
+    }
+
+    #[tokio::test]
+    async fn replacement_owner_executes_published_task_group() {
+        Box::pin(assert_local_publication_worker_with_replacement(
+            false,
+            true,
+            false,
+            PublicationOwner::Replacement,
+        ))
+        .await;
+    }
+
+    async fn assert_local_publication_worker_with_resources(
+        connected: bool,
+        parallel: bool,
+        serialized: bool,
+    ) {
+        Box::pin(assert_local_publication_worker_with_replacement(
+            connected,
+            parallel,
+            serialized,
+            PublicationOwner::Original,
+        ))
+        .await;
+    }
+
+    #[tokio::test]
+    async fn published_group_does_not_dispatch_after_source_failure() {
+        Box::pin(assert_group_source_blocked(
+            bcode_workflow_store::AttemptObservation::Failed {
+                message: "coordinator could not complete".into(),
+            },
+            "failed",
+        ))
+        .await;
+    }
+
+    #[tokio::test]
+    async fn published_group_does_not_dispatch_after_source_cancellation() {
+        Box::pin(assert_group_source_blocked(
+            bcode_workflow_store::AttemptObservation::Cancelled,
+            "cancelled",
+        ))
+        .await;
+    }
+
+    #[tokio::test]
+    async fn published_group_does_not_dispatch_after_unknown_source_outcome() {
+        Box::pin(assert_group_source_blocked(
+            bcode_workflow_store::AttemptObservation::Unknown,
+            "repair_required",
+        ))
+        .await;
+    }
+
+    #[tokio::test]
+    async fn replacement_owner_preserves_cancelled_group_source() {
+        Box::pin(assert_group_source_blocked_with_owner(
+            bcode_workflow_store::AttemptObservation::Cancelled,
+            "cancelled",
+            PublicationOwner::Replacement,
+        ))
+        .await;
+    }
+
+    #[tokio::test]
+    async fn replacement_owner_preserves_failed_group_source() {
+        Box::pin(assert_group_source_blocked_with_owner(
+            bcode_workflow_store::AttemptObservation::Failed {
+                message: "source failed".into(),
+            },
+            "failed",
+            PublicationOwner::Replacement,
+        ))
+        .await;
+    }
+
+    #[tokio::test]
+    async fn replacement_owner_preserves_unknown_group_source() {
+        Box::pin(assert_group_source_blocked_with_owner(
+            bcode_workflow_store::AttemptObservation::Unknown,
+            "repair_required",
+            PublicationOwner::Replacement,
+        ))
+        .await;
+    }
+
+    async fn assert_group_source_blocked(
+        observation: bcode_workflow_store::AttemptObservation,
+        expected_status: &str,
+    ) {
+        Box::pin(assert_group_source_blocked_with_owner(
+            observation,
+            expected_status,
+            PublicationOwner::Original,
+        ))
+        .await;
+    }
+
+    async fn assert_group_source_blocked_with_owner(
+        observation: bcode_workflow_store::AttemptObservation,
+        expected_status: &str,
+        owner: PublicationOwner,
+    ) {
+        let (mut state, session, _root) = active_edit_execution_fixture_with_graph(
+            bcode_workflow_store::DispatchSideEffect::ReadOnly,
+            true,
+        )
+        .await;
+        admit_publication_author(&state, session);
+        register_workflow_publication_tool(&mut state);
+        let (sender, mut queued) = mpsc::channel(1);
+        state.workflow_driver_sender.set(sender).expect("queue");
+        let source = state
+            .workflow_store
+            .lock()
+            .expect("store")
+            .attempt_history("edit-run", None, 10)
+            .expect("attempts")
+            .remove(0);
+        let edit = stage_group_through_tool(
+            &state,
+            session,
+            &publication_leaf_edit(source.activation_id),
+            false,
+            false,
+        )
+        .await;
+        state.set_workflow_run_graph_publication_policy(WorkflowRunGraphPublicationPolicy {
+            evaluator: Arc::new(|_| WorkflowApplicationAuthorizationDecision::Allow),
+        });
+        let mut state = Arc::new(state);
+        publish_and_discard_wakes(&state, edit, &mut queued).await;
+        let (path, authority) = {
+            let store = state.workflow_store.lock().expect("store");
+            (
+                store.path().to_path_buf(),
+                store
+                    .execution_authority("edit-run")
+                    .expect("authority")
+                    .expect("owner"),
+            )
+        };
+        persist_workflow_prompt_completion(
+            &path,
+            &source.dispatch_identity,
+            &authority,
+            observation,
+        )
+        .await
+        .expect("source outcome");
+        replace_receipt_fixture_owner(&mut state, owner.is_replacement()).await;
+        for _ in 0..2 {
+            drive_workflow_run(&state, "edit-run")
+                .await
+                .expect("drive failed source");
+        }
+        let store = bcode_workflow_store::WorkflowStore::open_at_path(&path).expect("reopen");
+        let attempts = store
+            .attempt_history("edit-run", None, 100)
+            .expect("attempts");
+        assert_eq!(
+            attempts.len(),
+            1,
+            "dependent work must not dispatch: {attempts:?}"
+        );
+        assert_eq!(attempts[0].status, expected_status);
+        assert!(
+            store
+                .validated_outputs("edit-run", 10)
+                .expect("outputs")
+                .is_empty()
+        );
+        drop(store);
+        drop(state);
+    }
+
+    enum PublicationOwner {
+        Original,
+        Replacement,
+    }
+
+    impl PublicationOwner {
+        const fn is_replacement(&self) -> bool {
+            matches!(self, Self::Replacement)
+        }
+    }
+
+    async fn assert_local_publication_worker_with_replacement(
+        connected: bool,
+        parallel: bool,
+        serialized: bool,
+        owner: PublicationOwner,
+    ) {
+        let (mut state, child_id, _root) = active_edit_execution_fixture_with_graph(
+            bcode_workflow_store::DispatchSideEffect::ReadOnly,
+            parallel,
+        )
+        .await;
         admit_publication_author(&state, child_id);
         let (sender, mut queued) = mpsc::channel(1);
         state.workflow_driver_sender.set(sender).expect("queue");
@@ -53772,19 +54430,22 @@ library = "test"
             .expect("execution")
             .provenance;
         let mut edit = publication_leaf_edit(provenance.activation_id.expect("activation"));
-        if connected {
-            add_publication_chain(&mut edit);
-        }
-        let final_node = if connected { "last" } else { "next" };
-        state
-            .stage_workflow_run_graph_edit_from_invocation(
-                child_id,
-                "bcode.workflow",
-                edit.clone(),
-                &TurnCancelState::default(),
-            )
-            .await
-            .expect("stage");
+        let final_node = if parallel {
+            edit = stage_group_through_tool(&state, child_id, &edit, connected, serialized).await;
+            "waiting-successor"
+        } else {
+            let final_node = configure_publication_tasks(&mut edit, connected, parallel);
+            state
+                .stage_workflow_run_graph_edit_from_invocation(
+                    child_id,
+                    "bcode.workflow",
+                    edit.clone(),
+                    &TurnCancelState::default(),
+                )
+                .await
+                .expect("stage");
+            final_node
+        };
         state.set_workflow_run_graph_publication_policy(WorkflowRunGraphPublicationPolicy {
             evaluator: Arc::new(|facts| {
                 workflow_operations::authorize_configured_run_graph_publication(
@@ -53795,15 +54456,15 @@ library = "test"
             }),
         });
         let mut state = Arc::new(state);
-        state
-            .publish_workflow_run_graph_edit(ClientId::new(), edit)
-            .await
-            .expect("publication queued");
-        assert_eq!(queued.try_recv().expect("discard wake"), "edit-run");
+        publish_and_discard_wakes(&state, edit, &mut queued).await;
+        if parallel {
+            settle_group_source(&state).await;
+        }
         Arc::get_mut(&mut state)
             .expect("exclusive state")
             .workflow_driver_sender
             .take();
+        replace_receipt_fixture_owner(&mut state, owner.is_replacement()).await;
         state.start_workflow_driver().await;
         let dispatched = tokio::time::timeout(Duration::from_secs(10), async {
             loop {
@@ -53847,12 +54508,235 @@ library = "test"
             panic!("published entry settled by worker: {error}; attempts: {attempts:?}")
         });
         assert_eq!(attempt.status, "succeeded", "{attempt:?}");
-        assert!(
-            outputs
-                .iter()
-                .any(|output| output.node_id == final_node
-                    && output.value == serde_json::json!(true))
+        assert_publication_tasks_execute_once(connected, parallel, &attempts, &outputs);
+        assert_exclusive_workers_do_not_overlap(&attempts, serialized);
+    }
+
+    fn assert_exclusive_workers_do_not_overlap(
+        attempts: &[bcode_workflow::AttemptSummary],
+        serialized: bool,
+    ) {
+        if !serialized {
+            return;
+        }
+        let mut workers: Vec<_> = attempts
+            .iter()
+            .filter(|attempt| matches!(attempt.node_id.as_str(), "next" | "right" | "third"))
+            .collect();
+        workers.sort_by_key(|attempt| attempt.prepared_at_ms);
+        assert_eq!(workers.len(), 3);
+        for pair in workers.windows(2) {
+            assert!(
+                pair[1].prepared_at_ms >= pair[0].terminal_at_ms.expect("settled worker"),
+                "exclusive resource holders must not overlap: {pair:?}"
+            );
+        }
+    }
+
+    async fn publish_and_discard_wakes(
+        state: &Arc<ServerState>,
+        edit: bcode_workflow::WorkflowRunGraphEditBatch,
+        queued: &mut mpsc::Receiver<String>,
+    ) {
+        // Retry after a lost response; neither publication may duplicate execution.
+        for _ in 0..2 {
+            state
+                .publish_workflow_run_graph_edit(ClientId::new(), edit.clone())
+                .await
+                .expect("publication queued");
+            assert_eq!(queued.try_recv().expect("discard wake"), "edit-run");
+        }
+    }
+
+    async fn settle_group_source(state: &Arc<ServerState>) {
+        drive_workflow_run(state, "edit-run")
+            .await
+            .expect("drive unsettled source");
+        let attempts = state
+            .workflow_store
+            .lock()
+            .expect("store")
+            .attempt_history("edit-run", None, 100)
+            .expect("attempts");
+        assert_eq!(
+            attempts.len(),
+            1,
+            "workers must not dispatch before source settles"
         );
+        let source = &attempts[0];
+        assert_eq!(source.node_id, "agent");
+        let observation = Box::pin(execute_publication_owner_turn(
+            state,
+            &source.dispatch_identity,
+            source.activation_id.clone(),
+        ))
+        .await;
+        assert!(matches!(
+            observation,
+            bcode_workflow_store::AttemptObservation::Succeeded { .. }
+        ));
+        let source_session = {
+            let store = state.workflow_store.lock().expect("store");
+            store
+                .execution_session_link("edit-run", "agent", &source.activation_id, 1)
+                .expect("link")
+                .expect("source session")
+                .session_id
+        }
+        .parse::<SessionId>()
+        .expect("session id");
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while state.sessions.session_is_owned(source_session).await {
+                tokio::task::yield_now().await;
+            }
+        }).await.expect("completed coordinator must automatically release execution-session ownership while workers run");
+        let (path, authority) = {
+            let store = state.workflow_store.lock().expect("store");
+            (
+                store.path().to_path_buf(),
+                store
+                    .execution_authority("edit-run")
+                    .expect("authority")
+                    .expect("owner"),
+            )
+        };
+        let mut stale_authority = authority.clone();
+        stale_authority.fencing_token.push_str("-stale");
+        assert!(
+            persist_workflow_prompt_completion(
+                &path,
+                &source.dispatch_identity,
+                &stale_authority,
+                observation.clone(),
+            )
+            .await
+            .is_err(),
+            "stale coordinator must not settle the source"
+        );
+        let after_rejection = state
+            .workflow_store
+            .lock()
+            .expect("store")
+            .attempt_history("edit-run", None, 100)
+            .expect("attempts");
+        assert_eq!(
+            after_rejection.len(),
+            1,
+            "rejected settlement cannot dispatch workers"
+        );
+        assert_eq!(
+            after_rejection[0].status, source.status,
+            "rejected settlement must preserve source state"
+        );
+        assert_source_terminal_delivery(
+            state,
+            &path,
+            &source.dispatch_identity,
+            &authority,
+            observation,
+        )
+        .await;
+    }
+
+    async fn assert_source_terminal_delivery(
+        state: &ServerState,
+        path: &Path,
+        identity: &str,
+        authority: &bcode_workflow_store::WorkflowExecutionAuthority,
+        observation: bcode_workflow_store::AttemptObservation,
+    ) {
+        persist_workflow_prompt_completion(path, identity, authority, observation.clone())
+            .await
+            .expect("initial settlement");
+        for update in [
+            observation,
+            bcode_workflow_store::AttemptObservation::Running,
+        ] {
+            // Terminal attempts are no longer receipt-reconciliation candidates. Rejection is
+            // safe, but must not be mistaken for an idempotent success acknowledgment.
+            assert!(
+                persist_workflow_prompt_completion(path, identity, authority, update)
+                    .await
+                    .is_err()
+            );
+        }
+        let settled = state
+            .workflow_store
+            .lock()
+            .expect("store")
+            .attempt_history("edit-run", None, 100)
+            .expect("attempts");
+        assert_eq!(
+            settled.len(),
+            1,
+            "completion delivery must not create another source attempt"
+        );
+        assert_eq!(
+            settled[0].status, "succeeded",
+            "late running observation cannot reopen terminal source"
+        );
+    }
+
+    fn assert_publication_tasks_execute_once(
+        connected: bool,
+        parallel: bool,
+        attempts: &[bcode_workflow::AttemptSummary],
+        outputs: &[bcode_workflow::ValidatedOutput],
+    ) {
+        if parallel {
+            let coordinator = attempts
+                .iter()
+                .find(|attempt| attempt.node_id == "coordinator")
+                .expect("coordinator");
+            let successor = attempts
+                .iter()
+                .find(|attempt| attempt.node_id == "waiting-successor")
+                .expect("successor");
+            assert!(
+                successor.prepared_at_ms
+                    >= coordinator.terminal_at_ms.expect("settled coordinator")
+            );
+            if connected {
+                assert!(outputs.iter().any(|output| output.node_id == "join.context"
+                    && output.value == serde_json::json!([true, true])));
+                assert!(!outputs.iter().any(|output| output.node_id == "join"));
+            } else {
+                assert!(outputs.iter().any(|output| output.node_id == "join.context"
+                    && output.value == serde_json::json!([true, [[true, true], true]])));
+                assert!(outputs.iter().any(|output| output.node_id == "join"
+                    && output.value == serde_json::json!([[true, true], true])));
+            }
+        }
+        let nodes: &[&str] = if parallel && connected {
+            &["next", "coordinator", "waiting-successor"]
+        } else if parallel {
+            &["next", "right", "third", "coordinator", "waiting-successor"]
+        } else if connected {
+            &["next", "last"]
+        } else {
+            &["next"]
+        };
+        for &node_id in nodes {
+            assert_eq!(
+                attempts
+                    .iter()
+                    .filter(|attempt| attempt.node_id == node_id)
+                    .count(),
+                1,
+                "duplicate publication must execute {node_id} exactly once: {attempts:?}"
+            );
+            assert_eq!(
+                outputs
+                    .iter()
+                    .filter(|output| output.node_id == node_id)
+                    .count(),
+                1,
+                "each delegated node must produce one canonical output"
+            );
+            assert!(outputs.iter().any(|output| {
+                output.node_id == node_id && output.value == serde_json::json!(true)
+            }));
+        }
     }
 
     #[tokio::test]
@@ -54680,6 +55564,176 @@ library = "test"
     }
 
     #[tokio::test]
+    async fn completed_source_turn_recovers_missing_workflow_receipt() {
+        assert_completed_source_receipt_recovery(false).await;
+    }
+
+    #[tokio::test]
+    async fn replacement_owner_recovers_completed_source_receipt() {
+        assert_completed_source_receipt_recovery(true).await;
+    }
+
+    async fn assert_completed_source_receipt_recovery(replace_owner: bool) {
+        let (state, _, _root) = active_edit_execution_fixture_with_graph(
+            bcode_workflow_store::DispatchSideEffect::ReadOnly,
+            true,
+        )
+        .await;
+        let mut state = Arc::new(state);
+        let request = receipt_owned_publication_request(&state);
+        let observation = execute_publication_owner_turn(
+            &state,
+            &request.dispatch_identity,
+            request.activation.activation_id.clone(),
+        )
+        .await;
+        assert!(matches!(
+            observation,
+            bcode_workflow_store::AttemptObservation::Succeeded { .. }
+        ));
+        let path = {
+            let store = state.workflow_store.lock().expect("store");
+            assert!(
+                !store
+                    .dispatch_receipt_committed(&request.dispatch_identity)
+                    .expect("receipt")
+            );
+            store.path().to_path_buf()
+        };
+        let previous_authority = state
+            .workflow_store
+            .lock()
+            .expect("store")
+            .execution_authority("edit-run")
+            .expect("authority")
+            .expect("owner");
+        replace_receipt_fixture_owner(&mut state, replace_owner).await;
+        assert_background_receipt_recovery(&state, &path, &request.dispatch_identity).await;
+        let current_authority = state
+            .workflow_store
+            .lock()
+            .expect("store")
+            .execution_authority("edit-run")
+            .expect("authority")
+            .expect("owner");
+        if replace_owner {
+            assert_eq!(
+                current_authority.daemon_instance_id,
+                state.daemon_status.instance_id
+            );
+            assert_ne!(
+                current_authority.daemon_instance_id,
+                previous_authority.daemon_instance_id
+            );
+            assert!(current_authority.generation > previous_authority.generation);
+            assert_ne!(
+                current_authority.fencing_token,
+                previous_authority.fencing_token
+            );
+            let mut store =
+                bcode_workflow_store::WorkflowStore::open_at_path(&path).expect("reopen");
+            let before = store.run_summary("edit-run").expect("run");
+            assert!(matches!(
+                store.request_cancellation_owned(
+                    "edit-run",
+                    current_unix_millis(),
+                    &previous_authority
+                ),
+                Err(WorkflowStoreError::InvalidData(message)) if message.contains("authority is stale or foreign")
+            ));
+            assert_eq!(store.run_summary("edit-run").expect("run"), before);
+            drop(store);
+        } else {
+            assert_eq!(current_authority, previous_authority);
+        }
+        drop(state);
+    }
+
+    async fn replace_receipt_fixture_owner(state: &mut Arc<ServerState>, replace_owner: bool) {
+        if !replace_owner {
+            return;
+        }
+        let mut replacement = reopen_publication_receipt_owner(state).await;
+        shutdown_publication_owner(state).await;
+        register_workflow_publication_tool(Arc::get_mut(&mut replacement).expect("replacement"));
+        *state = replacement;
+    }
+
+    async fn assert_background_receipt_recovery(
+        state: &Arc<ServerState>,
+        path: &Path,
+        identity: &str,
+    ) {
+        state.start_workflow_driver().await;
+        let recovered = tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                let attempts = state
+                    .workflow_store
+                    .lock()
+                    .expect("store")
+                    .attempt_history("edit-run", None, 10)
+                    .expect("attempts");
+                if attempts.len() == 2
+                    && attempts
+                        .iter()
+                        .all(|attempt| attempt.terminal_at_ms.is_some())
+                    && attempts
+                        .iter()
+                        .any(|attempt| attempt.node_id == "agent" && attempt.status == "succeeded")
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await;
+        let driver = state
+            .workflow_driver_task
+            .lock()
+            .await
+            .take()
+            .expect("driver");
+        driver.abort();
+        let _ = driver.await;
+        recovered.expect("background discovery recovers completed source without a wake");
+        let store = bcode_workflow_store::WorkflowStore::open_at_path(path).expect("reopen");
+        assert!(store.dispatch_receipt_committed(identity).expect("receipt"));
+        let attempts = store
+            .attempt_history("edit-run", None, 10)
+            .expect("attempts");
+        let source: Vec<_> = attempts
+            .iter()
+            .filter(|attempt| attempt.node_id == "agent")
+            .collect();
+        assert_eq!(
+            source.len(),
+            1,
+            "source must not be redispatched: {attempts:?}"
+        );
+        assert_eq!(source[0].status, "succeeded");
+        let successor = attempts
+            .iter()
+            .find(|attempt| attempt.node_id == "waiting-successor")
+            .expect("successor");
+        assert_eq!(successor.status, "succeeded", "{successor:?}");
+        assert_eq!(
+            attempts.len(),
+            2,
+            "driver should advance the existing successor: {attempts:?}"
+        );
+        let outputs = store.validated_outputs("edit-run", 10).expect("outputs");
+        for node in ["agent", "waiting-successor"] {
+            let matched: Vec<_> = outputs
+                .iter()
+                .filter(|output| output.node_id == node)
+                .collect();
+            assert_eq!(matched.len(), 1, "one canonical output for {node}");
+            assert_eq!(matched[0].value, serde_json::json!(true));
+        }
+        drop(store);
+    }
+
+    #[tokio::test]
     async fn duplicate_workflow_prompt_admission_reuses_receipt() {
         let (state, _, _root) = active_edit_execution_fixture_with_graph(
             bcode_workflow_store::DispatchSideEffect::ReadOnly,
@@ -55205,6 +56259,36 @@ library = "test"
         }
     }
 
+    async fn assert_existing_source_admission(
+        state: &ServerState,
+        session_id: SessionId,
+        identity: &str,
+        receipt: &bcode_session_models::TurnReceipt,
+    ) {
+        let duplicate = state
+            .sessions
+            .admit_turn(
+                session_id,
+                ClientId::new(),
+                "Return exactly true".into(),
+                bcode_session_models::TurnAdmissionMetadata {
+                    origin: Some(TurnOrigin {
+                        producer: "bcode.workflow".into(),
+                        correlation_id: Some(identity.into()),
+                        display_label: None,
+                    }),
+                    idempotency_key: Some(identity.into()),
+                    ..bcode_session_models::TurnAdmissionMetadata::default()
+                },
+            )
+            .await
+            .expect("duplicate admission");
+        assert!(
+            matches!(duplicate, bcode_session_models::TurnAdmission::Existing(ref existing) if existing.turn_id == receipt.turn_id),
+            "workflow identity must not admit a second source turn"
+        );
+    }
+
     async fn execute_publication_owner_turn(
         state: &Arc<ServerState>,
         identity: &str,
@@ -55231,6 +56315,12 @@ library = "test"
             "Return exactly true".into(),
             None,
             bcode_session_models::TurnAdmissionMetadata {
+                origin: Some(TurnOrigin {
+                    producer: "bcode.workflow".into(),
+                    correlation_id: Some(identity.into()),
+                    display_label: None,
+                }),
+                idempotency_key: Some(identity.into()),
                 execution: TurnExecutionOptions {
                     provider_plugin_id: Some("bcode.fake-provider".into()),
                     model_id: Some("fake-echo".into()),
@@ -55255,6 +56345,8 @@ library = "test"
             .await
             .expect("completion timeout")
             .expect("completed");
+        assert_existing_source_admission(&owner_state, session_id, identity, &receipt).await;
+        drop(owner_state);
         let request = bcode_workflow_store::AttemptReconciliationRequest {
             run_id: "edit-run".into(),
             node_id: "agent".into(),

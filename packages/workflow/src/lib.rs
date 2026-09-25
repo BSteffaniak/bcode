@@ -12278,6 +12278,23 @@ impl WorkflowPromptConfiguration {
     }
 }
 
+/// Read-only configured prerequisites for plugin-origin workflow graph edits.
+/// This snapshot grants no authority; each operation still evaluates policy and tool permissions.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WorkflowDelegationPreflight {
+    /// Compatibility version of this response (currently 1).
+    pub version: u32,
+    /// Plugin identity whose configured prerequisites were inspected.
+    pub plugin_id: String,
+    /// Whether the plugin is loaded in this daemon.
+    pub plugin_loaded: bool,
+    /// Whether configuration explicitly permits this plugin to stage run edits.
+    pub staging_configured: bool,
+    /// Whether configuration explicitly permits this plugin to publish run edits.
+    pub publication_configured: bool,
+}
+
 /// Execution target for a daemon-hosted workflow prompt node.
 #[derive(
     Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize, JsonSchema,
