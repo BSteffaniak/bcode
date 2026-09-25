@@ -754,6 +754,8 @@ pub struct ActivationDispatchSummary {
     pub admitted: Vec<String>,
     pub unsupported: Vec<String>,
     pub raced: Vec<String>,
+    /// Pending activations blocked by the run or root's durable execution allowance.
+    pub exhausted: Vec<String>,
 }
 
 /// Host owner boundary for executable durable workflow activations.
@@ -905,6 +907,20 @@ pub enum WorkflowStoreError {
     /// External owner dispatch failed; durable preparation remains available for recovery.
     #[error("workflow owner dispatch failed: {0}")]
     OwnerDispatch(Box<Self>),
+    /// The run is not a supported settled repeat-limit continuation checkpoint.
+    #[error(
+        "continuation requires a settled repeat-iteration limit failure; active allowance exhaustion is not supported"
+    )]
+    ContinuationIneligible,
+    /// The run's durable execution allowance has been consumed.
+    #[error("workflow node-execution cap exceeded")]
+    NodeExecutionAllowanceExhausted,
+    /// The composition root's durable execution allowance has been consumed.
+    #[error("workflow root node-execution cap exceeded")]
+    RootExecutionAllowanceExhausted,
+    /// All concurrent execution slots are occupied; pending work must wait for settlement.
+    #[error("workflow concurrency cap reached")]
+    ConcurrencyCapacityReached,
     /// Persisted data violated the storage contract.
     #[error("invalid workflow store data: {0}")]
     InvalidData(String),
@@ -7489,8 +7505,20 @@ impl WorkflowStore {
             );
             let prepared = match preparation {
                 Ok(Some(prepared)) => prepared,
-                Ok(None) => {
+                Ok(None) | Err(WorkflowStoreError::ConcurrencyCapacityReached) => {
                     summary.raced.push(activation.activation_id);
+                    continue;
+                }
+                Err(
+                    WorkflowStoreError::NodeExecutionAllowanceExhausted
+                    | WorkflowStoreError::RootExecutionAllowanceExhausted,
+                ) => {
+                    self.record_execution_allowance_exhaustion(
+                        &activation.run_id,
+                        authority.as_ref(),
+                        dispatched_at_ms,
+                    )?;
+                    summary.exhausted.push(activation.activation_id);
                     continue;
                 }
                 Err(error) if error.to_string().contains("already leased incompatibly") => {
@@ -7772,10 +7800,124 @@ impl WorkflowStore {
         Ok(())
     }
 
+    /// Observe current run and composition-root execution allowance without mutation.
+    /// Counts stop at the durable caps; this does not confer execution authority.
+    ///
+    /// # Errors
+    /// Returns an error for missing runs, invalid durable values, or database failures.
+    pub fn execution_allowance_observation(
+        &self,
+        run_id: &str,
+    ) -> Result<bcode_workflow::WorkflowExecutionAllowanceObservation, WorkflowStoreError> {
+        const READ_BUDGET: u64 = 1_000;
+        validate_id("run_id", run_id)?;
+        let transaction = self.connection.unchecked_transaction()?;
+        let root: String = transaction.query_row(
+            "SELECT COALESCE((SELECT root_run_id FROM workflow_run_links WHERE child_run_id = ?1), ?1)", [run_id], |row| row.get(0),
+        )?;
+        let cap = |id: &str| {
+            transaction.query_row(
+                "SELECT node_execution_cap FROM workflow_runs WHERE run_id = ?1",
+                [id],
+                |row| row.get::<_, u64>(0),
+            )
+        };
+        let run_cap = cap(run_id)?;
+        let root_cap = cap(&root)?;
+        if run_cap == 0 || root_cap == 0 {
+            return Err(WorkflowStoreError::InvalidData(
+                "execution allowance cap must be positive".into(),
+            ));
+        }
+        // Inspection work is independent of the caller's execution allowance. A count
+        // that exceeds this read budget is unknown, never an estimate of remaining work.
+        let count = |id: &str, cap: u64| -> Result<Option<u64>, WorkflowStoreError> {
+            let consumed: u64 = transaction.query_row(
+                "SELECT COUNT(*) FROM (SELECT 1 FROM workflow_attempts WHERE run_id = ?1 LIMIT ?2)",
+                rusqlite::params![id, cap.min(READ_BUDGET + 1)],
+                |row| row.get(0),
+            )?;
+            Ok((consumed <= READ_BUDGET || consumed == cap).then_some(consumed))
+        };
+        let run_consumed = count(run_id, run_cap)?;
+        let children: Vec<String> = transaction.prepare(
+            "SELECT child_run_id FROM workflow_run_links WHERE root_run_id = ?1 ORDER BY created_at_ms, child_run_id LIMIT ?2",
+        )?.query_map(rusqlite::params![root, READ_BUDGET + 1], |row| row.get(0))?
+            .collect::<Result<_, _>>()?;
+        let mut root_consumed = None;
+        if u64::try_from(children.len()).is_ok_and(|length| length <= READ_BUDGET) {
+            let mut consumed = 0;
+            for id in std::iter::once(&root).chain(children.iter()) {
+                let remaining = root_cap.saturating_sub(consumed);
+                let value: u64 = transaction.query_row(
+                    "SELECT COUNT(*) FROM (SELECT 1 FROM workflow_attempts WHERE run_id = ?1 LIMIT ?2)",
+                    rusqlite::params![id, remaining.min(READ_BUDGET + 1 - consumed)], |row| row.get(0),
+                )?;
+                consumed += value;
+                if consumed >= root_cap || consumed > READ_BUDGET {
+                    break;
+                }
+            }
+            if consumed <= READ_BUDGET || consumed == root_cap {
+                root_consumed = Some(consumed);
+            }
+        }
+        Ok(bcode_workflow::WorkflowExecutionAllowanceObservation {
+            run_cap,
+            run_consumed,
+            root_cap,
+            root_consumed,
+        })
+    }
+
+    // One bounded, indexed historical observation per run, not a current-status projection
+    // or permission to extend its allowance. Existing attempts must still reconcile normally.
+    fn record_execution_allowance_exhaustion(
+        &self,
+        run_id: &str,
+        authority: Option<&WorkflowExecutionAuthority>,
+        observed_at_ms: u64,
+    ) -> Result<(), WorkflowStoreError> {
+        let transaction = self.connection.unchecked_transaction()?;
+        if self.execution_authority(run_id)?.as_ref() != authority {
+            return Err(WorkflowStoreError::InvalidData(
+                "exhaustion observation authority changed".into(),
+            ));
+        }
+        let local_exhausted: bool = transaction.query_row(
+            "SELECT (SELECT COUNT(*) FROM (SELECT 1 FROM workflow_attempts WHERE run_id = ?1 LIMIT ?2)) >= ?2",
+            rusqlite::params![run_id, transaction.query_row("SELECT node_execution_cap FROM workflow_runs WHERE run_id = ?1", [run_id], |row| row.get::<_, u64>(0))?],
+            |row| row.get(0),
+        )?;
+        if !local_exhausted {
+            match enforce_root_attempt_limit(&transaction, run_id) {
+                Ok(()) => return Ok(()),
+                Err(WorkflowStoreError::RootExecutionAllowanceExhausted) => {}
+                Err(error) => return Err(error),
+            }
+        }
+        let exists: bool = transaction.query_row(
+            "SELECT EXISTS(SELECT 1 FROM workflow_events WHERE run_id = ?1 AND event_type = 'execution_allowance_exhausted')",
+            [run_id], |row| row.get(0),
+        )?;
+        if !exists {
+            append_event(
+                &transaction,
+                run_id,
+                "execution_allowance_exhausted",
+                r#"{"version":1,"additional_work_admitted":false}"#,
+                observed_at_ms,
+            )?;
+        }
+        transaction.commit()?;
+        Ok(())
+    }
+
     /// Persist prepared intent before an external operation is dispatched.
     ///
-    /// This operation is idempotent only for byte-equivalent intent at the same durable attempt
-    /// identity. Conflicting intent fails closed.
+    /// This operation is idempotent only for byte-equivalent intent and the same side-effect
+    /// classification at the same durable attempt identity. Conflicting intent or classification
+    /// fails closed. Acknowledgment of existing intent does not authorize another dispatch.
     ///
     /// # Errors
     ///
@@ -7786,7 +7928,6 @@ impl WorkflowStore {
         attempt: &PreparedAttempt,
     ) -> Result<String, WorkflowStoreError> {
         validate_prepared_attempt(attempt)?;
-        enforce_attempt_limits(&self.connection, attempt)?;
         let identity = attempt.dispatch_identity();
         let intent_json = serde_json::to_string(&attempt.intent)?;
         if intent_json.len() > MAX_INLINE_JSON_BYTES {
@@ -7798,7 +7939,7 @@ impl WorkflowStore {
         let transaction = self.connection.transaction()?;
         let existing = transaction
             .query_row(
-                "SELECT dispatch_identity, intent_checksum FROM workflow_attempts \
+                "SELECT dispatch_identity, intent_checksum, side_effect FROM workflow_attempts \
                  WHERE run_id = ?1 AND node_id = ?2 AND activation_id = ?3 AND attempt = ?4",
                 (
                     &attempt.run_id,
@@ -7806,17 +7947,29 @@ impl WorkflowStore {
                     &attempt.activation_id,
                     attempt.attempt,
                 ),
-                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                    ))
+                },
             )
             .optional()?;
-        if let Some((existing_identity, existing_checksum)) = existing {
-            if existing_identity == identity && existing_checksum == checksum {
+        if let Some((existing_identity, existing_checksum, existing_side_effect)) = existing {
+            if existing_identity == identity
+                && existing_checksum == checksum
+                && existing_side_effect == attempt.side_effect.as_str()
+            {
                 return Ok(identity);
             }
             return Err(WorkflowStoreError::InvalidData(format!(
                 "prepared attempt identity conflict: {identity}"
             )));
         }
+        // Identical delivery acknowledges existing intent, not a new execution. Only new
+        // attempts consume capacity; check inside the same transaction as their insertion.
+        enforce_attempt_limits(&transaction, attempt)?;
         transaction.execute(
             "INSERT INTO workflow_attempts \
              (run_id, node_id, activation_id, attempt, dispatch_identity, side_effect, status, \
@@ -16042,9 +16195,7 @@ fn enforce_attempt_limits(
         |row| row.get(0),
     )?;
     if execution_count >= node_execution_cap {
-        return Err(WorkflowStoreError::InvalidData(
-            "workflow node-execution cap exceeded".to_string(),
-        ));
+        return Err(WorkflowStoreError::NodeExecutionAllowanceExhausted);
     }
     enforce_root_attempt_limit(connection, &attempt.run_id)?;
     let active_count: u32 = connection.query_row(
@@ -16057,9 +16208,7 @@ fn enforce_attempt_limits(
         |row| row.get(0),
     )?;
     if active_count >= concurrency_cap {
-        return Err(WorkflowStoreError::InvalidData(
-            "workflow concurrency cap reached".to_string(),
-        ));
+        return Err(WorkflowStoreError::ConcurrencyCapacityReached);
     }
     Ok(())
 }
@@ -16086,9 +16235,7 @@ fn enforce_root_attempt_limit(
         |row| row.get(0),
     )?;
     if used >= cap {
-        return Err(WorkflowStoreError::InvalidData(
-            "workflow root node-execution cap exceeded".to_string(),
-        ));
+        return Err(WorkflowStoreError::RootExecutionAllowanceExhausted);
     }
     Ok(())
 }
@@ -23954,12 +24101,27 @@ mod tests {
             prepared_at_ms: 12,
         };
         let first = store.prepare_attempt(&attempt).expect("prepare");
-        let second = store.prepare_attempt(&attempt).expect("idempotent");
+        store.connection.execute(
+            "UPDATE workflow_runs SET node_execution_cap = 1, concurrency_cap = 1 WHERE run_id = 'run-1'", [],
+        ).expect("exhaust capacity with existing attempt");
+        let before = store.connection.total_changes();
+        let second = store
+            .prepare_attempt(&attempt)
+            .expect("idempotent at capacity");
+        assert_eq!(store.connection.total_changes(), before);
         assert_eq!(first, second);
         assert_eq!(
             first,
             dispatch_identity("run-1", "review", activation_id().as_str(), 1)
         );
+        let error = store
+            .prepare_attempt(&PreparedAttempt {
+                side_effect: DispatchSideEffect::ReadOnly,
+                ..attempt.clone()
+            })
+            .expect_err("conflicting side-effect classification");
+        assert!(error.to_string().contains("identity conflict"));
+        assert_eq!(store.connection.total_changes(), before);
         let error = store
             .prepare_attempt(&PreparedAttempt {
                 intent: serde_json::json!({"operation": "different"}),
@@ -35915,6 +36077,80 @@ mod tests {
         transaction.rollback().expect("restore fixture limits");
     }
 
+    async fn assert_root_exhaustion_defers_child_dispatch(path: &Path, child_run_id: &str) {
+        let mut reopened = WorkflowStore::open_at_path(path).unwrap();
+        let original_cap: u64 = reopened
+            .connection
+            .query_row(
+                "SELECT node_execution_cap FROM workflow_runs WHERE run_id = 'parent-run'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        reopened
+            .connection
+            .execute(
+                "UPDATE workflow_runs SET node_execution_cap = 1 WHERE run_id = 'parent-run'",
+                [],
+            )
+            .unwrap();
+        let owner = MutationDispatchOwner(std::sync::atomic::AtomicUsize::new(0));
+        let before = reopened.connection.total_changes();
+        let allowance = reopened
+            .execution_allowance_observation(child_run_id)
+            .unwrap();
+        assert_eq!(allowance.root_cap, 1);
+        assert_eq!(allowance.root_consumed, Some(1));
+        assert_eq!(allowance.run_consumed, Some(0));
+        assert!(allowance.run_cap > 0);
+        assert_eq!(reopened.connection.total_changes(), before);
+        let summary = reopened
+            .dispatch_pending_activations_for_run(&owner, child_run_id, 10, 3)
+            .await
+            .unwrap();
+        assert_eq!(summary.exhausted.len(), 1);
+        assert!(summary.admitted.is_empty());
+        assert!(summary.raced.is_empty());
+        assert_eq!(owner.0.load(std::sync::atomic::Ordering::SeqCst), 0);
+        assert!(reopened.connection.total_changes() > before);
+        let event: String = reopened.connection.query_row(
+            "SELECT payload_json FROM workflow_events WHERE run_id = ?1 AND event_type = 'execution_allowance_exhausted'",
+            [child_run_id], |row| row.get(0),
+        ).unwrap();
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&event).unwrap(),
+            serde_json::json!({"version":1,"additional_work_admitted":false})
+        );
+        let before_duplicate = reopened.connection.total_changes();
+        let duplicate = reopened
+            .dispatch_pending_activations_for_run(&owner, child_run_id, 10, 4)
+            .await
+            .unwrap();
+        assert_eq!(duplicate.exhausted, summary.exhausted);
+        assert_eq!(reopened.connection.total_changes(), before_duplicate);
+        assert_eq!(owner.0.load(std::sync::atomic::Ordering::SeqCst), 0);
+        assert!(
+            reopened
+                .attempt_history(child_run_id, None, 10)
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            reopened
+                .attempt_history("parent-run", None, 10)
+                .unwrap()
+                .len(),
+            1
+        );
+        reopened
+            .connection
+            .execute(
+                "UPDATE workflow_runs SET node_execution_cap = ?1 WHERE run_id = 'parent-run'",
+                [original_cap],
+            )
+            .unwrap();
+    }
+
     fn assert_inherited_child_cancellation(store: &mut WorkflowStore, child_run_id: &str) {
         let transaction = store
             .connection
@@ -35968,9 +36204,9 @@ mod tests {
         );
     }
 
-    #[test]
+    #[tokio::test]
     #[allow(clippy::too_many_lines)]
-    fn exact_child_run_creation_is_atomic_idempotent_bounded_and_restart_safe() {
+    async fn exact_child_run_creation_is_atomic_idempotent_bounded_and_restart_safe() {
         let temp = tempfile::tempdir().expect("temp");
         let mut store = WorkflowStore::open_in_state_dir(temp.path()).expect("store");
         let child_definition = definition("child");
@@ -36117,6 +36353,7 @@ mod tests {
                 .expect("created")
         );
         assert_root_attempt_budget_survives_reopen(&store, &child_run_id);
+        assert_root_exhaustion_defers_child_dispatch(store.path(), &child_run_id).await;
         let attempts = store
             .active_attempts_for_run("parent-run", 10)
             .expect("attempts");
@@ -39541,20 +39778,83 @@ mod tests {
             .expect("dispatch");
         assert_eq!(summary.admitted.len(), 1);
         assert_eq!(summary.raced.len(), 1);
+        let leases = store
+            .resource_leases_for_run("parallel-resource-run", 10)
+            .expect("leases");
+        assert_eq!(leases.len(), 1);
+        // With the resource lease released, concurrency alone must defer the second
+        // worker without preparing another attempt or changing its pending state.
+        store.connection.execute(
+            "UPDATE workflow_resource_leases SET released_at_ms = 3 WHERE run_id = 'parallel-resource-run'", [],
+        ).expect("release resource fixture");
+        store.connection.execute(
+            "UPDATE workflow_runs SET concurrency_cap = 1 WHERE run_id = 'parallel-resource-run'", [],
+        ).expect("single execution slot");
+        let summary = store
+            .dispatch_pending_activations(&Owner, 10, 4)
+            .await
+            .expect("capacity defers");
+        assert!(summary.admitted.is_empty());
+        assert_eq!(summary.raced.len(), 1);
+        assert_eq!(store.pending_activations(10).unwrap().len(), 1);
+        let attempts = store
+            .attempt_history("parallel-resource-run", None, 10)
+            .unwrap();
+        assert_eq!(attempts.len(), 1);
+        let leases = store
+            .resource_leases_for_run("parallel-resource-run", 10)
+            .unwrap();
+        assert!(leases.is_empty());
+        let first_dispatch = &attempts[0].dispatch_identity;
+        assert_deferred_worker_resumes(&mut store, &Owner, temp.path(), first_dispatch).await;
+    }
+
+    async fn assert_deferred_worker_resumes(
+        store: &mut WorkflowStore,
+        owner: &impl ActivationDispatchOwner,
+        path: &Path,
+        first_dispatch: &str,
+    ) {
+        store.connection.execute(
+            "UPDATE workflow_runs SET node_execution_cap = 1 WHERE run_id = 'parallel-resource-run'", [],
+        ).unwrap();
+        let exhausted = store
+            .dispatch_pending_activations(owner, 10, 5)
+            .await
+            .unwrap();
+        assert_eq!(exhausted.exhausted.len(), 1);
+        assert!(exhausted.admitted.is_empty());
+        store
+            .apply_attempt_observation(first_dispatch, AttemptObservation::Cancelled, 5)
+            .unwrap();
+        let mut reopened = WorkflowStore::open_in_state_dir(path).unwrap();
+        let exhausted = reopened
+            .dispatch_pending_activations(owner, 10, 6)
+            .await
+            .unwrap();
+        assert_eq!(exhausted.exhausted.len(), 1);
+        assert!(exhausted.admitted.is_empty());
+        reopened.connection.execute(
+            "UPDATE workflow_runs SET node_execution_cap = 1000 WHERE run_id = 'parallel-resource-run'", [],
+        ).unwrap();
+        let summary = reopened
+            .dispatch_pending_activations(owner, 10, 6)
+            .await
+            .unwrap();
+        assert_eq!(summary.admitted.len(), 1);
+        assert!(summary.raced.is_empty());
+        let attempts = reopened
+            .attempt_history("parallel-resource-run", None, 10)
+            .unwrap();
+        assert_eq!(attempts.len(), 2);
         assert_eq!(
-            store
-                .resource_leases_for_run("parallel-resource-run", 10)
-                .expect("leases")
-                .len(),
+            attempts
+                .iter()
+                .filter(|attempt| attempt.dispatch_identity == first_dispatch)
+                .count(),
             1
         );
-        assert_eq!(
-            store
-                .attempt_history("parallel-resource-run", None, 10)
-                .expect("attempts")
-                .len(),
-            1
-        );
+        assert!(reopened.pending_activations(10).unwrap().is_empty());
     }
 
     #[test]
@@ -44175,6 +44475,91 @@ mod tests {
             [&receipt.dispatch_identity], |row| row.get(0),
         ).expect("receipt not committed");
         assert_eq!(status, "prepared");
+    }
+
+    #[test]
+    fn allowance_inspection_reports_unknown_beyond_read_budget() {
+        let (_temp, mut store) = initialized_store();
+        store
+            .prepare_attempt(&PreparedAttempt {
+                run_id: "run-1".into(),
+                node_id: "review".into(),
+                activation_id: activation_id(),
+                attempt: 1,
+                side_effect: DispatchSideEffect::ReadOnly,
+                intent: serde_json::json!({}),
+                prepared_at_ms: 1,
+            })
+            .unwrap();
+        store.connection.execute_batch("UPDATE workflow_runs SET node_execution_cap = 10000 WHERE run_id = 'run-1';
+            WITH RECURSIVE numbers(n) AS (SELECT 2 UNION ALL SELECT n+1 FROM numbers WHERE n<1001)
+            INSERT INTO workflow_attempts (run_id,node_id,activation_id,attempt,dispatch_identity,side_effect,status,intent_json,intent_checksum,prepared_at_ms)
+            SELECT run_id,node_id,activation_id,n,'fixture-'||n,side_effect,status,intent_json,intent_checksum,prepared_at_ms FROM workflow_attempts,numbers WHERE attempt=1;").unwrap();
+        let before = store.connection.total_changes();
+        let observation = store.execution_allowance_observation("run-1").unwrap();
+        assert_eq!(observation.run_consumed, None);
+        assert_eq!(observation.root_consumed, None);
+        assert_eq!(observation.run_cap, 10000);
+        assert_eq!(store.connection.total_changes(), before);
+        // Terminal settlement does not refund attempts, and reaching the cap exactly
+        // proves exhaustion even at the inspection probe boundary.
+        store
+            .connection
+            .execute(
+                "UPDATE workflow_attempts SET status = 'cancelled' WHERE run_id = 'run-1'",
+                [],
+            )
+            .unwrap();
+        for (cap, expected) in [(1_000, Some(1_000)), (1_001, Some(1_001)), (1_002, None)] {
+            store
+                .connection
+                .execute(
+                    "UPDATE workflow_runs SET node_execution_cap = ?1 WHERE run_id = 'run-1'",
+                    [cap],
+                )
+                .unwrap();
+            let before = store.connection.total_changes();
+            let observed = store.execution_allowance_observation("run-1").unwrap();
+            assert_eq!(observed.run_consumed, expected);
+            assert_eq!(observed.root_consumed, expected);
+            assert_eq!(observed.exhausted(), expected.map(|_| true));
+            assert_eq!(store.connection.total_changes(), before);
+        }
+    }
+
+    #[test]
+    fn allowance_inspection_rejects_invalid_caps_without_mutation() {
+        let (_temp, store) = initialized_store();
+        for cap in [0_i64, -1] {
+            store
+                .connection
+                .execute(
+                    "UPDATE workflow_runs SET node_execution_cap = ?1 WHERE run_id = 'run-1'",
+                    [cap],
+                )
+                .unwrap();
+            let before = store.connection.total_changes();
+            assert!(store.execution_allowance_observation("run-1").is_err());
+            assert_eq!(store.connection.total_changes(), before);
+        }
+    }
+
+    #[test]
+    fn exhaustion_observation_rechecks_authority_and_allowance() {
+        let (_temp, store, run, authority, _) = connected_publication_fixture();
+        let before = store.connection.total_changes();
+        store
+            .record_execution_allowance_exhaustion(&run.run_id, Some(&authority), 25)
+            .unwrap();
+        assert_eq!(store.connection.total_changes(), before);
+        let mut stale = authority;
+        stale.generation += 1;
+        assert!(
+            store
+                .record_execution_allowance_exhaustion(&run.run_id, Some(&stale), 26)
+                .is_err()
+        );
+        assert_eq!(store.connection.total_changes(), before);
     }
 
     #[test]

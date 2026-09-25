@@ -1757,9 +1757,48 @@ pub struct WorkflowHistoryEvent {
     pub created_at_ms: u64,
 }
 
+/// Current canonical execution allowance facts. Counts saturate at their respective caps.
+/// Exhaustion blocks new attempts, not reconciliation of existing work.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkflowExecutionAllowanceObservation {
+    /// Run-local attempt cap.
+    pub run_cap: u64,
+    /// Run-local attempts consumed, capped at `run_cap`; absent when the read bound is reached.
+    pub run_consumed: Option<u64>,
+    /// Composition-root attempt cap.
+    pub root_cap: u64,
+    /// Root and descendant attempts consumed, capped at `root_cap`; absent when the read bound is reached.
+    pub root_consumed: Option<u64>,
+}
+
+impl WorkflowExecutionAllowanceObservation {
+    /// Whether current run/root facts prove execution allowance exhaustion.
+    /// Unknown consumption remains unknown unless the other budget proves exhaustion.
+    /// Invalid zero caps or counts above a cap fail closed as unknown.
+    // Repository convention: Option already communicates a must-use result.
+    #[allow(clippy::must_use_candidate)]
+    pub fn exhausted(&self) -> Option<bool> {
+        if self.run_cap == 0
+            || self.root_cap == 0
+            || self.run_consumed.is_some_and(|used| used > self.run_cap)
+            || self.root_consumed.is_some_and(|used| used > self.root_cap)
+        {
+            return None;
+        }
+        if self.run_consumed == Some(self.run_cap) || self.root_consumed == Some(self.root_cap) {
+            return Some(true);
+        }
+        self.run_consumed.zip(self.root_consumed).map(|_| false)
+    }
+}
+
 /// Bounded aggregate workflow inspection snapshot.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WorkflowRunInspection {
+    /// Current allowance observation; absent on older senders means unknown.
+    /// Does not imply runnable work or authorization to increase limits.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub execution_allowance: Option<WorkflowExecutionAllowanceObservation>,
     /// Explicit lineage; absent on original runs and older senders.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub continuation: Option<WorkflowContinuationLineage>,
@@ -1801,6 +1840,44 @@ pub struct WorkflowRunInspection {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn allowance_exhaustion_preserves_unknown_and_invalid_facts() {
+        use super::WorkflowExecutionAllowanceObservation;
+        for (local, root, expected) in [
+            (None, None, None),
+            (Some(0), None, None),
+            (None, Some(0), None),
+            (Some(2), None, Some(true)),
+            (None, Some(3), Some(true)),
+            (Some(1), Some(2), Some(false)),
+            (Some(2), Some(3), Some(true)),
+            (Some(3), Some(3), None),
+            (Some(2), Some(4), None),
+        ] {
+            let observation = WorkflowExecutionAllowanceObservation {
+                run_cap: 2,
+                run_consumed: local,
+                root_cap: 3,
+                root_consumed: root,
+            };
+            assert_eq!(observation.exhausted(), expected);
+            let encoded = serde_json::to_value(&observation).unwrap();
+            let decoded: WorkflowExecutionAllowanceObservation =
+                serde_json::from_value(encoded).unwrap();
+            assert_eq!(decoded.exhausted(), expected);
+        }
+        assert_eq!(
+            WorkflowExecutionAllowanceObservation {
+                run_cap: 0,
+                run_consumed: Some(0),
+                root_cap: 3,
+                root_consumed: Some(3)
+            }
+            .exhausted(),
+            None
+        );
+    }
+
     #[test]
     fn replacement_readiness_preserves_states_and_rejects_future_variants() {
         use super::ReplacementReadiness;

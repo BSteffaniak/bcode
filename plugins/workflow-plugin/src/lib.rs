@@ -805,7 +805,13 @@ pub(crate) async fn execute_command(
                 .inspect_workflow_run(run_id.clone(), QUERY_LIMIT)
                 .await
                 .map_err(|error| error.to_string())?;
+            let allowance_status =
+                inspection_allowance_status(inspection.execution_allowance.as_ref());
             options.extend([
+                (
+                    "execution_allowance".to_string(),
+                    serde_json::json!(inspection.execution_allowance),
+                ),
                 ("run".to_string(), serde_json::json!(inspection.run)),
                 ("graph".to_string(), serde_json::json!(inspection.graph)),
                 (
@@ -857,7 +863,7 @@ pub(crate) async fn execute_command(
                     serde_json::json!(inspection.child_sessions),
                 ),
             ]);
-            format!("workflow run {run_id}")
+            format!("workflow run {run_id} · {allowance_status}")
         }
         "workflow.doctor" => {
             let run_id = required_arg(&request, "run_id")?;
@@ -1345,6 +1351,18 @@ fn graph_page_request(
     })
 }
 
+fn inspection_allowance_status(
+    allowance: Option<&bcode_workflow::WorkflowExecutionAllowanceObservation>,
+) -> &'static str {
+    match allowance.and_then(bcode_workflow::WorkflowExecutionAllowanceObservation::exhausted) {
+        Some(true) => {
+            "execution allowance exhausted; no new attempts can be admitted under this allowance"
+        }
+        Some(false) => "execution allowance remains; this is not authorization to dispatch",
+        None => "execution allowance consumption unknown; do not infer remaining capacity",
+    }
+}
+
 fn required_arg(request: &InvokeCommandRequest, name: &str) -> Result<String, String> {
     request
         .args
@@ -1401,6 +1419,30 @@ bcode_plugin_sdk::export_plugin!(WorkflowPlugin, include_str!("../bcode-plugin.t
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn inspection_allowance_reports_exhausted_available_and_unknown() {
+        use bcode_workflow::WorkflowExecutionAllowanceObservation;
+        let mut observation = WorkflowExecutionAllowanceObservation {
+            run_cap: 5,
+            run_consumed: Some(1),
+            root_cap: 10,
+            root_consumed: Some(10),
+        };
+        assert_eq!(
+            super::inspection_allowance_status(Some(&observation)),
+            "execution allowance exhausted; no new attempts can be admitted under this allowance"
+        );
+        observation.root_consumed = Some(2);
+        assert!(
+            super::inspection_allowance_status(Some(&observation)).contains("not authorization")
+        );
+        observation.root_consumed = None;
+        assert!(super::inspection_allowance_status(Some(&observation)).contains("unknown"));
+        assert_eq!(
+            super::inspection_allowance_status(None),
+            super::inspection_allowance_status(Some(&observation))
+        );
+    }
     use super::*;
 
     #[test]

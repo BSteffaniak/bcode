@@ -5507,6 +5507,10 @@ fn workflow_store_error_response(error: &WorkflowStoreError) -> ErrorResponse {
                 ),
             );
         }
+        WorkflowStoreError::ContinuationIneligible => (
+            "workflow_continuation_ineligible",
+            "continuation requires a settled repeat-iteration limit failure; inspect the run, use resume for paused work; active allowance exhaustion is not yet supported",
+        ),
         WorkflowStoreError::CancellationPreventsControl => (
             "workflow_cancellation_prevents_control",
             "workflow cancellation prevents the requested state change",
@@ -5530,6 +5534,15 @@ fn workflow_store_error_response(error: &WorkflowStoreError) -> ErrorResponse {
         WorkflowStoreError::OwnerDispatch(_) | WorkflowStoreError::OwnerAccessDeferred => (
             "workflow_owner_unavailable",
             "workflow execution owner is unavailable",
+        ),
+        WorkflowStoreError::NodeExecutionAllowanceExhausted
+        | WorkflowStoreError::RootExecutionAllowanceExhausted => (
+            "workflow_execution_allowance_exhausted",
+            "workflow execution allowance is exhausted; no additional work was admitted",
+        ),
+        WorkflowStoreError::ConcurrencyCapacityReached => (
+            "workflow_concurrency_capacity_reached",
+            "workflow execution slots are occupied; pending work waits for settlement",
         ),
         WorkflowStoreError::Database(_)
         | WorkflowStoreError::Io(_)
@@ -54004,6 +54017,9 @@ library = "test"
     fn admit_publication_author(state: &ServerState, child_id: SessionId) {
         // The edit-only fixture stops before admission. Publication recovery needs an
         // admitted author turn, not an abandoned preparation with synthetic empty intent.
+        // This synthetic turn ID is not the receipt returned by execute_publication_owner_turn.
+        // Tests using this helper must inject settlement; automatic receipt-recovery tests
+        // must instead admit and persist the actual turn receipt before publication.
         let mut store = state.workflow_store.lock().expect("store");
         let attempt = store
             .attempt_history("edit-run", None, 1)
@@ -54029,6 +54045,39 @@ library = "test"
             })
             .expect("author admission");
         drop(store);
+    }
+
+    #[tokio::test]
+    async fn published_group_recovers_actual_source_receipt() {
+        Box::pin(assert_local_publication_worker_with_replacement(
+            false,
+            true,
+            false,
+            PublicationOwner::CompletedSource,
+        ))
+        .await;
+    }
+
+    #[tokio::test]
+    async fn published_serialized_group_recovers_actual_source_receipt() {
+        Box::pin(assert_local_publication_worker_with_replacement(
+            false,
+            true,
+            true,
+            PublicationOwner::CompletedSource,
+        ))
+        .await;
+    }
+
+    #[tokio::test]
+    async fn replacement_owner_recovers_group_actual_source_receipt() {
+        Box::pin(assert_local_publication_worker_with_replacement(
+            false,
+            true,
+            false,
+            PublicationOwner::ReplacementCompletedSource,
+        ))
+        .await;
     }
 
     #[tokio::test]
@@ -54397,13 +54446,51 @@ library = "test"
 
     enum PublicationOwner {
         Original,
+        CompletedSource,
+        ReplacementCompletedSource,
         Replacement,
     }
 
     impl PublicationOwner {
-        const fn is_replacement(&self) -> bool {
-            matches!(self, Self::Replacement)
+        const fn has_actual_receipt(&self) -> bool {
+            matches!(
+                self,
+                Self::CompletedSource | Self::ReplacementCompletedSource
+            )
         }
+
+        const fn is_replacement(&self) -> bool {
+            matches!(self, Self::Replacement | Self::ReplacementCompletedSource)
+        }
+    }
+
+    async fn prepare_publication_source(
+        state: &ServerState,
+        child_id: SessionId,
+        owner: &PublicationOwner,
+    ) {
+        if !owner.has_actual_receipt() {
+            admit_publication_author(state, child_id);
+            return;
+        }
+        let source = state
+            .workflow_store
+            .lock()
+            .expect("store")
+            .attempt_history("edit-run", None, 1)
+            .unwrap()
+            .remove(0);
+        let observation = Box::pin(execute_publication_owner_turn_with_receipt(
+            state,
+            &source.dispatch_identity,
+            source.activation_id,
+            true,
+        ))
+        .await;
+        assert!(matches!(
+            observation,
+            bcode_workflow_store::AttemptObservation::Succeeded { .. }
+        ));
     }
 
     async fn assert_local_publication_worker_with_replacement(
@@ -54417,7 +54504,7 @@ library = "test"
             parallel,
         )
         .await;
-        admit_publication_author(&state, child_id);
+        prepare_publication_source(&state, child_id, &owner).await;
         let (sender, mut queued) = mpsc::channel(1);
         state.workflow_driver_sender.set(sender).expect("queue");
         register_workflow_publication_tool(&mut state);
@@ -54457,7 +54544,7 @@ library = "test"
         });
         let mut state = Arc::new(state);
         publish_and_discard_wakes(&state, edit, &mut queued).await;
-        if parallel {
+        if parallel && !owner.has_actual_receipt() {
             settle_group_source(&state).await;
         }
         Arc::get_mut(&mut state)
@@ -56294,6 +56381,21 @@ library = "test"
         identity: &str,
         activation_id: String,
     ) -> bcode_workflow_store::AttemptObservation {
+        Box::pin(execute_publication_owner_turn_with_receipt(
+            state,
+            identity,
+            activation_id,
+            false,
+        ))
+        .await
+    }
+
+    async fn execute_publication_owner_turn_with_receipt(
+        state: &ServerState,
+        identity: &str,
+        activation_id: String,
+        persist_receipt: bool,
+    ) -> bcode_workflow_store::AttemptObservation {
         let session_id = SessionId::from_str(
             &state
                 .workflow_store
@@ -56341,6 +56443,15 @@ library = "test"
         else {
             panic!("new turn")
         };
+        if persist_receipt {
+            let mut store = state.workflow_store.lock().expect("store");
+            store.persist_dispatch_receipt(&bcode_workflow_store::DispatchReceipt {
+                run_id: "edit-run".into(), node_id: "agent".into(), activation_id: activation_id.clone(), attempt: 1,
+                dispatch_identity: identity.into(), admitted_at_ms: current_unix_millis(),
+                receipt: serde_json::json!({"owner":"bcode.server.agent-turn/v1", "owner_artifact_id":bcode_ipc::ArtifactId::current().to_string(), "owner_daemon_instance_id":state.daemon_status.instance_id, "session_id":session_id, "turn_id":receipt.turn_id.to_string(), "output_schema_id":"boolean"}),
+            }).expect("actual admission receipt");
+            drop(store);
+        }
         tokio::time::timeout(Duration::from_secs(10), completion)
             .await
             .expect("completion timeout")
@@ -57372,6 +57483,32 @@ library = "test"
 
     #[test]
     fn workflow_errors_are_stable_and_secret_safe() {
+        let continuation =
+            workflow_store_error_response(&WorkflowStoreError::ContinuationIneligible);
+        assert_eq!(continuation.code, "workflow_continuation_ineligible");
+        assert!(
+            continuation
+                .message
+                .contains("active allowance exhaustion is not yet supported")
+        );
+        for error in [
+            WorkflowStoreError::NodeExecutionAllowanceExhausted,
+            WorkflowStoreError::RootExecutionAllowanceExhausted,
+        ] {
+            let response = workflow_store_error_response(&error);
+            assert_eq!(response.code, "workflow_execution_allowance_exhausted");
+            assert_eq!(
+                response.message,
+                "workflow execution allowance is exhausted; no additional work was admitted"
+            );
+        }
+        let capacity =
+            workflow_store_error_response(&WorkflowStoreError::ConcurrencyCapacityReached);
+        assert_eq!(capacity.code, "workflow_concurrency_capacity_reached");
+        assert_eq!(
+            capacity.message,
+            "workflow execution slots are occupied; pending work waits for settlement"
+        );
         let missing = workflow_store_error_response(&WorkflowStoreError::RunNotFound {
             run_id: "secret-workflow-run".to_owned(),
         });
@@ -76216,6 +76353,34 @@ event_symbol = "bcode_plugin_handle_event_v1"
         drop(store);
     }
 
+    fn assert_allowance_inspection_compatibility(
+        inspection: &bcode_workflow::WorkflowRunInspection,
+    ) {
+        let allowance = inspection
+            .execution_allowance
+            .as_ref()
+            .expect("allowance over IPC");
+        assert_eq!(allowance.run_cap, allowance.root_cap);
+        assert_eq!(allowance.run_consumed, allowance.root_consumed);
+        assert!(allowance.run_consumed.is_some());
+        let mut legacy = serde_json::to_value(inspection).unwrap();
+        legacy
+            .as_object_mut()
+            .unwrap()
+            .remove("execution_allowance");
+        let decoded: bcode_workflow::WorkflowRunInspection =
+            serde_json::from_value(legacy).unwrap();
+        assert_eq!(decoded.execution_allowance, None);
+        let mut unknown = serde_json::to_value(inspection).unwrap();
+        unknown["execution_allowance"]["run_consumed"] = serde_json::Value::Null;
+        unknown["execution_allowance"]["root_consumed"] = serde_json::Value::Null;
+        let decoded: bcode_workflow::WorkflowRunInspection =
+            serde_json::from_value(unknown).unwrap();
+        let allowance = decoded.execution_allowance.unwrap();
+        assert_eq!(allowance.run_consumed, None);
+        assert_eq!(allowance.root_consumed, None);
+    }
+
     #[tokio::test]
     #[allow(clippy::too_many_lines)]
     async fn providing_input_drives_the_waiting_workflow_to_completion() {
@@ -76394,6 +76559,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
         else {
             panic!("expected populated inspection");
         };
+        assert_allowance_inspection_compatibility(&inspection);
         assert_eq!(
             inspection.replacement_readiness,
             Some(bcode_workflow::ReplacementReadiness::Absent)

@@ -151,7 +151,10 @@ fn successor(
 #[test]
 fn continuation_preserves_history_is_idempotent_and_survives_restart() {
     let (temp, mut store, original, definition) = fixture();
-    assert!(store.continuation_source(&original.run_id).is_err());
+    assert!(matches!(
+        store.continuation_source(&original.run_id),
+        Err(WorkflowStoreError::ContinuationIneligible)
+    ));
     execute(&mut store, &original, &definition, 2, false);
     let before = store.run_summary(&original.run_id).unwrap();
     let events = store.event_history(&original.run_id, None, 100).unwrap();
@@ -185,6 +188,41 @@ fn continuation_preserves_history_is_idempotent_and_survives_restart() {
     assert_eq!(source.iterations_completed, 3);
     assert_eq!(source.total_iterations_completed, 5);
     assert_eq!(source.document_scope_id, original.run_id);
+}
+
+#[test]
+fn short_continuation_bounds_concurrency_without_expanding_authority() {
+    let (_temp, mut store, original, definition) = fixture();
+    execute(&mut store, &original, &definition, 2, false);
+    let (mut request, mut run, _) = successor(&mut store, &original);
+    assert!(original.limits.concurrency_cap > 3);
+    run.limits.node_execution_cap = 3;
+    run.limits.concurrency_cap = 3;
+    request.successor.limits = run.limits.clone();
+    let authority = original.execution_authority.as_ref().unwrap();
+    assert!(store.continue_run_owned(&request, &run, authority).unwrap());
+    assert_eq!(store.run_limits(&run.run_id).unwrap(), Some(run.limits));
+}
+
+#[test]
+fn continuation_rejects_increased_concurrency() {
+    let (_temp, mut store, original, definition) = fixture();
+    execute(&mut store, &original, &definition, 2, false);
+    let (mut request, mut run, _) = successor(&mut store, &original);
+    run.limits.concurrency_cap += 1;
+    request.successor.limits = run.limits.clone();
+    let before = store.run_summary(&original.run_id).unwrap();
+    assert!(
+        store
+            .continue_run_owned(
+                &request,
+                &run,
+                original.execution_authority.as_ref().unwrap()
+            )
+            .is_err()
+    );
+    assert!(store.run_summary(&run.run_id).unwrap().is_none());
+    assert_eq!(store.run_summary(&original.run_id).unwrap(), before);
 }
 
 #[test]

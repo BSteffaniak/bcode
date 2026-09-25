@@ -12,7 +12,26 @@ configuration with explicit remedies. It rejects unsupported response versions a
 plugin identities without interpreting their flags. Missing prerequisites return command failure
 alongside the remedies; success means only that these configured prerequisites are present.
 It does not start work or verify model/workspace readiness.
-Automatic goal setup gating and collaboration launch remain unfinished. `/goal` setup offers
+Collaboration setup builds and dispatches a coordinator
+configuration with a fresh execution context, input-preserving output and bundled plugin-owned
+coordination instructions. Its portable activity stage is `coordination` (and `coordination_complete`
+on settlement); fallback text explicitly does not establish worker dispatch/results/integration and
+points to `/workflow`. The goal graph and evaluator policy/schema remain unchanged; collaborating
+evaluation adds plugin-owned instructions requiring canonical delegation/integration evidence and
+an incomplete verdict when evidence is missing. Optional judgement remains unchanged. This
+configuration is dispatched after prerequisite success through ordinary start authorization;
+handoff, allowance accounting and end-to-end execution still need acceptance proof. Fresh context is not filesystem isolation, and the unchanged mutating
+capability declaration grants no tools or publication authority. `/goal --collaborate` explicitly selects
+collaboration and checks prerequisites before fresh-session creation and prompt generation,
+then checks again before working-document creation, replacement cancellation or workflow start.
+Generation receives explicit collaboration guidance without granting tools or prescribing a strategy.
+Pending generation checks coalesce; closure discards late results, and failures permit retry.
+Missing/incompatible prerequisites block with remedies. Successful launch preflight retains the
+exact coordinator request through document preparation and starts it once; an explicit retry checks
+prerequisites again. A denied replacement re-enters replacement confirmation instead of becoming
+a direct-start retry; a denied direct start retains its exact request identity. Plain `/goal` retains its existing behavior. Unknown goal options
+reject with usage. These checks grant no authority and do not verify model/workspace readiness.
+`/goal` setup offers
 Ctrl-D for a nonblocking advisory check through the host API; repeated pending checks coalesce.
 The setup check times out after ten seconds and permits retry without treating timeout as readiness.
 Results do not start generation or grant authority. The full multiline remedy remains available
@@ -22,6 +41,47 @@ Plugin surfaces can use
 existing typed client and unsupported hosts fail closed. This adaptation owns no permission policy.
 
 ## Continuing revised goal loops
+
+Run inspection includes an optional `execution_allowance` observation with run/root caps and
+consumed attempts (counts saturate at each cap). Counts are nullable: inspection scans at most
+1,001 local attempts, 1,001 descendant links, and 1,001 root/descendant attempts; if those
+read bounds prevent a trustworthy count it reports unknown, never zero or remaining capacity.
+These are inspection bounds, not execution or composition limits. Older senders omit the observation, meaning unknown.
+The shared `exhausted()` query returns true if either valid budget proves exhaustion, false only
+when both known counts are below their caps, and unknown for incomplete or inconsistent facts.
+The workflow plugin's `workflow.inspect` structured result includes the observation, and its
+summary distinguishes exhausted, remaining and unknown allowance using the shared query.
+Neither remaining allowance nor the summary grants dispatch authority.
+The read uses a single database snapshot and does not mutate state; it does not imply runnable
+work or authorize any increase. Historical exhaustion events are not used to derive these facts.
+
+`/goal --collaborate --worker-attempts N` accepts an explicit positive extra execution
+allowance. Request construction adds it to the base goal-node allowance with checked arithmetic;
+it does not change goal rounds, concurrency/recursion policy or permission authority. It is a
+run-wide extra attempt budget (workers and added coordinators), not a worker count or reserved
+per-role quota. Omission adds no budget. Plain goals ignore the collaboration-only value.
+Full collaboration acceptance remains unverified. `/goal.continue R --worker-attempts N` explicitly adds
+N attempts to the retained graph's renewed base allowance without changing its input, graph,
+round count or recursive policy. Successor concurrency is the smaller of the retained concurrency
+cap and the renewed total attempt allowance, preventing invalid limits on short continuations.
+Omission adds no extra attempts; overflow and
+combined allowances outside the store's signed 64-bit integer range reject before launch effects.
+This is a new caller-authorized budget, not automatic renewal of the previous extra allowance.
+Mid-round delegated exhaustion and end-to-end continuation acceptance remain unverified;
+continuation requests for non-eligible run status or failure reason return the normalized
+`workflow_continuation_ineligible` error rather than generic workflow unavailability.
+This rejection preserves the run and explicitly reports that active allowance exhaustion is not
+yet supported. These options alone do not deliver swarm execution. Dispatch reports run/root execution-allowance
+exhaustion separately from concurrency contention and leaves blocked activations pending without
+admitting attempts. This allows the driver to reconcile already-admitted receipts despite exhausted
+allowance. Settlement does not replenish execution allowance; no automatic grant or successor
+continuation is implied. The first blocked dispatch records a version-1
+`execution_allowance_exhausted` history event under the observed execution authority. Its
+`additional_work_admitted: false` payload describes that observation, not a terminal outcome
+or a current-status projection. Repeated blocked passes do not append duplicate observations;
+existing attempts, results, run status and allowances are unchanged. Public history exposes only
+these reviewed version-1 fields, drops additional producer data, and reports unavailable details
+for missing/unsupported versions or malformed observations.
 
 The loop plugin derives an exhausted loop's renewed node-execution allowance from reachable
 Task, Agent, PluginBlock and WorkflowCall nodes in the retained graph, multiplied by the requested
@@ -60,6 +120,13 @@ and execution allowances still apply. Active-planner suspend/join and policy-gov
 recursive reuse remain unfinished; permitting call nodes does not establish them.
 
 ## Agent task staging
+
+Parallel result composition now expands supported nonrecursive local schema references within
+each component's own root before embedding. This preserves independent `$defs` namespaces and
+reference siblings, including goal judgement configuration, under an explicit expansion budget.
+Task-group worker and source-context joins share the workflow-domain helper. Unsupported recursive
+references, resource identifiers and dynamic references reject rather than weakening constraints.
+Existing persisted schemas are not rewritten or repaired by this change.
 
 Task groups accept optional `dependencies`, mapping a worker task ID to one predecessor worker
 in the same group. Dependent workers consume predecessor output; only roots consume group/source

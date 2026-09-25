@@ -34,6 +34,11 @@ fn activity_heading(
         format!(
             "Goal initialization · Researching and preparing progress document\nPrompt: {prompt}\nStop when: {stop}"
         )
+    } else if phase.starts_with("coordination") {
+        format!(
+            "Goal coordination · Round {} of {} · {phase}\nPrompt: {prompt}\nStop when: {stop}\nWorker dispatch, results and integration are not established by this activity; inspect /workflow.",
+            state.iteration, state.max_iterations
+        )
     } else {
         format!(
             "Loop · Iteration {} of {} · {phase}\nPrompt: {prompt}\nStop when: {stop}",
@@ -47,6 +52,8 @@ fn validate_stage(stage: &str) -> Result<(), String> {
         stage,
         "initialization"
             | "initialization_complete"
+            | "coordination"
+            | "coordination_complete"
             | "implementation"
             | "implementation_complete"
             | "evaluation"
@@ -206,6 +213,26 @@ pub fn project(request: ActivityProjectionRequest) -> Result<ActivityPresentatio
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn coordination_activity_does_not_claim_delegation_or_completion() {
+        for stage in ["coordination", "coordination_complete"] {
+            let presentation = project(request(stage)).unwrap();
+            assert!(
+                presentation
+                    .fallback
+                    .contains("Goal coordination · Round 2 of 10")
+            );
+            assert!(
+                presentation
+                    .fallback
+                    .contains("not established by this activity")
+            );
+            assert!(!presentation.fallback.contains("Goal completed"));
+            assert_eq!(presentation.payload["stage"], stage);
+            assert_eq!(presentation.activity_id, "iteration:2");
+        }
+    }
 
     #[test]
     fn terminal_presentation_distinguishes_approval_from_exhaustion() {

@@ -25,10 +25,10 @@ pub use run_contracts::{
     WorkflowCoordinatorStatus, WorkflowDecision, WorkflowDecisionInspection,
     WorkflowDecisionValueDisclosure, WorkflowDefinitionRepresentation, WorkflowDefinitionSnapshot,
     WorkflowDescendantRunSummary, WorkflowDoctorIssue, WorkflowDoctorReport,
-    WorkflowFanOutObservation, WorkflowGrant, WorkflowGrantInspection,
-    WorkflowGrantScopeDisclosure, WorkflowGrantUseObservation, WorkflowHistoryAttemptCorrelation,
-    WorkflowHistoryDiagnostic, WorkflowHistoryEvent, WorkflowMutationApproval,
-    WorkflowMutationApprovalDecision, WorkflowMutationApprovalInspection,
+    WorkflowExecutionAllowanceObservation, WorkflowFanOutObservation, WorkflowGrant,
+    WorkflowGrantInspection, WorkflowGrantScopeDisclosure, WorkflowGrantUseObservation,
+    WorkflowHistoryAttemptCorrelation, WorkflowHistoryDiagnostic, WorkflowHistoryEvent,
+    WorkflowMutationApproval, WorkflowMutationApprovalDecision, WorkflowMutationApprovalInspection,
     WorkflowMutationApprovalResolution, WorkflowMutationApprovalScopeInspection,
     WorkflowNodeRetryResult, WorkflowOutputInspection, WorkflowOutputSummary,
     WorkflowOutputValidationObservation, WorkflowPackageExportRunStartResponse,
@@ -8948,15 +8948,16 @@ fn validate_structured_source_retry(
 
 /// Compare a standalone member schema with its nested parallel-tuple schema.
 ///
-/// Only top-level titles and the supported default dialect declaration may differ.
-/// Nested keywords and validation constraints are compared exactly; unknown dialects fail closed.
+/// Local references are expanded within each component's own root under a bounded budget.
+/// Top-level titles and the supported default dialect declaration may differ.
+/// Constraints are compared conservatively; unsupported reference forms fail closed.
 #[must_use]
 pub fn parallel_member_schema_matches(
     standalone: &serde_json::Value,
     nested: &serde_json::Value,
 ) -> bool {
     fn normalized(schema: &serde_json::Value) -> Option<serde_json::Value> {
-        let mut schema = schema.clone();
+        let mut schema = embedded_schema(schema).ok()?;
         if let Some(object) = schema.as_object_mut() {
             if let Some(dialect) = object.get("$schema")
                 && dialect.as_str() != Some("https://json-schema.org/draft/2020-12/schema")
@@ -8974,6 +8975,99 @@ pub fn parallel_member_schema_matches(
     }
 }
 
+/// Compose a parallel result pair without changing the roots of local references.
+///
+/// # Errors
+/// Rejects invalid, recursive or unsupported local-reference schemas and oversized results.
+pub fn parallel_result_schema(
+    left: &ValueSchema,
+    right: &ValueSchema,
+) -> Result<ValueSchema, WorkflowError> {
+    workflow_parallel_join_schema(left, right)
+}
+
+fn embedded_schema(schema: &serde_json::Value) -> Result<serde_json::Value, WorkflowError> {
+    fn expand(
+        root: &serde_json::Value,
+        value: &serde_json::Value,
+        budget: &mut usize,
+    ) -> Result<serde_json::Value, WorkflowError> {
+        *budget = budget.checked_sub(1).ok_or_else(|| {
+            authoring_error("parallel.member", "schema expansion budget exceeded")
+        })?;
+        let Some(fields) = value.as_object() else {
+            return Ok(value.clone());
+        };
+        let mut fields = fields.clone();
+        let reference = fields.remove("$ref");
+        for (key, item) in &mut fields {
+            match key.as_str() {
+                "$defs" | "definitions" | "properties" | "patternProperties"
+                | "dependentSchemas" => {
+                    if let Some(map) = item.as_object_mut() {
+                        for schema in map.values_mut() {
+                            *schema = expand(root, schema, budget)?;
+                        }
+                    }
+                }
+                "allOf" | "anyOf" | "oneOf" | "prefixItems" => {
+                    if let Some(items) = item.as_array_mut() {
+                        for schema in items {
+                            *schema = expand(root, schema, budget)?;
+                        }
+                    }
+                }
+                "items"
+                | "contains"
+                | "additionalProperties"
+                | "unevaluatedProperties"
+                | "unevaluatedItems"
+                | "propertyNames"
+                | "not"
+                | "if"
+                | "then"
+                | "else" => *item = expand(root, item, budget)?,
+                "$id" | "$anchor" | "$dynamicAnchor" | "$dynamicRef" => {
+                    return Err(authoring_error(
+                        "parallel.member",
+                        "schema resource identifiers and dynamic references are unsupported in composition",
+                    ));
+                }
+                _ => {}
+            }
+        }
+        if let Some(reference) = reference {
+            let pointer = reference
+                .as_str()
+                .and_then(|text| text.strip_prefix('#'))
+                .ok_or_else(|| authoring_error("parallel.member", "unsupported reference"))?;
+            let target = root
+                .pointer(pointer)
+                .ok_or_else(|| authoring_error("parallel.member", "unresolved reference"))?;
+            let target = expand(root, target, budget)?;
+            if fields.is_empty() {
+                Ok(target)
+            } else {
+                // Keep sibling unevaluated* keywords at the same evaluation scope as
+                // the reference replacement so they see its evaluated properties/items.
+                let all_of = fields
+                    .entry("allOf")
+                    .or_insert_with(|| serde_json::json!([]));
+                all_of
+                    .as_array_mut()
+                    .ok_or_else(|| authoring_error("parallel.member", "allOf must be an array"))?
+                    .push(target);
+                Ok(serde_json::Value::Object(fields))
+            }
+        } else {
+            Ok(serde_json::Value::Object(fields))
+        }
+    }
+    validate_local_schema_references("parallel.member", schema)?;
+    let mut budget = MAX_WORKFLOW_AUTHORING_SCHEMA_PROPERTIES;
+    expand(schema, schema, &mut budget)
+}
+
 fn workflow_parallel_join_schema(
     left: &ValueSchema,
     right: &ValueSchema,
@@ -8985,7 +9079,7 @@ fn workflow_parallel_join_schema(
         ),
         schema: serde_json::json!({
             "type": "array",
-            "prefixItems": [left.schema.clone(), right.schema.clone()],
+            "prefixItems": [embedded_schema(&left.schema)?, embedded_schema(&right.schema)?],
             "minItems": 2,
             "maxItems": 2
         }),
@@ -22642,6 +22736,99 @@ steps:
             .validate()
             .is_err()
         );
+    }
+
+    #[test]
+    fn parallel_result_composition_preserves_independent_references_and_constraints() {
+        let member = |kind: &str| ValueSchema {
+            type_name: kind.into(),
+            schema: serde_json::json!({"$defs":{"value":{"type":kind}}, "$ref":"#/$defs/value"}),
+        };
+        let left = member("string");
+        let right = member("integer");
+        let pair = parallel_result_schema(&left, &right).unwrap();
+        assert!(
+            pair.validate_value("pair", &serde_json::json!(["ok", 1]))
+                .is_ok()
+        );
+        for invalid in [
+            serde_json::json!([1, "ok"]),
+            serde_json::json!(["ok"]),
+            serde_json::json!(["ok", "1"]),
+        ] {
+            assert!(pair.validate_value("pair", &invalid).is_err());
+        }
+        assert!(parallel_member_schema_matches(
+            &left.schema,
+            &pair.schema["prefixItems"][0]
+        ));
+        let bounded = ValueSchema {
+            type_name: "bounded".into(),
+            schema: serde_json::json!({"$defs":{"value":{"type":"integer"}},"$ref":"#/$defs/value", "minimum":3}),
+        };
+        let nested = parallel_result_schema(&pair, &bounded).unwrap();
+        assert!(
+            nested
+                .validate_value("nested", &serde_json::json!([["ok", 1], 3]))
+                .is_ok()
+        );
+        assert!(
+            nested
+                .validate_value("nested", &serde_json::json!([["ok", 1], 2]))
+                .is_err()
+        );
+        for schema in [
+            serde_json::json!({"$ref":"#/$defs/missing"}),
+            serde_json::json!({"$ref":"#"}),
+            serde_json::json!({"$id":"https://example.com/schema", "type":"string"}),
+        ] {
+            assert!(
+                parallel_result_schema(
+                    &ValueSchema {
+                        type_name: "invalid".into(),
+                        schema
+                    },
+                    &right
+                )
+                .is_err()
+            );
+        }
+    }
+
+    #[test]
+    fn parallel_reference_siblings_preserve_unevaluated_scope() {
+        for (schema, valid, invalid) in [
+            (
+                serde_json::json!({"$defs":{"base":{"type":"object","properties":{"known":{"type":"integer"}},"required":["known"]}},"$ref":"#/$defs/base","unevaluatedProperties":false,"allOf":[{"properties":{"known":{"minimum":1}}}]}),
+                serde_json::json!({"known":1}),
+                serde_json::json!({"known":1,"extra":true}),
+            ),
+            (
+                serde_json::json!({"$defs":{"base":{"type":"array","prefixItems":[{"type":"integer"}]}},"$ref":"#/$defs/base","unevaluatedItems":false}),
+                serde_json::json!([1]),
+                serde_json::json!([1, 2]),
+            ),
+        ] {
+            let member = ValueSchema {
+                type_name: "member".into(),
+                schema,
+            };
+            let pair = parallel_result_schema(&member, &member).unwrap();
+            assert!(member.validate_value("original", &valid).is_ok());
+            assert!(member.validate_value("original", &invalid).is_err());
+            assert!(
+                pair.validate_value("composed", &serde_json::json!([valid.clone(), valid]))
+                    .is_ok()
+            );
+            assert!(
+                pair.validate_value("composed", &serde_json::json!([invalid.clone(), invalid]))
+                    .is_err()
+            );
+            assert!(parallel_member_schema_matches(
+                &member.schema,
+                &pair.schema["prefixItems"][0]
+            ));
+        }
     }
 
     #[test]

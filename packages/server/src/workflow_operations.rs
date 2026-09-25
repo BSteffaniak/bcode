@@ -8223,6 +8223,22 @@ fn history_event(
         serde_json::json!({"reason": diagnostic})
     } else if let Some(lifecycle) = run_lifecycle_observation(&row.event_type) {
         lifecycle
+    } else if row.event_type == "execution_allowance_exhausted" {
+        if row
+            .payload
+            .get("version")
+            .and_then(serde_json::Value::as_u64)
+            == Some(1)
+            && row
+                .payload
+                .get("additional_work_admitted")
+                .and_then(serde_json::Value::as_bool)
+                == Some(false)
+        {
+            serde_json::json!({"version":1,"additional_work_admitted":false})
+        } else {
+            serde_json::json!({"unavailable":"invalid_execution_allowance_observation"})
+        }
     } else if row.event_type == "output_validated" {
         output_validation_observation(&row.payload)
     } else if matches!(
@@ -8349,6 +8365,46 @@ fn history_failure_and_pause_diagnostics_exclude_owner_content() {
             created_at_ms: 2,
         });
         assert_eq!(event.payload, serde_json::json!({"reason": reason}));
+    }
+}
+
+#[cfg(test)]
+#[test]
+fn history_execution_allowance_is_versioned_and_secret_safe() {
+    for (payload, valid) in [
+        (
+            serde_json::json!({"version":1,"additional_work_admitted":false,"secret":"SECRET"}),
+            true,
+        ),
+        (
+            serde_json::json!({"version":2,"additional_work_admitted":false}),
+            false,
+        ),
+        (serde_json::json!({"additional_work_admitted":false}), false),
+        (
+            serde_json::json!({"version":1,"additional_work_admitted":true}),
+            false,
+        ),
+        (
+            serde_json::json!({"version":1,"additional_work_admitted":"SECRET"}),
+            false,
+        ),
+    ] {
+        let event = history_event(bcode_workflow_store::WorkflowEventRow {
+            event_seq: 42,
+            run_id: "run".into(),
+            event_type: "execution_allowance_exhausted".into(),
+            payload,
+            created_at_ms: 23,
+        });
+        assert_eq!(
+            event.payload,
+            if valid {
+                serde_json::json!({"version":1,"additional_work_admitted":false})
+            } else {
+                serde_json::json!({"unavailable":"invalid_execution_allowance_observation"})
+            }
+        );
     }
 }
 
@@ -11231,12 +11287,19 @@ pub async fn inspect_run(
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .replacement_readiness(run_id)?,
     );
-    Ok(bcode_workflow::WorkflowRunInspection {
-        continuation: state
+    let (execution_allowance, continuation) = {
+        let store = state
             .workflow_store
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .continuation_lineage(run_id)?,
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        (
+            Some(store.execution_allowance_observation(run_id)?),
+            store.continuation_lineage(run_id)?,
+        )
+    };
+    Ok(bcode_workflow::WorkflowRunInspection {
+        execution_allowance,
+        continuation,
         replacement_readiness,
         run,
         graph: Some(graph),

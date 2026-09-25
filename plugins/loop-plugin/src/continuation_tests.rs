@@ -1,6 +1,59 @@
 use super::*;
 use crate::{LoopWorkflowInput, goal_workflow_spec, loop_workflow_spec};
 
+#[test]
+fn continuation_failures_are_not_successful_commands() {
+    for error in [
+        "No associated loop",
+        "Unsupported loop continuation topology",
+        "workflow state is unavailable",
+        "permission denied",
+    ] {
+        assert!(!continuation_response(Err(error.into())).success);
+    }
+    assert!(continuation_response(Ok("Granted continuation".into())).success);
+    assert!(!command(SessionId::new(), "0").success);
+}
+
+#[test]
+fn short_continuation_concurrency_does_not_exceed_total_attempt_allowance() {
+    let mut checkpoint = source(false);
+    checkpoint.limits.concurrency_cap = 100;
+    checkpoint.limits.retry_cap = 0;
+    let continued = request(checkpoint, 1).unwrap();
+    assert!(continued.successor.limits.node_execution_cap < 100);
+    assert_eq!(
+        u64::from(continued.successor.limits.concurrency_cap),
+        continued.successor.limits.node_execution_cap
+    );
+}
+
+#[test]
+fn extra_attempts_are_explicit_and_preserve_continuation_state() {
+    let baseline = request(source(true), 2).unwrap();
+    let extra = request_with_allowance(source(true), 2, 19).unwrap();
+    assert_eq!(extra.successor.definition, baseline.successor.definition);
+    assert_eq!(extra.successor.input, baseline.successor.input);
+    let mut expected = baseline.successor.limits;
+    expected.node_execution_cap += 19;
+    assert_eq!(extra.successor.limits, expected);
+    assert!(request_with_allowance(source(true), 2, i64::MAX as u64).is_err());
+    assert!(request_with_allowance(source(true), 2, u64::MAX).is_err());
+    assert_eq!(parse_allowance("2").unwrap(), (2, 0));
+    assert_eq!(parse_allowance("2 --worker-attempts 19").unwrap(), (2, 19));
+    for invalid in [
+        "",
+        "0",
+        "-1",
+        "2 --worker-attempts 0",
+        "2 --worker-attempts -1",
+        "2 extra",
+        "2 --worker-attempts 18446744073709551616",
+    ] {
+        assert!(parse_allowance(invalid).is_err());
+    }
+}
+
 fn source(progress: bool) -> bcode_workflow::WorkflowContinuationSource {
     let input = LoopWorkflowInput::new(
         "accepted implementation".into(),

@@ -4,6 +4,36 @@ use bcode_plugin_sdk::tui::PluginStructuredGenerationRequest;
 
 pub const SURFACE_KIND: &str = "goal.start";
 
+pub fn start_response(arguments: &str) -> InvokeCommandResponse {
+    let tokens: Vec<_> = arguments.split_whitespace().collect();
+    let allowance = match tokens.as_slice() {
+        [] | ["--collaborate"] => Ok(None),
+        ["--collaborate", "--worker-attempts", count] => count
+            .parse::<std::num::NonZeroU64>()
+            .map(|count| Some(count.get()))
+            .map_err(|_| ()),
+        _ => Err(()),
+    };
+    let Ok(allowance) = allowance else {
+        let mut response =
+            status_response("Usage: /goal [--collaborate [--worker-attempts <positive integer>]]");
+        response.success = false;
+        return response;
+    };
+    InvokeCommandResponse {
+        success: true,
+        message: None,
+        updated_model: None,
+        updated_provider: None,
+        updated_thinking: None,
+        effects: vec![CommandEffect::OpenPluginSurface {
+            surface_kind: SURFACE_KIND.into(),
+            instance_id: "goal-start".into(),
+            options: serde_json::json!({"collaboration":!tokens.is_empty(), "worker_attempts":allowance}),
+        }],
+    }
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct GeneratedGoalPrompts {
@@ -15,11 +45,15 @@ fn generation_request(
     objective: &str,
     guidance: &str,
     progress_document: bool,
+    collaboration: CollaborationMode,
 ) -> PluginStructuredGenerationRequest {
     PluginStructuredGenerationRequest {
         source_session_id: None,
         session_name: "Goal prompt generation".into(),
         system_prompt: [
+            if collaboration == CollaborationMode::Requested {
+                "The user explicitly requested collaborating agents. Preserve this requirement in both generated prompts: use the existing goal/workflow delegation mechanisms, collect worker evidence, revise or delegate follow-up work, integrate contributions and verify the original objective. Do not silently substitute a single-agent result. Missing collaboration support, permissions or verified results are blockers, not completion. Collaboration does not grant tools or prescribe a workspace or integration strategy."
+            } else { "Preserve the user's objective without requiring collaboration." },
             include_str!("../prompts/goal-generation.md"),
             include_str!("../prompts/goal-iteration-guidance.md"),
             include_str!("../prompts/goal-stop-condition-guidance.md"),
@@ -202,7 +236,22 @@ impl PluginTuiSurfaceFactory for GoalSurfaceFactory {
                 .get("session_id")
                 .and_then(serde_json::Value::as_str)
                 .and_then(|s| SessionId::from_str(s).ok());
-            Ok(Box::new(GoalSurface::new(session)) as BoxedPluginTuiSurface)
+            let mut surface = GoalSurface::new(session);
+            surface.editor.collaboration = if request
+                .options
+                .get("collaboration")
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(false)
+            {
+                CollaborationMode::Requested
+            } else {
+                CollaborationMode::Disabled
+            };
+            surface.editor.worker_attempts = request
+                .options
+                .get("worker_attempts")
+                .and_then(serde_json::Value::as_u64);
+            Ok(Box::new(surface) as BoxedPluginTuiSurface)
         })
     }
 }
@@ -211,6 +260,7 @@ type GenerationResult = Result<bcode_plugin_sdk::tui::PluginStructuredGeneration
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum GoalPhase {
     Draft,
+    CheckingDelegation { review: bool },
     Generating { review: bool },
     Generated,
     Closed,
@@ -232,6 +282,7 @@ struct GoalSurface {
     source: Option<(String, String, u64)>,
     completion: Arc<Mutex<Option<GenerationResult>>>,
     live: Option<crate::goal_live::GenerationView>,
+    generation_preflight: Arc<Mutex<Option<Result<(), String>>>>,
     preflight_pending: bool,
     preflight_completion: Arc<Mutex<Option<String>>>,
 }
@@ -247,6 +298,21 @@ fn preflight_setup_summary(result: &bcode_workflow::WorkflowDelegationPreflight)
     } else {
         "Delegation prerequisites missing; /goal.preflight for remedies. No authority changed."
             .into()
+    }
+}
+
+pub async fn require_delegation(
+    future: bcode_plugin_sdk::tui::PluginWorkflowDelegationPreflightFuture,
+) -> Result<(), String> {
+    let result = tokio::time::timeout(std::time::Duration::from_secs(10), future)
+        .await
+        .map_err(|_| "delegation prerequisite check timed out".to_string())?
+        .map_err(|error| error.to_string())?;
+    let message = delegation_preflight_message(&result)?;
+    if result.plugin_loaded && result.staging_configured && result.publication_configured {
+        Ok(())
+    } else {
+        Err(message)
     }
 }
 
@@ -288,6 +354,7 @@ impl GoalSurface {
             source: None,
             completion: Arc::default(),
             live: None,
+            generation_preflight: Arc::default(),
             preflight_pending: false,
             preflight_completion: Arc::default(),
         }
@@ -418,6 +485,36 @@ impl GoalSurface {
         None
     }
 
+    fn poll_generation_preflight(&mut self, host: &dyn PluginTuiHost) -> Option<PluginTuiAction> {
+        let result = self
+            .generation_preflight
+            .lock()
+            .expect("generation preflight completion")
+            .take()?;
+        let GoalPhase::CheckingDelegation { review } = self.phase else {
+            return None;
+        };
+        self.phase = GoalPhase::Draft;
+        Some(match result {
+            Ok(()) => self.generate_checked(host, review, true),
+            Err(error) => {
+                self.editor.status =
+                    format!("Collaboration generation blocked: {error}; submit to retry");
+                PluginTuiAction::Redraw
+            }
+        })
+    }
+
+    fn resume_session_generation(&mut self, host: &dyn PluginTuiHost) -> Option<PluginTuiAction> {
+        if self.editor.fresh_session != FreshSessionState::Resume {
+            return None;
+        }
+        self.editor.fresh_session = FreshSessionState::Ready;
+        self.pending_review
+            .take()
+            .map(|review| self.generate(host, review))
+    }
+
     fn poll_preflight(&mut self) -> bool {
         let result = self
             .preflight_completion
@@ -451,6 +548,15 @@ impl GoalSurface {
     }
 
     fn generate(&mut self, host: &dyn PluginTuiHost, review: bool) -> PluginTuiAction {
+        self.generate_checked(host, review, false)
+    }
+
+    fn generate_checked(
+        &mut self,
+        host: &dyn PluginTuiHost,
+        review: bool,
+        checked: bool,
+    ) -> PluginTuiAction {
         if self.phase != GoalPhase::Draft {
             return PluginTuiAction::None;
         }
@@ -478,6 +584,17 @@ impl GoalSurface {
                 return PluginTuiAction::Redraw;
             }
         };
+        if self.editor.collaboration == CollaborationMode::Requested && !checked {
+            self.phase = GoalPhase::CheckingDelegation { review };
+            self.editor.status = "Checking collaboration prerequisites before generation…".into();
+            let future = host.workflow_delegation_preflight("bcode.workflow".into());
+            let completion = self.generation_preflight.clone();
+            host.spawn(Box::pin(async move {
+                *completion.lock().expect("generation preflight completion") =
+                    Some(require_delegation(future).await);
+            }));
+            return PluginTuiAction::Redraw;
+        }
         if !self.editor.ensure_session(host) {
             self.pending_review = Some(review);
             return PluginTuiAction::Redraw;
@@ -493,6 +610,7 @@ impl GoalSurface {
             &objective,
             &guidance,
             self.editor.progress_document.is_some(),
+            self.editor.collaboration,
         );
         request.source_session_id = self.editor.session_id;
         let live = crate::goal_live::GenerationView::default();
@@ -603,11 +721,11 @@ impl PluginTuiSurface for GoalSurface {
         if self.phase == GoalPhase::Closed {
             return PluginTuiAction::None;
         }
-        if self.editor.fresh_session == FreshSessionState::Resume {
-            self.editor.fresh_session = FreshSessionState::Ready;
-            if let Some(review) = self.pending_review.take() {
-                return self.generate(host, review);
-            }
+        if let Some(action) = self.poll_generation_preflight(host) {
+            return action;
+        }
+        if let Some(action) = self.resume_session_generation(host) {
+            return action;
         }
         if let Some(live) = &mut self.live {
             live.poll(host);
@@ -828,6 +946,7 @@ mod tests {
 
     #[derive(Default)]
     struct Host {
+        prerequisites: bool,
         tasks: Mutex<Vec<bcode_plugin_sdk::tui::PluginTask>>,
         starts: Mutex<Vec<PluginWorkflowStartRequest>>,
         documents: Mutex<Vec<bcode_session_models::SessionWorkingDocumentRequest>>,
@@ -836,6 +955,21 @@ mod tests {
         generations: Mutex<usize>,
     }
     impl PluginTuiHost for Host {
+        fn workflow_delegation_preflight(
+            &self,
+            plugin_id: String,
+        ) -> bcode_plugin_sdk::tui::PluginWorkflowDelegationPreflightFuture {
+            let ready = self.prerequisites;
+            Box::pin(async move {
+                Ok(bcode_workflow::WorkflowDelegationPreflight {
+                    version: 1,
+                    plugin_id,
+                    plugin_loaded: ready,
+                    staging_configured: ready,
+                    publication_configured: ready,
+                })
+            })
+        }
         fn prepare_fresh_session(
             &self,
             existing: Option<SessionId>,
@@ -927,6 +1061,32 @@ mod tests {
     }
 
     #[test]
+    fn goal_command_requires_explicit_positive_worker_allowance() {
+        for args in [
+            "--worker-attempts 4",
+            "--collaborate --worker-attempts 0",
+            "--collaborate --worker-attempts -1",
+            "--collaborate --worker-attempts nope",
+            "--collaborate extra",
+        ] {
+            assert!(!start_response(args).success);
+        }
+        for (args, expected) in [
+            ("", None),
+            ("--collaborate", None),
+            ("--collaborate --worker-attempts 17", Some(17)),
+        ] {
+            let response = start_response(args);
+            assert!(response.success);
+            let CommandEffect::OpenPluginSurface { options, .. } = &response.effects[0] else {
+                panic!("surface");
+            };
+            assert_eq!(options["worker_attempts"].as_u64(), expected);
+            assert_eq!(options["collaboration"], !args.is_empty());
+        }
+    }
+
+    #[test]
     fn setup_preflight_summary_points_to_remedies_without_claiming_execution() {
         for loaded in [false, true] {
             for staging in [false, true] {
@@ -987,10 +1147,183 @@ mod tests {
         host.finish().await;
         surface.poll(&host);
         assert!(!surface.preflight_pending);
-        assert!(surface.editor.status.contains("could not be verified"));
+        assert!(surface.editor.status.contains("missing"));
         assert_eq!(*host.generations.lock().unwrap(), 0);
         assert_eq!(*host.created_sessions.lock().unwrap(), 0);
         assert!(surface.phase == GoalPhase::Draft);
+    }
+
+    #[tokio::test]
+    async fn collaboration_denial_precedes_session_and_generation_effects() {
+        let host = Host::default();
+        let mut surface = GoalSurface::new(None);
+        surface.editor.collaboration = CollaborationMode::Requested;
+        surface.editor.prompt = text_state("Coordinate a review");
+        surface.generate(&host, false);
+        surface.generate(&host, false);
+        assert_eq!(host.tasks.lock().unwrap().len(), 1);
+        assert_eq!(*host.created_sessions.lock().unwrap(), 0);
+        assert_eq!(*host.generations.lock().unwrap(), 0);
+        host.finish().await;
+        surface.poll(&host);
+        assert!(surface.phase == GoalPhase::Draft);
+        assert!(surface.editor.status.contains("generation blocked"));
+        assert_eq!(*host.created_sessions.lock().unwrap(), 0);
+        assert_eq!(*host.generations.lock().unwrap(), 0);
+        assert!(host.starts.lock().unwrap().is_empty());
+        assert!(host.documents.lock().unwrap().is_empty());
+        surface.generate(&host, true);
+        assert_eq!(host.tasks.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn closed_collaboration_setup_discards_late_preflight() {
+        let host = Host::default();
+        let mut surface = GoalSurface::new(None);
+        surface.editor.collaboration = CollaborationMode::Requested;
+        surface.editor.prompt = text_state("Coordinate a review");
+        surface.generate(&host, false);
+        surface.phase = GoalPhase::Closed;
+        *surface.generation_preflight.lock().unwrap() = Some(Ok(()));
+        surface.poll(&host);
+        assert!(surface.phase == GoalPhase::Closed);
+        assert_eq!(*host.created_sessions.lock().unwrap(), 0);
+        assert_eq!(*host.generations.lock().unwrap(), 0);
+    }
+
+    #[tokio::test]
+    async fn checked_collaboration_can_generate_without_launching_plain_loop() {
+        let host = Host::default();
+        let mut surface = GoalSurface::new(Some(SessionId::new()));
+        surface.editor.collaboration = CollaborationMode::Requested;
+        surface.editor.prompt = text_state("Coordinate a review");
+        surface.phase = GoalPhase::CheckingDelegation { review: true };
+        *surface.generation_preflight.lock().unwrap() = Some(Ok(()));
+        surface.poll(&host);
+        assert_eq!(*host.generations.lock().unwrap(), 1);
+        host.finish().await;
+        surface.poll(&host);
+        assert!(surface.phase == GoalPhase::Generated);
+        assert!(host.starts.lock().unwrap().is_empty());
+        assert!(host.documents.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn generation_preserves_explicit_collaboration_intent() {
+        let request = generation_request("Review", "", true, CollaborationMode::Requested);
+        assert!(
+            request
+                .system_prompt
+                .contains("explicitly requested collaborating agents")
+        );
+        assert!(request.system_prompt.contains("does not grant tools"));
+        let plain = generation_request("Review", "", true, CollaborationMode::Disabled);
+        assert!(
+            plain
+                .system_prompt
+                .contains("without requiring collaboration")
+        );
+        assert!(
+            !plain
+                .system_prompt
+                .contains("explicitly requested collaborating agents")
+        );
+    }
+
+    #[tokio::test]
+    async fn collaboration_launch_is_gated_and_dispatches_coordinator_once() {
+        for ready in [false, true] {
+            let host = Host {
+                prerequisites: ready,
+                ..Host::default()
+            };
+            let mut surface = GoalSurface::new(Some(SessionId::new()));
+            surface.editor.collaboration = CollaborationMode::Requested;
+            surface.editor.worker_attempts = Some(12);
+            surface.editor.prompt = text_state("Coordinate review");
+            surface.editor.condition = text_state("Verified evidence");
+            surface.editor.limit = text_state("2");
+            surface.phase = GoalPhase::Generated;
+            surface.editor.start();
+            surface.editor.begin_pending_host_work(&host);
+            assert!(host.starts.lock().unwrap().is_empty());
+            assert!(host.documents.lock().unwrap().is_empty());
+            for _ in 0..5 {
+                host.finish().await;
+                surface.poll(&host);
+            }
+            let starts = host.starts.lock().unwrap();
+            assert_eq!(starts.len(), usize::from(ready));
+            if let Some(start) = starts.first() {
+                let configuration: bcode_workflow::WorkflowPromptConfiguration =
+                    serde_json::from_value(
+                        start.definition.nodes["loop.implementation"]
+                            .configuration
+                            .clone(),
+                    )
+                    .unwrap();
+                assert_eq!(
+                    configuration.execution_target,
+                    bcode_workflow::PromptContextTarget::FreshIsolated
+                );
+                assert!(
+                    configuration
+                        .system_prompt
+                        .contains("workflow.stage_task_group")
+                );
+                assert!(start.limits.node_execution_cap >= 12);
+            }
+            drop(starts);
+            assert_eq!(host.documents.lock().unwrap().len(), usize::from(ready));
+        }
+    }
+
+    #[tokio::test]
+    async fn generated_collaboration_rechecks_prerequisites_before_launch() {
+        for revoke in [false, true] {
+            let mut host = Host {
+                prerequisites: true,
+                ..Host::default()
+            };
+            let mut surface = GoalSurface::new(Some(SessionId::new()));
+            surface.editor.collaboration = CollaborationMode::Requested;
+            surface.editor.worker_attempts = Some(12);
+            surface.editor.prompt = text_state("Coordinate a verified review");
+            surface.editor.limit = text_state("2");
+            surface.generate(&host, false);
+            assert_eq!(*host.generations.lock().unwrap(), 0);
+            host.finish().await;
+            surface.poll(&host);
+            assert_eq!(*host.generations.lock().unwrap(), 1);
+            // Change host policy after generation admission, before its completion
+            // triggers the independent launch check.
+            host.prerequisites = !revoke;
+            host.finish().await;
+            surface.poll(&host);
+            assert!(host.starts.lock().unwrap().is_empty());
+            assert!(host.documents.lock().unwrap().is_empty());
+            for _ in 0..5 {
+                host.finish().await;
+                surface.poll(&host);
+            }
+            let starts = host.starts.lock().unwrap();
+            assert_eq!(starts.len(), usize::from(!revoke));
+            if let Some(start) = starts.first() {
+                assert!(
+                    start.definition.nodes["loop.implementation"].configuration["system_prompt"]
+                        .as_str()
+                        .unwrap()
+                        .contains("workflow.stage_task_group")
+                );
+                assert_eq!(start.limits.cycle_cap, 2);
+                assert!(start.limits.node_execution_cap > 12);
+            }
+            drop(starts);
+            if revoke {
+                assert!(surface.editor.status.contains("launch blocked"));
+                assert!(surface.editor.failed_workflow_start.is_some());
+            }
+        }
     }
 
     #[tokio::test]

@@ -531,18 +531,7 @@ fn command_response(request: &InvokeCommandRequest) -> ServiceResponse {
             || missing_enforced_session_response("goal.progress"),
             goal::progress_response,
         ),
-        "goal" => InvokeCommandResponse {
-            success: true,
-            message: None,
-            updated_model: None,
-            updated_provider: None,
-            updated_thinking: None,
-            effects: vec![CommandEffect::OpenPluginSurface {
-                surface_kind: goal::SURFACE_KIND.to_owned(),
-                instance_id: "goal-start".to_owned(),
-                options: serde_json::json!({}),
-            }],
-        },
+        "goal" => goal::start_response(arguments),
         START_COMMAND if arguments == "status" => session_id.map_or_else(
             || status_response("/loop status requires an active session"),
             status_for_session,
@@ -772,6 +761,7 @@ impl Field {
 }
 
 enum LoopSurfaceCompletion {
+    DelegationChecked(Result<(), String>),
     SessionPrepared {
         configuring: bool,
         result: Result<SessionId, bcode_plugin_sdk::tui::PluginTuiHostError>,
@@ -830,7 +820,16 @@ enum FreshSessionState {
     Ready,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum CollaborationMode {
+    Disabled,
+    Requested,
+}
+
 struct LoopSurface {
+    collaboration: CollaborationMode,
+    worker_attempts: Option<u64>,
+    delegation_readiness: Option<()>,
     session_id: Option<SessionId>,
     fresh_session: FreshSessionState,
     prompt: TextInputState,
@@ -869,6 +868,9 @@ impl LoopSurface {
     fn new(session_id: Option<SessionId>) -> Self {
         Self {
             session_id,
+            collaboration: CollaborationMode::Disabled,
+            worker_attempts: None,
+            delegation_readiness: None,
             fresh_session: FreshSessionState::Idle,
             prompt: text_state(""),
             condition: text_state(""),
@@ -1006,6 +1008,7 @@ impl LoopSurface {
             "a durable loop start is already in progress".clone_into(&mut self.status);
             return PluginTuiAction::Redraw;
         }
+        self.delegation_readiness = None;
         if let Some(request) = self.failed_workflow_start.take() {
             self.pending_workflow_start = Some(request);
             "retrying durable loop workflow start".clone_into(&mut self.status);
@@ -1078,6 +1081,11 @@ impl LoopSurface {
         } else {
             loop_workflow_spec(&input)?
         };
+        let spec = if self.collaboration == CollaborationMode::Requested {
+            collaborating_goal_spec(&spec)?
+        } else {
+            spec
+        };
         let initial = loop_workflow_initial_value(&input);
         let mut request = PluginWorkflowStartRequest::typed(
             &spec,
@@ -1105,6 +1113,15 @@ impl LoopSurface {
             .and_then(|count| count.checked_add(initialization))
             .and_then(|count| count.checked_mul(u64::from(request.limits.retry_cap) + 1))
             .ok_or("loop node allowance overflow")?;
+        if self.collaboration == CollaborationMode::Requested {
+            request.limits.node_execution_cap = request
+                .limits
+                .node_execution_cap
+                .checked_add(self.worker_attempts.unwrap_or(0))
+                .ok_or("delegated execution allowance overflow")?;
+        }
+        i64::try_from(request.limits.node_execution_cap)
+            .map_err(|_| "node allowance exceeds the supported storage integer range")?;
         Ok(request)
     }
 
@@ -1168,6 +1185,26 @@ impl LoopSurface {
     }
 
     fn begin_pending_host_work(&mut self, host: &dyn PluginTuiHost) {
+        if self.collaboration == CollaborationMode::Requested && self.delegation_readiness.is_none()
+        {
+            if self.launch_state == LaunchState::InFlight
+                || (self.pending_replace_cancel.is_none() && self.pending_workflow_start.is_none())
+            {
+                return;
+            }
+            self.launch_state = LaunchState::InFlight;
+            self.status = "Checking collaboration prerequisites before launch…".into();
+            let future = host.workflow_delegation_preflight("bcode.workflow".into());
+            let completion = self.completions.clone();
+            host.spawn(Box::pin(async move {
+                let result = goal::require_delegation(future).await;
+                completion
+                    .lock()
+                    .expect("loop surface completion lock")
+                    .push(LoopSurfaceCompletion::DelegationChecked(result));
+            }));
+            return;
+        }
         self.begin_replace_cancel(host);
         self.begin_workflow_start(host);
     }
@@ -1267,6 +1304,24 @@ impl LoopSurface {
         PluginTuiAction::Redraw
     }
 
+    fn apply_delegation_checked(&mut self, result: Result<(), String>) {
+        self.launch_state = LaunchState::Ready;
+        match result {
+            Ok(()) => {
+                self.delegation_readiness = Some(());
+                self.status = "Collaboration prerequisites checked; starting coordinator under normal workflow authorization.".into();
+            }
+            Err(error) => {
+                self.failed_workflow_start = self.pending_workflow_start.take();
+                // A denied replacement has not cancelled its source. Re-enter the
+                // confirmation path rather than treating it as a failed direct start.
+                self.pending_replace_cancel = None;
+                self.replace_armed = false;
+                self.status = format!("Collaboration launch blocked: {error}; submit to retry");
+            }
+        }
+    }
+
     fn apply_completions(&mut self) -> PluginTuiAction {
         let completions = {
             let mut pending = self
@@ -1278,6 +1333,10 @@ impl LoopSurface {
         let mut action = PluginTuiAction::None;
         for completion in completions {
             match completion {
+                LoopSurfaceCompletion::DelegationChecked(result) => {
+                    self.apply_delegation_checked(result);
+                    action = PluginTuiAction::Redraw;
+                }
                 LoopSurfaceCompletion::SessionPrepared {
                     configuring,
                     result,
@@ -2252,6 +2311,42 @@ fn loop_workflow_spec(
         .map_err(|error| error.to_string())
 }
 
+fn collaborating_goal_spec(
+    base: &bcode_workflow::WorkflowSpec<LoopWorkflowIteration>,
+) -> Result<bcode_workflow::WorkflowSpec<LoopWorkflowIteration>, String> {
+    let mut definition = base.definition().clone();
+    let coordinator = definition
+        .nodes
+        .get_mut("loop.implementation")
+        .ok_or("goal implementation node is missing")?;
+    let mut configuration: bcode_workflow::WorkflowPromptConfiguration =
+        serde_json::from_value(coordinator.configuration.clone())
+            .map_err(|error| error.to_string())?;
+    configuration.system_prompt = include_str!("../prompts/goal-coordination.md").into();
+    configuration.activity_producer = Some(bcode_workflow::WorkflowActivityProducer {
+        plugin: PLUGIN_ID.into(),
+        stage: "coordination".into(),
+    });
+    configuration.execution_target = bcode_workflow::PromptContextTarget::FreshIsolated;
+    coordinator.configuration =
+        serde_json::to_value(configuration).map_err(|error| error.to_string())?;
+    let evaluator = definition
+        .nodes
+        .get_mut("loop.evaluation")
+        .ok_or("goal evaluation node is missing")?;
+    let mut evaluation: bcode_workflow::WorkflowPromptConfiguration =
+        serde_json::from_value(evaluator.configuration.clone())
+            .map_err(|error| error.to_string())?;
+    evaluation.system_prompt.push_str("\n\n");
+    evaluation
+        .system_prompt
+        .push_str(include_str!("../prompts/goal-collaboration-evaluation.md"));
+    evaluator.configuration =
+        serde_json::to_value(evaluation).map_err(|error| error.to_string())?;
+    bcode_workflow::WorkflowSpec::from_definition(WORKFLOW_KIND, definition)
+        .map_err(|error| error.to_string())
+}
+
 fn goal_workflow_spec(
     input: &LoopWorkflowInput,
 ) -> Result<bcode_workflow::WorkflowSpec<LoopWorkflowIteration>, String> {
@@ -2404,6 +2499,198 @@ mod tests {
             };
             assert!(delegation_preflight_message(&response).is_err());
             assert!(!delegation_preflight_command_result(&response).success);
+        }
+    }
+
+    #[tokio::test]
+    async fn collaboration_prerequisites_fail_closed() {
+        for loaded in [false, true] {
+            for staging in [false, true] {
+                for publication in [false, true] {
+                    let result = goal::require_delegation(Box::pin(async move {
+                        Ok(bcode_workflow::WorkflowDelegationPreflight {
+                            version: 1,
+                            plugin_id: "bcode.workflow".into(),
+                            plugin_loaded: loaded,
+                            staging_configured: staging,
+                            publication_configured: publication,
+                        })
+                    }))
+                    .await;
+                    assert_eq!(result.is_ok(), loaded && staging && publication);
+                }
+            }
+        }
+        for (version, plugin_id) in [(2, "bcode.workflow"), (1, "other")] {
+            assert!(
+                goal::require_delegation(Box::pin(async move {
+                    Ok(bcode_workflow::WorkflowDelegationPreflight {
+                        version,
+                        plugin_id: plugin_id.into(),
+                        plugin_loaded: true,
+                        staging_configured: true,
+                        publication_configured: true,
+                    })
+                }))
+                .await
+                .is_err()
+            );
+        }
+    }
+
+    #[test]
+    fn collaboration_readiness_retains_the_coordinator_request() {
+        let mut surface = LoopSurface::new(Some(SessionId::new()));
+        assert!(surface.collaboration == CollaborationMode::Disabled);
+        surface.collaboration = CollaborationMode::Requested;
+        surface.prompt = text_state("implement a goal");
+        surface.condition = text_state("verified result");
+        surface.limit = text_state("2");
+        let request = surface
+            .build_start_request(surface.session_id.unwrap())
+            .unwrap();
+        surface.pending_replace_cancel = Some(request.clone());
+        surface.pending_workflow_start = Some(request);
+        surface.launch_state = LaunchState::InFlight;
+        surface
+            .completions
+            .lock()
+            .unwrap()
+            .push(LoopSurfaceCompletion::DelegationChecked(Ok(())));
+        surface.apply_completions();
+        assert!(surface.pending_workflow_start.is_some());
+        assert!(surface.pending_replace_cancel.is_some());
+        assert!(surface.failed_workflow_start.is_none());
+        assert!(surface.launch_state == LaunchState::Ready);
+        assert!(surface.delegation_readiness.is_some());
+    }
+
+    #[test]
+    fn denied_replacement_preflight_does_not_become_a_direct_start_retry() {
+        let mut surface = LoopSurface::new(Some(SessionId::new()));
+        surface.collaboration = CollaborationMode::Requested;
+        surface.prompt = text_state("deliver");
+        surface.condition = text_state("verified");
+        surface.limit = text_state("2");
+        let request = surface
+            .build_start_request(surface.session_id.unwrap())
+            .unwrap();
+        surface.pending_replace_cancel = Some(request.clone());
+        surface.replace_armed = true;
+        surface.launch_state = LaunchState::InFlight;
+        surface.apply_delegation_checked(Err("publication grant removed".into()));
+        assert!(surface.failed_workflow_start.is_none());
+        assert!(surface.pending_replace_cancel.is_none());
+        assert!(surface.pending_workflow_start.is_none());
+        assert!(!surface.replace_armed);
+        assert!(surface.launch_state == LaunchState::Ready);
+        // Direct-start failures still retain the exact idempotent request for retry.
+        surface.pending_workflow_start = Some(request.clone());
+        surface.apply_delegation_checked(Err("plugin disabled".into()));
+        assert_eq!(
+            surface.failed_workflow_start.as_ref().unwrap().run_id,
+            request.run_id
+        );
+        assert!(surface.pending_workflow_start.is_none());
+    }
+
+    #[test]
+    fn explicit_worker_allowance_does_not_change_rounds_or_plain_loops() {
+        let mut surface = LoopSurface::new(Some(SessionId::new()));
+        surface.prompt = text_state("deliver");
+        surface.condition = text_state("verified");
+        surface.limit = text_state("3");
+        let plain = surface
+            .build_start_request(surface.session_id.unwrap())
+            .unwrap();
+        surface.worker_attempts = Some(17);
+        assert_eq!(
+            surface
+                .build_start_request(surface.session_id.unwrap())
+                .unwrap()
+                .limits,
+            plain.limits
+        );
+        surface.collaboration = CollaborationMode::Requested;
+        let collaborating = surface
+            .build_start_request(surface.session_id.unwrap())
+            .unwrap();
+        assert_eq!(
+            collaborating.limits.node_execution_cap,
+            plain.limits.node_execution_cap + 17
+        );
+        assert_eq!(collaborating.limits.cycle_cap, plain.limits.cycle_cap);
+        surface.worker_attempts = Some(i64::MAX as u64);
+        assert!(
+            surface
+                .build_start_request(surface.session_id.unwrap())
+                .is_err()
+        );
+        surface.worker_attempts = Some(u64::MAX);
+        assert!(
+            surface
+                .build_start_request(surface.session_id.unwrap())
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn collaborating_goal_retains_evaluation_and_uses_execution_context() {
+        for progress in [false, true] {
+            let mut surface = LoopSurface::new(Some(SessionId::new()));
+            surface.prompt = text_state("Deliver a verified change");
+            surface.condition = text_state("Combined verification passes");
+            surface.limit = text_state("3");
+            surface.progress_document = progress.then(goal::ProgressDocumentSetup::default);
+            let plain = surface
+                .build_start_request(surface.session_id.unwrap())
+                .unwrap();
+            surface.collaboration = CollaborationMode::Requested;
+            let collaborating = surface
+                .build_start_request(surface.session_id.unwrap())
+                .unwrap();
+            let mut expected = plain.definition.clone();
+            expected
+                .nodes
+                .get_mut("loop.implementation")
+                .unwrap()
+                .configuration = collaborating.definition.nodes["loop.implementation"]
+                .configuration
+                .clone();
+            expected
+                .nodes
+                .get_mut("loop.evaluation")
+                .unwrap()
+                .configuration = collaborating.definition.nodes["loop.evaluation"]
+                .configuration
+                .clone();
+            assert_eq!(expected, collaborating.definition);
+            let configuration: bcode_workflow::WorkflowPromptConfiguration =
+                serde_json::from_value(
+                    collaborating.definition.nodes["loop.implementation"]
+                        .configuration
+                        .clone(),
+                )
+                .unwrap();
+            assert_eq!(
+                configuration.execution_target,
+                bcode_workflow::PromptContextTarget::FreshIsolated
+            );
+            assert!(matches!(
+                configuration.output,
+                bcode_workflow::WorkflowPromptOutputPolicy::PreserveInput
+            ));
+            assert!(
+                configuration
+                    .system_prompt
+                    .contains("workflow.stage_task_group")
+            );
+            assert!(configuration.system_prompt.contains("Do not poll"));
+            assert_eq!(
+                configuration.tool_capability,
+                bcode_workflow::WorkflowToolCapability::Mutating
+            );
+            assert!(configuration.tool_allowlist.is_empty());
         }
     }
 
@@ -2756,6 +3043,52 @@ mod tests {
     }
 
     #[test]
+    fn collaborating_goal_passes_production_admission_with_optional_judgement() {
+        for progress in [false, true] {
+            for judgement in [false, true] {
+                let mut input =
+                    LoopWorkflowInput::new("deliver".into(), "verified".into(), 2).unwrap();
+                if judgement {
+                    input.judgement_evaluation = Some(judgement_evaluation::EvaluationConfig {
+                        provider_plugin_id: "bcode.jev".into(),
+                        model_id: "jev-1.13.0".into(),
+                        auth_profile: String::new(),
+                        threshold_percent: 90,
+                        on_failure: judgement_evaluation::FailurePolicy::Pause,
+                    });
+                }
+                let base = if progress {
+                    goal_workflow_spec(&input)
+                } else {
+                    loop_workflow_spec(&input)
+                }
+                .unwrap();
+                let spec = collaborating_goal_spec(&base).unwrap();
+                let admission =
+                    spec.definition()
+                        .production_admission(
+                            &bcode_workflow::WorkflowProductionCapabilities::current(),
+                        )
+                        .unwrap();
+                assert!(admission.is_supported(), "{:?}", admission.diagnostics);
+                let mut evaluator = spec.definition().nodes["loop.evaluation"].clone();
+                let prompt = evaluator.configuration["system_prompt"].as_str().unwrap();
+                assert!(prompt.contains("actual goal-directed delegation"));
+                assert!(prompt.contains("condition_met=false"));
+                evaluator.configuration["system_prompt"] =
+                    base.definition().nodes["loop.evaluation"].configuration["system_prompt"]
+                        .clone();
+                assert_eq!(evaluator, base.definition().nodes["loop.evaluation"]);
+                assert_eq!(
+                    spec.definition().nodes.get("loop.judgement.evaluate"),
+                    base.definition().nodes.get("loop.judgement.evaluate")
+                );
+                assert_eq!(spec.definition().edges, base.definition().edges);
+            }
+        }
+    }
+
+    #[test]
     fn judgement_loop_declares_admitted_plugin_block() {
         let mut input = LoopWorkflowInput::new("implement".into(), "done".into(), 2).unwrap();
         input.judgement_evaluation = Some(judgement_evaluation::EvaluationConfig {
@@ -2855,6 +3188,262 @@ mod tests {
         );
         let encoded = serde_json::to_value(&state).expect("state serializes");
         assert_eq!(encoded["outcome"], "implementing");
+    }
+
+    fn collaboration_store_fixture(
+        root: &std::path::Path,
+    ) -> (
+        bcode_workflow_store::WorkflowStore,
+        bcode_workflow_store::WorkflowExecutionAuthority,
+    ) {
+        let mut store = bcode_workflow_store::WorkflowStore::open_in_state_dir(root).unwrap();
+        let input = LoopWorkflowInput::new("deliver".into(), "verified".into(), 3).unwrap();
+        let spec = collaborating_goal_spec(&loop_workflow_spec(&input).unwrap()).unwrap();
+        let identity = spec.identity();
+        store
+            .persist_definition(
+                &identity.definition_id,
+                identity.definition_version,
+                spec.definition(),
+            )
+            .unwrap();
+        let authority = bcode_workflow_store::WorkflowExecutionAuthority {
+            target_artifact_id: "test-artifact".into(),
+            daemon_instance_id: "test-daemon".into(),
+            generation: 1,
+            fencing_token: "test-fence".into(),
+        };
+        store
+            .create_run(&bcode_workflow_store::NewWorkflowRun {
+                run_id: "collaborating-goal".into(),
+                definition_id: identity.definition_id.clone(),
+                definition_version: identity.definition_version,
+                workspace_snapshot: root.to_string_lossy().into_owned(),
+                parent_session_id: Some(SessionId::new().to_string()),
+                parent_session_generation: None,
+                binding: None,
+                authored_provenance: None,
+                input: Some(serde_json::to_value(loop_workflow_initial_value(&input)).unwrap()),
+                execution_authority: Some(authority.clone()),
+                created_at_ms: 10,
+                authorization_profile: bcode_workflow::WorkflowAuthorizationProfileIdentity {
+                    version: 1,
+                    provider_id: "test-policy".into(),
+                    profile_id: "build".into(),
+                    policy_digest_sha256: "a".repeat(64),
+                },
+                authorization_ceiling: bcode_workflow::WorkflowToolCapability::Mutating,
+                limits: bcode_workflow_store::WorkflowRunLimits::default(),
+            })
+            .unwrap();
+        (store, authority)
+    }
+
+    #[test]
+    fn collaborating_goal_parallel_join_waits_for_both_workers() {
+        assert_collaborating_goal_publication(true);
+    }
+
+    #[test]
+    fn collaborating_goal_publication_blocks_evaluation_until_inserted_work_settles() {
+        assert_collaborating_goal_publication(false);
+    }
+
+    fn assert_collaborating_goal_publication(parallel: bool) {
+        use bcode_workflow::{
+            WorkflowRunGraphEdit as Edit, WorkflowRunGraphReconciliation as Reconcile,
+        };
+        let temp = tempfile::tempdir().unwrap();
+        let (mut store, authority) = collaboration_store_fixture(temp.path());
+        let pending = store.pending_activations(10).unwrap();
+        assert_eq!(pending.len(), 1);
+        let source = &pending[0];
+        assert_eq!(source.node_id, "loop.implementation");
+        let input = LoopWorkflowInput::new("deliver".into(), "verified".into(), 3).unwrap();
+        let definition = collaborating_goal_spec(&loop_workflow_spec(&input).unwrap()).unwrap();
+        let edge_id = definition
+            .definition()
+            .edges
+            .iter()
+            .position(|edge| edge.from == "loop.implementation" && edge.to == "loop.evaluation")
+            .unwrap();
+        let mut worker = source.node.clone();
+        worker.id = "goal.worker".into();
+        let first_edge_id = u64::try_from(definition.definition().edges.len()).unwrap();
+        let mut request = bcode_workflow::WorkflowRunGraphEditBatch {
+            version: bcode_workflow::WORKFLOW_RUN_GRAPH_EDIT_VERSION,
+            run_id: "collaborating-goal".into(),
+            mutation_id: "insert-worker".into(),
+            expected_revision: 1,
+            edits: vec![
+                Edit::AddNode {
+                    node: worker,
+                    entry: false,
+                    exit: false,
+                },
+                Edit::ReplaceEdge {
+                    edge_id: u64::try_from(edge_id).unwrap(),
+                    edge: bcode_workflow::EdgeDefinition {
+                        from: "loop.implementation".into(),
+                        to: "goal.worker".into(),
+                        kind: bcode_workflow::EdgeKind::Direct,
+                        transform: None,
+                    },
+                },
+                Edit::AddEdge {
+                    edge_id: first_edge_id,
+                    edge: bcode_workflow::EdgeDefinition {
+                        from: "goal.worker".into(),
+                        to: "loop.evaluation".into(),
+                        kind: bcode_workflow::EdgeKind::Direct,
+                        transform: None,
+                    },
+                },
+            ],
+            reconciliation: vec![Reconcile::RetainWithBindings {
+                activation_id: source.activation_id.clone(),
+                edge_ids: vec![u64::try_from(edge_id).unwrap()],
+            }],
+        };
+        if parallel {
+            add_goal_parallel_join(&mut request, &source.node, first_edge_id);
+        }
+        store
+            .stage_run_graph_edit(&request, &authority, 20)
+            .unwrap();
+        store
+            .publish_retained_leaf_run_graph_edit(
+                "collaborating-goal",
+                "insert-worker",
+                &authority,
+                21,
+            )
+            .unwrap();
+        drop(store);
+        let mut store =
+            bcode_workflow_store::WorkflowStore::open_in_state_dir(temp.path()).unwrap();
+        verify_goal_publication_settlement(&mut store, &input, parallel);
+    }
+
+    fn verify_goal_publication_settlement(
+        store: &mut bcode_workflow_store::WorkflowStore,
+        input: &LoopWorkflowInput,
+        parallel: bool,
+    ) {
+        let expected_nodes: &[&str] = if parallel {
+            &[
+                "loop.implementation",
+                "goal.worker",
+                "goal.worker-right",
+                "goal.continuation",
+                "loop.evaluation",
+            ]
+        } else {
+            &["loop.implementation", "goal.worker", "loop.evaluation"]
+        };
+        for (index, expected) in expected_nodes.iter().copied().enumerate() {
+            store
+                .settle_pending_control_nodes("collaborating-goal", 10, 30)
+                .unwrap();
+            let pending = store.pending_activations(10).unwrap();
+            let expected_count = if parallel && expected == "goal.worker" {
+                2
+            } else {
+                1
+            };
+            assert_eq!(
+                pending.len(),
+                expected_count,
+                "unexpected early join or evaluation"
+            );
+            let activation = pending
+                .iter()
+                .find(|activation| activation.node_id == expected)
+                .expect("expected activation");
+            if parallel && expected == "goal.worker" {
+                assert!(
+                    pending
+                        .iter()
+                        .any(|activation| activation.node_id == "goal.worker-right")
+                );
+            }
+            if expected == "loop.evaluation" {
+                break;
+            }
+            let result = store.persist_validated_output(&bcode_workflow_store::ValidatedOutput {
+                output_id: format!("result-{index}"),
+                run_id: "collaborating-goal".into(),
+                node_id: activation.node_id.clone(),
+                activation_id: activation.activation_id.clone(),
+                schema_id: activation.node.output.type_name.clone(),
+                schema_version: 1,
+                value: serde_json::to_value(loop_workflow_initial_value(input)).unwrap(),
+                artifact_reference: None,
+                created_at_ms: 31,
+            });
+            result.unwrap();
+        }
+    }
+
+    fn add_goal_parallel_join(
+        request: &mut bcode_workflow::WorkflowRunGraphEditBatch,
+        template: &bcode_workflow::NodeDefinition,
+        first_edge: u64,
+    ) {
+        use bcode_workflow::WorkflowRunGraphEdit as Edit;
+        let mut right = template.clone();
+        right.id = "goal.worker-right".into();
+        let pair =
+            bcode_workflow::parallel_result_schema(&template.output, &template.output).unwrap();
+        let mut join = template.clone();
+        join.id = "goal.join".into();
+        join.kind = bcode_workflow::NodeKind::Parallel;
+        join.input = pair.clone();
+        join.output = pair.clone();
+        join.configuration = serde_json::json!({"failure_policy":"wait_all", "left_exits":["goal.worker"], "right_exits":["goal.worker-right"]});
+        let mut continuation = template.clone();
+        continuation.id = "goal.continuation".into();
+        continuation.input = pair;
+        let mut configuration = loop_agent_configuration::<LoopWorkflowIteration>(
+            "Collect worker evidence and preserve goal state",
+            "build",
+            false,
+        );
+        configuration.execution_target = bcode_workflow::PromptContextTarget::FreshIsolated;
+        continuation.configuration = serde_json::to_value(configuration).unwrap();
+        for node in [right, join, continuation] {
+            request.edits.push(Edit::AddNode {
+                node,
+                entry: false,
+                exit: false,
+            });
+        }
+        let Edit::AddEdge { edge, .. } = &mut request.edits[2] else {
+            panic!("worker edge");
+        };
+        edge.to = "goal.join".into();
+        for (offset, from, to) in [
+            (1, "loop.implementation", "goal.worker-right"),
+            (2, "goal.worker-right", "goal.join"),
+            (3, "goal.join", "goal.continuation"),
+            (4, "goal.continuation", "loop.evaluation"),
+        ] {
+            request.edits.push(Edit::AddEdge {
+                edge_id: first_edge + offset,
+                edge: bcode_workflow::EdgeDefinition {
+                    from: from.into(),
+                    to: to.into(),
+                    kind: bcode_workflow::EdgeKind::Direct,
+                    transform: None,
+                },
+            });
+        }
+        let bcode_workflow::WorkflowRunGraphReconciliation::RetainWithBindings { edge_ids, .. } =
+            &mut request.reconciliation[0]
+        else {
+            panic!("source binding");
+        };
+        edge_ids.push(first_edge + 1);
     }
 
     #[test]

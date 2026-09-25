@@ -74,9 +74,7 @@ impl WorkflowStore {
             .run_summary(run_id)?
             .ok_or_else(|| invalid("continuation source not found"))?;
         if run.status != RunStatus::Failed || run.cancellation_requested_at_ms.is_some() {
-            return Err(invalid(
-                "continuation requires a settled iteration-limit failure; paused runs use resume",
-            ));
+            return Err(WorkflowStoreError::ContinuationIneligible);
         }
         let blocked: bool = self.connection.query_row(
             "SELECT EXISTS(SELECT 1 FROM workflow_attempts WHERE run_id=?1 AND status NOT IN ('succeeded','failed','cancelled'))
@@ -98,9 +96,7 @@ impl WorkflowStore {
         ).optional()?.ok_or_else(|| invalid("continuation source has no durable exhaustion reason"))?;
         let failure: serde_json::Value = serde_json::from_str(&failure)?;
         if failure["reason"] != "repeat_iteration_limit_exhausted" {
-            return Err(invalid(
-                "run failed for a reason other than iteration exhaustion",
-            ));
+            return Err(WorkflowStoreError::ContinuationIneligible);
         }
         let node_id = failure["node_id"]
             .as_str()
@@ -272,7 +268,8 @@ impl WorkflowStore {
             || successor.limits.cycle_cap != request.additional_iterations
             || successor.limits.deadline_at_ms != source.limits.deadline_at_ms
             || successor.limits.retry_cap != source.limits.retry_cap
-            || successor.limits.concurrency_cap != source.limits.concurrency_cap
+            || u64::from(successor.limits.concurrency_cap)
+                != u64::from(source.limits.concurrency_cap).min(successor.limits.node_execution_cap)
             || successor.authorization_ceiling > source.run.authorization_ceiling
         {
             return Err(invalid(
