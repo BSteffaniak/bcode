@@ -147,6 +147,7 @@ fn node(task: Prompt, input: ValueSchema) -> Result<NodeDefinition, String> {
     {
         return Err("tool allowlist entries must not be empty".into());
     }
+    configuration.allow_user_questions = false;
     configuration.execution_target = task.context;
     configuration.tool_allowlist = task.tool_allowlist;
     if let Some(timeout) = task.timeout_ms {
@@ -860,6 +861,7 @@ mod tests {
         for node in nodes.iter().filter(|node| node.kind == NodeKind::Agent) {
             let configuration: WorkflowPromptConfiguration =
                 serde_json::from_value(node.configuration.clone()).expect("configuration");
+            assert!(!configuration.allow_user_questions);
             assert!(configuration.read_only);
         }
     }

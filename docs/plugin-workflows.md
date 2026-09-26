@@ -25,6 +25,22 @@ therefore remain ordinary prompt/tool outcomes and never invalidate a workflow d
 authority. The prompt's explicit model, tool, timeout, context-target, and structured-output policy
 remain authoritative.
 
+### User questions in background work
+
+Prompt configuration version 4 adds `allow_user_questions` (default `true`). Goal agent stages
+and delegated prompt/task-group workers set it to `false`. The host carries the setting into
+persisted turn execution options version 6, filters tools declaring the plugin-owned `ask_user`
+capability from model requests, and rejects their invocation before opening an exchange—even
+when discretionary permissions are bypassed. Other tools and permission checks are unchanged.
+The restriction is turn-scoped, so later interactive turns in a shared session remain interactive.
+Agent-authored graph edits from a restricted agent must also disable questions on added or
+replaced agent nodes; violations reject the edit rather than silently rewriting its identity.
+
+Version 2/3 prompt configurations and older turn options retain interactive defaults. A restricted
+configuration cannot claim an older contract version, and older executors reject the new versions.
+Retries use the persisted setting. Existing pending questions are not answered or cancelled by
+this change.
+
 Use typed workflow composition for domain behavior and let the host own durable registration,
 execution, discovery, and lifecycle state.
 

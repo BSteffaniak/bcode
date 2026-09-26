@@ -2172,6 +2172,7 @@ fn commit_message_agent_configuration(
         },
         read_only: true,
         tool_capability: bcode_workflow::WorkflowToolCapability::ReadOnly,
+        allow_user_questions: true,
         tool_allowlist: vec!["git.diff".to_string()],
         timeout_ms: 120_000,
         prompt_mode: "json_input".to_string(),
@@ -2239,6 +2240,7 @@ fn loop_agent_configuration<O: JsonSchema>(
         } else {
             bcode_workflow::WorkflowToolCapability::Mutating
         },
+        allow_user_questions: true,
         tool_allowlist: Vec::new(),
         timeout_ms: 3_600_000,
         prompt_mode: "json_input".to_string(),
@@ -2468,6 +2470,16 @@ fn goal_workflow_spec(
     definition.entries = planning.entries;
     definition.nodes.extend(planning.nodes);
     definition.edges.extend(planning.edges);
+    for node in definition.nodes.values_mut() {
+        if node.kind == bcode_workflow::NodeKind::Agent {
+            let mut configuration: bcode_workflow::WorkflowPromptConfiguration =
+                serde_json::from_value(node.configuration.clone())
+                    .map_err(|error| error.to_string())?;
+            configuration.allow_user_questions = false;
+            node.configuration =
+                serde_json::to_value(configuration).map_err(|error| error.to_string())?;
+        }
+    }
     bcode_workflow::WorkflowSpec::from_definition(WORKFLOW_KIND, definition)
         .map_err(|error| error.to_string())
 }
@@ -2780,12 +2792,19 @@ mod tests {
             bcode_workflow::PromptContextTarget::FreshIsolated
         );
         expected.execution_target = bcode_workflow::PromptContextTarget::FreshIsolated;
+        expected.allow_user_questions = false;
         expected.system_prompt.clone_from(&actual.system_prompt);
         assert_eq!(actual, expected);
-        assert_eq!(
-            goal.definition().nodes["loop.evaluation"],
-            plain.definition().nodes["loop.evaluation"]
-        );
+        for node in goal
+            .definition()
+            .nodes
+            .values()
+            .filter(|node| node.kind == bcode_workflow::NodeKind::Agent)
+        {
+            let configuration: bcode_workflow::WorkflowPromptConfiguration =
+                serde_json::from_value(node.configuration.clone()).unwrap();
+            assert!(!configuration.allow_user_questions);
+        }
     }
 
     #[test]

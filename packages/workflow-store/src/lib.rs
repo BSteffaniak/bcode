@@ -19775,6 +19775,7 @@ mod tests {
                                 },
                                 read_only: true,
                                 tool_capability: bcode_workflow::WorkflowToolCapability::ReadOnly,
+                                allow_user_questions: true,
                                 tool_allowlist: Vec::new(),
                                 timeout_ms: 30_000,
                                 prompt_mode: "json_input".to_string(),

@@ -1726,6 +1726,18 @@ impl ServerState {
                 facts.request.mutation_id,
             ));
         }
+        let source = store
+            .activation_graph_node(&provenance.run_id, &provenance.node_id, activation_id)?
+            .ok_or_else(denied)?;
+        if source.node.kind == bcode_workflow::NodeKind::Agent {
+            let source_configuration: WorkflowPromptConfiguration =
+                serde_json::from_value(source.node.configuration).map_err(|_| denied())?;
+            validate_user_question_inheritance(
+                source_configuration.allow_user_questions,
+                &facts.request,
+            )
+            .map_err(ServerError::WorkflowApplicationOperationUnauthorized)?;
+        }
         let result = store.stage_run_graph_edit_from_execution(
             &facts.request,
             &authority,
@@ -23942,7 +23954,22 @@ async fn prepare_static_model_turn_context(
             .and_then(|context| context.enabled_tools.clone()),
         execution.tool_allowlist.as_ref(),
     );
-    let base_tools = collect_model_tools(state, session_id, enabled_tools, execution.tools).await;
+    let base_tools = collect_model_tools(
+        state,
+        session_id,
+        enabled_tools,
+        execution.tools,
+        execution.allow_user_questions,
+    )
+    .await;
+    if !execution.allow_user_questions {
+        system_messages.push(ModelMessage {
+            role: MessageRole::System,
+            content: vec![ContentBlock::Text {
+                text: "User questions are unavailable. Work within existing authorization; report blockers rather than waiting for user input.".into(),
+            }],
+        });
+    }
     let profile = resolve_prompt_profile(
         state,
         session_id,
@@ -26035,6 +26062,40 @@ const fn tool_policy_allows_operation(
     }
 }
 
+fn validate_user_question_inheritance(
+    allow_user_questions: bool,
+    request: &bcode_workflow::WorkflowRunGraphEditBatch,
+) -> Result<(), String> {
+    if allow_user_questions {
+        return Ok(());
+    }
+    for edit in &request.edits {
+        if let bcode_workflow::WorkflowRunGraphEdit::AddNode { node, .. }
+        | bcode_workflow::WorkflowRunGraphEdit::ReplaceNode { node, .. } = edit
+            && node.kind == bcode_workflow::NodeKind::Agent
+        {
+            let configuration: WorkflowPromptConfiguration =
+                serde_json::from_value(node.configuration.clone())
+                    .map_err(|error| error.to_string())?;
+            if configuration.allow_user_questions {
+                return Err("spawned agent work must set allow_user_questions=false because its creator cannot ask user questions".into());
+            }
+        }
+    }
+    Ok(())
+}
+
+fn user_question_policy_denies_tool(
+    allow_user_questions: bool,
+    metadata: &ToolPolicyAuthorizationMetadata,
+) -> bool {
+    !allow_user_questions
+        && metadata
+            .capabilities
+            .iter()
+            .any(|capability| capability == "ask_user")
+}
+
 fn tool_policy_denies_tool(
     policy: bcode_session_models::TurnToolPolicy,
     metadata: Option<&ToolPolicyAuthorizationMetadata>,
@@ -26207,6 +26268,7 @@ async fn collect_model_tools(
     session_id: SessionId,
     enabled_tools: Option<Vec<String>>,
     policy: bcode_session_models::TurnToolPolicy,
+    allow_user_questions: bool,
 ) -> Vec<bcode_model::ToolDefinition> {
     let enabled_tools = enabled_tools.map(|tools| tools.into_iter().collect::<BTreeSet<_>>());
     if policy == bcode_session_models::TurnToolPolicy::Disabled {
@@ -26220,7 +26282,7 @@ async fn collect_model_tools(
         {
             continue;
         }
-        if !tool_policy_allows_operation(policy, false) {
+        if !allow_user_questions || !tool_policy_allows_operation(policy, false) {
             let call = bcode_model::ToolCall {
                 id: format!("catalog-{}", tool.name),
                 name: tool.name.clone(),
@@ -26234,7 +26296,9 @@ async fn collect_model_tools(
             else {
                 continue;
             };
-            if !metadata.is_read_only() {
+            if tool_policy_denies_tool(policy, Some(&metadata))
+                || user_question_policy_denies_tool(allow_user_questions, &metadata)
+            {
                 continue;
             }
         }
@@ -26790,6 +26854,7 @@ struct ServerAuthorizationCoordinator<'a> {
     cancel_state: &'a TurnCancelState,
     call_count: usize,
     tool_policy: bcode_session_models::TurnToolPolicy,
+    allow_user_questions: bool,
     permission_mode: bcode_session_models::TurnPermissionMode,
     agent_id: &'a str,
 }
@@ -26810,6 +26875,7 @@ impl<'a> ServerAuthorizationCoordinator<'a> {
             cancel_state,
             call_count,
             tool_policy,
+            allow_user_questions: true,
             permission_mode,
             agent_id,
         }
@@ -26830,6 +26896,11 @@ impl<'a> ServerAuthorizationCoordinator<'a> {
                     ));
                 }
             };
+        if user_question_policy_denies_tool(self.allow_user_questions, &policy_metadata) {
+            return ToolAuthorizationDecision::Deny(
+                "user questions are unavailable for this execution".into(),
+            );
+        }
         if tool_policy_denies_tool(self.tool_policy, Some(&policy_metadata)) {
             return ToolAuthorizationDecision::Deny(
                 "tool denied by read-only inspection policy".to_string(),
@@ -27218,6 +27289,7 @@ fn execute_model_tool_batch<'a>(
 ) -> ProviderCallFuture<'a, bool> {
     let tool_policy = execution.tools;
     let permission_mode = execution.permission_mode;
+    let allow_user_questions = execution.allow_user_questions;
     let tool_allowlist = execution
         .tool_allowlist
         .as_ref()
@@ -27274,15 +27346,18 @@ fn execute_model_tool_batch<'a>(
             ServerToolInvoker::new(state, session_id, &working_directory, cancel_state.as_ref())
                 .for_production_batch(output_positions);
         let agent_id = profile.unwrap_or(session_agent_selection(state, session_id).await);
-        let coordinator = ServerAuthorizationCoordinator::new(
-            state,
-            session_id,
-            cancel_state.as_ref(),
-            calls.len(),
-            tool_policy,
-            permission_mode,
-            &agent_id,
-        );
+        let coordinator = ServerAuthorizationCoordinator {
+            allow_user_questions,
+            ..ServerAuthorizationCoordinator::new(
+                state,
+                session_id,
+                cancel_state.as_ref(),
+                calls.len(),
+                tool_policy,
+                permission_mode,
+                &agent_id,
+            )
+        };
         let permission_context = bcode_agent_runtime::RuntimePermissionContext {
             session_id,
             agent_id: agent_id.clone(),
@@ -33602,6 +33677,7 @@ async fn dispatch_workflow_prompt_turn_after_admission(
         priority: TurnPriority::Background,
         idempotency_key: Some(request.dispatch_identity.clone()),
         execution: TurnExecutionOptions {
+            allow_user_questions: configuration.allow_user_questions,
             tools: match configuration.tool_capability {
                 WorkflowToolCapability::Disabled => TurnToolPolicy::Disabled,
                 WorkflowToolCapability::ReadOnly => TurnToolPolicy::ReadOnly,
@@ -53623,7 +53699,15 @@ library = "test"
             .execution
             .expect("execution")
             .provenance;
-        let (edit, call) = task_staging_call(provenance.activation_id.expect("activation"), prompt);
+        let (mut edit, call) =
+            task_staging_call(provenance.activation_id.expect("activation"), prompt);
+        if prompt {
+            for change in &mut edit.edits {
+                if let bcode_workflow::WorkflowRunGraphEdit::AddNode { node, .. } = change {
+                    node.configuration["allow_user_questions"] = serde_json::json!(false);
+                }
+            }
+        }
         let response = invoke_task_with_permission(&state, child_id, &call, allow).await;
         if !allow {
             assert!(response.is_err() || response.as_ref().is_ok_and(|result| result.is_error));
@@ -66682,6 +66766,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
             },
             read_only: true,
             tool_capability: bcode_workflow::WorkflowToolCapability::ReadOnly,
+            allow_user_questions: true,
             tool_allowlist: Vec::new(),
             timeout_ms: 30_000,
             prompt_mode: "json_input".to_string(),
@@ -70743,6 +70828,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
             },
             read_only: false,
             tool_capability: bcode_workflow::WorkflowToolCapability::Mutating,
+            allow_user_questions: true,
             tool_allowlist: vec!["shell.run".to_string()],
             timeout_ms: 30_000,
             prompt_mode: "json_input".to_string(),
@@ -72861,6 +72947,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
                 } else {
                     bcode_workflow::WorkflowToolCapability::Mutating
                 },
+                allow_user_questions: true,
                 tool_allowlist: Vec::new(),
                 timeout_ms: 30_000,
                 prompt_mode: "json_input".to_string(),
@@ -73066,6 +73153,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
                 } else {
                     bcode_workflow::WorkflowToolCapability::Mutating
                 },
+                allow_user_questions: true,
                 tool_allowlist: Vec::new(),
                 timeout_ms: 30_000,
                 prompt_mode: "json_input".to_string(),
@@ -73354,6 +73442,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
                                 },
                                 read_only: true,
                                 tool_capability: bcode_workflow::WorkflowToolCapability::ReadOnly,
+                                allow_user_questions: true,
                                 tool_allowlist: Vec::new(),
                                 timeout_ms: 30_000,
                                 prompt_mode: "json_input".to_string(),
@@ -74247,6 +74336,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
             },
             read_only: true,
             tool_capability: bcode_workflow::WorkflowToolCapability::ReadOnly,
+            allow_user_questions: true,
             tool_allowlist: Vec::new(),
             timeout_ms: 1_000,
             prompt_mode: "json_input".to_string(),
@@ -74730,6 +74820,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
                             },
                             read_only: true,
                             tool_capability: bcode_workflow::WorkflowToolCapability::ReadOnly,
+                            allow_user_questions: true,
                             tool_allowlist: Vec::new(),
                             timeout_ms: 30_000,
                             prompt_mode: "json_input".to_string(),
@@ -75153,6 +75244,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
                             },
                             read_only: true,
                             tool_capability: bcode_workflow::WorkflowToolCapability::ReadOnly,
+                            allow_user_questions: true,
                             tool_allowlist: Vec::new(),
                             timeout_ms: 30_000,
                             prompt_mode: "json_input".to_string(),
@@ -87167,6 +87259,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
                 admission: bcode_session_models::TurnAdmissionMetadata {
                     execution: bcode_session_models::TurnExecutionOptions {
                         tools: bcode_session_models::TurnToolPolicy::ReadOnly,
+                        allow_user_questions: false,
                         agent_profile: Some("review".to_string()),
                         tool_allowlist: Some(vec!["git.diff".to_string()]),
                         provider_plugin_id: Some("bcode.fake-provider".to_string()),
@@ -87187,6 +87280,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
         );
 
         let execution = turn_execution_options(&event);
+        assert!(!execution.allow_user_questions);
         assert_eq!(execution.agent_profile.as_deref(), Some("review"));
         assert_eq!(
             execution.tool_allowlist.as_deref(),
@@ -87927,10 +88021,116 @@ event_symbol = "bcode_plugin_handle_event_v1"
             session.id,
             None,
             bcode_session_models::TurnToolPolicy::Disabled,
+            true,
         )
         .await;
 
         assert!(tools.is_empty());
+        drop(state);
+    }
+
+    #[test]
+    fn user_question_policy_rejects_widening_in_spawned_agent_edits() {
+        let configuration = WorkflowPromptConfiguration::preserve_input("build", "work");
+        let mut request = bcode_workflow::WorkflowRunGraphEditBatch {
+            version: bcode_workflow::WORKFLOW_RUN_GRAPH_EDIT_VERSION,
+            run_id: "run".into(),
+            expected_revision: 1,
+            mutation_id: "edit".into(),
+            reconciliation: Vec::new(),
+            edits: vec![bcode_workflow::WorkflowRunGraphEdit::AddNode {
+                node: bcode_workflow::NodeDefinition {
+                    id: "worker".into(),
+                    name: "worker".into(),
+                    kind: bcode_workflow::NodeKind::Agent,
+                    dataflow: bcode_workflow::WorkflowNodeDataflowPolicy::Direct,
+                    input: bcode_workflow::ValueSchema::of::<String>(),
+                    output: bcode_workflow::ValueSchema::of::<String>(),
+                    resources: Vec::new(),
+                    configuration: serde_json::to_value(configuration).unwrap(),
+                },
+                entry: true,
+                exit: true,
+            }],
+        };
+        assert!(validate_user_question_inheritance(true, &request).is_ok());
+        assert!(validate_user_question_inheritance(false, &request).is_err());
+        if let bcode_workflow::WorkflowRunGraphEdit::AddNode { node, .. } = &mut request.edits[0] {
+            node.configuration["allow_user_questions"] = serde_json::json!(false);
+        }
+        assert!(validate_user_question_inheritance(false, &request).is_ok());
+    }
+
+    #[tokio::test]
+    async fn user_question_policy_filters_catalog_and_denies_even_permission_bypass() {
+        let sessions = SessionManager::default();
+        let session = sessions
+            .create_session(None, test_working_directory())
+            .await
+            .unwrap();
+        let state = test_server_state_with_question_plugin(sessions);
+        for policy in [TurnToolPolicy::Enabled, TurnToolPolicy::ReadOnly] {
+            assert!(
+                collect_model_tools(&state, session.id, None, policy, false)
+                    .await
+                    .is_empty()
+            );
+            assert!(
+                !collect_model_tools(&state, session.id, None, policy, true)
+                    .await
+                    .is_empty()
+            );
+        }
+        let call = bcode_model::ToolCall {
+            id: "blocked-question".into(),
+            name: "question".into(),
+            arguments: serde_json::json!({"questions": []}),
+        };
+        let (_, preparation) = prepare_server_tool(&state, session.id, &call)
+            .await
+            .unwrap();
+        let request = ToolAuthorizationRequest {
+            index: 0,
+            tool: RegisteredTool::plugin(
+                bcode_tool::ToolDefinition {
+                    name: call.name.clone(),
+                    description: String::new(),
+                    input_schema: serde_json::json!({}),
+                },
+                "bcode.question",
+            ),
+            call,
+            facts: preparation.authorization,
+            context: bcode_agent_runtime::RuntimePermissionContext {
+                session_id: session.id,
+                agent_id: "build".into(),
+            },
+        };
+        let cancel = TurnCancelState::default();
+        let (coordinator,) = (ServerAuthorizationCoordinator {
+            allow_user_questions: false,
+            ..ServerAuthorizationCoordinator::new(
+                &state,
+                session.id,
+                &cancel,
+                1,
+                TurnToolPolicy::Enabled,
+                bcode_session_models::TurnPermissionMode::Bypass,
+                "build",
+            )
+        },);
+        assert!(
+            matches!(coordinator.authorize_one(&request, None).await, ToolAuthorizationDecision::Deny(reason) if reason.contains("user questions"))
+        );
+        assert!(
+            !state
+                .sessions
+                .session_history(session.id)
+                .await
+                .unwrap()
+                .iter()
+                .any(|event| matches!(event.kind, SessionEventKind::ToolExchangeRequested { .. }))
+        );
         drop(state);
     }
 

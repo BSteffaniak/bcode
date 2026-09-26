@@ -5205,6 +5205,7 @@ impl WorkflowStructuredSourceConcisePrompt {
             },
             read_only: self.read_only,
             tool_capability,
+            allow_user_questions: true,
             tool_allowlist: self.tool_allowlist.clone(),
             timeout_ms: self.timeout_ms,
             prompt_mode: "json_input".to_string(),
@@ -11969,7 +11970,7 @@ impl ResourceClaim {
 }
 
 /// Stable durable prompt-node configuration version.
-pub const WORKFLOW_PROMPT_CONFIGURATION_VERSION: u32 = 3;
+pub const WORKFLOW_PROMPT_CONFIGURATION_VERSION: u32 = 4;
 const LEGACY_WORKFLOW_PROMPT_CONFIGURATION_VERSION: u32 = 2;
 
 /// Maximum result-only correction rounds accepted by a workflow prompt contract.
@@ -12089,6 +12090,8 @@ pub struct WorkflowPromptConfiguration {
     pub output: WorkflowPromptOutputPolicy,
     pub read_only: bool,
     pub tool_capability: WorkflowToolCapability,
+    /// Whether this execution may ask the user questions.
+    pub allow_user_questions: bool,
     pub tool_allowlist: Vec<String>,
     pub timeout_ms: u64,
     pub prompt_mode: String,
@@ -12112,6 +12115,8 @@ struct WorkflowPromptConfigurationWire {
     structured_output: Option<PromptStructuredOutputPolicy>,
     read_only: bool,
     tool_capability: WorkflowToolCapability,
+    #[serde(default = "default_allow_user_questions")]
+    allow_user_questions: bool,
     tool_allowlist: Vec<String>,
     timeout_ms: u64,
     prompt_mode: String,
@@ -12128,6 +12133,11 @@ impl<'de> Deserialize<'de> for WorkflowPromptConfiguration {
         use serde::de::Error as _;
 
         let wire = WorkflowPromptConfigurationWire::deserialize(deserializer)?;
+        if wire.version < 4 && !wire.allow_user_questions {
+            return Err(D::Error::custom(
+                "user-question policy requires prompt configuration version 4",
+            ));
+        }
         let output = match wire.version {
             LEGACY_WORKFLOW_PROMPT_CONFIGURATION_VERSION => {
                 if wire.output.is_some() {
@@ -12143,7 +12153,7 @@ impl<'de> Deserialize<'de> for WorkflowPromptConfiguration {
                     })?,
                 }
             }
-            WORKFLOW_PROMPT_CONFIGURATION_VERSION => {
+            3 | WORKFLOW_PROMPT_CONFIGURATION_VERSION => {
                 if wire.structured_output.is_some() {
                     return Err(D::Error::custom(
                         "prompt configuration version 3 must not contain structured_output",
@@ -12168,6 +12178,7 @@ impl<'de> Deserialize<'de> for WorkflowPromptConfiguration {
             output,
             read_only: wire.read_only,
             tool_capability: wire.tool_capability,
+            allow_user_questions: wire.allow_user_questions,
             tool_allowlist: wire.tool_allowlist,
             timeout_ms: wire.timeout_ms,
             prompt_mode: wire.prompt_mode,
@@ -12175,6 +12186,10 @@ impl<'de> Deserialize<'de> for WorkflowPromptConfiguration {
             activity_producer: wire.activity_producer,
         })
     }
+}
+
+const fn default_allow_user_questions() -> bool {
+    true
 }
 
 impl WorkflowPromptConfiguration {
@@ -12220,6 +12235,7 @@ impl WorkflowPromptConfiguration {
             output,
             read_only: true,
             tool_capability: WorkflowToolCapability::ReadOnly,
+            allow_user_questions: true,
             tool_allowlist: Vec::new(),
             timeout_ms: 300_000,
             prompt_mode: "json_input".to_string(),
@@ -16842,6 +16858,7 @@ mod tests {
             },
             read_only: true,
             tool_capability: WorkflowToolCapability::ReadOnly,
+            allow_user_questions: true,
             tool_allowlist: Vec::new(),
             timeout_ms: 30_000,
             prompt_mode: "json_input".to_string(),
@@ -16904,8 +16921,21 @@ mod tests {
             serde_json::from_value(legacy.clone()).expect("version 2 remains readable");
         assert_eq!(decoded.version, WORKFLOW_PROMPT_CONFIGURATION_VERSION);
         assert!(decoded.output.structured().is_some());
-        let encoded = serde_json::to_value(decoded).expect("version 3 serializes");
-        assert_eq!(encoded["version"], serde_json::json!(3));
+        assert!(decoded.allow_user_questions);
+        let encoded = serde_json::to_value(decoded).expect("current version serializes");
+        assert_eq!(
+            encoded["version"],
+            serde_json::json!(WORKFLOW_PROMPT_CONFIGURATION_VERSION)
+        );
+        let mut restricted = encoded.clone();
+        restricted["allow_user_questions"] = serde_json::json!(false);
+        assert!(
+            !serde_json::from_value::<WorkflowPromptConfiguration>(restricted.clone())
+                .unwrap()
+                .allow_user_questions
+        );
+        restricted["version"] = serde_json::json!(3);
+        assert!(serde_json::from_value::<WorkflowPromptConfiguration>(restricted).is_err());
         assert_eq!(encoded["output"]["mode"], serde_json::json!("structured"));
         assert!(encoded.get("structured_output").is_none());
 
@@ -16922,7 +16952,7 @@ mod tests {
         mixed["output"] = serde_json::json!({"mode": "preserve_input"});
         assert!(serde_json::from_value::<WorkflowPromptConfiguration>(mixed).is_err());
         let mut future = legacy;
-        future["version"] = serde_json::json!(4);
+        future["version"] = serde_json::json!(WORKFLOW_PROMPT_CONFIGURATION_VERSION + 1);
         assert!(serde_json::from_value::<WorkflowPromptConfiguration>(future).is_err());
     }
 
@@ -17030,6 +17060,7 @@ mod tests {
                             },
                             read_only: true,
                             tool_capability: WorkflowToolCapability::ReadOnly,
+                            allow_user_questions: true,
                             tool_allowlist: Vec::new(),
                             timeout_ms: 30_000,
                             prompt_mode: "json_input".to_string(),
@@ -18650,6 +18681,7 @@ steps:
             },
             read_only: true,
             tool_capability: WorkflowToolCapability::ReadOnly,
+            allow_user_questions: true,
             tool_allowlist: vec!["filesystem.read".to_string()],
             timeout_ms: 30_000,
             prompt_mode: "json_input".to_string(),
@@ -23051,6 +23083,7 @@ steps:
             },
             read_only: true,
             tool_capability: WorkflowToolCapability::ReadOnly,
+            allow_user_questions: true,
             tool_allowlist: vec!["filesystem.read".to_string()],
             timeout_ms: 30_000,
             prompt_mode: "json_input".to_string(),
@@ -25292,6 +25325,7 @@ steps:
             } else {
                 WorkflowToolCapability::Mutating
             },
+            allow_user_questions: true,
             tool_allowlist: Vec::new(),
             timeout_ms: 30_000,
             prompt_mode: "json_input".to_string(),

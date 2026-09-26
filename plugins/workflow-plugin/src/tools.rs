@@ -149,6 +149,7 @@ fn parse_prompt_task(arguments: &serde_json::Value) -> Result<AgentTaskRequest, 
     {
         return Err("tool allowlist entries must not be empty".into());
     }
+    configuration.allow_user_questions = false;
     configuration.execution_target = task.context;
     configuration.tool_allowlist = task.tool_allowlist;
     if let Some(timeout) = task.timeout_ms {
@@ -805,6 +806,7 @@ mod tests {
         let task = parse_prompt_task(&arguments).unwrap();
         let config: bcode_workflow::WorkflowPromptConfiguration =
             serde_json::from_value(task.node.configuration).unwrap();
+        assert!(!config.allow_user_questions);
         assert_eq!(config.timeout_ms, 1234);
         assert_eq!(config.tool_allowlist, vec!["filesystem.read"]);
         assert!(config.read_only);

@@ -1776,6 +1776,9 @@ pub struct TurnExecutionOptions {
     /// Persisted execution-options schema version.
     #[serde(default = "turn_execution_options_schema_version")]
     pub schema_version: u32,
+    /// Whether tools declaring `ask_user` may be exposed or executed.
+    #[serde(default = "default_allow_user_questions")]
+    pub allow_user_questions: bool,
     #[serde(default)]
     pub tools: TurnToolPolicy,
     /// Permission authorization behavior captured immutably for this turn.
@@ -1813,7 +1816,11 @@ pub struct TurnExecutionOptions {
 /// Earliest persisted turn execution-options schema version accepted by this build.
 pub const MIN_TURN_EXECUTION_OPTIONS_SCHEMA_VERSION: u32 = 1;
 /// Current persisted turn execution-options schema version.
-pub const TURN_EXECUTION_OPTIONS_SCHEMA_VERSION: u32 = 5;
+pub const TURN_EXECUTION_OPTIONS_SCHEMA_VERSION: u32 = 6;
+
+const fn default_allow_user_questions() -> bool {
+    true
+}
 
 const fn turn_execution_options_schema_version() -> u32 {
     TURN_EXECUTION_OPTIONS_SCHEMA_VERSION
@@ -1823,6 +1830,7 @@ impl Default for TurnExecutionOptions {
     fn default() -> Self {
         Self {
             schema_version: TURN_EXECUTION_OPTIONS_SCHEMA_VERSION,
+            allow_user_questions: true,
             tools: TurnToolPolicy::default(),
             permission_mode: TurnPermissionMode::default(),
             correlation: None,
@@ -2074,6 +2082,9 @@ impl TurnAdmissionMetadata {
         if !(MIN_TURN_EXECUTION_OPTIONS_SCHEMA_VERSION..=TURN_EXECUTION_OPTIONS_SCHEMA_VERSION)
             .contains(&self.execution.schema_version)
         {
+            return Err(TurnAdmissionMetadataError::UnsupportedExecutionOptionsVersion);
+        }
+        if !self.execution.allow_user_questions && self.execution.schema_version < 6 {
             return Err(TurnAdmissionMetadataError::UnsupportedExecutionOptionsVersion);
         }
         if self.execution.request_context_id.is_some() && self.execution.schema_version < 5 {
@@ -4458,6 +4469,22 @@ mod tests {
             WorkId::new(format!("model_{session_id}-42"))
         );
         assert_eq!(receipt.accepted_event_sequence, 42);
+    }
+
+    #[test]
+    fn user_question_policy_round_trips_and_rejects_old_execution_versions() {
+        let mut metadata = TurnAdmissionMetadata::default();
+        assert!(metadata.execution.allow_user_questions);
+        metadata.execution.allow_user_questions = false;
+        let decoded: TurnAdmissionMetadata =
+            serde_json::from_value(serde_json::to_value(&metadata).unwrap()).unwrap();
+        assert_eq!(decoded, metadata);
+        decoded.validate().unwrap();
+        metadata.execution.schema_version = 5;
+        assert!(metadata.validate().is_err());
+        let legacy: TurnExecutionOptions =
+            serde_json::from_value(serde_json::json!({"schema_version":5})).unwrap();
+        assert!(legacy.allow_user_questions);
     }
 
     #[test]
