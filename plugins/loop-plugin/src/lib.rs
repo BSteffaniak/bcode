@@ -1384,8 +1384,14 @@ impl LoopSurface {
     }
 
     fn paint_footer(&self, content: Rect, frame: &mut PaintCx<'_, '_>) {
-        let status_y = self.evaluation_area.bottom().saturating_add(1);
-        if status_y < content.bottom() {
+        // A failed submission must remain visible even when the terminal is too short
+        // to fit the form's footer below the input fields.
+        let status_y = self
+            .evaluation_area
+            .bottom()
+            .saturating_add(1)
+            .min(content.bottom().saturating_sub(1));
+        if content.height > 0 && status_y < content.bottom() {
             let status = [StatusSegment::new(&self.status).severity(StatusSeverity::Muted)];
             let status = StatusBarComponent::new("loop.status")
                 .left(&status)
@@ -3271,6 +3277,34 @@ mod tests {
         for iterations in [0, u64::from(u32::MAX) + 1] {
             assert!(LoopWorkflowInput::new("implement".into(), "done".into(), iterations).is_err());
         }
+    }
+
+    #[test]
+    fn short_loop_modal_keeps_failed_start_diagnostic_visible() {
+        use bmux_tui::frame::Frame;
+        let mut surface = LoopSurface::new(Some(SessionId::new()));
+        surface.status = "workflow ownership blocked; retry after handoff".into();
+        let area = Rect::new(0, 0, 80, 18);
+        let mut buffer = bmux_tui::buffer::Buffer::empty(area);
+        surface.render(area, &mut PaintCx::new(&mut Frame::new(&mut buffer)));
+        let text = (0..area.height)
+            .map(|row| {
+                (area.x..area.right())
+                    .map(|x| {
+                        buffer
+                            .get(bmux_tui::geometry::Point::new(x, row))
+                            .expect("visible row")
+                            .symbol
+                            .as_str()
+                    })
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>();
+        assert!(
+            text.iter()
+                .any(|row| row.contains("workflow ownership blocked")),
+            "{text:?}"
+        );
     }
 
     #[tokio::test]

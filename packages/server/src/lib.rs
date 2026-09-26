@@ -1574,9 +1574,11 @@ impl ServerState {
         let result = match receiver.try_recv() {
             Ok(result) => result,
             Err(tokio::sync::oneshot::error::TryRecvError::Empty) => {
+                // Keep the last verified failure visible while a background retry runs.
+                // In particular, ownership contention may persist for the lifetime of a
+                // different daemon; "initializing" is not an actionable diagnosis.
                 return Err(ServerError::WorkflowStorageUnavailable(
-                    "workflow storage initialization is in progress; retry the workflow request"
-                        .into(),
+                    reason.message.clone(),
                 ));
             }
             Err(tokio::sync::oneshot::error::TryRecvError::Closed) => {
@@ -71732,6 +71734,27 @@ event_symbol = "bcode_plugin_handle_event_v1"
         // The initializer is deliberately still pending throughout client handling.
         drop(sender);
         server.await.expect("server");
+    }
+
+    #[tokio::test]
+    async fn background_retry_reports_ownership_blocker_instead_of_perpetual_initialization() {
+        let mut state = test_server_state(SessionManager::default());
+        state.workflow_store_unavailable = StdMutex::new(Some(WorkflowInitializationFailure {
+            message: WorkflowInitializationFailure::from_store_error(
+                &WorkflowStoreError::UpgradeOwnershipUnavailable,
+            )
+            .message,
+            retryable: true,
+        }));
+        let (_sender, receiver) = tokio::sync::oneshot::channel();
+        *state
+            .workflow_initialization
+            .lock()
+            .expect("initialization") = Some(receiver);
+        let error = state.require_workflow_store().expect_err("still blocked");
+        drop(state);
+        assert!(error.to_string().contains("another owner"));
+        assert!(!error.to_string().contains("in progress"));
     }
 
     #[tokio::test]
