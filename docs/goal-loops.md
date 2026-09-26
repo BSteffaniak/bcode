@@ -7,7 +7,20 @@ generation or workflow dispatch. Configuration and attachment retries reuse the 
 session. Existing-session invocations continue using that session. Control commands still
 require a session. Closing after creation may leave an empty session but does not launch work.
 
-`/goal` opens a goal setup modal owned by the bundled loop plugin. Enter a goal;
+`/goal` opens a goal setup modal owned by the bundled loop plugin. Goals receive
+plugin-owned optional coordination guidance during implementation, whether or not progress
+notes are enabled: work directly when appropriate, or use authorized graph publication and a
+durable continuation when delegation helps. This guidance does not grant extra execution
+attempts or require workflow tools for single-agent work. Goal implementation uses a fresh
+workflow execution context so execution-scoped tools can authenticate its activation; this
+is not filesystem isolation or an authority grant. Plain loops retain their existing
+implementation instructions and shared-parent context. Existing admitted definitions are
+not rewritten. Live end-to-end optional delegation remains unverified.
+Use `/goal --worker-attempts 20` to explicitly authorize extra node-execution attempts
+while leaving collaboration optional. `/goal --collaborate --worker-attempts 20` instead
+requests collaboration. The extra allowance does not change goal rounds, concurrency,
+recursive policy, tool permissions or publication authorization; omission adds no attempts.
+Enter a goal;
 additional guidance and maximum iterations are optional. A blank maximum uses the
 existing loop default (20). Generation captures the source session's bounded normal
 model context at submission, including portable compaction summaries and projected tool

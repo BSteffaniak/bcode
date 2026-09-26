@@ -1673,16 +1673,19 @@ library = "libdynamic_visual_test.dylib"
         // Aggregate workspace tests can heavily contend the single adapter worker. Keep this
         // bounded while allowing an artifact completion followed by its replacement render.
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+        let mut last_text = None;
         while std::time::Instant::now() < deadline {
             let _ = presentation.poll_dynamic_visuals();
-            if let Some(visual) = dynamic_test_visual(presentation, invocation_id)
-                && routed_text(&visual) == expected
-            {
-                return visual;
+            if let Some(visual) = dynamic_test_visual(presentation, invocation_id) {
+                let text = routed_text(&visual);
+                if text == expected {
+                    return visual;
+                }
+                last_text = Some(text);
             }
             std::thread::sleep(std::time::Duration::from_millis(10));
         }
-        panic!("dynamic visual text did not converge to {expected}");
+        panic!("dynamic visual text did not converge to {expected}; last text: {last_text:?}");
     }
 
     fn hello_dynamic_library_path() -> std::path::PathBuf {

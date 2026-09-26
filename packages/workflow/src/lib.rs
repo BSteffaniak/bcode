@@ -123,6 +123,10 @@ pub struct WorkflowExecutionContext {
     pub activation_id: String,
     pub attempt: u32,
     pub graph: WorkflowRunGraphInspection,
+    /// Bounded run/root attempt accounting; omission by older senders means unknown.
+    /// This observation neither reserves attempts nor authorizes an increase.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub execution_allowance: Option<WorkflowExecutionAllowanceObservation>,
     /// Requested checksum-verified canonical result; absent when no output was requested.
     pub output: Option<WorkflowOutputInspection>,
     /// Bounded output metadata page. A full page may have successors; continue by ID.

@@ -615,13 +615,19 @@ pub async fn run_with_static_bundled_and_options(
 ) -> Result<(), TuiError> {
     set_build_info(build_info);
     let stdout = io::stdout();
-    let mut guard = CrosstermTerminalGuard::enter(stdout)?;
+    let mut guard = CrosstermTerminalGuard::enter(stdout)
+        .map_err(|error| io::Error::new(error.kind(), format!("entering terminal: {error}")))?;
     let result = {
         let mut terminal = Terminal::new(
             guard.writer_mut().ok_or_else(|| {
                 std::io::Error::other("terminal guard writer unavailable after entering terminal")
             })?,
-            terminal_area()?,
+            terminal_area().map_err(|error| {
+                io::Error::new(
+                    error.kind(),
+                    format!("reading terminal dimensions: {error}"),
+                )
+            })?,
         );
         Box::pin(runtime::run_event_loop_with_static_bundled(
             &mut terminal,
@@ -630,11 +636,19 @@ pub async fn run_with_static_bundled_and_options(
             launch_options,
         ))
         .await
+        .map_err(|error| match error {
+            TuiError::Io(error) => {
+                io::Error::new(error.kind(), format!("running chat runtime: {error}")).into()
+            }
+            error => error,
+        })
     };
 
     match result {
         Ok(()) => {
-            let _writer = guard.leave()?;
+            let _writer = guard.leave().map_err(|error| {
+                io::Error::new(error.kind(), format!("leaving chat terminal: {error}"))
+            })?;
             Ok(())
         }
         Err(error) => Err(error),

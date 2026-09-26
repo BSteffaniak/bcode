@@ -1790,11 +1790,12 @@ impl ServerState {
         let (page, output, outputs) =
             store.execution_context_graph_page(&link, &authority, &request)?;
         let context = bcode_workflow::WorkflowExecutionContext {
-            run_id: link.run_id,
+            run_id: link.run_id.clone(),
             node_id: link.node_id,
             activation_id: link.activation_id,
             attempt: link.attempt,
             graph: workflow_operations::graph_page_inspection(page),
+            execution_allowance: Some(store.execution_allowance_observation(&link.run_id)?),
             output,
             outputs,
         };
@@ -28187,6 +28188,24 @@ fn workflow_invocation_failure() -> ToolInvocationServiceResolution {
     }
 }
 
+fn workflow_operation_failure(error: &ServerError) -> ToolInvocationServiceResolution {
+    let (code, message) = match error {
+        ServerError::WorkflowApplicationOperationUnauthorized(_) => (
+            "workflow_authorization_failed",
+            "workflow edit requires matching active execution, retained candidate and application authorization",
+        ),
+        ServerError::WorkflowStore(_) => (
+            "workflow_candidate_rejected",
+            "workflow store rejected the candidate; verify revision, topology, schemas and active-work reconciliation",
+        ),
+        _ => return workflow_invocation_failure(),
+    };
+    ToolInvocationServiceResolution::Failed {
+        code: code.into(),
+        message: message.into(),
+    }
+}
+
 async fn invoke_run_graph_operation(
     state: &ServerState,
     session_id: SessionId,
@@ -28315,7 +28334,7 @@ async fn resolve_server_plugin_bridge_request(
                     Err(ServerError::WorkflowComputationCancelled(_)) => {
                         ToolInvocationServiceResolution::Cancelled
                     }
-                    Err(_) => workflow_invocation_failure(),
+                    Err(error) => workflow_operation_failure(&error),
                 }
             } else {
                 ToolInvocationServiceResolution::Failed {
@@ -53564,6 +53583,25 @@ library = "test"
         let context: bcode_workflow::WorkflowExecutionContext =
             serde_json::from_str(&response.output).expect("typed context");
         assert_eq!(context.run_id, "edit-run");
+        assert_eq!(
+            context.execution_allowance,
+            Some(
+                state
+                    .workflow_store
+                    .lock()
+                    .expect("store")
+                    .execution_allowance_observation("edit-run")
+                    .expect("allowance")
+            )
+        );
+        let mut older = serde_json::to_value(&context).unwrap();
+        older.as_object_mut().unwrap().remove("execution_allowance");
+        assert!(
+            serde_json::from_value::<bcode_workflow::WorkflowExecutionContext>(older)
+                .unwrap()
+                .execution_allowance
+                .is_none()
+        );
         assert_eq!(context.graph.revision, 1);
         assert!(context.graph.nodes.len() <= limit);
         assert!(
@@ -53745,6 +53783,61 @@ library = "test"
                 arguments,
             },
         )
+    }
+
+    #[tokio::test]
+    async fn task_group_replay_publishes_through_authenticated_tool_bridge() {
+        let (mut state, session, _root) = active_edit_execution_fixture().await;
+        register_workflow_publication_tool(&mut state);
+        state.set_workflow_run_graph_publication_policy(WorkflowRunGraphPublicationPolicy {
+            evaluator: Arc::new(|_| WorkflowApplicationAuthorizationDecision::Allow),
+        });
+        let (sender, mut receiver) = mpsc::channel(4);
+        state.workflow_driver_sender.set(sender).unwrap();
+        admit_publication_author(&state, session);
+        let activation = state
+            .sessions
+            .session_summary(session)
+            .await
+            .unwrap()
+            .execution
+            .unwrap()
+            .provenance
+            .activation_id
+            .unwrap();
+        let schema = serde_json::json!({"type_name":"boolean","schema":{"type":"boolean"}});
+        let task = |id| serde_json::json!({"task_id":id,"objective":"Review","agent_profile":"plan","output":schema});
+        let request = serde_json::json!({"run_id":"edit-run","expected_revision":1,"mutation_id":"replay-group",
+            "input":schema,"tasks":[task("a"),task("b")],"join_id":"join","continuation":task("resume"),
+            "first_edge_id":0,"reconciliation":[{"disposition":"retain","activation_id":activation}]});
+        let staging = bcode_model::ToolCall {
+            id: "stage-replay".into(),
+            name: "workflow.stage_task_group".into(),
+            arguments: request.clone(),
+        };
+        let staged = invoke_task_with_permission(&state, session, &staging, true)
+            .await
+            .unwrap();
+        assert!(!staged.is_error, "{}", staged.output);
+        let publication = bcode_model::ToolCall {
+            id: "publish-replay".into(),
+            name: "workflow.publish_run_graph_edit".into(),
+            arguments: serde_json::json!({"edit_json":serde_json::json!({"task_tool":staging.name,"request":request}).to_string()}),
+        };
+        let published = invoke_task_with_permission(&state, session, &publication, true)
+            .await
+            .unwrap();
+        assert!(!published.is_error, "{}", published.output);
+        assert_eq!(receiver.try_recv().unwrap(), "edit-run");
+        assert_eq!(
+            state
+                .workflow_store
+                .lock()
+                .unwrap()
+                .run_graph_revision("edit-run")
+                .unwrap(),
+            Some(2)
+        );
     }
 
     #[tokio::test]
@@ -54216,6 +54309,20 @@ library = "test"
         assert!(!response.is_error, "{}", response.output);
         let result: serde_json::Value = serde_json::from_str(&response.output).expect("response");
         assert_eq!(result["published"], false);
+        let replay = bcode_model::ToolCall {
+            id: "publish-group-replay".into(),
+            name: "workflow.publish_run_graph_edit".into(),
+            arguments: serde_json::json!({"edit_json": serde_json::json!({
+                "task_tool": call.name, "request": call.arguments
+            }).to_string()}),
+        };
+        let (_, preparation) = prepare_server_tool(state, session_id, &replay)
+            .await
+            .expect("prepare original-request group publication");
+        assert_eq!(preparation.descriptor["edit"], result["edit"]);
+        let metadata = tool_policy_authorization_metadata(&preparation.authorization, &replay.name)
+            .expect("publication facts");
+        assert!(metadata.requires_permission);
         serde_json::from_value(result["edit"].clone()).expect("exact candidate")
     }
 

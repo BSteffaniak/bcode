@@ -2542,7 +2542,13 @@ impl bmux_tui_runtime::Program for BcodeRuntimeModel {
             }
             bmux_tui_runtime::RuntimeEvent::Message(BcodeRuntimeMessage::TerminalInputFailed(
                 error,
-            )) => return Err(error.into()),
+            )) => {
+                return Err(std::io::Error::new(
+                    error.kind(),
+                    format!("reading terminal input: {error}"),
+                )
+                .into());
+            }
             bmux_tui_runtime::RuntimeEvent::Terminal(event)
             | bmux_tui_runtime::RuntimeEvent::Message(BcodeRuntimeMessage::Terminal(event)) => {
                 if self.loop_state.has_interactive_surface() && !self.loop_state.modal_foreground()

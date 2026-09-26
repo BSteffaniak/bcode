@@ -333,7 +333,7 @@ fn definition() -> ToolDefinition {
 
 fn edit_input_schema() -> serde_json::Value {
     json!({"type":"object","additionalProperties":false,
-        "properties":{"edit_json":{"type":"string","description":"JSON-encoded WorkflowRunGraphEditBatch. Serialize the exact staged edit without changing its fields or mutation_id."}},
+        "properties":{"edit_json":{"type":"string","description":"JSON-encoded WorkflowRunGraphEditBatch, or {task_tool,request} replay of an original workflow.stage_agent_task, workflow.stage_prompt_task or workflow.stage_task_group payload. Replay deterministically lowers the exact original request; publication still requires equality with the retained staged edit. Never change mutation identity or fields on retry."}},
         "required":["edit_json"]})
 }
 
@@ -350,7 +350,28 @@ fn parse_edit(arguments: &serde_json::Value) -> Result<WorkflowRunGraphEditBatch
     let edit: WorkflowRunGraphEditBatch = match (arguments.get("edit"), arguments.get("edit_json"))
     {
         (Some(edit), None) => serde_json::from_value(edit.clone()),
-        (None, Some(serde_json::Value::String(text))) => serde_json::from_str(text),
+        (None, Some(serde_json::Value::String(text))) => {
+            let value: serde_json::Value = serde_json::from_str(text)
+                .map_err(|_| "invalid workflow edit representation".to_owned())?;
+            if value.get("task_tool").is_some() {
+                #[derive(serde::Deserialize)]
+                #[serde(deny_unknown_fields)]
+                struct TaskReplay {
+                    task_tool: String,
+                    request: serde_json::Value,
+                }
+                let replay: TaskReplay = serde_json::from_value(value)
+                    .map_err(|_| "invalid task replay representation".to_owned())?;
+                if !matches!(
+                    replay.task_tool.as_str(),
+                    TASK_NAME | PROMPT_TASK_NAME | GROUP_NAME
+                ) {
+                    return Err("unsupported task replay tool".into());
+                }
+                return parse_tool_edit(&replay.task_tool, &replay.request);
+            }
+            serde_json::from_value(value)
+        }
         _ => return Err("supply exactly one of edit or edit_json".into()),
     }
     .map_err(|_| "invalid workflow edit representation".to_owned())?;
@@ -599,6 +620,27 @@ fn invoke_edit(context: &NativeServiceContext) -> ServiceResponse {
         Ok(ServiceBridgeResponse::Service(ToolInvocationServiceResolution::Cancelled)) => {
             ServiceResponse::error("cancelled", "workflow staging cancelled")
         }
+        Ok(ServiceBridgeResponse::Service(ToolInvocationServiceResolution::Failed {
+            code,
+            ..
+        })) => edit_failure(&code),
+        _ => ServiceResponse::error(
+            "workflow_staging_failed",
+            "workflow edit was not admitted; verify route, policy, and active execution",
+        ),
+    }
+}
+
+fn edit_failure(code: &str) -> ServiceResponse {
+    match code {
+        "workflow_authorization_failed" => ServiceResponse::error(
+            code,
+            "workflow edit requires matching active execution, retained candidate and application authorization",
+        ),
+        "workflow_candidate_rejected" => ServiceResponse::error(
+            code,
+            "workflow candidate rejected; verify revision, topology, schemas and active-work reconciliation",
+        ),
         _ => ServiceResponse::error(
             "workflow_staging_failed",
             "workflow edit was not admitted; verify route, policy, and active execution",
@@ -616,7 +658,11 @@ fn task_staging_response(
         return ServiceResponse::error("invalid_response", "task staging outcome unknown");
     };
     super::json_response(&bcode_tool::ToolInvocationResponse {
-        output: json!({"staged":staged.staged,"published":false,"edit":edit}).to_string(),
+        output: format!(
+            "{{\"staged\":{},\"published\":false,\"publication_hint\":\"If the edit is truncated, supply edit_json containing {{task_tool,request}} with the exact original staging tool name and request payload. Publication still validates equality with the retained staged edit.\",\"edit\":{}}}",
+            staged.staged,
+            serde_json::to_string(edit).expect("typed edit serializes"),
+        ),
         is_error: false,
         content: Vec::new(),
         full_output: None,
@@ -888,6 +934,17 @@ mod tests {
         assert_eq!(
             parse_tool_edit(PROMPT_TASK_NAME, &wrapped).unwrap(),
             parse_tool_edit(PROMPT_TASK_NAME, &arguments).unwrap()
+        );
+        let replay = json!({"edit_json":json!({"task_tool":PROMPT_TASK_NAME,"request":arguments}).to_string()});
+        assert_eq!(
+            parse_edit(&replay).unwrap(),
+            parse_tool_edit(PROMPT_TASK_NAME, &wrapped).unwrap()
+        );
+        assert!(
+            parse_edit(
+                &json!({"edit_json":json!({"task_tool":PUBLISH_NAME,"request":{}}).to_string()})
+            )
+            .is_err()
         );
         for name in [TASK_NAME, PROMPT_TASK_NAME, GROUP_NAME] {
             for invalid in [

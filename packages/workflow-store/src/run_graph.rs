@@ -1279,6 +1279,24 @@ impl WorkflowStore {
             {
                 return Err(invalid());
             }
+            // An unchanged historical dependency does not admit or restart work.
+            // Initialization may already have settled before an implementation
+            // activation revises unrelated planned work. Retention is required for
+            // affected targets, not every completed target in the existing graph.
+            if original_edges
+                .iter()
+                .any(|previous| previous.edge_id == *edge_id && previous.edge == *edge)
+                && [source, target].iter().all(|node| {
+                    original_nodes.iter().any(|previous| {
+                        previous.node == **node
+                            && nodes
+                                .get(&node.id)
+                                .is_some_and(|(_, entry)| *entry == previous.entry)
+                    })
+                })
+            {
+                continue;
+            }
             let admitted: bool = self.connection.query_row(
                 "SELECT EXISTS(SELECT 1 FROM workflow_activations WHERE run_id = ?1 AND node_id = ?2)",
                 (&request.run_id, &edge.to), |row| row.get(0),

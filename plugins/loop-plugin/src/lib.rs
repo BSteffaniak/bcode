@@ -317,6 +317,13 @@ fn format_workflow_inspection_status(inspection: &bcode_ipc::WorkflowRunInspecti
             lineage.predecessor_run_id, lineage.prior_iterations, lineage.additional_iterations
         );
     }
+    if !inspection.child_sessions.is_empty() {
+        let _ = write!(
+            status,
+            " · {} execution session(s): open /workflow for workers and their permissions",
+            inspection.child_sessions.len()
+        );
+    }
     if !inspection.mutation_approvals.is_empty() {
         let _ = write!(
             status,
@@ -834,6 +841,7 @@ enum CollaborationMode {
 }
 
 struct LoopSurface {
+    origin: SetupKind,
     collaboration: CollaborationMode,
     worker_attempts: Option<u64>,
     delegation_readiness: Option<()>,
@@ -875,6 +883,7 @@ impl LoopSurface {
     fn new(session_id: Option<SessionId>) -> Self {
         Self {
             session_id,
+            origin: SetupKind::Loop,
             collaboration: CollaborationMode::Disabled,
             worker_attempts: None,
             delegation_readiness: None,
@@ -1085,6 +1094,8 @@ impl LoopSurface {
             })?;
         let spec = if self.progress_document.is_some() {
             goal_workflow_spec(&input)?
+        } else if self.origin == SetupKind::Goal {
+            optional_goal_spec(&loop_workflow_spec(&input)?)?
         } else {
             loop_workflow_spec(&input)?
         };
@@ -1120,11 +1131,13 @@ impl LoopSurface {
             .and_then(|count| count.checked_add(initialization))
             .and_then(|count| count.checked_mul(u64::from(request.limits.retry_cap) + 1))
             .ok_or("loop node allowance overflow")?;
-        if self.collaboration == CollaborationMode::Requested {
+        if let Some(worker_attempts) = self.worker_attempts.filter(|_| {
+            self.origin == SetupKind::Goal || self.collaboration == CollaborationMode::Requested
+        }) {
             request.limits.node_execution_cap = request
                 .limits
                 .node_execution_cap
-                .checked_add(self.worker_attempts.unwrap_or(0))
+                .checked_add(worker_attempts)
                 .ok_or("delegated execution allowance overflow")?;
         }
         i64::try_from(request.limits.node_execution_cap)
@@ -2354,10 +2367,35 @@ fn collaborating_goal_spec(
         .map_err(|error| error.to_string())
 }
 
+fn optional_goal_spec(
+    base: &bcode_workflow::WorkflowSpec<LoopWorkflowIteration>,
+) -> Result<bcode_workflow::WorkflowSpec<LoopWorkflowIteration>, String> {
+    let mut definition = base.definition().clone();
+    let implementation = definition
+        .nodes
+        .get_mut("loop.implementation")
+        .ok_or("goal implementation node is missing")?;
+    let mut implementation_configuration: bcode_workflow::WorkflowPromptConfiguration =
+        serde_json::from_value(implementation.configuration.clone())
+            .map_err(|error| error.to_string())?;
+    implementation_configuration.execution_target =
+        bcode_workflow::PromptContextTarget::FreshIsolated;
+    implementation_configuration.system_prompt.push_str("\n\n");
+    implementation_configuration
+        .system_prompt
+        .push_str(include_str!("../prompts/goal-optional-coordination.md"));
+    implementation.configuration =
+        serde_json::to_value(implementation_configuration).map_err(|error| error.to_string())?;
+    bcode_workflow::WorkflowSpec::from_definition(WORKFLOW_KIND, definition)
+        .map_err(|error| error.to_string())
+}
+
 fn goal_workflow_spec(
     input: &LoopWorkflowInput,
 ) -> Result<bcode_workflow::WorkflowSpec<LoopWorkflowIteration>, String> {
-    let mut definition = loop_workflow_spec(input)?.definition().clone();
+    let mut definition = optional_goal_spec(&loop_workflow_spec(input)?)?
+        .definition()
+        .clone();
     let mut configuration = loop_agent_configuration::<LoopWorkflowIteration>(
         include_str!("../prompts/goal-initialization.md"),
         "build",
@@ -2638,6 +2676,113 @@ mod tests {
             surface
                 .build_start_request(surface.session_id.unwrap())
                 .is_err()
+        );
+    }
+
+    #[test]
+    fn optional_goal_allowance_does_not_force_collaboration_or_change_rounds() {
+        for progress in [false, true] {
+            let mut surface = LoopSurface::new(Some(SessionId::new()));
+            surface.origin = SetupKind::Goal;
+            surface.progress_document = progress.then(goal::ProgressDocumentSetup::default);
+            surface.prompt = text_state("Implement a change");
+            surface.condition = text_state("Verified");
+            let baseline = surface
+                .build_start_request(surface.session_id.unwrap())
+                .unwrap();
+            surface.worker_attempts = Some(17);
+            let extended = surface
+                .build_start_request(surface.session_id.unwrap())
+                .unwrap();
+            assert_eq!(extended.definition, baseline.definition);
+            assert_eq!(extended.input, baseline.input);
+            let mut limits = baseline.limits;
+            limits.node_execution_cap += 17;
+            assert_eq!(extended.limits, limits);
+            assert!(surface.collaboration == CollaborationMode::Disabled);
+            surface.worker_attempts = Some(u64::MAX);
+            assert!(
+                surface
+                    .build_start_request(surface.session_id.unwrap())
+                    .is_err()
+            );
+        }
+    }
+
+    #[test]
+    fn notes_disabled_goal_keeps_coordination_without_initialization_or_extra_authority() {
+        let mut surface = LoopSurface::new(Some(SessionId::new()));
+        surface.origin = SetupKind::Goal;
+        surface.progress_document = None;
+        surface.setup_kind = SetupKind::Loop;
+        surface.prompt = text_state("Implement a change");
+        surface.condition = text_state("Verified");
+        let request = surface
+            .build_start_request(surface.session_id.unwrap())
+            .unwrap();
+        let input = LoopWorkflowInput::new(
+            "Implement a change".into(),
+            "Verified".into(),
+            DEFAULT_MAX_ITERATIONS,
+        )
+        .unwrap();
+        let plain = loop_workflow_spec(&input).unwrap();
+        let mut expected = plain.definition().clone();
+        let configuration: bcode_workflow::WorkflowPromptConfiguration = serde_json::from_value(
+            request.definition.nodes["loop.implementation"]
+                .configuration
+                .clone(),
+        )
+        .unwrap();
+        assert!(
+            configuration
+                .system_prompt
+                .contains("Collaboration is optional")
+        );
+        expected
+            .nodes
+            .get_mut("loop.implementation")
+            .unwrap()
+            .configuration = request.definition.nodes["loop.implementation"]
+            .configuration
+            .clone();
+        assert_eq!(request.definition, expected);
+    }
+
+    #[test]
+    fn optional_goal_coordination_preserves_execution_authority_and_evaluation() {
+        let input =
+            LoopWorkflowInput::new("Implement a change".into(), "Verified".into(), 3).unwrap();
+        let plain = loop_workflow_spec(&input).unwrap();
+        let goal = goal_workflow_spec(&input).unwrap();
+        let mut expected: bcode_workflow::WorkflowPromptConfiguration = serde_json::from_value(
+            plain.definition().nodes["loop.implementation"]
+                .configuration
+                .clone(),
+        )
+        .unwrap();
+        let actual: bcode_workflow::WorkflowPromptConfiguration = serde_json::from_value(
+            goal.definition().nodes["loop.implementation"]
+                .configuration
+                .clone(),
+        )
+        .unwrap();
+        assert!(actual.system_prompt.contains("Collaboration is optional"));
+        assert!(
+            actual
+                .system_prompt
+                .contains("finish this activation normally")
+        );
+        assert_eq!(
+            actual.execution_target,
+            bcode_workflow::PromptContextTarget::FreshIsolated
+        );
+        expected.execution_target = bcode_workflow::PromptContextTarget::FreshIsolated;
+        expected.system_prompt.clone_from(&actual.system_prompt);
+        assert_eq!(actual, expected);
+        assert_eq!(
+            goal.definition().nodes["loop.evaluation"],
+            plain.definition().nodes["loop.evaluation"]
         );
     }
 
@@ -3227,7 +3372,7 @@ mod tests {
     ) {
         let mut store = bcode_workflow_store::WorkflowStore::open_in_state_dir(root).unwrap();
         let input = LoopWorkflowInput::new("deliver".into(), "verified".into(), 3).unwrap();
-        let spec = collaborating_goal_spec(&loop_workflow_spec(&input).unwrap()).unwrap();
+        let spec = collaborating_goal_spec(&goal_workflow_spec(&input).unwrap()).unwrap();
         let identity = spec.identity();
         store
             .persist_definition(
@@ -3265,6 +3410,26 @@ mod tests {
                 limits: bcode_workflow_store::WorkflowRunLimits::default(),
             })
             .unwrap();
+        let planning = store.pending_activations(10).unwrap().remove(0);
+        assert_eq!(planning.node_id, "goal.initialization");
+        let mut ready = loop_workflow_initial_value(&input);
+        ready.planning_ready = true;
+        store
+            .persist_validated_output(&bcode_workflow_store::ValidatedOutput {
+                output_id: "planning-output".into(),
+                run_id: "collaborating-goal".into(),
+                node_id: planning.node_id,
+                activation_id: planning.activation_id,
+                schema_id: planning.node.output.type_name,
+                schema_version: 1,
+                value: serde_json::to_value(ready).unwrap(),
+                artifact_reference: None,
+                created_at_ms: 11,
+            })
+            .unwrap();
+        store
+            .settle_pending_control_nodes("collaborating-goal", 10, 12)
+            .unwrap();
         (store, authority)
     }
 
@@ -3289,7 +3454,7 @@ mod tests {
         let source = &pending[0];
         assert_eq!(source.node_id, "loop.implementation");
         let input = LoopWorkflowInput::new("deliver".into(), "verified".into(), 3).unwrap();
-        let definition = collaborating_goal_spec(&loop_workflow_spec(&input).unwrap()).unwrap();
+        let definition = collaborating_goal_spec(&goal_workflow_spec(&input).unwrap()).unwrap();
         let edge_id = definition
             .definition()
             .edges
@@ -3374,6 +3539,9 @@ mod tests {
             store
                 .settle_pending_control_nodes("collaborating-goal", 10, 30)
                 .unwrap();
+            store
+                .settle_pending_control_nodes("collaborating-goal", 10, 30)
+                .unwrap();
             let pending = store.pending_activations(10).unwrap();
             let expected_count = if parallel && expected == "goal.worker" {
                 2
@@ -3412,6 +3580,107 @@ mod tests {
             });
             result.unwrap();
         }
+        verify_goal_second_round_settlement(store, input);
+    }
+
+    fn verify_goal_second_round_settlement(
+        store: &mut bcode_workflow_store::WorkflowStore,
+        input: &LoopWorkflowInput,
+    ) {
+        let evaluation = store.pending_activations(10).unwrap().remove(0);
+        assert_eq!(evaluation.node_id, "loop.evaluation");
+        let mut value = serde_json::to_value(loop_workflow_initial_value(input)).unwrap();
+        value.as_object_mut().unwrap().remove("planning_ready");
+        value["evidence"] = serde_json::json!(["More verification required"]);
+        value["summary"] = serde_json::json!("Continue");
+        store
+            .persist_validated_output(&bcode_workflow_store::ValidatedOutput {
+                output_id: "evaluation-first".into(),
+                run_id: "collaborating-goal".into(),
+                node_id: evaluation.node_id,
+                activation_id: evaluation.activation_id,
+                schema_id: evaluation.node.output.type_name,
+                schema_version: 1,
+                value,
+                artifact_reference: None,
+                created_at_ms: 40,
+            })
+            .unwrap();
+        store
+            .settle_pending_control_nodes("collaborating-goal", 10, 41)
+            .unwrap();
+        let source = store.pending_activations(10).unwrap().remove(0);
+        assert_eq!(source.node_id, "loop.implementation");
+        store
+            .persist_validated_output(&bcode_workflow_store::ValidatedOutput {
+                output_id: "implementation-second".into(),
+                run_id: "collaborating-goal".into(),
+                node_id: source.node_id,
+                activation_id: source.activation_id,
+                schema_id: source.node.output.type_name,
+                schema_version: 1,
+                value: source.input.unwrap(),
+                artifact_reference: None,
+                created_at_ms: 42,
+            })
+            .unwrap();
+        verify_goal_second_round_workers(store);
+    }
+
+    fn verify_goal_second_round_workers(store: &mut bcode_workflow_store::WorkflowStore) {
+        let workers = store.pending_activations(10).unwrap();
+        assert!(!workers.is_empty());
+        assert!(
+            workers
+                .iter()
+                .all(|worker| worker.node_id.starts_with("goal.worker"))
+        );
+        for (index, worker) in workers.iter().enumerate() {
+            let mut value = worker.input.clone().unwrap();
+            value["summary"] = serde_json::json!(format!("second-round-worker-{index}"));
+            store
+                .persist_validated_output(&bcode_workflow_store::ValidatedOutput {
+                    output_id: format!("second-worker-{index}"),
+                    run_id: "collaborating-goal".into(),
+                    node_id: worker.node_id.clone(),
+                    activation_id: worker.activation_id.clone(),
+                    schema_id: worker.node.output.type_name.clone(),
+                    schema_version: 1,
+                    value,
+                    artifact_reference: None,
+                    created_at_ms: 43,
+                })
+                .unwrap();
+            if index + 1 < workers.len() {
+                store
+                    .settle_pending_control_nodes("collaborating-goal", 10, 44)
+                    .unwrap();
+                assert!(
+                    store
+                        .pending_activations(10)
+                        .unwrap()
+                        .iter()
+                        .all(|node| node.node_id.starts_with("goal.worker"))
+                );
+            }
+        }
+        store
+            .settle_pending_control_nodes("collaborating-goal", 10, 45)
+            .unwrap();
+        store
+            .settle_pending_control_nodes("collaborating-goal", 10, 45)
+            .unwrap();
+        let pending = store.pending_activations(10).unwrap();
+        assert_eq!(pending.len(), 1);
+        let next = &pending[0];
+        if workers.len() == 2 {
+            assert_eq!(next.node_id, "goal.continuation");
+            let value = next.input.as_ref().unwrap();
+            assert_eq!(value[1][0]["summary"], "second-round-worker-0");
+            assert_eq!(value[1][1]["summary"], "second-round-worker-1");
+        } else {
+            assert_eq!(next.node_id, "loop.evaluation");
+        }
     }
 
     fn add_goal_parallel_join(
@@ -3430,9 +3699,16 @@ mod tests {
         join.input = pair.clone();
         join.output = pair.clone();
         join.configuration = serde_json::json!({"failure_policy":"wait_all", "left_exits":["goal.worker"], "right_exits":["goal.worker-right"]});
+        let mut context_join = join.clone();
+        context_join.id = "goal.context".into();
+        let context_schema =
+            bcode_workflow::parallel_result_schema(&template.output, &pair).unwrap();
+        context_join.input = context_schema.clone();
+        context_join.output = context_schema.clone();
+        context_join.configuration = serde_json::json!({"failure_policy":"wait_all", "left_exits":["loop.implementation"], "right_exits":["goal.join"]});
         let mut continuation = template.clone();
         continuation.id = "goal.continuation".into();
-        continuation.input = pair;
+        continuation.input = context_schema;
         let mut configuration = loop_agent_configuration::<LoopWorkflowIteration>(
             "Collect worker evidence and preserve goal state",
             "build",
@@ -3440,7 +3716,7 @@ mod tests {
         );
         configuration.execution_target = bcode_workflow::PromptContextTarget::FreshIsolated;
         continuation.configuration = serde_json::to_value(configuration).unwrap();
-        for node in [right, join, continuation] {
+        for node in [right, join, context_join, continuation] {
             request.edits.push(Edit::AddNode {
                 node,
                 entry: false,
@@ -3454,8 +3730,10 @@ mod tests {
         for (offset, from, to) in [
             (1, "loop.implementation", "goal.worker-right"),
             (2, "goal.worker-right", "goal.join"),
-            (3, "goal.join", "goal.continuation"),
+            (3, "goal.join", "goal.context"),
             (4, "goal.continuation", "loop.evaluation"),
+            (5, "loop.implementation", "goal.context"),
+            (6, "goal.context", "goal.continuation"),
         ] {
             request.edits.push(Edit::AddEdge {
                 edge_id: first_edge + offset,
@@ -3472,7 +3750,7 @@ mod tests {
         else {
             panic!("source binding");
         };
-        edge_ids.push(first_edge + 1);
+        edge_ids.extend([first_edge + 1, first_edge + 5]);
     }
 
     #[test]

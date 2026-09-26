@@ -8,7 +8,7 @@ pub fn start_response(arguments: &str) -> InvokeCommandResponse {
     let tokens: Vec<_> = arguments.split_whitespace().collect();
     let allowance = match tokens.as_slice() {
         [] | ["--collaborate"] => Ok(None),
-        ["--collaborate", "--worker-attempts", count] => count
+        ["--worker-attempts", count] | ["--collaborate", "--worker-attempts", count] => count
             .parse::<std::num::NonZeroU64>()
             .map(|count| Some(count.get()))
             .map_err(|_| ()),
@@ -16,7 +16,7 @@ pub fn start_response(arguments: &str) -> InvokeCommandResponse {
     };
     let Ok(allowance) = allowance else {
         let mut response =
-            status_response("Usage: /goal [--collaborate [--worker-attempts <positive integer>]]");
+            status_response("Usage: /goal [--collaborate] [--worker-attempts <positive integer>]");
         response.success = false;
         return response;
     };
@@ -29,7 +29,7 @@ pub fn start_response(arguments: &str) -> InvokeCommandResponse {
         effects: vec![CommandEffect::OpenPluginSurface {
             surface_kind: SURFACE_KIND.into(),
             instance_id: "goal-start".into(),
-            options: serde_json::json!({"collaboration":!tokens.is_empty(), "worker_attempts":allowance}),
+            options: serde_json::json!({"collaboration":tokens.first() == Some(&"--collaborate"), "worker_attempts":allowance}),
         }],
     }
 }
@@ -53,7 +53,7 @@ fn generation_request(
         system_prompt: [
             if collaboration == CollaborationMode::Requested {
                 "The user explicitly requested collaborating agents. Preserve this requirement in both generated prompts: use the existing goal/workflow delegation mechanisms, collect worker evidence, revise or delegate follow-up work, integrate contributions and verify the original objective. Do not silently substitute a single-agent result. Missing collaboration support, permissions or verified results are blockers, not completion. Collaboration does not grant tools or prescribe a workspace or integration strategy."
-            } else { "Preserve the user's objective without requiring collaboration." },
+            } else { "Preserve the user's objective. Collaboration is optional by default, but explicit requests for multiple agents or independent reviewers in the objective must remain requirements. Do not invent a collaboration requirement when the objective does not contain one." },
             include_str!("../prompts/goal-generation.md"),
             include_str!("../prompts/goal-iteration-guidance.md"),
             include_str!("../prompts/goal-stop-condition-guidance.md"),
@@ -345,6 +345,7 @@ impl GoalSurface {
     fn new(session: Option<SessionId>) -> Self {
         let mut editor = LoopSurface::new(session);
         editor.setup_kind = SetupKind::Goal;
+        editor.origin = SetupKind::Goal;
         editor.progress_document = Some(ProgressDocumentSetup::default());
         editor.limit = text_state("");
         Self {
@@ -1063,7 +1064,9 @@ mod tests {
     #[test]
     fn goal_command_requires_explicit_positive_worker_allowance() {
         for args in [
-            "--worker-attempts 4",
+            "--worker-attempts 0",
+            "--worker-attempts -1",
+            "--worker-attempts nope",
             "--collaborate --worker-attempts 0",
             "--collaborate --worker-attempts -1",
             "--collaborate --worker-attempts nope",
@@ -1074,6 +1077,7 @@ mod tests {
         for (args, expected) in [
             ("", None),
             ("--collaborate", None),
+            ("--worker-attempts 4", Some(4)),
             ("--collaborate --worker-attempts 17", Some(17)),
         ] {
             let response = start_response(args);
@@ -1082,7 +1086,7 @@ mod tests {
                 panic!("surface");
             };
             assert_eq!(options["worker_attempts"].as_u64(), expected);
-            assert_eq!(options["collaboration"], !args.is_empty());
+            assert_eq!(options["collaboration"], args.starts_with("--collaborate"));
         }
     }
 
@@ -1221,7 +1225,7 @@ mod tests {
         assert!(
             plain
                 .system_prompt
-                .contains("without requiring collaboration")
+                .contains("explicit requests for multiple agents or independent reviewers")
         );
         assert!(
             !plain

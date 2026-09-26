@@ -29,7 +29,10 @@ Pending generation checks coalesce; closure discards late results, and failures 
 Missing/incompatible prerequisites block with remedies. Successful launch preflight retains the
 exact coordinator request through document preparation and starts it once; an explicit retry checks
 prerequisites again. A denied replacement re-enters replacement confirmation instead of becoming
-a direct-start retry; a denied direct start retains its exact request identity. Plain `/goal` retains its existing behavior. Unknown goal options
+a direct-start retry; a denied direct start retains its exact request identity. Ordinary `/goal`
+implementation receives optional coordination guidance and a fresh workflow execution context,
+with or without progress notes. It may still work directly; fresh context is not workspace
+isolation. Existing admitted definitions are not rewritten. Unknown goal options
 reject with usage. These checks grant no authority and do not verify model/workspace readiness.
 `/goal` setup offers
 Ctrl-D for a nonblocking advisory check through the host API; repeated pending checks coalesce.
@@ -55,11 +58,12 @@ Neither remaining allowance nor the summary grants dispatch authority.
 The read uses a single database snapshot and does not mutate state; it does not imply runnable
 work or authorize any increase. Historical exhaustion events are not used to derive these facts.
 
-`/goal --collaborate --worker-attempts N` accepts an explicit positive extra execution
-allowance. Request construction adds it to the base goal-node allowance with checked arithmetic;
+`/goal --worker-attempts N` accepts an explicit positive extra execution allowance
+without requiring collaboration; `--collaborate` additionally requests collaboration.
+Request construction adds it to the base goal-node allowance with checked arithmetic;
 it does not change goal rounds, concurrency/recursion policy or permission authority. It is a
 run-wide extra attempt budget (workers and added coordinators), not a worker count or reserved
-per-role quota. Omission adds no budget. Plain goals ignore the collaboration-only value.
+per-role quota. Omission adds no budget. Plain `/loop` behavior is unchanged.
 Full collaboration acceptance remains unverified. `/goal.continue R --worker-attempts N` explicitly adds
 N attempts to the retained graph's renewed base allowance without changing its input, graph,
 round count or recursive policy. Successor concurrency is the smaller of the retained concurrency
@@ -166,6 +170,18 @@ Single tasks may specify `depends_on: {node_id, edge_id}` with `entry:false` to 
 source dependency without raw edge JSON. The source must be distinct/nonblank; the caller supplies
 an unused edge ID and matching input schema. Existing successors remain; publication still validates
 topology and authorization. This is not a multi-result join or an automatic handoff.
+
+`workflow.execution_context` also returns optional `execution_allowance` using the existing
+bounded run/root observation under authenticated execution authority. Older senders may omit
+it, meaning unknown; it neither reserves attempts nor grants budget increases. Older strict
+consumers can reject the extended response and must use a compatible plugin artifact.
+
+`edit_json` may also encode `{ "task_tool": "workflow.stage_task_group", "request": <original payload> }`
+(or either single-task staging tool). This re-lowers the exact original request when the expanded
+staging edit was truncated. It does not look up or publish by mutation ID alone: the server still
+requires equality with the retained candidate and separate publication authorization. Changed
+requests or incompatible lowering cannot silently replace the staged edit. Older plugin artifacts
+reject this representation; callers must not assume support across versions.
 
 `workflow.execution_context` accepts `{}` for its initial page, defaulting to 50
 items. Explicit limits remain 1–100; null, invalid limits and unknown fields reject.

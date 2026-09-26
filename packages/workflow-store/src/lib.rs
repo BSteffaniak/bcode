@@ -14856,13 +14856,10 @@ fn settle_parallel_failure(
                     .ok_or_else(|| {
                         WorkflowStoreError::InvalidData("parallel member is missing".into())
                     })?;
-                    let previously_activated: bool = transaction.query_row(
-                        "SELECT EXISTS(SELECT 1 FROM workflow_activations WHERE run_id = ?1 AND node_id = ?2)",
-                        (run_id, member), |row| row.get(0),
-                    )?;
-                    // A newly published dependency may not be ready yet (for example a
-                    // nested join). Its absence is pending work, not historical retention.
-                    if record.revision == graph_revision && !previously_activated {
+                    // A dependency at this revision may not be ready in this generation
+                    // (for example a nested join on a later repeat iteration). Earlier
+                    // generations do not supply or invalidate its current activation.
+                    if record.revision == graph_revision {
                         continue;
                     }
                     return Err(WorkflowStoreError::InvalidData(format!(
