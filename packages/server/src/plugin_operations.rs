@@ -538,6 +538,7 @@ mod tests {
         )
         .unwrap();
         let request = bcode_session_models::ActivityProjectionRequest {
+            working_document: None,
             stage: "implementation".into(),
             revision: 7,
             input: serde_json::json!({"implementation_prompt":"Implement safely", "stop_condition":"Tests pass", "max_iterations":10, "iteration":2, "condition_met":false, "summary":"", "evidence":[]}),
@@ -597,6 +598,7 @@ mod tests {
         .unwrap_err();
         assert_eq!(invalid.code, "invalid_activity_request");
         let request = bcode_session_models::ActivityProjectionRequest {
+            working_document: None,
             stage: "producer_stage".into(),
             revision: 1,
             input: serde_json::json!({}),
@@ -627,6 +629,7 @@ mod tests {
     #[test]
     fn activity_request_is_bounded_and_requires_nonzero_revision() {
         let mut request = bcode_session_models::ActivityProjectionRequest {
+            working_document: None,
             stage: "producer_defined".into(),
             revision: 3,
             input: serde_json::json!({}),

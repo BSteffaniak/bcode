@@ -16885,6 +16885,7 @@ async fn workflow_completion_message(
         &binding.owner_plugin_id,
         "workflow_completed",
         &output.value,
+        capture_activity_document(state, run.parent_session_id.as_deref(), &run.run_id).await,
     )
     .await
     else {
@@ -33194,13 +33195,55 @@ fn workflow_prompt_input_message(
     }
 }
 
+async fn capture_activity_document(
+    state: &ServerState,
+    session: Option<&str>,
+    scope_id: &str,
+) -> Option<bcode_session_models::ActivityWorkingDocument> {
+    let session_id = SessionId::from_str(session?).ok()?;
+    let root = state.sessions.session_store_root()?;
+    let ownership = state
+        .sessions
+        .acquire_session_ownership(session_id, bcode_session::SessionOwnershipKind::RuntimeWork)
+        .await
+        .ok()?;
+    let request = bcode_session_models::SessionWorkingDocumentRequest {
+        version: 1,
+        session_id,
+        scope_id: scope_id.to_owned(),
+        initial_text: None,
+    };
+    let result = tokio::task::spawn_blocking(move || {
+        let _ownership = ownership;
+        bcode_session::working_document::access(&root, &request)
+    })
+    .await;
+    let text = match result {
+        Ok(Ok(Some(document))) => Some(document.text),
+        Ok(Ok(None)) => return None,
+        _ => None,
+    };
+    Some(bcode_session_models::ActivityWorkingDocument {
+        scope_id: scope_id.to_owned(),
+        captured_at_ms: u64::try_from(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis(),
+        )
+        .unwrap_or(u64::MAX),
+        text,
+    })
+}
+
+#[cfg(test)]
 async fn workflow_prompt_activity(
     state: &ServerState,
     configuration: &bcode_workflow::WorkflowPromptConfiguration,
     input: &serde_json::Value,
 ) -> Option<bcode_session_models::ActivityPresentation> {
     let producer = configuration.activity_producer.as_ref()?;
-    project_workflow_activity(state, &producer.plugin, &producer.stage, input).await
+    project_workflow_activity(state, &producer.plugin, &producer.stage, input, None).await
 }
 
 async fn project_workflow_activity(
@@ -33208,8 +33251,10 @@ async fn project_workflow_activity(
     plugin: &str,
     activity_stage: &str,
     input: &serde_json::Value,
+    working_document: Option<bcode_session_models::ActivityWorkingDocument>,
 ) -> Option<bcode_session_models::ActivityPresentation> {
     let request = bcode_session_models::ActivityProjectionRequest {
+        working_document,
         stage: activity_stage.to_owned(),
         revision: 1,
         input: input.clone(),
@@ -33481,9 +33526,20 @@ async fn dispatch_workflow_prompt_turn_after_admission(
     )
     .await;
     let metadata = bcode_session_models::TurnAdmissionMetadata {
-        activity: workflow_prompt_activity(state, &configuration, input)
+        activity: if let Some(producer) = &configuration.activity_producer {
+            project_workflow_activity(
+                state,
+                &producer.plugin,
+                &producer.stage,
+                input,
+                capture_activity_document(state, run.parent_session_id.as_deref(), &run.run_id)
+                    .await,
+            )
             .await
-            .map(Box::new),
+            .map(Box::new)
+        } else {
+            None
+        },
         origin: Some(TurnOrigin {
             producer: "bcode.workflow".to_string(),
             correlation_id: Some(request.dispatch_identity.clone()),

@@ -19,6 +19,20 @@ pub struct ActivityProjectionRequest {
     pub revision: u64,
     /// Already admitted structured input supplied by the host.
     pub input: serde_json::Value,
+    /// Optional host-authorized working-document capture, separate from model input.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub working_document: Option<ActivityWorkingDocument>,
+}
+
+/// Bounded read-only document capture for producer-owned progress interpretation.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ActivityWorkingDocument {
+    /// Owning run/document scope, not a prompt-derived filesystem path.
+    pub scope_id: String,
+    /// Host capture time in Unix milliseconds.
+    pub captured_at_ms: u64,
+    /// Complete bounded document text, or unavailable on read failure.
+    pub text: Option<String>,
 }
 
 /// Current generic activity envelope version; producer payload versions evolve separately.

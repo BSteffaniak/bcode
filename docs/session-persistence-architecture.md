@@ -90,6 +90,18 @@ Launch-selected permission and tool modes are therefore ephemeral only until adm
 turn is admitted, queued execution and supported recovery use the canonical event value rather than
 client connection, renderer, environment, configuration, or daemon-global state.
 
+## Checklist captures in activity summaries
+
+At workflow prompt admission and terminal completion, the host performs a read-only bounded
+working-document lookup using the canonical parent session and run scope under session ownership.
+The optional capture is separate from model input. The loop plugin interprets Markdown and adds
+`Checklist: checked/total · ~percentage%` (or a truthful unavailable/no-checklist summary).
+The presentation carries a `progress_snapshot` with scope identity, capture time and summary,
+not the editable document text. Admitted presentations are retained in canonical event metadata;
+subsequent document edits cannot change the saved summary. Missing documents omit the section.
+Older requests without a capture retain their previous behavior. No capture influences stopping.
+This captures admission boundaries, not every implementation/evaluation completion boundary.
+
 ## Positioned durable transcript events
 
 Session event schema 42 and writer epoch 6 introduced positioned durable assistant segments,

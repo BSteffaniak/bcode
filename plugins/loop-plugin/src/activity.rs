@@ -73,10 +73,40 @@ fn completion_text(state: &LoopWorkflowIteration, summary: &str) -> String {
     )
 }
 
+fn progress_snapshot(
+    document: &bcode_session_models::ActivityWorkingDocument,
+) -> serde_json::Value {
+    let summary = document.text.as_deref().map_or_else(
+        || "Checklist unavailable".to_owned(),
+        |text| crate::progress::Checklist::parse(text).summary(),
+    );
+    serde_json::json!({"scope_id":document.scope_id, "captured_at_ms":document.captured_at_ms, "summary":summary})
+}
+
+fn append_progress(fallback: &mut String, progress: Option<&serde_json::Value>) {
+    if let Some(progress) = progress {
+        let _ = write!(
+            fallback,
+            "\nChecklist: {}",
+            progress["summary"].as_str().unwrap_or("unavailable")
+        );
+    }
+}
+
+fn evidence_previews(state: &LoopWorkflowIteration) -> Vec<String> {
+    state
+        .evidence
+        .iter()
+        .take(8)
+        .map(|item| preview(item))
+        .collect()
+}
+
 pub fn project(request: ActivityProjectionRequest) -> Result<ActivityPresentation, String> {
     validate_stage(&request.stage)?;
     // Bound encoded details independently of previews, including JSON escaping. Retain the
     // original value rather than reserializing the typed state, which could drop extra fields.
+    let progress = request.working_document.as_ref().map(progress_snapshot);
     let encoded_input = serde_json::to_vec(&request.input).map_err(|error| error.to_string())?;
     let exact_input = (encoded_input.len() <= 16_384).then(|| request.input.clone());
     let previews_only = exact_input.is_none();
@@ -93,12 +123,7 @@ pub fn project(request: ActivityProjectionRequest) -> Result<ActivityPresentatio
     let prompt = preview(&state.implementation_prompt);
     let stop_condition = preview(&state.stop_condition);
     let summary = preview(&state.summary);
-    let evidence: Vec<_> = state
-        .evidence
-        .iter()
-        .take(8)
-        .map(|item| preview(item))
-        .collect();
+    let evidence = evidence_previews(&state);
     let initialization = request.stage.starts_with("initialization");
     let mut fallback = activity_heading(
         initialization,
@@ -127,6 +152,7 @@ pub fn project(request: ActivityProjectionRequest) -> Result<ActivityPresentatio
             "\nEvaluator reported: {result} (not workflow control state)"
         );
     }
+    append_progress(&mut fallback, progress.as_ref());
     let mut presentation = ActivityPresentation {
         version: ACTIVITY_PRESENTATION_VERSION,
         producer: PLUGIN_ID.into(),
@@ -140,6 +166,7 @@ pub fn project(request: ActivityProjectionRequest) -> Result<ActivityPresentatio
         schema_version: 1,
         fallback,
         payload: serde_json::json!({
+            "progress_snapshot": progress,
             "iteration": state.iteration,
             "limit": state.max_iterations,
             "stage": request.stage,
@@ -199,8 +226,36 @@ mod tests {
         assert!(exhausted.fallback.contains("stop condition not satisfied"));
     }
 
+    #[test]
+    fn progress_capture_is_historical_and_not_execution_input() {
+        let mut input = request("evaluation");
+        let original = input.input.clone();
+        input.working_document = Some(bcode_session_models::ActivityWorkingDocument {
+            scope_id: "run-document".into(),
+            captured_at_ms: 123,
+            text: Some("- [x] done\n- [ ] pending".into()),
+        });
+        let first = project(input.clone()).unwrap();
+        assert!(first.fallback.contains("1/2 checked · ~50%"));
+        assert_eq!(first.payload["exact_structured_input"], original);
+        let persisted = serde_json::to_vec(&first).unwrap();
+        input.working_document.as_mut().unwrap().text = Some("- [x] done\n- [x] done".into());
+        let second = project(input).unwrap();
+        assert!(second.fallback.contains("2/2 checked · ~100%"));
+        let restored: ActivityPresentation = serde_json::from_slice(&persisted).unwrap();
+        assert_eq!(restored, first);
+        assert_eq!(restored.payload["progress_snapshot"]["captured_at_ms"], 123);
+        assert!(
+            !project(request("evaluation"))
+                .unwrap()
+                .fallback
+                .contains("Checklist:")
+        );
+    }
+
     fn request(stage: &str) -> ActivityProjectionRequest {
         ActivityProjectionRequest {
+            working_document: None,
             stage: stage.into(),
             revision: 1,
             input: serde_json::json!({
