@@ -67853,7 +67853,10 @@ event_symbol = "bcode_plugin_handle_event_v1"
                 .await
                 .expect("close retired client");
         }
-        std::fs::remove_file(socket_root.path().join("repair.sock")).expect("retired socket");
+        assert!(
+            !socket_root.path().join("repair.sock").exists(),
+            "retired listener removes its socket"
+        );
         let listener = LocalIpcListener::bind(&endpoint).expect("replacement listener");
         let (shutdown, stopped) = tokio::sync::oneshot::channel();
         let server = tokio::spawn(serve_runtime_test_clients(
