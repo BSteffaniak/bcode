@@ -217,10 +217,38 @@ fn task_definition() -> ToolDefinition {
     }
 }
 
+fn portable_task_definition(mut tool: ToolDefinition) -> ToolDefinition {
+    // Task payloads contain caller-authored schemas and configuration. Keep those
+    // opaque to provider schema rewriting, but validate them normally after decoding.
+    let payload_schema = tool.input_schema.to_string();
+    tool.input_schema = json!({
+        "type":"object", "additionalProperties":false, "required":["request_json"],
+        "properties":{"request_json":{"type":"string","description":format!(
+            "JSON-encoded task request. Payload contract: {payload_schema}"
+        )}}
+    });
+    tool
+}
+
 fn parse_tool_edit(
     name: &str,
     arguments: &serde_json::Value,
 ) -> Result<WorkflowRunGraphEditBatch, String> {
+    let decoded;
+    let arguments = if matches!(name, GROUP_NAME | TASK_NAME | PROMPT_TASK_NAME)
+        && arguments.get("request_json").is_some()
+    {
+        if arguments.as_object().is_none_or(|object| object.len() != 1) {
+            return Err("request_json cannot be combined with task fields".into());
+        }
+        let text = arguments["request_json"]
+            .as_str()
+            .ok_or("request_json must be a JSON string")?;
+        decoded = serde_json::from_str(text).map_err(|_| "invalid task request JSON")?;
+        &decoded
+    } else {
+        arguments
+    };
     if name == GROUP_NAME {
         return task_group::parse(arguments);
     }
@@ -331,32 +359,26 @@ fn parse_edit(arguments: &serde_json::Value) -> Result<WorkflowRunGraphEditBatch
     Ok(edit)
 }
 
+fn tool_definitions() -> Vec<ToolDefinition> {
+    vec![
+        definition(),
+        publication_definition(),
+        acceptance_definition(),
+        context_definition(),
+        portable_task_definition(task_definition()),
+        portable_task_definition(prompt_task_definition()),
+        portable_task_definition(task_group::definition()),
+    ]
+}
+
 /// Dispatch the plugin-owned workflow tool service.
 pub fn invoke(context: &NativeServiceContext) -> ServiceResponse {
     match context.request.operation.as_str() {
         bcode_tool::OP_LIST_TOOLS => super::json_response(&ToolList {
-            tools: vec![
-                definition(),
-                publication_definition(),
-                acceptance_definition(),
-                context_definition(),
-                task_definition(),
-                prompt_task_definition(),
-                task_group::definition(),
-            ],
+            tools: tool_definitions(),
         }),
-        bcode_tool::OP_PREPARE_TOOL => prepare_tool_service_response(
-            &context.request,
-            [
-                definition(),
-                publication_definition(),
-                acceptance_definition(),
-                context_definition(),
-                task_definition(),
-                prompt_task_definition(),
-                task_group::definition(),
-            ],
-            |request, _| {
+        bcode_tool::OP_PREPARE_TOOL => {
+            prepare_tool_service_response(&context.request, tool_definitions(), |request, _| {
                 let is_context = request.invocation.tool_name == CONTEXT_NAME;
                 let operation = if is_context {
                     CONTEXT_OPERATION
@@ -403,8 +425,8 @@ pub fn invoke(context: &NativeServiceContext) -> ServiceResponse {
                 .with_descriptor(
                     json!({"route_id":route.route_id, "operation": operation, "edit": payload}),
                 ))
-            },
-        ),
+            })
+        }
         bcode_tool::OP_INVOKE_TOOL => invoke_edit(context),
         _ => ServiceResponse::error(
             "unsupported_operation",
@@ -812,6 +834,70 @@ mod tests {
         for invalid in [json!("future"), json!(null)] {
             arguments["context"] = invalid;
             assert!(parse_prompt_task(&arguments).is_err());
+        }
+    }
+
+    #[test]
+    fn all_exposed_tools_have_strict_portable_parameters() {
+        fn check(schema: &serde_json::Value) {
+            if schema["type"] == "array" {
+                assert!(schema.get("items").is_some(), "array needs items: {schema}");
+                check(&schema["items"]);
+            }
+            if schema["type"] == "object" {
+                assert_eq!(schema["additionalProperties"], json!(false));
+                let properties = schema["properties"]
+                    .as_object()
+                    .expect("explicit properties");
+                for (key, value) in properties {
+                    assert!(schema["required"].as_array().unwrap().contains(&json!(key)));
+                    check(value);
+                }
+            }
+            for keyword in ["anyOf", "oneOf", "allOf"] {
+                if let Some(branches) = schema[keyword].as_array() {
+                    for branch in branches {
+                        check(branch);
+                    }
+                }
+            }
+        }
+        for tool in tool_definitions() {
+            let normalized = bcode_model_schema::normalize(
+                &tool.input_schema,
+                &bcode_model_schema::SchemaDialect {
+                    object_properties: bcode_model_schema::ObjectPropertyPolicy::RequireAllAndClose,
+                    one_of: bcode_model_schema::OneOfPolicy::CollapseAnnotatedConstants,
+                    reference_siblings:
+                        bcode_model_schema::ReferenceSiblingPolicy::RemoveAnnotationsRejectSemantic,
+                    ..bcode_model_schema::SchemaDialect::default()
+                },
+            )
+            .expect("strict normalization");
+            check(&normalized);
+        }
+    }
+
+    #[test]
+    fn task_envelope_preserves_typed_validation() {
+        let arguments = json!({"run_id":"run","expected_revision":1,"mutation_id":"proposal",
+            "task_id":"review","objective":"Review correctness.","agent_profile":"plan",
+            "input":{"type_name":"bool","schema":{"type":"boolean"}},
+            "entry":true,"exit":true,"reconciliation":[]});
+        let wrapped = json!({"request_json": arguments.to_string()});
+        assert_eq!(
+            parse_tool_edit(PROMPT_TASK_NAME, &wrapped).unwrap(),
+            parse_tool_edit(PROMPT_TASK_NAME, &arguments).unwrap()
+        );
+        for name in [TASK_NAME, PROMPT_TASK_NAME, GROUP_NAME] {
+            for invalid in [
+                json!({"request_json":null}),
+                json!({"request_json":"not json"}),
+                json!({"request_json":"{}","run_id":"run"}),
+                json!({"request_json":"{}"}),
+            ] {
+                assert!(parse_tool_edit(name, &invalid).is_err());
+            }
         }
     }
 
