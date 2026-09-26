@@ -449,42 +449,102 @@ fn spawn_worker(
 pub const MERMAID_RENDERER_PATH_ENV: &str = "BCODE_MERMAID_WORKER_PATH";
 
 /// Process-isolated Mermaid renderer with packaging-owned executable discovery.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 pub struct IsolatedMermaidRenderer {
     executable: std::path::PathBuf,
+    pinned: Option<Arc<PinnedWorker>>,
 }
 
+#[derive(Debug)]
+struct PinnedWorker {
+    _directory: tempfile::TempDir,
+    digest: Vec<u8>,
+}
+
+fn worker_digest(path: &std::path::Path) -> std::io::Result<Vec<u8>> {
+    use sha2::Digest as _;
+    let mut file = std::fs::File::open(path)?;
+    let mut hash = sha2::Sha256::new();
+    let mut buffer = [0_u8; 8192];
+    loop {
+        let count = file.read(&mut buffer)?;
+        if count == 0 {
+            break;
+        }
+        hash.update(&buffer[..count]);
+    }
+    Ok(hash.finalize().to_vec())
+}
+
+static PACKAGED_WORKER: OnceLock<Result<IsolatedMermaidRenderer, MermaidRenderError>> =
+    OnceLock::new();
+
 impl IsolatedMermaidRenderer {
-    /// Resolve the renderer packaged beside the current Bcode executable.
-    ///
-    /// `BCODE_MERMAID_WORKER_PATH` may explicitly override the packaged path.
+    /// Copy a packaged worker into private process-owned storage and pin its bytes.
     ///
     /// # Errors
+    /// Returns unavailable when the source cannot be opened or the snapshot cannot be published.
+    pub fn pin(path: &std::path::Path) -> Result<Self, MermaidRenderError> {
+        let capture = || -> std::io::Result<Self> {
+            let mut source = std::fs::File::open(path)?;
+            let directory = tempfile::tempdir()?;
+            let executable = directory.path().join(if cfg!(windows) {
+                "worker.exe"
+            } else {
+                "worker"
+            });
+            let mut target = std::fs::File::create(&executable)?;
+            std::io::copy(&mut source, &mut target)?;
+            target.sync_all()?;
+            std::fs::set_permissions(&executable, source.metadata()?.permissions())?;
+            let digest = worker_digest(&executable)?;
+            Ok(Self {
+                executable,
+                pinned: Some(Arc::new(PinnedWorker {
+                    _directory: directory,
+                    digest,
+                })),
+            })
+        };
+        capture().map_err(|error| MermaidRenderError::WorkerUnavailable {
+            message: error.to_string(),
+        })
+    }
+    /// Access the worker snapshot selected at process bootstrap.
     ///
-    /// Returns a typed unavailable error when the current executable directory
-    /// cannot be resolved.
+    /// # Errors
+    /// Returns the retained capture failure, or unavailable if the host did not initialize it.
     pub fn packaged() -> Result<Self, MermaidRenderError> {
+        PACKAGED_WORKER.get().cloned().unwrap_or_else(|| {
+            Err(MermaidRenderError::WorkerUnavailable {
+                message: "packaged worker was not captured at process bootstrap".to_owned(),
+            })
+        })
+    }
+
+    /// Snapshot the optional packaged worker once, using the bootstrap installation directory.
+    /// Both success and failure remain fixed for this process lifetime.
+    ///
+    /// # Errors
+    /// Returns unavailable if the selected worker cannot be captured.
+    pub fn initialize_packaged(directory: &std::path::Path) -> Result<Self, MermaidRenderError> {
+        PACKAGED_WORKER
+            .get_or_init(|| Self::capture_packaged(directory))
+            .clone()
+    }
+
+    fn capture_packaged(directory: &std::path::Path) -> Result<Self, MermaidRenderError> {
         if let Some(path) =
             std::env::var_os(MERMAID_RENDERER_PATH_ENV).filter(|value| !value.is_empty())
         {
-            return Ok(Self::from_path(path));
+            return Self::pin(std::path::Path::new(&path));
         }
-        let executable =
-            std::env::current_exe().map_err(|error| MermaidRenderError::WorkerUnavailable {
-                message: format!("cannot resolve current executable: {error}"),
-            })?;
-        let directory =
-            executable
-                .parent()
-                .ok_or_else(|| MermaidRenderError::WorkerUnavailable {
-                    message: "current executable has no parent directory".to_owned(),
-                })?;
         let name = if cfg!(windows) {
             "bcode-mermaid-worker.exe"
         } else {
             "bcode-mermaid-worker"
         };
-        Ok(Self::from_path(directory.join(name)))
+        Self::pin(&directory.join(name))
     }
 
     /// Use an explicit renderer executable path.
@@ -492,6 +552,7 @@ impl IsolatedMermaidRenderer {
     pub fn from_path(path: impl Into<std::path::PathBuf>) -> Self {
         Self {
             executable: path.into(),
+            pinned: None,
         }
     }
 
@@ -512,6 +573,18 @@ impl IsolatedMermaidRenderer {
         request: &MermaidRenderRequest,
         cancellation: &MermaidCancellationToken,
     ) -> Result<MermaidRendered, MermaidRenderError> {
+        if let Some(pin) = &self.pinned {
+            let digest = worker_digest(&self.executable).map_err(|error| {
+                MermaidRenderError::WorkerUnavailable {
+                    message: error.to_string(),
+                }
+            })?;
+            if digest != pin.digest {
+                return Err(MermaidRenderError::WorkerUnavailable {
+                    message: "pinned worker was modified".to_owned(),
+                });
+            }
+        }
         render_mermaid_with_worker(&self.executable, request, cancellation)
     }
 }
@@ -995,6 +1068,33 @@ mod tests {
             renderer.render(&request, &MermaidCancellationToken::default()),
             Err(MermaidRenderError::WorkerUnavailable { .. })
         ));
+    }
+
+    #[test]
+    fn pinned_worker_survives_source_replacement_and_rejects_tampering() {
+        let source_dir = tempfile::tempdir().unwrap();
+        let source = source_dir.path().join("worker");
+        std::fs::write(&source, b"original worker").unwrap();
+        let renderer = IsolatedMermaidRenderer::pin(&source).unwrap();
+        std::fs::write(&source, b"replacement worker").unwrap();
+        assert_eq!(
+            std::fs::read(renderer.executable()).unwrap(),
+            b"original worker"
+        );
+        let cloned = renderer.clone();
+        drop(renderer);
+        assert!(cloned.executable().exists());
+        std::fs::write(cloned.executable(), b"tampered worker").unwrap();
+        assert!(matches!(
+            cloned.render(
+                &MermaidRenderRequest::svg("flowchart LR\nA --> B", 800, 600),
+                &MermaidCancellationToken::default()
+            ),
+            Err(MermaidRenderError::WorkerUnavailable { .. })
+        ));
+        let path = cloned.executable().to_path_buf();
+        drop(cloned);
+        assert!(!path.exists());
     }
 
     #[test]

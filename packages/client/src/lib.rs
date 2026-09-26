@@ -7933,7 +7933,7 @@ mod client_timeout_tests {
         .unwrap();
         assert!(result.is_none());
         server.await.unwrap();
-        std::fs::remove_file(dir.join("catalog.sock")).unwrap();
+        assert!(!dir.join("catalog.sock").exists());
         std::fs::remove_dir(dir).unwrap();
     }
 
@@ -7992,7 +7992,7 @@ mod client_timeout_tests {
         .unwrap();
         assert!(result.is_none());
         server.await.unwrap();
-        std::fs::remove_file(dir.join("catalog.sock")).unwrap();
+        assert!(!dir.join("catalog.sock").exists());
         std::fs::remove_dir(dir).unwrap();
     }
 
@@ -8065,7 +8065,7 @@ mod client_timeout_tests {
         .unwrap();
         assert!(result.is_none());
         server.await.unwrap();
-        std::fs::remove_file(dir.join("catalog.sock")).unwrap();
+        assert!(!dir.join("catalog.sock").exists());
         std::fs::remove_dir(dir).unwrap();
     }
 
@@ -8554,7 +8554,7 @@ mod client_timeout_tests {
             .await
             .unwrap()
             .unwrap();
-        std::fs::remove_file(socket_dir.join("catalog.sock")).unwrap();
+        assert!(!socket_dir.join("catalog.sock").exists());
         std::fs::remove_dir(socket_dir).unwrap();
     }
 
@@ -8725,6 +8725,48 @@ mod client_timeout_tests {
             server.await.expect("server task");
             std::fs::remove_dir_all(socket_dir).expect("socket cleanup");
         }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn reconnect_rejects_replacement_executable_before_restoring_session() {
+        let directory = std::path::PathBuf::from(format!("/tmp/bcp-{}", SessionId::new()));
+        std::fs::create_dir_all(&directory).unwrap();
+        let endpoint = bcode_ipc::IpcEndpoint::unix_socket(directory.join("pin.sock"));
+        let listener = bcode_ipc::LocalIpcListener::bind(&endpoint).unwrap();
+        let server = tokio::spawn(async move {
+            for replacement in [false, true] {
+                let mut stream = listener.accept().await.unwrap();
+                let hello = bcode_ipc::recv_envelope(&mut stream).await.unwrap();
+                let mut daemon = matching_daemon_status();
+                if replacement {
+                    daemon.executable_digest = Some("replacement".into());
+                }
+                let response = bcode_ipc::Response::Ok(bcode_ipc::ResponsePayload::Hello {
+                    protocol_version: bcode_ipc::ProtocolVersion::current(),
+                    client_id: bcode_session_models::ClientId::new(),
+                    daemon,
+                });
+                bcode_ipc::send_envelope(
+                    &mut stream,
+                    &bcode_ipc::response_envelope(hello.request_id, &response).unwrap(),
+                )
+                .await
+                .unwrap();
+                if replacement {
+                    assert!(bcode_ipc::recv_envelope(&mut stream).await.is_err());
+                }
+            }
+        });
+        let client = BcodeClient::new(endpoint);
+        let mut connection = client.connect("pin-test").await.unwrap();
+        assert!(matches!(
+            connection.reconnect_and_restore().await,
+            Err(ClientError::IncompatibleDaemon { .. })
+        ));
+        drop(connection);
+        server.await.unwrap();
+        std::fs::remove_dir(directory).unwrap();
     }
 
     #[cfg(unix)]

@@ -13,6 +13,8 @@ version     = { workspace = true }
 [dependencies]
 libc                = { workspace = true }
 mermaid-rs-renderer = { workspace = true }
+sha2                = { workspace = true }
+tempfile            = { workspace = true }
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { workspace = true, features = [

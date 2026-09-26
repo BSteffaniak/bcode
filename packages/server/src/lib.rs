@@ -3418,32 +3418,15 @@ fn register_daemon(
     endpoint: &IpcEndpoint,
 ) -> Result<bcode_daemon_lifecycle::DaemonRecord, ServerError> {
     let instance_id = daemon_instance_id()?;
-    let executable_path = std::env::current_exe().ok();
-    let executable_digest = std::env::var(bcode_daemon_lifecycle::BCODE_EXECUTABLE_DIGEST_ENV)
-        .ok()
-        .filter(|digest| {
-            executable_path.as_deref().is_some_and(|path| {
-                bcode_daemon_lifecycle::executable_path_matches_digest(path, digest)
-                    || bcode_daemon_lifecycle::executable_sha256(path)
-                        .is_ok_and(|actual| actual == *digest)
-            })
-        });
-    let mut record = if executable_digest.is_some() {
-        bcode_daemon_lifecycle::DaemonRecord::current_with_digest(
-            endpoint,
-            daemon_log_path(),
-            executable_path,
-            executable_digest,
-            instance_id,
-        )?
-    } else {
-        bcode_daemon_lifecycle::DaemonRecord::current(
-            endpoint,
-            daemon_log_path(),
-            executable_path,
-            instance_id,
-        )?
-    };
+    let (executable_path, executable_digest) =
+        bcode_daemon_lifecycle::current_executable_identity()?;
+    let mut record = bcode_daemon_lifecycle::DaemonRecord::current_with_digest(
+        endpoint,
+        daemon_log_path(),
+        Some(executable_path),
+        Some(executable_digest),
+        instance_id,
+    )?;
     record.storage_writer_epoch = Some(bcode_session::lease::CURRENT_SESSION_STORAGE_WRITER_EPOCH);
     bcode_daemon_lifecycle::write_record(&bcode_config::default_state_dir(), &record)?;
     Ok(record)
@@ -4959,7 +4942,9 @@ async fn run_with_services(
             build_fingerprint: Some(daemon_status.build_fingerprint.clone()),
             protocol_version: Some(daemon_status.protocol_version),
             endpoint: Some(format!("{endpoint:?}")),
-            executable_path: std::env::current_exe().ok(),
+            executable_path: bcode_daemon_lifecycle::initialize_artifact_bootstrap()
+                .ok()
+                .map(|bootstrap| bootstrap.source_path().to_path_buf()),
             daemon_instance_id: Some(daemon_status.instance_id.clone()),
         },
     );

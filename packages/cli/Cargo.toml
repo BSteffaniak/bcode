@@ -19,6 +19,7 @@ bcode_config = { workspace = true }
 bcode_daemon_lifecycle = { workspace = true }
 bcode_hyperchad = { workspace = true, optional = true }
 bcode_ipc = { workspace = true }
+bcode_mermaid_render = { workspace = true }
 bcode_metrics = { workspace = true }
 bcode_model = { workspace = true }
 bcode_model_catalog = { workspace = true }

@@ -525,11 +525,41 @@ fn process_identity_evidence(record: &DaemonRecord) -> ProcessIdentityEvidence {
     }
 }
 
+/// Resolve a registry target only when it belongs to this process's pinned identity.
+///
+/// # Errors
+/// Rejects foreign artifacts, executable bytes, state locations, and unsupported endpoints
+/// before opening any transport connection.
+pub fn pinned_daemon_endpoint(record: &DaemonRecord) -> Result<IpcEndpoint, DaemonLifecycleError> {
+    let digest = initialize_artifact_bootstrap()?.digest()?;
+    if record.artifact_id.as_ref() != Some(&bcode_ipc::ArtifactId::current())
+        || !record.is_current_namespace()
+        || record.executable_digest.as_deref() != Some(digest.as_str())
+        || record.state_location_id.as_deref() != Some(bcode_ipc::state_location_id().as_str())
+    {
+        return Err(DaemonLifecycleError::Io {
+            path: PathBuf::from("<daemon-target>"),
+            source: std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "daemon target differs from the process-pinned executable or state location; use a separately started matching process",
+            ),
+        });
+    }
+    record
+        .endpoint
+        .to_ipc_endpoint()
+        .ok_or_else(|| DaemonLifecycleError::Io {
+            path: PathBuf::from("<daemon-target>"),
+            source: std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                "unsupported daemon endpoint",
+            ),
+        })
+}
+
 /// Classify one daemon record without mutating registry or endpoint state.
 pub async fn classify_daemon_record(record: &DaemonRecord) -> DaemonRecordClassification {
-    if !record.is_current_namespace()
-        || record.artifact_id.as_ref() != Some(&bcode_ipc::ArtifactId::current())
-    {
+    if pinned_daemon_endpoint(record).is_err() {
         // Foreign endpoints must never be contacted, even for liveness probes.
         // Process evidence can prove death; everything else remains conservative.
         return match process_identity_evidence(record) {
@@ -1123,14 +1153,6 @@ fn current_cached_daemon_image(
     }
 }
 
-/// Ensure the currently running executable is cached for detached daemon starts.
-///
-/// The returned path is content-addressed and never replaced after publication.
-///
-/// # Errors
-///
-/// Returns an error when the current executable cannot be located, copied, verified, or made
-/// executable.
 /// Verified immutable executable selected from the process bootstrap.
 #[derive(Debug)]
 pub struct PinnedBcodeExecutable {
@@ -1695,13 +1717,13 @@ mod tests {
     }
 
     #[test]
-    fn readiness_identity_uses_contract_epochs_not_executable_digest() {
+    fn readiness_identity_requires_pinned_executable_digest() {
         let matching = bcode_ipc::DaemonStatus {
             namespace: daemon_namespace(),
             protocol_version: u32::from(CURRENT_PROTOCOL_VERSION),
             artifact_id: Some(bcode_ipc::ArtifactId::current()),
             build_fingerprint: BUILD_FINGERPRINT.to_owned(),
-            executable_digest: Some("diagnostic-digest-may-differ".to_owned()),
+            executable_digest: Some(initialize_artifact_bootstrap().unwrap().digest().unwrap()),
             storage_writer_epoch: Some(bcode_ipc::CURRENT_SESSION_STORAGE_WRITER_EPOCH),
             session_event_schema_version: Some(
                 bcode_session_models::CURRENT_SESSION_EVENT_SCHEMA_VERSION,
@@ -1709,6 +1731,12 @@ mod tests {
             ..bcode_ipc::DaemonStatus::default()
         };
         assert!(daemon_status_matches_current_executable(&matching));
+        assert!(!daemon_status_matches_current_executable(
+            &bcode_ipc::DaemonStatus {
+                executable_digest: Some("different-bytes".into()),
+                ..matching.clone()
+            }
+        ));
         assert!(!daemon_status_matches_current_executable(
             &bcode_ipc::DaemonStatus {
                 storage_writer_epoch: matching.storage_writer_epoch.map(|epoch| epoch + 1),
@@ -2173,6 +2201,39 @@ mod tests {
         assert_eq!(executable_sha256(&copied).unwrap(), original_digest);
         assert_ne!(executable_sha256(&source).unwrap(), original_digest);
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn foreign_record_classification_never_connects_to_its_socket() {
+        let directory = tempfile::tempdir().unwrap();
+        let socket = directory.path().join("foreign.sock");
+        let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+        let endpoint = IpcEndpoint::unix_socket(socket);
+        let mut record = DaemonRecord::current(
+            &endpoint,
+            directory.path().join("log"),
+            None,
+            "foreign".into(),
+        )
+        .unwrap();
+        record.artifact_id = Some(bcode_ipc::ArtifactId::parse("foreign-artifact").unwrap());
+        assert!(pinned_daemon_endpoint(&record).is_err());
+        let _ = classify_daemon_record(&record).await;
+        assert!(
+            tokio::time::timeout(Duration::from_millis(25), listener.accept())
+                .await
+                .is_err()
+        );
+        record.artifact_id = Some(bcode_ipc::ArtifactId::current());
+        record.executable_digest = Some("foreign-bytes".into());
+        assert!(pinned_daemon_endpoint(&record).is_err());
+        let _ = classify_daemon_record(&record).await;
+        assert!(
+            tokio::time::timeout(Duration::from_millis(25), listener.accept())
+                .await
+                .is_err()
+        );
     }
 
     #[test]
@@ -2989,6 +3050,9 @@ async fn ping_ready(endpoint: &IpcEndpoint) -> bool {
 
 fn daemon_status_matches_current_executable(status: &bcode_ipc::DaemonStatus) -> bool {
     status.namespace == daemon_namespace()
+        && initialize_artifact_bootstrap()
+            .and_then(ArtifactBootstrap::digest)
+            .is_ok_and(|digest| status.executable_digest.as_deref() == Some(digest.as_str()))
         && status.protocol_version == u32::from(CURRENT_PROTOCOL_VERSION)
         && status.artifact_id.as_ref() == Some(&bcode_ipc::ArtifactId::current())
         && status.build_fingerprint == BUILD_FINGERPRINT

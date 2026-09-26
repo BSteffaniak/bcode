@@ -1342,14 +1342,16 @@ impl LoopSurface {
         }
     }
 
+    fn take_completions(&self) -> Vec<LoopSurfaceCompletion> {
+        let mut pending = self
+            .completions
+            .lock()
+            .expect("loop surface completion lock");
+        std::mem::take(&mut *pending)
+    }
+
     fn apply_completions(&mut self) -> PluginTuiAction {
-        let completions = {
-            let mut pending = self
-                .completions
-                .lock()
-                .expect("loop surface completion lock");
-            std::mem::take(&mut *pending)
-        };
+        let completions = self.take_completions();
         let mut action = PluginTuiAction::None;
         for completion in completions {
             match completion {

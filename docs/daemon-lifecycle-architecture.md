@@ -159,4 +159,8 @@ Records without the process's exact artifact identity are never contacted, inclu
 
 ## Performance boundary
 
-The warm path performs endpoint derivation and one verified local handshake, with no executable file read. Cold-path copy, hashing, and metadata verification are intentionally excluded from warm routing. Evidence and locked budgets are recorded in `docs/daemon-startup-performance.md`.
+The first verified connection hashes the retained bootstrap executable; subsequent identity checks reuse that process-pinned digest. Launches verify the immutable image, and foreign registry targets are rejected before transport access. Historical startup performance budgets must be remeasured for these stronger integrity checks.
+
+## Packaged helpers
+
+CLI bootstrap captures the optional Mermaid worker once from the bootstrap installation directory (or its explicit environment override). The renderer owns a private process-lifetime snapshot, checks its digest before each launch, and preserves capture failure instead of rediscovering another binary later. Snapshot failure disables Mermaid rendering only. Explicit low-level renderer paths remain caller-owned; normal packaged rendering never uses PATH discovery.

@@ -342,6 +342,15 @@ fn record_early_startup(times: [Instant; 6]) {
     }
 }
 
+fn initialize_process_executables() -> Result<(), CliError> {
+    let bootstrap = bcode_daemon_lifecycle::initialize_artifact_bootstrap()?;
+    // Optional helper failure is retained, but never prevents unrelated CLI work.
+    if let Some(directory) = bootstrap.source_path().parent() {
+        let _ = bcode_mermaid_render::IsolatedMermaidRenderer::initialize_packaged(directory);
+    }
+    Ok(())
+}
+
 /// Parse CLI arguments and run with caller-provided static bundled plugins.
 ///
 /// # Errors
@@ -362,7 +371,7 @@ pub async fn run_with_static_bundled(
         .set(artifact_build_info.clone())
         .expect("Bcode CLI build information initialized more than once");
     bcode_tui::initialize_build_info(artifact_build_info);
-    bcode_daemon_lifecycle::initialize_artifact_bootstrap()?;
+    initialize_process_executables()?;
     let bootstrap_ready = Instant::now();
     let static_plugin_ids = bcode_plugin::static_bundled_plugin_ids(&static_plugins)?;
     let static_default_plugin_ids =
@@ -14076,7 +14085,7 @@ const fn daemon_control_policy(
     }
 }
 
-async fn cleanup_delegated_graceful_daemon(
+fn cleanup_delegated_graceful_daemon(
     record: &bcode_daemon_lifecycle::DaemonRecord,
     classification: bcode_daemon_lifecycle::DaemonRecordClassification,
     stop_current: bool,
@@ -14089,13 +14098,13 @@ async fn cleanup_delegated_graceful_daemon(
         summary.skipped = summary.skipped.saturating_add(1);
         if verbose {
             summary.messages.push(format!(
-                "preserved {}: {classification:?} (use `bcode server stop-all --yes` to stop it through its own executable)",
+                "preserved {}: {classification:?} (use a separately started matching Bcode process to control it)",
                 record.namespace
             ));
         }
         return;
     }
-    match stop_protocol_unsupported_daemon_via_own_executable(record).await {
+    match refuse_foreign_daemon_delegation(record) {
         Ok(()) => {
             summary.stopped = summary.stopped.saturating_add(1);
             if verbose {
@@ -14129,7 +14138,7 @@ async fn cleanup_daemons(stop_current: bool, verbose: bool) -> DaemonCleanupSumm
         let classification = bcode_daemon_lifecycle::classify_daemon_record(&record).await;
         match daemon_control_policy(classification) {
             DaemonControlPolicy::GracefulIpc => {
-                let Some(endpoint) = record.endpoint.to_ipc_endpoint() else {
+                let Ok(endpoint) = bcode_daemon_lifecycle::pinned_daemon_endpoint(&record) else {
                     summary.skipped = summary.skipped.saturating_add(1);
                     continue;
                 };
@@ -14178,8 +14187,7 @@ async fn cleanup_daemons(stop_current: bool, verbose: bool) -> DaemonCleanupSumm
                     stop_current,
                     verbose,
                     &mut summary,
-                )
-                .await;
+                );
             }
             DaemonControlPolicy::PreserveAndRefuse => {
                 summary.skipped = summary.skipped.saturating_add(1);
@@ -14254,6 +14262,9 @@ fn daemon_status_matches(
 
 #[cfg(unix)]
 fn remove_stale_socket(record: &bcode_daemon_lifecycle::DaemonRecord) {
+    if bcode_daemon_lifecycle::pinned_daemon_endpoint(record).is_err() {
+        return;
+    }
     if let bcode_daemon_lifecycle::DaemonEndpointRecord::UnixSocket { path } = &record.endpoint
         && is_bcode_socket_path(path)
         && !unix_socket_has_listener(path)
@@ -14294,12 +14305,7 @@ async fn retire_incompatible_daemons() -> Result<(), CliError> {
         return Ok(());
     }
     for (record_path, record) in incompatible {
-        let endpoint = record.endpoint.to_ipc_endpoint().ok_or_else(|| {
-            CliError::IncompatibleDaemonStorage(format!(
-                "cannot retire namespace {}: unsupported endpoint {:?}",
-                record.namespace, record.endpoint
-            ))
-        })?;
+        let endpoint = bcode_daemon_lifecycle::pinned_daemon_endpoint(&record)?;
         let client = BcodeClient::new(endpoint)
             .with_request_timeout(Duration::from_secs(2))
             .with_daemon_availability(DaemonAvailability::RequireRunning);
@@ -14415,12 +14421,7 @@ fn session_ownership_release_message(
 
 async fn release_session_owner(session_id: SessionId) -> Result<(), CliError> {
     let record = session_owner_record(session_id).await?;
-    let endpoint = record.endpoint.to_ipc_endpoint().ok_or_else(|| {
-        CliError::InvalidArguments(format!(
-            "daemon {} has no supported IPC endpoint",
-            record.instance_id
-        ))
-    })?;
+    let endpoint = bcode_daemon_lifecycle::pinned_daemon_endpoint(&record)?;
     let client =
         BcodeClient::new(endpoint).with_daemon_availability(DaemonAvailability::RequireRunning);
     let message = session_ownership_release_message(
@@ -14443,7 +14444,7 @@ async fn stop_session_owner(session_id: SessionId, force: bool) -> Result<(), Cl
         classification,
         bcode_daemon_lifecycle::DaemonRecordClassification::HistoricalProcessVerifiedProtocolUnsupported
     ) {
-        stop_protocol_unsupported_daemon_via_own_executable(&record).await?;
+        refuse_foreign_daemon_delegation(&record)?;
         println!(
             "stopped session owner {} through its own executable",
             record.instance_id
@@ -14459,12 +14460,7 @@ async fn stop_session_owner(session_id: SessionId, force: bool) -> Result<(), Cl
             "refusing graceful stop because daemon identity is {classification:?}"
         )));
     }
-    let endpoint = record.endpoint.to_ipc_endpoint().ok_or_else(|| {
-        CliError::InvalidArguments(format!(
-            "daemon {} has no supported IPC endpoint",
-            record.instance_id
-        ))
-    })?;
+    let endpoint = bcode_daemon_lifecycle::pinned_daemon_endpoint(&record)?;
     BcodeClient::new(endpoint)
         .with_daemon_availability(DaemonAvailability::RequireRunning)
         .server_stop()
@@ -14478,7 +14474,7 @@ async fn stop_session_owner(session_id: SessionId, force: bool) -> Result<(), Cl
 ///
 /// # Errors
 /// Always returns an actionable refusal without launching another executable.
-async fn stop_protocol_unsupported_daemon_via_own_executable(
+fn refuse_foreign_daemon_delegation(
     expected: &bcode_daemon_lifecycle::DaemonRecord,
 ) -> Result<(), CliError> {
     Err(CliError::InvalidArguments(format!(
@@ -14674,12 +14670,7 @@ async fn run_new_session_tui(
 
 async fn session_owner_client(session_id: SessionId) -> Result<BcodeClient, CliError> {
     let record = session_owner_record(session_id).await?;
-    let endpoint = record.endpoint.to_ipc_endpoint().ok_or_else(|| {
-        CliError::InvalidArguments(format!(
-            "daemon {} has no supported IPC endpoint",
-            record.instance_id
-        ))
-    })?;
+    let endpoint = bcode_daemon_lifecycle::pinned_daemon_endpoint(&record)?;
     let client =
         BcodeClient::new(endpoint).with_daemon_availability(DaemonAvailability::RequireRunning);
     let status = client.server_status().await?;
@@ -25041,6 +25032,27 @@ mod json_stream_output_tests {
     }
 
     #[cfg(unix)]
+    fn artifact_test_daemon_status() -> bcode_ipc::DaemonStatus {
+        bcode_ipc::DaemonStatus {
+            namespace: bcode_ipc::daemon_namespace(),
+            protocol_version: u32::from(bcode_ipc::CURRENT_PROTOCOL_VERSION),
+            artifact_id: Some(bcode_ipc::ArtifactId::current()),
+            build_fingerprint: bcode_ipc::BUILD_FINGERPRINT.into(),
+            executable_digest: Some(
+                bcode_daemon_lifecycle::current_executable_identity()
+                    .unwrap()
+                    .1,
+            ),
+            storage_writer_epoch: Some(bcode_ipc::CURRENT_SESSION_STORAGE_WRITER_EPOCH),
+            session_event_schema_version: Some(
+                bcode_session_models::CURRENT_SESSION_EVENT_SCHEMA_VERSION,
+            ),
+            state_location_id: Some(bcode_ipc::state_location_id()),
+            ..Default::default()
+        }
+    }
+
+    #[cfg(unix)]
     #[tokio::test]
     async fn artifact_range_handler_preserves_ipc_success_and_failure_output() {
         for (raw, outcome) in [false, true]
@@ -25085,18 +25097,7 @@ mod json_stream_output_tests {
             let server = tokio::spawn(async move {
                 let mut stream = listener.accept().await.unwrap();
                 let hello = bcode_ipc::recv_envelope(&mut stream).await.unwrap();
-                let daemon = bcode_ipc::DaemonStatus {
-                    namespace: bcode_ipc::daemon_namespace(),
-                    protocol_version: u32::from(bcode_ipc::CURRENT_PROTOCOL_VERSION),
-                    artifact_id: Some(bcode_ipc::ArtifactId::current()),
-                    build_fingerprint: bcode_ipc::BUILD_FINGERPRINT.into(),
-                    storage_writer_epoch: Some(bcode_ipc::CURRENT_SESSION_STORAGE_WRITER_EPOCH),
-                    session_event_schema_version: Some(
-                        bcode_session_models::CURRENT_SESSION_EVENT_SCHEMA_VERSION,
-                    ),
-                    state_location_id: Some(bcode_ipc::state_location_id()),
-                    ..Default::default()
-                };
+                let daemon = artifact_test_daemon_status();
                 let response = bcode_ipc::Response::Ok(bcode_ipc::ResponsePayload::Hello {
                     protocol_version: bcode_ipc::ProtocolVersion(
                         bcode_ipc::CURRENT_PROTOCOL_VERSION,

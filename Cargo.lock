@@ -1603,6 +1603,7 @@ dependencies = [
  "bcode_daemon_lifecycle",
  "bcode_hyperchad",
  "bcode_ipc",
+ "bcode_mermaid_render",
  "bcode_metrics",
  "bcode_model",
  "bcode_model_catalog",
@@ -2136,6 +2137,7 @@ version = "0.0.1-alpha.0"
 dependencies = [
  "libc",
  "mermaid-rs-renderer",
+ "sha2 0.11.0",
  "tempfile",
  "windows-sys 0.61.2",
 ]
