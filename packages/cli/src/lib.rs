@@ -13522,6 +13522,7 @@ struct ServerDiagnosis {
     selected_model_id: Option<String>,
     plugin_runtime: Vec<bcode_plugin::PluginExecutorStatus>,
     active_runtime_work: Vec<bcode_ipc::SessionRuntimeWork>,
+    workflow_unavailable_reason: Option<String>,
     idle_shutdown_blocker: Option<String>,
     metrics: bcode_metrics::MetricsSnapshot,
     observations: Vec<DiagnosticObservation>,
@@ -13589,6 +13590,7 @@ impl ServerDiagnosis {
             selected_model_id: status.selected_model_id,
             plugin_runtime: status.plugin_runtime,
             active_runtime_work: status.active_runtime_work,
+            workflow_unavailable_reason: status.workflow_unavailable_reason,
             idle_shutdown_blocker: status.idle_shutdown_blocker,
             metrics: status.metrics,
             observations,
@@ -26679,7 +26681,7 @@ mod interaction_cli_tests {
 
 #[cfg(test)]
 mod latency_diagnosis_tests {
-    use super::{DiagnosticSeverity, diagnostic_observations};
+    use super::{DiagnosticSeverity, ServerDiagnosis, diagnostic_observations};
     use bcode_ipc::ServerStatus;
     use bcode_metrics::{HistogramSnapshot, MetricsSnapshot};
 
@@ -26697,6 +26699,7 @@ mod latency_diagnosis_tests {
             daemon: bcode_ipc::DaemonStatus::default(),
             metrics,
             metrics_report: Box::default(),
+            workflow_unavailable_reason: None,
             active_runtime_work: Vec::new(),
             idle_shutdown_blocker: None,
         }
@@ -26715,6 +26718,20 @@ mod latency_diagnosis_tests {
             },
         );
         status_with_metrics(metrics)
+    }
+
+    #[test]
+    fn diagnosis_carries_workflow_unavailability() {
+        let mut status = status_with_metrics(MetricsSnapshot::default());
+        status.workflow_unavailable_reason =
+            Some("workflow upgrade blocked by another owner".into());
+        assert_eq!(
+            ServerDiagnosis::from_status(status)
+                .expect("diagnosis")
+                .workflow_unavailable_reason
+                .as_deref(),
+            Some("workflow upgrade blocked by another owner")
+        );
     }
 
     #[test]

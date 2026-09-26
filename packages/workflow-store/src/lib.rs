@@ -28306,6 +28306,48 @@ mod tests {
     }
 
     #[test]
+    fn independent_run_child() {
+        let Ok(root) = std::env::var("BCODE_TEST_INDEPENDENT_RUN_ROOT") else {
+            return;
+        };
+        let mut store = WorkflowStore::initialize_in_state_dir(Path::new(&root), 915)
+            .expect("open while another process owns a different run");
+        let mut run = new_run();
+        run.run_id = "independent-child".into();
+        store.create_run(&run).expect("admit independent run");
+        assert!(store.pause_run(&run.run_id, 22).expect("advance child run"));
+    }
+
+    #[test]
+    fn independent_runs_admit_across_live_processes() {
+        let (temp, mut parent) = initialized_store();
+        let status = std::process::Command::new(std::env::current_exe().expect("test binary"))
+            .args(["--exact", "tests::independent_run_child"])
+            .env("BCODE_TEST_INDEPENDENT_RUN_ROOT", temp.path())
+            .status()
+            .expect("child process");
+        assert!(status.success());
+        let mut parent_run = new_run();
+        parent_run.run_id = "independent-parent".into();
+        parent.create_run(&parent_run).expect("admit parent run");
+        assert!(
+            parent
+                .pause_run(&parent_run.run_id, 23)
+                .expect("advance parent run")
+        );
+        for id in ["independent-parent", "independent-child"] {
+            assert_eq!(
+                parent
+                    .run_summary(id)
+                    .expect("summary")
+                    .expect("run")
+                    .status,
+                RunStatus::Paused
+            );
+        }
+    }
+
+    #[test]
     fn additive_revision_child() {
         let Ok(root) = std::env::var("BCODE_TEST_ADDITIVE_REVISION_ROOT") else {
             return;

@@ -1547,7 +1547,7 @@ impl ServerState {
             Err(std::sync::TryLockError::Poisoned(error)) => error.into_inner(),
             Err(std::sync::TryLockError::WouldBlock) => {
                 return Err(ServerError::WorkflowStorageUnavailable(
-                    "workflow storage initialization is in progress; retry the workflow request"
+                    "workflow readiness status is temporarily unavailable; retry the workflow request (no initialization progress has been verified)"
                         .into(),
                 ));
             }
@@ -2833,6 +2833,12 @@ impl ServerState {
             daemon: self.daemon_status.clone(),
             metrics: self.metrics.snapshot(),
             metrics_report: Box::new(self.metrics.report()),
+            workflow_unavailable_reason: self.poll_workflow_initialization(false).err().map(
+                |error| match error {
+                    ServerError::WorkflowStorageUnavailable(message) => message,
+                    _ => "workflow capability is unavailable".to_owned(),
+                },
+            ),
             active_runtime_work,
             idle_shutdown_blocker,
         }
@@ -72175,6 +72181,32 @@ event_symbol = "bcode_plugin_handle_event_v1"
         // The initializer is deliberately still pending throughout client handling.
         drop(sender);
         server.await.expect("server");
+    }
+
+    #[tokio::test]
+    async fn server_status_exposes_workflow_blocker_without_blocking_sessions() {
+        let mut state = test_server_state(SessionManager::default());
+        state.workflow_store_unavailable = StdMutex::new(Some(WorkflowInitializationFailure {
+            message: WorkflowInitializationFailure::from_store_error(
+                &WorkflowStoreError::UpgradeOwnershipUnavailable,
+            )
+            .message,
+            retryable: true,
+        }));
+        let (_sender, receiver) = tokio::sync::oneshot::channel();
+        *state
+            .workflow_initialization
+            .lock()
+            .expect("initialization") = Some(receiver);
+        let status = state.status(None).await;
+        drop(state);
+        assert!(status.sessions.is_empty());
+        assert!(
+            status
+                .workflow_unavailable_reason
+                .as_deref()
+                .is_some_and(|reason| reason.contains("another owner"))
+        );
     }
 
     #[tokio::test]

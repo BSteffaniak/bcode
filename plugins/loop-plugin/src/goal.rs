@@ -208,7 +208,7 @@ impl PluginTuiSurfaceFactory for GoalSurfaceFactory {
 }
 
 type GenerationResult = Result<bcode_plugin_sdk::tui::PluginStructuredGenerationResult, String>;
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum GoalPhase {
     Draft,
     Generating { review: bool },
@@ -949,6 +949,51 @@ mod tests {
         drop(document_requests);
         drop(starts);
         assert_eq!(input_text(&surface.editor.limit), "20");
+    }
+
+    #[tokio::test]
+    async fn generated_goal_failed_admission_preserves_prompts_and_retries_exact_request() {
+        let host = Host::default();
+        let mut surface = GoalSurface::new(Some(SessionId::new()));
+        surface.editor.prompt = text_state("complete the goal");
+        assert_eq!(surface.generate(&host, true), PluginTuiAction::Redraw);
+        host.finish().await;
+        surface.poll(&host);
+        assert_eq!(surface.phase, GoalPhase::Generated);
+        assert!(host.starts.lock().unwrap().is_empty());
+        let implementation = input_text(&surface.editor.prompt);
+        let condition = input_text(&surface.editor.condition);
+        assert_eq!(surface.editor.submit(&host), PluginTuiAction::Redraw);
+        surface.editor.begin_pending_host_work(&host);
+        host.finish().await;
+        surface.poll(&host);
+        surface.editor.begin_pending_host_work(&host);
+        host.finish().await;
+        let first = host.starts.lock().unwrap()[0].clone();
+        {
+            let mut completions = surface.editor.completions.lock().unwrap();
+            for completion in completions.iter_mut() {
+                if let LoopSurfaceCompletion::WorkflowStart { result, .. } = completion {
+                    *result = Err(bcode_plugin_sdk::tui::PluginTuiHostError::Internal(
+                        "workflow storage blocked by another owner".into(),
+                    ));
+                }
+            }
+        }
+        assert_eq!(surface.poll(&host), PluginTuiAction::Redraw);
+        assert_eq!(surface.phase, GoalPhase::Generated);
+        assert!(surface.editor.status.contains("another owner"));
+        assert_eq!(input_text(&surface.editor.prompt), implementation);
+        assert_eq!(input_text(&surface.editor.condition), condition);
+        assert_eq!(surface.editor.submit(&host), PluginTuiAction::Redraw);
+        surface.editor.begin_pending_host_work(&host);
+        host.finish().await;
+        assert!(matches!(surface.poll(&host), PluginTuiAction::Close { .. }));
+        let starts = host.starts.lock().unwrap();
+        assert_eq!(starts.len(), 2);
+        assert_eq!(starts[0], first);
+        assert_eq!(starts[1], first);
+        drop(starts);
     }
 
     #[tokio::test]

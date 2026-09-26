@@ -1415,6 +1415,9 @@ pub struct ServerStatus {
     /// Rich dashboard-ready metrics report.
     #[serde(default = "default_metrics_report_box")]
     pub metrics_report: Box<bcode_metrics::MetricsReport>,
+    /// Why workflow operations are unavailable, without private storage details.
+    #[serde(default)]
+    pub workflow_unavailable_reason: Option<String>,
     /// Runtime work currently registered as active on this daemon, across all sessions.
     ///
     /// This is the same set the daemon consults when deciding whether it is idle, so a
@@ -5632,6 +5635,7 @@ mod tests {
                     },
                     metrics: MetricsSnapshot::default(),
                     metrics_report: Box::default(),
+                    workflow_unavailable_reason: None,
                     active_runtime_work: Vec::new(),
                     idle_shutdown_blocker: None,
                 },

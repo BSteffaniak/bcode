@@ -1224,15 +1224,24 @@ impl LoopSurface {
                     action = PluginTuiAction::Redraw;
                 }
                 LoopSurfaceCompletion::WorkflowLookup(result) => {
-                    self.active_workflow = result.unwrap_or_else(|error| {
-                        self.status = format!("failed to inspect active loop: {error}");
-                        None
-                    });
-                    if !self.status.starts_with("failed to inspect") {
-                        self.status = self.active_workflow.as_ref().map_or_else(
-                            || "Tab changes field · Ctrl+Enter starts · Esc cancels".to_owned(),
-                            format_plugin_workflow_status,
-                        );
+                    match result {
+                        Ok(run) => {
+                            self.active_workflow = run;
+                            if self.failed_workflow_start.is_none() {
+                                self.status = self.active_workflow.as_ref().map_or_else(
+                                    || {
+                                        "Tab changes field · Ctrl+Enter starts · Esc cancels"
+                                            .to_owned()
+                                    },
+                                    format_plugin_workflow_status,
+                                );
+                            }
+                        }
+                        Err(error) => {
+                            if self.failed_workflow_start.is_none() {
+                                self.status = format!("failed to inspect active loop: {error}");
+                            }
+                        }
                     }
                     action = PluginTuiAction::Redraw;
                 }
@@ -3305,6 +3314,38 @@ mod tests {
                 .any(|row| row.contains("workflow ownership blocked")),
             "{text:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn late_workflow_lookup_does_not_erase_failed_start_diagnostic() {
+        let host = FailingHost::default();
+        let mut surface = LoopSurface::new(Some(SessionId::new()));
+        surface.prompt = text_state("implement");
+        surface.condition = text_state("done");
+        surface.limit = text_state("2");
+        surface.pending_workflow_lookup = true;
+        assert_eq!(surface.start(), PluginTuiAction::Redraw);
+        surface.begin_workflow_start(&host);
+        assert!(matches!(
+            poll_surface_until_action(&mut surface, &host).await,
+            PluginTuiAction::Redraw
+        ));
+        assert!(surface.failed_workflow_start.is_some());
+        let diagnostic = surface.status.clone();
+        surface
+            .completions
+            .lock()
+            .expect("completion lock")
+            .push(LoopSurfaceCompletion::WorkflowLookup(Ok(None)));
+        assert_eq!(surface.apply_completions(), PluginTuiAction::Redraw);
+        assert_eq!(surface.status, diagnostic);
+        surface.completions.lock().expect("completion lock").push(
+            LoopSurfaceCompletion::WorkflowLookup(Err(
+                bcode_plugin_sdk::tui::PluginTuiHostError::Internal("lookup failed".into()),
+            )),
+        );
+        assert_eq!(surface.apply_completions(), PluginTuiAction::Redraw);
+        assert_eq!(surface.status, diagnostic);
     }
 
     #[tokio::test]
