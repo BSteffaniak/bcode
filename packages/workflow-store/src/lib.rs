@@ -1758,7 +1758,10 @@ impl WorkflowStore {
             checksum_sha256,
             definition_json,
         };
-        let transaction = self.connection.transaction()?;
+        let transaction = self
+            .connection
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        verify_store_schema(&transaction)?;
         persist_definition_transaction(&transaction, &stored)?;
         transaction.commit()?;
         Ok(stored)
@@ -4435,7 +4438,11 @@ impl WorkflowStore {
         validate_id("replacement artifact", &replacement.target_artifact_id)?;
         validate_id("replacement daemon", &replacement.daemon_instance_id)?;
         validate_id("replacement fence", &replacement.fencing_token)?;
-        let tx = self.connection.unchecked_transaction()?;
+        let tx = rusqlite::Transaction::new_unchecked(
+            &self.connection,
+            rusqlite::TransactionBehavior::Immediate,
+        )?;
+        verify_store_schema(&tx)?;
         self.verify_execution_authority(run_id, expected)?;
         if terminal_proof {
             let terminal: bool = tx.query_row("SELECT status IN ('completed','failed','cancelled') FROM workflow_runs WHERE run_id=?1", [run_id], |row| row.get(0))?;
@@ -4510,7 +4517,11 @@ impl WorkflowStore {
         }
         validate_id("replacement daemon", &replacement.daemon_instance_id)?;
         validate_id("replacement fence", &replacement.fencing_token)?;
-        let tx = self.connection.unchecked_transaction()?;
+        let tx = rusqlite::Transaction::new_unchecked(
+            &self.connection,
+            rusqlite::TransactionBehavior::Immediate,
+        )?;
+        verify_store_schema(&tx)?;
         let pending_replacement = self.pending_replacement(run_id)?.is_some();
         let changed = tx.execute(
             "UPDATE workflow_runs SET coordinator_daemon_instance_id = ?6, \
@@ -4603,7 +4614,11 @@ impl WorkflowStore {
         validate_id("replacement artifact", &replacement.target_artifact_id)?;
         validate_id("replacement daemon", &replacement.daemon_instance_id)?;
         validate_id("replacement fence", &replacement.fencing_token)?;
-        let transaction = self.connection.unchecked_transaction()?;
+        let transaction = rusqlite::Transaction::new_unchecked(
+            &self.connection,
+            rusqlite::TransactionBehavior::Immediate,
+        )?;
+        verify_store_schema(&transaction)?;
         self.validate_quiescent_reassignment(run_id)?;
         let changed = transaction.execute(
             "UPDATE workflow_runs SET target_artifact_id = ?6, coordinator_daemon_instance_id = ?7, \
@@ -4690,6 +4705,8 @@ impl WorkflowStore {
         let transaction = self
             .connection
             .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        *operation = "verify_schema";
+        verify_store_schema(&transaction)?;
         *operation = "verify_package";
         if let Some((id, digest)) = package {
             let lock = Self::package_lock_on(&transaction, id, digest)?.ok_or_else(|| {
@@ -4902,6 +4919,7 @@ impl WorkflowStore {
         let transaction = self
             .connection
             .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        verify_store_schema(&transaction)?;
         create_run_in_transaction(&transaction, run)?;
         transaction.commit()?;
         Ok(())
@@ -7766,7 +7784,11 @@ impl WorkflowStore {
         validate_id("node_id", node_id)?;
         validate_id("activation_id", activation_id)?;
         let intent_json = bounded_json("dispatch intent", &intent)?;
-        let transaction = self.connection.unchecked_transaction()?;
+        let transaction = rusqlite::Transaction::new_unchecked(
+            &self.connection,
+            rusqlite::TransactionBehavior::Immediate,
+        )?;
+        verify_store_schema(&transaction)?;
         if self.execution_authority(run_id)?.as_ref() != expected_authority {
             return Err(WorkflowStoreError::InvalidData(
                 "preparation execution authority changed".into(),
@@ -7922,7 +7944,11 @@ impl WorkflowStore {
         request: &PreparedActivationDispatch,
         expected_authority: Option<&WorkflowExecutionAuthority>,
     ) -> Result<(), WorkflowStoreError> {
-        let transaction = self.connection.unchecked_transaction()?;
+        let transaction = rusqlite::Transaction::new_unchecked(
+            &self.connection,
+            rusqlite::TransactionBehavior::Immediate,
+        )?;
+        verify_store_schema(&transaction)?;
         if self
             .execution_authority(&request.activation.run_id)?
             .as_ref()
@@ -8106,7 +8132,11 @@ impl WorkflowStore {
             )));
         }
         let checksum = sha256_hex(intent_json.as_bytes());
-        let transaction = self.connection.transaction()?;
+        let transaction = self
+            .connection
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        verify_store_schema(&transaction)?;
+        enforce_attempt_limits(&transaction, attempt)?;
         let existing = transaction
             .query_row(
                 "SELECT dispatch_identity, intent_checksum, side_effect FROM workflow_attempts \
@@ -8693,7 +8723,11 @@ impl WorkflowStore {
         receipt: &DispatchReceipt,
         authority: Option<&WorkflowExecutionAuthority>,
     ) -> Result<(), WorkflowStoreError> {
-        let transaction = self.connection.unchecked_transaction()?;
+        let transaction = rusqlite::Transaction::new_unchecked(
+            &self.connection,
+            rusqlite::TransactionBehavior::Immediate,
+        )?;
+        verify_store_schema(&transaction)?;
         self.persist_dispatch_receipt_transaction(&transaction, receipt, authority)?;
         transaction.commit()?;
         Ok(())
@@ -8711,7 +8745,11 @@ impl WorkflowStore {
         observation: AttemptObservation,
         observed_at_ms: u64,
     ) -> Result<ReceiptReconciliationSummary, WorkflowStoreError> {
-        let transaction = self.connection.unchecked_transaction()?;
+        let transaction = rusqlite::Transaction::new_unchecked(
+            &self.connection,
+            rusqlite::TransactionBehavior::Immediate,
+        )?;
+        verify_store_schema(&transaction)?;
         self.persist_dispatch_receipt_transaction(&transaction, receipt, Some(authority))?;
         let request = receipt_backed_attempt(&transaction, &receipt.dispatch_identity)?
             .ok_or_else(|| WorkflowStoreError::InvalidData("recovered receipt missing".into()))?;
@@ -9427,13 +9465,17 @@ impl WorkflowStore {
         observed_at_ms: u64,
     ) -> Result<ReceiptReconciliationSummary, WorkflowStoreError> {
         validate_id("dispatch_identity", dispatch_identity)?;
+        let transaction = rusqlite::Transaction::new_unchecked(
+            &self.connection,
+            rusqlite::TransactionBehavior::Immediate,
+        )?;
+        verify_store_schema(&transaction)?;
         let request =
-            receipt_backed_attempt(&self.connection, dispatch_identity)?.ok_or_else(|| {
+            receipt_backed_attempt(&transaction, dispatch_identity)?.ok_or_else(|| {
                 WorkflowStoreError::InvalidData(format!(
                     "receipt-backed workflow attempt not found: {dispatch_identity}"
                 ))
             })?;
-        let transaction = self.connection.transaction()?;
         let mut summary = ReceiptReconciliationSummary::default();
         apply_attempt_observation(
             &transaction,
@@ -9458,7 +9500,11 @@ impl WorkflowStore {
         observed_at_ms: u64,
     ) -> Result<ReceiptReconciliationSummary, WorkflowStoreError> {
         validate_id("dispatch_identity", dispatch_identity)?;
-        let transaction = self.connection.unchecked_transaction()?;
+        let transaction = rusqlite::Transaction::new_unchecked(
+            &self.connection,
+            rusqlite::TransactionBehavior::Immediate,
+        )?;
+        verify_store_schema(&transaction)?;
         let request =
             receipt_backed_attempt(&transaction, dispatch_identity)?.ok_or_else(|| {
                 WorkflowStoreError::InvalidData(format!(
@@ -11223,7 +11269,11 @@ impl WorkflowStore {
         authority: &WorkflowExecutionAuthority,
         now_ms: u64,
     ) -> Result<bool, WorkflowStoreError> {
-        let tx = self.connection.unchecked_transaction()?;
+        let tx = rusqlite::Transaction::new_unchecked(
+            &self.connection,
+            rusqlite::TransactionBehavior::Immediate,
+        )?;
+        verify_store_schema(&tx)?;
         self.verify_execution_authority(run_id, authority)?;
         let Some(link) = self.parent_run_link(run_id)? else {
             return Ok(false);
@@ -11259,7 +11309,11 @@ impl WorkflowStore {
         authority: Option<&WorkflowExecutionAuthority>,
     ) -> Result<bool, WorkflowStoreError> {
         validate_id("run_id", run_id)?;
-        let transaction = self.connection.unchecked_transaction()?;
+        let transaction = rusqlite::Transaction::new_unchecked(
+            &self.connection,
+            rusqlite::TransactionBehavior::Immediate,
+        )?;
+        verify_store_schema(&transaction)?;
         if let Some(authority) = authority {
             self.verify_execution_authority(run_id, authority)?;
         }
@@ -11286,6 +11340,11 @@ impl WorkflowStore {
         requested_at_ms: u64,
     ) -> Result<(bool, Vec<String>), WorkflowStoreError> {
         validate_id("run_id", run_id)?;
+        let transaction = rusqlite::Transaction::new_unchecked(
+            &self.connection,
+            rusqlite::TransactionBehavior::Immediate,
+        )?;
+        verify_store_schema(&transaction)?;
         let descendants =
             self.descendant_run_summaries(run_id, MAX_WORKFLOW_RUN_DESCENDANTS as usize)?;
         let mut candidates = Vec::with_capacity(descendants.len().saturating_add(1));
@@ -11306,10 +11365,15 @@ impl WorkflowStore {
         let mut run_ids = Vec::with_capacity(candidates.len());
         for (target_run_id, status) in candidates {
             if matches!(status, RunStatus::Running | RunStatus::Paused) {
-                recorded |= self.request_cancellation(&target_run_id, requested_at_ms)?;
+                recorded |= request_run_cancellation_in_transaction(
+                    &transaction,
+                    &target_run_id,
+                    requested_at_ms,
+                )?;
                 run_ids.push(target_run_id);
             }
         }
+        transaction.commit()?;
         Ok((recorded, run_ids))
     }
 
@@ -11325,7 +11389,11 @@ impl WorkflowStore {
         now_ms: u64,
     ) -> Result<bool, WorkflowStoreError> {
         validate_id("dispatch_identity", dispatch_identity)?;
-        let tx = self.connection.unchecked_transaction()?;
+        let tx = rusqlite::Transaction::new_unchecked(
+            &self.connection,
+            rusqlite::TransactionBehavior::Immediate,
+        )?;
+        verify_store_schema(&tx)?;
         let candidate: Option<(String, String, String)> = tx
             .query_row(
                 "SELECT a.run_id, a.node_id, a.activation_id FROM workflow_attempts a
@@ -11647,7 +11715,11 @@ impl WorkflowStore {
         authority: Option<&WorkflowExecutionAuthority>,
     ) -> Result<RunStatus, WorkflowStoreError> {
         validate_id("dispatch_identity", dispatch_identity)?;
-        let transaction = self.connection.unchecked_transaction()?;
+        let transaction = rusqlite::Transaction::new_unchecked(
+            &self.connection,
+            rusqlite::TransactionBehavior::Immediate,
+        )?;
+        verify_store_schema(&transaction)?;
         let (run_id, node_id, activation_id, status, side_effect) = transaction.query_row(
             "SELECT run_id, node_id, activation_id, status, side_effect \
                  FROM workflow_attempts WHERE dispatch_identity = ?1",
@@ -11680,9 +11752,7 @@ impl WorkflowStore {
         // A missing runtime entry is not proof of orphanhood while owner admission
         // is between durable handoff and receipt commit. Keep cancellation discoverable
         // until the owner supplies evidence; do not destroy the late receipt's target.
-        let admission_in_flight =
-            cancellation_admission_in_flight(&transaction, dispatch_identity)?;
-        if admission_in_flight {
+        if cancellation_admission_in_flight(&transaction, dispatch_identity)? {
             let run_status: String = transaction.query_row(
                 "SELECT status FROM workflow_runs WHERE run_id = ?1",
                 [&run_id],
@@ -11832,7 +11902,11 @@ impl WorkflowStore {
         authority: Option<&WorkflowExecutionAuthority>,
     ) -> Result<bool, WorkflowStoreError> {
         validate_id("dispatch_identity", dispatch_identity)?;
-        let transaction = self.connection.unchecked_transaction()?;
+        let transaction = rusqlite::Transaction::new_unchecked(
+            &self.connection,
+            rusqlite::TransactionBehavior::Immediate,
+        )?;
+        verify_store_schema(&transaction)?;
         let run_id = transaction
             .query_row(
                 "SELECT run_id FROM workflow_attempts WHERE dispatch_identity = ?1",
@@ -17593,7 +17667,9 @@ fn transition_run_control_state(
     authority: Option<&WorkflowExecutionAuthority>,
 ) -> Result<bool, WorkflowStoreError> {
     validate_id("run_id", run_id)?;
-    let transaction = connection.transaction()?;
+    let transaction =
+        connection.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+    verify_store_schema(&transaction)?;
     if let Some(authority) = authority {
         let owned: bool = transaction.query_row(
             "SELECT EXISTS(SELECT 1 FROM workflow_runs WHERE run_id = ?1
@@ -23122,6 +23198,60 @@ mod tests {
     }
 
     #[test]
+    fn inherited_cancellation_refuses_incompatible_contract_without_mutation() {
+        let (temp, mut store) = initialized_store();
+        let authority = WorkflowExecutionAuthority {
+            target_artifact_id: "artifact".into(),
+            daemon_instance_id: "child-owner".into(),
+            generation: 1,
+            fencing_token: "child-fence".into(),
+        };
+        store
+            .create_run(&NewWorkflowRun {
+                run_id: "child".into(),
+                execution_authority: Some(authority.clone()),
+                ..new_run()
+            })
+            .expect("child");
+        let identity = bcode_workflow::WorkflowDefinitionIdentity::for_definition(
+            "example",
+            &definition("example"),
+        )
+        .expect("identity");
+        let target =
+            serde_json::to_string(&bcode_workflow::WorkflowCallTarget::Definition { identity })
+                .expect("target");
+        store.connection.execute("INSERT INTO workflow_run_links VALUES ('run-1','run-1','review','activation',1,'child',?1,?2,2,0)", rusqlite::params![WORKFLOW_RUN_LINK_VERSION, target]).expect("link");
+        store
+            .request_cancellation("run-1", 21)
+            .expect("parent cancellation");
+        let foreign = Connection::open(store.path()).expect("foreign connection");
+        foreign
+            .execute(
+                "UPDATE workflow_storage_compatibility SET compatibility = ?1 WHERE contract_id = 1",
+                [WORKFLOW_STORE_COMPATIBILITY + 1],
+            )
+            .expect("incompatible contract");
+        let error = store
+            .inherit_parent_cancellation_owned("child", &authority, 22)
+            .expect_err("child must not inherit across incompatible contract");
+        assert!(matches!(error, WorkflowStoreError::UnsupportedStore { .. }));
+        let requested: Option<u64> = foreign
+            .query_row(
+                "SELECT cancellation_requested_at_ms FROM workflow_runs WHERE run_id = 'child'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("child cancellation");
+        assert_eq!(requested, None);
+        drop(store);
+        assert!(matches!(
+            WorkflowStore::open_in_state_dir(temp.path()),
+            Err(WorkflowStoreError::UnsupportedStore { .. })
+        ));
+    }
+
+    #[test]
     fn inherited_cancellation_requires_child_authority_and_parent_intent() {
         let (_temp, mut store) = initialized_store();
         let authority = WorkflowExecutionAuthority {
@@ -24003,6 +24133,175 @@ mod tests {
             .expect("attempt row");
         assert_eq!(attempt.status, "prepared");
         assert!(!attempt.has_receipt);
+    }
+
+    #[test]
+    fn retained_handle_refuses_pending_activation_after_incompatible_contract_change() {
+        let (temp, mut store) = initialized_store();
+        let foreign = Connection::open(store.path()).expect("foreign connection");
+        foreign
+            .execute(
+                "UPDATE workflow_storage_compatibility SET compatibility = ?1 WHERE contract_id = 1",
+                [WORKFLOW_STORE_COMPATIBILITY + 1],
+            )
+            .expect("incompatible contract");
+        let error = store
+            .prepare_pending_activation(
+                "run-1",
+                "review",
+                &activation_id(),
+                DispatchSideEffect::ReadOnly,
+                serde_json::json!({"operation": "review"}),
+                12,
+            )
+            .expect_err("retained handle must refuse pending activation");
+        assert!(matches!(error, WorkflowStoreError::UnsupportedStore { .. }));
+        let count: u32 = foreign
+            .query_row(
+                "SELECT count(*) FROM workflow_attempts WHERE run_id = 'run-1'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("attempt count");
+        assert_eq!(count, 0);
+        drop(store);
+        assert!(matches!(
+            WorkflowStore::open_in_state_dir(temp.path()),
+            Err(WorkflowStoreError::UnsupportedStore { .. })
+        ));
+    }
+
+    #[test]
+    fn retained_handle_refuses_prepared_attempt_after_incompatible_contract_change() {
+        let (temp, mut store) = initialized_store();
+        let foreign = Connection::open(store.path()).expect("foreign connection");
+        foreign
+            .execute(
+                "UPDATE workflow_storage_compatibility SET compatibility = ?1 WHERE contract_id = 1",
+                [WORKFLOW_STORE_COMPATIBILITY + 1],
+            )
+            .expect("incompatible contract");
+        let attempt = PreparedAttempt {
+            run_id: "run-1".into(),
+            node_id: "review".into(),
+            activation_id: activation_id(),
+            attempt: 1,
+            side_effect: DispatchSideEffect::ReadOnly,
+            intent: serde_json::json!({"operation": "review"}),
+            prepared_at_ms: 12,
+        };
+        let error = store
+            .prepare_attempt(&attempt)
+            .expect_err("retained handle must refuse dispatch preparation");
+        assert!(matches!(error, WorkflowStoreError::UnsupportedStore { .. }));
+        let count: u32 = foreign
+            .query_row(
+                "SELECT count(*) FROM workflow_attempts WHERE run_id = 'run-1'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("attempt count");
+        assert_eq!(count, 0);
+        drop(store);
+        assert!(matches!(
+            WorkflowStore::open_in_state_dir(temp.path()),
+            Err(WorkflowStoreError::UnsupportedStore { .. })
+        ));
+    }
+
+    #[test]
+    fn retained_handle_refuses_tree_cancellation_after_contract_change() {
+        let (_temp, mut store) = initialized_store();
+        let foreign = Connection::open(store.path()).expect("foreign connection");
+        foreign
+            .execute(
+                "UPDATE workflow_storage_compatibility SET compatibility = ?1 WHERE contract_id = 1",
+                [WORKFLOW_STORE_COMPATIBILITY + 1],
+            )
+            .expect("incompatible contract");
+        let error = store
+            .request_cancellation_tree("run-1", 12)
+            .expect_err("retained handle must refuse tree cancellation");
+        assert!(matches!(error, WorkflowStoreError::UnsupportedStore { .. }));
+        let intent: Option<u64> = foreign
+            .query_row(
+                "SELECT cancellation_requested_at_ms FROM workflow_runs WHERE run_id = 'run-1'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("cancellation intent");
+        assert_eq!(intent, None);
+    }
+
+    #[test]
+    fn retained_handle_refuses_attempt_observation_after_contract_change() {
+        for owned in [false, true] {
+            let (_temp, mut store) = initialized_store();
+            let id = activation_id();
+            let prepared = store
+                .prepare_pending_activation(
+                    "run-1",
+                    "review",
+                    &id,
+                    DispatchSideEffect::ReadOnly,
+                    serde_json::json!({}),
+                    12,
+                )
+                .expect("prepare")
+                .expect("pending");
+            let authority = WorkflowExecutionAuthority {
+                target_artifact_id: "artifact-a".into(),
+                daemon_instance_id: "daemon-a".into(),
+                generation: 1,
+                fencing_token: "token-a".into(),
+            };
+            store.connection.execute(
+                "UPDATE workflow_runs SET target_artifact_id = 'artifact-a', coordinator_daemon_instance_id = 'daemon-a', coordinator_generation = 1, coordinator_fencing_token = 'token-a' WHERE run_id = 'run-1'", [],
+            ).expect("authority");
+            let receipt = DispatchReceipt {
+                run_id: "run-1".into(),
+                node_id: "review".into(),
+                activation_id: id,
+                attempt: prepared.attempt,
+                dispatch_identity: prepared.dispatch_identity.clone(),
+                receipt: serde_json::json!({"accepted": true}),
+                admitted_at_ms: 13,
+            };
+            store
+                .persist_owned_dispatch_receipt(&receipt, &authority)
+                .expect("receipt");
+            let foreign = Connection::open(store.path()).expect("foreign connection");
+            foreign
+                .execute(
+                    "UPDATE workflow_storage_compatibility SET compatibility = ?1 WHERE contract_id = 1",
+                    [WORKFLOW_STORE_COMPATIBILITY + 1],
+                )
+                .expect("incompatible contract");
+            let error = if owned {
+                store.apply_owned_attempt_observation(
+                    &receipt.dispatch_identity,
+                    &authority,
+                    AttemptObservation::Unknown,
+                    14,
+                )
+            } else {
+                store.apply_attempt_observation(
+                    &receipt.dispatch_identity,
+                    AttemptObservation::Unknown,
+                    14,
+                )
+            }
+            .expect_err("retained handle must refuse observation");
+            assert!(matches!(error, WorkflowStoreError::UnsupportedStore { .. }));
+            let status: String = foreign
+                .query_row(
+                    "SELECT status FROM workflow_attempts WHERE dispatch_identity = ?1",
+                    [&receipt.dispatch_identity],
+                    |row| row.get(0),
+                )
+                .expect("attempt unchanged");
+            assert_eq!(status, "admitted");
+        }
     }
 
     #[test]
@@ -28912,6 +29211,182 @@ mod tests {
                 .expect("publications"),
             1
         );
+    }
+
+    #[test]
+    fn retained_handle_refuses_authority_transfer_after_incompatible_contract_change() {
+        let (temp, mut store) = initialized_store();
+        store
+            .connection
+            .execute_batch("UPDATE workflow_runs SET target_artifact_id = 'artifact-a', coordinator_daemon_instance_id = 'daemon-a', coordinator_generation = 1, coordinator_fencing_token = 'token-a' WHERE run_id = 'run-1';")
+            .expect("fixture authority");
+        let expected = store
+            .execution_authority("run-1")
+            .expect("authority read")
+            .expect("owner");
+        let replacement = WorkflowExecutionAuthority {
+            target_artifact_id: expected.target_artifact_id.clone(),
+            daemon_instance_id: "daemon-b".into(),
+            generation: expected.generation + 1,
+            fencing_token: "token-b".into(),
+        };
+        let foreign = Connection::open(store.path()).expect("foreign connection");
+        foreign
+            .execute(
+                "UPDATE workflow_storage_compatibility SET compatibility = ?1 WHERE contract_id = 1",
+                [WORKFLOW_STORE_COMPATIBILITY + 1],
+            )
+            .expect("incompatible contract");
+        let error = store
+            .transfer_execution_authority("run-1", &expected, &replacement, 901)
+            .expect_err("retained handle must refuse handoff");
+        assert!(matches!(error, WorkflowStoreError::UnsupportedStore { .. }));
+        assert_eq!(
+            store
+                .execution_authority("run-1")
+                .expect("authority unchanged"),
+            Some(expected)
+        );
+        drop(store);
+        assert!(matches!(
+            WorkflowStore::open_in_state_dir(temp.path()),
+            Err(WorkflowStoreError::UnsupportedStore { .. })
+        ));
+    }
+
+    #[test]
+    fn retained_handle_refuses_owned_cancellation_after_incompatible_contract_change() {
+        let (temp, mut store) = initialized_store();
+        store
+            .connection
+            .execute_batch("UPDATE workflow_runs SET target_artifact_id = 'artifact-a', coordinator_daemon_instance_id = 'daemon-a', coordinator_generation = 1, coordinator_fencing_token = 'token-a' WHERE run_id = 'run-1';")
+            .expect("fixture authority");
+        let authority = store
+            .execution_authority("run-1")
+            .expect("authority read")
+            .expect("run authority");
+        let foreign = Connection::open(store.path()).expect("foreign connection");
+        foreign
+            .execute(
+                "UPDATE workflow_storage_compatibility SET compatibility = ?1 WHERE contract_id = 1",
+                [WORKFLOW_STORE_COMPATIBILITY + 1],
+            )
+            .expect("incompatible contract");
+        let error = store
+            .request_cancellation_owned("run-1", 901, &authority)
+            .expect_err("retained handle must refuse cancellation");
+        assert!(matches!(error, WorkflowStoreError::UnsupportedStore { .. }));
+        let (status, requested): (String, Option<u64>) = foreign
+            .query_row(
+                "SELECT status, cancellation_requested_at_ms FROM workflow_runs WHERE run_id = 'run-1'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .expect("run state");
+        assert_eq!(status, "running");
+        assert_eq!(requested, None);
+        drop(store);
+        assert!(matches!(
+            WorkflowStore::open_in_state_dir(temp.path()),
+            Err(WorkflowStoreError::UnsupportedStore { .. })
+        ));
+    }
+
+    #[test]
+    fn retained_handle_refuses_owned_control_after_incompatible_contract_change() {
+        let (temp, mut store) = initialized_store();
+        store
+            .connection
+            .execute_batch("UPDATE workflow_runs SET target_artifact_id = 'artifact-a', coordinator_daemon_instance_id = 'daemon-a', coordinator_generation = 1, coordinator_fencing_token = 'token-a' WHERE run_id = 'run-1';")
+            .expect("fixture authority");
+        let authority = store
+            .execution_authority("run-1")
+            .expect("authority read")
+            .expect("run authority");
+        let foreign = Connection::open(store.path()).expect("foreign connection");
+        foreign
+            .execute(
+                "UPDATE workflow_storage_compatibility SET compatibility = ?1 WHERE contract_id = 1",
+                [WORKFLOW_STORE_COMPATIBILITY + 1],
+            )
+            .expect("incompatible contract");
+        let error = store
+            .pause_run_owned("run-1", 901, &authority)
+            .expect_err("retained handle must refuse active control");
+        assert!(matches!(error, WorkflowStoreError::UnsupportedStore { .. }));
+        let status: String = foreign
+            .query_row(
+                "SELECT status FROM workflow_runs WHERE run_id = 'run-1'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("run status");
+        assert_eq!(status, "running");
+        drop(store);
+        assert!(matches!(
+            WorkflowStore::open_in_state_dir(temp.path()),
+            Err(WorkflowStoreError::UnsupportedStore { .. })
+        ));
+    }
+
+    #[test]
+    fn retained_handle_refuses_run_admission_after_incompatible_contract_change() {
+        let (temp, mut store) = initialized_store();
+        let foreign = Connection::open(store.path()).expect("foreign connection");
+        foreign
+            .execute(
+                "UPDATE workflow_storage_compatibility SET compatibility = ?1 WHERE contract_id = 1",
+                [WORKFLOW_STORE_COMPATIBILITY + 1],
+            )
+            .expect("incompatible contract");
+        let mut run = new_run();
+        run.run_id = "incompatible-admission".into();
+        let error = store
+            .create_run(&run)
+            .expect_err("retained handle must refuse run admission");
+        assert!(matches!(error, WorkflowStoreError::UnsupportedStore { .. }));
+        let count: u32 = foreign
+            .query_row(
+                "SELECT count(*) FROM workflow_runs WHERE run_id = ?1",
+                [&run.run_id],
+                |row| row.get(0),
+            )
+            .expect("run count");
+        assert_eq!(count, 0);
+        drop(store);
+        assert!(matches!(
+            WorkflowStore::open_in_state_dir(temp.path()),
+            Err(WorkflowStoreError::UnsupportedStore { .. })
+        ));
+    }
+
+    #[test]
+    fn retained_handle_refuses_definition_write_after_incompatible_contract_change() {
+        let (temp, mut store) = initialized_store();
+        let foreign = Connection::open(store.path()).expect("foreign connection");
+        foreign
+            .execute(
+                "UPDATE workflow_storage_compatibility SET compatibility = ?1 WHERE contract_id = 1",
+                [WORKFLOW_STORE_COMPATIBILITY + 1],
+            )
+            .expect("incompatible contract");
+        let error = store
+            .persist_definition("incompatible-write", 1, &definition("example"))
+            .expect_err("retained handle must not write across compatibility boundary");
+        assert!(matches!(error, WorkflowStoreError::UnsupportedStore { .. }));
+        let count: u32 = foreign
+            .query_row(
+                "SELECT count(*) FROM workflow_definitions WHERE definition_id = 'incompatible-write'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("definition count");
+        assert_eq!(count, 0);
+        drop(store);
+        assert!(matches!(
+            WorkflowStore::open_in_state_dir(temp.path()),
+            Err(WorkflowStoreError::UnsupportedStore { .. })
+        ));
     }
 
     #[test]
@@ -45543,6 +46018,79 @@ mod tests {
     }
 
     #[test]
+    fn retained_handle_refuses_dispatch_handoff_and_receipts_after_contract_change() {
+        for stage in 0..3 {
+            let (_temp, mut store, run, authority, _) = connected_publication_fixture();
+            let id = activation_identity(&run.run_id, "first", 0);
+            let prepared = store
+                .prepare_pending_activation(
+                    &run.run_id,
+                    "first",
+                    &id,
+                    DispatchSideEffect::ReadOnly,
+                    serde_json::json!({}),
+                    25,
+                )
+                .expect("prepare")
+                .expect("pending");
+            if stage != 0 {
+                store
+                    .record_dispatch_handoff(&prepared, Some(&authority))
+                    .expect("handoff before incompatible contract");
+            }
+            let receipt = DispatchReceipt {
+                run_id: run.run_id.clone(),
+                node_id: "first".into(),
+                activation_id: id,
+                attempt: prepared.attempt,
+                dispatch_identity: prepared.dispatch_identity.clone(),
+                receipt: serde_json::json!({"accepted": true}),
+                admitted_at_ms: 26,
+            };
+            let foreign = Connection::open(store.path()).expect("foreign connection");
+            foreign
+                .execute(
+                    "UPDATE workflow_storage_compatibility SET compatibility = ?1 WHERE contract_id = 1",
+                    [WORKFLOW_STORE_COMPATIBILITY + 1],
+                )
+                .expect("incompatible contract");
+            let error = match stage {
+                0 => store.record_dispatch_handoff(&prepared, Some(&authority)),
+                1 => store.persist_owned_dispatch_receipt(&receipt, &authority),
+                _ => store
+                    .recover_owned_dispatch_observation(
+                        &receipt,
+                        &authority,
+                        AttemptObservation::Unknown,
+                        27,
+                    )
+                    .map(|_| ()),
+            }
+            .expect_err("retained handle must refuse dispatch write");
+            assert!(matches!(error, WorkflowStoreError::UnsupportedStore { .. }));
+            let (status, has_receipt): (String, bool) = foreign
+                .query_row(
+                    "SELECT status, receipt_json IS NOT NULL FROM workflow_attempts WHERE dispatch_identity = ?1",
+                    [&prepared.dispatch_identity],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .expect("attempt unchanged");
+            assert_eq!(status, "prepared");
+            assert!(!has_receipt);
+            if stage == 0 {
+                let handed_off: bool = foreign
+                    .query_row(
+                        "SELECT handed_off FROM workflow_dispatch_handoffs WHERE dispatch_identity = ?1",
+                        [&prepared.dispatch_identity],
+                        |row| row.get(0),
+                    )
+                    .expect("handoff unchanged");
+                assert!(!handed_off);
+            }
+        }
+    }
+
+    #[test]
     fn owned_receipt_rejects_stale_authority_without_admitting_attempt() {
         let (_temp, mut store, run, mut authority, _) = connected_publication_fixture();
         let id = activation_identity(&run.run_id, "first", 0);
@@ -46604,6 +47152,160 @@ mod tests {
                 .finish_recovery_only(&run.run_id, &authority, 23)
                 .expect("settled child")
         );
+    }
+
+    #[test]
+    fn retained_handle_refuses_cancellation_signal_markers_after_contract_change() {
+        for sibling in [false, true] {
+            let (_temp, mut store, run, authority, _) = connected_publication_fixture();
+            let id = activation_identity(&run.run_id, "first", 0);
+            let prepared = store
+                .prepare_pending_activation(
+                    &run.run_id,
+                    "first",
+                    &id,
+                    DispatchSideEffect::Mutating,
+                    serde_json::json!({}),
+                    10,
+                )
+                .expect("prepare")
+                .expect("pending");
+            store
+                .request_cancellation_owned(&run.run_id, 12, &authority)
+                .expect("intent");
+            if sibling {
+                store.connection.execute(
+                    "UPDATE workflow_attempts SET status = 'sibling_cancelling' WHERE dispatch_identity = ?1",
+                    [&prepared.dispatch_identity],
+                ).expect("sibling cancellation intent");
+            }
+            let foreign = Connection::open(store.path()).expect("foreign connection");
+            foreign
+                .execute(
+                    "UPDATE workflow_storage_compatibility SET compatibility = ?1 WHERE contract_id = 1",
+                    [WORKFLOW_STORE_COMPATIBILITY + 1],
+                )
+                .expect("incompatible contract");
+            let error = if sibling {
+                store.mark_sibling_cancellation_signalled_owned(
+                    &prepared.dispatch_identity,
+                    13,
+                    &authority,
+                )
+            } else {
+                store.mark_cancellation_signalled_owned(&prepared.dispatch_identity, 13, &authority)
+            }
+            .expect_err("retained handle must refuse signal marker");
+            assert!(matches!(error, WorkflowStoreError::UnsupportedStore { .. }));
+            let status: String = foreign
+                .query_row(
+                    "SELECT status FROM workflow_attempts WHERE dispatch_identity = ?1",
+                    [&prepared.dispatch_identity],
+                    |row| row.get(0),
+                )
+                .expect("attempt unchanged");
+            assert_eq!(
+                status,
+                if sibling {
+                    "sibling_cancelling"
+                } else {
+                    "prepared"
+                }
+            );
+        }
+    }
+
+    #[test]
+    fn retained_handle_refuses_never_dispatched_cancellation_after_contract_change() {
+        let (_temp, mut store, run, authority, _) = connected_publication_fixture();
+        let id = activation_identity(&run.run_id, "first", 0);
+        let prepared = store
+            .prepare_pending_activation(
+                &run.run_id,
+                "first",
+                &id,
+                DispatchSideEffect::Mutating,
+                serde_json::json!({}),
+                10,
+            )
+            .expect("prepare")
+            .expect("pending");
+        store
+            .enter_recovery_only(&run.run_id, &authority, 11)
+            .expect("recovery");
+        store
+            .request_cancellation_owned(&run.run_id, 12, &authority)
+            .expect("intent");
+        let foreign = Connection::open(store.path()).expect("foreign connection");
+        foreign
+            .execute(
+                "UPDATE workflow_storage_compatibility SET compatibility = ?1 WHERE contract_id = 1",
+                [WORKFLOW_STORE_COMPATIBILITY + 1],
+            )
+            .expect("incompatible contract");
+        let error = store
+            .cancel_never_dispatched_owned(&prepared.dispatch_identity, &authority, 13)
+            .expect_err("retained handle must refuse cancellation");
+        assert!(matches!(error, WorkflowStoreError::UnsupportedStore { .. }));
+        let (status, handed_off): (String, bool) = foreign
+            .query_row(
+                "SELECT a.status, h.handed_off FROM workflow_attempts a JOIN workflow_dispatch_handoffs h USING (dispatch_identity) WHERE a.dispatch_identity = ?1",
+                [&prepared.dispatch_identity],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .expect("unchanged attempt and handoff");
+        assert_eq!(status, "prepared");
+        assert!(!handed_off);
+    }
+
+    #[test]
+    fn retained_handle_refuses_orphaned_cancellation_settlement_after_contract_change() {
+        let (_temp, mut store, run, authority, _) = connected_publication_fixture();
+        let id = activation_identity(&run.run_id, "first", 0);
+        let prepared = store
+            .prepare_pending_activation(
+                &run.run_id,
+                "first",
+                &id,
+                DispatchSideEffect::Mutating,
+                serde_json::json!({}),
+                10,
+            )
+            .expect("prepare")
+            .expect("pending");
+        store
+            .enter_recovery_only(&run.run_id, &authority, 11)
+            .expect("recovery");
+        store
+            .request_cancellation_owned(&run.run_id, 12, &authority)
+            .expect("intent");
+        let foreign = Connection::open(store.path()).expect("foreign connection");
+        foreign
+            .execute(
+                "UPDATE workflow_storage_compatibility SET compatibility = ?1 WHERE contract_id = 1",
+                [WORKFLOW_STORE_COMPATIBILITY + 1],
+            )
+            .expect("incompatible contract");
+        let error = store
+            .settle_orphaned_attempt_cancellation_owned(&prepared.dispatch_identity, 13, &authority)
+            .expect_err("retained handle must refuse settlement");
+        assert!(matches!(error, WorkflowStoreError::UnsupportedStore { .. }));
+        let status: String = foreign
+            .query_row(
+                "SELECT status FROM workflow_attempts WHERE dispatch_identity = ?1",
+                [&prepared.dispatch_identity],
+                |row| row.get(0),
+            )
+            .expect("attempt status");
+        assert_eq!(status, "prepared");
+        let run_status: String = foreign
+            .query_row(
+                "SELECT status FROM workflow_runs WHERE run_id = ?1",
+                [&run.run_id],
+                |row| row.get(0),
+            )
+            .expect("run status");
+        assert_ne!(run_status, "repair_required");
     }
 
     #[test]
