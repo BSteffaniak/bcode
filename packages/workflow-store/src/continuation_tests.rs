@@ -1,6 +1,35 @@
 use super::*;
 use crate::{ValidatedOutput, WorkflowRunBinding};
 
+#[test]
+fn admission_allowance_evidence_is_bounded_and_fails_closed() {
+    let (_temp, store, run, _) = fixture();
+    assert_eq!(
+        admission_execution_cap(&store.connection, &run.run_id, 10).unwrap(),
+        10
+    );
+    for payload in [
+        r#"{"version":2,"previous_cap":1,"target_cap":2}"#.to_owned(),
+        r#"{"version":1,"previous_cap":0,"target_cap":2}"#.to_owned(),
+        r#"{"version":1,"previous_cap":2,"target_cap":1}"#.to_owned(),
+        r#"{"version":1,"previous_cap":1,"target_cap":11}"#.to_owned(),
+        "invalid".into(),
+        "x".repeat(1025),
+    ] {
+        let tx = store.connection.unchecked_transaction().unwrap();
+        append_event(
+            &tx,
+            &run.run_id,
+            "execution_allowance_increased",
+            &payload,
+            20,
+        )
+        .unwrap();
+        assert!(admission_execution_cap(&tx, &run.run_id, 10).is_err());
+        tx.rollback().unwrap();
+    }
+}
+
 fn fixture() -> (
     tempfile::TempDir,
     WorkflowStore,

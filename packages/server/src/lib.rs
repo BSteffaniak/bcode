@@ -5559,6 +5559,10 @@ fn request_error_response(error: &ServerError) -> ErrorResponse {
         return ErrorResponse::new(failure.code(), failure.to_string());
     }
     let (code, message) = match error {
+        ServerError::Session(bcode_session::SessionError::NotFound(_)) => (
+            "session_not_found",
+            "a session required by this request was not found in the selected session store; verify the state location and session-store selection",
+        ),
         ServerError::WorkflowStore(error) => return workflow_store_error_response(error),
         ServerError::Workflow(_) => (
             "workflow_contract_invalid",
@@ -57564,6 +57568,26 @@ library = "test"
         assert_eq!(unknown.code(), "unknown_skill");
         assert_eq!(unknown.message(), "skill is unavailable");
         assert!(!unknown.message().contains("secret-skill-id"));
+    }
+
+    #[test]
+    fn request_session_errors_are_actionable_and_secret_safe() {
+        let session_id = SessionId::new();
+        let missing = request_error_response(&ServerError::Session(
+            bcode_session::SessionError::NotFound(session_id),
+        ));
+        assert_eq!(missing.code, "session_not_found");
+        assert!(missing.message.contains("selected session store"));
+        assert!(!missing.message.contains(&session_id.to_string()));
+
+        let private = request_error_response(&ServerError::Session(
+            bcode_session::SessionError::MigrationBackup {
+                session_id,
+                reason: "secret-storage-detail".to_owned(),
+            },
+        ));
+        assert_eq!(private.code, "request_failed");
+        assert_eq!(private.message, "request failed");
     }
 
     #[test]

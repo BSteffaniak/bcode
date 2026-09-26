@@ -67,7 +67,19 @@ cap and the renewed total attempt allowance, preventing invalid limits on short 
 Omission adds no extra attempts; overflow and
 combined allowances outside the store's signed 64-bit integer range reject before launch effects.
 This is a new caller-authorized budget, not automatic renewal of the previous extra allowance.
-Mid-round delegated exhaustion and end-to-end continuation acceptance remain unverified;
+Mid-round delegated exhaustion and end-to-end continuation acceptance remain unverified.
+The store provides an application-authorized, execution-fenced compare-and-set increase of
+one active run's attempt cap. It preserves attempts, graph, outcomes and other limits;
+child increases do not increase root allowance. Exact expected/target retries are no-ops
+while the target remains current and the latest bounded grant event matches the exact cap pair;
+missing, malformed or conflicting grant evidence and intervening caps reject. Successful changes atomically
+record a version-1 `execution_allowance_increased` event with `previous_cap` and `target_cap`.
+Idempotent run admission compares the original attempt cap from the first bounded grant
+event, not the renewed execution cap; invalid or unsupported admission evidence rejects.
+Public history exposes only those reviewed fields, requires positive increasing signed-range
+caps and version 1, and reports unavailable details for malformed or unsupported observations.
+This storage capability is not yet exposed through public authorization/control or `/goal`
+commands and does not itself resume dispatch. Existing
 continuation requests for non-eligible run status or failure reason return the normalized
 `workflow_continuation_ineligible` error rather than generic workflow unavailability.
 This rejection preserves the run and explicitly reports that active allowance exhaustion is not

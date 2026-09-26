@@ -12454,6 +12454,7 @@ fn verify_models(
     };
     // Provider work is complete; output failures must not skip plugin deactivation.
     host.deactivate_all()?;
+    require_verification_candidates(report.total_models, dry_run)?;
     let body = serde_json::to_string_pretty(&report)?;
     if let Some(output) = output {
         if let Some(parent) = output.parent() {
@@ -12463,6 +12464,15 @@ fn verify_models(
         println!("wrote {}", display_from_current_dir(&output));
     } else {
         print_json(&report)?;
+    }
+    Ok(())
+}
+
+fn require_verification_candidates(count: usize, dry_run: bool) -> Result<(), CliError> {
+    if count == 0 && !dry_run {
+        return Err(CliError::InvalidArguments(
+            "no models selected for verification; inspect model discovery and --id-pattern".into(),
+        ));
     }
     Ok(())
 }
@@ -27132,6 +27142,14 @@ mod client_timeout_cli_tests {
             locations.primary().provenance(),
             bcode_config::StateLocationProvenance::Cli
         );
+    }
+
+    #[test]
+    fn model_verification_requires_candidates_unless_dry_run() {
+        assert!(super::require_verification_candidates(0, false).is_err());
+        assert!(super::require_verification_candidates(0, true).is_ok());
+        assert!(super::require_verification_candidates(1, false).is_ok());
+        assert!(super::require_verification_candidates(1, true).is_ok());
     }
 
     #[test]

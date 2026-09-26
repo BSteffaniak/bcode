@@ -16,6 +16,12 @@ do not expect this command alone to change the running plan. Draft authoring rem
 
 ## Pause, resume, and binding conflicts
 
+Full run inspection verifies linked execution-session summaries in the selected session store.
+If a required session is missing, the request returns `session_not_found` with guidance to
+verify the state location and session-store selection. It does not search alternate canonical
+roots, repair state, or treat the missing session as completed work. A successful run summary
+or graph page alone does not establish that linked session evidence is available.
+
 Pause blocks new attempt admission, not settlement of already-admitted work. Completion may
 persist output and pending successors while paused; those successors cannot execute until resume.
 A final admitted operation may complete the run while paused. Control responses describe the

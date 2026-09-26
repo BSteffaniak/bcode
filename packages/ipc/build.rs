@@ -46,10 +46,14 @@ fn main() {
 }
 
 fn workspace_root() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("../..")
-        .canonicalize()
-        .unwrap_or_else(|_| Path::new(env!("CARGO_MANIFEST_DIR")).join("../.."))
+    // Build-script executables can be reused across worktrees sharing a target
+    // directory. Cargo supplies the active manifest at execution time; baking it
+    // into the executable can watch and fingerprint a different checkout.
+    let manifest = PathBuf::from(
+        std::env::var_os("CARGO_MANIFEST_DIR").expect("Cargo supplies the manifest directory"),
+    );
+    let workspace = manifest.join("../..");
+    workspace.canonicalize().unwrap_or(workspace)
 }
 
 fn source_files(workspace_root: &Path) -> std::io::Result<Vec<PathBuf>> {

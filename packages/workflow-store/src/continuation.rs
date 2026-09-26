@@ -31,7 +31,123 @@ fn invalid(message: &str) -> WorkflowStoreError {
     WorkflowStoreError::InvalidData(message.into())
 }
 
+pub fn admission_execution_cap(
+    connection: &Connection,
+    run_id: &str,
+    current_cap: u64,
+) -> Result<u64, WorkflowStoreError> {
+    let first: Option<Option<String>> = connection
+        .query_row(
+            "SELECT CASE WHEN length(CAST(payload_json AS BLOB)) <= 1024 THEN payload_json END
+         FROM workflow_events WHERE run_id = ?1 AND event_type = 'execution_allowance_increased'
+         ORDER BY event_seq ASC LIMIT 1",
+            [run_id],
+            |row| row.get(0),
+        )
+        .optional()?;
+    let Some(first) = first else {
+        return Ok(current_cap);
+    };
+    let value: serde_json::Value = serde_json::from_str(
+        &first.ok_or_else(|| invalid("oversized allowance admission evidence"))?,
+    )
+    .map_err(|_| invalid("invalid allowance admission evidence"))?;
+    match (
+        value["version"].as_u64(),
+        value["previous_cap"].as_u64(),
+        value["target_cap"].as_u64(),
+    ) {
+        (Some(1), Some(previous), Some(target))
+            if previous > 0 && target > previous && target <= current_cap =>
+        {
+            Ok(previous)
+        }
+        _ => Err(invalid(
+            "unsupported or inconsistent allowance admission evidence",
+        )),
+    }
+}
+
 impl WorkflowStore {
+    /// Increase one active run's attempt cap after application authorization.
+    ///
+    /// This compare-and-set operation leaves attempts, topology, outcomes and all other
+    /// limits unchanged. Repeating the same expected/target pair is harmless while the
+    /// target cap is current; a different intervening cap fails closed. Child grants do
+    /// not grant root allowance. Callers must authorize the exact run and both caps.
+    ///
+    /// # Errors
+    /// Rejects invalid caps, stale authority, recovery-only, cancelled or terminal runs,
+    /// conflicting current caps, and storage failures.
+    pub fn increase_execution_allowance(
+        &mut self,
+        run_id: &str,
+        authority: &WorkflowExecutionAuthority,
+        expected_cap: u64,
+        target_cap: u64,
+        now_ms: u64,
+    ) -> Result<(), WorkflowStoreError> {
+        validate_id("run_id", run_id)?;
+        if expected_cap == 0 || target_cap <= expected_cap || target_cap > i64::MAX as u64 {
+            return Err(invalid("invalid execution allowance increase"));
+        }
+        let transaction = self.connection.unchecked_transaction()?;
+        self.verify_execution_authority(run_id, authority)?;
+        let run = self
+            .run_summary(run_id)?
+            .ok_or_else(|| invalid("run not found"))?;
+        if !matches!(run.status, RunStatus::Running | RunStatus::Paused)
+            || run.cancellation_requested_at_ms.is_some()
+            || self.is_recovery_only(run_id)?
+        {
+            return Err(invalid(
+                "run is not eligible for an execution allowance increase",
+            ));
+        }
+        let current: u64 = transaction.query_row(
+            "SELECT node_execution_cap FROM workflow_runs WHERE run_id = ?1",
+            [run_id],
+            |row| row.get(0),
+        )?;
+        let observation = serde_json::json!({"version": 1, "previous_cap": expected_cap, "target_cap": target_cap});
+        if current == target_cap {
+            let previous: Option<String> = transaction.query_row(
+                "SELECT CASE WHEN length(CAST(payload_json AS BLOB)) <= 1024 THEN payload_json END
+                 FROM workflow_events WHERE run_id = ?1 AND event_type = 'execution_allowance_increased'
+                 ORDER BY event_seq DESC LIMIT 1",
+                [run_id], |row| row.get(0),
+            ).optional()?.flatten();
+            if previous
+                .and_then(|json| serde_json::from_str::<serde_json::Value>(&json).ok())
+                .as_ref()
+                != Some(&observation)
+            {
+                return Err(invalid(
+                    "execution allowance retry has no matching grant evidence",
+                ));
+            }
+            return Ok(());
+        }
+        if current != expected_cap {
+            return Err(invalid(
+                "execution allowance changed; inspect before retrying",
+            ));
+        }
+        transaction.execute(
+            "UPDATE workflow_runs SET node_execution_cap = ?2 WHERE run_id = ?1",
+            (run_id, target_cap),
+        )?;
+        append_event(
+            &transaction,
+            run_id,
+            "execution_allowance_increased",
+            &observation.to_string(),
+            now_ms,
+        )?;
+        transaction.commit()?;
+        Ok(())
+    }
+
     /// Read explicit continuation lineage without traversing predecessor history.
     ///
     /// # Errors

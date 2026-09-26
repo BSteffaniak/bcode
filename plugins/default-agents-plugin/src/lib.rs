@@ -551,6 +551,10 @@ mod tests {
 
     #[test]
     fn effective_config_scopes_agent_accent_and_permissions_without_ambient_state() {
+        let _guard = ENV_LOCK.lock().expect("env lock should not be poisoned");
+        let root = unique_temp_dir();
+        let _state = StateGuard::set(&root.join("missing-permissions.toml"));
+
         let allow_toml = r##"
 [agent.build]
 accent = "#112233"
@@ -1001,6 +1005,33 @@ tools = { "filesystem.read" = true }
         assert!(tools.contains(&"ask".to_string()));
         assert!(tools.contains(&"ocr.extract".to_string()));
         assert!(tools.contains(&"filesystem.grep".to_string()));
+    }
+
+    #[test]
+    fn coordination_tools_are_build_only_and_explicitly_disableable() {
+        let _guard = ENV_LOCK.lock().expect("env lock");
+        let root = unique_temp_dir();
+        let _state = StateGuard::set(&root.join("missing-permissions.toml"));
+        let (config, tools_config) = policy_and_tools_from_effective_toml(Some("")).unwrap();
+        let mut build = agent_config(&config, BUILD_AGENT);
+        let mut plan = agent_config(&config, PLAN_AGENT);
+        apply_tool_selection(&mut build, &tools_config, &[]);
+        apply_tool_selection(&mut plan, &tools_config, &[]);
+        assert!(active_tools_for(&plan).contains(&"workflow.execution_context".into()));
+        for tool in [
+            "workflow.stage_task_group",
+            "workflow.publish_run_graph_edit",
+            "workflow.accept_run_graph_publication",
+        ] {
+            assert!(active_tools_for(&build).contains(&tool.into()));
+            assert!(!active_tools_for(&plan).contains(&tool.into()));
+        }
+        let disabled = bcode_config::ToolsConfig {
+            disabled: BTreeSet::from(["workflow.stage_task_group".into()]),
+            ..Default::default()
+        };
+        apply_tool_selection(&mut build, &disabled, &[]);
+        assert!(!active_tools_for(&build).contains(&"workflow.stage_task_group".into()));
     }
 
     #[test]

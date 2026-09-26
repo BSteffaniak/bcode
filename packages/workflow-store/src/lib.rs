@@ -4737,7 +4737,11 @@ impl WorkflowStore {
             })?;
         let limits = WorkflowRunLimits {
             deadline_at_ms,
-            node_execution_cap,
+            node_execution_cap: continuation::admission_execution_cap(
+                transaction,
+                &run.run_id,
+                node_execution_cap,
+            )?,
             concurrency_cap,
             cycle_cap,
             retry_cap,
@@ -36104,6 +36108,7 @@ mod tests {
         assert_eq!(allowance.run_consumed, Some(0));
         assert!(allowance.run_cap > 0);
         assert_eq!(reopened.connection.total_changes(), before);
+        assert_child_allowance_does_not_grant_root(&mut reopened, child_run_id);
         let summary = reopened
             .dispatch_pending_activations_for_run(&owner, child_run_id, 10, 3)
             .await
@@ -36129,6 +36134,31 @@ mod tests {
         assert_eq!(duplicate.exhausted, summary.exhausted);
         assert_eq!(reopened.connection.total_changes(), before_duplicate);
         assert_eq!(owner.0.load(std::sync::atomic::Ordering::SeqCst), 0);
+        let pending_before_restart = reopened
+            .pending_activations_for_run(child_run_id, 10)
+            .unwrap();
+        let run_before_restart = reopened.run_summary(child_run_id).unwrap();
+        drop(reopened);
+        let mut reopened = WorkflowStore::open_at_path(path).unwrap();
+        assert_eq!(
+            reopened.run_summary(child_run_id).unwrap(),
+            run_before_restart
+        );
+        let before_restart_dispatch = reopened.connection.total_changes();
+        let after_restart = reopened
+            .dispatch_pending_activations_for_run(&owner, child_run_id, 10, 5)
+            .await
+            .unwrap();
+        assert_eq!(after_restart.exhausted, summary.exhausted);
+        assert!(after_restart.admitted.is_empty());
+        assert_eq!(reopened.connection.total_changes(), before_restart_dispatch);
+        assert_eq!(owner.0.load(std::sync::atomic::Ordering::SeqCst), 0);
+        assert_eq!(
+            reopened
+                .pending_activations_for_run(child_run_id, 10)
+                .unwrap(),
+            pending_before_restart
+        );
         assert!(
             reopened
                 .attempt_history(child_run_id, None, 10)
@@ -36149,6 +36179,32 @@ mod tests {
                 [original_cap],
             )
             .unwrap();
+    }
+
+    fn assert_child_allowance_does_not_grant_root(store: &mut WorkflowStore, child_run_id: &str) {
+        // The composition fixture predates owned execution; give this child a verified
+        // fixture owner before exercising the same fenced operation used for renewal.
+        store.connection.execute("UPDATE workflow_runs SET target_artifact_id = 'artifact-a', coordinator_daemon_instance_id = 'daemon-a', coordinator_generation = 1, coordinator_fencing_token = 'token-a' WHERE run_id = ?1", [child_run_id]).unwrap();
+        let authority = store.execution_authority(child_run_id).unwrap().unwrap();
+        let before = store.execution_allowance_observation(child_run_id).unwrap();
+        store
+            .increase_execution_allowance(
+                child_run_id,
+                &authority,
+                before.run_cap,
+                before.run_cap + 1,
+                3,
+            )
+            .unwrap();
+        let after = store.execution_allowance_observation(child_run_id).unwrap();
+        assert_eq!(after.run_cap, before.run_cap + 1);
+        assert_eq!(after.root_cap, before.root_cap);
+        assert_eq!(after.root_consumed, before.root_consumed);
+        assert_eq!(after.run_consumed, before.run_consumed);
+        assert_eq!(after.exhausted(), Some(true));
+        // Leave the increased cap installed: retrying the original child admission
+        // must compare against its original allowance, not the renewed execution cap.
+        store.connection.execute("UPDATE workflow_runs SET target_artifact_id = NULL, coordinator_daemon_instance_id = NULL, coordinator_generation = NULL, coordinator_fencing_token = NULL WHERE run_id = ?1", [child_run_id]).unwrap();
     }
 
     fn assert_inherited_child_cancellation(store: &mut WorkflowStore, child_run_id: &str) {
@@ -39738,10 +39794,10 @@ mod tests {
 
         let temp = tempfile::tempdir().expect("temp");
         let mut definition = parallel_join_definition();
-        definition.nodes.get_mut("left").expect("left").resources =
-            vec![bcode_workflow::ResourceClaim::write("repository")];
-        definition.nodes.get_mut("right").expect("right").resources =
-            vec![bcode_workflow::ResourceClaim::write("repository")];
+        for node in ["left", "right"] {
+            definition.nodes.get_mut(node).expect("worker").resources =
+                vec![bcode_workflow::ResourceClaim::write("repository")];
+        }
         let mut store = WorkflowStore::open_in_state_dir(temp.path()).expect("store");
         store
             .persist_definition("parallel-resource", 1, &definition)
@@ -39752,12 +39808,12 @@ mod tests {
                 definition_id: "parallel-resource".to_string(),
                 definition_version: 1,
                 workspace_snapshot: "snapshot".to_string(),
-                parent_session_id: None,
+                parent_session_id: Some("test-session".into()),
                 parent_session_generation: None,
                 binding: None,
                 authored_provenance: None,
                 input: Some(serde_json::json!(1)),
-                execution_authority: None,
+                execution_authority: Some(resource_run_authority()),
                 created_at_ms: 1,
                 authorization_profile: bcode_workflow::WorkflowAuthorizationProfileIdentity {
                     version: 1,
@@ -39809,6 +39865,15 @@ mod tests {
         assert_deferred_worker_resumes(&mut store, &Owner, temp.path(), first_dispatch).await;
     }
 
+    fn resource_run_authority() -> WorkflowExecutionAuthority {
+        WorkflowExecutionAuthority {
+            target_artifact_id: "test-artifact".into(),
+            daemon_instance_id: "test-daemon".into(),
+            generation: 1,
+            fencing_token: "test-fence".into(),
+        }
+    }
+
     async fn assert_deferred_worker_resumes(
         store: &mut WorkflowStore,
         owner: &impl ActivationDispatchOwner,
@@ -39834,9 +39899,18 @@ mod tests {
             .unwrap();
         assert_eq!(exhausted.exhausted.len(), 1);
         assert!(exhausted.admitted.is_empty());
-        reopened.connection.execute(
-            "UPDATE workflow_runs SET node_execution_cap = 1000 WHERE run_id = 'parallel-resource-run'", [],
-        ).unwrap();
+        let authority = reopened
+            .execution_authority("parallel-resource-run")
+            .unwrap()
+            .unwrap();
+        reopened
+            .increase_execution_allowance("parallel-resource-run", &authority, 1, 1000, 6)
+            .unwrap();
+        let before_retry = reopened.connection.total_changes();
+        reopened
+            .increase_execution_allowance("parallel-resource-run", &authority, 1, 1000, 6)
+            .unwrap();
+        assert_eq!(reopened.connection.total_changes(), before_retry);
         let summary = reopened
             .dispatch_pending_activations(owner, 10, 6)
             .await
@@ -44541,6 +44615,139 @@ mod tests {
             let before = store.connection.total_changes();
             assert!(store.execution_allowance_observation("run-1").is_err());
             assert_eq!(store.connection.total_changes(), before);
+        }
+    }
+
+    #[test]
+    fn execution_allowance_increase_is_fenced_and_compare_and_set() {
+        let (_temp, mut store, run, authority, _) = connected_publication_fixture();
+        let cap = store
+            .execution_allowance_observation(&run.run_id)
+            .unwrap()
+            .run_cap;
+        let pending = store.pending_activations_for_run(&run.run_id, 10).unwrap();
+        let summary = store.run_summary(&run.run_id).unwrap();
+        let mut stale = authority.clone();
+        stale.generation += 1;
+        let before = store.connection.total_changes();
+        assert!(cap > 1);
+        assert!(
+            store
+                .increase_execution_allowance(&run.run_id, &authority, cap - 1, cap, 24)
+                .is_err()
+        );
+        assert!(
+            store
+                .increase_execution_allowance(&run.run_id, &stale, cap, cap + 1, 25)
+                .is_err()
+        );
+        assert!(
+            store
+                .increase_execution_allowance(&run.run_id, &authority, cap, cap, 25)
+                .is_err()
+        );
+        assert_eq!(store.connection.total_changes(), before);
+        store
+            .increase_execution_allowance(&run.run_id, &authority, cap, cap + 1, 25)
+            .unwrap();
+        assert_eq!(
+            store
+                .execution_allowance_observation(&run.run_id)
+                .unwrap()
+                .run_cap,
+            cap + 1
+        );
+        let after = store.connection.total_changes();
+        assert!(
+            store
+                .increase_execution_allowance(&run.run_id, &authority, cap - 1, cap + 1, 26)
+                .is_err()
+        );
+        store
+            .increase_execution_allowance(&run.run_id, &authority, cap, cap + 1, 26)
+            .unwrap();
+        assert!(
+            store
+                .increase_execution_allowance(&run.run_id, &authority, cap, cap + 2, 27)
+                .is_err()
+        );
+        assert_eq!(store.connection.total_changes(), after);
+        assert_eq!(store.run_summary(&run.run_id).unwrap(), summary);
+        assert_eq!(
+            store.pending_activations_for_run(&run.run_id, 10).unwrap(),
+            pending
+        );
+        assert!(
+            store
+                .attempt_history(&run.run_id, None, 10)
+                .unwrap()
+                .is_empty()
+        );
+        for status in ["completed", "failed", "cancelled", "repair_required"] {
+            store
+                .connection
+                .execute(
+                    "UPDATE workflow_runs SET status = ?2 WHERE run_id = ?1",
+                    (&run.run_id, status),
+                )
+                .unwrap();
+            let before = store.connection.total_changes();
+            assert!(
+                store
+                    .increase_execution_allowance(&run.run_id, &authority, cap + 1, cap + 2, 28)
+                    .is_err()
+            );
+            assert_eq!(store.connection.total_changes(), before);
+        }
+    }
+
+    #[test]
+    fn execution_allowance_increase_survives_reopen_and_respects_barriers() {
+        let (_temp, mut store, run, authority, _) = connected_publication_fixture();
+        let cap = store
+            .execution_allowance_observation(&run.run_id)
+            .unwrap()
+            .run_cap;
+        store
+            .increase_execution_allowance(&run.run_id, &authority, cap, cap + 1, 25)
+            .unwrap();
+        let path = store.path().to_path_buf();
+        drop(store);
+        let mut store = WorkflowStore::open_at_path(&path).unwrap();
+        let before = store.connection.total_changes();
+        store
+            .increase_execution_allowance(&run.run_id, &authority, cap, cap + 1, 26)
+            .unwrap();
+        assert_eq!(store.connection.total_changes(), before);
+        let events: u64 = store.connection.query_row(
+            "SELECT COUNT(*) FROM workflow_events WHERE run_id = ?1 AND event_type = 'execution_allowance_increased'",
+            [&run.run_id], |row| row.get(0),
+        ).unwrap();
+        assert_eq!(events, 1);
+        for barrier in ["cancel", "recovery"] {
+            if barrier == "cancel" {
+                store.connection.execute("UPDATE workflow_runs SET cancellation_requested_at_ms = 27 WHERE run_id = ?1", [&run.run_id]).unwrap();
+            } else {
+                store.connection.execute("UPDATE workflow_runs SET cancellation_requested_at_ms = NULL WHERE run_id = ?1", [&run.run_id]).unwrap();
+                store.connection.execute("INSERT INTO workflow_recovery_barriers VALUES (?1, 'original-artifact', 1)", [&run.run_id]).unwrap();
+            }
+            let before = store.connection.total_changes();
+            // Even a duplicate acknowledgement must not bypass current eligibility.
+            for (expected, target) in [(cap, cap + 1), (cap + 1, cap + 2)] {
+                assert!(
+                    store
+                        .increase_execution_allowance(&run.run_id, &authority, expected, target, 28)
+                        .is_err()
+                );
+            }
+            assert_eq!(store.connection.total_changes(), before);
+            assert_eq!(
+                store
+                    .execution_allowance_observation(&run.run_id)
+                    .unwrap()
+                    .run_cap,
+                cap + 1
+            );
         }
     }
 

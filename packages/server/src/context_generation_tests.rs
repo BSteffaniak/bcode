@@ -4,6 +4,49 @@ use bcode_session_models::{
 };
 
 #[tokio::test]
+async fn captured_generation_uses_submitting_client_model_and_auth() {
+    let sessions = bcode_session::SessionManager::default();
+    let source = sessions
+        .create_session(Some("source".into()), std::env::current_dir().unwrap())
+        .await
+        .unwrap();
+    let state = crate::tests::test_server_state_with_fake_provider(sessions);
+    let captured = prepare(
+        &state,
+        bcode_session_models::PrepareContextGeneration {
+            version: 1,
+            source_session_id: source.id,
+            name: "generation".into(),
+        },
+    )
+    .await
+    .unwrap();
+    let provider_context = bcode_model::ProviderRequestContext {
+        auth_profile: Some("client-profile".into()),
+        settings: std::collections::BTreeMap::from([("mode".into(), "client-mode".into())]),
+        ..Default::default()
+    };
+    let selection = crate::session_model_selection_with_runtime_context(
+        &state,
+        captured.session_id,
+        Some(crate::ClientRuntimeContext {
+            selected_provider_plugin_id: Some("client.provider".into()),
+            selected_model_id: Some("client-model".into()),
+            provider_context: provider_context.clone(),
+            ..Default::default()
+        }),
+    )
+    .await;
+    assert_eq!(
+        selection.provider_plugin_id.as_deref(),
+        Some("client.provider")
+    );
+    assert_eq!(selection.model_id.as_deref(), Some("client-model"));
+    assert_eq!(selection.provider_context, provider_context);
+    drop(state);
+}
+
+#[tokio::test]
 async fn source_capture_is_pinned_private_and_fails_closed() {
     let sessions = bcode_session::SessionManager::default();
     let source = sessions
@@ -114,11 +157,22 @@ async fn assert_generation_request(
         )
         .await
         .unwrap();
-    let selection = crate::SessionModelSelection {
-        provider_plugin_id: Some("bcode.fake-provider".into()),
-        model_id: Some("fake-echo".into()),
-        ..crate::SessionModelSelection::default()
+    let provider_context = bcode_model::ProviderRequestContext {
+        auth_profile: Some("generation-profile".into()),
+        settings: std::collections::BTreeMap::from([("mode".into(), "generation-mode".into())]),
+        ..Default::default()
     };
+    let selection = crate::session_model_selection_with_runtime_context(
+        state,
+        session_id,
+        Some(crate::ClientRuntimeContext {
+            selected_provider_plugin_id: Some("bcode.fake-provider".into()),
+            selected_model_id: Some("fake-echo".into()),
+            provider_context: provider_context.clone(),
+            ..Default::default()
+        }),
+    )
+    .await;
     let policy = crate::automatic_compaction_policy(
         state,
         &selection,
@@ -151,6 +205,11 @@ async fn assert_generation_request(
     .await
     .unwrap()
     .request;
+    assert_eq!(
+        request.provider_context.auth_profile,
+        provider_context.auth_profile
+    );
+    assert_eq!(request.provider_context.settings, provider_context.settings);
     let actual = serde_json::to_string(&request.messages).unwrap();
     assert!(actual.contains("Preserve streaming"));
     assert!(actual.contains("formulate the goal"));

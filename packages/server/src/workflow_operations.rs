@@ -8207,6 +8207,22 @@ fn history_diagnostic(
     }
 }
 
+fn allowance_increase_observation(payload: &serde_json::Value) -> serde_json::Value {
+    let caps = payload["previous_cap"]
+        .as_u64()
+        .zip(payload["target_cap"].as_u64());
+    if payload["version"].as_u64() == Some(1)
+        && let Some((previous, target)) = caps
+        && previous > 0
+        && target > previous
+        && i64::try_from(target).is_ok()
+    {
+        serde_json::json!({"version":1,"previous_cap":previous,"target_cap":target})
+    } else {
+        serde_json::json!({"unavailable":"invalid_execution_allowance_increase"})
+    }
+}
+
 /// Adapt a durable diagnostic row without interpreting opaque producer content.
 fn history_event(
     row: bcode_workflow_store::WorkflowEventRow,
@@ -8223,6 +8239,8 @@ fn history_event(
         serde_json::json!({"reason": diagnostic})
     } else if let Some(lifecycle) = run_lifecycle_observation(&row.event_type) {
         lifecycle
+    } else if row.event_type == "execution_allowance_increased" {
+        allowance_increase_observation(&row.payload)
     } else if row.event_type == "execution_allowance_exhausted" {
         if row
             .payload
@@ -8403,6 +8421,58 @@ fn history_execution_allowance_is_versioned_and_secret_safe() {
                 serde_json::json!({"version":1,"additional_work_admitted":false})
             } else {
                 serde_json::json!({"unavailable":"invalid_execution_allowance_observation"})
+            }
+        );
+    }
+}
+
+#[cfg(test)]
+#[test]
+fn history_allowance_increase_is_bounded_and_secret_safe() {
+    for (payload, valid) in [
+        (
+            serde_json::json!({"version":1,"previous_cap":1,"target_cap":2,"private":"SECRET"}),
+            true,
+        ),
+        (
+            serde_json::json!({"version":2,"previous_cap":1,"target_cap":2}),
+            false,
+        ),
+        (serde_json::json!({"previous_cap":1,"target_cap":2}), false),
+        (
+            serde_json::json!({"version":1,"previous_cap":0,"target_cap":2}),
+            false,
+        ),
+        (
+            serde_json::json!({"version":1,"previous_cap":2,"target_cap":2}),
+            false,
+        ),
+        (
+            serde_json::json!({"version":1,"previous_cap":3,"target_cap":2}),
+            false,
+        ),
+        (
+            serde_json::json!({"version":1,"previous_cap":1,"target_cap":u64::MAX}),
+            false,
+        ),
+        (
+            serde_json::json!({"version":1,"previous_cap":"SECRET","target_cap":2}),
+            false,
+        ),
+    ] {
+        let event = history_event(bcode_workflow_store::WorkflowEventRow {
+            event_seq: 42,
+            run_id: "run".into(),
+            event_type: "execution_allowance_increased".into(),
+            payload,
+            created_at_ms: 23,
+        });
+        assert_eq!(
+            event.payload,
+            if valid {
+                serde_json::json!({"version":1,"previous_cap":1,"target_cap":2})
+            } else {
+                serde_json::json!({"unavailable":"invalid_execution_allowance_increase"})
             }
         );
     }

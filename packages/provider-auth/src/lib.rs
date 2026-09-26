@@ -1345,6 +1345,10 @@ pub fn resolve_auth_profile(
             merge_mapped_process_env(auth_profile, &mut env);
             merge_settings_env(auth_profile, &mut env);
         }
+        "env" => {
+            merge_mapped_process_env(auth_profile, &mut env);
+            merge_settings_env(auth_profile, &mut env);
+        }
         "aws" | "aws_default_chain" => merge_settings_env(auth_profile, &mut env),
         _ => {}
     }
@@ -2990,6 +2994,35 @@ profiles = ["account"]
                 .and_then(|mapping| mapping.key.as_deref()),
             Some("TEST_PROVIDER_API_KEY")
         );
+    }
+
+    #[test]
+    fn environment_profile_materializes_chatgpt_credentials_without_vault() {
+        let profile = bcode_config::AuthProfileConfig {
+            backend: "env".into(),
+            provider_id: Some("openai".into()),
+            owner_plugin_id: Some("bcode.openai-compatible".into()),
+            scheme: Some("chatgpt".into()),
+            map: BTreeMap::new(),
+            settings: BTreeMap::from([
+                ("provider".into(), "openai".into()),
+                ("mode".into(), "chatgpt".into()),
+                (
+                    "env.BCODE_OPENAI_CODEX_ACCESS_TOKEN".into(),
+                    "test-access".into(),
+                ),
+                (
+                    "env.BCODE_OPENAI_CODEX_ACCOUNT_ID".into(),
+                    "test-account".into(),
+                ),
+            ]),
+        };
+        let resolved = resolve_auth_profile("environment-test", &profile);
+        let auth = resolved.auth;
+        assert_eq!(auth.scheme.as_deref(), Some("chatgpt"));
+        assert_eq!(auth.credentials["access_token"].value, "test-access");
+        assert_eq!(auth.credentials["account_id"].value, "test-account");
+        assert_eq!(resolved.env["BCODE_OPENAI_AUTH_MODE"], "chatgpt");
     }
 
     #[test]
