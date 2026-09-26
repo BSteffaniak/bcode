@@ -82,7 +82,7 @@ record copied or inherited from another scope is surfaced rather than silently t
 A spawned daemon receives its state root, session root, and config directory explicitly rather than
 inheriting them, so an explicit command-line selection is not lost across the process boundary.
 
-Executable SHA-256 remains cold-path integrity and process evidence. It is not a routing key.
+Executable SHA-256 is additionally verified by the client against its retained process bootstrap. The `pinned_bcode_executable` capability owns the immutable launch path, artifact identity, and digest. Cache selection requires the retained executable's digest, not merely a matching artifact label. Subsequent access rejects a missing or modified pinned image.
 
 ## Connection policy
 
@@ -155,7 +155,7 @@ Snapshots, event envelopes, and bounded reconnect checkpoints are state transfer
 
 ## Transition behavior
 
-Records without exact artifact identity are historical records. They may be classified through exact endpoint or process evidence, but they are not treated as current-artifact routing authority. Workaround-era content-addressed images may remain until no live record retains them; new startup publishes artifact-scoped image metadata. Old responsive daemons are not replaced merely because their namespace or protocol is historical. Exact responsive historical records remain controllable through graceful IPC. Process-verified daemons whose protocol cannot be decoded are stopped gracefully by delegating `server stop` to the daemon's own retained content-addressed executable after re-verifying that the image is content-addressed and still matches its recorded digest; that executable speaks the daemon's exact protocol, so the daemon keeps its normal refusal semantics for in-flight work. Explicit `server stop-all --yes` and `session stop-owner` use this delegated path; `server cleanup` cannot ask such a daemon whether it is idle and therefore preserves it. Direct signalling remains a reviewed explicit force action. Identity-mismatched or unverifiable records are preserved and refused rather than guessed.
+Records without the process's exact artifact identity are never contacted, including for liveness probes. Process evidence may prove termination; otherwise foreign ownership remains unverifiable. Maintenance commands do not launch a historical executable to control its daemon. Use a separately started matching Bcode process for that operation. Identity-mismatched or unverifiable records are preserved and refused rather than guessed.
 
 ## Performance boundary
 

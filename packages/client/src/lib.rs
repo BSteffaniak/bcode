@@ -2132,7 +2132,13 @@ impl BcodeClient {
         let expected_artifact_id = bcode_ipc::ArtifactId::current();
         let expected_writer_epoch = bcode_ipc::CURRENT_SESSION_STORAGE_WRITER_EPOCH;
         let expected_event_schema = bcode_session_models::CURRENT_SESSION_EVENT_SCHEMA_VERSION;
-        if status.namespace == expected_namespace
+        let expected_digest = bcode_daemon_lifecycle::current_executable_identity()
+            .map_err(|error| ClientError::IncompatibleDaemon {
+                message: error.to_string(),
+            })?
+            .1;
+        if status.executable_digest.as_deref() == Some(expected_digest.as_str())
+            && status.namespace == expected_namespace
             && status.protocol_version == expected_protocol
             && status.artifact_id.as_ref() == Some(&expected_artifact_id)
             && status.build_fingerprint == bcode_ipc::BUILD_FINGERPRINT
@@ -7752,15 +7758,14 @@ mod client_timeout_tests {
     }
 
     #[test]
-    fn daemon_identity_accepts_same_artifact_with_different_executable_digest() {
+    fn daemon_identity_rejects_same_artifact_with_different_executable_digest() {
         let matching = matching_daemon_status();
         let resigned = bcode_ipc::DaemonStatus {
             executable_digest: Some("different-signed-executable-digest".to_owned()),
             ..matching
         };
 
-        BcodeClient::verify_daemon_identity(&resigned)
-            .expect("executable digest is diagnostic, not a compatibility boundary");
+        assert!(BcodeClient::verify_daemon_identity(&resigned).is_err());
     }
 
     #[test]

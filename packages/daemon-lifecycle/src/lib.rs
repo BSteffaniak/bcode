@@ -527,6 +527,20 @@ fn process_identity_evidence(record: &DaemonRecord) -> ProcessIdentityEvidence {
 
 /// Classify one daemon record without mutating registry or endpoint state.
 pub async fn classify_daemon_record(record: &DaemonRecord) -> DaemonRecordClassification {
+    if !record.is_current_namespace()
+        || record.artifact_id.as_ref() != Some(&bcode_ipc::ArtifactId::current())
+    {
+        // Foreign endpoints must never be contacted, even for liveness probes.
+        // Process evidence can prove death; everything else remains conservative.
+        return match process_identity_evidence(record) {
+            ProcessIdentityEvidence::MissingOrReused => {
+                DaemonRecordClassification::UnreachableStale
+            }
+            ProcessIdentityEvidence::Exact | ProcessIdentityEvidence::Unverifiable => {
+                DaemonRecordClassification::Unverifiable
+            }
+        };
+    }
     let endpoint = record.endpoint.to_ipc_endpoint();
     let status = if let Some(endpoint) = endpoint.as_ref() {
         tokio::time::timeout(Duration::from_millis(500), probe_daemon_status(endpoint))
@@ -1099,45 +1113,14 @@ fn remove_interrupted_image_publications(state_dir: &Path) -> Result<(), DaemonL
 fn current_cached_daemon_image(
     state_dir: &Path,
 ) -> Result<Option<(PathBuf, String)>, DaemonLifecycleError> {
-    let artifact_dir = daemon_image_dir(state_dir);
-    let entries = match fs::read_dir(&artifact_dir) {
-        Ok(entries) => entries,
-        Err(source) if source.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(source) => {
-            return Err(DaemonLifecycleError::Io {
-                path: artifact_dir,
-                source,
-            });
-        }
-    };
-    let mut candidate = None;
-    for entry in entries {
-        let entry = entry.map_err(|source| DaemonLifecycleError::Io {
-            path: artifact_dir.clone(),
-            source,
-        })?;
-        if !entry.file_type().is_ok_and(|file_type| file_type.is_dir()) {
-            continue;
-        }
-        let executable = entry
-            .path()
-            .join(if cfg!(windows) { "bcode.exe" } else { "bcode" });
-        let Some(metadata) = read_daemon_image_metadata(&executable)? else {
-            continue;
-        };
-        if metadata.schema_version != DAEMON_IMAGE_METADATA_SCHEMA_VERSION
-            || metadata.artifact_id != bcode_ipc::ArtifactId::current()
-            || !executable_path_matches_digest(&executable, &metadata.executable_digest)
-            || !daemon_image_is_valid(&executable, &metadata.executable_digest)?
-        {
-            continue;
-        }
-        if candidate.is_some() {
-            return Ok(None);
-        }
-        candidate = Some((executable, metadata.executable_digest));
+    let bootstrap = initialize_artifact_bootstrap()?;
+    let digest = bootstrap.digest()?;
+    let executable = cached_daemon_executable_path_for_digest(state_dir, &digest);
+    if daemon_image_is_valid(&executable, &digest)? {
+        Ok(Some((executable, digest)))
+    } else {
+        Ok(None)
     }
-    Ok(candidate)
 }
 
 /// Ensure the currently running executable is cached for detached daemon starts.
@@ -1148,8 +1131,70 @@ fn current_cached_daemon_image(
 ///
 /// Returns an error when the current executable cannot be located, copied, verified, or made
 /// executable.
+/// Verified immutable executable selected from the process bootstrap.
+#[derive(Debug)]
+pub struct PinnedBcodeExecutable {
+    path: PathBuf,
+    digest: String,
+}
+
+impl PinnedBcodeExecutable {
+    /// Return the verified immutable launch path.
+    #[must_use]
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    /// Return the startup executable's SHA-256 digest.
+    #[must_use]
+    pub fn digest(&self) -> &str {
+        &self.digest
+    }
+
+    /// Return the embedded process artifact identity.
+    #[must_use]
+    pub fn artifact_id(&self) -> bcode_ipc::ArtifactId {
+        bcode_ipc::ArtifactId::current()
+    }
+}
+
+static PINNED_EXECUTABLE: OnceLock<PinnedBcodeExecutable> = OnceLock::new();
+
+/// Access the process-pinned Bcode executable, never a PATH-resolved replacement.
+///
+/// # Panics
+/// Panics only if the process-global pin disappears after initialization.
+///
+/// # Errors
+/// Returns an error if materialization or verification fails. A missing or modified
+/// published image fails closed; this accessor never selects another executable.
+pub fn pinned_bcode_executable() -> Result<&'static PinnedBcodeExecutable, DaemonLifecycleError> {
+    if PINNED_EXECUTABLE.get().is_none() {
+        let path = ensure_current_executable_cached_in_state(&bcode_config::default_state_dir())?;
+        let digest = initialize_artifact_bootstrap()?.digest()?;
+        let _ = PINNED_EXECUTABLE.set(PinnedBcodeExecutable { path, digest });
+    }
+    let executable = PINNED_EXECUTABLE
+        .get()
+        .expect("pinned executable initialized");
+    if !daemon_image_is_valid(executable.path(), executable.digest())? {
+        return Err(DaemonLifecycleError::Io {
+            path: executable.path.clone(),
+            source: std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "pinned Bcode executable is missing or modified",
+            ),
+        });
+    }
+    Ok(executable)
+}
+
+/// Return the immutable process-pinned executable path.
+///
+/// # Errors
+/// Returns an error if the pinned executable cannot be materialized or verified.
 pub fn ensure_current_executable_cached() -> Result<PathBuf, DaemonLifecycleError> {
-    ensure_current_executable_cached_in_state(&bcode_config::default_state_dir())
+    Ok(pinned_bcode_executable()?.path().to_path_buf())
 }
 
 fn materialize_verified_daemon_image(
@@ -2128,6 +2173,30 @@ mod tests {
         assert_eq!(executable_sha256(&copied).unwrap(), original_digest);
         assert_ne!(executable_sha256(&source).unwrap(), original_digest);
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn cached_image_with_same_artifact_but_different_bytes_is_not_selected() {
+        let state_dir = std::env::temp_dir().join(format!(
+            "bcode-wrong-image-{}-{}",
+            std::process::id(),
+            unix_time_millis().unwrap()
+        ));
+        let other = b"another executable with the same artifact identity";
+        let digest = hex::encode(Sha256::digest(other));
+        let path = cached_daemon_executable_path_for_digest(&state_dir, &digest);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(&path, other).unwrap();
+        write_daemon_image_metadata(&path, &digest).unwrap();
+        assert!(daemon_image_is_valid(&path, &digest).unwrap());
+        assert!(current_cached_daemon_image(&state_dir).unwrap().is_none());
+        let selected = ensure_current_executable_cached_in_state(&state_dir).unwrap();
+        assert_ne!(selected, path);
+        assert_eq!(
+            executable_sha256(&selected).unwrap(),
+            initialize_artifact_bootstrap().unwrap().digest().unwrap()
+        );
+        fs::remove_dir_all(state_dir).unwrap();
     }
 
     #[test]
