@@ -281,7 +281,7 @@ fn acceptance_definition() -> ToolDefinition {
 fn publication_definition() -> ToolDefinition {
     ToolDefinition {
         name: PUBLISH_NAME.to_owned(),
-        description: "Publish the exact edit returned by staging for this active execution, using edit directly (or legacy edit_json). Requires separate publication authorization and explicit active-work reconciliation. Preserve the staged edit and mutation_id exactly when retrying; unsupported topology is rejected.".to_owned(),
+        description: "Publish the exact edit returned by staging for this active execution, using JSON-encoded edit_json. Requires separate publication authorization and explicit active-work reconciliation. Preserve the staged edit and mutation_id exactly when retrying; unsupported topology is rejected.".to_owned(),
         input_schema: edit_input_schema(),
     }
 }
@@ -298,16 +298,15 @@ fn operation(name: &str) -> Result<&'static str, String> {
 fn definition() -> ToolDefinition {
     ToolDefinition {
         name: NAME.to_owned(),
-        description: "Stage a revision-checked edit for the workflow run owning this active execution. Requires workflow application authorization. Does not publish or execute topology. Supply a WorkflowRunGraphEditBatch as edit (or legacy edit_json); preserve mutation_id when retrying.".to_owned(),
+        description: "Stage a revision-checked edit for the workflow run owning this active execution. Requires workflow application authorization. Does not publish or execute topology. Supply a WorkflowRunGraphEditBatch as JSON-encoded edit_json; preserve mutation_id when retrying.".to_owned(),
         input_schema: edit_input_schema(),
     }
 }
 
 fn edit_input_schema() -> serde_json::Value {
     json!({"type":"object","additionalProperties":false,
-        "properties":{"edit":{"type":"object","description":"Exact edit object returned by staging; do not modify it."},
-        "edit_json":{"type":"string","description":"Legacy JSON-encoded WorkflowRunGraphEditBatch."}},
-        "oneOf":[{"required":["edit"]},{"required":["edit_json"]}]})
+        "properties":{"edit_json":{"type":"string","description":"JSON-encoded WorkflowRunGraphEditBatch. Serialize the exact staged edit without changing its fields or mutation_id."}},
+        "required":["edit_json"]})
 }
 
 fn parse_edit(arguments: &serde_json::Value) -> Result<WorkflowRunGraphEditBatch, String> {
@@ -996,6 +995,47 @@ mod tests {
             json!({"future":true}),
         ] {
             assert!(parse_context(invalid).is_err());
+        }
+    }
+
+    #[test]
+    fn edit_tools_preserve_payloads_through_strict_schema_normalization() {
+        let batch = WorkflowRunGraphEditBatch {
+            version: bcode_workflow::WORKFLOW_RUN_GRAPH_EDIT_VERSION,
+            run_id: "run".to_owned(),
+            mutation_id: "edit".to_owned(),
+            expected_revision: 1,
+            edits: vec![bcode_workflow::WorkflowRunGraphEdit::RemoveEdge { edge_id: 0 }],
+            reconciliation: vec![],
+        };
+        let arguments = json!({"edit_json": serde_json::to_string(&batch).expect("batch")});
+        for tool in [
+            definition(),
+            publication_definition(),
+            acceptance_definition(),
+        ] {
+            let schema = bcode_model_schema::normalize(
+                &tool.input_schema,
+                &bcode_model_schema::SchemaDialect {
+                    object_properties: bcode_model_schema::ObjectPropertyPolicy::RequireAllAndClose,
+                    one_of: bcode_model_schema::OneOfPolicy::CollapseAnnotatedConstants,
+                    reference_siblings:
+                        bcode_model_schema::ReferenceSiblingPolicy::RemoveAnnotationsRejectSemantic,
+                    ..bcode_model_schema::SchemaDialect::default()
+                },
+            )
+            .expect("portable strict tool schema");
+            let validator = jsonschema::validator_for(&schema).expect("valid schema");
+            assert!(validator.is_valid(&arguments), "{}", tool.name);
+            for invalid in [
+                json!({}),
+                json!({"edit_json": null}),
+                json!({"edit_json": {}}),
+                json!({"edit_json": "{}", "edit": {}}),
+            ] {
+                assert!(!validator.is_valid(&invalid), "{}", tool.name);
+            }
+            assert_eq!(parse_edit(&arguments).expect("decoded edit"), batch);
         }
     }
 
