@@ -4349,6 +4349,37 @@ mod tests {
     }
 
     #[test]
+    fn loop_schemas_fit_strict_provider_dialect_without_changing_defaults() {
+        let dialect = bcode_model_schema::SchemaDialect {
+            object_properties: bcode_model_schema::ObjectPropertyPolicy::RequireAllAndClose,
+            one_of: bcode_model_schema::OneOfPolicy::CollapseAnnotatedConstants,
+            reference_siblings:
+                bcode_model_schema::ReferenceSiblingPolicy::RemoveAnnotationsRejectSemantic,
+            ..bcode_model_schema::SchemaDialect::default()
+        };
+        for schema in [
+            schemars::schema_for!(LoopWorkflowIteration),
+            schemars::schema_for!(LoopWorkflowEvaluation),
+        ] {
+            let source = serde_json::to_value(schema).expect("serialize loop schema");
+            let normalized = bcode_model_schema::normalize(&source, &dialect)
+                .expect("loop schema must fit the strict provider dialect");
+            let blocker = &normalized["properties"]["external_blocker"];
+            assert!(blocker.get("$ref").is_some());
+            assert!(blocker.get("default").is_none());
+            assert_eq!(
+                normalized["$defs"]["LoopExternalBlocker"]["enum"],
+                serde_json::json!([
+                    "none",
+                    "approval_required",
+                    "input_required",
+                    "dependency_required"
+                ])
+            );
+        }
+    }
+
+    #[test]
     fn loop_implementation_allows_empty_evidence_but_evaluation_requires_it() {
         let envelope = serde_json::json!({
             "implementation_prompt": "continue implementation",
@@ -4362,6 +4393,7 @@ mod tests {
         let implementation: LoopWorkflowIteration = serde_json::from_value(envelope.clone())
             .expect("implementation envelope may carry no evaluation evidence");
         assert_eq!(implementation.iteration, 3);
+        assert_eq!(implementation.external_blocker, LoopExternalBlocker::None);
         assert!(!implementation.condition_met);
         assert!(implementation.evidence.is_empty());
 

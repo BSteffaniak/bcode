@@ -290,7 +290,14 @@ fn normalize_reference_siblings(
     {
         return Ok(());
     }
-    for annotation in ["description", "title", "$comment", "deprecated", "examples"] {
+    for annotation in [
+        "description",
+        "title",
+        "$comment",
+        "deprecated",
+        "examples",
+        "default",
+    ] {
         object.remove(annotation);
     }
     if let Some(sibling) = object.keys().find(|key| key.as_str() != "$ref") {
@@ -575,7 +582,8 @@ mod tests {
                 "properties": {
                     "confidence": {
                         "$ref": "#/$defs/confidence",
-                        "description": "Model-reported confidence"
+                        "description": "Model-reported confidence",
+                        "default": "none"
                     }
                 }
             }),
