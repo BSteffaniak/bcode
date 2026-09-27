@@ -109,7 +109,7 @@ fn remember_skill_tool_decision(key: SkillToolDecisionKey, decision: SkillToolDe
 /// Allocate the next process-local pending permission identity.
 pub async fn next_permission_id(state: &ServerState) -> String {
     let mut next = state.next_permission_id.lock().await;
-    let permission_id = format!("perm-{}", *next);
+    let permission_id = format!("perm-{}-{}", state.daemon_status.instance_id, *next);
     *next += 1;
     permission_id
 }
@@ -243,14 +243,45 @@ pub async fn register_pending_permission(
     } else {
         None
     };
+    let mut routed = pending.clone();
+    routed.summary.interaction_route = state
+        .session_current_turn(pending.summary.session_id)
+        .await
+        .and_then(|turn| turn.interaction_route);
     state
         .pending_permissions
         .lock()
         .await
-        .insert(pending.summary.permission_id.clone(), pending.clone());
+        .insert(pending.summary.permission_id.clone(), routed.clone());
     append_permission_requested_event(state, pending.summary.session_id, event).await;
+    notify_interaction_destination(state, &routed.summary).await;
     drop(batch_decision);
     Ok(())
+}
+
+/// Notify clients to refresh the destination through the normal bounded snapshot boundary.
+/// This is only an invalidation; canonical permission state remains in the source session.
+async fn notify_interaction_destination(
+    state: &ServerState,
+    permission: &bcode_session_models::PermissionSummary,
+) {
+    use futures::StreamExt as _;
+
+    let Some(route) = &permission.interaction_route else {
+        return;
+    };
+    let sinks = state.workflow_event_sinks().await;
+    futures::stream::iter(sinks)
+        .for_each_concurrent(32, |sink| async move {
+            let _ = tokio::time::timeout(
+                std::time::Duration::from_secs(1),
+                sink.send(bcode_ipc::Event::SessionViewResyncRequired {
+                    session_id: route.destination_session_id,
+                }),
+            )
+            .await;
+        })
+        .await;
 }
 
 /// Read one current permission-batch decision for focused verification.
@@ -311,6 +342,7 @@ pub async fn complete_pending_permission(
     }
     *permission.decision.lock().await = Some(approved);
     permission.notify.notify_waiters();
+    notify_interaction_destination(state, &permission.summary).await;
     append_permission_resolved_event(
         state,
         permission.summary.session_id,

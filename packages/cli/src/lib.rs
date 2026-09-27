@@ -25986,6 +25986,7 @@ mod json_stream_output_tests {
     fn populated_permission_lists_preserve_metadata_order_and_output_errors() {
         let session_id = bcode_session_models::SessionId::new();
         let permissions = ["second", "first"].map(|id| bcode_session_models::PermissionSummary {
+            interaction_route: None,
             permission_id: id.to_owned(),
             session_id,
             tool_call_id: format!("call-{id}"),

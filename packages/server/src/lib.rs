@@ -861,6 +861,7 @@ enum RuntimeOperationKind {
 
 #[derive(Debug, Clone)]
 struct RuntimeCurrentTurn {
+    interaction_route: Option<bcode_session_models::ExecutionInteractionRoute>,
     kind: RuntimeOperationKind,
     client_id: ClientId,
     turn_id: String,
@@ -1310,6 +1311,7 @@ impl WorkflowPermissionResolver<'_> {
             })?;
         let pending = PendingPermission {
             summary: PermissionSummary {
+                interaction_route: None,
                 permission_id: permission_id.clone(),
                 session_id: self.session_id,
                 tool_call_id: tool_call_id.clone(),
@@ -13742,6 +13744,25 @@ async fn admit_turn(
     bcode_session::SessionError,
 > {
     let mut admission = admission;
+    if let Some(route) = &admission.execution.interaction_route {
+        let source = state.sessions.session_summary(session_id).await?;
+        let permitted = route.version == 1
+            && (route.destination_session_id == session_id
+                || source.execution.as_ref().is_some_and(|execution| {
+                    execution.provenance.parent_session_id == route.destination_session_id
+                }));
+        if !permitted {
+            return Err(
+                bcode_session::SessionError::InvalidExecutionSessionProvenance(
+                    "interaction destination is not an authorized execution association".into(),
+                ),
+            );
+        }
+        state
+            .sessions
+            .session_summary(route.destination_session_id)
+            .await?;
+    }
     if admission.execution.agent_profile.is_none() {
         admission.execution.agent_profile = Some(session_agent_selection(state, session_id).await);
     }
@@ -14595,7 +14616,7 @@ async fn begin_current_turn(
     client_id: ClientId,
     turn_id: String,
     cancel_state: Arc<TurnCancelState>,
-    agent_profile: Option<String>,
+    execution: TurnExecutionOptions,
 ) {
     let mut current_turn = context.current_turn.lock().await;
     debug_assert!(
@@ -14603,8 +14624,9 @@ async fn begin_current_turn(
         "begin_current_turn requires no active current turn"
     );
     *current_turn = Some(RuntimeCurrentTurn {
+        interaction_route: execution.interaction_route,
         kind: RuntimeOperationKind::ModelTurn,
-        agent_profile,
+        agent_profile: execution.agent_profile,
         client_id,
         turn_id,
         cancel_state,
@@ -14890,6 +14912,7 @@ async fn process_compact_session_command(
 ) -> Result<String, CompactionError> {
     let cancel_state = Arc::new(TurnCancelState::default());
     *current_turn.lock().await = Some(RuntimeCurrentTurn {
+        interaction_route: None,
         kind: RuntimeOperationKind::ManualCompaction,
         agent_profile: None,
         client_id,
@@ -18056,7 +18079,7 @@ async fn run_model_turn(
         client_id,
         turn_id.clone(),
         Arc::clone(&cancel_state),
-        turn_execution_options(trigger_event).agent_profile,
+        turn_execution_options(trigger_event),
     )
     .await;
     if !recovering {
@@ -19705,13 +19728,13 @@ async fn compact_session_after_max_tokens(
         Some("model exhausted its output token budget; attempting context compaction before continuing".to_owned()),
     )
     .await;
-    match compact_session_context_before_sequence(
+    match Box::pin(compact_session_context_before_sequence(
         state,
         session_id,
         selection,
         first_kept_sequence,
         cancel_state,
-    )
+    ))
     .await
     {
         Ok(completion) => {
@@ -19778,13 +19801,13 @@ async fn compact_session_after_context_overflow(
         )),
     )
     .await;
-    match compact_session_context_before_sequence(
+    match Box::pin(compact_session_context_before_sequence(
         state,
         session_id,
         selection,
         first_kept_sequence,
         cancel_state,
-    )
+    ))
     .await
     {
         Ok(completion) => {
@@ -29804,6 +29827,7 @@ async fn request_tool_permission(
         .unwrap_or(session_agent_selection(state, session_id).await);
     let pending = PendingPermission {
         summary: PermissionSummary {
+            interaction_route: None,
             permission_id: permission_id.clone(),
             session_id,
             tool_call_id: call.id.clone(),
@@ -33686,6 +33710,10 @@ async fn dispatch_workflow_prompt_turn_after_admission(
         priority: TurnPriority::Background,
         idempotency_key: Some(request.dispatch_identity.clone()),
         execution: TurnExecutionOptions {
+            interaction_route: Some(bcode_session_models::ExecutionInteractionRoute {
+                version: 1,
+                destination_session_id: parent_session_id,
+            }),
             allow_user_questions: configuration.allow_user_questions,
             tools: match configuration.tool_capability {
                 WorkflowToolCapability::Disabled => TurnToolPolicy::Disabled,
@@ -56074,6 +56102,7 @@ library = "test"
                 queued_steering: Arc::new(AtomicUsize::new(0)),
                 phase: Arc::new(Mutex::new(SessionRuntimePhase::ProviderActive)),
                 current_turn: Arc::new(Mutex::new(Some(RuntimeCurrentTurn {
+                    interaction_route: None,
                     kind: RuntimeOperationKind::ModelTurn,
                     client_id: ClientId::new(),
                     turn_id: turn_id.into(),
@@ -60940,6 +60969,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
 
         *handle.phase.lock().await = SessionRuntimePhase::ProviderActive;
         *handle.current_turn.lock().await = Some(RuntimeCurrentTurn {
+            interaction_route: None,
             kind: RuntimeOperationKind::ModelTurn,
             client_id,
             turn_id: "provider-active-turn".to_owned(),
@@ -61485,6 +61515,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
     ) -> PendingPermission {
         PendingPermission {
             summary: PermissionSummary {
+                interaction_route: None,
                 permission_id: permission_id.to_string(),
                 session_id,
                 tool_call_id: format!("call-{call_index}"),
@@ -61599,6 +61630,132 @@ event_symbol = "bcode_plugin_handle_event_v1"
         .await;
         assert!(late, "late sibling must inherit the latched batch decision");
         assert_eq!(state.pending_permissions.lock().await.len(), 1);
+        drop(state);
+    }
+
+    #[tokio::test]
+    async fn interaction_route_cannot_target_an_unrelated_session() {
+        let sessions = SessionManager::default();
+        let source = sessions
+            .create_session(None, test_working_directory())
+            .await
+            .unwrap()
+            .id;
+        let destination = sessions
+            .create_session(None, test_working_directory())
+            .await
+            .unwrap()
+            .id;
+        let state = test_server_state(sessions);
+        let metadata = bcode_session_models::TurnAdmissionMetadata {
+            execution: TurnExecutionOptions {
+                interaction_route: Some(bcode_session_models::ExecutionInteractionRoute {
+                    version: 1,
+                    destination_session_id: destination,
+                }),
+                ..TurnExecutionOptions::default()
+            },
+            ..bcode_session_models::TurnAdmissionMetadata::default()
+        };
+        assert!(
+            admit_turn(&state, source, ClientId::new(), "work".into(), metadata)
+                .await
+                .is_err()
+        );
+        assert!(
+            !state
+                .sessions
+                .session_history(source)
+                .await
+                .unwrap()
+                .iter()
+                .any(|event| matches!(event.kind, SessionEventKind::UserMessage { .. }))
+        );
+        drop(state);
+    }
+
+    #[tokio::test]
+    async fn routed_permission_keeps_source_authority_and_resolves_once() {
+        let sessions = SessionManager::default();
+        let source = sessions
+            .create_session(None, test_working_directory())
+            .await
+            .unwrap()
+            .id;
+        let destination = sessions
+            .create_session(None, test_working_directory())
+            .await
+            .unwrap()
+            .id;
+        let state = test_server_state(sessions);
+        let (followup_commands, _) = mpsc::channel(1);
+        let (steering_commands, _) = mpsc::channel(1);
+        let (cancel_commands, _) = mpsc::channel(1);
+        let route = bcode_session_models::ExecutionInteractionRoute {
+            version: 1,
+            destination_session_id: destination,
+        };
+        state.session_runtimes.lock().await.insert(
+            source,
+            SessionRuntimeHandle {
+                followup_commands,
+                steering_commands,
+                cancel_commands,
+                queued_followups: Arc::new(AtomicUsize::new(0)),
+                queued_steering: Arc::new(AtomicUsize::new(0)),
+                phase: Arc::new(Mutex::new(SessionRuntimePhase::ProviderActive)),
+                current_turn: Arc::new(Mutex::new(Some(RuntimeCurrentTurn {
+                    interaction_route: Some(route.clone()),
+                    kind: RuntimeOperationKind::ModelTurn,
+                    client_id: ClientId::new(),
+                    turn_id: "turn".into(),
+                    cancel_state: Arc::new(TurnCancelState::default()),
+                    model: None,
+                    agent_profile: Some("build".into()),
+                }))),
+            },
+        );
+        let mut pending = pending_permission_for_batch("routed", source, 0, "unused");
+        pending.summary.batch = None;
+        let event = SessionEventKind::PermissionRequested {
+            permission_id: "routed".into(),
+            tool_call_id: "call-0".into(),
+            producer_plugin_id: None,
+            tool_name: "example.tool".into(),
+            arguments_json: "{}".into(),
+            batch: None,
+            policy_source: None,
+            policy_reason: None,
+        };
+        interaction_operations::register_pending_permission(&state, &pending, event)
+            .await
+            .unwrap();
+        let listed = interaction_operations::list_permissions(&state).await;
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].session_id, source);
+        assert_eq!(listed[0].interaction_route, Some(route));
+        assert!(listed[0].is_addressed_to(destination));
+        assert!(!listed[0].is_addressed_to(SessionId::new()));
+        assert_eq!(*pending.decision.lock().await, None);
+        assert!(interaction_operations::resolve_permission(&state, "routed", true, false).await);
+        assert!(!interaction_operations::resolve_permission(&state, "routed", false, false).await);
+        assert_eq!(*pending.decision.lock().await, Some(true));
+        assert!(
+            interaction_operations::list_permissions(&state)
+                .await
+                .is_empty()
+        );
+        let source_history = state.sessions.session_history(source).await.unwrap();
+        assert!(source_history.iter().any(|event| matches!(
+            event.kind,
+            SessionEventKind::PermissionResolved { approved: true, .. }
+        )));
+        let destination_history = state.sessions.session_history(destination).await.unwrap();
+        assert!(!destination_history.iter().any(|event| matches!(
+            event.kind,
+            SessionEventKind::PermissionRequested { .. }
+                | SessionEventKind::PermissionResolved { .. }
+        )));
         drop(state);
     }
 
@@ -64074,6 +64231,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
             "web-route-permission".to_owned(),
             PendingPermission {
                 summary: PermissionSummary {
+                    interaction_route: None,
                     permission_id: "web-route-permission".to_owned(),
                     session_id: session.id,
                     tool_call_id: "web-route-call".to_owned(),
@@ -65328,6 +65486,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
             .expect("queued command ownership guard");
         let pending = PendingPermission {
             summary: PermissionSummary {
+                interaction_route: None,
                 permission_id: "permission-ipc".to_owned(),
                 session_id,
                 tool_call_id: "call-ipc".to_owned(),

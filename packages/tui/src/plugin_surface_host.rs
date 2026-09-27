@@ -1125,7 +1125,7 @@ fn client_permission_views(
 ) -> Vec<PermissionView> {
     permissions
         .into_iter()
-        .filter(|permission| permission.session_id == session_id)
+        .filter(|permission| permission.is_addressed_to(session_id))
         .map(|permission| PermissionView {
             permission_id: permission.permission_id,
             session_id: Some(permission.session_id),

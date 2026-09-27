@@ -278,6 +278,9 @@ impl MessageAcceptance {
 pub struct PermissionSummary {
     /// Identity of the pending checkpoint.
     pub permission_id: String,
+    /// Host-authenticated notification destination; the source session remains authoritative.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub interaction_route: Option<ExecutionInteractionRoute>,
     /// Canonical session requesting permission.
     pub session_id: SessionId,
     /// Tool invocation requesting permission.
@@ -300,6 +303,30 @@ pub struct PermissionSummary {
     /// Whether the permission owner supports remembering this decision.
     #[serde(default)]
     pub can_remember_policy: bool,
+}
+
+/// Explicit destination for execution interaction notifications.
+///
+/// Routing grants no permission to decide requests and does not copy canonical history.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ExecutionInteractionRoute {
+    /// Route contract version; currently 1.
+    pub version: u32,
+    /// Session whose authorized clients should see requests from this execution.
+    pub destination_session_id: SessionId,
+}
+
+/// Pending renderer-neutral permission checkpoint.
+impl PermissionSummary {
+    /// Whether this canonical request is addressed to a session's interaction view.
+    #[must_use]
+    pub fn is_addressed_to(&self, session_id: SessionId) -> bool {
+        self.session_id == session_id
+            || self.interaction_route.as_ref().is_some_and(|route| {
+                route.version == 1 && route.destination_session_id == session_id
+            })
+    }
 }
 
 /// Pending renderer-neutral invocation exchange associated with a canonical session.
@@ -1779,6 +1806,9 @@ pub struct TurnExecutionOptions {
     /// Whether tools declaring `ask_user` may be exposed or executed.
     #[serde(default = "default_allow_user_questions")]
     pub allow_user_questions: bool,
+    /// Explicit interaction destination, validated by the application at admission.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub interaction_route: Option<ExecutionInteractionRoute>,
     #[serde(default)]
     pub tools: TurnToolPolicy,
     /// Permission authorization behavior captured immutably for this turn.
@@ -1816,7 +1846,7 @@ pub struct TurnExecutionOptions {
 /// Earliest persisted turn execution-options schema version accepted by this build.
 pub const MIN_TURN_EXECUTION_OPTIONS_SCHEMA_VERSION: u32 = 1;
 /// Current persisted turn execution-options schema version.
-pub const TURN_EXECUTION_OPTIONS_SCHEMA_VERSION: u32 = 6;
+pub const TURN_EXECUTION_OPTIONS_SCHEMA_VERSION: u32 = 7;
 
 const fn default_allow_user_questions() -> bool {
     true
@@ -1831,6 +1861,7 @@ impl Default for TurnExecutionOptions {
         Self {
             schema_version: TURN_EXECUTION_OPTIONS_SCHEMA_VERSION,
             allow_user_questions: true,
+            interaction_route: None,
             tools: TurnToolPolicy::default(),
             permission_mode: TurnPermissionMode::default(),
             correlation: None,
@@ -2081,6 +2112,11 @@ impl TurnAdmissionMetadata {
     pub fn validate(&self) -> Result<(), TurnAdmissionMetadataError> {
         if !(MIN_TURN_EXECUTION_OPTIONS_SCHEMA_VERSION..=TURN_EXECUTION_OPTIONS_SCHEMA_VERSION)
             .contains(&self.execution.schema_version)
+        {
+            return Err(TurnAdmissionMetadataError::UnsupportedExecutionOptionsVersion);
+        }
+        if let Some(route) = &self.execution.interaction_route
+            && (self.execution.schema_version < 7 || route.version != 1)
         {
             return Err(TurnAdmissionMetadataError::UnsupportedExecutionOptionsVersion);
         }
@@ -4469,6 +4505,29 @@ mod tests {
             WorkId::new(format!("model_{session_id}-42"))
         );
         assert_eq!(receipt.accepted_event_sequence, 42);
+    }
+
+    #[test]
+    fn interaction_route_requires_supported_execution_contract() {
+        let mut admission = TurnAdmissionMetadata::default();
+        admission.execution.interaction_route = Some(ExecutionInteractionRoute {
+            version: 1,
+            destination_session_id: SessionId::new(),
+        });
+        admission.validate().unwrap();
+        let restored: TurnAdmissionMetadata =
+            serde_json::from_value(serde_json::to_value(&admission).unwrap()).unwrap();
+        assert_eq!(restored, admission);
+        admission.execution.schema_version = 6;
+        assert!(admission.validate().is_err());
+        admission.execution.schema_version = TURN_EXECUTION_OPTIONS_SCHEMA_VERSION;
+        admission
+            .execution
+            .interaction_route
+            .as_mut()
+            .unwrap()
+            .version = 2;
+        assert!(admission.validate().is_err());
     }
 
     #[test]

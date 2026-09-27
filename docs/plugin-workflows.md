@@ -25,6 +25,26 @@ therefore remain ordinary prompt/tool outcomes and never invalidate a workflow d
 authority. The prompt's explicit model, tool, timeout, context-target, and structured-output policy
 remain authoritative.
 
+### Routed permission notifications
+
+Turn execution-options version 7 adds an explicit version-1 `interaction_route` with a
+`destination_session_id`. The application currently admits self routes and routes to the execution's
+recorded parent association, not arbitrary caller-selected sessions. Workflow dispatch installs this
+route explicitly; ordinary user turns have no route. It is restored with the admitted turn rather
+than inferred from which clients happen to be attached.
+
+Pending permission summaries retain the canonical source session and carry the destination separately.
+TUI and web permission lists include requests addressed to the viewed session. Resolution uses the
+original permission owner and existing authorization path; routing grants no approval authority and
+never copies permission history into the destination. Live destination invalidations request a normal
+snapshot refresh. Permission identities include the daemon instance to avoid reuse across restarts.
+
+This is a same-daemon permission-notification implementation, **not** a durable execution messaging
+transport. Pending decisions remain daemon-memory observations. Cross-daemon routing, arbitrary
+execution recipients, explicit associations between independently launched runs, general typed
+request/response delivery, durable acknowledgments/recovery, and dependency-driven blocked-loop
+resumption are not implemented here. Existing runs are not retroactively associated or approved.
+
 ### User questions in background work
 
 Prompt configuration version 4 adds `allow_user_questions` (default `true`). Goal agent stages

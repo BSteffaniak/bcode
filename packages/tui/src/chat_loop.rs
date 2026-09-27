@@ -3433,7 +3433,10 @@ fn apply_permission_list_result(
         Ok(permissions) => {
             let active_permissions = permissions
                 .iter()
-                .filter(|permission| Some(permission.session_id) == chat.viewing_session_id())
+                .filter(|permission| {
+                    chat.viewing_session_id()
+                        .is_some_and(|session_id| permission.is_addressed_to(session_id))
+                })
                 .cloned()
                 .map(permission_summary_view)
                 .collect::<Vec<_>>();

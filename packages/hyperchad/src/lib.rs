@@ -683,7 +683,7 @@ async fn hydrate_pending_permissions(
         .list_permissions()
         .await?
         .into_iter()
-        .filter(|permission| permission.session_id == session_id)
+        .filter(|permission| permission.is_addressed_to(session_id))
     {
         let title = Some(format!("Permission requested: {}", permission.tool_name));
         let detail = permission.policy_reason.clone();

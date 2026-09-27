@@ -3669,6 +3669,7 @@ mod tests {
     #[test]
     fn permission_batch_correlation_round_trips_and_defaults_when_absent() {
         let summary = PermissionSummary {
+            interaction_route: None,
             permission_id: "perm-1".to_string(),
             session_id: SessionId::new(),
             tool_call_id: "call-2".to_string(),
