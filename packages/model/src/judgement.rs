@@ -43,6 +43,44 @@ pub enum QuestionKind {
     YesNo,
 }
 
+/// One application-checked selection for a non-conversational evaluator.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SetupSelection {
+    /// Enabled provider plugin route.
+    pub provider_plugin_id: String,
+    /// Advertised model ID; callers should prefer concrete versions for stable calibration.
+    pub model_id: String,
+    /// Named owned account, or empty for explicitly selected daemon environment auth.
+    pub auth_profile: String,
+}
+
+/// Bounded, secret-free setup snapshot for choosing a non-conversational evaluator.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SetupCatalog {
+    /// Enabled providers with a registered judgement service.
+    pub providers: Vec<SetupProvider>,
+}
+
+/// One enabled provider's advertised options and authentication state.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SetupProvider {
+    /// Plugin route identity, not the user-facing auth provider name.
+    pub plugin_id: String,
+    /// Provider-contributed display name.
+    pub display_name: String,
+    /// Human-facing auth ID for setup instructions.
+    pub auth_provider_id: String,
+    /// Named profiles that are owned and have usable credential material in the daemon.
+    /// Names are account references, never the credential values themselves.
+    pub profiles: Vec<String>,
+    /// Whether daemon environment credentials are available; not remote verification.
+    pub environment_available: bool,
+    /// Model capabilities advertised by this provider, if discovery succeeded.
+    pub models: Vec<Model>,
+    /// Normalized discovery diagnostic; never a provider error body.
+    pub unavailable_reason: Option<String>,
+}
+
 /// Provider-advertised models and their supported question kinds.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ModelList {

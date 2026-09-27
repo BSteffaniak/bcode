@@ -846,6 +846,15 @@ impl Field {
 
 enum LoopSurfaceCompletion {
     DelegationChecked(Result<(), String>),
+    JudgementSetup {
+        generation: u64,
+        result:
+            Result<bcode_model::judgement::SetupCatalog, bcode_plugin_sdk::tui::PluginTuiHostError>,
+    },
+    JudgementValidated {
+        request: Box<PluginWorkflowStartRequest>,
+        result: Result<bool, bcode_plugin_sdk::tui::PluginTuiHostError>,
+    },
     SessionPrepared {
         configuring: bool,
         result: Result<SessionId, bcode_plugin_sdk::tui::PluginTuiHostError>,
@@ -877,6 +886,12 @@ enum LoopSurfaceCompletion {
             bcode_plugin_sdk::tui::PluginTuiHostError,
         >,
     ),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EvaluationMode {
+    Standard,
+    Judgement,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -918,6 +933,23 @@ impl CollaborationMode {
     }
 }
 
+enum SetupDiscovery {
+    Pending,
+    Loading,
+    Ready(bcode_model::judgement::SetupCatalog),
+    Failed,
+}
+
+impl SetupDiscovery {
+    const fn as_ref(&self) -> Option<&bcode_model::judgement::SetupCatalog> {
+        if let Self::Ready(catalog) = self {
+            Some(catalog)
+        } else {
+            None
+        }
+    }
+}
+
 struct LoopSurface {
     origin: SetupKind,
     collaboration: CollaborationMode,
@@ -930,6 +962,13 @@ struct LoopSurface {
     condition: TextInputState,
     limit: TextInputState,
     evaluation: TextInputState,
+    judgement_enabled: EvaluationMode,
+    judgement_catalog: SetupDiscovery,
+    judgement_generation: u64,
+    judgement_choice: usize,
+    judgement_profile: usize,
+    judgement_threshold: u8,
+    judgement_fallback: judgement_evaluation::FailurePolicy,
     field: Field,
     pending_workflow_start: Option<PluginWorkflowStartRequest>,
     failed_workflow_start: Option<PluginWorkflowStartRequest>,
@@ -1046,6 +1085,13 @@ impl LoopSurface {
             condition: text_state(""),
             limit: text_state(&DEFAULT_MAX_ITERATIONS.to_string()),
             evaluation: text_state(""),
+            judgement_enabled: EvaluationMode::Standard,
+            judgement_catalog: SetupDiscovery::Pending,
+            judgement_generation: 0,
+            judgement_choice: 0,
+            judgement_profile: 0,
+            judgement_threshold: 90,
+            judgement_fallback: judgement_evaluation::FailurePolicy::Pause,
             field: Field::Prompt,
             pending_workflow_start: None,
             failed_workflow_start: None,
@@ -1075,20 +1121,312 @@ impl LoopSurface {
         }
     }
 
+    fn handle_judgement_key(&mut self, event: &Event, host: &dyn PluginTuiHost) -> PluginTuiAction {
+        if let Event::Key(stroke) = event
+            && stroke.modifiers.is_empty()
+        {
+            let choices: Vec<_> =
+                self.judgement_catalog
+                    .as_ref()
+                    .map_or_else(Vec::new, |catalog| {
+                        catalog
+                            .providers
+                            .iter()
+                            .flat_map(|provider| {
+                                provider
+                                    .models
+                                    .iter()
+                                    .filter(|model| {
+                                        model
+                                            .question_kinds
+                                            .contains(&bcode_model::judgement::QuestionKind::YesNo)
+                                    })
+                                    .map(move |model| (provider, model))
+                            })
+                            .collect()
+                    });
+            match stroke.key {
+                KeyCode::Char(' ') => {
+                    self.judgement_enabled = if self.judgement_enabled == EvaluationMode::Standard {
+                        EvaluationMode::Judgement
+                    } else {
+                        EvaluationMode::Standard
+                    }
+                }
+                KeyCode::Char('r' | 'R') => self.refresh_judgement(host),
+                KeyCode::Left if self.judgement_enabled == EvaluationMode::Judgement => {
+                    self.judgement_choice = self.judgement_choice.saturating_sub(1);
+                    self.judgement_profile = 0;
+                }
+                KeyCode::Right
+                    if self.judgement_enabled == EvaluationMode::Judgement
+                        && !choices.is_empty() =>
+                {
+                    self.judgement_choice = (self.judgement_choice + 1) % choices.len();
+                    self.judgement_profile = 0;
+                }
+                KeyCode::Up if self.judgement_enabled == EvaluationMode::Judgement => {
+                    self.judgement_profile = self.judgement_profile.saturating_sub(1);
+                }
+                KeyCode::Down if self.judgement_enabled == EvaluationMode::Judgement => {
+                    if let Some((provider, _)) = choices.get(self.judgement_choice) {
+                        let count =
+                            provider.profiles.len() + usize::from(provider.environment_available);
+                        if count > 0 {
+                            self.judgement_profile = (self.judgement_profile + 1) % count;
+                        }
+                    }
+                }
+                KeyCode::Char('+') if self.judgement_enabled == EvaluationMode::Judgement => {
+                    self.judgement_threshold = self.judgement_threshold.saturating_add(5).min(100);
+                }
+                KeyCode::Char('-') if self.judgement_enabled == EvaluationMode::Judgement => {
+                    self.judgement_threshold = self.judgement_threshold.saturating_sub(5).max(1);
+                }
+                KeyCode::Char('f' | 'F') if self.judgement_enabled == EvaluationMode::Judgement => {
+                    self.judgement_fallback =
+                        if self.judgement_fallback == judgement_evaluation::FailurePolicy::Pause {
+                            judgement_evaluation::FailurePolicy::AgentFallback
+                        } else {
+                            judgement_evaluation::FailurePolicy::Pause
+                        };
+                }
+                _ => return PluginTuiAction::None,
+            }
+            return PluginTuiAction::Redraw;
+        }
+        PluginTuiAction::None
+    }
+
+    fn refresh_judgement(&mut self, host: &dyn PluginTuiHost) {
+        if matches!(self.judgement_catalog, SetupDiscovery::Loading) {
+            return;
+        }
+        self.judgement_catalog = SetupDiscovery::Loading;
+        self.judgement_generation = self.judgement_generation.wrapping_add(1);
+        let generation = self.judgement_generation;
+        let future = host.judgement_setup();
+        let completions = Arc::clone(&self.completions);
+        host.spawn(Box::pin(async move {
+            let result = future.await;
+            completions
+                .lock()
+                .expect("loop setup completion lock")
+                .push(LoopSurfaceCompletion::JudgementSetup { generation, result });
+        }));
+    }
+
+    fn selected_judgement(&self) -> Result<Option<judgement_evaluation::EvaluationConfig>, String> {
+        if self.judgement_enabled == EvaluationMode::Standard {
+            return Ok(None);
+        }
+        let catalog = self
+            .judgement_catalog
+            .as_ref()
+            .ok_or("Judgement options are still loading; press R to refresh")?;
+        Self::configured_judgement(
+            catalog,
+            self.judgement_choice,
+            self.judgement_profile,
+            self.judgement_threshold,
+            self.judgement_fallback,
+        )
+    }
+
+    fn configured_judgement(
+        catalog: &bcode_model::judgement::SetupCatalog,
+        choice: usize,
+        profile: usize,
+        threshold: u8,
+        fallback: judgement_evaluation::FailurePolicy,
+    ) -> Result<Option<judgement_evaluation::EvaluationConfig>, String> {
+        let choices: Vec<_> = catalog
+            .providers
+            .iter()
+            .flat_map(|provider| {
+                provider
+                    .models
+                    .iter()
+                    .filter(|model| {
+                        model
+                            .question_kinds
+                            .contains(&bcode_model::judgement::QuestionKind::YesNo)
+                    })
+                    .map(move |model| (provider, model))
+            })
+            .collect();
+        let Some((provider, model)) = choices.get(choice) else {
+            return Err(catalog.providers.first().map_or_else(
+                || "No judgement provider enabled; press R to refresh".into(),
+                |provider| {
+                    format!(
+                        "{}: {}",
+                        provider.display_name,
+                        provider
+                            .unavailable_reason
+                            .as_deref()
+                            .unwrap_or("No compatible YesNo model; press R to refresh")
+                    )
+                },
+            ));
+        };
+        let auth_profile = if profile < provider.profiles.len() {
+            provider.profiles[profile].clone()
+        } else if provider.environment_available && profile == provider.profiles.len() {
+            String::new()
+        } else {
+            return Err(format!(
+                "No usable account; run bcode auth login {} and press R",
+                provider.auth_provider_id
+            ));
+        };
+        let config = judgement_evaluation::EvaluationConfig {
+            provider_plugin_id: provider.plugin_id.clone(),
+            model_id: model.model_id.clone(),
+            auth_profile,
+            threshold_percent: threshold,
+            on_failure: fallback,
+        };
+        config.validate().map_err(str::to_string)?;
+        Ok(Some(config))
+    }
+
+    fn evaluation_preview(&self) -> String {
+        let choices: Vec<_> = self
+            .judgement_catalog
+            .as_ref()
+            .map_or_else(Vec::new, |catalog| {
+                catalog
+                    .providers
+                    .iter()
+                    .flat_map(|provider| {
+                        provider
+                            .models
+                            .iter()
+                            .filter(|model| {
+                                model
+                                    .question_kinds
+                                    .contains(&bcode_model::judgement::QuestionKind::YesNo)
+                            })
+                            .map(move |model| (provider, model))
+                    })
+                    .collect()
+            });
+        if let Some((provider, model)) = choices.get(self.judgement_choice) {
+            if provider.profiles.is_empty() && !provider.environment_available {
+                return format!(
+                    "{} / {} · {}",
+                    provider.display_name,
+                    model.model_id,
+                    provider
+                        .unavailable_reason
+                        .as_deref()
+                        .unwrap_or("no usable account")
+                );
+            }
+            let account = provider
+                .profiles
+                .get(self.judgement_profile)
+                .map(String::as_str)
+                .or_else(|| {
+                    (provider.environment_available
+                        && self.judgement_profile == provider.profiles.len())
+                    .then_some("daemon environment")
+                })
+                .unwrap_or("no account; bcode auth login and R refresh");
+            return format!(
+                "{} / {} · {} · {}% · {}",
+                provider.display_name,
+                model.model_id,
+                account,
+                self.judgement_threshold,
+                if self.judgement_fallback == judgement_evaluation::FailurePolicy::AgentFallback {
+                    "agent fallback"
+                } else {
+                    "pause on failure"
+                }
+            );
+        }
+        if matches!(self.judgement_catalog, SetupDiscovery::Failed) {
+            return "Evaluator discovery unavailable · R retry".into();
+        }
+        self.judgement_catalog
+            .as_ref()
+            .and_then(|catalog| {
+                catalog.providers.first().map(|provider| {
+                    format!(
+                        "{}: {}",
+                        provider.display_name,
+                        provider
+                            .unavailable_reason
+                            .as_deref()
+                            .unwrap_or("no compatible YesNo model; R refresh")
+                    )
+                })
+            })
+            .unwrap_or_else(|| {
+                if matches!(self.judgement_catalog, SetupDiscovery::Loading) {
+                    "Loading evaluator options…".into()
+                } else {
+                    "No judgement providers available · R refresh".into()
+                }
+            })
+    }
+
     fn paint_evaluation_field(&mut self, content: Rect, area: Rect, frame: &mut PaintCx<'_, '_>) {
         let top = self.limit_area.bottom().saturating_add(1);
-        self.evaluation_area = Rect::new(content.x, top, content.width, 4)
-            .intersection(content)
-            .intersection(area);
+        self.evaluation_area = if content.width == 0
+            || area.width == 0
+            || top >= content.bottom()
+            || top >= area.bottom()
+        {
+            Rect::new(0, 0, 0, 0)
+        } else {
+            Rect::new(content.x, top, content.width, 4)
+                .intersection(content)
+                .intersection(area)
+        };
+        let details = self.evaluation_preview();
+        let label = if self.judgement_enabled == EvaluationMode::Judgement {
+            "Evaluation: agent evidence + judgement model"
+        } else {
+            "Evaluation: standard agent (no extra key) · Space to change"
+        };
+        let preview = if self.judgement_enabled == EvaluationMode::Judgement {
+            format!("{details} · ←/→ model ↑/↓ account +/- confidence F fallback R refresh")
+        } else {
+            "The current agent evaluates completion. Goal readiness also uses the agent.".into()
+        };
+        let preview_area = Rect::new(
+            self.evaluation_area.x,
+            self.evaluation_area.y.saturating_add(3),
+            self.evaluation_area.width,
+            1,
+        )
+        .intersection(content)
+        .intersection(area);
         Self::render_input(
             self.evaluation_area,
             frame,
-            "Judgement (optional: provider/model/profile/threshold/failure)",
+            label,
             &mut self.evaluation,
             self.field == Field::Evaluation && self.goal_option_focus.is_none(),
             1,
             self.theme.as_ref(),
         );
+        if preview_area.width > 0 && preview_area.height > 0 && content.width > 0 {
+            let block = TextBlock::new(preview);
+            let layout = block.layout(
+                Constraints::tight(preview_area.size()),
+                &mut LayoutCx::new(),
+            );
+            frame.with_child(
+                i32::from(preview_area.x),
+                i64::from(preview_area.y),
+                LocalRect::new(0, 0, preview_area.width, preview_area.height),
+                |cx| block.paint(&layout, cx),
+            );
+        }
     }
 
     const fn active_state_mut(&mut self) -> &mut TextInputState {
@@ -1161,6 +1499,11 @@ impl LoopSurface {
         if let Err(error) =
             LoopWorkflowInput::new(input_text(&self.prompt), input_text(&self.condition), limit)
         {
+            self.status = error;
+            return PluginTuiAction::Redraw;
+        }
+        if let Err(error) = self.selected_judgement() {
+            self.field = Field::Evaluation;
             self.status = error;
             return PluginTuiAction::Redraw;
         }
@@ -1240,7 +1583,6 @@ impl LoopSurface {
             self.field = Field::Limit;
             return Err("maximum iterations must be a number".to_owned());
         };
-        let evaluation = input_text(&self.evaluation);
         let mut input = LoopWorkflowInput::new(prompt, condition, max_iterations)?;
         if self.origin == SetupKind::Goal {
             let instructions = input_text(&self.swarm_ui.instructions);
@@ -1253,10 +1595,9 @@ impl LoopSurface {
                 max_iterations,
             )?;
         }
-        input.judgement_evaluation =
-            judgement_evaluation::parse_config(&evaluation).inspect_err(|_| {
-                self.field = Field::Evaluation;
-            })?;
+        input.judgement_evaluation = self.selected_judgement().inspect_err(|_| {
+            self.field = Field::Evaluation;
+        })?;
         let mut request = build_start_request(
             &input,
             session_id,
@@ -1331,11 +1672,12 @@ impl LoopSurface {
     }
 
     fn begin_pending_host_work(&mut self, host: &dyn PluginTuiHost) {
+        if self.launch_state == LaunchState::InFlight {
+            return;
+        }
         if self.collaboration == CollaborationMode::Requested && self.delegation_readiness.is_none()
         {
-            if self.launch_state == LaunchState::InFlight
-                || (self.pending_replace_cancel.is_none() && self.pending_workflow_start.is_none())
-            {
+            if self.pending_replace_cancel.is_none() && self.pending_workflow_start.is_none() {
                 return;
             }
             self.launch_state = LaunchState::InFlight;
@@ -1359,6 +1701,44 @@ impl LoopSurface {
         let Some(request) = self.pending_workflow_start.take() else {
             return;
         };
+        let completion = Arc::clone(&self.completions);
+        self.launch_state = LaunchState::InFlight;
+        if let Some(config) = request.input.get("judgement_evaluation")
+            && !config.is_null()
+        {
+            let Ok(config) =
+                serde_json::from_value::<judgement_evaluation::EvaluationConfig>(config.clone())
+            else {
+                self.launch_state = LaunchState::Ready;
+                self.status = "Invalid judgement selection; choose an available model".into();
+                return;
+            };
+            let selection = bcode_model::judgement::SetupSelection {
+                provider_plugin_id: config.provider_plugin_id,
+                model_id: config.model_id,
+                auth_profile: config.auth_profile,
+            };
+            self.status = "Rechecking judgement model and account…".into();
+            let future = host.validate_judgement_setup(selection);
+            host.spawn(Box::pin(async move {
+                let result = future.await;
+                completion.lock().expect("loop completion lock").push(
+                    LoopSurfaceCompletion::JudgementValidated {
+                        request: Box::new(request),
+                        result,
+                    },
+                );
+            }));
+            return;
+        }
+        self.start_prevalidated_workflow(host, request);
+    }
+
+    fn start_prevalidated_workflow(
+        &mut self,
+        host: &dyn PluginTuiHost,
+        request: PluginWorkflowStartRequest,
+    ) {
         let completion = Arc::clone(&self.completions);
         self.launch_state = LaunchState::InFlight;
         if let Some(setup) = &self.progress_document
@@ -1476,11 +1856,79 @@ impl LoopSurface {
         std::mem::take(&mut *pending)
     }
 
-    fn apply_completions(&mut self) -> PluginTuiAction {
+    fn apply_judgement_setup(
+        &mut self,
+        result: Result<
+            bcode_model::judgement::SetupCatalog,
+            bcode_plugin_sdk::tui::PluginTuiHostError,
+        >,
+    ) {
+        match result {
+            Ok(catalog) => {
+                self.judgement_catalog = SetupDiscovery::Ready(catalog);
+                self.judgement_choice = 0;
+                self.judgement_profile = 0;
+            }
+            Err(_) => self.judgement_catalog = SetupDiscovery::Failed,
+        }
+    }
+
+    fn apply_workflow_lookup(
+        &mut self,
+        result: Result<
+            Option<bcode_plugin_sdk::tui::PluginWorkflowSummary>,
+            bcode_plugin_sdk::tui::PluginTuiHostError,
+        >,
+    ) {
+        match result {
+            Ok(run) => {
+                self.active_workflow = run;
+                if self.failed_workflow_start.is_none() {
+                    self.status = self.active_workflow.as_ref().map_or_else(
+                        || "Tab changes field · Ctrl+Enter starts · Esc cancels".to_owned(),
+                        format_plugin_workflow_status,
+                    );
+                }
+            }
+            Err(error) => {
+                if self.failed_workflow_start.is_none() {
+                    self.status = format!("failed to inspect active loop: {error}");
+                }
+            }
+        }
+    }
+
+    fn apply_validated_judgement(
+        &mut self,
+        host: &dyn PluginTuiHost,
+        request: PluginWorkflowStartRequest,
+        result: &Result<bool, bcode_plugin_sdk::tui::PluginTuiHostError>,
+    ) {
+        if matches!(result, Ok(true)) {
+            self.start_prevalidated_workflow(host, request);
+        } else {
+            self.launch_state = LaunchState::Ready;
+            self.status =
+                "Judgement model or account is no longer available; press R to refresh".into();
+            self.field = Field::Evaluation;
+        }
+    }
+
+    fn apply_completions(&mut self, host: &dyn PluginTuiHost) -> PluginTuiAction {
         let completions = self.take_completions();
         let mut action = PluginTuiAction::None;
         for completion in completions {
             match completion {
+                LoopSurfaceCompletion::JudgementSetup { generation, result } => {
+                    if generation == self.judgement_generation {
+                        self.apply_judgement_setup(result);
+                        action = PluginTuiAction::Redraw;
+                    }
+                }
+                LoopSurfaceCompletion::JudgementValidated { request, result } => {
+                    self.apply_validated_judgement(host, *request, &result);
+                    action = PluginTuiAction::Redraw;
+                }
                 LoopSurfaceCompletion::DelegationChecked(result) => {
                     self.apply_delegation_checked(result);
                     action = PluginTuiAction::Redraw;
@@ -1496,25 +1944,7 @@ impl LoopSurface {
                     action = PluginTuiAction::Redraw;
                 }
                 LoopSurfaceCompletion::WorkflowLookup(result) => {
-                    match result {
-                        Ok(run) => {
-                            self.active_workflow = run;
-                            if self.failed_workflow_start.is_none() {
-                                self.status = self.active_workflow.as_ref().map_or_else(
-                                    || {
-                                        "Tab changes field · Ctrl+Enter starts · Esc cancels"
-                                            .to_owned()
-                                    },
-                                    format_plugin_workflow_status,
-                                );
-                            }
-                        }
-                        Err(error) => {
-                            if self.failed_workflow_start.is_none() {
-                                self.status = format!("failed to inspect active loop: {error}");
-                            }
-                        }
-                    }
+                    self.apply_workflow_lookup(result);
                     action = PluginTuiAction::Redraw;
                 }
                 LoopSurfaceCompletion::WorkflowStart { request, result } => match result {
@@ -1731,7 +2161,7 @@ impl LoopSurface {
     fn render_input(
         area: Rect,
         frame: &mut PaintCx<'_, '_>,
-        label: &'static str,
+        label: &str,
         state: &mut TextInputState,
         focused: bool,
         rows: u16,
@@ -1750,19 +2180,28 @@ impl LoopSurface {
             disabled_background: theme.canvas,
         });
         let retained = std::cell::RefCell::new(state.clone());
-        let input = TextInputBoxComponent::new(label, TextInputPolicy::chat_composer(), &retained)
-            .styles(styles)
-            .label(label)
-            .policy(TextInputBoxPolicy {
-                field_chrome: true,
-                panel_chrome: true,
-                background: true,
-                cursor: true,
-                focused,
-                disabled: false,
-                min_rows: rows,
-                max_rows: Some(rows),
-            });
+        let input = TextInputBoxComponent::new(
+            match label {
+                "Goal (required)" | "Iteration prompt" => "loop.prompt",
+                "Additional guidance (optional)" | "Stop condition" => "loop.condition",
+                "Max iterations (blank = 20)" | "Maximum iterations" => "loop.limit",
+                _ => "loop.evaluation",
+            },
+            TextInputPolicy::chat_composer(),
+            &retained,
+        )
+        .styles(styles)
+        .label(label)
+        .policy(TextInputBoxPolicy {
+            field_chrome: true,
+            panel_chrome: true,
+            background: true,
+            cursor: true,
+            focused,
+            disabled: false,
+            min_rows: rows,
+            max_rows: Some(rows),
+        });
         let layout = input.layout(Constraints::tight(area.size()), &mut LayoutCx::new());
         frame.with_child(
             i32::from(area.x),
@@ -1922,6 +2361,9 @@ impl PluginTuiSurface for LoopSurface {
     }
 
     fn poll(&mut self, host: &dyn PluginTuiHost) -> PluginTuiAction {
+        if matches!(self.judgement_catalog, SetupDiscovery::Pending) {
+            self.refresh_judgement(host);
+        }
         if self.fresh_session == FreshSessionState::NeedsConfiguration {
             self.ensure_session(host);
         }
@@ -1931,7 +2373,7 @@ impl PluginTuiSurface for LoopSurface {
         }
         self.begin_workflow_lookup(host);
         self.begin_pending_host_work(host);
-        self.apply_completions()
+        self.apply_completions(host)
     }
 
     fn handle_event(&mut self, event: &Event, host: &dyn PluginTuiHost) -> PluginTuiAction {
@@ -2001,6 +2443,9 @@ impl PluginTuiSurface for LoopSurface {
             }
             state.sync_scroll_to_cursor(&TextInputPolicy::chat_composer());
             return PluginTuiAction::Redraw;
+        }
+        if self.field == Field::Evaluation {
+            return self.handle_judgement_key(event, host);
         }
         let state = self.active_state_mut();
         match bmux_tui_components::text_input::TextInputControl::new(
@@ -2950,7 +3395,7 @@ mod tests {
             .lock()
             .unwrap()
             .push(LoopSurfaceCompletion::DelegationChecked(Ok(())));
-        surface.apply_completions();
+        surface.apply_completions(&TestHost::default());
         assert!(surface.pending_workflow_start.is_some());
         assert!(surface.pending_replace_cancel.is_some());
         assert!(surface.failed_workflow_start.is_none());
@@ -3291,6 +3736,16 @@ mod tests {
             _lookup: bcode_plugin_sdk::tui::PluginWorkflowLookup,
         ) -> bcode_plugin_sdk::tui::PluginWorkflowLookupFuture {
             Box::pin(async { Ok(None) })
+        }
+
+        fn validate_judgement_setup(
+            &self,
+            selection: bcode_model::judgement::SetupSelection,
+        ) -> bcode_plugin_sdk::tui::PluginJudgementValidationFuture {
+            let allowed = selection.provider_plugin_id == "bcode.jev"
+                && selection.model_id == "jev-1.13.0"
+                && selection.auth_profile == "jev";
+            Box::pin(async move { Ok(allowed) })
         }
 
         fn start_workflow(
@@ -3747,6 +4202,58 @@ mod tests {
                 assert_collaboration_edges(base.definition(), spec.definition());
             }
         }
+    }
+
+    #[test]
+    fn guided_evaluation_defaults_to_agent_and_requires_available_account() {
+        let mut surface = LoopSurface::new(None);
+        assert!(surface.selected_judgement().unwrap().is_none());
+        surface.judgement_enabled = EvaluationMode::Judgement;
+        assert!(surface.selected_judgement().is_err());
+        surface.apply_judgement_setup(Ok(bcode_model::judgement::SetupCatalog {
+            providers: vec![bcode_model::judgement::SetupProvider {
+                plugin_id: "bcode.jev".into(),
+                display_name: "Jev".into(),
+                auth_provider_id: "jev".into(),
+                profiles: Vec::new(),
+                environment_available: false,
+                models: vec![bcode_model::judgement::Model {
+                    model_id: "jev-1.13.0".into(),
+                    question_kinds: std::collections::BTreeSet::from([
+                        bcode_model::judgement::QuestionKind::YesNo,
+                    ]),
+                }],
+                unavailable_reason: None,
+            }],
+        }));
+        assert!(
+            surface
+                .selected_judgement()
+                .unwrap_err()
+                .contains("auth login jev")
+        );
+        if let SetupDiscovery::Ready(catalog) = &mut surface.judgement_catalog {
+            catalog.providers[0].profiles.push("jev".into());
+        }
+        let selected = surface.selected_judgement().unwrap().unwrap();
+        assert_eq!(selected.provider_plugin_id, "bcode.jev");
+        assert_eq!(selected.auth_profile, "jev");
+        assert_eq!(selected.threshold_percent, 90);
+        surface.judgement_profile = 1;
+        assert!(surface.selected_judgement().is_err());
+        if let SetupDiscovery::Ready(catalog) = &mut surface.judgement_catalog {
+            catalog.providers[0].environment_available = true;
+        }
+        assert!(
+            surface
+                .selected_judgement()
+                .unwrap()
+                .unwrap()
+                .auth_profile
+                .is_empty()
+        );
+        surface.judgement_enabled = EvaluationMode::Standard;
+        assert!(surface.selected_judgement().unwrap().is_none());
     }
 
     #[test]
@@ -5054,6 +5561,21 @@ mod tests {
             PluginTuiAction::Redraw
         );
         assert_eq!(surface.limit.buffer().text(), "4");
+        assert_eq!(
+            surface.handle_event(&key(KeyCode::Tab), &host),
+            PluginTuiAction::Redraw
+        );
+        assert_eq!(
+            surface.handle_event(&key(KeyCode::Char(' ')), &host),
+            PluginTuiAction::Redraw
+        );
+        assert_eq!(surface.judgement_enabled, EvaluationMode::Judgement);
+        assert_eq!(
+            surface.handle_event(&key(KeyCode::Char('+')), &host),
+            PluginTuiAction::Redraw
+        );
+        assert_eq!(surface.judgement_threshold, 95);
+        assert!(surface.evaluation.buffer().text().is_empty());
     }
 
     #[test]
@@ -5176,6 +5698,85 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn opt_in_preflight_rejects_stale_selection_before_workflow_start() {
+        let host = TestHost::default();
+        let mut surface = LoopSurface::new(Some(SessionId::new()));
+        surface.prompt = text_state("implement");
+        surface.condition = text_state("verified");
+        surface.limit = text_state("2");
+        surface.judgement_enabled = EvaluationMode::Judgement;
+        surface.apply_judgement_setup(Ok(bcode_model::judgement::SetupCatalog {
+            providers: vec![bcode_model::judgement::SetupProvider {
+                plugin_id: "bcode.jev".into(),
+                display_name: "Jev".into(),
+                auth_provider_id: "jev".into(),
+                profiles: vec!["stale".into()],
+                environment_available: false,
+                models: vec![bcode_model::judgement::Model {
+                    model_id: "jev-1.13.0".into(),
+                    question_kinds: std::collections::BTreeSet::from([
+                        bcode_model::judgement::QuestionKind::YesNo,
+                    ]),
+                }],
+                unavailable_reason: None,
+            }],
+        }));
+        surface.pending_workflow_lookup = true;
+        assert_eq!(surface.start(), PluginTuiAction::Redraw);
+        surface.begin_workflow_start(&host);
+        assert_eq!(
+            poll_surface_until_action(&mut surface, &host).await,
+            PluginTuiAction::Redraw
+        );
+        assert!(host.request.lock().unwrap().is_none());
+        assert!(surface.status.contains("no longer available"));
+        assert!(surface.pending_workflow_start.is_none());
+    }
+
+    #[test]
+    fn guided_selection_compiles_goal_and_loop_with_pinned_judgement() {
+        let mut surface = LoopSurface::new(Some(SessionId::new()));
+        surface.prompt = text_state("implement");
+        surface.condition = text_state("done");
+        surface.limit = text_state("2");
+        surface.judgement_enabled = EvaluationMode::Judgement;
+        surface.apply_judgement_setup(Ok(bcode_model::judgement::SetupCatalog {
+            providers: vec![bcode_model::judgement::SetupProvider {
+                plugin_id: "bcode.jev".into(),
+                display_name: "Jev".into(),
+                auth_provider_id: "jev".into(),
+                profiles: vec!["jev".into()],
+                environment_available: false,
+                models: vec![bcode_model::judgement::Model {
+                    model_id: "jev-1.13.0".into(),
+                    question_kinds: std::collections::BTreeSet::from([
+                        bcode_model::judgement::QuestionKind::YesNo,
+                    ]),
+                }],
+                unavailable_reason: None,
+            }],
+        }));
+        for origin in [SetupKind::Loop, SetupKind::Goal] {
+            surface.origin = origin;
+            let request = surface
+                .build_start_request(surface.session_id.unwrap())
+                .unwrap();
+            assert_eq!(request.input["judgement_evaluation"]["auth_profile"], "jev");
+            assert!(
+                request
+                    .definition
+                    .nodes
+                    .contains_key("loop.judgement.evaluate")
+            );
+        }
+        surface.judgement_enabled = EvaluationMode::Standard;
+        let request = surface
+            .build_start_request(surface.session_id.unwrap())
+            .unwrap();
+        assert!(request.input.get("judgement_evaluation").is_none());
+    }
+
     #[test]
     fn requested_iteration_count_controls_all_loop_budgets() {
         for iterations in [200, 1_001, u32::MAX] {
@@ -5204,6 +5805,20 @@ mod tests {
         }
         for iterations in [0, u64::from(u32::MAX) + 1] {
             assert!(LoopWorkflowInput::new("implement".into(), "done".into(), iterations).is_err());
+        }
+    }
+
+    #[test]
+    fn evaluation_control_degrades_without_invisible_hit_area_on_tiny_modals() {
+        use bmux_tui::frame::Frame;
+        let mut surface = LoopSurface::new(Some(SessionId::new()));
+        surface.judgement_enabled = EvaluationMode::Judgement;
+        for width in [0, 1, 12, 64] {
+            let area = Rect::new(0, 0, width, 12);
+            let mut buffer = bmux_tui::buffer::Buffer::empty(area);
+            surface.render(area, &mut PaintCx::new(&mut Frame::new(&mut buffer)));
+            assert!(surface.evaluation_area.right() <= area.right());
+            assert!(surface.evaluation_area.bottom() <= area.bottom());
         }
     }
 
@@ -5256,14 +5871,14 @@ mod tests {
             .lock()
             .expect("completion lock")
             .push(LoopSurfaceCompletion::WorkflowLookup(Ok(None)));
-        assert_eq!(surface.apply_completions(), PluginTuiAction::Redraw);
+        assert_eq!(surface.apply_completions(&host), PluginTuiAction::Redraw);
         assert_eq!(surface.status, diagnostic);
         surface.completions.lock().expect("completion lock").push(
             LoopSurfaceCompletion::WorkflowLookup(Err(
                 bcode_plugin_sdk::tui::PluginTuiHostError::Internal("lookup failed".into()),
             )),
         );
-        assert_eq!(surface.apply_completions(), PluginTuiAction::Redraw);
+        assert_eq!(surface.apply_completions(&host), PluginTuiAction::Redraw);
         assert_eq!(surface.status, diagnostic);
     }
 

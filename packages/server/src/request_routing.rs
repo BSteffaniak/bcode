@@ -739,6 +739,10 @@ pub enum CoreRuntimeRequest {
     SessionModelList {
         provider_plugin_id: Option<String>,
     },
+    JudgementSetup,
+    JudgementSetupValidate {
+        selection_json: String,
+    },
     Judge {
         provider_plugin_id: String,
         auth_profile: String,
@@ -1490,6 +1494,14 @@ impl RoutedRequest {
             Request::SessionModelList { provider_plugin_id } => {
                 Self::CoreRuntime(Box::new(CoreRuntimeRequest::SessionModelList {
                     provider_plugin_id,
+                }))
+            }
+            Request::JudgementSetup => {
+                Self::CoreRuntime(Box::new(CoreRuntimeRequest::JudgementSetup))
+            }
+            Request::JudgementSetupValidate { selection_json } => {
+                Self::CoreRuntime(Box::new(CoreRuntimeRequest::JudgementSetupValidate {
+                    selection_json,
                 }))
             }
             Request::Judge {

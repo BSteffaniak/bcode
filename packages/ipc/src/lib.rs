@@ -929,6 +929,13 @@ pub enum Request {
     SessionModelList {
         provider_plugin_id: Option<String>,
     },
+    /// Inspect enabled judgement models and owned account availability without evaluating.
+    JudgementSetup,
+    /// Recheck one exact evaluator and account selection against current daemon state.
+    JudgementSetupValidate {
+        /// Bounded JSON encoding of a portable selection.
+        selection_json: String,
+    },
     /// Invoke a judgement model without creating or modifying a session turn.
     Judge {
         provider_plugin_id: String,
@@ -2015,6 +2022,16 @@ pub enum ResponsePayload {
     SessionModelList {
         provider_plugin_id: Option<String>,
         models: bcode_model::ModelList,
+    },
+    /// Secret-free, bounded non-conversational evaluator setup catalog.
+    JudgementSetup {
+        /// Bounded JSON encoding of the portable catalog (codec-safe).
+        catalog_json: String,
+    },
+    /// Whether daemon credentials exist and the exact model still advertises `YesNo`.
+    /// Not an upstream key-validity probe or an account reservation.
+    JudgementSetupValidated {
+        available: bool,
     },
     /// Normalized judgement answers; no provider context or secret material.
     Judgement {
@@ -5218,6 +5235,44 @@ mod tests {
             panic!("decoded response should be attached");
         };
         assert_eq!(session, summary);
+    }
+
+    #[test]
+    fn judgement_setup_validation_round_trips_as_bounded_json() {
+        let selection = bcode_model::judgement::SetupSelection {
+            provider_plugin_id: "bcode.jev".into(),
+            model_id: "jev-1.13.0".into(),
+            auth_profile: "jev".into(),
+        };
+        let request = Request::JudgementSetupValidate {
+            selection_json: serde_json::to_string(&selection).unwrap(),
+        };
+        assert_eq!(
+            decode_request(&encode_request(&request).unwrap()).unwrap(),
+            request
+        );
+        let response = Response::Ok(ResponsePayload::JudgementSetupValidated { available: true });
+        assert_eq!(
+            decode_response(&encode_response(&response).unwrap()).unwrap(),
+            response
+        );
+    }
+
+    #[test]
+    fn judgement_setup_round_trips_as_bounded_json() {
+        let request = Request::JudgementSetup;
+        assert_eq!(
+            decode_request(&encode_request(&request).unwrap()).unwrap(),
+            request
+        );
+        let setup = bcode_model::judgement::SetupCatalog { providers: vec![] };
+        let response = Response::Ok(ResponsePayload::JudgementSetup {
+            catalog_json: serde_json::to_string(&setup).unwrap(),
+        });
+        assert_eq!(
+            decode_response(&encode_response(&response).unwrap()).unwrap(),
+            response
+        );
     }
 
     #[test]

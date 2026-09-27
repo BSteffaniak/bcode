@@ -221,7 +221,8 @@ async fn discover_models(context: &ProviderRequestContext) -> Result<ModelList, 
     if base_url(context)? == DEFAULT_BASE_URL {
         // This API currently exposes no authenticated model-list route. Advertise only the
         // alias and concrete model observed on its decision endpoint, not another host's list.
-        credential(context)?;
+        // Model metadata is public; credential availability is checked independently by
+        // the application, and judgement still requires a selected owned credential.
         return Ok(ModelList {
             provider_id: "bcode.jev".into(),
             question_kinds: supported_kinds(),
@@ -588,7 +589,8 @@ mod tests {
         );
         let mut unauthenticated = provider_context;
         unauthenticated.auth = None;
-        assert!(runtime.block_on(discover_models(&unauthenticated)).is_err());
+        assert!(runtime.block_on(discover_models(&unauthenticated)).is_ok());
+        assert!(credential(&unauthenticated).is_err());
     }
 
     #[test]

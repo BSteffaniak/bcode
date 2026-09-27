@@ -25,6 +25,19 @@ use bmux_tui::prelude::{Line, Style};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use tokio::sync::mpsc;
 
+/// Asynchronous result of rechecking one exact judgement selection before launch.
+pub type PluginJudgementValidationFuture =
+    Pin<Box<dyn Future<Output = Result<bool, PluginTuiHostError>> + Send + 'static>>;
+
+/// Asynchronous, bounded judgement setup discovery result.
+pub type PluginJudgementSetupFuture = Pin<
+    Box<
+        dyn Future<Output = Result<bcode_model::judgement::SetupCatalog, PluginTuiHostError>>
+            + Send
+            + 'static,
+    >,
+>;
+
 /// Boxed error returned by native TUI plugin surface factories.
 pub type PluginTuiError = Box<dyn Error + Send + Sync>;
 
@@ -597,6 +610,27 @@ pub type PluginUsageCollectFuture = Pin<
 
 /// Host services available to native TUI plugin surfaces.
 pub trait PluginTuiHost: Send + Sync {
+    /// Recheck one exact evaluator/account selection immediately before workflow launch.
+    fn validate_judgement_setup(
+        &self,
+        _selection: bcode_model::judgement::SetupSelection,
+    ) -> PluginJudgementValidationFuture {
+        Box::pin(async {
+            Err(PluginTuiHostError::Unsupported(
+                "judgement validation unavailable".into(),
+            ))
+        })
+    }
+
+    /// Discover secret-free, enabled judgement evaluator options through the application.
+    fn judgement_setup(&self) -> PluginJudgementSetupFuture {
+        Box::pin(async {
+            Err(PluginTuiHostError::Unsupported(
+                "judgement setup unavailable".into(),
+            ))
+        })
+    }
+
     /// Query a bounded, normalized reporting snapshot.
     fn usage_report(&self, _query: bcode_usage_models::UsageQuery) -> PluginUsageReportFuture {
         Box::pin(async {

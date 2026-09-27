@@ -5766,7 +5766,7 @@ async fn run_client_operation(
     writer: &SharedWriter,
     attached_session: &mut Option<SessionId>,
 ) -> Option<Result<(), ServerError>> {
-    let cancel_on_disconnect = matches!(&request, Request::Judge { .. });
+    let cancel_on_disconnect = matches!(&request, Request::Judge { .. } | Request::JudgementSetup);
     let operation = Box::pin(handle_request(
         request,
         request_id,
@@ -6184,6 +6184,8 @@ const fn request_kind(request: &Request) -> &'static str {
         Request::SessionModelStatus { .. } => "session_model_status",
         Request::DefaultModelStatus => "default_model_status",
         Request::SessionModelList { .. } => "session_model_list",
+        Request::JudgementSetup => "judgement_setup",
+        Request::JudgementSetupValidate { .. } => "judgement_setup_validate",
         Request::Judge { .. } => "judge",
         Request::ListAgents => "list_agents",
         Request::ListSkills => "list_skills",
@@ -8515,6 +8517,37 @@ async fn handle_core_runtime_request(
         CoreRuntimeRequest::SessionModelList { provider_plugin_id } => {
             handle_session_model_list(request_id, client_id, state, writer, provider_plugin_id)
                 .await
+        }
+        CoreRuntimeRequest::JudgementSetup => {
+            let catalog = judgement::setup_catalog(state).await;
+            let response = serde_json::to_string(&catalog).map_or_else(
+                |_| {
+                    Response::Err(ErrorResponse::new(
+                        "judgement_unavailable",
+                        "judgement setup could not be encoded",
+                    ))
+                },
+                |catalog_json| Response::Ok(ResponsePayload::JudgementSetup { catalog_json }),
+            );
+            send_response(writer, request_id, response).await
+        }
+        CoreRuntimeRequest::JudgementSetupValidate { selection_json } => {
+            let available = if selection_json.len() <= 1024 {
+                match serde_json::from_str::<bcode_model::judgement::SetupSelection>(
+                    &selection_json,
+                ) {
+                    Ok(selection) => judgement::validate_setup_selection(state, &selection).await,
+                    Err(_) => false,
+                }
+            } else {
+                false
+            };
+            send_response(
+                writer,
+                request_id,
+                Response::Ok(ResponsePayload::JudgementSetupValidated { available }),
+            )
+            .await
         }
         CoreRuntimeRequest::Judge {
             provider_plugin_id,
@@ -68904,6 +68937,66 @@ event_symbol = "bcode_plugin_handle_event_v1"
     }
 
     #[tokio::test]
+    async fn judgement_setup_lists_disabled_and_unconfigured_providers_safely() {
+        let empty = judgement::setup_catalog(&test_server_state(SessionManager::default())).await;
+        assert!(empty.providers.is_empty());
+        let state = test_server_state_with_fake_provider(SessionManager::default());
+        let catalog = judgement::setup_catalog(&state).await;
+        let fake = catalog
+            .providers
+            .iter()
+            .find(|entry| entry.plugin_id == "bcode.fake-provider")
+            .expect("fake provider");
+        assert_eq!(fake.auth_provider_id, "fake");
+        assert!(fake.profiles.is_empty());
+        assert!(!fake.environment_available);
+        assert!(fake.unavailable_reason.is_some());
+        assert!(serde_json::to_string(&catalog).unwrap().len() <= 262_144);
+        drop(state);
+    }
+
+    #[tokio::test]
+    #[allow(clippy::significant_drop_tightening)] // The plugin host remains active through setup discovery.
+    async fn judgement_setup_shows_unconfigured_jev_models_without_credentials() {
+        let plugin = bcode_plugin::StaticBundledPlugin::new(
+            include_str!("../../../plugins/jev-provider-plugin/bcode-plugin.toml"),
+            bcode_jev_provider_plugin::static_plugin(),
+        );
+        let plugins = bcode_plugin::PluginRuntimeHost::load_defaults_with_static_bundled(
+            &bcode_plugin::PluginSelection {
+                mode: bcode_plugin::PluginSelectionMode::Explicit,
+                enabled: BTreeSet::from(["bcode.jev".into()]),
+                disabled: BTreeSet::new(),
+            },
+            &[plugin],
+        )
+        .expect("load Jev");
+        let mut state = test_server_state(SessionManager::default());
+        state.plugins = plugins;
+        let catalog = judgement::setup_catalog(&state).await;
+        let jev = catalog
+            .providers
+            .iter()
+            .find(|provider| provider.plugin_id == "bcode.jev")
+            .expect("Jev option");
+        assert_eq!(jev.auth_provider_id, "jev");
+        assert!(
+            jev.models
+                .iter()
+                .any(|model| model.model_id == "jev-1.13.0")
+        );
+        assert!(jev.profiles.is_empty());
+        assert!(!jev.environment_available);
+        assert!(
+            jev.unavailable_reason
+                .as_deref()
+                .unwrap()
+                .contains("auth login jev")
+        );
+        drop(state);
+    }
+
+    #[tokio::test]
     #[allow(clippy::significant_drop_tightening, clippy::too_many_lines)] // The fixture owns server state and two transports until shutdown.
     async fn judgement_client_ipc_calls_jev_over_authenticated_loopback_http() {
         use std::io::{Read, Write};
@@ -68911,6 +69004,9 @@ event_symbol = "bcode_plugin_handle_event_v1"
         let url = format!("http://{}", listener.local_addr().expect("address"));
         let http = std::thread::spawn(move || {
             for (method, body) in [
+                ("GET /api/v1/models", r#"{"models":[{"name":"jev-1"}]}"#),
+                ("GET /api/v1/models", r#"{"models":[{"name":"jev-1"}]}"#),
+                ("GET /api/v1/models", r#"{"models":[{"name":"jev-1"}]}"#),
                 ("GET /api/v1/models", r#"{"models":[{"name":"jev-1"}]}"#),
                 (
                     "POST /api/v1/decide",
@@ -68985,6 +69081,29 @@ event_symbol = "bcode_plugin_handle_event_v1"
             stopped,
         ));
         let client = bcode_client::BcodeClient::new(endpoint);
+        let setup = client.judgement_setup().await.expect("Jev setup catalog");
+        let jev = setup
+            .providers
+            .iter()
+            .find(|provider| provider.plugin_id == "bcode.jev")
+            .expect("enabled Jev");
+        assert_eq!(jev.auth_provider_id, "jev");
+        assert!(jev.profiles.contains(&"jev-fixture".into()));
+        assert!(jev.models.iter().any(|model| {
+            model.model_id == "jev-1"
+                && model
+                    .question_kinds
+                    .contains(&bcode_model::judgement::QuestionKind::YesNo)
+        }));
+        let selection = bcode_model::judgement::SetupSelection {
+            provider_plugin_id: "bcode.jev".into(),
+            model_id: "jev-1".into(),
+            auth_profile: "jev-fixture".into(),
+        };
+        assert!(client.validate_judgement_setup(&selection).await.unwrap());
+        let mut missing = selection;
+        missing.model_id = "not-a-model".into();
+        assert!(!client.validate_judgement_setup(&missing).await.unwrap());
         let result = client
             .judge(
                 "bcode.jev".into(),

@@ -3721,6 +3721,45 @@ impl BcodeClient {
         }
     }
 
+    /// Return bounded, secret-free judgement setup options from the connected daemon.
+    /// Discovery indicates advertised capability, not successful remote authentication.
+    ///
+    /// # Errors
+    /// Returns a client error when the daemon cannot be reached or the catalog is invalid.
+    pub async fn judgement_setup(
+        &self,
+    ) -> Result<bcode_model::judgement::SetupCatalog, ClientError> {
+        match self.send_request(Request::JudgementSetup).await? {
+            ResponsePayload::JudgementSetup { catalog_json } if catalog_json.len() <= 262_144 => {
+                serde_json::from_str(&catalog_json).map_err(|_| ClientError::UnexpectedResponse)
+            }
+            _ => Err(ClientError::UnexpectedResponse),
+        }
+    }
+
+    /// Recheck a selected evaluator and its exact account against the connected daemon.
+    /// This does not perform an upstream evaluation or prove an API key is valid.
+    ///
+    /// # Errors
+    /// Returns a client error when the daemon is unavailable or rejects this check.
+    pub async fn validate_judgement_setup(
+        &self,
+        selection: &bcode_model::judgement::SetupSelection,
+    ) -> Result<bool, ClientError> {
+        let selection_json =
+            serde_json::to_string(selection).map_err(|_| ClientError::UnexpectedResponse)?;
+        if selection_json.len() > 1024 {
+            return Err(ClientError::UnexpectedResponse);
+        }
+        match self
+            .send_request(Request::JudgementSetupValidate { selection_json })
+            .await?
+        {
+            ResponsePayload::JudgementSetupValidated { available } => Ok(available),
+            _ => Err(ClientError::UnexpectedResponse),
+        }
+    }
+
     /// Evaluate named questions with a non-conversational model. A named auth profile must be
     /// owned by the provider; an empty name explicitly selects its declared environment keys.
     /// This does not create a session or select a chat turn model.

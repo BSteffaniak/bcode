@@ -118,6 +118,30 @@ fn workflow_run_limits(
 }
 
 impl PluginTuiHost for BcodePluginTuiHost {
+    fn validate_judgement_setup(
+        &self,
+        selection: bcode_model::judgement::SetupSelection,
+    ) -> bcode_plugin_sdk::tui::PluginJudgementValidationFuture {
+        let client = self.client.clone();
+        Box::pin(async move {
+            client
+                .validate_judgement_setup(&selection)
+                .await
+                .map_err(|_| {
+                    PluginTuiHostError::Internal("judgement setup validation unavailable".into())
+                })
+        })
+    }
+
+    fn judgement_setup(&self) -> bcode_plugin_sdk::tui::PluginJudgementSetupFuture {
+        let client = self.client.clone();
+        Box::pin(async move {
+            client.judgement_setup().await.map_err(|_| {
+                PluginTuiHostError::Internal("judgement setup unavailable; retry discovery".into())
+            })
+        })
+    }
+
     fn prepare_fresh_session(
         &self,
         existing: Option<SessionId>,

@@ -42,6 +42,7 @@ impl EvaluationConfig {
     }
 }
 
+#[cfg(test)]
 pub fn parse_config(raw: &str) -> Result<Option<EvaluationConfig>, String> {
     let raw = raw.trim();
     if raw.is_empty() {
