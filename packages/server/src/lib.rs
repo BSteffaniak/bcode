@@ -433,6 +433,7 @@ pub struct ServerState {
     required_skill_model_overrides:
         Mutex<BTreeMap<(SessionId, SkillId), RequiredSkillModelOverride>>,
     pending_permissions: Mutex<BTreeMap<String, PendingPermission>>,
+    recovered_permissions: Mutex<BTreeMap<String, bcode_session::InvocationRecoveryCheckpoint>>,
     pending_permission_batches: Arc<StdMutex<BTreeMap<String, Arc<PendingPermissionBatch>>>>,
     pending_tool_exchanges: Mutex<BTreeMap<String, PendingToolExchange>>,
     active_plugin_invocations: Arc<StdMutex<BTreeMap<(SessionId, String), ActivePluginInvocation>>>,
@@ -2352,6 +2353,7 @@ impl ServerState {
             session_model_selection_origins: Mutex::default(),
             required_skill_model_overrides: Mutex::default(),
             pending_permissions: Mutex::default(),
+            recovered_permissions: Mutex::default(),
             pending_permission_batches: Arc::new(StdMutex::default()),
             pending_tool_exchanges: Mutex::default(),
             active_plugin_invocations: Arc::default(),
@@ -5428,20 +5430,37 @@ async fn recover_abandoned_tool_runs(
                 1024,
             )
             .await?;
-        let message = if matches!(
+        if matches!(
             observation,
             bcode_session::InvocationRecoveryObservation::WaitingForPermission { .. }
+                | bcode_session::InvocationRecoveryObservation::PermissionDecided { .. }
         ) {
-            format!(
-                "The daemon restarted while tool `{}` was waiting for permission. The recorded request was not approved. Its invocation continuation is unavailable, so Bcode did not execute it.",
-                tool.tool_name.as_deref().unwrap_or("unknown")
-            )
-        } else {
-            format!(
-                "The daemon restarted while tool `{}` was running. Its outcome could not be verified, so Bcode did not execute it again.",
-                tool.tool_name.as_deref().unwrap_or("unknown")
-            )
-        };
+            // An unresolved authorization request is not a failed invocation. Preserve its
+            // canonical identity and parent work until a continuation can be restored.
+            if let Some(checkpoint) = state
+                .sessions
+                .invocation_recovery_checkpoint(
+                    session_id,
+                    &tool.tool_call_id,
+                    tool.event_seq_start,
+                    1024,
+                )
+                .await?
+                && matches!(
+                    observation,
+                    bcode_session::InvocationRecoveryObservation::WaitingForPermission { .. }
+                )
+            {
+                interaction_operations::restore_permission(state, checkpoint).await?;
+            }
+            return Err(ServerError::WorkflowApplicationOperationUnauthorized(
+                "pending tool permission requires invocation continuation recovery; canonical work was preserved".into(),
+            ));
+        }
+        let message = format!(
+            "The daemon restarted while tool `{}` was running. Its outcome could not be verified, so Bcode did not execute it again.",
+            tool.tool_name.as_deref().unwrap_or("unknown")
+        );
         let event = state
             .sessions
             .append_tool_invocation_result(
@@ -60447,6 +60466,132 @@ event_symbol = "bcode_plugin_handle_event_v1"
             1
         );
         drop(state);
+    }
+
+    #[tokio::test]
+    async fn unresolved_permission_recovery_preserves_canonical_work_across_reopen() {
+        let root = tempfile::tempdir().unwrap();
+        let sessions = SessionManager::persistent(root.path()).unwrap();
+        let session = sessions
+            .create_session(None, root.path().to_path_buf())
+            .await
+            .unwrap();
+        let turn = sessions
+            .append_event(
+                session.id,
+                SessionEventKind::UserMessage {
+                    client_id: ClientId::new(),
+                    text: "recover permission".into(),
+                    admission: bcode_session_models::TurnAdmissionMetadata::default(),
+                },
+            )
+            .await
+            .unwrap();
+        sessions
+            .append_event(
+                session.id,
+                SessionEventKind::PositionedToolCallRequested {
+                    turn_id: format!("{}-{}", session.id, turn.sequence),
+                    output_position: bcode_session_models::TurnOutputPosition::new(0),
+                    tool_call_id: "pending-call".into(),
+                    producer_plugin_id: Some("example".into()),
+                    tool_name: "example.write".into(),
+                    arguments_json: "{}".into(),
+                    working_directory: Some(session.working_directory.clone()),
+                },
+            )
+            .await
+            .unwrap();
+        sessions
+            .append_permission_requested(
+                session.id,
+                SessionEventKind::PermissionRequested {
+                    permission_id: "pending-permission".into(),
+                    tool_call_id: "pending-call".into(),
+                    producer_plugin_id: Some("example".into()),
+                    tool_name: "example.write".into(),
+                    arguments_json: "{}".into(),
+                    batch: None,
+                    policy_source: None,
+                    policy_reason: None,
+                },
+            )
+            .await
+            .unwrap();
+        let generation = sessions
+            .current_session_generation(session.id)
+            .await
+            .unwrap();
+        sessions
+            .release_session_ownership(session.id)
+            .await
+            .unwrap();
+        drop(sessions);
+        let state = Arc::new(test_server_state(
+            SessionManager::persistent(root.path()).unwrap(),
+        ));
+        for _ in 0..2 {
+            assert!(
+                recover_abandoned_session_runtime_work(&state, session.id)
+                    .await
+                    .is_err()
+            );
+            assert_eq!(
+                state
+                    .sessions
+                    .current_session_generation(session.id)
+                    .await
+                    .unwrap(),
+                generation
+            );
+            assert_eq!(
+                state
+                    .sessions
+                    .active_tool_runs(session.id)
+                    .await
+                    .unwrap()
+                    .len(),
+                1
+            );
+        }
+        let restored = interaction_operations::list_permissions(&state).await;
+        assert_eq!(restored.len(), 1);
+        assert_eq!(restored[0].permission_id, "pending-permission");
+        assert!(
+            interaction_operations::resolve_permission(&state, "pending-permission", true, false)
+                .await
+        );
+        assert_recovered_decision_preserved(&state, session.id, generation).await;
+        drop(state);
+    }
+
+    async fn assert_recovered_decision_preserved(
+        state: &Arc<ServerState>,
+        session_id: SessionId,
+        generation: u64,
+    ) {
+        assert!(
+            !interaction_operations::resolve_permission(state, "pending-permission", false, false)
+                .await
+        );
+        assert!(
+            interaction_operations::list_permissions(state)
+                .await
+                .is_empty()
+        );
+        assert!(
+            recover_abandoned_session_runtime_work(state, session_id)
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            state
+                .sessions
+                .current_session_generation(session_id)
+                .await
+                .unwrap(),
+            generation + 1
+        );
     }
 
     #[tokio::test]

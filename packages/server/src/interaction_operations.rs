@@ -323,6 +323,64 @@ pub async fn permission_batch_decision(state: &ServerState, batch_id: &str) -> O
     *batch.decision.lock().await
 }
 
+/// Restore visibility of a verified canonical wait without appending another request.
+/// Recovery's caller holds execution authority; this operation grants no dispatch permission.
+pub async fn restore_permission(
+    state: &ServerState,
+    checkpoint: bcode_session::InvocationRecoveryCheckpoint,
+) -> Result<(), super::ServerError> {
+    let bcode_session_models::SessionEventKind::UserMessage { admission, .. } =
+        &checkpoint.turn().kind
+    else {
+        return Ok(());
+    };
+    super::validate_interaction_route(state, checkpoint.session_id(), &admission.execution).await?;
+    let bcode_session_models::SessionEventKind::PermissionRequested {
+        permission_id,
+        tool_call_id,
+        tool_name,
+        arguments_json,
+        policy_source,
+        policy_reason,
+        ..
+    } = &checkpoint.permission().kind
+    else {
+        return Ok(());
+    };
+    let pending = PendingPermission {
+        summary: bcode_session_models::PermissionSummary {
+            permission_id: permission_id.clone(),
+            session_id: checkpoint.session_id(),
+            tool_call_id: tool_call_id.clone(),
+            tool_name: tool_name.clone(),
+            arguments_json: arguments_json.clone(),
+            batch: None,
+            agent_id: admission
+                .execution
+                .agent_profile
+                .clone()
+                .unwrap_or_else(|| "build".into()),
+            interaction_route: admission.execution.interaction_route.clone(),
+            policy_source: policy_source.clone(),
+            policy_reason: policy_reason.clone(),
+            can_remember_policy: false,
+        },
+        decision: Arc::new(Mutex::new(None)),
+        notify: Arc::new(tokio::sync::Notify::new()),
+        skill_decision_key: None,
+    };
+    let mut recovered = state.recovered_permissions.lock().await;
+    let mut permissions = state.pending_permissions.lock().await;
+    if !permissions.contains_key(permission_id) {
+        permissions.insert(permission_id.clone(), pending.clone());
+        recovered.insert(permission_id.clone(), checkpoint);
+    }
+    drop(permissions);
+    drop(recovered);
+    notify_interaction_destination(state, &pending.summary).await;
+    Ok(())
+}
+
 /// Return current pending permission summaries without transport framing.
 pub async fn list_permissions(state: &ServerState) -> Vec<bcode_session_models::PermissionSummary> {
     let mut permissions = state
@@ -343,11 +401,69 @@ pub async fn resolve_permission(
     approved: bool,
     remember: bool,
 ) -> bool {
+    let checkpoint = state
+        .recovered_permissions
+        .lock()
+        .await
+        .get(permission_id)
+        .cloned();
+    if let Some(checkpoint) = checkpoint {
+        return Box::pin(resolve_recovered_permission(
+            state,
+            permission_id,
+            &checkpoint,
+            approved,
+            remember,
+        ))
+        .await;
+    }
     let Some(permission) = take_pending_permission_for_individual(state, permission_id).await
     else {
         return false;
     };
     complete_pending_permission(state, permission, approved, remember).await
+}
+
+async fn resolve_recovered_permission(
+    state: &ServerState,
+    permission_id: &str,
+    checkpoint: &bcode_session::InvocationRecoveryCheckpoint,
+    approved: bool,
+    remember: bool,
+) -> bool {
+    if remember {
+        return false;
+    }
+    let Ok(summary) = state
+        .sessions
+        .session_summary(checkpoint.session_id())
+        .await
+    else {
+        return false;
+    };
+    // Cross-store decision commit still requires an execution-fenced continuation owner.
+    // Do not turn a session association or a prior authority observation into a grant.
+    if summary.execution.is_some() {
+        return false;
+    }
+    let Ok(event) = state
+        .sessions
+        .append_recovered_permission_decision(checkpoint, approved)
+        .await
+    else {
+        return false;
+    };
+    publish_session_event(state, &event).await;
+    state
+        .recovered_permissions
+        .lock()
+        .await
+        .remove(permission_id);
+    let pending = state.pending_permissions.lock().await.remove(permission_id);
+    if let Some(pending) = pending {
+        notify_interaction_destination(state, &pending.summary).await;
+    }
+    true
 }
 
 pub async fn complete_pending_permission(
