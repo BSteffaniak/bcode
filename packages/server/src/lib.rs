@@ -5474,6 +5474,24 @@ async fn recover_abandoned_session_runtime_work(
     if state.session_current_turn(session_id).await.is_some() {
         return Ok(());
     }
+    let summary = state.sessions.session_summary(session_id).await?;
+    let _workflow_authority = if let Some(execution) = summary.execution {
+        if execution.provenance.owner == "bcode.workflow" {
+            Some(
+                workflow_operations::execution_authority(state, &execution.provenance.run_id)
+                    .await?
+                    .ok_or_else(|| {
+                        ServerError::WorkflowApplicationOperationUnauthorized(
+                            "workflow recovery requires current durable execution authority".into(),
+                        )
+                    })?,
+            )
+        } else {
+            None
+        }
+    } else {
+        None
+    };
     let active_runtime_ids = state.runtime_work.active_ids_for_session(session_id).await;
     recover_abandoned_tool_runs(state, session_id, &active_runtime_ids).await?;
     let active = state.sessions.active_runtime_work(session_id).await?;
@@ -26736,20 +26754,30 @@ async fn invoke_server_registered_tool(
         .span("tool.invocation")
         .labels(tool_labels.clone());
     let tool_start = Instant::now();
-    if invoker.persist_lifecycle {
-        append_tool_invocation_lifecycle_event(
-            invoker.state,
+    // This append is the dispatch boundary, not a best-effort presentation update.
+    // Without a durable start marker, a replacement owner cannot distinguish an
+    // approved-but-unstarted request from an invocation with ambiguous effects.
+    let started = invoker
+        .state
+        .sessions
+        .append_event(
             invoker.session_id,
-            bcode_session_models::ToolInvocationLifecycleEvent {
-                invocation_id: call.id.clone(),
-                sequence: 0,
-                stage: bcode_session_models::ToolInvocationLifecycleStage::Started,
-                message: None,
-                metadata: serde_json::Value::Null,
+            SessionEventKind::ToolInvocationLifecycle {
+                event: bcode_session_models::ToolInvocationLifecycleEvent {
+                    invocation_id: call.id.clone(),
+                    sequence: 0,
+                    stage: bcode_session_models::ToolInvocationLifecycleStage::Started,
+                    message: None,
+                    metadata: serde_json::json!({"dispatch_boundary_version": 1}),
+                },
             },
         )
-        .await;
-    }
+        .await
+        .map_err(|_| RuntimeError::ToolExecution {
+            tool_name: call.name.clone(),
+            message: "tool dispatch could not be recorded; tool was not executed".into(),
+        })?;
+    publish_session_event(invoker.state, &started).await;
     let result = invoke_plugin_tool_transport(
         invoker.state,
         invoker.session_id,
@@ -27295,6 +27323,12 @@ async fn persist_scoped_turn_event(
     match event {
         ScopedTurnEvent::Runtime(_) => Ok(()),
         ScopedTurnEvent::InvocationLifecycle(event) => {
+            // The server invoker records Started synchronously before entering the plugin.
+            // The runtime's queued copy is not a second dispatch and must not create another
+            // canonical start (or arrive after the synchronous marker with different facts).
+            if event.stage == bcode_session_models::ToolInvocationLifecycleStage::Started {
+                return Ok(());
+            }
             let invocation_id = event.invocation_id.clone();
             if event.stage == bcode_session_models::ToolInvocationLifecycleStage::Progress {
                 let _ = state
@@ -60349,6 +60383,73 @@ event_symbol = "bcode_plugin_handle_event_v1"
     }
 
     #[tokio::test]
+    async fn workflow_child_recovery_without_execution_authority_preserves_history() {
+        let root = tempfile::tempdir().unwrap();
+        let sessions = SessionManager::persistent(root.path()).unwrap();
+        let parent = sessions
+            .create_session(None, root.path().to_path_buf())
+            .await
+            .unwrap();
+        let child = sessions
+            .create_fresh_execution_session(
+                None,
+                ExecutionSessionProvenance {
+                    version: bcode_session_models::EXECUTION_SESSION_PROVENANCE_VERSION,
+                    owner: "bcode.workflow".into(),
+                    run_id: "missing-authority".into(),
+                    node_id: "agent".into(),
+                    activation_id: Some("activation".into()),
+                    attempt: 1,
+                    parent_session_id: parent.id,
+                    context_mode: bcode_session_models::ExecutionSessionContextMode::FreshIsolated,
+                    workspace_snapshot: Some("snapshot".into()),
+                    parent_generation: None,
+                },
+                None,
+            )
+            .await
+            .unwrap();
+        sessions
+            .append_tool_call_requested(
+                child.id,
+                bcode_session::AppendToolCallRequestedInput {
+                    tool_call_id: "call".into(),
+                    producer_plugin_id: None,
+                    tool_name: "example.write".into(),
+                    arguments_json: "{}".into(),
+                    working_directory: None,
+                },
+            )
+            .await
+            .unwrap();
+        let before = sessions.current_session_generation(child.id).await.unwrap();
+        let state = Arc::new(test_server_state(sessions));
+        assert!(
+            recover_abandoned_session_runtime_work(&state, child.id)
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            state
+                .sessions
+                .current_session_generation(child.id)
+                .await
+                .unwrap(),
+            before
+        );
+        assert_eq!(
+            state
+                .sessions
+                .active_tool_runs(child.id)
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+        drop(state);
+    }
+
+    #[tokio::test]
     async fn abandoned_tool_recovery_records_unknown_outcome_without_rerunning() {
         let root = tempfile::tempdir().expect("session root");
         let sessions = SessionManager::persistent(root.path()).expect("persistent session manager");
@@ -63003,6 +63104,39 @@ event_symbol = "bcode_plugin_handle_event_v1"
             std::fs::read(guarded_path).expect("guarded image bytes"),
             png_bytes
         );
+        drop(state);
+    }
+
+    #[tokio::test]
+    async fn tool_dispatch_persistence_failure_prevents_filesystem_effect() {
+        let workspace = tempfile::tempdir().unwrap();
+        let sessions = SessionManager::default();
+        let session = sessions
+            .create_session(None, workspace.path().to_path_buf())
+            .await
+            .unwrap();
+        let state = test_server_state_with_filesystem_plugin(sessions);
+        let target = workspace.path().join("must-not-exist");
+        let call = bcode_model::ToolCall {
+            id: "dispatch-failure".into(),
+            name: "filesystem.write".into(),
+            arguments: serde_json::json!({"path":target,"contents":"unauthorized effect"}),
+        };
+        let (tool, preparation) = prepare_server_tool(&state, session.id, &call)
+            .await
+            .unwrap();
+        let result = execute_model_tool(
+            &state,
+            SessionId::new(),
+            call,
+            workspace.path().to_path_buf(),
+            tool,
+            preparation,
+            Arc::new(TurnCancelState::default()),
+        )
+        .await;
+        assert!(result.is_none());
+        assert!(!target.exists());
         drop(state);
     }
 
@@ -82166,6 +82300,21 @@ event_symbol = "bcode_plugin_handle_event_v1"
                 payload: serde_json::json!({"sequence": sequence}),
             })
         };
+        // Production records the start synchronously at the invoker boundary; the
+        // queued runtime copy below must not duplicate that canonical event.
+        if let ScopedTurnEvent::InvocationLifecycle(event) = lifecycle(
+            0,
+            bcode_session_models::ToolInvocationLifecycleStage::Started,
+        ) {
+            state
+                .sessions
+                .append_event(
+                    session_id,
+                    SessionEventKind::ToolInvocationLifecycle { event },
+                )
+                .await
+                .unwrap();
+        }
         let (sink, receiver) = SessionInvocationSink::new(8);
         assert!(sink.emit(lifecycle(
             0,

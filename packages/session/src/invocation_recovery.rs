@@ -31,9 +31,16 @@ pub struct InvocationRecoveryCheckpoint {
     turn: SessionEvent,
     request: SessionEvent,
     permission: SessionEvent,
+    decision: Option<bool>,
 }
 
 impl InvocationRecoveryCheckpoint {
+    /// Recorded decision; inspect without granting dispatch authority.
+    #[must_use]
+    pub const fn is_approved(&self) -> bool {
+        matches!(self.decision, Some(true))
+    }
+
     /// Canonical session that owns this checkpoint.
     #[must_use]
     pub const fn session_id(&self) -> SessionId {
@@ -80,6 +87,11 @@ impl SessionManager {
         approved: bool,
     ) -> Result<SessionEvent, SessionError> {
         let session_id = checkpoint.session_id();
+        if checkpoint.decision.is_some() {
+            return Err(SessionError::EventSerialization(
+                "recovered permission already has a decision".into(),
+            ));
+        }
         let SessionEventKind::PermissionRequested { permission_id, .. } =
             &checkpoint.permission.kind
         else {
@@ -103,7 +115,47 @@ impl SessionManager {
         Ok(event)
     }
 
-    /// Read the canonical turn and invocation records for an unresolved authorization wait.
+    /// Persist a one-time dispatch marker for an approved recovered invocation.
+    ///
+    /// The caller must first verify current execution authority, plugin preparation, and
+    /// applicable policy. This only consumes the checkpoint; it does not execute a tool.
+    /// A crash after this marker is an ambiguous execution, never an automatic retry.
+    ///
+    /// # Errors
+    /// Rejects unresolved/denied decisions, stale generations, and ownership/storage failures.
+    pub async fn claim_recovered_invocation_dispatch(
+        &self,
+        checkpoint: &InvocationRecoveryCheckpoint,
+    ) -> Result<SessionEvent, SessionError> {
+        if checkpoint.decision != Some(true) {
+            return Err(SessionError::EventSerialization(
+                "recovered invocation is not approved".into(),
+            ));
+        }
+        let SessionEventKind::PositionedToolCallRequested { tool_call_id, .. } =
+            &checkpoint.request.kind
+        else {
+            unreachable!("checkpoints require positioned requests");
+        };
+        let session_id = checkpoint.session_id();
+        let handle = self.session_handle(session_id).await?;
+        let event = handle.append_event_at_generation(
+            SessionEventKind::ToolInvocationLifecycle { event: bcode_session_models::ToolInvocationLifecycleEvent {
+                invocation_id: tool_call_id.clone(), sequence: 0,
+                stage: bcode_session_models::ToolInvocationLifecycleStage::Started,
+                message: None,
+                metadata: serde_json::json!({"dispatch_boundary_version":1,"recovered":true}),
+            } },
+            checkpoint.generation, self.next_activity_timestamp_ms(),
+        ).await?;
+        let summary = handle.summary().await?;
+        self.release_persistent_idle_session_resources(session_id)
+            .await;
+        self.publish_committed_mutation(event.clone(), summary);
+        Ok(event)
+    }
+
+    /// Read the canonical turn and invocation records for an authorization wait or decision.
     ///
     /// Only positioned requests with an exact canonical user-turn identity are accepted.
     /// Unpositioned requests, changed generations, incomplete reads, and request-only context
@@ -130,23 +182,35 @@ impl SessionManager {
                 max_events.min(1024),
             )
             .await?;
-        let InvocationRecoveryObservation::WaitingForPermission { permission_id } =
-            observe(&events, invocation_id, request_sequence, generation)
-        else {
-            return Ok(None);
-        };
+        let (permission_id, decision) =
+            match observe(&events, invocation_id, request_sequence, generation) {
+                InvocationRecoveryObservation::WaitingForPermission { permission_id } => {
+                    (permission_id, None)
+                }
+                InvocationRecoveryObservation::PermissionDecided {
+                    permission_id,
+                    approved,
+                } => (permission_id, Some(approved)),
+                _ => return Ok(None),
+            };
         let Some(request) = events.first() else {
             return Ok(None);
         };
         let SessionEventKind::PositionedToolCallRequested {
             turn_id,
-            producer_plugin_id: Some(_),
-            working_directory: Some(_),
+            producer_plugin_id: Some(producer),
+            working_directory: Some(working_directory),
             ..
         } = &request.kind
         else {
             return Ok(None);
         };
+        if producer.trim().is_empty()
+            || !working_directory.is_absolute()
+            || self.session_working_directory(session_id).await? != *working_directory
+        {
+            return Ok(None);
+        }
         let Some(sequence) = turn_id
             .strip_prefix(&format!("{session_id}-"))
             .and_then(|value| value.parse::<u64>().ok())
@@ -186,6 +250,7 @@ impl SessionManager {
             turn,
             request: request.clone(),
             permission,
+            decision,
         }))
     }
 
@@ -247,14 +312,16 @@ fn observe(
             tool_call_id,
             tool_name,
             arguments_json,
+            producer_plugin_id,
             ..
         }
         | SessionEventKind::PositionedToolCallRequested {
             tool_call_id,
             tool_name,
             arguments_json,
+            producer_plugin_id,
             ..
-        } if tool_call_id == invocation => (tool_name, arguments_json),
+        } if tool_call_id == invocation => (tool_name, arguments_json, producer_plugin_id),
         _ => return Unverifiable,
     };
     let mut permission = None;
@@ -266,9 +333,12 @@ fn observe(
                 permission_id,
                 tool_name,
                 arguments_json,
+                producer_plugin_id,
                 ..
             } if tool_call_id == invocation => {
-                if permission.is_some() || (tool_name, arguments_json) != request {
+                if permission.is_some()
+                    || (tool_name, arguments_json, producer_plugin_id) != request
+                {
                     return Unverifiable;
                 }
                 permission = Some(permission_id.clone());
@@ -309,8 +379,59 @@ fn observe(
 mod tests {
     use super::*;
 
+    #[test]
+    fn mismatched_permission_producer_is_not_recoverable() {
+        let session_id = SessionId::new();
+        let event = |sequence, kind| SessionEvent {
+            schema_version: bcode_session_models::CURRENT_SESSION_EVENT_SCHEMA_VERSION,
+            sequence,
+            timestamp_ms: sequence,
+            session_id,
+            provenance: None,
+            kind,
+        };
+        let events = vec![
+            event(
+                1,
+                SessionEventKind::ToolCallRequested {
+                    tool_call_id: "call".into(),
+                    producer_plugin_id: Some("original".into()),
+                    tool_name: "write".into(),
+                    arguments_json: "{}".into(),
+                    working_directory: None,
+                },
+            ),
+            event(
+                2,
+                SessionEventKind::PermissionRequested {
+                    permission_id: "permission".into(),
+                    tool_call_id: "call".into(),
+                    producer_plugin_id: Some("other".into()),
+                    tool_name: "write".into(),
+                    arguments_json: "{}".into(),
+                    batch: None,
+                    policy_source: None,
+                    policy_reason: None,
+                },
+            ),
+        ];
+        assert_eq!(
+            observe(&events, "call", 1, 2),
+            InvocationRecoveryObservation::Unverifiable
+        );
+    }
+
     #[tokio::test]
     async fn positioned_checkpoint_reopens_exact_turn_request_and_permission() {
+        verify_positioned_checkpoint(false).await;
+    }
+
+    #[tokio::test]
+    async fn approved_checkpoint_dispatch_is_claimed_once_across_reopen() {
+        verify_positioned_checkpoint(true).await;
+    }
+
+    async fn verify_positioned_checkpoint(approved: bool) {
         let root = tempfile::tempdir().unwrap();
         let manager = SessionManager::persistent(root.path()).unwrap();
         let session = manager
@@ -338,7 +459,7 @@ mod tests {
                     producer_plugin_id: Some("example.tool".into()),
                     tool_name: "example.write".into(),
                     arguments_json: "{}".into(),
-                    working_directory: Some(root.path().to_path_buf()),
+                    working_directory: Some(session.working_directory.clone()),
                 },
             )
             .await
@@ -378,7 +499,7 @@ mod tests {
             Some(checkpoint.clone())
         );
         restored
-            .append_recovered_permission_decision(&checkpoint, false)
+            .append_recovered_permission_decision(&checkpoint, approved)
             .await
             .unwrap();
         assert!(matches!(
@@ -394,12 +515,77 @@ mod tests {
                 .unwrap(),
             checkpoint.generation() + 1
         );
+        let decided = restored
+            .invocation_recovery_checkpoint(session.id, "call", request.sequence, 16)
+            .await
+            .unwrap()
+            .unwrap();
+        if approved {
+            assert_approved_checkpoint(restored, &decided, root.path()).await;
+        } else {
+            assert_denied_checkpoint(&restored, &decided).await;
+        }
+    }
+
+    async fn assert_approved_checkpoint(
+        restored: SessionManager,
+        decided: &InvocationRecoveryCheckpoint,
+        root: &std::path::Path,
+    ) {
+        assert!(decided.is_approved());
+        let event = restored
+            .claim_recovered_invocation_dispatch(decided)
+            .await
+            .unwrap();
+        assert_eq!(event.sequence, decided.generation() + 1);
+        assert!(matches!(
+            restored.claim_recovered_invocation_dispatch(decided).await,
+            Err(SessionError::AppendGenerationChanged { .. })
+        ));
+        let session_id = decided.session_id();
+        let request_sequence = decided.request().sequence;
+        restored
+            .release_session_ownership(session_id)
+            .await
+            .unwrap();
+        drop(restored);
+        let reopened = SessionManager::persistent(root).unwrap();
         assert!(
-            restored
-                .invocation_recovery_checkpoint(session.id, "call", request.sequence, 16)
+            reopened
+                .invocation_recovery_checkpoint(session_id, "call", request_sequence, 32)
                 .await
                 .unwrap()
                 .is_none()
+        );
+        assert!(matches!(
+            reopened.claim_recovered_invocation_dispatch(decided).await,
+            Err(SessionError::AppendGenerationChanged { .. })
+        ));
+        assert_eq!(
+            reopened
+                .current_session_generation(session_id)
+                .await
+                .unwrap(),
+            event.sequence
+        );
+    }
+
+    async fn assert_denied_checkpoint(
+        restored: &SessionManager,
+        decided: &InvocationRecoveryCheckpoint,
+    ) {
+        assert!(!decided.is_approved());
+        assert!(
+            restored
+                .claim_recovered_invocation_dispatch(decided)
+                .await
+                .is_err()
+        );
+        assert!(
+            restored
+                .append_recovered_permission_decision(decided, true)
+                .await
+                .is_err()
         );
     }
 
