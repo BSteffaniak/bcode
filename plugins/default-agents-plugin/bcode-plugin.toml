@@ -43,6 +43,16 @@ build_tools = [
     "question",
     "ask",
 ]
+# These tools mutate only the authenticated active run. Application policy, ownership,
+# exact-candidate publication, execution ceilings and downstream tool permissions still apply.
+build_preauthorizations = [
+    "workflow.stage_task_group",
+    "workflow.stage_agent_task",
+    "workflow.stage_prompt_task",
+    "workflow.stage_run_graph_edit",
+    "workflow.publish_run_graph_edit",
+    "workflow.accept_run_graph_publication",
+]
 plan_disabled_tools = [
     "workflow.stage_task_group",
     "workflow.stage_agent_task",

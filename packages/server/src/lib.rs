@@ -454,6 +454,7 @@ pub struct ServerState {
     client_forwarders: Mutex<BTreeMap<ClientId, Vec<JoinHandle<()>>>>,
     event_clients: Mutex<BTreeMap<ClientId, CatalogEventSubscription>>,
     workflow_event_clients: Mutex<BTreeMap<ClientId, ClientEventSink>>,
+    interaction_invalidations: tokio::sync::broadcast::Sender<SessionId>,
     workflow_event_forwarder_started: std::sync::atomic::AtomicBool,
     workflow_event_forwarder: Mutex<Option<JoinHandle<()>>>,
     workflow_event_forwarder_failed: std::sync::atomic::AtomicBool,
@@ -2371,6 +2372,7 @@ impl ServerState {
             client_forwarders: Mutex::default(),
             event_clients: Mutex::default(),
             workflow_event_clients: Mutex::default(),
+            interaction_invalidations: tokio::sync::broadcast::channel(256).0,
             workflow_event_forwarder_started: std::sync::atomic::AtomicBool::new(false),
             workflow_event_forwarder: Mutex::new(None),
             workflow_event_forwarder_failed: std::sync::atomic::AtomicBool::new(false),
@@ -7949,7 +7951,7 @@ async fn handle_workflow_run_request(
             send_response(writer, request_id, response).await
         }
         RuntimeAndModelRequest::WorkflowRunView { run_id, limit } => {
-            let view = workflow_operations::run_view(state, &run_id, limit)?;
+            let view = workflow_operations::run_view(state, &run_id, limit).await?;
             send_response(
                 writer,
                 request_id,
@@ -13330,8 +13332,13 @@ async fn handle_attach_session(
             let sink = ClientEventSink::new(client_id, writer.clone(), state.metrics.clone());
             send_live_checkpoints(&sink, &attachment.live_checkpoints).await?;
             send_active_runtime_snapshots(state, session_id, &sink).await?;
-            let handle =
-                forward_session_events(sink, session_id, attachment.events, attachment.live_events);
+            let handle = forward_session_events(
+                sink,
+                session_id,
+                state.interaction_invalidations.subscribe(),
+                attachment.events,
+                attachment.live_events,
+            );
             state.register_client_forwarder(client_id, handle).await;
             Ok(())
         }
@@ -13630,8 +13637,13 @@ async fn finish_attach_session_projection_window_success(
     );
     send_live_checkpoints(&sink, &attachment.live_checkpoints).await?;
     send_active_runtime_snapshots(state, session_id, &sink).await?;
-    let handle =
-        forward_session_events(sink, session_id, attachment.events, attachment.live_events);
+    let handle = forward_session_events(
+        sink,
+        session_id,
+        state.interaction_invalidations.subscribe(),
+        attachment.events,
+        attachment.live_events,
+    );
     state
         .register_client_forwarder(context.client_id, handle)
         .await;
@@ -13722,8 +13734,13 @@ async fn finish_attach_session_recent_success(
     );
     send_live_checkpoints(&sink, &attachment.live_checkpoints).await?;
     send_active_runtime_snapshots(state, session_id, &sink).await?;
-    let handle =
-        forward_session_events(sink, session_id, attachment.events, attachment.live_events);
+    let handle = forward_session_events(
+        sink,
+        session_id,
+        state.interaction_invalidations.subscribe(),
+        attachment.events,
+        attachment.live_events,
+    );
     state
         .register_client_forwarder(context.client_id, handle)
         .await;
@@ -36204,6 +36221,7 @@ impl Drop for SessionForwarderLifetime {
 fn forward_session_events(
     sink: ClientEventSink,
     session_id: SessionId,
+    mut interaction_invalidations: tokio::sync::broadcast::Receiver<SessionId>,
     mut events: tokio::sync::broadcast::Receiver<bcode_session_models::SessionEvent>,
     mut live_events: tokio::sync::broadcast::Receiver<bcode_session_models::SessionLiveEvent>,
 ) -> JoinHandle<()> {
@@ -36293,6 +36311,19 @@ fn forward_session_events(
                                 );
                             }
                             break;
+                        }
+                    }
+                }
+                invalidation = interaction_invalidations.recv() => {
+                    match invalidation {
+                        Ok(destination) if destination != session_id => {},
+                        Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                        Ok(_) | Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
+                            // Routed decisions do not append events to the destination's history.
+                            // Notify its actual session stream, not only workflow-watch clients.
+                            if send_session_resync_required(&sink, session_id, "interaction").await.is_err() {
+                                break;
+                            }
                         }
                     }
                 }
@@ -36977,6 +37008,35 @@ mod tests {
             workflow_operations::run_view_collection_limit(usize::MAX),
             1_000
         );
+    }
+
+    #[tokio::test]
+    async fn run_view_reports_child_tool_permission_separately_from_workflow_gates() {
+        let (state, child, _root) = active_edit_execution_fixture_with_graph(
+            bcode_workflow_store::DispatchSideEffect::ReadOnly,
+            false,
+        )
+        .await;
+        let pending = pending_permission_for_batch("attention", child, 0, "attention-batch");
+        state
+            .pending_permissions
+            .lock()
+            .await
+            .insert("attention".into(), pending);
+        let view = workflow_operations::run_view(&state, "edit-run", 10)
+            .await
+            .unwrap();
+        assert_eq!(view.run.attention.pending_approvals, 0);
+        assert_eq!(view.run.attention.pending_tool_permissions, 1);
+        assert!(view.run.attention.needs_attention());
+        assert_eq!(view.tool_permissions[0].session_id, child.to_string());
+        assert_eq!(view.tool_permissions[0].permission_id, "attention");
+        state.pending_permissions.lock().await.clear();
+        let view = workflow_operations::run_view(&state, "edit-run", 10)
+            .await
+            .unwrap();
+        assert_eq!(view.run.attention.pending_tool_permissions, 0);
+        assert!(view.tool_permissions.is_empty());
     }
 
     #[tokio::test]
@@ -53806,6 +53866,68 @@ library = "test"
         assert_eq!(staged, Some(edit));
     }
 
+    #[tokio::test]
+    async fn active_execution_stages_with_default_policy_without_permission_prompt() {
+        let (mut state, session, _root) = active_edit_execution_fixture_with_graph(
+            bcode_workflow_store::DispatchSideEffect::ReadOnly,
+            false,
+        )
+        .await;
+        state.plugins = bcode_plugin::PluginRuntimeHost::load_defaults_with_static_bundled(
+            &bcode_plugin::PluginSelection {
+                mode: bcode_plugin::PluginSelectionMode::Explicit,
+                enabled: BTreeSet::from(["bcode.workflow".into(), "bcode.default-agents".into()]),
+                disabled: BTreeSet::new(),
+            },
+            &[
+                bcode_plugin::StaticBundledPlugin::new(
+                    include_str!("../../../plugins/workflow-plugin/bcode-plugin.toml"),
+                    bcode_workflow_plugin::static_plugin(),
+                ),
+                bcode_plugin::StaticBundledPlugin::new(
+                    include_str!("../../../plugins/default-agents-plugin/bcode-plugin.toml"),
+                    bcode_default_agents_plugin::static_plugin(),
+                ),
+            ],
+        )
+        .unwrap();
+        let activation = state
+            .sessions
+            .session_summary(session)
+            .await
+            .unwrap()
+            .execution
+            .unwrap()
+            .provenance
+            .activation_id
+            .unwrap();
+        let (_, call) = task_staging_call(activation, true);
+        let (tool, preparation) = prepare_server_tool(&state, session, &call).await.unwrap();
+        let metadata =
+            tool_policy_authorization_metadata(&preparation.authorization, &call.name).unwrap();
+        let response = tokio::time::timeout(
+            Duration::from_secs(5),
+            invoke_prepared_tool_for_test(
+                &state,
+                session,
+                &call,
+                tool,
+                preparation,
+                &metadata,
+                &TurnCancelState::default(),
+            ),
+        )
+        .await
+        .expect("preauthorized staging must not wait for permission")
+        .unwrap();
+        assert!(!response.is_error, "{}", response.output);
+        assert!(
+            interaction_operations::list_permissions(&state)
+                .await
+                .is_empty()
+        );
+    }
+
     async fn invoke_task_with_permission(
         state: &ServerState,
         session_id: SessionId,
@@ -61808,7 +61930,9 @@ event_symbol = "bcode_plugin_handle_event_v1"
         );
     }
 
+    #[cfg(unix)]
     #[tokio::test]
+    #[allow(clippy::too_many_lines)]
     async fn routed_permission_keeps_source_authority_and_resolves_once() {
         let sessions = SessionManager::default();
         let source = sessions
@@ -61821,7 +61945,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
             .await
             .unwrap()
             .id;
-        let state = test_server_state(sessions);
+        let state = Arc::new(test_server_state(sessions));
         let (followup_commands, _) = mpsc::channel(1);
         let (steering_commands, _) = mpsc::channel(1);
         let (cancel_commands, _) = mpsc::channel(1);
@@ -61850,6 +61974,28 @@ event_symbol = "bcode_plugin_handle_event_v1"
             },
         );
         assert_routed_exchange(&state, source, destination).await;
+        let socket_dir = tempfile::tempdir().unwrap();
+        let endpoint = bcode_ipc::IpcEndpoint::unix_socket(socket_dir.path().join("routed.sock"));
+        let listener = LocalIpcListener::bind(&endpoint).unwrap();
+        let server_state = Arc::clone(&state);
+        let server = tokio::spawn(async move {
+            let stream = listener.accept().await.unwrap();
+            handle_client(stream, server_state).await.unwrap();
+        });
+        let client = bcode_client::BcodeClient::new(endpoint);
+        let mut connection = client.connect("routed-permission-test").await.unwrap();
+        connection
+            .attach_session_projection_window_with_input_history(
+                destination,
+                projection_ipc_window_request(
+                    bcode_session_models::ProjectionWindowAnchor::Latest,
+                    bcode_session_models::ProjectionWindowDirection::Backward,
+                ),
+            )
+            .await
+            .unwrap();
+        assert!(state.workflow_event_clients.lock().await.is_empty());
+        let mut invalidations = state.interaction_invalidations.subscribe();
         let mut pending = pending_permission_for_batch("routed", source, 0, "unused");
         pending.summary.batch = None;
         let event = SessionEventKind::PermissionRequested {
@@ -61866,15 +62012,38 @@ event_symbol = "bcode_plugin_handle_event_v1"
             .await
             .unwrap();
         let listed = interaction_operations::list_permissions(&state).await;
+        assert_eq!(invalidations.try_recv().unwrap(), destination);
         assert_eq!(listed.len(), 1);
         assert_eq!(listed[0].session_id, source);
         assert_eq!(listed[0].interaction_route, Some(route));
         assert!(listed[0].is_addressed_to(destination));
         assert!(!listed[0].is_addressed_to(SessionId::new()));
         assert_eq!(*pending.decision.lock().await, None);
+        assert!(matches!(
+            tokio::time::timeout(Duration::from_secs(2), connection.recv_event()).await.unwrap().unwrap(),
+            bcode_ipc::Event::SessionViewResyncRequired { session_id } if session_id == destination
+        ));
         assert!(interaction_operations::resolve_permission(&state, "routed", true, false).await);
         assert!(!interaction_operations::resolve_permission(&state, "routed", false, false).await);
         assert_eq!(*pending.decision.lock().await, Some(true));
+        assert_eq!(invalidations.try_recv().unwrap(), destination);
+        let mut cancelled = pending_permission_for_batch("cancelled-routed", source, 0, "unused");
+        cancelled.summary.batch = None;
+        cancelled.summary.interaction_route = listed[0].interaction_route.clone();
+        state
+            .pending_permissions
+            .lock()
+            .await
+            .insert("cancelled-routed".into(), cancelled.clone());
+        assert!(
+            interaction_operations::cancel_pending_permission(&state, "cancelled-routed").await
+        );
+        assert!(
+            !interaction_operations::resolve_permission(&state, "cancelled-routed", true, false)
+                .await
+        );
+        assert_eq!(*cancelled.decision.lock().await, Some(false));
+        assert_eq!(invalidations.try_recv().unwrap(), destination);
         assert!(
             interaction_operations::list_permissions(&state)
                 .await
@@ -61891,6 +62060,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
             SessionEventKind::PermissionRequested { .. }
                 | SessionEventKind::PermissionResolved { .. }
         )));
+        server.abort();
         drop(state);
     }
 
@@ -65526,21 +65696,8 @@ event_symbol = "bcode_plugin_handle_event_v1"
         ));
 
         let client_id = connection.client_id().expect("client id");
-        connection
-            .subscribe_catalog_updates()
-            .await
-            .expect("register event client");
-        let sink = state
-            .event_clients
-            .lock()
-            .await
-            .get(&client_id)
-            .expect("registered event client")
-            .sink
-            .clone();
-        sink.send(bcode_ipc::Event::SessionViewResyncRequired { session_id })
-            .await
-            .expect("resync event");
+        assert!(state.workflow_event_clients.lock().await.is_empty());
+        state.interaction_invalidations.send(session_id).unwrap();
         assert!(matches!(
             tokio::time::timeout(Duration::from_secs(2), connection.recv_event())
                 .await
@@ -65657,7 +65814,6 @@ event_symbol = "bcode_plugin_handle_event_v1"
         // Keep one attachment alive while replacing the observed connection. A final detach is a
         // session-unload boundary and correctly clears transient state rather than replaying it.
         state.abort_client_forwarders(client_id).await;
-        drop(sink);
         tokio::time::timeout(Duration::from_secs(2), async {
             // Already buffered events may precede EOF, but no new producer remains.
             while connection.recv_event_without_reconnect().await.is_ok() {}

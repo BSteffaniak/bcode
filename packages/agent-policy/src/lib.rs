@@ -247,6 +247,22 @@ fn evaluate_mutating_fallback(
     request: &EvaluateToolCallRequest,
 ) -> PolicyEvaluation {
     if tool_enabled(config, request) == Some(true) {
+        if let Some(action) = config.permission.tools.get(&request.tool_name) {
+            let decision = match action {
+                Action::Allow => AgentDecision::Allow,
+                Action::Ask => AgentDecision::Ask,
+                Action::Deny => AgentDecision::Deny,
+            };
+            return evaluation(
+                decision,
+                format!(
+                    "{} agent tool rule for {}: {action:?}",
+                    request.agent_id, request.tool_name
+                ),
+                Some(request.tool_name.clone()),
+                None,
+            );
+        }
         evaluation(
             AgentDecision::Ask,
             format!(

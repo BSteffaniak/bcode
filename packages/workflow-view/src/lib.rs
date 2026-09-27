@@ -228,6 +228,7 @@ pub fn project_run(input: WorkflowRunProjectionInput) -> WorkflowRunView {
             .filter_map(project_failure_diagnostic)
             .collect(),
         descendant_runs: input.descendant_runs,
+        tool_permissions: Vec::new(),
         child_sessions: input.child_sessions,
         actions,
         terminal,

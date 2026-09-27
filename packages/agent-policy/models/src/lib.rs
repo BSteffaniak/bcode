@@ -55,6 +55,10 @@ pub struct AgentConfig {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ConfigDoc)]
 #[config_doc(section = "permission")]
 pub struct PermissionConfig {
+    /// Exact tool rules for generic mutating operations. Application authorization still applies.
+    #[config_doc(map_key = "<tool-id>")]
+    #[serde(default)]
+    pub tools: BTreeMap<String, Action>,
     /// Shell command rules.
     #[config_doc(map_key = "<pattern>")]
     #[serde(default)]
@@ -88,6 +92,7 @@ pub struct PermissionConfig {
 impl Default for PermissionConfig {
     fn default() -> Self {
         Self {
+            tools: BTreeMap::new(),
             command: BTreeMap::new(),
             command_patterns: BTreeMap::new(),
             read: BTreeMap::new(),

@@ -7,7 +7,7 @@
 use serde::{Deserialize, Serialize};
 
 /// Current workflow projection schema version.
-pub const WORKFLOW_VIEW_VERSION: u32 = 4;
+pub const WORKFLOW_VIEW_VERSION: u32 = 5;
 
 /// Current workflow live-event contract version.
 pub const WORKFLOW_LIVE_EVENT_VERSION: u32 = 1;
@@ -252,6 +252,8 @@ pub struct WorkflowAttentionSummary {
     pub pending_inputs: u32,
     pub pending_approvals: u32,
     pub pending_mutation_approvals: u32,
+    /// Live tool decisions required by execution sessions, separate from workflow gates.
+    pub pending_tool_permissions: u32,
     pub retryable_failures: u32,
     pub repair_required: bool,
 }
@@ -263,6 +265,7 @@ impl WorkflowAttentionSummary {
         self.pending_inputs > 0
             || self.pending_approvals > 0
             || self.pending_mutation_approvals > 0
+            || self.pending_tool_permissions > 0
             || self.retryable_failures > 0
             || self.repair_required
     }
@@ -448,10 +451,24 @@ pub struct WorkflowRunView {
     /// Bounded canonical diagnostics explaining terminal or node failure.
     pub failure_diagnostics: Vec<WorkflowFailureDiagnostic>,
     pub descendant_runs: Vec<WorkflowDescendantRunView>,
+    /// Live tool permission requests correlated to bounded execution-session links.
+    pub tool_permissions: Vec<WorkflowToolPermissionView>,
     pub child_sessions: Vec<WorkflowChildSessionView>,
     pub actions: Vec<WorkflowActionAffordance>,
     pub terminal: Option<WorkflowTerminalView>,
     pub health: WorkflowProjectionHealth,
+}
+
+/// A live tool decision owned by an execution session, not a workflow approval gate.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WorkflowToolPermissionView {
+    pub node_id: String,
+    pub activation_id: String,
+    pub attempt: u32,
+    pub session_id: String,
+    pub permission_id: String,
+    pub tool_name: String,
 }
 
 impl WorkflowRunView {
@@ -971,6 +988,7 @@ mod live_event_tests {
             outputs: Vec::new(),
             failure_diagnostics: Vec::new(),
             descendant_runs: Vec::new(),
+            tool_permissions: Vec::new(),
             child_sessions: Vec::new(),
             actions: vec![WorkflowActionAffordance {
                 kind: WorkflowActionKind::RetryNode,

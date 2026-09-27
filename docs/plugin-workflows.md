@@ -63,7 +63,17 @@ Pending permission summaries retain the canonical source session and carry the d
 TUI and web permission lists include requests addressed to the viewed session. Resolution uses the
 original permission owner and existing authorization path; routing grants no approval authority and
 never copies permission history into the destination. Live destination invalidations request a normal
-snapshot refresh. Permission identities include the daemon instance to avoid reuse across restarts.
+snapshot refresh on the destination's session stream as well as workflow-watch connections.
+A client need not subscribe to workflow events to receive a routed permission or exchange
+invalidation. Lag on the bounded invalidation channel requires resynchronization rather than
+silently losing a decision. Permission identities include the daemon instance to avoid reuse
+across restarts.
+
+Workflow run-view version 5 includes bounded `tool_permissions` correlated to execution-session
+links and a separate `pending_tool_permissions` attention count. The inspector distinguishes
+these from workflow approval gates. This is a live run-detail observation, not durable wait
+storage; catalog filtering is still based on durable workflow gates and does not yet include
+these live tool decisions.
 
 This is a same-daemon permission-notification implementation, **not** a durable execution messaging
 transport. Pending decisions remain daemon-memory observations. Cross-daemon routing, arbitrary

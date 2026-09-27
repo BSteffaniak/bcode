@@ -35,6 +35,7 @@ struct DefaultAgentsManifestExtension {
 struct AgentDefaultsManifestExtension {
     build_tools: Vec<String>,
     plan_disabled_tools: Vec<String>,
+    build_preauthorizations: Vec<String>,
 }
 
 fn manifest_defaults() -> Result<AgentDefaultsManifestExtension, toml::de::Error> {
@@ -64,6 +65,12 @@ fn default_config_with_defaults(defaults: AgentDefaultsManifestExtension) -> Age
     let mut config = policy_default_config();
     if let Some(build) = config.agent.get_mut(BUILD_AGENT) {
         set_default_tools(build, &defaults.build_tools, true);
+        build.permission.tools.extend(
+            defaults
+                .build_preauthorizations
+                .iter()
+                .map(|tool| (tool.clone(), bcode_agent_policy::Action::Allow)),
+        );
     }
     if let Some(plan) = config.agent.get_mut(PLAN_AGENT) {
         set_default_tools(plan, &defaults.build_tools, true);
@@ -1005,6 +1012,49 @@ tools = { "filesystem.read" = true }
         assert!(tools.contains(&"ask".to_string()));
         assert!(tools.contains(&"ocr.extract".to_string()));
         assert!(tools.contains(&"filesystem.grep".to_string()));
+    }
+
+    #[test]
+    fn workflow_coordination_defaults_allow_but_explicit_policy_still_wins() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let root = unique_temp_dir();
+        let _state = StateGuard::set(&root.join("missing-permissions.toml"));
+        for tool in manifest_defaults().unwrap().build_preauthorizations {
+            let mut request = EvaluateToolCallRequest {
+                session_id: SessionId::new(),
+                agent_id: BUILD_AGENT.into(),
+                tool_name: tool.clone(),
+                operation: bcode_agent_profile::ToolPolicyOperation::Mutating,
+                aliases: Vec::new(),
+                requires_permission: true,
+                policy_profile: None,
+                cwd: Some("/tmp/project".into()),
+                effective_config_toml: Some(Box::new(String::new())),
+            };
+            assert_eq!(
+                evaluate_tool_request(&request).unwrap().decision,
+                AgentDecision::Allow
+            );
+            for (action, expected) in [("ask", AgentDecision::Ask), ("deny", AgentDecision::Deny)] {
+                request.effective_config_toml = Some(Box::new(format!(
+                    "[agent.build.permission.tools]\n\"{tool}\" = \"{action}\"\n"
+                )));
+                assert_eq!(evaluate_tool_request(&request).unwrap().decision, expected);
+            }
+            request.effective_config_toml = Some(Box::new(format!(
+                "[agent.build.tools]\n\"{tool}\" = false\n"
+            )));
+            assert_eq!(
+                evaluate_tool_request(&request).unwrap().decision,
+                AgentDecision::Deny
+            );
+            request.agent_id = PLAN_AGENT.into();
+            request.effective_config_toml = Some(Box::new(String::new()));
+            assert_eq!(
+                evaluate_tool_request(&request).unwrap().decision,
+                AgentDecision::Deny
+            );
+        }
     }
 
     #[test]

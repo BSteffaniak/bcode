@@ -6643,6 +6643,15 @@ fn inspector_approval_lines(
             lines.push(Line::from(format!("Warning: {warning}")));
         }
     }
+    for permission in &run.tool_permissions {
+        lines.push(Line::from(format!(
+            "Tool permission · {} · {} · session {} · request {}",
+            permission.node_id,
+            permission.tool_name,
+            permission.session_id,
+            permission.permission_id
+        )));
+    }
     if lines.is_empty() {
         lines.push(Line::from("No pending approvals"));
     }
@@ -7704,6 +7713,7 @@ mod tests {
                 occurred_at_ms: 3,
             }],
             descendant_runs: Vec::new(),
+            tool_permissions: Vec::new(),
             child_sessions: vec![bcode_workflow_view_models::WorkflowChildSessionView {
                 node_id: "reviewer".to_string(),
                 activation_id: "activation-1".to_string(),

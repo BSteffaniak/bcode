@@ -2411,13 +2411,13 @@ pub fn run_view_collection_limit(requested: usize) -> usize {
 }
 
 #[allow(clippy::too_many_lines)]
-pub fn run_view(
+pub async fn run_view(
     state: &ServerState,
     run_id: &str,
     limit: usize,
 ) -> Result<bcode_workflow_view_models::WorkflowRunView, super::ServerError> {
     let limit = run_view_collection_limit(limit);
-    let view = {
+    let mut view = {
         let store = state
             .workflow_store
             .lock()
@@ -2670,7 +2670,43 @@ pub fn run_view(
                 .collect(),
         })
     };
+    let permissions = state.pending_permissions.lock().await;
+    project_tool_permissions(
+        &mut view,
+        permissions.values().map(|permission| &permission.summary),
+        limit,
+    );
+    drop(permissions);
     Ok(view)
+}
+
+fn project_tool_permissions<'a>(
+    view: &mut bcode_workflow_view_models::WorkflowRunView,
+    permissions: impl Iterator<Item = &'a bcode_session_models::PermissionSummary>,
+    limit: usize,
+) {
+    let links = view
+        .child_sessions
+        .iter()
+        .map(|link| (link.session_id.as_str(), link))
+        .collect::<BTreeMap<_, _>>();
+    view.tool_permissions = permissions
+        .filter_map(|permission| {
+            let session_id = permission.session_id.to_string();
+            let link = links.get(session_id.as_str())?;
+            Some(bcode_workflow_view_models::WorkflowToolPermissionView {
+                node_id: link.node_id.clone(),
+                activation_id: link.activation_id.clone(),
+                attempt: link.attempt,
+                session_id,
+                permission_id: permission.permission_id.clone(),
+                tool_name: permission.tool_name.clone(),
+            })
+        })
+        .take(limit)
+        .collect();
+    view.run.attention.pending_tool_permissions =
+        u32::try_from(view.tool_permissions.len()).unwrap_or(u32::MAX);
 }
 
 fn run_list_item(
@@ -2754,6 +2790,7 @@ fn run_list_item_with_summary(
         attention: bcode_workflow_view_models::WorkflowAttentionSummary {
             pending_inputs: summary.pending_inputs,
             pending_approvals: summary.pending_approvals,
+            pending_tool_permissions: 0,
             pending_mutation_approvals: summary.pending_mutation_approvals,
             retryable_failures: summary.retryable_failures,
             repair_required: run.status == bcode_workflow_store::RunStatus::RepairRequired

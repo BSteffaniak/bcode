@@ -179,6 +179,7 @@ pub fn evaluate_profile_tool_call(
 pub fn allow_all_agent_policy() -> AgentPermissionPolicy {
     let config = AgentConfig {
         permission: PermissionConfig {
+            tools: BTreeMap::new(),
             command: BTreeMap::from([("*".to_string(), Action::Allow)]),
             command_patterns: BTreeMap::new(),
             read: BTreeMap::from([("*".to_string(), Action::Allow)]),

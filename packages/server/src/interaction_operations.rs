@@ -280,6 +280,9 @@ async fn notify_route_destination(
     let Some(route) = route else {
         return;
     };
+    let _ = state
+        .interaction_invalidations
+        .send(route.destination_session_id);
     let sinks = state.workflow_event_sinks().await;
     futures::stream::iter(sinks)
         .for_each_concurrent(32, |sink| async move {

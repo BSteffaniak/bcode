@@ -66,6 +66,26 @@ For example, add this under `[agent.plan.permission.command_patterns]` to allow 
 * `edit` — path globs for `filesystem.edit`.
 * `external_directory` — a single action governing any tool argument that resolves outside the session working directory. This short-circuits before path-category matching: if a write path resolves outside `cwd` and `external_directory = "deny"`, the call is denied even when a more permissive `write` rule would match.
 
+## Workflow coordination defaults
+
+The bundled build agent preauthorizes the exact execution-scoped workflow staging and
+publication tools. This removes the redundant tool prompt, not application authorization:
+active execution identity, current run ownership, exact retained candidates, reconciliation,
+and the run capability ceiling are still checked. Workers' tool calls retain their own
+permission checks. Plan-agent coordination tools remain disabled.
+
+Generic mutating tools support exact-name overrides (no wildcard matching):
+
+```toml
+[agent.build.permission.tools]
+"workflow.stage_task_group" = "ask"
+"workflow.publish_run_graph_edit" = "deny"
+```
+
+These rules apply only to the generic mutating-operation fallback; they do not override
+filesystem, shell, or web operation rules or disabled tools. Declarative and runtime-state
+overlays retain their usual precedence. Unlisted mutating tools still ask by default.
+
 ## Actions
 
 * `allow` — run the tool immediately. No prompt.
