@@ -5417,6 +5417,7 @@ async fn recover_abandoned_tool_runs(
     active_runtime_ids: &BTreeSet<WorkId>,
 ) -> Result<(), ServerError> {
     let active_tool_runs = state.sessions.active_tool_runs(session_id).await?;
+    let mut continuation_required = false;
     for tool in active_tool_runs {
         if active_runtime_ids.contains(&WorkId::new(format!("tool_{}", tool.tool_call_id))) {
             continue;
@@ -5453,9 +5454,8 @@ async fn recover_abandoned_tool_runs(
             {
                 interaction_operations::restore_permission(state, checkpoint).await?;
             }
-            return Err(ServerError::WorkflowApplicationOperationUnauthorized(
-                "pending tool permission requires invocation continuation recovery; canonical work was preserved".into(),
-            ));
+            continuation_required = true;
+            continue;
         }
         let message = format!(
             "The daemon restarted while tool `{}` was running. Its outcome could not be verified, so Bcode did not execute it again.",
@@ -5480,6 +5480,11 @@ async fn recover_abandoned_tool_runs(
             )
             .await?;
         publish_session_event(state, &event).await;
+    }
+    if continuation_required {
+        return Err(ServerError::WorkflowApplicationOperationUnauthorized(
+            "pending tool permission requires invocation continuation recovery; canonical work was preserved".into(),
+        ));
     }
     Ok(())
 }
@@ -60465,6 +60470,85 @@ event_symbol = "bcode_plugin_handle_event_v1"
                 .len(),
             1
         );
+        drop(state);
+    }
+
+    #[tokio::test]
+    async fn recovery_restores_all_waits_not_only_the_first_request() {
+        let root = tempfile::tempdir().unwrap();
+        let sessions = SessionManager::persistent(root.path()).unwrap();
+        let session = sessions
+            .create_session(None, root.path().to_path_buf())
+            .await
+            .unwrap();
+        let turn = sessions
+            .append_event(
+                session.id,
+                SessionEventKind::UserMessage {
+                    client_id: ClientId::new(),
+                    text: "batch".into(),
+                    admission: bcode_session_models::TurnAdmissionMetadata::default(),
+                },
+            )
+            .await
+            .unwrap();
+        for index in 0..3 {
+            sessions
+                .append_event(
+                    session.id,
+                    SessionEventKind::PositionedToolCallRequested {
+                        turn_id: format!("{}-{}", session.id, turn.sequence),
+                        output_position: bcode_session_models::TurnOutputPosition::new(index),
+                        tool_call_id: format!("call-{index}"),
+                        producer_plugin_id: Some("example".into()),
+                        tool_name: "example.write".into(),
+                        arguments_json: "{}".into(),
+                        working_directory: Some(session.working_directory.clone()),
+                    },
+                )
+                .await
+                .unwrap();
+            sessions
+                .append_permission_requested(
+                    session.id,
+                    SessionEventKind::PermissionRequested {
+                        permission_id: format!("permission-{index}"),
+                        tool_call_id: format!("call-{index}"),
+                        producer_plugin_id: Some("example".into()),
+                        tool_name: "example.write".into(),
+                        arguments_json: "{}".into(),
+                        batch: None,
+                        policy_source: None,
+                        policy_reason: None,
+                    },
+                )
+                .await
+                .unwrap();
+        }
+        let generation = sessions
+            .current_session_generation(session.id)
+            .await
+            .unwrap();
+        let state = Arc::new(test_server_state(sessions));
+        for _ in 0..2 {
+            assert!(
+                recover_abandoned_session_runtime_work(&state, session.id)
+                    .await
+                    .is_err()
+            );
+            assert_eq!(
+                interaction_operations::list_permissions(&state).await.len(),
+                3
+            );
+            assert_eq!(
+                state
+                    .sessions
+                    .current_session_generation(session.id)
+                    .await
+                    .unwrap(),
+                generation
+            );
+        }
         drop(state);
     }
 
