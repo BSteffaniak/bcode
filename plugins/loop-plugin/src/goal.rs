@@ -157,6 +157,47 @@ pub fn attach_document(
     Ok(())
 }
 
+fn unblock_decision(arguments: &str) -> Result<(&str, bool), &'static str> {
+    let tokens = arguments.split_whitespace().collect::<Vec<_>>();
+    match tokens.as_slice() {
+        [activation, "approve"] => Ok((activation, true)),
+        [activation, "deny"] => Ok((activation, false)),
+        _ => Err(
+            "Usage: /goal.unblock <activation-id> approve|deny. Resolve the original permission/dependency first; this only decides whether the goal resumes.",
+        ),
+    }
+}
+
+pub fn unblock_response(session_id: SessionId, arguments: &str) -> InvokeCommandResponse {
+    let (activation_id, approved) = match unblock_decision(arguments) {
+        Ok(decision) => decision,
+        Err(message) => return status_response(message),
+    };
+    let activation_id = activation_id.to_owned();
+    let result = run_async(async move {
+        let client = BcodeClient::default_endpoint();
+        let Some(run) = client
+            .associated_workflow_run(workflow_binding_key(session_id))
+            .await?
+        else {
+            return Ok("No associated goal".to_string());
+        };
+        client
+            .resolve_workflow_approval(run.run_id, "loop.blocked".into(), activation_id, approved)
+            .await?;
+        Ok(if approved {
+            "Goal resume checkpoint approved. Original tool permissions remain enforced."
+                .to_string()
+        } else {
+            "Goal resume checkpoint denied.".to_string()
+        })
+    });
+    match result {
+        Ok(message) => status_response(&message),
+        Err(error) => status_response(&format!("Goal blocker resolution unavailable: {error}")),
+    }
+}
+
 pub fn progress_status(session_id: SessionId) -> InvokeCommandResponse {
     let result = run_async(async move {
         let client = BcodeClient::default_endpoint();
@@ -906,6 +947,27 @@ impl PluginTuiSurface for GoalSurface {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn unblock_requires_exact_activation_and_explicit_decision() {
+        assert_eq!(
+            unblock_decision("activation-1 approve"),
+            Ok(("activation-1", true))
+        );
+        assert_eq!(
+            unblock_decision("activation-1 deny"),
+            Ok(("activation-1", false))
+        );
+        for input in [
+            "",
+            "approve",
+            "activation-1",
+            "activation-1 yes",
+            "activation-1 approve extra",
+        ] {
+            assert!(unblock_decision(input).is_err(), "{input}");
+        }
+    }
 
     #[test]
     fn generation_modal_keeps_top_border_after_short_title() {

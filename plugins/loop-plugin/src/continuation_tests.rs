@@ -1,5 +1,5 @@
 use super::*;
-use crate::{LoopWorkflowInput, goal_workflow_spec, loop_workflow_spec};
+use crate::{LoopExternalBlocker, LoopWorkflowInput, goal_workflow_spec, loop_workflow_spec};
 
 #[test]
 fn continuation_failures_are_not_successful_commands() {
@@ -106,6 +106,7 @@ fn source(progress: bool) -> bcode_workflow::WorkflowContinuationSource {
             judgement_evaluation: None,
             iteration: 2,
             planning_ready: true,
+            external_blocker: LoopExternalBlocker::None,
             condition_met: false,
             evidence: vec!["remaining work".into()],
             summary: "incomplete".into(),

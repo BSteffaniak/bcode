@@ -25,6 +25,15 @@ therefore remain ordinary prompt/tool outcomes and never invalidate a workflow d
 authority. The prompt's explicit model, tool, timeout, context-target, and structured-output policy
 remain authoritative.
 
+### Explicit goal resume consent
+
+`/goal.status` identifies a blocked loop approval checkpoint and shows its exact activation ID.
+`/goal.unblock <activation-id> approve|deny` resolves that checkpoint through the existing workflow
+application API. The activation ID is required so a delayed command cannot approve a later checkpoint.
+Approval resumes from retained goal state; it does not approve the original tool permission or assert
+that an external dependency is satisfied. Resolve that original request first. This is an explicit
+user-controlled fallback, not automatic authenticated dependency resolution.
+
 ### Routed permission notifications
 
 Turn execution-options version 7 adds an explicit version-1 `interaction_route` with a
@@ -70,6 +79,31 @@ preparation and canonical authorization, including the question restriction, sti
 
 Use typed workflow composition for domain behavior and let the host own durable registration,
 execution, discovery, and lifecycle state.
+
+## Structured loop blockers
+
+New loop/goal definitions evaluate an `external_blocker` enum (`none`,
+`approval_required`, `input_required`, `dependency_required`). A non-`none` result
+parks at the durable `loop.blocked` approval gate before judgement or repeat, including
+when a contradictory completion flag is supplied. Scheduler passes and reopening
+the store do not spend another model turn or iteration. The normal authorized
+workflow approval operation addresses the exact run/node/activation; conflicting
+stale resolutions cannot change the accepted outcome. Approval means explicit consent
+to resume the goal, not approval of the underlying tool request or evidence that a
+dependency resolved. Denial fails the run without scheduling continuation. The gate
+forwards retained activation input; replacement goal-state input is rejected. Outgoing
+transforms restore the admitted objective, iteration limit and optional judgement policy
+from immutable run input, preserve retained iteration/evidence, clear the reported
+blocker and force completion false. A resume cannot attest successful completion.
+Existing persisted definitions retain their original input-gate semantics; this change
+applies to newly authored definitions and does not migrate or resolve existing waits.
+
+This is a reported blocker, not an authenticated dependency reference or permission
+approval. Automatic correlated dependency resolution, independent-run linkage and
+cross-daemon delivery remain unfinished. A permission decision does not itself
+resolve this gate. Existing persisted definitions are not rewritten. The judgement
+block contract is version 2 with the additional blocker field; old block declarations
+must fail compatibility checks rather than silently run under the new declaration.
 
 ## Loop iteration budgets
 

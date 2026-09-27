@@ -104,9 +104,18 @@ pub fn pinned_input_transform() -> bcode_workflow::WorkflowTransform {
         ("stop_condition", pinned("stop_condition")),
         ("max_iterations", pinned("max_iterations")),
         ("planning_ready", current("planning_ready")),
-        ("judgement_evaluation", pinned("judgement_evaluation")),
+        (
+            "judgement_evaluation",
+            Expr::Default {
+                value: Box::new(pinned("judgement_evaluation")),
+                default: Box::new(Expr::Constant {
+                    value: serde_json::Value::Null,
+                }),
+            },
+        ),
         ("iteration", current("iteration")),
         ("condition_met", current("condition_met")),
+        ("external_blocker", current("external_blocker")),
         ("evidence", current("evidence")),
         ("summary", current("summary")),
     ]
@@ -118,6 +127,28 @@ pub fn pinned_input_transform() -> bcode_workflow::WorkflowTransform {
         expression: Expr::Object { fields },
         output: bcode_workflow::ValueSchema::of::<LoopWorkflowIteration>(),
     }
+}
+
+/// Resume consent forwards retained state, never caller-supplied goal data.
+/// It clears the reported blocker but cannot attest completion or grant tool authority.
+pub fn resume_input_transform() -> bcode_workflow::WorkflowTransform {
+    use bcode_workflow::WorkflowTransformExpression as Expr;
+    let mut transform = pinned_input_transform();
+    if let Expr::Object { fields } = &mut transform.expression {
+        fields.insert(
+            "condition_met".into(),
+            Expr::Constant {
+                value: false.into(),
+            },
+        );
+        fields.insert(
+            "external_blocker".into(),
+            Expr::Constant {
+                value: "none".into(),
+            },
+        );
+    }
+    transform
 }
 
 pub fn manifest_block() -> bcode_workflow::WorkflowBlockDefinition {

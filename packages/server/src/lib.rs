@@ -13730,21 +13730,12 @@ async fn finish_attach_session_recent_success(
     Ok(())
 }
 
-async fn admit_turn(
+async fn validate_interaction_route(
     state: &ServerState,
     session_id: SessionId,
-    client_id: ClientId,
-    text: String,
-    admission: bcode_session_models::TurnAdmissionMetadata,
-) -> Result<
-    (
-        bcode_session_models::TurnAdmission,
-        Option<bcode_session_models::SessionEvent>,
-    ),
-    bcode_session::SessionError,
-> {
-    let mut admission = admission;
-    if let Some(route) = &admission.execution.interaction_route {
+    execution: &TurnExecutionOptions,
+) -> Result<(), bcode_session::SessionError> {
+    if let Some(route) = &execution.interaction_route {
         let source = state.sessions.session_summary(session_id).await?;
         let permitted = route.version == 1
             && (route.destination_session_id == session_id
@@ -13763,6 +13754,24 @@ async fn admit_turn(
             .session_summary(route.destination_session_id)
             .await?;
     }
+    Ok(())
+}
+
+async fn admit_turn(
+    state: &ServerState,
+    session_id: SessionId,
+    client_id: ClientId,
+    text: String,
+    admission: bcode_session_models::TurnAdmissionMetadata,
+) -> Result<
+    (
+        bcode_session_models::TurnAdmission,
+        Option<bcode_session_models::SessionEvent>,
+    ),
+    bcode_session::SessionError,
+> {
+    let mut admission = admission;
+    validate_interaction_route(state, session_id, &admission.execution).await?;
     if admission.execution.agent_profile.is_none() {
         admission.execution.agent_profile = Some(session_agent_selection(state, session_id).await);
     }
@@ -14950,6 +14959,7 @@ async fn append_turn_user_message_with_admission(
     text: String,
     admission: bcode_session_models::TurnAdmissionMetadata,
 ) -> Result<Option<bcode_session_models::SessionEvent>, bcode_session::SessionError> {
+    validate_interaction_route(state, permit.session_id(), &admission.execution).await?;
     state
         .sessions
         .require_write_readiness(permit.session_id())
@@ -15296,6 +15306,7 @@ async fn append_steering_user_message(
     text: String,
     execution: bcode_session_models::TurnExecutionOptions,
 ) -> Result<Option<bcode_session_models::SessionEvent>, bcode_session::SessionError> {
+    validate_interaction_route(state, session_id, &execution).await?;
     state.sessions.require_write_readiness(session_id).await?;
     let (_, events) = state
         .sessions
@@ -53328,7 +53339,7 @@ library = "test"
         drop(state);
         assert!(matches!(response, ServiceBridgeResponse::Service(
             ToolInvocationServiceResolution::Failed { code, message }
-        ) if code == "workflow_admission_failed" && !message.contains("private policy detail")));
+        ) if code == "workflow_authorization_failed" && !message.contains("private policy detail")));
     }
 
     fn persist_active_edit_definition(store: &mut bcode_workflow_store::WorkflowStore) {
@@ -53446,8 +53457,10 @@ library = "test"
     ) -> (ServerState, SessionId, tempfile::TempDir) {
         let root = tempfile::tempdir().expect("root");
         let sessions = publication_fixture_sessions(root.path(), connected);
+        // Keep model-context discovery out of the checkout: repository instructions and
+        // Git state are unrelated to these settlement fixtures and contend across tests.
         let parent = sessions
-            .create_session(None, PathBuf::from("."))
+            .create_session(None, root.path().to_path_buf())
             .await
             .expect("parent");
         let mut store =
@@ -61658,9 +61671,38 @@ event_symbol = "bcode_plugin_handle_event_v1"
             ..bcode_session_models::TurnAdmissionMetadata::default()
         };
         assert!(
-            admit_turn(&state, source, ClientId::new(), "work".into(), metadata)
-                .await
-                .is_err()
+            admit_turn(
+                &state,
+                source,
+                ClientId::new(),
+                "work".into(),
+                metadata.clone()
+            )
+            .await
+            .is_err()
+        );
+        let mut permit = SessionTurnPermit::new(source);
+        assert!(
+            append_turn_user_message_with_admission(
+                &state,
+                &mut permit,
+                ClientId::new(),
+                "unauthorized turn".into(),
+                metadata.clone(),
+            )
+            .await
+            .is_err()
+        );
+        assert!(
+            append_steering_user_message(
+                &state,
+                source,
+                ClientId::new(),
+                "unauthorized steering".into(),
+                metadata.execution,
+            )
+            .await
+            .is_err()
         );
         assert!(
             !state
@@ -61672,6 +61714,51 @@ event_symbol = "bcode_plugin_handle_event_v1"
                 .any(|event| matches!(event.kind, SessionEventKind::UserMessage { .. }))
         );
         drop(state);
+    }
+
+    #[tokio::test]
+    async fn stale_permission_batch_response_cannot_resolve_another_daemons_batch() {
+        let first = test_server_state(SessionManager::default());
+        let mut second = test_server_state(SessionManager::default());
+        second.daemon_status.instance_id = "replacement-daemon".to_owned();
+        let (first_id, _first_registration) =
+            interaction_operations::PendingPermissionBatchRegistration::allocate(
+                &first,
+                SessionId::new(),
+            )
+            .await;
+        let (second_id, _second_registration) =
+            interaction_operations::PendingPermissionBatchRegistration::allocate(
+                &second,
+                SessionId::new(),
+            )
+            .await;
+
+        assert_eq!(
+            interaction_operations::resolve_permission_batch(&second, &first_id, true).await,
+            0
+        );
+        assert_eq!(
+            interaction_operations::permission_batch_decision(&second, &second_id).await,
+            None,
+            "a response from another daemon must not latch a local approval"
+        );
+        interaction_operations::resolve_permission_batch(&second, &second_id, false).await;
+        assert_eq!(
+            interaction_operations::permission_batch_decision(&second, &second_id).await,
+            Some(false)
+        );
+        interaction_operations::resolve_permission_batch(&second, &second_id, true).await;
+        assert_eq!(
+            interaction_operations::permission_batch_decision(&second, &second_id).await,
+            Some(false),
+            "a conflicting stale response must not replace the terminal decision"
+        );
+        drop(second);
+        assert_eq!(
+            interaction_operations::permission_batch_decision(&first, &first_id).await,
+            None
+        );
     }
 
     #[tokio::test]
@@ -61757,6 +61844,496 @@ event_symbol = "bcode_plugin_handle_event_v1"
                 | SessionEventKind::PermissionResolved { .. }
         )));
         drop(state);
+    }
+
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)]
+    async fn admitted_execution_permission_waits_then_resumes_without_repeating_turn() {
+        for approved in [false, true] {
+            let workspace = tempfile::tempdir().expect("workspace");
+            let output = workspace.path().join("approved-write.txt");
+            let sessions = SessionManager::default();
+            let parent = sessions
+                .create_session(None, workspace.path().to_path_buf())
+                .await
+                .expect("parent");
+            let child = sessions
+                .create_fresh_execution_session(
+                    None,
+                    ExecutionSessionProvenance {
+                        version: bcode_session_models::EXECUTION_SESSION_PROVENANCE_VERSION,
+                        owner: "bcode.workflow".into(),
+                        run_id: "permission-wait-run".into(),
+                        node_id: "implementation".into(),
+                        activation_id: Some("permission-wait-activation".into()),
+                        attempt: 1,
+                        parent_session_id: parent.id,
+                        context_mode:
+                            bcode_session_models::ExecutionSessionContextMode::FreshIsolated,
+                        workspace_snapshot: Some("snapshot".into()),
+                        parent_generation: None,
+                    },
+                    None,
+                )
+                .await
+                .expect("execution session");
+            let state = Arc::new(test_server_state_with_fake_provider_and_filesystem(
+                sessions,
+            ));
+            let submitted = submit_session_model_turn_with_admission(
+                &state,
+                child.id,
+                format!("tool-write {} authorized", output.display()),
+                None,
+                bcode_session_models::TurnAdmissionMetadata {
+                    execution: bcode_session_models::TurnExecutionOptions {
+                        allow_user_questions: false,
+                        interaction_route: Some(bcode_session_models::ExecutionInteractionRoute {
+                            version: 1,
+                            destination_session_id: parent.id,
+                        }),
+                        provider_plugin_id: Some("bcode.fake-provider".into()),
+                        model_id: Some("fake-echo".into()),
+                        tool_allowlist: Some(vec!["filesystem.write".into()]),
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                },
+                None,
+            )
+            .await
+            .expect("admitted turn");
+            let SubmittedModelTurn::Started { mut completion, .. } = submitted else {
+                panic!("expected a newly admitted turn");
+            };
+            let pending = wait_for_pending_permissions(&state, 1).await;
+            let request = &pending[0].summary;
+            assert_eq!(request.session_id, child.id);
+            assert!(request.is_addressed_to(parent.id));
+            assert!(!request.is_addressed_to(SessionId::new()));
+            assert_eq!(request.tool_name, "filesystem.write");
+            assert!(!output.exists(), "authorization precedes the write");
+            assert!(
+                tokio::time::timeout(Duration::from_millis(100), &mut completion)
+                    .await
+                    .is_err()
+            );
+            let history = state
+                .sessions
+                .session_history(child.id)
+                .await
+                .expect("waiting history");
+            assert_eq!(
+                history
+                    .iter()
+                    .filter(|event| matches!(event.kind, SessionEventKind::ModelTurnStarted { .. }))
+                    .count(),
+                1
+            );
+            assert!(
+                !history
+                    .iter()
+                    .any(|event| matches!(event.kind, SessionEventKind::ModelTurnFinished { .. }))
+            );
+            assert!(
+                interaction_operations::resolve_permission(
+                    &state,
+                    &request.permission_id,
+                    approved,
+                    false
+                )
+                .await
+            );
+            assert!(
+                !interaction_operations::resolve_permission(
+                    &state,
+                    &request.permission_id,
+                    !approved,
+                    false
+                )
+                .await
+            );
+            let completed = tokio::time::timeout(Duration::from_secs(10), completion)
+                .await
+                .expect("resumes after decision")
+                .expect("completion channel");
+            assert_eq!(completed.outcome, ModelTurnOutcome::Completed);
+            assert_eq!(output.exists(), approved);
+            if approved {
+                assert_eq!(
+                    std::fs::read_to_string(&output).expect("written content"),
+                    "authorized"
+                );
+            }
+            let history = state
+                .sessions
+                .session_history(child.id)
+                .await
+                .expect("completed history");
+            assert_eq!(
+                history
+                    .iter()
+                    .filter(|event| matches!(event.kind, SessionEventKind::ModelTurnStarted { .. }))
+                    .count(),
+                1
+            );
+            assert_eq!(
+                history
+                    .iter()
+                    .filter(|event| matches!(
+                        event.kind,
+                        SessionEventKind::ModelTurnFinished { .. }
+                    ))
+                    .count(),
+                1
+            );
+            let destination_history = state
+                .sessions
+                .session_history(parent.id)
+                .await
+                .expect("destination history");
+            assert!(!destination_history.iter().any(|event| matches!(
+                event.kind,
+                SessionEventKind::PermissionRequested { .. }
+                    | SessionEventKind::PermissionResolved { .. }
+            )));
+            drop(state);
+        }
+    }
+
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)]
+    async fn admitted_workflow_staging_waits_for_original_permission() {
+        for (approved, publication_approved) in [(false, false), (true, false), (true, true)] {
+            let (mut state, session, _root) = active_edit_execution_fixture_with_graph(
+                bcode_workflow_store::DispatchSideEffect::ReadOnly,
+                true,
+            )
+            .await;
+            register_workflow_publication_tool(&mut state);
+            state.set_workflow_run_graph_publication_policy(WorkflowRunGraphPublicationPolicy {
+                evaluator: Arc::new(|_| WorkflowApplicationAuthorizationDecision::Allow),
+            });
+            let (sender, mut receiver) = mpsc::channel(4);
+            state.workflow_driver_sender.set(sender).unwrap();
+            let provenance = state
+                .sessions
+                .session_summary(session)
+                .await
+                .unwrap()
+                .execution
+                .unwrap()
+                .provenance;
+            let schema = serde_json::json!({"type_name":"boolean","schema":{"type":"boolean"}});
+            let task = |id| {
+                serde_json::json!({"task_id":id,"objective":"Return true.","agent_profile":"plan","output":schema,
+                "model_selection":{"provider":"bcode.fake-provider","model":"fake-echo"}})
+            };
+            let request = serde_json::json!({"run_id":"edit-run","expected_revision":1,
+                "mutation_id":"admitted-group","input":schema,"tasks":[task("worker")],
+                "join_id":"join","continuation":task("resume"),"first_edge_id":1,
+                "source_node_id":"agent","include_source_output":true,
+                "reconnect":{"edge_id":0,"node_id":"waiting-successor"},
+                "reconciliation":[{"disposition":"retain_with_bindings","activation_id":provenance.activation_id.unwrap(),"edge_ids":[1,2]}]});
+            let state = Arc::new(state);
+            let submitted = submit_session_model_turn_with_admission(
+                &state,
+                session,
+                format!("tool-call workflow.stage_task_group {request}"),
+                None,
+                bcode_session_models::TurnAdmissionMetadata {
+                    execution: bcode_session_models::TurnExecutionOptions {
+                        allow_user_questions: false,
+                        interaction_route: Some(bcode_session_models::ExecutionInteractionRoute {
+                            version: 1,
+                            destination_session_id: provenance.parent_session_id,
+                        }),
+                        provider_plugin_id: Some("bcode.fake-provider".into()),
+                        model_id: Some("fake-echo".into()),
+                        tool_allowlist: Some(vec!["workflow.stage_task_group".into()]),
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                },
+                None,
+            )
+            .await
+            .expect("admitted workflow turn");
+            let SubmittedModelTurn::Started { mut completion, .. } = submitted else {
+                panic!("expected newly admitted turn");
+            };
+            let pending = wait_for_pending_permissions(&state, 1).await;
+            let permission = &pending[0].summary;
+            assert_eq!(permission.tool_name, "workflow.stage_task_group");
+            assert_eq!(permission.session_id, session);
+            assert!(permission.is_addressed_to(provenance.parent_session_id));
+            assert!(
+                tokio::time::timeout(Duration::from_millis(100), &mut completion)
+                    .await
+                    .is_err()
+            );
+            assert_eq!(
+                state
+                    .workflow_store
+                    .lock()
+                    .unwrap()
+                    .run_graph_revision("edit-run")
+                    .unwrap(),
+                Some(1)
+            );
+            assert!(
+                interaction_operations::resolve_permission(
+                    &state,
+                    &permission.permission_id,
+                    approved,
+                    false
+                )
+                .await
+            );
+            tokio::time::timeout(Duration::from_secs(10), completion)
+                .await
+                .expect("decision resumes turn")
+                .expect("completion channel");
+            // Staging never publishes or dispatches workers, even after tool approval.
+            assert_eq!(
+                state
+                    .workflow_store
+                    .lock()
+                    .unwrap()
+                    .run_graph_revision("edit-run")
+                    .unwrap(),
+                Some(1)
+            );
+            let history = state.sessions.session_history(session).await.unwrap();
+            let result = history
+                .iter()
+                .find_map(|event| match &event.kind {
+                    SessionEventKind::ToolInvocationResultRecorded { record } => Some(record),
+                    _ => None,
+                })
+                .expect("workflow tool result");
+            assert_eq!(result.is_error, !approved, "{}", result.model_output);
+            assert_eq!(
+                history
+                    .iter()
+                    .filter(|event| matches!(event.kind, SessionEventKind::ModelTurnStarted { .. }))
+                    .count(),
+                1
+            );
+            assert_eq!(
+                history
+                    .iter()
+                    .filter(|event| matches!(
+                        event.kind,
+                        SessionEventKind::ModelTurnFinished { .. }
+                    ))
+                    .count(),
+                1
+            );
+            assert!(receiver.try_recv().is_err());
+            if !approved {
+                continue;
+            }
+            let arguments = serde_json::json!({"edit_json": serde_json::json!({
+                "task_tool":"workflow.stage_task_group", "request":request
+            }).to_string()});
+            let submitted = submit_session_model_turn_with_admission(
+                &state,
+                session,
+                format!("tool-call workflow.publish_run_graph_edit {arguments}"),
+                None,
+                bcode_session_models::TurnAdmissionMetadata {
+                    execution: bcode_session_models::TurnExecutionOptions {
+                        allow_user_questions: false,
+                        interaction_route: Some(bcode_session_models::ExecutionInteractionRoute {
+                            version: 1,
+                            destination_session_id: provenance.parent_session_id,
+                        }),
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                },
+                None,
+            )
+            .await
+            .expect("admitted publication turn");
+            let SubmittedModelTurn::Started { mut completion, .. } = submitted else {
+                panic!("expected newly admitted publication turn");
+            };
+            let pending = wait_for_pending_permissions(&state, 1).await;
+            let permission = &pending[0].summary;
+            assert_eq!(permission.tool_name, "workflow.publish_run_graph_edit");
+            assert!(permission.is_addressed_to(provenance.parent_session_id));
+            assert!(
+                tokio::time::timeout(Duration::from_millis(100), &mut completion)
+                    .await
+                    .is_err()
+            );
+            assert!(receiver.try_recv().is_err());
+            assert!(
+                interaction_operations::resolve_permission(
+                    &state,
+                    &permission.permission_id,
+                    publication_approved,
+                    false
+                )
+                .await
+            );
+            tokio::time::timeout(Duration::from_secs(10), completion)
+                .await
+                .expect("publication decision resumes turn")
+                .expect("completion channel");
+            let graph_revision = state
+                .workflow_store
+                .lock()
+                .unwrap()
+                .run_graph_revision("edit-run")
+                .unwrap();
+            assert_eq!(
+                graph_revision,
+                Some(if publication_approved { 2 } else { 1 }),
+                "publication history: {:?}",
+                state.sessions.session_history(session).await.unwrap()
+            );
+            if publication_approved {
+                assert_eq!(receiver.try_recv().unwrap(), "edit-run");
+            }
+            assert!(receiver.try_recv().is_err());
+            if publication_approved {
+                // Approval publishes the dependency, not permission to run ahead of its source.
+                // Reuse real source admission/receipt reconciliation before driving descendants.
+                let (source, path, authority) = {
+                    let store = state.workflow_store.lock().unwrap();
+                    let attempts = store.attempt_history("edit-run", None, 100).unwrap();
+                    assert_eq!(attempts.len(), 1, "workers wait for the source");
+                    (
+                        attempts[0].clone(),
+                        store.path().to_path_buf(),
+                        store.execution_authority("edit-run").unwrap().unwrap(),
+                    )
+                };
+                let SubmittedModelTurn::Started {
+                    receipt,
+                    completion,
+                } = submit_session_model_turn_with_admission(
+                    &state,
+                    session,
+                    "Return exactly true".into(),
+                    None,
+                    bcode_session_models::TurnAdmissionMetadata {
+                        execution: TurnExecutionOptions {
+                            allow_user_questions: false,
+                            provider_plugin_id: Some("bcode.fake-provider".into()),
+                            model_id: Some("fake-echo".into()),
+                            structured_output: Some(
+                                bcode_session_models::TurnStructuredOutputRequest {
+                                    name: "publication".into(),
+                                    schema: serde_json::json!({"type":"boolean"}),
+                                    strict: true,
+                                    max_corrections: 0,
+                                },
+                            ),
+                            ..TurnExecutionOptions::default()
+                        },
+                        ..Default::default()
+                    },
+                    None,
+                )
+                .await
+                .unwrap()
+                else {
+                    panic!("source completion turn")
+                };
+                state.workflow_store.lock().unwrap().persist_dispatch_receipt(&bcode_workflow_store::DispatchReceipt {
+                    run_id: "edit-run".into(), node_id: "agent".into(), activation_id: source.activation_id.clone(), attempt: 1,
+                    dispatch_identity: source.dispatch_identity.clone(), admitted_at_ms: current_unix_millis(),
+                    receipt: serde_json::json!({"owner":"bcode.server.agent-turn/v1", "owner_artifact_id":bcode_ipc::ArtifactId::current().to_string(), "owner_daemon_instance_id":state.daemon_status.instance_id, "session_id":session, "turn_id":receipt.turn_id.to_string(), "output_schema_id":"boolean"}),
+                }).unwrap();
+                completion.await.unwrap();
+                let observation = observe_workflow_turn(
+                    &state,
+                    session,
+                    &receipt.turn_id.to_string(),
+                    "boolean",
+                    &bcode_workflow_store::AttemptReconciliationRequest {
+                        run_id: "edit-run".into(),
+                        node_id: "agent".into(),
+                        activation_id: source.activation_id.clone(),
+                        attempt: 1,
+                        dispatch_identity: source.dispatch_identity.clone(),
+                        side_effect: bcode_workflow_store::DispatchSideEffect::ReadOnly,
+                        receipt: serde_json::Value::Null,
+                    },
+                )
+                .await
+                .unwrap();
+                assert!(
+                    matches!(
+                        observation,
+                        bcode_workflow_store::AttemptObservation::Succeeded { .. }
+                    ),
+                    "{observation:?}"
+                );
+                persist_workflow_prompt_completion(
+                    &path,
+                    &source.dispatch_identity,
+                    &authority,
+                    observation,
+                )
+                .await
+                .unwrap();
+                tokio::time::timeout(Duration::from_secs(10), async {
+                    loop {
+                        drive_workflow_run(&state, "edit-run").await.unwrap();
+                        let attempts = state
+                            .workflow_store
+                            .lock()
+                            .unwrap()
+                            .attempt_history("edit-run", None, 100)
+                            .unwrap();
+                        if attempts.iter().any(|attempt| {
+                            attempt.node_id == "waiting-successor" && attempt.terminal_at_ms.is_some()
+                        }) {
+                            assert_eq!(
+                                attempts.len(),
+                                4,
+                                "source, worker, continuation and successor execute exactly once: {attempts:?}"
+                            );
+                            assert!(
+                                attempts.iter().all(|attempt| attempt.status == "succeeded"),
+                                "{attempts:?}"
+                            );
+                            break;
+                        }
+                        tokio::time::sleep(Duration::from_millis(10)).await;
+                    }
+                })
+                .await
+                .expect("approved publication executes worker and continuation");
+            }
+            let history = state.sessions.session_history(session).await.unwrap();
+            drop(state);
+            let result = history
+                .iter()
+                .rev()
+                .find_map(|event| match &event.kind {
+                    SessionEventKind::ToolInvocationResultRecorded { record } => Some(record),
+                    _ => None,
+                })
+                .expect("publication tool result");
+            assert_eq!(
+                result.is_error, !publication_approved,
+                "{}",
+                result.model_output
+            );
+            assert_eq!(
+                history
+                    .iter()
+                    .filter(|event| matches!(event.kind, SessionEventKind::ModelTurnStarted { .. }))
+                    .count(),
+                2 + usize::from(publication_approved)
+            );
+        }
     }
 
     #[tokio::test]
@@ -74010,7 +74587,8 @@ event_symbol = "bcode_plugin_handle_event_v1"
         drop(guard);
         assert!(
             matches!(result, Err(ServerError::WorkflowStorageUnavailable(message))
-            if message.contains("initialization is in progress"))
+            if message.contains("readiness status is temporarily unavailable")
+                && message.contains("no initialization progress has been verified"))
         );
         assert!(!state.workflow_restore_pending.load(Ordering::SeqCst));
         drop(state);

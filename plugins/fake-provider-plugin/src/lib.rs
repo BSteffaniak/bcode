@@ -2302,6 +2302,14 @@ fn required_fake_tool_call(request: &ModelTurnRequest, next_turn: u64) -> Option
 }
 
 fn fake_tool_call(user_text: &str, next_turn: u64) -> Option<ToolCall> {
+    if let Some(rest) = user_text.strip_prefix("tool-call ") {
+        let (name, arguments) = rest.split_once(' ')?;
+        return Some(ToolCall {
+            id: format!("fake-tool-{next_turn}"),
+            name: name.to_owned(),
+            arguments: serde_json::from_str(arguments).ok()?,
+        });
+    }
     if let Some(path) = user_text.strip_prefix("tool-read ") {
         return Some(ToolCall {
             id: format!("fake-tool-{next_turn}"),

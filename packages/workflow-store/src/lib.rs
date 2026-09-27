@@ -13315,13 +13315,16 @@ fn skip_branch_nodes(
     node_ids: &[String],
     created_at_ms: u64,
 ) -> Result<(), WorkflowStoreError> {
+    let graph_revision = run_graph::graph_revision(transaction, run_id)?
+        .ok_or_else(|| WorkflowStoreError::InvalidData("branch run is missing".into()))?;
     let mut absent_nodes = std::collections::BTreeSet::new();
     for node_id in node_ids {
-        run_graph::initial_node(transaction, run_id, node_id)?.ok_or_else(|| {
-            WorkflowStoreError::InvalidData(format!(
-                "workflow branch skip references missing run-graph node: {node_id}"
-            ))
-        })?;
+        WorkflowStore::current_run_graph_node_in_snapshot(transaction, run_id, node_id)?
+            .ok_or_else(|| {
+                WorkflowStoreError::InvalidData(format!(
+                    "workflow branch skip references missing run-graph node: {node_id}"
+                ))
+            })?;
         if activation_status_at_generation(transaction, run_id, node_id, generation)?.is_none() {
             absent_nodes.insert(node_id);
         }
@@ -13344,7 +13347,7 @@ fn skip_branch_nodes(
             run_id,
             node_id,
             &activation_identity(run_id, node_id, generation),
-            1,
+            graph_revision,
         )?;
     }
     Ok(())

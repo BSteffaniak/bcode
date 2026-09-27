@@ -117,7 +117,10 @@ pub async fn next_permission_id(state: &ServerState) -> String {
 /// Allocate the next process-local permission batch identity.
 pub async fn next_permission_batch_id(state: &ServerState) -> String {
     let mut next = state.next_permission_batch_id.lock().await;
-    let batch_id = format!("permission-batch-{}", *next);
+    let batch_id = format!(
+        "permission-batch-{}-{}",
+        state.daemon_status.instance_id, *next
+    );
     *next += 1;
     batch_id
 }
