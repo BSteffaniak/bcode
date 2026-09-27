@@ -25,6 +25,14 @@ therefore remain ordinary prompt/tool outcomes and never invalidate a workflow d
 authority. The prompt's explicit model, tool, timeout, context-target, and structured-output policy
 remain authoritative.
 
+### Execution ownership at wait resolution
+
+Application input/approval resolution acquires verified run execution authority before mutation.
+The workflow-store owned resolution methods compare artifact, daemon, generation and fencing token
+inside the same immediate transaction that resolves the wait. Foreign or stale resolutions leave
+waits untouched. This applies to explicit goal resume checkpoints as well as other workflow gates;
+it does not grant approval authority or establish communication routes between independent runs.
+
 ### Explicit goal resume consent
 
 `/goal.status` identifies a blocked loop approval checkpoint and shows its exact activation ID.

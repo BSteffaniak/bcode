@@ -7629,16 +7629,22 @@ pub async fn provide_input(
     value: serde_json::Value,
 ) -> Result<bcode_workflow_store::WaitingResolutionResult, super::ServerError> {
     let started_at = std::time::Instant::now();
+    let guard = execution_authority(state, run_id).await?.ok_or_else(|| {
+        super::ServerError::WorkflowApplicationOperationUnauthorized(
+            "wait resolution requires durable execution authority".into(),
+        )
+    })?;
     let result = state
         .workflow_store
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .provide_input(
+        .provide_input_owned(
             run_id,
             node_id,
             activation_id,
             value,
             super::current_unix_millis(),
+            &guard.authority,
         )?;
     super::drive_workflow_run_and_parents(state, run_id).await?;
     state.metrics.record_histogram(
@@ -7657,16 +7663,22 @@ pub async fn resolve_approval(
     approved: bool,
 ) -> Result<bcode_workflow_store::WaitingResolutionResult, super::ServerError> {
     let started_at = std::time::Instant::now();
+    let guard = execution_authority(state, run_id).await?.ok_or_else(|| {
+        super::ServerError::WorkflowApplicationOperationUnauthorized(
+            "wait resolution requires durable execution authority".into(),
+        )
+    })?;
     let result = state
         .workflow_store
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .resolve_approval(
+        .resolve_approval_owned(
             run_id,
             node_id,
             activation_id,
             approved,
             super::current_unix_millis(),
+            &guard.authority,
         )?;
     super::drive_workflow_run_and_parents(state, run_id).await?;
     state.metrics.record_histogram_with_labels(

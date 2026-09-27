@@ -12763,6 +12763,32 @@ impl WorkflowStore {
             Some(value),
             true,
             resolved_at_ms,
+            None,
+        )
+    }
+
+    /// Resolve input only while holding the exact durable execution authority.
+    ///
+    /// # Errors
+    /// Rejects stale/foreign authority, invalid input or gate identity, and storage failures.
+    pub fn provide_input_owned(
+        &mut self,
+        run_id: &str,
+        node_id: &str,
+        activation_id: &str,
+        value: serde_json::Value,
+        resolved_at_ms: u64,
+        authority: &WorkflowExecutionAuthority,
+    ) -> Result<WaitingResolutionResult, WorkflowStoreError> {
+        self.resolve_waiting_activation(
+            run_id,
+            node_id,
+            activation_id,
+            WorkflowWaitKind::Input,
+            Some(value),
+            true,
+            resolved_at_ms,
+            Some(authority),
         )
     }
 
@@ -12791,6 +12817,32 @@ impl WorkflowStore {
             None,
             approved,
             resolved_at_ms,
+            None,
+        )
+    }
+
+    /// Resolve approval only while holding the exact durable execution authority.
+    ///
+    /// # Errors
+    /// Rejects stale/foreign authority, invalid gate state, conflicting decisions and storage failures.
+    pub fn resolve_approval_owned(
+        &mut self,
+        run_id: &str,
+        node_id: &str,
+        activation_id: &str,
+        approved: bool,
+        resolved_at_ms: u64,
+        authority: &WorkflowExecutionAuthority,
+    ) -> Result<WaitingResolutionResult, WorkflowStoreError> {
+        self.resolve_waiting_activation(
+            run_id,
+            node_id,
+            activation_id,
+            WorkflowWaitKind::Approval,
+            None,
+            approved,
+            resolved_at_ms,
+            Some(authority),
         )
     }
 
@@ -12804,11 +12856,33 @@ impl WorkflowStore {
         supplied_value: Option<serde_json::Value>,
         accepted: bool,
         resolved_at_ms: u64,
+        authority: Option<&WorkflowExecutionAuthority>,
     ) -> Result<WaitingResolutionResult, WorkflowStoreError> {
         validate_id("run_id", run_id)?;
         validate_id("node_id", node_id)?;
         validate_id("activation_id", activation_id)?;
-        let transaction = self.connection.transaction()?;
+        let transaction = self
+            .connection
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        if let Some(authority) = authority {
+            let current: Option<(String, String, u64, String)> = transaction.query_row(
+                "SELECT target_artifact_id, coordinator_daemon_instance_id, coordinator_generation, coordinator_fencing_token FROM workflow_runs WHERE run_id = ?1 AND coordinator_fencing_token IS NOT NULL",
+                [run_id], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            ).optional()?;
+            if current
+                .as_ref()
+                .is_none_or(|(artifact, daemon, generation, token)| {
+                    artifact != &authority.target_artifact_id
+                        || daemon != &authority.daemon_instance_id
+                        || *generation != authority.generation
+                        || token != &authority.fencing_token
+                })
+            {
+                return Err(WorkflowStoreError::InvalidData(
+                    "wait resolution requires current execution authority".into(),
+                ));
+            }
+        }
         let (status, input_json, run_status, cancellation_requested): (
             String,
             Option<String>,
@@ -39217,18 +39291,24 @@ mod tests {
         store
             .persist_definition("approval", 1, &definition)
             .expect("definition");
+        let authority = WorkflowExecutionAuthority {
+            target_artifact_id: "test-artifact".into(),
+            daemon_instance_id: "test-owner".into(),
+            generation: 2,
+            fencing_token: "current-token".into(),
+        };
         store
             .create_run(&NewWorkflowRun {
                 run_id: "approval-run".to_string(),
                 definition_id: "approval".to_string(),
                 definition_version: 1,
                 workspace_snapshot: "snapshot".to_string(),
-                parent_session_id: None,
+                parent_session_id: Some("approval-session".into()),
                 parent_session_generation: None,
                 binding: None,
                 authored_provenance: None,
                 input: Some(serde_json::json!(3)),
-                execution_authority: None,
+                execution_authority: Some(authority.clone()),
                 created_at_ms: 1,
                 authorization_profile: bcode_workflow::WorkflowAuthorizationProfileIdentity {
                     version: 1,
@@ -39253,6 +39333,45 @@ mod tests {
                 .expect("reopened wait"),
             std::slice::from_ref(&wait)
         );
+        let foreign = WorkflowExecutionAuthority {
+            target_artifact_id: "foreign".into(),
+            daemon_instance_id: "foreign".into(),
+            generation: 1,
+            fencing_token: "foreign".into(),
+        };
+        let before = store.connection.total_changes();
+        assert!(
+            store
+                .resolve_approval_owned(
+                    "approval-run",
+                    "approve",
+                    &wait.activation_id,
+                    true,
+                    18,
+                    &foreign
+                )
+                .is_err()
+        );
+        assert_eq!(store.connection.total_changes(), before);
+        assert_eq!(
+            store.waiting_activations("approval-run", 10).unwrap(),
+            std::slice::from_ref(&wait)
+        );
+        let mut stale = authority.clone();
+        stale.generation = 1;
+        assert!(
+            store
+                .resolve_approval_owned(
+                    "approval-run",
+                    "approve",
+                    &wait.activation_id,
+                    true,
+                    18,
+                    &stale
+                )
+                .is_err()
+        );
+        assert_eq!(store.connection.total_changes(), before);
         for damage in [
             "UPDATE workflow_run_graph_nodes SET node_json = '{}' WHERE run_id = 'approval-run' AND node_id = 'approve'",
             "UPDATE workflow_run_graphs SET revision = 2 WHERE run_id = 'approval-run'",
@@ -39296,7 +39415,14 @@ mod tests {
             rusqlite::params![json, sha256_hex(json.as_bytes())],
         ).expect("source fixture");
         let result = store
-            .resolve_approval("approval-run", "approve", &wait.activation_id, false, 20)
+            .resolve_approval_owned(
+                "approval-run",
+                "approve",
+                &wait.activation_id,
+                false,
+                20,
+                &authority,
+            )
             .expect("deny");
         assert_eq!(result.outcome, "denied");
         assert_eq!(result.run_status, RunStatus::Failed);
