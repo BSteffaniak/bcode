@@ -396,6 +396,21 @@ impl SessionHandle {
         .await?
     }
 
+    pub async fn append_event_at_generation(
+        &self,
+        kind: SessionEventKind,
+        expected_generation: u64,
+        activity_timestamp_ms: u64,
+    ) -> Result<SessionEvent, SessionError> {
+        self.send(|reply| SessionCommand::AppendEventAtGeneration {
+            kind,
+            expected_generation,
+            activity_timestamp_ms,
+            reply,
+        })
+        .await?
+    }
+
     pub async fn append_event_with_provenance(
         &self,
         kind: SessionEventKind,
@@ -801,6 +816,12 @@ enum SessionCommand {
         activity_timestamp_ms: u64,
         reply: oneshot::Sender<Result<SessionEvent, SessionError>>,
     },
+    AppendEventAtGeneration {
+        kind: SessionEventKind,
+        expected_generation: u64,
+        activity_timestamp_ms: u64,
+        reply: oneshot::Sender<Result<SessionEvent, SessionError>>,
+    },
     AppendToolInvocationResult {
         record: bcode_session_models::ToolInvocationResultRecord,
         activity_timestamp_ms: u64,
@@ -1037,6 +1058,22 @@ impl SessionActor {
                         .await,
                 );
             }
+            SessionCommand::AppendEventAtGeneration {
+                kind,
+                expected_generation,
+                activity_timestamp_ms,
+                reply,
+            } => {
+                let _ = reply.send(
+                    self.append_event_checked(
+                        kind,
+                        None,
+                        activity_timestamp_ms,
+                        Some(expected_generation),
+                    )
+                    .await,
+                );
+            }
             SessionCommand::AppendToolInvocationResult {
                 record,
                 activity_timestamp_ms,
@@ -1065,16 +1102,8 @@ impl SessionActor {
                 queued_at,
                 reply,
             } => {
-                let result = self.attach(client_id, mode, queued_at).await;
-                if result.is_err() && self.state.clients.is_empty() && !self.has_ownership_guards()
-                {
-                    let _ = self.release_idle_resources().await;
-                }
-                if let Err(undelivered) = reply.send(result)
-                    && undelivered.is_ok()
-                {
-                    let _ = self.detach(client_id).await;
-                }
+                self.handle_attach_reply(client_id, mode, queued_at, reply)
+                    .await;
             }
             SessionCommand::SetComposerDraft {
                 text,
@@ -1088,6 +1117,24 @@ impl SessionActor {
         false
     }
 
+    async fn handle_attach_reply(
+        &mut self,
+        client_id: ClientId,
+        mode: AttachMode,
+        queued_at: Instant,
+        reply: oneshot::Sender<Result<SessionAttachment, SessionError>>,
+    ) {
+        let result = self.attach(client_id, mode, queued_at).await;
+        if result.is_err() && self.state.clients.is_empty() && !self.has_ownership_guards() {
+            let _ = self.release_idle_resources().await;
+        }
+        if let Err(undelivered) = reply.send(result)
+            && undelivered.is_ok()
+        {
+            let _ = self.detach(client_id).await;
+        }
+    }
+
     #[allow(clippy::too_many_lines)]
     async fn handle_read_command(&mut self, command: SessionCommand) -> bool {
         match command {
@@ -1095,6 +1142,7 @@ impl SessionActor {
             | SessionCommand::RepriceUsage { .. }
             | SessionCommand::AppendUsage { .. }
             | SessionCommand::AppendEvent { .. }
+            | SessionCommand::AppendEventAtGeneration { .. }
             | SessionCommand::AppendToolInvocationResult { .. }
             | SessionCommand::AppendUserMessage { .. }
             | SessionCommand::Attach { .. }
@@ -1971,6 +2019,31 @@ impl SessionActor {
         provenance: Option<SessionEventProvenance>,
         activity_timestamp_ms: u64,
     ) -> Result<SessionEvent, SessionError> {
+        self.append_event_checked(kind, provenance, activity_timestamp_ms, None)
+            .await
+    }
+
+    const fn validate_append_generation(&self, expected: Option<u64>) -> Result<(), SessionError> {
+        let current = self.state.next_sequence.saturating_sub(1);
+        if let Some(expected) = expected
+            && expected != current
+        {
+            return Err(SessionError::AppendGenerationChanged {
+                session_id: self.state.summary.id,
+                expected,
+                current,
+            });
+        }
+        Ok(())
+    }
+
+    async fn append_event_checked(
+        &mut self,
+        kind: SessionEventKind,
+        provenance: Option<SessionEventProvenance>,
+        activity_timestamp_ms: u64,
+        expected_generation: Option<u64>,
+    ) -> Result<SessionEvent, SessionError> {
         self.ensure_ownership()?;
         let total_started_at = Instant::now();
         let metrics = self.store.as_ref().map(SessionStoreExecutor::metrics);
@@ -1998,6 +2071,7 @@ impl SessionActor {
             let readiness_started_at = Instant::now();
             self.ensure_session_db_for_write().await?;
             self.refresh_state_from_db_for_write().await?;
+            self.validate_append_generation(expected_generation)?;
             if let Some(metrics) = &metrics {
                 metrics.record_histogram(
                     "session.actor.append_event.readiness_duration_ms",
@@ -2032,6 +2106,7 @@ impl SessionActor {
             }
             event
         } else {
+            self.validate_append_generation(expected_generation)?;
             let mut event = self.state.build_next_event(kind, event_timestamp_ms);
             event.provenance = provenance;
             event

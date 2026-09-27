@@ -46,14 +46,20 @@ async fn append_permission_requested_event(
     state: &ServerState,
     session_id: SessionId,
     request: bcode_session_models::SessionEventKind,
-) {
+) -> bool {
     match state
         .sessions
         .append_permission_requested(session_id, request)
         .await
     {
-        Ok(event) => publish_session_event(state, &event).await,
-        Err(error) => tracing::warn!("failed to append permission request: {error}"),
+        Ok(event) => {
+            publish_session_event(state, &event).await;
+            true
+        }
+        Err(error) => {
+            tracing::warn!("failed to append permission request: {error}");
+            false
+        }
     }
 }
 
@@ -62,14 +68,20 @@ async fn append_permission_resolved_event(
     session_id: SessionId,
     permission_id: String,
     approved: bool,
-) {
+) -> bool {
     match state
         .sessions
         .append_permission_resolved(session_id, permission_id, approved)
         .await
     {
-        Ok(event) => publish_session_event(state, &event).await,
-        Err(error) => tracing::warn!("failed to append permission result: {error}"),
+        Ok(event) => {
+            publish_session_event(state, &event).await;
+            true
+        }
+        Err(error) => {
+            tracing::warn!("failed to append permission result: {error}");
+            false
+        }
     }
 }
 
@@ -251,12 +263,14 @@ pub async fn register_pending_permission(
         .session_current_turn(pending.summary.session_id)
         .await
         .and_then(|turn| turn.interaction_route);
+    if !append_permission_requested_event(state, pending.summary.session_id, event).await {
+        return Err(false);
+    }
     state
         .pending_permissions
         .lock()
         .await
         .insert(pending.summary.permission_id.clone(), routed.clone());
-    append_permission_requested_event(state, pending.summary.session_id, event).await;
     notify_interaction_destination(state, &routed.summary).await;
     drop(batch_decision);
     Ok(())
@@ -333,8 +347,7 @@ pub async fn resolve_permission(
     else {
         return false;
     };
-    complete_pending_permission(state, permission, approved, remember).await;
-    true
+    complete_pending_permission(state, permission, approved, remember).await
 }
 
 pub async fn complete_pending_permission(
@@ -342,8 +355,21 @@ pub async fn complete_pending_permission(
     permission: PendingPermission,
     approved: bool,
     remember: bool,
-) {
-    if remember && let Some(key) = permission.skill_decision_key.clone() {
+) -> bool {
+    // Never release a waiting invocation on a decision that has not been recorded.
+    // A failed append fails closed; it must not become an in-memory approval.
+    let recorded = append_permission_resolved_event(
+        state,
+        permission.summary.session_id,
+        permission.summary.permission_id.clone(),
+        approved,
+    )
+    .await;
+    let approved = approved && recorded;
+    if remember
+        && recorded
+        && let Some(key) = permission.skill_decision_key.clone()
+    {
         remember_skill_tool_decision(
             key,
             if approved {
@@ -356,13 +382,7 @@ pub async fn complete_pending_permission(
     *permission.decision.lock().await = Some(approved);
     permission.notify.notify_waiters();
     notify_interaction_destination(state, &permission.summary).await;
-    append_permission_resolved_event(
-        state,
-        permission.summary.session_id,
-        permission.summary.permission_id,
-        approved,
-    )
-    .await;
+    recorded
 }
 
 pub async fn take_pending_permission_for_individual(
@@ -490,9 +510,11 @@ pub async fn resolve_permission_batch(
         }
         permissions
     };
-    let resolved = permissions.len();
+    let mut resolved = 0;
     for permission in permissions {
-        complete_pending_permission(state, permission, approved, false).await;
+        if complete_pending_permission(state, permission, approved, false).await {
+            resolved += 1;
+        }
     }
     resolved
 }

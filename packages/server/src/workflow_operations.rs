@@ -9793,11 +9793,37 @@ pub async fn repair_attempt(
 }
 
 /// Project a bounded workflow catalog page without transport framing.
-pub fn catalog_view(
+pub async fn catalog_view(
     state: &ServerState,
     request: &bcode_workflow_view_models::WorkflowCatalogRequest,
 ) -> Result<bcode_workflow_view_models::WorkflowCatalogView, bcode_workflow_store::WorkflowStoreError>
 {
+    let mut sessions = BTreeMap::<super::SessionId, u32>::new();
+    {
+        let pending = state.pending_permissions.lock().await;
+        for permission in pending.values() {
+            let count = sessions.entry(permission.summary.session_id).or_default();
+            *count = count.saturating_add(1);
+        }
+    }
+    let mut tool_attention = BTreeMap::<String, u32>::new();
+    for (session_id, count) in sessions {
+        let session = state
+            .sessions
+            .session_summary(session_id)
+            .await
+            .map_err(|error| {
+                bcode_workflow_store::WorkflowStoreError::InvalidData(error.to_string())
+            })?;
+        if let Some(execution) = session.execution
+            && execution.provenance.owner == "bcode.workflow"
+        {
+            let total = tool_attention
+                .entry(execution.provenance.run_id)
+                .or_default();
+            *total = total.saturating_add(count);
+        }
+    }
     let store = state
         .workflow_store
         .lock()
@@ -9852,11 +9878,16 @@ pub fn catalog_view(
         },
         search: request.search.clone(),
     };
-    let page = store.workflow_run_catalog_page(&query)?;
+    let page = store.workflow_run_catalog_page_with_attention(&query, &tool_attention)?;
     let items = page
         .entries
         .iter()
-        .map(|entry| run_list_item_with_summary(&store, &entry.run, &entry.summary))
+        .map(|entry| {
+            let mut item = run_list_item_with_summary(&store, &entry.run, &entry.summary)?;
+            item.attention.pending_tool_permissions =
+                tool_attention.get(&entry.run.run_id).copied().unwrap_or(0);
+            Ok::<_, bcode_workflow_store::WorkflowStoreError>(item)
+        })
         .collect::<Result<Vec<_>, _>>()?;
     drop(store);
     Ok(bcode_workflow_view::project_catalog(

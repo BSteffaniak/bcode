@@ -71,9 +71,14 @@ across restarts.
 
 Workflow run-view version 5 includes bounded `tool_permissions` correlated to execution-session
 links and a separate `pending_tool_permissions` attention count. The inspector distinguishes
-these from workflow approval gates. This is a live run-detail observation, not durable wait
-storage; catalog filtering is still based on durable workflow gates and does not yet include
-these live tool decisions.
+these from workflow approval gates. Catalog attention filtering and counts include current
+execution-session tool permissions before page truncation, so tool-blocked runs appear in
+`needs_attention` even without a durable workflow approval gate. The overlay is a live
+observation and grants no execution authority; durable pending-invocation recovery remains
+unfinished. Permission registration records the canonical request before exposing it as pending.
+Resolution records the canonical decision before waking the invocation; persistence failures fail
+closed and cannot release an approved operation. This ordering is a prerequisite for recovery,
+not a durable continuation checkpoint.
 
 This is a same-daemon permission-notification implementation, **not** a durable execution messaging
 transport. Pending decisions remain daemon-memory observations. Cross-daemon routing, arbitrary

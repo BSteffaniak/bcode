@@ -40,6 +40,7 @@ pub(crate) mod db_validation;
 mod derivation;
 pub mod event_compression;
 pub mod history_compression;
+mod invocation_recovery;
 pub mod lease;
 mod manifest;
 mod mutation;
@@ -47,6 +48,7 @@ pub mod ownership;
 pub mod persisted;
 pub mod projection;
 pub mod repair;
+pub use invocation_recovery::{InvocationRecoveryCheckpoint, InvocationRecoveryObservation};
 mod runtime_work;
 pub(crate) mod state;
 pub mod storage_access;
@@ -443,6 +445,15 @@ pub enum SessionError {
         projection: &'static str,
         checkpoint: Option<u64>,
         expected: u64,
+    },
+    /// An optimistic append observed a different canonical generation under the write lock.
+    #[error(
+        "session append generation changed: {session_id} expected={expected} current={current}"
+    )]
+    AppendGenerationChanged {
+        session_id: SessionId,
+        expected: u64,
+        current: u64,
     },
     /// Turn admission metadata is invalid.
     #[error(transparent)]

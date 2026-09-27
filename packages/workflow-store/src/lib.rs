@@ -16,7 +16,7 @@ use bcode_workflow::{
 use rusqlite::{Connection, OptionalExtension, Transaction};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
 use std::fs::{File, OpenOptions};
 use std::future::Future;
@@ -12313,6 +12313,22 @@ impl WorkflowStore {
         &self,
         request: &WorkflowRunCatalogQuery,
     ) -> Result<WorkflowRunCatalogPage, WorkflowStoreError> {
+        self.workflow_run_catalog_page_with_attention(request, &BTreeMap::new())
+    }
+
+    /// Query a catalog page with application-owned live tool-attention counts.
+    ///
+    /// The overlay affects filtering before pagination; it grants no execution authority
+    /// and is not persisted as canonical workflow state.
+    ///
+    /// # Errors
+    /// Returns the same validation and storage errors as [`Self::workflow_run_catalog_page`].
+    #[allow(clippy::too_many_lines)]
+    pub fn workflow_run_catalog_page_with_attention(
+        &self,
+        request: &WorkflowRunCatalogQuery,
+        tool_attention: &BTreeMap<String, u32>,
+    ) -> Result<WorkflowRunCatalogPage, WorkflowStoreError> {
         let query_limit = authoring_page_query_limit(request.limit)?;
         if request
             .search
@@ -12360,6 +12376,9 @@ impl WorkflowStore {
                             || summary.retryable_failures > 0
                             || summary.repair_required > 0
                     }) || run.status == RunStatus::RepairRequired
+                        || tool_attention
+                            .get(&run.run_id)
+                            .is_some_and(|count| *count > 0)
                 }
                 WorkflowRunCatalogFilter::Failed => {
                     matches!(run.status, RunStatus::Failed | RunStatus::RepairRequired)

@@ -5409,17 +5409,39 @@ const fn enqueue_recovered_model_turn(
     false
 }
 
-async fn recover_abandoned_session_runtime_work(
+async fn recover_abandoned_tool_runs(
     state: &Arc<ServerState>,
     session_id: SessionId,
+    active_runtime_ids: &BTreeSet<WorkId>,
 ) -> Result<(), ServerError> {
-    let active_runtime_ids = state.runtime_work.active_ids_for_session(session_id).await;
     let active_tool_runs = state.sessions.active_tool_runs(session_id).await?;
     for tool in active_tool_runs {
-        let message = format!(
-            "The daemon restarted while tool `{}` was running. Its outcome could not be verified, so Bcode did not execute it again.",
-            tool.tool_name.as_deref().unwrap_or("unknown")
-        );
+        if active_runtime_ids.contains(&WorkId::new(format!("tool_{}", tool.tool_call_id))) {
+            continue;
+        }
+        let observation = state
+            .sessions
+            .invocation_recovery_observation(
+                session_id,
+                &tool.tool_call_id,
+                tool.event_seq_start,
+                1024,
+            )
+            .await?;
+        let message = if matches!(
+            observation,
+            bcode_session::InvocationRecoveryObservation::WaitingForPermission { .. }
+        ) {
+            format!(
+                "The daemon restarted while tool `{}` was waiting for permission. The recorded request was not approved. Its invocation continuation is unavailable, so Bcode did not execute it.",
+                tool.tool_name.as_deref().unwrap_or("unknown")
+            )
+        } else {
+            format!(
+                "The daemon restarted while tool `{}` was running. Its outcome could not be verified, so Bcode did not execute it again.",
+                tool.tool_name.as_deref().unwrap_or("unknown")
+            )
+        };
         let event = state
             .sessions
             .append_tool_invocation_result(
@@ -5440,6 +5462,20 @@ async fn recover_abandoned_session_runtime_work(
             .await?;
         publish_session_event(state, &event).await;
     }
+    Ok(())
+}
+
+async fn recover_abandoned_session_runtime_work(
+    state: &Arc<ServerState>,
+    session_id: SessionId,
+) -> Result<(), ServerError> {
+    // An attach is not proof of daemon loss. A live turn owns its invocation batch,
+    // including requests that are waiting for permission and have not entered a tool.
+    if state.session_current_turn(session_id).await.is_some() {
+        return Ok(());
+    }
+    let active_runtime_ids = state.runtime_work.active_ids_for_session(session_id).await;
+    recover_abandoned_tool_runs(state, session_id, &active_runtime_ids).await?;
     let active = state.sessions.active_runtime_work(session_id).await?;
     let work_ids = active
         .iter()
@@ -7962,7 +7998,7 @@ async fn handle_workflow_run_request(
             .await
         }
         RuntimeAndModelRequest::WorkflowCatalogView { request } => {
-            let view = workflow_operations::catalog_view(state, &request)?;
+            let view = workflow_operations::catalog_view(state, &request).await?;
             send_response(
                 writer,
                 request_id,
@@ -37031,7 +37067,28 @@ mod tests {
         assert!(view.run.attention.needs_attention());
         assert_eq!(view.tool_permissions[0].session_id, child.to_string());
         assert_eq!(view.tool_permissions[0].permission_id, "attention");
+        let query = bcode_workflow_view_models::WorkflowCatalogRequest {
+            limit: 1,
+            cursor: None,
+            filter: bcode_workflow_view_models::WorkflowCatalogFilter::NeedsAttention,
+            sort: bcode_workflow_view_models::WorkflowCatalogSort::default(),
+            group: bcode_workflow_view_models::WorkflowCatalogGroup::default(),
+            search: None,
+        };
+        let catalog = workflow_operations::catalog_view(&state, &query)
+            .await
+            .unwrap();
+        assert_eq!(catalog.runs.len(), 1);
+        assert_eq!(catalog.runs[0].run_id, "edit-run");
+        assert_eq!(catalog.runs[0].attention.pending_tool_permissions, 1);
         state.pending_permissions.lock().await.clear();
+        assert!(
+            workflow_operations::catalog_view(&state, &query)
+                .await
+                .unwrap()
+                .runs
+                .is_empty()
+        );
         let view = workflow_operations::run_view(&state, "edit-run", 10)
             .await
             .unwrap();
@@ -58744,9 +58801,25 @@ library = "test"
     }
 
     #[tokio::test]
+    async fn permission_persistence_failure_cannot_release_an_approved_invocation() {
+        let state = test_server_state(SessionManager::default());
+        let missing = SessionId::new();
+        let mut pending = pending_permission_for_batch("unpersistable", missing, 0, "unused");
+        pending.summary.batch = None;
+        let decision = Arc::clone(&pending.decision);
+        interaction_operations::complete_pending_permission(&state, pending, true, false).await;
+        assert_eq!(*decision.lock().await, Some(false));
+    }
+
+    #[tokio::test]
     async fn interaction_operations_list_and_resolve_permissions_without_transport_writing() {
         let state = test_server_state(SessionManager::default());
-        let session_id = SessionId::new();
+        let session_id = state
+            .sessions
+            .create_session(None, test_working_directory())
+            .await
+            .unwrap()
+            .id;
         let mut pending = pending_permission_for_batch("permission-1", session_id, 0, "batch-1");
         pending.summary.batch = None;
         let decision = Arc::clone(&pending.decision);
@@ -61678,7 +61751,12 @@ event_symbol = "bcode_plugin_handle_event_v1"
     #[tokio::test]
     async fn interaction_operations_batch_permission_resolution_is_latched_and_batch_scoped() {
         let state = test_server_state(SessionManager::default());
-        let session_id = SessionId::new();
+        let session_id = state
+            .sessions
+            .create_session(None, test_working_directory())
+            .await
+            .unwrap()
+            .id;
         let first_batch = Arc::new(PendingPermissionBatch::new(session_id));
         let second_batch = Arc::new(PendingPermissionBatch::new(session_id));
         state
@@ -62131,6 +62209,17 @@ event_symbol = "bcode_plugin_handle_event_v1"
             assert!(!request.is_addressed_to(SessionId::new()));
             assert_eq!(request.tool_name, "filesystem.write");
             assert!(!output.exists(), "authorization precedes the write");
+            recover_abandoned_session_runtime_work(&state, child.id)
+                .await
+                .unwrap();
+            assert_eq!(
+                interaction_operations::list_permissions(&state).await.len(),
+                1
+            );
+            assert!(!state.sessions.session_history(child.id).await.unwrap().iter().any(|event| {
+                matches!(&event.kind, SessionEventKind::ToolInvocationResultRecorded { record }
+                    if record.invocation_id == request.tool_call_id)
+            }), "attaching during a live permission wait must not terminalize its invocation");
             assert!(
                 tokio::time::timeout(Duration::from_millis(100), &mut completion)
                     .await
