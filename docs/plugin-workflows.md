@@ -41,6 +41,13 @@ configuration cannot claim an older contract version, and older executors reject
 Retries use the persisted setting. Existing pending questions are not answered or cancelled by
 this change.
 
+Tool discovery uses argument-independent `ToolList.discovery` metadata (policy version 1),
+provided by each tool-owning plugin. It never prepares a synthetic null-argument invocation.
+Missing or unsupported discovery policies exclude tools from restricted catalogs; ordinary
+unrestricted catalogs retain compatibility with older plugins. Rebuild bundled tool plugins with
+the host to supply these policies. Discovery metadata does not authorize execution: real argument
+preparation and canonical authorization, including the question restriction, still run at dispatch.
+
 Use typed workflow composition for domain behavior and let the host own durable registration,
 execution, discovery, and lifecycle state.
 

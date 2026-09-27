@@ -7015,6 +7015,7 @@ library = "libexample_plugin.dylib"
             .validate_loaded_tool_presentation_ownership(
                 "bcode.catalog-owner",
                 &bcode_tool::ToolList {
+                    discovery: BTreeMap::new(),
                     tools: vec![bcode_tool::ToolDefinition {
                         name: "different.tool".to_owned(),
                         description: String::new(),

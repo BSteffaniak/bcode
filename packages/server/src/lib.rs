@@ -26265,7 +26265,7 @@ fn apply_tool_description_profile(
 
 async fn collect_model_tools(
     state: &ServerState,
-    session_id: SessionId,
+    _session_id: SessionId,
     enabled_tools: Option<Vec<String>>,
     policy: bcode_session_models::TurnToolPolicy,
     allow_user_questions: bool,
@@ -26275,32 +26275,20 @@ async fn collect_model_tools(
         return Vec::new();
     }
     let mut tools = Vec::new();
-    for tool in collect_tool_definitions(state).await {
+    for (tool, discovery) in collect_tool_discovery(state).await {
         if enabled_tools
             .as_ref()
             .is_some_and(|enabled| !enabled.contains(&tool.name))
         {
             continue;
         }
-        if !allow_user_questions || !tool_policy_allows_operation(policy, false) {
-            let call = bcode_model::ToolCall {
-                id: format!("catalog-{}", tool.name),
-                name: tool.name.clone(),
-                arguments: serde_json::Value::Null,
-            };
-            let Ok((_, preparation)) = prepare_server_tool(state, session_id, &call).await else {
-                continue;
-            };
-            let Ok(metadata) =
-                tool_policy_authorization_metadata(&preparation.authorization, &tool.name)
-            else {
-                continue;
-            };
-            if tool_policy_denies_tool(policy, Some(&metadata))
-                || user_question_policy_denies_tool(allow_user_questions, &metadata)
-            {
-                continue;
-            }
+        if (!allow_user_questions || policy == TurnToolPolicy::ReadOnly)
+            && discovery.as_ref().is_none_or(|metadata| {
+                !metadata.allows(policy == TurnToolPolicy::ReadOnly, allow_user_questions)
+            })
+        {
+            tracing::debug!(tool = %tool.name, "tool unavailable under discovery policy");
+            continue;
         }
         tools.push(bcode_model::ToolDefinition {
             name: tool.name,
@@ -26312,6 +26300,19 @@ async fn collect_model_tools(
 }
 
 async fn collect_tool_definitions(state: &ServerState) -> Vec<ServiceToolDefinition> {
+    collect_tool_discovery(state)
+        .await
+        .into_iter()
+        .map(|(tool, _)| tool)
+        .collect()
+}
+
+async fn collect_tool_discovery(
+    state: &ServerState,
+) -> Vec<(
+    ServiceToolDefinition,
+    Option<bcode_tool::ToolDiscoveryPolicy>,
+)> {
     let mut tools = Vec::new();
     for plugin_id in tool_provider_plugin_ids(state) {
         let response = state
@@ -26324,7 +26325,12 @@ async fn collect_tool_definitions(state: &ServerState) -> Vec<ServiceToolDefinit
             )
             .await;
         match response {
-            Ok(list) => tools.extend(list.tools),
+            Ok(mut list) => {
+                for tool in list.tools {
+                    let policy = list.discovery.remove(&tool.name);
+                    tools.push((tool, policy));
+                }
+            }
             Err(error) => tracing::warn!("failed to list tools from {plugin_id}: {error}"),
         }
     }
@@ -26779,6 +26785,7 @@ async fn collect_server_tool_catalog(state: &ServerState) -> Result<UnifiedToolC
     Ok(catalog)
 }
 
+#[cfg(test)]
 async fn registered_server_tool(
     state: &ServerState,
     tool_name: &str,
@@ -26827,6 +26834,7 @@ async fn prepare_registered_server_tool(
     }
 }
 
+#[cfg(test)]
 async fn prepare_server_tool_with_cancel(
     state: &ServerState,
     session_id: SessionId,
@@ -26839,6 +26847,7 @@ async fn prepare_server_tool_with_cancel(
     Ok((tool, preparation))
 }
 
+#[cfg(test)]
 async fn prepare_server_tool(
     state: &ServerState,
     session_id: SessionId,
@@ -53708,6 +53717,12 @@ library = "test"
                 }
             }
         }
+        let available =
+            collect_model_tools(&state, child_id, None, TurnToolPolicy::Enabled, false).await;
+        assert!(
+            available.iter().any(|tool| tool.name == call.name),
+            "delegation must remain exposed with questions disabled"
+        );
         let response = invoke_task_with_permission(&state, child_id, &call, allow).await;
         if !allow {
             assert!(response.is_err() || response.as_ref().is_ok_and(|result| result.is_error));
@@ -88026,6 +88041,70 @@ event_symbol = "bcode_plugin_handle_event_v1"
         .await;
 
         assert!(tools.is_empty());
+        drop(state);
+    }
+
+    #[tokio::test]
+    async fn discovery_preserves_workflow_tools_without_preparing_fake_invocations() {
+        let (mut state,) = (test_server_state(SessionManager::default()),);
+        register_workflow_publication_tool(&mut state);
+        state.plugins = bcode_plugin::PluginRuntimeHost::load_defaults_with_static_bundled(
+            &bcode_plugin::PluginSelection {
+                mode: bcode_plugin::PluginSelectionMode::Explicit,
+                enabled: BTreeSet::from(["bcode.workflow".into(), "bcode.question".into()]),
+                disabled: BTreeSet::new(),
+            },
+            &[
+                bcode_plugin::StaticBundledPlugin::new(
+                    include_str!("../../../plugins/workflow-plugin/bcode-plugin.toml"),
+                    bcode_workflow_plugin::static_plugin(),
+                ),
+                bcode_plugin::StaticBundledPlugin::new(
+                    include_str!("../../../plugins/question-plugin/bcode-plugin.toml"),
+                    bcode_question_plugin::static_plugin(),
+                ),
+            ],
+        )
+        .unwrap();
+        // No session exists: catalog discovery must not prepare a session-bound invocation.
+        let session_id = SessionId::new();
+        let enabled =
+            collect_model_tools(&state, session_id, None, TurnToolPolicy::Enabled, false).await;
+        let interactive =
+            collect_model_tools(&state, session_id, None, TurnToolPolicy::Enabled, true).await;
+        assert!(interactive.iter().any(|tool| tool.name == "question"));
+        assert!(!enabled.iter().any(|tool| tool.name == "question"));
+        assert_eq!(enabled.len() + 1, interactive.len());
+        for name in [
+            "workflow.execution_context",
+            "workflow.stage_task_group",
+            "workflow.stage_prompt_task",
+            "workflow.publish_run_graph_edit",
+        ] {
+            assert!(
+                enabled.iter().any(|tool| tool.name == name),
+                "missing {name}"
+            );
+        }
+        let read_only =
+            collect_model_tools(&state, session_id, None, TurnToolPolicy::ReadOnly, false).await;
+        assert_eq!(
+            read_only
+                .iter()
+                .map(|tool| tool.name.as_str())
+                .collect::<Vec<_>>(),
+            ["workflow.execution_context"]
+        );
+        let invalid = bcode_model::ToolCall {
+            id: "invalid".into(),
+            name: "workflow.stage_task_group".into(),
+            arguments: serde_json::Value::Null,
+        };
+        assert!(
+            prepare_server_tool(&state, session_id, &invalid)
+                .await
+                .is_err()
+        );
         drop(state);
     }
 

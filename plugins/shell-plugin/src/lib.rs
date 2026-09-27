@@ -991,9 +991,10 @@ fn list_tools(request: &ServiceRequest) -> ServiceResponse {
     if let Err(error) = request.payload_json::<ListToolsRequest>() {
         return invalid_request(&error);
     }
-    json_response(&ToolList {
-        tools: vec![shell_tool_definition()],
-    })
+    json_response(&ToolList::with_discovery(
+        vec![shell_tool_definition()],
+        |_tool| bcode_tool::ToolDiscoveryPolicy::new(false),
+    ))
 }
 
 fn invoke_tool(context: &NativeServiceContext) -> ServiceResponse {

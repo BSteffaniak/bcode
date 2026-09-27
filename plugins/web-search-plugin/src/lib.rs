@@ -1953,9 +1953,10 @@ fn list_tools(
     if let Err(error) = request.payload_json::<ListToolsRequest>() {
         return invalid_request(&error);
     }
-    json_response(&ToolList {
-        tools: web_tool_definitions(config, credentials),
-    })
+    json_response(&ToolList::with_discovery(
+        web_tool_definitions(config, credentials),
+        |_tool| bcode_tool::ToolDiscoveryPolicy::new(true),
+    ))
 }
 
 fn web_request_schema(operation: &str) -> Option<&'static str> {

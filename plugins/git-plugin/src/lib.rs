@@ -78,9 +78,10 @@ fn list_tools(request: &ServiceRequest) -> ServiceResponse {
     if let Err(error) = request.payload_json::<ListToolsRequest>() {
         return invalid_request(&error);
     }
-    json_response(&ToolList {
-        tools: vec![clone_tool_definition(), github_clone_alias_definition()],
-    })
+    json_response(&ToolList::with_discovery(
+        vec![clone_tool_definition(), github_clone_alias_definition()],
+        |_tool| bcode_tool::ToolDiscoveryPolicy::new(false),
+    ))
 }
 
 fn invoke_tool(context: &NativeServiceContext) -> ServiceResponse {

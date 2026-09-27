@@ -51,6 +51,79 @@ pub struct ListToolsRequest {}
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ToolList {
     pub tools: Vec<ToolDefinition>,
+    /// Argument-independent discovery policy. Missing entries are unknown, not permissive.
+    #[serde(default)]
+    pub discovery: std::collections::BTreeMap<String, ToolDiscoveryPolicy>,
+}
+
+/// Plugin-owned discovery facts, never a substitute for invocation authorization.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ToolDiscoveryPolicy {
+    /// Compatibility boundary for argument-independent discovery.
+    pub version: u32,
+    /// True only when every invocation is read-only.
+    pub read_only: bool,
+    /// Declared capabilities, including `ask_user` for user-question tools.
+    pub capabilities: Vec<String>,
+}
+
+impl ToolList {
+    /// Attach argument-independent policies supplied by the owning plugin.
+    #[must_use]
+    pub fn with_discovery(
+        tools: Vec<ToolDefinition>,
+        policy: impl Fn(&ToolDefinition) -> ToolDiscoveryPolicy,
+    ) -> Self {
+        let discovery = tools
+            .iter()
+            .map(|tool| (tool.name.clone(), policy(tool)))
+            .collect();
+        Self { tools, discovery }
+    }
+}
+
+impl ToolDiscoveryPolicy {
+    /// Declare a tool's conservative read-only classification without preparing an invocation.
+    #[must_use]
+    pub const fn new(read_only: bool) -> Self {
+        Self {
+            version: 1,
+            read_only,
+            capabilities: Vec::new(),
+        }
+    }
+
+    /// Whether these known discovery facts permit exposure under the supplied restrictions.
+    #[must_use]
+    pub fn allows(&self, read_only: bool, allow_user_questions: bool) -> bool {
+        self.version == 1
+            && (!read_only || self.read_only)
+            && (allow_user_questions
+                || !self
+                    .capabilities
+                    .iter()
+                    .any(|capability| capability == "ask_user"))
+    }
+}
+
+#[cfg(test)]
+mod discovery_tests {
+    use super::*;
+
+    #[test]
+    fn discovery_policy_is_versioned_and_restrictive() {
+        let mut policy = ToolDiscoveryPolicy::new(false);
+        assert!(policy.allows(false, false));
+        assert!(!policy.allows(true, false));
+        policy.capabilities.push("ask_user".into());
+        assert!(!policy.allows(false, false));
+        assert!(policy.allows(false, true));
+        policy.version = 2;
+        assert!(!policy.allows(false, true));
+        let legacy: ToolList = serde_json::from_value(serde_json::json!({"tools":[]})).unwrap();
+        assert!(legacy.discovery.is_empty());
+    }
 }
 
 /// Model-callable tool definition.

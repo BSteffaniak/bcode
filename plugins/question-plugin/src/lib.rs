@@ -88,9 +88,13 @@ fn question_policy_preparation() -> bcode_plugin_sdk::ToolPolicyPreparation {
 
 fn list_tools(request: &ServiceRequest) -> ServiceResponse {
     match request.payload_json::<ListToolsRequest>() {
-        Ok(ListToolsRequest {}) => json_response(&ToolList {
-            tools: vec![question_tool_definition()],
-        }),
+        Ok(ListToolsRequest {}) => json_response(&ToolList::with_discovery(
+            vec![question_tool_definition()],
+            |_| bcode_tool::ToolDiscoveryPolicy {
+                capabilities: question_policy_preparation().identity.capabilities,
+                ..bcode_tool::ToolDiscoveryPolicy::new(true)
+            },
+        )),
         Err(error) => ServiceResponse::error("invalid_request", error.to_string()),
     }
 }

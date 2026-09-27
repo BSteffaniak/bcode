@@ -396,9 +396,11 @@ fn tool_definitions() -> Vec<ToolDefinition> {
 /// Dispatch the plugin-owned workflow tool service.
 pub fn invoke(context: &NativeServiceContext) -> ServiceResponse {
     match context.request.operation.as_str() {
-        bcode_tool::OP_LIST_TOOLS => super::json_response(&ToolList {
-            tools: tool_definitions(),
-        }),
+        bcode_tool::OP_LIST_TOOLS => {
+            super::json_response(&ToolList::with_discovery(tool_definitions(), |tool| {
+                bcode_tool::ToolDiscoveryPolicy::new(tool.name == CONTEXT_NAME)
+            }))
+        }
         bcode_tool::OP_PREPARE_TOOL => {
             prepare_tool_service_response(&context.request, tool_definitions(), |request, _| {
                 let is_context = request.invocation.tool_name == CONTEXT_NAME;
