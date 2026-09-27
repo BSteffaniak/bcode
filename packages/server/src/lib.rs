@@ -60549,6 +60549,30 @@ event_symbol = "bcode_plugin_handle_event_v1"
                 generation
             );
         }
+        for index in 0..3 {
+            assert!(
+                interaction_operations::resolve_permission(
+                    &state,
+                    &format!("permission-{index}"),
+                    true,
+                    false
+                )
+                .await
+            );
+        }
+        assert!(
+            interaction_operations::list_permissions(&state)
+                .await
+                .is_empty()
+        );
+        assert_eq!(
+            state
+                .sessions
+                .current_session_generation(session.id)
+                .await
+                .unwrap(),
+            generation + 3
+        );
         drop(state);
     }
 

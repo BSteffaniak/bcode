@@ -446,9 +446,34 @@ async fn resolve_recovered_permission(
     if summary.execution.is_some() {
         return false;
     }
+    let bcode_session_models::SessionEventKind::PermissionRequested { tool_call_id, .. } =
+        &checkpoint.permission().kind
+    else {
+        return false;
+    };
+    let Ok(Some(current)) = state
+        .sessions
+        .invocation_recovery_checkpoint(
+            checkpoint.session_id(),
+            tool_call_id,
+            checkpoint.request().sequence,
+            1024,
+        )
+        .await
+    else {
+        return false;
+    };
+    if current.turn() != checkpoint.turn()
+        || current.request() != checkpoint.request()
+        || current.permission() != checkpoint.permission()
+    {
+        return false;
+    }
+    // This is a fresh validation of the exact original request. A commit conflict below
+    // is returned to the caller, never retried against a silently advanced generation.
     let Ok(event) = state
         .sessions
-        .append_recovered_permission_decision(checkpoint, approved)
+        .append_recovered_permission_decision(&current, approved)
         .await
     else {
         return false;
