@@ -42,6 +42,15 @@ Approval resumes from retained goal state; it does not approve the original tool
 that an external dependency is satisfied. Resolve that original request first. This is an explicit
 user-controlled fallback, not automatic authenticated dependency resolution.
 
+### Routed input exchanges and CLI discovery
+
+The same explicitly admitted interaction destination is now carried by pending tool-exchange
+summaries. TUI and web pending-input hydration and CLI exchange/permission session filters include
+requests addressed to that destination while preserving the source session identity. Registration,
+resolution and cancellation invalidate the destination view. Payload semantics remain producer-owned;
+this does not enable the question tool in question-disabled turns or grant response authority.
+These are same-daemon live observations, not durable delivery or cross-daemon routing.
+
 ### Routed permission notifications
 
 Turn execution-options version 7 adds an explicit version-1 `interaction_route` with a

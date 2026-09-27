@@ -268,9 +268,16 @@ async fn notify_interaction_destination(
     state: &ServerState,
     permission: &bcode_session_models::PermissionSummary,
 ) {
+    notify_route_destination(state, permission.interaction_route.as_ref()).await;
+}
+
+async fn notify_route_destination(
+    state: &ServerState,
+    route: Option<&bcode_session_models::ExecutionInteractionRoute>,
+) {
     use futures::StreamExt as _;
 
-    let Some(route) = &permission.interaction_route else {
+    let Some(route) = route else {
         return;
     };
     let sinks = state.workflow_event_sinks().await;
@@ -597,8 +604,13 @@ pub async fn register_pending_tool_exchange(
     ),
     String,
 > {
+    let route = state
+        .session_current_turn(session_id)
+        .await
+        .and_then(|turn| turn.interaction_route);
     let pending = PendingToolExchange {
         summary: PendingToolExchangeSummary {
+            interaction_route: route.clone(),
             session_id,
             request: request.clone(),
         },
@@ -616,6 +628,7 @@ pub async fn register_pending_tool_exchange(
     }
     exchanges.insert(request.exchange_id.clone(), pending);
     drop(exchanges);
+    notify_route_destination(state, route.as_ref()).await;
     Ok((resolution, notify))
 }
 
@@ -696,11 +709,14 @@ pub async fn abort_tool_exchange(
     interaction_id: &str,
     resolution: ToolExchangeResolution,
 ) -> ToolExchangeResolution {
-    state
+    let pending = state
         .pending_tool_exchanges
         .lock()
         .await
         .remove(interaction_id);
+    if let Some(pending) = pending {
+        notify_route_destination(state, pending.summary.interaction_route.as_ref()).await;
+    }
     resolution
 }
 
@@ -720,6 +736,7 @@ pub async fn complete_pending_tool_exchange(
     };
     *request.resolution.lock().await = Some(resolution);
     request.notify.notify_waiters();
+    notify_route_destination(state, request.summary.interaction_route.as_ref()).await;
     true
 }
 

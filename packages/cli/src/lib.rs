@@ -3170,7 +3170,7 @@ fn filter_session_exchanges(
     session_id: Option<SessionId>,
 ) {
     if let Some(session_id) = session_id {
-        exchanges.retain(|exchange| exchange.session_id == session_id);
+        exchanges.retain(|exchange| exchange.is_addressed_to(session_id));
     }
 }
 
@@ -6457,7 +6457,7 @@ enum PermissionCommand {
         json: bool,
     },
     List {
-        /// Restrict pending permissions to one canonical session.
+        /// Include canonical requests from this session and requests explicitly routed to it.
         #[arg(long)]
         session_id: Option<SessionId>,
         /// Print complete structured permission summaries as JSON.
@@ -17666,11 +17666,15 @@ fn write_permission_status<W: std::io::Write, E: std::io::Write>(
     Ok(())
 }
 
+fn filter_permission_list(permissions: &mut Vec<PermissionSummary>, session_id: Option<SessionId>) {
+    if let Some(session_id) = session_id {
+        permissions.retain(|permission| permission.is_addressed_to(session_id));
+    }
+}
+
 async fn list_permissions(session_id: Option<SessionId>, json: bool) -> Result<(), CliError> {
     let mut permissions = BcodeClient::default_endpoint().list_permissions().await?;
-    if let Some(session_id) = session_id {
-        permissions.retain(|permission| permission.session_id == session_id);
-    }
+    filter_permission_list(&mut permissions, session_id);
     write_permission_list(&mut std::io::stdout().lock(), &permissions, json)
 }
 
@@ -25706,6 +25710,7 @@ mod json_stream_output_tests {
     fn interaction_lists_preserve_formats_and_propagate_output_failures() {
         let session_id = bcode_session_models::SessionId::new();
         let exchange = bcode_session_models::PendingToolExchangeSummary {
+            interaction_route: None,
             session_id,
             request: bcode_session_models::ToolExchangeRequest {
                 invocation_id: "invocation".to_owned(),
@@ -26002,6 +26007,25 @@ mod json_stream_output_tests {
             policy_reason: Some("approval required".to_owned()),
             can_remember_policy: true,
         });
+        let destination = bcode_session_models::SessionId::new();
+        let mut routed = permissions.to_vec();
+        routed[0].interaction_route = Some(bcode_session_models::ExecutionInteractionRoute {
+            version: 1,
+            destination_session_id: destination,
+        });
+        let mut source_view = routed.clone();
+        super::filter_permission_list(&mut source_view, Some(session_id));
+        assert_eq!(source_view.len(), 2);
+        let mut unrelated_view = routed.clone();
+        super::filter_permission_list(
+            &mut unrelated_view,
+            Some(bcode_session_models::SessionId::new()),
+        );
+        assert!(unrelated_view.is_empty());
+        super::filter_permission_list(&mut routed, Some(destination));
+        assert_eq!(routed.len(), 1);
+        assert_eq!(routed[0].permission_id, "second");
+        assert_eq!(routed[0].session_id, session_id);
         for json in [false, true] {
             let mut output = Output::default();
             super::write_permission_list(&mut output, &permissions, json).unwrap();
@@ -26489,6 +26513,7 @@ mod interaction_cli_tests {
         }) if id == selected));
         let make_exchange =
             |session_id, exchange_id: &str| bcode_session_models::PendingToolExchangeSummary {
+                interaction_route: None,
                 session_id,
                 request: bcode_session_models::ToolExchangeRequest {
                     invocation_id: "invocation".to_owned(),

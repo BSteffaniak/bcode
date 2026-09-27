@@ -337,10 +337,24 @@ impl PermissionSummary {
 /// support for that version.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PendingToolExchangeSummary {
+    /// Host-validated notification destination; resolution remains source-owned.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub interaction_route: Option<ExecutionInteractionRoute>,
     /// Canonical session containing the pending exchange.
     pub session_id: SessionId,
     /// Producer-owned request, including its schema identity and payload.
     pub request: ToolExchangeRequest,
+}
+
+impl PendingToolExchangeSummary {
+    /// Whether a session should present this source-owned request.
+    #[must_use]
+    pub fn is_addressed_to(&self, session_id: SessionId) -> bool {
+        self.session_id == session_id
+            || self.interaction_route.as_ref().is_some_and(|route| {
+                route.version == 1 && route.destination_session_id == session_id
+            })
+    }
 }
 
 /// Stable zero-based position of one semantic output unit within a provider round.

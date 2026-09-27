@@ -786,7 +786,7 @@ async fn hydrate_pending_interactions(
     retire_stale_interaction_controllers(interaction_controllers, &pending_ids)?;
     for request in exchanges
         .into_iter()
-        .filter(|request| request.session_id == session_id)
+        .filter(|request| request.is_addressed_to(session_id))
     {
         let exchange = request.request;
         let interaction_id = exchange.exchange_id.clone();

@@ -7606,6 +7606,7 @@ mod client_timeout_tests {
     #[test]
     fn pending_exchange_selection_preserves_schema_and_rejects_ambiguity() {
         let exchange = bcode_session_models::PendingToolExchangeSummary {
+            interaction_route: None,
             session_id: bcode_session_models::SessionId::new(),
             request: bcode_session_models::ToolExchangeRequest {
                 invocation_id: "invocation".to_owned(),

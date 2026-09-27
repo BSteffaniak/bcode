@@ -44128,6 +44128,7 @@ library = "test"
 
         let pending = PendingToolExchange {
             summary: bcode_ipc::PendingToolExchangeSummary {
+                interaction_route: None,
                 session_id: SessionId::new(),
                 request: request.clone(),
             },
@@ -57646,6 +57647,7 @@ library = "test"
     ) -> PendingToolExchange {
         PendingToolExchange {
             summary: bcode_ipc::PendingToolExchangeSummary {
+                interaction_route: None,
                 session_id: SessionId::new(),
                 request: ToolExchangeRequest {
                     invocation_id: "invocation".to_owned(),
@@ -58695,6 +58697,7 @@ library = "test"
         assert_eq!(
             observed,
             vec![bcode_session_models::PendingToolExchangeSummary {
+                interaction_route: None,
                 session_id,
                 request: request.clone(),
             }]
@@ -61761,6 +61764,50 @@ event_symbol = "bcode_plugin_handle_event_v1"
         );
     }
 
+    async fn assert_routed_exchange(
+        state: &ServerState,
+        source: SessionId,
+        destination: SessionId,
+    ) {
+        let exchange = ToolExchangeRequest {
+            invocation_id: "routed-input".into(),
+            exchange_id: "routed-input-exchange".into(),
+            producer_id: "test.input".into(),
+            schema: "test.input.request".into(),
+            schema_version: 1,
+            payload: serde_json::json!({"prompt":"input required"}),
+            response_policy: bcode_session_models::ToolExchangeResponsePolicy::Required,
+        };
+        let (resolution, _) =
+            interaction_operations::register_pending_tool_exchange(state, source, &exchange)
+                .await
+                .unwrap();
+        let exchanges = interaction_operations::list_pending_tool_exchanges(state).await;
+        assert_eq!(exchanges.len(), 1);
+        assert!(exchanges[0].is_addressed_to(destination));
+        assert_eq!(exchanges[0].session_id, source);
+        assert!(!exchanges[0].is_addressed_to(SessionId::new()));
+        assert!(
+            interaction_operations::complete_pending_tool_exchange(
+                state,
+                &exchange.exchange_id,
+                ToolExchangeResolution::Responded {
+                    payload: serde_json::json!({"answer":"yes"})
+                }
+            )
+            .await
+        );
+        assert!(resolution.lock().await.is_some());
+        assert!(
+            !interaction_operations::complete_pending_tool_exchange(
+                state,
+                &exchange.exchange_id,
+                ToolExchangeResolution::Cancelled
+            )
+            .await
+        );
+    }
+
     #[tokio::test]
     async fn routed_permission_keeps_source_authority_and_resolves_once() {
         let sessions = SessionManager::default();
@@ -61802,6 +61849,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
                 }))),
             },
         );
+        assert_routed_exchange(&state, source, destination).await;
         let mut pending = pending_permission_for_batch("routed", source, 0, "unused");
         pending.summary.batch = None;
         let event = SessionEventKind::PermissionRequested {
@@ -65072,6 +65120,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
                 interaction_id.clone(),
                 PendingToolExchange {
                     summary: bcode_ipc::PendingToolExchangeSummary {
+                        interaction_route: None,
                         session_id: session.id,
                         request: ToolExchangeRequest {
                             invocation_id: format!("unknown-call-{index}"),

@@ -2624,7 +2624,7 @@ pub async fn load_pending_interactions(
         .list_pending_tool_exchanges()
         .await?
         .into_iter()
-        .filter(|request| request.session_id == session_id)
+        .filter(|request| request.is_addressed_to(session_id))
     {
         let exchange = request.request;
         let interaction_id = exchange.exchange_id.clone();
