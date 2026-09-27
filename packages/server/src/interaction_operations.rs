@@ -497,6 +497,45 @@ pub async fn complete_pending_permission(
     approved: bool,
     remember: bool,
 ) -> bool {
+    Box::pin(complete_pending_permission_inner(
+        state, permission, approved, remember,
+    ))
+    .await
+}
+
+async fn complete_pending_permission_inner(
+    state: &ServerState,
+    permission: PendingPermission,
+    approved: bool,
+    remember: bool,
+) -> bool {
+    let checkpoint = state
+        .recovered_permissions
+        .lock()
+        .await
+        .get(&permission.summary.permission_id)
+        .cloned();
+    if let Some(checkpoint) = checkpoint {
+        let resolved = Box::pin(resolve_recovered_permission(
+            state,
+            &permission.summary.permission_id,
+            &checkpoint,
+            approved,
+            remember,
+        ))
+        .await;
+        if !resolved {
+            // Live cancellation callers may already have removed the summary. Keep the
+            // unresolved recovered request visible when its fenced decision is refused.
+            state
+                .pending_permissions
+                .lock()
+                .await
+                .entry(permission.summary.permission_id.clone())
+                .or_insert(permission);
+        }
+        return resolved;
+    }
     // Never release a waiting invocation on a decision that has not been recorded.
     // A failed append fails closed; it must not become an in-memory approval.
     let recorded = append_permission_resolved_event(
@@ -564,8 +603,7 @@ pub async fn cancel_pending_permission(state: &ServerState, permission_id: &str)
     let Some(permission) = permission else {
         return false;
     };
-    complete_pending_permission(state, permission, false, false).await;
-    true
+    complete_pending_permission(state, permission, false, false).await
 }
 
 /// Deny and complete every pending permission for one cancelled session.

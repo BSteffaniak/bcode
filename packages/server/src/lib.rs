@@ -60549,7 +60549,8 @@ event_symbol = "bcode_plugin_handle_event_v1"
                 generation
             );
         }
-        for index in 0..3 {
+        assert_recovered_cancellation(&state).await;
+        for index in 1..3 {
             assert!(
                 interaction_operations::resolve_permission(
                     &state,
@@ -60574,6 +60575,20 @@ event_symbol = "bcode_plugin_handle_event_v1"
             generation + 3
         );
         drop(state);
+    }
+
+    async fn assert_recovered_cancellation(state: &ServerState) {
+        assert!(interaction_operations::cancel_pending_permission(state, "permission-0").await);
+        assert!(
+            !interaction_operations::resolve_permission(state, "permission-0", true, false).await
+        );
+        assert!(
+            !state
+                .recovered_permissions
+                .lock()
+                .await
+                .contains_key("permission-0")
+        );
     }
 
     #[tokio::test]
