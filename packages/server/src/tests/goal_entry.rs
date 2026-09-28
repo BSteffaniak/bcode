@@ -389,6 +389,15 @@ fn configure_goal_execution(server: &mut ServerState, root: &Path) {
         ],
     )
     .unwrap();
+    // Derive handshake metadata from explicit fixture configuration through production
+    // normalization (which also includes default provider selections).
+    server.startup_config.plugins.default = bcode_config::PluginDefaultMode::None;
+    server.startup_config.plugins.enabled = server.plugins.selection().enabled.clone();
+    server.startup_config.plugins.disabled = server.plugins.selection().disabled.clone();
+    server.startup_plugin_selection = bcode_config::plugin_selection_with_default_plugin_ids(
+        &server.startup_config,
+        &server.default_plugin_ids,
+    );
     server.startup_config.workflows.run_edit_plugins = BTreeSet::from(["bcode.workflow".into()]);
     server.startup_config.workflows.run_publication_plugins =
         BTreeSet::from(["bcode.workflow".into()]);
@@ -850,8 +859,29 @@ fn goal_ipc_client(
 }
 
 // Isolate the default-endpoint environment from concurrently running server tests.
-async fn invoke_goal_allowance_command(root: &Path, session: SessionId) {
+async fn invoke_goal_allowance_command(
+    root: &Path,
+    session: SessionId,
+    config: &bcode_config::BcodeConfig,
+) {
     let output = tokio::process::Command::new(std::env::current_exe().unwrap())
+        .env_clear()
+        .current_dir(root)
+        .env("HOME", root.join("home"))
+        // Keep the daemon's routing scope while replacing ambient configuration with the
+        // fixture's complete effective configuration. Changing XDG paths changes scope identity.
+        .env(
+            "XDG_CONFIG_HOME",
+            bcode_config::default_config_dir().parent().unwrap(),
+        )
+        .env(
+            bcode_config::BCODE_STATE_DIR_ENV,
+            bcode_config::default_state_dir(),
+        )
+        .env(
+            bcode_config::BCODE_CONFIG_TOML_ENV,
+            bcode_config::encode_effective_config(config).unwrap(),
+        )
         .args([
             "--exact",
             "tests::goal_entry::goal_allowance_command_subprocess",
@@ -888,6 +918,74 @@ async fn goal_allowance_command_subprocess() {
         &[bcode_bundled_plugins::static_loop_plugin()],
     )
     .unwrap();
+    // Exercise the shipped status command over the same client/daemon boundary as
+    // continuation, rather than testing only its semantic-view formatter.
+    let status: bcode_command::InvokeCommandResponse = plugins
+        .invoke_service_json(
+            "bcode.loop",
+            bcode_command::COMMAND_INTERFACE_ID,
+            bcode_command::OP_INVOKE_COMMAND,
+            &bcode_command::InvokeCommandRequest {
+                command_id: "goal.status".into(),
+                args: BTreeMap::new(),
+                context: Some(bcode_command::CommandInvocationContext {
+                    session_id: Some(session.parse().unwrap()),
+                    working_directory: std::env::current_dir().unwrap(),
+                }),
+            },
+        )
+        .await
+        .unwrap();
+    assert!(status.success, "{:?}", status.message);
+    let message = status.message.unwrap();
+    assert!(
+        message.contains("Goal execution (bounded snapshot"),
+        "{message}"
+    );
+    assert!(
+        message.contains("Execution allowance exhausted"),
+        "{message}"
+    );
+    assert!(
+        message.contains("/goal.continue --worker-attempts"),
+        "{message}"
+    );
+    // This fixture has no usable working-document store. Optional notes must not
+    // erase the execution snapshot or the exact allowance recovery action.
+    assert!(
+        message.contains("Progress document unavailable:"),
+        "{message}"
+    );
+    assert!(!message.contains("Goal status unavailable"), "{message}");
+    let unrelated_worker: bcode_command::InvokeCommandResponse = plugins
+        .invoke_service_json(
+            "bcode.loop",
+            bcode_command::COMMAND_INTERFACE_ID,
+            bcode_command::OP_INVOKE_COMMAND,
+            &bcode_command::InvokeCommandRequest {
+                command_id: "goal.worker".into(),
+                args: BTreeMap::from([("arguments".into(), SessionId::new().to_string())]),
+                context: Some(bcode_command::CommandInvocationContext {
+                    session_id: Some(session.parse().unwrap()),
+                    working_directory: std::env::current_dir().unwrap(),
+                }),
+            },
+        )
+        .await
+        .unwrap();
+    assert!(!unrelated_worker.success);
+    assert!(
+        unrelated_worker
+            .message
+            .unwrap()
+            .contains("current bounded goal snapshot")
+    );
+    assert!(
+        !unrelated_worker
+            .effects
+            .iter()
+            .any(|effect| matches!(effect, bcode_command::CommandEffect::OpenSession { .. }))
+    );
     let response: bcode_command::InvokeCommandResponse = plugins
         .invoke_service_json(
             "bcode.loop",
@@ -904,6 +1002,7 @@ async fn goal_allowance_command_subprocess() {
         )
         .await
         .unwrap();
+    drop(plugins);
     assert!(response.success, "{:?}", response.message);
     assert!(
         response
@@ -911,6 +1010,32 @@ async fn goal_allowance_command_subprocess() {
             .unwrap()
             .contains("Granted 99 execution attempts")
     );
+}
+
+async fn assert_goal_config_mismatch_rejected(
+    client: &bcode_client::BcodeClient,
+    config: &bcode_config::BcodeConfig,
+    run_id: &str,
+) {
+    let mut incompatible_config = config.clone();
+    incompatible_config
+        .plugins
+        .disabled
+        .insert("bcode.workflow".into());
+    let incompatible_client =
+        client
+            .clone()
+            .with_runtime_context(Some(bcode_ipc::ClientRuntimeContext {
+                effective_config_toml: Some(Box::new(
+                    bcode_config::encode_effective_config(&incompatible_config).unwrap(),
+                )),
+                ..bcode_ipc::ClientRuntimeContext::default()
+            }));
+    let error = incompatible_client
+        .inspect_workflow_run(run_id.to_owned(), 10)
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("incompatible_config"), "{error}");
 }
 
 #[tokio::test]
@@ -932,6 +1057,7 @@ async fn exhausted_goal_resumes_after_idempotent_ipc_allowance_grant() {
         goal_entry_request_with_cap(session.id, root.path(), Arc::clone(&state), Some(1)).await;
     let run_id = request.run_id.unwrap();
     let (client, server) = goal_ipc_client(root.path(), &state);
+    assert_goal_config_mismatch_rejected(&client, &state.startup_config, &run_id).await;
     let observation = tokio::time::timeout(Duration::from_secs(20), async {
         loop {
             approve_goal_permissions(&state, session.id).await;
@@ -954,7 +1080,7 @@ async fn exhausted_goal_resumes_after_idempotent_ipc_allowance_grant() {
         expected_cap: observation.run_cap,
         target_cap: 100,
     };
-    invoke_goal_allowance_command(root.path(), session.id).await;
+    invoke_goal_allowance_command(root.path(), session.id, &state.startup_config).await;
     client
         .control_workflow_run(run_id.clone(), action)
         .await

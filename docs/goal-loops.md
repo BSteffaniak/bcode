@@ -1,5 +1,19 @@
 # Goal setup for prompt loops
 
+`/goal.status` includes a bounded execution snapshot from the application's semantic
+workflow view: agent task names and states, execution-session identities, pending tool
+permissions, input/approval prompts, failure diagnostics, and canonical terminal result
+identity when available. This is not a complete history or proof of integrated completion.
+Refresh with `/goal.status`; use `/goal.worker <session-id>` to open a listed execution
+session's canonical transcript and inspect its pending requests using normal session controls.
+Opening a worker does not approve a request, resume work, or grant permission. The command
+checks membership in the current bounded goal snapshot; use `/workflow` for older executions,
+full details and exact approval controls.
+Unavailable or unsupported detail is reported without hiding the existing goal controls.
+An unavailable progress document is reported separately without hiding execution status
+or allowance-continuation guidance.
+The run summary and execution detail are separate observations and can advance between reads.
+
 `/goal` and `/loop` can open from a fresh sessionless screen. Opening or cancelling an
 unsubmitted modal creates nothing. Valid submission creates a session in the current working
 directory, applies draft model/provider/agent/reasoning selections, and attaches it before

@@ -198,6 +198,69 @@ pub fn unblock_response(session_id: SessionId, arguments: &str) -> InvokeCommand
     }
 }
 
+pub fn worker_response(session_id: SessionId, arguments: &str) -> InvokeCommandResponse {
+    let Ok(worker) = arguments.trim().parse::<SessionId>() else {
+        let mut response = status_response("Usage: /goal.worker <session-id from /goal.status>");
+        response.success = false;
+        return response;
+    };
+    let result = run_async(async move {
+        let client = BcodeClient::default_endpoint();
+        let Some(inspection) = client
+            .inspect_associated_workflow_run(workflow_binding_key(session_id), 10)
+            .await?
+        else {
+            return Ok(None);
+        };
+        client
+            .workflow_run_view(inspection.run.run_id, 10)
+            .await
+            .map(Some)
+    });
+    match result {
+        Ok(Some(view)) => worker_view_response(&view, worker),
+        Ok(None) => worker_unavailable("No associated goal"),
+        Err(error) => worker_unavailable(&format!("Goal worker detail unavailable: {error}")),
+    }
+}
+
+fn worker_unavailable(message: &str) -> InvokeCommandResponse {
+    let mut response = status_response(message);
+    response.success = false;
+    response
+}
+
+fn worker_view_response(
+    view: &bcode_workflow_view_models::WorkflowRunView,
+    worker: SessionId,
+) -> InvokeCommandResponse {
+    if view.validate_version().is_err() {
+        return worker_unavailable(
+            "Goal worker detail unavailable: unsupported workflow view version",
+        );
+    }
+    if !view
+        .child_sessions
+        .iter()
+        .any(|session| session.session_id == worker.to_string())
+    {
+        return worker_unavailable(
+            "Worker is not in the current bounded goal snapshot. Refresh /goal.status or use /workflow for older executions.",
+        );
+    }
+    InvokeCommandResponse {
+        success: true,
+        message: None,
+        updated_model: None,
+        updated_provider: None,
+        updated_thinking: None,
+        effects: vec![CommandEffect::OpenSession {
+            session_id: worker,
+            focus: bcode_command::SessionOpenFocus::Default,
+        }],
+    }
+}
+
 pub fn progress_status(session_id: SessionId) -> InvokeCommandResponse {
     let result = run_async(async move {
         let client = BcodeClient::default_endpoint();
@@ -209,6 +272,12 @@ pub fn progress_status(session_id: SessionId) -> InvokeCommandResponse {
         };
         let run = &inspection.run;
         let mut status = format_workflow_inspection_status(&inspection);
+        match client.workflow_run_view(run.run_id.clone(), 10).await {
+            Ok(view) => status.push_str(&crate::goal_status::format(&view)),
+            Err(error) => {
+                let _ = write!(status, "\nGoal execution detail unavailable: {error}");
+            }
+        }
         if inspection
             .execution_allowance
             .as_ref()
@@ -243,16 +312,19 @@ pub fn progress_status(session_id: SessionId) -> InvokeCommandResponse {
                 scope_id: document_scope,
                 initial_text: None,
             })
-            .await?
+            .await
         {
-            Some(document) => {
+            Ok(Some(document)) => {
                 let _ = write!(
                     status,
                     "\nProgress document: {} · /goal.progress to read",
                     document.path
                 );
             }
-            None => status.push_str("\nNo progress document"),
+            Ok(None) => status.push_str("\nNo progress document"),
+            Err(error) => {
+                let _ = write!(status, "\nProgress document unavailable: {error}");
+            }
         }
         Ok(status)
     });
@@ -961,6 +1033,42 @@ impl PluginTuiSurface for GoalSurface {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn worker_navigation_requires_current_goal_membership_and_known_version() {
+        let worker = SessionId::new();
+        let mut view = crate::goal_status::tests::view();
+        assert!(!worker_view_response(&view, worker).success);
+        view.child_sessions
+            .push(bcode_workflow_view_models::WorkflowChildSessionView {
+                node_id: "worker".into(),
+                activation_id: "active".into(),
+                attempt: 1,
+                session_id: worker.to_string(),
+            });
+        let response = worker_view_response(&view, worker);
+        assert!(response.success);
+        assert!(
+            matches!(response.effects.as_slice(), [CommandEffect::OpenSession { session_id, .. }] if *session_id == worker)
+        );
+        assert!(!worker_view_response(&view, SessionId::new()).success);
+        view.version += 1;
+        let response = worker_view_response(&view, worker);
+        assert!(!response.success);
+        assert!(
+            !response
+                .effects
+                .iter()
+                .any(|effect| matches!(effect, CommandEffect::OpenSession { .. }))
+        );
+    }
+
+    #[test]
+    fn worker_navigation_rejects_malformed_arguments_before_ipc() {
+        for arguments in ["", "worker", "approve", "worker extra"] {
+            assert!(!worker_response(SessionId::new(), arguments).success);
+        }
+    }
 
     #[test]
     fn unblock_requires_exact_activation_and_explicit_decision() {

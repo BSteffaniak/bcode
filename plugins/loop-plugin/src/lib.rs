@@ -56,6 +56,7 @@ mod continuation;
 mod goal;
 mod goal_document_view;
 mod goal_live;
+mod goal_status;
 mod judgement_evaluation;
 mod progress;
 
@@ -149,6 +150,11 @@ fn commands() -> Vec<CommandContribution> {
             "Inspect configured delegation prerequisites without granting authority",
         ),
         session_command("goal.status", "Goal Status", "Show the session loop status"),
+        session_command(
+            "goal.worker",
+            "Open Goal Worker",
+            "Open an execution session from goal status: <session-id>; inspect requests before approving",
+        ),
         session_command(
             "goal.unblock",
             "Resolve Goal Blocker",
@@ -552,6 +558,10 @@ fn command_response(request: &InvokeCommandRequest) -> ServiceResponse {
         "goal.unblock" => session_id.map_or_else(
             || missing_enforced_session_response("goal.unblock"),
             |session| goal::unblock_response(session, arguments),
+        ),
+        "goal.worker" => session_id.map_or_else(
+            || missing_enforced_session_response("goal.worker"),
+            |session| goal::worker_response(session, arguments),
         ),
         "goal.status" => session_id.map_or_else(
             || missing_enforced_session_response(STATUS_COMMAND),

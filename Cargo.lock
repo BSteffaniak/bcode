@@ -2098,6 +2098,7 @@ dependencies = [
  "bcode_workflow",
  "bcode_workflow_plugin",
  "bcode_workflow_store",
+ "bcode_workflow_view_models",
  "bmux_keyboard",
  "bmux_text_edit",
  "bmux_tui",
