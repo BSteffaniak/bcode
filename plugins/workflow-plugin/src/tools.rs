@@ -20,10 +20,17 @@ fn parse_context(
     let object = arguments
         .as_object_mut()
         .ok_or("execution context request must be an object")?;
-    if let Some(compact) = object.remove("compact")
-        && !compact.is_boolean()
+    for field in ["compact", "delegation_only"] {
+        if let Some(value) = object.remove(field)
+            && !value.is_boolean()
+        {
+            return Err(format!("{field} must be a boolean"));
+        }
+    }
+    if let Some(field) = object.remove("delegation_part")
+        && !matches!(field.as_str(), Some("bindings" | "input" | "reconnect"))
     {
-        return Err("compact must be a boolean".into());
+        return Err("delegation_part must be bindings, input or reconnect".into());
     }
     object.entry("limit").or_insert(json!(50));
     let context: bcode_workflow::WorkflowExecutionContextRequest =
@@ -41,6 +48,8 @@ fn context_definition() -> ToolDefinition {
         description: "Read this active workflow execution's authenticated identity and bounded graph page. Omit revision and cursors initially; continue with the returned revision and last node/edge identities. Restart on revision conflict. This grants no mutation authority.".to_owned(),
         input_schema: json!({"type":"object", "additionalProperties":false,
             "properties": {
+                "delegation_part":{"type":"string","enum":["bindings","input","reconnect"],"description":"Read a recipe in bounded pieces: bindings returns non-schema arguments and revision-pinned input/reconnect inspection arguments. Merge the returned arguments without reconstruction. Unsupported topology fails explicitly; very large individual schemas may still require retained-output inspection."},
+                "delegation_only":{"type":"boolean","default":false,"description":"Return only the authenticated delegation recipe from this bounded page, without duplicating graph facts. Use for default-budget staging; unavailable recipes remain explicit. Does not change authorization or discovery completeness."},
                 "compact":{"type":"boolean","default":false,"description":"Return graph node identities instead of full executable definitions. Edges and authenticated identity remain available; omitted node definitions require a normal paged read."},
                 "after_output_id":{"type":["string","null"], "description":"Exclusive last output ID. Outputs arriving behind the cursor require a fresh scan; this is not a durable event stream."},
                 "output_id":{"type":["string","null"], "description":"Exact canonical output identity from this run; returns checksum-verified value without opening artifacts."},
@@ -515,6 +524,12 @@ fn invoke_context(
     request: ToolInvocationRequest,
 ) -> ServiceResponse {
     let compact = request.arguments.get("compact") == Some(&json!(true));
+    let delegation_only = request.arguments.get("delegation_only") == Some(&json!(true));
+    let delegation_part = request
+        .arguments
+        .get("delegation_part")
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_owned);
     let Ok(query) = parse_context(request.arguments) else {
         return ServiceResponse::error("invalid_request", "invalid execution context request");
     };
@@ -557,7 +572,11 @@ fn invoke_context(
                 |_| ServiceResponse::error("invalid_response", "invalid workflow context"),
                 |context| {
                     super::json_response(&bcode_tool::ToolInvocationResponse {
-                        output: context_output_with_navigation(&context, compact, &query),
+                        output: if delegation_only || delegation_part.is_some() {
+                            json!({"delegation":delegation_recipe_part(&context, &query, delegation_part.as_deref())}).to_string()
+                        } else {
+                            context_output_with_navigation(&context, compact, &query)
+                        },
                         is_error: false,
                         content: Vec::new(),
                         full_output: None,
@@ -595,6 +614,7 @@ fn context_output_with_navigation(
     } else {
         serde_json::Value::Null
     };
+    output["delegation"] = delegation_recipe(context, query);
     for result in output["outputs"].as_array_mut().expect("output metadata") {
         result["inspection_arguments"] = json!({
             "output_id": result["output_id"],
@@ -604,6 +624,104 @@ fn context_output_with_navigation(
         });
     }
     output.to_string()
+}
+
+fn delegation_recipe_part(
+    context: &bcode_workflow::WorkflowExecutionContext,
+    query: &bcode_workflow::WorkflowExecutionContextRequest,
+    part: Option<&str>,
+) -> serde_json::Value {
+    let mut recipe = delegation_recipe(context, query);
+    let Some(part) = part else {
+        return recipe;
+    };
+    let Some(arguments) = recipe
+        .get_mut("arguments")
+        .and_then(serde_json::Value::as_object_mut)
+    else {
+        return recipe;
+    };
+    if part == "bindings" {
+        arguments.remove("input");
+        arguments.remove("reconnect");
+        for field in ["input", "reconnect"] {
+            let mut inspection = serde_json::to_value(query).expect("serializable query");
+            inspection["expected_revision"] = json!(context.graph.revision);
+            inspection["delegation_part"] = json!(field);
+            recipe["inspection_arguments"][field] = inspection;
+        }
+    } else {
+        arguments.retain(|key, _| key == part);
+        recipe.as_object_mut().unwrap().remove("instructions");
+    }
+    recipe
+}
+
+// Advice is computed from the full typed response, never the compact presentation.
+// A tail page's completion flags do not prove that preceding edges were inspected.
+fn delegation_recipe(
+    context: &bcode_workflow::WorkflowExecutionContext,
+    query: &bcode_workflow::WorkflowExecutionContextRequest,
+) -> serde_json::Value {
+    let unavailable = |reason| json!({"available":false,"reason":reason});
+    if query.after_edge_id.is_some() || !context.graph.edges_complete {
+        return unavailable(
+            "Complete source-edge discovery from the initial cursor is required; use advanced task-group staging for larger graphs.",
+        );
+    }
+    let Some(first_edge_id) = context.graph.next_edge_id else {
+        return unavailable("Edge allocation is unavailable.");
+    };
+    let Some(source) = context
+        .graph
+        .nodes
+        .iter()
+        .find(|node| node.node.id == context.node_id)
+    else {
+        return unavailable("The source node definition is not in this bounded page.");
+    };
+    let mut successors = context
+        .graph
+        .edges
+        .iter()
+        .filter(|edge| edge.edge.from == context.node_id);
+    let Some(successor) = successors.next() else {
+        return unavailable("Source has no successor to reconnect.");
+    };
+    if successors.next().is_some()
+        || successor.edge.to == context.node_id
+        || successor.edge.kind != bcode_workflow::EdgeKind::Direct
+    {
+        return unavailable(
+            "Multiple or control-flow successors require explicit advanced staging.",
+        );
+    }
+    if let Some(transform) = &successor.edge.transform {
+        let bcode_workflow::WorkflowTransformExpression::Input { source, path } =
+            &transform.expression
+        else {
+            return unavailable("Successor transform is not a canonical source selection.");
+        };
+        if transform.version != bcode_workflow::WORKFLOW_TRANSFORM_VERSION
+            || source != bcode_workflow::WORKFLOW_TRANSFORM_SOURCE_CURRENT
+            || path.split('.').any(|segment| segment != "source")
+        {
+            return unavailable("Successor transform is not a canonical source selection.");
+        }
+    }
+    json!({
+        "available":true,
+        "tool":"workflow.stage_task_group",
+        "arguments":{
+            "version":2,"generated_ids":true,
+            "run_id":context.run_id,"expected_revision":context.graph.revision,
+            "source_node_id":context.node_id,"bind_source_activation":context.activation_id,
+            "input":source.node.output,"first_edge_id":first_edge_id,
+            "preserve_source_output":true,"retain_source_edge_ids":[],"reconciliation":[],
+            "reconnect":{"edge_id":successor.edge_id,"node_id":successor.edge.to,"transform":successor.edge.transform}
+        },
+        "instructions":"Copy arguments and add a fresh mutation_id, semantic tasks and continuation objective/agent_profile. Choose workspace safety, access, dependencies and criteria explicitly. This advice grants no authority and does not reserve identities. Staging validates affected active work; explicitly reconcile any additional affected activations. Publish the returned publication_arguments separately, then finish this source turn without waiting. On revision conflict rediscover; never silently rebase."
+    })
 }
 
 fn context_output(context: &bcode_workflow::WorkflowExecutionContext, compact: bool) -> String {
@@ -1442,6 +1560,71 @@ mod tests {
             assert!(!tool.is_error);
             assert!(tool.output.contains("Topology has not been published"));
         }
+    }
+
+    #[test]
+    fn delegation_recipe_lowers_authenticated_source_and_rejects_partial_discovery() {
+        let schema = json!({"type_name":"goal","schema":{"type":"object"}});
+        let mut context: bcode_workflow::WorkflowExecutionContext = serde_json::from_value(json!({
+            "run_id":"run", "node_id":"source", "activation_id":"activation", "attempt":1,
+            "graph":{"revision":7,"next_edge_id":19,
+                "nodes":[{"revision":7,"entry":true,"exit":false,"node":{
+                    "id":"source","name":"source","kind":"agent",
+                    "input":schema,"output":schema,"configuration":{},"resources":[]
+                }}],
+                "edges":[{"revision":7,"edge_id":3,"edge":{"from":"source","to":"evaluate"}}],
+                "nodes_complete":true,"edges_complete":true},
+            "output":null,"outputs":[]
+        }))
+        .unwrap();
+        let query = parse_context(json!({})).unwrap();
+        let recipe = delegation_recipe(&context, &query);
+        assert_eq!(recipe["available"], true);
+        let mut request = recipe["arguments"].clone();
+        request["mutation_id"] = json!("delegate");
+        request["tasks"] =
+            json!([{"task_id":"review","objective":"Review changes","agent_profile":"plan"}]);
+        request["continuation"] = json!({"objective":"Integrate evidence","agent_profile":"build"});
+        assert!(parse_tool_edit(GROUP_NAME, &request).is_ok());
+        assert_eq!(request["bind_source_activation"], "activation");
+        assert_eq!(request["input"], schema);
+        assert_eq!(request["first_edge_id"], 19);
+        let mut tail = query.clone();
+        tail.after_edge_id = Some(2);
+        assert_eq!(delegation_recipe(&context, &tail)["available"], false);
+        context.graph.edges_complete = false;
+        assert_eq!(delegation_recipe(&context, &query)["available"], false);
+        context.graph.edges_complete = true;
+        context.graph.edges[0].edge.transform = Some(bcode_workflow::WorkflowTransform {
+            version: bcode_workflow::WORKFLOW_TRANSFORM_VERSION,
+            expression: bcode_workflow::WorkflowTransformExpression::Input {
+                source: bcode_workflow::WORKFLOW_TRANSFORM_SOURCE_CURRENT.into(),
+                path: "source.source".into(),
+            },
+            output: context.graph.nodes[0].node.output.clone(),
+        });
+        let recipe = delegation_recipe(&context, &query);
+        assert_eq!(
+            recipe["arguments"]["reconnect"]["transform"],
+            serde_json::to_value(&context.graph.edges[0].edge.transform).unwrap()
+        );
+        let bindings = delegation_recipe_part(&context, &query, Some("bindings"));
+        let mut assembled = bindings["arguments"].as_object().unwrap().clone();
+        for field in ["input", "reconnect"] {
+            let inspection = &bindings["inspection_arguments"][field];
+            assert_eq!(inspection["expected_revision"], context.graph.revision);
+            let part_query = parse_context(inspection.clone()).unwrap();
+            let part = delegation_recipe_part(&context, &part_query, Some(field));
+            assembled.extend(part["arguments"].as_object().unwrap().clone());
+        }
+        assert_eq!(json!(assembled), recipe["arguments"]);
+        assert!(parse_context(json!({"delegation_part":"unknown"})).is_err());
+        assert!(parse_context(json!({"delegation_only":1})).is_err());
+        context.graph.edges.push(context.graph.edges[0].clone());
+        assert_eq!(delegation_recipe(&context, &query)["available"], false);
+        context.graph.edges.pop();
+        context.graph.next_edge_id = None;
+        assert_eq!(delegation_recipe(&context, &query)["available"], false);
     }
 
     #[test]

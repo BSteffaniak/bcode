@@ -19,6 +19,21 @@ it as success-only behavior. Live-model recovery remains unverified.
 
 ## Source-preserving integration
 
+`workflow.execution_context` now returns a `delegation` recipe for a source with
+one direct successor when the bounded response contains its definition and all
+edges from the initial edge cursor. This works with compact presentation too:
+the plugin uses the authenticated typed edge, including its actual transform.
+Copy `delegation.arguments`, add `mutation_id`, semantic `tasks` and a
+`continuation` objective/profile, then call `workflow.stage_task_group`. Workspace
+selection, access, criteria, dependencies and integration strategy remain authored.
+The recipe preserves canonical source output and supplies revision, allocation,
+source activation binding and reconnection without model reconstruction. It grants
+no authority: staging still validates reconciliation and publication remains
+separate. Conflicts require fresh discovery. Partial pages, unavailable allocation,
+multiple/control successors and unsupported transforms return an actionable
+unavailable result; use advanced staging for those topologies. This bounded helper
+is not automatic planning, workspace integration or evidence of worker success.
+
 Task-group workers and continuations may select `worktree_directory`, an absolute
 path to an existing registered worktree of the parent session's repository. Prompt
 configuration version 5 persists this choice; versions 2–4 upgrade only with the
@@ -351,6 +366,18 @@ confer no publication authority. Read normal revision-pinned pages for executabl
 request an exact `output_id` to retrieve its value. Explicitly requested outputs are
 not shortened by compact presentation. Large pages or requested outputs may still
 exceed the model's tool-output budget; truncated results are not complete JSON.
+
+For recipe-only reads, `delegation_only:true` excludes duplicated graph facts.
+For larger corrective recipes, `delegation_part:"bindings"` returns non-schema
+arguments and exact revision-pinned `inspection_arguments.input` and
+`inspection_arguments.reconnect` requests. Follow both and merge their returned
+`delegation.arguments` with the bindings; no schemas or transforms are reconstructed.
+A revision conflict invalidates all pieces. These presentation options do not change
+canonical discovery, preparation, authorization or topology validation. Unsupported
+recipes still return an explicit reason. Individual very large schemas may still
+need bounded retained-output inspection; splitting is not an unlimited-output guarantee.
+The goal-entry scripted-provider tests exercise initial and corrective staging at
+the default 4,000-character budget, not an enlarged test-only limit.
 
 `workflow.execution_context` accepts `{}` for its initial page, defaulting to 50
 items. Explicit limits remain 1–100; null, invalid limits and unknown fields reject.

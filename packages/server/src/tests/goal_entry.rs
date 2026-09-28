@@ -138,13 +138,6 @@ const COMBINED_CHECK: &str = ". ./integrated.sh; actual=$(total 3 8); test \"$ac
 fn install_goal_script(request: &mut PluginWorkflowStartRequest, workspace: &Path) {
     let reference =
         |pointer: &str| serde_json::json!({"$fake_result":{"index":0,"pointer":pointer}});
-    let source = &request.definition.nodes["loop.implementation"];
-    let successor = request
-        .definition
-        .edges
-        .iter()
-        .position(|edge| edge.from == source.id && edge.to == "loop.evaluation")
-        .expect("goal evaluation successor");
     let task = |id: &str| {
         serde_json::json!({
             "task_id":id,"objective":format!("Implement {id}.\ntool-call filesystem.write {}", serde_json::json!({"path":workspace.join(format!("{id}.sh")),"contents":if id == "left" { LEFT_MODULE } else { RIGHT_MODULE }})),
@@ -162,16 +155,17 @@ fn install_goal_script(request: &mut PluginWorkflowStartRequest, workspace: &Pat
     });
     let mut group = serde_json::json!({
         "version":2,"generated_ids":true,"mutation_id":"goal-workers","failure_policy":"collect_outcomes",
-        "run_id":reference("/run_id"),"expected_revision":reference("/graph/revision"),
-        "source_node_id":reference("/node_id"),"bind_source_activation":reference("/activation_id"),
-        "input":source.output,"preserve_source_output":true,
+        "run_id":reference("/delegation/arguments/run_id"),"expected_revision":reference("/delegation/arguments/expected_revision"),
+        "source_node_id":reference("/delegation/arguments/source_node_id"),"bind_source_activation":reference("/delegation/arguments/bind_source_activation"),
+        "input":reference("/delegation/arguments/input"),"preserve_source_output":true,
         "tasks":[task("left"),task("right")],
         "continuation":{"objective":format!("Integrate the actual contributions and verify the combined result.\ntool-call shell.run {integrate}"), "agent_profile":"build", "read_only":false, "tool_allowlist":["shell.run"], "resources":[{"resource":"integration","access":"write"}], "model_selection":{"provider":"bcode.fake-provider","model":"fake-echo"}},
-        "first_edge_id":reference("/graph/next_edge_id"),
-        "reconnect":{"edge_id":successor,"node_id":"loop.evaluation"},
-        "reconciliation":[]
+        "first_edge_id":reference("/delegation/arguments/first_edge_id"),
+        "reconnect":reference("/delegation/arguments/reconnect"),
+        "retain_source_edge_ids":reference("/delegation/arguments/retain_source_edge_ids"),
+        "reconciliation":reference("/delegation/arguments/reconciliation")
     });
-    install_corrective_script(&mut group, &source.output, successor, workspace, &integrate);
+    install_corrective_script(&mut group, workspace, &integrate);
     let publication =
         serde_json::json!({"$fake_result":{"index":0,"pointer":"/publication_arguments"}});
     let source = request
@@ -181,7 +175,7 @@ fn install_goal_script(request: &mut PluginWorkflowStartRequest, workspace: &Pat
         .unwrap();
     let instructions = source.configuration["system_prompt"].as_str().unwrap();
     source.configuration["system_prompt"] = serde_json::json!(format!(
-        "{instructions}\ntool-call workflow.execution_context {{\"limit\":1,\"compact\":true}}\ntool-call workflow.stage_task_group {group}\ntool-call workflow.publish_run_graph_edit {publication}"
+        "{instructions}\ntool-call workflow.execution_context {{\"limit\":100,\"delegation_only\":true}}\ntool-call workflow.stage_task_group {group}\ntool-call workflow.publish_run_graph_edit {publication}"
     ));
     let evaluation = request.definition.nodes.get_mut("loop.evaluation").unwrap();
     let instructions = evaluation.configuration["system_prompt"].as_str().unwrap();
@@ -192,15 +186,9 @@ fn install_goal_script(request: &mut PluginWorkflowStartRequest, workspace: &Pat
 
 fn install_corrective_script(
     group: &mut serde_json::Value,
-    source: &bcode_workflow::ValueSchema,
-    successor: usize,
     workspace: &Path,
     integrate: &serde_json::Value,
 ) {
-    let boolean = bcode_workflow::ValueSchema {
-        type_name: "boolean".into(),
-        schema: serde_json::json!({"type":"boolean"}),
-    };
     let failed_output = bcode_workflow::ValueSchema {
         type_name: "receipt".into(),
         schema: serde_json::json!({"type":"string","pattern":"x"}),
@@ -208,44 +196,24 @@ fn install_corrective_script(
     // A valid but unsupported fake-provider schema fails only this worker after its
     // file effect. Recovery must retain that failure, inspect the artifact and correct it.
     group["tasks"][1]["output"] = serde_json::to_value(&failed_output).unwrap();
-    let results = bcode_workflow::named_result_schema(
-        "delegation.results".into(),
-        &BTreeMap::from([
-            (
-                "left".into(),
-                bcode_workflow::workflow_member_outcome_schema(&boolean).unwrap(),
-            ),
-            (
-                "right".into(),
-                bcode_workflow::workflow_member_outcome_schema(&failed_output).unwrap(),
-            ),
-        ]),
-    )
-    .unwrap();
-    let input = bcode_workflow::named_result_schema(
-        "bcode.delegation_input.v2".into(),
-        &BTreeMap::from([
-            ("results".into(), results),
-            ("source".into(), source.clone()),
-        ]),
-    )
-    .unwrap();
-    let reference =
-        |pointer: &str| serde_json::json!({"$fake_result":{"index":0,"pointer":pointer}});
-    let transform = bcode_workflow::WorkflowTransform {
-        version: bcode_workflow::WORKFLOW_TRANSFORM_VERSION,
-        expression: bcode_workflow::WorkflowTransformExpression::Input {
-            source: bcode_workflow::WORKFLOW_TRANSFORM_SOURCE_CURRENT.into(),
-            path: "source".into(),
-        },
-        output: source.clone(),
+
+    let reference = |pointer: &str| {
+        let index = match pointer {
+            "/delegation/arguments/input" => 1,
+            "/delegation/arguments/reconnect" => 0,
+            _ => 2,
+        };
+        serde_json::json!({"$fake_result":{"index":index,"pointer":pointer}})
     };
+
+    let input_inspection = serde_json::json!({"$fake_result":{"index":0,"pointer":"/delegation/inspection_arguments/input"}});
+    let reconnect_inspection = serde_json::json!({"$fake_result":{"index":1,"pointer":"/delegation/inspection_arguments/reconnect"}});
     let fix = serde_json::json!({"path":workspace.join("right.sh"),"contents":RIGHT_MODULE});
     let correction = serde_json::json!({
         "version":2,"generated_ids":true,"mutation_id":"goal-correction",
-        "run_id":reference("/run_id"),"expected_revision":reference("/graph/revision"),
-        "source_node_id":reference("/node_id"),"bind_source_activation":reference("/activation_id"),
-        "input":input,"preserve_source_output":true,
+        "run_id":reference("/delegation/arguments/run_id"),"expected_revision":reference("/delegation/arguments/expected_revision"),
+        "source_node_id":reference("/delegation/arguments/source_node_id"),"bind_source_activation":reference("/delegation/arguments/bind_source_activation"),
+        "input":reference("/delegation/arguments/input"),"preserve_source_output":true,
         "tasks":[{"task_id":"repair-right","objective":format!("Fix contribution.\ntool-call filesystem.write {fix}"),
             "agent_profile":"build","read_only":false,"tool_allowlist":["filesystem.write"],
             "resources":[{"resource":"contribution:right","access":"write"}],
@@ -255,9 +223,10 @@ fn install_corrective_script(
             "agent_profile":"build","read_only":false,"tool_allowlist":["shell.run"],
             "resources":[{"resource":"integration","access":"write"}],
             "model_selection":{"provider":"bcode.fake-provider","model":"fake-echo"}},
-        "first_edge_id":reference("/graph/next_edge_id"),
-        "reconnect":{"edge_id":successor,"node_id":"loop.evaluation","transform":transform},
-        "reconciliation":[]
+        "first_edge_id":reference("/delegation/arguments/first_edge_id"),
+        "reconnect":reference("/delegation/arguments/reconnect"),
+        "retain_source_edge_ids":reference("/delegation/arguments/retain_source_edge_ids"),
+        "reconciliation":reference("/delegation/arguments/reconciliation")
     });
     let broken =
         serde_json::json!({"path":workspace.join("right.sh"),"contents":BROKEN_RIGHT_MODULE});
@@ -279,7 +248,7 @@ fn install_corrective_script(
         "workflow.publish_run_graph_edit"
     ]);
     group["continuation"]["objective"] = serde_json::json!(format!(
-        "Check contributions and correct failure.\ntool-call-expect-error expected total 27, got 28 :: shell.run {probe}\ntool-call workflow.execution_context {{\"limit\":1,\"compact\":true}}\ntool-call workflow.stage_task_group {correction}\ntool-call workflow.publish_run_graph_edit {publication}"
+        "Check contributions and correct failure.\ntool-call-expect-error expected total 27, got 28 :: shell.run {probe}\ntool-call workflow.execution_context {{\"limit\":100,\"delegation_part\":\"bindings\"}}\ntool-call workflow.execution_context {input_inspection}\ntool-call workflow.execution_context {reconnect_inspection}\ntool-call workflow.stage_task_group {correction}\ntool-call workflow.publish_run_graph_edit {publication}"
     ));
 }
 
