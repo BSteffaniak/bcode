@@ -167,6 +167,10 @@ pub fn create_worktree(
         cwd,
         &current_repo_root,
     )?;
+    let source_directory = current_repo_root.canonicalize().map_err(|error| {
+        WorktreeError::InvalidRequest(format!("cannot resolve source checkout: {error}"))
+    })?;
+    let source_has_local_changes = worktree_is_dirty(&source_directory);
     setup_create_worktree(
         &repo,
         &path,
@@ -177,6 +181,11 @@ pub fn create_worktree(
             force: request.force,
         },
     )?;
+    let provenance = bcode_worktree_models::WorktreeCreationProvenance {
+        source_directory,
+        base_commit: current_head_ref(&path)?,
+        source_has_local_changes,
+    };
     let setup_applied = if config.worktree.setup.enabled && !request.no_setup {
         apply_setup(config, &repo_root, &path)?;
         true
@@ -192,6 +201,7 @@ pub fn create_worktree(
         branch,
         created_branch,
         setup_applied,
+        provenance: Some(provenance),
         session: None,
     })
 }
@@ -669,6 +679,89 @@ mod tests {
             ],
         );
         assert_eq!(super::current_head_ref(&checkout).unwrap(), pinned);
+    }
+
+    #[test]
+    fn dirty_source_and_conflicting_contributions_remain_recoverable() {
+        let repo = TempRepo::init();
+        let workspaces = tempfile::tempdir().unwrap();
+        std::fs::write(repo.root.join("README.md"), "user draft\n").unwrap();
+        std::fs::write(repo.root.join("notes.txt"), "user notes\n").unwrap();
+        let base = super::current_head_ref(&repo.root).unwrap();
+        let create = |name: &str| {
+            let mut request = create_request(name);
+            request.path = Some(workspaces.path().join(name));
+            request.base_ref = Some(bcode_worktree_models::WorktreeBaseRef::Head);
+            create_worktree(&bcode_config::BcodeConfig::default(), &request, &repo.root).unwrap()
+        };
+        let first = create("first");
+        let second = create("second");
+        let target = create("integration");
+        let mut historical = serde_json::to_value(&target).unwrap();
+        historical.as_object_mut().unwrap().remove("provenance");
+        let historical: bcode_worktree_models::WorktreeCreateResponse =
+            serde_json::from_value(historical).unwrap();
+        assert!(historical.provenance.is_none());
+        for workspace in [&first, &second, &target] {
+            let provenance = workspace.provenance.as_ref().unwrap();
+            assert_eq!(provenance.base_commit, base);
+            assert_eq!(
+                provenance.source_directory,
+                repo.root.canonicalize().unwrap()
+            );
+            assert!(provenance.source_has_local_changes);
+            assert!(!workspace.path.join("notes.txt").exists());
+        }
+        for (workspace, contents) in [(&first, "first\n"), (&second, "second\n")] {
+            std::fs::write(workspace.path.join("README.md"), contents).unwrap();
+            run(&workspace.path, &["add", "README.md"]);
+            run(&workspace.path, &["commit", "-m", "contribution"]);
+        }
+        let first_commit = super::current_head_ref(&first.path).unwrap();
+        let second_commit = super::current_head_ref(&second.path).unwrap();
+        run(&target.path, &["cherry-pick", &first_commit]);
+        let conflict = Command::new("git")
+            .args(["cherry-pick", &second_commit])
+            .current_dir(&target.path)
+            .output()
+            .unwrap();
+        assert!(!conflict.status.success());
+        assert!(remove_worktree(&repo.root, &target.path, false).is_err());
+        assert_eq!(
+            super::current_head_ref(&second.path).unwrap(),
+            second_commit
+        );
+        assert_eq!(
+            std::fs::read_to_string(repo.root.join("README.md")).unwrap(),
+            "user draft\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(repo.root.join("notes.txt")).unwrap(),
+            "user notes\n"
+        );
+        // Explicit resolution, not a successful worker summary, establishes the
+        // combined artifact. All Git mutations here are confined to temporary repos.
+        std::fs::write(target.path.join("README.md"), "first\nsecond\n").unwrap();
+        run(&target.path, &["add", "README.md"]);
+        run(
+            &target.path,
+            &["-c", "core.editor=true", "cherry-pick", "--continue"],
+        );
+        assert_eq!(
+            std::fs::read_to_string(target.path.join("README.md")).unwrap(),
+            "first\nsecond\n"
+        );
+        for workspace in [&first, &second, &target] {
+            remove_worktree(&repo.root, &workspace.path, false).unwrap();
+            assert!(!workspace.path.exists());
+            assert!(
+                super::run_git(
+                    &repo.root,
+                    &["rev-parse", "--verify", workspace.branch.as_ref().unwrap()]
+                )
+                .is_some()
+            );
+        }
     }
 
     #[test]

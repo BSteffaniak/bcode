@@ -3242,6 +3242,7 @@ dependencies = [
  "bcode_config",
  "bcode_plugin_sdk",
  "bcode_worktree_models",
+ "serde_json",
  "tempfile",
  "thiserror 2.0.20",
  "worktree_setup_config",

@@ -51,7 +51,15 @@ Workspace creation with `base_ref: "head"` resolves the invoking checkout's exac
 commit, including detached linked worktrees, before creation. `detach` changes
 branch ownership, not base selection. Unresolvable HEAD fails closed. This does
 not copy uncommitted work or pin later worker edits; authors still own contribution
-provenance and integration verification.
+provenance and integration verification. Creation responses now include optional
+`provenance`: the canonical source checkout, full created `base_commit` observed
+before setup, and conservative `source_has_local_changes` (including ignored files
+or failed inspection). Older responses omit it; absence means unknown. This is an
+observation, not a source lock, copied dirty snapshot, or integration receipt.
+Retain it with worker evidence alongside produced revisions and observed checks.
+For a dirty source, integrate in a separate registered target first; inspect and
+resolve conflicts there, verify the combined artifact, and preserve the user's
+uncommitted files. Do not automatically stash, reset, or force-clean the source.
 
 Workspace cleanup uses the existing worktree service. Non-forced removal refuses
 uncommitted, ignored, or unverifiable files, regardless of Git's untracked-file

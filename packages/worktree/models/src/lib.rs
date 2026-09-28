@@ -165,9 +165,25 @@ pub struct WorktreeCreateResponse {
     pub created_branch: bool,
     /// Whether setup was attempted.
     pub setup_applied: bool,
+    /// Creation-time provenance. Older responses omit this; absence is unknown,
+    /// not proof that the source was clean or that contributions were integrated.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provenance: Option<WorktreeCreationProvenance>,
     /// Updated or created session when requested.
     #[serde(default)]
     pub session: Option<SessionSummary>,
+}
+
+/// Observed creation boundary, not an integration receipt or filesystem snapshot.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorktreeCreationProvenance {
+    /// Canonical source checkout; uncommitted contents are not copied.
+    pub source_directory: PathBuf,
+    /// Full created checkout commit identity observed before setup runs.
+    pub base_commit: String,
+    /// Source had local changes (including ignored files), or cleanliness could
+    /// not be established. Observation does not lock out concurrent user edits.
+    pub source_has_local_changes: bool,
 }
 
 /// Worktree removal request.
