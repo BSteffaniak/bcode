@@ -849,6 +849,70 @@ fn goal_ipc_client(
     (bcode_client::BcodeClient::new(endpoint), server)
 }
 
+// Isolate the default-endpoint environment from concurrently running server tests.
+async fn invoke_goal_allowance_command(root: &Path, session: SessionId) {
+    let output = tokio::process::Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "tests::goal_entry::goal_allowance_command_subprocess",
+            "--nocapture",
+        ])
+        .env("BCODE_SOCKET", root.join("allowance.sock"))
+        .env_remove(bcode_ipc::BCODE_IPC_ENDPOINT_ENV)
+        .env_remove(bcode_ipc::BCODE_IPC_ENDPOINT_NAMESPACE_ENV)
+        .env_remove("BCODE_DAEMON_LOG")
+        .env("BCODE_GOAL_COMMAND_SESSION", session.to_string())
+        .output()
+        .await
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "goal command failed: {} {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(String::from_utf8_lossy(&output.stdout).contains("1 passed"));
+}
+
+#[tokio::test]
+async fn goal_allowance_command_subprocess() {
+    let Ok(session) = std::env::var("BCODE_GOAL_COMMAND_SESSION") else {
+        return;
+    };
+    let plugins = bcode_plugin::PluginRuntimeHost::load_defaults_with_static_bundled(
+        &bcode_plugin::PluginSelection {
+            mode: bcode_plugin::PluginSelectionMode::Explicit,
+            enabled: BTreeSet::from(["bcode.loop".into()]),
+            disabled: BTreeSet::new(),
+        },
+        &[bcode_bundled_plugins::static_loop_plugin()],
+    )
+    .unwrap();
+    let response: bcode_command::InvokeCommandResponse = plugins
+        .invoke_service_json(
+            "bcode.loop",
+            bcode_command::COMMAND_INTERFACE_ID,
+            bcode_command::OP_INVOKE_COMMAND,
+            &bcode_command::InvokeCommandRequest {
+                command_id: "goal.continue".into(),
+                args: BTreeMap::from([("arguments".into(), "--worker-attempts 99".into())]),
+                context: Some(bcode_command::CommandInvocationContext {
+                    session_id: Some(session.parse().unwrap()),
+                    working_directory: std::env::current_dir().unwrap(),
+                }),
+            },
+        )
+        .await
+        .unwrap();
+    assert!(response.success, "{:?}", response.message);
+    assert!(
+        response
+            .message
+            .unwrap()
+            .contains("Granted 99 execution attempts")
+    );
+}
+
 #[tokio::test]
 async fn exhausted_goal_resumes_after_idempotent_ipc_allowance_grant() {
     let root = tempfile::tempdir().unwrap();
@@ -890,10 +954,7 @@ async fn exhausted_goal_resumes_after_idempotent_ipc_allowance_grant() {
         expected_cap: observation.run_cap,
         target_cap: 100,
     };
-    client
-        .control_workflow_run(run_id.clone(), action)
-        .await
-        .unwrap();
+    invoke_goal_allowance_command(root.path(), session.id).await;
     client
         .control_workflow_run(run_id.clone(), action)
         .await
