@@ -1,5 +1,22 @@
 # Runtime workflow authoring architecture
 
+## Explicit terminal-outcome collection
+
+V2 task groups may select `failure_policy: "collect_outcomes"` for two or more
+independent workers. The continuation receives `results[task_id]` as either
+`{"status":"completed","value":...}` or `{"status":"failed"|"cancelled"|"skipped"}`.
+Successful values remain schema-validated canonical outputs; failures do not gain
+invented outputs. Receipt assignments mark `terminal_outcome: true`. The source
+context join remains success-only and source preservation is unchanged.
+
+The durable controller waits for all declared members, preserves their terminal
+states, and materializes one named outcome input. It does not retry effects or
+assert goal completion. The continuation must inspect evidence and unresolved
+effects before authoring corrective work. Existing `wait_all`/`fail_fast` semantics
+are unchanged. Dependent-worker groups and homogeneous fan-out do not support this
+mode and reject it. Old runtimes reject the unknown policy rather than interpreting
+it as success-only behavior. Live-model recovery remains unverified.
+
 ## Source-preserving integration
 
 Task-group workers and continuations may select `worktree_directory`, an absolute

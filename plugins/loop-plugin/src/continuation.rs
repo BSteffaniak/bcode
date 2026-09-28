@@ -192,7 +192,91 @@ fn parse_allowance(arguments: &str) -> Result<(u32, u64), &'static str> {
     Ok((rounds.get(), workers))
 }
 
+fn active_allowance_action(
+    run: &bcode_workflow::WorkflowRunSummary,
+    allowance: Option<&bcode_workflow::WorkflowExecutionAllowanceObservation>,
+    additional: u64,
+) -> Result<bcode_workflow::WorkflowRunControlAction, &'static str> {
+    if !matches!(
+        run.status,
+        bcode_workflow::RunStatus::Running | bcode_workflow::RunStatus::Paused
+    ) || run.cancellation_requested_at_ms.is_some()
+    {
+        return Err("Execution attempts can only be granted to an active, non-cancelling goal");
+    }
+    let allowance = allowance
+        .ok_or("Execution allowance is unavailable; inspect the goal before granting attempts")?;
+    if allowance.exhausted().is_none() {
+        return Err("Execution allowance is unknown; no grant was made");
+    }
+    let target_cap = allowance
+        .run_cap
+        .checked_add(additional)
+        .filter(|target| additional > 0 && i64::try_from(*target).is_ok())
+        .ok_or("Additional attempts must be positive and fit the supported execution cap")?;
+    Ok(
+        bcode_workflow::WorkflowRunControlAction::IncreaseExecutionAllowance {
+            expected_cap: allowance.run_cap,
+            target_cap,
+        },
+    )
+}
+
+async fn grant_active_attempts(
+    client: &BcodeClient,
+    session_id: SessionId,
+    additional: u64,
+) -> Result<Result<String, String>, ClientError> {
+    let Some(inspection) = client
+        .inspect_associated_workflow_run(workflow_binding_key(session_id), 1)
+        .await?
+    else {
+        return Ok(Err("No associated loop".into()));
+    };
+    let action = match active_allowance_action(
+        &inspection.run,
+        inspection.execution_allowance.as_ref(),
+        additional,
+    ) {
+        Ok(action) => action,
+        Err(error) => return Ok(Err(error.into())),
+    };
+    let run_id = inspection.run.run_id;
+    // A transport retry must reuse the exact run and expected/target caps. Never
+    // re-read and add again: an unobserved first response may already have granted it.
+    let result = match client.control_workflow_run(run_id.clone(), action).await {
+        Ok(result) => result,
+        Err(ClientError::Server { code, message }) => {
+            return Err(ClientError::Server { code, message });
+        }
+        Err(_) => client.control_workflow_run(run_id.clone(), action).await?,
+    };
+    let Some(run) = result.0 else {
+        return Ok(Err("Goal run is no longer available".into()));
+    };
+    Ok(Ok(format!(
+        "Granted {additional} execution attempts to goal {run_id} · {:?}. Iteration limits and any separate composition-root allowance are unchanged; paused goals still require /goal.resume. Use /goal.status to inspect remaining blockers.",
+        run.status
+    )))
+}
+
 pub fn command(session_id: SessionId, arguments: &str) -> InvokeCommandResponse {
+    if let ["--worker-attempts", count] =
+        arguments.split_whitespace().collect::<Vec<_>>().as_slice()
+    {
+        let Ok(additional) = count.parse::<std::num::NonZeroU64>() else {
+            return continuation_response(Err("Worker attempts must be a positive integer".into()));
+        };
+        let result = run_async(async move {
+            grant_active_attempts(
+                &BcodeClient::default_endpoint(),
+                session_id,
+                additional.get(),
+            )
+            .await
+        });
+        return continuation_response(result.unwrap_or_else(|error| Err(error.to_string())));
+    }
     let (additional, worker_attempts) = match parse_allowance(arguments) {
         Ok(allowance) => allowance,
         Err(error) => {

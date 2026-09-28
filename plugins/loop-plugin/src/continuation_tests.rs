@@ -16,6 +16,40 @@ fn continuation_failures_are_not_successful_commands() {
 }
 
 #[test]
+fn active_grants_preserve_exact_caps_and_reject_unknown_or_terminal_state() {
+    let mut run = source(true).run;
+    run.status = bcode_workflow::RunStatus::Running;
+    let mut allowance = bcode_workflow::WorkflowExecutionAllowanceObservation {
+        run_cap: 10,
+        run_consumed: Some(10),
+        root_cap: 20,
+        root_consumed: Some(20),
+    };
+    assert_eq!(
+        active_allowance_action(&run, Some(&allowance), 7).unwrap(),
+        bcode_workflow::WorkflowRunControlAction::IncreaseExecutionAllowance {
+            expected_cap: 10,
+            target_cap: 17
+        }
+    );
+    assert!(active_allowance_action(&run, None, 7).is_err());
+    assert!(active_allowance_action(&run, Some(&allowance), 0).is_err());
+    assert!(active_allowance_action(&run, Some(&allowance), u64::MAX).is_err());
+    allowance.run_consumed = None;
+    allowance.root_consumed = None;
+    assert!(active_allowance_action(&run, Some(&allowance), 7).is_err());
+    allowance.run_consumed = Some(10);
+    run.status = bcode_workflow::RunStatus::Paused;
+    assert!(active_allowance_action(&run, Some(&allowance), 7).is_ok());
+    run.cancellation_requested_at_ms = Some(1);
+    assert!(active_allowance_action(&run, Some(&allowance), 7).is_err());
+    run.cancellation_requested_at_ms = None;
+    run.status = bcode_workflow::RunStatus::Completed;
+    assert!(active_allowance_action(&run, Some(&allowance), 7).is_err());
+    assert!(!command(SessionId::new(), "--worker-attempts 0").success);
+}
+
+#[test]
 fn short_continuation_concurrency_does_not_exceed_total_attempt_allowance() {
     let mut checkpoint = source(false);
     checkpoint.limits.concurrency_cap = 100;

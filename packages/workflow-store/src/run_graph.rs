@@ -1290,18 +1290,48 @@ impl WorkflowStore {
                 })
                 .collect::<Option<Vec<_>>>()
                 .ok_or_else(invalid)?;
-            let tuple = node
-                .input
-                .schema
-                .get("prefixItems")
-                .and_then(serde_json::Value::as_array)
-                .ok_or_else(invalid)?;
-            if tuple.len() != member_schemas.len()
-                || !member_schemas.iter().zip(tuple).all(|(member, nested)| {
-                    bcode_workflow::parallel_member_schema_matches(member, nested)
-                })
+            if node
+                .configuration
+                .get("failure_policy")
+                .and_then(serde_json::Value::as_str)
+                == Some("collect_outcomes")
             {
-                return Err(invalid());
+                let schemas = members
+                    .iter()
+                    .map(|id| {
+                        Ok((
+                            id.to_string(),
+                            bcode_workflow::workflow_member_outcome_schema(&nodes[*id].0.output)
+                                .map_err(|error| {
+                                    WorkflowStoreError::InvalidData(error.to_string())
+                                })?,
+                        ))
+                    })
+                    .collect::<Result<std::collections::BTreeMap<_, _>, WorkflowStoreError>>()?;
+                let expected =
+                    bcode_workflow::named_result_schema(node.input.type_name.clone(), &schemas)
+                        .map_err(|error| WorkflowStoreError::InvalidData(error.to_string()))?;
+                if node.input != expected
+                    || edges
+                        .values()
+                        .any(|edge| edge.to == node.id && edge.transform.is_some())
+                {
+                    return Err(invalid());
+                }
+            } else {
+                let tuple = node
+                    .input
+                    .schema
+                    .get("prefixItems")
+                    .and_then(serde_json::Value::as_array)
+                    .ok_or_else(invalid)?;
+                if tuple.len() != member_schemas.len()
+                    || !member_schemas.iter().zip(tuple).all(|(member, nested)| {
+                        bcode_workflow::parallel_member_schema_matches(member, nested)
+                    })
+                {
+                    return Err(invalid());
+                }
             }
             let admitted: bool = self.connection.query_row(
                 "SELECT EXISTS(SELECT 1 FROM workflow_activations WHERE run_id = ?1 AND node_id = ?2)",

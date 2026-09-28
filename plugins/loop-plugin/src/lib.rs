@@ -158,7 +158,7 @@ fn commands() -> Vec<CommandContribution> {
         session_command(
             "goal.continue",
             "Continue Goal",
-            "Grant additional iterations after allowance exhaustion",
+            "Grant more iterations, or use --worker-attempts <count> to extend active execution allowance",
         ),
         session_command(
             "loop.continue",

@@ -55,6 +55,16 @@ claims remain fallible and should be checked against current evidence.
 
 ## Continuing after the iteration allowance is exhausted
 
+Use `/goal.continue --worker-attempts <positive integer>` to explicitly extend the
+execution-attempt cap of the currently associated active goal. The command inspects
+bounded canonical allowance facts and submits the exact run and expected/target caps
+through the existing authorized control. Transport retries reuse that exact request;
+conflicts are reported rather than rebased. It does not add iterations, unpause work,
+or increase a separate composition-root cap. `/goal.status` points exhausted active
+goals to this intervention; `/goal.resume` remains necessary for paused goals. Missing
+or unknown allowance facts fail closed. This wiring has deterministic contract coverage;
+a goal-command IPC exhaustion/resumption experiment remains required.
+
 Use `/goal.continue <additional_iterations>` (or `/loop.continue`) to authorize more work:
 
 ```text

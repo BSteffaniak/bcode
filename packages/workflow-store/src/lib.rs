@@ -15113,6 +15113,21 @@ fn settle_parallel_failure(
             }
             outcomes.push(serde_json::json!({"node_id": member, "status": status}));
         }
+        if policy == bcode_workflow::ParallelFailurePolicy::CollectOutcomes {
+            if all_terminal {
+                materialize_terminal_outcomes(
+                    transaction,
+                    run_id,
+                    &join,
+                    generation,
+                    settled_at_ms,
+                )?;
+            }
+            return Ok(Some(ParallelFailureSettlement {
+                run_failed: false,
+                sibling_cancellations: Vec::new(),
+            }));
+        }
         // Skipped alternatives are valid, but each side still needs a completed
         // result. All-terminal is not evidence that a tuple can be constructed.
         if all_terminal {
@@ -15129,6 +15144,7 @@ fn settle_parallel_failure(
             }
         }
         let should_fail = match policy {
+            bcode_workflow::ParallelFailurePolicy::CollectOutcomes => unreachable!("handled above"),
             bcode_workflow::ParallelFailurePolicy::WaitAll => all_terminal && has_failure,
             bcode_workflow::ParallelFailurePolicy::FailFast => {
                 member_failed || (all_terminal && has_failure)
@@ -15136,6 +15152,9 @@ fn settle_parallel_failure(
         };
         if should_fail {
             let (decision_type, decision_suffix) = match policy {
+                bcode_workflow::ParallelFailurePolicy::CollectOutcomes => {
+                    unreachable!("handled above")
+                }
                 bcode_workflow::ParallelFailurePolicy::WaitAll => {
                     ("parallel_wait_all", "parallel-wait-all")
                 }
@@ -15190,6 +15209,85 @@ fn settle_parallel_failure(
         }));
     }
     Ok(None)
+}
+
+/// Materialize the controller input, not a fabricated output for any failed worker.
+fn materialize_terminal_outcomes(
+    transaction: &Transaction<'_>,
+    run_id: &str,
+    join: &bcode_workflow::NodeDefinition,
+    generation: u64,
+    settled_at_ms: u64,
+) -> Result<(), WorkflowStoreError> {
+    let permits_collection: bool = transaction.query_row(
+        "SELECT status IN ('running', 'paused') AND cancellation_requested_at_ms IS NULL FROM workflow_runs WHERE run_id = ?1",
+        [run_id], |row| row.get(0),
+    )?;
+    if !permits_collection || successor_already_admitted(transaction, run_id, &join.id, generation)?
+    {
+        return Ok(());
+    }
+    let mut outcomes = serde_json::Map::new();
+    for member in bcode_workflow::parallel_join_member_ids(join)
+        .map_err(|error| WorkflowStoreError::InvalidData(error.to_string()))?
+    {
+        let status = activation_status_at_generation(transaction, run_id, member, generation)?;
+        // A graph-edit cancellation is retirement, not an independent worker outcome.
+        // A successful sibling can arrive after retirement settled, so checking only
+        // the currently settling attempt would admit a controller for the old graph.
+        if status.as_deref() == Some("cancelled")
+            && transaction.query_row(
+                "SELECT EXISTS(SELECT 1 FROM workflow_activations activation
+                 JOIN workflow_attempts attempt ON attempt.run_id = activation.run_id
+                    AND attempt.node_id = activation.node_id
+                    AND attempt.activation_id = activation.activation_id
+                 JOIN workflow_publication_cancellations intent
+                    ON intent.run_id = attempt.run_id
+                    AND intent.dispatch_identity = attempt.dispatch_identity
+                 WHERE activation.run_id = ?1 AND activation.node_id = ?2
+                    AND activation.dependency_generation = ?3)",
+                (run_id, member, generation),
+                |row| row.get::<_, bool>(0),
+            )?
+        {
+            return Ok(());
+        }
+        let value = match status.as_deref() {
+            Some("completed") => serde_json::json!({"status":"completed", "value":
+                activation_output_value(transaction, run_id, member, generation)?}),
+            Some(status @ ("failed" | "cancelled" | "skipped")) => {
+                serde_json::json!({"status":status})
+            }
+            _ => {
+                return Err(WorkflowStoreError::InvalidData(
+                    "outcome collection requires terminal members".into(),
+                ));
+            }
+        };
+        outcomes.insert(member.to_string(), value);
+    }
+    let record = WorkflowStore::current_run_graph_node_in_snapshot(transaction, run_id, &join.id)?
+        .ok_or_else(|| WorkflowStoreError::InvalidData("outcome join is missing".into()))?;
+    let activation = NewActivation {
+        run_id: run_id.to_string(),
+        node_id: join.id.clone(),
+        activation_id: activation_identity(run_id, &join.id, generation),
+        dependency_generation: generation,
+        input: Some(serde_json::Value::Object(outcomes)),
+        created_at_ms: settled_at_ms,
+    };
+    enforce_activation_materialization_limits(transaction, &activation, true)?;
+    insert_activation_bound_to_node(transaction, &activation, "pending", join, record.revision)?;
+    let revision = run_graph::graph_revision(transaction, run_id)?
+        .ok_or_else(|| WorkflowStoreError::InvalidData("outcome graph is missing".into()))?;
+    record_activation_graph_binding(
+        transaction,
+        run_id,
+        &join.id,
+        &activation.activation_id,
+        revision,
+    )?;
+    Ok(())
 }
 
 fn schedule_retry_for_observation_transaction(
@@ -15534,6 +15632,30 @@ fn apply_attempt_observation(
                    AND status = 'running' AND output_id IS NULL",
                 (&request.run_id, &request.node_id, &request.activation_id),
             )?;
+            // Only an independently cancelled member participates in its join's failure
+            // policy. Run cancellation and graph-edit retirement own their own settlement.
+            if !publication_cancellation
+                && !fan_out_retirement_pending(
+                    transaction,
+                    &request.run_id,
+                    &request.activation_id,
+                )?
+                && !cancellation_requested_for_run(transaction, &request.run_id)?
+            {
+                let parallel_state = settle_parallel_failure(
+                    transaction,
+                    &request.run_id,
+                    &request.node_id,
+                    &request.activation_id,
+                    true,
+                    reconciled_at_ms,
+                )?;
+                if let Some(parallel_state) = parallel_state {
+                    summary
+                        .sibling_cancellations
+                        .extend(parallel_state.sibling_cancellations);
+                }
+            }
             finalize_run_cancellation_if_settled(transaction, &request.run_id, reconciled_at_ms)?;
             append_event(
                 transaction,
@@ -47024,6 +47146,210 @@ mod tests {
         assert_eq!(join_count, 1);
     }
 
+    fn outcome_collection_definition() -> bcode_workflow::WorkflowDefinition {
+        let mut definition = parallel_join_definition_with_policy(
+            bcode_workflow::ParallelFailurePolicy::CollectOutcomes,
+        );
+        let schemas = ["left", "right"]
+            .into_iter()
+            .map(|id| {
+                (
+                    id.to_string(),
+                    bcode_workflow::workflow_member_outcome_schema(&definition.nodes[id].output)
+                        .expect("outcome schema"),
+                )
+            })
+            .collect();
+        let schema =
+            bcode_workflow::named_result_schema("outcomes".into(), &schemas).expect("schema");
+        let join = definition.nodes.get_mut("join").expect("join");
+        join.input = schema.clone();
+        join.output = schema.clone();
+        definition.output = schema;
+        definition
+    }
+
+    #[test]
+    fn outcome_collection_does_not_admit_controller_after_publication_retirement() {
+        let temp = tempfile::tempdir().expect("temp");
+        let definition = outcome_collection_definition();
+        let mut store = WorkflowStore::open_in_state_dir(temp.path()).expect("store");
+        store
+            .persist_definition("retirement", 1, &definition)
+            .expect("definition");
+        let mut run = new_run();
+        run.definition_id = "retirement".into();
+        store.create_run(&run).expect("run");
+        let attempt = store
+            .prepare_pending_activation(
+                &run.run_id,
+                "left",
+                &activation_identity(&run.run_id, "left", 0),
+                DispatchSideEffect::ReadOnly,
+                serde_json::json!({}),
+                2,
+            )
+            .expect("prepare")
+            .expect("attempt");
+        store
+            .persist_dispatch_receipt(&DispatchReceipt {
+                run_id: run.run_id.clone(),
+                node_id: "left".into(),
+                activation_id: attempt.activation.activation_id,
+                attempt: attempt.attempt,
+                dispatch_identity: attempt.dispatch_identity.clone(),
+                receipt: serde_json::json!({}),
+                admitted_at_ms: 3,
+            })
+            .expect("receipt");
+        // State after accepted graph-edit retirement, before sibling settlement.
+        store.connection.execute_batch(
+            "INSERT INTO workflow_graph_edit_candidates VALUES ('run-1', 'retire', 1, '{}', '{}', 4);
+             INSERT INTO workflow_pending_publications VALUES ('run-1', 'retire', 1, 4);
+             UPDATE workflow_attempts SET status = 'cancelled';
+             UPDATE workflow_activations SET status = 'cancelled' WHERE node_id = 'left';"
+        ).expect("retirement fixture");
+        store
+            .connection
+            .execute(
+                "INSERT INTO workflow_publication_cancellations VALUES (?1, 'retire', ?2)",
+                (&run.run_id, &attempt.dispatch_identity),
+            )
+            .expect("cancellation intent");
+        drop(store);
+        let mut store = WorkflowStore::open_in_state_dir(temp.path()).expect("reopen");
+        store
+            .persist_validated_output(&ValidatedOutput {
+                output_id: "surviving-contribution".into(),
+                run_id: run.run_id.clone(),
+                node_id: "right".into(),
+                activation_id: activation_identity(&run.run_id, "right", 0),
+                schema_id: definition.nodes["right"].output.type_name.clone(),
+                schema_version: 1,
+                value: serde_json::json!(2),
+                artifact_reference: None,
+                created_at_ms: 5,
+            })
+            .expect("preserve contribution");
+        assert!(
+            !store
+                .pending_activations(10)
+                .expect("pending")
+                .iter()
+                .any(|item| item.node_id == "join")
+        );
+        let outputs = store.output_summaries(&run.run_id, 10).expect("outputs");
+        assert_eq!(outputs.len(), 1);
+        assert_eq!(outputs[0].node_id, "right");
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn outcome_collection_retains_success_and_terminal_failure_across_restart() {
+        struct TerminalObserver(bool);
+        impl AttemptStatusObserver for TerminalObserver {
+            fn observe(
+                &self,
+                _: &AttemptReconciliationRequest,
+            ) -> Result<AttemptObservation, WorkflowStoreError> {
+                Ok(if self.0 {
+                    AttemptObservation::Cancelled
+                } else {
+                    AttemptObservation::Failed {
+                        message: "worker failed".into(),
+                    }
+                })
+            }
+        }
+        for (failed_first, cancelled) in
+            [(false, false), (true, false), (false, true), (true, true)]
+        {
+            let observer = TerminalObserver(cancelled);
+            let temp = tempfile::tempdir().expect("temp");
+            let definition = outcome_collection_definition();
+            let mut store = WorkflowStore::open_in_state_dir(temp.path()).expect("store");
+            store
+                .persist_definition("outcomes", 1, &definition)
+                .expect("definition");
+            let mut run = new_run();
+            run.definition_id = "outcomes".into();
+            run.input = Some(serde_json::json!(1));
+            store.create_run(&run).expect("run");
+            let attempt = store
+                .prepare_pending_activation(
+                    &run.run_id,
+                    "left",
+                    &activation_identity(&run.run_id, "left", 0),
+                    DispatchSideEffect::ReadOnly,
+                    serde_json::json!({}),
+                    2,
+                )
+                .expect("prepare")
+                .expect("attempt");
+            store
+                .persist_dispatch_receipt(&DispatchReceipt {
+                    run_id: run.run_id.clone(),
+                    node_id: "left".into(),
+                    activation_id: attempt.activation.activation_id,
+                    attempt: attempt.attempt,
+                    dispatch_identity: attempt.dispatch_identity,
+                    receipt: serde_json::json!({}),
+                    admitted_at_ms: 3,
+                })
+                .expect("receipt");
+            if failed_first {
+                store
+                    .reconcile_receipt_backed_attempts(&observer, 10, 4)
+                    .expect("terminal failure");
+            }
+            store
+                .persist_validated_output(&ValidatedOutput {
+                    output_id: "right-output".into(),
+                    run_id: run.run_id.clone(),
+                    node_id: "right".into(),
+                    activation_id: activation_identity(&run.run_id, "right", 0),
+                    schema_id: definition.nodes["right"].output.type_name.clone(),
+                    schema_version: 1,
+                    value: serde_json::json!(2),
+                    artifact_reference: None,
+                    created_at_ms: 5,
+                })
+                .expect("output");
+            if !failed_first {
+                store
+                    .reconcile_receipt_backed_attempts(&observer, 10, 6)
+                    .expect("terminal failure");
+            }
+            drop(store);
+            let mut store = WorkflowStore::open_in_state_dir(temp.path()).expect("reopen");
+            assert_eq!(
+                store
+                    .run_summary(&run.run_id)
+                    .expect("summary")
+                    .expect("run")
+                    .status,
+                RunStatus::Running
+            );
+            let pending = store.pending_activations(10).expect("pending");
+            let join = pending
+                .iter()
+                .find(|item| item.node_id == "join")
+                .expect("outcome controller");
+            assert_eq!(
+                join.input,
+                Some(
+                    serde_json::json!({"left":{"status":if cancelled { "cancelled" } else { "failed" }},"right":{"status":"completed","value":2}})
+                )
+            );
+            store
+                .settle_pending_control_nodes(&run.run_id, 10, 7)
+                .expect("settle");
+            let outputs = store.output_summaries(&run.run_id, 10).expect("outputs");
+            assert_eq!(outputs.len(), 2);
+            assert!(outputs.iter().all(|output| output.node_id != "left"));
+        }
+    }
+
     #[test]
     #[allow(clippy::too_many_lines)]
     fn wait_all_parallel_failure_persists_only_after_all_members_settle() {
@@ -47146,6 +47472,109 @@ mod tests {
     }
 
     #[test]
+    fn cancelled_parallel_member_settles_wait_all_in_either_order() {
+        struct CancelledObserver;
+        impl AttemptStatusObserver for CancelledObserver {
+            fn observe(
+                &self,
+                _request: &AttemptReconciliationRequest,
+            ) -> Result<AttemptObservation, WorkflowStoreError> {
+                Ok(AttemptObservation::Cancelled)
+            }
+        }
+
+        for cancelled_first in [false, true] {
+            let temp = tempfile::tempdir().expect("temp");
+            let definition = parallel_join_definition();
+            let mut store = WorkflowStore::open_in_state_dir(temp.path()).expect("store");
+            store
+                .persist_definition("cancelled-member", 1, &definition)
+                .expect("definition");
+            let mut run = new_run();
+            run.definition_id = "cancelled-member".into();
+            run.input = Some(serde_json::json!(1));
+            store.create_run(&run).expect("run");
+            let attempt = store
+                .prepare_pending_activation(
+                    &run.run_id,
+                    "left",
+                    &activation_identity(&run.run_id, "left", 0),
+                    DispatchSideEffect::ReadOnly,
+                    serde_json::json!({}),
+                    2,
+                )
+                .expect("prepare")
+                .expect("attempt");
+            store
+                .persist_dispatch_receipt(&DispatchReceipt {
+                    run_id: run.run_id.clone(),
+                    node_id: "left".into(),
+                    activation_id: attempt.activation.activation_id,
+                    attempt: attempt.attempt,
+                    dispatch_identity: attempt.dispatch_identity,
+                    receipt: serde_json::json!({"accepted":true}),
+                    admitted_at_ms: 3,
+                })
+                .expect("receipt");
+            if cancelled_first {
+                store
+                    .reconcile_receipt_backed_attempts(&CancelledObserver, 10, 4)
+                    .expect("cancel");
+                assert_eq!(
+                    store
+                        .run_summary(&run.run_id)
+                        .expect("summary")
+                        .expect("run")
+                        .status,
+                    RunStatus::Running
+                );
+            }
+            store
+                .persist_validated_output(&ValidatedOutput {
+                    output_id: "right-output".into(),
+                    run_id: run.run_id.clone(),
+                    node_id: "right".into(),
+                    activation_id: activation_identity(&run.run_id, "right", 0),
+                    schema_id: definition.nodes["right"].output.type_name.clone(),
+                    schema_version: 1,
+                    value: serde_json::json!(2),
+                    artifact_reference: None,
+                    created_at_ms: 5,
+                })
+                .expect("sibling output");
+            if !cancelled_first {
+                store
+                    .reconcile_receipt_backed_attempts(&CancelledObserver, 10, 6)
+                    .expect("cancel");
+            }
+            drop(store);
+            let reopened = WorkflowStore::open_in_state_dir(temp.path()).expect("reopen");
+            assert_eq!(
+                reopened
+                    .run_summary(&run.run_id)
+                    .expect("summary")
+                    .expect("run")
+                    .status,
+                RunStatus::Failed
+            );
+            let join_count: u64 = reopened.connection.query_row(
+                "SELECT COUNT(*) FROM workflow_activations WHERE run_id = ?1 AND node_id = 'join'",
+                [&run.run_id], |row| row.get(0),
+            ).expect("join count");
+            assert_eq!(join_count, 0);
+            assert_eq!(
+                reopened.output_summaries(&run.run_id, 10).expect("outputs")[0].output_id,
+                "right-output"
+            );
+            let decision = reopened
+                .decision(&format!("{}:join:0:parallel-wait-all", run.run_id))
+                .expect("decision")
+                .expect("settled");
+            assert_eq!(decision.value["outcome"], "failed");
+        }
+    }
+
+    #[test]
     fn parallel_missing_result_preserves_successful_sibling_and_failure_after_reopen() {
         for policy in [
             bcode_workflow::ParallelFailurePolicy::WaitAll,
@@ -47194,6 +47623,9 @@ mod tests {
             assert_eq!(outputs.len(), 1);
             assert_eq!(outputs[0].output_id, "right-output");
             let suffix = match policy {
+                bcode_workflow::ParallelFailurePolicy::CollectOutcomes => {
+                    unreachable!("success-only test")
+                }
                 bcode_workflow::ParallelFailurePolicy::WaitAll => "parallel-wait-all",
                 bcode_workflow::ParallelFailurePolicy::FailFast => "parallel-fail-fast",
             };

@@ -8,6 +8,7 @@ struct GoalEntryHost {
     workspace: PathBuf,
     tasks: StdMutex<Vec<PluginTask>>,
     starts: StdMutex<Vec<PluginWorkflowStartRequest>>,
+    execution_cap: Option<u64>,
 }
 
 impl PluginTuiHost for GoalEntryHost {
@@ -78,6 +79,10 @@ impl PluginTuiHost for GoalEntryHost {
     fn start_workflow(&self, mut request: PluginWorkflowStartRequest) -> PluginWorkflowStartFuture {
         request.run_id = Some("goal-entry-acceptance".into());
         install_goal_script(&mut request, &self.workspace);
+        if let Some(cap) = self.execution_cap {
+            request.limits.node_execution_cap = cap;
+            request.limits.concurrency_cap = 1;
+        }
         request.identity = bcode_workflow::WorkflowDefinitionIdentity::for_definition(
             request.identity.kind.clone(),
             &request.definition,
@@ -125,6 +130,11 @@ impl PluginTuiHost for GoalEntryHost {
 
 // Script only the model's choices; identity, authorization, publication and execution
 // still pass through the production tools and driver.
+const LEFT_MODULE: &str = "subtotal() { echo $(( $1 * $2 )); }\n";
+const RIGHT_MODULE: &str = "total() { echo $(( $(subtotal \"$1\" \"$2\") + 3 )); }\n";
+const BROKEN_RIGHT_MODULE: &str = "total() { echo $(( $(subtotal \"$1\" \"$2\") + 4 )); }\n";
+const COMBINED_CHECK: &str = ". ./integrated.sh; actual=$(total 3 8); test \"$actual\" = 27 || { printf \"expected total 27, got %s\\n\" \"$actual\"; exit 1; }; test \"$(total 0 8)\" = 3";
+
 fn install_goal_script(request: &mut PluginWorkflowStartRequest, workspace: &Path) {
     let reference =
         |pointer: &str| serde_json::json!({"$fake_result":{"index":0,"pointer":pointer}});
@@ -137,7 +147,7 @@ fn install_goal_script(request: &mut PluginWorkflowStartRequest, workspace: &Pat
         .expect("goal evaluation successor");
     let task = |id: &str| {
         serde_json::json!({
-            "task_id":id,"objective":format!("Produce the {id} contribution.\ntool-call filesystem.write {}", serde_json::json!({"path":workspace.join(format!("{id}.txt")),"contents":id})),
+            "task_id":id,"objective":format!("Implement {id}.\ntool-call filesystem.write {}", serde_json::json!({"path":workspace.join(format!("{id}.sh")),"contents":if id == "left" { LEFT_MODULE } else { RIGHT_MODULE }})),
             "agent_profile":"build","read_only":false,
             "tool_allowlist":["filesystem.write"],
             "resources":[{"resource":format!("contribution:{id}"),"access":"write"}],
@@ -147,11 +157,11 @@ fn install_goal_script(request: &mut PluginWorkflowStartRequest, workspace: &Pat
     // Integration consumes the files, not workers' boolean claims. The shell's
     // successful exit gates the verification receipt; assertions below inspect both.
     let integrate = serde_json::json!({
-        "command":"/bin/sh -c 'cat left.txt right.txt > integrated.txt && test \"$(cat integrated.txt)\" = leftright && printf verified > verification.txt'",
+        "command":format!("/bin/sh -c 'cat left.sh right.sh > integrated.sh && ({COMBINED_CHECK}) && printf verified > verification.txt'"),
         "cwd":workspace,"timeout_ms":10000
     });
     let mut group = serde_json::json!({
-        "version":2,"generated_ids":true,"mutation_id":"goal-workers",
+        "version":2,"generated_ids":true,"mutation_id":"goal-workers","failure_policy":"collect_outcomes",
         "run_id":reference("/run_id"),"expected_revision":reference("/graph/revision"),
         "source_node_id":reference("/node_id"),"bind_source_activation":reference("/activation_id"),
         "input":source.output,"preserve_source_output":true,
@@ -191,9 +201,25 @@ fn install_corrective_script(
         type_name: "boolean".into(),
         schema: serde_json::json!({"type":"boolean"}),
     };
+    let failed_output = bcode_workflow::ValueSchema {
+        type_name: "receipt".into(),
+        schema: serde_json::json!({"type":"string","pattern":"x"}),
+    };
+    // A valid but unsupported fake-provider schema fails only this worker after its
+    // file effect. Recovery must retain that failure, inspect the artifact and correct it.
+    group["tasks"][1]["output"] = serde_json::to_value(&failed_output).unwrap();
     let results = bcode_workflow::named_result_schema(
         "delegation.results".into(),
-        &BTreeMap::from([("left".into(), boolean.clone()), ("right".into(), boolean)]),
+        &BTreeMap::from([
+            (
+                "left".into(),
+                bcode_workflow::workflow_member_outcome_schema(&boolean).unwrap(),
+            ),
+            (
+                "right".into(),
+                bcode_workflow::workflow_member_outcome_schema(&failed_output).unwrap(),
+            ),
+        ]),
     )
     .unwrap();
     let input = bcode_workflow::named_result_schema(
@@ -214,18 +240,18 @@ fn install_corrective_script(
         },
         output: source.clone(),
     };
-    let fix = serde_json::json!({"path":workspace.join("right.txt"),"contents":"right"});
+    let fix = serde_json::json!({"path":workspace.join("right.sh"),"contents":RIGHT_MODULE});
     let correction = serde_json::json!({
         "version":2,"generated_ids":true,"mutation_id":"goal-correction",
         "run_id":reference("/run_id"),"expected_revision":reference("/graph/revision"),
         "source_node_id":reference("/node_id"),"bind_source_activation":reference("/activation_id"),
         "input":input,"preserve_source_output":true,
-        "tasks":[{"task_id":"repair-right","objective":format!("Correct the contribution rejected by combined verification.\ntool-call filesystem.write {fix}"),
+        "tasks":[{"task_id":"repair-right","objective":format!("Fix contribution.\ntool-call filesystem.write {fix}"),
             "agent_profile":"build","read_only":false,"tool_allowlist":["filesystem.write"],
             "resources":[{"resource":"contribution:right","access":"write"}],
             "model_selection":{"provider":"bcode.fake-provider","model":"fake-echo"},
             "output":{"type_name":"boolean","schema":{"type":"boolean"}}}],
-        "continuation":{"objective":format!("Reintegrate and verify the corrected result.\ntool-call shell.run {integrate}"),
+        "continuation":{"objective":format!("verify\ntool-call shell.run {integrate}"),
             "agent_profile":"build","read_only":false,"tool_allowlist":["shell.run"],
             "resources":[{"resource":"integration","access":"write"}],
             "model_selection":{"provider":"bcode.fake-provider","model":"fake-echo"}},
@@ -233,14 +259,15 @@ fn install_corrective_script(
         "reconnect":{"edge_id":successor,"node_id":"loop.evaluation","transform":transform},
         "reconciliation":[]
     });
-    let broken = serde_json::json!({"path":workspace.join("right.txt"),"contents":"broken"});
+    let broken =
+        serde_json::json!({"path":workspace.join("right.sh"),"contents":BROKEN_RIGHT_MODULE});
     group["tasks"][1]["objective"] = serde_json::json!(format!(
         "Produce a contribution.\ntool-call filesystem.write {broken}"
     ));
-    // The probe succeeds only when combined verification fails as expected. Unexpected
-    // success stops the directive script; denied/failed tools are never skipped.
+    // Exercise an actual failed tool result before corrective delegation, rather
+    // than masking the verifier's nonzero exit with a successful diagnostic probe.
     let probe = serde_json::json!({
-        "command":"/bin/sh -c 'cat left.txt right.txt > integrated.txt && if test \"$(cat integrated.txt)\" = leftright; then exit 1; else printf rejected > rejected.txt; fi'",
+        "command":format!("/bin/sh -c 'cat left.sh right.sh > integrated.sh && ({COMBINED_CHECK}) > rejected.txt; status=$?; cat rejected.txt; exit $status'"),
         "cwd":workspace,"timeout_ms":10000
     });
     let publication =
@@ -252,7 +279,7 @@ fn install_corrective_script(
         "workflow.publish_run_graph_edit"
     ]);
     group["continuation"]["objective"] = serde_json::json!(format!(
-        "Verify contributions and commission correction for the rejected result.\ntool-call shell.run {probe}\ntool-call workflow.execution_context {{\"limit\":1,\"compact\":true}}\ntool-call workflow.stage_task_group {correction}\ntool-call workflow.publish_run_graph_edit {publication}"
+        "Check contributions and correct failure.\ntool-call-expect-error expected total 27, got 28 :: shell.run {probe}\ntool-call workflow.execution_context {{\"limit\":1,\"compact\":true}}\ntool-call workflow.stage_task_group {correction}\ntool-call workflow.publish_run_graph_edit {publication}"
     ));
 }
 
@@ -260,6 +287,15 @@ async fn goal_entry_request(
     session: SessionId,
     root: &Path,
     state: Arc<ServerState>,
+) -> PluginWorkflowStartRequest {
+    goal_entry_request_with_cap(session, root, state, None).await
+}
+
+async fn goal_entry_request_with_cap(
+    session: SessionId,
+    root: &Path,
+    state: Arc<ServerState>,
+    execution_cap: Option<u64>,
 ) -> PluginWorkflowStartRequest {
     let registry = bcode_bundled_plugins::tui_registry("bcode.loop").unwrap();
     let mut surface = registry
@@ -281,6 +317,7 @@ async fn goal_entry_request(
         workspace: root.to_path_buf(),
         tasks: StdMutex::default(),
         starts: StdMutex::default(),
+        execution_cap,
     };
     let key = |key, ctrl| {
         bmux_tui::event::Event::Key(bmux_keyboard::KeyStroke {
@@ -384,16 +421,64 @@ fn configure_goal_execution(server: &mut ServerState, root: &Path) {
     register_test_execution_lifetime(server, root);
 }
 
+fn contributions_settled(attempts: &[bcode_workflow::AttemptSummary]) -> bool {
+    ["left", "right"].iter().all(|id| {
+        attempts.iter().any(|attempt| {
+            attempt.node_id == *id && attempt.status == expected_worker_terminal_status(id)
+        })
+    })
+}
+
+fn assert_correction_without_replay(attempts: &[bcode_workflow::AttemptSummary]) {
+    // Correction reuses successful work instead of replaying settled effects.
+    for id in ["left", "right", "repair-right"] {
+        let matching: Vec<_> = attempts
+            .iter()
+            .filter(|attempt| attempt.node_id == id)
+            .collect();
+        assert_eq!(matching.len(), 1, "unexpected replay of {id}");
+        assert!(matching[0].terminal_at_ms.is_some());
+    }
+    let failed = attempts
+        .iter()
+        .find(|attempt| attempt.node_id == "right")
+        .unwrap();
+    let repair = attempts
+        .iter()
+        .find(|attempt| attempt.node_id == "repair-right")
+        .unwrap();
+    assert!(repair.prepared_at_ms >= failed.terminal_at_ms.unwrap());
+}
+
 fn assert_integrated_files(root: &Path) {
     for (path, contents) in [
-        ("left.txt", "left"),
-        ("right.txt", "right"),
-        ("integrated.txt", "leftright"),
+        ("left.sh", LEFT_MODULE),
+        ("right.sh", RIGHT_MODULE),
         ("verification.txt", "verified"),
         ("user.txt", "uncommitted user work"),
     ] {
         assert_eq!(std::fs::read_to_string(root.join(path)).unwrap(), contents);
     }
+    assert_eq!(
+        std::fs::read_to_string(root.join("integrated.sh")).unwrap(),
+        format!("{LEFT_MODULE}{RIGHT_MODULE}"),
+        "integration must contain both current contributions"
+    );
+    // Independently execute the artifact: a provider's success output and a marker
+    // file are not proof that the integrated implementation behaves correctly.
+    let verification = std::process::Command::new("/bin/sh")
+        .args(["-c", COMBINED_CHECK])
+        .current_dir(root)
+        .output()
+        .expect("run independent combined verification");
+    assert!(
+        verification.status.success(),
+        "combined verification failed: {verification:?}"
+    );
+}
+
+fn expected_worker_terminal_status(id: &str) -> &'static str {
+    if id == "right" { "failed" } else { "succeeded" }
 }
 
 fn assert_worker_sessions(state: &ServerState, run_id: &str, session: SessionId) {
@@ -428,9 +513,13 @@ fn assert_named_contributions(
         .find(|output| output.node_id == "loop.implementation")
         .expect("canonical coordinator output");
     assert_eq!(collected.value["source"], source.value);
+    assert!(
+        !outputs.iter().any(|output| output.node_id == "right"),
+        "failed worker must not gain a successful output"
+    );
     assert_eq!(
         collected.value["results"],
-        serde_json::json!({"left":true,"right":true})
+        serde_json::json!({"left":{"status":"completed","value":true},"right":{"status":"failed"}})
     );
 }
 
@@ -442,7 +531,7 @@ fn assert_corrected_contributions(
     assert_integrated_files(root);
     assert_eq!(
         std::fs::read_to_string(root.join("rejected.txt")).unwrap(),
-        "rejected"
+        "expected total 27, got 28\n"
     );
     assert!(
         outputs
@@ -566,12 +655,7 @@ async fn real_goal_entry_denied_delegation_prevents_worker_effects() {
         std::fs::read_to_string(root.path().join("user.txt")).unwrap(),
         "uncommitted user work"
     );
-    for artifact in [
-        "left.txt",
-        "right.txt",
-        "integrated.txt",
-        "verification.txt",
-    ] {
+    for artifact in ["left.sh", "right.sh", "integrated.sh", "verification.txt"] {
         assert!(!root.path().join(artifact).exists(), "{artifact}");
     }
 }
@@ -623,8 +707,8 @@ async fn real_goal_entry_approval_resumes_correction_and_verified_completion() {
     })
     .await
     .expect("denied goal must expose an actionable approval wait");
-    assert!(!root.path().join("left.txt").exists());
-    assert!(!root.path().join("right.txt").exists());
+    assert!(!root.path().join("left.sh").exists());
+    assert!(!root.path().join("right.sh").exists());
     workflow_operations::resolve_approval(&state, run_id, &wait.node_id, &wait.activation_id, true)
         .await
         .expect("authorized approval must resume the existing goal");
@@ -650,6 +734,215 @@ async fn real_goal_entry_approval_resumes_correction_and_verified_completion() {
     .expect("approved resumed work must integrate, correct and verify");
     drop(state);
     assert_integrated_files(root.path());
+}
+
+#[tokio::test]
+async fn real_goal_entry_denied_verification_does_not_delegate_correction() {
+    let root = tempfile::tempdir().unwrap();
+    let sessions = publication_fixture_sessions(root.path(), true);
+    let session = sessions
+        .create_session(None, root.path().into())
+        .await
+        .unwrap();
+    let store = bcode_workflow_store::WorkflowStore::open_in_state_dir(root.path()).unwrap();
+    let mut state = Arc::new(test_server_state_with_workflow_authorization(
+        sessions, store,
+    ));
+    configure_goal_execution(Arc::get_mut(&mut state).unwrap(), root.path());
+    state.start_workflow_driver().await;
+    let request = goal_entry_request(session.id, root.path(), Arc::clone(&state)).await;
+    let run_id = request.run_id.as_ref().unwrap();
+    let mut denied_verification = false;
+    tokio::time::timeout(Duration::from_secs(20), async {
+        loop {
+            for permission in interaction_operations::list_permissions(&state).await {
+                assert!(permission.is_addressed_to(session.id));
+                let allow = permission.tool_name != "shell.run";
+                denied_verification |= !allow;
+                assert!(
+                    interaction_operations::resolve_permission(
+                        &state,
+                        &permission.permission_id,
+                        allow,
+                        false,
+                    )
+                    .await
+                );
+            }
+            let (attempts, outputs) = {
+                let store = state.workflow_store.lock().unwrap();
+                assert!(store.canonical_terminal_output(run_id).unwrap().is_none());
+                (
+                    store.attempt_history(run_id, None, 100).unwrap(),
+                    store.validated_outputs(run_id, 100).unwrap(),
+                )
+            };
+            assert!(
+                !attempts
+                    .iter()
+                    .any(|attempt| attempt.node_id == "repair-right"),
+                "permission denial is not a failed combined check"
+            );
+            if let Some(evaluation) = outputs
+                .iter()
+                .find(|output| output.node_id == "loop.evaluation")
+            {
+                assert!(denied_verification);
+                assert_eq!(evaluation.value["condition_met"], false);
+                assert_eq!(evaluation.value["external_blocker"], "approval_required");
+                let waits = state
+                    .workflow_store
+                    .lock()
+                    .unwrap()
+                    .waiting_activations(run_id, 10)
+                    .unwrap();
+                if waits.iter().any(|wait| wait.node_id == "loop.blocked") {
+                    break;
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .unwrap_or_else(|error| {
+        panic!(
+            "denied verifier: {error}; attempts: {:?}",
+            state
+                .workflow_store
+                .lock()
+                .unwrap()
+                .attempt_history(run_id, None, 100)
+                .unwrap()
+        )
+    });
+    assert_eq!(
+        std::fs::read_to_string(root.path().join("left.sh")).unwrap(),
+        LEFT_MODULE
+    );
+    assert_eq!(
+        std::fs::read_to_string(root.path().join("right.sh")).unwrap(),
+        BROKEN_RIGHT_MODULE
+    );
+    for path in ["integrated.sh", "rejected.txt", "verification.txt"] {
+        assert!(
+            !root.path().join(path).exists(),
+            "denied verifier wrote {path}"
+        );
+    }
+    drop(state);
+}
+
+fn goal_ipc_client(
+    root: &Path,
+    state: &Arc<ServerState>,
+) -> (bcode_client::BcodeClient, tokio::task::JoinHandle<()>) {
+    let endpoint = bcode_ipc::IpcEndpoint::unix_socket(root.join("allowance.sock"));
+    let listener = LocalIpcListener::bind(&endpoint).unwrap();
+    let server_state = Arc::clone(state);
+    let server = tokio::spawn(async move {
+        loop {
+            let stream = listener.accept().await.unwrap();
+            let state = Arc::clone(&server_state);
+            tokio::spawn(async move { handle_client(stream, state).await });
+        }
+    });
+    (bcode_client::BcodeClient::new(endpoint), server)
+}
+
+#[tokio::test]
+async fn exhausted_goal_resumes_after_idempotent_ipc_allowance_grant() {
+    let root = tempfile::tempdir().unwrap();
+    let sessions = publication_fixture_sessions(root.path(), true);
+    let session = sessions
+        .create_session(None, root.path().into())
+        .await
+        .unwrap();
+    let store = bcode_workflow_store::WorkflowStore::open_in_state_dir(root.path()).unwrap();
+    let mut state = Arc::new(test_server_state_with_workflow_authorization(
+        sessions, store,
+    ));
+    configure_goal_execution(Arc::get_mut(&mut state).unwrap(), root.path());
+    std::fs::write(root.path().join("user.txt"), "uncommitted user work").unwrap();
+    state.start_workflow_driver().await;
+    let request =
+        goal_entry_request_with_cap(session.id, root.path(), Arc::clone(&state), Some(1)).await;
+    let run_id = request.run_id.unwrap();
+    let (client, server) = goal_ipc_client(root.path(), &state);
+    let observation = tokio::time::timeout(Duration::from_secs(20), async {
+        loop {
+            approve_goal_permissions(&state, session.id).await;
+            let inspection = client
+                .inspect_workflow_run(run_id.clone(), 10)
+                .await
+                .unwrap();
+            let allowance = inspection.execution_allowance.unwrap();
+            if allowance.exhausted() == Some(true) {
+                break allowance;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(observation.run_cap, 1);
+    assert!(!root.path().join("verification.txt").exists());
+    let action = bcode_workflow::WorkflowRunControlAction::IncreaseExecutionAllowance {
+        expected_cap: observation.run_cap,
+        target_cap: 100,
+    };
+    client
+        .control_workflow_run(run_id.clone(), action)
+        .await
+        .unwrap();
+    client
+        .control_workflow_run(run_id.clone(), action)
+        .await
+        .unwrap();
+    assert!(
+        client
+            .control_workflow_run(
+                run_id.clone(),
+                bcode_workflow::WorkflowRunControlAction::IncreaseExecutionAllowance {
+                    expected_cap: observation.run_cap,
+                    target_cap: 101,
+                }
+            )
+            .await
+            .is_err()
+    );
+    let inspection = client
+        .inspect_workflow_run(run_id.clone(), 10)
+        .await
+        .unwrap();
+    assert_eq!(inspection.execution_allowance.unwrap().run_cap, 100);
+    tokio::time::timeout(Duration::from_secs(30), async {
+        loop {
+            approve_goal_permissions(&state, session.id).await;
+            let terminal = state
+                .workflow_store
+                .lock()
+                .unwrap()
+                .canonical_terminal_output(&run_id)
+                .unwrap();
+            if let Some(terminal) = terminal {
+                assert_eq!(terminal.value["condition_met"], true);
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .unwrap();
+    let attempts = state
+        .workflow_store
+        .lock()
+        .unwrap()
+        .attempt_history(&run_id, None, 100)
+        .unwrap();
+    assert_correction_without_replay(&attempts);
+    drop(state);
+    assert_integrated_files(root.path());
+    server.abort();
 }
 
 #[tokio::test]
@@ -690,13 +983,7 @@ async fn real_goal_entry_publishes_and_executes_two_workers() {
                 .find(|attempt| {
                     attempt.node_id == "loop.implementation" && attempt.terminal_at_ms.is_some()
                 })
-                .filter(|_| {
-                    ["left", "right"].iter().all(|id| {
-                        attempts
-                            .iter()
-                            .any(|attempt| attempt.node_id == *id && attempt.status == "succeeded")
-                    })
-                })
+                .filter(|_| contributions_settled(&attempts))
             {
                 assert_eq!(coordinator.status, "succeeded", "{attempts:?}");
                 let outputs = state
@@ -728,12 +1015,15 @@ async fn real_goal_entry_publishes_and_executes_two_workers() {
                     continue;
                 };
                 assert_corrected_contributions(root.path(), &outputs, collected);
+                assert_correction_without_replay(&attempts);
                 assert_goal_evaluation(&outputs, &request.input);
                 assert_eq!(terminal.value["condition_met"], true);
                 break;
             }
             assert!(
-                attempts.iter().all(|attempt| attempt.status != "failed"),
+                attempts
+                    .iter()
+                    .all(|attempt| attempt.status != "failed" || attempt.node_id == "right"),
                 "goal execution failed before coordinator settlement: {attempts:?}"
             );
             tokio::time::sleep(Duration::from_millis(20)).await;

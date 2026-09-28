@@ -209,6 +209,18 @@ pub fn progress_status(session_id: SessionId) -> InvokeCommandResponse {
         };
         let run = &inspection.run;
         let mut status = format_workflow_inspection_status(&inspection);
+        if inspection
+            .execution_allowance
+            .as_ref()
+            .and_then(bcode_workflow::WorkflowExecutionAllowanceObservation::exhausted)
+            == Some(true)
+            && matches!(
+                run.status,
+                bcode_workflow::RunStatus::Running | bcode_workflow::RunStatus::Paused
+            )
+        {
+            status.push_str("\nExecution allowance exhausted · /goal.continue --worker-attempts <positive integer> grants attempts to this exact goal, not extra iterations or a separate composition root. Paused goals also require /goal.resume.");
+        }
         if run.status == bcode_workflow_store::RunStatus::Failed
             && let Ok(source) = client
                 .workflow_continuation_source(run.run_id.clone())

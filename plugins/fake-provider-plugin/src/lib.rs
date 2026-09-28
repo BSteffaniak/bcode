@@ -2387,25 +2387,45 @@ fn scripted_prompt_tool_call(request: &ModelTurnRequest, next_turn: u64) -> Opti
 // Results are scoped to the current user message, never a previous activation.
 // Stop on errors instead of scripting past denied or failed operations.
 fn next_prompt_tool_directive(messages: &[ModelMessage], next_turn: u64) -> Option<ToolCall> {
-    let mut completed = 0;
-    for message in messages
+    // Scripts must explicitly declare an expected tool failure. This allows a
+    // deterministic correction scenario without disguising a failed check as a
+    // successful shell command; unexpected failures still stop the script.
+    let prompt = last_user_text(messages);
+    let directives = prompt
+        .lines()
+        .filter_map(|line| {
+            let (line, expected_error) =
+                if let Some(rest) = line.strip_prefix("tool-call-expect-error ") {
+                    let (expected, call) = rest.split_once(" :: ")?;
+                    if expected.is_empty() {
+                        return None;
+                    }
+                    (format!("tool-call {call}"), Some(expected))
+                } else {
+                    (line.to_owned(), None)
+                };
+            fake_tool_call(&line, next_turn).map(|call| (call, expected_error))
+        })
+        .collect::<Vec<_>>();
+    let completed_results = messages
         .iter()
         .rev()
         .take_while(|message| message.role != MessageRole::User)
-    {
-        for block in &message.content {
-            if let ContentBlock::ToolResult { result } = block {
-                if result.is_error {
-                    return None;
-                }
-                completed += 1;
-            }
+        .flat_map(|message| &message.content)
+        .filter_map(|block| match block {
+            ContentBlock::ToolResult { result } => Some(result),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    for (index, result) in completed_results.iter().rev().enumerate() {
+        let expected = directives.get(index)?.1;
+        if result.is_error != expected.is_some()
+            || expected.is_some_and(|text| !result.output.contains(text))
+        {
+            return None;
         }
     }
-    let mut call = last_user_text(messages)
-        .lines()
-        .filter_map(|line| fake_tool_call(line, next_turn))
-        .nth(completed)?;
+    let mut call = directives.get(completed_results.len())?.0.clone();
     let results = messages
         .iter()
         .rev()
@@ -3068,6 +3088,56 @@ tool-call publish {"$fake_result":{"index":0,"pointer":"/publication_arguments"}
             r#"tool-call publish {"$fake_result":{"index":0,"pointer":"/publication_arguments"}}"#,
         ));
         assert!(next_prompt_tool_directive(&messages, 6).is_none());
+    }
+
+    #[test]
+    fn prompt_directives_require_the_declared_failure_before_correction() {
+        let mut messages = vec![ModelMessage {
+            role: MessageRole::User,
+            content: vec![ContentBlock::Text {
+                text:
+                    "tool-call-expect-error failed combined verification :: shell.run {}\ntool-call repair {}\ntool-call verify {}"
+                        .into(),
+            }],
+        }];
+        assert_eq!(
+            next_prompt_tool_directive(&messages, 1).unwrap().name,
+            "shell.run"
+        );
+        let result = |is_error| ModelMessage {
+            role: MessageRole::Tool,
+            content: vec![ContentBlock::ToolResult {
+                result: bcode_model::ToolResult {
+                    call_id: "check".into(),
+                    output: "failed combined verification".into(),
+                    is_error,
+                    content: Vec::new(),
+                },
+            }],
+        };
+        messages.push(result(false));
+        assert!(next_prompt_tool_directive(&messages, 2).is_none());
+        messages.pop();
+        let mut denied = result(true);
+        if let ContentBlock::ToolResult { result } = &mut denied.content[0] {
+            result.output = "tool execution denied: permission denied".into();
+        }
+        messages.push(denied);
+        assert!(next_prompt_tool_directive(&messages, 2).is_none());
+        messages.pop();
+        messages.push(result(true));
+        assert_eq!(
+            next_prompt_tool_directive(&messages, 2).unwrap().name,
+            "repair"
+        );
+        messages.push(result(false));
+        assert_eq!(
+            next_prompt_tool_directive(&messages, 3).unwrap().name,
+            "verify"
+        );
+        messages.pop();
+        messages.push(result(true));
+        assert!(next_prompt_tool_directive(&messages, 3).is_none());
     }
 
     #[test]

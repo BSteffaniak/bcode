@@ -1940,6 +1940,7 @@ impl WorkflowFanOutConfiguration {
             || self.max_members == 0
             || self.max_concurrency == 0
             || self.max_concurrency > self.max_members
+            || self.failure_policy == ParallelFailurePolicy::CollectOutcomes
         {
             return Err(WorkflowError::Build {
                 path: "fan_out".to_string(),
@@ -12970,6 +12971,7 @@ impl WorkflowProductionCapabilities {
             parallel_join_policies: BTreeSet::from([
                 ParallelFailurePolicy::WaitAll,
                 ParallelFailurePolicy::FailFast,
+                ParallelFailurePolicy::CollectOutcomes,
             ]),
             automatic_retry: WorkflowCapabilitySupport::Supported,
             fan_out: WorkflowCapabilitySupport::Supported,
@@ -15333,6 +15335,30 @@ pub enum ParallelFailurePolicy {
     WaitAll,
     /// Return the first observed failure and request cooperative sibling cancellation.
     FailFast,
+    /// Durable-only collection of named terminal outcomes, without converting failure to success.
+    /// The join emits a map keyed by member node ID after every member settles.
+    CollectOutcomes,
+}
+
+/// Schema for an explicitly collected terminal member outcome.
+/// Successful values retain their declared schema; other states carry no invented output.
+/// # Errors
+/// Rejects unsupported local references or excessive schema expansion.
+pub fn workflow_member_outcome_schema(output: &ValueSchema) -> Result<ValueSchema, WorkflowError> {
+    let value = embedded_schema(&output.schema)?;
+    Ok(ValueSchema {
+        type_name: format!("workflow.outcome<{}>", output.type_name),
+        schema: serde_json::json!({
+            "oneOf": [
+                {"type":"object","additionalProperties":false,
+                 "properties":{"status":{"const":"completed"},"value":value},
+                 "required":["status","value"]},
+                {"type":"object","additionalProperties":false,
+                 "properties":{"status":{"enum":["failed","cancelled","skipped"]}},
+                 "required":["status"]}
+            ]
+        }),
+    })
 }
 
 /// Execute a homogeneous collection through one cloned step with bounded concurrency.
@@ -15570,6 +15596,11 @@ where
             Box::pin(async move {
                 context.controller_started(&join_id);
                 let result = match failure_policy {
+                    ParallelFailurePolicy::CollectOutcomes => Err(WorkflowError::Build {
+                        path: join_id.clone(),
+                        message: "outcome collection requires the durable named-outcome contract"
+                            .into(),
+                    }),
                     ParallelFailurePolicy::WaitAll => {
                         let (left, right) = switchy::unsync::join!(
                             left_run(input, context.clone()),
@@ -16596,6 +16627,40 @@ pub fn validate_parallel_join_configuration(
                 message: format!(
                     "parallel join member '{member}' must exist and have a direct edge to the join"
                 ),
+            });
+        }
+    }
+    if node
+        .configuration
+        .get("failure_policy")
+        .and_then(serde_json::Value::as_str)
+        == Some("collect_outcomes")
+    {
+        let schemas = parallel_join_member_ids(node)?
+            .into_iter()
+            .map(|id| {
+                Ok((
+                    id.to_string(),
+                    workflow_member_outcome_schema(&definition.nodes[id].output)?,
+                ))
+            })
+            .collect::<Result<BTreeMap<_, _>, WorkflowError>>()?;
+        let expected = named_result_schema(node.output.type_name.clone(), &schemas)?;
+        if node.input != expected || node.output != expected {
+            return Err(WorkflowError::Build {
+                path: node.id.clone(),
+                message: "outcome collection requires the exact named terminal-outcome schema"
+                    .into(),
+            });
+        }
+        if definition
+            .edges
+            .iter()
+            .any(|edge| edge.to == node.id && edge.transform.is_some())
+        {
+            return Err(WorkflowError::Build {
+                path: node.id.clone(),
+                message: "outcome collection does not accept member edge transforms".into(),
             });
         }
     }
@@ -22263,6 +22328,7 @@ steps:
             BTreeSet::from([
                 ParallelFailurePolicy::WaitAll,
                 ParallelFailurePolicy::FailFast,
+                ParallelFailurePolicy::CollectOutcomes,
             ])
         );
         assert_eq!(

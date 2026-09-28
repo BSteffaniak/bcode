@@ -655,6 +655,17 @@ failure persists cancellation intent for active siblings, cancels undispatched s
 the controller/run; wait-all retains all admitted work before terminal failure. Reopening discovers
 persisted pending members without rematerializing identities or inputs.
 
+For explicitly authored `collect_outcomes` parallel controllers, all terminal members
+instead produce one named controller input, retaining successful validated values and
+separate failed/cancelled/skipped statuses without worker outputs. Materialization shares
+the member settlement transaction, activation-generation identity, graph binding and
+admission limits. It does not run during whole-run cancellation or terminal run state;
+paused runs may retain pending coordination but cannot dispatch it. A member cancelled
+under a durable graph-publication intent is retirement rather than an independent
+outcome: later sibling settlement preserves its contribution without admitting the
+retiring graph's outcome controller, including after store reopen. Existing success-only
+policies are unchanged. Unknown policies fail compatibility checks on older runtimes.
+
 For supported wait-all joins, a failed member does not terminate the run while another member is
 non-terminal. Once all declared members are terminal, the store persists one generation-scoped
 ordered member-outcome decision and fails the run if any member failed or was cancelled.

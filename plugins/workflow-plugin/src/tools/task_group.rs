@@ -403,6 +403,11 @@ fn decode_group(arguments: &serde_json::Value) -> Result<Group, String> {
     if group.tasks.is_empty() {
         return Err("task group requires at least one worker".into());
     }
+    if group.failure_policy == bcode_workflow::ParallelFailurePolicy::CollectOutcomes
+        && (group.version != 2 || group.tasks.len() < 2 || !group.dependencies.is_empty())
+    {
+        return Err("collect_outcomes requires v2 with at least two independent workers; dependent-worker failure propagation is not supported".into());
+    }
     if let Some(resource) = &group.workspace_resource {
         if resource.trim().is_empty() {
             return Err("workspace resource must not be blank".into());
@@ -461,7 +466,12 @@ fn result_mapping(group: &Group) -> serde_json::Value {
                 json!(worker_result_indices(group, position))
             };
             // Only recognize the exact bundled contract, not a caller-supplied type name.
-            if task.output == default_worker_output() {
+            if group.failure_policy == bcode_workflow::ParallelFailurePolicy::CollectOutcomes {
+                assignment["terminal_outcome"] = json!(true);
+            }
+            if task.output == default_worker_output()
+                && group.failure_policy != bcode_workflow::ParallelFailurePolicy::CollectOutcomes
+            {
                 let path = assignment["input_path"]
                     .as_array()
                     .expect("normalized result path");
@@ -573,11 +583,40 @@ fn append_successor_context(
     Ok(())
 }
 
-fn lower_group(mut group: Group) -> Result<WorkflowRunGraphEditBatch, String> {
-    let inputs = worker_inputs(&group)?;
-    validate_source_preservation(&group)?;
-    let mut reconnect = reconnect_successor(&group)?;
-    let members = member_ids(&group);
+fn outcome_join(group: &Group, members: &[String]) -> Result<NodeDefinition, String> {
+    let schemas = group
+        .tasks
+        .iter()
+        .map(|task| {
+            Ok((
+                task.task_id.clone(),
+                bcode_workflow::workflow_member_outcome_schema(&task.output)
+                    .map_err(|error| error.to_string())?,
+            ))
+        })
+        .collect::<Result<std::collections::BTreeMap<_, _>, String>>()?;
+    let schema =
+        bcode_workflow::named_result_schema(format!("{}.outcomes", group.join_id), &schemas)
+            .map_err(|error| error.to_string())?;
+    Ok(NodeDefinition {
+        id: group.join_id.clone(),
+        name: group.join_id.clone(),
+        kind: NodeKind::Parallel,
+        dataflow: WorkflowNodeDataflowPolicy::Direct,
+        input: schema.clone(),
+        output: schema,
+        resources: Vec::new(),
+        configuration: json!({"failure_policy":"collect_outcomes",
+            "left_exits":[members[0]], "right_exits":members[1..]}),
+    })
+}
+
+fn lower_group_joins(
+    group: &Group,
+    members: &[String],
+    joins: &mut Vec<WorkflowRunGraphEdit>,
+    edges: &mut Vec<(String, String)>,
+) -> Result<(String, ValueSchema), String> {
     let ids: std::collections::BTreeSet<_> = members
         .iter()
         .chain([&group.join_id, &group.continuation.task_id])
@@ -585,14 +624,27 @@ fn lower_group(mut group: Group) -> Result<WorkflowRunGraphEditBatch, String> {
     validate_member_ids(&ids, members.len(), group.source_node_id.as_ref())?;
     let mut aggregate_id = members[0].clone();
     let mut aggregate_schema = group.tasks[0].output.clone();
-    let mut joins = Vec::new();
-    let mut edges = worker_edges(&group, &members);
     let mut identities = ids
         .into_iter()
         .cloned()
         .collect::<std::collections::BTreeSet<_>>();
     identities.extend(group.source_node_id.iter().cloned());
-    for (index, task) in group.tasks.iter().enumerate().skip(1) {
+    if group.failure_policy == bcode_workflow::ParallelFailurePolicy::CollectOutcomes {
+        let node = outcome_join(group, members)?;
+        aggregate_schema = node.output.clone();
+        aggregate_id.clone_from(&node.id);
+        joins.push(WorkflowRunGraphEdit::AddNode {
+            node,
+            entry: false,
+            exit: false,
+        });
+        edges.extend(members.iter().map(|id| (id.clone(), aggregate_id.clone())));
+    }
+    for (index, task) in
+        group.tasks.iter().enumerate().skip(1).filter(|_| {
+            group.failure_policy != bcode_workflow::ParallelFailurePolicy::CollectOutcomes
+        })
+    {
         let id = if index + 1 == members.len() {
             group.join_id.clone()
         } else {
@@ -616,7 +668,19 @@ fn lower_group(mut group: Group) -> Result<WorkflowRunGraphEditBatch, String> {
         aggregate_id = id;
         aggregate_schema = schema;
     }
-    (aggregate_id, aggregate_schema) = include_source_output(
+    Ok((aggregate_id, aggregate_schema))
+}
+
+fn lower_group(mut group: Group) -> Result<WorkflowRunGraphEditBatch, String> {
+    let inputs = worker_inputs(&group)?;
+    validate_source_preservation(&group)?;
+    let mut reconnect = reconnect_successor(&group)?;
+    let members = member_ids(&group);
+    let mut joins = Vec::new();
+    let mut edges = worker_edges(&group, &members);
+    let (aggregate_id, aggregate_schema) =
+        lower_group_joins(&group, &members, &mut joins, &mut edges)?;
+    let (aggregate_id, aggregate_schema) = include_source_output(
         &group,
         aggregate_id,
         aggregate_schema,
@@ -860,8 +924,33 @@ fn named_results(group: &Group) -> Result<bcode_workflow::WorkflowTransform, Str
     let mut schemas = std::collections::BTreeMap::new();
     for (position, task) in group.tasks.iter().enumerate() {
         let indices = worker_result_indices(group, position);
-        results.insert(task.task_id.clone(), select(indices));
-        schemas.insert(task.task_id.clone(), task.output.clone());
+        if group.failure_policy == bcode_workflow::ParallelFailurePolicy::CollectOutcomes {
+            let mut segments = Vec::new();
+            if group.include_source_output {
+                segments.push(Segment::Index { index: 1 });
+            }
+            segments.push(Segment::Field {
+                name: task.task_id.clone(),
+            });
+            results.insert(
+                task.task_id.clone(),
+                Expression::SelectedInput {
+                    source: bcode_workflow::WORKFLOW_TRANSFORM_SOURCE_CURRENT.into(),
+                    selector: bcode_workflow::WorkflowValueSelector {
+                        version: bcode_workflow::WORKFLOW_VALUE_SELECTOR_VERSION,
+                        segments,
+                    },
+                },
+            );
+            schemas.insert(
+                task.task_id.clone(),
+                bcode_workflow::workflow_member_outcome_schema(&task.output)
+                    .map_err(|error| error.to_string())?,
+            );
+        } else {
+            results.insert(task.task_id.clone(), select(indices));
+            schemas.insert(task.task_id.clone(), task.output.clone());
+        }
     }
     let result_schema = bcode_workflow::named_result_schema("delegation.results".into(), &schemas)
         .map_err(|error| error.to_string())?;
@@ -921,7 +1010,7 @@ fn include_source_output(
         node:NodeDefinition {
             id:id.clone(),name:id.clone(),kind:NodeKind::Parallel,
             dataflow:WorkflowNodeDataflowPolicy::Direct,input:schema.clone(),output:schema.clone(),resources:Vec::new(),
-            configuration:json!({"failure_policy":group.failure_policy,"left_exits":[source],"right_exits":[aggregate_id]}),
+            configuration:json!({"failure_policy":if group.failure_policy == bcode_workflow::ParallelFailurePolicy::CollectOutcomes { bcode_workflow::ParallelFailurePolicy::WaitAll } else { group.failure_policy },"left_exits":[source],"right_exits":[aggregate_id]}),
         },entry:false,exit:false,
     });
     edges.push((source.clone(), id.clone()));
@@ -1001,7 +1090,7 @@ pub(super) fn definition() -> bcode_tool::ToolDefinition {
             ],
             "properties":{"version":{"type":"integer","enum":[1,2],"default":1,"description":"Task-group compatibility version; omission means v1 positional results. V2 delivers {results:{task_id:value},source?:value} through a deterministic edge transform."},"run_id":{"type":"string"},"expected_revision":{"type":"integer","minimum":1},"mutation_id":{"type":"string"},
                 "reconnect":{"type":"object","additionalProperties":false,"required":["edge_id","node_id"],"properties":{"edge_id":{"type":"integer","minimum":0},"node_id":{"type":"string"},"transform":{"type":"object","description":"Optional canonical WorkflowTransform for the replacement edge. Copy required state-protection transforms explicitly; omission preserves legacy untransformed reconnection. Validated by canonical publication."}},"description":"Explicitly replace this existing edge with continuation -> node_id; requires source_node_id. Include complete active-source reconciliation. Publication validates the existing graph and successor input schema."},
-                "failure_policy":{"type":"string","enum":["wait_all","fail_fast"],"default":"wait_all","description":"Canonical join failure policy applied to result/context joins. Fail-fast requests cooperative cancellation; it does not undo effects."},
+                "failure_policy":{"type":"string","enum":["wait_all","fail_fast","collect_outcomes"],"default":"wait_all","description":"Canonical join failure policy. collect_outcomes requires v2 independent workers and delivers named terminal outcomes to the continuation; it does not retry effects. Fail-fast requests cooperative cancellation; it does not undo effects."},
                 "include_source_output":{"type":"boolean","description":"Requires source_node_id. Continuation input becomes [canonical source output, worker result pairs]. Reserves join_id.context."},
                 "preserve_source_output":{"type":"boolean","description":"V2 side-effect-only integration: requires reconnect and continuation.output equal to input; omitted include_source_output defaults to true and omitted continuation.output derives input. Explicit false or incompatible schemas reject. Host preserves the named envelope and reconnect selects canonical source; continuation cannot rewrite source state or claim goal completion. Existing current-input source-only selections are composed for corrective delegation; other transforms reject."},
                 "workspace_resource":{"type":"string","minLength":1,"description":"Optional shared scheduler resource identity. Adds a read claim to read-only workers/integrator and a write claim to mutating ones; preserves stronger existing claims. Writers serialize against matching claims. Not filesystem isolation, path confinement, cross-run locking or tool authorization; all cooperating work must use the same identity."},
@@ -2539,6 +2628,46 @@ mod tests {
         let mut request = request();
         request["failure_policy"] = json!("ignore_failures");
         assert!(parse(&request).is_err());
+    }
+
+    #[test]
+    fn outcome_collection_lowers_named_terminal_values_with_source() {
+        for context in [false, true] {
+            let mut request = request();
+            request["version"] = json!(2);
+            request["failure_policy"] = json!("collect_outcomes");
+            request["include_source_output"] = json!(context);
+            if context {
+                request["source_node_id"] = json!("source");
+            }
+            let edit = parse(&request).expect("outcome group");
+            let transform = edit
+                .edits
+                .iter()
+                .find_map(|edit| match edit {
+                    WorkflowRunGraphEdit::AddEdge { edge, .. } if edge.to == "resume" => {
+                        edge.transform.as_ref()
+                    }
+                    _ => None,
+                })
+                .expect("named transform");
+            let outcomes = json!({"a":{"status":"failed"},"b":{"status":"completed","value":true},"c":{"status":"cancelled"}});
+            let input = if context {
+                json!([true, outcomes])
+            } else {
+                outcomes.clone()
+            };
+            let value = transform
+                .evaluate(&[bcode_workflow::WorkflowTransformInput {
+                    name: bcode_workflow::WORKFLOW_TRANSFORM_SOURCE_CURRENT,
+                    value: &input,
+                }])
+                .expect("transform");
+            assert_eq!(value["results"], outcomes);
+            if context {
+                assert_eq!(value["source"], true);
+            }
+        }
     }
 
     #[test]
