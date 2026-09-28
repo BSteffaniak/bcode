@@ -150,6 +150,20 @@ fn format_result(text: &mut String, view: &WorkflowRunView, output_id: &str) {
             "\n  Additional evidence omitted; inspect the canonical result in /workflow.",
         );
     }
+    if let Some(delivery) = &result.delivery {
+        text.push_str("\nDelivery report (evaluator-reported):");
+        for target in delivery.integrated_targets.iter().take(DETAIL_LIMIT) {
+            let _ = write!(text, "\n  Integrated target: {}", preview(target));
+        }
+        let _ = write!(
+            text,
+            "\n  {} contribution references · {} criteria · {} checks · {} unresolved items. Inspect /workflow for full delivery evidence.",
+            delivery.contribution_output_ids.len(),
+            delivery.criteria.len(),
+            delivery.checks.len(),
+            delivery.unresolved_work.len()
+        );
+    }
     text.push_str("\nEvaluation evidence is reported, not independently verified by this display.");
 }
 
@@ -172,7 +186,13 @@ pub mod tests {
                 "implementation_prompt":"Implement objective","stop_condition":"Combined checks pass",
                 "max_iterations":1,"iteration":1,"condition_met":met,
                 "summary":"Combined check failed\nRetain both contributions",
-                "evidence":["integrated.sh: expected 27, observed 28"]
+                "evidence":["integrated.sh: expected 27, observed 28"],
+                "delivery": {
+                    "version":"1", "integrated_targets":["integrated.sh"],
+                    "contribution_output_ids":["left", "right"],
+                    "criteria":[{"criterion":"total is 27", "status":"failed", "evidence":"observed 28"}],
+                    "checks":[], "retained_workspaces":[], "unresolved_work":["fix surcharge"]
+                }
             }}
         })).unwrap()
         };
@@ -182,6 +202,10 @@ pub mod tests {
         assert!(!text.contains("criteria reported satisfied"));
         assert!(text.contains("Combined check failed Retain both contributions"));
         assert!(text.contains("integrated.sh: expected 27, observed 28"));
+        assert!(text.contains("Integrated target: integrated.sh"));
+        assert!(
+            text.contains("2 contribution references · 1 criteria · 0 checks · 1 unresolved items")
+        );
         snapshot.outputs[1].value = WorkflowOutputValue::Unresolved;
         let text = format(&snapshot);
         assert!(text.contains("Goal result detail unavailable"));

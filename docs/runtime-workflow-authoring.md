@@ -19,6 +19,11 @@ it as success-only behavior. Live-model recovery remains unverified.
 
 ## Source-preserving integration
 
+Compact v2 staging receipts retain publication arguments and named result paths,
+but omit the redundant reconnect transform/schema. Corrective authors inspect the
+current revision-pinned successor through `workflow.execution_context`; a staging
+receipt is neither current topology nor permission to infer an absent transform.
+
 `workflow.execution_context` now returns a `delegation` recipe for a source with
 one direct successor when the bounded response contains its definition and all
 edges from the initial edge cursor. This works with compact presentation too:
@@ -33,6 +38,14 @@ separate. Conflicts require fresh discovery. Partial pages, unavailable allocati
 multiple/control successors and unsupported transforms return an actionable
 unavailable result; use advanced staging for those topologies. This bounded helper
 is not automatic planning, workspace integration or evidence of worker success.
+
+For oversized recipe schemas, request `delegation_part: "serialized"`. Concatenate
+returned `delegation.chunk` strings in order, following `next_arguments` unchanged
+until null, then parse the concatenation as the exact staging arguments. Each
+chunk is bounded independently of schema size; offsets count Unicode characters,
+not bytes. Later chunks require the pinned revision. Restart on revision conflict;
+never combine chunks from different revisions. This is read-only transport of the
+same authenticated recipe, not a schema simplification or additional authority.
 
 Task-group workers and continuations may select `worktree_directory`, an absolute
 path to an existing registered worktree of the parent session's repository. Prompt

@@ -118,6 +118,15 @@ pub fn pinned_input_transform() -> bcode_workflow::WorkflowTransform {
         ("external_blocker", current("external_blocker")),
         ("evidence", current("evidence")),
         ("summary", current("summary")),
+        (
+            "delivery",
+            Expr::Default {
+                value: Box::new(current("delivery")),
+                default: Box::new(Expr::Constant {
+                    value: serde_json::Value::Null,
+                }),
+            },
+        ),
     ]
     .into_iter()
     .map(|(field, expression)| (field.into(), expression))

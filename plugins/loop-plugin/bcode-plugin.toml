@@ -28,7 +28,7 @@ name         = "Loop Judgement Evaluation"
 
 [[services.workflow_blocks]]
 block_id               = "loop.judgement.evaluate"
-block_version          = 2
+block_version          = 3
 cancellation_supported = true
 effect                 = "read_only"
 operation              = "loop.judgement.evaluate"
@@ -37,24 +37,13 @@ reconciliation         = "repair_required"
 timeout_ms             = 60000
 
 [services.workflow_blocks.input]
-schema = { "$defs" = { "LoopExternalBlocker" = { "enum" = [
-    "none",
-    "approval_required",
-    "input_required",
-    "dependency_required",
-], "type" = "string" }, "EvaluationConfig" = { "additionalProperties" = false, "properties" = { "auth_profile" = { "type" = "string" }, "model_id" = { "type" = "string" }, "on_failure" = { "$ref" = "#/$defs/FailurePolicy", "description" = "The existing read-only agent evaluator can be retained on service failure." }, "provider_plugin_id" = { "type" = "string" }, "threshold_percent" = { "description" = "Completion requires at least this probability, plus concrete agent-collected evidence.", "format" = "uint8", "maximum" = 255, "minimum" = 0, "type" = "integer" } }, "required" = [
-    "provider_plugin_id",
-    "model_id",
-    "auth_profile",
-    "threshold_percent",
-    "on_failure",
-], "type" = "object" }, "FailurePolicy" = { "enum" = [
-    "pause",
-    "agent_fallback",
-], "type" = "string" } }, "$schema" = "https://json-schema.org/draft/2020-12/schema", "properties" = { "external_blocker" = { "$ref" = "#/$defs/LoopExternalBlocker", "default" = "none" }, "condition_met" = { "type" = "boolean" }, "evidence" = { "items" = { "type" = "string" }, "type" = "array" }, "implementation_prompt" = { "type" = "string" }, "iteration" = { "format" = "uint32", "minimum" = 0, "type" = "integer" }, "judgement_evaluation" = { "anyOf" = [
+schema = { "$schema" = "https://json-schema.org/draft/2020-12/schema", "title" = "LoopWorkflowIteration", "type" = "object", "properties" = { "condition_met" = { "type" = "boolean" }, "delivery" = { "anyOf" = [
+    { "$ref" = "#/$defs/DeliveryReport" },
+    { "type" = "null" },
+] }, "evidence" = { "type" = "array", "items" = { "type" = "string" } }, "external_blocker" = { "$ref" = "#/$defs/LoopExternalBlocker", "default" = "none" }, "implementation_prompt" = { "type" = "string" }, "iteration" = { "type" = "integer", "format" = "uint32", "minimum" = 0 }, "judgement_evaluation" = { "anyOf" = [
     { "$ref" = "#/$defs/EvaluationConfig" },
     { "type" = "null" },
-] }, "max_iterations" = { "format" = "uint32", "minimum" = 0, "type" = "integer" }, "planning_ready" = { "default" = false, "type" = "boolean" }, "stop_condition" = { "type" = "string" }, "summary" = { "type" = "string" } }, "required" = [
+] }, "max_iterations" = { "type" = "integer", "format" = "uint32", "minimum" = 0 }, "planning_ready" = { "type" = "boolean", "default" = false }, "stop_condition" = { "type" = "string" }, "summary" = { "type" = "string" } }, "required" = [
     "implementation_prompt",
     "stop_condition",
     "max_iterations",
@@ -62,28 +51,54 @@ schema = { "$defs" = { "LoopExternalBlocker" = { "enum" = [
     "condition_met",
     "evidence",
     "summary",
-], "title" = "LoopWorkflowIteration", "type" = "object" }
+], "$defs" = { "Check" = { "type" = "object", "properties" = { "command" = { "type" = "string", "maxLength" = 2048, "minLength" = 1 }, "evidence" = { "type" = "string", "maxLength" = 4096, "minLength" = 1 }, "outcome" = { "$ref" = "#/$defs/Observation" }, "workspace" = { "type" = "string", "maxLength" = 4096, "minLength" = 1 } }, "additionalProperties" = false, "required" = [
+    "command",
+    "workspace",
+    "outcome",
+    "evidence",
+] }, "Criterion" = { "type" = "object", "properties" = { "criterion" = { "type" = "string", "maxLength" = 2048, "minLength" = 1 }, "evidence" = { "type" = "string", "maxLength" = 4096, "minLength" = 1 }, "status" = { "$ref" = "#/$defs/Observation" } }, "additionalProperties" = false, "required" = [
+    "criterion",
+    "status",
+    "evidence",
+] }, "DeliveryReport" = { "description" = "Optional versioned report. Older goal outputs omit it; unknown versions reject.", "type" = "object", "properties" = { "checks" = { "type" = "array", "items" = { "$ref" = "#/$defs/Check" }, "maxItems" = 32 }, "contribution_output_ids" = { "type" = "array", "items" = { "type" = "string", "maxLength" = 4096, "minLength" = 1 }, "maxItems" = 64 }, "criteria" = { "type" = "array", "items" = { "$ref" = "#/$defs/Criterion" }, "maxItems" = 64, "minItems" = 1 }, "integrated_targets" = { "type" = "array", "items" = { "type" = "string", "maxLength" = 4096, "minLength" = 1 }, "maxItems" = 64, "minItems" = 1 }, "retained_workspaces" = { "type" = "array", "items" = { "type" = "string", "maxLength" = 4096, "minLength" = 1 }, "maxItems" = 64 }, "unresolved_work" = { "type" = "array", "items" = { "type" = "string", "maxLength" = 2048, "minLength" = 1 }, "maxItems" = 64 }, "version" = { "$ref" = "#/$defs/ReportVersion" } }, "additionalProperties" = false, "required" = [
+    "version",
+    "integrated_targets",
+    "contribution_output_ids",
+    "criteria",
+    "checks",
+    "retained_workspaces",
+    "unresolved_work",
+] }, "EvaluationConfig" = { "type" = "object", "properties" = { "auth_profile" = { "type" = "string" }, "model_id" = { "type" = "string" }, "on_failure" = { "description" = "The existing read-only agent evaluator can be retained on service failure.", "$ref" = "#/$defs/FailurePolicy" }, "provider_plugin_id" = { "type" = "string" }, "threshold_percent" = { "description" = "Completion requires at least this probability, plus concrete agent-collected evidence.", "type" = "integer", "format" = "uint8", "maximum" = 255, "minimum" = 0 } }, "additionalProperties" = false, "required" = [
+    "provider_plugin_id",
+    "model_id",
+    "auth_profile",
+    "threshold_percent",
+    "on_failure",
+] }, "FailurePolicy" = { "type" = "string", "enum" = [
+    "pause",
+    "agent_fallback",
+] }, "LoopExternalBlocker" = { "type" = "string", "enum" = [
+    "none",
+    "approval_required",
+    "input_required",
+    "dependency_required",
+] }, "Observation" = { "type" = "string", "enum" = [
+    "passed",
+    "failed",
+    "unverified",
+] }, "ReportVersion" = { "type" = "string", "enum" = [
+    "1",
+] } } }
 type_name = "bcode_loop_plugin::LoopWorkflowIteration"
 
 [services.workflow_blocks.output]
-schema = { "$defs" = { "LoopExternalBlocker" = { "enum" = [
-    "none",
-    "approval_required",
-    "input_required",
-    "dependency_required",
-], "type" = "string" }, "EvaluationConfig" = { "additionalProperties" = false, "properties" = { "auth_profile" = { "type" = "string" }, "model_id" = { "type" = "string" }, "on_failure" = { "$ref" = "#/$defs/FailurePolicy", "description" = "The existing read-only agent evaluator can be retained on service failure." }, "provider_plugin_id" = { "type" = "string" }, "threshold_percent" = { "description" = "Completion requires at least this probability, plus concrete agent-collected evidence.", "format" = "uint8", "maximum" = 255, "minimum" = 0, "type" = "integer" } }, "required" = [
-    "provider_plugin_id",
-    "model_id",
-    "auth_profile",
-    "threshold_percent",
-    "on_failure",
-], "type" = "object" }, "FailurePolicy" = { "enum" = [
-    "pause",
-    "agent_fallback",
-], "type" = "string" } }, "$schema" = "https://json-schema.org/draft/2020-12/schema", "properties" = { "external_blocker" = { "$ref" = "#/$defs/LoopExternalBlocker", "default" = "none" }, "condition_met" = { "type" = "boolean" }, "evidence" = { "items" = { "type" = "string" }, "type" = "array" }, "implementation_prompt" = { "type" = "string" }, "iteration" = { "format" = "uint32", "minimum" = 0, "type" = "integer" }, "judgement_evaluation" = { "anyOf" = [
+schema = { "$schema" = "https://json-schema.org/draft/2020-12/schema", "title" = "LoopWorkflowIteration", "type" = "object", "properties" = { "condition_met" = { "type" = "boolean" }, "delivery" = { "anyOf" = [
+    { "$ref" = "#/$defs/DeliveryReport" },
+    { "type" = "null" },
+] }, "evidence" = { "type" = "array", "items" = { "type" = "string" } }, "external_blocker" = { "$ref" = "#/$defs/LoopExternalBlocker", "default" = "none" }, "implementation_prompt" = { "type" = "string" }, "iteration" = { "type" = "integer", "format" = "uint32", "minimum" = 0 }, "judgement_evaluation" = { "anyOf" = [
     { "$ref" = "#/$defs/EvaluationConfig" },
     { "type" = "null" },
-] }, "max_iterations" = { "format" = "uint32", "minimum" = 0, "type" = "integer" }, "planning_ready" = { "default" = false, "type" = "boolean" }, "stop_condition" = { "type" = "string" }, "summary" = { "type" = "string" } }, "required" = [
+] }, "max_iterations" = { "type" = "integer", "format" = "uint32", "minimum" = 0 }, "planning_ready" = { "type" = "boolean", "default" = false }, "stop_condition" = { "type" = "string" }, "summary" = { "type" = "string" } }, "required" = [
     "implementation_prompt",
     "stop_condition",
     "max_iterations",
@@ -91,7 +106,44 @@ schema = { "$defs" = { "LoopExternalBlocker" = { "enum" = [
     "condition_met",
     "evidence",
     "summary",
-], "title" = "LoopWorkflowIteration", "type" = "object" }
+], "$defs" = { "Check" = { "type" = "object", "properties" = { "command" = { "type" = "string", "maxLength" = 2048, "minLength" = 1 }, "evidence" = { "type" = "string", "maxLength" = 4096, "minLength" = 1 }, "outcome" = { "$ref" = "#/$defs/Observation" }, "workspace" = { "type" = "string", "maxLength" = 4096, "minLength" = 1 } }, "additionalProperties" = false, "required" = [
+    "command",
+    "workspace",
+    "outcome",
+    "evidence",
+] }, "Criterion" = { "type" = "object", "properties" = { "criterion" = { "type" = "string", "maxLength" = 2048, "minLength" = 1 }, "evidence" = { "type" = "string", "maxLength" = 4096, "minLength" = 1 }, "status" = { "$ref" = "#/$defs/Observation" } }, "additionalProperties" = false, "required" = [
+    "criterion",
+    "status",
+    "evidence",
+] }, "DeliveryReport" = { "description" = "Optional versioned report. Older goal outputs omit it; unknown versions reject.", "type" = "object", "properties" = { "checks" = { "type" = "array", "items" = { "$ref" = "#/$defs/Check" }, "maxItems" = 32 }, "contribution_output_ids" = { "type" = "array", "items" = { "type" = "string", "maxLength" = 4096, "minLength" = 1 }, "maxItems" = 64 }, "criteria" = { "type" = "array", "items" = { "$ref" = "#/$defs/Criterion" }, "maxItems" = 64, "minItems" = 1 }, "integrated_targets" = { "type" = "array", "items" = { "type" = "string", "maxLength" = 4096, "minLength" = 1 }, "maxItems" = 64, "minItems" = 1 }, "retained_workspaces" = { "type" = "array", "items" = { "type" = "string", "maxLength" = 4096, "minLength" = 1 }, "maxItems" = 64 }, "unresolved_work" = { "type" = "array", "items" = { "type" = "string", "maxLength" = 2048, "minLength" = 1 }, "maxItems" = 64 }, "version" = { "$ref" = "#/$defs/ReportVersion" } }, "additionalProperties" = false, "required" = [
+    "version",
+    "integrated_targets",
+    "contribution_output_ids",
+    "criteria",
+    "checks",
+    "retained_workspaces",
+    "unresolved_work",
+] }, "EvaluationConfig" = { "type" = "object", "properties" = { "auth_profile" = { "type" = "string" }, "model_id" = { "type" = "string" }, "on_failure" = { "description" = "The existing read-only agent evaluator can be retained on service failure.", "$ref" = "#/$defs/FailurePolicy" }, "provider_plugin_id" = { "type" = "string" }, "threshold_percent" = { "description" = "Completion requires at least this probability, plus concrete agent-collected evidence.", "type" = "integer", "format" = "uint8", "maximum" = 255, "minimum" = 0 } }, "additionalProperties" = false, "required" = [
+    "provider_plugin_id",
+    "model_id",
+    "auth_profile",
+    "threshold_percent",
+    "on_failure",
+] }, "FailurePolicy" = { "type" = "string", "enum" = [
+    "pause",
+    "agent_fallback",
+] }, "LoopExternalBlocker" = { "type" = "string", "enum" = [
+    "none",
+    "approval_required",
+    "input_required",
+    "dependency_required",
+] }, "Observation" = { "type" = "string", "enum" = [
+    "passed",
+    "failed",
+    "unverified",
+] }, "ReportVersion" = { "type" = "string", "enum" = [
+    "1",
+] } } }
 type_name = "bcode_loop_plugin::LoopWorkflowIteration"
 
 [services.workflow_blocks.authorization]

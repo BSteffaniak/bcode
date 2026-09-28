@@ -28,9 +28,17 @@ fn parse_context(
         }
     }
     if let Some(field) = object.remove("delegation_part")
-        && !matches!(field.as_str(), Some("bindings" | "input" | "reconnect"))
+        && !matches!(
+            field.as_str(),
+            Some("bindings" | "input" | "reconnect" | "serialized")
+        )
     {
-        return Err("delegation_part must be bindings, input or reconnect".into());
+        return Err("delegation_part must be bindings, input, reconnect or serialized".into());
+    }
+    if let Some(offset) = object.remove("delegation_offset")
+        && offset.as_u64().is_none()
+    {
+        return Err("delegation_offset must be a nonnegative integer".into());
     }
     object.entry("limit").or_insert(json!(50));
     let context: bcode_workflow::WorkflowExecutionContextRequest =
@@ -48,7 +56,8 @@ fn context_definition() -> ToolDefinition {
         description: "Read this active workflow execution's authenticated identity and bounded graph page. Omit revision and cursors initially; continue with the returned revision and last node/edge identities. Restart on revision conflict. This grants no mutation authority.".to_owned(),
         input_schema: json!({"type":"object", "additionalProperties":false,
             "properties": {
-                "delegation_part":{"type":"string","enum":["bindings","input","reconnect"],"description":"Read a recipe in bounded pieces: bindings returns non-schema arguments and revision-pinned input/reconnect inspection arguments. Merge the returned arguments without reconstruction. Unsupported topology fails explicitly; very large individual schemas may still require retained-output inspection."},
+                "delegation_part":{"type":"string","enum":["bindings","input","reconnect","serialized"],"description":"Read recipe fields, or use serialized for bounded JSON string chunks. Concatenate chunks in order and parse once; do not reconstruct schemas. Follow next_arguments unchanged at the pinned revision."},
+                "delegation_offset":{"type":"integer","minimum":0,"description":"Character offset for serialized recipe chunks; use returned next_arguments."},
                 "delegation_only":{"type":"boolean","default":false,"description":"Return only the authenticated delegation recipe from this bounded page, without duplicating graph facts. Use for default-budget staging; unavailable recipes remain explicit. Does not change authorization or discovery completeness."},
                 "compact":{"type":"boolean","default":false,"description":"Return graph node identities instead of full executable definitions. Edges and authenticated identity remain available; omitted node definitions require a normal paged read."},
                 "after_output_id":{"type":["string","null"], "description":"Exclusive last output ID. Outputs arriving behind the cursor require a fresh scan; this is not a durable event stream."},
@@ -530,6 +539,11 @@ fn invoke_context(
         .get("delegation_part")
         .and_then(serde_json::Value::as_str)
         .map(str::to_owned);
+    let delegation_offset = request
+        .arguments
+        .get("delegation_offset")
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(0);
     let Ok(query) = parse_context(request.arguments) else {
         return ServiceResponse::error("invalid_request", "invalid execution context request");
     };
@@ -573,7 +587,7 @@ fn invoke_context(
                 |context| {
                     super::json_response(&bcode_tool::ToolInvocationResponse {
                         output: if delegation_only || delegation_part.is_some() {
-                            json!({"delegation":delegation_recipe_part(&context, &query, delegation_part.as_deref())}).to_string()
+                            json!({"delegation": if delegation_part.as_deref() == Some("serialized") { serialized_delegation_recipe(&context, &query, delegation_offset) } else { delegation_recipe_part(&context, &query, delegation_part.as_deref()) }}).to_string()
                         } else {
                             context_output_with_navigation(&context, compact, &query)
                         },
@@ -624,6 +638,39 @@ fn context_output_with_navigation(
         });
     }
     output.to_string()
+}
+
+// Chunk the exact JSON representation rather than attempting to split arbitrary
+// JSON Schema constructs. Revision-pinned reads prevent mixing graph revisions.
+fn serialized_delegation_recipe(
+    context: &bcode_workflow::WorkflowExecutionContext,
+    query: &bcode_workflow::WorkflowExecutionContextRequest,
+    offset: u64,
+) -> serde_json::Value {
+    let recipe = delegation_recipe(context, query);
+    if recipe["available"] != true {
+        return recipe;
+    }
+    let serialized = recipe["arguments"].to_string();
+    let Ok(offset) = usize::try_from(offset) else {
+        return json!({"available":false,"reason":"Invalid serialized recipe offset"});
+    };
+    let total = serialized.chars().count();
+    if offset > total || (offset > 0 && query.expected_revision != Some(context.graph.revision)) {
+        return json!({"available":false,"reason":"Invalid offset or missing pinned revision"});
+    }
+    // At most six JSON bytes per source character, leaving room for navigation.
+    let chunk: String = serialized.chars().skip(offset).take(384).collect();
+    let end = offset + chunk.chars().count();
+    let next = (end < total).then(|| {
+        let mut next = serde_json::to_value(query).expect("serializable query");
+        next["expected_revision"] = json!(context.graph.revision);
+        next["delegation_part"] = json!("serialized");
+        next["delegation_offset"] = json!(end);
+        next
+    });
+    json!({"available":true,"revision":context.graph.revision,"offset":offset,
+        "chunk":chunk,"next_arguments":next})
 }
 
 fn delegation_recipe_part(
@@ -1005,7 +1052,7 @@ fn task_staging_response(
         output["edit"] = json!(edit);
     }
     if task_tool == GROUP_NAME {
-        let Ok((mapped_edit, mapping)) =
+        let Ok((mapped_edit, mut mapping)) =
             task_group::mapped_candidate(decoded.as_ref().unwrap_or(request))
         else {
             return ServiceResponse::error("invalid_response", "task result mapping unavailable");
@@ -1015,6 +1062,15 @@ fn task_staging_response(
                 "invalid_response",
                 "task mapping differs from staged edit",
             );
+        }
+        if compact {
+            // The successor transform can repeat a large source schema. Corrective
+            // delegation must inspect the revision-pinned edge anyway; do not let
+            // redundant topology truncate the publication reference and named paths.
+            mapping
+                .as_object_mut()
+                .expect("mapping object")
+                .remove("reconnect");
         }
         output["result_mapping"] = mapping;
     }
@@ -1618,6 +1674,34 @@ mod tests {
             assembled.extend(part["arguments"].as_object().unwrap().clone());
         }
         assert_eq!(json!(assembled), recipe["arguments"]);
+        // Large Unicode schemas can be retrieved losslessly without raising the
+        // normal tool-output budget, including across escaped JSON boundaries.
+        context.graph.nodes[0].node.output.schema["description"] = json!("界\\\"\n".repeat(4000));
+        let mut chunk_query = query.clone();
+        let mut offset = 0;
+        let mut serialized = String::new();
+        loop {
+            let page = serialized_delegation_recipe(&context, &chunk_query, offset);
+            assert_eq!(page["available"], true);
+            assert!(page.to_string().len() < 4000);
+            serialized.push_str(page["chunk"].as_str().unwrap());
+            if page["next_arguments"].is_null() {
+                break;
+            }
+            offset = page["next_arguments"]["delegation_offset"]
+                .as_u64()
+                .unwrap();
+            chunk_query = parse_context(page["next_arguments"].clone()).unwrap();
+        }
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&serialized).unwrap(),
+            delegation_recipe(&context, &query)["arguments"]
+        );
+        assert_eq!(
+            serialized_delegation_recipe(&context, &query, 1)["available"],
+            false
+        );
+        assert!(parse_context(json!({"delegation_offset":-1})).is_err());
         assert!(parse_context(json!({"delegation_part":"unknown"})).is_err());
         assert!(parse_context(json!({"delegation_only":1})).is_err());
         context.graph.edges.push(context.graph.edges[0].clone());

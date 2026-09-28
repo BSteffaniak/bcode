@@ -144,6 +144,7 @@ fn source(progress: bool) -> bcode_workflow::WorkflowContinuationSource {
             condition_met: false,
             evidence: vec!["remaining work".into()],
             summary: "incomplete".into(),
+            delivery: None,
         })
         .unwrap(),
         repeat_node_id: "loop.repeat".into(),

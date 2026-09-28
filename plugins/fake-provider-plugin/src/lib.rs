@@ -1056,9 +1056,33 @@ fn fake_response_text(
     {
         return Ok("{malformed".to_string());
     }
-    if let Some(value) = configured_fake_structured_output(request, structured, user_text)? {
+    let value = if request
+        .provider_context
+        .settings
+        .get("fake_prompt_tool_directives")
+        .is_some_and(|value| value == "true")
+        && let Some(value) = user_text
+            .lines()
+            .find_map(|line| line.strip_prefix("structured-result "))
+    {
+        serde_json::from_str(value).map_err(|error| fake_structured_output_error(&error))?
+    } else if let Some(value) = configured_fake_structured_output(request, structured, user_text)? {
         return Ok(value);
-    }
+    } else {
+        fake_value_for_schema(&structured.schema, 0).ok_or_else(|| ProviderError {
+            code: "unsupported_structured_output_schema".to_string(),
+            category: ProviderErrorCategory::UnsupportedFeature,
+            message: "fake provider cannot construct a value for the requested JSON schema"
+                .to_string(),
+            retryable: false,
+            provider_message: None,
+            failure: None,
+            request_id: None,
+            diagnostic_context: Box::default(),
+            sources: Box::default(),
+            retry: None,
+        })?
+    };
     let validator =
         jsonschema::validator_for(&structured.schema).map_err(|error| ProviderError {
             code: "invalid_structured_output_schema".to_string(),
@@ -1072,18 +1096,6 @@ fn fake_response_text(
             sources: Box::default(),
             retry: None,
         })?;
-    let value = fake_value_for_schema(&structured.schema, 0).ok_or_else(|| ProviderError {
-        code: "unsupported_structured_output_schema".to_string(),
-        category: ProviderErrorCategory::UnsupportedFeature,
-        message: "fake provider cannot construct a value for the requested JSON schema".to_string(),
-        retryable: false,
-        provider_message: None,
-        failure: None,
-        request_id: None,
-        diagnostic_context: Box::default(),
-        sources: Box::default(),
-        retry: None,
-    })?;
     if !validator.is_valid(&value) {
         return Err(ProviderError {
             code: "unsupported_structured_output_schema".to_string(),
@@ -3393,6 +3405,35 @@ tool-call publish {"$fake_result":{"index":0,"pointer":"/publication_arguments"}
             fake_response_text(&request, None, "input").expect("configured malformed output"),
             "{malformed"
         );
+    }
+
+    #[test]
+    fn scripted_result_requires_opt_in_and_validates_the_requested_schema() {
+        let mut request: ModelTurnRequest = serde_json::from_value(serde_json::json!({
+            "session_id": "00000000-0000-0000-0000-000000000000",
+            "turn_id": "turn", "model_id": "fake-echo", "messages": []
+        }))
+        .unwrap();
+        request.structured_output = Some(bcode_model::StructuredOutputRequest {
+            name: "Result".into(),
+            schema: serde_json::json!({"type":"boolean"}),
+            strict: true,
+        });
+        let baseline = fake_response_text(&request, None, "input").unwrap();
+        assert_eq!(
+            fake_response_text(&request, None, "structured-result false").unwrap(),
+            baseline
+        );
+        request
+            .provider_context
+            .settings
+            .insert("fake_prompt_tool_directives".into(), "true".into());
+        assert_eq!(
+            fake_response_text(&request, None, "structured-result false").unwrap(),
+            "false"
+        );
+        assert!(fake_response_text(&request, None, "structured-result {}").is_err());
+        assert!(fake_response_text(&request, None, "structured-result invalid").is_err());
     }
 
     #[test]

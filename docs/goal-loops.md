@@ -1,5 +1,23 @@
 # Goal setup for prompt loops
 
+New goal evaluations may retain an optional `delivery` report in their canonical
+output: `version: "1"`, integrated targets, inspected canonical contribution output
+IDs, original criteria with passed/failed/unverified evidence, combined commands and
+workspaces with observed outcomes, retained workspaces, and unresolved work. Lists
+and text are schema-bounded. `/goal.status` previews targets and report counts;
+`/workflow` retains the full result. These are evaluator-reported observations, not
+host-verified receipts or automatic Git integration. Missing reports remain unknown;
+ordinary goals do not require collaboration. Unknown report versions reject.
+Existing admitted graphs are not rewritten. The judgement block is version 3 for
+the extended state schema; incompatible older bindings require normal compatibility
+handling, not silent reinterpretation.
+
+Large nested corrective inputs can exceed the default tool-output context budget.
+Use revision-pinned recipe parts and retained-output inspection, not guessed fields.
+The scripted server acceptance test uses an explicit 16,000-character budget because
+its fake provider cannot autonomously follow retained-output guidance; this is not
+live-model usability evidence or a change to production defaults.
+
 `/goal.status` includes a bounded execution snapshot from the application's semantic
 workflow view: agent task names and states, execution-session identities, pending tool
 permissions, mutation approval identities/operations/workspaces and reconciliation warnings,

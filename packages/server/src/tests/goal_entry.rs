@@ -135,16 +135,34 @@ const RIGHT_MODULE: &str = "total() { echo $(( $(subtotal \"$1\" \"$2\") + 3 ));
 const BROKEN_RIGHT_MODULE: &str = "total() { echo $(( $(subtotal \"$1\" \"$2\") + 4 )); }\n";
 const COMBINED_CHECK: &str = ". ./integrated.sh; actual=$(total 3 8); test \"$actual\" = 27 || { printf \"expected total 27, got %s\\n\" \"$actual\"; exit 1; }; test \"$(total 0 8)\" = 3";
 
+fn contribution_result(workspace: &Path, id: &str) -> serde_json::Value {
+    serde_json::json!({
+        "summary":format!("Implemented {id}"), "evidence":[format!("{id}.sh written")], "blockers":[],
+        "contributions":[{
+            "workspace":workspace, "base_revision":null, "source_directory":null,
+            "source_had_local_changes":null, "produced_revisions":[],
+            "artifacts":[workspace.join(format!("{id}.sh"))], "validation":[],
+            "remaining_work":["Integrate and run combined check"], "retention":"retained"
+        }]
+    })
+}
+
 fn install_goal_script(request: &mut PluginWorkflowStartRequest, workspace: &Path) {
-    let reference =
-        |pointer: &str| serde_json::json!({"$fake_result":{"index":0,"pointer":pointer}});
+    let reference = |pointer: &str| {
+        let index = match pointer {
+            "/delegation/arguments/input" => 1,
+            "/delegation/arguments/reconnect" => 0,
+            _ => 2,
+        };
+        serde_json::json!({"$fake_result":{"index":index,"pointer":pointer}})
+    };
     let task = |id: &str| {
         serde_json::json!({
-            "task_id":id,"objective":format!("Implement {id}.\ntool-call filesystem.write {}", serde_json::json!({"path":workspace.join(format!("{id}.sh")),"contents":if id == "left" { LEFT_MODULE } else { RIGHT_MODULE }})),
+            "task_id":id,"objective":format!("Implement {id}.\ntool-call filesystem.write {}\nstructured-result {}", serde_json::json!({"path":workspace.join(format!("{id}.sh")),"contents":if id == "left" { LEFT_MODULE } else { RIGHT_MODULE }}), contribution_result(workspace, id)),
             "agent_profile":"build","read_only":false,
             "tool_allowlist":["filesystem.write"],
             "resources":[{"resource":format!("contribution:{id}"),"access":"write"}],
-            "model_selection":{"provider":"bcode.fake-provider","model":"fake-echo"},"output":{"type_name":"boolean","schema":{"type":"boolean"}}
+            "model_selection":{"provider":"bcode.fake-provider","model":"fake-echo"}
         })
     };
     // Integration consumes the files, not workers' boolean claims. The shell's
@@ -174,8 +192,10 @@ fn install_goal_script(request: &mut PluginWorkflowStartRequest, workspace: &Pat
         .get_mut("loop.implementation")
         .unwrap();
     let instructions = source.configuration["system_prompt"].as_str().unwrap();
+    let input_inspection = serde_json::json!({"$fake_result":{"index":0,"pointer":"/delegation/inspection_arguments/input"}});
+    let reconnect_inspection = serde_json::json!({"$fake_result":{"index":1,"pointer":"/delegation/inspection_arguments/reconnect"}});
     source.configuration["system_prompt"] = serde_json::json!(format!(
-        "{instructions}\ntool-call workflow.execution_context {{\"limit\":100,\"delegation_only\":true}}\ntool-call workflow.stage_task_group {group}\ntool-call workflow.publish_run_graph_edit {publication}"
+        "{instructions}\ntool-call workflow.execution_context {{\"limit\":100,\"delegation_part\":\"bindings\"}}\ntool-call workflow.execution_context {input_inspection}\ntool-call workflow.execution_context {reconnect_inspection}\ntool-call workflow.stage_task_group {group}\ntool-call workflow.publish_run_graph_edit {publication}"
     ));
     let evaluation = request.definition.nodes.get_mut("loop.evaluation").unwrap();
     let instructions = evaluation.configuration["system_prompt"].as_str().unwrap();
@@ -214,11 +234,10 @@ fn install_corrective_script(
         "run_id":reference("/delegation/arguments/run_id"),"expected_revision":reference("/delegation/arguments/expected_revision"),
         "source_node_id":reference("/delegation/arguments/source_node_id"),"bind_source_activation":reference("/delegation/arguments/bind_source_activation"),
         "input":reference("/delegation/arguments/input"),"preserve_source_output":true,
-        "tasks":[{"task_id":"repair-right","objective":format!("Fix contribution.\ntool-call filesystem.write {fix}"),
+        "tasks":[{"task_id":"repair-right","objective":format!("Fix contribution.\ntool-call filesystem.write {fix}\nstructured-result {}", contribution_result(workspace, "right")),
             "agent_profile":"build","read_only":false,"tool_allowlist":["filesystem.write"],
             "resources":[{"resource":"contribution:right","access":"write"}],
-            "model_selection":{"provider":"bcode.fake-provider","model":"fake-echo"},
-            "output":{"type_name":"boolean","schema":{"type":"boolean"}}}],
+            "model_selection":{"provider":"bcode.fake-provider","model":"fake-echo"}}],
         "continuation":{"objective":format!("verify\ntool-call shell.run {integrate}"),
             "agent_profile":"build","read_only":false,"tool_allowlist":["shell.run"],
             "resources":[{"resource":"integration","access":"write"}],
@@ -387,6 +406,10 @@ fn configure_goal_execution(server: &mut ServerState, root: &Path) {
             )
         }),
     });
+    // Nested correction inputs include the retained source delivery schema. This
+    // scripted provider cannot follow artifact inspection guidance after truncation.
+    // Use an explicit bounded context allowance, not a production default change.
+    server.startup_config.model.tool_output.context_chars = 16_000;
     server.selected_provider_plugin_id = Some("bcode.fake-provider".into());
     server
         .selected_provider_context
@@ -495,9 +518,18 @@ fn assert_named_contributions(
         !outputs.iter().any(|output| output.node_id == "right"),
         "failed worker must not gain a successful output"
     );
+    let left = outputs
+        .iter()
+        .find(|output| output.node_id == "left")
+        .unwrap();
+    assert_eq!(left.value["contributions"][0]["retention"], "retained");
+    assert_eq!(
+        left.value["contributions"][0]["source_had_local_changes"],
+        serde_json::Value::Null
+    );
     assert_eq!(
         collected.value["results"],
-        serde_json::json!({"left":{"status":"completed","value":true},"right":{"status":"failed"}})
+        serde_json::json!({"left":{"status":"completed","value":left.value},"right":{"status":"failed"}})
     );
 }
 
@@ -511,11 +543,20 @@ fn assert_corrected_contributions(
         std::fs::read_to_string(root.join("rejected.txt")).unwrap(),
         "expected total 27, got 28\n"
     );
-    assert!(
-        outputs
+    for (node, id, expected) in [
+        ("left", "left", LEFT_MODULE),
+        ("repair-right", "right", RIGHT_MODULE),
+    ] {
+        let output = outputs
             .iter()
-            .any(|output| output.node_id == "repair-right")
-    );
+            .find(|output| output.node_id == node)
+            .unwrap();
+        assert_eq!(output.value, contribution_result(root, id));
+        let artifact = output.value["contributions"][0]["artifacts"][0]
+            .as_str()
+            .unwrap();
+        assert_eq!(std::fs::read_to_string(artifact).unwrap(), expected);
+    }
     assert!(outputs.iter().any(|output| {
         output.value["results"].get("repair-right").is_some()
             && output.value["source"] == collected.value

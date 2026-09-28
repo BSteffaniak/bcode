@@ -4,6 +4,8 @@
 
 //! Workflow-native deterministic prompt loops for Bcode sessions.
 
+mod delivery;
+
 use std::collections::BTreeSet;
 use std::fmt::Write as _;
 use std::fs;
@@ -2094,6 +2096,8 @@ struct LoopWorkflowIteration {
     condition_met: bool,
     evidence: Vec<String>,
     summary: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    delivery: Option<delivery::DeliveryReport>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -2110,6 +2114,8 @@ struct LoopWorkflowEvaluation {
     evidence: Vec<String>,
     #[schemars(length(min = 1))]
     summary: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    delivery: Option<delivery::DeliveryReport>,
 }
 
 #[allow(dead_code)]
@@ -2322,7 +2328,7 @@ fn loop_workflow_spec(
         "loop.evaluation",
         bcode_workflow::NodeKind::Agent,
         serde_json::to_value(loop_agent_configuration::<LoopWorkflowEvaluation>(
-            "Read-only loop completion evaluation. Inspect repository/session state against stop_condition. For delegated coding work, inspect checksum-verified canonical worker outputs and actual integrated artifacts, not just worker summaries or coordinator completion. Identify the integrated target or revision, observed combined validation commands and outcomes, original criteria covered, unresolved work and retained workspaces in evidence. Missing provenance is unknown, and unverified required criteria or unresolved conflicts preclude completion. Preserve implementation_prompt, stop_condition, max_iterations, iteration, and judgement_evaluation unchanged. Return condition_met, external_blocker, non-empty concrete evidence, and a concise non-empty summary in the exact structured schema. Set external_blocker to none for useful incomplete work or verified completion. When progress requires an external approval, input, or dependency, report the matching blocker and identify the original request/dependency and authorized next action in evidence; do not infer associations from prose or treat this report as approval. A blocker parks the loop until explicit authorized workflow resume approval; that approval does not approve the underlying tool or resolve the external dependency. it does not poll or automatically resolve dependencies. A blocked result is not completion. If a judgement evaluator is selected, your condition_met is provisional: gather concrete bounded evidence for that evaluator; do not change its configuration.",
+            "Read-only loop completion evaluation. Inspect repository/session state against stop_condition. For delegated coding work, inspect checksum-verified canonical worker outputs and actual integrated artifacts, not just worker summaries or coordinator completion. Identify the integrated target or revision, observed combined validation commands and outcomes, original criteria covered, unresolved work and retained workspaces in evidence. For coding delivery, populate the optional version-1 delivery report with canonical contribution output IDs you actually inspected, integrated targets, each original criterion and its observed status, combined check commands/workspaces/outcomes/evidence, retained workspaces and unresolved work. These references are claims, not verified receipts; never invent identities or infer validation from worker success. Omit delivery when no integrated target is inspectable; failed or unverified required criteria and unresolved work preclude condition_met. Missing provenance is unknown, and unverified required criteria or unresolved conflicts preclude completion. Preserve implementation_prompt, stop_condition, max_iterations, iteration, and judgement_evaluation unchanged. Return condition_met, external_blocker, non-empty concrete evidence, and a concise non-empty summary in the exact structured schema. Set external_blocker to none for useful incomplete work or verified completion. When progress requires an external approval, input, or dependency, report the matching blocker and identify the original request/dependency and authorized next action in evidence; do not infer associations from prose or treat this report as approval. A blocker parks the loop until explicit authorized workflow resume approval; that approval does not approve the underlying tool or resolve the external dependency. it does not poll or automatically resolve dependencies. A blocked result is not completion. If a judgement evaluator is selected, your condition_met is provisional: gather concrete bounded evidence for that evaluator; do not change its configuration.",
             "plan",
             true,
         ))
@@ -2586,6 +2592,7 @@ fn loop_workflow_initial_value(input: &LoopWorkflowInput) -> LoopWorkflowIterati
         condition_met: false,
         evidence: Vec::new(),
         summary: String::new(),
+        delivery: None,
     }
 }
 
@@ -3407,6 +3414,13 @@ mod tests {
         model_output["judgement_evaluation"]["provider_plugin_id"] =
             serde_json::json!("bcode.other");
         model_output["stop_condition"] = serde_json::json!("weaker condition");
+        model_output["delivery"] = serde_json::json!({
+            "version":"1", "integrated_targets":["integrated.sh"],
+            "contribution_output_ids":["left-output", "right-output"],
+            "criteria":[{"criterion":"combined result", "status":"failed", "evidence":"check exited 1"}],
+            "checks":[{"command":"sh check.sh", "workspace":"/workspace", "outcome":"failed", "evidence":"exit 1"}],
+            "retained_workspaces":["/worker-left"], "unresolved_work":["fix combined result"]
+        });
         let pinned = serde_json::to_value(loop_workflow_initial_value(&input)).unwrap();
         let adapted = transform
             .evaluate(&[
@@ -3426,6 +3440,12 @@ mod tests {
         );
         assert_eq!(adapted["stop_condition"], pinned["stop_condition"]);
         assert_eq!(adapted["evidence"], model_output["evidence"]);
+        assert_eq!(adapted["delivery"], model_output["delivery"]);
+        let decoded: LoopWorkflowIteration = serde_json::from_value(adapted).unwrap();
+        assert_eq!(
+            decoded.delivery.unwrap().checks[0].outcome,
+            delivery::Observation::Failed
+        );
         assert_eq!(
             node.configuration,
             serde_json::to_value(judgement_evaluation::manifest_block()).unwrap()
