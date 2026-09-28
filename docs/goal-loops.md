@@ -2,8 +2,13 @@
 
 `/goal.status` includes a bounded execution snapshot from the application's semantic
 workflow view: agent task names and states, execution-session identities, pending tool
-permissions, input/approval prompts, failure diagnostics, and canonical terminal result
-identity when available. This is not a complete history or proof of integrated completion.
+permissions, mutation approval identities/operations/workspaces and reconciliation warnings,
+input/approval prompts, failure diagnostics, and canonical terminal result
+identity when available. For a resolved canonical loop result, it also shows the evaluator's
+criteria verdict, summary and up to ten bounded evidence entries. A finished workflow with
+`condition_met: false` remains explicitly unsatisfied. Missing or unsupported result detail
+is surfaced, never replaced by a worker's result. Evidence is reported by the evaluator,
+not independently verified by the status display. This is not a complete history or proof of integrated completion.
 Refresh with `/goal.status`; use `/goal.worker <session-id>` to open a listed execution
 session's canonical transcript and inspect its pending requests using normal session controls.
 Opening a worker does not approve a request, resume work, or grant permission. The command

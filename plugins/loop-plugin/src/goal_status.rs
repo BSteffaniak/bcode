@@ -3,7 +3,8 @@
 use std::fmt::Write as _;
 
 use bcode_workflow_view_models::{
-    WorkflowNodeKind, WorkflowProjectionHealth, WorkflowRunView, WorkflowTerminalView,
+    WorkflowNodeKind, WorkflowOutputValue, WorkflowProjectionHealth, WorkflowRunView,
+    WorkflowTerminalView,
 };
 
 const DETAIL_LIMIT: usize = 10;
@@ -58,6 +59,19 @@ pub fn format(view: &WorkflowRunView) -> String {
             preview(&permission.session_id)
         );
     }
+    for approval in view.mutation_approvals.iter().take(DETAIL_LIMIT) {
+        let _ = write!(
+            text,
+            "\nMutation approval needed: {} · {} · approval {} · workspace {}. Use /workflow to inspect the exact request and approve or deny; status does not authorize execution.",
+            preview(&approval.node_id),
+            preview(&approval.operation),
+            preview(&approval.approval_id),
+            preview(&approval.workspace_snapshot)
+        );
+        if let Some(warning) = &approval.reconciliation_warning {
+            let _ = write!(text, "\n  Reconciliation warning: {}", preview(warning));
+        }
+    }
     for wait in view.waits.iter().take(DETAIL_LIMIT) {
         let _ = write!(
             text,
@@ -87,6 +101,7 @@ pub fn format(view: &WorkflowRunView) -> String {
     match &view.terminal {
         Some(WorkflowTerminalView::Completed { output_id }) => {
             let _ = write!(text, "\nWorkflow finished · canonical result {}. Worker success alone does not establish integrated goal completion.", preview(output_id));
+            format_result(&mut text, view, output_id);
         }
         Some(WorkflowTerminalView::Failed) => text.push_str("\nWorkflow failed; successful sibling contributions are not an integrated result. Inspect failure details before corrective work."),
         Some(WorkflowTerminalView::Cancelled) => text.push_str("\nWorkflow cancelled; already committed effects are not undone."),
@@ -97,9 +112,108 @@ pub fn format(view: &WorkflowRunView) -> String {
     text
 }
 
+fn format_result(text: &mut String, view: &WorkflowRunView, output_id: &str) {
+    let Some(value) = view.outputs.iter().find_map(|output| {
+        if output.output_id != output_id {
+            return None;
+        }
+        match &output.value {
+            WorkflowOutputValue::Resolved { value } => Some(value),
+            WorkflowOutputValue::Unresolved => None,
+        }
+    }) else {
+        text.push_str("\nGoal result detail unavailable in this bounded snapshot; inspect the canonical result in /workflow.");
+        return;
+    };
+    // Interpret only the loop-owned state contract, never arbitrary worker summaries.
+    let Ok(result) = serde_json::from_value::<super::LoopWorkflowIteration>(value.clone()) else {
+        text.push_str(
+            "\nGoal result detail unavailable: unsupported result shape; inspect /workflow.",
+        );
+        return;
+    };
+    let verdict = if result.condition_met {
+        "criteria reported satisfied"
+    } else {
+        "criteria not satisfied"
+    };
+    let _ = write!(
+        text,
+        "\nGoal evaluation: {verdict} · {}",
+        preview(&result.summary)
+    );
+    for evidence in result.evidence.iter().take(DETAIL_LIMIT) {
+        let _ = write!(text, "\n  Evidence: {}", preview(evidence));
+    }
+    if result.evidence.len() > DETAIL_LIMIT {
+        text.push_str(
+            "\n  Additional evidence omitted; inspect the canonical result in /workflow.",
+        );
+    }
+    text.push_str("\nEvaluation evidence is reported, not independently verified by this display.");
+}
+
 #[cfg(test)]
 pub mod tests {
     use super::*;
+
+    #[test]
+    fn final_result_uses_terminal_identity_and_preserves_incomplete_verdict() {
+        let mut snapshot = view();
+        snapshot.terminal = Some(WorkflowTerminalView::Completed {
+            output_id: "final".into(),
+        });
+        let output = |id: &str, met: bool| {
+            serde_json::from_value(serde_json::json!({
+            "output_id":id,"node_id":"evaluation","activation_id":"a",
+            "schema_id":"loop","schema_version":1,"checksum_sha256":"checksum",
+            "artifact_reference":null,"created_at_ms":0,
+            "value":{"availability":"resolved","value":{
+                "implementation_prompt":"Implement objective","stop_condition":"Combined checks pass",
+                "max_iterations":1,"iteration":1,"condition_met":met,
+                "summary":"Combined check failed\nRetain both contributions",
+                "evidence":["integrated.sh: expected 27, observed 28"]
+            }}
+        })).unwrap()
+        };
+        snapshot.outputs = vec![output("worker", true), output("final", false)];
+        let text = format(&snapshot);
+        assert!(text.contains("criteria not satisfied"));
+        assert!(!text.contains("criteria reported satisfied"));
+        assert!(text.contains("Combined check failed Retain both contributions"));
+        assert!(text.contains("integrated.sh: expected 27, observed 28"));
+        snapshot.outputs[1].value = WorkflowOutputValue::Unresolved;
+        let text = format(&snapshot);
+        assert!(text.contains("Goal result detail unavailable"));
+        assert!(!text.contains("Evidence:"));
+    }
+
+    #[test]
+    fn final_result_evidence_is_bounded_and_unknown_shapes_are_not_guessed() {
+        let mut snapshot = view();
+        snapshot.terminal = Some(WorkflowTerminalView::Completed {
+            output_id: "final".into(),
+        });
+        snapshot.outputs =
+            vec![serde_json::from_value(serde_json::json!({
+            "output_id":"final","node_id":"evaluation","activation_id":"a",
+            "schema_id":"loop","schema_version":1,"checksum_sha256":"checksum",
+            "artifact_reference":null,"created_at_ms":0,
+            "value":{"availability":"resolved","value":{
+                "implementation_prompt":"objective","stop_condition":"criteria",
+                "max_iterations":1,"iteration":1,"condition_met":true,
+                "summary":"verified integrated artifact", "evidence":vec!["x".repeat(400); 12]
+            }}
+        })).unwrap()];
+        let text = format(&snapshot);
+        assert_eq!(text.matches("  Evidence:").count(), DETAIL_LIMIT);
+        assert!(text.contains("Additional evidence omitted"));
+        assert!(!text.contains(&"x".repeat(321)));
+        snapshot.outputs[0].value = WorkflowOutputValue::Resolved {
+            value: serde_json::json!({"summary":"success"}),
+        };
+        assert!(format(&snapshot).contains("unsupported result shape"));
+    }
 
     pub fn view() -> WorkflowRunView {
         serde_json::from_value(serde_json::json!({
@@ -156,6 +270,39 @@ pub mod tests {
         assert!(text.contains("Approval needed: worker · shell.run · execution session session"));
         assert!(text.contains("Failure: integrator · Combined checks failed"));
         assert!(text.contains("successful sibling contributions are not an integrated result"));
+    }
+
+    #[test]
+    fn mutation_approvals_expose_bounded_request_identity_and_warnings() {
+        let mut view = view();
+        let approval = bcode_workflow_view_models::WorkflowMutationApprovalView {
+            approval_id: "approval-1".into(),
+            node_id: "integrator".into(),
+            activation_id: "active".into(),
+            plugin_id: "coding".into(),
+            block_id: "integrate".into(),
+            block_version: 1,
+            operation: "integrate contributions".into(),
+            effect: bcode_workflow_view_models::WorkflowOperationEffect::Mutating,
+            input_summary: serde_json::json!({}),
+            resource_claims: Vec::new(),
+            workspace_snapshot: "dirty workspace\nretained".into(),
+            reconciliation_warning: Some("Conflict requires explicit resolution".into()),
+            requested_at_ms: 1,
+            expires_at_ms: None,
+        };
+        view.mutation_approvals = vec![approval; DETAIL_LIMIT + 1];
+        let text = format(&view);
+        assert_eq!(
+            text.matches("Mutation approval needed:").count(),
+            DETAIL_LIMIT
+        );
+        assert!(text.contains("integrator · integrate contributions · approval approval-1"));
+        assert!(text.contains("workspace dirty workspace retained"));
+        assert!(text.contains("Reconciliation warning: Conflict requires explicit resolution"));
+        assert!(text.contains("Use /workflow to inspect the exact request and approve or deny"));
+        assert!(text.contains("status does not authorize execution"));
+        assert_eq!(view.mutation_approvals.len(), DETAIL_LIMIT + 1);
     }
 
     #[test]

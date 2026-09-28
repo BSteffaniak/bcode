@@ -236,7 +236,7 @@ fn install_corrective_script(
     // Exercise an actual failed tool result before corrective delegation, rather
     // than masking the verifier's nonzero exit with a successful diagnostic probe.
     let probe = serde_json::json!({
-        "command":format!("/bin/sh -c 'cat left.sh right.sh > integrated.sh && ({COMBINED_CHECK}) > rejected.txt; status=$?; cat rejected.txt; exit $status'"),
+        "command":format!("/bin/sh -c 'test ! -e integrated.sh || {{ printf \"integration conflict: integrated.sh already exists; retain user work and contributions\\n\"; exit 1; }}; cat left.sh right.sh > integrated.sh && ({COMBINED_CHECK}) > rejected.txt; status=$?; cat rejected.txt; exit $status'"),
         "cwd":workspace,"timeout_ms":10000
     });
     let publication =
@@ -1099,6 +1099,75 @@ async fn exhausted_goal_resumes_after_idempotent_ipc_allowance_grant() {
     drop(state);
     assert_integrated_files(root.path());
     server.abort();
+}
+
+#[tokio::test]
+async fn goal_integration_conflict_retains_dirty_target_and_worker_effects() {
+    let root = tempfile::tempdir().unwrap();
+    let sessions = publication_fixture_sessions(root.path(), true);
+    let session = sessions
+        .create_session(None, root.path().into())
+        .await
+        .unwrap();
+    let store = bcode_workflow_store::WorkflowStore::open_in_state_dir(root.path()).unwrap();
+    let mut state = Arc::new(test_server_state_with_workflow_authorization(
+        sessions, store,
+    ));
+    configure_goal_execution(Arc::get_mut(&mut state).unwrap(), root.path());
+    let user_work = "# existing user implementation; do not replace\n";
+    std::fs::write(root.path().join("integrated.sh"), user_work).unwrap();
+    state.start_workflow_driver().await;
+    let request = goal_entry_request(session.id, root.path(), Arc::clone(&state)).await;
+    let run_id = request.run_id.unwrap();
+    tokio::time::timeout(Duration::from_secs(30), async {
+        loop {
+            approve_goal_permissions(&state, session.id).await;
+            let outputs = state
+                .workflow_store
+                .lock()
+                .unwrap()
+                .validated_outputs(&run_id, 100)
+                .unwrap();
+            if let Some(evaluation) = outputs
+                .iter()
+                .find(|output| output.node_id == "loop.evaluation")
+            {
+                assert_eq!(evaluation.value["condition_met"], false);
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("conflict must reach evaluation without claiming delivery");
+    assert_eq!(
+        std::fs::read_to_string(root.path().join("integrated.sh")).unwrap(),
+        user_work
+    );
+    assert_eq!(
+        std::fs::read_to_string(root.path().join("left.sh")).unwrap(),
+        LEFT_MODULE
+    );
+    assert_eq!(
+        std::fs::read_to_string(root.path().join("right.sh")).unwrap(),
+        BROKEN_RIGHT_MODULE
+    );
+    assert!(!root.path().join("verification.txt").exists());
+    assert!(!root.path().join("rejected.txt").exists());
+    let attempts = state
+        .workflow_store
+        .lock()
+        .unwrap()
+        .attempt_history(&run_id, None, 100)
+        .unwrap();
+    drop(state);
+    assert!(contributions_settled(&attempts));
+    assert!(
+        !attempts
+            .iter()
+            .any(|attempt| attempt.node_id == "repair-right"),
+        "an integration collision must not be mistaken for the expected failed check"
+    );
 }
 
 #[tokio::test]
