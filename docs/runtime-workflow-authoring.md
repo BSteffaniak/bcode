@@ -76,6 +76,11 @@ paths for Unicode or punctuation in worker IDs. Continuation assignment metadata
 these same `input_path` arrays in both positional v1 and named v2 groups: string
 segments are literal keys and integer segments are array indices from the entire
 continuation input. Missing paths are missing evidence, not successful empty results.
+Workers using the exact bundled result schema also receive `evidence_paths` for
+`summary`, `evidence` and `blockers`, in both receipts and continuation assignments.
+Custom schemas (even with the bundled type name) are not interpreted. Nonempty
+blockers require inspection and correction or an actionable blocker; empty blockers
+are not proof of integrated verification.
 This derived description is neither
 canonical execution state nor evidence that any worker succeeded. Receipt mapping and
 candidate lowering share one normalized request; mapping is returned only after its
@@ -306,6 +311,14 @@ staging edit was truncated. It does not look up or publish by mutation ID alone:
 requires equality with the retained candidate and separate publication authorization. Changed
 requests or incompatible lowering cannot silently replace the staged edit. Older plugin artifacts
 reject this representation; callers must not assume support across versions.
+
+Execution-context responses also include `next_page_arguments` (null when the
+observed collections are exhausted) and per-output `inspection_arguments` for
+checksum-verified value reads. Follow these recipes verbatim; independent cursors
+are retained across empty collections and reads remain revision-pinned. A full
+output page may require a final empty read. Outputs arriving behind a cursor
+require a fresh scan; these recipes are not subscriptions, reservations, proof of
+complete discovery from an arbitrary starting cursor, or authorization.
 
 For coordination reads, `workflow.execution_context` accepts `compact:true`: the
 plugin presents `graph.node_ids` and `node_definitions_omitted:true` instead of full

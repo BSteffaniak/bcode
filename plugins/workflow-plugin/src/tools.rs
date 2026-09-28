@@ -518,7 +518,7 @@ fn invoke_context(
     let Ok(query) = parse_context(request.arguments) else {
         return ServiceResponse::error("invalid_request", "invalid execution context request");
     };
-    let Ok(payload) = serde_json::to_value(query) else {
+    let Ok(payload) = serde_json::to_value(&query) else {
         return ServiceResponse::error("invalid_request", "invalid execution context request");
     };
     let descriptor = &request.preparation_descriptor;
@@ -557,7 +557,7 @@ fn invoke_context(
                 |_| ServiceResponse::error("invalid_response", "invalid workflow context"),
                 |context| {
                     super::json_response(&bcode_tool::ToolInvocationResponse {
-                        output: context_output(&context, compact),
+                        output: context_output_with_navigation(&context, compact, &query),
                         is_error: false,
                         content: Vec::new(),
                         full_output: None,
@@ -571,6 +571,41 @@ fn invoke_context(
 
 // Compact inspection is presentation only: the host still validates the same
 // bounded revision-pinned request and supplies all authenticated facts.
+fn context_output_with_navigation(
+    context: &bcode_workflow::WorkflowExecutionContext,
+    compact: bool,
+    query: &bcode_workflow::WorkflowExecutionContextRequest,
+) -> String {
+    let mut output: serde_json::Value =
+        serde_json::from_str(&context_output(context, compact)).expect("serialized context");
+    // Independent cursors must survive empty/exhausted pages in the other collections.
+    // Outputs can arrive behind the cursor: this recipe is not a durable subscription.
+    let more = !context.graph.nodes_complete
+        || !context.graph.edges_complete
+        || context.outputs.len() == query.limit;
+    output["next_page_arguments"] = if more {
+        json!({
+            "expected_revision": context.graph.revision,
+            "after_node_id": context.graph.nodes.last().map(|entry| &entry.node.id).or(query.after_node_id.as_ref()),
+            "after_edge_id": context.graph.edges.last().map(|entry| entry.edge_id).or(query.after_edge_id),
+            "after_output_id": context.outputs.last().map(|entry| &entry.output_id).or(query.after_output_id.as_ref()),
+            "limit": query.limit,
+            "compact": compact,
+        })
+    } else {
+        serde_json::Value::Null
+    };
+    for result in output["outputs"].as_array_mut().expect("output metadata") {
+        result["inspection_arguments"] = json!({
+            "output_id": result["output_id"],
+            "expected_revision": context.graph.revision,
+            "limit": 1,
+            "compact": compact,
+        });
+    }
+    output.to_string()
+}
+
 fn context_output(context: &bcode_workflow::WorkflowExecutionContext, compact: bool) -> String {
     let mut output = serde_json::to_value(context).expect("serializable workflow context");
     if compact {
@@ -1438,6 +1473,47 @@ mod tests {
             parse_context(json!({})).unwrap()
         );
         assert!(parse_context(json!({"compact":"true"})).is_err());
+    }
+
+    #[test]
+    fn context_navigation_preserves_independent_cursors_and_fetches_exact_outputs() {
+        let mut context: bcode_workflow::WorkflowExecutionContext = serde_json::from_value(json!({
+            "run_id":"run", "node_id":"source", "activation_id":"activation", "attempt":1,
+            "graph":{"revision":7,"nodes":[],"edges":[],
+                "nodes_complete":true,"edges_complete":true},
+            "output":null,"outputs":[{
+                "output_id":"worker.結果", "run_id":"run", "node_id":"worker",
+                "activation_id":"worker-activation", "schema_id":"result", "schema_version":1,
+                "artifact_reference":null,"checksum_sha256":"checksum","created_at_ms":0
+            }]
+        }))
+        .unwrap();
+        for compact in [false, true] {
+            let query = parse_context(json!({
+                "limit":1,"after_node_id":"last-node","after_edge_id":91,
+                "after_output_id":"previous", "output_id":"old-exact-output"
+            }))
+            .unwrap();
+            let rendered: serde_json::Value =
+                serde_json::from_str(&context_output_with_navigation(&context, compact, &query))
+                    .unwrap();
+            let next = parse_context(rendered["next_page_arguments"].clone()).unwrap();
+            assert_eq!(next.expected_revision, Some(7));
+            assert_eq!(next.after_node_id, query.after_node_id);
+            assert_eq!(next.after_edge_id, Some(91));
+            assert_eq!(next.after_output_id.as_deref(), Some("worker.結果"));
+            assert_eq!(next.output_id, None);
+            let exact =
+                parse_context(rendered["outputs"][0]["inspection_arguments"].clone()).unwrap();
+            assert_eq!(exact.output_id.as_deref(), Some("worker.結果"));
+            assert_eq!(exact.expected_revision, Some(7));
+            assert_eq!(exact.after_output_id, None);
+        }
+        context.outputs.clear();
+        let query = parse_context(json!({"limit":1})).unwrap();
+        let rendered: serde_json::Value =
+            serde_json::from_str(&context_output_with_navigation(&context, true, &query)).unwrap();
+        assert!(rendered["next_page_arguments"].is_null());
     }
 
     #[test]

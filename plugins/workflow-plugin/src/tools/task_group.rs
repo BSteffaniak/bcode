@@ -218,7 +218,7 @@ fn continuation_node(
         .push_str("\n\nDelegated assignments (JSON): ");
     task.objective
         .push_str(&serde_json::to_string(&assignments).map_err(|error| error.to_string())?);
-    task.objective.push_str("\n\nEach assignment's input_path selects its result from the entire continuation input. Traverse string segments as literal object keys (never split dotted IDs), and integer segments as array indices. A missing path is missing evidence, not an empty successful contribution.");
+    task.objective.push_str("\n\nEach assignment's input_path selects its result from the entire continuation input. Traverse string segments as literal object keys (never split dotted IDs), and integer segments as array indices. A missing path is missing evidence, not an empty successful contribution. For the bundled result contract, evidence_paths provides literal paths to summary, evidence and blockers. Nonempty blockers require inspection and corrective work or an actionable blocker; an empty blockers array and successful worker execution do not establish verified completion. Custom result schemas have no inferred evidence_paths; inspect their declared contract.");
     if named {
         task.objective.push_str("\n\nInput is an object with results keyed by exact worker task ID. The optional source field contains canonical source output; never reconstruct it from worker statements.");
         task.objective.push_str(" For corrective delegation, prefer version: 2 with generated_ids: true and semantic worker task IDs. Use the revision-pinned graph.next_edge_id, not a maximum computed from one page. When preserving canonical source output, set preserve_source_output: true, use this continuation's canonical output schema as input, omit continuation.output, and copy the source-selecting successor transform into reconnect.transform unchanged. Compact discovery omits transforms: use the successor edge's inspection_arguments with workflow.execution_context for a revision-pinned noncompact read, verify its identity, and never infer transform absence from compact output. Publish the returned publication_arguments unchanged under separate authorization; do not reconstruct graph edits or silently rebase a conflict.");
@@ -460,6 +460,17 @@ fn result_mapping(group: &Group) -> serde_json::Value {
             } else {
                 json!(worker_result_indices(group, position))
             };
+            // Only recognize the exact bundled contract, not a caller-supplied type name.
+            if task.output == default_worker_output() {
+                let path = assignment["input_path"]
+                    .as_array()
+                    .expect("normalized result path");
+                assignment["evidence_paths"] = json!({
+                    "summary": extended_result_path(path, "summary"),
+                    "evidence": extended_result_path(path, "evidence"),
+                    "blockers": extended_result_path(path, "blockers"),
+                });
+            }
             assignment
         })
         .collect();
@@ -469,6 +480,13 @@ fn result_mapping(group: &Group) -> serde_json::Value {
         "source_path":if !group.include_source_output { serde_json::Value::Null } else if group.version == 2 { json!(["source"]) } else { json!([0]) },
         "preserves_source_output":group.preserve_source_output,
     })
+}
+
+fn extended_result_path(path: &[serde_json::Value], field: &str) -> Vec<serde_json::Value> {
+    path.iter()
+        .cloned()
+        .chain(std::iter::once(json!(field)))
+        .collect()
 }
 
 fn worker_inputs(group: &Group) -> Result<std::collections::BTreeMap<String, ValueSchema>, String> {
@@ -1108,6 +1126,44 @@ mod tests {
         for invalid in [json!(null), json!([" "]), json!([42])] {
             compact["worker_defaults"]["acceptance_criteria"] = invalid;
             assert!(parse(&compact).is_err());
+        }
+    }
+
+    #[test]
+    fn standard_evidence_paths_resolve_blockers_without_guessing_custom_contracts() {
+        for version in [1, 2] {
+            let mut request = request();
+            request["version"] = json!(version);
+            request["tasks"][0]["task_id"] = json!("review.雪");
+            request["tasks"][0]["output"] = json!(default_worker_output());
+            let (_, receipt) = mapped_candidate(&request).unwrap();
+            let worker = &receipt["workers"][0];
+            let mut expected = worker["input_path"].as_array().unwrap().clone();
+            expected.push(json!("blockers"));
+            assert_eq!(worker["evidence_paths"]["blockers"], json!(expected));
+            // Build the actual nested input at the advertised path, including literal dotted keys.
+            let mut value = json!(["permission denied"]);
+            for segment in expected.iter().rev() {
+                value = if let Some(key) = segment.as_str() {
+                    json!({key: value})
+                } else {
+                    let index = usize::try_from(segment.as_u64().unwrap()).unwrap();
+                    let mut values = vec![serde_json::Value::Null; index + 1];
+                    values[index] = value;
+                    json!(values)
+                };
+            }
+            let input = value;
+            let resolved = expected.iter().fold(&input, |value, segment| {
+                segment.as_str().map_or_else(
+                    || &value[usize::try_from(segment.as_u64().unwrap()).unwrap()],
+                    |key| &value[key],
+                )
+            });
+            assert_eq!(resolved, &json!(["permission denied"]));
+            request["tasks"][0]["output"]["schema"] = json!({"type":"boolean"});
+            let (_, custom) = mapped_candidate(&request).unwrap();
+            assert!(custom["workers"][0].get("evidence_paths").is_none());
         }
     }
 
