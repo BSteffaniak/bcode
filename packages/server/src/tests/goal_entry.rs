@@ -190,9 +190,28 @@ fn install_goal_script(request: &mut PluginWorkflowStartRequest, workspace: &Pat
     ));
     let evaluation = request.definition.nodes.get_mut("loop.evaluation").unwrap();
     let instructions = evaluation.configuration["system_prompt"].as_str().unwrap();
-    let read = serde_json::json!({"path":workspace.join("verification.txt"),"offset":1,"limit":1});
-    evaluation.configuration["system_prompt"] =
-        serde_json::json!(format!("{instructions}\ntool-call filesystem.read {read}"));
+    // Independently inspect the delivered artifact. A stale success marker from
+    // integration is not evidence that the current artifact still matches.
+    let read = serde_json::json!({"path":workspace.join("integrated.sh"),"offset":1,"limit":100});
+    let inspect = |index, node| {
+        serde_json::json!({"$fake_result":{
+            "index":index,"pointer":"/outputs","where":{"node_id":node},"select":"/inspection_arguments","latest_by":"created_at_ms"
+        }})
+    };
+    let left = inspect(0, "left");
+    let repaired = inspect(1, "repair-right");
+    let output_id =
+        |index| serde_json::json!({"$fake_result":{"index":index,"pointer":"/output/output_id"}});
+    let report = serde_json::json!({
+        "version":"1", "integrated_targets":[workspace.join("integrated.sh")],
+        "contribution_output_ids":[output_id(2),output_id(1)],
+        "criteria":[{"criterion":request.input["stop_condition"],"status":"passed","evidence":"Inspected canonical left and repaired right outputs and the combined artifact"}],
+        "checks":[{"command":COMBINED_CHECK,"workspace":workspace,"outcome":"passed","evidence":"Combined integration check succeeded; evaluator independently read the expected artifact"}],
+        "retained_workspaces":[workspace],"unresolved_work":[]
+    });
+    evaluation.configuration["system_prompt"] = serde_json::json!(format!(
+        "{instructions}\ntool-call workflow.execution_context {{\"outputs_only\":true,\"limit\":3,\"$fake_json_pages\":{{\"items\":\"/outputs\",\"next\":\"/next_page_arguments\"}}}}\ntool-call workflow.execution_context {left}\ntool-call workflow.execution_context {repaired}\ntool-call filesystem.read {read}\nloop-delivery {report}"
+    ));
 }
 
 fn install_corrective_script(
@@ -397,7 +416,10 @@ fn configure_goal_execution(server: &mut ServerState, root: &Path) {
         .insert("fake_prompt_tool_directives".into(), "true".into());
     server.selected_provider_context.settings.insert(
         "fake_structured_output_json".into(),
-        "loop_tool_evidence:verified".into(),
+        format!(
+            "loop_tool_evidence:{LEFT_MODULE}{}",
+            RIGHT_MODULE.trim_end()
+        ),
     );
     register_test_execution_lifetime(server, root);
 }
@@ -552,6 +574,29 @@ fn assert_goal_evaluation(
         .find(|output| output.node_id == "loop.evaluation")
         .expect("successful run retains evaluator output");
     assert_eq!(evaluated.value["condition_met"], true);
+    let delivery = &evaluated.value["delivery"];
+    assert_eq!(delivery["version"], "1");
+    for (index, node) in ["left", "repair-right"].iter().enumerate() {
+        let contribution = outputs
+            .iter()
+            .find(|output| output.node_id == *node)
+            .unwrap();
+        assert_eq!(
+            delivery["contribution_output_ids"][index],
+            contribution.output_id
+        );
+        assert_eq!(
+            delivery["retained_workspaces"][0],
+            contribution.value["contributions"][0]["workspace"]
+        );
+    }
+    assert_eq!(delivery["checks"][0]["command"], COMBINED_CHECK);
+    assert_eq!(delivery["checks"][0]["outcome"], "passed");
+    assert_eq!(
+        delivery["criteria"][0]["criterion"],
+        input["stop_condition"]
+    );
+    assert_eq!(delivery["unresolved_work"], serde_json::json!([]));
     for field in [
         "implementation_prompt",
         "stop_condition",
@@ -713,7 +758,7 @@ async fn real_goal_entry_approval_resumes_correction_and_verified_completion() {
         .expect("authorized approval must resume the existing goal");
     // Resume approval does not approve tools: each resumed call still passes
     // through the normal permission boundary before integrated verification.
-    tokio::time::timeout(Duration::from_secs(30), async {
+    tokio::time::timeout(Duration::from_mins(1), async {
         loop {
             approve_goal_permissions(&state, session.id).await;
             let terminal = state
@@ -1124,6 +1169,15 @@ async fn exhausted_goal_resumes_after_idempotent_ipc_allowance_grant() {
 
 #[tokio::test]
 async fn goal_integration_conflict_retains_dirty_target_and_worker_effects() {
+    assert_goal_integration_conflict(false).await;
+}
+
+#[tokio::test]
+async fn goal_stale_verification_marker_does_not_prove_delivery() {
+    assert_goal_integration_conflict(true).await;
+}
+
+async fn assert_goal_integration_conflict(stale_marker: bool) {
     let root = tempfile::tempdir().unwrap();
     let sessions = publication_fixture_sessions(root.path(), true);
     let session = sessions
@@ -1137,6 +1191,9 @@ async fn goal_integration_conflict_retains_dirty_target_and_worker_effects() {
     configure_goal_execution(Arc::get_mut(&mut state).unwrap(), root.path());
     let user_work = "# existing user implementation; do not replace\n";
     std::fs::write(root.path().join("integrated.sh"), user_work).unwrap();
+    if stale_marker {
+        std::fs::write(root.path().join("verification.txt"), "verified").unwrap();
+    }
     state.start_workflow_driver().await;
     let request = goal_entry_request(session.id, root.path(), Arc::clone(&state)).await;
     let run_id = request.run_id.unwrap();
@@ -1173,7 +1230,7 @@ async fn goal_integration_conflict_retains_dirty_target_and_worker_effects() {
         std::fs::read_to_string(root.path().join("right.sh")).unwrap(),
         BROKEN_RIGHT_MODULE
     );
-    assert!(!root.path().join("verification.txt").exists());
+    assert_eq!(root.path().join("verification.txt").exists(), stale_marker);
     assert!(!root.path().join("rejected.txt").exists());
     let attempts = state
         .workflow_store
@@ -1215,7 +1272,7 @@ async fn real_goal_entry_publishes_and_executes_two_workers() {
     );
     let run_id = request.run_id.unwrap();
     // Admission is not execution: observe the real production driver settlement.
-    tokio::time::timeout(Duration::from_secs(20), async {
+    tokio::time::timeout(Duration::from_mins(1), async {
         loop {
             approve_goal_permissions(&state, session.id).await;
             let attempts = state

@@ -566,6 +566,13 @@ snapshot query, not a durable stream: concurrently created outputs behind a curs
 require a fresh scan. `output_id` selects a value only within the authenticated run;
 missing, oversized, or checksum-inconsistent values fail closed. Reads never open
 artifact references or infer overall run completion from an individual output.
+For contribution discovery, `outputs_only: true` returns authenticated identity,
+revision, bounded output metadata and output-specific `next_page_arguments`, without
+graph or delegation payloads. Follow these recipes until null, then rescan for later
+arrivals (output identities are not arrival order). This is not graph or active-binding
+discovery. Inspect each reference using its `inspection_arguments`; metadata alone
+is not checksum-verified contribution evidence.
+
 The plugin's `output_only: true` presentation option requires an exact `output_id`
 and returns authenticated execution identity, revision and the complete verified
 `output`, omitting unrelated graph/discovery/delegation data. Listed output

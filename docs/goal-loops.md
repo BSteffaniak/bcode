@@ -1,5 +1,12 @@
 # Goal setup for prompt loops
 
+New goal evaluators use a fresh authenticated workflow context for canonical-output
+inspection (not filesystem isolation); plain loop context behavior is unchanged.
+Production-path deterministic tests discover revision-pinned output pages, inspect
+exact contribution values, retain their IDs in delivery, and compare the report to
+canonical outputs and the combined artifact. This is scripted coverage, not live-model
+acceptance or host verification of positive evaluator claims.
+
 New goal evaluations may retain an optional `delivery` report in their canonical
 output: `version: "1"`, integrated targets, inspected canonical contribution output
 IDs, original criteria with passed/failed/unverified evidence, combined commands and

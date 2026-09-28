@@ -2328,7 +2328,7 @@ fn loop_workflow_spec(
         "loop.evaluation",
         bcode_workflow::NodeKind::Agent,
         serde_json::to_value(loop_agent_configuration::<LoopWorkflowEvaluation>(
-            "Read-only loop completion evaluation. Inspect repository/session state against stop_condition. For delegated coding work, inspect checksum-verified canonical worker outputs and actual integrated artifacts, not just worker summaries or coordinator completion. Use workflow.execution_context compact discovery and the listed inspection_arguments for each contribution: output_only returns the exact verified value without unrelated graph/delegation payloads. Follow revision-pinned pages for discovery; missing or truncated output is not inspected evidence. Independently inspect the integrated artifact and observed combined checks; a marker file alone is not proof that the current artifact passes. Identify the integrated target or revision, observed combined validation commands and outcomes, original criteria covered, unresolved work and retained workspaces in evidence. For coding delivery, populate the optional version-1 delivery report with canonical contribution output IDs you actually inspected, integrated targets, each original criterion and its observed status, combined check commands/workspaces/outcomes/evidence, retained workspaces and unresolved work. These references are claims, not verified receipts; never invent identities or infer validation from worker success. Omit delivery when no integrated target is inspectable; failed or unverified required criteria and unresolved work preclude condition_met. Missing provenance is unknown, and unverified required criteria or unresolved conflicts preclude completion. Preserve implementation_prompt, stop_condition, max_iterations, iteration, and judgement_evaluation unchanged. Return condition_met, external_blocker, non-empty concrete evidence, and a concise non-empty summary in the exact structured schema. Set external_blocker to none for useful incomplete work or verified completion. When progress requires an external approval, input, or dependency, report the matching blocker and identify the original request/dependency and authorized next action in evidence; do not infer associations from prose or treat this report as approval. A blocker parks the loop until explicit authorized workflow resume approval; that approval does not approve the underlying tool or resolve the external dependency. it does not poll or automatically resolve dependencies. A blocked result is not completion. If a judgement evaluator is selected, your condition_met is provisional: gather concrete bounded evidence for that evaluator; do not change its configuration.",
+            "Read-only loop completion evaluation. Inspect repository/session state against stop_condition. For delegated coding work, inspect checksum-verified canonical worker outputs and actual integrated artifacts, not just worker summaries or coordinator completion. Use workflow.execution_context with outputs_only:true and a small limit for bounded contribution discovery without graph/delegation overhead, then use the listed inspection_arguments for each contribution: output_only returns the exact verified value without unrelated graph/delegation payloads. Follow revision-pinned pages for discovery; missing or truncated output is not inspected evidence. Independently inspect the integrated artifact and observed combined checks; a marker file alone is not proof that the current artifact passes. Identify the integrated target or revision, observed combined validation commands and outcomes, original criteria covered, unresolved work and retained workspaces in evidence. For coding delivery, populate the optional version-1 delivery report with canonical contribution output IDs you actually inspected, integrated targets, each original criterion and its observed status, combined check commands/workspaces/outcomes/evidence, retained workspaces and unresolved work. These references are claims, not verified receipts; never invent identities or infer validation from worker success. Omit delivery when no integrated target is inspectable; failed or unverified required criteria and unresolved work preclude condition_met. Missing provenance is unknown, and unverified required criteria or unresolved conflicts preclude completion. Preserve implementation_prompt, stop_condition, max_iterations, iteration, and judgement_evaluation unchanged. Return condition_met, external_blocker, non-empty concrete evidence, and a concise non-empty summary in the exact structured schema. Set external_blocker to none for useful incomplete work or verified completion. When progress requires an external approval, input, or dependency, report the matching blocker and identify the original request/dependency and authorized next action in evidence; do not infer associations from prose or treat this report as approval. A blocker parks the loop until explicit authorized workflow resume approval; that approval does not approve the underlying tool or resolve the external dependency. it does not poll or automatically resolve dependencies. A blocked result is not completion. If a judgement evaluator is selected, your condition_met is provisional: gather concrete bounded evidence for that evaluator; do not change its configuration.",
             "plan",
             true,
         ))
@@ -2445,6 +2445,7 @@ fn collaborating_goal_spec(
     let mut evaluation: bcode_workflow::WorkflowPromptConfiguration =
         serde_json::from_value(evaluator.configuration.clone())
             .map_err(|error| error.to_string())?;
+    evaluation.execution_target = bcode_workflow::PromptContextTarget::FreshIsolated;
     evaluation.system_prompt.push_str("\n\n");
     evaluation
         .system_prompt
@@ -2474,6 +2475,17 @@ fn optional_goal_spec(
         .push_str(include_str!("../prompts/goal-optional-coordination.md"));
     implementation.configuration =
         serde_json::to_value(implementation_configuration).map_err(|error| error.to_string())?;
+    // Evaluators need their own authenticated activation to inspect canonical outputs.
+    let evaluator = definition
+        .nodes
+        .get_mut("loop.evaluation")
+        .ok_or("goal evaluation node is missing")?;
+    let mut evaluation: bcode_workflow::WorkflowPromptConfiguration =
+        serde_json::from_value(evaluator.configuration.clone())
+            .map_err(|error| error.to_string())?;
+    evaluation.execution_target = bcode_workflow::PromptContextTarget::FreshIsolated;
+    evaluator.configuration =
+        serde_json::to_value(evaluation).map_err(|error| error.to_string())?;
     bcode_workflow::WorkflowSpec::from_definition(WORKFLOW_KIND, definition)
         .map_err(|error| error.to_string())
 }
@@ -2846,6 +2858,11 @@ mod tests {
             .configuration = request.definition.nodes["loop.implementation"]
             .configuration
             .clone();
+        expected
+            .nodes
+            .get_mut("loop.evaluation")
+            .unwrap()
+            .configuration["execution_target"] = serde_json::json!("fresh_isolated");
         assert_eq!(request.definition, expected);
     }
 
@@ -3367,6 +3384,13 @@ mod tests {
                 assert!(prompt.contains("condition_met=false"));
                 evaluator.configuration["system_prompt"] =
                     base.definition().nodes["loop.evaluation"].configuration["system_prompt"]
+                        .clone();
+                assert_eq!(
+                    evaluator.configuration["execution_target"],
+                    "fresh_isolated"
+                );
+                evaluator.configuration["execution_target"] =
+                    base.definition().nodes["loop.evaluation"].configuration["execution_target"]
                         .clone();
                 assert_eq!(evaluator, base.definition().nodes["loop.evaluation"]);
                 assert_eq!(

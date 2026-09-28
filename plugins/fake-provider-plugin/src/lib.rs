@@ -1241,6 +1241,41 @@ fn apply_loop_tool_evidence(
     value["summary"] = serde_json::json!(evidence);
 }
 
+fn apply_loop_delivery(
+    value: &mut serde_json::Value,
+    request: &ModelTurnRequest,
+    user_text: &str,
+) -> Result<(), ProviderError> {
+    if value["condition_met"] == true
+        && let Some(report) = user_text
+            .lines()
+            .find_map(|line| line.strip_prefix("loop-delivery "))
+    {
+        let mut report =
+            serde_json::from_str(report).map_err(|error| fake_structured_output_error(&error))?;
+        let results = request
+            .messages
+            .iter()
+            .rev()
+            .take_while(|message| message.role != MessageRole::User)
+            .flat_map(|message| message.content.iter().rev())
+            .filter_map(|block| match block {
+                ContentBlock::ToolResult { result } if !result.is_error => {
+                    Some(result.output.as_str())
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        if bind_prompt_results(&mut report, &results).is_some() {
+            value["delivery"] = report;
+        } else {
+            value["condition_met"] = serde_json::json!(false);
+            value["evidence"] = serde_json::json!(["Delivery references could not be resolved"]);
+        }
+    }
+    Ok(())
+}
+
 fn configured_fake_structured_output(
     request: &ModelTurnRequest,
     structured: &bcode_model::StructuredOutputRequest,
@@ -1286,6 +1321,7 @@ fn configured_fake_structured_output(
         if evaluation {
             if let Some(expected) = configured.strip_prefix("loop_tool_evidence:") {
                 apply_loop_tool_evidence(&mut value, &request.messages, expected);
+                apply_loop_delivery(&mut value, request, user_text)?;
             } else {
                 value["condition_met"] =
                     serde_json::json!(iteration >= threshold.unwrap_or_default());
@@ -2439,6 +2475,7 @@ fn next_prompt_tool_directive(messages: &[ModelMessage], next_turn: u64) -> Opti
         let results = outputs.iter().rev().map(String::as_str).collect::<Vec<_>>();
         bind_prompt_results(&mut call.arguments, &results)?;
         let mut assembled = String::new();
+        let mut entries = Vec::new();
         loop {
             let Some(result) = completed_results.next() else {
                 return Some(call);
@@ -2453,10 +2490,18 @@ fn next_prompt_tool_directive(messages: &[ModelMessage], next_turn: u64) -> Opti
                 break;
             };
             let page: serde_json::Value = serde_json::from_str(&result.output).ok()?;
-            assembled.push_str(page.pointer(paging["chunk"].as_str()?)?.as_str()?);
+            if let Some(pointer) = paging.get("items") {
+                entries.extend(page.pointer(pointer.as_str()?)?.as_array()?.iter().cloned());
+            } else {
+                assembled.push_str(page.pointer(paging["chunk"].as_str()?)?.as_str()?);
+            }
             let next = page.pointer(paging["next"].as_str()?)?;
             if next.is_null() {
-                let value: serde_json::Value = serde_json::from_str(&assembled).ok()?;
+                let value: serde_json::Value = if paging.get("items").is_some() {
+                    serde_json::json!({"outputs":entries})
+                } else {
+                    serde_json::from_str(&assembled).ok()?
+                };
                 outputs.push(value.to_string());
                 break;
             }
@@ -2476,13 +2521,49 @@ fn bind_prompt_results(value: &mut serde_json::Value, results: &[&str]) -> Optio
                 return None;
             }
             let reference = object.get("$fake_result")?.as_object()?;
-            if reference.len() != 2 {
+            if !(reference.len() == 2 || reference.len() == 4 || reference.len() == 5) {
                 return None;
             }
             let index = usize::try_from(reference.get("index")?.as_u64()?).ok()?;
             let pointer = reference.get("pointer")?.as_str()?;
             let result: serde_json::Value = serde_json::from_str(results.get(index)?).ok()?;
-            *value = result.pointer(pointer)?.clone();
+            let mut selected = result.pointer(pointer)?;
+            if reference.len() >= 4 {
+                let predicate = reference.get("where")?.as_object()?;
+                let matches = selected
+                    .as_array()?
+                    .iter()
+                    .filter(|entry| {
+                        predicate
+                            .iter()
+                            .all(|(key, expected)| entry.get(key) == Some(expected))
+                    })
+                    .collect::<Vec<_>>();
+                selected = if let Some(field) = reference.get("latest_by") {
+                    let field = field.as_str()?;
+                    let newest = matches
+                        .iter()
+                        .map(|entry| entry.get(field)?.as_u64())
+                        .collect::<Option<Vec<_>>>()?
+                        .into_iter()
+                        .max()?;
+                    let mut newest_matches = matches
+                        .into_iter()
+                        .filter(|entry| entry[field].as_u64() == Some(newest));
+                    let selected = newest_matches.next()?;
+                    if newest_matches.next().is_some() {
+                        return None;
+                    }
+                    selected
+                } else {
+                    if matches.len() != 1 {
+                        return None;
+                    }
+                    matches[0]
+                };
+                selected = selected.pointer(reference.get("select")?.as_str()?)?;
+            }
+            *value = selected.clone();
         }
         serde_json::Value::Object(object) => {
             for child in object.values_mut() {
@@ -3051,6 +3132,33 @@ mod tests {
         }
         assert_eq!(
             bind_prompt_results(&mut reference(0, ""), &["not JSON"]),
+            None
+        );
+    }
+
+    #[test]
+    fn prompt_metadata_selection_rejects_ambiguous_or_missing_results() {
+        let receipt = r#"{"outputs":[{"node_id":"left","created_at_ms":1,"id":"old"},{"node_id":"left","created_at_ms":2,"id":"new"}]}"#;
+        let mut reference = serde_json::json!({"$fake_result":{
+            "index":0,"pointer":"/outputs","where":{"node_id":"left"},"select":"/id","latest_by":"created_at_ms"
+        }});
+        let mut selected = reference.clone();
+        assert_eq!(bind_prompt_results(&mut selected, &[receipt]), Some(()));
+        assert_eq!(selected, "new");
+        let mut ambiguous = reference.clone();
+        ambiguous["$fake_result"]
+            .as_object_mut()
+            .unwrap()
+            .remove("latest_by");
+        assert_eq!(bind_prompt_results(&mut ambiguous, &[receipt]), None);
+        let mut missing = reference.clone();
+        missing["$fake_result"]["where"]["node_id"] = serde_json::json!("missing");
+        assert_eq!(bind_prompt_results(&mut missing, &[receipt]), None);
+        assert_eq!(
+            bind_prompt_results(
+                &mut reference,
+                &[&receipt.replace("\"created_at_ms\":1", "\"created_at_ms\":2")]
+            ),
             None
         );
     }

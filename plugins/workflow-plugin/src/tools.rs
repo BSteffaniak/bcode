@@ -20,6 +20,19 @@ fn parse_context(
     let object = arguments
         .as_object_mut()
         .ok_or("execution context request must be an object")?;
+    let discovery_only = object.get("outputs_only") == Some(&json!(true));
+    if discovery_only
+        && (object.get("output_only") == Some(&json!(true))
+            || object
+                .get("output_id")
+                .is_some_and(|value| !value.is_null())
+            || object.get("delegation_only") == Some(&json!(true))
+            || object.contains_key("delegation_part")
+            || object.contains_key("after_node_id")
+            || object.contains_key("after_edge_id"))
+    {
+        return Err("outputs_only cannot request exact output, graph cursors or delegation".into());
+    }
     let output_only = object.get("output_only") == Some(&json!(true));
     if output_only
         && (object
@@ -31,7 +44,7 @@ fn parse_context(
     {
         return Err("output_only requires an exact output_id and cannot request delegation".into());
     }
-    for field in ["compact", "delegation_only", "output_only"] {
+    for field in ["compact", "delegation_only", "output_only", "outputs_only"] {
         if let Some(value) = object.remove(field)
             && !value.is_boolean()
         {
@@ -72,6 +85,7 @@ fn context_definition() -> ToolDefinition {
                 "delegation_only":{"type":"boolean","default":false,"description":"Return only the authenticated delegation recipe from this bounded page, without duplicating graph facts. Use for default-budget staging; unavailable recipes remain explicit. Does not change authorization or discovery completeness."},
                 "compact":{"type":"boolean","default":false,"description":"Return graph node identities instead of full executable definitions. Edges and authenticated identity remain available; omitted node definitions require a normal paged read."},
                 "output_only":{"type":"boolean","default":false,"description":"With output_id, return only authenticated identity, revision and the exact checksum-verified output. Omits graph, discovery and delegation payloads; does not truncate the value or grant authority."},
+                "outputs_only":{"type":"boolean","default":false,"description":"Discover bounded canonical output references without graph or delegation payloads. Follow next_page_arguments, then each inspection_arguments to verify values. Rescan for later arrivals; this is not complete graph discovery."},
                 "after_output_id":{"type":["string","null"], "description":"Exclusive last output ID. Outputs arriving behind the cursor require a fresh scan; this is not a durable event stream."},
                 "output_id":{"type":["string","null"], "description":"Exact canonical output identity from this run; returns checksum-verified value without opening artifacts."},
                 "limit":{"type":"integer", "minimum":1, "maximum":100, "default":50},
@@ -540,11 +554,47 @@ fn prepared_edit_matches(
             == Some(edit)
 }
 
+fn output_discovery_view(
+    context: &bcode_workflow::WorkflowExecutionContext,
+    query: &bcode_workflow::WorkflowExecutionContextRequest,
+) -> String {
+    let outputs: Vec<_> = context
+        .outputs
+        .iter()
+        .map(|entry| {
+            let mut value = serde_json::to_value(entry).expect("output metadata");
+            value["inspection_arguments"] = json!({
+                "output_id": entry.output_id, "output_only": true,
+                "expected_revision": context.graph.revision, "limit": 1,
+            });
+            value
+        })
+        .collect();
+    let next = if context.outputs.len() == query.limit {
+        context.outputs.last().map(|entry| {
+            json!({
+                "outputs_only": true, "expected_revision": context.graph.revision,
+                "after_output_id": entry.output_id, "limit": query.limit,
+            })
+        })
+    } else {
+        None
+    };
+    json!({
+        "run_id": context.run_id, "node_id": context.node_id,
+        "activation_id": context.activation_id, "attempt": context.attempt,
+        "revision": context.graph.revision, "outputs": outputs,
+        "next_page_arguments": next,
+    })
+    .to_string()
+}
+
 fn invoke_context(
     context: &NativeServiceContext,
     request: ToolInvocationRequest,
 ) -> ServiceResponse {
     let compact = request.arguments.get("compact") == Some(&json!(true));
+    let discovery_only = request.arguments.get("outputs_only") == Some(&json!(true));
     let output_only = request.arguments.get("output_only") == Some(&json!(true));
     let delegation_only = request.arguments.get("delegation_only") == Some(&json!(true));
     let delegation_part = request
@@ -599,7 +649,9 @@ fn invoke_context(
                 |_| ServiceResponse::error("invalid_response", "invalid workflow context"),
                 |context| {
                     super::json_response(&bcode_tool::ToolInvocationResponse {
-                        output: if output_only {
+                        output: if discovery_only {
+                            output_discovery_view(&context, &query)
+                        } else if output_only {
                             exact_output_view(&context)
                         } else if delegation_only || delegation_part.is_some() {
                             json!({"delegation": if delegation_part.as_deref() == Some("serialized") { serialized_delegation_recipe(&context, &query, delegation_offset) } else { delegation_recipe_part(&context, &query, delegation_part.as_deref()) }}).to_string()
@@ -1775,6 +1827,53 @@ mod tests {
             parse_context(json!({})).unwrap()
         );
         assert!(parse_context(json!({"compact":"true"})).is_err());
+    }
+
+    #[test]
+    fn output_discovery_pages_independently_of_incomplete_graph() {
+        let mut context: bcode_workflow::WorkflowExecutionContext = serde_json::from_value(json!({
+            "run_id":"run", "node_id":"evaluator", "activation_id":"evaluation", "attempt":1,
+            "graph":{"revision":7,"nodes":[],"edges":[],
+                "nodes_complete":false,"edges_complete":false},
+            "output":null,"outputs":[{
+                "output_id":"worker.結果", "run_id":"run", "node_id":"worker",
+                "activation_id":"worker-activation", "schema_id":"result", "schema_version":1,
+                "artifact_reference":null,"checksum_sha256":"checksum","created_at_ms":0
+            }]
+        }))
+        .unwrap();
+        context.graph.nodes_complete = false;
+        context.graph.edges_complete = false;
+        let query = parse_context(json!({"outputs_only":true,"limit":1})).unwrap();
+        let rendered: serde_json::Value =
+            serde_json::from_str(&output_discovery_view(&context, &query)).unwrap();
+        assert!(rendered.get("graph").is_none());
+        assert!(rendered.get("delegation").is_none());
+        let next = parse_context(rendered["next_page_arguments"].clone()).unwrap();
+        assert_eq!(
+            next.after_output_id,
+            context.outputs.last().map(|entry| entry.output_id.clone())
+        );
+        assert_eq!(next.expected_revision, Some(context.graph.revision));
+        assert_eq!(next.after_node_id, None);
+        let inspect =
+            parse_context(rendered["outputs"][0]["inspection_arguments"].clone()).unwrap();
+        assert_eq!(
+            inspect.output_id,
+            Some(context.outputs[0].output_id.clone())
+        );
+        context.outputs.clear();
+        let rendered: serde_json::Value =
+            serde_json::from_str(&output_discovery_view(&context, &next)).unwrap();
+        assert!(rendered["next_page_arguments"].is_null());
+        for invalid in [
+            json!({"outputs_only":"true"}),
+            json!({"outputs_only":true,"output_id":"exact"}),
+            json!({"outputs_only":true,"delegation_only":true}),
+            json!({"outputs_only":true,"after_edge_id":1}),
+        ] {
+            assert!(parse_context(invalid).is_err());
+        }
     }
 
     #[test]
