@@ -138,6 +138,10 @@ This derived description is neither
 canonical execution state nor evidence that any worker succeeded. Receipt mapping and
 candidate lowering share one normalized request; mapping is returned only after its
 candidate matches the application-admitted edit, including topology validation.
+Compact v2 receipts retain worker identities and result/evidence paths, but do not
+repeat worker prompts, criteria or output schemas. Those assignment details remain
+in the authored request and canonical nodes; large assignments must not obscure the
+publication reference. Large worker counts can still require retained receipt inspection.
 Both permission preparation and invocation perform the same deterministic lowering.
 Task staging receipts include bounded `publication_arguments` containing a versioned
 candidate reference (run, mutation, revision and SHA-256 of the complete serialized edit).
@@ -562,6 +566,14 @@ snapshot query, not a durable stream: concurrently created outputs behind a curs
 require a fresh scan. `output_id` selects a value only within the authenticated run;
 missing, oversized, or checksum-inconsistent values fail closed. Reads never open
 artifact references or infer overall run completion from an individual output.
+The plugin's `output_only: true` presentation option requires an exact `output_id`
+and returns authenticated execution identity, revision and the complete verified
+`output`, omitting unrelated graph/discovery/delegation data. Listed output
+`inspection_arguments` select this view automatically. It cannot be combined with
+delegation views, does not relax host checks or size limits, and is not a guarantee
+that large values fit the tool-output budget. Missing/truncated values remain
+uninspected evidence; the report must not claim otherwise. Contribution values
+still require comparison with integrated artifacts and observed combined checks.
 These fields extend the still-unreleased context operation, not a durable format.
 This read-only operation does
 not grant edit/publication authority or expose other runs. The optional objective

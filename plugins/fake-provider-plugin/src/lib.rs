@@ -2419,37 +2419,51 @@ fn next_prompt_tool_directive(messages: &[ModelMessage], next_turn: u64) -> Opti
             fake_tool_call(&line, next_turn).map(|call| (call, expected_error))
         })
         .collect::<Vec<_>>();
-    let completed_results = messages
+    let start = messages
         .iter()
-        .rev()
-        .take_while(|message| message.role != MessageRole::User)
+        .rposition(|message| message.role == MessageRole::User)?
+        + 1;
+    let mut completed_results = messages[start..]
+        .iter()
         .flat_map(|message| &message.content)
         .filter_map(|block| match block {
             ContentBlock::ToolResult { result } => Some(result),
             _ => None,
-        })
-        .collect::<Vec<_>>();
-    for (index, result) in completed_results.iter().rev().enumerate() {
-        let expected = directives.get(index)?.1;
-        if result.is_error != expected.is_some()
-            || expected.is_some_and(|text| !result.output.contains(text))
-        {
-            return None;
+        });
+    // Paging is an opt-in fixture directive, not a tool argument. Each page uses
+    // the returned arguments unchanged; only complete JSON becomes a logical
+    // result. Physical page calls must not advance the scripted operation index.
+    let mut outputs = Vec::new();
+    for (mut call, expected) in directives {
+        let paged = call.arguments.as_object_mut()?.remove("$fake_json_pages");
+        let results = outputs.iter().rev().map(String::as_str).collect::<Vec<_>>();
+        bind_prompt_results(&mut call.arguments, &results)?;
+        let mut assembled = String::new();
+        loop {
+            let Some(result) = completed_results.next() else {
+                return Some(call);
+            };
+            if result.is_error != expected.is_some()
+                || expected.is_some_and(|text| !result.output.contains(text))
+            {
+                return None;
+            }
+            let Some(ref paging) = paged else {
+                outputs.push(result.output.clone());
+                break;
+            };
+            let page: serde_json::Value = serde_json::from_str(&result.output).ok()?;
+            assembled.push_str(page.pointer(paging["chunk"].as_str()?)?.as_str()?);
+            let next = page.pointer(paging["next"].as_str()?)?;
+            if next.is_null() {
+                let value: serde_json::Value = serde_json::from_str(&assembled).ok()?;
+                outputs.push(value.to_string());
+                break;
+            }
+            call.arguments = next.clone();
         }
     }
-    let mut call = directives.get(completed_results.len())?.0.clone();
-    let results = messages
-        .iter()
-        .rev()
-        .take_while(|message| message.role != MessageRole::User)
-        .flat_map(|message| &message.content)
-        .filter_map(|block| match block {
-            ContentBlock::ToolResult { result } => Some(result.output.as_str()),
-            _ => None,
-        })
-        .collect::<Vec<_>>();
-    bind_prompt_results(&mut call.arguments, &results)?;
-    Some(call)
+    None
 }
 
 // Explicit opt-in fixture references use reverse chronological result indices and
@@ -3100,6 +3114,59 @@ tool-call publish {"$fake_result":{"index":0,"pointer":"/publication_arguments"}
             r#"tool-call publish {"$fake_result":{"index":0,"pointer":"/publication_arguments"}}"#,
         ));
         assert!(next_prompt_tool_directive(&messages, 6).is_none());
+    }
+
+    #[test]
+    fn prompt_directives_assemble_pages_as_one_result_after_expected_failure() {
+        let mut messages = vec![ModelMessage {
+            role: MessageRole::User,
+            content: vec![ContentBlock::Text {
+                text: concat!(
+                    "tool-call-expect-error broken :: check {}\n",
+                    "tool-call inspect {\"$fake_json_pages\":{\"chunk\":\"/chunk\",\"next\":\"/next\"}}\n",
+                    "tool-call publish {\"$fake_result\":{\"index\":0,\"pointer\":\"\"}}"
+                ).into(),
+            }],
+        }];
+        let result = |output: String, is_error| ModelMessage {
+            role: MessageRole::Tool,
+            content: vec![ContentBlock::ToolResult {
+                result: bcode_model::ToolResult {
+                    call_id: "fixture".into(),
+                    output,
+                    is_error,
+                    content: Vec::new(),
+                },
+            }],
+        };
+        messages.push(result("broken".into(), true));
+        let first = next_prompt_tool_directive(&messages, 1).unwrap();
+        assert_eq!(first.name, "inspect");
+        assert_eq!(first.arguments, serde_json::json!({}));
+        messages.push(result(
+            serde_json::json!({"chunk":"{\"unicode\":", "next":{"offset":12,"revision":7}})
+                .to_string(),
+            false,
+        ));
+        let next = next_prompt_tool_directive(&messages, 2).unwrap();
+        assert_eq!(next.name, "inspect");
+        assert_eq!(
+            next.arguments,
+            serde_json::json!({"offset":12,"revision":7})
+        );
+        messages.push(result(
+            serde_json::json!({"chunk":"\"你好\"}","next":null}).to_string(),
+            false,
+        ));
+        let publish = next_prompt_tool_directive(&messages, 3).unwrap();
+        assert_eq!(publish.name, "publish");
+        assert_eq!(publish.arguments, serde_json::json!({"unicode":"你好"}));
+        messages.pop();
+        messages.push(result("truncated JSON".into(), false));
+        assert!(next_prompt_tool_directive(&messages, 4).is_none());
+        messages.pop();
+        messages.push(result("permission denied".into(), true));
+        assert!(next_prompt_tool_directive(&messages, 5).is_none());
     }
 
     #[test]

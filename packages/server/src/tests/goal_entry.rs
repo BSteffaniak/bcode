@@ -148,14 +148,7 @@ fn contribution_result(workspace: &Path, id: &str) -> serde_json::Value {
 }
 
 fn install_goal_script(request: &mut PluginWorkflowStartRequest, workspace: &Path) {
-    let reference = |pointer: &str| {
-        let index = match pointer {
-            "/delegation/arguments/input" => 1,
-            "/delegation/arguments/reconnect" => 0,
-            _ => 2,
-        };
-        serde_json::json!({"$fake_result":{"index":index,"pointer":pointer}})
-    };
+    let reference = |pointer: &str| serde_json::json!({"$fake_result":{"index":0,"pointer":pointer.trim_start_matches("/delegation/arguments")}});
     let task = |id: &str| {
         serde_json::json!({
             "task_id":id,"objective":format!("Implement {id}.\ntool-call filesystem.write {}\nstructured-result {}", serde_json::json!({"path":workspace.join(format!("{id}.sh")),"contents":if id == "left" { LEFT_MODULE } else { RIGHT_MODULE }}), contribution_result(workspace, id)),
@@ -192,10 +185,8 @@ fn install_goal_script(request: &mut PluginWorkflowStartRequest, workspace: &Pat
         .get_mut("loop.implementation")
         .unwrap();
     let instructions = source.configuration["system_prompt"].as_str().unwrap();
-    let input_inspection = serde_json::json!({"$fake_result":{"index":0,"pointer":"/delegation/inspection_arguments/input"}});
-    let reconnect_inspection = serde_json::json!({"$fake_result":{"index":1,"pointer":"/delegation/inspection_arguments/reconnect"}});
     source.configuration["system_prompt"] = serde_json::json!(format!(
-        "{instructions}\ntool-call workflow.execution_context {{\"limit\":100,\"delegation_part\":\"bindings\"}}\ntool-call workflow.execution_context {input_inspection}\ntool-call workflow.execution_context {reconnect_inspection}\ntool-call workflow.stage_task_group {group}\ntool-call workflow.publish_run_graph_edit {publication}"
+        "{instructions}\ntool-call workflow.execution_context {{\"delegation_part\":\"serialized\",\"$fake_json_pages\":{{\"chunk\":\"/delegation/chunk\",\"next\":\"/delegation/next_arguments\"}}}}\ntool-call workflow.stage_task_group {group}\ntool-call workflow.publish_run_graph_edit {publication}"
     ));
     let evaluation = request.definition.nodes.get_mut("loop.evaluation").unwrap();
     let instructions = evaluation.configuration["system_prompt"].as_str().unwrap();
@@ -217,17 +208,8 @@ fn install_corrective_script(
     // file effect. Recovery must retain that failure, inspect the artifact and correct it.
     group["tasks"][1]["output"] = serde_json::to_value(&failed_output).unwrap();
 
-    let reference = |pointer: &str| {
-        let index = match pointer {
-            "/delegation/arguments/input" => 1,
-            "/delegation/arguments/reconnect" => 0,
-            _ => 2,
-        };
-        serde_json::json!({"$fake_result":{"index":index,"pointer":pointer}})
-    };
+    let reference = |pointer: &str| serde_json::json!({"$fake_result":{"index":0,"pointer":pointer.trim_start_matches("/delegation/arguments")}});
 
-    let input_inspection = serde_json::json!({"$fake_result":{"index":0,"pointer":"/delegation/inspection_arguments/input"}});
-    let reconnect_inspection = serde_json::json!({"$fake_result":{"index":1,"pointer":"/delegation/inspection_arguments/reconnect"}});
     let fix = serde_json::json!({"path":workspace.join("right.sh"),"contents":RIGHT_MODULE});
     let correction = serde_json::json!({
         "version":2,"generated_ids":true,"mutation_id":"goal-correction",
@@ -267,7 +249,7 @@ fn install_corrective_script(
         "workflow.publish_run_graph_edit"
     ]);
     group["continuation"]["objective"] = serde_json::json!(format!(
-        "Check contributions and correct failure.\ntool-call-expect-error expected total 27, got 28 :: shell.run {probe}\ntool-call workflow.execution_context {{\"limit\":100,\"delegation_part\":\"bindings\"}}\ntool-call workflow.execution_context {input_inspection}\ntool-call workflow.execution_context {reconnect_inspection}\ntool-call workflow.stage_task_group {correction}\ntool-call workflow.publish_run_graph_edit {publication}"
+        "Check contributions and correct failure.\ntool-call-expect-error expected total 27, got 28 :: shell.run {probe}\ntool-call workflow.execution_context {{\"delegation_part\":\"serialized\",\"$fake_json_pages\":{{\"chunk\":\"/delegation/chunk\",\"next\":\"/delegation/next_arguments\"}}}}\ntool-call workflow.stage_task_group {correction}\ntool-call workflow.publish_run_graph_edit {publication}"
     ));
 }
 
@@ -346,6 +328,7 @@ fn configure_goal_execution(server: &mut ServerState, root: &Path) {
             mode: bcode_plugin::PluginSelectionMode::Explicit,
             enabled: BTreeSet::from([
                 "bcode.workflow".into(),
+                "bcode.loop".into(),
                 "bcode.fake-provider".into(),
                 "bcode.default-agents".into(),
                 "bcode.filesystem".into(),
@@ -354,6 +337,7 @@ fn configure_goal_execution(server: &mut ServerState, root: &Path) {
             disabled: BTreeSet::new(),
         },
         &[
+            bcode_bundled_plugins::static_loop_plugin(),
             bcode_plugin::StaticBundledPlugin::new(
                 include_str!("../../../../plugins/filesystem-plugin/bcode-plugin.toml"),
                 bcode_filesystem_plugin::static_plugin(),
@@ -406,10 +390,6 @@ fn configure_goal_execution(server: &mut ServerState, root: &Path) {
             )
         }),
     });
-    // Nested correction inputs include the retained source delivery schema. This
-    // scripted provider cannot follow artifact inspection guidance after truncation.
-    // Use an explicit bounded context allowance, not a production default change.
-    server.startup_config.model.tool_output.context_chars = 16_000;
     server.selected_provider_plugin_id = Some("bcode.fake-provider".into());
     server
         .selected_provider_context

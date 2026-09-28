@@ -155,6 +155,49 @@ fn format_result(text: &mut String, view: &WorkflowRunView, output_id: &str) {
         for target in delivery.integrated_targets.iter().take(DETAIL_LIMIT) {
             let _ = write!(text, "\n  Integrated target: {}", preview(target));
         }
+        for criterion in delivery.criteria.iter().take(DETAIL_LIMIT) {
+            let _ = write!(
+                text,
+                "\n  Criterion [{}]: {} · {}",
+                observation(&criterion.status),
+                preview(&criterion.description),
+                preview(&criterion.evidence)
+            );
+        }
+        for check in delivery.checks.iter().take(DETAIL_LIMIT) {
+            let _ = write!(
+                text,
+                "\n  Check [{}]: {} · workspace {} · {}",
+                observation(&check.outcome),
+                preview(&check.command),
+                preview(&check.workspace),
+                preview(&check.evidence)
+            );
+        }
+        for unresolved in delivery.unresolved_work.iter().take(DETAIL_LIMIT) {
+            let _ = write!(text, "\n  Unresolved: {}", preview(unresolved));
+        }
+        for workspace in delivery.retained_workspaces.iter().take(DETAIL_LIMIT) {
+            let _ = write!(text, "\n  Retained workspace: {}", preview(workspace));
+        }
+        for output in delivery.contribution_output_ids.iter().take(DETAIL_LIMIT) {
+            let _ = write!(text, "\n  Contribution reference: {}", preview(output));
+        }
+        if [
+            delivery.integrated_targets.len(),
+            delivery.criteria.len(),
+            delivery.checks.len(),
+            delivery.unresolved_work.len(),
+            delivery.retained_workspaces.len(),
+            delivery.contribution_output_ids.len(),
+        ]
+        .into_iter()
+        .any(|count| count > DETAIL_LIMIT)
+        {
+            text.push_str(
+                "\n  Additional delivery details omitted; inspect /workflow for the full report.",
+            );
+        }
         let _ = write!(
             text,
             "\n  {} contribution references · {} criteria · {} checks · {} unresolved items. Inspect /workflow for full delivery evidence.",
@@ -165,6 +208,14 @@ fn format_result(text: &mut String, view: &WorkflowRunView, output_id: &str) {
         );
     }
     text.push_str("\nEvaluation evidence is reported, not independently verified by this display.");
+}
+
+const fn observation(value: &crate::delivery::Observation) -> &'static str {
+    match value {
+        crate::delivery::Observation::Passed => "passed",
+        crate::delivery::Observation::Failed => "failed",
+        crate::delivery::Observation::Unverified => "unverified",
+    }
 }
 
 #[cfg(test)]
@@ -191,7 +242,7 @@ pub mod tests {
                     "version":"1", "integrated_targets":["integrated.sh"],
                     "contribution_output_ids":["left", "right"],
                     "criteria":[{"criterion":"total is 27", "status":"failed", "evidence":"observed 28"}],
-                    "checks":[], "retained_workspaces":[], "unresolved_work":["fix surcharge"]
+                    "checks":[{"command":"sh verify.sh", "workspace":"integration", "outcome":"failed", "evidence":"exit 1"}], "retained_workspaces":["worker-right"], "unresolved_work":["fix surcharge"]
                 }
             }}
         })).unwrap()
@@ -201,10 +252,15 @@ pub mod tests {
         assert!(text.contains("criteria not satisfied"));
         assert!(!text.contains("criteria reported satisfied"));
         assert!(text.contains("Combined check failed Retain both contributions"));
+        assert!(text.contains("Criterion [failed]: total is 27 · observed 28"));
+        assert!(text.contains("Check [failed]: sh verify.sh · workspace integration · exit 1"));
+        assert!(text.contains("Unresolved: fix surcharge"));
+        assert!(text.contains("Retained workspace: worker-right"));
+        assert!(text.contains("Contribution reference: right"));
         assert!(text.contains("integrated.sh: expected 27, observed 28"));
         assert!(text.contains("Integrated target: integrated.sh"));
         assert!(
-            text.contains("2 contribution references · 1 criteria · 0 checks · 1 unresolved items")
+            text.contains("2 contribution references · 1 criteria · 1 checks · 1 unresolved items")
         );
         snapshot.outputs[1].value = WorkflowOutputValue::Unresolved;
         let text = format(&snapshot);
@@ -237,6 +293,48 @@ pub mod tests {
             value: serde_json::json!({"summary":"success"}),
         };
         assert!(format(&snapshot).contains("unsupported result shape"));
+    }
+
+    #[test]
+    fn delivery_details_are_bounded_and_do_not_upgrade_unknown_checks() {
+        let mut snapshot = view();
+        snapshot.terminal = Some(WorkflowTerminalView::Completed {
+            output_id: "final".into(),
+        });
+        snapshot.outputs = vec![serde_json::from_value(serde_json::json!({
+            "output_id":"final","node_id":"evaluation","activation_id":"a",
+            "schema_id":"loop","schema_version":1,"checksum_sha256":"checksum",
+            "artifact_reference":null,"created_at_ms":0,
+            "value":{"availability":"resolved","value":{
+                "implementation_prompt":"objective","stop_condition":"criteria",
+                "max_iterations":1,"iteration":1,"condition_met":false,
+                "summary":"verification pending", "evidence":["check not run"],
+                "delivery": {
+                    "version":"1", "integrated_targets":vec!["target"; 11],
+                    "contribution_output_ids":vec!["output"; 11],
+                    "criteria":vec![serde_json::json!({"criterion":"required", "status":"unverified", "evidence":"not checked"}); 11],
+                    "checks":vec![serde_json::json!({"command":"verify", "workspace":"workspace", "outcome":"unverified", "evidence":"not run"}); 11],
+                    "retained_workspaces":vec!["worker"; 11],
+                    "unresolved_work":vec![format!("repair\n{}", "界".repeat(400)); 11]
+                }
+            }}
+        })).unwrap()];
+        let text = format(&snapshot);
+        for label in [
+            "Integrated target:",
+            "Contribution reference:",
+            "Criterion [unverified]:",
+            "Check [unverified]:",
+            "Retained workspace:",
+            "Unresolved:",
+        ] {
+            assert_eq!(text.matches(label).count(), DETAIL_LIMIT, "{label}");
+        }
+        assert!(text.contains("Additional delivery details omitted"));
+        assert!(text.contains("Unresolved: repair 界"));
+        assert!(!text.contains(&"界".repeat(321)));
+        assert!(!text.contains("Check [passed]"));
+        assert!(text.contains("not independently verified"));
     }
 
     pub fn view() -> WorkflowRunView {

@@ -4,13 +4,24 @@ New goal evaluations may retain an optional `delivery` report in their canonical
 output: `version: "1"`, integrated targets, inspected canonical contribution output
 IDs, original criteria with passed/failed/unverified evidence, combined commands and
 workspaces with observed outcomes, retained workspaces, and unresolved work. Lists
-and text are schema-bounded. `/goal.status` previews targets and report counts;
+and text are schema-bounded. `/goal.status` previews targets, contribution references,
+criterion statuses and evidence, combined check commands/workspaces/outcomes, unresolved
+work and retained workspaces. Each category is limited to ten entries and each text
+field to 320 characters; omissions are explicit.
 `/workflow` retains the full result. These are evaluator-reported observations, not
 host-verified receipts or automatic Git integration. Missing reports remain unknown;
 ordinary goals do not require collaboration. Unknown report versions reject.
 Existing admitted graphs are not rewritten. The judgement block is version 3 for
 the extended state schema; incompatible older bindings require normal compatibility
 handling, not silent reinterpretation.
+New loops always run the loop-owned completion safeguard after agent evaluation,
+including agent-only loops with no judgement provider configured. Reported blockers,
+failed or unverified criteria/checks, empty target/criterion lists and unresolved work
+withhold completion. The optional judgement evaluator additionally receives the delivery
+report along with prose evidence and cannot override those negatives, even with fallback
+enabled. Agent-only safeguarding makes no provider request. This is conservative rejection,
+not independent verification of positive claims. Existing admitted graphs are unchanged;
+new graph-derived execution allowances account for the additional block.
 
 Large nested corrective inputs can exceed the default tool-output context budget.
 Use revision-pinned recipe parts and retained-output inspection, not guessed fields.

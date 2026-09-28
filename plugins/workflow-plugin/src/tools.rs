@@ -20,7 +20,18 @@ fn parse_context(
     let object = arguments
         .as_object_mut()
         .ok_or("execution context request must be an object")?;
-    for field in ["compact", "delegation_only"] {
+    let output_only = object.get("output_only") == Some(&json!(true));
+    if output_only
+        && (object
+            .get("output_id")
+            .and_then(serde_json::Value::as_str)
+            .is_none_or(str::is_empty)
+            || object.get("delegation_only") == Some(&json!(true))
+            || object.contains_key("delegation_part"))
+    {
+        return Err("output_only requires an exact output_id and cannot request delegation".into());
+    }
+    for field in ["compact", "delegation_only", "output_only"] {
         if let Some(value) = object.remove(field)
             && !value.is_boolean()
         {
@@ -60,6 +71,7 @@ fn context_definition() -> ToolDefinition {
                 "delegation_offset":{"type":"integer","minimum":0,"description":"Character offset for serialized recipe chunks; use returned next_arguments."},
                 "delegation_only":{"type":"boolean","default":false,"description":"Return only the authenticated delegation recipe from this bounded page, without duplicating graph facts. Use for default-budget staging; unavailable recipes remain explicit. Does not change authorization or discovery completeness."},
                 "compact":{"type":"boolean","default":false,"description":"Return graph node identities instead of full executable definitions. Edges and authenticated identity remain available; omitted node definitions require a normal paged read."},
+                "output_only":{"type":"boolean","default":false,"description":"With output_id, return only authenticated identity, revision and the exact checksum-verified output. Omits graph, discovery and delegation payloads; does not truncate the value or grant authority."},
                 "after_output_id":{"type":["string","null"], "description":"Exclusive last output ID. Outputs arriving behind the cursor require a fresh scan; this is not a durable event stream."},
                 "output_id":{"type":["string","null"], "description":"Exact canonical output identity from this run; returns checksum-verified value without opening artifacts."},
                 "limit":{"type":"integer", "minimum":1, "maximum":100, "default":50},
@@ -533,6 +545,7 @@ fn invoke_context(
     request: ToolInvocationRequest,
 ) -> ServiceResponse {
     let compact = request.arguments.get("compact") == Some(&json!(true));
+    let output_only = request.arguments.get("output_only") == Some(&json!(true));
     let delegation_only = request.arguments.get("delegation_only") == Some(&json!(true));
     let delegation_part = request
         .arguments
@@ -586,7 +599,9 @@ fn invoke_context(
                 |_| ServiceResponse::error("invalid_response", "invalid workflow context"),
                 |context| {
                     super::json_response(&bcode_tool::ToolInvocationResponse {
-                        output: if delegation_only || delegation_part.is_some() {
+                        output: if output_only {
+                            exact_output_view(&context)
+                        } else if delegation_only || delegation_part.is_some() {
                             json!({"delegation": if delegation_part.as_deref() == Some("serialized") { serialized_delegation_recipe(&context, &query, delegation_offset) } else { delegation_recipe_part(&context, &query, delegation_part.as_deref()) }}).to_string()
                         } else {
                             context_output_with_navigation(&context, compact, &query)
@@ -600,6 +615,19 @@ fn invoke_context(
             ),
         _ => ServiceResponse::error("context_unavailable", "active workflow context unavailable"),
     }
+}
+
+// Projection only: host authentication, checksum verification and size limits are unchanged.
+fn exact_output_view(context: &bcode_workflow::WorkflowExecutionContext) -> String {
+    json!({
+        "run_id": context.run_id,
+        "node_id": context.node_id,
+        "activation_id": context.activation_id,
+        "attempt": context.attempt,
+        "revision": context.graph.revision,
+        "output": context.output,
+    })
+    .to_string()
 }
 
 // Compact inspection is presentation only: the host still validates the same
@@ -632,6 +660,7 @@ fn context_output_with_navigation(
     for result in output["outputs"].as_array_mut().expect("output metadata") {
         result["inspection_arguments"] = json!({
             "output_id": result["output_id"],
+            "output_only": true,
             "expected_revision": context.graph.revision,
             "limit": 1,
             "compact": compact,
@@ -1064,6 +1093,19 @@ fn task_staging_response(
             );
         }
         if compact {
+            // Assignment details remain in the canonical nodes and authored request.
+            // Receipts need identities and paths, not repeated prompts and schemas.
+            for worker in mapping["workers"].as_array_mut().expect("worker mappings") {
+                worker
+                    .as_object_mut()
+                    .expect("worker mapping")
+                    .retain(|key, _| {
+                        matches!(
+                            key.as_str(),
+                            "task_id" | "input_path" | "terminal_outcome" | "evidence_paths"
+                        )
+                    });
+            }
             // The successor transform can repeat a large source schema. Corrective
             // delegation must inspect the revision-pinned edge anyway; do not let
             // redundant topology truncate the publication reference and named paths.
@@ -1175,7 +1217,7 @@ mod tests {
             "run_id":"run","expected_revision":1,"mutation_id":"delegate",
             "input":{"type_name":"bool","schema":{"type":"boolean"}},
             "tasks":[
-                {"task_id":"review.日本語","objective":"Review","agent_profile":"plan"},
+                {"task_id":"review.日本語","objective":"Review".repeat(10_000),"agent_profile":"plan"},
                 {"task_id":"verify","objective":"Verify","agent_profile":"plan"}
             ],
             "continuation":{"objective":"Integrate","agent_profile":"plan",
@@ -1206,20 +1248,12 @@ mod tests {
                 {
                     assert_eq!(worker["task_id"], task_id);
                     assert_eq!(worker["input_path"], json!(["results", task_id]));
-                    assert_eq!(worker["acceptance_criteria"], json!([]));
-                    let output = edit
-                        .edits
-                        .iter()
-                        .find_map(|edit| match edit {
-                            bcode_workflow::WorkflowRunGraphEdit::AddNode { node, .. }
-                                if node.id == task_id =>
-                            {
-                                Some(&node.output)
-                            }
-                            _ => None,
-                        })
-                        .unwrap();
-                    assert_eq!(worker["output"], json!(output));
+                    assert!(worker.get("objective").is_none());
+                    assert!(worker.get("output").is_none());
+                    assert_eq!(
+                        worker["evidence_paths"]["summary"],
+                        json!(["results", task_id, "summary"])
+                    );
                 }
                 assert_eq!(mapping["source_path"], serde_json::Value::Null);
                 assert_eq!(mapping["preserves_source_output"], false);
@@ -1235,6 +1269,7 @@ mod tests {
                         .unwrap()
                         .contains(&json!("review.日本語"))
                 );
+                assert!(tool.output.len() < 4_000);
                 assert!(tool.output.len() < serde_json::to_string(&edit).unwrap().len());
             }
             let mut different = edit.clone();
@@ -1743,6 +1778,46 @@ mod tests {
     }
 
     #[test]
+    fn exact_output_projection_preserves_evidence_without_graph_overhead() {
+        let context: bcode_workflow::WorkflowExecutionContext = serde_json::from_value(json!({
+            "run_id":"run", "node_id":"evaluator", "activation_id":"evaluation", "attempt":1,
+            "graph":{"revision":7,"next_edge_id":19,"nodes":[],"edges":[],
+                "nodes_complete":false,"edges_complete":false},
+            "output":{
+                "version":1,"output_id":"worker-result","run_id":"run","node_id":"worker",
+                "activation_id":"worker-activation","schema_id":"contribution","schema_version":1,
+                "checksum_sha256":"checksum","created_at_ms":1,
+                "value":{"contributions":[{"artifacts":["src/結果.rs"]}],"blockers":["unverified"]}
+            },"outputs":[]
+        }))
+        .unwrap();
+        let projected: serde_json::Value =
+            serde_json::from_str(&exact_output_view(&context)).unwrap();
+        assert_eq!(
+            projected["output"],
+            serde_json::to_value(&context.output).unwrap()
+        );
+        assert_eq!(projected["revision"], 7);
+        assert_eq!(projected["activation_id"], "evaluation");
+        assert!(projected.get("graph").is_none());
+        assert!(projected.get("delegation").is_none());
+        assert_eq!(
+            parse_context(json!({"output_only":true,"output_id":"worker-result","limit":1}))
+                .unwrap(),
+            parse_context(json!({"output_id":"worker-result","limit":1})).unwrap()
+        );
+        for invalid in [
+            json!({"output_only":true}),
+            json!({"output_only":true,"output_id":""}),
+            json!({"output_only":"true","output_id":"result"}),
+            json!({"output_only":true,"output_id":"result","delegation_only":true}),
+            json!({"output_only":true,"output_id":"result","delegation_part":"input"}),
+        ] {
+            assert!(parse_context(invalid).is_err());
+        }
+    }
+
+    #[test]
     fn context_navigation_preserves_independent_cursors_and_fetches_exact_outputs() {
         let mut context: bcode_workflow::WorkflowExecutionContext = serde_json::from_value(json!({
             "run_id":"run", "node_id":"source", "activation_id":"activation", "attempt":1,
@@ -1770,6 +1845,10 @@ mod tests {
             assert_eq!(next.after_edge_id, Some(91));
             assert_eq!(next.after_output_id.as_deref(), Some("worker.結果"));
             assert_eq!(next.output_id, None);
+            assert_eq!(
+                rendered["outputs"][0]["inspection_arguments"]["output_only"],
+                true
+            );
             let exact =
                 parse_context(rendered["outputs"][0]["inspection_arguments"].clone()).unwrap();
             assert_eq!(exact.output_id.as_deref(), Some("worker.結果"));

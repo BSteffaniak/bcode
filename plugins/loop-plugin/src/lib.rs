@@ -2328,7 +2328,7 @@ fn loop_workflow_spec(
         "loop.evaluation",
         bcode_workflow::NodeKind::Agent,
         serde_json::to_value(loop_agent_configuration::<LoopWorkflowEvaluation>(
-            "Read-only loop completion evaluation. Inspect repository/session state against stop_condition. For delegated coding work, inspect checksum-verified canonical worker outputs and actual integrated artifacts, not just worker summaries or coordinator completion. Identify the integrated target or revision, observed combined validation commands and outcomes, original criteria covered, unresolved work and retained workspaces in evidence. For coding delivery, populate the optional version-1 delivery report with canonical contribution output IDs you actually inspected, integrated targets, each original criterion and its observed status, combined check commands/workspaces/outcomes/evidence, retained workspaces and unresolved work. These references are claims, not verified receipts; never invent identities or infer validation from worker success. Omit delivery when no integrated target is inspectable; failed or unverified required criteria and unresolved work preclude condition_met. Missing provenance is unknown, and unverified required criteria or unresolved conflicts preclude completion. Preserve implementation_prompt, stop_condition, max_iterations, iteration, and judgement_evaluation unchanged. Return condition_met, external_blocker, non-empty concrete evidence, and a concise non-empty summary in the exact structured schema. Set external_blocker to none for useful incomplete work or verified completion. When progress requires an external approval, input, or dependency, report the matching blocker and identify the original request/dependency and authorized next action in evidence; do not infer associations from prose or treat this report as approval. A blocker parks the loop until explicit authorized workflow resume approval; that approval does not approve the underlying tool or resolve the external dependency. it does not poll or automatically resolve dependencies. A blocked result is not completion. If a judgement evaluator is selected, your condition_met is provisional: gather concrete bounded evidence for that evaluator; do not change its configuration.",
+            "Read-only loop completion evaluation. Inspect repository/session state against stop_condition. For delegated coding work, inspect checksum-verified canonical worker outputs and actual integrated artifacts, not just worker summaries or coordinator completion. Use workflow.execution_context compact discovery and the listed inspection_arguments for each contribution: output_only returns the exact verified value without unrelated graph/delegation payloads. Follow revision-pinned pages for discovery; missing or truncated output is not inspected evidence. Independently inspect the integrated artifact and observed combined checks; a marker file alone is not proof that the current artifact passes. Identify the integrated target or revision, observed combined validation commands and outcomes, original criteria covered, unresolved work and retained workspaces in evidence. For coding delivery, populate the optional version-1 delivery report with canonical contribution output IDs you actually inspected, integrated targets, each original criterion and its observed status, combined check commands/workspaces/outcomes/evidence, retained workspaces and unresolved work. These references are claims, not verified receipts; never invent identities or infer validation from worker success. Omit delivery when no integrated target is inspectable; failed or unverified required criteria and unresolved work preclude condition_met. Missing provenance is unknown, and unverified required criteria or unresolved conflicts preclude completion. Preserve implementation_prompt, stop_condition, max_iterations, iteration, and judgement_evaluation unchanged. Return condition_met, external_blocker, non-empty concrete evidence, and a concise non-empty summary in the exact structured schema. Set external_blocker to none for useful incomplete work or verified completion. When progress requires an external approval, input, or dependency, report the matching blocker and identify the original request/dependency and authorized next action in evidence; do not infer associations from prose or treat this report as approval. A blocker parks the loop until explicit authorized workflow resume approval; that approval does not approve the underlying tool or resolve the external dependency. it does not poll or automatically resolve dependencies. A blocked result is not completion. If a judgement evaluator is selected, your condition_met is provisional: gather concrete bounded evidence for that evaluator; do not change its configuration.",
             "plan",
             true,
         ))
@@ -2346,7 +2346,7 @@ fn loop_workflow_spec(
             "loop.blocked",
         ),
     );
-    let cycle = if input.judgement_evaluation.is_some() {
+    let cycle = {
         let block = judgement_evaluation::manifest_block();
         block.validate().map_err(|error| error.to_string())?;
         let schema = bcode_workflow::ValueSchema::of::<LoopWorkflowIteration>();
@@ -2373,15 +2373,6 @@ fn loop_workflow_spec(
                 bcode_workflow::field::<LoopWorkflowIteration>("condition_met").eq(false),
                 input.max_iterations,
             )
-    } else {
-        implementation
-            .agent_execution_target(bcode_workflow::PromptContextTarget::SharedParentSequential)
-            .then(evaluation)
-            .repeat_while(
-                "loop.repeat",
-                bcode_workflow::field::<LoopWorkflowIteration>("condition_met").eq(false),
-                input.max_iterations,
-            )
     };
     let mut definition = bcode_workflow::WorkflowBuilder::new(WORKFLOW_KIND, cycle)
         .build()
@@ -2394,10 +2385,7 @@ fn loop_workflow_spec(
         // Keep the admitted objective, limit and judgement policy pinned as well.
         if edge.from == "loop.blocked" {
             edge.transform = Some(judgement_evaluation::resume_input_transform());
-        } else if input.judgement_evaluation.is_some()
-            && edge.from == "loop.progress"
-            && edge.to == "loop.judgement.evaluate"
-        {
+        } else if edge.from == "loop.progress" && edge.to == "loop.judgement.evaluate" {
             edge.transform = Some(judgement_evaluation::pinned_input_transform());
         }
     }
@@ -3753,6 +3741,24 @@ mod tests {
         store
             .settle_pending_control_nodes("collaborating-goal", 10, 41)
             .unwrap();
+        let guard = store.pending_activations(10).unwrap().remove(0);
+        assert_eq!(guard.node_id, "loop.judgement.evaluate");
+        store
+            .persist_validated_output(&bcode_workflow_store::ValidatedOutput {
+                output_id: "guard-first".into(),
+                run_id: "collaborating-goal".into(),
+                node_id: guard.node_id,
+                activation_id: guard.activation_id,
+                schema_id: guard.node.output.type_name,
+                schema_version: 1,
+                value: guard.input.unwrap(),
+                artifact_reference: None,
+                created_at_ms: 41,
+            })
+            .unwrap();
+        store
+            .settle_pending_control_nodes("collaborating-goal", 10, 41)
+            .unwrap();
         let source = store.pending_activations(10).unwrap().remove(0);
         assert_eq!(source.node_id, "loop.implementation");
         store
@@ -4205,8 +4211,8 @@ mod tests {
             .expect("resume");
         let pending = store.pending_activations(10).unwrap();
         assert_eq!(pending.len(), 1);
-        assert_eq!(pending[0].node_id, "loop.implementation");
-        assert_eq!(pending[0].input.as_ref().unwrap()["iteration"], 2);
+        assert_eq!(pending[0].node_id, "loop.judgement.evaluate");
+        assert_eq!(pending[0].input.as_ref().unwrap()["iteration"], 1);
         let resumed: LoopWorkflowIteration =
             serde_json::from_value(pending[0].input.clone().unwrap()).unwrap();
         assert_eq!(resumed.implementation_prompt, blocked.implementation_prompt);
@@ -4651,7 +4657,10 @@ mod tests {
                 iterations
             );
             assert_eq!(request.limits.cycle_cap, iterations);
-            assert_eq!(request.limits.node_execution_cap, u64::from(iterations) * 8);
+            assert_eq!(
+                request.limits.node_execution_cap,
+                u64::from(iterations) * 12
+            );
             let encoded = serde_json::to_vec(&request).expect("encode");
             assert_eq!(
                 serde_json::from_slice::<PluginWorkflowStartRequest>(&encoded).expect("decode"),

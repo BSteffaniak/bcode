@@ -165,13 +165,13 @@ fn graph_allowance_counts_initialization_once_and_excludes_controls() {
     let input = LoopWorkflowInput::new("implement".into(), "done".into(), 2).unwrap();
     let plain = loop_workflow_spec(&input).unwrap();
     let goal = goal_workflow_spec(&input).unwrap();
-    assert_eq!(executable_node_count(plain.definition()).unwrap(), 2);
-    assert_eq!(executable_node_count(goal.definition()).unwrap(), 3);
+    assert_eq!(executable_node_count(plain.definition()).unwrap(), 3);
+    assert_eq!(executable_node_count(goal.definition()).unwrap(), 4);
     let mut revised = goal.definition().clone();
     let mut worker = revised.nodes["loop.implementation"].clone();
     worker.id = "worker".into();
     revised.nodes.insert(worker.id.clone(), worker);
-    assert_eq!(executable_node_count(&revised).unwrap(), 4);
+    assert_eq!(executable_node_count(&revised).unwrap(), 5);
 }
 
 #[test]
@@ -200,7 +200,7 @@ fn continuation_budgets_reachable_delegated_agents() {
     let continued = request(source, 3).expect("continue revised loop");
     assert_eq!(
         continued.successor.limits.node_execution_cap,
-        3 * 3 * retry_allowance
+        3 * 4 * retry_allowance
     );
     assert!(
         continued
@@ -279,7 +279,7 @@ fn continuation_preserves_prompts_and_skips_initialization() {
             ["loop.implementation"]
         );
         assert_eq!(request.successor.limits.cycle_cap, 3);
-        assert_eq!(request.successor.limits.node_execution_cap, 24);
+        assert_eq!(request.successor.limits.node_execution_cap, 36);
         assert!(
             !request
                 .successor
