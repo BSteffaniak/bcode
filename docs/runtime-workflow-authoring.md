@@ -1,5 +1,116 @@
 # Runtime workflow authoring architecture
 
+## Source-preserving integration
+
+Task-group workers and continuations may select `worktree_directory`, an absolute
+path to an existing registered worktree of the parent session's repository. Prompt
+configuration version 5 persists this choice; versions 2–4 upgrade only with the
+inherited workspace and reject an explicit worktree field. Fresh and fixed-generation
+sessions use the selected worktree; shared-parent execution rejects relocation.
+The host validates registration before session creation and checks recovered session
+workspace identity before continuing. Missing or foreign worktrees fail closed.
+This does not create a sandbox, grant tool permissions, create/clean up worktrees,
+or integrate contributions. Use ordinary authorized worktree operations first,
+explicit scheduler claims for shared locations, and inspect/verify integration.
+Omitting the field retains existing parent-workspace behavior. Assignment context
+includes the declared worktree but is not proof of contribution correctness.
+
+Workspace creation with `base_ref: "head"` resolves the invoking checkout's exact
+commit, including detached linked worktrees, before creation. `detach` changes
+branch ownership, not base selection. Unresolvable HEAD fails closed. This does
+not copy uncommitted work or pin later worker edits; authors still own contribution
+provenance and integration verification.
+
+Workspace cleanup uses the existing worktree service. Non-forced removal refuses
+uncommitted, ignored, or unverifiable files, regardless of Git's untracked-file
+display configuration. Detached contributions must first be retained by a branch,
+tag, or remote-tracking ref containing HEAD. Keeping a ref protects the contribution;
+it does not prove integration or verification. Explicit force remains destructive
+and must not be used as automatic cleanup for ambiguous worker outcomes.
+
+Task-group continuations and v2 result receipts receive the same normalized worker assignments: objectives, criteria, output schemas, agent profile, model selection, tool allowlist, timeout, context, workspace, read-only access, resource claims and dependency task IDs. Omitted model/timeout values remain null (normal resolution/defaults), not observed execution facts. These assignments help interpret contributions; they are not execution evidence. Resource claims coordinate scheduling and fresh contexts do not isolate files. Integration must inspect actual workspace state and independently verify the combined result.
+
+Task-group v2 accepts explicit `preserve_source_output: true` with
+`reconnect`. Omitted `include_source_output` derives `true` in this mode; explicit
+`false` rejects rather than weakening preservation. `continuation.output` must equal
+the source input schema.
+Omit `continuation.output` in this mode to derive it deterministically from `input`;
+explicit null or incompatible schemas still reject. Other modes require an output.
+Lowering uses the existing host `PreserveInput` prompt policy and a typed reconnect
+transform selecting `source` from the named envelope. Integration can perform
+authorized work and verification without recreating protected goal state. The
+downstream evaluator, not continuation settlement, determines completion. Corrective
+delegation may copy an existing current-input source-only selection into
+`reconnect.transform`; lowering prefixes that selection for the new envelope.
+Unsupported transforms fail closed rather than being silently overwritten.
+
+V2 accepts `worker_defaults` for repeated `agent_profile`, `context`,
+`model_selection`, `timeout_ms`, shared `acceptance_criteria` and a typed `output`
+schema. Use `worker_defaults.output` to declare a common contribution/evidence contract
+once; omitted worker outputs inherit it, while explicit schemas override it. Explicit
+null rejects rather than selecting the bounded fallback. A schema describes evidence,
+not proof of success. Explicit worker fields override by presence,
+not truthiness; normal typed validation still applies. An explicit criteria array
+replaces, rather than appends to, the defaults (including an empty array). Defaults
+never apply to integration. Access, resource claims, tools, identities and objectives
+remain task-specific; unsupported default keys and v1 defaults reject. Expansion
+is deterministic before staging and exact-request publication replay.
+
+V2 also accepts opt-in `generated_ids: true`: omit `join_id` and
+`continuation.task_id`. Lowering derives those mechanical identities from the exact
+UTF-8 mutation identity using hexadecimal encoding; explicit worker IDs remain the
+semantic result keys. V2 staging receipts expose generated identities in `node_ids`
+and omit the redundant expanded `edit`; legacy task receipts retain `edit`.
+V2 receipts also include `result_mapping`: the normalized `continuation_id`, ordered
+`workers` with exact `task_id`, `input_path` key arrays, normalized `output` schemas
+and `acceptance_criteria`, plus requested `context`, `worktree_directory`, `read_only`,
+normalized `resources` and `depends_on`; optional `source_path`
+(null when absent), and `preserves_source_output`. `reconnect` is null without a
+successor; otherwise it contains the exact lowered edge ID, successor node ID and
+transform, including composed source preservation. The same successor is supplied
+to the integrator's prompt. Before corrective reuse, verify it against a revision-pinned
+execution-context read: it describes the authored candidate, not current graph state.
+This avoids rebuilding nested source selectors without hiding reconciliation or
+publication authorization. Key arrays avoid ambiguous dotted
+paths for Unicode or punctuation in worker IDs. Continuation assignment metadata uses
+these same `input_path` arrays in both positional v1 and named v2 groups: string
+segments are literal keys and integer segments are array indices from the entire
+continuation input. Missing paths are missing evidence, not successful empty results.
+This derived description is neither
+canonical execution state nor evidence that any worker succeeded. Receipt mapping and
+candidate lowering share one normalized request; mapping is returned only after its
+candidate matches the application-admitted edit, including topology validation.
+Both permission preparation and invocation perform the same deterministic lowering.
+Task staging receipts include bounded `publication_arguments` containing a versioned
+candidate reference (run, mutation, revision and SHA-256 of the complete serialized edit).
+The application authenticates the active execution, resolves the retained candidate,
+checks the complete binding, then authorizes publication using the full canonical edit.
+Pass those arguments to
+`workflow.publish_run_graph_edit` under separate authorization rather than rebuilding
+the graph edit. This is explanatory output, not a publication or authority token.
+Identical retries must retain the original request and mutation identity; collisions
+still reject canonically. Legacy explicit-ID requests remain supported. Neither
+convenience grants execution authority or establishes integrated verification evidence.
+
+Corrective reconnection after a repeat may target a node whose older generations
+have already settled. Publication requires the replaced edge's explicitly retained
+active source to establish the later dependency generation, and rejects any active,
+unknown, same-generation or newer target admission. Historical outcomes remain
+unchanged; this permits future evaluation, not replay of a completed activation.
+
+## Revision-pinned edge allocation advice
+
+Graph inspection, including authenticated `workflow.execution_context`, exposes
+`graph.next_edge_id`: the first edge identity above all identities ever used by
+the run, including retired edges outside the bounded page. The indexed lookup
+shares the page snapshot and does not scan or reserve the graph. Coordinators
+use it as task-group `first_edge_id` with the observed revision; concurrent
+publication still conflicts normally. Absence means unknown (older sender) or
+identity-space exhaustion, not permission to guess from a partial page. Range
+overflow and collisions still reject during canonical edit validation. This
+removes edge-watermark bookkeeping, not node naming, explicit reconciliation,
+or the current multi-page publication limitation.
+
 ## Delegation prerequisite inspection
 
 The typed client `workflow_delegation_preflight(plugin_id)` reads the matching daemon's loaded
@@ -126,6 +237,14 @@ New, changed or deleted controllers/control edges still fail this publication pr
 controller incident edges must remain identical, including no added incident edges. Validation coverage
 includes an unchanged repeat definition; full goal-loop delegation execution remains unverified.
 
+Connected publication permits typed transforms on direct edges using canonical transform
+validation and runtime evaluation. This is required by v2 named task-group results and
+source-preserving corrective delegation. Controller incident edges and non-direct edges
+remain unchanged; transformed dependencies do not bypass admitted-target reconciliation.
+A goal-generation → plugin-lowering → store regression covers two workers followed by a
+second corrective group and verifies the original evaluator input. Agent outputs and host
+admission are simulated; daemon, permission, live-model and filesystem acceptance remain open.
+
 Connected graph publication now permits `WorkflowCall` nodes through the existing
 child dispatcher. Added/replaced call nodes must resolve an available exact target
 and match its input/output interfaces before publication commits; this validation
@@ -143,6 +262,11 @@ reference siblings, including goal judgement configuration, under an explicit ex
 Task-group worker and source-context joins share the workflow-domain helper. Unsupported recursive
 references, resource identifiers and dynamic references reject rather than weakening constraints.
 Existing persisted schemas are not rewritten or repaired by this change.
+
+Task-group lowering validates worker and integrator prompt configurations before producing
+permission-preparation candidates. Invalid worktree paths, shared-parent relocation, zero
+timeouts and blank tool entries reject before staging; registered-worktree membership and
+execution authority remain application-time checks.
 
 Task groups accept optional `dependencies`, mapping a worker task ID to one predecessor worker
 in the same group. Dependent workers consume predecessor output; only roots consume group/source
@@ -183,6 +307,21 @@ requires equality with the retained candidate and separate publication authoriza
 requests or incompatible lowering cannot silently replace the staged edit. Older plugin artifacts
 reject this representation; callers must not assume support across versions.
 
+For coordination reads, `workflow.execution_context` accepts `compact:true`: the
+plugin presents `graph.node_ids` and `node_definitions_omitted:true` instead of full
+node definitions. It omits edge transforms (`edge_transforms_omitted:true`) and
+lists output identity, node and checksum rather than values (`output_values_omitted:true`).
+Authenticated identity, revision, allocation advice, edge endpoints and pagination
+flags are unchanged. Each compact edge includes `inspection_arguments`: exact
+revision-pinned, noncompact one-edge read arguments for `workflow.execution_context`.
+Use these before copying a successor transform for corrective reconnection; omission
+from compact presentation never means the edge has no transform. Revision conflicts
+require fresh discovery, not guessed or remembered transforms. These read arguments
+confer no publication authority. Read normal revision-pinned pages for executable definitions;
+request an exact `output_id` to retrieve its value. Explicitly requested outputs are
+not shortened by compact presentation. Large pages or requested outputs may still
+exceed the model's tool-output budget; truncated results are not complete JSON.
+
 `workflow.execution_context` accepts `{}` for its initial page, defaulting to 50
 items. Explicit limits remain 1–100; null, invalid limits and unknown fields reject.
 The plugin normalizes this default during both preparation and invocation; the
@@ -195,12 +334,26 @@ Legacy `edit_json` remains supported; supplying both or unknown envelope fields
 rejects. Canonical validation, preparation matching and separate publication authorization
 remain unchanged. This does not automate coordinator handoff.
 
-`workflow.stage_task_group` uses request `version: 1`; omission means the initial v1
-representation. Unsupported versions, null/string versions and unknown fields reject before
+`workflow.stage_task_group` supports request versions 1 and 2; omission retains the initial v1
+representation and exact replay. Version 2 deterministically transforms the final join into
+`{results: {task_id: value}}`, with `source` containing the canonical source output when
+`include_source_output` is enabled. Exact task IDs (including dots and Unicode) are object keys,
+not paths. Required member schemas retain local-reference constraints; missing or malformed
+results fail closed. Both goal coordination prompts request v2. This removes positional-result
+bookkeeping, not explicit edge allocation, reconciliation or publication authorization. Canonical
+goal fields still require preservation in continuation output; named input is not a protected-state
+merge or proof of completion. The positional mapping described below remains the internal join
+representation and v1 continuation input.
+Unsupported versions, null/string versions and unknown fields reject before
 staging. It stages workers, ordered joins, and a
 continuation in one canonical edit. `failure_policy` defaults to `wait_all`; `fail_fast` selects
 canonical cooperative sibling cancellation on every generated result/context join. It does not
-undo effects or imply immediate cancellation. Prompts default to read-only; explicit `read_only: false`
+undo effects or imply immediate cancellation. Once every member is terminal, each side must have
+at least one completed result: skipped alternatives are allowed, but an entirely skipped side
+settles as failure under either policy. Successful sibling outputs remain durable; a missing-result
+join does not dispatch its integration continuation or fabricate a tuple. This is failure reporting,
+not automatic corrective delegation or retry.
+Prompts default to read-only; explicit `read_only: false`
 declares mutating capability without granting execution authority. Workflow ceilings, selected
 agent policy and tool permission decisions still apply. Publication rejects added/replaced Agent
 and PluginBlock nodes whose declared capability exceeds the run ceiling, even after staging
@@ -238,7 +391,15 @@ or automatically establish completion. Both workers and the continuation accept 
 Prompts may also declare canonical `resources` (`resource` and `read`/`write` access). These
 scheduler claims are preserved on worker/continuation nodes, do not grant tool authority, and
 are not filesystem isolation; an exclusive claim alone does not enable mutations.
-Omitting resources declares no claims. Optional positive `timeout_ms` and `tool_allowlist` lower
+Omitting resources declares no claims unless the group supplies `workspace_resource`.
+This opt-in shared scheduler identity adds read claims for read-only workers and the
+continuation, and write claims for mutating ones. Existing stronger claims are preserved.
+Matching writers serialize against readers and writers through the canonical scheduler;
+read-only workers can still overlap. Use the same identity for all cooperating work.
+This is not filesystem isolation, path confinement, cross-run locking, or permission to
+mutate. It does not protect against unrelated editors or resolve conflicting contributions;
+isolated worktrees and explicit integration remain separate authorable choices.
+Optional positive `timeout_ms` and `tool_allowlist` lower
 to canonical prompt constraints; omission retains the prompt timeout and normal agent tool
 selection. An allowlist never grants tool permission, and a task timeout never extends run limits.
 Publication remains separate. This
@@ -246,6 +407,31 @@ adds independent entries only when no source is selected. Optional `reconnect: {
 replaces the selected existing edge with continuation → successor and makes the continuation
 non-exit. It requires a source selection and explicit active-work reconciliation; publication
 validates the candidate against actual edges and schemas. Other successors remain unchanged.
+For v2, optional `bind_source_activation` explicitly consents to retain that activation and
+bind its output to every generated edge from `source_node_id`, including source-context
+aggregation but excluding worker-to-worker dependencies. The plugin computes edge identities
+in the exact canonical batch before permission preparation. Do not also list that activation
+in `reconciliation`; conflicting dispositions are rejected. Other affected activations still
+need explicit reconciliation. Optional v2 `retain_source_edge_ids` lists caller-selected existing
+source bindings to combine with generated bindings. It requires `bind_source_activation` and
+rejects duplicates, generated IDs and the replaced reconnect edge. Inspect every relevant
+revision-pinned edge page: this list is explicit retention intent, not a claim that a partial
+page is complete. Canonical staging validates the exact set against actual graph state.
+Omitting the list preserves generated-only behavior. Omission of `bind_source_activation`
+grants no bindings; v1 rejects this convenience.
+Canonical staging still verifies source ownership and schema compatibility, and publication
+remains separately authorized. This does not allocate graph identities or auto-select a successor.
+
+An optional `reconnect.transform` carries a typed canonical `WorkflowTransform` onto the
+replacement edge in either request version. Callers must explicitly retain any required
+state-protection transform; omission keeps the legacy untransformed behavior. Exact replay
+includes the transform, and normal publication validates its compatibility. This does not
+infer the original edge or automatically protect goal state.
+With v2 `preserve_source_output`, an existing current-input selection whose path contains
+only `source` segments is composed beneath the new envelope's `source`. This allows corrective
+delegation to retain the original goal state without model reconstruction. Copy the existing
+transform exactly and use the current continuation's output schema as the next group's input
+and declared continuation output. Other transforms and unknown versions reject in this mode.
 This tool does not yield the current turn or wire
 itself into the goal loop. Existing admission and run allowances remain authoritative.
 

@@ -198,9 +198,14 @@ pub fn create_worktree(
 
 /// Remove a registered worktree without deleting its branch.
 ///
+/// Without `force`, refuses dirty (including ignored), unverifiable, or unreferenced
+/// work. A detached HEAD must be retained by a branch, tag, or remote-tracking ref.
+/// Retention protects the contribution; it does not assert integration or verification.
+///
 /// # Errors
 ///
-/// Returns an error when repository discovery or removal fails.
+/// Returns an error when repository discovery or removal fails, the target is the
+/// main worktree, or safe removal cannot be established without explicit force.
 pub fn remove_worktree(
     cwd: &Path,
     path: &Path,
@@ -226,11 +231,21 @@ pub fn remove_worktree(
             "refusing to remove the main worktree".to_string(),
         ));
     }
-    if !force && worktree_is_dirty(path) {
-        return Err(WorktreeError::RemoveRefused(format!(
-            "{} has uncommitted changes; use force to remove it",
-            display_from_current_dir(path)
-        )));
+    if !force {
+        if worktree_is_dirty(path) {
+            return Err(WorktreeError::RemoveRefused(format!(
+                "{} has uncommitted, ignored or unverifiable work; use force to remove it",
+                display_from_current_dir(path)
+            )));
+        }
+        // Detached worker commits have no branch retained by removal. Require a
+        // durable ref containing HEAD before discarding the checkout; do not count
+        // another worktree's HEAD or reflog as retained contribution ownership.
+        if !worktree_head_is_retained(path) {
+            return Err(WorktreeError::RemoveRefused(
+                "HEAD is not verifiably retained by a branch or tag; retain the contribution before removal, or explicitly use force".to_string(),
+            ));
+        }
     }
     setup_remove_worktree(&repo, path, force)?;
     Ok(WorktreeRemoveResponse {
@@ -293,17 +308,15 @@ fn branch_ref_for_create(
     cwd: &Path,
     repo_root: &Path,
 ) -> Result<Option<String>, WorktreeError> {
-    if request.detach {
-        return Ok(None);
-    }
     if request.branch.is_some() {
         return Ok(branch.map(ToString::to_string));
     }
+    // Detachment controls branch ownership, not the selected base commit.
     match base_ref {
-        WorktreeBaseRef::Head => Ok(current_head_ref(cwd)),
+        WorktreeBaseRef::Head => current_head_ref(cwd).map(Some),
         WorktreeBaseRef::DefaultBranch => Ok(Some(default_branch_ref(repo_root)?)),
         WorktreeBaseRef::Auto => default_branch_ref(repo_root).map_or_else(
-            |_| Ok(current_head_ref(cwd)),
+            |_| current_head_ref(cwd).map(Some),
             |default_branch| Ok(Some(default_branch)),
         ),
     }
@@ -327,12 +340,46 @@ fn default_branch_ref(repo_root: &Path) -> Result<String, WorktreeError> {
     })
 }
 
-fn current_head_ref(cwd: &Path) -> Option<String> {
-    run_git(cwd, &["rev-parse", "--abbrev-ref", "HEAD"]).filter(|value| value != "HEAD")
+fn current_head_ref(cwd: &Path) -> Result<String, WorktreeError> {
+    // Resolve the invoking checkout, including detached linked worktrees. Passing
+    // no ref delegates base selection to another repository handle's HEAD; passing
+    // a branch name allows that ref to move between selection and creation.
+    run_git(cwd, &["rev-parse", "--verify", "HEAD^{commit}"]).ok_or_else(|| {
+        WorktreeError::InvalidRequest("current HEAD commit could not be resolved".to_string())
+    })
 }
 
 fn worktree_is_dirty(cwd: &Path) -> bool {
-    run_git(cwd, &["status", "--porcelain"]).is_some_and(|status| !status.trim().is_empty())
+    // Cleanup must fail closed: an unavailable status is not evidence that user
+    // work is absent. Include ignored files and override status configuration so
+    // generated artifacts and untracked contributions are not silently deleted.
+    run_git(
+        cwd,
+        &[
+            "status",
+            "--porcelain",
+            "--untracked-files=all",
+            "--ignored",
+            "--ignore-submodules=none",
+        ],
+    )
+    .is_none_or(|status| !status.trim().is_empty())
+}
+
+fn worktree_head_is_retained(cwd: &Path) -> bool {
+    run_git(
+        cwd,
+        &[
+            "for-each-ref",
+            "--contains=HEAD",
+            "--format=%(refname)",
+            "--count=1",
+            "refs/heads/",
+            "refs/tags/",
+            "refs/remotes/",
+        ],
+    )
+    .is_some_and(|refs| !refs.is_empty())
 }
 
 fn run_git(cwd: &Path, args: &[&str]) -> Option<String> {
@@ -556,6 +603,82 @@ mod tests {
     }
 
     #[test]
+    fn head_base_preserves_detached_linked_checkout_provenance() {
+        let repo = TempRepo::init();
+        let workspaces = tempfile::tempdir().expect("workspace root");
+        let source = workspaces.path().join("source");
+        run(
+            &repo.root,
+            &["worktree", "add", "--detach", source.to_str().unwrap()],
+        );
+        std::fs::write(source.join("contribution.txt"), "worker contribution\n").unwrap();
+        run(&source, &["add", "contribution.txt"]);
+        run(&source, &["commit", "-m", "detached contribution"]);
+        let expected = super::current_head_ref(&source).unwrap();
+        assert_ne!(expected, super::current_head_ref(&repo.root).unwrap());
+        // Uncommitted user work must neither be lost nor implicitly copied.
+        std::fs::write(source.join("user.txt"), "uncommitted\n").unwrap();
+        for detached in [false, true] {
+            let mut request = create_request(if detached { "detached" } else { "branched" });
+            request.path = Some(workspaces.path().join(&request.name));
+            request.base_ref = Some(bcode_worktree_models::WorktreeBaseRef::Head);
+            request.detach = detached;
+            request.no_setup = true;
+            let response =
+                create_worktree(&bcode_config::BcodeConfig::default(), &request, &source)
+                    .expect("create from exact detached source HEAD");
+            assert_eq!(super::current_head_ref(&response.path).unwrap(), expected);
+            assert_eq!(
+                std::fs::read_to_string(response.path.join("contribution.txt")).unwrap(),
+                "worker contribution\n"
+            );
+            assert!(!response.path.join("user.txt").exists());
+        }
+        assert_eq!(
+            std::fs::read_to_string(source.join("user.txt")).unwrap(),
+            "uncommitted\n"
+        );
+    }
+
+    #[test]
+    fn head_base_is_pinned_before_source_branch_moves() {
+        let repo = TempRepo::init();
+        let mut request = create_request("pinned");
+        request.base_ref = Some(bcode_worktree_models::WorktreeBaseRef::Head);
+        let pinned = super::branch_ref_for_create(
+            &request,
+            Some("pinned"),
+            bcode_worktree_models::WorktreeBaseRef::Head,
+            &repo.root,
+            &repo.root,
+        )
+        .unwrap()
+        .unwrap();
+        run(&repo.root, &["commit", "--allow-empty", "-m", "advance"]);
+        assert_ne!(pinned, super::current_head_ref(&repo.root).unwrap());
+        let destination = tempfile::tempdir().unwrap();
+        let checkout = destination.path().join("pinned");
+        run(
+            &repo.root,
+            &[
+                "worktree",
+                "add",
+                "--detach",
+                checkout.to_str().unwrap(),
+                &pinned,
+            ],
+        );
+        assert_eq!(super::current_head_ref(&checkout).unwrap(), pinned);
+    }
+
+    #[test]
+    fn head_base_rejects_unborn_checkout() {
+        let repo = tempfile::tempdir().unwrap();
+        run(repo.path(), &["init", "--initial-branch", "main"]);
+        assert!(super::current_head_ref(repo.path()).is_err());
+    }
+
+    #[test]
     fn registered_worktree_validation_rejects_arbitrary_directory() {
         let repo = TempRepo::init();
         let arbitrary = tempfile::tempdir().expect("arbitrary directory");
@@ -767,9 +890,86 @@ mod tests {
         let error = remove_worktree(&repo.root, &response.path, false)
             .expect_err("dirty worktree removal should be refused");
 
-        assert!(error.to_string().contains("uncommitted changes"));
+        assert!(error.to_string().contains("uncommitted"));
         remove_worktree(&repo.root, &response.path, true)
             .expect("forced dirty worktree removal should succeed");
+    }
+
+    #[test]
+    fn detached_contribution_requires_retained_ref_before_cleanup() {
+        let repo = TempRepo::init();
+        let mut request = create_request("Detached Contribution");
+        request.detach = true;
+        let response = create_worktree(&bcode_config::BcodeConfig::default(), &request, &repo.root)
+            .expect("detached worktree");
+        std::fs::write(response.path.join("result.txt"), "worker result\n").expect("result");
+        run(&response.path, &["add", "result.txt"]);
+        run(&response.path, &["commit", "-m", "worker contribution"]);
+
+        let error = remove_worktree(&repo.root, &response.path, false)
+            .expect_err("unreferenced contribution must survive");
+        assert!(error.to_string().contains("retain the contribution"));
+        assert_eq!(
+            std::fs::read_to_string(response.path.join("result.txt")).expect("preserved result"),
+            "worker result\n"
+        );
+
+        run(&response.path, &["branch", "retained-contribution"]);
+        remove_worktree(&repo.root, &response.path, false).expect("retained contribution cleanup");
+        let output = Command::new("git")
+            .args(["show", "retained-contribution:result.txt"])
+            .current_dir(&repo.root)
+            .output()
+            .expect("read retained result");
+        assert!(output.status.success());
+        assert_eq!(output.stdout, b"worker result\n");
+    }
+
+    #[test]
+    fn remove_worktree_preserves_ignored_and_hidden_untracked_contributions() {
+        for ignored in [false, true] {
+            let repo = TempRepo::init();
+            run(&repo.root, &["config", "status.showUntrackedFiles", "no"]);
+            if ignored {
+                std::fs::write(repo.root.join(".gitignore"), "contribution.txt\n")
+                    .expect("ignore rule");
+                run(&repo.root, &["add", ".gitignore"]);
+                run(
+                    &repo.root,
+                    &["commit", "-m", "ignore generated contribution"],
+                );
+            }
+            let response = create_worktree(
+                &bcode_config::BcodeConfig::default(),
+                &create_request("Retain Contribution"),
+                &repo.root,
+            )
+            .expect("worktree");
+            let contribution = response.path.join("contribution.txt");
+            std::fs::write(&contribution, "unintegrated worker result\n").expect("contribution");
+
+            remove_worktree(&repo.root, &response.path, false)
+                .expect_err("cleanup must preserve contributions");
+
+            assert_eq!(
+                std::fs::read_to_string(contribution).expect("retained contribution"),
+                "unintegrated worker result\n"
+            );
+            assert!(
+                list_worktrees(&repo.root)
+                    .expect("registered worktrees")
+                    .worktrees
+                    .iter()
+                    .any(|worktree| worktree.path == response.path)
+            );
+        }
+    }
+
+    #[test]
+    fn unavailable_worktree_status_is_not_clean() {
+        let temp = TempDir::new().expect("directory without repository");
+        assert!(super::worktree_is_dirty(temp.path()));
+        assert!(super::worktree_is_dirty(&temp.path().join("missing")));
     }
 
     #[test]

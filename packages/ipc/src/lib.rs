@@ -6307,6 +6307,7 @@ mod tests {
     async fn graph_inspection_preserves_selected_edge_revision_across_frames() {
         let graph = WorkflowRunGraphInspection {
             revision: 3,
+            next_edge_id: Some(8),
             nodes: Vec::new(),
             edges: vec![WorkflowRunGraphEdgeInspection {
                 revision: 2,

@@ -55,6 +55,72 @@ mod reconciliation_tests {
     }
 
     #[test]
+    fn repeated_target_requires_settled_older_generation() {
+        let root = tempfile::tempdir().unwrap();
+        let store = WorkflowStore::open_in_state_dir(root.path()).unwrap();
+        store.connection.execute_batch(
+            "CREATE TEMP TABLE workflow_activations
+             (run_id TEXT, node_id TEXT, activation_id TEXT, status TEXT, dependency_generation INTEGER);
+             INSERT INTO workflow_activations VALUES ('run', 'source', 'source-1', 'running', 1);
+             INSERT INTO workflow_activations VALUES ('run', 'target', 'target-0', 'completed', 0);",
+        ).unwrap();
+        let edge = EdgeDefinition {
+            from: "source".into(),
+            to: "target".into(),
+            kind: bcode_workflow::EdgeKind::Direct,
+            transform: None,
+        };
+        let mut request = bcode_workflow::WorkflowRunGraphEditBatch {
+            version: bcode_workflow::WORKFLOW_RUN_GRAPH_EDIT_VERSION,
+            run_id: "run".into(),
+            mutation_id: "edit".into(),
+            expected_revision: 1,
+            edits: vec![],
+            reconciliation: vec![],
+        };
+        assert!(
+            !store
+                .target_is_only_from_prior_generations(&request, &edge)
+                .unwrap()
+        );
+        request.reconciliation.push(
+            bcode_workflow::WorkflowRunGraphReconciliation::RetainWithBindings {
+                activation_id: "source-1".into(),
+                edge_ids: vec![1],
+            },
+        );
+        assert!(
+            store
+                .target_is_only_from_prior_generations(&request, &edge)
+                .unwrap()
+        );
+        for (status, generation) in [
+            ("pending", 0),
+            ("running", 0),
+            ("waiting_approval", 0),
+            ("waiting_input", 0),
+            ("waiting_mutation_approval", 0),
+            ("unknown", 0),
+            ("completed", 1),
+            ("completed", 2),
+        ] {
+            store.connection.execute("UPDATE workflow_activations SET status = ?1, dependency_generation = ?2 WHERE node_id = 'target'", (status, generation)).unwrap();
+            assert!(
+                !store
+                    .target_is_only_from_prior_generations(&request, &edge)
+                    .unwrap(),
+                "{status}/{generation}"
+            );
+        }
+        store.connection.execute_batch("UPDATE workflow_activations SET dependency_generation = 0 WHERE node_id = 'target'; UPDATE workflow_activations SET status = 'completed' WHERE node_id = 'source';").unwrap();
+        assert!(
+            !store
+                .target_is_only_from_prior_generations(&request, &edge)
+                .unwrap()
+        );
+    }
+
+    #[test]
     fn affected_dependencies_follow_current_and_new_edges_without_looping() {
         let edge = |from: &str, to: &str| EdgeDefinition {
             from: from.to_string(),
@@ -622,6 +688,22 @@ impl WorkflowStore {
             })?;
         ensure_run_accepts_graph_edits(transaction, run_id)?;
         validate_reconciliation_targets(transaction, &request)?;
+        // Node-local errors must not be hidden behind the graph paging boundary.
+        // Global structure and execution reconciliation still require validation below.
+        for edit in &request.edits {
+            match edit {
+                bcode_workflow::WorkflowRunGraphEdit::AddNode { node, .. }
+                | bcode_workflow::WorkflowRunGraphEdit::ReplaceNode { node, .. } => node
+                    .validate_structure()
+                    .map_err(|error| WorkflowStoreError::InvalidData(error.to_string()))?,
+                bcode_workflow::WorkflowRunGraphEdit::AddEdge { edge, .. }
+                | bcode_workflow::WorkflowRunGraphEdit::ReplaceEdge { edge, .. } => edge
+                    .validate_structure()
+                    .map_err(|error| WorkflowStoreError::InvalidData(error.to_string()))?,
+                bcode_workflow::WorkflowRunGraphEdit::RemoveNode { .. }
+                | bcode_workflow::WorkflowRunGraphEdit::RemoveEdge { .. } => {}
+            }
+        }
         let page = self.current_run_graph_page(
             run_id,
             Some(request.expected_revision),
@@ -1165,9 +1247,10 @@ impl WorkflowStore {
                 return Err(invalid());
             }
         }
-        for previous in original_edges.iter().filter(|record| {
-            record.edge.kind != bcode_workflow::EdgeKind::Direct || record.edge.transform.is_some()
-        }) {
+        for previous in original_edges
+            .iter()
+            .filter(|record| record.edge.kind != bcode_workflow::EdgeKind::Direct)
+        {
             if edges.get(&previous.edge_id) != Some(&previous.edge) {
                 return Err(invalid());
             }
@@ -1257,7 +1340,7 @@ impl WorkflowStore {
         for (edge_id, edge) in &edges {
             let (source, _) = nodes.get(&edge.from).ok_or_else(invalid)?;
             let (target, entry) = nodes.get(&edge.to).ok_or_else(invalid)?;
-            if edge.kind != bcode_workflow::EdgeKind::Direct || edge.transform.is_some() {
+            if edge.kind != bcode_workflow::EdgeKind::Direct {
                 let previous = self
                     .current_run_graph_edge(&request.run_id, *edge_id)?
                     .ok_or_else(invalid)?;
@@ -1274,7 +1357,14 @@ impl WorkflowStore {
                 }
                 continue;
             }
-            if (target.kind != bcode_workflow::NodeKind::Parallel && source.output != target.input)
+            // Typed direct transforms use the same canonical validation and runtime
+            // evaluation as authored edges. They do not exempt an admitted target
+            // from retention or permit changes to controller incident edges.
+            let output = edge
+                .transform
+                .as_ref()
+                .map_or(&source.output, |value| &value.output);
+            if (target.kind != bcode_workflow::NodeKind::Parallel && *output != target.input)
                 || *entry
             {
                 return Err(invalid());
@@ -1323,6 +1413,11 @@ impl WorkflowStore {
             .current_run_graph_edge(&request.run_id, edge_id)?
             .ok_or_else(invalid)?;
         if previous.edge != *edge {
+            if previous.edge.to == edge.to
+                && self.target_is_only_from_prior_generations(request, &previous.edge)?
+            {
+                return Ok(());
+            }
             return Err(invalid());
         }
         // Retention validation already proves that active executable revisions are
@@ -1362,6 +1457,49 @@ impl WorkflowStore {
             return Err(invalid());
         }
         Ok(())
+    }
+
+    // Reconnecting an evaluator after a repeat must not mistake a settled older
+    // generation for the future target. The replaced edge's explicitly retained
+    // active source proves the generation; node identity alone grants no reuse.
+    fn target_is_only_from_prior_generations(
+        &self,
+        request: &bcode_workflow::WorkflowRunGraphEditBatch,
+        previous: &EdgeDefinition,
+    ) -> Result<bool, WorkflowStoreError> {
+        let mut generation = None;
+        for disposition in &request.reconciliation {
+            let bcode_workflow::WorkflowRunGraphReconciliation::RetainWithBindings {
+                activation_id,
+                ..
+            } = disposition
+            else {
+                continue;
+            };
+            let source = self.connection.query_row(
+                "SELECT dependency_generation FROM workflow_activations
+                 WHERE run_id = ?1 AND node_id = ?2 AND activation_id = ?3
+                 AND status IN ('pending', 'running', 'waiting_input', 'waiting_approval', 'waiting_mutation_approval')",
+                (&request.run_id, &previous.from, activation_id),
+                |row| row.get::<_, u64>(0),
+            ).optional()?;
+            if let Some(source) = source
+                && generation.replace(source).is_some()
+            {
+                return Ok(false);
+            }
+        }
+        let Some(generation) = generation else {
+            return Ok(false);
+        };
+        let unsafe_target: bool = self.connection.query_row(
+            "SELECT EXISTS(SELECT 1 FROM workflow_activations
+             WHERE run_id = ?1 AND node_id = ?2
+             AND (dependency_generation >= ?3 OR status NOT IN ('completed', 'failed', 'cancelled', 'skipped')))",
+            (&request.run_id, &previous.to, generation),
+            |row| row.get(0),
+        )?;
+        Ok(!unsafe_target)
     }
 
     /// Durably stage a live graph edit without publishing executable topology.
@@ -3176,6 +3314,9 @@ fn edge_cursor(after_edge_id: Option<u64>) -> Result<i64, WorkflowStoreError> {
 pub struct RunGraphPage {
     /// Committed graph revision shared by every field.
     pub revision: u64,
+    /// First unused edge identity across current and retired rows, or exhausted.
+    #[serde(default)]
+    pub next_edge_id: Option<u64>,
     /// Current node representations in identity order.
     pub nodes: Vec<RunGraphNode>,
     /// Current edges in identity order.
@@ -3279,11 +3420,27 @@ impl WorkflowStore {
             .is_empty(),
             None => true,
         };
+        // The primary key starts with (run_id, edge_id), so this lookup stays
+        // bounded independently of graph size and includes retired identities.
+        let last_edge: Option<i64> = self
+            .connection
+            .query_row(
+                "SELECT edge_id FROM workflow_run_graph_edges WHERE run_id = ?1
+             ORDER BY edge_id DESC LIMIT 1",
+                [run_id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        let next_edge_id = last_edge.map_or(Some(0), |last| {
+            last.checked_add(1)
+                .and_then(|next| u64::try_from(next).ok())
+        });
         if let Some(transaction) = transaction {
             transaction.commit()?;
         }
         Ok(RunGraphPage {
             revision,
+            next_edge_id,
             nodes,
             edges,
             nodes_complete,

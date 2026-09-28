@@ -14,6 +14,20 @@ candidate against all execution state, publish topology, cancel activations, or 
 A staged candidate is not permission to execute it. General live-edit publication remains incomplete;
 do not expect this command alone to change the running plan. Draft authoring remains separate.
 
+## Explicit execution allowance grants
+
+Inspect a run's `execution_allowance` before granting more attempts. An operator can use
+`bcode workflow increase-allowance --run-id RUN --expected-cap CURRENT --target-cap HIGHER`.
+This uses the existing application/client run-control boundary and verified execution ownership.
+It changes only the run-local cap; a composition-root cap may separately require an explicit grant.
+Stale expectations, terminal/cancelled runs, recovery-only state and unverifiable owners fail closed.
+Exact retries are idempotent. The response's `changed` flag reports a persisted grant, not completion.
+
+The grant neither resumes a paused run nor dispatches work. Use the existing resume action separately
+when appropriate. Existing attempts and outputs are preserved. This operator action is not exposed as
+an agent delegation tool and does not authorize an agent to grant itself resources. Exhausted terminal
+repeat loops still use the distinct checkpoint/successor continuation path.
+
 ## Pause, resume, and binding conflicts
 
 Full run inspection verifies linked execution-session summaries in the selected session store.

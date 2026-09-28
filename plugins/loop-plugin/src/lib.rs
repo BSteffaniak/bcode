@@ -277,11 +277,15 @@ fn control_associated_workflow_run(
 fn terminal_workflow_control_message(
     run: &bcode_workflow_store::WorkflowRunSummary,
 ) -> Option<String> {
+    if run.status == bcode_workflow_store::RunStatus::Failed {
+        return Some(format!(
+            "loop workflow {} failed; inspect the failed node in /workflow and retry only after reviewing its effects and retry eligibility; starting a new goal may repeat completed work",
+            run.run_id
+        ));
+    }
     matches!(
         run.status,
-        bcode_workflow_store::RunStatus::Completed
-            | bcode_workflow_store::RunStatus::Failed
-            | bcode_workflow_store::RunStatus::Cancelled
+        bcode_workflow_store::RunStatus::Completed | bcode_workflow_store::RunStatus::Cancelled
     )
     .then(|| {
         format!(
@@ -2193,6 +2197,7 @@ fn commit_message_agent_configuration(
     }
     Ok(bcode_workflow::WorkflowPromptConfiguration {
         version: bcode_workflow::WORKFLOW_PROMPT_CONFIGURATION_VERSION,
+        worktree_directory: None,
         activity_producer: None,
         execution_target: bcode_workflow::PromptContextTarget::FreshIsolated,
         agent_profile: "plan".to_string(),
@@ -2249,6 +2254,7 @@ fn loop_agent_configuration<O: JsonSchema>(
 ) -> bcode_workflow::WorkflowPromptConfiguration {
     bcode_workflow::WorkflowPromptConfiguration {
         version: bcode_workflow::WORKFLOW_PROMPT_CONFIGURATION_VERSION,
+        worktree_directory: None,
         activity_producer: Some(bcode_workflow::WorkflowActivityProducer {
             plugin: PLUGIN_ID.to_string(),
             stage: if read_only {
@@ -3109,7 +3115,7 @@ mod tests {
 
     #[test]
     fn terminal_workflow_control_message_explains_completed_runs() {
-        let run = bcode_workflow_store::WorkflowRunSummary {
+        let mut run = bcode_workflow_store::WorkflowRunSummary {
             run_id: "completed-loop".to_string(),
             definition_id: "loop".to_string(),
             definition_version: 1,
@@ -3137,6 +3143,15 @@ mod tests {
             terminal_workflow_control_message(&run).as_deref(),
             Some("loop workflow is already completed; start a new loop to run it again")
         );
+        run.status = bcode_workflow_store::RunStatus::Failed;
+        assert_eq!(
+            terminal_workflow_control_message(&run).as_deref(),
+            Some(
+                "loop workflow completed-loop failed; inspect the failed node in /workflow and retry only after reviewing its effects and retry eligibility; starting a new goal may repeat completed work"
+            )
+        );
+        run.status = bcode_workflow_store::RunStatus::Running;
+        assert!(terminal_workflow_control_message(&run).is_none());
     }
 
     #[test]

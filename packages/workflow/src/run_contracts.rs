@@ -1084,6 +1084,12 @@ pub enum WorkflowRunControlAction {
     WithdrawReplacement,
     /// Reauthorize and complete a quiescent pending replacement.
     CompleteReplacement,
+    /// Explicit operator grant for an active run. Does not resume or dispatch work.
+    /// The expected cap fences stale grants; exact retries are idempotent.
+    IncreaseExecutionAllowance {
+        expected_cap: u64,
+        target_cap: u64,
+    },
 }
 
 /// Generic associated workflow run lookup key.

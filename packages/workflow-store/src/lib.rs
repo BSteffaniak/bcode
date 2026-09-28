@@ -10356,12 +10356,13 @@ impl WorkflowStore {
                 "workflow run is not eligible for node retry".to_string(),
             ));
         }
-        let (activation_status, output_id): (String, Option<String>) = transaction.query_row(
-            "SELECT status, output_id FROM workflow_activations \
+        let (activation_status, output_id, dependency_generation): (String, Option<String>, u64) =
+            transaction.query_row(
+                "SELECT status, output_id, dependency_generation FROM workflow_activations \
              WHERE run_id = ?1 AND node_id = ?2 AND activation_id = ?3",
-            (run_id, node_id, activation_id),
-            |row| Ok((row.get(0)?, row.get(1)?)),
-        )?;
+                (run_id, node_id, activation_id),
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )?;
         if activation_status != "failed" || output_id.is_some() {
             return Err(WorkflowStoreError::InvalidData(
                 "workflow activation is not an output-free failed activation".to_string(),
@@ -10385,38 +10386,45 @@ impl WorkflowStore {
                 "workflow retry cap exceeded".to_string(),
             ));
         }
-        let definition_json: String = transaction.query_row(
-            "SELECT definition.definition_json FROM workflow_runs run \
-             JOIN workflow_definitions definition ON definition.definition_id = run.definition_id \
-               AND definition.version = run.definition_version WHERE run.run_id = ?1",
-            [run_id],
-            |row| row.get(0),
-        )?;
-        let definition: WorkflowDefinition = serde_json::from_str(&definition_json)?;
-        let direct_targets = definition
-            .edges
-            .iter()
-            .filter(|edge| {
-                edge.from == node_id
-                    && !matches!(
-                        edge.kind,
-                        bcode_workflow::EdgeKind::Retry { .. }
-                            | bcode_workflow::EdgeKind::Back { .. }
-                    )
-            })
-            .map(|edge| edge.to.as_str())
-            .collect::<Vec<_>>();
-        for target in direct_targets {
-            let downstream_exists: bool = transaction.query_row(
-                "SELECT EXISTS(SELECT 1 FROM workflow_activations \
-                 WHERE run_id = ?1 AND node_id = ?2)",
-                (run_id, target),
-                |row| row.get(0),
+        let graph_revision = self.run_graph_revision(run_id)?.ok_or_else(|| {
+            WorkflowStoreError::InvalidData("workflow retry graph is missing".to_string())
+        })?;
+        let mut cursor = None;
+        loop {
+            let edges = self.current_run_graph_incident_edges(
+                run_id,
+                graph_revision,
+                node_id,
+                true,
+                cursor,
+                100,
             )?;
-            if downstream_exists {
-                return Err(WorkflowStoreError::InvalidData(
-                    "workflow retry is unsafe after downstream activation".to_string(),
-                ));
+            if edges.is_empty() {
+                break;
+            }
+            cursor = edges.last().map(|edge| edge.edge_id);
+            for edge in edges {
+                if matches!(
+                    edge.edge.kind,
+                    bcode_workflow::EdgeKind::Retry { .. } | bcode_workflow::EdgeKind::Back { .. }
+                ) {
+                    continue;
+                }
+                // Settled targets from earlier loop generations did not consume this
+                // activation. Unresolved older targets remain unsafe to overlap.
+                let downstream_exists: bool = transaction.query_row(
+                    "SELECT EXISTS(SELECT 1 FROM workflow_activations \
+                     WHERE run_id = ?1 AND node_id = ?2 \
+                     AND (dependency_generation >= ?3 \
+                     OR status NOT IN ('completed', 'failed', 'cancelled', 'skipped')))",
+                    (run_id, &edge.edge.to, dependency_generation),
+                    |row| row.get(0),
+                )?;
+                if downstream_exists {
+                    return Err(WorkflowStoreError::InvalidData(
+                        "workflow retry is unsafe after downstream activation".to_string(),
+                    ));
+                }
             }
         }
         transaction.execute(
@@ -13292,7 +13300,6 @@ fn settle_output_successors<F: WorkflowOutputFault + ?Sized>(
     checksum: &str,
     fault: &F,
 ) -> Result<OutputPersistenceResult, WorkflowStoreError> {
-    let (activated, completed_is_exit) = materialize_direct_successors(transaction, output, fault)?;
     let parallel_failure = settle_parallel_failure(
         transaction,
         &output.run_id,
@@ -13302,6 +13309,14 @@ fn settle_output_successors<F: WorkflowOutputFault + ?Sized>(
         output.created_at_ms,
     )?
     .is_some_and(|settlement| settlement.run_failed);
+    let (activated, completed_is_exit) = if parallel_failure {
+        // A failed join has no value to materialize. Preserve the successful sibling's
+        // output and the durable failure decision instead of rolling both back while
+        // trying to construct a tuple from absent results.
+        (Vec::new(), false)
+    } else {
+        materialize_direct_successors(transaction, output, fault)?
+    };
     fault.after_boundary(WorkflowOutputBoundary::SuccessorsMaterialized, output)?;
     let has_unfinished = run_has_unfinished_activations(transaction, &output.run_id)?;
     let current_status = transaction.query_row(
@@ -15098,9 +15113,26 @@ fn settle_parallel_failure(
             }
             outcomes.push(serde_json::json!({"node_id": member, "status": status}));
         }
+        // Skipped alternatives are valid, but each side still needs a completed
+        // result. All-terminal is not evidence that a tuple can be constructed.
+        if all_terminal {
+            for field in ["left_exits", "right_exits"] {
+                let exits = configured_node_ids(&join.configuration, field)?;
+                let mut completed = false;
+                for exit in exits {
+                    completed |=
+                        activation_status_at_generation(transaction, run_id, &exit, generation)?
+                            .as_deref()
+                            == Some("completed");
+                }
+                has_failure |= !completed;
+            }
+        }
         let should_fail = match policy {
             bcode_workflow::ParallelFailurePolicy::WaitAll => all_terminal && has_failure,
-            bcode_workflow::ParallelFailurePolicy::FailFast => member_failed,
+            bcode_workflow::ParallelFailurePolicy::FailFast => {
+                member_failed || (all_terminal && has_failure)
+            }
         };
         if should_fail {
             let (decision_type, decision_suffix) = match policy {
@@ -19856,6 +19888,7 @@ mod tests {
                         configuration: serde_json::to_value(
                             bcode_workflow::WorkflowPromptConfiguration {
                                 version: bcode_workflow::WORKFLOW_PROMPT_CONFIGURATION_VERSION,
+                                worktree_directory: None,
                                 activity_producer: None,
                                 execution_target:
                                     bcode_workflow::PromptContextTarget::FreshIsolated,
@@ -25034,6 +25067,148 @@ mod tests {
                 .retry_failed_node("run-1", "review", &activation_id(), 1, 23)
                 .is_err()
         );
+    }
+
+    #[test]
+    fn failed_node_retry_checks_revised_graph_not_authored_edges() {
+        struct Failed;
+        impl AttemptStatusObserver for Failed {
+            fn observe(
+                &self,
+                _: &AttemptReconciliationRequest,
+            ) -> Result<AttemptObservation, WorkflowStoreError> {
+                Ok(AttemptObservation::Failed {
+                    message: "worker failed".into(),
+                })
+            }
+        }
+        let (_temp, mut store) = initialized_store();
+        let definition = sequential_definition();
+        store
+            .persist_definition("sequential", 1, &definition)
+            .unwrap();
+        let mut run = new_run();
+        run.definition_id = "sequential".into();
+        run.run_id = "revised-retry".into();
+        store.create_run(&run).unwrap();
+        let activation = activation_identity(&run.run_id, "first", 0);
+        let prepared = store
+            .prepare_pending_activation(
+                &run.run_id,
+                "first",
+                &activation,
+                DispatchSideEffect::ReadOnly,
+                serde_json::json!({"operation":"review"}),
+                12,
+            )
+            .unwrap()
+            .unwrap();
+        store
+            .persist_dispatch_receipt(&DispatchReceipt {
+                run_id: run.run_id.clone(),
+                node_id: "first".into(),
+                activation_id: activation.clone(),
+                attempt: prepared.attempt,
+                dispatch_identity: prepared.dispatch_identity,
+                receipt: serde_json::json!({"turn_id":"failed-worker"}),
+                admitted_at_ms: 13,
+            })
+            .unwrap();
+        store
+            .create_activation(&NewActivation {
+                run_id: run.run_id.clone(),
+                node_id: "second".into(),
+                activation_id: activation_identity(&run.run_id, "second", 0),
+                dependency_generation: 0,
+                input: Some(serde_json::json!(2)),
+                created_at_ms: 19,
+            })
+            .unwrap();
+        store
+            .reconcile_receipt_backed_attempts(&Failed, 10, 20)
+            .unwrap();
+        // The current graph includes a dependency absent from the authored snapshot.
+        // Recovery must use canonical execution topology, not reinterpret that snapshot.
+        let mut authored = definition;
+        authored.edges.clear();
+        store.connection.execute(
+            "UPDATE workflow_definitions SET definition_json=?1 WHERE definition_id='sequential'",
+            [serde_json::to_string(&authored).unwrap()],
+        ).unwrap();
+        store
+            .connection
+            .execute(
+                "UPDATE workflow_run_graphs SET revision=2 WHERE run_id=?1",
+                [&run.run_id],
+            )
+            .unwrap();
+        let error = store
+            .retry_failed_node(&run.run_id, "first", &activation, 1, 21)
+            .unwrap_err();
+        assert!(error.to_string().contains("downstream activation"));
+        assert_eq!(
+            store.run_summary(&run.run_id).unwrap().unwrap().status,
+            RunStatus::Failed
+        );
+        assert_eq!(
+            store.attempt_history(&run.run_id, None, 10).unwrap().len(),
+            1
+        );
+        assert_retry_with_historical_target(&store, &run, &activation);
+    }
+
+    fn assert_retry_with_historical_target(
+        store: &WorkflowStore,
+        run: &NewWorkflowRun,
+        activation: &str,
+    ) {
+        // A repeated goal may have a settled evaluator from a prior generation.
+        // Neither a current/future target nor an unresolved older target is safe.
+        store.connection.execute(
+            "UPDATE workflow_activations SET dependency_generation=1 WHERE run_id=?1 AND node_id='first'",
+            [&run.run_id],
+        ).unwrap();
+        for (generation, status) in [
+            (0, "pending"),
+            (0, "running"),
+            (0, "waiting_approval"),
+            (0, "repair_required"),
+            (1, "completed"),
+            (2, "completed"),
+        ] {
+            store.connection.execute(
+                "UPDATE workflow_activations SET dependency_generation=?2, status=?3 WHERE run_id=?1 AND node_id='second'",
+                (&run.run_id, generation, status),
+            ).unwrap();
+            assert!(
+                store
+                    .retry_failed_node(&run.run_id, "first", activation, 1, 22)
+                    .is_err(),
+                "unsafe downstream generation {generation}, status {status}"
+            );
+            assert_eq!(
+                store.run_summary(&run.run_id).unwrap().unwrap().status,
+                RunStatus::Failed
+            );
+        }
+        store.connection.execute(
+            "UPDATE workflow_activations SET dependency_generation=0, status='completed' WHERE run_id=?1 AND node_id='second'",
+            [&run.run_id],
+        ).unwrap();
+        let retried = store
+            .retry_failed_node(&run.run_id, "first", activation, 1, 23)
+            .unwrap();
+        assert_eq!(retried.next_attempt, 2);
+        assert_eq!(retried.activation_id, activation);
+        let downstream_status: String = store
+            .connection
+            .query_row(
+                "SELECT status FROM workflow_activations WHERE run_id=?1 AND node_id='second'",
+                [&run.run_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(downstream_status, "completed");
     }
 
     fn assert_context_pagination(
@@ -33716,6 +33891,7 @@ mod tests {
             .current_run_graph_page("run-1", Some(1), None, None, 1)
             .expect("first page");
         assert_eq!(first.edges[0].edge_id, maximum - 1);
+        assert_eq!(first.next_edge_id, None);
         assert!(!first.edges_complete);
         let last = store
             .current_run_graph_page("run-1", Some(1), None, Some(maximum - 1), 1)
@@ -33765,6 +33941,59 @@ mod tests {
                 .run_graph_outgoing_edges("run-1", "review", Some(maximum), 1)
                 .expect("outgoing exhausted")
                 .is_empty()
+        );
+        assert_eq!(store.connection.total_changes(), before);
+    }
+
+    #[test]
+    fn graph_edge_allocation_observation_includes_retired_edges_outside_page() {
+        let (_temp, store) = initialized_store();
+        let empty = store
+            .current_run_graph_page("run-1", Some(1), None, None, 1)
+            .expect("empty graph");
+        assert_eq!(empty.next_edge_id, Some(0));
+        let edge = bcode_workflow::EdgeDefinition {
+            from: "review".into(),
+            to: "review".into(),
+            kind: bcode_workflow::EdgeKind::Direct,
+            transform: None,
+        };
+        for id in [2, 900] {
+            store.connection.execute(
+                "INSERT INTO workflow_run_graph_edges (run_id, edge_id, revision, source_node_id, target_node_id, edge_json) VALUES ('run-1', ?1, 1, 'review', 'review', ?2)",
+                (id, serde_json::to_string(&edge).expect("edge")),
+            ).expect("fixture");
+        }
+        store
+            .connection
+            .execute(
+                "UPDATE workflow_run_graph_edges SET retired_at_revision = 2 WHERE edge_id = 900",
+                [],
+            )
+            .expect("retire");
+        store
+            .connection
+            .execute(
+                "UPDATE workflow_run_graphs SET revision = 2 WHERE run_id = 'run-1'",
+                [],
+            )
+            .expect("advance revision");
+        let before = store.connection.total_changes();
+        let page = store
+            .current_run_graph_page("run-1", Some(2), None, None, 1)
+            .expect("bounded page");
+        assert_eq!(page.edges.len(), 1);
+        assert_eq!(page.edges[0].edge_id, 2);
+        assert_eq!(page.next_edge_id, Some(901));
+        let exhausted = store
+            .current_run_graph_page("run-1", Some(2), None, Some(2), 1)
+            .expect("empty page");
+        assert!(exhausted.edges.is_empty());
+        assert_eq!(exhausted.next_edge_id, Some(901));
+        assert!(
+            store
+                .current_run_graph_page("run-1", Some(1), None, None, 1)
+                .is_err()
         );
         assert_eq!(store.connection.total_changes(), before);
     }
@@ -46917,6 +47146,66 @@ mod tests {
     }
 
     #[test]
+    fn parallel_missing_result_preserves_successful_sibling_and_failure_after_reopen() {
+        for policy in [
+            bcode_workflow::ParallelFailurePolicy::WaitAll,
+            bcode_workflow::ParallelFailurePolicy::FailFast,
+        ] {
+            let temp = tempfile::tempdir().expect("temp");
+            let definition = parallel_join_definition_with_policy(policy);
+            let mut store = WorkflowStore::open_in_state_dir(temp.path()).expect("store");
+            store
+                .persist_definition("missing-result", 1, &definition)
+                .expect("definition");
+            let mut run = new_run();
+            run.definition_id = "missing-result".into();
+            run.input = Some(serde_json::json!(1));
+            store.create_run(&run).expect("run");
+            store.connection.execute(
+                "UPDATE workflow_activations SET status = 'skipped' WHERE run_id = ?1 AND node_id = 'left'",
+                [&run.run_id],
+            ).expect("skip left without output");
+            let result = store
+                .persist_validated_output(&ValidatedOutput {
+                    output_id: "right-output".into(),
+                    run_id: run.run_id.clone(),
+                    node_id: "right".into(),
+                    activation_id: activation_identity(&run.run_id, "right", 0),
+                    schema_id: definition.nodes["right"].output.type_name.clone(),
+                    schema_version: 1,
+                    value: serde_json::json!(2),
+                    artifact_reference: None,
+                    created_at_ms: 5,
+                })
+                .expect("retain successful sibling despite missing result");
+            assert_eq!(result.run_status, RunStatus::Failed);
+            assert!(result.activated.is_empty());
+            drop(store);
+            let reopened = WorkflowStore::open_in_state_dir(temp.path()).expect("reopen");
+            assert_eq!(
+                reopened
+                    .run_summary(&run.run_id)
+                    .expect("summary")
+                    .expect("run")
+                    .status,
+                RunStatus::Failed
+            );
+            let outputs = reopened.output_summaries(&run.run_id, 10).expect("outputs");
+            assert_eq!(outputs.len(), 1);
+            assert_eq!(outputs[0].output_id, "right-output");
+            let suffix = match policy {
+                bcode_workflow::ParallelFailurePolicy::WaitAll => "parallel-wait-all",
+                bcode_workflow::ParallelFailurePolicy::FailFast => "parallel-fail-fast",
+            };
+            let decision = reopened
+                .decision(&format!("{}:join:0:{suffix}", run.run_id))
+                .expect("decision")
+                .expect("failed join");
+            assert_eq!(decision.value["outcome"], "failed");
+        }
+    }
+
+    #[test]
     #[allow(clippy::too_many_lines)]
     fn fail_fast_parallel_failure_persists_sibling_cancellation_before_signalling() {
         let temp = tempfile::tempdir().expect("temp");
@@ -47555,7 +47844,7 @@ mod tests {
                 created_at_ms: 20,
             })
             .expect_err("ambiguous members");
-        assert!(error.to_string().contains("exactly one side"));
+        assert!(matches!(error, WorkflowStoreError::InvalidData(_)));
         assert_eq!(output_count(&store), 0);
         assert_eq!(
             store

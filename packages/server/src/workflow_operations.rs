@@ -9620,6 +9620,32 @@ fn detach_run(
     Ok(changed)
 }
 
+async fn increase_allowance(
+    state: &std::sync::Arc<ServerState>,
+    run_id: &str,
+    expected_cap: u64,
+    target_cap: u64,
+) -> Result<bool, super::ServerError> {
+    let authority = execution_authority(state, run_id).await?.ok_or_else(|| {
+        bcode_workflow_store::WorkflowStoreError::InvalidData(
+            "execution allowance increase requires verified ownership".into(),
+        )
+    })?;
+    let mut store = state
+        .workflow_store
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let previous = store.execution_allowance_observation(run_id)?;
+    store.increase_execution_allowance(
+        run_id,
+        &authority.authority,
+        expected_cap,
+        target_cap,
+        super::current_unix_millis(),
+    )?;
+    Ok(previous != store.execution_allowance_observation(run_id)?)
+}
+
 /// Control an exact run, preserving its identity across asynchronous ownership checks.
 pub async fn control_exact_run(
     state: &std::sync::Arc<ServerState>,
@@ -9629,16 +9655,15 @@ pub async fn control_exact_run(
     let run = run_status(state, run_id)?;
     let changed = if let Some(run) = &run {
         match action {
+            bcode_workflow::WorkflowRunControlAction::IncreaseExecutionAllowance {
+                expected_cap,
+                target_cap,
+            } => increase_allowance(state, &run.run_id, expected_cap, target_cap).await?,
             bcode_workflow::WorkflowRunControlAction::Detach => detach_run(state, &run.run_id)?,
             bcode_workflow::WorkflowRunControlAction::CompleteReplacement => {
                 if let Some(successor_id) = complete_pending_replacement(state, &run.run_id).await?
                 {
-                    let successor = state
-                        .workflow_store
-                        .lock()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner)
-                        .run_summary(&successor_id)?;
-                    return Ok((successor, true));
+                    return Ok((run_status(state, &successor_id)?, true));
                 }
                 false
             }
@@ -11218,6 +11243,7 @@ pub fn graph_page_inspection(
     let edges_complete = page.edges_complete;
     bcode_workflow::WorkflowRunGraphInspection {
         revision,
+        next_edge_id: page.next_edge_id,
         nodes: nodes
             .into_iter()
             .map(|record| bcode_workflow::WorkflowRunGraphNodeInspection {

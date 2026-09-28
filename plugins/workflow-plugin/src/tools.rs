@@ -17,11 +17,15 @@ const CONTEXT_OPERATION: &str = "execution_context";
 fn parse_context(
     mut arguments: serde_json::Value,
 ) -> Result<bcode_workflow::WorkflowExecutionContextRequest, String> {
-    arguments
+    let object = arguments
         .as_object_mut()
-        .ok_or("execution context request must be an object")?
-        .entry("limit")
-        .or_insert(json!(50));
+        .ok_or("execution context request must be an object")?;
+    if let Some(compact) = object.remove("compact")
+        && !compact.is_boolean()
+    {
+        return Err("compact must be a boolean".into());
+    }
+    object.entry("limit").or_insert(json!(50));
     let context: bcode_workflow::WorkflowExecutionContextRequest =
         serde_json::from_value(arguments)
             .map_err(|_| "invalid execution context request".to_owned())?;
@@ -37,6 +41,7 @@ fn context_definition() -> ToolDefinition {
         description: "Read this active workflow execution's authenticated identity and bounded graph page. Omit revision and cursors initially; continue with the returned revision and last node/edge identities. Restart on revision conflict. This grants no mutation authority.".to_owned(),
         input_schema: json!({"type":"object", "additionalProperties":false,
             "properties": {
+                "compact":{"type":"boolean","default":false,"description":"Return graph node identities instead of full executable definitions. Edges and authenticated identity remain available; omitted node definitions require a normal paged read."},
                 "after_output_id":{"type":["string","null"], "description":"Exclusive last output ID. Outputs arriving behind the cursor require a fresh scan; this is not a durable event stream."},
                 "output_id":{"type":["string","null"], "description":"Exact canonical output identity from this run; returns checksum-verified value without opening artifacts."},
                 "limit":{"type":"integer", "minimum":1, "maximum":100, "default":50},
@@ -334,8 +339,33 @@ fn definition() -> ToolDefinition {
 
 fn edit_input_schema() -> serde_json::Value {
     json!({"type":"object","additionalProperties":false,
-        "properties":{"edit_json":{"type":"string","description":"JSON-encoded WorkflowRunGraphEditBatch, or {task_tool,request} replay of an original workflow.stage_agent_task, workflow.stage_prompt_task or workflow.stage_task_group payload. Replay deterministically lowers the exact original request; publication still requires equality with the retained staged edit. Never change mutation identity or fields on retry."}},
+        "properties":{"edit_json":{"type":"string","description":"JSON-encoded WorkflowRunGraphEditBatch, a {candidate} reference returned by staging, or {task_tool,request} replay of an original workflow.stage_agent_task, workflow.stage_prompt_task or workflow.stage_task_group payload. Replay deterministically lowers the exact original request; publication still requires equality with the retained staged edit. Never change mutation identity or fields on retry."}},
         "required":["edit_json"]})
+}
+
+fn candidate_reference(
+    arguments: &serde_json::Value,
+) -> Option<bcode_workflow::WorkflowRunGraphCandidateReference> {
+    if arguments.as_object()?.len() != 1 {
+        return None;
+    }
+    let value: serde_json::Value =
+        serde_json::from_str(arguments.get("edit_json")?.as_str()?).ok()?;
+    if value.as_object()?.len() != 1 {
+        return None;
+    }
+    let reference: bcode_workflow::WorkflowRunGraphCandidateReference =
+        serde_json::from_value(value.get("candidate")?.clone()).ok()?;
+    (reference.version == 1
+        && reference.expected_revision > 0
+        && !reference.run_id.is_empty()
+        && !reference.mutation_id.is_empty()
+        && reference.checksum_sha256.len() == 64
+        && reference
+            .checksum_sha256
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit()))
+    .then_some(reference)
 }
 
 fn parse_edit(arguments: &serde_json::Value) -> Result<WorkflowRunGraphEditBatch, String> {
@@ -412,6 +442,10 @@ pub fn invoke(context: &NativeServiceContext) -> ServiceResponse {
                 let payload = if is_context {
                     let context = parse_context(request.invocation.arguments.clone())?;
                     serde_json::to_value(context).map_err(|error| error.to_string())?
+                } else if matches!(operation, PUBLISH_OPERATION | ACCEPT_OPERATION)
+                    && candidate_reference(&request.invocation.arguments).is_some()
+                {
+                    json!({"candidate": candidate_reference(&request.invocation.arguments)})
                 } else {
                     serde_json::to_value(parse_tool_edit(
                         &request.invocation.tool_name,
@@ -480,6 +514,7 @@ fn invoke_context(
     context: &NativeServiceContext,
     request: ToolInvocationRequest,
 ) -> ServiceResponse {
+    let compact = request.arguments.get("compact") == Some(&json!(true));
     let Ok(query) = parse_context(request.arguments) else {
         return ServiceResponse::error("invalid_request", "invalid execution context request");
     };
@@ -522,7 +557,7 @@ fn invoke_context(
                 |_| ServiceResponse::error("invalid_response", "invalid workflow context"),
                 |context| {
                     super::json_response(&bcode_tool::ToolInvocationResponse {
-                        output: serde_json::to_string(&context).unwrap_or_default(),
+                        output: context_output(&context, compact),
                         is_error: false,
                         content: Vec::new(),
                         full_output: None,
@@ -531,6 +566,111 @@ fn invoke_context(
                 },
             ),
         _ => ServiceResponse::error("context_unavailable", "active workflow context unavailable"),
+    }
+}
+
+// Compact inspection is presentation only: the host still validates the same
+// bounded revision-pinned request and supplies all authenticated facts.
+fn context_output(context: &bcode_workflow::WorkflowExecutionContext, compact: bool) -> String {
+    let mut output = serde_json::to_value(context).expect("serializable workflow context");
+    if compact {
+        output["graph"].as_object_mut().unwrap().remove("nodes");
+        output["graph"]["node_ids"] = json!(
+            context
+                .graph
+                .nodes
+                .iter()
+                .map(|entry| &entry.node.id)
+                .collect::<Vec<_>>()
+        );
+        for edge in output["graph"]["edges"].as_array_mut().unwrap() {
+            // Cursors are exclusive numeric identities, not offsets into this page.
+            // A one-edge read also works for sparse/retired identities and edge zero.
+            let edge_id = edge["edge_id"].as_u64().expect("typed edge identity");
+            edge["inspection_arguments"] = json!({
+                "expected_revision": context.graph.revision,
+                "after_edge_id": edge_id.checked_sub(1),
+                "limit": 1,
+                "compact": false
+            });
+            if let Some(definition) = edge
+                .get_mut("edge")
+                .and_then(serde_json::Value::as_object_mut)
+            {
+                definition.remove("transform");
+            }
+        }
+        // Result discovery lists identities only; exact values remain available
+        // through an explicit output_id request, never silently substituted.
+        for result in output["outputs"].as_array_mut().unwrap() {
+            if let Some(result) = result.as_object_mut() {
+                result.retain(|key, _| {
+                    matches!(key.as_str(), "output_id" | "node_id" | "checksum_sha256")
+                });
+            }
+        }
+        output["output_values_omitted"] = json!(true);
+        output["graph"]["edge_transforms_omitted"] = json!(true);
+        output["graph"]["node_definitions_omitted"] = json!(true);
+    }
+    output.to_string()
+}
+
+fn invoke_candidate(
+    context: &NativeServiceContext,
+    request: ToolInvocationRequest,
+    operation: &str,
+    reference: &bcode_workflow::WorkflowRunGraphCandidateReference,
+) -> ServiceResponse {
+    let payload = json!({"candidate":reference});
+    if request
+        .preparation_descriptor
+        .get("operation")
+        .and_then(serde_json::Value::as_str)
+        != Some(operation)
+        || request.preparation_descriptor.get("edit") != Some(&payload)
+        || context.cancellation.is_cancelled()
+    {
+        return ServiceResponse::error(
+            "invalid_request",
+            "candidate differs from prepared authorization",
+        );
+    }
+    let Some(route_id) = request
+        .preparation_descriptor
+        .get("route_id")
+        .and_then(serde_json::Value::as_str)
+    else {
+        return ServiceResponse::error("invalid_request", "candidate route missing");
+    };
+    // The application authorizes the complete retained edit, not the reference.
+    match context.bridge.request(&ServiceBridgeRequest::InvokeService(
+        ToolInvocationServiceRequest {
+            invocation_id: request.tool_call_id.clone(),
+            request_id: request.tool_call_id,
+            route_id: Some(route_id.to_owned()),
+            interface_id: WORKFLOW_APPLICATION_INTERFACE_ID.into(),
+            operation: operation.into(),
+            payload,
+        },
+    )) {
+        Ok(ServiceBridgeResponse::Service(ToolInvocationServiceResolution::Responded {
+            payload,
+        })) => {
+            if operation == ACCEPT_OPERATION {
+                acceptance_response(payload)
+            } else {
+                publication_response(&payload)
+            }
+        }
+        Ok(ServiceBridgeResponse::Service(ToolInvocationServiceResolution::Failed {
+            code,
+            ..
+        })) => edit_failure(&code),
+        _ => ServiceResponse::error(
+            "workflow_publication_failed",
+            "candidate publication outcome unknown",
+        ),
     }
 }
 
@@ -544,6 +684,11 @@ fn invoke_edit(context: &NativeServiceContext) -> ServiceResponse {
     let Ok(operation) = operation(&request.name) else {
         return ServiceResponse::error("unsupported_tool", "unsupported workflow tool");
     };
+    if matches!(operation, PUBLISH_OPERATION | ACCEPT_OPERATION)
+        && let Some(reference) = candidate_reference(&request.arguments)
+    {
+        return invoke_candidate(context, request, operation, &reference);
+    }
     let edit = match parse_tool_edit(&request.name, &request.arguments) {
         Ok(edit) => edit,
         Err(message) => return ServiceResponse::error("invalid_request", message),
@@ -615,7 +760,7 @@ fn invoke_edit(context: &NativeServiceContext) -> ServiceResponse {
                 request.name.as_str(),
                 TASK_NAME | PROMPT_TASK_NAME | GROUP_NAME
             ) {
-                task_staging_response(payload, &edit)
+                task_staging_response(payload, &edit, &request.name, &request.arguments)
             } else {
                 staging_response(payload)
             }
@@ -654,18 +799,74 @@ fn edit_failure(code: &str) -> ServiceResponse {
 fn task_staging_response(
     payload: serde_json::Value,
     edit: &WorkflowRunGraphEditBatch,
+    task_tool: &str,
+    request: &serde_json::Value,
 ) -> ServiceResponse {
     let Ok(staged) =
         serde_json::from_value::<bcode_workflow::WorkflowRunGraphStageResponse>(payload)
     else {
         return ServiceResponse::error("invalid_response", "task staging outcome unknown");
     };
+    // A replay is a convenience, not authority: re-lowering must produce exactly
+    // the candidate admitted by the application before it can be published.
+    let replay = json!({"task_tool":task_tool,"request":request});
+    let publication_arguments = json!({"edit_json":replay.to_string()});
+    if parse_edit(&publication_arguments).as_ref() != Ok(edit) {
+        return ServiceResponse::error("invalid_response", "task replay differs from staged edit");
+    }
+    let publication_arguments =
+        match bcode_workflow::WorkflowRunGraphCandidateReference::from_edit(edit) {
+            Ok(reference) => json!({"edit_json":json!({"candidate":reference}).to_string()}),
+            Err(_) => {
+                return ServiceResponse::error(
+                    "invalid_response",
+                    "candidate reference unavailable",
+                );
+            }
+        };
+    let decoded = request
+        .get("request_json")
+        .and_then(serde_json::Value::as_str)
+        .and_then(|text| serde_json::from_str::<serde_json::Value>(text).ok());
+    let compact = task_tool == GROUP_NAME
+        && decoded.as_ref().unwrap_or(request).get("version") == Some(&json!(2));
+    let mut output = json!({
+        "staged":staged.staged,
+        "published":false,
+        "publication_arguments":publication_arguments,
+        "publication_hint":"Use publication_arguments with workflow.publish_run_graph_edit under separate authorization. Retain this exact request on retry; staging is not publication.",
+    });
+    if compact {
+        // V2 carries a bounded exact-candidate reference. Do not repeat expanded prompts and
+        // schemas in the model context merely to expose generated identities.
+        let node_ids: Vec<_> = edit
+            .edits
+            .iter()
+            .filter_map(|operation| match operation {
+                bcode_workflow::WorkflowRunGraphEdit::AddNode { node, .. } => Some(&node.id),
+                _ => None,
+            })
+            .collect();
+        output["node_ids"] = json!(node_ids);
+    } else {
+        output["edit"] = json!(edit);
+    }
+    if task_tool == GROUP_NAME {
+        let Ok((mapped_edit, mapping)) =
+            task_group::mapped_candidate(decoded.as_ref().unwrap_or(request))
+        else {
+            return ServiceResponse::error("invalid_response", "task result mapping unavailable");
+        };
+        if &mapped_edit != edit {
+            return ServiceResponse::error(
+                "invalid_response",
+                "task mapping differs from staged edit",
+            );
+        }
+        output["result_mapping"] = mapping;
+    }
     super::json_response(&bcode_tool::ToolInvocationResponse {
-        output: format!(
-            "{{\"staged\":{},\"published\":false,\"publication_hint\":\"If the edit is truncated, supply edit_json containing {{task_tool,request}} with the exact original staging tool name and request payload. Publication still validates equality with the retained staged edit.\",\"edit\":{}}}",
-            staged.staged,
-            serde_json::to_string(edit).expect("typed edit serializes"),
-        ),
+        output: output.to_string(),
         is_error: false,
         content: Vec::new(),
         full_output: None,
@@ -758,6 +959,94 @@ fn staging_response(payload: serde_json::Value) -> ServiceResponse {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn staging_receipt_replays_portable_v2_request_without_reconstruction() {
+        let request = json!({"version":2,"generated_ids":true,
+            "run_id":"run","expected_revision":1,"mutation_id":"delegate",
+            "input":{"type_name":"bool","schema":{"type":"boolean"}},
+            "tasks":[
+                {"task_id":"review.日本語","objective":"Review","agent_profile":"plan"},
+                {"task_id":"verify","objective":"Verify","agent_profile":"plan"}
+            ],
+            "continuation":{"objective":"Integrate","agent_profile":"plan",
+                "output":{"type_name":"bool","schema":{"type":"boolean"}}},
+            "first_edge_id":1,"reconciliation":[]});
+        for arguments in [request.clone(), json!({"request_json":request.to_string()})] {
+            let edit = parse_tool_edit(GROUP_NAME, &arguments).unwrap();
+            for staged in [true, false] {
+                let response =
+                    task_staging_response(json!({"staged":staged}), &edit, GROUP_NAME, &arguments);
+                assert!(response.error.is_none());
+                let tool: bcode_tool::ToolInvocationResponse =
+                    serde_json::from_slice(&response.payload).unwrap();
+                let receipt: serde_json::Value = serde_json::from_str(&tool.output).unwrap();
+                assert_eq!(receipt["published"], false);
+                assert_eq!(receipt["staged"], staged);
+                assert_eq!(
+                    candidate_reference(&receipt["publication_arguments"]).unwrap(),
+                    bcode_workflow::WorkflowRunGraphCandidateReference::from_edit(&edit).unwrap()
+                );
+                assert!(receipt.get("edit").is_none());
+                let mapping = &receipt["result_mapping"];
+                for (worker, task_id) in mapping["workers"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .zip(["review.日本語", "verify"])
+                {
+                    assert_eq!(worker["task_id"], task_id);
+                    assert_eq!(worker["input_path"], json!(["results", task_id]));
+                    assert_eq!(worker["acceptance_criteria"], json!([]));
+                    let output = edit
+                        .edits
+                        .iter()
+                        .find_map(|edit| match edit {
+                            bcode_workflow::WorkflowRunGraphEdit::AddNode { node, .. }
+                                if node.id == task_id =>
+                            {
+                                Some(&node.output)
+                            }
+                            _ => None,
+                        })
+                        .unwrap();
+                    assert_eq!(worker["output"], json!(output));
+                }
+                assert_eq!(mapping["source_path"], serde_json::Value::Null);
+                assert_eq!(mapping["preserves_source_output"], false);
+                assert!(
+                    receipt["node_ids"]
+                        .as_array()
+                        .unwrap()
+                        .contains(&mapping["continuation_id"])
+                );
+                assert!(
+                    receipt["node_ids"]
+                        .as_array()
+                        .unwrap()
+                        .contains(&json!("review.日本語"))
+                );
+                assert!(tool.output.len() < serde_json::to_string(&edit).unwrap().len());
+            }
+            let mut different = edit.clone();
+            different.mutation_id = "different".into();
+            assert!(
+                task_staging_response(json!({"staged":true}), &different, GROUP_NAME, &arguments)
+                    .error
+                    .is_some()
+            );
+            assert!(
+                task_staging_response(
+                    json!({"staged":true,"version":99}),
+                    &edit,
+                    GROUP_NAME,
+                    &arguments
+                )
+                .error
+                .is_some()
+            );
+        }
+    }
 
     #[test]
     fn prompt_task_defaults_output_without_changing_explicit_contracts() {
@@ -1117,6 +1406,86 @@ mod tests {
                 serde_json::from_slice(&response.payload).expect("tool response");
             assert!(!tool.is_error);
             assert!(tool.output.contains("Topology has not been published"));
+        }
+    }
+
+    #[test]
+    fn compact_context_preserves_identity_and_revision_without_node_payloads() {
+        let context: bcode_workflow::WorkflowExecutionContext = serde_json::from_value(json!({
+            "run_id":"run", "node_id":"source", "activation_id":"activation", "attempt":1,
+            "graph":{"revision":7,"next_edge_id":19,"nodes":[],"edges":[],
+                "nodes_complete":false,"edges_complete":true},
+            "output":null,"outputs":[]
+        }))
+        .unwrap();
+        let compact: serde_json::Value =
+            serde_json::from_str(&context_output(&context, true)).unwrap();
+        assert_eq!(compact["activation_id"], "activation");
+        assert_eq!(compact["graph"]["revision"], 7);
+        assert_eq!(compact["graph"]["next_edge_id"], 19);
+        assert_eq!(compact["graph"]["nodes_complete"], false);
+        assert_eq!(compact["graph"]["node_definitions_omitted"], true);
+        assert!(compact["graph"].get("nodes").is_none());
+        assert_eq!(
+            serde_json::from_str::<bcode_workflow::WorkflowExecutionContext>(&context_output(
+                &context, false
+            ))
+            .unwrap(),
+            context
+        );
+        assert_eq!(
+            parse_context(json!({"compact":true})).unwrap(),
+            parse_context(json!({})).unwrap()
+        );
+        assert!(parse_context(json!({"compact":"true"})).is_err());
+    }
+
+    #[test]
+    fn compact_edge_inspection_is_revision_pinned_and_recovers_exact_transform() {
+        for edge_id in [0_u64, 9, u64::MAX] {
+            let mut context: bcode_workflow::WorkflowExecutionContext =
+                serde_json::from_value(json!({
+                    "run_id":"run", "node_id":"source", "activation_id":"activation", "attempt":1,
+                    "graph":{"revision":7,"next_edge_id":null,"nodes":[],"edges":[],
+                        "nodes_complete":true,"edges_complete":true},
+                    "output":null,"outputs":[]
+                }))
+                .unwrap();
+            let transform = bcode_workflow::WorkflowTransform {
+                version: 1,
+                expression: bcode_workflow::WorkflowTransformExpression::Input {
+                    source: bcode_workflow::WORKFLOW_TRANSFORM_SOURCE_CURRENT.into(),
+                    path: "source".into(),
+                },
+                output: bcode_workflow::ValueSchema {
+                    type_name: "goal".into(),
+                    schema: json!({"type":"object"}),
+                },
+            };
+            context
+                .graph
+                .edges
+                .push(bcode_workflow::WorkflowRunGraphEdgeInspection {
+                    edge_id,
+                    revision: 7,
+                    edge: bcode_workflow::EdgeDefinition {
+                        from: "integrate".into(),
+                        to: "evaluate".into(),
+                        kind: bcode_workflow::EdgeKind::Direct,
+                        transform: Some(transform.clone()),
+                    },
+                });
+            let compact: serde_json::Value =
+                serde_json::from_str(&context_output(&context, true)).unwrap();
+            let edge = &compact["graph"]["edges"][0];
+            assert!(edge["edge"].get("transform").is_none());
+            let request = parse_context(edge["inspection_arguments"].clone()).unwrap();
+            assert_eq!(request.expected_revision, Some(7));
+            assert_eq!(request.after_edge_id, edge_id.checked_sub(1));
+            assert_eq!(request.limit, 1);
+            let full: bcode_workflow::WorkflowExecutionContext =
+                serde_json::from_str(&context_output(&context, false)).unwrap();
+            assert_eq!(full.graph.edges[0].edge.transform, Some(transform));
         }
     }
 

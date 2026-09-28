@@ -272,11 +272,13 @@ impl PluginTuiSurfaceFactory for GoalSurfaceFactory {
     }
     fn open(&self, request: PluginTuiSurfaceOpenRequest) -> PluginTuiSurfaceFuture {
         Box::pin(async move {
-            let session = request
-                .options
-                .get("session_id")
-                .and_then(serde_json::Value::as_str)
-                .and_then(|s| SessionId::from_str(s).ok());
+            let session = request.session_id.or_else(|| {
+                request
+                    .options
+                    .get("session_id")
+                    .and_then(serde_json::Value::as_str)
+                    .and_then(|s| SessionId::from_str(s).ok())
+            });
             let mut surface = GoalSurface::new(session);
             surface.editor.collaboration = if request
                 .options
@@ -1005,6 +1007,10 @@ mod tests {
                 .symbol,
             "╮"
         );
+    }
+
+    mod collaboration {
+        include!("goal_collaboration_tests.rs");
     }
 
     #[derive(Default)]

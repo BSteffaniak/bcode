@@ -634,6 +634,11 @@ impl FakeProviderPlugin {
                     .flatten()
             })
             .or_else(|| {
+                (!matches!(request.tool_call_policy.choice, ToolChoice::None))
+                    .then(|| scripted_prompt_tool_call(&request, state.next_turn))
+                    .flatten()
+            })
+            .or_else(|| {
                 (tool_result.is_none()
                     && !matches!(request.tool_call_policy.choice, ToolChoice::None))
                 .then(|| fake_tool_call(&user_text, state.next_turn))
@@ -1025,7 +1030,14 @@ fn fake_response_text(
         return vision::answer(request, user_text)
             .map_err(|message| fake_structured_output_error(&message));
     }
-    if let Some(result) = tool_result {
+    if let Some(result) = tool_result
+        && !(request.structured_output.is_some()
+            && request
+                .provider_context
+                .settings
+                .get("fake_prompt_tool_directives")
+                .is_some_and(|value| value == "true"))
+    {
         return Ok(format!("fake tool result: {result}"));
     }
     let Some(structured) = request.structured_output.as_ref() else {
@@ -1179,6 +1191,44 @@ fn configured_matching_input(
     })
 }
 
+// This opt-in fixture checks tool evidence, never the filesystem or worker prose.
+// Prior activations and error outputs cannot serve as a verification receipt.
+fn current_tool_evidence(messages: &[ModelMessage], expected: &str) -> bool {
+    messages
+        .iter()
+        .rev()
+        .take_while(|message| message.role != MessageRole::User)
+        .flat_map(|message| &message.content)
+        .find_map(|block| match block {
+            ContentBlock::ToolResult { result } => {
+                Some(!result.is_error && result.output == expected)
+            }
+            _ => None,
+        })
+        .unwrap_or(false)
+}
+
+fn apply_loop_tool_evidence(
+    value: &mut serde_json::Value,
+    messages: &[ModelMessage],
+    expected: &str,
+) {
+    let verified = current_tool_evidence(messages, expected);
+    value["condition_met"] = serde_json::json!(verified);
+    value["external_blocker"] = serde_json::json!(if verified {
+        "none"
+    } else {
+        "approval_required"
+    });
+    let evidence = if verified {
+        "Current evaluation read the expected integrated verification receipt"
+    } else {
+        "Evaluation could not verify the receipt through its requested tool; inspect the failed or denied read and authorize recovery before retrying"
+    };
+    value["evidence"] = serde_json::json!([evidence]);
+    value["summary"] = serde_json::json!(evidence);
+}
+
 fn configured_fake_structured_output(
     request: &ModelTurnRequest,
     structured: &bcode_model::StructuredOutputRequest,
@@ -1195,22 +1245,41 @@ fn configured_fake_structured_output(
         configured_matching_input(user_text, &structured.schema, true)?
     } else if configured == "matching_input:" {
         configured_matching_input(user_text, &structured.schema, false)?
-    } else if let Some(threshold) = configured.strip_prefix("loop_until:") {
-        let threshold = threshold
-            .parse::<u64>()
+    } else if configured.starts_with("loop_until:") || configured.starts_with("loop_tool_evidence:")
+    {
+        let threshold = configured
+            .strip_prefix("loop_until:")
+            .map(str::parse::<u64>)
+            .transpose()
             .map_err(|error| fake_structured_output_error(&error))?;
-        let mut value: serde_json::Value =
-            serde_json::from_str(structured_input_payload(user_text))
-                .map_err(|error| fake_structured_output_error(&error))?;
+        let input: serde_json::Value = serde_json::from_str(structured_input_payload(user_text))
+            .map_err(|error| fake_structured_output_error(&error))?;
+        let Some(mut value) = find_object_with_fields(
+            &input,
+            &[
+                "implementation_prompt",
+                "stop_condition",
+                "iteration",
+                "max_iterations",
+            ],
+        )
+        .cloned() else {
+            return Ok(None);
+        };
         let evaluation = user_text.starts_with("Read-only loop completion evaluation.");
         let iteration = value
             .get("iteration")
             .and_then(serde_json::Value::as_u64)
             .unwrap_or_default();
         if evaluation {
-            value["condition_met"] = serde_json::json!(iteration >= threshold);
-            value["evidence"] = serde_json::json!([format!("evaluated iteration {iteration}")]);
-            value["summary"] = serde_json::json!(format!("iteration {iteration} evaluated"));
+            if let Some(expected) = configured.strip_prefix("loop_tool_evidence:") {
+                apply_loop_tool_evidence(&mut value, &request.messages, expected);
+            } else {
+                value["condition_met"] =
+                    serde_json::json!(iteration >= threshold.unwrap_or_default());
+                value["evidence"] = serde_json::json!([format!("evaluated iteration {iteration}")]);
+                value["summary"] = serde_json::json!(format!("iteration {iteration} evaluated"));
+            }
         } else {
             value["iteration"] = serde_json::json!(iteration);
             value["condition_met"] = serde_json::json!(false);
@@ -2301,6 +2370,89 @@ fn required_fake_tool_call(request: &ModelTurnRequest, next_turn: u64) -> Option
     })
 }
 
+// Opt-in acceptance fixture: inspect lines of the latest user prompt, which may
+// include instructions followed by canonical workflow JSON. Never enabled by default.
+fn scripted_prompt_tool_call(request: &ModelTurnRequest, next_turn: u64) -> Option<ToolCall> {
+    if request
+        .provider_context
+        .settings
+        .get("fake_prompt_tool_directives")
+        .is_none_or(|value| value != "true")
+    {
+        return None;
+    }
+    next_prompt_tool_directive(&request.messages, next_turn)
+}
+
+// Results are scoped to the current user message, never a previous activation.
+// Stop on errors instead of scripting past denied or failed operations.
+fn next_prompt_tool_directive(messages: &[ModelMessage], next_turn: u64) -> Option<ToolCall> {
+    let mut completed = 0;
+    for message in messages
+        .iter()
+        .rev()
+        .take_while(|message| message.role != MessageRole::User)
+    {
+        for block in &message.content {
+            if let ContentBlock::ToolResult { result } = block {
+                if result.is_error {
+                    return None;
+                }
+                completed += 1;
+            }
+        }
+    }
+    let mut call = last_user_text(messages)
+        .lines()
+        .filter_map(|line| fake_tool_call(line, next_turn))
+        .nth(completed)?;
+    let results = messages
+        .iter()
+        .rev()
+        .take_while(|message| message.role != MessageRole::User)
+        .flat_map(|message| &message.content)
+        .filter_map(|block| match block {
+            ContentBlock::ToolResult { result } => Some(result.output.as_str()),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    bind_prompt_results(&mut call.arguments, &results)?;
+    Some(call)
+}
+
+// Explicit opt-in fixture references use reverse chronological result indices and
+// RFC 6901 pointers. Missing/malformed references stop the script, never dispatch
+// unresolved placeholders. Result values are data, not recursively interpreted.
+fn bind_prompt_results(value: &mut serde_json::Value, results: &[&str]) -> Option<()> {
+    match value {
+        serde_json::Value::Object(object) if object.contains_key("$fake_result") => {
+            if object.len() != 1 {
+                return None;
+            }
+            let reference = object.get("$fake_result")?.as_object()?;
+            if reference.len() != 2 {
+                return None;
+            }
+            let index = usize::try_from(reference.get("index")?.as_u64()?).ok()?;
+            let pointer = reference.get("pointer")?.as_str()?;
+            let result: serde_json::Value = serde_json::from_str(results.get(index)?).ok()?;
+            *value = result.pointer(pointer)?.clone();
+        }
+        serde_json::Value::Object(object) => {
+            for child in object.values_mut() {
+                bind_prompt_results(child, results)?;
+            }
+        }
+        serde_json::Value::Array(array) => {
+            for child in array {
+                bind_prompt_results(child, results)?;
+            }
+        }
+        _ => {}
+    }
+    Some(())
+}
+
 fn fake_tool_call(user_text: &str, next_turn: u64) -> Option<ToolCall> {
     if let Some(rest) = user_text.strip_prefix("tool-call ") {
         let (name, arguments) = rest.split_once(' ')?;
@@ -2825,6 +2977,100 @@ mod tests {
     }
 
     #[test]
+    fn prompt_receipt_bindings_are_typed_and_fail_closed() {
+        let reference = |index, pointer| {
+            serde_json::json!({
+                "$fake_result": {"index": index, "pointer": pointer}
+            })
+        };
+        let receipt = r#"{"publication_arguments":{"mutation_id":"actual"},"a/b":[7],"literal":{"$fake_result":{}}}"#;
+        let mut arguments = serde_json::json!({
+            "receipt": reference(0, "/publication_arguments"),
+            "nested": [reference(0, "/a~1b/0")],
+            "literal": reference(0, "/literal")
+        });
+        assert_eq!(bind_prompt_results(&mut arguments, &[receipt]), Some(()));
+        assert_eq!(arguments["receipt"]["mutation_id"], "actual");
+        assert_eq!(arguments["nested"][0], 7);
+        assert_eq!(
+            arguments["literal"],
+            serde_json::json!({"$fake_result": {}})
+        );
+        for mut invalid in [
+            reference(1, ""),
+            reference(0, "/missing"),
+            reference(0, "bad"),
+        ] {
+            assert_eq!(bind_prompt_results(&mut invalid, &[receipt]), None);
+        }
+        assert_eq!(
+            bind_prompt_results(&mut reference(0, ""), &["not JSON"]),
+            None
+        );
+    }
+
+    #[test]
+    fn prompt_directives_advance_only_after_successful_current_results() {
+        let user = |text: &str| ModelMessage {
+            role: MessageRole::User,
+            content: vec![ContentBlock::Text { text: text.into() }],
+        };
+        let result = |is_error| ModelMessage {
+            role: MessageRole::Tool,
+            content: vec![ContentBlock::ToolResult {
+                result: bcode_model::ToolResult {
+                    call_id: "first".into(),
+                    output: "result".into(),
+                    is_error,
+                    content: Vec::new(),
+                },
+            }],
+        };
+        let mut messages = vec![
+            result(true),
+            user("Instructions\ntool-call first {}\ntool-call second {}"),
+        ];
+        assert_eq!(
+            next_prompt_tool_directive(&messages, 1).unwrap().name,
+            "first"
+        );
+        messages.push(result(false));
+        assert_eq!(
+            next_prompt_tool_directive(&messages, 2).unwrap().name,
+            "second"
+        );
+        messages.push(result(false));
+        assert!(next_prompt_tool_directive(&messages, 3).is_none());
+        messages.pop();
+        messages.push(result(true));
+        assert!(next_prompt_tool_directive(&messages, 3).is_none());
+        messages.push(user("tool-call fresh {}"));
+        assert_eq!(
+            next_prompt_tool_directive(&messages, 4).unwrap().name,
+            "fresh"
+        );
+        messages.push(user(
+            r#"tool-call inspect {}
+tool-call publish {"$fake_result":{"index":0,"pointer":"/publication_arguments"}}"#,
+        ));
+        let mut receipt = result(false);
+        if let ContentBlock::ToolResult { result } = &mut receipt.content[0] {
+            result.output = r#"{"publication_arguments":{"edit_json":"exact receipt"}}"#.into();
+        }
+        messages.push(receipt);
+        let call = next_prompt_tool_directive(&messages, 5).unwrap();
+        assert_eq!(call.name, "publish");
+        assert_eq!(
+            call.arguments,
+            serde_json::json!({"edit_json":"exact receipt"})
+        );
+        messages.push(user(
+            r#"tool-call publish {"$fake_result":{"index":0,"pointer":"/publication_arguments"}}"#,
+        ));
+        assert!(next_prompt_tool_directive(&messages, 6).is_none());
+    }
+
+    #[test]
     fn tool_result_only_applies_after_the_current_user_message() {
         let messages = vec![
             ModelMessage {
@@ -2846,6 +3092,48 @@ mod tests {
             },
         ];
         assert_eq!(last_tool_result(&messages), None);
+    }
+
+    #[test]
+    fn loop_evidence_requires_current_successful_exact_tool_receipt() {
+        let receipt = |output: &str, is_error| ModelMessage {
+            role: MessageRole::Tool,
+            content: vec![ContentBlock::ToolResult {
+                result: bcode_model::ToolResult {
+                    call_id: "verification-read".into(),
+                    output: output.into(),
+                    is_error,
+                    content: Vec::new(),
+                },
+            }],
+        };
+        let user = ModelMessage {
+            role: MessageRole::User,
+            content: vec![ContentBlock::Text {
+                text: "evaluate".into(),
+            }],
+        };
+        assert!(!current_tool_evidence(&[], "verified"));
+        assert!(!current_tool_evidence(
+            &[receipt("verified", true)],
+            "verified"
+        ));
+        assert!(!current_tool_evidence(
+            &[receipt("claimed verified", false)],
+            "verified"
+        ));
+        assert!(!current_tool_evidence(
+            &[receipt("verified", false), user.clone()],
+            "verified"
+        ));
+        assert!(current_tool_evidence(
+            &[user.clone(), receipt("verified", false)],
+            "verified"
+        ));
+        assert!(!current_tool_evidence(
+            &[user, receipt("verified", false), receipt("denied", true)],
+            "verified"
+        ));
     }
 
     #[test]

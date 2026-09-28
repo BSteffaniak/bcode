@@ -28420,6 +28420,71 @@ fn workflow_operation_failure(error: &ServerError) -> ToolInvocationServiceResol
     }
 }
 
+async fn resolve_invocation_graph_edit(
+    state: &ServerState,
+    session_id: SessionId,
+    operation: &str,
+    payload: serde_json::Value,
+    cancellation: &TurnCancelState,
+) -> Result<bcode_workflow::WorkflowRunGraphEditBatch, ServerError> {
+    #[derive(serde::Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct ReferenceRequest {
+        candidate: bcode_workflow::WorkflowRunGraphCandidateReference,
+    }
+    let denied = || {
+        ServerError::WorkflowApplicationOperationUnauthorized("candidate reference rejected".into())
+    };
+    if payload.get("candidate").is_none() {
+        return serde_json::from_value(payload).map_err(|_| denied());
+    }
+    if !matches!(
+        operation,
+        "publish_run_graph_edit" | "accept_run_graph_publication"
+    ) {
+        return Err(denied());
+    }
+    let reference = serde_json::from_value::<ReferenceRequest>(payload)
+        .map_err(|_| denied())?
+        .candidate;
+    // Reuse the authenticated bounded context path to verify session provenance,
+    // active execution and this daemon's durable ownership before looking up data.
+    let context = state
+        .workflow_execution_context_from_invocation(
+            session_id,
+            bcode_workflow::WorkflowExecutionContextRequest {
+                output_id: None,
+                after_output_id: None,
+                expected_revision: None,
+                after_node_id: None,
+                after_edge_id: None,
+                limit: 1,
+            },
+            cancellation,
+        )
+        .await?;
+    if reference.version != 1 || reference.run_id != context.run_id {
+        return Err(denied());
+    }
+    let store = state
+        .workflow_store
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let authority = store
+        .execution_authority(&context.run_id)?
+        .ok_or_else(denied)?;
+    let edit = store
+        .staged_run_graph_edit(&reference.run_id, &reference.mutation_id, &authority)?
+        .ok_or_else(denied)?;
+    drop(store);
+    if bcode_workflow::WorkflowRunGraphCandidateReference::from_edit(&edit).map_err(|_| denied())?
+        != reference
+    {
+        return Err(denied());
+    }
+    Ok(edit)
+}
+
 async fn invoke_run_graph_operation(
     state: &ServerState,
     session_id: SessionId,
@@ -28533,7 +28598,15 @@ async fn resolve_server_plugin_bridge_request(
                 ToolInvocationServiceResolution::Unsupported
             } else if request.operation == "execution_context" {
                 resolve_execution_context(state, session_id, request.payload, cancel_state).await
-            } else if let Ok(edit) = serde_json::from_value(request.payload) {
+            } else if let Ok(edit) = resolve_invocation_graph_edit(
+                state,
+                session_id,
+                &request.operation,
+                request.payload,
+                cancel_state,
+            )
+            .await
+            {
                 let result = invoke_run_graph_operation(
                     state,
                     session_id,
@@ -33740,36 +33813,81 @@ async fn dispatch_workflow_prompt_turn_after_admission(
             )
             .await?
             {
+                if let Some(directory) = &configuration.worktree_directory {
+                    let parent = state
+                        .sessions
+                        .session_summary(parent_session_id)
+                        .await
+                        .map_err(|error| WorkflowStoreError::InvalidData(error.to_string()))?;
+                    let worktree = bcode_worktree::validate_registered_worktree(
+                        &parent.working_directory,
+                        Path::new(directory),
+                    )
+                    .map_err(|error| WorkflowStoreError::InvalidData(error.to_string()))?;
+                    if existing.working_directory.canonicalize().ok().as_deref()
+                        != Some(worktree.path())
+                    {
+                        return Err(WorkflowStoreError::InvalidData(
+                            "recovered workflow session does not match the declared worktree"
+                                .into(),
+                        ));
+                    }
+                }
                 existing
             } else {
-                let child = match execution_target {
-                    bcode_workflow::PromptContextTarget::FreshIsolated => {
+                let child = match (
+                    execution_target,
+                    configuration.worktree_directory.as_deref(),
+                ) {
+                    (bcode_workflow::PromptContextTarget::FreshIsolated, Some(directory)) => state
+                        .create_fresh_execution_session_in_registered_worktree(
+                            Some(format!("workflow {}", request.activation.node.name)),
+                            provenance.clone(),
+                            Path::new(directory),
+                        )
+                        .await
+                        .map_err(WorkflowStoreError::InvalidData)?,
+                    (bcode_workflow::PromptContextTarget::FixedGenerationFork, Some(directory)) => {
                         state
-                            .sessions
-                            .create_fresh_execution_session(
-                                Some(format!("workflow {}", request.activation.node.name)),
-                                provenance.clone(),
-                                None,
-                            )
-                            .await
-                    }
-                    bcode_workflow::PromptContextTarget::FixedGenerationFork => {
-                        state
-                            .sessions
-                            .create_pinned_generation_execution_session(
+                            .create_fixed_generation_execution_session_in_registered_worktree(
                                 Some(format!("workflow {}", request.activation.node.name)),
                                 provenance.clone(),
                                 run.parent_session_generation
                                     .expect("validated pinned generation"),
-                                None,
+                                Path::new(directory),
                             )
                             .await
+                            .map_err(WorkflowStoreError::InvalidData)?
                     }
-                    bcode_workflow::PromptContextTarget::SharedParentSequential => {
-                        unreachable!("shared execution handled separately")
+                    _ => match execution_target {
+                        bcode_workflow::PromptContextTarget::FreshIsolated => {
+                            state
+                                .sessions
+                                .create_fresh_execution_session(
+                                    Some(format!("workflow {}", request.activation.node.name)),
+                                    provenance.clone(),
+                                    None,
+                                )
+                                .await
+                        }
+                        bcode_workflow::PromptContextTarget::FixedGenerationFork => {
+                            state
+                                .sessions
+                                .create_pinned_generation_execution_session(
+                                    Some(format!("workflow {}", request.activation.node.name)),
+                                    provenance.clone(),
+                                    run.parent_session_generation
+                                        .expect("validated pinned generation"),
+                                    None,
+                                )
+                                .await
+                        }
+                        bcode_workflow::PromptContextTarget::SharedParentSequential => {
+                            unreachable!("shared execution handled separately")
+                        }
                     }
-                }
-                .map_err(|error| WorkflowStoreError::InvalidData(error.to_string()))?;
+                    .map_err(|error| WorkflowStoreError::InvalidData(error.to_string()))?,
+                };
                 state
                     .workflow_store
                     .lock()
@@ -37092,6 +37210,8 @@ fn default_session_artifact_dir(session_id: SessionId) -> PathBuf {
 
 #[cfg(test)]
 mod tests {
+    mod collaboration_execution;
+    mod goal_entry;
     // Destructured bindings below avoid significant_drop_tightening false positives on moved
     // owners and non-owning adapters. Actual resource owners retain explicit teardown drops.
     #[test]
@@ -54148,6 +54268,49 @@ library = "test"
         )
     }
 
+    async fn assert_candidate_reference_rejects_tampering(
+        state: &ServerState,
+        session: SessionId,
+        reference: &serde_json::Value,
+    ) {
+        for field in [
+            "version",
+            "run_id",
+            "mutation_id",
+            "expected_revision",
+            "checksum_sha256",
+        ] {
+            let mut invalid = reference.clone();
+            invalid["candidate"][field] = match field {
+                "version" | "expected_revision" => serde_json::json!(999),
+                "checksum_sha256" => serde_json::json!("0".repeat(64)),
+                _ => serde_json::json!("foreign"),
+            };
+            assert!(
+                resolve_invocation_graph_edit(
+                    state,
+                    session,
+                    "publish_run_graph_edit",
+                    invalid,
+                    &TurnCancelState::default()
+                )
+                .await
+                .is_err()
+            );
+        }
+        assert!(
+            resolve_invocation_graph_edit(
+                state,
+                session,
+                "stage_run_graph_edit",
+                reference.clone(),
+                &TurnCancelState::default()
+            )
+            .await
+            .is_err()
+        );
+    }
+
     #[tokio::test]
     async fn task_group_replay_publishes_through_authenticated_tool_bridge() {
         let (mut state, session, _root) = active_edit_execution_fixture().await;
@@ -54182,6 +54345,39 @@ library = "test"
             .await
             .unwrap();
         assert!(!staged.is_error, "{}", staged.output);
+        let receipt: serde_json::Value = serde_json::from_str(&staged.output).unwrap();
+        let reference: serde_json::Value = serde_json::from_str(
+            receipt["publication_arguments"]["edit_json"]
+                .as_str()
+                .unwrap(),
+        )
+        .unwrap();
+        assert_candidate_reference_rejects_tampering(&state, session, &reference).await;
+        let candidate_call = bcode_model::ToolCall {
+            id: "publish-candidate".into(),
+            name: "workflow.publish_run_graph_edit".into(),
+            arguments: receipt["publication_arguments"].clone(),
+        };
+        // A matching reference still cannot bypass the separate application grant.
+        state.set_workflow_run_graph_publication_policy(WorkflowRunGraphPublicationPolicy {
+            evaluator: Arc::new(|_| WorkflowApplicationAuthorizationDecision::Deny {
+                reason: "test denial".into(),
+            }),
+        });
+        assert!(
+            invoke_task_with_permission(&state, session, &candidate_call, true)
+                .await
+                .is_err()
+        );
+        assert!(receiver.try_recv().is_err());
+        state.set_workflow_run_graph_publication_policy(WorkflowRunGraphPublicationPolicy {
+            evaluator: Arc::new(|_| WorkflowApplicationAuthorizationDecision::Allow),
+        });
+        let published = invoke_task_with_permission(&state, session, &candidate_call, true)
+            .await
+            .unwrap();
+        assert!(!published.is_error, "{}", published.output);
+        assert_eq!(receiver.try_recv().unwrap(), "edit-run");
         let publication = bcode_model::ToolCall {
             id: "publish-replay".into(),
             name: "workflow.publish_run_graph_edit".into(),
@@ -68199,6 +68395,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
     ) -> bcode_workflow::WorkflowPromptConfiguration {
         bcode_workflow::WorkflowPromptConfiguration {
             version: bcode_workflow::WORKFLOW_PROMPT_CONFIGURATION_VERSION,
+            worktree_directory: None,
             activity_producer: None,
             execution_target,
             agent_profile: "build".to_string(),
@@ -72261,6 +72458,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
         };
         let configuration = bcode_workflow::WorkflowPromptConfiguration {
             version: bcode_workflow::WORKFLOW_PROMPT_CONFIGURATION_VERSION,
+            worktree_directory: None,
             activity_producer: None,
             execution_target: bcode_workflow::PromptContextTarget::FreshIsolated,
             agent_profile: "build".to_string(),
@@ -74375,6 +74573,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
             resources: Vec::new(),
             configuration: serde_json::to_value(bcode_workflow::WorkflowPromptConfiguration {
                 version: bcode_workflow::WORKFLOW_PROMPT_CONFIGURATION_VERSION,
+                worktree_directory: None,
                 activity_producer: None,
                 execution_target: bcode_workflow::PromptContextTarget::SharedParentSequential,
                 agent_profile: "build".to_string(),
@@ -74581,6 +74780,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
             resources: Vec::new(),
             configuration: serde_json::to_value(bcode_workflow::WorkflowPromptConfiguration {
                 version: bcode_workflow::WORKFLOW_PROMPT_CONFIGURATION_VERSION,
+                worktree_directory: None,
                 activity_producer: None,
                 execution_target: bcode_workflow::PromptContextTarget::SharedParentSequential,
                 agent_profile: "build".to_string(),
@@ -74874,6 +75074,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
                         configuration: serde_json::to_value(
                             bcode_workflow::WorkflowPromptConfiguration {
                                 version: bcode_workflow::WORKFLOW_PROMPT_CONFIGURATION_VERSION,
+                                worktree_directory: None,
                                 activity_producer: None,
                                 execution_target:
                                     bcode_workflow::PromptContextTarget::FreshIsolated,
@@ -75770,6 +75971,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
         };
         let configuration = bcode_workflow::WorkflowPromptConfiguration {
             version: bcode_workflow::WORKFLOW_PROMPT_CONFIGURATION_VERSION,
+            worktree_directory: None,
             activity_producer: None,
             execution_target: bcode_workflow::PromptContextTarget::SharedParentSequential,
             agent_profile: "plan".to_string(),
@@ -76254,6 +76456,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
                     configuration: serde_json::to_value(
                         bcode_workflow::WorkflowPromptConfiguration {
                             version: bcode_workflow::WORKFLOW_PROMPT_CONFIGURATION_VERSION,
+                            worktree_directory: None,
                             activity_producer: None,
                             execution_target: bcode_workflow::PromptContextTarget::FreshIsolated,
                             agent_profile: "build".to_string(),
@@ -76672,6 +76875,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
                     configuration: serde_json::to_value(
                         bcode_workflow::WorkflowPromptConfiguration {
                             version: bcode_workflow::WORKFLOW_PROMPT_CONFIGURATION_VERSION,
+                            worktree_directory: None,
                             activity_producer: None,
                             execution_target: bcode_workflow::PromptContextTarget::FreshIsolated,
                             agent_profile: "build".to_string(),
@@ -79190,6 +79394,61 @@ event_symbol = "bcode_plugin_handle_event_v1"
         );
     }
 
+    async fn assert_operator_allowance_grant(state: &Arc<ServerState>, run_id: &str) {
+        let expected_cap = state
+            .workflow_store
+            .lock()
+            .unwrap()
+            .execution_allowance_observation(run_id)
+            .unwrap()
+            .run_cap;
+        let action = bcode_workflow::WorkflowRunControlAction::IncreaseExecutionAllowance {
+            expected_cap,
+            target_cap: expected_cap + 1,
+        };
+        let application =
+            workflow_operations::WorkflowAuthoringApplication::new(state, ClientId::new());
+        let (run, changed) = bcode_workflow::WorkflowRunApplication::control_workflow_run(
+            &application,
+            run_id.into(),
+            action,
+        )
+        .await
+        .expect("explicit operator grant");
+        assert!(changed);
+        assert_eq!(run.unwrap().status, bcode_workflow_store::RunStatus::Paused);
+        let (_, changed) = bcode_workflow::WorkflowRunApplication::control_workflow_run(
+            &application,
+            run_id.into(),
+            action,
+        )
+        .await
+        .expect("identical retry");
+        assert!(!changed);
+        assert!(
+            bcode_workflow::WorkflowRunApplication::control_workflow_run(
+                &application,
+                run_id.into(),
+                bcode_workflow::WorkflowRunControlAction::IncreaseExecutionAllowance {
+                    expected_cap,
+                    target_cap: expected_cap + 2,
+                },
+            )
+            .await
+            .is_err()
+        );
+        assert_eq!(
+            state
+                .workflow_store
+                .lock()
+                .unwrap()
+                .execution_allowance_observation(run_id)
+                .unwrap()
+                .run_cap,
+            expected_cap + 1
+        );
+    }
+
     async fn assert_associated_resume_pending(recovering: bool) {
         let sessions = SessionManager::default();
         let session = sessions
@@ -79268,6 +79527,9 @@ event_symbol = "bcode_plugin_handle_event_v1"
         ));
 
         assert_no_pending_replacement_withdrawal(&state, &key).await;
+        if !recovering {
+            assert_operator_allowance_grant(&state, "resume-pending-run").await;
+        }
         if recovering {
             enter_test_run_recovery(&state, "resume-pending-run");
         }

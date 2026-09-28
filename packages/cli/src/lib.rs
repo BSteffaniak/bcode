@@ -1460,6 +1460,23 @@ async fn dispatch_workflow_command(command: Box<WorkflowCommand>) -> Result<(), 
                 .await?,
             )?;
         }
+        WorkflowCommand::IncreaseAllowance {
+            run_id,
+            expected_cap,
+            target_cap,
+        } => {
+            print_json(
+                &client
+                    .control_workflow_run(
+                        run_id,
+                        bcode_workflow::WorkflowRunControlAction::IncreaseExecutionAllowance {
+                            expected_cap,
+                            target_cap,
+                        },
+                    )
+                    .await?,
+            )?;
+        }
         WorkflowCommand::RetryNode {
             run_id,
             node_id,
@@ -4461,6 +4478,15 @@ enum WorkflowCommand {
     ResumeRun {
         #[arg(long)]
         run_id: String,
+    },
+    /// Explicitly increase an active run's allowance without resuming it.
+    IncreaseAllowance {
+        #[arg(long)]
+        run_id: String,
+        #[arg(long, value_parser = clap::value_parser!(u64).range(1..))]
+        expected_cap: u64,
+        #[arg(long, value_parser = clap::value_parser!(u64).range(1..))]
+        target_cap: u64,
     },
     /// Retry one exact failed node attempt and return the admission result as JSON.
     RetryNode {
@@ -21288,6 +21314,29 @@ mod web_command_tests {
             assert!(rendered.contains("schema 39"));
             assert!(rendered.contains("upgrade Bcode"));
         }
+    }
+
+    #[test]
+    fn workflow_allowance_requires_explicit_caps() {
+        let arguments = [
+            "bcode",
+            "workflow",
+            "increase-allowance",
+            "--run-id",
+            "run-1",
+            "--expected-cap",
+            "100",
+            "--target-cap",
+            "200",
+        ];
+        let cli = Cli::try_parse_from(arguments).unwrap();
+        assert!(matches!(cli.command, Some(Commands::Workflow {
+            command: WorkflowCommand::IncreaseAllowance { run_id, expected_cap: 100, target_cap: 200 }
+        }) if run_id == "run-1"));
+        assert!(Cli::try_parse_from(&arguments[..7]).is_err());
+        let mut zero = arguments;
+        zero[6] = "0";
+        assert!(Cli::try_parse_from(zero).is_err());
     }
 
     #[test]

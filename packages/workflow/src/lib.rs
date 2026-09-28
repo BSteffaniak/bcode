@@ -158,6 +158,11 @@ pub struct WorkflowRunGraphPageRequest {
 #[serde(deny_unknown_fields)]
 pub struct WorkflowRunGraphInspection {
     pub revision: u64,
+    /// First edge identity never used by this run, including retired edges.
+    /// Revision-qualified advice, not a reservation. None means unavailable or exhausted;
+    /// callers must not infer an allocation from a partial edge page.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next_edge_id: Option<u64>,
     pub nodes: Vec<WorkflowRunGraphNodeInspection>,
     pub edges: Vec<WorkflowRunGraphEdgeInspection>,
     pub nodes_complete: bool,
@@ -4497,6 +4502,39 @@ pub struct WorkflowRunGraphEditBatch {
     pub reconciliation: Vec<WorkflowRunGraphReconciliation>,
 }
 
+/// Bounded reference to one exact retained candidate; never an authorization token.
+/// Version 1 binds the complete serialized edit with SHA-256. Unknown versions reject.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WorkflowRunGraphCandidateReference {
+    /// Reference representation version.
+    pub version: u32,
+    /// Canonical run identity.
+    pub run_id: String,
+    /// Stable candidate identity.
+    pub mutation_id: String,
+    /// Candidate's authored graph revision.
+    pub expected_revision: u64,
+    /// SHA-256 of the complete serialized edit.
+    pub checksum_sha256: String,
+}
+
+impl WorkflowRunGraphCandidateReference {
+    /// Bind an exact edit without repeating its potentially large payload.
+    ///
+    /// # Errors
+    /// Returns an error if the edit cannot be serialized.
+    pub fn from_edit(edit: &WorkflowRunGraphEditBatch) -> Result<Self, serde_json::Error> {
+        Ok(Self {
+            version: 1,
+            run_id: edit.run_id.clone(),
+            mutation_id: edit.mutation_id.clone(),
+            expected_revision: edit.expected_revision,
+            checksum_sha256: hex::encode(Sha256::digest(serde_json::to_vec(edit)?)),
+        })
+    }
+}
+
 /// Publication lifecycle projection. Variant tags define compatibility; unknown variants reject.
 ///
 /// Pending is acceptance, not executable authority. A conflict never revokes cancellation
@@ -5191,6 +5229,7 @@ impl WorkflowStructuredSourceConcisePrompt {
         };
         let configuration = WorkflowPromptConfiguration {
             version: WORKFLOW_PROMPT_CONFIGURATION_VERSION,
+            worktree_directory: None,
             activity_producer: None,
             execution_target: self.execution_target,
             agent_profile: self.agent_profile.clone(),
@@ -8991,6 +9030,30 @@ pub fn parallel_result_schema(
     workflow_parallel_join_schema(left, right)
 }
 
+/// Compose exact named member schemas into a required object without leaking local references.
+///
+/// # Errors
+///
+/// Returns an error for unsupported schema references or excessive composition size.
+pub fn named_result_schema(
+    type_name: String,
+    members: &BTreeMap<String, ValueSchema>,
+) -> Result<ValueSchema, WorkflowError> {
+    let properties: BTreeMap<_, _> = members
+        .iter()
+        .map(|(name, schema)| Ok((name.clone(), embedded_schema(&schema.schema)?)))
+        .collect::<Result<_, WorkflowError>>()?;
+    let schema = ValueSchema {
+        type_name,
+        schema: serde_json::json!({
+            "type": "object", "additionalProperties": false,
+            "required": members.keys().collect::<Vec<_>>(), "properties": properties,
+        }),
+    };
+    validate_runtime_value_schema("named.members", &schema)?;
+    Ok(schema)
+}
+
 fn embedded_schema(schema: &serde_json::Value) -> Result<serde_json::Value, WorkflowError> {
     fn expand(
         root: &serde_json::Value,
@@ -11970,7 +12033,7 @@ impl ResourceClaim {
 }
 
 /// Stable durable prompt-node configuration version.
-pub const WORKFLOW_PROMPT_CONFIGURATION_VERSION: u32 = 4;
+pub const WORKFLOW_PROMPT_CONFIGURATION_VERSION: u32 = 5;
 const LEGACY_WORKFLOW_PROMPT_CONFIGURATION_VERSION: u32 = 2;
 
 /// Maximum result-only correction rounds accepted by a workflow prompt contract.
@@ -12084,6 +12147,10 @@ pub struct WorkflowActivityProducer {
 pub struct WorkflowPromptConfiguration {
     pub version: u32,
     pub execution_target: PromptContextTarget,
+    /// Explicit existing registered worktree; absent inherits the parent workspace.
+    /// This selects a filesystem location, not a sandbox or permission grant.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub worktree_directory: Option<String>,
     pub agent_profile: String,
     pub provider: Option<String>,
     pub model: Option<String>,
@@ -12106,6 +12173,8 @@ pub struct WorkflowPromptConfiguration {
 struct WorkflowPromptConfigurationWire {
     version: u32,
     execution_target: PromptContextTarget,
+    #[serde(default)]
+    worktree_directory: Option<String>,
     agent_profile: String,
     provider: Option<String>,
     model: Option<String>,
@@ -12133,6 +12202,13 @@ impl<'de> Deserialize<'de> for WorkflowPromptConfiguration {
         use serde::de::Error as _;
 
         let wire = WorkflowPromptConfigurationWire::deserialize(deserializer)?;
+        if wire.worktree_directory.is_some()
+            && wire.version != WORKFLOW_PROMPT_CONFIGURATION_VERSION
+        {
+            return Err(D::Error::custom(
+                "worktree selection requires current prompt configuration version",
+            ));
+        }
         if wire.version < 4 && !wire.allow_user_questions {
             return Err(D::Error::custom(
                 "user-question policy requires prompt configuration version 4",
@@ -12153,7 +12229,7 @@ impl<'de> Deserialize<'de> for WorkflowPromptConfiguration {
                     })?,
                 }
             }
-            3 | WORKFLOW_PROMPT_CONFIGURATION_VERSION => {
+            3 | 4 | WORKFLOW_PROMPT_CONFIGURATION_VERSION => {
                 if wire.structured_output.is_some() {
                     return Err(D::Error::custom(
                         "prompt configuration version 3 must not contain structured_output",
@@ -12172,6 +12248,7 @@ impl<'de> Deserialize<'de> for WorkflowPromptConfiguration {
         Ok(Self {
             version: WORKFLOW_PROMPT_CONFIGURATION_VERSION,
             execution_target: wire.execution_target,
+            worktree_directory: wire.worktree_directory,
             agent_profile: wire.agent_profile,
             provider: wire.provider,
             model: wire.model,
@@ -12227,6 +12304,7 @@ impl WorkflowPromptConfiguration {
     ) -> Self {
         Self {
             version: WORKFLOW_PROMPT_CONFIGURATION_VERSION,
+            worktree_directory: None,
             activity_producer: None,
             execution_target: PromptContextTarget::FreshIsolated,
             agent_profile: agent_profile.into(),
@@ -12326,6 +12404,19 @@ impl WorkflowPromptConfiguration {
                 path: "prompt.configuration".to_string(),
                 message: "prompt profile, prompt mode, timeout, or system prompt is invalid"
                     .to_string(),
+            });
+        }
+        if self.worktree_directory.as_ref().is_some_and(|path| {
+            path.trim().is_empty()
+                || path.len() > 4096
+                || !std::path::Path::new(path).is_absolute()
+                || self.execution_target == PromptContextTarget::SharedParentSequential
+        }) {
+            return Err(WorkflowError::Build {
+                path: "prompt.worktree_directory".to_string(),
+                message:
+                    "worktree requires a bounded absolute path and a separate execution session"
+                        .to_string(),
             });
         }
         if self.read_only && self.tool_capability != WorkflowToolCapability::ReadOnly {
@@ -12666,6 +12757,52 @@ pub struct NodeDefinition {
     pub configuration: serde_json::Value,
 }
 
+impl NodeDefinition {
+    /// Validate node-local structural rules without loading the surrounding graph.
+    ///
+    /// This does not validate edges, graph boundaries, reachability, production admission,
+    /// or execution reconciliation and does not authorize publication.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for blank identity/name, invalid control configuration, or a
+    /// workflow call that retains resources while awaiting children.
+    pub fn validate_structure(&self) -> Result<(), WorkflowError> {
+        if self.id.trim().is_empty() {
+            return Err(WorkflowError::Build {
+                path: self.id.clone(),
+                message: "step identity must not be empty".to_string(),
+            });
+        }
+        if self.name.trim().is_empty() {
+            return Err(WorkflowError::Build {
+                path: self.id.clone(),
+                message: "step name must not be empty".to_string(),
+            });
+        }
+        if self.kind == NodeKind::WorkflowCall && !self.resources.is_empty() {
+            return Err(WorkflowError::Build {
+                path: self.id.clone(),
+                message:
+                    "workflow call nodes must not retain resource leases while awaiting children"
+                        .to_string(),
+            });
+        }
+        validate_control_node(self)?;
+        if self.kind == NodeKind::WorkflowCall {
+            let call: WorkflowCallConfiguration =
+                serde_json::from_value(self.configuration.clone()).map_err(|error| {
+                    WorkflowError::Build {
+                        path: self.id.clone(),
+                        message: format!("workflow call configuration is invalid: {error}"),
+                    }
+                })?;
+            call.validate()?;
+        }
+        Ok(())
+    }
+}
+
 /// Generic workflow node kind.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -12906,6 +13043,40 @@ pub struct EdgeDefinition {
     /// Optional bounded declarative mapping evaluated before target activation insertion.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub transform: Option<WorkflowTransform>,
+}
+
+impl EdgeDefinition {
+    /// Validate edge-local control and transform structure without loading a graph.
+    ///
+    /// Callers must separately validate endpoint existence, transform dependencies and
+    /// target schemas, and global topology before publication.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for an invalid transform, predicate, or zero repeat allowance.
+    pub fn validate_structure(&self) -> Result<(), WorkflowError> {
+        if let Some(transform) = &self.transform {
+            transform.validate()?;
+        }
+        if matches!(
+            self.kind,
+            EdgeKind::Back {
+                max_iterations: 0,
+                ..
+            }
+        ) {
+            return Err(WorkflowError::Build {
+                path: self.from.clone(),
+                message: "repeat max_iterations must be greater than zero".to_string(),
+            });
+        }
+        match &self.kind {
+            EdgeKind::Conditional { predicate, .. } | EdgeKind::Back { predicate, .. } => {
+                validate_predicate_expression(predicate)
+            }
+            EdgeKind::Direct | EdgeKind::Retry { .. } => Ok(()),
+        }
+    }
 }
 
 /// Serializable workflow edge behavior category used by production capability admission.
@@ -16024,31 +16195,7 @@ fn validate_compiled_definition(definition: &WorkflowDefinition) -> Result<(), W
                 message: format!("node map identity does not match node identity: '{id}'"),
             });
         }
-        if node.name.trim().is_empty() {
-            return Err(WorkflowError::Build {
-                path: node.id.clone(),
-                message: "step name must not be empty".to_string(),
-            });
-        }
-        if node.kind == NodeKind::WorkflowCall && !node.resources.is_empty() {
-            return Err(WorkflowError::Build {
-                path: node.id.clone(),
-                message:
-                    "workflow call nodes must not retain resource leases while awaiting children"
-                        .to_string(),
-            });
-        }
-        validate_control_node(node)?;
-        if node.kind == NodeKind::WorkflowCall {
-            let call: WorkflowCallConfiguration =
-                serde_json::from_value(node.configuration.clone()).map_err(|error| {
-                    WorkflowError::Build {
-                        path: node.id.clone(),
-                        message: format!("workflow call configuration is invalid: {error}"),
-                    }
-                })?;
-            call.validate()?;
-        }
+        node.validate_structure()?;
     }
     for id in definition.entries.iter().chain(&definition.exits) {
         if !definition.nodes.contains_key(id) {
@@ -16091,7 +16238,6 @@ fn validate_compiled_definition(definition: &WorkflowDefinition) -> Result<(), W
                         .to_string(),
                 });
             }
-            transform.validate()?;
             if transform.output != definition.nodes[&edge.to].input {
                 return Err(WorkflowError::Build {
                     path: edge.from.clone(),
@@ -16102,24 +16248,7 @@ fn validate_compiled_definition(definition: &WorkflowDefinition) -> Result<(), W
                 });
             }
         }
-        if matches!(
-            edge.kind,
-            EdgeKind::Back {
-                max_iterations: 0,
-                ..
-            }
-        ) {
-            return Err(WorkflowError::Build {
-                path: edge.from.clone(),
-                message: "repeat max_iterations must be greater than zero".to_string(),
-            });
-        }
-        match &edge.kind {
-            EdgeKind::Conditional { predicate, .. } | EdgeKind::Back { predicate, .. } => {
-                validate_predicate_expression(predicate)?;
-            }
-            EdgeKind::Direct | EdgeKind::Retry { .. } => {}
-        }
+        edge.validate_structure()?;
     }
     ensure_acyclic(&definition.name, &definition.nodes, &definition.edges)
 }
@@ -16729,6 +16858,91 @@ mod tests {
     use std::sync::atomic::AtomicUsize;
 
     #[test]
+    fn node_local_validation_matches_definition_validation() {
+        let node = NodeDefinition {
+            id: "task".into(),
+            name: "Task".into(),
+            kind: NodeKind::Task,
+            dataflow: WorkflowNodeDataflowPolicy::default(),
+            input: ValueSchema::of::<String>(),
+            output: ValueSchema::of::<String>(),
+            resources: vec![],
+            configuration: serde_json::Value::Null,
+        };
+        for (id, name, kind, valid) in [
+            ("task", "Task", NodeKind::Task, true),
+            ("", "Task", NodeKind::Task, false),
+            ("task", " ", NodeKind::Task, false),
+            ("task", "Task", NodeKind::WorkflowCall, false),
+            ("task", "Task", NodeKind::Parallel, true),
+        ] {
+            let candidate = NodeDefinition {
+                id: id.into(),
+                name: name.into(),
+                kind,
+                ..node.clone()
+            };
+            let graph = WorkflowDefinition {
+                schema_version: WORKFLOW_DEFINITION_SCHEMA_VERSION,
+                name: "validation".into(),
+                input: candidate.input.clone(),
+                output: candidate.output.clone(),
+                entries: vec![candidate.id.clone()],
+                exits: vec![candidate.id.clone()],
+                nodes: BTreeMap::from([(candidate.id.clone(), candidate.clone())]),
+                edges: vec![],
+            };
+            assert_eq!(candidate.validate_structure().is_ok(), valid, "{kind:?}");
+            assert_eq!(graph.validate().is_ok(), valid, "{kind:?}");
+        }
+    }
+
+    #[test]
+    fn edge_local_validation_matches_definition_validation() {
+        let node = NodeDefinition {
+            id: "task".into(),
+            name: "Task".into(),
+            kind: NodeKind::Task,
+            dataflow: WorkflowNodeDataflowPolicy::default(),
+            input: ValueSchema::of::<String>(),
+            output: ValueSchema::of::<String>(),
+            resources: vec![],
+            configuration: serde_json::Value::Null,
+        };
+        for (version, max_iterations, valid) in [
+            (WORKFLOW_PREDICATE_VERSION, 1, true),
+            (WORKFLOW_PREDICATE_VERSION, 0, false),
+            (u32::MAX, 1, false),
+        ] {
+            let edge = EdgeDefinition {
+                from: node.id.clone(),
+                to: node.id.clone(),
+                kind: EdgeKind::Back {
+                    predicate: PredicateExpression::Equals {
+                        version,
+                        path: String::new(),
+                        value: serde_json::json!("done"),
+                    },
+                    max_iterations,
+                },
+                transform: None,
+            };
+            let graph = WorkflowDefinition {
+                schema_version: WORKFLOW_DEFINITION_SCHEMA_VERSION,
+                name: "validation".into(),
+                input: node.input.clone(),
+                output: node.output.clone(),
+                entries: vec![node.id.clone()],
+                exits: vec![node.id.clone()],
+                nodes: BTreeMap::from([(node.id.clone(), node.clone())]),
+                edges: vec![edge.clone()],
+            };
+            assert_eq!(edge.validate_structure().is_ok(), valid);
+            assert_eq!(graph.validate().is_ok(), valid);
+        }
+    }
+
+    #[test]
     fn run_edit_facts_validate_actor_request_and_compatibility() {
         let mut facts = WorkflowRunGraphEditFacts {
             version: WORKFLOW_RUN_GRAPH_EDIT_FACTS_VERSION,
@@ -16844,6 +17058,7 @@ mod tests {
     fn valid_prompt_configuration() -> WorkflowPromptConfiguration {
         WorkflowPromptConfiguration {
             version: WORKFLOW_PROMPT_CONFIGURATION_VERSION,
+            worktree_directory: None,
             activity_producer: None,
             execution_target: PromptContextTarget::FreshIsolated,
             agent_profile: "build".to_string(),
@@ -17046,6 +17261,7 @@ mod tests {
                         resources: vec![ResourceClaim::read("repository")],
                         configuration: serde_json::to_value(WorkflowPromptConfiguration {
                             version: WORKFLOW_PROMPT_CONFIGURATION_VERSION,
+                            worktree_directory: None,
                             activity_producer: None,
                             execution_target: PromptContextTarget::FreshIsolated,
                             agent_profile: "review".to_string(),
@@ -18667,6 +18883,7 @@ steps:
         };
         let configuration = WorkflowPromptConfiguration {
             version: WORKFLOW_PROMPT_CONFIGURATION_VERSION,
+            worktree_directory: None,
             activity_producer: None,
             execution_target: PromptContextTarget::FixedGenerationFork,
             agent_profile: "review".to_string(),
@@ -23069,6 +23286,7 @@ steps:
     fn versioned_agent_configuration_rejects_workflow_skill_selection_and_escalation() {
         let contract = WorkflowPromptConfiguration {
             version: WORKFLOW_PROMPT_CONFIGURATION_VERSION,
+            worktree_directory: None,
             activity_producer: None,
             execution_target: PromptContextTarget::FreshIsolated,
             agent_profile: "build".to_string(),
@@ -25307,6 +25525,7 @@ steps:
     fn prompt_configuration(schema: &ValueSchema, read_only: bool) -> WorkflowPromptConfiguration {
         WorkflowPromptConfiguration {
             version: WORKFLOW_PROMPT_CONFIGURATION_VERSION,
+            worktree_directory: None,
             activity_producer: None,
             execution_target: PromptContextTarget::FreshIsolated,
             agent_profile: "build".to_string(),
