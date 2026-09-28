@@ -319,9 +319,21 @@ input and become entries when no external source is selected. Cycles and unknown
 Aggregation still includes every worker in request order. This lowers to canonical direct edges,
 not a second scheduler; publication/admission and execution acceptance remain separate.
 
-Task-group workers and `workflow.stage_prompt_task` may omit `output` to use `bcode.delegated_task_result.v1`: an object
+Task-group workers and `workflow.stage_prompt_task` may omit `output` to use `bcode.delegated_task_result.v2`: an object
 with required `summary` (up to 4096 characters), `evidence` and `blockers` (each up to
-32 strings of 2048 characters). Explicit schemas remain supported; null rejects.
+32 strings of 2048 characters). Optional `contributions` holds up to 32 observed workspace
+records: creation-time base revision, source directory and local-change observation (nullable
+when unknown), produced revisions/artifacts, validation commands with `passed`, `failed` or
+`not_run` outcomes and evidence, remaining work, and retention (`retained`, `removed`, `unknown`).
+Omission means unknown, not clean or integrated. Records are worker claims, not authenticated
+Git facts or approval to commit/clean up. Integrators receive literal contribution paths and
+instructions to inspect actual changes, preserve user work, surface conflicts, verify the combined
+target, and identify integrated artifacts and unresolved acceptance criteria in their final response.
+This is evidence transport and integration guidance, not automatic Git integration or a verified
+completion report. Existing persisted v1 schemas/outputs remain unchanged; explicitly authored
+v1 contracts remain supported as custom schemas. New default lowering uses v2; retries of older
+staged requests require their original compatible artifact or exact staged candidate, not silent
+re-lowering across versions. Explicit schemas remain supported; null rejects.
 Continuation output remains required to preserve caller-selected downstream contracts.
 This default is result evidence, not an automatic completion verdict. Single prompt tasks also
 accept optional `acceptance_criteria`, using the same evidence instructions as task groups.

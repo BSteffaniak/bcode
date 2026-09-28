@@ -151,10 +151,14 @@ fn node(task: Prompt, input: ValueSchema) -> Result<NodeDefinition, String> {
     if task.objective.trim().is_empty() || task.agent_profile.trim().is_empty() {
         return Err("task requires objective and agent profile".into());
     }
+    let mut instructions = task_instructions(task.objective, &task.acceptance_criteria)?;
+    if task.output == default_worker_output() {
+        instructions.push_str("\n\nFor coding contributions, return contributions with observed workspace, creation-time base_revision, source_directory and source_had_local_changes from worktree creation provenance when available (null for unknown; never infer clean). Identify produced revisions or artifacts, exact observed validation commands/outcomes, remaining work and workspace retention. Do not create commits or remove workspaces merely to populate this report. Records are claims, not integration or completion proof; preserve existing user changes and report conflicts as blockers.");
+    }
     let mut configuration = WorkflowPromptConfiguration::structured(
         task.agent_profile,
         task.output.clone(),
-        task_instructions(task.objective, &task.acceptance_criteria)?,
+        instructions,
     );
     if task
         .tool_allowlist
@@ -214,6 +218,7 @@ fn continuation_node(
         .collect();
     let order = serde_json::to_string(&members).map_err(|error| error.to_string())?;
     task.objective.push_str("\n\nThe assignments below describe requested context, access and dependencies, not proof of execution or filesystem isolation. Resource claims coordinate scheduling only; inspect actual contributions and workspace state before integration.");
+    task.objective.push_str("\n\nThe optional contributions evidence path contains worker-reported provenance, produced revisions/artifacts, validation and retention. Missing records or null provenance mean unknown. Inspect these claims against actual workspaces and canonical outputs before integration. Preserve dirty source work, surface conflicts without discarding either contribution, verify the combined target against the original acceptance criteria, and report the integrated target/revision or artifacts, actual combined checks, unresolved criteria and retained workspaces in your ordinary completion response. Worker validation alone is not combined verification; do not remove unintegrated or ambiguous workspaces.");
     task.objective
         .push_str("\n\nDelegated assignments (JSON): ");
     task.objective
@@ -258,14 +263,40 @@ fn member_ids(group: &Group) -> Vec<String> {
 
 pub(super) fn default_worker_output() -> ValueSchema {
     ValueSchema {
-        type_name: "bcode.delegated_task_result.v1".into(),
+        type_name: "bcode.delegated_task_result.v2".into(),
         schema: json!({
             "type":"object", "additionalProperties":false,
             "required":["summary","evidence","blockers"],
             "properties":{
                 "summary":{"type":"string","maxLength":4096},
                 "evidence":{"type":"array","maxItems":32,"items":{"type":"string","maxLength":2048}},
-                "blockers":{"type":"array","maxItems":32,"items":{"type":"string","maxLength":2048}}
+                "blockers":{"type":"array","maxItems":32,"items":{"type":"string","maxLength":2048}},
+                "contributions":{
+                    "description":"Optional observed contribution records. Omission means unknown, not no changes. Claims require independent integration verification.",
+                    "type":"array","maxItems":32,"items":{
+                        "type":"object","additionalProperties":false,
+                        "required":["workspace","base_revision","source_directory","source_had_local_changes","produced_revisions","artifacts","validation","remaining_work","retention"],
+                        "properties":{
+                            "workspace":{"type":"string","minLength":1,"maxLength":4096},
+                            "base_revision":{"type":["string","null"],"maxLength":256},
+                            "source_directory":{"type":["string","null"],"maxLength":4096},
+                            "source_had_local_changes":{"type":["boolean","null"]},
+                            "produced_revisions":{"type":"array","maxItems":32,"items":{"type":"string","minLength":1,"maxLength":256}},
+                            "artifacts":{"type":"array","maxItems":64,"items":{"type":"string","minLength":1,"maxLength":4096}},
+                            "validation":{"type":"array","maxItems":32,"items":{
+                                "type":"object","additionalProperties":false,
+                                "required":["command","outcome","evidence"],
+                                "properties":{
+                                    "command":{"type":"string","minLength":1,"maxLength":2048},
+                                    "outcome":{"enum":["passed","failed","not_run"]},
+                                    "evidence":{"type":"string","minLength":1,"maxLength":2048}
+                                }
+                            }},
+                            "remaining_work":{"type":"array","maxItems":32,"items":{"type":"string","minLength":1,"maxLength":2048}},
+                            "retention":{"enum":["retained","removed","unknown"]}
+                        }
+                    }
+                }
             }
         }),
     }
@@ -479,6 +510,7 @@ fn result_mapping(group: &Group) -> serde_json::Value {
                     "summary": extended_result_path(path, "summary"),
                     "evidence": extended_result_path(path, "evidence"),
                     "blockers": extended_result_path(path, "blockers"),
+                    "contributions": extended_result_path(path, "contributions"),
                 });
             }
             assignment
@@ -1070,7 +1102,7 @@ pub(super) fn definition() -> bcode_tool::ToolDefinition {
         "output":worker["properties"]["output"]
     }});
     worker["properties"]["output"]["description"] = json!(
-        "Optional ValueSchema. Omission uses v2 worker_defaults.output when supplied, otherwise bounded bcode.delegated_task_result.v1: summary, evidence and blockers. Explicit null rejects. Continuation output may be omitted only with v2 preserve_source_output."
+        "Optional ValueSchema. Omission uses v2 worker_defaults.output when supplied, otherwise bounded bcode.delegated_task_result.v2: summary, evidence, blockers and optional contribution provenance. Explicit null rejects. Continuation output may be omitted only with v2 preserve_source_output."
     );
     let mut continuation = task;
     continuation["required"] = json!(["objective", "agent_profile"]);
@@ -1227,6 +1259,12 @@ mod tests {
             request["tasks"][0]["output"] = json!(default_worker_output());
             let (_, receipt) = mapped_candidate(&request).unwrap();
             let worker = &receipt["workers"][0];
+            let mut contribution_path = worker["input_path"].as_array().unwrap().clone();
+            contribution_path.push(json!("contributions"));
+            assert_eq!(
+                worker["evidence_paths"]["contributions"],
+                json!(contribution_path)
+            );
             let mut expected = worker["input_path"].as_array().unwrap().clone();
             expected.push(json!("blockers"));
             assert_eq!(worker["evidence_paths"]["blockers"], json!(expected));
@@ -2121,6 +2159,31 @@ mod tests {
         legacy.as_object_mut().unwrap().remove("worktree_directory");
         let inherited: WorkflowPromptConfiguration = serde_json::from_value(legacy).unwrap();
         assert!(inherited.worktree_directory.is_none());
+    }
+
+    #[test]
+    fn contribution_contract_preserves_unknown_provenance_and_checks_observed_results() {
+        let schema = default_worker_output();
+        let validator = jsonschema::validator_for(&schema.schema).unwrap();
+        let mut result = json!({"summary":"change", "evidence":[], "blockers":[]});
+        assert!(validator.is_valid(&result));
+        result["contributions"] = json!([{
+            "workspace":"/work/worker", "base_revision":null,
+            "source_directory":null, "source_had_local_changes":null,
+            "produced_revisions":[], "artifacts":["src/lib.rs"],
+            "validation":[{"command":"cargo test", "outcome":"failed", "evidence":"conflict remains"}],
+            "remaining_work":["resolve integration conflict"], "retention":"retained"
+        }]);
+        assert!(validator.is_valid(&result));
+        result["contributions"][0]["validation"][0]["outcome"] = json!("probably passed");
+        assert!(!validator.is_valid(&result));
+        result["contributions"][0]["validation"][0]["outcome"] = json!("not_run");
+        result["contributions"][0]["source_had_local_changes"] = json!("unknown");
+        assert!(!validator.is_valid(&result));
+        result["contributions"][0]["source_had_local_changes"] = json!(true);
+        assert!(validator.is_valid(&result));
+        result["contributions"][0]["produced_revisions"] = json!(vec!["revision"; 33]);
+        assert!(!validator.is_valid(&result));
     }
 
     #[test]

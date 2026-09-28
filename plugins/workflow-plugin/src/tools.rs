@@ -123,7 +123,7 @@ fn prompt_task_definition() -> ToolDefinition {
                 "depends_on":{"type":"object","additionalProperties":false,"required":["node_id","edge_id"],"properties":{"node_id":{"type":"string","minLength":1},"edge_id":{"type":"integer","minimum":0}},"description":"Direct dependency on one existing source; requires entry:false. Input must match its output. Supply an unused edge ID. Does not remove existing successors or publish."},
                 "objective":{"type":"string","minLength":1},"agent_profile":{"type":"string","minLength":1},
                 "input":{"type":"object","description":"ValueSchema with type_name and schema"},
-                "output":{"type":"object","description":"Optional ValueSchema; omission uses bounded bcode.delegated_task_result.v1 with summary, evidence and blockers. Explicit null rejects."},
+                "output":{"type":"object","description":"Optional ValueSchema; omission uses bounded bcode.delegated_task_result.v2 with summary, evidence, blockers and optional contribution provenance. Explicit null rejects."},
                 "entry":{"type":"boolean"},"exit":{"type":"boolean"},
                 "edges":{"type":"array"},"reconciliation":{"type":"array"}
             }}),
