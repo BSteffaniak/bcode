@@ -21,6 +21,13 @@ fn parse_context(
     let object = arguments
         .as_object_mut()
         .ok_or("execution context request must be an object")?;
+    // Strict tool schemas require every property. Only optional selectors may
+    // use null to represent omission; retain unknown fields for fail-closed decoding.
+    for field in ["delegation_part", "after_node_id", "after_edge_id"] {
+        if object.get(field).is_some_and(serde_json::Value::is_null) {
+            object.remove(field);
+        }
+    }
     let discovery_only = object.get("outputs_only") == Some(&json!(true));
     if discovery_only
         && (object.get("output_only") == Some(&json!(true))
@@ -81,7 +88,7 @@ fn context_definition() -> ToolDefinition {
         description: "Read this active workflow execution's authenticated identity and bounded graph page. Omit revision and cursors initially; continue with the returned revision and last node/edge identities. Restart on revision conflict. This grants no mutation authority.".to_owned(),
         input_schema: json!({"type":"object", "additionalProperties":false,
             "properties": {
-                "delegation_part":{"type":"string","enum":["bindings","input","reconnect","serialized"],"description":"Read recipe fields, or use serialized for bounded JSON string chunks. Concatenate chunks in order and parse once; do not reconstruct schemas. Follow next_arguments unchanged at the pinned revision."},
+                "delegation_part":{"type":["string","null"],"enum":[null,"bindings","input","reconnect","serialized"],"description":"Use null when not reading a delegation recipe. Read recipe fields, or use serialized for bounded JSON string chunks. Concatenate chunks in order and parse once; do not reconstruct schemas. Follow next_arguments unchanged at the pinned revision."},
                 "delegation_offset":{"type":"integer","minimum":0,"description":"Character offset for serialized recipe chunks; use returned next_arguments."},
                 "delegation_only":{"type":"boolean","default":false,"description":"Return only the authenticated delegation recipe from this bounded page, without duplicating graph facts. Use for default-budget staging; unavailable recipes remain explicit. Does not change authorization or discovery completeness."},
                 "compact":{"type":"boolean","default":false,"description":"Return graph node identities instead of full executable definitions. Edges and authenticated identity remain available; omitted node definitions require a normal paged read."},
@@ -2102,6 +2109,80 @@ mod tests {
             json!({"limit":0}),
             json!({"limit":101}),
             json!({"future":true}),
+        ] {
+            assert!(parse_context(invalid).is_err());
+        }
+    }
+
+    #[test]
+    fn context_modes_survive_strict_schema_normalization() {
+        let schema = bcode_model_schema::normalize(
+            &context_definition().input_schema,
+            &bcode_model_schema::SchemaDialect {
+                object_properties: bcode_model_schema::ObjectPropertyPolicy::RequireAllAndClose,
+                one_of: bcode_model_schema::OneOfPolicy::CollapseAnnotatedConstants,
+                reference_siblings:
+                    bcode_model_schema::ReferenceSiblingPolicy::RemoveAnnotationsRejectSemantic,
+                ..bcode_model_schema::SchemaDialect::default()
+            },
+        )
+        .expect("portable strict context schema");
+        let validator = jsonschema::validator_for(&schema).unwrap();
+        let defaults = json!({
+            "compact": false, "delegation_only": false, "delegation_part": null,
+            "delegation_offset": 0, "output_only": false, "outputs_only": false,
+            "after_output_id": null, "output_id": null, "limit": 50,
+            "expected_revision": null, "after_node_id": null, "after_edge_id": null
+        });
+        for sparse in [
+            json!({}),
+            json!({"compact": true}),
+            json!({"after_node_id": "node", "after_edge_id": 3, "expected_revision": 7}),
+            json!({"outputs_only": true}),
+            json!({"outputs_only": true, "after_output_id": "output", "expected_revision": 7}),
+            json!({"output_only": true, "output_id": "output"}),
+            json!({"delegation_only": true}),
+            json!({"delegation_part": "bindings"}),
+            json!({"delegation_part": "input"}),
+            json!({"delegation_part": "reconnect"}),
+            json!({"delegation_part": "serialized", "delegation_offset": 128}),
+        ] {
+            let mut strict = defaults.clone();
+            strict
+                .as_object_mut()
+                .unwrap()
+                .extend(sparse.as_object().unwrap().clone());
+            assert!(validator.is_valid(&strict), "{strict}");
+            assert_eq!(
+                serde_json::to_value(parse_context(strict).expect("strict request")).unwrap(),
+                serde_json::to_value(parse_context(sparse).expect("sparse request")).unwrap(),
+            );
+        }
+        // Schema-compatible but conflicting modes must still fail preparation.
+        for conflict in [
+            json!({"outputs_only": true, "after_node_id": "node"}),
+            json!({"outputs_only": true, "after_edge_id": 0}),
+            json!({"outputs_only": true, "delegation_part": "input"}),
+            json!({"outputs_only": true, "delegation_only": true}),
+            json!({"outputs_only": true, "output_id": "output"}),
+            json!({"outputs_only": true, "output_only": true, "output_id": "output"}),
+            json!({"output_only": true}),
+            json!({"output_only": true, "output_id": "output", "delegation_part": "input"}),
+        ] {
+            let mut strict = defaults.clone();
+            strict
+                .as_object_mut()
+                .unwrap()
+                .extend(conflict.as_object().unwrap().clone());
+            assert!(validator.is_valid(&strict), "{strict}");
+            assert!(parse_context(strict).is_err());
+        }
+        for invalid in [
+            json!({"future": null}),
+            json!({"delegation_part": "unknown"}),
+            json!({"delegation_part": 1}),
+            json!({"after_node_id": 1}),
+            json!({"after_edge_id": "edge"}),
         ] {
             assert!(parse_context(invalid).is_err());
         }
