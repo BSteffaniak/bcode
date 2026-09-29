@@ -9,6 +9,31 @@ use bcode_workflow_view_models::{
 
 const DETAIL_LIMIT: usize = 10;
 
+/// Describe existing controls from the canonical run summary, without granting authority.
+pub const fn controls(status: bcode_workflow::RunStatus) -> &'static str {
+    use bcode_workflow::RunStatus;
+    match status {
+        RunStatus::Running => {
+            "\nControls: /goal.pause stops new attempt admission; already-admitted work may still finish. /goal.stop requests cancellation; it does not undo effects. Refresh /goal.status to observe the outcome."
+        }
+        RunStatus::Paused => {
+            "\nControls: /goal.resume requests continuation, subject to ownership, compatibility and remaining allowances; it does not approve pending requests. Already-admitted work may still finish while paused. /goal.stop requests cancellation without undoing effects."
+        }
+        RunStatus::RepairRequired => {
+            "\nRecovery required: inspect /workflow before taking further action; unresolved operations may have had effects. /goal.detach releases only this session association, without cancelling, repairing or resolving the run. Start a new /goal separately only after reviewing possible effects."
+        }
+        RunStatus::Failed => {
+            "\nGoal failed: inspect the failure and any retained contributions in /workflow. Continuation is available only when explicitly offered below; do not replay unresolved operations."
+        }
+        RunStatus::Cancelled => {
+            "\nGoal cancelled: completed effects and retained workspaces are not undone. Inspect /workflow and the workspace before starting another /goal."
+        }
+        RunStatus::Completed => {
+            "\nExecution finished: inspect the goal evaluation and delivery evidence below; a completed run alone does not establish that the original criteria were satisfied."
+        }
+    }
+}
+
 fn preview(text: &str) -> String {
     // A content budget, not terminal geometry. Keep status a bounded, single-line preview.
     text.chars()
@@ -246,6 +271,38 @@ const fn observation(value: &crate::delivery::Observation) -> &'static str {
 
 #[cfg(test)]
 pub mod tests {
+    #[test]
+    fn controls_distinguish_admission_cancellation_and_recovery() {
+        use bcode_workflow::RunStatus;
+
+        let running = super::controls(RunStatus::Running);
+        assert!(running.contains("/goal.pause"));
+        assert!(running.contains("already-admitted work may still finish"));
+        assert!(running.contains("/goal.stop requests cancellation"));
+        assert!(running.contains("does not undo effects"));
+
+        let paused = super::controls(RunStatus::Paused);
+        assert!(paused.contains("/goal.resume"));
+        assert!(paused.contains("does not approve pending requests"));
+        assert!(paused.contains("remaining allowances"));
+
+        let repair = super::controls(RunStatus::RepairRequired);
+        assert!(repair.contains("/goal.detach releases only this session association"));
+        assert!(repair.contains("may have had effects"));
+        assert!(!repair.contains("/goal.resume"));
+        for status in [
+            RunStatus::Completed,
+            RunStatus::Failed,
+            RunStatus::Cancelled,
+        ] {
+            let text = super::controls(status);
+            assert!(!text.contains("/goal.resume"));
+            assert!(!text.contains("/goal.stop"));
+        }
+        assert!(super::controls(RunStatus::Completed).contains("does not establish"));
+        assert!(super::controls(RunStatus::Failed).contains("only when explicitly offered"));
+        assert!(super::controls(RunStatus::Cancelled).contains("not undone"));
+    }
     use super::*;
 
     #[test]

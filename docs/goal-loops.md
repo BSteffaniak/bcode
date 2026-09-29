@@ -63,6 +63,16 @@ Unavailable or unsupported detail is reported without hiding the existing goal c
 An unavailable progress document is reported separately without hiding execution status
 or allowance-continuation guidance.
 The run summary and execution detail are separate observations and can advance between reads.
+Status also explains the controls appropriate to the observed run state:
+* Running: `/goal.pause` stops new attempt admission, not settlement of admitted work;
+  `/goal.stop` requests cancellation without undoing effects. Refresh to observe the outcome.
+* Paused: `/goal.resume` remains subject to ownership, compatibility and allowances;
+  it does not approve pending requests. Admitted work may still finish while paused.
+* Repair required: inspect `/workflow` and possible effects before using `/goal.detach`,
+  which releases only the session association, not execution authority or unresolved work.
+* Failed: continuation is offered only when the application recognizes a supported source.
+  Completed and cancelled runs do not offer resume; inspect retained results and workspaces.
+These hints are not authorization or a promise that a control will succeed against a newer state.
 
 `/goal` and `/loop` can open from a fresh sessionless screen. Opening or cancelling an
 unsubmitted modal creates nothing. Valid submission creates a session in the current working

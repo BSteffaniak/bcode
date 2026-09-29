@@ -272,6 +272,7 @@ pub fn progress_status(session_id: SessionId) -> InvokeCommandResponse {
         };
         let run = &inspection.run;
         let mut status = format_workflow_inspection_status(&inspection);
+        status.push_str(crate::goal_status::controls(run.status));
         match client.workflow_run_view(run.run_id.clone(), 10).await {
             Ok(view) => status.push_str(&crate::goal_status::format(&view)),
             Err(error) => {
