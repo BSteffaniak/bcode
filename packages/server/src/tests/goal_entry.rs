@@ -155,7 +155,8 @@ fn contribution_result(workspace: &Path, id: &str) -> serde_json::Value {
 }
 
 fn install_goal_script(request: &mut PluginWorkflowStartRequest, workspace: &Path) {
-    let reference = |pointer: &str| serde_json::json!({"$fake_result":{"index":0,"pointer":pointer.trim_start_matches("/delegation/arguments")}});
+    let reference =
+        |pointer: &str| serde_json::json!({"$fake_result":{"index":0,"pointer":pointer}});
     let task = |id: &str| {
         serde_json::json!({
             "task_id":id,"objective":format!("Implement {id}.\ntool-call filesystem.write {}\nstructured-result {}", serde_json::json!({"path":workspace.join(format!("{id}.sh")),"contents":if id == "left" { LEFT_MODULE } else { RIGHT_MODULE }}), contribution_result(workspace, id)),
@@ -172,16 +173,12 @@ fn install_goal_script(request: &mut PluginWorkflowStartRequest, workspace: &Pat
         "cwd":workspace,"timeout_ms":10000
     });
     let mut group = serde_json::json!({
-        "version":2,"generated_ids":true,"mutation_id":"goal-workers","failure_policy":"collect_outcomes",
-        "run_id":reference("/delegation/arguments/run_id"),"expected_revision":reference("/delegation/arguments/expected_revision"),
-        "source_node_id":reference("/delegation/arguments/source_node_id"),"bind_source_activation":reference("/delegation/arguments/bind_source_activation"),
-        "input":reference("/delegation/arguments/input"),"preserve_source_output":true,
+        "mutation_id":"goal-workers","failure_policy":"collect_outcomes",
+        "run_id":reference("/run_id"),"expected_revision":reference("/graph/revision"),
+        "bind_source_activation":reference("/activation_id"),
         "tasks":[task("left"),task("right")],
         "continuation":{"objective":format!("Integrate the actual contributions and verify the combined result.\ntool-call shell.run {integrate}"), "agent_profile":"build", "read_only":false, "tool_allowlist":["shell.run"], "resources":[{"resource":"integration","access":"write"}], "model_selection":{"provider":"bcode.fake-provider","model":"fake-echo"}},
-        "first_edge_id":reference("/delegation/arguments/first_edge_id"),
-        "reconnect":reference("/delegation/arguments/reconnect"),
-        "retain_source_edge_ids":reference("/delegation/arguments/retain_source_edge_ids"),
-        "reconciliation":reference("/delegation/arguments/reconciliation")
+        "reconciliation":[]
     });
     install_corrective_script(&mut group, workspace, &integrate);
     let publication =
@@ -193,7 +190,7 @@ fn install_goal_script(request: &mut PluginWorkflowStartRequest, workspace: &Pat
         .unwrap();
     let instructions = source.configuration["system_prompt"].as_str().unwrap();
     source.configuration["system_prompt"] = serde_json::json!(format!(
-        "{instructions}\ntool-call workflow.execution_context {{\"delegation_part\":\"serialized\",\"$fake_json_pages\":{{\"chunk\":\"/delegation/chunk\",\"next\":\"/delegation/next_arguments\"}}}}\ntool-call workflow.stage_task_group {group}\ntool-call workflow.publish_run_graph_edit {publication}"
+        "{instructions}\ntool-call workflow.execution_context {{\"compact\":true,\"limit\":1}}\ntool-call workflow.stage_delegation {group}\ntool-call workflow.publish_run_graph_edit {publication}"
     ));
     let evaluation = request.definition.nodes.get_mut("loop.evaluation").unwrap();
     let instructions = evaluation.configuration["system_prompt"].as_str().unwrap();

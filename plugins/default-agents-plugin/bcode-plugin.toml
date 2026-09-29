@@ -31,6 +31,7 @@ build_tools = [
     "worktree.create",
     "worktree.remove",
     "workflow.execution_context",
+    "workflow.stage_delegation",
     "workflow.stage_task_group",
     "workflow.stage_agent_task",
     "workflow.stage_prompt_task",
@@ -46,6 +47,7 @@ build_tools = [
 # These tools mutate only the authenticated active run. Application policy, ownership,
 # exact-candidate publication, execution ceilings and downstream tool permissions still apply.
 build_preauthorizations = [
+    "workflow.stage_delegation",
     "workflow.stage_task_group",
     "workflow.stage_agent_task",
     "workflow.stage_prompt_task",
@@ -54,6 +56,7 @@ build_preauthorizations = [
     "workflow.accept_run_graph_publication",
 ]
 plan_disabled_tools = [
+    "workflow.stage_delegation",
     "workflow.stage_task_group",
     "workflow.stage_agent_task",
     "workflow.stage_prompt_task",

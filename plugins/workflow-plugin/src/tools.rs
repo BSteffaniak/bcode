@@ -8,6 +8,7 @@ use bcode_tool::{
 use bcode_workflow::{WORKFLOW_APPLICATION_INTERFACE_ID, WorkflowRunGraphEditBatch};
 use serde_json::json;
 
+mod delegation;
 mod task_group;
 const GROUP_NAME: &str = "workflow.stage_task_group";
 
@@ -366,7 +367,7 @@ fn publication_definition() -> ToolDefinition {
 
 fn operation(name: &str) -> Result<&'static str, String> {
     match name {
-        NAME | TASK_NAME | PROMPT_TASK_NAME | GROUP_NAME => Ok(OPERATION),
+        NAME | TASK_NAME | PROMPT_TASK_NAME | GROUP_NAME | delegation::NAME => Ok(OPERATION),
         PUBLISH_NAME => Ok(PUBLISH_OPERATION),
         ACCEPT_NAME => Ok(ACCEPT_OPERATION),
         _ => Err("unsupported workflow tool".to_owned()),
@@ -464,6 +465,7 @@ fn tool_definitions() -> Vec<ToolDefinition> {
         portable_task_definition(task_definition()),
         portable_task_definition(prompt_task_definition()),
         portable_task_definition(task_group::definition()),
+        portable_task_definition(delegation::definition()),
     ]
 }
 
@@ -486,6 +488,8 @@ pub fn invoke(context: &NativeServiceContext) -> ServiceResponse {
                 let payload = if is_context {
                     let context = parse_context(request.invocation.arguments.clone())?;
                     serde_json::to_value(context).map_err(|error| error.to_string())?
+                } else if request.invocation.tool_name == delegation::NAME {
+                    delegation::request(&request.invocation.arguments)?
                 } else if matches!(operation, PUBLISH_OPERATION | ACCEPT_OPERATION)
                     && candidate_reference(&request.invocation.arguments).is_some()
                 {
@@ -962,6 +966,16 @@ fn invoke_edit(context: &NativeServiceContext) -> ServiceResponse {
     if request.name == CONTEXT_NAME {
         return invoke_context(context, request);
     }
+    if request.name == delegation::NAME {
+        return delegation::invoke(context, request);
+    }
+    invoke_prepared_edit(context, request)
+}
+
+fn invoke_prepared_edit(
+    context: &NativeServiceContext,
+    request: ToolInvocationRequest,
+) -> ServiceResponse {
     let Ok(operation) = operation(&request.name) else {
         return ServiceResponse::error("unsupported_tool", "unsupported workflow tool");
     };
@@ -1703,6 +1717,64 @@ mod tests {
             assert!(!tool.is_error);
             assert!(tool.output.contains("Topology has not been published"));
         }
+    }
+
+    #[test]
+    fn semantic_delegation_preserves_pinned_source_and_exact_task_group_lowering() {
+        let schema = json!({"type_name":"goal","schema":{"type":"object"}});
+        let mut context: bcode_workflow::WorkflowExecutionContext = serde_json::from_value(json!({
+            "run_id":"run", "node_id":"source", "activation_id":"activation", "attempt":1,
+            "graph":{"revision":7,"next_edge_id":19,
+                "nodes":[{"revision":7,"entry":true,"exit":false,"node":{
+                    "id":"source","name":"source","kind":"agent",
+                    "input":schema,"output":schema,"configuration":{},"resources":[]
+                }}],
+                "edges":[{"revision":7,"edge_id":3,"edge":{"from":"source","to":"evaluate"}}],
+                "nodes_complete":true,"edges_complete":true},"output":null,"outputs":[]
+        }))
+        .unwrap();
+        let request = json!({"run_id":"run","expected_revision":7,"bind_source_activation":"activation",
+            "mutation_id":"delegate", "reconciliation":[],
+            "tasks":[{"task_id":"investigate","objective":"Inspect evidence","agent_profile":"plan"}],
+            "continuation":{"objective":"Integrate evidence","agent_profile":"build"}});
+        let parsed = delegation::request(&json!({"request_json":request.to_string()})).unwrap();
+        assert_eq!(parsed, request);
+        let query = parse_context(json!({"expected_revision":7,"limit":100})).unwrap();
+        let lowered = delegation::lower(&parsed, &context, &query).unwrap();
+        assert_eq!(lowered["input"], schema);
+        assert_eq!(lowered["first_edge_id"], 19);
+        assert_eq!(lowered["reconnect"]["edge_id"], 3);
+        assert_eq!(lowered["preserve_source_output"], true);
+        let edit = task_group::parse(&lowered).unwrap();
+        let receipt = task_staging_response(json!({"staged":true}), &edit, GROUP_NAME, &lowered);
+        assert!(receipt.error.is_none());
+        for field in ["input", "reconnect", "first_edge_id", "source_node_id"] {
+            let mut invalid = request.clone();
+            invalid[field] = json!(null);
+            assert!(delegation::request(&invalid).is_err());
+        }
+        for field in ["run_id", "bind_source_activation", "expected_revision"] {
+            let mut stale = request.clone();
+            stale[field] = json!("stale");
+            assert!(delegation::lower(&stale, &context, &query).is_err());
+        }
+        context.graph.edges_complete = false;
+        assert!(delegation::lower(&request, &context, &query).is_err());
+        context.graph.edges_complete = true;
+        context.graph.edges[0].edge.transform = Some(bcode_workflow::WorkflowTransform {
+            version: bcode_workflow::WORKFLOW_TRANSFORM_VERSION,
+            expression: bcode_workflow::WorkflowTransformExpression::Input {
+                source: bcode_workflow::WORKFLOW_TRANSFORM_SOURCE_CURRENT.into(),
+                path: "source.source".into(),
+            },
+            output: context.graph.nodes[0].node.output.clone(),
+        });
+        let corrected = delegation::lower(&request, &context, &query).unwrap();
+        assert_eq!(
+            corrected["reconnect"]["transform"],
+            json!(context.graph.edges[0].edge.transform)
+        );
+        task_group::parse(&corrected).unwrap();
     }
 
     #[test]

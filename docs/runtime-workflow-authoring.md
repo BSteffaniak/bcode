@@ -407,6 +407,20 @@ request an exact `output_id` to retrieve its value. Explicitly requested outputs
 not shortened by compact presentation. Large pages or requested outputs may still
 exceed the model's tool-output budget; truncated results are not complete JSON.
 
+For the normal single-successor source-preserving case, `workflow.stage_delegation`
+accepts only semantic choices plus `run_id`, `expected_revision`,
+`bind_source_activation`, `mutation_id` and explicit `reconciliation`. Inspect
+identity with `workflow.execution_context` (`compact:true, limit:1` is sufficient
+for identity, not complete graph discovery). The plugin reads a revision-pinned
+bounded page internally and lowers the same v2 task group, carrying input schemas,
+edge allocation and the exact corrective source transform without model copying.
+Workers, continuation, workspace claims, access, dependencies and criteria remain
+explicit caller choices. It refuses incomplete/unsupported topology and stale
+identity or revision; use advanced staging for those graph shapes, not automatic
+rebasing. It never publishes, extends allowances or dispatches. Publish the returned
+exact `publication_arguments` separately, then settle the source turn. The default
+build profile exposes this tool; plan excludes it and explicit disable still wins.
+
 For recipe-only reads, `delegation_only:true` excludes duplicated graph facts.
 For larger corrective recipes, `delegation_part:"bindings"` returns non-schema
 arguments and exact revision-pinned `inspection_arguments.input` and

@@ -1069,6 +1069,7 @@ tools = { "filesystem.read" = true }
         apply_tool_selection(&mut plan, &tools_config, &[]);
         assert!(active_tools_for(&plan).contains(&"workflow.execution_context".into()));
         for tool in [
+            "workflow.stage_delegation",
             "workflow.stage_task_group",
             "workflow.publish_run_graph_edit",
             "workflow.accept_run_graph_publication",
