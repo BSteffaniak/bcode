@@ -76,7 +76,10 @@ uncommitted files. Do not automatically stash, reset, or force-clean the source.
 
 Workspace cleanup uses the existing worktree service. Non-forced removal refuses
 uncommitted, ignored, or unverifiable files, regardless of Git's untracked-file
-display configuration. Detached contributions must first be retained by a branch,
+display configuration. It also refuses unfinished or unverifiable Git operations
+(cherry-pick, revert, merge, rebase, sequencer or bisect), even with a clean index.
+Resolve and explicitly continue, skip or abort the operation in that worktree;
+cleanup never makes that integration decision. Detached contributions must first be retained by a branch,
 tag, or remote-tracking ref containing HEAD. Keeping a ref protects the contribution;
 it does not prove integration or verification. Explicit force remains destructive
 and must not be used as automatic cleanup for ambiguous worker outcomes.

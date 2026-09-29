@@ -242,6 +242,11 @@ pub fn remove_worktree(
         ));
     }
     if !force {
+        if worktree_has_pending_operation(path) {
+            return Err(WorktreeError::RemoveRefused(
+                "unfinished or unverifiable Git operation; resolve, continue or abort it in the worktree before removal".to_string(),
+            ));
+        }
         if worktree_is_dirty(path) {
             return Err(WorktreeError::RemoveRefused(format!(
                 "{} has uncommitted, ignored or unverifiable work; use force to remove it",
@@ -356,6 +361,26 @@ fn current_head_ref(cwd: &Path) -> Result<String, WorktreeError> {
     // a branch name allows that ref to move between selection and creation.
     run_git(cwd, &["rev-parse", "--verify", "HEAD^{commit}"]).ok_or_else(|| {
         WorktreeError::InvalidRequest("current HEAD commit could not be resolved".to_string())
+    })
+}
+
+fn worktree_has_pending_operation(cwd: &Path) -> bool {
+    // A resolved conflict can leave a clean index while sequencer/rebase state
+    // still owns recovery instructions. Resolve paths through Git: linked
+    // worktrees have private operation state, not a local .git directory.
+    [
+        "CHERRY_PICK_HEAD",
+        "REVERT_HEAD",
+        "MERGE_HEAD",
+        "rebase-merge",
+        "rebase-apply",
+        "sequencer",
+        "BISECT_START",
+    ]
+    .iter()
+    .any(|marker| {
+        run_git(cwd, &["rev-parse", "--git-path", marker])
+            .is_none_or(|path| cwd.join(path).try_exists().unwrap_or(true))
     })
 }
 
@@ -588,6 +613,65 @@ mod tests {
             new_session: false,
             no_setup: true,
         }
+    }
+
+    #[test]
+    fn cleanup_preserves_clean_but_unfinished_conflict_recovery() {
+        let repo = TempRepo::init();
+        let workspaces = tempfile::tempdir().unwrap();
+        let worker = workspaces.path().join("worker");
+        run(
+            &repo.root,
+            &["worktree", "add", "-b", "worker", worker.to_str().unwrap()],
+        );
+        std::fs::write(worker.join("README.md"), "worker contribution\n").unwrap();
+        run(&worker, &["commit", "-am", "worker contribution"]);
+        let contribution = super::current_head_ref(&worker).unwrap();
+        std::fs::write(repo.root.join("README.md"), "integration change\n").unwrap();
+        run(&repo.root, &["commit", "-am", "integration change"]);
+        // Existing user work stays outside the isolated integration checkout.
+        std::fs::write(repo.root.join("user.txt"), "keep me\n").unwrap();
+        let integration = workspaces.path().join("integration");
+        run(
+            &repo.root,
+            &[
+                "worktree",
+                "add",
+                "-b",
+                "integration",
+                integration.to_str().unwrap(),
+            ],
+        );
+        let pick = Command::new("git")
+            .args(["cherry-pick", &contribution])
+            .current_dir(&integration)
+            .output()
+            .unwrap();
+        assert!(!pick.status.success());
+        assert!(remove_worktree(&repo.root, &integration, false).is_err());
+        // Resolving to the current contents yields an empty pick: status is
+        // clean, but removing now would silently discard the pending decision.
+        run(&integration, &["checkout", "--ours", "README.md"]);
+        run(&integration, &["add", "README.md"]);
+        assert!(!super::worktree_is_dirty(&integration));
+        let error = remove_worktree(&repo.root, &integration, false).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("unfinished or unverifiable Git operation")
+        );
+        // Recovery is explicit; cleanup never decides to discard a contribution.
+        run(&integration, &["cherry-pick", "--abort"]);
+        remove_worktree(&repo.root, &integration, false).unwrap();
+        assert_eq!(super::current_head_ref(&worker).unwrap(), contribution);
+        assert_eq!(
+            std::fs::read_to_string(worker.join("README.md")).unwrap(),
+            "worker contribution\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(repo.root.join("user.txt")).unwrap(),
+            "keep me\n"
+        );
     }
 
     #[test]
