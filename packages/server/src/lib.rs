@@ -27896,8 +27896,10 @@ fn workflow_output_evidence_resolution(
     if cancellation.is_cancelled() {
         return ToolInvocationServiceResolution::Cancelled;
     }
-    if request.operation != bcode_workflow::OP_AUTHENTICATE_OUTPUT
-        || request.route_id.as_deref() != Some(bcode_workflow::WORKFLOW_EVIDENCE_INTERFACE_ID)
+    if !matches!(
+        request.operation.as_str(),
+        bcode_workflow::OP_AUTHENTICATE_OUTPUT | bcode_workflow::OP_INSPECT_OUTPUT
+    ) || request.route_id.as_deref() != Some(bcode_workflow::WORKFLOW_EVIDENCE_INTERFACE_ID)
     {
         return ToolInvocationServiceResolution::Unsupported;
     }
@@ -27917,6 +27919,11 @@ fn workflow_output_evidence_resolution(
         return ToolInvocationServiceResolution::Cancelled;
     }
     match evidence {
+        Some(output) if request.operation == bcode_workflow::OP_INSPECT_OUTPUT => {
+            ToolInvocationServiceResolution::Responded {
+                payload: serde_json::json!(output),
+            }
+        }
         Some(output) => ToolInvocationServiceResolution::Responded {
             payload: serde_json::json!(bcode_workflow::WorkflowOutputEvidence {
                 output_id: output.output_id,
@@ -74446,10 +74453,13 @@ event_symbol = "bcode_plugin_handle_event_v1"
                 .unwrap()
         };
         let state = Arc::new(state);
-        for (run_id, cancelled) in [
-            ("edit-run", false),
-            ("foreign-run", false),
-            ("edit-run", true),
+        for (run_id, cancelled, operation) in [
+            ("edit-run", false, bcode_workflow::OP_AUTHENTICATE_OUTPUT),
+            ("foreign-run", false, bcode_workflow::OP_AUTHENTICATE_OUTPUT),
+            ("edit-run", true, bcode_workflow::OP_AUTHENTICATE_OUTPUT),
+            ("edit-run", false, bcode_workflow::OP_INSPECT_OUTPUT),
+            ("foreign-run", false, bcode_workflow::OP_INSPECT_OUTPUT),
+            ("edit-run", true, bcode_workflow::OP_INSPECT_OUTPUT),
         ] {
             let bridge = server_workflow_plugin_bridge(
                 Arc::clone(&state),
@@ -74470,7 +74480,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
                         request_id: "evidence".into(),
                         route_id: Some(bcode_workflow::WORKFLOW_EVIDENCE_INTERFACE_ID.into()),
                         interface_id: bcode_workflow::WORKFLOW_EVIDENCE_INTERFACE_ID.into(),
-                        operation: bcode_workflow::OP_AUTHENTICATE_OUTPUT.into(),
+                        operation: operation.into(),
                         payload: serde_json::json!({"output_id":"evidence-output"}),
                     }),
                     cancellation,
@@ -74488,10 +74498,16 @@ event_symbol = "bcode_plugin_handle_event_v1"
                 else {
                     panic!("canonical output must authenticate");
                 };
-                let evidence: bcode_workflow::WorkflowOutputEvidence =
-                    serde_json::from_value(payload).unwrap();
-                assert_eq!(evidence.output_id, expected.output_id);
-                assert_eq!(evidence.checksum_sha256, expected.checksum_sha256);
+                if operation == bcode_workflow::OP_INSPECT_OUTPUT {
+                    let evidence: bcode_workflow::WorkflowOutputInspection =
+                        serde_json::from_value(payload).unwrap();
+                    assert_eq!(evidence, expected);
+                } else {
+                    let evidence: bcode_workflow::WorkflowOutputEvidence =
+                        serde_json::from_value(payload).unwrap();
+                    assert_eq!(evidence.output_id, expected.output_id);
+                    assert_eq!(evidence.checksum_sha256, expected.checksum_sha256);
+                }
             } else {
                 assert!(matches!(response, ServiceBridgeResponse::Service(
                     ToolInvocationServiceResolution::Failed { code, .. }

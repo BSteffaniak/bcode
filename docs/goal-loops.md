@@ -52,9 +52,14 @@ not independent verification of positive claims. Supplied contribution IDs are n
 resolved through the versioned, invocation-scoped workflow evidence application service
 before an affirmative decision. The host checksum-verifies each exact output in the
 invoking run; callers cannot select a different run. Missing, corrupt, unsupported or
-unavailable evidence withholds completion even with judgement fallback. This authenticates
-references only: contribution content, integrated-target identity and freshness of checks
-remain unverified by this safeguard. Consequently new affirmative evaluations carrying a
+unavailable evidence withholds completion even with judgement fallback. The additive
+`inspect_output` operation returns the bounded, checksum-verified canonical value; older
+hosts reject the unsupported operation. The loop consumer rejects explicit blockers and
+remaining work in standard `bcode.delegated_task_result.v2` contributions, including malformed
+required fields. Custom contribution schemas remain authorable but unknown; neither an
+unknown schema nor an empty blocker list proves success. Integrated-target identity,
+criterion coverage and freshness of checks remain unverified by this safeguard.
+Consequently new affirmative evaluations carrying a
 V1 delivery report are withheld with an explicit target-bound-verification blocker, even
 when references authenticate, checks claim success, or judgement fallback is configured.
 The report and original criteria are retained. This is a conservative safety restriction,

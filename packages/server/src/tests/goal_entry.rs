@@ -587,8 +587,20 @@ fn assert_goal_evaluation(
     let evaluated = outputs
         .iter()
         .find(|output| output.node_id == "loop.evaluation")
-        .expect("successful run retains evaluator output");
+        .expect("run retains evaluator output");
     assert_eq!(evaluated.value["condition_met"], true);
+    let guarded = outputs
+        .iter()
+        .find(|output| output.node_id == "loop.judgement.evaluate")
+        .expect("run retains production delivery decision");
+    assert_eq!(guarded.value["condition_met"], false);
+    assert_eq!(guarded.value["delivery"], evaluated.value["delivery"]);
+    assert!(
+        guarded.value["summary"]
+            .as_str()
+            .unwrap()
+            .contains("no target-bound observed verification")
+    );
     let delivery = &evaluated.value["delivery"];
     assert_eq!(delivery["version"], "1");
     for (index, node) in ["left", "repair-right"].iter().enumerate() {
@@ -1322,20 +1334,29 @@ async fn real_goal_entry_publishes_and_executes_two_workers() {
                     attempt.node_id == collected.node_id && attempt.status == "succeeded"
                 }));
                 assert_worker_sessions(&state, &run_id, session.id);
-                let terminal = state
-                    .workflow_store
-                    .lock()
-                    .unwrap()
-                    .canonical_terminal_output(&run_id)
-                    .unwrap();
-                let Some(terminal) = terminal else {
+                // The scripted V1 report is an assertion, not target-bound observed
+                // verification. Wait for evaluation, not a positive terminal output:
+                // production must retain the contributions and continue the goal.
+                if !outputs
+                    .iter()
+                    .any(|output| output.node_id == "loop.judgement.evaluate")
+                {
                     tokio::time::sleep(Duration::from_millis(20)).await;
                     continue;
-                };
+                }
                 assert_corrected_contributions(root.path(), &outputs, collected);
                 assert_correction_without_replay(&attempts);
                 assert_goal_evaluation(&outputs, &request.input);
-                assert_eq!(terminal.value["condition_met"], true);
+                assert!(
+                    state
+                        .workflow_store
+                        .lock()
+                        .unwrap()
+                        .canonical_terminal_output(&run_id)
+                        .unwrap()
+                        .is_none(),
+                    "V1 evaluator assertions must not terminalize the goal as delivered"
+                );
                 break;
             }
             assert!(

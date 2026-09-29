@@ -51,6 +51,41 @@ impl DeliveryReport {
     }
 }
 
+/// Canonical worker claims can disprove delivery, never certify it. Unknown
+/// schemas remain unknown; custom worker schemas are an authorable choice.
+pub fn contribution_precludes_completion(
+    output: &bcode_workflow::WorkflowOutputInspection,
+) -> bool {
+    if output.schema_id != "bcode.delegated_task_result.v2" {
+        return false;
+    }
+    if output.schema_version != 1 {
+        return true;
+    }
+    let Some(blockers) = output
+        .value
+        .get("blockers")
+        .and_then(serde_json::Value::as_array)
+    else {
+        return true;
+    };
+    if !blockers.is_empty() {
+        return true;
+    }
+    let Some(contributions) = output.value.get("contributions") else {
+        return false;
+    };
+    let Some(contributions) = contributions.as_array() else {
+        return true;
+    };
+    contributions.iter().any(|contribution| {
+        contribution
+            .get("remaining_work")
+            .and_then(serde_json::Value::as_array)
+            .is_none_or(|remaining| !remaining.is_empty())
+    })
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub enum ReportVersion {
     #[serde(rename = "1")]
@@ -92,6 +127,31 @@ pub enum Observation {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn canonical_contribution_blockers_cannot_be_hidden_by_delivery_claims() {
+        let mut output: bcode_workflow::WorkflowOutputInspection = serde_json::from_value(json!({
+            "version":1, "output_id":"output", "run_id":"run", "node_id":"worker",
+            "activation_id":"activation", "schema_id":"bcode.delegated_task_result.v2",
+            "schema_version":1, "checksum_sha256":"a".repeat(64), "created_at_ms":1,
+            "value":{"blockers":[], "contributions":[{"remaining_work":[]}]}
+        }))
+        .unwrap();
+        assert!(!contribution_precludes_completion(&output));
+        output.value["blockers"] = json!(["permission denied"]);
+        assert!(contribution_precludes_completion(&output));
+        output.value["blockers"] = json!([]);
+        output.value["contributions"][0]["remaining_work"] = json!(["conflict unresolved"]);
+        assert!(contribution_precludes_completion(&output));
+        output.value["contributions"][0]["remaining_work"] = json!(null);
+        assert!(contribution_precludes_completion(&output));
+        output.value = json!({"blockers":[]});
+        assert!(!contribution_precludes_completion(&output));
+        output.value = json!({});
+        assert!(contribution_precludes_completion(&output));
+        output.schema_id = "custom.worker".into();
+        assert!(!contribution_precludes_completion(&output));
+    }
 
     #[test]
     fn negative_delivery_claims_preclude_completion() {

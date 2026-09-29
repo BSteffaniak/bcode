@@ -221,7 +221,7 @@ pub fn invoke(context: &NativeServiceContext) -> ServiceResponse {
         })
     {
         input.condition_met = false;
-        input.summary = "Completion withheld: canonical contribution references could not be authenticated in this run".into();
+        input.summary = "Completion withheld: canonical contribution references could not be authenticated in this run or report unresolved work".into();
         return json_response(&input);
     }
     // V1 records evaluator assertions only. Even authenticated output identities
@@ -341,7 +341,7 @@ fn authenticate_output(bridge: &ServiceBridge, dispatch_identity: &str, output_i
         request_id: "loop-contribution".into(),
         route_id: Some(bcode_workflow::WORKFLOW_EVIDENCE_INTERFACE_ID.into()),
         interface_id: bcode_workflow::WORKFLOW_EVIDENCE_INTERFACE_ID.into(),
-        operation: bcode_workflow::OP_AUTHENTICATE_OUTPUT.into(),
+        operation: bcode_workflow::OP_INSPECT_OUTPUT.into(),
         payload: serde_json::json!(bcode_workflow::WorkflowOutputEvidenceRequest {
             output_id: output_id.into(),
         }),
@@ -352,14 +352,16 @@ fn authenticate_output(bridge: &ServiceBridge, dispatch_identity: &str, output_i
     else {
         return false;
     };
-    serde_json::from_value::<bcode_workflow::WorkflowOutputEvidence>(payload).is_ok_and(
+    serde_json::from_value::<bcode_workflow::WorkflowOutputInspection>(payload).is_ok_and(
         |evidence| {
-            evidence.output_id == output_id
+            evidence.version == bcode_workflow::WORKFLOW_OUTPUT_INSPECTION_VERSION
+                && evidence.output_id == output_id
                 && evidence.checksum_sha256.len() == 64
                 && evidence
                     .checksum_sha256
                     .bytes()
                     .all(|byte| byte.is_ascii_hexdigit())
+                && !delivery::contribution_precludes_completion(&evidence)
         },
     )
 }
@@ -608,11 +610,15 @@ mod tests {
             let ServiceBridgeRequest::InvokeService(request) = request else {
                 panic!("expected evidence request")
             };
-            assert_eq!(request.operation, bcode_workflow::OP_AUTHENTICATE_OUTPUT);
+            assert_eq!(request.operation, bcode_workflow::OP_INSPECT_OUTPUT);
             let response = ServiceBridgeResponse::Service(
                 bcode_tool::ToolInvocationServiceResolution::Responded {
                     payload: serde_json::json!({
+                        "version": 1,
                         "output_id": "same-run:unrelated-output",
+                        "run_id": "same-run", "node_id": "worker", "activation_id": "activation",
+                        "schema_id": "custom", "schema_version": 1,
+                        "value": {"claim": "passed"}, "created_at_ms": 1,
                         "checksum_sha256": "a".repeat(64)
                     }),
                 },

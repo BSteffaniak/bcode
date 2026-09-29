@@ -118,6 +118,9 @@ pub struct ShellWorkflowOutputPolicy {
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct ShellWorkflowCommandPlan {
+    /// Optional bounded files to observe before and after execution. Empty preserves legacy behavior.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub observe_files: Vec<PathBuf>,
     pub version: u32,
     pub cwd: PathBuf,
     pub commands: Vec<ShellWorkflowCommand>,
@@ -176,6 +179,11 @@ pub struct ShellWorkflowCommandResult {
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct ShellWorkflowCommandPlanResult {
+    /// Owner-observed content; absence means unknown, not verified.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub content_before: Option<crate::content_observation::ContentObservation>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub content_after: Option<crate::content_observation::ContentObservation>,
     pub version: u32,
     /// Canonical SHA-256 of the exact normalized command plan executed by the shell owner.
     pub plan_sha256: String,
@@ -276,6 +284,7 @@ mod tests {
     #[test]
     fn workflow_command_plan_contract_is_versioned_bounded_and_argv_explicit() {
         let plan = ShellWorkflowCommandPlan {
+            observe_files: Vec::new(),
             version: SHELL_COMMAND_PLAN_VERSION,
             cwd: PathBuf::from("workspace"),
             commands: vec![ShellWorkflowCommand {
@@ -308,6 +317,8 @@ mod tests {
     #[test]
     fn workflow_command_plan_result_carries_terminal_detail_and_artifacts() {
         let result = ShellWorkflowCommandPlanResult {
+            content_before: None,
+            content_after: None,
             version: SHELL_COMMAND_PLAN_VERSION,
             plan_sha256: "a".repeat(64),
             passed: false,

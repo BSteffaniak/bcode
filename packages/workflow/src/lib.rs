@@ -2158,6 +2158,12 @@ impl WorkflowBlockPreparationResponse {
 pub const WORKFLOW_EVIDENCE_INTERFACE_ID: &str = "bcode.workflow-evidence/v1";
 /// Authenticate one exact output reference without opening artifacts or replaying history.
 pub const OP_AUTHENTICATE_OUTPUT: &str = "authenticate_output";
+/// Inspect one checksum-verified canonical output in the invoking run.
+///
+/// Returns [`WorkflowOutputInspection`], not an execution or delivery certificate.
+/// This additive operation uses the same bounded request as identity authentication;
+/// hosts that do not implement it must reject it rather than synthesize a value.
+pub const OP_INSPECT_OUTPUT: &str = "inspect_output";
 
 /// Bounded request for a canonical output in the invoking workflow run.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

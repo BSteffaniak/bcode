@@ -12,6 +12,7 @@
 //! carrying bounded recording artifact revisions; durable replay uses shell-owned artifact
 //! references.
 
+mod content_observation;
 mod contracts;
 pub mod recording;
 #[cfg(feature = "static-bundled")]
@@ -580,6 +581,7 @@ fn shell_script_command_plan(
     }
     shell.push(script);
     Ok(ShellWorkflowCommandPlan {
+        observe_files: Vec::new(),
         version: contracts::SHELL_COMMAND_PLAN_VERSION,
         cwd,
         commands: vec![contracts::ShellWorkflowCommand {
@@ -646,6 +648,11 @@ fn execute_workflow_command_plan(
         return Err("workflow cwd escapes the immutable workspace".to_string());
     }
     validate_workflow_environment(&plan.environment)?;
+    let content_before = if plan.observe_files.is_empty() {
+        None
+    } else {
+        Some(content_observation::observe(&cwd, &plan.observe_files)?)
+    };
     let mut commands = Vec::with_capacity(plan.commands.len());
     let mut artifacts = Vec::new();
     for (index, command) in plan.commands.iter().enumerate() {
@@ -680,6 +687,14 @@ fn execute_workflow_command_plan(
             result.status == ShellWorkflowCommandStatus::Exited && result.exit_accepted
         });
     Ok(ShellWorkflowCommandPlanResult {
+        content_before,
+        // Missing or unreadable post-execution content is explicitly unknown. Do not
+        // hide the already observed command outcomes or imply that effects did not occur.
+        content_after: if plan.observe_files.is_empty() {
+            None
+        } else {
+            content_observation::observe(&cwd, &plan.observe_files).ok()
+        },
         version: plan.version,
         plan_sha256: canonical_command_plan_sha256(plan)?,
         passed,
@@ -2612,6 +2627,7 @@ mod tests {
                 preparation: None,
             },
             ShellWorkflowCommandPlan {
+                observe_files: Vec::new(),
                 version: contracts::SHELL_COMMAND_PLAN_VERSION,
                 cwd: PathBuf::from("."),
                 commands,
@@ -2944,6 +2960,62 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn workflow_content_observation_records_actual_execution_not_claims() {
+        let workspace = tempfile::tempdir().unwrap();
+        std::fs::write(workspace.path().join("target"), "before").unwrap();
+        let (invocation, mut plan) = workflow_command_plan(
+            workspace.path(),
+            vec![contracts::ShellWorkflowCommand {
+                argv: vec!["sh".into(), "-c".into(), "printf after > target".into()],
+                timeout_ms: 5_000,
+                accepted_exit_codes: None,
+                continue_on_unaccepted_exit: false,
+            }],
+        );
+        plan.observe_files = vec![PathBuf::from("target")];
+        let result = execute_workflow_command_plan(
+            &workflow_context(
+                &invocation,
+                bcode_plugin_sdk::ServiceCancellation::default(),
+            ),
+            &invocation,
+            &plan,
+        )
+        .unwrap();
+        assert!(result.passed);
+        assert_ne!(result.content_before, result.content_after);
+        assert_eq!(
+            result.content_after,
+            Some(content_observation::observe(workspace.path(), &plan.observe_files).unwrap())
+        );
+        plan.commands[0].argv[2] = "test $(cat target) = after".into();
+        let result = execute_workflow_command_plan(
+            &workflow_context(
+                &invocation,
+                bcode_plugin_sdk::ServiceCancellation::default(),
+            ),
+            &invocation,
+            &plan,
+        )
+        .unwrap();
+        assert!(result.passed);
+        assert_eq!(result.content_before, result.content_after);
+        plan.commands[0].argv[2] = "exit 1".into();
+        let result = execute_workflow_command_plan(
+            &workflow_context(
+                &invocation,
+                bcode_plugin_sdk::ServiceCancellation::default(),
+            ),
+            &invocation,
+            &plan,
+        )
+        .unwrap();
+        assert!(!result.passed);
+        assert_eq!(result.content_before, result.content_after);
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn workflow_command_plan_runs_sequentially_and_branches_on_nonzero() {
         let workspace = tempfile::tempdir().expect("workspace");
         let command = |script: &str, continue_on_unaccepted_exit| contracts::ShellWorkflowCommand {
@@ -3249,6 +3321,8 @@ mod tests {
             value: serde_json::json!(false),
         };
         let result = ShellWorkflowCommandPlanResult {
+            content_before: None,
+            content_after: None,
             version: contracts::SHELL_COMMAND_PLAN_VERSION,
             plan_sha256: "a".repeat(64),
             passed: false,
