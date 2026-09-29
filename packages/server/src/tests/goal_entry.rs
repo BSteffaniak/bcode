@@ -2,6 +2,8 @@
 use super::*;
 use bcode_plugin_sdk::tui::*;
 
+mod isolated_recovery;
+
 struct GoalEntryHost {
     session: SessionId,
     state: Arc<ServerState>,
@@ -9,6 +11,7 @@ struct GoalEntryHost {
     tasks: StdMutex<Vec<PluginTask>>,
     starts: StdMutex<Vec<PluginWorkflowStartRequest>>,
     execution_cap: Option<u64>,
+    isolated_workspace: Option<PathBuf>,
 }
 
 impl PluginTuiHost for GoalEntryHost {
@@ -78,7 +81,11 @@ impl PluginTuiHost for GoalEntryHost {
     }
     fn start_workflow(&self, mut request: PluginWorkflowStartRequest) -> PluginWorkflowStartFuture {
         request.run_id = Some("goal-entry-acceptance".into());
-        install_goal_script(&mut request, &self.workspace);
+        if let Some(trees) = &self.isolated_workspace {
+            isolated_recovery::install_script(&mut request, &self.workspace, trees);
+        } else {
+            install_goal_script(&mut request, &self.workspace);
+        }
         if let Some(cap) = self.execution_cap {
             request.limits.node_execution_cap = cap;
             request.limits.concurrency_cap = 1;
@@ -286,6 +293,16 @@ async fn goal_entry_request_with_cap(
     state: Arc<ServerState>,
     execution_cap: Option<u64>,
 ) -> PluginWorkflowStartRequest {
+    goal_entry_request_with_workspace(session, root, state, execution_cap, None).await
+}
+
+async fn goal_entry_request_with_workspace(
+    session: SessionId,
+    root: &Path,
+    state: Arc<ServerState>,
+    execution_cap: Option<u64>,
+    isolated_workspace: Option<PathBuf>,
+) -> PluginWorkflowStartRequest {
     let registry = bcode_bundled_plugins::tui_registry("bcode.loop").unwrap();
     let mut surface = registry
         .open(
@@ -307,6 +324,7 @@ async fn goal_entry_request_with_cap(
         tasks: StdMutex::default(),
         starts: StdMutex::default(),
         execution_cap,
+        isolated_workspace,
     };
     let key = |key, ctrl| {
         bmux_tui::event::Event::Key(bmux_keyboard::KeyStroke {

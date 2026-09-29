@@ -98,6 +98,7 @@ pub fn format(view: &WorkflowRunView) -> String {
             preview(&session.session_id)
         );
     }
+    format_omissions(&mut text, view);
     match &view.terminal {
         Some(WorkflowTerminalView::Completed { output_id }) => {
             let _ = write!(text, "\nWorkflow finished · canonical result {}. Worker success alone does not establish integrated goal completion.", preview(output_id));
@@ -110,6 +111,31 @@ pub fn format(view: &WorkflowRunView) -> String {
     }
     text.push_str("\n/goal.status refreshes this snapshot; /workflow retains detailed history, results and approval controls.");
     text
+}
+
+fn format_omissions(text: &mut String, view: &WorkflowRunView) {
+    for (label, count) in [
+        (
+            "workers",
+            view.nodes
+                .iter()
+                .filter(|node| node.kind == WorkflowNodeKind::Agent)
+                .count(),
+        ),
+        ("tool approvals", view.tool_permissions.len()),
+        ("mutation approvals", view.mutation_approvals.len()),
+        ("waits", view.waits.len()),
+        ("failures", view.failure_diagnostics.len()),
+        ("execution sessions", view.child_sessions.len()),
+    ] {
+        if count > DETAIL_LIMIT {
+            let _ = write!(
+                text,
+                "\nAdditional {label} omitted from this preview: {} in this snapshot. Inspect /workflow; this count is not a full-run total.",
+                count - DETAIL_LIMIT
+            );
+        }
+    }
 }
 
 fn format_result(text: &mut String, view: &WorkflowRunView, output_id: &str) {
@@ -358,6 +384,23 @@ pub mod tests {
     }
 
     #[test]
+    fn bounded_worker_preview_reports_omissions_without_claiming_global_totals() {
+        let mut snapshot = view();
+        let worker = snapshot.nodes[0].clone();
+        snapshot.nodes = vec![worker; DETAIL_LIMIT];
+        assert!(!format(&snapshot).contains("Additional workers omitted"));
+        snapshot.nodes.push(snapshot.nodes[0].clone());
+        let text = format(&snapshot);
+        assert_eq!(
+            text.matches("Implement change [worker]").count(),
+            DETAIL_LIMIT
+        );
+        assert!(text.contains("Additional workers omitted from this preview: 1 in this snapshot"));
+        assert!(text.contains("this count is not a full-run total"));
+        assert_eq!(snapshot.nodes.len(), DETAIL_LIMIT + 1);
+    }
+
+    #[test]
     fn completed_worker_is_not_goal_completion() {
         let text = format(&view());
         assert!(text.contains("Implement change [worker] · Completed"));
@@ -424,6 +467,7 @@ pub mod tests {
         assert!(text.contains("Reconciliation warning: Conflict requires explicit resolution"));
         assert!(text.contains("Use /workflow to inspect the exact request and approve or deny"));
         assert!(text.contains("status does not authorize execution"));
+        assert!(text.contains("Additional mutation approvals omitted from this preview: 1"));
         assert_eq!(view.mutation_approvals.len(), DETAIL_LIMIT + 1);
     }
 

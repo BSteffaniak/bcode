@@ -5,7 +5,13 @@ inspection (not filesystem isolation); plain loop context behavior is unchanged.
 Production-path deterministic tests discover revision-pinned output pages, inspect
 exact contribution values, retain their IDs in delivery, and compare the report to
 canonical outputs and the combined artifact. This is scripted coverage, not live-model
-acceptance or host verification of positive evaluator claims.
+acceptance or host verification of positive evaluator claims. The isolated Git
+conflict scenario also retains the observed integrated commit and checkout,
+references both inspected canonical worker outputs, and lists all retained checkouts.
+Its read-only evaluator inspects the resolved artifact and the revision recorded after
+combined verification; this does not independently rerun validation or certify worker
+commit provenance. New evaluator guidance distinguishes base, contribution and integrated
+revisions, asks for working-tree state, and forbids creating commits just for reporting.
 
 New goal evaluations may retain an optional `delivery` report in their canonical
 output: `version: "1"`, integrated targets, inspected canonical contribution output
@@ -15,7 +21,10 @@ and text are schema-bounded. `/goal.status` previews targets, contribution refer
 criterion statuses and evidence, combined check commands/workspaces/outcomes, unresolved
 work and retained workspaces. Each category is limited to ten entries and each text
 field to 320 characters; omissions are explicit.
-`/workflow` retains the full result. These are evaluator-reported observations, not
+`/workflow` retains the full result. Worker, approval, wait, failure and execution-session
+previews also show at most ten entries each. Omission notices count only entries hidden
+from the current snapshot, not the whole run; use `/workflow` for further inspection.
+These are evaluator-reported observations, not
 host-verified receipts or automatic Git integration. Missing reports remain unknown;
 ordinary goals do not require collaboration. Unknown report versions reject.
 Existing admitted graphs are not rewritten. The judgement block is version 3 for

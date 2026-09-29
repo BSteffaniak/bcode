@@ -1065,7 +1065,7 @@ fn fake_response_text(
             .lines()
             .find_map(|line| line.strip_prefix("structured-result "))
     {
-        serde_json::from_str(value).map_err(|error| fake_structured_output_error(&error))?
+        scripted_structured_result(value, request)?
     } else if let Some(value) = configured_fake_structured_output(request, structured, user_text)? {
         return Ok(value);
     } else {
@@ -1253,20 +1253,7 @@ fn apply_loop_delivery(
     {
         let mut report =
             serde_json::from_str(report).map_err(|error| fake_structured_output_error(&error))?;
-        let results = request
-            .messages
-            .iter()
-            .rev()
-            .take_while(|message| message.role != MessageRole::User)
-            .flat_map(|message| message.content.iter().rev())
-            .filter_map(|block| match block {
-                ContentBlock::ToolResult { result } if !result.is_error => {
-                    Some(result.output.as_str())
-                }
-                _ => None,
-            })
-            .collect::<Vec<_>>();
-        if bind_prompt_results(&mut report, &results).is_some() {
+        if bind_request_results(&mut report, request).is_some() {
             value["delivery"] = report;
         } else {
             value["condition_met"] = serde_json::json!(false);
@@ -2511,6 +2498,33 @@ fn next_prompt_tool_directive(messages: &[ModelMessage], next_turn: u64) -> Opti
     None
 }
 
+fn scripted_structured_result(
+    text: &str,
+    request: &ModelTurnRequest,
+) -> Result<serde_json::Value, ProviderError> {
+    let mut value =
+        serde_json::from_str(text).map_err(|error| fake_structured_output_error(&error))?;
+    bind_request_results(&mut value, request).ok_or_else(|| {
+        fake_structured_output_error(&"Structured result references could not be resolved")
+    })?;
+    Ok(value)
+}
+
+fn bind_request_results(value: &mut serde_json::Value, request: &ModelTurnRequest) -> Option<()> {
+    let results = request
+        .messages
+        .iter()
+        .rev()
+        .take_while(|message| message.role != MessageRole::User)
+        .flat_map(|message| message.content.iter().rev())
+        .filter_map(|block| match block {
+            ContentBlock::ToolResult { result } if !result.is_error => Some(result.output.as_str()),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    bind_prompt_results(value, &results)
+}
+
 // Explicit opt-in fixture references use reverse chronological result indices and
 // RFC 6901 pointers. Missing/malformed references stop the script, never dispatch
 // unresolved placeholders. Result values are data, not recursively interpreted.
@@ -3609,6 +3623,14 @@ tool-call publish {"$fake_result":{"index":0,"pointer":"/publication_arguments"}
         );
         assert!(fake_response_text(&request, None, "structured-result {}").is_err());
         assert!(fake_response_text(&request, None, "structured-result invalid").is_err());
+        assert!(
+            fake_response_text(
+                &request,
+                None,
+                r#"structured-result {"$fake_result":{"index":0,"pointer":""}}"#,
+            )
+            .is_err()
+        );
     }
 
     #[test]
