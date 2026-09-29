@@ -2151,6 +2151,32 @@ impl WorkflowBlockPreparationResponse {
     }
 }
 
+/// Invocation-scoped application service for canonical workflow evidence.
+///
+/// Hosts bind this service to the invoking block's run; callers cannot select another run.
+/// Unsupported hosts reject the versioned interface rather than trusting caller claims.
+pub const WORKFLOW_EVIDENCE_INTERFACE_ID: &str = "bcode.workflow-evidence/v1";
+/// Authenticate one exact output reference without opening artifacts or replaying history.
+pub const OP_AUTHENTICATE_OUTPUT: &str = "authenticate_output";
+
+/// Bounded request for a canonical output in the invoking workflow run.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WorkflowOutputEvidenceRequest {
+    /// Exact canonical output identity, not a filesystem path.
+    pub output_id: String,
+}
+
+/// Authenticated identity only; this does not certify contribution content or delivery.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WorkflowOutputEvidence {
+    /// Exact canonical output identity.
+    pub output_id: String,
+    /// SHA-256 verified against the stored output value by the host.
+    pub checksum_sha256: String,
+}
+
 /// Versioned host envelope for one exact plugin-owned workflow-block invocation.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]

@@ -27,16 +27,42 @@ from the current snapshot, not the whole run; use `/workflow` for further inspec
 These are evaluator-reported observations, not
 host-verified receipts or automatic Git integration. Missing reports remain unknown;
 ordinary goals do not require collaboration. Unknown report versions reject.
-Existing admitted graphs are not rewritten. The judgement block is version 3 for
+Existing admitted graphs are not rewritten. The judgement block is version 4 for
 the extended state schema; incompatible older bindings require normal compatibility
-handling, not silent reinterpretation.
+handling, not silent reinterpretation. Newly authored collaboration goals pin
+`delivery_required=true` on normal and approval-resume safeguard entries. Evaluators
+cannot bypass delivery safeguards by omitting or nulling the report (or returning
+`delivery_required=false`). This requirement is authored graph policy, preserved by
+source-preserving delegation; authorized graph revision remains possible. Historical
+state without the field defaults to false; ordinary goals retain their existing policy.
 New loops always run the loop-owned completion safeguard after agent evaluation,
 including agent-only loops with no judgement provider configured. Reported blockers,
-failed or unverified criteria/checks, empty target/criterion lists and unresolved work
+failed or unverified criteria/checks, empty target/criterion lists, blank target or supplied
+contribution identities, blank criterion descriptions or check commands/workspaces, and unresolved work
 withhold completion. The optional judgement evaluator additionally receives the delivery
 report along with prose evidence and cannot override those negatives, even with fallback
-enabled. Agent-only safeguarding makes no provider request. This is conservative rejection,
-not independent verification of positive claims. Existing admitted graphs are unchanged;
+enabled. Model confidence is an additional gate: it cannot promote an agent evaluator's
+`condition_met=false` into completion, even at probability 1.0. Agent-only safeguarding
+makes no provider request. It also withholds an affirmative decision with empty,
+blank, or oversized prose evidence, using the judgement-backed evidence bounds.
+The service boundary validates supplied delivery reports against the declared V1 schema
+before interpreting them; deserialization alone does not enforce list or string bounds.
+This is conservative rejection,
+not independent verification of positive claims. Supplied contribution IDs are now
+resolved through the versioned, invocation-scoped workflow evidence application service
+before an affirmative decision. The host checksum-verifies each exact output in the
+invoking run; callers cannot select a different run. Missing, corrupt, unsupported or
+unavailable evidence withholds completion even with judgement fallback. This authenticates
+references only: contribution content, integrated-target identity and freshness of checks
+remain unverified by this safeguard. Consequently new affirmative evaluations carrying a
+V1 delivery report are withheld with an explicit target-bound-verification blocker, even
+when references authenticate, checks claim success, or judgement fallback is configured.
+The report and original criteria are retained. This is a conservative safety restriction,
+not a positive verification implementation: a canonical target/content-bound observation
+path is still required before such delivery can be certified. Historical reports remain
+readable and terminal outcomes are not rewritten. Ordinary goals without delivery reports
+retain their existing behavior and do not gain a collaboration requirement.
+Existing admitted graphs are unchanged;
 new graph-derived execution allowances account for the additional block.
 
 Large nested corrective inputs can exceed the default tool-output context budget.

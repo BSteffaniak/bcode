@@ -2089,6 +2089,8 @@ struct LoopWorkflowIteration {
     #[serde(default)]
     planning_ready: bool,
     #[serde(default)]
+    delivery_required: bool,
+    #[serde(default)]
     external_blocker: LoopExternalBlocker,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     judgement_evaluation: Option<judgement_evaluation::EvaluationConfig>,
@@ -2452,6 +2454,24 @@ fn collaborating_goal_spec(
         .push_str(include_str!("../prompts/goal-collaboration-evaluation.md"));
     evaluator.configuration =
         serde_json::to_value(evaluation).map_err(|error| error.to_string())?;
+    // Pin authored collaboration policy at every safeguard entry, including resume.
+    // The evaluator cannot relax it by omitting the optional delivery report.
+    for edge in &mut definition.edges {
+        if edge.to != "loop.judgement.evaluate" {
+            continue;
+        }
+        let Some(bcode_workflow::WorkflowTransform {
+            expression: bcode_workflow::WorkflowTransformExpression::Object { fields },
+            ..
+        }) = &mut edge.transform
+        else {
+            return Err("collaboration safeguard entry lacks a pinned state transform".into());
+        };
+        fields.insert(
+            "delivery_required".into(),
+            bcode_workflow::WorkflowTransformExpression::Constant { value: true.into() },
+        );
+    }
     bcode_workflow::WorkflowSpec::from_definition(WORKFLOW_KIND, definition)
         .map_err(|error| error.to_string())
 }
@@ -2587,6 +2607,7 @@ fn loop_workflow_initial_value(input: &LoopWorkflowInput) -> LoopWorkflowIterati
         max_iterations: input.max_iterations,
         judgement_evaluation: input.judgement_evaluation.clone(),
         planning_ready: false,
+        delivery_required: false,
         external_blocker: LoopExternalBlocker::None,
         iteration: 1,
         condition_met: false,

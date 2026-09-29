@@ -28,7 +28,7 @@ name         = "Loop Judgement Evaluation"
 
 [[services.workflow_blocks]]
 block_id               = "loop.judgement.evaluate"
-block_version          = 3
+block_version          = 4
 cancellation_supported = true
 effect                 = "read_only"
 operation              = "loop.judgement.evaluate"
@@ -37,7 +37,7 @@ reconciliation         = "repair_required"
 timeout_ms             = 60000
 
 [services.workflow_blocks.input]
-schema = { "$schema" = "https://json-schema.org/draft/2020-12/schema", "title" = "LoopWorkflowIteration", "type" = "object", "properties" = { "condition_met" = { "type" = "boolean" }, "delivery" = { "anyOf" = [
+schema = { "$schema" = "https://json-schema.org/draft/2020-12/schema", "title" = "LoopWorkflowIteration", "type" = "object", "properties" = { "delivery_required" = { "type" = "boolean", "default" = false }, "condition_met" = { "type" = "boolean" }, "delivery" = { "anyOf" = [
     { "$ref" = "#/$defs/DeliveryReport" },
     { "type" = "null" },
 ] }, "evidence" = { "type" = "array", "items" = { "type" = "string" } }, "external_blocker" = { "$ref" = "#/$defs/LoopExternalBlocker", "default" = "none" }, "implementation_prompt" = { "type" = "string" }, "iteration" = { "type" = "integer", "format" = "uint32", "minimum" = 0 }, "judgement_evaluation" = { "anyOf" = [
@@ -92,7 +92,7 @@ schema = { "$schema" = "https://json-schema.org/draft/2020-12/schema", "title" =
 type_name = "bcode_loop_plugin::LoopWorkflowIteration"
 
 [services.workflow_blocks.output]
-schema = { "$schema" = "https://json-schema.org/draft/2020-12/schema", "title" = "LoopWorkflowIteration", "type" = "object", "properties" = { "condition_met" = { "type" = "boolean" }, "delivery" = { "anyOf" = [
+schema = { "$schema" = "https://json-schema.org/draft/2020-12/schema", "title" = "LoopWorkflowIteration", "type" = "object", "properties" = { "delivery_required" = { "type" = "boolean", "default" = false }, "condition_met" = { "type" = "boolean" }, "delivery" = { "anyOf" = [
     { "$ref" = "#/$defs/DeliveryReport" },
     { "type" = "null" },
 ] }, "evidence" = { "type" = "array", "items" = { "type" = "string" } }, "external_blocker" = { "$ref" = "#/$defs/LoopExternalBlocker", "default" = "none" }, "implementation_prompt" = { "type" = "string" }, "iteration" = { "type" = "integer", "format" = "uint32", "minimum" = 0 }, "judgement_evaluation" = { "anyOf" = [

@@ -27,12 +27,25 @@ impl DeliveryReport {
     /// Claims can rule out completion, but cannot establish verified delivery.
     pub(crate) fn precludes_completion(&self) -> bool {
         self.integrated_targets.is_empty()
+            || self
+                .integrated_targets
+                .iter()
+                .any(|target| target.trim().is_empty())
+            || self
+                .contribution_output_ids
+                .iter()
+                .any(|id| id.trim().is_empty())
             || self.criteria.is_empty()
             || self.criteria.iter().any(|criterion| {
-                criterion.status != Observation::Passed || criterion.evidence.trim().is_empty()
+                criterion.description.trim().is_empty()
+                    || criterion.status != Observation::Passed
+                    || criterion.evidence.trim().is_empty()
             })
             || self.checks.iter().any(|check| {
-                check.outcome != Observation::Passed || check.evidence.trim().is_empty()
+                check.command.trim().is_empty()
+                    || check.workspace.trim().is_empty()
+                    || check.outcome != Observation::Passed
+                    || check.evidence.trim().is_empty()
             })
             || !self.unresolved_work.is_empty()
     }
@@ -92,6 +105,12 @@ mod tests {
         let report: DeliveryReport = serde_json::from_value(value.clone()).unwrap();
         assert!(!report.precludes_completion()); // Not proof of completion.
         for (pointer, replacement) in [
+            ("/criteria/0/criterion", json!(" \t\n")),
+            ("/criteria/0/evidence", json!("\u{2003}")),
+            ("/checks/0/command", json!(" \t")),
+            ("/checks/0/workspace", json!("\n")),
+            ("/integrated_targets", json!(["valid", " \t"])),
+            ("/contribution_output_ids", json!(["valid", "\u{2003}"])),
             ("/criteria/0/status", json!("failed")),
             ("/criteria/0/status", json!("unverified")),
             ("/checks/0/outcome", json!("failed")),

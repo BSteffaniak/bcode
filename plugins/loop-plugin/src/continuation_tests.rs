@@ -140,6 +140,7 @@ fn source(progress: bool) -> bcode_workflow::WorkflowContinuationSource {
             judgement_evaluation: None,
             iteration: 2,
             planning_ready: true,
+            delivery_required: false,
             external_blocker: LoopExternalBlocker::None,
             condition_met: false,
             evidence: vec!["remaining work".into()],

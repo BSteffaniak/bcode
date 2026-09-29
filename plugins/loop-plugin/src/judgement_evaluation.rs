@@ -105,6 +105,15 @@ pub fn pinned_input_transform() -> bcode_workflow::WorkflowTransform {
         ("max_iterations", pinned("max_iterations")),
         ("planning_ready", pinned("planning_ready")),
         (
+            "delivery_required",
+            Expr::Default {
+                value: Box::new(pinned("delivery_required")),
+                default: Box::new(Expr::Constant {
+                    value: false.into(),
+                }),
+            },
+        ),
+        (
             "judgement_evaluation",
             Expr::Default {
                 value: Box::new(pinned("judgement_evaluation")),
@@ -185,31 +194,47 @@ pub fn invoke(context: &NativeServiceContext) -> ServiceResponse {
     else {
         return ServiceResponse::error("invalid_request", "invalid loop block invocation");
     };
+    if !valid_delivery_input(&invocation.input) {
+        return ServiceResponse::error("invalid_request", "invalid loop delivery report");
+    }
     let Ok(mut input) = invocation.typed_input::<LoopWorkflowIteration>() else {
         return ServiceResponse::error("invalid_request", "invalid loop evaluation input");
     };
-    if let Some(config) = &input.judgement_evaluation
-        && let Err(message) = config.validate()
+    if input
+        .judgement_evaluation
+        .as_ref()
+        .is_some_and(|config| config.validate().is_err())
     {
-        return ServiceResponse::error("invalid_request", message);
+        return ServiceResponse::error("invalid_request", "invalid loop judgement configuration");
     }
     if context.cancellation.is_cancelled() {
         return ServiceResponse::error("cancelled", "loop evaluation cancelled");
     }
-    // Negative delivery evidence is authoritative for this decision even when the
-    // optional model is confident, or its service fails with agent fallback enabled.
-    if input.external_blocker != LoopExternalBlocker::None
-        || input
-            .delivery
-            .as_ref()
-            .is_some_and(delivery::DeliveryReport::precludes_completion)
+    if missing_required_delivery(&mut input) || negative_delivery(&mut input) {
+        return json_response(&input);
+    }
+    if input.condition_met
+        && input.delivery.as_ref().is_some_and(|report| {
+            report.contribution_output_ids.iter().any(|output_id| {
+                !authenticate_output(&context.bridge, &invocation.dispatch_identity, output_id)
+            })
+        })
     {
         input.condition_met = false;
-        input.summary = "Completion withheld: resolve the reported blocker, failed or unverified delivery evidence, or unresolved work before reevaluation".into();
+        input.summary = "Completion withheld: canonical contribution references could not be authenticated in this run".into();
+        return json_response(&input);
+    }
+    // V1 records evaluator assertions only. Even authenticated output identities
+    // do not bind a successful check to the delivered content. Preserve the report
+    // for inspection, but do not let confidence or fallback certify those claims.
+    if input.condition_met && input.delivery.is_some() {
+        input.condition_met = false;
+        input.summary = "Completion withheld: delivery V1 has no target-bound observed verification; retain the report and contributions until canonical verification support is available".into();
         return json_response(&input);
     }
     // Agent-only loops use the same deterministic safeguard without provider dispatch.
     let Some(config) = input.judgement_evaluation.clone() else {
+        safeguard_agent_evidence(&mut input);
         return json_response(&input);
     };
     let result = evaluate(&context.bridge, &invocation.dispatch_identity, &input);
@@ -257,6 +282,86 @@ pub fn invoke(context: &NativeServiceContext) -> ServiceResponse {
             "loop judgement unavailable; workflow requires attention",
         ),
     }
+}
+
+// Negative evidence cannot be overridden by model confidence or provider fallback.
+fn negative_delivery(input: &mut LoopWorkflowIteration) -> bool {
+    if input.external_blocker == LoopExternalBlocker::None
+        && !input
+            .delivery
+            .as_ref()
+            .is_some_and(delivery::DeliveryReport::precludes_completion)
+    {
+        return false;
+    }
+    input.condition_met = false;
+    input.summary = "Completion withheld: resolve the reported blocker, failed or unverified delivery evidence, or unresolved work before reevaluation".into();
+    true
+}
+
+fn missing_required_delivery(input: &mut LoopWorkflowIteration) -> bool {
+    if !input.condition_met || !input.delivery_required || input.delivery.is_some() {
+        return false;
+    }
+    input.condition_met = false;
+    input.summary =
+        "Completion withheld: this goal requires a delivery report; omission is not verification"
+            .into();
+    true
+}
+
+fn valid_delivery_input(input: &serde_json::Value) -> bool {
+    input
+        .get("delivery")
+        .filter(|value| !value.is_null())
+        .is_none_or(|value| {
+            bcode_workflow::ValueSchema::of::<delivery::DeliveryReport>()
+                .validate_value("loop.delivery", value)
+                .is_ok()
+        })
+}
+
+fn safeguard_agent_evidence(input: &mut LoopWorkflowIteration) {
+    // Absence of a judgement provider does not make empty or unbounded evidence sufficient.
+    let evidence_bytes = input.evidence.join("\n").len();
+    if input.condition_met
+        && (input.evidence.is_empty()
+            || input.evidence.iter().any(|item| item.trim().is_empty())
+            || evidence_bytes > EVIDENCE_LIMIT
+            || input.stop_condition.len() + evidence_bytes > judgement::MAX_REQUEST_BYTES / 2)
+    {
+        input.condition_met = false;
+        input.summary = "Completion withheld: no bounded concrete evaluation evidence".into();
+    }
+}
+
+fn authenticate_output(bridge: &ServiceBridge, dispatch_identity: &str, output_id: &str) -> bool {
+    let request = bcode_tool::ToolInvocationServiceRequest {
+        invocation_id: dispatch_identity.into(),
+        request_id: "loop-contribution".into(),
+        route_id: Some(bcode_workflow::WORKFLOW_EVIDENCE_INTERFACE_ID.into()),
+        interface_id: bcode_workflow::WORKFLOW_EVIDENCE_INTERFACE_ID.into(),
+        operation: bcode_workflow::OP_AUTHENTICATE_OUTPUT.into(),
+        payload: serde_json::json!(bcode_workflow::WorkflowOutputEvidenceRequest {
+            output_id: output_id.into(),
+        }),
+    };
+    let Ok(ServiceBridgeResponse::Service(
+        bcode_tool::ToolInvocationServiceResolution::Responded { payload },
+    )) = bridge.request(&ServiceBridgeRequest::InvokeService(request))
+    else {
+        return false;
+    };
+    serde_json::from_value::<bcode_workflow::WorkflowOutputEvidence>(payload).is_ok_and(
+        |evidence| {
+            evidence.output_id == output_id
+                && evidence.checksum_sha256.len() == 64
+                && evidence
+                    .checksum_sha256
+                    .bytes()
+                    .all(|byte| byte.is_ascii_hexdigit())
+        },
+    )
 }
 
 fn evaluate(
@@ -333,7 +438,9 @@ fn evaluate(
         return Err("invalid judgement answer");
     }
     Ok((
-        *probability >= f64::from(config.threshold_percent) / 100.0,
+        // Model confidence is an additional gate, not authority to promote an
+        // evaluator's unresolved or unverified stop condition into completion.
+        input.condition_met && *probability >= f64::from(config.threshold_percent) / 100.0,
         *probability,
     ))
 }
@@ -341,6 +448,242 @@ fn evaluate(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn collaboration_delivery_requirement_survives_evaluator_omission_and_resume() {
+        let input = LoopWorkflowInput::new("implement".into(), "complete".into(), 2).unwrap();
+        let base = loop_workflow_spec(&input).unwrap();
+        let spec = collaborating_goal_spec(&base).unwrap();
+        let state = serde_json::to_value(loop_workflow_initial_value(&input)).unwrap();
+        let mut current = state.clone();
+        current["condition_met"] = true.into();
+        current["delivery_required"] = false.into();
+        for definition in [base.definition(), spec.definition()] {
+            let mut evaluated = 0;
+            for edge in &definition.edges {
+                if edge.to != "loop.judgement.evaluate" {
+                    continue;
+                }
+                let output = edge
+                    .transform
+                    .as_ref()
+                    .expect("pinned entry")
+                    .evaluate(&[
+                        bcode_workflow::WorkflowTransformInput {
+                            name: "state",
+                            value: &state,
+                        },
+                        bcode_workflow::WorkflowTransformInput {
+                            name: "current",
+                            value: &current,
+                        },
+                    ])
+                    .unwrap();
+                assert_eq!(output["delivery_required"], definition == spec.definition());
+                assert_eq!(output["stop_condition"], state["stop_condition"]);
+                evaluated += 1;
+            }
+            assert_eq!(evaluated, 2, "normal and approval entry both pinned");
+        }
+    }
+
+    #[test]
+    fn required_delivery_omission_blocks_all_judgement_policies() {
+        for policy in [
+            "",
+            "bcode.fake-provider/fake-judgement/-/90/pause",
+            "bcode.fake-provider/fake-judgement/-/90/agent_fallback",
+        ] {
+            let mut input =
+                LoopWorkflowInput::new("implement".into(), "complete".into(), 2).unwrap();
+            input.judgement_evaluation = parse_config(policy).unwrap();
+            let mut state = loop_workflow_initial_value(&input);
+            state.delivery_required = true;
+            state.condition_met = true;
+            state.evidence = vec!["claimed verification".into()];
+            for null_report in [false, true] {
+                let mut value = serde_json::to_value(&state).unwrap();
+                if null_report {
+                    value["delivery"] = serde_json::Value::Null;
+                }
+                let invocation = bcode_workflow::WorkflowBlockInvocation {
+                    version: bcode_workflow::WorkflowBlockInvocation::VERSION,
+                    dispatch_identity: "dispatch".into(),
+                    workspace_root: std::env::temp_dir(),
+                    input: value,
+                    preparation: None,
+                };
+                let context = NativeServiceContext {
+                    plugin_id: PLUGIN_ID.into(),
+                    request: ServiceRequest {
+                        interface_id: bcode_workflow::WORKFLOW_BLOCK_INTERFACE_ID.into(),
+                        operation: OPERATION.into(),
+                        payload: serde_json::to_vec(&invocation).unwrap(),
+                    },
+                    config: bcode_plugin_sdk::PluginConfigContext::default(),
+                    events: ServiceEventEmitter::default(),
+                    cancellation: bcode_plugin_sdk::ServiceCancellation::default(),
+                    bridge: ServiceBridge::default(),
+                    transient_progress_limits: TransientProgressLimits::default(),
+                };
+                let response = invoke(&context);
+                assert!(response.error.is_none());
+                let output: LoopWorkflowIteration =
+                    serde_json::from_slice(&response.payload).unwrap();
+                assert!(!output.condition_met);
+                assert!(output.summary.contains("requires a delivery report"));
+                assert!(output.delivery_required);
+            }
+        }
+    }
+
+    #[test]
+    fn unauthenticated_contributions_block_completion_without_judgement_fallback() {
+        let mut input = LoopWorkflowInput::new("implement".into(), "complete".into(), 2).unwrap();
+        for judgement in ["", "bcode.fake-provider/fake-judgement/-/90/agent_fallback"] {
+            // Configure fallback explicitly below; parsing is not part of this test.
+            input.judgement_evaluation = if judgement.is_empty() {
+                None
+            } else {
+                let mut config = parse_config("bcode.fake-provider/fake-judgement/-/90/pause")
+                    .unwrap()
+                    .unwrap();
+                config.on_failure = FailurePolicy::AgentFallback;
+                Some(config)
+            };
+            let mut state = loop_workflow_initial_value(&input);
+            state.condition_met = true;
+            state.evidence = vec!["claimed observed output".into()];
+            state.delivery = Some(
+                serde_json::from_value(serde_json::json!({
+                    "version":"1", "integrated_targets":["checkout"],
+                    "contribution_output_ids":["invented:output"],
+                    "criteria":[{"criterion":"works", "status":"passed", "evidence":"claimed"}],
+                    "checks":[], "retained_workspaces":[], "unresolved_work":[]
+                }))
+                .unwrap(),
+            );
+            let invocation = bcode_workflow::WorkflowBlockInvocation {
+                version: bcode_workflow::WorkflowBlockInvocation::VERSION,
+                dispatch_identity: "dispatch".into(),
+                workspace_root: std::env::temp_dir(),
+                input: serde_json::to_value(&state).unwrap(),
+                preparation: None,
+            };
+            let context = NativeServiceContext {
+                plugin_id: PLUGIN_ID.into(),
+                request: ServiceRequest {
+                    interface_id: bcode_workflow::WORKFLOW_BLOCK_INTERFACE_ID.into(),
+                    operation: OPERATION.into(),
+                    payload: serde_json::to_vec(&invocation).unwrap(),
+                },
+                config: bcode_plugin_sdk::PluginConfigContext::default(),
+                events: ServiceEventEmitter::default(),
+                cancellation: bcode_plugin_sdk::ServiceCancellation::default(),
+                bridge: ServiceBridge::default(),
+                transient_progress_limits: TransientProgressLimits::default(),
+            };
+            let response = invoke(&context);
+            assert!(response.error.is_none());
+            let output: LoopWorkflowIteration = serde_json::from_slice(&response.payload).unwrap();
+            assert!(!output.condition_met);
+            assert!(output.summary.contains("could not be authenticated"));
+            assert_eq!(output.delivery, state.delivery);
+            assert_eq!(output.stop_condition, state.stop_condition);
+        }
+    }
+
+    #[test]
+    fn authenticated_assertions_do_not_certify_delivery_or_dispatch_judgement() {
+        extern "C" fn authenticate(
+            request_ptr: *const u8,
+            request_len: usize,
+            output_ptr: *mut u8,
+            output_capacity: usize,
+            output_len: *mut usize,
+            _user_data: *mut std::ffi::c_void,
+        ) -> i32 {
+            let bytes = unsafe { std::slice::from_raw_parts(request_ptr, request_len) };
+            let request: ServiceBridgeRequest = serde_json::from_slice(bytes).unwrap();
+            let ServiceBridgeRequest::InvokeService(request) = request else {
+                panic!("expected evidence request")
+            };
+            assert_eq!(request.operation, bcode_workflow::OP_AUTHENTICATE_OUTPUT);
+            let response = ServiceBridgeResponse::Service(
+                bcode_tool::ToolInvocationServiceResolution::Responded {
+                    payload: serde_json::json!({
+                        "output_id": "same-run:unrelated-output",
+                        "checksum_sha256": "a".repeat(64)
+                    }),
+                },
+            );
+            let encoded = serde_json::to_vec(&response).unwrap();
+            assert!(encoded.len() <= output_capacity);
+            unsafe {
+                std::ptr::copy_nonoverlapping(encoded.as_ptr(), output_ptr, encoded.len());
+                *output_len = encoded.len();
+            }
+            0
+        }
+        for judgement in ["", "bcode.jev/jev-1.13.0/-/90/agent_fallback"] {
+            for workspace in [None, Some("other-checkout"), Some("delivered-checkout")] {
+                let mut input =
+                    LoopWorkflowInput::new("implement".into(), "original criteria".into(), 2)
+                        .unwrap();
+                input.judgement_evaluation = parse_config(judgement).unwrap();
+                let mut state = loop_workflow_initial_value(&input);
+                state.condition_met = true;
+                state.evidence = vec!["claimed successful verification".into()];
+                let checks: Vec<_> = workspace.into_iter().map(|workspace| serde_json::json!({
+                    "command": "cargo test", "workspace": workspace,
+                    "outcome": "passed", "evidence": "claimed prior success; content may have changed"
+                })).collect();
+                state.delivery = Some(serde_json::from_value(serde_json::json!({
+                    "version": "1", "integrated_targets": ["delivered-checkout"],
+                    "contribution_output_ids": ["same-run:unrelated-output"],
+                    "criteria": [{"criterion": "works", "status": "passed", "evidence": "claimed"}],
+                    "checks": checks, "retained_workspaces": ["worker-checkout"], "unresolved_work": []
+                })).unwrap());
+                let invocation = bcode_workflow::WorkflowBlockInvocation {
+                    version: bcode_workflow::WorkflowBlockInvocation::VERSION,
+                    dispatch_identity: "dispatch".into(),
+                    workspace_root: std::env::temp_dir(),
+                    input: serde_json::to_value(&state).unwrap(),
+                    preparation: None,
+                };
+                let context = NativeServiceContext {
+                    plugin_id: PLUGIN_ID.into(),
+                    request: ServiceRequest {
+                        interface_id: bcode_workflow::WORKFLOW_BLOCK_INTERFACE_ID.into(),
+                        operation: OPERATION.into(),
+                        payload: serde_json::to_vec(&invocation).unwrap(),
+                    },
+                    config: bcode_plugin_sdk::PluginConfigContext::default(),
+                    events: ServiceEventEmitter::default(),
+                    cancellation: bcode_plugin_sdk::ServiceCancellation::default(),
+                    bridge: ServiceBridge::new(
+                        Some(authenticate),
+                        std::ptr::null_mut(),
+                        bcode_plugin_sdk::ServiceCancellation::default(),
+                    ),
+                    transient_progress_limits: TransientProgressLimits::default(),
+                };
+                let response = invoke(&context);
+                assert!(response.error.is_none());
+                let output: LoopWorkflowIteration =
+                    serde_json::from_slice(&response.payload).unwrap();
+                assert!(!output.condition_met);
+                assert!(
+                    output
+                        .summary
+                        .contains("no target-bound observed verification")
+                );
+                assert_eq!(output.delivery, state.delivery);
+                assert_eq!(output.stop_condition, state.stop_condition);
+                assert_eq!(output.implementation_prompt, state.implementation_prompt);
+            }
+        }
+    }
 
     #[test]
     fn judgement_config_requires_explicit_failure_and_threshold() {
@@ -403,7 +746,14 @@ mod tests {
             parse_config("bcode.fake-provider/fake-judgement/-/90/pause").unwrap();
         let mut state = loop_workflow_initial_value(&input);
         state.evidence = vec!["test output reviewed".into()];
-        for (percentage, expected) in [(89_u8, false), (90_u8, true)] {
+        for (agent_completed, percentage, expected) in [
+            (false, 89_u8, false),
+            (false, 90_u8, false),
+            (false, 100_u8, false),
+            (true, 89_u8, false),
+            (true, 90_u8, true),
+        ] {
+            state.condition_met = agent_completed;
             let bridge = ServiceBridge::new(
                 Some(callback),
                 std::ptr::from_ref(&percentage).cast_mut().cast(),
@@ -412,18 +762,116 @@ mod tests {
             let (completed, probability) = evaluate(&bridge, "dispatch", &state).unwrap();
             assert_eq!(completed, expected);
             assert!((probability - f64::from(percentage) / 100.0).abs() < f64::EPSILON);
+
+            let invocation = bcode_workflow::WorkflowBlockInvocation {
+                version: bcode_workflow::WorkflowBlockInvocation::VERSION,
+                dispatch_identity: "dispatch".into(),
+                workspace_root: std::env::temp_dir(),
+                input: serde_json::to_value(&state).unwrap(),
+                preparation: None,
+            };
+            let context = NativeServiceContext {
+                plugin_id: PLUGIN_ID.into(),
+                request: ServiceRequest {
+                    interface_id: bcode_workflow::WORKFLOW_BLOCK_INTERFACE_ID.into(),
+                    operation: OPERATION.into(),
+                    payload: serde_json::to_vec(&invocation).unwrap(),
+                },
+                config: bcode_plugin_sdk::PluginConfigContext::default(),
+                events: ServiceEventEmitter::default(),
+                cancellation: bcode_plugin_sdk::ServiceCancellation::default(),
+                bridge,
+                transient_progress_limits: TransientProgressLimits::default(),
+            };
+            let response = invoke(&context);
+            assert!(response.error.is_none());
+            let output: LoopWorkflowIteration = serde_json::from_slice(&response.payload).unwrap();
+            assert_eq!(output.condition_met, expected);
+            assert_eq!(output.stop_condition, state.stop_condition);
+            assert_eq!(output.evidence, state.evidence);
+            assert_eq!(output.delivery, state.delivery);
+        }
+    }
+
+    #[test]
+    fn delivery_bounds_are_enforced_at_the_service_boundary() {
+        let input = LoopWorkflowInput::new("implement".into(), "complete".into(), 2).unwrap();
+        let mut state = loop_workflow_initial_value(&input);
+        state.condition_met = true;
+        state.evidence = vec!["observed".into()];
+        let valid = serde_json::json!({
+            "version": "1", "integrated_targets": ["result.rs"],
+            "contribution_output_ids": [],
+            "criteria": [{"criterion": "complete", "status": "passed", "evidence": "observed"}],
+            "checks": [], "retained_workspaces": [], "unresolved_work": []
+        });
+        for (field, replacement) in [
+            ("integrated_targets", serde_json::json!(vec!["target"; 65])),
+            (
+                "contribution_output_ids",
+                serde_json::json!(vec!["output"; 65]),
+            ),
+            (
+                "retained_workspaces",
+                serde_json::json!(vec!["workspace"; 65]),
+            ),
+            ("integrated_targets", serde_json::json!(["x".repeat(4097)])),
+        ] {
+            let mut report = valid.clone();
+            report[field] = replacement;
+            let mut value = serde_json::to_value(&state).unwrap();
+            value["delivery"] = report;
+            let invocation = bcode_workflow::WorkflowBlockInvocation {
+                version: bcode_workflow::WorkflowBlockInvocation::VERSION,
+                dispatch_identity: "dispatch".into(),
+                workspace_root: std::env::temp_dir(),
+                input: value,
+                preparation: None,
+            };
+            let context = NativeServiceContext {
+                plugin_id: PLUGIN_ID.into(),
+                request: ServiceRequest {
+                    interface_id: bcode_workflow::WORKFLOW_BLOCK_INTERFACE_ID.into(),
+                    operation: OPERATION.into(),
+                    payload: serde_json::to_vec(&invocation).unwrap(),
+                },
+                config: bcode_plugin_sdk::PluginConfigContext::default(),
+                events: ServiceEventEmitter::default(),
+                cancellation: bcode_plugin_sdk::ServiceCancellation::default(),
+                bridge: ServiceBridge::default(),
+                transient_progress_limits: TransientProgressLimits::default(),
+            };
+            assert_eq!(
+                invoke(&context).error.unwrap().code,
+                "invalid_request",
+                "{field}"
+            );
         }
     }
 
     #[test]
     fn agent_only_completion_rejects_negative_delivery_without_provider_dispatch() {
         let input = LoopWorkflowInput::new("implement".into(), "complete".into(), 2).unwrap();
-        for status in ["passed", "failed", "unverified"] {
+        for (status, target, evidence, expected) in [
+            ("passed", "result.rs", vec!["observed".into()], false),
+            ("failed", "result.rs", vec!["observed".into()], false),
+            ("unverified", "result.rs", vec!["observed".into()], false),
+            ("passed", " \t\n", vec!["observed".into()], false),
+            ("passed", "result.rs", vec![], false),
+            ("passed", "result.rs", vec!["\u{2003}".into()], false),
+            (
+                "passed",
+                "result.rs",
+                vec!["x".repeat(EVIDENCE_LIMIT + 1)],
+                false,
+            ),
+        ] {
             let mut state = loop_workflow_initial_value(&input);
             state.condition_met = true;
+            state.evidence = evidence;
             state.delivery = Some(
                 serde_json::from_value(serde_json::json!({
-                    "version":"1", "integrated_targets":["result.rs"],
+                    "version":"1", "integrated_targets":[target],
                     "contribution_output_ids":[],
                     "criteria":[{"criterion":"works", "status":status, "evidence":"observed"}],
                     "checks":[], "retained_workspaces":[], "unresolved_work":[]
@@ -453,7 +901,7 @@ mod tests {
             let response = invoke(&context);
             assert!(response.error.is_none());
             let output: LoopWorkflowIteration = serde_json::from_slice(&response.payload).unwrap();
-            assert_eq!(output.condition_met, status == "passed");
+            assert_eq!(output.condition_met, expected);
             assert_eq!(output.delivery, state.delivery);
             assert!(output.judgement_evaluation.is_none());
         }

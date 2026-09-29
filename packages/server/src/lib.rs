@@ -27887,13 +27887,58 @@ fn server_workflow_judgement_resolution(
     }
 }
 
+fn workflow_output_evidence_resolution(
+    state: &ServerState,
+    run_id: &str,
+    request: bcode_tool::ToolInvocationServiceRequest,
+    cancellation: &bcode_plugin_sdk::ServiceCancellation,
+) -> ToolInvocationServiceResolution {
+    if cancellation.is_cancelled() {
+        return ToolInvocationServiceResolution::Cancelled;
+    }
+    if request.operation != bcode_workflow::OP_AUTHENTICATE_OUTPUT
+        || request.route_id.as_deref() != Some(bcode_workflow::WORKFLOW_EVIDENCE_INTERFACE_ID)
+    {
+        return ToolInvocationServiceResolution::Unsupported;
+    }
+    let evidence =
+        serde_json::from_value::<bcode_workflow::WorkflowOutputEvidenceRequest>(request.payload)
+            .ok()
+            .filter(|input| !input.output_id.trim().is_empty() && input.output_id.len() <= 4096)
+            .and_then(|input| {
+                state
+                    .workflow_store
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .inspect_exact_output(run_id, &input.output_id)
+                    .ok()
+            });
+    if cancellation.is_cancelled() {
+        return ToolInvocationServiceResolution::Cancelled;
+    }
+    match evidence {
+        Some(output) => ToolInvocationServiceResolution::Responded {
+            payload: serde_json::json!(bcode_workflow::WorkflowOutputEvidence {
+                output_id: output.output_id,
+                checksum_sha256: output.checksum_sha256,
+            }),
+        },
+        None => ToolInvocationServiceResolution::Failed {
+            code: "unverified_output".into(),
+            message: "canonical output could not be authenticated in this run".into(),
+        },
+    }
+}
+
 fn server_workflow_plugin_bridge(
     state: Arc<ServerState>,
     config: bcode_config::BcodeConfig,
     parent_session_id: SessionId,
     dispatch_identity: &str,
     caller_plugin_id: &str,
+    run_id: &str,
 ) -> PluginInvocationBridge {
+    let run_id = run_id.to_owned();
     let dispatch_identity = dispatch_identity.to_string();
     let caller_plugin_id = caller_plugin_id.to_owned();
     let runtime = tokio::runtime::Handle::current();
@@ -27933,6 +27978,14 @@ fn server_workflow_plugin_bridge(
         ServiceBridgeRequest::ReceiveInput { .. } => Ok(ServiceBridgeResponse::Input(
             ToolInvocationInputResolution::Closed,
         )),
+        ServiceBridgeRequest::InvokeService(request)
+            if request.invocation_id == dispatch_identity
+                && request.interface_id == bcode_workflow::WORKFLOW_EVIDENCE_INTERFACE_ID =>
+        {
+            Ok(ServiceBridgeResponse::Service(
+                workflow_output_evidence_resolution(&state, &run_id, request, &cancellation),
+            ))
+        }
         ServiceBridgeRequest::InvokeService(request)
             if request.invocation_id == dispatch_identity
                 && request.interface_id
@@ -33023,6 +33076,7 @@ async fn dispatch_workflow_plugin_block(
                 parent_session_id,
                 &request.dispatch_identity,
                 &block.plugin_id,
+                &request.activation.run_id,
             )),
         )
         .await
@@ -74243,6 +74297,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
             SessionId::new(),
             "judgement-workflow",
             "bcode.loop",
+            "test-run",
         );
         let resolved = tokio::task::spawn_blocking(move || {
             bridge.request(
@@ -74269,6 +74324,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
             SessionId::new(),
             "other-workflow",
             "bcode.loop",
+            "test-run",
         );
         let failed = tokio::task::spawn_blocking(move || {
             mismatch.request(
@@ -74288,6 +74344,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
             SessionId::new(),
             "judgement-workflow",
             "bcode.loop",
+            "test-run",
         );
         let disabled = tokio::task::spawn_blocking(move || {
             let mut request = request();
@@ -74304,6 +74361,143 @@ event_symbol = "bcode_plugin_handle_event_v1"
             matches!(disabled, ServiceBridgeResponse::Service(ToolInvocationServiceResolution::Failed { code, .. }) if code == "judgement_failed")
         );
         drop(state);
+    }
+
+    #[test]
+    fn workflow_evidence_bridge_rejects_unscoped_and_missing_references() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let _guard = runtime.enter();
+        let root = tempfile::tempdir().unwrap();
+        let bridge = server_workflow_plugin_bridge(
+            Arc::new(test_server_state(SessionManager::persistent_lazy(
+                root.path(),
+            ))),
+            bcode_config::BcodeConfig::default(),
+            SessionId::new(),
+            "dispatch",
+            "bcode.test",
+            "authorized-run",
+        );
+        for (invocation_id, payload, expected) in [
+            (
+                "foreign-dispatch",
+                serde_json::json!({"output_id":"output"}),
+                "invocation_id_mismatch",
+            ),
+            (
+                "dispatch",
+                serde_json::json!({"output_id":"missing"}),
+                "unverified_output",
+            ),
+            (
+                "dispatch",
+                serde_json::json!({"output_id":"output", "run_id":"foreign-run"}),
+                "unverified_output",
+            ),
+            (
+                "dispatch",
+                serde_json::json!({"output_id":" ".repeat(4097)}),
+                "unverified_output",
+            ),
+        ] {
+            let response = bridge
+                .request(
+                    ServiceBridgeRequest::InvokeService(bcode_tool::ToolInvocationServiceRequest {
+                        invocation_id: invocation_id.into(),
+                        request_id: "evidence".into(),
+                        route_id: Some(bcode_workflow::WORKFLOW_EVIDENCE_INTERFACE_ID.into()),
+                        interface_id: bcode_workflow::WORKFLOW_EVIDENCE_INTERFACE_ID.into(),
+                        operation: bcode_workflow::OP_AUTHENTICATE_OUTPUT.into(),
+                        payload,
+                    }),
+                    bcode_plugin_sdk::ServiceCancellation::default(),
+                )
+                .unwrap();
+            assert!(matches!(response, ServiceBridgeResponse::Service(
+                ToolInvocationServiceResolution::Failed { code, .. }) if code == expected));
+        }
+    }
+
+    #[tokio::test]
+    async fn workflow_evidence_authenticates_only_the_invoking_runs_output() {
+        let (state, _, _root) = active_edit_execution_fixture().await;
+        let expected = {
+            let mut store = state.workflow_store.lock().unwrap();
+            store
+                .persist_validated_output(&bcode_workflow_store::ValidatedOutput {
+                    output_id: "evidence-output".into(),
+                    run_id: "edit-run".into(),
+                    node_id: "agent".into(),
+                    activation_id: bcode_workflow_store::activation_identity(
+                        "edit-run", "agent", 0,
+                    ),
+                    schema_id: "boolean".into(),
+                    schema_version: 1,
+                    value: serde_json::json!(true),
+                    artifact_reference: None,
+                    created_at_ms: 3,
+                })
+                .unwrap();
+            store
+                .inspect_exact_output("edit-run", "evidence-output")
+                .unwrap()
+        };
+        let state = Arc::new(state);
+        for (run_id, cancelled) in [
+            ("edit-run", false),
+            ("foreign-run", false),
+            ("edit-run", true),
+        ] {
+            let bridge = server_workflow_plugin_bridge(
+                Arc::clone(&state),
+                bcode_config::BcodeConfig::default(),
+                SessionId::new(),
+                "dispatch",
+                "bcode.test",
+                run_id,
+            );
+            let cancellation = bcode_plugin_sdk::ServiceCancellation::default();
+            if cancelled {
+                cancellation.cancel();
+            }
+            let response = bridge
+                .request(
+                    ServiceBridgeRequest::InvokeService(bcode_tool::ToolInvocationServiceRequest {
+                        invocation_id: "dispatch".into(),
+                        request_id: "evidence".into(),
+                        route_id: Some(bcode_workflow::WORKFLOW_EVIDENCE_INTERFACE_ID.into()),
+                        interface_id: bcode_workflow::WORKFLOW_EVIDENCE_INTERFACE_ID.into(),
+                        operation: bcode_workflow::OP_AUTHENTICATE_OUTPUT.into(),
+                        payload: serde_json::json!({"output_id":"evidence-output"}),
+                    }),
+                    cancellation,
+                )
+                .unwrap();
+            if cancelled {
+                assert!(matches!(
+                    response,
+                    ServiceBridgeResponse::Service(ToolInvocationServiceResolution::Cancelled)
+                ));
+            } else if run_id == "edit-run" {
+                let ServiceBridgeResponse::Service(ToolInvocationServiceResolution::Responded {
+                    payload,
+                }) = response
+                else {
+                    panic!("canonical output must authenticate");
+                };
+                let evidence: bcode_workflow::WorkflowOutputEvidence =
+                    serde_json::from_value(payload).unwrap();
+                assert_eq!(evidence.output_id, expected.output_id);
+                assert_eq!(evidence.checksum_sha256, expected.checksum_sha256);
+            } else {
+                assert!(matches!(response, ServiceBridgeResponse::Service(
+                    ToolInvocationServiceResolution::Failed { code, .. }
+                ) if code == "unverified_output"));
+            }
+        }
     }
 
     #[test]
@@ -74325,6 +74519,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
             session_id,
             invocation_id,
             "bcode.test",
+            "test-run",
         );
         let response = bridge
             .request(
