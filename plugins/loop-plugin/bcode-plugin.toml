@@ -200,6 +200,16 @@ description = "Generate loop prompts from an objective and start the existing lo
 kind        = "goal.start"
 title       = "Start Goal"
 
+[[tui_surfaces]]
+description = "View the live goal progress document"
+kind        = "goal.progress.live"
+title       = "Goal Progress"
+
+[[tui_surfaces]]
+description = "Watch goal execution and inspect worker sessions"
+kind        = "goal.watch"
+title       = "Watch Goal"
+
 [concurrency]
 max  = 1
 type = "limited"
