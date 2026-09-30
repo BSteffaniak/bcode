@@ -224,6 +224,9 @@ pub fn invoke(context: &NativeServiceContext) -> ServiceResponse {
         input.summary = "Completion withheld: canonical contribution references could not be authenticated in this run or report unresolved work".into();
         return json_response(&input);
     }
+    if reject_unobserved_checks(&mut input, &context.bridge, &invocation.dispatch_identity) {
+        return json_response(&input);
+    }
     // V1 records evaluator assertions only. Even authenticated output identities
     // do not bind a successful check to the delivered content. Preserve the report
     // for inspection, but do not let confidence or fallback certify those claims.
@@ -333,6 +336,53 @@ fn safeguard_agent_evidence(input: &mut LoopWorkflowIteration) {
         input.condition_met = false;
         input.summary = "Completion withheld: no bounded concrete evaluation evidence".into();
     }
+}
+
+fn reject_unobserved_checks(
+    input: &mut LoopWorkflowIteration,
+    bridge: &ServiceBridge,
+    dispatch_identity: &str,
+) -> bool {
+    let rejected = input.condition_met
+        && input.delivery.as_ref().is_some_and(|report| {
+            report.checks.iter().any(|check| {
+                check.execution.as_ref().is_some_and(|reference| {
+                    !authenticate_check(bridge, dispatch_identity, check, reference)
+                })
+            })
+        });
+    if rejected {
+        input.condition_met = false;
+        input.summary = "Completion withheld: referenced checks lack matching shell-owned execution and unchanged selected-file observations".into();
+    }
+    rejected
+}
+
+fn authenticate_check(
+    bridge: &ServiceBridge,
+    dispatch_identity: &str,
+    check: &delivery::Check,
+    reference: &delivery::CheckExecution,
+) -> bool {
+    let request = bcode_tool::ToolInvocationServiceRequest {
+        invocation_id: dispatch_identity.into(),
+        request_id: "loop-check".into(),
+        route_id: Some(bcode_workflow::WORKFLOW_EVIDENCE_INTERFACE_ID.into()),
+        interface_id: bcode_workflow::WORKFLOW_EVIDENCE_INTERFACE_ID.into(),
+        operation: bcode_workflow::OP_INSPECT_OUTPUT_EXECUTION.into(),
+        payload: serde_json::json!(bcode_workflow::WorkflowOutputEvidenceRequest {
+            output_id: reference.output_id.clone(),
+        }),
+    };
+    let Ok(ServiceBridgeResponse::Service(
+        bcode_tool::ToolInvocationServiceResolution::Responded { payload },
+    )) = bridge.request(&ServiceBridgeRequest::InvokeService(request))
+    else {
+        return false;
+    };
+    serde_json::from_value::<bcode_workflow::WorkflowOutputExecutionEvidence>(payload).is_ok_and(
+        |evidence| super::delivery_execution::observed_check(&evidence, check, reference),
+    )
 }
 
 fn authenticate_output(bridge: &ServiceBridge, dispatch_identity: &str, output_id: &str) -> bool {
@@ -747,6 +797,23 @@ mod tests {
                 assert_eq!(output.implementation_prompt, state.implementation_prompt);
             }
         }
+    }
+
+    #[test]
+    fn referenced_check_requires_execution_service_without_falling_back_to_claims() {
+        let check: delivery::Check = serde_json::from_value(serde_json::json!({
+            "command":"cargo test", "workspace":"/workspace", "outcome":"passed",
+            "evidence":"asserted", "execution": {
+                "output_id":"output", "command_index":0, "argv":["cargo", "test"]
+            }
+        }))
+        .unwrap();
+        assert!(!authenticate_check(
+            &ServiceBridge::default(),
+            "dispatch",
+            &check,
+            check.execution.as_ref().unwrap()
+        ));
     }
 
     #[test]

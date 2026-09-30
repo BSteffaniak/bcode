@@ -5856,6 +5856,48 @@ impl WorkflowStore {
         Ok(evidence)
     }
 
+    /// Inspect canonical output, producer, and retained activation input atomically.
+    ///
+    /// This bounded read does not interpret plugin plans or certify execution effects.
+    ///
+    /// # Errors
+    /// Rejects unverifiable provenance, absent, oversized or malformed input, and
+    /// database failures. No current input or graph is substituted for retained state.
+    pub fn inspect_output_execution(
+        &self,
+        run_id: &str,
+        output_id: &str,
+    ) -> Result<bcode_workflow::WorkflowOutputExecutionEvidence, WorkflowStoreError> {
+        let transaction = self
+            .connection
+            .is_autocommit()
+            .then(|| self.connection.unchecked_transaction())
+            .transpose()?;
+        let provenance = self.inspect_output_provenance(run_id, output_id)?;
+        let input: String = self.connection.query_row(
+            "SELECT CASE WHEN typeof(input_json) = 'text'
+             AND length(CAST(input_json AS BLOB)) <= ?4 THEN input_json END
+             FROM workflow_activations
+             WHERE run_id = ?1 AND node_id = ?2 AND activation_id = ?3",
+            rusqlite::params![
+                run_id,
+                provenance.output.node_id,
+                provenance.output.activation_id,
+                MAX_INLINE_JSON_BYTES
+            ],
+            |row| row.get(0),
+        )?;
+        let evidence = bcode_workflow::WorkflowOutputExecutionEvidence {
+            version: bcode_workflow::WorkflowOutputExecutionEvidence::VERSION,
+            provenance,
+            admitted_input: serde_json::from_str(&input)?,
+        };
+        if let Some(transaction) = transaction {
+            transaction.commit()?;
+        }
+        Ok(evidence)
+    }
+
     /// Return bounded validated output values without replaying workflow history.
     ///
     /// Values are read from the canonical output rows and checksum-verified before being returned.
@@ -49316,6 +49358,67 @@ mod tests {
             Some(first.clone())
         );
         assert_eq!(store.list_definitions(10).expect("list"), [first]);
+    }
+
+    #[test]
+    fn output_execution_evidence_uses_bounded_retained_activation_input() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut store = WorkflowStore::open_in_state_dir(temp.path()).unwrap();
+        store
+            .persist_definition("example", 1, &definition("example"))
+            .unwrap();
+        store.create_run(&new_run()).unwrap();
+        let activation_id = activation_identity("run-1", "review", 0);
+        store
+            .persist_validated_output(&ValidatedOutput {
+                output_id: "execution-output".into(),
+                run_id: "run-1".into(),
+                node_id: "review".into(),
+                activation_id: activation_id.clone(),
+                schema_id: definition("example").nodes["review"]
+                    .output
+                    .type_name
+                    .clone(),
+                schema_version: 1,
+                value: serde_json::json!(7),
+                artifact_reference: None,
+                created_at_ms: 2,
+            })
+            .unwrap();
+        let before = store.connection.total_changes();
+        let evidence = store
+            .inspect_output_execution("run-1", "execution-output")
+            .unwrap();
+        assert_eq!(
+            evidence.version,
+            bcode_workflow::WorkflowOutputExecutionEvidence::VERSION
+        );
+        assert_eq!(evidence.admitted_input, serde_json::json!(1));
+        assert_eq!(evidence.provenance.output.value, serde_json::json!(7));
+        assert!(
+            store
+                .inspect_output_execution("foreign", "execution-output")
+                .is_err()
+        );
+        assert!(store.inspect_output_execution("run-1", "missing").is_err());
+        assert_eq!(store.connection.total_changes(), before);
+        for damaged in [
+            None,
+            Some("not json".to_owned()),
+            Some("x".repeat(MAX_INLINE_JSON_BYTES + 1)),
+        ] {
+            store.connection.execute(
+                "UPDATE workflow_activations SET input_json = ?1 WHERE run_id = 'run-1' AND activation_id = ?2",
+                rusqlite::params![damaged, activation_id],
+            ).unwrap();
+            let before = store.connection.total_changes();
+            assert!(
+                store
+                    .inspect_output_execution("run-1", "execution-output")
+                    .is_err()
+            );
+            assert_eq!(store.connection.total_changes(), before);
+        }
     }
 
     #[test]

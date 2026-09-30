@@ -20,6 +20,15 @@ envelope containing the checksum-verified output and the immutable executable no
 bound to that output's activation. The store reads both in one snapshot, without replay or
 mutation; missing or damaged bindings fail closed. Older hosts reject the operation.
 
+The additive `inspect_output_execution` operation accepts the same exact output ID and
+returns a version-1 `WorkflowOutputExecutionEvidence`: provenance plus the retained
+activation input. Output, executable and input are read in one database snapshot. Missing,
+malformed or oversized inputs fail closed; the SQL read bounds bytes before materializing
+the input. It does not substitute current run input or a model's purported command plan.
+The existing provenance response is unchanged for compatible older callers. Consumers must
+still interpret input/output dataflow adaptation and owner-specific execution semantics;
+retained input is not itself an execution receipt or proof of current target freshness.
+
 This lets evidence consumers distinguish agent-authored values from plugin-block outputs even
 when they use identical schema labels. It does **not** certify command success, verification
 scope, current content, or delivery. Consumers must validate the producer's operation and
@@ -107,10 +116,15 @@ older consumers with closed schemas reject extended results rather than guess.
 These observations cover only explicitly selected files. They do not prove complete
 input coverage, prevent concurrent external writes or filesystem replacement races,
 authenticate canonical contribution provenance, or certify delivery. Unchanged selected
-files and exit success are not sufficient to establish a goal criterion. The application
-evidence bridge and loop delivery consumer do not yet consume these observations;
-the V1 positive-delivery guard remains in place. Do not use this producer alone as a
-completion oracle.
+files and exit success are not sufficient to establish a goal criterion. The loop delivery
+consumer now accepts optional `checks[].execution` references (canonical `output_id`,
+`command_index` and exact `argv`) and inspects retained execution evidence through the
+application bridge. It rejects non-shell or adapted producers, mismatched plans/workspaces,
+nonzero exits, incomplete command results and changed/missing selected-file observations.
+This is a bounded negative-evidence gate, not complete scope or current freshness verification;
+the V1 positive-delivery guard remains in place. Legacy checks without execution references
+remain readable assertions. Older closed-schema consumers reject extended reports rather
+than interpreting references as receipts. Do not use this producer alone as a completion oracle.
 
 ## Shell authorization
 

@@ -2173,6 +2173,31 @@ pub const OP_INSPECT_OUTPUT: &str = "inspect_output";
 /// Returns [`WorkflowOutputProvenance`]. Schema labels and output values alone do not
 /// establish who produced evidence. Hosts lacking this additive operation reject it.
 pub const OP_INSPECT_OUTPUT_PROVENANCE: &str = "inspect_output_provenance";
+/// Inspect provenance plus the retained input admitted for the producer activation.
+///
+/// Returns [`WorkflowOutputExecutionEvidence`]. This additive operation does not change
+/// the provenance response on older routes; unsupported hosts must reject it.
+pub const OP_INSPECT_OUTPUT_EXECUTION: &str = "inspect_output_execution";
+
+/// Canonical producer evidence with its admitted input, not a model-supplied plan.
+///
+/// Input dataflow adaptation still belongs to the consumer's contract interpretation.
+/// This envelope alone does not certify command success, coverage, or freshness.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WorkflowOutputExecutionEvidence {
+    /// Envelope compatibility version; unsupported versions must be rejected.
+    pub version: u32,
+    /// Checksum-verified canonical output and activation-bound executable.
+    pub provenance: WorkflowOutputProvenance,
+    /// Retained activation input. Missing or oversized inputs fail the operation.
+    pub admitted_input: serde_json::Value,
+}
+
+impl WorkflowOutputExecutionEvidence {
+    /// Current execution-evidence envelope version.
+    pub const VERSION: u32 = 1;
+}
 
 /// Canonical output and the immutable executable selected for its activation.
 ///

@@ -27901,6 +27901,7 @@ fn workflow_output_evidence_resolution(
         bcode_workflow::OP_AUTHENTICATE_OUTPUT
             | bcode_workflow::OP_INSPECT_OUTPUT
             | bcode_workflow::OP_INSPECT_OUTPUT_PROVENANCE
+            | bcode_workflow::OP_INSPECT_OUTPUT_EXECUTION
     ) || request.route_id.as_deref() != Some(bcode_workflow::WORKFLOW_EVIDENCE_INTERFACE_ID)
     {
         return ToolInvocationServiceResolution::Unsupported;
@@ -27914,7 +27915,12 @@ fn workflow_output_evidence_resolution(
                     .workflow_store
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner);
-                if request.operation == bcode_workflow::OP_INSPECT_OUTPUT_PROVENANCE {
+                if request.operation == bcode_workflow::OP_INSPECT_OUTPUT_EXECUTION {
+                    store
+                        .inspect_output_execution(run_id, &input.output_id)
+                        .ok()
+                        .and_then(|output| serde_json::to_value(output).ok())
+                } else if request.operation == bcode_workflow::OP_INSPECT_OUTPUT_PROVENANCE {
                     store
                         .inspect_output_provenance(run_id, &input.output_id)
                         .ok()
@@ -74440,6 +74446,20 @@ event_symbol = "bcode_plugin_handle_event_v1"
         }
     }
 
+    fn assert_workflow_output_execution(
+        payload: serde_json::Value,
+        expected: &bcode_workflow::WorkflowOutputInspection,
+    ) {
+        let evidence: bcode_workflow::WorkflowOutputExecutionEvidence =
+            serde_json::from_value(payload).unwrap();
+        assert_eq!(
+            evidence.version,
+            bcode_workflow::WorkflowOutputExecutionEvidence::VERSION
+        );
+        assert_eq!(&evidence.provenance.output, expected);
+        assert_eq!(evidence.admitted_input, serde_json::json!(true));
+    }
+
     fn assert_workflow_output_provenance(
         payload: serde_json::Value,
         expected: &bcode_workflow::WorkflowOutputInspection,
@@ -74485,6 +74505,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
             bcode_workflow::OP_AUTHENTICATE_OUTPUT,
             bcode_workflow::OP_INSPECT_OUTPUT,
             bcode_workflow::OP_INSPECT_OUTPUT_PROVENANCE,
+            bcode_workflow::OP_INSPECT_OUTPUT_EXECUTION,
         ]
         .into_iter()
         .flat_map(|operation| {
@@ -74533,7 +74554,9 @@ event_symbol = "bcode_plugin_handle_event_v1"
                 else {
                     panic!("canonical output must authenticate");
                 };
-                if operation == bcode_workflow::OP_INSPECT_OUTPUT_PROVENANCE {
+                if operation == bcode_workflow::OP_INSPECT_OUTPUT_EXECUTION {
+                    assert_workflow_output_execution(payload, &expected);
+                } else if operation == bcode_workflow::OP_INSPECT_OUTPUT_PROVENANCE {
                     assert_workflow_output_provenance(payload, &expected);
                 } else if operation == bcode_workflow::OP_INSPECT_OUTPUT {
                     let evidence: bcode_workflow::WorkflowOutputInspection =

@@ -5,6 +5,7 @@
 //! Workflow-native deterministic prompt loops for Bcode sessions.
 
 mod delivery;
+mod delivery_execution;
 
 use std::collections::BTreeSet;
 use std::fmt::Write as _;

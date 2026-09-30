@@ -113,6 +113,19 @@ pub struct Check {
     pub outcome: Observation,
     #[schemars(length(min = 1, max = 4096))]
     pub evidence: String,
+    /// Exact canonical shell output and argv; prose command text is display-only.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub execution: Option<CheckExecution>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct CheckExecution {
+    #[schemars(length(min = 1, max = 4096))]
+    pub output_id: String,
+    pub command_index: u32,
+    #[schemars(length(min = 1, max = 128), inner(length(max = 65536)))]
+    pub argv: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
