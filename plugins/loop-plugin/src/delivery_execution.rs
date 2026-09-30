@@ -97,25 +97,97 @@ fn unchanged_observation(plan: &Value, result: &Value, workspace: &str) -> bool 
     let Some(paths) = plan.get("observe_files").and_then(Value::as_array) else {
         return false;
     };
-    let Some(files) = before.get("files").and_then(Value::as_array) else {
-        return false;
-    };
-    !paths.is_empty()
-        && paths.len() <= 64
-        && paths.len() == files.len()
-        && before.get("version") == Some(&Value::from(1))
+    observation_matches_paths(before, paths)
         && before.get("workspace").and_then(Value::as_str) == Some(workspace)
         && result.get("content_after") == Some(before)
-        && paths.iter().zip(files).all(|(path, file)| {
-            path.as_str().is_some_and(|path| !path.is_empty())
-                && file.get("path") == Some(path)
-                && file
-                    .get("sha256")
-                    .and_then(Value::as_str)
-                    .is_some_and(|digest| {
-                        digest.len() == 64 && digest.bytes().all(|byte| byte.is_ascii_hexdigit())
-                    })
-        })
+}
+
+/// Interpret the shell owner's bounded scope manifest, not evaluator-supplied coverage.
+fn observation_matches_paths(observation: &Value, paths: &[Value]) -> bool {
+    let Some(files) = observation.get("files").and_then(Value::as_array) else {
+        return false;
+    };
+    let Some(roots) = paths
+        .iter()
+        .map(normalized_path)
+        .collect::<Option<Vec<_>>>()
+    else {
+        return false;
+    };
+    if roots.is_empty() || roots.len() > 64 {
+        return false;
+    }
+    let mut entries = std::collections::BTreeSet::new();
+    if !files.iter().all(|file| {
+        file.get("path")
+            .and_then(normalized_path)
+            .is_some_and(|path| entries.insert(path))
+            && file
+                .get("sha256")
+                .and_then(Value::as_str)
+                .is_some_and(|digest| {
+                    digest.len() == 64 && digest.bytes().all(|byte| byte.is_ascii_hexdigit())
+                })
+    }) {
+        return false;
+    }
+    match observation.get("version").and_then(Value::as_u64) {
+        Some(1) => {
+            observation
+                .get("directories")
+                .is_none_or(|value| value.as_array().is_some_and(Vec::is_empty))
+                && paths.len() == files.len()
+                && paths
+                    .iter()
+                    .zip(files)
+                    .all(|(path, file)| file.get("path") == Some(path))
+        }
+        Some(2) => {
+            let Some(directories) = observation.get("directories").and_then(Value::as_array) else {
+                return false;
+            };
+            let Some(directories) = directories
+                .iter()
+                .map(normalized_path)
+                .collect::<Option<std::collections::BTreeSet<_>>>()
+            else {
+                return false;
+            };
+            if directories.is_empty()
+                || directories.len() != observation["directories"].as_array().map_or(0, Vec::len)
+                || !directories.iter().all(|path| entries.insert(*path))
+                || entries.len() > 64
+            {
+                return false;
+            }
+            // Every selected root must exist; every observed descendant must have one
+            // root and an observed directory parent. This rejects overlaps and gaps.
+            roots.iter().all(|root| entries.contains(root))
+                && entries.iter().all(|entry| {
+                    roots.iter().filter(|root| entry.starts_with(root)).count() == 1
+                        && (roots.contains(entry)
+                            || entry
+                                .parent()
+                                .is_some_and(|parent| directories.contains(parent)))
+                })
+        }
+        _ => false,
+    }
+}
+
+fn normalized_path(value: &Value) -> Option<&std::path::Path> {
+    let text = value.as_str()?;
+    let path = std::path::Path::new(text);
+    (!text.is_empty()
+        && path
+            .components()
+            .all(|component| matches!(component, std::path::Component::Normal(_)))
+        && !text.contains("//")
+        && !text.ends_with('/')
+        && !text
+            .split('/')
+            .any(|component| component == "." || component == ".."))
+    .then_some(path)
 }
 
 #[cfg(test)]
@@ -156,6 +228,58 @@ mod tests {
                 "output_id":"check-output","command_index":0,"argv":["cargo","test"]}}))
             .unwrap();
         (evidence, check)
+    }
+
+    #[test]
+    fn directory_observations_bind_scope_membership_and_content() {
+        let (mut evidence, check) = fixture();
+        evidence.admitted_input["observe_files"] = json!(["src", "empty"]);
+        let observation = json!({"version":2,"workspace":"/workspace",
+            "directories":["empty", "src", "src/nested"],
+            "files":[{"path":"src/nested/result.rs","sha256":"a".repeat(64)}]});
+        evidence.provenance.output.value["content_before"] = observation.clone();
+        evidence.provenance.output.value["content_after"] = observation.clone();
+        let reference = check.execution.as_ref().unwrap();
+        assert!(observed_check(&evidence, &check, reference));
+        for (field, value) in [
+            ("version", json!(3)),
+            ("directories", json!(["empty", "src"])),
+            ("directories", json!(["empty", "src", "src", "src/nested"])),
+            ("directories", json!(["src", "src/nested"])),
+            (
+                "directories",
+                json!(["empty", "src", "src/nested", "other"]),
+            ),
+            (
+                "files",
+                json!([{"path":"src/../result.rs","sha256":"a".repeat(64)}]),
+            ),
+            (
+                "files",
+                json!([{"path":"src/nested/result.rs","sha256":"invalid"}]),
+            ),
+        ] {
+            let mut changed = evidence.clone();
+            changed.provenance.output.value["content_before"][field] = value.clone();
+            changed.provenance.output.value["content_after"][field] = value;
+            assert!(!observed_check(&changed, &check, reference), "{field}");
+        }
+        for paths in [
+            json!(["src"]),
+            json!(["src", "src/nested", "empty"]),
+            json!(["src", "src", "empty"]),
+        ] {
+            let mut changed = evidence.clone();
+            changed.admitted_input["observe_files"] = paths;
+            assert!(!observed_check(&changed, &check, reference));
+        }
+        evidence.provenance.output.value["content_after"]["files"][0]["sha256"] =
+            json!("b".repeat(64));
+        assert!(!observed_check(&evidence, &check, reference));
+        evidence.provenance.output.value["content_after"] = observation;
+        evidence.provenance.output.value["content_after"]["directories"] =
+            json!(["src", "src/nested"]);
+        assert!(!observed_check(&evidence, &check, reference));
     }
 
     #[test]

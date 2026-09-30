@@ -119,8 +119,9 @@ in deterministic order using observation version 2. Traversal is descriptor-conf
 rejects symlinks, overlapping selections and non-UTF-8 names, and fails closed above
 64 total entries or 16 MiB; it never returns partial coverage. Directory enumeration
 is supported on macOS and Linux. File-only selections retain version 1 and original
-serialization/order. Older consumers reject version 2; the loop verifier currently
-accepts only version 1. The bound is an observation-operation limit, not a workflow
+serialization/order. Older consumers reject version 2. The loop verifier accepts both
+versions and checks that directory manifests cover the admitted roots without overlapping
+roots, missing parents, duplicate entries or out-of-scope descendants. The bound is an observation-operation limit, not a workflow
 size or lifetime limit; large-target incremental verification remains unfinished.
 
 They do not prove complete
