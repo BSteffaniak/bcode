@@ -126,6 +126,11 @@ pub struct CheckExecution {
     pub command_index: u32,
     #[schemars(length(min = 1, max = 128), inner(length(max = 65536)))]
     pub argv: Vec<String>,
+    /// Explicit selected content roots, matched exactly against the admitted check plan.
+    /// Absence preserves historical reports; neither presence nor a match proves freshness.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(length(min = 1, max = 64), inner(length(min = 1, max = 4096)))]
+    pub content_roots: Option<Vec<String>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]

@@ -84,6 +84,13 @@ pub fn observed_check(
     {
         return false;
     }
+    if reference.content_roots.as_ref().is_some_and(|roots| {
+        roots.is_empty()
+            || roots.len() > 64
+            || plan.get("observe_files") != Some(&serde_json::json!(roots))
+    }) {
+        return false;
+    }
     unchanged_observation(plan, result, &check.workspace)
 }
 
@@ -228,6 +235,37 @@ mod tests {
                 "output_id":"check-output","command_index":0,"argv":["cargo","test"]}}))
             .unwrap();
         (evidence, check)
+    }
+
+    #[test]
+    fn explicit_content_roots_must_match_the_admitted_observation_scope() {
+        let (evidence, mut check) = fixture();
+        for roots in [
+            vec![],
+            vec!["other.rs".into()],
+            vec!["result.rs".into(), "other.rs".into()],
+            vec!["result.rs".into(), "result.rs".into()],
+            vec!["./result.rs".into()],
+        ] {
+            check.execution.as_mut().unwrap().content_roots = Some(roots);
+            assert!(!observed_check(
+                &evidence,
+                &check,
+                check.execution.as_ref().unwrap()
+            ));
+        }
+        check.execution.as_mut().unwrap().content_roots = Some(vec!["result.rs".into()]);
+        assert!(observed_check(
+            &evidence,
+            &check,
+            check.execution.as_ref().unwrap()
+        ));
+        check.execution.as_mut().unwrap().content_roots = None;
+        assert!(observed_check(
+            &evidence,
+            &check,
+            check.execution.as_ref().unwrap()
+        ));
     }
 
     #[test]

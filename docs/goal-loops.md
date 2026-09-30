@@ -78,6 +78,12 @@ criterion coverage and freshness of checks remain unverified by this safeguard.
 Consequently new affirmative evaluations carrying a
 V1 delivery report are withheld with an explicit target-bound-verification blocker, even
 when references authenticate, checks claim success, or judgement fallback is configured.
+Check execution references may additionally declare `content_roots` (1–64 relative
+paths). When supplied, these must exactly match the canonical admitted shell plan's
+`observe_files`, including order; omitted roots preserve historical reports. This
+binds a scope assertion to the executed observation, not to current filesystem state
+or the entire delivered target. It does not enable positive completion. Older plugin
+versions reject the new field rather than silently ignoring its meaning.
 The report and original criteria are retained. This is a conservative safety restriction,
 not a positive verification implementation: a canonical target/content-bound observation
 path is still required before such delivery can be certified. Historical reports remain
