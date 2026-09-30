@@ -82,8 +82,26 @@ Check execution references may additionally declare `content_roots` (1–64 rela
 paths). When supplied, these must exactly match the canonical admitted shell plan's
 `observe_files`, including order; omitted roots preserve historical reports. This
 binds a scope assertion to the executed observation, not to current filesystem state
-or the entire delivered target. It does not enable positive completion. Older plugin
-versions reject the new field rather than silently ignoring its meaning.
+or the entire delivered target. It does not enable positive completion. Shell advanced
+command plans may also supply `expected_content`, an exact previously observed content
+object, alongside `observe_files`. The shell owner re-observes those scopes after normal
+execution authorization and rejects mismatches before running any command. With a
+precondition, it also re-observes after each command: changed or unreadable content
+stops the batch, retains executed command outcomes, and makes the plan unsuccessful,
+even if the last command exited successfully or requested continuation. A final
+observation checks the precondition again. This binds verification to selected integrated
+content (including directory additions), not an arbitrary claim of success. Omitting observations while supplying a precondition fails
+closed. The precondition is part of the prepared command plan identity; omitted
+preconditions preserve existing behavior. It neither locks files against concurrent writers
+nor certifies delivery-time freshness or complete target coverage. Older shell plugins
+reject the new field. Advanced plans may use empty `commands` with nonempty
+`observe_files` for an observation-only execution. This retains the existing exact
+preparation, approval, workspace confinement, and cancellation path; preparation
+exposes read-path policy facts rather than an empty shell command. No process is
+spawned, and successful output requires equal before/after observations. Empty
+commands without observation scopes remain invalid. Older shell plugins reject
+empty commands. This gives callers an authorized current observation at that
+activation, not a delivery-time freshness certificate or a successful executed check.
 The report and original criteria are retained. This is a conservative safety restriction,
 not a positive verification implementation: a canonical target/content-bound observation
 path is still required before such delivery can be certified. Historical reports remain

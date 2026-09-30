@@ -121,8 +121,12 @@ pub struct ShellWorkflowCommandPlan {
     /// Optional bounded files/directory scopes observed around execution. Empty preserves legacy behavior.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub observe_files: Vec<PathBuf>,
+    /// Optional exact observation required before any command runs. Requires `observe_files`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expected_content: Option<crate::content_observation::ContentObservation>,
     pub version: u32,
     pub cwd: PathBuf,
+    /// Commands to execute; empty is an observation-only plan requiring nonempty `observe_files`.
     pub commands: Vec<ShellWorkflowCommand>,
     pub environment: ShellWorkflowEnvironment,
     pub output: ShellWorkflowOutputPolicy,
@@ -285,6 +289,7 @@ mod tests {
     fn workflow_command_plan_contract_is_versioned_bounded_and_argv_explicit() {
         let plan = ShellWorkflowCommandPlan {
             observe_files: Vec::new(),
+            expected_content: None,
             version: SHELL_COMMAND_PLAN_VERSION,
             cwd: PathBuf::from("workspace"),
             commands: vec![ShellWorkflowCommand {

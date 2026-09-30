@@ -339,6 +339,17 @@ fn workflow_command_analysis(
     input: &serde_json::Value,
     plan: &ShellWorkflowCommandPlan,
 ) -> bcode_plugin_sdk::ToolPolicyOperation {
+    if plan.commands.is_empty() {
+        // Observation-only plans still pass through exact workflow preparation and
+        // approval. Expose their filesystem reads rather than an empty shell command.
+        return bcode_plugin_sdk::ToolPolicyOperation::Read {
+            paths: plan
+                .observe_files
+                .iter()
+                .map(|path| plan.cwd.join(path).to_string_lossy().into_owned())
+                .collect(),
+        };
+    }
     let command = input
         .as_str()
         .or_else(|| input.get("script").and_then(serde_json::Value::as_str))
@@ -502,7 +513,7 @@ fn invoke_workflow_block_contract(context: &NativeServiceContext) -> ServiceResp
         Err(error) => return ServiceResponse::error("invalid_request", error),
     };
     if plan.version != contracts::SHELL_COMMAND_PLAN_VERSION
-        || plan.commands.is_empty()
+        || (plan.commands.is_empty() && plan.observe_files.is_empty())
         || plan.commands.len() > 64
         || plan.cwd.is_absolute()
         || plan.cwd.components().any(|component| {
@@ -582,6 +593,7 @@ fn shell_script_command_plan(
     shell.push(script);
     Ok(ShellWorkflowCommandPlan {
         observe_files: Vec::new(),
+        expected_content: None,
         version: contracts::SHELL_COMMAND_PLAN_VERSION,
         cwd,
         commands: vec![contracts::ShellWorkflowCommand {
@@ -653,8 +665,13 @@ fn execute_workflow_command_plan(
     } else {
         Some(content_observation::observe(&cwd, &plan.observe_files)?)
     };
+    if plan.expected_content.is_some() && plan.expected_content != content_before {
+        return Err("verification content precondition does not match current observation".into());
+    }
     let mut commands = Vec::with_capacity(plan.commands.len());
     let mut artifacts = Vec::new();
+    let mut content_after = content_before.clone();
+    let mut content_invalidated = false;
     for (index, command) in plan.commands.iter().enumerate() {
         let _ = progress.upsert_if_ready(&serde_json::json!({
             "state": "running",
@@ -677,12 +694,25 @@ fn execute_workflow_command_plan(
             || !accepted_exit && !continue_on_unaccepted;
         commands.push(result);
         artifacts.extend(command_artifacts);
-        if should_stop {
+        if plan.expected_content.is_some() {
+            // Preserve completed effects, but never run later checks against a
+            // target that no longer matches the caller's verification precondition.
+            content_after = content_observation::observe(&cwd, &plan.observe_files).ok();
+            content_invalidated = plan.expected_content != content_after;
+        }
+        if should_stop || content_invalidated {
             break;
         }
     }
     let _ = progress.finish();
-    let passed = commands.len() == plan.commands.len()
+    if !plan.observe_files.is_empty() {
+        content_after = content_observation::observe(&cwd, &plan.observe_files).ok();
+    }
+    let passed = !context.cancellation.is_cancelled()
+        && !content_invalidated
+        && (!plan.commands.is_empty() || content_before == content_after)
+        && commands.len() == plan.commands.len()
+        && (plan.expected_content.is_none() || plan.expected_content == content_after)
         && commands.iter().all(|result| {
             result.status == ShellWorkflowCommandStatus::Exited && result.exit_accepted
         });
@@ -690,11 +720,7 @@ fn execute_workflow_command_plan(
         content_before,
         // Missing or unreadable post-execution content is explicitly unknown. Do not
         // hide the already observed command outcomes or imply that effects did not occur.
-        content_after: if plan.observe_files.is_empty() {
-            None
-        } else {
-            content_observation::observe(&cwd, &plan.observe_files).ok()
-        },
+        content_after,
         version: plan.version,
         plan_sha256: canonical_command_plan_sha256(plan)?,
         passed,
@@ -2611,6 +2637,83 @@ mod tests {
     use super::*;
     use std::collections::BTreeMap;
 
+    #[test]
+    fn observation_only_workflow_requires_preparation_and_reports_current_content() {
+        let workspace = tempfile::tempdir().unwrap();
+        std::fs::write(workspace.path().join("result"), "integrated").unwrap();
+        let (mut invocation, mut plan) = workflow_command_plan(workspace.path(), vec![]);
+        plan.observe_files = vec![PathBuf::from("result")];
+        invocation.input = serde_json::to_value(&plan).unwrap();
+        assert!(
+            invoke_workflow_block_contract(&workflow_context(
+                &invocation,
+                bcode_plugin_sdk::ServiceCancellation::default(),
+            ))
+            .error
+            .is_some()
+        );
+        let request = bcode_workflow::WorkflowBlockPreparationRequest {
+            version: bcode_workflow::WORKFLOW_BLOCK_PREPARATION_VERSION,
+            block: shell_workflow_block_definition("exec"),
+            context: bcode_workflow::WorkflowBlockPreparationContext {
+                run_id: "run".into(),
+                node_id: "node".into(),
+                activation_id: "activation".into(),
+                attempt: 0,
+                preparation_identity: "preparation".into(),
+                workspace_root: workspace.path().to_path_buf(),
+            },
+            input: invocation.input.clone(),
+        };
+        let response = prepare_workflow_block_contract(&ServiceRequest {
+            interface_id: bcode_workflow::WORKFLOW_BLOCK_INTERFACE_ID.into(),
+            operation: bcode_workflow::WORKFLOW_BLOCK_PREPARE_OPERATION.into(),
+            payload: serde_json::to_vec(&request).unwrap(),
+        });
+        let preparation: bcode_workflow::WorkflowBlockPreparationResponse =
+            serde_json::from_slice(&response.payload).unwrap();
+        let policy: bcode_agent_profile::ToolPolicyAuthorizationMetadata =
+            serde_json::from_value(preparation.operation_facts.clone()).unwrap();
+        assert!(policy.requires_permission);
+        assert_eq!(
+            policy.operation,
+            bcode_plugin_sdk::ToolPolicyOperation::Read {
+                paths: vec!["./result".into()],
+            }
+        );
+        invocation.preparation = Some(preparation);
+        let response = invoke_workflow_block_contract(&workflow_context(
+            &invocation,
+            bcode_plugin_sdk::ServiceCancellation::default(),
+        ));
+        assert!(response.error.is_none(), "{:?}", response.error);
+        let result: ShellWorkflowCommandPlanResult =
+            serde_json::from_slice(&response.payload).unwrap();
+        assert!(result.passed);
+        assert!(result.commands.is_empty());
+        assert_eq!(result.content_before, result.content_after);
+        assert_eq!(
+            result.content_before,
+            Some(content_observation::observe(workspace.path(), &plan.observe_files).unwrap())
+        );
+        let cancelled = bcode_plugin_sdk::ServiceCancellation::default();
+        cancelled.cancel();
+        assert!(
+            invoke_workflow_block_contract(&workflow_context(&invocation, cancelled,))
+                .error
+                .is_some()
+        );
+        std::fs::remove_file(workspace.path().join("result")).unwrap();
+        assert!(
+            invoke_workflow_block_contract(&workflow_context(
+                &invocation,
+                bcode_plugin_sdk::ServiceCancellation::default(),
+            ))
+            .error
+            .is_some()
+        );
+    }
+
     fn workflow_command_plan(
         workspace: &Path,
         commands: Vec<contracts::ShellWorkflowCommand>,
@@ -2628,6 +2731,7 @@ mod tests {
             },
             ShellWorkflowCommandPlan {
                 observe_files: Vec::new(),
+                expected_content: None,
                 version: contracts::SHELL_COMMAND_PLAN_VERSION,
                 cwd: PathBuf::from("."),
                 commands,
@@ -2956,6 +3060,91 @@ mod tests {
         assert_eq!(continued.commands.len(), 2);
         assert_eq!(continued.commands[0].accepted_exit_codes, vec![7]);
         assert!(!continued.commands[0].exit_accepted);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn workflow_content_precondition_rejects_stale_targets_before_commands() {
+        let workspace = tempfile::tempdir().unwrap();
+        std::fs::create_dir(workspace.path().join("src")).unwrap();
+        std::fs::write(workspace.path().join("src/input"), "integrated").unwrap();
+        let (invocation, mut plan) = workflow_command_plan(
+            workspace.path(),
+            vec![contracts::ShellWorkflowCommand {
+                argv: vec!["sh".into(), "-c".into(), "printf ran > marker".into()],
+                timeout_ms: 5_000,
+                accepted_exit_codes: None,
+                continue_on_unaccepted_exit: false,
+            }],
+        );
+        plan.observe_files = vec![PathBuf::from("src")];
+        plan.expected_content =
+            Some(content_observation::observe(workspace.path(), &plan.observe_files).unwrap());
+        let context = workflow_context(
+            &invocation,
+            bcode_plugin_sdk::ServiceCancellation::default(),
+        );
+        std::fs::write(workspace.path().join("src/input"), "changed").unwrap();
+        assert!(execute_workflow_command_plan(&context, &invocation, &plan).is_err());
+        assert!(!workspace.path().join("marker").exists());
+        std::fs::write(workspace.path().join("src/input"), "integrated").unwrap();
+        std::fs::write(workspace.path().join("src/extra"), "added").unwrap();
+        assert!(execute_workflow_command_plan(&context, &invocation, &plan).is_err());
+        assert!(!workspace.path().join("marker").exists());
+        plan.observe_files.clear();
+        assert!(execute_workflow_command_plan(&context, &invocation, &plan).is_err());
+        assert!(!workspace.path().join("marker").exists());
+        plan.observe_files.push(PathBuf::from("src"));
+        plan.expected_content =
+            Some(content_observation::observe(workspace.path(), &plan.observe_files).unwrap());
+        let result = execute_workflow_command_plan(&context, &invocation, &plan).unwrap();
+        assert!(result.passed);
+        assert_eq!(result.content_before, plan.expected_content);
+        assert_eq!(
+            std::fs::read_to_string(workspace.path().join("marker")).unwrap(),
+            "ran"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn workflow_content_precondition_stops_after_changed_or_missing_content() {
+        for script in ["printf changed > target", "rm target"] {
+            for following_command in [false, true] {
+                let workspace = tempfile::tempdir().unwrap();
+                std::fs::write(workspace.path().join("target"), "integrated").unwrap();
+                let command = |script: &str| contracts::ShellWorkflowCommand {
+                    argv: vec!["sh".into(), "-c".into(), script.into()],
+                    timeout_ms: 5_000,
+                    accepted_exit_codes: None,
+                    continue_on_unaccepted_exit: true,
+                };
+                let mut commands = vec![command(script)];
+                if following_command {
+                    commands.push(command("printf ran > marker"));
+                }
+                let (invocation, mut plan) = workflow_command_plan(workspace.path(), commands);
+                plan.observe_files = vec![PathBuf::from("target")];
+                plan.expected_content = Some(
+                    content_observation::observe(workspace.path(), &plan.observe_files).unwrap(),
+                );
+                let result = execute_workflow_command_plan(
+                    &workflow_context(
+                        &invocation,
+                        bcode_plugin_sdk::ServiceCancellation::default(),
+                    ),
+                    &invocation,
+                    &plan,
+                )
+                .unwrap();
+                assert!(!result.passed);
+                assert_eq!(result.commands.len(), 1);
+                assert_eq!(result.commands[0].exit_code, Some(0));
+                assert!(result.commands[0].exit_accepted);
+                assert_ne!(result.content_before, result.content_after);
+                assert!(!workspace.path().join("marker").exists());
+            }
+        }
     }
 
     #[cfg(unix)]
