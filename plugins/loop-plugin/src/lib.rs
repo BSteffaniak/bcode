@@ -555,6 +555,10 @@ fn session_status_response(session_id: SessionId) -> bcode_plugin_sdk::SessionSt
             text,
             priority: 20,
             metadata: std::collections::BTreeMap::from([
+                (
+                    "inspection_surface".to_owned(),
+                    serde_json::json!(goal_supervision::SURFACE),
+                ),
                 ("run_id".to_owned(), serde_json::json!(run.run_id)),
                 (
                     "status".to_owned(),

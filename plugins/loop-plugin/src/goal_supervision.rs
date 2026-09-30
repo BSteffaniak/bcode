@@ -30,7 +30,11 @@ impl PluginTuiSurfaceFactory for Factory {
             view.detail = "Connecting to the associated execution".into();
             Ok(Box::new(Supervision {
                 session,
-                run: None,
+                run: request
+                    .options
+                    .get("run_id")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_owned),
                 pending: false,
                 completion: Arc::default(),
                 next_refresh: Instant::now(),

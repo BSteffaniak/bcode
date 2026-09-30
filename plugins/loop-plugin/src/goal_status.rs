@@ -45,7 +45,7 @@ pub fn overview(view: &WorkflowRunView) -> String {
     {
         text.push_str(" · attention needed (bounded observation)");
     }
-    text.push_str(" · /goal.watch to inspect · /workflow for decisions");
+    text.push_str(" · Click activity to inspect · /goal.watch · /workflow for decisions");
     text
 }
 

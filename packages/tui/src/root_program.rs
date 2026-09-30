@@ -1169,6 +1169,40 @@ impl BcodeRuntimeModel {
                         super::invalidation::UiInvalidation::None
                     };
                 }
+                if !self.loop_state.modal_foreground()
+                    && matches!(
+                        mouse.kind,
+                        bmux_tui::event::MouseEventKind::Down(bmux_tui::event::MouseButton::Left)
+                    )
+                    && let Some(hit) = super::mouse_flow::mouse_hit_id(&self.committed_hits, mouse)
+                    && let Some((index, identity)) = hit
+                        .strip_prefix("activity-inspect:")
+                        .and_then(|value| value.split_once(':'))
+                    && let (Ok(index), Ok(identity)) =
+                        (index.parse::<usize>(), identity.parse::<u64>())
+                    && self
+                        .chat
+                        .app
+                        .transcript()
+                        .get(index)
+                        .is_some_and(|item| item.id().get() == identity)
+                    && let Some((plugin_id, surface_kind, options)) =
+                        self.chat.app.activity_inspection(index)
+                {
+                    self.chat
+                        .replace_effect(super::effects::TuiEffect::OpenPluginSurface {
+                            plugin_id,
+                            instance_id: format!("activity-{surface_kind}"),
+                            surface_kind,
+                            options,
+                            working_directory: self
+                                .settings
+                                .launch_working_directory()
+                                .to_path_buf(),
+                            session_id: self.chat.attached_session_id(),
+                        });
+                    return super::invalidation::UiInvalidation::Structural;
+                }
                 if let Some(selection_damage) = self.handle_transcript_selection_mouse(mouse) {
                     return selection_damage;
                 }

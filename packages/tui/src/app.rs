@@ -2459,6 +2459,25 @@ impl BmuxApp {
         self.session_view.snapshot().plugin_status.values()
     }
 
+    /// Resolve a plugin-owned inspection surface from a current activity entry.
+    pub fn activity_inspection(&self, index: usize) -> Option<(String, String, serde_json::Value)> {
+        let source = self.transcript.plugin_activity_source(index)?;
+        let status = self.plugin_status().find(|status| {
+            source
+                == format!(
+                    "bcode.plugin-activity:{}:{}",
+                    status.plugin_id, status.note_id
+                )
+        })?;
+        let surface = status.metadata.get("inspection_surface")?.as_str()?;
+        let run = status.metadata.get("run_id")?.as_str()?;
+        Some((
+            status.plugin_id.clone(),
+            surface.to_owned(),
+            serde_json::json!({"run_id": run}),
+        ))
+    }
+
     /// Atomically replace active plugin-owned session status contributions.
     pub fn set_plugin_status(
         &mut self,

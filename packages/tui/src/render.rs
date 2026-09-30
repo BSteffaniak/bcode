@@ -1741,6 +1741,22 @@ fn render_transcript(app: &BmuxApp, area: Rect, frame: &mut PaintCx<'_, '_>) {
                         .collect::<Vec<_>>()
                 })
                 .collect();
+            if visible.source == super::transcript_layout::VisibleTranscriptSource::Transcript
+                && app.activity_inspection(visible.entry_index).is_some()
+            {
+                frame.push_hit(
+                    HitRegion::new(
+                        format!(
+                            "activity-inspect:{}:{}",
+                            visible.entry_index,
+                            app.transcript()[visible.entry_index].id().get()
+                        ),
+                        Rect::new(area.x, y, area.width, 1),
+                    )
+                    .role(HitRole::Action)
+                    .layer(1),
+                );
+            }
             frame.write_line(
                 LocalRect::terminal(Rect::new(area.x, y, area.width, 1)),
                 &styled,

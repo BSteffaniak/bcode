@@ -274,6 +274,18 @@ impl TranscriptDocument {
         self.entries.iter().map(TranscriptPresentationEntry::item)
     }
 
+    /// Identify a current plugin activity entry without interpreting its visible text.
+    pub fn plugin_activity_source(&self, index: usize) -> Option<&str> {
+        match &self.entries.get(index)?.origin {
+            TranscriptPresentationOrigin::Ephemeral { source, .. }
+                if source.starts_with("bcode.plugin-activity:") =>
+            {
+                Some(source)
+            }
+            _ => None,
+        }
+    }
+
     /// Replace transient plugin activity in place, preserving its chronology and identity.
     pub fn set_plugin_activity(&mut self, activity: &[(String, String)]) -> bool {
         let mut changed = false;
