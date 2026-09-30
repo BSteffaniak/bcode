@@ -341,7 +341,7 @@ fn authenticate_output(bridge: &ServiceBridge, dispatch_identity: &str, output_i
         request_id: "loop-contribution".into(),
         route_id: Some(bcode_workflow::WORKFLOW_EVIDENCE_INTERFACE_ID.into()),
         interface_id: bcode_workflow::WORKFLOW_EVIDENCE_INTERFACE_ID.into(),
-        operation: bcode_workflow::OP_INSPECT_OUTPUT.into(),
+        operation: bcode_workflow::OP_INSPECT_OUTPUT_PROVENANCE.into(),
         payload: serde_json::json!(bcode_workflow::WorkflowOutputEvidenceRequest {
             output_id: output_id.into(),
         }),
@@ -352,18 +352,30 @@ fn authenticate_output(bridge: &ServiceBridge, dispatch_identity: &str, output_i
     else {
         return false;
     };
-    serde_json::from_value::<bcode_workflow::WorkflowOutputInspection>(payload).is_ok_and(
-        |evidence| {
-            evidence.version == bcode_workflow::WORKFLOW_OUTPUT_INSPECTION_VERSION
+    serde_json::from_value::<bcode_workflow::WorkflowOutputProvenance>(payload)
+        .is_ok_and(|provenance| valid_contribution_provenance(&provenance, output_id))
+}
+
+fn valid_contribution_provenance(
+    provenance: &bcode_workflow::WorkflowOutputProvenance,
+    output_id: &str,
+) -> bool {
+    let evidence = &provenance.output;
+    provenance.version == bcode_workflow::WorkflowOutputProvenance::VERSION
+                && provenance.producer_revision > 0
+                && provenance.producer.id == evidence.node_id
+                // Until adapted contribution contracts are interpreted, do not let an
+                // envelope hide the worker's blockers behind an unrelated schema.
+                && provenance.producer.dataflow
+                    == bcode_workflow::WorkflowNodeDataflowPolicy::Direct
+                && evidence.version == bcode_workflow::WORKFLOW_OUTPUT_INSPECTION_VERSION
                 && evidence.output_id == output_id
                 && evidence.checksum_sha256.len() == 64
                 && evidence
                     .checksum_sha256
                     .bytes()
                     .all(|byte| byte.is_ascii_hexdigit())
-                && !delivery::contribution_precludes_completion(&evidence)
-        },
-    )
+                && !delivery::contribution_precludes_completion(evidence)
 }
 
 fn evaluate(
@@ -596,41 +608,87 @@ mod tests {
     }
 
     #[test]
-    fn authenticated_assertions_do_not_certify_delivery_or_dispatch_judgement() {
-        extern "C" fn authenticate(
-            request_ptr: *const u8,
-            request_len: usize,
-            output_ptr: *mut u8,
-            output_capacity: usize,
-            output_len: *mut usize,
-            _user_data: *mut std::ffi::c_void,
-        ) -> i32 {
-            let bytes = unsafe { std::slice::from_raw_parts(request_ptr, request_len) };
-            let request: ServiceBridgeRequest = serde_json::from_slice(bytes).unwrap();
-            let ServiceBridgeRequest::InvokeService(request) = request else {
-                panic!("expected evidence request")
-            };
-            assert_eq!(request.operation, bcode_workflow::OP_INSPECT_OUTPUT);
-            let response = ServiceBridgeResponse::Service(
-                bcode_tool::ToolInvocationServiceResolution::Responded {
-                    payload: serde_json::json!({
-                        "version": 1,
-                        "output_id": "same-run:unrelated-output",
-                        "run_id": "same-run", "node_id": "worker", "activation_id": "activation",
-                        "schema_id": "custom", "schema_version": 1,
-                        "value": {"claim": "passed"}, "created_at_ms": 1,
-                        "checksum_sha256": "a".repeat(64)
-                    }),
+    fn contribution_provenance_rejects_unknown_mismatched_and_adapted_producers() {
+        let mut provenance: bcode_workflow::WorkflowOutputProvenance =
+            serde_json::from_value(serde_json::json!({
+                "version": 1, "producer_revision": 1,
+                "producer": {
+                    "id":"worker", "name":"Worker", "kind":"agent",
+                    "input":{"type_name":"input", "schema":{}},
+                    "output":{"type_name":"custom", "schema":{}}
                 },
-            );
-            let encoded = serde_json::to_vec(&response).unwrap();
-            assert!(encoded.len() <= output_capacity);
-            unsafe {
-                std::ptr::copy_nonoverlapping(encoded.as_ptr(), output_ptr, encoded.len());
-                *output_len = encoded.len();
-            }
-            0
+                "output": {
+                    "version":1, "output_id":"output", "run_id":"run",
+                    "node_id":"worker", "activation_id":"activation",
+                    "schema_id":"custom", "schema_version":1,
+                    "checksum_sha256":"a".repeat(64), "created_at_ms":1,
+                    "value":{"blockers":[]}
+                }
+            }))
+            .unwrap();
+        assert!(valid_contribution_provenance(&provenance, "output"));
+        assert!(!valid_contribution_provenance(&provenance, "other"));
+        provenance.version = 2;
+        assert!(!valid_contribution_provenance(&provenance, "output"));
+        provenance.version = 1;
+        provenance.producer_revision = 0;
+        assert!(!valid_contribution_provenance(&provenance, "output"));
+        provenance.producer_revision = 1;
+        provenance.producer.id = "different".into();
+        assert!(!valid_contribution_provenance(&provenance, "output"));
+        provenance.producer.id = "worker".into();
+        provenance.producer.dataflow = bcode_workflow::WorkflowNodeDataflowPolicy::StateEnvelopeV1;
+        assert!(!valid_contribution_provenance(&provenance, "output"));
+    }
+
+    extern "C" fn authenticate_assertion(
+        request_ptr: *const u8,
+        request_len: usize,
+        output_ptr: *mut u8,
+        output_capacity: usize,
+        output_len: *mut usize,
+        _user_data: *mut std::ffi::c_void,
+    ) -> i32 {
+        let bytes = unsafe { std::slice::from_raw_parts(request_ptr, request_len) };
+        let request: ServiceBridgeRequest = serde_json::from_slice(bytes).unwrap();
+        let ServiceBridgeRequest::InvokeService(request) = request else {
+            panic!("expected evidence request")
+        };
+        assert_eq!(
+            request.operation,
+            bcode_workflow::OP_INSPECT_OUTPUT_PROVENANCE
+        );
+        let response = ServiceBridgeResponse::Service(
+            bcode_tool::ToolInvocationServiceResolution::Responded {
+                payload: serde_json::json!({
+                    "version": 1,
+                    "producer_revision": 1,
+                    "producer": {
+                        "id": "worker", "name": "Worker", "kind": "agent",
+                        "input": {"type_name":"input", "schema":{}},
+                        "output": {"type_name":"custom", "schema":{}}
+                    },
+                    "output": {
+                    "version": 1,
+                    "output_id": "same-run:unrelated-output",
+                    "run_id": "same-run", "node_id": "worker", "activation_id": "activation",
+                    "schema_id": "custom", "schema_version": 1,
+                    "value": {"claim": "passed"}, "created_at_ms": 1,
+                    "checksum_sha256": "a".repeat(64)
+                    }
+                }),
+            },
+        );
+        let encoded = serde_json::to_vec(&response).unwrap();
+        assert!(encoded.len() <= output_capacity);
+        unsafe {
+            std::ptr::copy_nonoverlapping(encoded.as_ptr(), output_ptr, encoded.len());
+            *output_len = encoded.len();
         }
+        0
+    }
+    #[test]
+    fn authenticated_assertions_do_not_certify_delivery_or_dispatch_judgement() {
         for judgement in ["", "bcode.jev/jev-1.13.0/-/90/agent_fallback"] {
             for workspace in [None, Some("other-checkout"), Some("delivered-checkout")] {
                 let mut input =
@@ -668,7 +726,7 @@ mod tests {
                     events: ServiceEventEmitter::default(),
                     cancellation: bcode_plugin_sdk::ServiceCancellation::default(),
                     bridge: ServiceBridge::new(
-                        Some(authenticate),
+                        Some(authenticate_assertion),
                         std::ptr::null_mut(),
                         bcode_plugin_sdk::ServiceCancellation::default(),
                     ),

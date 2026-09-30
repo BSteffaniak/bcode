@@ -66,8 +66,11 @@ resolved through the versioned, invocation-scoped workflow evidence application 
 before an affirmative decision. The host checksum-verifies each exact output in the
 invoking run; callers cannot select a different run. Missing, corrupt, unsupported or
 unavailable evidence withholds completion even with judgement fallback. The additive
-`inspect_output` operation returns the bounded, checksum-verified canonical value; older
-hosts reject the unsupported operation. The loop consumer rejects explicit blockers and
+`inspect_output_provenance` operation returns the bounded, checksum-verified canonical value
+and its immutable activation-bound producer; older hosts reject the unsupported operation.
+The loop consumer checks envelope compatibility, producer identity and revision, and currently
+rejects adapted contribution dataflow rather than risk hiding blockers inside an envelope.
+It rejects explicit blockers and
 remaining work in standard `bcode.delegated_task_result.v2` contributions, including malformed
 required fields. Custom contribution schemas remain authorable but unknown; neither an
 unknown schema nor an empty blocker list proves success. Integrated-target identity,
