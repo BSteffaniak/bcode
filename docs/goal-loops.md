@@ -104,7 +104,10 @@ empty commands. This gives callers an authorized current observation at that
 activation, not a delivery-time freshness certificate or a successful executed check.
 The report and original criteria are retained. This is a conservative safety restriction,
 not a positive verification implementation: a canonical target/content-bound observation
-path is still required before such delivery can be certified. Historical reports remain
+path is still required before such delivery can be certified. The safeguard applies
+even when the incoming agent verdict is negative: a configured judgement provider
+must not promote an omitted required report or an unverified V1 report into
+completion. Such reports return before provider dispatch. Historical reports remain
 readable and terminal outcomes are not rewritten. Ordinary goals without delivery reports
 retain their existing behavior and do not gain a collaboration requirement.
 Existing admitted graphs are unchanged;

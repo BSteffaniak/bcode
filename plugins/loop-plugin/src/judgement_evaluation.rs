@@ -230,7 +230,8 @@ pub fn invoke(context: &NativeServiceContext) -> ServiceResponse {
     // V1 records evaluator assertions only. Even authenticated output identities
     // do not bind a successful check to the delivered content. Preserve the report
     // for inspection, but do not let confidence or fallback certify those claims.
-    if input.condition_met && input.delivery.is_some() {
+    // Apply even to a negative agent verdict: judgement may otherwise promote it.
+    if input.delivery.is_some() {
         input.condition_met = false;
         input.summary = "Completion withheld: delivery V1 has no target-bound observed verification; retain the report and contributions until canonical verification support is available".into();
         return json_response(&input);
@@ -303,7 +304,7 @@ fn negative_delivery(input: &mut LoopWorkflowIteration) -> bool {
 }
 
 fn missing_required_delivery(input: &mut LoopWorkflowIteration) -> bool {
-    if !input.condition_met || !input.delivery_required || input.delivery.is_some() {
+    if !input.delivery_required || input.delivery.is_some() {
         return false;
     }
     input.condition_met = false;
@@ -565,7 +566,10 @@ mod tests {
             state.delivery_required = true;
             state.condition_met = true;
             state.evidence = vec!["claimed verification".into()];
-            for null_report in [false, true] {
+            for (null_report, condition_met) in
+                [(false, false), (false, true), (true, false), (true, true)]
+            {
+                state.condition_met = condition_met;
                 let mut value = serde_json::to_value(&state).unwrap();
                 if null_report {
                     value["delivery"] = serde_json::Value::Null;
@@ -740,13 +744,20 @@ mod tests {
     #[test]
     fn authenticated_assertions_do_not_certify_delivery_or_dispatch_judgement() {
         for judgement in ["", "bcode.jev/jev-1.13.0/-/90/agent_fallback"] {
-            for workspace in [None, Some("other-checkout"), Some("delivered-checkout")] {
+            for (workspace, condition_met) in [
+                (None, false),
+                (None, true),
+                (Some("other-checkout"), false),
+                (Some("other-checkout"), true),
+                (Some("delivered-checkout"), false),
+                (Some("delivered-checkout"), true),
+            ] {
                 let mut input =
                     LoopWorkflowInput::new("implement".into(), "original criteria".into(), 2)
                         .unwrap();
                 input.judgement_evaluation = parse_config(judgement).unwrap();
                 let mut state = loop_workflow_initial_value(&input);
-                state.condition_met = true;
+                state.condition_met = condition_met;
                 state.evidence = vec!["claimed successful verification".into()];
                 let checks: Vec<_> = workspace.into_iter().map(|workspace| serde_json::json!({
                     "command": "cargo test", "workspace": workspace,
