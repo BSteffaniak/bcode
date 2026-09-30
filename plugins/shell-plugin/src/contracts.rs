@@ -118,7 +118,7 @@ pub struct ShellWorkflowOutputPolicy {
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct ShellWorkflowCommandPlan {
-    /// Optional bounded files to observe before and after execution. Empty preserves legacy behavior.
+    /// Optional bounded files/directory scopes observed around execution. Empty preserves legacy behavior.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub observe_files: Vec<PathBuf>,
     pub version: u32,

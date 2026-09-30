@@ -8,13 +8,16 @@ use sha2::{Digest, Sha256};
 const MAX_FILES: usize = 64;
 const MAX_BYTES: u64 = 16 * 1024 * 1024;
 
-/// Versioned observation of explicitly selected files, not a claim of complete coverage.
+/// Versioned observation of explicitly selected scopes, not a claim of complete input coverage.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ContentObservation {
     pub version: u32,
     pub workspace: PathBuf,
     pub files: Vec<FileObservation>,
+    /// Exhaustively enumerated directory scopes, including empty directories.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub directories: Vec<PathBuf>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -24,7 +27,7 @@ pub struct FileObservation {
     pub sha256: String,
 }
 
-/// Observe only bounded regular files confined to the actual command directory.
+/// Observe bounded regular files and directory scopes confined to the command directory.
 /// Symlinks and special files fail closed, including symlinked path components.
 pub fn observe(workspace: &Path, paths: &[PathBuf]) -> Result<ContentObservation, String> {
     if paths.is_empty() || paths.len() > MAX_FILES {
@@ -36,7 +39,9 @@ pub fn observe(workspace: &Path, paths: &[PathBuf]) -> Result<ContentObservation
     let mut remaining = MAX_BYTES;
     let mut files = Vec::with_capacity(paths.len());
     let mut unique = std::collections::BTreeSet::new();
-    for path in paths {
+    let mut pending = paths.to_vec();
+    let mut directories = Vec::new();
+    while let Some(path) = pending.pop() {
         if path.as_os_str().is_empty()
             || path.as_os_str().len() > 4096
             || path
@@ -46,10 +51,22 @@ pub fn observe(workspace: &Path, paths: &[PathBuf]) -> Result<ContentObservation
         {
             return Err("observation requires unique normalized relative file paths".into());
         }
-        let mut file = open_confined(&workspace, path)?;
+        if unique.len() > MAX_FILES {
+            return Err("content observation entry limit exceeded".into());
+        }
+        let mut file = open_confined(&workspace, &path)?;
         let metadata = file
             .metadata()
             .map_err(|_| "observation metadata unavailable")?;
+        if metadata.is_dir() {
+            let children = directory_entries(file, MAX_FILES - unique.len())?;
+            if pending.len() + children.len() + unique.len() > MAX_FILES {
+                return Err("content observation entry limit exceeded".into());
+            }
+            pending.extend(children.into_iter().map(|name| path.join(name)));
+            directories.push(path);
+            continue;
+        }
         if !metadata.is_file() || metadata.len() > remaining {
             return Err("observation requires bounded regular files".into());
         }
@@ -67,11 +84,73 @@ pub fn observe(workspace: &Path, paths: &[PathBuf]) -> Result<ContentObservation
             sha256: hex::encode(Sha256::digest(&bytes)),
         });
     }
+    if directories.is_empty() {
+        files.reverse(); // Preserve the V1 caller-selected order.
+    } else {
+        files.sort_by(|left, right| left.path.cmp(&right.path));
+        directories.sort();
+    }
     Ok(ContentObservation {
-        version: 1,
+        version: if directories.is_empty() { 1 } else { 2 },
         workspace,
         files,
+        directories,
     })
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn directory_entries(file: std::fs::File, limit: usize) -> Result<Vec<PathBuf>, String> {
+    use std::os::fd::{FromRawFd, IntoRawFd};
+    use std::os::unix::ffi::OsStrExt;
+
+    struct Directory(*mut libc::DIR);
+    impl Drop for Directory {
+        fn drop(&mut self) {
+            // SAFETY: this guard exclusively owns the stream from fdopendir.
+            unsafe { libc::closedir(self.0) };
+        }
+    }
+    let descriptor = file.into_raw_fd();
+    // SAFETY: descriptor is live and owned; ownership transfers only on success.
+    let stream = unsafe { libc::fdopendir(descriptor) };
+    if stream.is_null() {
+        // SAFETY: failed fdopendir leaves descriptor ownership with the caller.
+        drop(unsafe { std::fs::File::from_raw_fd(descriptor) });
+        return Err("observation directory unavailable".into());
+    }
+    let directory = Directory(stream);
+    let mut entries = Vec::new();
+    loop {
+        // SAFETY: errno is thread-local, and this live directory has no other users.
+        let name = unsafe {
+            #[cfg(target_os = "macos")]
+            let errno = libc::__error();
+            #[cfg(target_os = "linux")]
+            let errno = libc::__errno_location();
+            *errno = 0;
+            let entry = libc::readdir(directory.0);
+            if entry.is_null() {
+                if *errno != 0 {
+                    return Err("observation directory read failed".into());
+                }
+                break;
+            }
+            std::ffi::CStr::from_ptr((*entry).d_name.as_ptr()).to_bytes()
+        };
+        if name == b"." || name == b".." {
+            continue;
+        }
+        if entries.len() >= limit || std::str::from_utf8(name).is_err() {
+            return Err("observation directory exceeds supported bounds".into());
+        }
+        entries.push(PathBuf::from(std::ffi::OsStr::from_bytes(name)));
+    }
+    Ok(entries)
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+fn directory_entries(_file: std::fs::File, _limit: usize) -> Result<Vec<PathBuf>, String> {
+    Err("directory observations are unsupported on this platform".into())
 }
 
 // Walk from an anchored root descriptor. Never check a pathname and subsequently
@@ -117,6 +196,41 @@ fn open_confined(_workspace: &Path, _path: &Path) -> Result<std::fs::File, Strin
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn directory_scopes_detect_membership_and_content_changes() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(root.path().join("src/empty")).unwrap();
+        std::fs::write(root.path().join("src/a"), "before").unwrap();
+        let paths = [PathBuf::from("src")];
+        let before = observe(root.path(), &paths).unwrap();
+        assert_eq!(before.version, 2);
+        assert_eq!(
+            before.directories,
+            [PathBuf::from("src"), PathBuf::from("src/empty")]
+        );
+        assert_eq!(before, observe(root.path(), &paths).unwrap());
+        std::fs::write(root.path().join("src/b"), "added").unwrap();
+        assert_ne!(before, observe(root.path(), &paths).unwrap());
+        std::fs::remove_file(root.path().join("src/b")).unwrap();
+        assert_eq!(before, observe(root.path(), &paths).unwrap());
+        std::fs::remove_dir(root.path().join("src/empty")).unwrap();
+        assert_ne!(before, observe(root.path(), &paths).unwrap());
+        assert!(observe(root.path(), &[PathBuf::from("src"), PathBuf::from("src/a")]).is_err());
+        for index in 0..64 {
+            std::fs::write(root.path().join(format!("src/{index}")), "").unwrap();
+        }
+        assert!(observe(root.path(), &paths).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn directory_scope_rejects_symlink_members() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::create_dir(root.path().join("src")).unwrap();
+        std::os::unix::fs::symlink("/", root.path().join("src/link")).unwrap();
+        assert!(observe(root.path(), &[PathBuf::from("src")]).is_err());
+    }
 
     #[test]
     fn observations_bind_content_and_actual_workspace() {

@@ -104,7 +104,7 @@ command sequences, prompts, skills, Git procedures, reviews, or product orchestr
 ## Opt-in shell content observations
 
 Advanced `exec` command plans may supply `observe_files` (1–64 unique normalized
-relative paths, at most 16 MiB total). The shell owner records optional
+relative file or directory paths, at most 64 observed entries and 16 MiB total). The shell owner records optional
 `content_before` and `content_after` observations around actual process execution:
 observation version 1, canonical command directory, relative file paths and SHA-256
 content digests. Symlinks, missing files, special files and oversized reads reject
@@ -113,7 +113,17 @@ without hiding already executed commands or implying no effects. This is an addi
 opt-in extension: omitted fields preserve legacy plan serialization and plan digests;
 older consumers with closed schemas reject extended results rather than guess.
 
-These observations cover only explicitly selected files. They do not prove complete
+These observations cover only explicitly selected scopes. Directory selections recursively
+record all regular-file descendants and directory membership (including empty directories)
+in deterministic order using observation version 2. Traversal is descriptor-confined,
+rejects symlinks, overlapping selections and non-UTF-8 names, and fails closed above
+64 total entries or 16 MiB; it never returns partial coverage. Directory enumeration
+is supported on macOS and Linux. File-only selections retain version 1 and original
+serialization/order. Older consumers reject version 2; the loop verifier currently
+accepts only version 1. The bound is an observation-operation limit, not a workflow
+size or lifetime limit; large-target incremental verification remains unfinished.
+
+They do not prove complete
 input coverage, prevent concurrent external writes or filesystem replacement races,
 authenticate canonical contribution provenance, or certify delivery. Unchanged selected
 files and exit success are not sufficient to establish a goal criterion. The loop delivery

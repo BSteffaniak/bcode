@@ -2960,6 +2960,46 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn workflow_directory_observation_records_added_files() {
+        let workspace = tempfile::tempdir().unwrap();
+        std::fs::create_dir(workspace.path().join("src")).unwrap();
+        let (invocation, mut plan) = workflow_command_plan(
+            workspace.path(),
+            vec![contracts::ShellWorkflowCommand {
+                argv: vec!["sh".into(), "-c".into(), "printf added > src/new".into()],
+                timeout_ms: 5_000,
+                accepted_exit_codes: None,
+                continue_on_unaccepted_exit: false,
+            }],
+        );
+        plan.observe_files = vec![PathBuf::from("src")];
+        let result = execute_workflow_command_plan(
+            &workflow_context(
+                &invocation,
+                bcode_plugin_sdk::ServiceCancellation::default(),
+            ),
+            &invocation,
+            &plan,
+        )
+        .unwrap();
+        assert!(result.passed);
+        let before = result.content_before.as_ref().unwrap();
+        let after = result.content_after.as_ref().unwrap();
+        assert_eq!(before.version, 2);
+        assert!(before.files.is_empty());
+        assert_eq!(after.files[0].path, PathBuf::from("src/new"));
+        assert_ne!(before, after);
+        assert_eq!(
+            serde_json::from_value::<ShellWorkflowCommandPlanResult>(
+                serde_json::to_value(&result).unwrap()
+            )
+            .unwrap(),
+            result
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn workflow_content_observation_records_actual_execution_not_claims() {
         let workspace = tempfile::tempdir().unwrap();
         std::fs::write(workspace.path().join("target"), "before").unwrap();

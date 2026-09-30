@@ -66,11 +66,20 @@ schema = { "x-bcode-allow-dynamic-complete-input" = false, "x-bcode-dynamic-bind
 type_name = "bcode.shell.exec/v1"
 
 [services.workflow_blocks.output]
-schema = { "$defs" = { content_observation = { type = "object", additionalProperties = false, required = [
+schema = { "$defs" = { content_observation = { type = "object", allOf = [
+    { if = { properties = { version = { const = 1 } } }, then = { not = { required = [
+        "directories",
+    ] }, properties = { files = { minItems = 1 } } }, else = { required = [
+        "directories",
+    ] } },
+], additionalProperties = false, required = [
     "version",
     "workspace",
     "files",
-], properties = { version = { const = 1 }, workspace = { type = "string" }, files = { type = "array", minItems = 1, maxItems = 64, items = { type = "object", additionalProperties = false, required = [
+], properties = { version = { enum = [
+    1,
+    2,
+] }, workspace = { type = "string" }, directories = { type = "array", minItems = 1, maxItems = 64, uniqueItems = true, items = { type = "string", minLength = 1, maxLength = 4096 } }, files = { type = "array", maxItems = 64, items = { type = "object", additionalProperties = false, required = [
     "path",
     "sha256",
 ], properties = { path = { type = "string", minLength = 1, maxLength = 4096 }, sha256 = { type = "string", pattern = "^[0-9a-f]{64}$" } } } } } } }, type = "object", additionalProperties = false, required = [
