@@ -113,16 +113,17 @@ impl Publisher {
 pub async fn connect(
     config: &SessionResurrectionConfig,
     explicit_session: Option<SessionId>,
-) -> std::io::Result<(Option<SessionId>, Option<Publisher>)> {
+) -> std::io::Result<(Option<SessionId>, Option<Publisher>, Option<String>)> {
     let advertised = std::env::var("APPLICATION_RESURRECTION_HOST").ok();
     let disabled = std::env::var_os("BCODE_NO_SESSION_RESURRECTION").is_some();
     let Some(path) = endpoint(config, advertised.as_deref(), disabled)? else {
-        return Ok((explicit_session, None));
+        return Ok((explicit_session, None, None));
     };
     connect_endpoint(
         path,
         explicit_session,
         bcode_config::default_session_store_dir(),
+        config.mode,
     )
     .await
 }
@@ -131,12 +132,42 @@ async fn connect_endpoint(
     path: PathBuf,
     explicit_session: Option<SessionId>,
     authority: PathBuf,
-) -> std::io::Result<(Option<SessionId>, Option<Publisher>)> {
+    mode: SessionResurrectionMode,
+) -> std::io::Result<(Option<SessionId>, Option<Publisher>, Option<String>)> {
     #[cfg(unix)]
     {
-        let authority = authority.canonicalize()?;
-        let (mut stream, restored, authority) = tokio::task::spawn_blocking(move || {
-            let stream = std::os::unix::net::UnixStream::connect(path)?;
+        // Only transport discovery failures are optional. Never downgrade handshake
+        // or authority validation failures to a successful ordinary launch.
+        let connected = tokio::task::spawn_blocking(move || {
+            match std::os::unix::net::UnixStream::connect(path) {
+                Ok(stream) => Ok(Some(stream)),
+                Err(error)
+                    if mode == SessionResurrectionMode::Auto
+                        && matches!(
+                            error.kind(),
+                            std::io::ErrorKind::NotFound | std::io::ErrorKind::ConnectionRefused
+                        ) =>
+                {
+                    Ok(None)
+                }
+                Err(error) => Err(std::io::Error::new(
+                    error.kind(),
+                    format!("connecting to session resurrection host: {error}"),
+                )),
+            }
+        })
+        .await
+        .map_err(std::io::Error::other)??;
+        let Some(stream) = connected else {
+            return Ok((
+                explicit_session,
+                None,
+                Some(
+                    "Session resurrection host unavailable; continuing without restoration.".into(),
+                ),
+            ));
+        };
+        let (stream, restored, authority) = tokio::task::spawn_blocking(move || {
             stream.set_read_timeout(Some(std::time::Duration::from_secs(2)))?;
             stream.set_write_timeout(Some(std::time::Duration::from_secs(2)))?;
             let mut stream = std::io::BufReader::new(stream);
@@ -159,7 +190,15 @@ async fn connect_endpoint(
                 welcome
                     .restore
                     .as_ref()
-                    .map(|value| value.session(&authority))
+                    .map(|value| {
+                        let canonical = authority.canonicalize().map_err(|error| {
+                            std::io::Error::new(
+                                error.kind(),
+                                format!("validating resurrection session store: {error}"),
+                            )
+                        })?;
+                        value.session(&canonical)
+                    })
                     .transpose()?
             } else {
                 None
@@ -168,55 +207,10 @@ async fn connect_endpoint(
         })
         .await
         .map_err(std::io::Error::other)??;
-        let (sender, mut receiver) = tokio::sync::watch::channel(None);
-        tokio::spawn(async move {
-            let mut revision = 0_u64;
-            while receiver.changed().await.is_ok() {
-                let selected = *receiver.borrow_and_update();
-                let Some(next) = revision.checked_add(1) else {
-                    break;
-                };
-                revision = next;
-                let descriptor = selected.map(|session_id| Descriptor {
-                    application: "bcode".to_owned(),
-                    version: 1,
-                    session_store: authority.clone(),
-                    session_id,
-                });
-                let result = tokio::task::spawn_blocking(move || {
-                    write_frame(
-                        stream.get_mut(),
-                        &Selection {
-                            operation: "selection",
-                            revision,
-                            descriptor,
-                        },
-                    )?;
-                    let ack: Acknowledgement = read_frame(&mut stream)?;
-                    if ack.revision != revision {
-                        return Err(std::io::Error::other(
-                            "resurrection acknowledgement revision mismatch",
-                        ));
-                    }
-                    Ok(stream)
-                })
-                .await;
-                match result {
-                    Ok(Ok(next_stream)) => stream = next_stream,
-                    error => {
-                        tracing::warn!(?error, "session resurrection publication stopped");
-                        break;
-                    }
-                }
-            }
-        });
         Ok((
             explicit_session.or(restored),
-            Some(Publisher {
-                sender,
-                last: None,
-                published: false,
-            }),
+            Some(start_publisher(stream, authority)),
+            None,
         ))
     }
     #[cfg(not(unix))]
@@ -226,6 +220,71 @@ async fn connect_endpoint(
             std::io::ErrorKind::Unsupported,
             "local resurrection transport is unavailable on this platform",
         ))
+    }
+}
+
+#[cfg(unix)]
+fn start_publisher(
+    mut stream: std::io::BufReader<std::os::unix::net::UnixStream>,
+    authority: PathBuf,
+) -> Publisher {
+    let (sender, mut receiver) = tokio::sync::watch::channel(None);
+    tokio::spawn(async move {
+        let mut revision = 0_u64;
+        while receiver.changed().await.is_ok() {
+            let selected = *receiver.borrow_and_update();
+            let Some(next) = revision.checked_add(1) else {
+                break;
+            };
+            revision = next;
+            let descriptor = match selected {
+                Some(session_id) => {
+                    let Ok(session_store) = authority.canonicalize() else {
+                        tracing::warn!(
+                            "session resurrection publication stopped: session store unavailable"
+                        );
+                        break;
+                    };
+                    Some(Descriptor {
+                        application: "bcode".to_owned(),
+                        version: 1,
+                        session_store,
+                        session_id,
+                    })
+                }
+                None => None,
+            };
+            let result = tokio::task::spawn_blocking(move || {
+                write_frame(
+                    stream.get_mut(),
+                    &Selection {
+                        operation: "selection",
+                        revision,
+                        descriptor,
+                    },
+                )?;
+                let ack: Acknowledgement = read_frame(&mut stream)?;
+                if ack.revision != revision {
+                    return Err(std::io::Error::other(
+                        "resurrection acknowledgement revision mismatch",
+                    ));
+                }
+                Ok(stream)
+            })
+            .await;
+            match result {
+                Ok(Ok(next_stream)) => stream = next_stream,
+                error => {
+                    tracing::warn!(?error, "session resurrection publication stopped");
+                    break;
+                }
+            }
+        }
+    });
+    Publisher {
+        sender,
+        last: None,
+        published: false,
     }
 }
 
@@ -358,9 +417,15 @@ mod tests {
                 assert_eq!(selection["operation"], "selection");
                 write_frame(stream.get_mut(), &serde_json::json!({"revision": 1})).unwrap();
             });
-            let (selected, publisher) = connect_endpoint(socket, explicit_id, authority)
-                .await
-                .unwrap();
+            let (selected, publisher, warning) = connect_endpoint(
+                socket,
+                explicit_id,
+                authority,
+                SessionResurrectionMode::Auto,
+            )
+            .await
+            .unwrap();
+            assert!(warning.is_none());
             assert_eq!(selected, explicit_id.or_else(|| offer.then_some(restored)));
             let mut publisher = publisher.unwrap();
             publisher.observe(selected.map_or(
@@ -370,6 +435,90 @@ mod tests {
             tokio::task::spawn_blocking(move || host.join().unwrap())
                 .await
                 .unwrap();
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn unavailable_hosts_are_optional_only_in_auto_mode() {
+        let root = tempfile::tempdir().unwrap();
+        let socket = root.path().join("host");
+        let missing_store = root.path().join("missing-store");
+        let explicit = Some(SessionId::new());
+        for refused in [false, true] {
+            if refused {
+                drop(std::os::unix::net::UnixListener::bind(&socket).unwrap());
+            }
+            let (selected, publisher, warning) = connect_endpoint(
+                socket.clone(),
+                explicit,
+                missing_store.clone(),
+                SessionResurrectionMode::Auto,
+            )
+            .await
+            .unwrap();
+            assert_eq!(selected, explicit);
+            assert!(publisher.is_none());
+            assert!(warning.is_some());
+            assert!(
+                connect_endpoint(
+                    socket.clone(),
+                    explicit,
+                    missing_store.clone(),
+                    SessionResurrectionMode::Enabled
+                )
+                .await
+                .is_err()
+            );
+            assert!(!missing_store.exists());
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn handshake_and_restore_failures_are_not_optional() {
+        for (protocol, offer, explicit, succeeds) in [
+            (PROTOCOL, false, false, true),
+            (PROTOCOL, true, false, false),
+            ("future", false, false, false),
+            (PROTOCOL, true, true, true),
+        ] {
+            let root = tempfile::tempdir().unwrap();
+            let socket = root.path().join("host");
+            let authority = root.path().join("missing-store");
+            let listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+            let host_authority = authority.clone();
+            let host = std::thread::spawn(move || {
+                let (stream, _) = listener.accept().unwrap();
+                let mut stream = std::io::BufReader::new(stream);
+                let _: serde_json::Value = read_frame(&mut stream).unwrap();
+                let descriptor = offer.then(|| Descriptor {
+                    application: "bcode".into(),
+                    version: 1,
+                    session_store: host_authority,
+                    session_id: SessionId::new(),
+                });
+                write_frame(
+                    stream.get_mut(),
+                    &serde_json::json!({"protocol": protocol, "restore": descriptor}),
+                )
+                .unwrap();
+            });
+            let explicit_id = explicit.then(SessionId::new);
+            let result = connect_endpoint(
+                socket,
+                explicit_id,
+                authority.clone(),
+                SessionResurrectionMode::Auto,
+            )
+            .await;
+            assert_eq!(result.is_ok(), succeeds);
+            if let Ok((selected, _, warning)) = result {
+                assert_eq!(selected, explicit_id);
+                assert!(warning.is_none());
+            }
+            assert!(!authority.exists());
+            host.join().unwrap();
         }
     }
 

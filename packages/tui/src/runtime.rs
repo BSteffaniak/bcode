@@ -117,13 +117,17 @@ pub async fn run_event_loop_with_startup_and_static_bundled<W: Write>(
     launch_options: super::TuiLaunchOptions,
 ) -> Result<(), TuiError> {
     let config = bcode_config::load_config();
-    let (session_id, publisher) = if let Ok(config) = &config {
+    let (session_id, publisher, warning) = if let Ok(config) = &config {
         super::resurrection::connect(&config.tui.session_resurrection, session_id).await?
     } else {
         // Preserve the existing in-TUI configuration error reporting path.
-        (session_id, None)
+        (session_id, None, None)
     };
-    let initialized = initialize_tui(terminal.area(), session_id, static_plugins, launch_options);
+    let mut initialized =
+        initialize_tui(terminal.area(), session_id, static_plugins, launch_options);
+    if let Some(warning) = warning {
+        initialized.chat.app.set_status(warning);
+    }
     Box::pin(run_root(terminal, initialized, startup_action, publisher)).await
 }
 
