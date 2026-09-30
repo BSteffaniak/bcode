@@ -27898,7 +27898,9 @@ fn workflow_output_evidence_resolution(
     }
     if !matches!(
         request.operation.as_str(),
-        bcode_workflow::OP_AUTHENTICATE_OUTPUT | bcode_workflow::OP_INSPECT_OUTPUT
+        bcode_workflow::OP_AUTHENTICATE_OUTPUT
+            | bcode_workflow::OP_INSPECT_OUTPUT
+            | bcode_workflow::OP_INSPECT_OUTPUT_PROVENANCE
     ) || request.route_id.as_deref() != Some(bcode_workflow::WORKFLOW_EVIDENCE_INTERFACE_ID)
     {
         return ToolInvocationServiceResolution::Unsupported;
@@ -27908,33 +27910,42 @@ fn workflow_output_evidence_resolution(
             .ok()
             .filter(|input| !input.output_id.trim().is_empty() && input.output_id.len() <= 4096)
             .and_then(|input| {
-                state
+                let store = state
                     .workflow_store
                     .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .inspect_exact_output(run_id, &input.output_id)
-                    .ok()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                if request.operation == bcode_workflow::OP_INSPECT_OUTPUT_PROVENANCE {
+                    store
+                        .inspect_output_provenance(run_id, &input.output_id)
+                        .ok()
+                        .and_then(|output| serde_json::to_value(output).ok())
+                } else {
+                    store
+                        .inspect_exact_output(run_id, &input.output_id)
+                        .ok()
+                        .and_then(|output| {
+                            if request.operation == bcode_workflow::OP_INSPECT_OUTPUT {
+                                serde_json::to_value(output).ok()
+                            } else {
+                                serde_json::to_value(bcode_workflow::WorkflowOutputEvidence {
+                                    output_id: output.output_id,
+                                    checksum_sha256: output.checksum_sha256,
+                                })
+                                .ok()
+                            }
+                        })
+                }
             });
     if cancellation.is_cancelled() {
         return ToolInvocationServiceResolution::Cancelled;
     }
-    match evidence {
-        Some(output) if request.operation == bcode_workflow::OP_INSPECT_OUTPUT => {
-            ToolInvocationServiceResolution::Responded {
-                payload: serde_json::json!(output),
-            }
-        }
-        Some(output) => ToolInvocationServiceResolution::Responded {
-            payload: serde_json::json!(bcode_workflow::WorkflowOutputEvidence {
-                output_id: output.output_id,
-                checksum_sha256: output.checksum_sha256,
-            }),
-        },
-        None => ToolInvocationServiceResolution::Failed {
+    evidence.map_or_else(
+        || ToolInvocationServiceResolution::Failed {
             code: "unverified_output".into(),
             message: "canonical output could not be authenticated in this run".into(),
         },
-    }
+        |payload| ToolInvocationServiceResolution::Responded { payload },
+    )
 }
 
 fn server_workflow_plugin_bridge(
@@ -74429,6 +74440,22 @@ event_symbol = "bcode_plugin_handle_event_v1"
         }
     }
 
+    fn assert_workflow_output_provenance(
+        payload: serde_json::Value,
+        expected: &bcode_workflow::WorkflowOutputInspection,
+    ) {
+        let evidence: bcode_workflow::WorkflowOutputProvenance =
+            serde_json::from_value(payload).unwrap();
+        assert_eq!(
+            evidence.version,
+            bcode_workflow::WorkflowOutputProvenance::VERSION
+        );
+        assert_eq!(&evidence.output, expected);
+        assert_eq!(evidence.producer.id, "agent");
+        assert_eq!(evidence.producer.kind, bcode_workflow::NodeKind::Agent);
+        assert_eq!(evidence.producer_revision, 1);
+    }
+
     #[tokio::test]
     async fn workflow_evidence_authenticates_only_the_invoking_runs_output() {
         let (state, _, _root) = active_edit_execution_fixture().await;
@@ -74454,14 +74481,21 @@ event_symbol = "bcode_plugin_handle_event_v1"
                 .unwrap()
         };
         let state = Arc::new(state);
-        for (run_id, cancelled, operation) in [
-            ("edit-run", false, bcode_workflow::OP_AUTHENTICATE_OUTPUT),
-            ("foreign-run", false, bcode_workflow::OP_AUTHENTICATE_OUTPUT),
-            ("edit-run", true, bcode_workflow::OP_AUTHENTICATE_OUTPUT),
-            ("edit-run", false, bcode_workflow::OP_INSPECT_OUTPUT),
-            ("foreign-run", false, bcode_workflow::OP_INSPECT_OUTPUT),
-            ("edit-run", true, bcode_workflow::OP_INSPECT_OUTPUT),
-        ] {
+        let cases = [
+            bcode_workflow::OP_AUTHENTICATE_OUTPUT,
+            bcode_workflow::OP_INSPECT_OUTPUT,
+            bcode_workflow::OP_INSPECT_OUTPUT_PROVENANCE,
+        ]
+        .into_iter()
+        .flat_map(|operation| {
+            [
+                ("edit-run", false),
+                ("foreign-run", false),
+                ("edit-run", true),
+            ]
+            .map(|(run_id, cancelled)| (run_id, cancelled, operation))
+        });
+        for (run_id, cancelled, operation) in cases {
             let bridge = server_workflow_plugin_bridge(
                 Arc::clone(&state),
                 bcode_config::BcodeConfig::default(),
@@ -74499,7 +74533,9 @@ event_symbol = "bcode_plugin_handle_event_v1"
                 else {
                     panic!("canonical output must authenticate");
                 };
-                if operation == bcode_workflow::OP_INSPECT_OUTPUT {
+                if operation == bcode_workflow::OP_INSPECT_OUTPUT_PROVENANCE {
+                    assert_workflow_output_provenance(payload, &expected);
+                } else if operation == bcode_workflow::OP_INSPECT_OUTPUT {
                     let evidence: bcode_workflow::WorkflowOutputInspection =
                         serde_json::from_value(payload).unwrap();
                     assert_eq!(evidence, expected);

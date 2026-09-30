@@ -11,6 +11,21 @@ The workflow store remains the canonical authority for definitions, runs, activa
 outputs, decisions, waits, receipts, resources, and terminal state. Source and package formats lower
 to canonical definitions; they do not define another scheduler or store.
 
+## Canonical output producer evidence
+
+The invocation-scoped `bcode.workflow-evidence/v1` bridge supports the additive
+`inspect_output_provenance` operation. Like `inspect_output`, it accepts an exact output ID
+and confines lookup to the invoking run. It returns a version-1 `WorkflowOutputProvenance`
+envelope containing the checksum-verified output and the immutable executable node/revision
+bound to that output's activation. The store reads both in one snapshot, without replay or
+mutation; missing or damaged bindings fail closed. Older hosts reject the operation.
+
+This lets evidence consumers distinguish agent-authored values from plugin-block outputs even
+when they use identical schema labels. It does **not** certify command success, verification
+scope, current content, or delivery. Consumers must validate the producer's operation and
+node dataflow adaptation and apply the owning plugin's evidence semantics. The goal delivery
+consumer and target freshness checks remain unfinished; positive V1 delivery is still withheld.
+
 ## Execution ownership release
 
 Daemon execution-lifetime evidence remains held until the last execution-capable server reference

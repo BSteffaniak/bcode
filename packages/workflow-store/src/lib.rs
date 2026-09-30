@@ -5820,6 +5820,42 @@ impl WorkflowStore {
         Ok(output)
     }
 
+    /// Inspect an output with its immutable activation-bound producer.
+    ///
+    /// No current-graph substitution or evidence inference is permitted. This is a
+    /// bounded non-mutating read and does not certify delivery or command success.
+    ///
+    /// # Errors
+    /// Returns an error for invalid, missing, corrupt, oversized, or unverifiable
+    /// outputs and executable bindings, or database failures.
+    pub fn inspect_output_provenance(
+        &self,
+        run_id: &str,
+        output_id: &str,
+    ) -> Result<bcode_workflow::WorkflowOutputProvenance, WorkflowStoreError> {
+        let transaction = self
+            .connection
+            .is_autocommit()
+            .then(|| self.connection.unchecked_transaction())
+            .transpose()?;
+        let output = self.inspect_exact_output(run_id, output_id)?;
+        let producer = self
+            .activation_graph_node(run_id, &output.node_id, &output.activation_id)?
+            .ok_or_else(|| {
+                WorkflowStoreError::InvalidData("output producer binding is missing".into())
+            })?;
+        let evidence = bcode_workflow::WorkflowOutputProvenance {
+            version: bcode_workflow::WorkflowOutputProvenance::VERSION,
+            output,
+            producer_revision: producer.revision,
+            producer: producer.node,
+        };
+        if let Some(transaction) = transaction {
+            transaction.commit()?;
+        }
+        Ok(evidence)
+    }
+
     /// Return bounded validated output values without replaying workflow history.
     ///
     /// Values are read from the canonical output rows and checksum-verified before being returned.
@@ -49329,6 +49365,18 @@ mod tests {
             exact.activation_id,
             activation_identity("run-1", "review", 0)
         );
+        let provenance = store
+            .inspect_output_provenance("run-1", "output-1")
+            .expect("producer evidence");
+        assert_eq!(provenance.output, exact);
+        assert_eq!(provenance.producer, definition("example").nodes["review"]);
+        assert_eq!(provenance.producer_revision, 1);
+        assert!(
+            store
+                .inspect_output_provenance("other-run", "output-1")
+                .is_err()
+        );
+        assert!(store.inspect_output_provenance("run-1", "absent").is_err());
         assert!(store.inspect_exact_output("other-run", "output-1").is_err());
         assert!(store.inspect_exact_output("run-1", "absent").is_err());
         assert_eq!(store.connection.total_changes(), before);

@@ -2168,6 +2168,34 @@ pub const OP_AUTHENTICATE_OUTPUT: &str = "authenticate_output";
 /// This additive operation uses the same bounded request as identity authentication;
 /// hosts that do not implement it must reject it rather than synthesize a value.
 pub const OP_INSPECT_OUTPUT: &str = "inspect_output";
+/// Inspect a canonical output together with its activation-bound executable producer.
+///
+/// Returns [`WorkflowOutputProvenance`]. Schema labels and output values alone do not
+/// establish who produced evidence. Hosts lacking this additive operation reject it.
+pub const OP_INSPECT_OUTPUT_PROVENANCE: &str = "inspect_output_provenance";
+
+/// Canonical output and the immutable executable selected for its activation.
+///
+/// This authenticates producer identity, not successful verification, scope coverage,
+/// content freshness, or delivery. Consumers must also interpret the owner's contract
+/// and any node dataflow adaptation before treating a value as an owner observation.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WorkflowOutputProvenance {
+    /// Envelope compatibility version; unsupported versions must be rejected.
+    pub version: u32,
+    /// Checksum-verified output from the invoking run.
+    pub output: WorkflowOutputInspection,
+    /// Immutable executable revision, not necessarily the admission graph revision.
+    pub producer_revision: u64,
+    /// Retained executable, never a lookup of the current mutable graph node.
+    pub producer: NodeDefinition,
+}
+
+impl WorkflowOutputProvenance {
+    /// Current provenance envelope version.
+    pub const VERSION: u32 = 1;
+}
 
 /// Bounded request for a canonical output in the invoking workflow run.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
