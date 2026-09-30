@@ -103,6 +103,10 @@ use tokio::task::JoinHandle;
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct WorkflowExecutionContextRequest {
+    /// Inspect only the authenticated source node and its outgoing edges.
+    /// Omission retains whole-graph pagination. Node cursors are unsupported in this scope.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub source_local: bool,
     /// Optional exact canonical output to consume from this execution's run.
     pub output_id: Option<String>,
     /// Exclusive output identity cursor; outputs are immutable and ordered by identity.

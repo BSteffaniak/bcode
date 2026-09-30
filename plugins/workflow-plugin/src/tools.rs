@@ -1746,7 +1746,8 @@ mod tests {
             "continuation":{"objective":"Integrate evidence","agent_profile":"build"}});
         let parsed = delegation::request(&json!({"request_json":request.to_string()})).unwrap();
         assert_eq!(parsed, request);
-        let query = parse_context(json!({"expected_revision":7,"limit":100})).unwrap();
+        let query =
+            parse_context(json!({"expected_revision":7,"source_local":true,"limit":2})).unwrap();
         let lowered = delegation::lower(&parsed, &context, &query).unwrap();
         assert_eq!(lowered["input"], schema);
         assert_eq!(lowered["first_edge_id"], 19);

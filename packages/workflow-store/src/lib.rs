@@ -25353,10 +25353,82 @@ mod tests {
         }
     }
 
+    fn assert_source_local_context(
+        store: &WorkflowStore,
+        link: &WorkflowExecutionSessionLink,
+        authority: &WorkflowExecutionAuthority,
+        request: &bcode_workflow::WorkflowExecutionContextRequest,
+        page: &run_graph::RunGraphPage,
+    ) {
+        let before = store.connection.total_changes();
+        let source_request = bcode_workflow::WorkflowExecutionContextRequest {
+            source_local: true,
+            expected_revision: Some(page.revision),
+            ..request.clone()
+        };
+        let (source_page, _, _) = store
+            .execution_context_graph_page(link, authority, &source_request)
+            .expect("source context");
+        assert_eq!(source_page.nodes.len(), 1);
+        assert_eq!(source_page.nodes[0].node.id, link.node_id);
+        assert!(source_page.nodes_complete);
+        assert_eq!(source_page.edges.len(), 1);
+        assert!(source_page.edges_complete);
+        assert!(
+            source_page
+                .edges
+                .iter()
+                .all(|edge| edge.edge.from == link.node_id)
+        );
+        assert!(!page.edges_complete);
+        assert_ne!(page.nodes[0].node.id, link.node_id);
+        assert_eq!(source_page.next_edge_id, Some(120));
+        assert_eq!(source_page.next_edge_id, page.next_edge_id);
+        let continuation = bcode_workflow::WorkflowExecutionContextRequest {
+            after_edge_id: Some(source_page.edges[0].edge_id),
+            ..source_request.clone()
+        };
+        let (last, _, _) = store
+            .execution_context_graph_page(link, authority, &continuation)
+            .expect("source continuation");
+        assert!(last.edges.is_empty());
+        assert!(last.edges_complete);
+        let stale = bcode_workflow::WorkflowExecutionContextRequest {
+            expected_revision: Some(999),
+            ..source_request.clone()
+        };
+        assert!(
+            store
+                .execution_context_graph_page(link, authority, &stale)
+                .is_err()
+        );
+        assert_context_pagination(store, link, authority, &source_request);
+        assert_eq!(store.connection.total_changes(), before);
+    }
+
+    fn large_context_store(path: &Path) -> WorkflowStore {
+        let mut store = WorkflowStore::open_in_state_dir(path).expect("store");
+        let mut steps = Step::task("review", |value: u32, _| async move { Ok(value + 1) });
+        for index in 0..120 {
+            steps = steps.then(Step::task(
+                format!("earlier-{index:03}"),
+                |value: u32, _| async move { Ok(value + 1) },
+            ));
+        }
+        let large = WorkflowBuilder::new("example", steps)
+            .build()
+            .expect("large graph");
+        store
+            .persist_definition("example", 1, large.definition())
+            .expect("definition");
+        store.create_run(&new_run()).expect("run");
+        store
+    }
+
     #[test]
     fn run_edit_staging_checks_exact_active_execution() {
         let temp = tempfile::tempdir().expect("temp");
-        let mut store = initialized_store_at(temp.path());
+        let mut store = large_context_store(temp.path());
         store
             .connection
             .execute_batch(
@@ -25401,6 +25473,7 @@ mod tests {
         let mut wrong = link.clone();
         wrong.session_id = "other-session".to_string();
         let context_request = bcode_workflow::WorkflowExecutionContextRequest {
+            source_local: false,
             output_id: None,
             after_output_id: None,
             expected_revision: None,
@@ -25421,6 +25494,7 @@ mod tests {
                 .execution_context_graph_page(&wrong, &authority, &context_request)
                 .is_err()
         );
+        assert_source_local_context(&store, &link, &authority, &context_request, &page);
         assert_context_pagination(&store, &link, &authority, &context_request);
         assert!(
             store

@@ -5448,7 +5448,9 @@ mod tests {
             0
         );
         app.set_plugin_status(Vec::new());
-        assert!(!app.transcript.iter().any(|item| item.id() == first));
+        let removed = !app.transcript.iter().any(|item| item.id() == first);
+        drop(app);
+        assert!(removed);
     }
 
     #[test]

@@ -575,6 +575,17 @@ and current daemon authority. Verification and graph reads share one non-mutatin
 store snapshot. Continuation without an expected revision fails closed; conflicts
 require restarting pagination. Unknown request fields are rejected.
 
+The optional application request field `source_local: true` selects the authenticated
+source node and only its outgoing edges, using the same snapshot and authority checks.
+Node cursors are rejected in this scope; edge cursors remain revision-pinned and
+completion flags describe this source-local selection, not the whole graph. Omission
+retains whole-graph behavior; older implementations reject the new field rather than
+silently broadening the query. `workflow.stage_delegation` uses this bounded selection
+internally (two edges suffice to distinguish a supported single successor from branching),
+so unrelated nodes or edges beyond the first graph page do not block routine delegation.
+Multiple/control-flow successors still require explicit advanced authoring. Allocation
+includes retired identities and remains advice, never a reservation.
+
 The response uses portable workflow contracts and contains authenticated execution
 identity plus the existing bounded graph projection, a bounded canonical output
 metadata page, and optionally one exact checksum-verified output. `after_output_id`

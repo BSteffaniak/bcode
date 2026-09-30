@@ -595,11 +595,24 @@ fn assert_goal_evaluation(
         .expect("run retains production delivery decision");
     assert_eq!(guarded.value["condition_met"], false);
     assert_eq!(guarded.value["delivery"], evaluated.value["delivery"]);
+    // Workers explicitly retain integration/check work in their immutable reports.
+    // Current delivery policy rejects that unresolved contribution before reaching
+    // the independent target-verification safeguard; integration cannot rewrite it.
+    assert!(
+        outputs
+            .iter()
+            .filter(|output| matches!(output.node_id.as_str(), "left" | "repair-right"))
+            .all(|output| !output.value["contributions"][0]["remaining_work"]
+                .as_array()
+                .unwrap()
+                .is_empty())
+    );
     assert!(
         guarded.value["summary"]
             .as_str()
             .unwrap()
-            .contains("no target-bound observed verification")
+            .contains("canonical contribution references could not be authenticated in this run or report unresolved work"),
+        "delivery safeguard: {}", guarded.value["summary"]
     );
     let delivery = &evaluated.value["delivery"];
     assert_eq!(delivery["version"], "1");

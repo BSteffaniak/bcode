@@ -28513,6 +28513,7 @@ async fn resolve_invocation_graph_edit(
         .workflow_execution_context_from_invocation(
             session_id,
             bcode_workflow::WorkflowExecutionContextRequest {
+                source_local: false,
                 output_id: None,
                 after_output_id: None,
                 expected_revision: None,

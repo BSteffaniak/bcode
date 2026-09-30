@@ -577,16 +577,20 @@ fn command_session_id(request: &InvokeCommandRequest) -> Option<SessionId> {
         .and_then(|context| context.session_id)
 }
 
-fn command_response(request: &InvokeCommandRequest) -> ServiceResponse {
-    let session_id = command_session_id(request);
-    let arguments = request.args.get("arguments").map_or("", String::as_str);
-    let command_id = match request.command_id.as_str() {
+fn loop_control_command(command_id: &str) -> &str {
+    match command_id {
         "goal.pause" => PAUSE_COMMAND,
         "goal.resume" => RESUME_COMMAND,
         "goal.stop" => STOP_COMMAND,
         "goal.detach" => DETACH_COMMAND,
         other => other,
-    };
+    }
+}
+
+fn command_response(request: &InvokeCommandRequest) -> ServiceResponse {
+    let session_id = command_session_id(request);
+    let arguments = request.args.get("arguments").map_or("", String::as_str);
+    let command_id = loop_control_command(&request.command_id);
     let response = match command_id {
         "goal.preflight" => delegation_preflight_response(),
         "goal.continue" | "loop.continue" => session_id.map_or_else(
@@ -2972,6 +2976,51 @@ mod tests {
         }
     }
 
+    fn assert_collaboration_edges(
+        base: &bcode_workflow::WorkflowDefinition,
+        collaborating: &bcode_workflow::WorkflowDefinition,
+    ) {
+        assert_eq!(base.edges.len(), collaborating.edges.len());
+        let input = LoopWorkflowInput::new("implement".into(), "done".into(), 2).unwrap();
+        let state = serde_json::to_value(loop_workflow_initial_value(&input)).unwrap();
+        let mut current = state.clone();
+        current["condition_met"] = true.into();
+        current["delivery_required"] = false.into();
+        let mut safeguarded = 0;
+        for (plain, requested) in base.edges.iter().zip(&collaborating.edges) {
+            if requested.to != "loop.judgement.evaluate" {
+                assert_eq!(plain, requested);
+                continue;
+            }
+            let mut topology = requested.clone();
+            topology.transform.clone_from(&plain.transform);
+            assert_eq!(&topology, plain);
+            let inputs = [
+                bcode_workflow::WorkflowTransformInput {
+                    name: "state",
+                    value: &state,
+                },
+                bcode_workflow::WorkflowTransformInput {
+                    name: "current",
+                    value: &current,
+                },
+            ];
+            let mut expected = plain.transform.as_ref().unwrap().evaluate(&inputs).unwrap();
+            expected["delivery_required"] = true.into();
+            assert_eq!(
+                requested
+                    .transform
+                    .as_ref()
+                    .unwrap()
+                    .evaluate(&inputs)
+                    .unwrap(),
+                expected
+            );
+            safeguarded += 1;
+        }
+        assert_eq!(safeguarded, 2, "normal and approval-resume entries");
+    }
+
     #[test]
     fn collaborating_goal_retains_evaluation_and_uses_execution_context() {
         for progress in [false, true] {
@@ -3002,6 +3051,8 @@ mod tests {
                 .configuration = collaborating.definition.nodes["loop.evaluation"]
                 .configuration
                 .clone();
+            assert_collaboration_edges(&plain.definition, &collaborating.definition);
+            expected.edges.clone_from(&collaborating.definition.edges);
             assert_eq!(expected, collaborating.definition);
             let configuration: bcode_workflow::WorkflowPromptConfiguration =
                 serde_json::from_value(
@@ -3459,7 +3510,7 @@ mod tests {
                     spec.definition().nodes.get("loop.judgement.evaluate"),
                     base.definition().nodes.get("loop.judgement.evaluate")
                 );
-                assert_eq!(spec.definition().edges, base.definition().edges);
+                assert_collaboration_edges(base.definition(), spec.definition());
             }
         }
     }

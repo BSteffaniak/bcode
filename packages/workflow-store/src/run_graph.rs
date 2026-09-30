@@ -1603,13 +1603,65 @@ impl WorkflowStore {
         let transaction = self.connection.unchecked_transaction()?;
         self.verify_execution_authority(&caller.run_id, authority)?;
         self.verify_active_graph_edit_caller(&caller.run_id, caller)?;
-        let page = self.current_run_graph_page(
-            &caller.run_id,
-            request.expected_revision,
-            request.after_node_id.as_deref(),
-            request.after_edge_id,
-            request.limit,
-        )?;
+        if request.source_local && request.after_node_id.is_some() {
+            return Err(WorkflowStoreError::InvalidData(
+                "source-local context does not accept a node cursor".to_owned(),
+            ));
+        }
+        let page = if request.source_local {
+            let revision = graph_revision(&self.connection, &caller.run_id)?.ok_or_else(|| {
+                WorkflowStoreError::InvalidData("workflow run graph not found".to_owned())
+            })?;
+            if request
+                .expected_revision
+                .is_some_and(|expected| expected != revision)
+            {
+                return Err(WorkflowStoreError::InvalidData(
+                    "workflow graph revision conflict".to_owned(),
+                ));
+            }
+            let node = self
+                .current_run_graph_node(&caller.run_id, &caller.node_id)?
+                .ok_or_else(|| {
+                    WorkflowStoreError::InvalidData("source node unavailable".to_owned())
+                })?;
+            let edges = self.current_run_graph_incident_edges(
+                &caller.run_id,
+                revision,
+                &caller.node_id,
+                true,
+                request.after_edge_id,
+                request.limit,
+            )?;
+            let edges_complete = edges.len() < request.limit
+                || self
+                    .current_run_graph_incident_edges(
+                        &caller.run_id,
+                        revision,
+                        &caller.node_id,
+                        true,
+                        edges.last().map(|edge| edge.edge_id),
+                        1,
+                    )?
+                    .is_empty();
+            let next_edge_id = self.next_run_graph_edge_id(&caller.run_id)?;
+            RunGraphPage {
+                revision,
+                next_edge_id,
+                nodes: vec![node],
+                edges,
+                nodes_complete: true,
+                edges_complete,
+            }
+        } else {
+            self.current_run_graph_page(
+                &caller.run_id,
+                request.expected_revision,
+                request.after_node_id.as_deref(),
+                request.after_edge_id,
+                request.limit,
+            )?
+        };
         let output = request
             .output_id
             .as_deref()
@@ -3386,6 +3438,18 @@ impl WorkflowStore {
         Ok(())
     }
 
+    fn next_run_graph_edge_id(&self, run_id: &str) -> Result<Option<u64>, WorkflowStoreError> {
+        // The primary key starts with (run_id, edge_id), including retired identities.
+        let last: Option<i64> = self.connection.query_row(
+            "SELECT edge_id FROM workflow_run_graph_edges WHERE run_id = ?1 ORDER BY edge_id DESC LIMIT 1",
+            [run_id], |row| row.get(0),
+        ).optional()?;
+        Ok(last.map_or(Some(0), |last| {
+            last.checked_add(1)
+                .and_then(|next| u64::try_from(next).ok())
+        }))
+    }
+
     /// Read nodes, edges, and continuation status from one read snapshot.
     ///
     /// First-page discovery may omit the expected revision. Continuation cursors
@@ -3450,21 +3514,7 @@ impl WorkflowStore {
             .is_empty(),
             None => true,
         };
-        // The primary key starts with (run_id, edge_id), so this lookup stays
-        // bounded independently of graph size and includes retired identities.
-        let last_edge: Option<i64> = self
-            .connection
-            .query_row(
-                "SELECT edge_id FROM workflow_run_graph_edges WHERE run_id = ?1
-             ORDER BY edge_id DESC LIMIT 1",
-                [run_id],
-                |row| row.get(0),
-            )
-            .optional()?;
-        let next_edge_id = last_edge.map_or(Some(0), |last| {
-            last.checked_add(1)
-                .and_then(|next| u64::try_from(next).ok())
-        });
+        let next_edge_id = self.next_run_graph_edge_id(run_id)?;
         if let Some(transaction) = transaction {
             transaction.commit()?;
         }

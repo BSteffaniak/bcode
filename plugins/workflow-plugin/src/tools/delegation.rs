@@ -16,7 +16,7 @@ pub(super) const NAME: &str = "workflow.stage_delegation";
 pub(super) fn definition() -> ToolDefinition {
     let mut definition = task_group::definition();
     definition.name = NAME.into();
-    definition.description = "Stage workers and an integration continuation from this authenticated source at an explicitly inspected revision. Tooling reads a bounded complete graph page and carries schemas, allocation and the exact source-preserving successor transform; unsupported topology requires advanced task-group staging. Supply run_id, expected_revision, bind_source_activation, mutation_id, tasks, continuation and explicit reconciliation. Workspace/access/criteria remain caller choices. This retains the source activation, does not dispatch, and requires separate publication authorization. On conflict rediscover; never silently retry at a new revision.".into();
+    definition.description = "Stage workers and an integration continuation from this authenticated source at an explicitly inspected revision. Tooling reads the authenticated source and a bounded outgoing-edge page independently of total graph size and carries schemas, allocation and the exact source-preserving successor transform; unsupported topology requires advanced task-group staging. Supply run_id, expected_revision, bind_source_activation, mutation_id, tasks, continuation and explicit reconciliation. Workspace/access/criteria remain caller choices. This retains the source activation, does not dispatch, and requires separate publication authorization. On conflict rediscover; never silently retry at a new revision.".into();
     let schema = &mut definition.input_schema;
     schema.as_object_mut().unwrap().remove("oneOf");
     schema.as_object_mut().unwrap().remove("if");
@@ -146,7 +146,7 @@ pub(super) fn invoke(
         return ServiceResponse::error("invalid_request", "delegation route missing");
     };
     let query = match parse_context(
-        json!({"expected_revision": request["expected_revision"], "limit":100}),
+        json!({"expected_revision": request["expected_revision"], "source_local":true, "limit":2}),
     ) {
         Ok(query) => query,
         Err(error) => return ServiceResponse::error("invalid_request", error),

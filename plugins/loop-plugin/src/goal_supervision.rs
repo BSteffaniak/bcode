@@ -90,7 +90,8 @@ impl PluginTuiSurface for Supervision {
         crate::goal::paint_generation(&mut self.view, area, frame);
     }
     fn poll(&mut self, host: &dyn PluginTuiHost) -> PluginTuiAction {
-        if let Some(result) = self.completion.lock().expect("supervision result").take() {
+        let completed = self.completion.lock().expect("supervision result").take();
+        if let Some(result) = completed {
             self.pending = false;
             self.next_refresh = Instant::now() + Duration::from_secs(2);
             match result {
