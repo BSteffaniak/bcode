@@ -9,11 +9,7 @@ use serde_json::Value;
 /// Only direct advanced command plans are supported. Scripts and adapted inputs fail closed.
 /// This establishes selected-file observations at execution time, not complete input coverage
 /// or current filesystem freshness. The positive-delivery safeguard must remain in force.
-pub fn observed_check(
-    evidence: &WorkflowOutputExecutionEvidence,
-    check: &Check,
-    reference: &CheckExecution,
-) -> bool {
+fn shell_observation(evidence: &WorkflowOutputExecutionEvidence, output_id: &str) -> bool {
     let provenance = &evidence.provenance;
     let output = &provenance.output;
     let producer = &provenance.producer;
@@ -26,7 +22,7 @@ pub fn observed_check(
         || provenance.version != WorkflowOutputProvenance::VERSION
         || provenance.producer_revision == 0
         || output.version != WORKFLOW_OUTPUT_INSPECTION_VERSION
-        || output.output_id != reference.output_id
+        || output.output_id != output_id
         || output.node_id != producer.id
         || output.checksum_sha256.len() != 64
         || !output
@@ -63,6 +59,20 @@ pub fn observed_check(
     {
         return false;
     }
+    true
+}
+
+/// Authenticate an executed check without interpreting a later observation as current state.
+pub fn observed_check(
+    evidence: &WorkflowOutputExecutionEvidence,
+    check: &Check,
+    reference: &CheckExecution,
+) -> bool {
+    if !shell_observation(evidence, &reference.output_id) {
+        return false;
+    }
+    let plan = &evidence.admitted_input;
+    let result = &evidence.provenance.output.value;
     let Some(commands) = plan.get("commands").and_then(Value::as_array) else {
         return false;
     };
@@ -102,6 +112,35 @@ pub fn observed_check(
         return false;
     }
     unchanged_observation(plan, result, &check.workspace)
+}
+
+/// Match an authorized later observation to the exact checked snapshot and scope.
+/// Ordering is necessary but not sufficient for delivery-time freshness: later writes
+/// remain possible, so this must not bypass the positive-delivery safeguard.
+pub fn reobserved_check(
+    execution: &WorkflowOutputExecutionEvidence,
+    observation: &WorkflowOutputExecutionEvidence,
+    check: &Check,
+    reference: &CheckExecution,
+    observation_id: &str,
+) -> bool {
+    let checked = &execution.provenance.output;
+    let observed = &observation.provenance.output;
+    observed_check(execution, check, reference)
+        && shell_observation(observation, observation_id)
+        && checked.run_id == observed.run_id
+        && checked.output_id != observed.output_id
+        && checked.created_at_ms <= observed.created_at_ms
+        && observation.admitted_input.get("commands") == Some(&serde_json::json!([]))
+        && observed.value.get("commands") == Some(&serde_json::json!([]))
+        && execution.admitted_input.get("observe_files")
+            == observation.admitted_input.get("observe_files")
+        && checked.value.get("content_after") == observed.value.get("content_before")
+        && unchanged_observation(
+            &observation.admitted_input,
+            &observed.value,
+            &check.workspace,
+        )
 }
 
 fn unchanged_observation(plan: &Value, result: &Value, workspace: &str) -> bool {
@@ -250,6 +289,66 @@ mod tests {
                 "output_id":"check-output","command_index":0,"argv":["cargo","test"]}}))
             .unwrap();
         (evidence, check)
+    }
+
+    #[test]
+    fn later_observation_must_authenticate_the_same_checked_content() {
+        let (execution, check) = fixture();
+        let reference = check.execution.as_ref().unwrap();
+        let mut observation = execution.clone();
+        observation.provenance.output.output_id = "observation".into();
+        observation.provenance.output.created_at_ms += 1;
+        observation.admitted_input["commands"] = json!([]);
+        observation.provenance.output.value["commands"] = json!([]);
+        assert!(reobserved_check(
+            &execution,
+            &observation,
+            &check,
+            reference,
+            "observation"
+        ));
+        for (pointer, replacement) in [
+            ("/provenance/output/run_id", json!("other-run")),
+            ("/provenance/output/output_id", json!("check-output")),
+            ("/provenance/output/created_at_ms", json!(0)),
+            (
+                "/provenance/producer/configuration/plugin_id",
+                json!("other"),
+            ),
+            (
+                "/admitted_input/commands",
+                execution.admitted_input["commands"].clone(),
+            ),
+            ("/admitted_input/observe_files", json!(["other.rs"])),
+            ("/admitted_input/expected_content", Value::Null),
+            ("/provenance/output/value/passed", json!(false)),
+            ("/provenance/output/value/content_after", Value::Null),
+            (
+                "/provenance/output/value/commands",
+                execution.provenance.output.value["commands"].clone(),
+            ),
+        ] {
+            let mut value = serde_json::to_value(&observation).unwrap();
+            *value.pointer_mut(pointer).unwrap() = replacement;
+            let changed = serde_json::from_value(value).unwrap();
+            assert!(
+                !reobserved_check(&execution, &changed, &check, reference, "observation"),
+                "{pointer}"
+            );
+        }
+        for field in ["content_before", "content_after"] {
+            observation.provenance.output.value[field]["files"][0]["sha256"] =
+                json!("b".repeat(64));
+        }
+        observation.admitted_input["expected_content"] =
+            observation.provenance.output.value["content_before"].clone();
+        assert!(!reobserved_check(
+            &execution,
+            &observation,
+            &check,
+            reference,
+            "observation"
+        ));
     }
 
     #[test]

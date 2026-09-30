@@ -365,6 +365,33 @@ fn authenticate_check(
     check: &delivery::Check,
     reference: &delivery::CheckExecution,
 ) -> bool {
+    let Some(evidence) = inspect_execution(bridge, dispatch_identity, &reference.output_id) else {
+        return false;
+    };
+    if !super::delivery_execution::observed_check(&evidence, check, reference) {
+        return false;
+    }
+    reference
+        .observation_output_id
+        .as_ref()
+        .is_none_or(|output_id| {
+            inspect_execution(bridge, dispatch_identity, output_id).is_some_and(|observation| {
+                super::delivery_execution::reobserved_check(
+                    &evidence,
+                    &observation,
+                    check,
+                    reference,
+                    output_id,
+                )
+            })
+        })
+}
+
+fn inspect_execution(
+    bridge: &ServiceBridge,
+    dispatch_identity: &str,
+    output_id: &str,
+) -> Option<bcode_workflow::WorkflowOutputExecutionEvidence> {
     let request = bcode_tool::ToolInvocationServiceRequest {
         invocation_id: dispatch_identity.into(),
         request_id: "loop-check".into(),
@@ -372,18 +399,16 @@ fn authenticate_check(
         interface_id: bcode_workflow::WORKFLOW_EVIDENCE_INTERFACE_ID.into(),
         operation: bcode_workflow::OP_INSPECT_OUTPUT_EXECUTION.into(),
         payload: serde_json::json!(bcode_workflow::WorkflowOutputEvidenceRequest {
-            output_id: reference.output_id.clone(),
+            output_id: output_id.into(),
         }),
     };
     let Ok(ServiceBridgeResponse::Service(
         bcode_tool::ToolInvocationServiceResolution::Responded { payload },
     )) = bridge.request(&ServiceBridgeRequest::InvokeService(request))
     else {
-        return false;
+        return None;
     };
-    serde_json::from_value::<bcode_workflow::WorkflowOutputExecutionEvidence>(payload).is_ok_and(
-        |evidence| super::delivery_execution::observed_check(&evidence, check, reference),
-    )
+    serde_json::from_value(payload).ok()
 }
 
 fn authenticate_output(bridge: &ServiceBridge, dispatch_identity: &str, output_id: &str) -> bool {

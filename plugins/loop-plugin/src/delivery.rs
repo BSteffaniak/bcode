@@ -131,6 +131,11 @@ pub struct CheckExecution {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schemars(length(min = 1, max = 64), inner(length(min = 1, max = 4096)))]
     pub content_roots: Option<Vec<String>>,
+    /// Optional later observation-only shell output matching the checked content.
+    /// This authenticates re-observation, not delivery-time freshness.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(length(min = 1, max = 4096))]
+    pub observation_output_id: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]

@@ -106,6 +106,14 @@ spawned, and successful output requires equal before/after observations. Empty
 commands without observation scopes remain invalid. Older shell plugins reject
 empty commands. This gives callers an authorized current observation at that
 activation, not a delivery-time freshness certificate or a successful executed check.
+A check reference may supply `observation_output_id` for a later observation-only
+shell execution. The loop resolves it through the same invocation-scoped execution
+evidence service and requires the same run, supported shell producer, successful
+empty command plan, unchanged precondition, exact selected roots, workspace and
+checked content. Missing or mismatched references reject the check; omission retains
+historical report behavior. Timestamp ordering rejects older observations but does
+not prove causal ordering or exclude intervening writes. This linkage does not
+remove the positive-delivery safeguard or establish complete target coverage.
 The report and original criteria are retained. This is a conservative safety restriction,
 not a positive verification implementation: a canonical target/content-bound observation
 path is still required before such delivery can be certified. The safeguard applies
