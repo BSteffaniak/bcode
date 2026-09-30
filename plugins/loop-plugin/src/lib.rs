@@ -519,17 +519,43 @@ fn session_status_response(session_id: SessionId) -> bcode_plugin_sdk::SessionSt
                 | bcode_workflow_store::RunStatus::RepairRequired
         )
     })
-    .map(|run| bcode_plugin_sdk::SessionStatusContribution {
-        contribution_id: "active-loop".to_owned(),
-        text: format_workflow_status(&run),
-        priority: 20,
-        metadata: std::collections::BTreeMap::from([
-            ("run_id".to_owned(), serde_json::json!(run.run_id)),
-            (
-                "status".to_owned(),
-                serde_json::json!(format!("{:?}", run.status)),
-            ),
-        ]),
+    .map(|run| {
+        let run_id = run.run_id.clone();
+        let text = run_async(async move {
+            BcodeClient::default_endpoint()
+                .workflow_run_view(run_id, 10)
+                .await
+        })
+        .map_or_else(
+            |_| {
+                format!(
+                    "{} · observation unavailable · /workflow",
+                    format_workflow_status(&run)
+                )
+            },
+            |view| {
+                if run.cancellation_requested_at_ms.is_some() {
+                    format!(
+                        "Cancellation requested (not undo) · {}",
+                        crate::goal_status::overview(&view)
+                    )
+                } else {
+                    crate::goal_status::overview(&view)
+                }
+            },
+        );
+        bcode_plugin_sdk::SessionStatusContribution {
+            contribution_id: "active-loop".to_owned(),
+            text,
+            priority: 20,
+            metadata: std::collections::BTreeMap::from([
+                ("run_id".to_owned(), serde_json::json!(run.run_id)),
+                (
+                    "status".to_owned(),
+                    serde_json::json!(format!("{:?}", run.status)),
+                ),
+            ]),
+        }
     });
     bcode_plugin_sdk::SessionStatusResponse { contribution }
 }

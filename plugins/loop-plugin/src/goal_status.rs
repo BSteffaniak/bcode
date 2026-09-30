@@ -7,6 +7,48 @@ use bcode_workflow_view_models::{
     WorkflowTerminalView,
 };
 
+/// Compact, read-only supervision from the same bounded projection as detailed inspection.
+#[must_use]
+pub fn overview(view: &WorkflowRunView) -> String {
+    if view.version != bcode_workflow_view_models::WORKFLOW_VIEW_VERSION {
+        return "Execution observation unavailable: unsupported view · /workflow".into();
+    }
+    let mut text = format!(
+        "{} · {:?}",
+        preview(&view.run.display_title),
+        view.run.status
+    );
+    if view.health != WorkflowProjectionHealth::Current {
+        text.push_str(" · observation degraded");
+    }
+    for node in view
+        .nodes
+        .iter()
+        .filter(|node| {
+            use bcode_workflow_view_models::WorkflowNodeStatus as S;
+            matches!(
+                node.status,
+                S::Running
+                    | S::WaitingInput
+                    | S::WaitingApproval
+                    | S::WaitingMutationApproval
+                    | S::RepairRequired
+            )
+        })
+        .take(3)
+    {
+        let _ = write!(text, " · {}: {:?}", preview(&node.name), node.status);
+    }
+    if !view.tool_permissions.is_empty()
+        || !view.mutation_approvals.is_empty()
+        || !view.waits.is_empty()
+    {
+        text.push_str(" · attention needed (bounded observation)");
+    }
+    text.push_str(" · /workflow to inspect work and decisions");
+    text
+}
+
 const DETAIL_LIMIT: usize = 10;
 
 /// Describe existing controls from the canonical run summary, without granting authority.
@@ -271,6 +313,29 @@ const fn observation(value: &crate::delivery::Observation) -> &'static str {
 
 #[cfg(test)]
 pub mod tests {
+    #[test]
+    fn overview_reports_attention_without_claiming_completion() {
+        let mut snapshot = view();
+        snapshot.run.display_title = "Inspect 界👩‍💻".into();
+        snapshot
+            .nodes
+            .push(bcode_workflow_view_models::WorkflowNodeView {
+                node_id: "implementation".into(),
+                name: "Implementation".into(),
+                kind: WorkflowNodeKind::Agent,
+                activation_id: Some("attempt".into()),
+                status: bcode_workflow_view_models::WorkflowNodeStatus::WaitingApproval,
+            });
+        let text = overview(&snapshot);
+        assert!(text.contains("Inspect 界👩‍💻"));
+        assert!(text.contains("Implementation: WaitingApproval"));
+        assert!(text.contains("/workflow"));
+        assert!(!text.contains("100%"));
+        snapshot.version = u32::MAX;
+        assert!(overview(&snapshot).contains("unsupported view"));
+        assert!(!overview(&snapshot).contains("Implementation"));
+    }
+
     #[test]
     fn controls_distinguish_admission_cancellation_and_recovery() {
         use bcode_workflow::RunStatus;

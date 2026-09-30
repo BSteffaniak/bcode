@@ -1,7 +1,7 @@
 //! Renderer-neutral presentation of structured model output and correlated activity.
 use std::borrow::Cow;
 
-use bcode_session_view_models::{SessionViewSnapshot, TranscriptViewItemKind};
+use bcode_session_view_models::SessionViewSnapshot;
 
 /// Present structured model output as provisional readable fields, never as raw JSON.
 /// Ordinary prose is unchanged. Parsing is bounded and cannot validate or authorize execution.
@@ -61,7 +61,7 @@ pub fn persistent_activity_text(snapshot: &SessionViewSnapshot) -> Option<String
         .plugin_status
         .values()
         .find(|status| status.metadata.contains_key("run_id"))?;
-    let run_id = status.metadata.get("run_id")?.as_str()?;
+    status.metadata.get("run_id")?.as_str()?;
     if status
         .metadata
         .get("status")
@@ -70,35 +70,9 @@ pub fn persistent_activity_text(snapshot: &SessionViewSnapshot) -> Option<String
     {
         return None;
     }
-    let activity = snapshot
-        .transcript
-        .items
-        .iter()
-        .filter_map(|item| match &item.kind {
-            TranscriptViewItemKind::UserMessage { message } => message.activity.as_ref(),
-            _ => None,
-        })
-        .filter(|activity| activity.execution.execution_id == run_id)
-        .max_by_key(|activity| activity.source_sequence);
-    Some(activity.map_or_else(
-        || status.text.clone(),
-        |activity| {
-            let title = activity
-                .presentation
-                .fallback
-                .lines()
-                .next()
-                .unwrap_or(&status.text);
-            format!(
-                "{title} · {}",
-                status
-                    .metadata
-                    .get("status")
-                    .and_then(serde_json::Value::as_str)
-                    .unwrap_or("active")
-            )
-        },
-    ))
+    // Current plugin status owns lifecycle and attention. Historical activity may
+    // describe a previous stage, so it must not replace the live contribution.
+    Some(status.text.clone())
 }
 
 #[cfg(test)]
