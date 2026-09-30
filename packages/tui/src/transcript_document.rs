@@ -274,6 +274,37 @@ impl TranscriptDocument {
         self.entries.iter().map(TranscriptPresentationEntry::item)
     }
 
+    /// Replace transient plugin activity in place, preserving its chronology and identity.
+    pub fn set_plugin_activity(&mut self, activity: &[(String, String)]) -> bool {
+        let mut changed = false;
+        self.entries.retain(|entry| {
+            let TranscriptPresentationOrigin::Ephemeral { source, .. } = &entry.origin else {
+                return true;
+            };
+            let keep = !source.starts_with("bcode.plugin-activity:")
+                || activity.iter().any(|(id, _)| source == id);
+            changed |= !keep;
+            keep
+        });
+        for (source, text) in activity {
+            if let Some(entry) = self.entries.iter_mut().find(|entry| {
+                matches!(&entry.origin, TranscriptPresentationOrigin::Ephemeral { source: existing, .. } if existing == source)
+            }) {
+                if entry.item.text != *text {
+                    entry.item.replace_presentation_text(text);
+                    changed = true;
+                }
+            } else {
+                self.push_ephemeral(source.clone(), TranscriptItem::with_format("Activity", text.clone(), bcode_session_view_models::TextFormat::PlainText));
+                changed = true;
+            }
+        }
+        if changed {
+            self.rebuild_indices();
+        }
+        changed
+    }
+
     /// Append a process-local notice at the current canonical chronology boundary.
     pub fn push_ephemeral(&mut self, source: String, item: TranscriptItem) {
         debug_assert!(item.source_view_item_id().is_none());

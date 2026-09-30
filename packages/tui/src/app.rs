@@ -2464,6 +2464,22 @@ impl BmuxApp {
         &mut self,
         plugin_status: Vec<bcode_session_view_models::PluginStatusView>,
     ) {
+        let activity: Vec<_> = plugin_status
+            .iter()
+            .map(|status| {
+                (
+                    format!(
+                        "bcode.plugin-activity:{}:{}",
+                        status.plugin_id, status.note_id
+                    ),
+                    status.text.clone(),
+                )
+            })
+            .collect();
+        if self.transcript.set_plugin_activity(&activity) {
+            self.transcript_projection_revision =
+                self.transcript_projection_revision.saturating_add(1);
+        }
         self.session_view.set_plugin_status(plugin_status);
     }
 
@@ -5384,6 +5400,36 @@ mod tests {
             transcript,
             ["first", "notice one", "second", "notice two", "third"]
         );
+    }
+
+    #[test]
+    fn live_plugin_activity_updates_in_place_and_is_removed_when_absent() {
+        let mut app = BmuxApp::new_with_history(None, &[], &[], true);
+        let mut status = bcode_session_view_models::PluginStatusView {
+            plugin_id: "example".into(),
+            note_id: "execution".into(),
+            text: "Implementation running".into(),
+            priority: 20,
+            metadata: std::collections::BTreeMap::new(),
+        };
+        app.set_plugin_status(vec![status.clone()]);
+        let first = app.transcript.iter().last().unwrap().id();
+        status.text = "Evaluation waiting".into();
+        app.set_plugin_status(vec![status]);
+        assert_eq!(app.transcript.iter().last().unwrap().id(), first);
+        assert_eq!(
+            app.transcript.iter().last().unwrap().text(),
+            "Evaluation waiting"
+        );
+        assert_eq!(
+            app.transcript
+                .iter()
+                .filter(|item| item.text() == "Implementation running")
+                .count(),
+            0
+        );
+        app.set_plugin_status(Vec::new());
+        assert!(!app.transcript.iter().any(|item| item.id() == first));
     }
 
     #[test]

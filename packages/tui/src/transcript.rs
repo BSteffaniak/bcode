@@ -372,6 +372,12 @@ impl TranscriptItem {
         &self.text
     }
 
+    /// Replace presentation-only text and invalidate retained layout.
+    pub(crate) fn replace_presentation_text(&mut self, text: &str) {
+        self.text = text.to_owned();
+        self.bump_revision();
+    }
+
     /// Append text to this transcript item.
     #[cfg(test)]
     pub fn append_text(&mut self, text: &str) {
