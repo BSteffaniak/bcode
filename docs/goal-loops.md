@@ -1,5 +1,18 @@
 # Goal setup for prompt loops
 
+## Live supervision
+
+Use `/goal.watch` from the originating conversation to watch the associated run.
+The read-only view refreshes a bounded workflow snapshot every two seconds and pins
+that run for the lifetime of the view. It shows execution stages, attention, available
+results and limitations. Press `1`–`9` to open a listed execution session using the
+normal session viewer and return to supervision; Escape returns to the conversation
+without stopping work. Observation failures retain the last preview, label it unavailable
+and disable child navigation until a successful refresh. `/goal.status` remains the
+portable text snapshot; `/workflow` provides advanced exact-target decisions and controls.
+This is not a completion verifier, and absent child links or evidence are not success.
+
+
 New goal evaluators use a fresh authenticated workflow context for canonical-output
 inspection (not filesystem isolation); plain loop context behavior is unchanged.
 Production-path deterministic tests discover revision-pinned output pages, inspect

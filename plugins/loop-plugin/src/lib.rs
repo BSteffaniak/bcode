@@ -59,6 +59,7 @@ mod goal;
 mod goal_document_view;
 mod goal_live;
 mod goal_status;
+mod goal_supervision;
 mod judgement_evaluation;
 mod progress;
 
@@ -150,6 +151,11 @@ fn commands() -> Vec<CommandContribution> {
             "goal.preflight",
             "Goal Delegation Preflight",
             "Inspect configured delegation prerequisites without granting authority",
+        ),
+        session_command(
+            "goal.watch",
+            "Supervise Goal",
+            "Watch execution and inspect child sessions without losing the conversation",
         ),
         session_command("goal.status", "Goal Status", "Show the session loop status"),
         session_command(
@@ -595,6 +601,10 @@ fn command_response(request: &InvokeCommandRequest) -> ServiceResponse {
             || missing_enforced_session_response(STATUS_COMMAND),
             goal::progress_status,
         ),
+        "goal.watch" => session_id.map_or_else(
+            || missing_enforced_session_response("goal.watch"),
+            goal::supervision_response,
+        ),
         "goal.progress" => session_id.map_or_else(
             || missing_enforced_session_response("goal.progress"),
             goal::progress_response,
@@ -785,6 +795,7 @@ pub fn tui_registry() -> PluginTuiRegistry {
     registry.register_factory(Box::new(LoopSurfaceFactory));
     registry.register_factory(Box::new(goal::GoalSurfaceFactory));
     registry.register_factory(Box::new(goal_document_view::Factory));
+    registry.register_factory(Box::new(goal_supervision::Factory));
     registry
 }
 

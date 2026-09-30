@@ -335,6 +335,21 @@ pub fn progress_status(session_id: SessionId) -> InvokeCommandResponse {
     }
 }
 
+pub fn supervision_response(session_id: SessionId) -> InvokeCommandResponse {
+    InvokeCommandResponse {
+        success: true,
+        message: Some("Goal supervision · bounded observation; viewing does not change execution. /goal.status provides a text snapshot.".into()),
+        updated_model: None,
+        updated_provider: None,
+        updated_thinking: None,
+        effects: vec![CommandEffect::OpenPluginSurface {
+            surface_kind: crate::goal_supervision::SURFACE.into(),
+            instance_id: "goal-supervision".into(),
+            options: serde_json::json!({"session_id":session_id}),
+        }],
+    }
+}
+
 pub fn progress_response(session_id: SessionId) -> InvokeCommandResponse {
     InvokeCommandResponse {
         success: true,
