@@ -49,7 +49,17 @@ pub fn observed_check(
     if plan.get("version") != Some(&Value::from(2))
         || result.get("version") != Some(&Value::from(2))
         || result.get("passed") != Some(&Value::Bool(true))
-        || plan.get("cwd").and_then(Value::as_str) != Some(check.workspace.as_str())
+        // The shell owner admits a relative cwd and records its resolved absolute
+        // identity in content_before/after. Comparing the relative plan path to
+        // the reported workspace would reject every production observation.
+        || !plan.get("cwd").and_then(Value::as_str).is_some_and(|cwd| {
+            let path = std::path::Path::new(cwd);
+            !path.is_absolute()
+                && !path.components().any(|component| {
+                    matches!(component, std::path::Component::ParentDir
+                        | std::path::Component::RootDir | std::path::Component::Prefix(_))
+                })
+        })
     {
         return false;
     }
@@ -226,7 +236,7 @@ mod tests {
                         "content_after":observation,"commands":[{"index":0,"status":"exited",
                             "exit_code":0,"signal":null,"accepted_exit_codes":[0],"exit_accepted":true}]}}
             },
-            "admitted_input":{"version":2,"cwd":"/workspace","observe_files":["result.rs"],
+            "admitted_input":{"version":2,"cwd":".","observe_files":["result.rs"],
                 "commands":[{"argv":["cargo","test"],"accepted_exit_codes":[0]}]}
         })).unwrap();
         let check =
@@ -235,6 +245,45 @@ mod tests {
                 "output_id":"check-output","command_index":0,"argv":["cargo","test"]}}))
             .unwrap();
         (evidence, check)
+    }
+
+    #[test]
+    fn relative_execution_directory_uses_shell_resolved_workspace_identity() {
+        let (mut evidence, mut check) = fixture();
+        for cwd in [".", "subdir", ""] {
+            evidence.admitted_input["cwd"] = json!(cwd);
+            assert!(observed_check(
+                &evidence,
+                &check,
+                check.execution.as_ref().unwrap()
+            ));
+        }
+        for cwd in [
+            json!("/workspace"),
+            json!("../escape"),
+            json!("sub/../../escape"),
+            json!(null),
+        ] {
+            evidence.admitted_input["cwd"] = cwd;
+            assert!(!observed_check(
+                &evidence,
+                &check,
+                check.execution.as_ref().unwrap()
+            ));
+        }
+        evidence.admitted_input["cwd"] = json!(".");
+        check.workspace = "/other-workspace".into();
+        assert!(!observed_check(
+            &evidence,
+            &check,
+            check.execution.as_ref().unwrap()
+        ));
+        check.workspace = ".".into();
+        assert!(!observed_check(
+            &evidence,
+            &check,
+            check.execution.as_ref().unwrap()
+        ));
     }
 
     #[test]
