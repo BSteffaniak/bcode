@@ -93,7 +93,11 @@ observation checks the precondition again. This binds verification to selected i
 content (including directory additions), not an arbitrary claim of success. Omitting observations while supplying a precondition fails
 closed. The precondition is part of the prepared command plan identity; omitted
 preconditions preserve existing behavior. It neither locks files against concurrent writers
-nor certifies delivery-time freshness or complete target coverage. Older shell plugins
+nor certifies delivery-time freshness or complete target coverage. The loop evidence
+consumer requires that exact precondition when recognizing a check: equal before/after
+snapshots alone can conceal a batch that changes content, checks it, and restores it.
+This does not detect changes restored within a single command and does not establish
+complete input coverage or delivery-time freshness. Older shell plugins
 reject the new field. Advanced plans may use empty `commands` with nonempty
 `observe_files` for an observation-only execution. This retains the existing exact
 preparation, approval, workspace confinement, and cancellation path; preparation

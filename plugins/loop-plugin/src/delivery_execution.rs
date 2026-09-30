@@ -115,6 +115,10 @@ fn unchanged_observation(plan: &Value, result: &Value, workspace: &str) -> bool 
         return false;
     };
     observation_matches_paths(before, paths)
+        // Matching endpoints alone permit a batch to check changed content and
+        // restore it later. The shell owner's precondition checks each command
+        // boundary and stops on the first mismatch, retaining executed outcomes.
+        && plan.get("expected_content") == Some(before)
         && before.get("workspace").and_then(Value::as_str) == Some(workspace)
         && result.get("content_after") == Some(before)
 }
@@ -237,6 +241,7 @@ mod tests {
                             "exit_code":0,"signal":null,"accepted_exit_codes":[0],"exit_accepted":true}]}}
             },
             "admitted_input":{"version":2,"cwd":".","observe_files":["result.rs"],
+                "expected_content":observation,
                 "commands":[{"argv":["cargo","test"],"accepted_exit_codes":[0]}]}
         })).unwrap();
         let check =
@@ -324,6 +329,7 @@ mod tests {
         let observation = json!({"version":2,"workspace":"/workspace",
             "directories":["empty", "src", "src/nested"],
             "files":[{"path":"src/nested/result.rs","sha256":"a".repeat(64)}]});
+        evidence.admitted_input["expected_content"] = observation.clone();
         evidence.provenance.output.value["content_before"] = observation.clone();
         evidence.provenance.output.value["content_after"] = observation.clone();
         let reference = check.execution.as_ref().unwrap();
@@ -347,6 +353,7 @@ mod tests {
             ),
         ] {
             let mut changed = evidence.clone();
+            changed.admitted_input["expected_content"][field] = value.clone();
             changed.provenance.output.value["content_before"][field] = value.clone();
             changed.provenance.output.value["content_after"][field] = value;
             assert!(!observed_check(&changed, &check, reference), "{field}");
@@ -366,6 +373,25 @@ mod tests {
         evidence.provenance.output.value["content_after"] = observation;
         evidence.provenance.output.value["content_after"]["directories"] =
             json!(["src", "src/nested"]);
+        assert!(!observed_check(&evidence, &check, reference));
+    }
+
+    #[test]
+    fn matching_endpoints_without_an_enforced_precondition_are_not_verification() {
+        let (mut evidence, check) = fixture();
+        let reference = check.execution.as_ref().unwrap();
+        assert!(observed_check(&evidence, &check, reference));
+        evidence
+            .admitted_input
+            .as_object_mut()
+            .unwrap()
+            .remove("expected_content");
+        assert!(!observed_check(&evidence, &check, reference));
+        evidence.admitted_input["expected_content"] = Value::Null;
+        assert!(!observed_check(&evidence, &check, reference));
+        evidence.admitted_input["expected_content"] =
+            evidence.provenance.output.value["content_before"].clone();
+        evidence.admitted_input["expected_content"]["files"][0]["sha256"] = json!("b".repeat(64));
         assert!(!observed_check(&evidence, &check, reference));
     }
 

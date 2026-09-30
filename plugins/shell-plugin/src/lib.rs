@@ -3149,6 +3149,47 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn verification_precondition_stops_change_check_restore_batches() {
+        let workspace = tempfile::tempdir().unwrap();
+        std::fs::write(workspace.path().join("target"), "integrated").unwrap();
+        let commands = [
+            "printf altered > target",
+            "test $(cat target) = altered",
+            "printf integrated > target",
+        ]
+        .map(|script| contracts::ShellWorkflowCommand {
+            argv: vec!["sh".into(), "-c".into(), script.into()],
+            timeout_ms: 5_000,
+            accepted_exit_codes: None,
+            continue_on_unaccepted_exit: true,
+        });
+        let (invocation, mut plan) = workflow_command_plan(workspace.path(), commands.to_vec());
+        plan.observe_files = vec![PathBuf::from("target")];
+        let context = workflow_context(
+            &invocation,
+            bcode_plugin_sdk::ServiceCancellation::default(),
+        );
+        // Historical endpoint-only observations cannot distinguish this batch
+        // from checks performed throughout on the integrated content.
+        let unguarded = execute_workflow_command_plan(&context, &invocation, &plan).unwrap();
+        assert!(unguarded.passed);
+        assert_eq!(unguarded.commands.len(), 3);
+        assert_eq!(unguarded.content_before, unguarded.content_after);
+
+        plan.expected_content = unguarded.content_after;
+        let guarded = execute_workflow_command_plan(&context, &invocation, &plan).unwrap();
+        assert!(!guarded.passed);
+        assert_eq!(guarded.commands.len(), 1);
+        assert_eq!(guarded.commands[0].exit_code, Some(0));
+        assert_ne!(guarded.content_before, guarded.content_after);
+        assert_eq!(
+            std::fs::read_to_string(workspace.path().join("target")).unwrap(),
+            "altered"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn workflow_directory_observation_records_added_files() {
         let workspace = tempfile::tempdir().unwrap();
         std::fs::create_dir(workspace.path().join("src")).unwrap();
