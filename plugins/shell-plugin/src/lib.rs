@@ -338,6 +338,7 @@ fn posix_quote_workflow_word(word: &str) -> String {
 fn workflow_command_analysis(
     input: &serde_json::Value,
     plan: &ShellWorkflowCommandPlan,
+    workspace_root: &std::path::Path,
 ) -> bcode_plugin_sdk::ToolPolicyOperation {
     if plan.commands.is_empty() {
         // Observation-only plans still pass through exact workflow preparation and
@@ -346,7 +347,16 @@ fn workflow_command_analysis(
             paths: plan
                 .observe_files
                 .iter()
-                .map(|path| plan.cwd.join(path).to_string_lossy().into_owned())
+                .map(|path| {
+                    workspace_root
+                        .join(&plan.cwd)
+                        .join(path)
+                        .components()
+                        .filter(|part| !matches!(part, std::path::Component::CurDir))
+                        .collect::<PathBuf>()
+                        .to_string_lossy()
+                        .into_owned()
+                })
                 .collect(),
         };
     }
@@ -409,7 +419,26 @@ fn prepare_workflow_block_contract(request: &ServiceRequest) -> ServiceResponse 
         Ok(plan) => plan,
         Err(error) => return ServiceResponse::error("invalid_preparation", error),
     };
-    let operation = workflow_command_analysis(&request.input, &plan);
+    // Preparation must describe the same confined paths execution will read.
+    // Validate lexically here: preparation must not read the filesystem before policy.
+    if plan.cwd.components().any(|part| {
+        !matches!(
+            part,
+            std::path::Component::Normal(_) | std::path::Component::CurDir
+        )
+    }) || plan.observe_files.iter().any(|path| {
+        path.as_os_str().is_empty()
+            || path
+                .components()
+                .any(|part| !matches!(part, std::path::Component::Normal(_)))
+    }) {
+        return ServiceResponse::error(
+            "invalid_preparation",
+            "observation paths must remain relative to the workflow workspace",
+        );
+    }
+    let operation =
+        workflow_command_analysis(&request.input, &plan, &request.context.workspace_root);
     if matches!(
         &operation,
         bcode_plugin_sdk::ToolPolicyOperation::Command { analysis: None, .. }
@@ -2637,6 +2666,49 @@ mod tests {
     use super::*;
     use std::collections::BTreeMap;
 
+    fn assert_observation_preparation_paths(
+        request: &bcode_workflow::WorkflowBlockPreparationRequest,
+        plan: &ShellWorkflowCommandPlan,
+        workspace: &std::path::Path,
+    ) {
+        // Policy paths must not depend on the daemon's current directory.
+        let mut nested = plan.clone();
+        nested.cwd = PathBuf::from("nested");
+        assert_eq!(
+            workflow_command_analysis(&request.input, &nested, workspace),
+            bcode_plugin_sdk::ToolPolicyOperation::Read {
+                paths: vec![
+                    workspace
+                        .join("nested/result")
+                        .to_string_lossy()
+                        .into_owned()
+                ],
+            }
+        );
+        for (cwd, observed) in [
+            ("../escape", "result"),
+            ("/outside", "result"),
+            (".", "../secret"),
+            (".", "/secret"),
+            (".", ""),
+        ] {
+            let mut invalid = request.clone();
+            let mut invalid_plan = plan.clone();
+            invalid_plan.cwd = PathBuf::from(cwd);
+            invalid_plan.observe_files = vec![PathBuf::from(observed)];
+            invalid.input = serde_json::to_value(invalid_plan).unwrap();
+            assert!(
+                prepare_workflow_block_contract(&ServiceRequest {
+                    interface_id: bcode_workflow::WORKFLOW_BLOCK_INTERFACE_ID.into(),
+                    operation: bcode_workflow::WORKFLOW_BLOCK_PREPARE_OPERATION.into(),
+                    payload: serde_json::to_vec(&invalid).unwrap(),
+                })
+                .error
+                .is_some()
+            );
+        }
+    }
+
     #[test]
     fn observation_only_workflow_requires_preparation_and_reports_current_content() {
         let workspace = tempfile::tempdir().unwrap();
@@ -2665,6 +2737,7 @@ mod tests {
             },
             input: invocation.input.clone(),
         };
+        assert_observation_preparation_paths(&request, &plan, workspace.path());
         let response = prepare_workflow_block_contract(&ServiceRequest {
             interface_id: bcode_workflow::WORKFLOW_BLOCK_INTERFACE_ID.into(),
             operation: bcode_workflow::WORKFLOW_BLOCK_PREPARE_OPERATION.into(),
@@ -2678,7 +2751,13 @@ mod tests {
         assert_eq!(
             policy.operation,
             bcode_plugin_sdk::ToolPolicyOperation::Read {
-                paths: vec!["./result".into()],
+                paths: vec![
+                    workspace
+                        .path()
+                        .join("result")
+                        .to_string_lossy()
+                        .into_owned()
+                ],
             }
         );
         invocation.preparation = Some(preparation);
@@ -3695,7 +3774,11 @@ mod tests {
                     compatibility_aliases: Vec::new(),
                     capabilities: shell_policy_identity().capabilities,
                     permission_category: Some("command".to_string()),
-                    operation: workflow_command_analysis(&prepared_invocation.input, &plan),
+                    operation: workflow_command_analysis(
+                        &prepared_invocation.input,
+                        &plan,
+                        workspace.path(),
+                    ),
                 },
             )
             .expect("facts"),

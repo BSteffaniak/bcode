@@ -11,6 +11,10 @@ pub struct DeliveryReport {
     pub version: ReportVersion,
     #[schemars(length(min = 1, max = 64), inner(length(min = 1, max = 4096)))]
     pub integrated_targets: Vec<String>,
+    /// Optional explicit scope for every named target. Claims only, never freshness evidence.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(length(min = 1, max = 64))]
+    pub content_scope: Option<Vec<DeliveredContent>>,
     #[schemars(length(max = 64), inner(length(min = 1, max = 4096)))]
     pub contribution_output_ids: Vec<String>,
     #[schemars(length(min = 1, max = 64))]
@@ -47,8 +51,58 @@ impl DeliveryReport {
                     || check.outcome != Observation::Passed
                     || check.evidence.trim().is_empty()
             })
+            || self
+                .content_scope
+                .as_ref()
+                .is_some_and(|scope| !self.covers_scope(scope))
             || !self.unresolved_work.is_empty()
     }
+
+    fn covers_scope(&self, scope: &[DeliveredContent]) -> bool {
+        let targets: std::collections::BTreeSet<_> = self.integrated_targets.iter().collect();
+        let declared: std::collections::BTreeSet<_> =
+            scope.iter().map(|item| &item.target).collect();
+        targets.len() == self.integrated_targets.len()
+            && declared.len() == scope.len()
+            && targets == declared
+            && scope.iter().all(|item| {
+                let roots: std::collections::BTreeSet<_> = item.roots.iter().collect();
+                !roots.is_empty()
+                    && roots.len() == item.roots.len()
+                    && std::path::Path::new(&item.workspace).is_absolute()
+                    && item.roots.iter().all(|root| {
+                        let path = std::path::Path::new(root);
+                        !root.is_empty()
+                            && path.components().all(|component| {
+                                matches!(component, std::path::Component::Normal(_))
+                            })
+                            && !root
+                                .split('/')
+                                .any(|part| part.is_empty() || part == "." || part == "..")
+                            && !roots
+                                .iter()
+                                .any(|other| *other != root && path.starts_with(other))
+                    })
+                    && self.checks.iter().any(|check| {
+                        check.workspace == item.workspace
+                            && check.execution.as_ref().is_some_and(|execution| {
+                                execution.content_roots.as_ref() == Some(&item.roots)
+                            })
+                    })
+            })
+    }
+}
+
+/// Explicit delivered target coverage, interpreted only by the loop domain.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct DeliveredContent {
+    #[schemars(length(min = 1, max = 4096))]
+    pub target: String,
+    #[schemars(length(min = 1, max = 4096))]
+    pub workspace: String,
+    #[schemars(length(min = 1, max = 64), inner(length(min = 1, max = 4096)))]
+    pub roots: Vec<String>,
 }
 
 /// Canonical worker claims can disprove delivery, never certify it. Unknown
@@ -150,6 +204,39 @@ pub enum Observation {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn explicit_scope_requires_complete_unambiguous_checked_targets() {
+        let value = json!({
+            "version":"1", "integrated_targets":["result"],
+            "content_scope":[{"target":"result", "workspace":"/repo", "roots":["src"]}],
+            "contribution_output_ids":[],
+            "criteria":[{"criterion":"behavior", "status":"passed", "evidence":"review"}],
+            "checks":[{"command":"test", "workspace":"/repo", "outcome":"passed", "evidence":"receipt",
+                "execution":{"output_id":"check", "command_index":0, "argv":["test"], "content_roots":["src"]}}],
+            "retained_workspaces":[], "unresolved_work":[]
+        });
+        let report: DeliveryReport = serde_json::from_value(value.clone()).unwrap();
+        assert!(!report.precludes_completion()); // Coverage claim, not verification.
+        for (pointer, replacement) in [
+            ("/integrated_targets", json!(["result", "missing"])),
+            ("/integrated_targets", json!(["result", "result"])),
+            ("/content_scope/0/target", json!("other")),
+            ("/content_scope/0/workspace", json!("repo")),
+            ("/content_scope/0/roots", json!(["src", "src/file"])),
+            ("/content_scope/0/roots", json!(["../src"])),
+            ("/content_scope/0/roots", json!(["src/./file"])),
+            ("/content_scope/0/roots", json!(["src", "src"])),
+            ("/checks/0/execution/content_roots", json!(["other"])),
+            ("/checks/0/workspace", json!("/other")),
+            ("/checks/0/execution", json!(null)),
+        ] {
+            let mut invalid = value.clone();
+            *invalid.pointer_mut(pointer).unwrap() = replacement;
+            let report: DeliveryReport = serde_json::from_value(invalid).unwrap();
+            assert!(report.precludes_completion(), "{pointer}");
+        }
+    }
 
     #[test]
     fn canonical_contribution_blockers_cannot_be_hidden_by_delivery_claims() {

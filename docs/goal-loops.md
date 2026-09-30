@@ -78,6 +78,12 @@ criterion coverage and freshness of checks remain unverified by this safeguard.
 Consequently new affirmative evaluations carrying a
 V1 delivery report are withheld with an explicit target-bound-verification blocker, even
 when references authenticate, checks claim success, or judgement fallback is configured.
+Reports may additionally declare `content_scope`: one `{target, workspace, roots}`
+entry for every `integrated_targets` label. The loop rejects duplicate/missing targets,
+relative workspaces, overlapping or non-normalized roots, and scopes without an exact
+workspace/root match in a check execution reference. This is an explicit coverage claim,
+not proof that the chosen scope includes every relevant input, or a freshness certificate.
+Historical reports omit it; positive delivery remains withheld in either case.
 Check execution references may additionally declare `content_roots` (1–64 relative
 paths). When supplied, these must exactly match the canonical admitted shell plan's
 `observe_files`, including order; omitted roots preserve historical reports. This
@@ -101,7 +107,9 @@ complete input coverage or delivery-time freshness. Older shell plugins
 reject the new field. Advanced plans may use empty `commands` with nonempty
 `observe_files` for an observation-only execution. This retains the existing exact
 preparation, approval, workspace confinement, and cancellation path; preparation
-exposes read-path policy facts rather than an empty shell command. No process is
+exposes absolute workspace-bound read-path policy facts rather than an empty shell
+command. Traversing or absolute observation paths are rejected during preparation,
+before policy or filesystem access. No process is
 spawned, and successful output requires equal before/after observations. Empty
 commands without observation scopes remain invalid. Older shell plugins reject
 empty commands. This gives callers an authorized current observation at that
