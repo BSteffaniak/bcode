@@ -251,14 +251,14 @@ fn install_corrective_script(
     // file effect. Recovery must retain that failure, inspect the artifact and correct it.
     group["tasks"][1]["output"] = serde_json::to_value(&failed_output).unwrap();
 
-    let reference = |pointer: &str| serde_json::json!({"$fake_result":{"index":0,"pointer":pointer.trim_start_matches("/delegation/arguments")}});
+    let reference =
+        |pointer: &str| serde_json::json!({"$fake_result":{"index":0,"pointer":pointer}});
 
     let fix = serde_json::json!({"path":workspace.join("right.sh"),"contents":RIGHT_MODULE});
     let correction = serde_json::json!({
-        "version":2,"generated_ids":true,"mutation_id":"goal-correction",
-        "run_id":reference("/delegation/arguments/run_id"),"expected_revision":reference("/delegation/arguments/expected_revision"),
-        "source_node_id":reference("/delegation/arguments/source_node_id"),"bind_source_activation":reference("/delegation/arguments/bind_source_activation"),
-        "input":reference("/delegation/arguments/input"),"preserve_source_output":true,
+        "mutation_id":"goal-correction",
+        "run_id":reference("/run_id"),"expected_revision":reference("/graph/revision"),
+        "bind_source_activation":reference("/activation_id"),
         "tasks":[{"task_id":"repair-right","objective":format!("Fix contribution.\ntool-call filesystem.write {fix}\nstructured-result {}", snapshot_contribution_result(workspace, "right", snapshot)),
             "agent_profile":"build","read_only":false,"tool_allowlist":["filesystem.write"],
             "resources":[{"resource":"contribution:right","access":"write"}],
@@ -267,10 +267,7 @@ fn install_corrective_script(
             "agent_profile":"build","read_only":false,"tool_allowlist":["shell.run"],
             "resources":[{"resource":"integration","access":"write"}],
             "model_selection":{"provider":"bcode.fake-provider","model":"fake-echo"}},
-        "first_edge_id":reference("/delegation/arguments/first_edge_id"),
-        "reconnect":reference("/delegation/arguments/reconnect"),
-        "retain_source_edge_ids":reference("/delegation/arguments/retain_source_edge_ids"),
-        "reconciliation":reference("/delegation/arguments/reconciliation")
+        "reconciliation":[]
     });
     let broken =
         serde_json::json!({"path":workspace.join("right.sh"),"contents":BROKEN_RIGHT_MODULE});
@@ -288,11 +285,11 @@ fn install_corrective_script(
     group["continuation"]["tool_allowlist"] = serde_json::json!([
         "shell.run",
         "workflow.execution_context",
-        "workflow.stage_task_group",
+        "workflow.stage_delegation",
         "workflow.publish_run_graph_edit"
     ]);
     group["continuation"]["objective"] = serde_json::json!(format!(
-        "Check contributions and correct failure.\ntool-call-expect-error expected total 27, got 28 :: shell.run {probe}\ntool-call workflow.execution_context {{\"delegation_part\":\"serialized\",\"$fake_json_pages\":{{\"chunk\":\"/delegation/chunk\",\"next\":\"/delegation/next_arguments\"}}}}\ntool-call workflow.stage_task_group {correction}\ntool-call workflow.publish_run_graph_edit {publication}"
+        "Check contributions and correct failure.\ntool-call-expect-error expected total 27, got 28 :: shell.run {probe}\ntool-call workflow.execution_context {{\"compact\":true,\"limit\":1}}\ntool-call workflow.stage_delegation {correction}\ntool-call workflow.publish_run_graph_edit {publication}"
     ));
 }
 
@@ -1292,7 +1289,17 @@ async fn exhausted_goal_resumes_after_idempotent_ipc_allowance_grant() {
         }
     })
     .await
-    .expect("renewed goal must settle correction and the conservative delivery decision");
+    .unwrap_or_else(|error| {
+        let attempts = state
+            .workflow_store
+            .lock()
+            .unwrap()
+            .attempt_history(&run_id, None, 100)
+            .unwrap();
+        panic!(
+            "renewed goal must settle correction and the conservative delivery decision: {error}; attempts: {attempts:?}"
+        );
+    });
     let attempts = state
         .workflow_store
         .lock()
