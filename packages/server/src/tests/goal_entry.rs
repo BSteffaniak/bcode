@@ -3,6 +3,7 @@ use super::*;
 use bcode_plugin_sdk::tui::*;
 
 mod isolated_recovery;
+mod repository_delivery;
 mod snapshot_delivery;
 
 // These production-driver fixtures each run several real plugin sessions and
@@ -91,7 +92,13 @@ impl PluginTuiHost for GoalEntryHost {
         if let Some(trees) = &self.isolated_workspace {
             isolated_recovery::install_script(&mut request, &self.workspace, trees);
         } else {
-            install_goal_script(&mut request, &self.workspace, self.snapshot_case.is_some());
+            install_goal_script(
+                &mut request,
+                &self.workspace,
+                self.snapshot_case.is_some(),
+                self.snapshot_case
+                    .and_then(snapshot_delivery::Case::repository),
+            );
         }
         if let Some(case) = self.snapshot_case {
             snapshot_delivery::install(&mut request, &self.workspace, case);
@@ -173,7 +180,12 @@ fn snapshot_contribution_result(workspace: &Path, id: &str, snapshot: bool) -> s
     result
 }
 
-fn install_goal_script(request: &mut PluginWorkflowStartRequest, workspace: &Path, snapshot: bool) {
+fn install_goal_script(
+    request: &mut PluginWorkflowStartRequest,
+    workspace: &Path,
+    snapshot: bool,
+    repository: Option<repository_delivery::Case>,
+) {
     let reference =
         |pointer: &str| serde_json::json!({"$fake_result":{"index":0,"pointer":pointer}});
     let task = |id: &str| {
@@ -199,7 +211,26 @@ fn install_goal_script(request: &mut PluginWorkflowStartRequest, workspace: &Pat
         "continuation":{"objective":format!("Integrate the actual contributions and verify the combined result.\ntool-call shell.run {integrate}"), "agent_profile":"build", "read_only":false, "tool_allowlist":["shell.run"], "resources":[{"resource":"integration","access":"write"}], "model_selection":{"provider":"bcode.fake-provider","model":"fake-echo"}},
         "reconciliation":[]
     });
-    install_corrective_script(&mut group, workspace, &integrate, snapshot);
+    if repository.is_some() {
+        let mut historical = snapshot_contribution_result(workspace, "left", true);
+        historical["blockers"] = serde_json::json!([
+            "Combined repository not checked",
+            "Immutable delivery not retained"
+        ]);
+        group["tasks"][0]["objective"] = serde_json::json!(format!(
+            "Implement left.\ntool-call filesystem.write {}\nstructured-result {historical}",
+            serde_json::json!({"path":workspace.join("left.sh"),"contents":LEFT_MODULE})
+        ));
+    }
+    install_corrective_script(
+        &mut group,
+        workspace,
+        &integrate,
+        snapshot,
+        repository.map(|case| {
+            repository_delivery::handoff(workspace, &request.input["stop_condition"], case)
+        }),
+    );
     let publication =
         serde_json::json!({"$fake_result":{"index":0,"pointer":"/publication_arguments"}});
     let source = request
@@ -242,6 +273,7 @@ fn install_corrective_script(
     workspace: &Path,
     integrate: &serde_json::Value,
     snapshot: bool,
+    repository_handoff: Option<String>,
 ) {
     let failed_output = bcode_workflow::ValueSchema {
         type_name: "receipt".into(),
@@ -263,8 +295,8 @@ fn install_corrective_script(
             "agent_profile":"build","read_only":false,"tool_allowlist":["filesystem.write"],
             "resources":[{"resource":"contribution:right","access":"write"}],
             "model_selection":{"provider":"bcode.fake-provider","model":"fake-echo"}}],
-        "continuation":{"objective":format!("verify\ntool-call shell.run {integrate}"),
-            "agent_profile":"build","read_only":false,"tool_allowlist":["shell.run"],
+        "continuation":{"objective":format!("verify\ntool-call shell.run {integrate}{}", repository_handoff.unwrap_or_default()),
+            "agent_profile":"build","read_only":false,"tool_allowlist":["shell.run","workflow.execution_context","loop.stage_repository_verification","workflow.publish_run_graph_edit"],
             "resources":[{"resource":"integration","access":"write"}],
             "model_selection":{"provider":"bcode.fake-provider","model":"fake-echo"}},
         "reconciliation":[]
@@ -286,6 +318,7 @@ fn install_corrective_script(
         "shell.run",
         "workflow.execution_context",
         "workflow.stage_delegation",
+        "loop.stage_repository_verification",
         "workflow.publish_run_graph_edit"
     ]);
     group["continuation"]["objective"] = serde_json::json!(format!(
@@ -446,14 +479,15 @@ fn configure_goal_execution(server: &mut ServerState, root: &Path) {
         &server.startup_config,
         &server.default_plugin_ids,
     );
-    server.startup_config.workflows.run_edit_plugins = BTreeSet::from(["bcode.workflow".into()]);
+    server.startup_config.workflows.run_edit_plugins =
+        BTreeSet::from(["bcode.workflow".into(), "bcode.loop".into()]);
     server.startup_config.workflows.run_publication_plugins =
         BTreeSet::from(["bcode.workflow".into()]);
     server.set_workflow_run_graph_edit_policy(WorkflowRunGraphEditPolicy {
         evaluator: Arc::new(|facts| {
             workflow_operations::authorize_configured_run_graph_edit(
                 facts,
-                &BTreeSet::from(["bcode.workflow".to_owned()]),
+                &BTreeSet::from(["bcode.workflow".to_owned(), "bcode.loop".to_owned()]),
             )
         }),
     });

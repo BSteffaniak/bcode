@@ -529,8 +529,18 @@ fn authenticate_output(
     serde_json::from_value::<bcode_workflow::WorkflowOutputProvenance>(payload).is_ok_and(
         |provenance| {
             valid_contribution_identity(&provenance, output_id)
-                && (!delivery::contribution_precludes_completion(&provenance.output)
-                    || report.resolves(&provenance.output))
+                && if report
+                    .resolutions
+                    .iter()
+                    .any(|resolution| resolution.output_id == output_id)
+                {
+                    // Explicit resolution claims must authenticate even when this
+                    // output has no recognized negative items. Otherwise a stale,
+                    // duplicate or custom-schema claim silently bypasses validation.
+                    report.resolves(&provenance.output)
+                } else {
+                    !delivery::contribution_precludes_completion(&provenance.output)
+                }
         },
     )
 }
@@ -877,6 +887,36 @@ mod tests {
         }
         0
     }
+    #[test]
+    fn explicit_resolution_cannot_hide_behind_unrecognized_contribution_schema() {
+        let bridge = ServiceBridge::new(
+            Some(authenticate_assertion),
+            std::ptr::null_mut(),
+            bcode_plugin_sdk::ServiceCancellation::default(),
+        );
+        let mut report: delivery::DeliveryReport = serde_json::from_value(serde_json::json!({
+            "version":"3", "integrated_targets":["retained-export"],
+            "contribution_output_ids":["same-run:unrelated-output"],
+            "criteria":[], "checks":[], "unresolved_work":[], "retained_workspaces":[]
+        }))
+        .unwrap();
+        // Custom output contracts remain authorable; absence of recognized negative
+        // evidence is not a certificate, but does not itself reject provenance.
+        assert!(authenticate_contributions(&bridge, "dispatch", &report));
+        for checksum in ["a".repeat(64), "b".repeat(64)] {
+            report.resolutions = vec![delivery::ContributionResolution {
+                output_id: "same-run:unrelated-output".into(),
+                checksum_sha256: checksum,
+                item_paths: vec!["/blockers/0".into()],
+                evidence: "Claimed historical resolution".into(),
+                check_indices: vec![0],
+            }];
+            assert!(!authenticate_contributions(&bridge, "dispatch", &report));
+            report.resolutions.push(report.resolutions[0].clone());
+            assert!(!authenticate_contributions(&bridge, "dispatch", &report));
+        }
+    }
+
     #[test]
     fn authenticated_assertions_do_not_certify_delivery_or_dispatch_judgement() {
         for judgement in ["", "bcode.jev/jev-1.13.0/-/90/agent_fallback"] {

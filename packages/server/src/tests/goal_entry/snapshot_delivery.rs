@@ -7,9 +7,24 @@ pub(super) enum Case {
     Stale,
     Failed,
     Incomplete,
+    Repository(super::repository_delivery::Case),
+}
+
+impl Case {
+    pub(super) const fn repository(self) -> Option<super::repository_delivery::Case> {
+        if let Self::Repository(case) = self {
+            Some(case)
+        } else {
+            None
+        }
+    }
 }
 
 pub(super) fn install(request: &mut PluginWorkflowStartRequest, workspace: &Path, case: Case) {
+    if let Case::Repository(case) = case {
+        super::repository_delivery::install(request, workspace, case);
+        return;
+    }
     let manifest: serde_json::Value = toml::from_str(include_str!(
         "../../../../../plugins/shell-plugin/bcode-plugin.toml"
     ))
@@ -102,7 +117,7 @@ async fn approve_snapshot_execution(state: &Arc<ServerState>, run_id: &str) {
     }
 }
 
-async fn exercise(case: Case) {
+pub(super) async fn exercise(case: Case) {
     let _execution = GOAL_ENTRY_EXECUTION.lock().await;
     let root = tempfile::tempdir().unwrap();
     let sessions = publication_fixture_sessions(root.path(), true);
@@ -143,6 +158,24 @@ async fn exercise(case: Case) {
                 .iter()
                 .find(|attempt| attempt.status == "failed" && attempt.node_id != "right")
             {
+                let links = state
+                    .workflow_store
+                    .lock()
+                    .unwrap()
+                    .execution_session_links_for_run(&run_id, 100)
+                    .unwrap();
+                for link in links {
+                    if link.node_id.ends_with("integrate") {
+                        eprintln!(
+                            "HISTORY {} {:?}",
+                            link.node_id,
+                            state
+                                .sessions
+                                .session_history(link.session_id.parse().unwrap())
+                                .await
+                        );
+                    }
+                }
                 panic!(
                     "unexpected failure {failed:?}; events {:?}",
                     state
@@ -157,7 +190,10 @@ async fn exercise(case: Case) {
                 .iter()
                 .find(|output| output.node_id == "loop.judgement.evaluate")
             {
-                let complete = matches!(case, Case::Complete);
+                let complete = matches!(
+                    case,
+                    Case::Complete | Case::Repository(super::repository_delivery::Case::Complete)
+                );
                 assert_eq!(
                     judgement.value["condition_met"], complete,
                     "{case:?}: {:?}",
@@ -190,7 +226,34 @@ async fn exercise(case: Case) {
         }
     })
     .await;
-    outcome.unwrap_or_else(|error| panic!("{case:?}: {error}"));
+    if outcome.is_err() {
+        let links = state
+            .workflow_store
+            .lock()
+            .unwrap()
+            .execution_session_links_for_run(&run_id, 100)
+            .unwrap();
+        for link in links {
+            if link.node_id.ends_with("integrate") {
+                eprintln!(
+                    "HISTORY {} {:?}",
+                    link.node_id,
+                    state
+                        .sessions
+                        .session_history(link.session_id.parse().unwrap())
+                        .await
+                );
+            }
+        }
+    }
+    outcome.unwrap_or_else(|error| {
+        let store = state.workflow_store.lock().unwrap();
+        panic!(
+            "{case:?}: {error}; attempts {:?}; events {:?}",
+            store.attempt_history(&run_id, None, 100).unwrap(),
+            store.event_history(&run_id, None, 100).unwrap()
+        );
+    });
     drop(state);
 }
 

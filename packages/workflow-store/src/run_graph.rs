@@ -2686,6 +2686,22 @@ fn validate_retained_bindings(
                     "binding target is missing from candidate".to_string(),
                 )
             })?;
+            // A constant plan does not reinterpret the retained result. Its declared
+            // target and literal value can be checked independently of source data.
+            if edge.from == source_id
+                && target.kind != bcode_workflow::NodeKind::Parallel
+                && let Some(transform) = &edge.transform
+                && transform.version == bcode_workflow::WORKFLOW_TRANSFORM_VERSION
+                && transform.output == target.input
+                && let bcode_workflow::WorkflowTransformExpression::Constant { value } =
+                    &transform.expression
+            {
+                target
+                    .input
+                    .validate_value("retained constant binding", value)
+                    .map_err(|error| WorkflowStoreError::InvalidData(error.to_string()))?;
+                continue;
+            }
             // Exact schema equality is a conservative proof. Transform-aware compatibility
             // requires a separate proof and must not be inferred from a node identity.
             let target_schema = if target.kind == bcode_workflow::NodeKind::Parallel {

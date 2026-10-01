@@ -174,8 +174,11 @@ impl DeliveryReport {
             && output.schema_version == 1
             && matching.len() == 1
             && matching.iter().all(|resolution| {
+                let declared: std::collections::BTreeSet<_> =
+                    resolution.item_paths.iter().collect();
                 resolution.checksum_sha256 == output.checksum_sha256
-                    && resolution.item_paths == items
+                    && declared.len() == resolution.item_paths.len()
+                    && declared == items.iter().collect()
                     && !resolution.evidence.trim().is_empty()
                     && !resolution.check_indices.is_empty()
                     && resolution.check_indices.iter().all(|index| {
@@ -576,6 +579,15 @@ mod tests {
         });
         let report: DeliveryReport = serde_json::from_value(value.clone()).unwrap();
         assert!(report.resolves(&output));
+        let mut reordered = report.clone();
+        reordered.resolutions[0].item_paths.reverse();
+        assert!(reordered.resolves(&output));
+        reordered.resolutions[0]
+            .item_paths
+            .push("/blockers/0".into());
+        assert!(!reordered.resolves(&output));
+        reordered.resolutions[0].item_paths = vec!["/blockers/0".into(); 2];
+        assert!(!reordered.resolves(&output));
         assert!(contribution_precludes_completion(&output)); // History is never rewritten.
         for retention in [json!("future"), json!(null), json!(true), json!({})] {
             let mut history = output.clone();

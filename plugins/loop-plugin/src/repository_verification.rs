@@ -381,7 +381,7 @@ fn invoke_staging(context: &NativeServiceContext) -> ServiceResponse {
         let receipt: workflow::WorkflowRunGraphStageResponse = serde_json::from_value(receipt)
             .map_err(|_| "staging outcome unknown; inspect retained candidate".to_owned())?;
         Ok(
-            json!({"receipt":receipt,"candidate":workflow::WorkflowRunGraphCandidateReference::from_edit(&edit).map_err(|e| e.to_string())?,"instructions":"Staged only. Separately authorize workflow.publish_run_graph_edit with this exact candidate, then finish this activation to release the retained source. Checks require normal shell authorization."}),
+            json!({"receipt":receipt,"candidate":workflow::WorkflowRunGraphCandidateReference::from_edit(&edit).map_err(|e| e.to_string())?,"publication_arguments":{"edit_json":json!({"candidate":workflow::WorkflowRunGraphCandidateReference::from_edit(&edit).map_err(|e| e.to_string())?}).to_string()},"instructions":"Staged only. Separately authorize workflow.publish_run_graph_edit with this exact candidate, then finish this activation to release the retained source. Checks require normal shell authorization."}),
         )
     })();
     match result {
@@ -469,6 +469,8 @@ fn report_configuration(
             correction: workflow::WorkflowStructuredResultCorrectionPolicy::default(),
         },
     };
+    // A collector must not widen its delegating source's interaction authority.
+    config.allow_user_questions = false;
     config.execution_target = workflow::PromptContextTarget::FreshIsolated;
     config
 }
