@@ -7,7 +7,7 @@ pub(super) enum Case {
     MissingChecksum,
     WrongChecksum,
     IncompleteItems,
-    ReorderedItems,
+    DuplicateItems,
     MissingCheck,
     WrongArgv,
     WrongTarget,
@@ -66,7 +66,7 @@ pub(super) fn handoff(workspace: &Path, condition: &serde_json::Value, case: Cas
         "contribution_output_ids":[reference(0,"/output/output_id")],
         "resolutions":[{"output_id":reference(0,"/output/output_id"),"checksum_sha256":reference(0,"/output/checksum_sha256"),"item_paths":["/blockers/0","/blockers/1"],"evidence":"Reviewed historical blockers against retained combined repository check","check_indices":[0]}],
         "criteria":[{"criterion":condition,"status":"passed","basis":"observed_check","check_indices":[0],"evidence":"Combined exported fixture passed"}],
-        "checks":[{"command":COMBINED_CHECK,"workspace":workspace,"outcome":"passed","evidence":"Canonical direct shell check","output_id":reference(1,"/output/output_id"),"command_index":0,"argv":argv}],
+        "checks":[{"command":COMBINED_CHECK,"workspace":workspace,"outcome":"passed","evidence":"Canonical direct shell check","execution":{"output_id":reference(1,"/output/output_id"),"command_index":0,"argv":argv}}],
         "unresolved_work":[],"retained_workspaces":[workspace]
     });
     match case {
@@ -83,16 +83,16 @@ pub(super) fn handoff(workspace: &Path, condition: &serde_json::Value, case: Cas
         Case::IncompleteItems => {
             report["resolutions"][0]["item_paths"] = serde_json::json!(["/blockers/0"]);
         }
-        Case::ReorderedItems => {
+        Case::DuplicateItems => {
             report["resolutions"][0]["item_paths"] =
-                serde_json::json!(["/blockers/1", "/blockers/0"]);
+                serde_json::json!(["/blockers/0", "/blockers/0"]);
         }
         Case::MissingCheck => report["checks"] = serde_json::json!([]),
-        Case::WrongArgv => report["checks"][0]["argv"] = serde_json::json!(["true"]),
+        Case::WrongArgv => report["checks"][0]["execution"]["argv"] = serde_json::json!(["true"]),
         Case::WrongTarget => report["integrated_targets"] = serde_json::json!(["unrelated-export"]),
     }
     let objective = format!(
-        "tool-call workflow.execution_context {{\"outputs_only\":true,\"limit\":100}}\ntool-call workflow.execution_context {}\ntool-call workflow.execution_context {}\nstructured-result {report}",
+        "tool-call workflow.execution_context {{\"outputs_only\":true,\"limit\":3,\"$fake_json_pages\":{{\"items\":\"/outputs\",\"next\":\"/next_page_arguments\"}}}}\ntool-call workflow.execution_context {}\ntool-call workflow.execution_context {}\nstructured-result {report}",
         inspect(0, "repository-regression.repository"),
         inspect(1, "left")
     );
@@ -115,7 +115,7 @@ pub(super) fn install(request: &mut PluginWorkflowStartRequest, workspace: &Path
         .to_owned();
     let read = serde_json::json!({"path":workspace.join("integrated.sh"),"offset":1,"limit":100});
     evaluation.configuration["system_prompt"] = serde_json::json!(format!(
-        "{instructions}\ntool-call workflow.execution_context {{\"outputs_only\":true,\"limit\":100}}\ntool-call workflow.execution_context {inspect}\ntool-call filesystem.read {read}\nloop-delivery {}",
+        "{instructions}\ntool-call workflow.execution_context {{\"outputs_only\":true,\"limit\":3,\"$fake_json_pages\":{{\"items\":\"/outputs\",\"next\":\"/next_page_arguments\"}}}}\ntool-call workflow.execution_context {inspect}\ntool-call filesystem.read {read}\nloop-delivery {}",
         reference(1, "/output/value")
     ));
 }
@@ -131,7 +131,7 @@ async fn repository_handoff_rejects_unauthenticated_or_incomplete_evidence() {
         Case::MissingChecksum,
         Case::WrongChecksum,
         Case::IncompleteItems,
-        Case::ReorderedItems,
+        Case::DuplicateItems,
         Case::MissingCheck,
         Case::WrongArgv,
         Case::WrongTarget,

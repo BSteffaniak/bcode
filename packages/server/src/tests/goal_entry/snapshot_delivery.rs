@@ -158,33 +158,25 @@ pub(super) async fn exercise(case: Case) {
                 .iter()
                 .find(|attempt| attempt.status == "failed" && attempt.node_id != "right")
             {
-                let links = state
-                    .workflow_store
-                    .lock()
-                    .unwrap()
-                    .execution_session_links_for_run(&run_id, 100)
-                    .unwrap();
-                for link in links {
-                    if link.node_id.ends_with("integrate") {
-                        eprintln!(
-                            "HISTORY {} {:?}",
-                            link.node_id,
-                            state
-                                .sessions
-                                .session_history(link.session_id.parse().unwrap())
-                                .await
-                        );
-                    }
+                if matches!(
+                    case,
+                    Case::Repository(super::repository_delivery::Case::MissingChecksum)
+                ) && failed.node_id == "repository-regression.report"
+                {
+                    assert!(
+                        !outputs
+                            .iter()
+                            .any(|output| output.node_id == "repository-regression.report")
+                    );
+                    assert!(
+                        !outputs
+                            .iter()
+                            .any(|output| output.node_id == "loop.judgement.evaluate"
+                                && output.value["condition_met"] == true)
+                    );
+                    break;
                 }
-                panic!(
-                    "unexpected failure {failed:?}; events {:?}",
-                    state
-                        .workflow_store
-                        .lock()
-                        .unwrap()
-                        .event_history(&run_id, None, 100)
-                        .unwrap()
-                );
+                panic!("{case:?}: unexpected failed attempt: {failed:?}");
             }
             if let Some(judgement) = outputs
                 .iter()
@@ -192,7 +184,11 @@ pub(super) async fn exercise(case: Case) {
             {
                 let complete = matches!(
                     case,
-                    Case::Complete | Case::Repository(super::repository_delivery::Case::Complete)
+                    Case::Complete
+                        | Case::Repository(
+                            super::repository_delivery::Case::Complete
+                                | super::repository_delivery::Case::ReorderedItems
+                        )
                 );
                 assert_eq!(
                     judgement.value["condition_met"], complete,
@@ -226,33 +222,14 @@ pub(super) async fn exercise(case: Case) {
         }
     })
     .await;
-    if outcome.is_err() {
-        let links = state
-            .workflow_store
-            .lock()
-            .unwrap()
-            .execution_session_links_for_run(&run_id, 100)
-            .unwrap();
-        for link in links {
-            if link.node_id.ends_with("integrate") {
-                eprintln!(
-                    "HISTORY {} {:?}",
-                    link.node_id,
-                    state
-                        .sessions
-                        .session_history(link.session_id.parse().unwrap())
-                        .await
-                );
-            }
-        }
-    }
     outcome.unwrap_or_else(|error| {
         let store = state.workflow_store.lock().unwrap();
-        panic!(
-            "{case:?}: {error}; attempts {:?}; events {:?}",
-            store.attempt_history(&run_id, None, 100).unwrap(),
-            store.event_history(&run_id, None, 100).unwrap()
-        );
+        let attempts = store.attempt_history(&run_id, None, 100).unwrap();
+        let statuses: Vec<_> = attempts
+            .iter()
+            .map(|attempt| (&attempt.node_id, &attempt.status))
+            .collect();
+        panic!("{case:?}: {error}; attempt statuses {statuses:?}");
     });
     drop(state);
 }

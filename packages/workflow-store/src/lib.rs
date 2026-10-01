@@ -6541,35 +6541,25 @@ impl WorkflowStore {
         validate_mutation_approval(approval)?;
         let scope_json = bounded_json("workflow mutation approval scope", &approval.scope)?;
         let transaction = self.connection.transaction()?;
-        let (
-            status,
-            definition_id,
-            definition_version,
-            workspace_snapshot,
-            input_json,
-            definition_json,
-        ) = transaction.query_row(
-            "SELECT activation.status, run.definition_id, run.definition_version, \
-                 run.workspace_snapshot, activation.input_json, definition.definition_json \
+        let (status, definition_id, definition_version, workspace_snapshot, input_json) =
+            transaction.query_row(
+                "SELECT activation.status, run.definition_id, run.definition_version, \
+                 run.workspace_snapshot, activation.input_json \
                  FROM workflow_activations activation \
                  JOIN workflow_runs run ON run.run_id = activation.run_id \
-                 JOIN workflow_definitions definition \
-                   ON definition.definition_id = run.definition_id \
-                  AND definition.version = run.definition_version \
                  WHERE activation.run_id = ?1 AND activation.node_id = ?2 \
                    AND activation.activation_id = ?3",
-            (&approval.run_id, &approval.node_id, &approval.activation_id),
-            |row| {
-                Ok((
-                    row.get::<_, String>(0)?,
-                    row.get::<_, String>(1)?,
-                    row.get::<_, u32>(2)?,
-                    row.get::<_, String>(3)?,
-                    row.get::<_, Option<String>>(4)?,
-                    row.get::<_, String>(5)?,
-                ))
-            },
-        )?;
+                (&approval.run_id, &approval.node_id, &approval.activation_id),
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, u32>(2)?,
+                        row.get::<_, String>(3)?,
+                        row.get::<_, Option<String>>(4)?,
+                    ))
+                },
+            )?;
         if !matches!(status.as_str(), "pending" | "waiting_mutation_approval")
             || definition_id != approval.scope.definition_id
             || definition_version != approval.scope.definition_version
@@ -6579,11 +6569,7 @@ impl WorkflowStore {
                 "mutation approval does not match dispatchable activation identity".to_string(),
             ));
         }
-        validate_mutation_approval_input_checksum(
-            approval,
-            input_json.as_deref(),
-            &definition_json,
-        )?;
+        validate_mutation_approval_input_checksum(approval, input_json.as_deref(), &transaction)?;
         let changed = transaction.execute(
             "INSERT OR IGNORE INTO workflow_mutation_approvals \
              (approval_id, run_id, node_id, activation_id, scope_json, status, requested_at_ms, expires_at_ms) \
@@ -6703,16 +6689,12 @@ impl WorkflowStore {
                  approval.scope_json, approval.status, approval.requested_at_ms, \
                  approval.expires_at_ms, approval.grant_id, activation.status, \
                  activation.input_json, run.definition_id, run.definition_version, \
-                 run.workspace_snapshot, run.status, run.cancellation_requested_at_ms, \
-                 definition.definition_json \
+                 run.workspace_snapshot, run.status, run.cancellation_requested_at_ms \
                  FROM workflow_mutation_approvals approval \
                  JOIN workflow_activations activation ON activation.run_id = approval.run_id \
                    AND activation.node_id = approval.node_id \
                    AND activation.activation_id = approval.activation_id \
                  JOIN workflow_runs run ON run.run_id = approval.run_id \
-                 JOIN workflow_definitions definition \
-                   ON definition.definition_id = run.definition_id \
-                  AND definition.version = run.definition_version \
                  WHERE approval.approval_id = ?1",
                 [approval_id],
                 |row| {
@@ -6732,7 +6714,6 @@ impl WorkflowStore {
                         row.get::<_, String>(12)?,
                         row.get::<_, String>(13)?,
                         row.get::<_, Option<u64>>(14)?,
-                        row.get::<_, String>(15)?,
                     ))
                 },
             )
@@ -6758,7 +6739,6 @@ impl WorkflowStore {
             workspace_snapshot,
             run_status,
             cancellation_requested_at_ms,
-            definition_json,
         ) = row;
         let stored_authority = transaction.query_row(
             "SELECT target_artifact_id, coordinator_daemon_instance_id, coordinator_generation, coordinator_fencing_token FROM workflow_runs WHERE run_id = ?1",
@@ -6851,7 +6831,7 @@ impl WorkflowStore {
                 expires_at_ms,
             },
             input_json.as_deref(),
-            &definition_json,
+            &transaction,
         )?;
         if scope.definition_id != definition_id
             || scope.definition_version != definition_version
@@ -17518,13 +17498,18 @@ fn validate_repair_resolution(resolution: &RepairResolution) -> Result<(), Workf
 fn validate_mutation_approval_input_checksum(
     approval: &WorkflowMutationApproval,
     input_json: Option<&str>,
-    definition_json: &str,
+    connection: &Connection,
 ) -> Result<(), WorkflowStoreError> {
     let input: serde_json::Value = serde_json::from_str(input_json.unwrap_or("null"))?;
-    let definition: WorkflowDefinition = serde_json::from_str(definition_json)?;
-    let node = definition.node(&approval.node_id).ok_or_else(|| {
+    let node = run_graph::bound_activation_node(
+        connection,
+        &approval.run_id,
+        &approval.node_id,
+        &approval.activation_id,
+    )?
+    .ok_or_else(|| {
         WorkflowStoreError::InvalidData(
-            "mutation approval references a missing workflow node".to_string(),
+            "mutation approval references a missing activation graph binding".to_string(),
         )
     })?;
     let owner_input = if node.dataflow == WorkflowNodeDataflowPolicy::StateEnvelopeV1 {

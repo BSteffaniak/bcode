@@ -31920,6 +31920,7 @@ fn observe_workflow_plugin_receipt(
                 },
             })
         }
+        "unknown" => Ok(bcode_workflow_store::AttemptObservation::Unknown),
         "failed" => Ok(bcode_workflow_store::AttemptObservation::Failed {
             message: request
                 .receipt
@@ -33176,8 +33177,10 @@ async fn dispatch_workflow_plugin_block(
             )),
             RuntimeWorkStatus::Failed,
         ),
+        // Losing the response cannot prove that an admitted operation had no effects.
+        // Preserve ambiguity for explicit repair rather than enabling ordinary failure retry.
         Ok(Err(error)) => (
-            "failed",
+            "unknown",
             None,
             Some(error.to_string()),
             RuntimeWorkStatus::Failed,
@@ -33185,7 +33188,7 @@ async fn dispatch_workflow_plugin_block(
         Err(_) => {
             invocation.cancel.cancel();
             (
-                "failed",
+                "unknown",
                 None,
                 Some(format!(
                     "workflow plugin block timed out after {} ms",
@@ -73809,7 +73812,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
 
     #[tokio::test]
     #[allow(clippy::too_many_lines)]
-    async fn workflow_plugin_block_timeout_cancels_owner_and_persists_failure() {
+    async fn workflow_plugin_block_timeout_preserves_unproven_outcome_for_repair() {
         let sessions = SessionManager::default();
         let parent = sessions
             .create_session(Some("parent".to_string()), PathBuf::from("."))
@@ -73962,7 +73965,25 @@ event_symbol = "bcode_plugin_handle_event_v1"
             .expect("attempt")
             .pop()
             .expect("row");
-        assert_eq!(attempt.status, "failed");
+        assert_eq!(attempt.status, "repair_required");
+        let retry = bcode_workflow::WorkflowRunApplication::retry_workflow_node(
+            &workflow_operations::WorkflowAuthoringApplication::new(&state, ClientId::new()),
+            "delayed-run".into(),
+            "test.delay".into(),
+            attempt.activation_id.clone(),
+            1,
+        )
+        .await;
+        assert!(
+            retry.is_err(),
+            "unproven timeout must not allow ordinary retry"
+        );
+        let redispatch = bcode_workflow_store::WorkflowStore::open_at_path(&store_path)
+            .expect("scheduler")
+            .dispatch_pending_activations(&owner, 10, 4)
+            .await
+            .expect("dispatch repair-required run");
+        assert!(redispatch.admitted.is_empty());
         let events = state
             .sessions
             .session_history(parent.id)
