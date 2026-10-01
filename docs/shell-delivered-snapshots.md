@@ -1,5 +1,21 @@
 # Shell delivered snapshot verification
 
+## Model-provider representation
+
+The canonical `files` map remains unchanged. For strict OpenAI-compatible structured
+responses, the provider adapter encodes dynamic maps as arrays of exact `key`/`value`
+records and decodes the completed response before emitting canonical text. Duplicate
+keys and malformed records reject; encoded text is buffered with a 1 MiB bound and
+is not emitted on cancellation, failed or incomplete responses. Canonical workflow
+schema and delivery validation still apply after decoding. Unsupported compositions
+fail before dispatch rather than silently changing map semantics.
+
+Closed-object normalization now rejects unencoded dynamic maps. Other providers
+without a reversible adapter (including the current Bedrock structured-output path)
+report incompatibility instead of constraining `files` to an empty object. Local
+normalization tests are not evidence of acceptance by a live model endpoint.
+
+
 `shell.exec` command-plan version 2 accepts optional `delivered_snapshot`:
 
 ```json

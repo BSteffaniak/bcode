@@ -4,7 +4,9 @@
 
 //! Portable JSON Schema normalization for model-provider output contracts.
 
+mod object_maps;
 mod traversal;
+pub use object_maps::ObjectMapEncoding;
 
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
@@ -236,6 +238,15 @@ fn normalize_object(
         ObjectPropertyPolicy::RequireAllAndClose
     ) && is_object_schema(object)
     {
+        if object
+            .get("additionalProperties")
+            .is_some_and(Value::is_object)
+        {
+            return Err(SchemaPortabilityError::new(
+                &join_pointer(path, "additionalProperties"),
+                "dynamic map cannot be closed without changing its meaning; use a reversible wire encoding",
+            ));
+        }
         object.insert("additionalProperties".to_string(), Value::Bool(false));
         let properties = object
             .entry("properties".to_string())

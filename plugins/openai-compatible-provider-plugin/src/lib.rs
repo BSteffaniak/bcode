@@ -221,6 +221,7 @@ struct TurnState {
     positioned_output: Arc<AtomicBool>,
     cancelled: Arc<AtomicBool>,
     cancel_notify: Arc<Notify>,
+    structured_text: Arc<Mutex<Option<Result<String, String>>>>,
 }
 
 #[derive(Debug)]
@@ -269,6 +270,19 @@ struct OpenAiAuthTokenResponse {
 
 impl TurnState {
     fn push(&self, event: ProviderTurnEvent) {
+        if let ProviderTurnEvent::TextDelta { text } = &event {
+            let mut buffered = self.structured_text.lock().expect("structured text lock");
+            if let Some(result) = buffered.as_mut() {
+                if let Ok(output) = result {
+                    if output.len().saturating_add(text.len()) > 1024 * 1024 {
+                        *result = Err("encoded structured output exceeds 1 MiB".into());
+                    } else {
+                        output.push_str(text);
+                    }
+                }
+                return;
+            }
+        }
         if matches!(
             event,
             ProviderTurnEvent::TurnFinished { .. } | ProviderTurnEvent::Cancelled
@@ -3281,7 +3295,8 @@ fn start_chat_completion(runtime: &ProviderRuntime, request: ModelTurnRequest, t
 }
 
 async fn stream_chat_completion(request: &ModelTurnRequest, turn: &TurnState) {
-    match stream_chat_completion_with_failover(request, turn).await {
+    let outcome = stream_encoded_completion(request, turn).await;
+    match outcome {
         Ok(StreamOutcome::Finished) => turn.push(ProviderTurnEvent::TurnFinished {
             stop_reason: StopReason::EndTurn,
         }),
@@ -3304,6 +3319,63 @@ async fn stream_chat_completion(request: &ModelTurnRequest, turn: &TurnState) {
             });
         }
     }
+}
+
+async fn stream_encoded_completion(
+    request: &ModelTurnRequest,
+    turn: &TurnState,
+) -> Result<StreamOutcome, ProviderError> {
+    let encoding = request
+        .structured_output
+        .as_ref()
+        .filter(|output| output.strict)
+        .map(|output| bcode_model_schema::ObjectMapEncoding::compile(&output.schema))
+        .transpose()
+        .map_err(|error| {
+            provider_error(
+                "invalid_structured_output_schema",
+                ProviderErrorCategory::InvalidRequest,
+                error.to_string(),
+            )
+        })?;
+    let Some(encoding) = encoding.filter(bcode_model_schema::ObjectMapEncoding::is_adapted) else {
+        return stream_chat_completion_with_failover(request, turn).await;
+    };
+    strict_openai_schema(encoding.schema())?;
+    let mut wire = request.clone();
+    wire.structured_output
+        .as_mut()
+        .expect("structured request")
+        .schema = encoding.schema().clone();
+    wire.messages.push(bcode_model::ModelMessage {
+        role: bcode_model::MessageRole::System,
+        content: vec![bcode_model::ContentBlock::Text { text: "For this structured response, dynamic JSON maps are represented on the wire as arrays of {\"key\": string, \"value\": value} records as specified by the response schema. Use unique keys. The provider adapter restores these arrays to the original maps.".into() }],
+    });
+    *turn.structured_text.lock().expect("structured text lock") = Some(Ok(String::new()));
+    let outcome = stream_chat_completion_with_failover(&wire, turn).await;
+    let text = turn
+        .structured_text
+        .lock()
+        .expect("structured text lock")
+        .take()
+        .expect("buffer installed");
+    if matches!(outcome, Ok(StreamOutcome::Finished)) {
+        let decoded = text
+            .and_then(|text| {
+                serde_json::from_str(&text).map_err(|_| "invalid encoded structured JSON".into())
+            })
+            .and_then(|value| encoding.decode(value).map_err(|error| error.to_string()))
+            .and_then(|value| serde_json::to_string(&value).map_err(|error| error.to_string()))
+            .map_err(|message| {
+                provider_error(
+                    "invalid_structured_output",
+                    ProviderErrorCategory::InvalidRequest,
+                    message,
+                )
+            })?;
+        turn.push(ProviderTurnEvent::TextDelta { text: decoded });
+    }
+    outcome
 }
 
 async fn stream_chat_completion_with_failover(
@@ -11399,6 +11471,86 @@ mod tests {
         );
         assert_eq!(schema["properties"]["timestamp"]["format"], "date-time");
         assert!(schema["properties"]["note"].get("default").is_none());
+    }
+
+    #[test]
+    fn structured_map_wire_schema_and_stream_preserve_canonical_files() {
+        let schema = serde_json::json!({"type":"object","properties":{"files":{"type":"object","additionalProperties":{"type":"string"}}},"required":["files"],"additionalProperties":false});
+        let encoding = bcode_model_schema::ObjectMapEncoding::compile(&schema).unwrap();
+        let mut request = test_request(Vec::new());
+        request.structured_output = Some(bcode_model::StructuredOutputRequest {
+            name: "result".into(),
+            schema: encoding.schema().clone(),
+            strict: true,
+        });
+        let chat = serde_json::to_value(chat_response_format(&request).unwrap()).unwrap();
+        assert_eq!(
+            chat["json_schema"]["schema"]["properties"]["files"]["type"],
+            "array"
+        );
+        let settings = test_settings(test_api_key_auth(), OpenAiCompatibleDialect::ResponsesApi);
+        let responses =
+            serde_json::to_value(responses_text_options(&settings, &request).unwrap()).unwrap();
+        assert_eq!(responses["format"]["schema"], chat["json_schema"]["schema"]);
+        let turn = TurnState::default();
+        *turn.structured_text.lock().unwrap() = Some(Ok(String::new()));
+        turn.push(ProviderTurnEvent::TextDelta {
+            text: "{\"files\":[{\"key\":\"src/main.rs\",".into(),
+        });
+        assert!(
+            turn.drain().is_empty(),
+            "wire fragments must not enter canonical history"
+        );
+        turn.push(ProviderTurnEvent::TextDelta {
+            text: "\"value\":\"fn main() {}\"}]}".into(),
+        });
+        let text = turn
+            .structured_text
+            .lock()
+            .unwrap()
+            .take()
+            .unwrap()
+            .unwrap();
+        let value = encoding
+            .decode(serde_json::from_str(&text).unwrap())
+            .unwrap();
+        assert_eq!(
+            value,
+            serde_json::json!({"files":{"src/main.rs":"fn main() {}"}})
+        );
+        turn.push(ProviderTurnEvent::TextDelta {
+            text: value.to_string(),
+        });
+        assert!(matches!(
+            turn.drain().as_slice(),
+            [ProviderTurnEvent::TextDelta { .. }]
+        ));
+        assert!(
+            strict_openai_schema(&schema).is_err(),
+            "unencoded maps must never be silently closed"
+        );
+    }
+
+    #[test]
+    fn encoded_output_buffer_is_bounded_and_cancellation_remains_visible() {
+        let turn = TurnState::default();
+        *turn.structured_text.lock().unwrap() = Some(Ok(String::new()));
+        turn.push(ProviderTurnEvent::TextDelta {
+            text: "x".repeat(1024 * 1024 + 1),
+        });
+        assert!(
+            turn.structured_text
+                .lock()
+                .unwrap()
+                .as_ref()
+                .unwrap()
+                .is_err()
+        );
+        turn.push(ProviderTurnEvent::Cancelled);
+        assert!(matches!(
+            turn.drain().as_slice(),
+            [ProviderTurnEvent::Cancelled]
+        ));
     }
 
     #[test]

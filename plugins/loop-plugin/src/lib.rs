@@ -4514,8 +4514,11 @@ mod tests {
         );
         let evaluation_schema = &definition.nodes["loop.evaluation"].configuration["output"]["result"]
             ["schema"]["schema"];
-        bcode_model_schema::normalize(evaluation_schema, &bedrock_schema_dialect_for_test())
-            .unwrap_or_else(|error| panic!("loop.evaluation schema must fit Bedrock: {error}"));
+        assert!(
+            bcode_model_schema::normalize(evaluation_schema, &bedrock_schema_dialect_for_test())
+                .is_err(),
+            "Bedrock must reject the dynamic map rather than silently erase delivered files"
+        );
         assert!(
             definition.nodes["loop.implementation"].configuration["tools"].is_null(),
             "implementation keeps the current session's unrestricted tool policy"
@@ -4551,8 +4554,41 @@ mod tests {
             schemars::schema_for!(LoopWorkflowEvaluation),
         ] {
             let source = serde_json::to_value(schema).expect("serialize loop schema");
-            let normalized = bcode_model_schema::normalize(&source, &dialect)
+            let encoding = bcode_model_schema::ObjectMapEncoding::compile(&source)
+                .expect("loop maps have a reversible provider representation");
+            assert!(encoding.is_adapted());
+            let normalized = bcode_model_schema::normalize(encoding.schema(), &dialect)
                 .expect("loop schema must fit the strict provider dialect");
+            let canonical = serde_json::json!({
+                "implementation_prompt":"work", "stop_condition":"done", "max_iterations":1,
+                "iteration":0, "condition_met":false,"external_blocker":"none",
+                "evidence":["pending"],"summary":"pending", "delivery":null
+            });
+            let decoded = encoding.decode(canonical.clone()).unwrap();
+            assert_eq!(decoded, canonical);
+            assert!(
+                jsonschema::validator_for(&source)
+                    .unwrap()
+                    .is_valid(&decoded)
+            );
+            // Exercise the real nested delivery schema, not just a null optional report.
+            let snapshot = serde_json::json!({"version":1,"files":[{"key":"src/a.rs","value":"fn a() {}\n"},{"key":"README.md","value":"hello"}]});
+            let mut with_delivery = canonical.clone();
+            with_delivery["delivery"] = serde_json::json!({
+                "version":"2", "delivered_snapshot":snapshot, "integrated_targets":["README.md","src/a.rs"],
+                "contribution_output_ids":[],"criteria":[{"criterion":"done","status":"passed","evidence":"check"}],
+                "checks":[],"retained_workspaces":[],"unresolved_work":[]
+            });
+            let decoded = encoding.decode(with_delivery).unwrap();
+            assert_eq!(
+                decoded["delivery"]["delivered_snapshot"]["files"]["src/a.rs"],
+                "fn a() {}\n"
+            );
+            assert!(
+                jsonschema::validator_for(&source)
+                    .unwrap()
+                    .is_valid(&decoded)
+            );
             let blocker = &normalized["properties"]["external_blocker"];
             assert!(blocker.get("$ref").is_some());
             assert!(blocker.get("default").is_none());
