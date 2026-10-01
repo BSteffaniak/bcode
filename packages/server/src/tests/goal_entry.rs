@@ -404,11 +404,16 @@ fn configure_goal_execution(server: &mut ServerState, root: &Path) {
                 "bcode.default-agents".into(),
                 "bcode.filesystem".into(),
                 "bcode.shell".into(),
+                "bcode.worktree".into(),
             ]),
             disabled: BTreeSet::new(),
         },
         &[
             bcode_bundled_plugins::static_loop_plugin(),
+            bcode_plugin::StaticBundledPlugin::new(
+                include_str!("../../../../plugins/worktree-plugin/bcode-plugin.toml"),
+                bcode_worktree_plugin::static_plugin(),
+            ),
             bcode_plugin::StaticBundledPlugin::new(
                 include_str!("../../../../plugins/filesystem-plugin/bcode-plugin.toml"),
                 bcode_filesystem_plugin::static_plugin(),

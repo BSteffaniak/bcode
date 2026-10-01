@@ -2644,6 +2644,7 @@ dependencies = [
  "bcode_workflow_view_models",
  "bcode_worktree",
  "bcode_worktree_models",
+ "bcode_worktree_plugin",
  "bmux_keyboard",
  "bmux_tui",
  "chrono",

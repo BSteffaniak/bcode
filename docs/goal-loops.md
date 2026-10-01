@@ -2,7 +2,13 @@
 
 ## Repository delivery V3
 
-Normal goal generation and collaboration guidance support `repository_target` on a direct
+Normal goal generation, collaboration guidance and the read-only completion evaluator support
+repository delivery V3. The evaluator preserves the original stop condition: support for V3
+does not authorize upgrading an existing V2-only pinned condition. Checkout locations belong
+in `retained_workspaces`, revision observations in evidence, and the retained artifact alone
+in V3 `integrated_targets`.
+
+Use `repository_target` on a direct
 `shell.exec` command-plan V2. This is an additive input, not a reinterpretation of
 `delivered_snapshot` or delivery report V2. The target is `{version:1,commit:<full lowercase OID>}`
 at the plan's confined repository cwd. Creating an integrated commit requires ordinary Git

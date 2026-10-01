@@ -85,8 +85,17 @@ pub(super) fn install_script(request: &mut PluginWorkflowStartRequest, root: &Pa
         .get_mut("loop.implementation")
         .unwrap();
     let instructions = source.configuration["system_prompt"].as_str().unwrap();
+    let preparation = ["left", "right", "integration"]
+        .map(|id| {
+            let create = serde_json::json!({
+                "name":id,"cwd":root,"path":trees.join(id),
+                "new_branch":format!("swarm-{id}"),"base_ref":"head","no_setup":true
+            });
+            format!("tool-call worktree.create {create}")
+        })
+        .join("\n");
     source.configuration["system_prompt"] = serde_json::json!(format!(
-        "{instructions}\ntool-call workflow.execution_context {{\"delegation_part\":\"serialized\",\"$fake_json_pages\":{{\"chunk\":\"/delegation/chunk\",\"next\":\"/delegation/next_arguments\"}}}}\ntool-call workflow.stage_task_group {group}\ntool-call workflow.publish_run_graph_edit {publication}"
+        "{instructions}\n{preparation}\ntool-call workflow.execution_context {{\"delegation_part\":\"serialized\",\"$fake_json_pages\":{{\"chunk\":\"/delegation/chunk\",\"next\":\"/delegation/next_arguments\"}}}}\ntool-call workflow.stage_task_group {group}\ntool-call workflow.publish_run_graph_edit {publication}"
     ));
     install_delivery_report(request, &integration, trees);
 }
@@ -126,7 +135,7 @@ fn install_delivery_report(
     ));
 }
 
-fn prepare_checkouts(root: &Path, trees: &Path) -> String {
+fn prepare_source(root: &Path) -> String {
     git(root, &["init", "--quiet"]);
     std::fs::write(root.join("integrated.sh"), "# base\n").unwrap();
     git(root, &["add", "integrated.sh"]);
@@ -143,19 +152,9 @@ fn prepare_checkouts(root: &Path, trees: &Path) -> String {
         ],
     );
     let base = git(root, &["rev-parse", "HEAD"]);
-    for id in ["left", "right", "integration"] {
-        git(
-            root,
-            &[
-                "worktree",
-                "add",
-                "-b",
-                &format!("swarm-{id}"),
-                trees.join(id).to_str().unwrap(),
-                "HEAD",
-            ],
-        );
-    }
+    std::fs::write(root.join("staged.txt"), "staged user work\n").unwrap();
+    git(root, &["add", "staged.txt"]);
+    std::fs::write(root.join("untracked.txt"), "untracked user work\n").unwrap();
     std::fs::write(
         root.join("integrated.sh"),
         "# uncommitted user implementation\n",
@@ -169,7 +168,18 @@ async fn goal_workers_recover_real_git_conflict_in_isolated_integration_checkout
     let _execution = GOAL_ENTRY_EXECUTION.lock().await;
     let root = tempfile::tempdir().unwrap();
     let trees = tempfile::tempdir().unwrap();
-    let base = prepare_checkouts(root.path(), trees.path());
+    let base = prepare_source(root.path());
+    let status_args = [
+        "status",
+        "--porcelain",
+        "--",
+        "integrated.sh",
+        "staged.txt",
+        "untracked.txt",
+    ];
+    let source_status = git(root.path(), &status_args);
+    let source_index = git(root.path(), &["diff", "--cached"]);
+    assert_eq!(std::fs::read_dir(trees.path()).unwrap().count(), 0);
     let sessions = publication_fixture_sessions(root.path(), true);
     let session = sessions
         .create_session(None, root.path().into())
@@ -240,11 +250,24 @@ async fn goal_workers_recover_real_git_conflict_in_isolated_integration_checkout
     .expect("isolated goal recovery must reach evaluation");
     drop(state);
     assert_eq!(git(root.path(), &["rev-parse", "HEAD"]), base);
+    assert_eq!(git(root.path(), &status_args), source_status);
+    assert_eq!(git(root.path(), &["diff", "--cached"]), source_index);
+    assert_retained_checkouts(root.path(), trees.path(), &base);
+}
+
+fn assert_retained_checkouts(root: &Path, trees: &Path, base: &str) {
+    for (name, contents) in [
+        ("staged.txt", "staged user work\n"),
+        ("untracked.txt", "untracked user work\n"),
+    ] {
+        assert_eq!(std::fs::read_to_string(root.join(name)).unwrap(), contents);
+        assert!(!trees.join("integration").join(name).exists());
+    }
     assert_eq!(
-        std::fs::read_to_string(root.path().join("integrated.sh")).unwrap(),
+        std::fs::read_to_string(root.join("integrated.sh")).unwrap(),
         "# uncommitted user implementation\n"
     );
-    let integration = trees.path().join("integration");
+    let integration = trees.join("integration");
     assert_eq!(
         std::fs::read_to_string(integration.join("integrated.sh")).unwrap(),
         format!("{LEFT_MODULE}{RIGHT_MODULE}")
@@ -255,7 +278,7 @@ async fn goal_workers_recover_real_git_conflict_in_isolated_integration_checkout
     );
     assert!(git(&integration, &["ls-files", "-u"]).is_empty());
     for id in ["left", "right"] {
-        assert_ne!(git(&trees.path().join(id), &["rev-parse", "HEAD"]), base);
-        assert!(git(&trees.path().join(id), &["status", "--porcelain"]).is_empty());
+        assert_ne!(git(&trees.join(id), &["rev-parse", "HEAD"]), base);
+        assert!(git(&trees.join(id), &["status", "--porcelain"]).is_empty());
     }
 }

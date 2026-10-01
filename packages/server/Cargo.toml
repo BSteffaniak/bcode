@@ -112,6 +112,7 @@ bcode_tantivy_session_search_plugin = { workspace = true, features = [
 bcode_vim_edit_plugin = { workspace = true, features = ["static-bundled"] }
 bcode_web_search_plugin = { workspace = true, features = ["static-bundled"] }
 bcode_workflow_plugin = { workspace = true, features = ["static-bundled"] }
+bcode_worktree_plugin = { workspace = true, features = ["static-bundled"] }
 bmux_keyboard = { workspace = true }
 bmux_tui = { workspace = true }
 hyperchad = { workspace = true, features = ["router", "router-form"] }
