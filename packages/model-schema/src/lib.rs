@@ -63,6 +63,10 @@ pub struct SchemaDialect {
     /// Unsupported keywords and how each should be handled.
     #[serde(default)]
     pub unsupported_keywords: std::collections::BTreeMap<String, UnsupportedKeywordPolicy>,
+    /// Format annotations unsupported by a provider. Matching annotations are removed;
+    /// structural types and bounds remain unchanged.
+    #[serde(default)]
+    pub unsupported_formats: BTreeSet<String>,
     /// Accepted `minItems` values. Empty means every value is accepted.
     #[serde(default)]
     pub accepted_min_items: BTreeSet<u64>,
@@ -89,6 +93,7 @@ impl Default for SchemaDialect {
         Self {
             object_properties: ObjectPropertyPolicy::Preserve,
             unsupported_keywords: std::collections::BTreeMap::new(),
+            unsupported_formats: BTreeSet::new(),
             accepted_min_items: BTreeSet::new(),
             one_of: OneOfPolicy::Preserve,
             reference_siblings: ReferenceSiblingPolicy::Preserve,
@@ -189,6 +194,13 @@ fn normalize_object(
     dialect: &SchemaDialect,
     path: &str,
 ) -> Result<(), SchemaPortabilityError> {
+    if object
+        .get("format")
+        .and_then(Value::as_str)
+        .is_some_and(|format| dialect.unsupported_formats.contains(format))
+    {
+        object.remove("format");
+    }
     collapse_annotated_constant_one_of(object, dialect, path)?;
     normalize_reference_siblings(object, dialect, path)?;
     for (keyword, policy) in &dialect.unsupported_keywords {

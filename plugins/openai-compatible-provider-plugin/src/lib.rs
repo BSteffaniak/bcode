@@ -5942,6 +5942,17 @@ fn strict_openai_schema(schema: &serde_json::Value) -> Result<serde_json::Value,
     bcode_model_schema::normalize(
         schema,
         &bcode_model_schema::SchemaDialect {
+            unsupported_keywords: std::collections::BTreeMap::from([(
+                "default".to_owned(),
+                bcode_model_schema::UnsupportedKeywordPolicy::Remove,
+            )]),
+            unsupported_formats: [
+                "uint8", "uint16", "uint32", "uint64", "uint128", "int8", "int16", "int32",
+                "int64", "int128", "float", "double",
+            ]
+            .into_iter()
+            .map(str::to_owned)
+            .collect(),
             object_properties: bcode_model_schema::ObjectPropertyPolicy::RequireAllAndClose,
             one_of: bcode_model_schema::OneOfPolicy::CollapseAnnotatedConstants,
             reference_siblings:
@@ -11364,6 +11375,30 @@ mod tests {
                 case.name == required_case && case.outcome == ProviderConformanceOutcome::Passed
             }));
         }
+    }
+
+    #[test]
+    fn strict_schema_preserves_numeric_bounds_without_rust_format_annotations() {
+        let schema = strict_openai_schema(&serde_json::json!({
+            "type": "object",
+            "properties": {
+                "iteration": {"type": "integer", "format": "uint32", "minimum": 0},
+                "threshold": {"type": "integer", "format": "uint8", "minimum": 0, "maximum": 255},
+                "timestamp": {"type": "string", "format": "date-time"},
+                "note": {"type": "string", "default": {"format": "uint32"}}
+            }
+        }))
+        .unwrap();
+        assert_eq!(
+            schema["properties"]["iteration"],
+            serde_json::json!({"type":"integer", "minimum":0})
+        );
+        assert_eq!(
+            schema["properties"]["threshold"],
+            serde_json::json!({"type":"integer", "minimum":0, "maximum":255})
+        );
+        assert_eq!(schema["properties"]["timestamp"]["format"], "date-time");
+        assert!(schema["properties"]["note"].get("default").is_none());
     }
 
     #[test]
