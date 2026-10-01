@@ -46,6 +46,7 @@ pub(super) fn install_script(request: &mut PluginWorkflowStartRequest, root: &Pa
         }]});
         serde_json::json!({"task_id":id,"objective":format!("Contribute in the assigned checkout.\ntool-call filesystem.write {write}\ntool-call shell.run {commit}\ntool-call filesystem.read {revision}\nstructured-result {result}"),
             "agent_profile":"build","read_only":false,"worktree_directory":reference(creation_index, "/path"),
+            "acceptance_criteria":["Creation-time base commit (verify before editing):",reference(creation_index, "/provenance/base_commit"),"Canonical source checkout (do not modify):",reference(creation_index, "/provenance/source_directory"),"Creation provenance does not include uncommitted inputs; inspect source dirtiness and report required missing inputs rather than copying or overwriting user work."],
             "tool_allowlist":["filesystem.write","filesystem.read","shell.run"],"resources":[{"resource":format!("checkout:{id}"),"access":"write"}],
             "model_selection":{"provider":"bcode.fake-provider","model":"fake-echo"}})
     };
@@ -73,6 +74,7 @@ pub(super) fn install_script(request: &mut PluginWorkflowStartRequest, root: &Pa
         "tasks":[task("left", 3),task("right", 2)],
         "continuation":{"objective":format!("Integrate both retained contributions. Inspect the actual conflict before resolving it; never overwrite the source checkout.\ntool-call-expect-error CONFLICT :: shell.run {probe}\ntool-call shell.run {inspect}\ntool-call filesystem.write {resolution}\ntool-call shell.run {verify}"),
             "agent_profile":"build","read_only":false,"worktree_directory":reference(1, "/path"),"tool_allowlist":["shell.run","filesystem.write"],
+            "acceptance_criteria":["Integration creation-time base commit (verify before applying contributions):",reference(1, "/provenance/base_commit"),"Canonical source checkout (retain all user edits):",reference(1, "/provenance/source_directory"),"Retain conflicts and successful contributions; creation provenance is an observation, not authorization to overwrite the source."],
             "resources":[{"resource":"checkout:integration","access":"write"}],"model_selection":{"provider":"bcode.fake-provider","model":"fake-echo"}},
         "reconciliation":[]
     });

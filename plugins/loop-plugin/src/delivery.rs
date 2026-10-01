@@ -216,12 +216,13 @@ fn negative_items(value: &serde_json::Value) -> Option<Vec<String>> {
                     }
                 }
             }
-            if contribution
-                .get("retention")
-                .and_then(serde_json::Value::as_str)
-                == Some("removed")
-            {
-                items.push(format!("/contributions/{index}/retention"));
+            match contribution.get("retention") {
+                None => {} // Historical omission remains unknown, not retention proof.
+                Some(retention) => match retention.as_str()? {
+                    "retained" | "unknown" => {}
+                    "removed" => items.push(format!("/contributions/{index}/retention")),
+                    _ => return None,
+                },
             }
         }
     }
@@ -280,10 +281,9 @@ pub fn contribution_precludes_completion(
         // An explicit removal is negative evidence even when the worker omitted
         // remaining work. Absence/unknown retention remains unknown, not proof
         // that any contribution was retained or integrated.
-        contribution
-            .get("retention")
-            .and_then(serde_json::Value::as_str)
-            == Some("removed")
+        contribution.get("retention").is_some_and(|retention| {
+            !matches!(retention.as_str(), Some("retained" | "unknown"))
+        })
             || contribution
                 .get("remaining_work")
                 .and_then(serde_json::Value::as_array)
@@ -577,6 +577,25 @@ mod tests {
         let report: DeliveryReport = serde_json::from_value(value.clone()).unwrap();
         assert!(report.resolves(&output));
         assert!(contribution_precludes_completion(&output)); // History is never rewritten.
+        for retention in [json!("future"), json!(null), json!(true), json!({})] {
+            let mut history = output.clone();
+            history.value["contributions"][0]["retention"] = retention;
+            assert!(contribution_precludes_completion(&history));
+            assert!(!report.resolves(&history));
+        }
+        let mut removed = output.clone();
+        removed.value["contributions"][0]["retention"] = json!("removed");
+        assert!(contribution_precludes_completion(&removed));
+        assert!(!report.resolves(&removed));
+        let mut resolved = value.clone();
+        resolved["resolutions"][0]["item_paths"] = json!([
+            "/blockers/0",
+            "/contributions/0/remaining_work/0",
+            "/contributions/0/retention"
+        ]);
+        let resolved: DeliveryReport = serde_json::from_value(resolved).unwrap();
+        assert!(resolved.resolves(&removed));
+        assert!(contribution_precludes_completion(&removed));
         for outcome in ["failed", "not_run"] {
             let mut history = output.clone();
             history.value["contributions"][0]["validation"] = json!([{"outcome":outcome}]);

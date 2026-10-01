@@ -1069,6 +1069,7 @@ tools = { "filesystem.read" = true }
         apply_tool_selection(&mut plan, &tools_config, &[]);
         assert!(active_tools_for(&plan).contains(&"workflow.execution_context".into()));
         for tool in [
+            "loop.stage_repository_verification",
             "workflow.stage_delegation",
             "workflow.stage_task_group",
             "workflow.publish_run_graph_edit",
@@ -1077,12 +1078,17 @@ tools = { "filesystem.read" = true }
             assert!(active_tools_for(&build).contains(&tool.into()));
             assert!(!active_tools_for(&plan).contains(&tool.into()));
         }
-        let disabled = bcode_config::ToolsConfig {
-            disabled: BTreeSet::from(["workflow.stage_task_group".into()]),
-            ..Default::default()
-        };
-        apply_tool_selection(&mut build, &disabled, &[]);
-        assert!(!active_tools_for(&build).contains(&"workflow.stage_task_group".into()));
+        for tool in [
+            "workflow.stage_task_group",
+            "loop.stage_repository_verification",
+        ] {
+            let disabled = bcode_config::ToolsConfig {
+                disabled: BTreeSet::from([tool.into()]),
+                ..Default::default()
+            };
+            apply_tool_selection(&mut build, &disabled, &[]);
+            assert!(!active_tools_for(&build).contains(&tool.into()));
+        }
     }
 
     #[test]

@@ -1,5 +1,31 @@
 # Goal setup for prompt loops
 
+## Repository verification handoff
+
+`loop.stage_repository_verification` accepts inspected run/revision/activation identity,
+a fresh mutation ID, `repository_target {version:1,commit}`, relative repository `cwd`,
+argv-vector `commands`, `report_objective`, and explicit reconciliation. It stages a
+direct shell-owner producer and dependent read-only structured report collector using
+the shell plugin's declared block contract. Normal admission checks owner availability
+and compatibility. Staging performs no export, checks or publication. Separately
+publish the exact candidate with `workflow.publish_run_graph_edit`, then finish the
+source activation. Shell checks retain their normal preparation and permission gates.
+
+Canonical joins preserve source state separately from producer and report outputs.
+The original successor receives its unchanged source selection; the evaluator discovers
+the collector's checksum-verified canonical output and authenticates its direct-shell
+and historical checksum/item references. Reports are claims, not completion. Unknown
+evidence blocks completion. V1/V2 and pinned conditions are unchanged; a V2-only pinned
+condition cannot be satisfied merely by producing a V3 report.
+
+The handoff supports one direct successor with optional nested `source`
+selection or paired left-hand source selectors retained by an earlier repository
+handoff. Repeated verification composes that selection without selecting prior check
+or report results; stale revisions or unsupported topology fail closed. Failed checks do not
+automatically replay. Normal goal-entry execution with historical resolution still
+needs acceptance coverage beyond the current graph-lowering tests.
+
+
 ## Repository delivery V3
 
 Normal goal generation, collaboration guidance and the read-only completion evaluator support

@@ -6,6 +6,7 @@
 
 mod delivery;
 mod delivery_execution;
+mod repository_verification;
 
 use std::collections::BTreeSet;
 use std::fmt::Write as _;
@@ -89,6 +90,9 @@ impl RustPlugin for LoopPlugin {
     }
 
     fn invoke_service(&mut self, context: NativeServiceContext) -> ServiceResponse {
+        if context.request.interface_id == "bcode.tool/v1" {
+            return repository_verification::invoke(&context);
+        }
         if context.request.interface_id == bcode_workflow::WORKFLOW_BLOCK_INTERFACE_ID {
             return judgement_evaluation::invoke(&context);
         }

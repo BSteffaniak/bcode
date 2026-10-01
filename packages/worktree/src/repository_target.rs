@@ -117,7 +117,11 @@ pub fn export(
     commit: &str,
     cancellation: &bcode_plugin_sdk::ServiceCancellation,
 ) -> Result<RepositoryExport, String> {
-    if !matches!(commit.len(), 40 | 64) || !commit.bytes().all(|b| b.is_ascii_hexdigit()) {
+    if !matches!(commit.len(), 40 | 64)
+        || !commit
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
         return Err("repository target requires a full commit object identity".into());
     }
     let kind = git(repository, &["cat-file", "-t", commit], 32, cancellation)?;
@@ -161,7 +165,9 @@ pub fn export(
             MAX_BYTES - size,
             cancellation,
         )?;
-        if bytes.starts_with(b"version https://git-lfs.github.com/spec/v1\n") {
+        if bytes.starts_with(b"version https://git-lfs.github.com/spec/v1\n")
+            || bytes.starts_with(b"version https://git-lfs.github.com/spec/v1\r\n")
+        {
             return Err("Git LFS payload unavailable: pointer is not delivered content".into());
         }
         size += bytes.len();
@@ -254,6 +260,43 @@ mod tests {
         String::from_utf8_lossy(&output.stdout).trim().into()
     }
     #[test]
+    fn rejects_lfs_pointers_with_lf_or_crlf_without_delivering_pointer_bytes() {
+        for newline in ["\n", "\r\n"] {
+            let source = tempfile::tempdir().unwrap();
+            run(source.path(), &["init", "-q"]);
+            let pointer = format!(
+                "version https://git-lfs.github.com/spec/v1{newline}oid sha256:{}{newline}size 123{newline}",
+                "a".repeat(64)
+            );
+            std::fs::write(source.path().join("asset"), &pointer).unwrap();
+            run(source.path(), &["add", "asset"]);
+            run(
+                source.path(),
+                &[
+                    "-c",
+                    "user.name=Test",
+                    "-c",
+                    "user.email=test@example.test",
+                    "commit",
+                    "-qm",
+                    "pointer",
+                ],
+            );
+            let error = export(
+                source.path(),
+                &run(source.path(), &["rev-parse", "HEAD"]),
+                &bcode_plugin_sdk::ServiceCancellation::default(),
+            )
+            .unwrap_err();
+            assert!(error.contains("Git LFS payload unavailable"));
+            assert_eq!(
+                std::fs::read_to_string(source.path().join("asset")).unwrap(),
+                pointer
+            );
+        }
+    }
+
+    #[test]
     fn complete_binary_modes_dirty_checkout_and_unsupported_content() {
         let source = tempfile::tempdir().unwrap();
         run(source.path(), &["init", "-q"]);
@@ -274,6 +317,14 @@ mod tests {
             ],
         );
         let commit = run(source.path(), &["rev-parse", "HEAD"]);
+        let cancellation = bcode_plugin_sdk::ServiceCancellation::default();
+        // The owning capability must enforce the same identity representation as
+        // its public callers, rather than silently normalize unsupported input.
+        for invalid in ["HEAD".to_owned(), "A".repeat(40), "0".repeat(40)] {
+            assert!(export(source.path(), &invalid, &cancellation).is_err());
+        }
+        let blob = run(source.path(), &["rev-parse", "HEAD:binary"]);
+        assert!(export(source.path(), &blob, &cancellation).is_err());
         std::fs::write(source.path().join("binary"), b"dirty user work").unwrap();
         std::fs::write(source.path().join("untracked"), b"user work").unwrap();
         let target = export(

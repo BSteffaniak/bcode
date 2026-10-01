@@ -3,6 +3,12 @@ name    = "Bcode Loop Plugin"
 version = "0.0.1"
 
 [[services]]
+class        = "tool_execution"
+description  = "Goal repository verification handoff staging"
+interface_id = "bcode.tool/v1"
+name         = "Goal Verification Tools"
+
+[[services]]
 class        = "service"
 description  = "Prompt loop commands"
 interface_id = "bcode.command/v1"
