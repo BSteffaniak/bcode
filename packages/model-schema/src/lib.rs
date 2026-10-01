@@ -5,8 +5,10 @@
 //! Portable JSON Schema normalization for model-provider output contracts.
 
 mod object_maps;
+mod references;
 mod traversal;
 pub use object_maps::ObjectMapEncoding;
+pub use references::inline_local_references;
 
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};

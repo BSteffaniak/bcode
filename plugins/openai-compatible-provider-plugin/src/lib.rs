@@ -6032,6 +6032,7 @@ fn strict_openai_schema(schema: &serde_json::Value) -> Result<serde_json::Value,
             ..bcode_model_schema::SchemaDialect::default()
         },
     )
+    .and_then(|schema| bcode_model_schema::inline_local_references(&schema, 1024 * 1024))
     .map_err(|error| {
         provider_error(
             "invalid_structured_output_schema",
@@ -11617,12 +11618,37 @@ mod tests {
         let body = build_responses_request(&settings, &request, "model").expect("request");
         assert_eq!(
             body.pointer("/text/format/schema/properties/confidence"),
-            Some(&serde_json::json!({"$ref": "#/$defs/confidence"}))
-        );
-        assert_eq!(
-            body.pointer("/text/format/schema/$defs/confidence"),
             Some(&serde_json::json!({"enum": ["high", "low"]}))
         );
+        assert!(body.pointer("/text/format/schema/$defs").is_none());
+    }
+
+    #[test]
+    fn nested_output_references_are_inlined_on_both_wire_surfaces() {
+        let mut request = test_request(Vec::new());
+        request.structured_output = Some(bcode_model::StructuredOutputRequest {
+            name: "NestedCheck".into(),
+            strict: true,
+            schema: serde_json::json!({"type":"object","properties":{"check":{"$ref":"#/$defs/Check"}},"$defs":{"Check":{"type":"object","properties":{"execution":{"anyOf":[{"$ref":"#/$defs/Execution"},{"type":"null"}]}}},"Execution":{"type":"object","properties":{"argv":{"type":"array","minItems":1,"items":{"type":"string"}}}}}}),
+        });
+        let canonical = request.structured_output.as_ref().unwrap().schema.clone();
+        let chat = serde_json::to_value(chat_response_format(&request).unwrap()).unwrap();
+        for dialect in [
+            OpenAiCompatibleDialect::ResponsesApi,
+            OpenAiCompatibleDialect::ChatGptCodex,
+        ] {
+            let settings = test_settings(test_api_key_auth(), dialect);
+            let responses =
+                serde_json::to_value(responses_text_options(&settings, &request).unwrap()).unwrap();
+            assert_eq!(responses["format"]["schema"], chat["json_schema"]["schema"]);
+            let execution = &responses["format"]["schema"]["properties"]["check"]["properties"]["execution"]
+                ["anyOf"][0];
+            assert_eq!(execution["properties"]["argv"]["minItems"], 1);
+            assert_eq!(execution["required"], serde_json::json!(["argv"]));
+            assert_eq!(execution["additionalProperties"], false);
+            assert!(execution.get("$ref").is_none());
+        }
+        assert_eq!(request.structured_output.unwrap().schema, canonical);
     }
 
     #[test]
@@ -12599,6 +12625,52 @@ mod tests {
         }
         assert_eq!(diagnostics.source, "runtime_context");
         assert_eq!(diagnostics.mode, "chatgpt");
+    }
+
+    #[tokio::test]
+    #[ignore = "live provider diagnostic; requires explicit schema path and selected profile"]
+    async fn live_structured_schema_acceptance() {
+        let Ok(path) = std::env::var("BCODE_SCHEMA_PROBE") else {
+            return;
+        };
+        let schema: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap();
+        let model =
+            std::env::var("BCODE_SCHEMA_PROBE_MODEL").expect("explicit live model required");
+        let profile = std::env::var("BCODE_SCHEMA_PROBE_PROFILE")
+            .expect("explicit live auth profile required");
+        let config = bcode_config::load_config().unwrap();
+        let mut selection = config.resolved_model_selection();
+        selection.provider_plugin_id = Some("bcode.openai-compatible".into());
+        selection.model_id = Some(model.clone());
+        selection.auth_profile = Some(profile);
+        selection.auth_pool = None;
+        let context = bcode_provider_auth::try_resolve_provider_request_context(
+            bcode_provider_auth::ProviderRequestContextResolution {
+                config: &config,
+                selection,
+            },
+        )
+        .unwrap();
+        let mut request = test_request(vec![ModelMessage { role: MessageRole::User, content: vec![ContentBlock::Text { text: "Return a minimal valid result. Do not use tools. This is only a schema compatibility probe.".into() }] }]);
+        request.model_id = model;
+        request.provider_context = context;
+        request.structured_output = Some(bcode_model::StructuredOutputRequest {
+            name: "bcode_loop_plugin__LoopWorkflowIteration".into(),
+            schema,
+            strict: true,
+        });
+        let turn = TurnState::default();
+        let result = tokio::time::timeout(
+            Duration::from_secs(45),
+            stream_encoded_completion(&request, &turn),
+        )
+        .await;
+        match result {
+            Ok(Ok(outcome)) => println!("PROBE accepted {outcome:?}"),
+            Ok(Err(error)) => panic!("PROBE rejected: {} {}", error.code, error.message),
+            Err(error) => panic!("PROBE timed out: {error}"),
+        }
     }
 
     fn test_request(messages: Vec<ModelMessage>) -> ModelTurnRequest {

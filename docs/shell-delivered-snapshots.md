@@ -2,6 +2,18 @@
 
 ## Model-provider representation
 
+Strict OpenAI-compatible response schemas expand local references within a bounded
+1 MiB expansion-work budget before dispatch. Live Codex probing of the admitted
+`LoopWorkflowIteration` schema on 2026-09-30 reproduced HTTP 400 with nested
+`Check -> CheckExecution` references; the same full schema was accepted after
+inlining. Constraints and the canonical schema remain unchanged. Recursive,
+external or unresolved references and unsafe reference siblings fail locally.
+The opt-in provider test `live_structured_schema_acceptance` accepts an explicit
+`BCODE_SCHEMA_PROBE` JSON schema path, `BCODE_SCHEMA_PROBE_MODEL` and
+`BCODE_SCHEMA_PROBE_PROFILE`; it sends only a tool-free compatibility prompt
+through normal auth resolution, not the original goal or repository content.
+
+
 The canonical `files` map remains unchanged. For strict OpenAI-compatible structured
 responses, the provider adapter encodes dynamic maps as arrays of exact `key`/`value`
 records and decodes the completed response before emitting canonical text. Duplicate
