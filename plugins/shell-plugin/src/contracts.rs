@@ -118,6 +118,9 @@ pub struct ShellWorkflowOutputPolicy {
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct ShellWorkflowCommandPlan {
+    /// Complete immutable repository revision exported by the workspace owner.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub repository_target: Option<bcode_shell_models::RepositoryTarget>,
     /// Complete inline target materialized in a private temporary command directory.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub delivered_snapshot: Option<bcode_shell_models::DeliveredSnapshot>,
@@ -186,6 +189,9 @@ pub struct ShellWorkflowCommandResult {
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct ShellWorkflowCommandPlanResult {
+    /// Retained repository identity and owner-observed check scope.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub repository_verification: Option<bcode_shell_models::RepositoryVerification>,
     /// Authenticated only by the enclosing canonical shell output.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub snapshot_verification: Option<bcode_shell_models::SnapshotVerification>,
@@ -294,6 +300,7 @@ mod tests {
     #[test]
     fn workflow_command_plan_contract_is_versioned_bounded_and_argv_explicit() {
         let plan = ShellWorkflowCommandPlan {
+            repository_target: None,
             delivered_snapshot: None,
             observe_files: Vec::new(),
             expected_content: None,
@@ -329,6 +336,7 @@ mod tests {
     #[test]
     fn workflow_command_plan_result_carries_terminal_detail_and_artifacts() {
         let result = ShellWorkflowCommandPlanResult {
+            repository_verification: None,
             snapshot_verification: None,
             content_before: None,
             content_after: None,

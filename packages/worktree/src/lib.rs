@@ -4,6 +4,8 @@
 
 //! Git worktree orchestration for Bcode.
 
+pub mod repository_target;
+
 use bcode_config::{BcodeConfig, WorktreeBaseRefConfig};
 use bcode_plugin_sdk::path::display_from_current_dir;
 use bcode_worktree_models::{

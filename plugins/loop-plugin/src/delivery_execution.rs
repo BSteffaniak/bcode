@@ -108,6 +108,36 @@ pub fn delivered_check(
         .is_some_and(|verification| verification.accept(delivered).is_ok())
 }
 
+/// Authenticate a repository check against its exact admitted revision and retained export.
+pub fn repository_check(
+    evidence: &WorkflowOutputExecutionEvidence,
+    reference: &CheckExecution,
+    delivery: &bcode_shell_models::RepositoryDelivery,
+) -> bool {
+    if !shell_observation(evidence, &reference.output_id)
+        || !command_identity(evidence, reference)
+        || reference.content_roots.is_some()
+        || reference.observation_output_id.is_some()
+        || evidence.admitted_input.get("repository_target")
+            != Some(&serde_json::json!(delivery.target))
+        || evidence
+            .admitted_input
+            .get("delivered_snapshot")
+            .is_some_and(|v| !v.is_null())
+    {
+        return false;
+    }
+    evidence
+        .provenance
+        .output
+        .value
+        .get("repository_verification")
+        .and_then(|value| {
+            serde_json::from_value::<bcode_shell_models::RepositoryVerification>(value.clone()).ok()
+        })
+        .is_some_and(|verification| verification.accepts(delivery))
+}
+
 fn command_identity(
     evidence: &WorkflowOutputExecutionEvidence,
     reference: &CheckExecution,
@@ -374,6 +404,76 @@ mod tests {
                     &serde_json::from_value(value).unwrap(),
                     reference,
                     &snapshot
+                ),
+                "{pointer}"
+            );
+        }
+    }
+
+    #[test]
+    fn repository_delivery_requires_exact_canonical_owner_evidence() {
+        let (mut evidence, check) = fixture();
+        let reference = check.execution.as_ref().unwrap();
+        let delivery = bcode_shell_models::RepositoryDelivery {
+            target: bcode_shell_models::RepositoryTarget {
+                version: 1,
+                commit: "a".repeat(40),
+            },
+            artifact: "retained-export".into(),
+            sha256: "b".repeat(64),
+        };
+        evidence.admitted_input["repository_target"] = json!(delivery.target);
+        evidence.provenance.output.value["repository_verification"] =
+            json!(bcode_shell_models::RepositoryVerification {
+                version: 1,
+                delivery: delivery.clone(),
+                commands_passed: true,
+                sources_unchanged: true,
+                environment: bcode_shell_models::RepositoryVerification::ENVIRONMENT.into(),
+            });
+        assert!(repository_check(&evidence, reference, &delivery));
+        for (pointer, replacement) in [
+            (
+                "/admitted_input/repository_target/commit",
+                json!("c".repeat(40)),
+            ),
+            (
+                "/provenance/output/value/repository_verification/delivery/sha256",
+                json!("c".repeat(64)),
+            ),
+            (
+                "/provenance/output/value/repository_verification/delivery/artifact",
+                json!("other"),
+            ),
+            (
+                "/provenance/output/value/repository_verification/version",
+                json!(2),
+            ),
+            (
+                "/provenance/output/value/repository_verification/commands_passed",
+                json!(false),
+            ),
+            (
+                "/provenance/output/value/repository_verification/sources_unchanged",
+                json!(false),
+            ),
+            (
+                "/provenance/output/value/repository_verification/environment",
+                json!("hermetic"),
+            ),
+            (
+                "/provenance/producer/configuration/plugin_id",
+                json!("forged"),
+            ),
+            ("/admitted_input/commands/0/argv", json!(["other"])),
+        ] {
+            let mut value = serde_json::to_value(&evidence).unwrap();
+            *value.pointer_mut(pointer).unwrap() = replacement;
+            assert!(
+                !repository_check(
+                    &serde_json::from_value(value).unwrap(),
+                    reference,
+                    &delivery
                 ),
                 "{pointer}"
             );

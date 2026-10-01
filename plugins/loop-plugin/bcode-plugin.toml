@@ -51,7 +51,13 @@ schema = { "$schema" = "https://json-schema.org/draft/2020-12/schema", "title" =
     "condition_met",
     "evidence",
     "summary",
-], "$defs" = { "Check" = { "type" = "object", "properties" = { "command" = { "type" = "string", "maxLength" = 2048, "minLength" = 1 }, "evidence" = { "type" = "string", "maxLength" = 4096, "minLength" = 1 }, "execution" = { "description" = "Exact canonical shell output and argv; prose command text is display-only.", "anyOf" = [
+], "$defs" = { "ContributionResolution" = { "description" = "Explicit later review of all negative items in one immutable contribution.\nThis is a judgment backed by target checks, not a claim that checks prove prose.", "type" = "object", "properties" = { "check_indices" = { "type" = "array", "items" = { "type" = "integer", "format" = "uint32", "minimum" = 0 }, "maxItems" = 32, "minItems" = 1 }, "checksum_sha256" = { "type" = "string", "maxLength" = 64, "minLength" = 64 }, "evidence" = { "type" = "string", "maxLength" = 4096, "minLength" = 1 }, "item_paths" = { "description" = "Exact JSON pointers to every historical negative item being reviewed.", "type" = "array", "items" = { "type" = "string", "maxLength" = 4096, "minLength" = 1 }, "maxItems" = 128, "minItems" = 1 }, "output_id" = { "type" = "string", "maxLength" = 4096, "minLength" = 1 } }, "additionalProperties" = false, "required" = [
+    "output_id",
+    "checksum_sha256",
+    "item_paths",
+    "evidence",
+    "check_indices",
+] }, "Check" = { "type" = "object", "properties" = { "command" = { "type" = "string", "maxLength" = 2048, "minLength" = 1 }, "evidence" = { "type" = "string", "maxLength" = 4096, "minLength" = 1 }, "execution" = { "description" = "Exact canonical shell output and argv; prose command text is display-only.", "anyOf" = [
     { "$ref" = "#/$defs/CheckExecution" },
     { "type" = "null" },
 ] }, "outcome" = { "$ref" = "#/$defs/Observation" }, "workspace" = { "type" = "string", "maxLength" = 4096, "minLength" = 1 } }, "additionalProperties" = false, "required" = [
@@ -90,13 +96,16 @@ schema = { "$schema" = "https://json-schema.org/draft/2020-12/schema", "title" =
 ], "type" = "object" }, "DeliveryReport" = { "additionalProperties" = false, "description" = "Optional versioned report. Older goal outputs omit it; unknown versions reject.", "properties" = { "checks" = { "items" = { "$ref" = "#/$defs/Check" }, "maxItems" = 32, "type" = "array" }, "content_scope" = { "description" = "Optional explicit scope for every named target. Claims only, never freshness evidence.", "items" = { "$ref" = "#/$defs/DeliveredContent" }, "maxItems" = 64, "minItems" = 1, "type" = [
     "array",
     "null",
-] }, "contribution_output_ids" = { "items" = { "maxLength" = 4096, "minLength" = 1, "type" = "string" }, "maxItems" = 64, "type" = "array" }, "criteria" = { "items" = { "$ref" = "#/$defs/Criterion" }, "maxItems" = 64, "minItems" = 1, "type" = "array" }, "delivered_snapshot" = { "anyOf" = [
+] }, "resolutions" = { "description" = "V3 later integration judgments; historical canonical outputs remain unchanged.", "type" = "array", "items" = { "$ref" = "#/$defs/ContributionResolution" }, "maxItems" = 64 }, "contribution_output_ids" = { "items" = { "maxLength" = 4096, "minLength" = 1, "type" = "string" }, "maxItems" = 64, "type" = "array" }, "criteria" = { "items" = { "$ref" = "#/$defs/Criterion" }, "maxItems" = 64, "minItems" = 1, "type" = "array" }, "delivered_snapshot" = { "anyOf" = [
     { "$ref" = "#/$defs/DeliveredSnapshot" },
     { "type" = "null" },
 ], "description" = "V2 delivers these complete retained bytes, not a live workspace." }, "integrated_targets" = { "items" = { "maxLength" = 4096, "minLength" = 1, "type" = "string" }, "maxItems" = 64, "minItems" = 1, "type" = "array" }, "original_stop_condition" = { "description" = "Exact original stop condition this report evaluates. Absence in historical V1\nreports means coverage is unknown, never that the original criteria were covered.", "maxLength" = 65536, "minLength" = 1, "type" = [
     "string",
     "null",
-] }, "retained_workspaces" = { "items" = { "maxLength" = 4096, "minLength" = 1, "type" = "string" }, "maxItems" = 64, "type" = "array" }, "unresolved_work" = { "items" = { "maxLength" = 2048, "minLength" = 1, "type" = "string" }, "maxItems" = 64, "type" = "array" }, "version" = { "$ref" = "#/$defs/ReportVersion" } }, "required" = [
+] }, "repository_delivery" = { "anyOf" = [
+    { "$ref" = "#/$defs/RepositoryDelivery" },
+    { "type" = "null" },
+], "description" = "V3 complete retained binary-safe repository export." }, "retained_workspaces" = { "items" = { "maxLength" = 4096, "minLength" = 1, "type" = "string" }, "maxItems" = 64, "type" = "array" }, "unresolved_work" = { "items" = { "maxLength" = 2048, "minLength" = 1, "type" = "string" }, "maxItems" = 64, "type" = "array" }, "version" = { "$ref" = "#/$defs/ReportVersion" } }, "required" = [
     "version",
     "integrated_targets",
     "contribution_output_ids",
@@ -122,9 +131,17 @@ schema = { "$schema" = "https://json-schema.org/draft/2020-12/schema", "title" =
     "passed",
     "failed",
     "unverified",
-] }, "ReportVersion" = { "enum" = [
+] }, "RepositoryTarget" = { "additionalProperties" = false, "description" = "Requested complete Git commit. Working checkout changes are never included.", "properties" = { "commit" = { "description" = "Full lowercase SHA-1 or SHA-256 commit object identity.", "type" = "string" }, "version" = { "description" = "Repository target boundary version (1).", "format" = "uint32", "minimum" = 0, "type" = "integer" } }, "required" = [
+    "version",
+    "commit",
+], "type" = "object" }, "RepositoryDelivery" = { "additionalProperties" = false, "description" = "Retained complete repository export identity produced by the shell execution owner.", "properties" = { "artifact" = { "description" = "Canonical artifact location containing the entire binary-safe export.", "type" = "string" }, "sha256" = { "description" = "SHA-256 of the exact retained export bytes, not a mutable checkout hash.", "type" = "string" }, "target" = { "$ref" = "#/$defs/RepositoryTarget", "description" = "Repository request that the workspace owner exported." } }, "required" = [
+    "target",
+    "artifact",
+    "sha256",
+], "type" = "object" }, "ReportVersion" = { "enum" = [
     "1",
     "2",
+    "3",
 ], "type" = "string" } } }
 type_name = "bcode_loop_plugin::LoopWorkflowIteration"
 
@@ -143,7 +160,13 @@ schema = { "$schema" = "https://json-schema.org/draft/2020-12/schema", "title" =
     "condition_met",
     "evidence",
     "summary",
-], "$defs" = { "Check" = { "type" = "object", "properties" = { "command" = { "type" = "string", "maxLength" = 2048, "minLength" = 1 }, "evidence" = { "type" = "string", "maxLength" = 4096, "minLength" = 1 }, "execution" = { "description" = "Exact canonical shell output and argv; prose command text is display-only.", "anyOf" = [
+], "$defs" = { "ContributionResolution" = { "description" = "Explicit later review of all negative items in one immutable contribution.\nThis is a judgment backed by target checks, not a claim that checks prove prose.", "type" = "object", "properties" = { "check_indices" = { "type" = "array", "items" = { "type" = "integer", "format" = "uint32", "minimum" = 0 }, "maxItems" = 32, "minItems" = 1 }, "checksum_sha256" = { "type" = "string", "maxLength" = 64, "minLength" = 64 }, "evidence" = { "type" = "string", "maxLength" = 4096, "minLength" = 1 }, "item_paths" = { "description" = "Exact JSON pointers to every historical negative item being reviewed.", "type" = "array", "items" = { "type" = "string", "maxLength" = 4096, "minLength" = 1 }, "maxItems" = 128, "minItems" = 1 }, "output_id" = { "type" = "string", "maxLength" = 4096, "minLength" = 1 } }, "additionalProperties" = false, "required" = [
+    "output_id",
+    "checksum_sha256",
+    "item_paths",
+    "evidence",
+    "check_indices",
+] }, "Check" = { "type" = "object", "properties" = { "command" = { "type" = "string", "maxLength" = 2048, "minLength" = 1 }, "evidence" = { "type" = "string", "maxLength" = 4096, "minLength" = 1 }, "execution" = { "description" = "Exact canonical shell output and argv; prose command text is display-only.", "anyOf" = [
     { "$ref" = "#/$defs/CheckExecution" },
     { "type" = "null" },
 ] }, "outcome" = { "$ref" = "#/$defs/Observation" }, "workspace" = { "type" = "string", "maxLength" = 4096, "minLength" = 1 } }, "additionalProperties" = false, "required" = [
@@ -182,13 +205,16 @@ schema = { "$schema" = "https://json-schema.org/draft/2020-12/schema", "title" =
 ], "type" = "object" }, "DeliveryReport" = { "additionalProperties" = false, "description" = "Optional versioned report. Older goal outputs omit it; unknown versions reject.", "properties" = { "checks" = { "items" = { "$ref" = "#/$defs/Check" }, "maxItems" = 32, "type" = "array" }, "content_scope" = { "description" = "Optional explicit scope for every named target. Claims only, never freshness evidence.", "items" = { "$ref" = "#/$defs/DeliveredContent" }, "maxItems" = 64, "minItems" = 1, "type" = [
     "array",
     "null",
-] }, "contribution_output_ids" = { "items" = { "maxLength" = 4096, "minLength" = 1, "type" = "string" }, "maxItems" = 64, "type" = "array" }, "criteria" = { "items" = { "$ref" = "#/$defs/Criterion" }, "maxItems" = 64, "minItems" = 1, "type" = "array" }, "delivered_snapshot" = { "anyOf" = [
+] }, "resolutions" = { "description" = "V3 later integration judgments; historical canonical outputs remain unchanged.", "type" = "array", "items" = { "$ref" = "#/$defs/ContributionResolution" }, "maxItems" = 64 }, "contribution_output_ids" = { "items" = { "maxLength" = 4096, "minLength" = 1, "type" = "string" }, "maxItems" = 64, "type" = "array" }, "criteria" = { "items" = { "$ref" = "#/$defs/Criterion" }, "maxItems" = 64, "minItems" = 1, "type" = "array" }, "delivered_snapshot" = { "anyOf" = [
     { "$ref" = "#/$defs/DeliveredSnapshot" },
     { "type" = "null" },
 ], "description" = "V2 delivers these complete retained bytes, not a live workspace." }, "integrated_targets" = { "items" = { "maxLength" = 4096, "minLength" = 1, "type" = "string" }, "maxItems" = 64, "minItems" = 1, "type" = "array" }, "original_stop_condition" = { "description" = "Exact original stop condition this report evaluates. Absence in historical V1\nreports means coverage is unknown, never that the original criteria were covered.", "maxLength" = 65536, "minLength" = 1, "type" = [
     "string",
     "null",
-] }, "retained_workspaces" = { "items" = { "maxLength" = 4096, "minLength" = 1, "type" = "string" }, "maxItems" = 64, "type" = "array" }, "unresolved_work" = { "items" = { "maxLength" = 2048, "minLength" = 1, "type" = "string" }, "maxItems" = 64, "type" = "array" }, "version" = { "$ref" = "#/$defs/ReportVersion" } }, "required" = [
+] }, "repository_delivery" = { "anyOf" = [
+    { "$ref" = "#/$defs/RepositoryDelivery" },
+    { "type" = "null" },
+], "description" = "V3 complete retained binary-safe repository export." }, "retained_workspaces" = { "items" = { "maxLength" = 4096, "minLength" = 1, "type" = "string" }, "maxItems" = 64, "type" = "array" }, "unresolved_work" = { "items" = { "maxLength" = 2048, "minLength" = 1, "type" = "string" }, "maxItems" = 64, "type" = "array" }, "version" = { "$ref" = "#/$defs/ReportVersion" } }, "required" = [
     "version",
     "integrated_targets",
     "contribution_output_ids",
@@ -214,9 +240,17 @@ schema = { "$schema" = "https://json-schema.org/draft/2020-12/schema", "title" =
     "passed",
     "failed",
     "unverified",
-] }, "ReportVersion" = { "enum" = [
+] }, "RepositoryTarget" = { "additionalProperties" = false, "description" = "Requested complete Git commit. Working checkout changes are never included.", "properties" = { "commit" = { "description" = "Full lowercase SHA-1 or SHA-256 commit object identity.", "type" = "string" }, "version" = { "description" = "Repository target boundary version (1).", "format" = "uint32", "minimum" = 0, "type" = "integer" } }, "required" = [
+    "version",
+    "commit",
+], "type" = "object" }, "RepositoryDelivery" = { "additionalProperties" = false, "description" = "Retained complete repository export identity produced by the shell execution owner.", "properties" = { "artifact" = { "description" = "Canonical artifact location containing the entire binary-safe export.", "type" = "string" }, "sha256" = { "description" = "SHA-256 of the exact retained export bytes, not a mutable checkout hash.", "type" = "string" }, "target" = { "$ref" = "#/$defs/RepositoryTarget", "description" = "Repository request that the workspace owner exported." } }, "required" = [
+    "target",
+    "artifact",
+    "sha256",
+], "type" = "object" }, "ReportVersion" = { "enum" = [
     "1",
     "2",
+    "3",
 ], "type" = "string" } } }
 type_name = "bcode_loop_plugin::LoopWorkflowIteration"
 

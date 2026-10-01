@@ -15,6 +15,7 @@
 mod content_observation;
 mod contracts;
 pub mod recording;
+mod repository;
 #[cfg(feature = "static-bundled")]
 pub mod shell_run_tui;
 mod snapshot;
@@ -381,6 +382,17 @@ fn workflow_command_analysis(
             },
             ToString::to_string,
         );
+    let command = if let Some(target) = &plan.repository_target {
+        format!(
+            "{} ; {command}",
+            bcode_worktree::repository_target::authorization_command(
+                &workspace_root.join(&plan.cwd),
+                &target.commit
+            )
+        )
+    } else {
+        command
+    };
     let (analysis, analysis_error) = match bcode_shell_command_analysis::analyze(
         &bcode_shell_command_analysis_models::ShellAnalysisRequest::posix(command.clone()),
     ) {
@@ -622,6 +634,7 @@ fn shell_script_command_plan(
     }
     shell.push(script);
     Ok(ShellWorkflowCommandPlan {
+        repository_target: None,
         delivered_snapshot: None,
         observe_files: Vec::new(),
         expected_content: None,
@@ -668,6 +681,24 @@ fn canonical_command_plan_sha256(plan: &ShellWorkflowCommandPlan) -> Result<Stri
     Ok(hex::encode(Sha256::digest(normalized)))
 }
 
+fn workflow_command_directory(
+    invocation: &bcode_workflow::WorkflowBlockInvocation,
+    plan: &ShellWorkflowCommandPlan,
+) -> Result<PathBuf, String> {
+    let workspace = invocation
+        .workspace_root
+        .canonicalize()
+        .map_err(|error| format!("workflow workspace is unavailable: {error}"))?;
+    let cwd = workspace
+        .join(&plan.cwd)
+        .canonicalize()
+        .map_err(|error| format!("workflow cwd is unavailable: {error}"))?;
+    if !cwd.starts_with(&workspace) || !cwd.is_dir() {
+        return Err("workflow cwd escapes the immutable workspace".to_string());
+    }
+    Ok(cwd)
+}
+
 fn execute_workflow_command_plan(
     context: &NativeServiceContext,
     invocation: &bcode_workflow::WorkflowBlockInvocation,
@@ -679,21 +710,14 @@ fn execute_workflow_command_plan(
         "bcode.shell.exec.progress",
         1,
     );
-    let workspace = invocation
-        .workspace_root
-        .canonicalize()
-        .map_err(|error| format!("workflow workspace is unavailable: {error}"))?;
-    let cwd = workspace.join(&plan.cwd);
-    let cwd = cwd
-        .canonicalize()
-        .map_err(|error| format!("workflow cwd is unavailable: {error}"))?;
-    if !cwd.starts_with(&workspace) || !cwd.is_dir() {
-        return Err("workflow cwd escapes the immutable workspace".to_string());
-    }
+    let cwd = workflow_command_directory(invocation, plan)?;
     validate_workflow_environment(&plan.environment)?;
+    let repository = repository::PreparedRepository::prepare(context, invocation, plan, &cwd)?;
     let snapshot_directory = snapshot::prepare(plan)?;
-    let cwd = snapshot_directory
+    let cwd = repository
         .as_ref()
+        .map(|prepared| &prepared.directory)
+        .or(snapshot_directory.as_ref())
         .map_or(cwd, |directory| directory.path().to_path_buf());
     let content_before = if plan.observe_files.is_empty() {
         None
@@ -704,7 +728,11 @@ fn execute_workflow_command_plan(
         return Err("verification content precondition does not match current observation".into());
     }
     let mut commands = Vec::with_capacity(plan.commands.len());
-    let mut artifacts = Vec::new();
+    let mut artifacts = repository
+        .as_ref()
+        .map(|prepared| prepared.artifact.clone())
+        .into_iter()
+        .collect::<Vec<_>>();
     let mut content_after = content_before.clone();
     let mut content_invalidated = false;
     for (index, command) in plan.commands.iter().enumerate() {
@@ -728,6 +756,9 @@ fn execute_workflow_command_plan(
         let should_stop = result.status != ShellWorkflowCommandStatus::Exited
             || !accepted_exit && !continue_on_unaccepted;
         commands.push(result);
+        if repository.as_ref().is_some_and(|export| !export.matches()) {
+            content_invalidated = true;
+        }
         if let Some(target) = &plan.delivered_snapshot {
             content_invalidated |= !snapshot::matches(&cwd, target);
         }
@@ -755,6 +786,8 @@ fn execute_workflow_command_plan(
             result.status == ShellWorkflowCommandStatus::Exited && result.exit_accepted
         });
     Ok(ShellWorkflowCommandPlanResult {
+        repository_verification: repository
+            .map(|prepared| prepared.verification(passed, content_invalidated)),
         snapshot_verification: plan.delivered_snapshot.as_ref().map(|target| {
             bcode_shell_models::SnapshotVerification {
                 version: 1,
@@ -2826,6 +2859,7 @@ mod tests {
                 preparation: None,
             },
             ShellWorkflowCommandPlan {
+                repository_target: None,
                 delivered_snapshot: None,
                 observe_files: Vec::new(),
                 expected_content: None,
@@ -3635,6 +3669,76 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn repository_checks_bind_binary_revision_and_preserve_dirty_user_work() {
+        let workspace = tempfile::tempdir().unwrap();
+        let git = |args: &[&str]| {
+            let output = std::process::Command::new("git")
+                .arg("-C")
+                .arg(workspace.path())
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(output.status.success());
+            String::from_utf8_lossy(&output.stdout).trim().to_owned()
+        };
+        git(&["init", "-q"]);
+        std::fs::write(workspace.path().join("source"), b"retained").unwrap();
+        std::fs::write(workspace.path().join("binary"), [0, 255]).unwrap();
+        git(&["add", "."]);
+        git(&[
+            "-c",
+            "user.name=Test",
+            "-c",
+            "user.email=test@example.test",
+            "commit",
+            "-qm",
+            "fixture",
+        ]);
+        let commit = git(&["rev-parse", "HEAD"]);
+        std::fs::write(workspace.path().join("source"), b"dirty user work").unwrap();
+        for (script, passed) in [
+            (
+                "test $(cat source) = retained; mkdir build; echo generated > build/result",
+                true,
+            ),
+            ("exit 1", false),
+            ("echo changed > source", false),
+        ] {
+            let (invocation, mut plan) = workflow_command_plan(
+                workspace.path(),
+                vec![contracts::ShellWorkflowCommand {
+                    argv: vec!["sh".into(), "-c".into(), script.into()],
+                    timeout_ms: 5000,
+                    accepted_exit_codes: None,
+                    continue_on_unaccepted_exit: false,
+                }],
+            );
+            plan.repository_target = Some(bcode_shell_models::RepositoryTarget {
+                version: 1,
+                commit: commit.clone(),
+            });
+            let context = workflow_context_with_bridge(
+                &invocation,
+                bcode_plugin_sdk::ServiceCancellation::default(),
+                ServiceBridge::new(
+                    Some(workflow_artifact_bridge),
+                    std::ptr::null_mut(),
+                    bcode_plugin_sdk::ServiceCancellation::default(),
+                ),
+            );
+            let result = execute_workflow_command_plan(&context, &invocation, &plan).unwrap();
+            let verification = result.repository_verification.unwrap();
+            assert_eq!(verification.accepts(&verification.delivery), passed);
+            assert_eq!(result.artifacts.len(), 1);
+            assert_eq!(
+                std::fs::read(workspace.path().join("source")).unwrap(),
+                b"dirty user work"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn workflow_command_plan_spills_truncated_output_to_artifact() {
         let workspace = tempfile::tempdir().expect("workspace");
         let (invocation, mut plan) = workflow_command_plan(
@@ -3737,6 +3841,7 @@ mod tests {
             value: serde_json::json!(false),
         };
         let result = ShellWorkflowCommandPlanResult {
+            repository_verification: None,
             snapshot_verification: None,
             content_before: None,
             content_after: None,

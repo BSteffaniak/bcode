@@ -1,5 +1,43 @@
 # Goal setup for prompt loops
 
+## Repository delivery V3
+
+Normal goal generation and collaboration guidance support `repository_target` on a direct
+`shell.exec` command-plan V2. This is an additive input, not a reinterpretation of
+`delivered_snapshot` or delivery report V2. The target is `{version:1,commit:<full lowercase OID>}`
+at the plan's confined repository cwd. Creating an integrated commit requires ordinary Git
+permission; this operation itself never stages, commits, updates refs, or changes user files.
+Uncommitted, ignored and untracked files are not silently represented as delivered: this
+contract explicitly delivers only the requested complete commit. Required work outside that
+commit remains unresolved.
+
+The workspace owner exports every regular Git blob without checkout filters/attributes,
+preserving binary content and executable modes. Symlinks, submodules, LFS pointers,
+non-UTF-8/unsafe paths, unavailable objects, empty trees, and exports exceeding 100,000 files
+or 16 MiB of blob bytes fail explicitly. Export version 1 is retained as a complete JSON
+artifact (`bcode.repository.export`, file bytes encoded as arrays), with SHA-256 identity.
+The shell owner materializes it privately, retains it before commands, checks all original
+bytes/modes after each command, and records the exact environment limitation contract.
+Generated build files are allowed but not delivered. This is not a sandbox: tools,
+dependencies, network, external inputs and writers are not isolated; checks that require
+`.git` metadata need a different supported procedure and cannot be reported as passing here.
+
+A V3 report copies `repository_verification.delivery` into `repository_delivery`, names its
+artifact as the sole `integrated_targets` entry, omits snapshot/content-scope fields, and
+references canonical direct shell outputs with exact command indexes/argv. The loop verifies
+producer identity, admitted target, retained artifact identity, successful zero-exit commands,
+unchanged sources, supported evidence versions and full unchanged original criteria. Reviews
+remain judgments. Historical unresolved contribution evidence blocks completion unless V3
+supplies a later `resolutions` review: exact canonical `output_id` and `checksum_sha256`,
+`item_paths` covering every negative JSON pointer (blockers first, then each contribution's
+remaining_work and removed retention), a concrete `evidence` explanation, and `check_indices`
+into the final target's authenticated checks. Malformed/unknown history, partial coverage,
+stale identities, duplicate resolutions and failed/missing checks cannot resolve it. This
+retains history and records a review judgment; commands do not prove arbitrary prose.
+V1 cannot certify; V2 retains
+its exact bounded UTF-8 semantics. Existing runs with explicitly V2-only pinned criteria are
+not silently rewritten. New guidance does not override their original stop condition.
+
 ## Live supervision
 
 Use `/goal.watch` from the originating conversation to watch the associated run.

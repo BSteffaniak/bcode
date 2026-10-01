@@ -5,6 +5,82 @@
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
+/// Requested complete Git commit. Working checkout changes are never included.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct RepositoryTarget {
+    /// Repository target boundary version (1).
+    pub version: u32,
+    /// Full lowercase SHA-1 or SHA-256 commit object identity.
+    pub commit: String,
+}
+impl RepositoryTarget {
+    /// Validate representation, without asserting that objects are available.
+    #[must_use]
+    pub fn valid(&self) -> bool {
+        self.version == 1
+            && matches!(self.commit.len(), 40 | 64)
+            && self
+                .commit
+                .bytes()
+                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+    }
+}
+
+/// Retained complete repository export identity produced by the shell execution owner.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct RepositoryDelivery {
+    /// Repository request that the workspace owner exported.
+    pub target: RepositoryTarget,
+    /// Canonical artifact location containing the entire binary-safe export.
+    pub artifact: String,
+    /// SHA-256 of the exact retained export bytes, not a mutable checkout hash.
+    pub sha256: String,
+}
+impl RepositoryDelivery {
+    /// Validate bounded reference shape; callers must authenticate producer evidence.
+    #[must_use]
+    pub fn valid(&self) -> bool {
+        self.target.valid()
+            && !self.artifact.is_empty()
+            && self.artifact.len() <= 4096
+            && self.sha256.len() == 64
+            && self.sha256.bytes().all(|b| b.is_ascii_hexdigit())
+    }
+}
+
+/// Evidence is meaningful only inside an authenticated canonical shell output.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RepositoryVerification {
+    /// Evidence version (1).
+    pub version: u32,
+    /// Complete retained delivery, captured before commands.
+    pub delivery: RepositoryDelivery,
+    /// All commands passed without cancellation or timeout.
+    pub commands_passed: bool,
+    /// Every original file and mode matched after each command.
+    pub sources_unchanged: bool,
+    /// Explicit limitation contract; does not claim hermetic checks or checkout freshness.
+    pub environment: String,
+}
+impl RepositoryVerification {
+    /// Stable interpretation of environmental scope in version 1.
+    pub const ENVIRONMENT: &str = "private materialization; generated files permitted but not delivered; tools, dependencies, network, external writers and external inputs are not isolated; mutable checkout is not the target";
+
+    /// Validate exact retained identity and successful source-bound evidence.
+    #[must_use]
+    pub fn accepts(&self, delivery: &RepositoryDelivery) -> bool {
+        self.version == 1
+            && delivery.valid()
+            && self.delivery == *delivery
+            && self.commands_passed
+            && self.sources_unchanged
+            && self.environment == Self::ENVIRONMENT
+    }
+}
+
 /// Complete delivered target, not a selection from or certification of a live workspace.
 ///
 /// Version 1 supports only UTF-8 regular non-executable files and implicit directories.

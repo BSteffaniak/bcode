@@ -12,12 +12,19 @@ pub struct DeliveryReport {
     /// V2 delivers these complete retained bytes, not a live workspace.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub delivered_snapshot: Option<bcode_shell_models::DeliveredSnapshot>,
+    /// V3 complete retained binary-safe repository export.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub repository_delivery: Option<bcode_shell_models::RepositoryDelivery>,
     #[schemars(length(min = 1, max = 64), inner(length(min = 1, max = 4096)))]
     pub integrated_targets: Vec<String>,
     /// Optional explicit scope for every named target. Claims only, never freshness evidence.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schemars(length(min = 1, max = 64))]
     pub content_scope: Option<Vec<DeliveredContent>>,
+    /// V3 later integration judgments; historical canonical outputs remain unchanged.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[schemars(length(max = 64))]
+    pub resolutions: Vec<ContributionResolution>,
     #[schemars(length(max = 64), inner(length(min = 1, max = 4096)))]
     pub contribution_output_ids: Vec<String>,
     #[schemars(length(min = 1, max = 64))]
@@ -37,13 +44,16 @@ pub struct DeliveryReport {
 
 impl DeliveryReport {
     pub(crate) fn snapshot_coverage(&self, stop_condition: &str) -> bool {
-        self.version == ReportVersion::V2
-            && self.identifies_original_criteria(stop_condition)
-            && self.content_scope.is_none()
+        (self.version == ReportVersion::V2 && self.repository_delivery.is_none()
             && self.delivered_snapshot.as_ref().is_some_and(|snapshot| {
                 snapshot.validate().is_ok()
                     && self.integrated_targets == snapshot.files.keys().cloned().collect::<Vec<_>>()
-            })
+            }) || self.version == ReportVersion::V3 && self.delivered_snapshot.is_none()
+                && self.repository_delivery.as_ref().is_some_and(|delivery| {
+                    delivery.valid() && self.integrated_targets == vec![delivery.artifact.clone()]
+                }))
+            && self.identifies_original_criteria(stop_condition)
+            && self.content_scope.is_none()
             // An explicit whole-objective judgment prevents a selected subset from
             // silently replacing the original stop condition. It remains a judgment.
             && self.criteria.iter().any(|criterion| criterion.description == stop_condition)
@@ -87,6 +97,10 @@ impl DeliveryReport {
                 .content_scope
                 .as_ref()
                 .is_some_and(|scope| !self.covers_scope(scope))
+            || self.resolutions.iter().any(|resolution| {
+                self.version != ReportVersion::V3
+                    || !self.contribution_output_ids.contains(&resolution.output_id)
+            })
             || !self.unresolved_work.is_empty()
     }
 
@@ -123,6 +137,83 @@ impl DeliveryReport {
                     })
             })
     }
+}
+
+/// Explicit later review of all negative items in one immutable contribution.
+/// This is a judgment backed by target checks, not a claim that checks prove prose.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ContributionResolution {
+    #[schemars(length(min = 1, max = 4096))]
+    pub output_id: String,
+    #[schemars(length(min = 64, max = 64))]
+    pub checksum_sha256: String,
+    /// Exact JSON pointers to every historical negative item being reviewed.
+    #[schemars(length(min = 1, max = 128), inner(length(min = 1, max = 4096)))]
+    pub item_paths: Vec<String>,
+    #[schemars(length(min = 1, max = 4096))]
+    pub evidence: String,
+    #[schemars(length(min = 1, max = 32))]
+    pub check_indices: Vec<u32>,
+}
+
+impl DeliveryReport {
+    pub(crate) fn resolves(&self, output: &bcode_workflow::WorkflowOutputInspection) -> bool {
+        let matching: Vec<_> = self
+            .resolutions
+            .iter()
+            .filter(|resolution| resolution.output_id == output.output_id)
+            .collect();
+        let Some(items) = negative_items(&output.value) else {
+            return false;
+        };
+        self.version == ReportVersion::V3
+            && !items.is_empty()
+            && self.repository_delivery.is_some()
+            && output.schema_id == "bcode.delegated_task_result.v2"
+            && output.schema_version == 1
+            && matching.len() == 1
+            && matching.iter().all(|resolution| {
+                resolution.checksum_sha256 == output.checksum_sha256
+                    && resolution.item_paths == items
+                    && !resolution.evidence.trim().is_empty()
+                    && !resolution.check_indices.is_empty()
+                    && resolution.check_indices.iter().all(|index| {
+                        self.checks.get(*index as usize).is_some_and(|check| {
+                            check.outcome == Observation::Passed && check.execution.is_some()
+                        })
+                    })
+            })
+    }
+}
+
+fn negative_items(value: &serde_json::Value) -> Option<Vec<String>> {
+    let mut items = Vec::new();
+    for (index, blocker) in value.get("blockers")?.as_array()?.iter().enumerate() {
+        blocker.as_str()?;
+        items.push(format!("/blockers/{index}"));
+    }
+    if let Some(contributions) = value.get("contributions") {
+        for (index, contribution) in contributions.as_array()?.iter().enumerate() {
+            for (item, remaining) in contribution
+                .get("remaining_work")?
+                .as_array()?
+                .iter()
+                .enumerate()
+            {
+                remaining.as_str()?;
+                items.push(format!("/contributions/{index}/remaining_work/{item}"));
+            }
+            if contribution
+                .get("retention")
+                .and_then(serde_json::Value::as_str)
+                == Some("removed")
+            {
+                items.push(format!("/contributions/{index}/retention"));
+            }
+        }
+    }
+    Some(items)
 }
 
 /// Explicit delivered target coverage, interpreted only by the loop domain.
@@ -185,6 +276,8 @@ pub enum ReportVersion {
     V1,
     #[serde(rename = "2")]
     V2,
+    #[serde(rename = "3")]
+    V3,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -413,6 +506,61 @@ mod tests {
     }
 
     #[test]
+    fn repository_coverage_keeps_original_criteria_and_version_boundaries() {
+        let mut value = json!({
+            "version":"3", "repository_delivery":{"target":{"version":1,"commit":"a".repeat(40)},"artifact":"retained-export","sha256":"b".repeat(64)},
+            "integrated_targets":["retained-export"], "contribution_output_ids":[],
+            "original_stop_condition":"whole objective",
+            "criteria":[{"criterion":"whole objective","status":"passed","basis":"observed_check","check_indices":[0],"evidence":"canonical check"}],
+            "checks":[{"command":"test","workspace":"private target","outcome":"passed","evidence":"canonical"}],
+            "retained_workspaces":[],"unresolved_work":[]
+        });
+        let report: DeliveryReport = serde_json::from_value(value.clone()).unwrap();
+        assert!(report.snapshot_coverage("whole objective"));
+        assert!(!report.snapshot_coverage("different objective"));
+        for version in ["1", "2"] {
+            value["version"] = json!(version);
+            let report: DeliveryReport = serde_json::from_value(value.clone()).unwrap();
+            assert!(!report.snapshot_coverage("whole objective"));
+        }
+    }
+
+    #[test]
+    fn later_resolution_requires_exact_history_items_and_checked_target() {
+        let output: bcode_workflow::WorkflowOutputInspection = serde_json::from_value(json!({
+            "version":1,"output_id":"worker","run_id":"run","node_id":"worker",
+            "activation_id":"activation","schema_id":"bcode.delegated_task_result.v2",
+            "schema_version":1,"checksum_sha256":"a".repeat(64),"created_at_ms":1,
+            "value":{"blockers":["integrate"],"contributions":[{"remaining_work":["test"]}]}
+        }))
+        .unwrap();
+        let value = json!({
+            "version":"3", "repository_delivery":{"target":{"version":1,"commit":"a".repeat(40)},"artifact":"export","sha256":"b".repeat(64)},
+            "integrated_targets":["export"],"contribution_output_ids":["worker"],
+            "criteria":[],"checks":[{"command":"test","workspace":"target","outcome":"passed","evidence":"checked","execution":{"output_id":"check","command_index":0,"argv":["test"]}}],
+            "retained_workspaces":[],"unresolved_work":[],
+            "resolutions":[{"output_id":"worker","checksum_sha256":"a".repeat(64),"item_paths":["/blockers/0","/contributions/0/remaining_work/0"],"evidence":"Integrated and checked; review judgment","check_indices":[0]}]
+        });
+        let report: DeliveryReport = serde_json::from_value(value.clone()).unwrap();
+        assert!(report.resolves(&output));
+        assert!(contribution_precludes_completion(&output)); // History is never rewritten.
+        for (pointer, replacement) in [
+            ("/version", json!("2")),
+            ("/resolutions/0/checksum_sha256", json!("b".repeat(64))),
+            ("/resolutions/0/item_paths", json!(["/blockers/0"])),
+            ("/resolutions/0/check_indices", json!([1])),
+            ("/checks/0/outcome", json!("failed")),
+            ("/checks/0/execution", json!(null)),
+            ("/resolutions/0/evidence", json!(" ")),
+        ] {
+            let mut invalid = value.clone();
+            *invalid.pointer_mut(pointer).unwrap() = replacement;
+            let report: DeliveryReport = serde_json::from_value(invalid).unwrap();
+            assert!(!report.resolves(&output), "{pointer}");
+        }
+    }
+
+    #[test]
     fn delivery_report_is_bounded_and_preserves_unverified_evidence() {
         let schema = serde_json::to_value(schemars::schema_for!(DeliveryReport)).unwrap();
         let validator = jsonschema::validator_for(&schema).unwrap();
@@ -425,7 +573,7 @@ mod tests {
         assert!(validator.is_valid(&value));
         let report: DeliveryReport = serde_json::from_value(value.clone()).unwrap();
         assert_eq!(report.criteria[0].status, Observation::Unverified);
-        value["version"] = json!("3");
+        value["version"] = json!("4");
         assert!(!validator.is_valid(&value));
         assert!(serde_json::from_value::<DeliveryReport>(value.clone()).is_err());
         value["version"] = json!("1");

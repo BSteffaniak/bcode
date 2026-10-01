@@ -218,9 +218,7 @@ pub fn invoke(context: &NativeServiceContext) -> ServiceResponse {
     }
     if input.condition_met
         && input.delivery.as_ref().is_some_and(|report| {
-            report.contribution_output_ids.iter().any(|output_id| {
-                !authenticate_output(&context.bridge, &invocation.dispatch_identity, output_id)
-            })
+            !authenticate_contributions(&context.bridge, &invocation.dispatch_identity, report)
         })
     {
         input.condition_met = false;
@@ -321,14 +319,17 @@ fn reject_snapshot_delivery(
     dispatch_identity: &str,
 ) -> bool {
     if let Some(report) = &input.delivery
-        && report.version == delivery::ReportVersion::V2
+        && matches!(
+            report.version,
+            delivery::ReportVersion::V2 | delivery::ReportVersion::V3
+        )
     {
         let verified = !report.precludes_completion()
             && report.snapshot_coverage(&input.stop_condition)
             && report
                 .contribution_output_ids
                 .iter()
-                .all(|id| authenticate_output(bridge, dispatch_identity, id))
+                .all(|id| authenticate_output(bridge, dispatch_identity, id, report))
             && report.checks.iter().all(|check| {
                 check.execution.as_ref().is_some_and(|reference| {
                     inspect_execution(bridge, dispatch_identity, &reference.output_id).is_some_and(
@@ -336,6 +337,10 @@ fn reject_snapshot_delivery(
                             report.delivered_snapshot.as_ref().is_some_and(|snapshot| {
                                 super::delivery_execution::delivered_check(
                                     &evidence, reference, snapshot,
+                                )
+                            }) || report.repository_delivery.as_ref().is_some_and(|delivery| {
+                                super::delivery_execution::repository_check(
+                                    &evidence, reference, delivery,
                                 )
                             })
                         },
@@ -347,7 +352,7 @@ fn reject_snapshot_delivery(
             input.summary = "Completion withheld: incomplete original-criterion coverage or unauthenticated, failed, stale immutable delivery verification".into();
             return true;
         }
-        input.summary.push_str("; delivery is the exact retained UTF-8 snapshot, not live checkout freshness or hermetic environment verification; criterion reviews remain judgments");
+        input.summary.push_str("; delivery is the exact retained target, not live checkout freshness or hermetic environment verification; criterion reviews remain judgments");
     }
     false
 }
@@ -488,7 +493,23 @@ fn inspect_execution(
     serde_json::from_value(payload).ok()
 }
 
-fn authenticate_output(bridge: &ServiceBridge, dispatch_identity: &str, output_id: &str) -> bool {
+fn authenticate_contributions(
+    bridge: &ServiceBridge,
+    dispatch_identity: &str,
+    report: &delivery::DeliveryReport,
+) -> bool {
+    report
+        .contribution_output_ids
+        .iter()
+        .all(|id| authenticate_output(bridge, dispatch_identity, id, report))
+}
+
+fn authenticate_output(
+    bridge: &ServiceBridge,
+    dispatch_identity: &str,
+    output_id: &str,
+    report: &delivery::DeliveryReport,
+) -> bool {
     let request = bcode_tool::ToolInvocationServiceRequest {
         invocation_id: dispatch_identity.into(),
         request_id: "loop-contribution".into(),
@@ -505,11 +526,25 @@ fn authenticate_output(bridge: &ServiceBridge, dispatch_identity: &str, output_i
     else {
         return false;
     };
-    serde_json::from_value::<bcode_workflow::WorkflowOutputProvenance>(payload)
-        .is_ok_and(|provenance| valid_contribution_provenance(&provenance, output_id))
+    serde_json::from_value::<bcode_workflow::WorkflowOutputProvenance>(payload).is_ok_and(
+        |provenance| {
+            valid_contribution_identity(&provenance, output_id)
+                && (!delivery::contribution_precludes_completion(&provenance.output)
+                    || report.resolves(&provenance.output))
+        },
+    )
 }
 
+#[cfg(test)]
 fn valid_contribution_provenance(
+    provenance: &bcode_workflow::WorkflowOutputProvenance,
+    output_id: &str,
+) -> bool {
+    valid_contribution_identity(provenance, output_id)
+        && !delivery::contribution_precludes_completion(&provenance.output)
+}
+
+fn valid_contribution_identity(
     provenance: &bcode_workflow::WorkflowOutputProvenance,
     output_id: &str,
 ) -> bool {
@@ -528,7 +563,6 @@ fn valid_contribution_provenance(
                     .checksum_sha256
                     .bytes()
                     .all(|byte| byte.is_ascii_hexdigit())
-                && !delivery::contribution_precludes_completion(evidence)
 }
 
 fn evaluate(

@@ -52,7 +52,10 @@ schema = { "x-bcode-allow-dynamic-complete-input" = false, "x-bcode-dynamic-bind
         "commands",
         "environment",
         "output",
-    ], properties = { version = { const = 2 }, delivered_snapshot = { type = "object", additionalProperties = false, required = [
+    ], properties = { version = { const = 2 }, repository_target = { type = "object", additionalProperties = false, required = [
+        "version",
+        "commit",
+    ], properties = { version = { const = 1 }, commit = { type = "string", pattern = "^([0-9a-f]{40}|[0-9a-f]{64})$" } } }, delivered_snapshot = { type = "object", additionalProperties = false, required = [
         "version",
         "files",
     ], properties = { version = { const = 1 }, files = { type = "object", minProperties = 1, maxProperties = 64, additionalProperties = { type = "string", maxLength = 262144 } } } }, expected_content = { type = "object", additionalProperties = false, required = [
@@ -101,7 +104,20 @@ schema = { "$defs" = { content_observation = { type = "object", allOf = [
     "passed",
     "commands",
     "artifacts",
-], properties = { snapshot_verification = { type = "object", additionalProperties = false, required = [
+], properties = { repository_verification = { type = "object", additionalProperties = false, required = [
+    "version",
+    "delivery",
+    "commands_passed",
+    "sources_unchanged",
+    "environment",
+], properties = { version = { const = 1 }, commands_passed = { type = "boolean" }, sources_unchanged = { type = "boolean" }, environment = { type = "string", maxLength = 4096 }, delivery = { type = "object", additionalProperties = false, required = [
+    "target",
+    "artifact",
+    "sha256",
+], properties = { target = { type = "object", additionalProperties = false, required = [
+    "version",
+    "commit",
+], properties = { version = { const = 1 }, commit = { type = "string", pattern = "^([0-9a-f]{40}|[0-9a-f]{64})$" } } }, artifact = { type = "string", minLength = 1, maxLength = 4096 }, sha256 = { type = "string", pattern = "^[0-9a-f]{64}$" } } } } }, snapshot_verification = { type = "object", additionalProperties = false, required = [
     "version",
     "target",
     "commands_passed",
