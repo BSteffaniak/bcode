@@ -204,6 +204,18 @@ fn negative_items(value: &serde_json::Value) -> Option<Vec<String>> {
                 remaining.as_str()?;
                 items.push(format!("/contributions/{index}/remaining_work/{item}"));
             }
+            if let Some(validation) = contribution.get("validation") {
+                for (check, result) in validation.as_array()?.iter().enumerate() {
+                    match result.get("outcome")?.as_str()? {
+                        "passed" => {}
+                        "failed" | "not_run" => {
+                            items
+                                .push(format!("/contributions/{index}/validation/{check}/outcome"));
+                        }
+                        _ => return None,
+                    }
+                }
+            }
             if contribution
                 .get("retention")
                 .and_then(serde_json::Value::as_str)
@@ -256,6 +268,15 @@ pub fn contribution_precludes_completion(
         return true;
     };
     contributions.iter().any(|contribution| {
+        // Failed or unrun worker checks remain negative history until an explicit
+        // target-bound later review resolves them. Unknown representations fail closed.
+        contribution.get("validation").is_some_and(|validation| {
+            validation.as_array().is_none_or(|checks| {
+                checks.iter().any(|check| {
+                    check.get("outcome").and_then(serde_json::Value::as_str) != Some("passed")
+                })
+            })
+        }) ||
         // An explicit removal is negative evidence even when the worker omitted
         // remaining work. Absence/unknown retention remains unknown, not proof
         // that any contribution was retained or integrated.
@@ -456,6 +477,18 @@ mod tests {
         assert!(!contribution_precludes_completion(&output)); // Unknown is not certification.
         output.value["contributions"][0]["retention"] = json!("retained");
         assert!(!contribution_precludes_completion(&output)); // A claim is not certification.
+        for validation in [
+            json!([{"outcome":"failed"}]),
+            json!([{"outcome":"not_run"}]),
+            json!([{"outcome":"future"}]),
+            json!([{}]),
+            json!(null),
+        ] {
+            output.value["contributions"][0]["validation"] = validation;
+            assert!(contribution_precludes_completion(&output));
+        }
+        output.value["contributions"][0]["validation"] = json!([{"outcome":"passed"}]);
+        assert!(!contribution_precludes_completion(&output));
         output.value["blockers"] = json!(["permission denied"]);
         assert!(contribution_precludes_completion(&output));
         output.value["blockers"] = json!([]);
@@ -544,6 +577,23 @@ mod tests {
         let report: DeliveryReport = serde_json::from_value(value.clone()).unwrap();
         assert!(report.resolves(&output));
         assert!(contribution_precludes_completion(&output)); // History is never rewritten.
+        for outcome in ["failed", "not_run"] {
+            let mut history = output.clone();
+            history.value["contributions"][0]["validation"] = json!([{"outcome":outcome}]);
+            assert!(contribution_precludes_completion(&history));
+            assert!(!report.resolves(&history));
+            let mut resolved = value.clone();
+            resolved["resolutions"][0]["item_paths"] = json!([
+                "/blockers/0",
+                "/contributions/0/remaining_work/0",
+                "/contributions/0/validation/0/outcome"
+            ]);
+            let resolved: DeliveryReport = serde_json::from_value(resolved).unwrap();
+            assert!(resolved.resolves(&history));
+            assert!(contribution_precludes_completion(&history));
+            history.value["contributions"][0]["validation"][0]["outcome"] = json!("future");
+            assert!(!resolved.resolves(&history));
+        }
         for (pointer, replacement) in [
             ("/version", json!("2")),
             ("/resolutions/0/checksum_sha256", json!("b".repeat(64))),

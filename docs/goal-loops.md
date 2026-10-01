@@ -3,7 +3,11 @@
 ## Repository delivery V3
 
 Normal goal generation, collaboration guidance and the read-only completion evaluator support
-repository delivery V3. The evaluator preserves the original stop condition: support for V3
+repository delivery V3. `/goal.status` previews the retained repository artifact, commit and
+SHA-256 identity, plus bounded later-resolution reviews referencing historical outputs.
+These are evaluator-reported claims, not independent authentication by the display; the
+canonical report retains full item paths and check references. Missing repository identity
+and unresolved live acceptance remain explicit. The evaluator preserves the original stop condition: support for V3
 does not authorize upgrading an existing V2-only pinned condition. Checkout locations belong
 in `retained_workspaces`, revision observations in evidence, and the retained artifact alone
 in V3 `integrated_targets`.
@@ -36,7 +40,8 @@ unchanged sources, supported evidence versions and full unchanged original crite
 remain judgments. Historical unresolved contribution evidence blocks completion unless V3
 supplies a later `resolutions` review: exact canonical `output_id` and `checksum_sha256`,
 `item_paths` covering every negative JSON pointer (blockers first, then each contribution's
-remaining_work and removed retention), a concrete `evidence` explanation, and `check_indices`
+remaining_work, failed/not_run validation outcomes (`/contributions/N/validation/M/outcome`),
+and removed retention), a concrete `evidence` explanation, and `check_indices`
 into the final target's authenticated checks. Malformed/unknown history, partial coverage,
 stale identities, duplicate resolutions and failed/missing checks cannot resolve it. This
 retains history and records a review judgment; commands do not prove arbitrary prose.

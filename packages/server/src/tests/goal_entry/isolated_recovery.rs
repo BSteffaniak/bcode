@@ -20,10 +20,9 @@ fn shell(directory: &Path, command: &str) -> serde_json::Value {
 }
 
 pub(super) fn install_script(request: &mut PluginWorkflowStartRequest, root: &Path, trees: &Path) {
-    let reference =
-        |key: &str| serde_json::json!({"$fake_result":{"index":0,"pointer":format!("/{key}")}});
+    let reference = |index: usize, pointer: &str| serde_json::json!({"$fake_result":{"index":index,"pointer":pointer}});
     let base = git(root, &["rev-parse", "HEAD"]);
-    let task = |id: &str| {
+    let task = |id: &str, creation_index: usize| {
         let workspace = trees.join(id);
         let contents = if id == "left" {
             LEFT_MODULE
@@ -46,7 +45,7 @@ pub(super) fn install_script(request: &mut PluginWorkflowStartRequest, root: &Pa
             "remaining_work":["Resolve integration conflict and verify combined result"],"retention":"retained"
         }]});
         serde_json::json!({"task_id":id,"objective":format!("Contribute in the assigned checkout.\ntool-call filesystem.write {write}\ntool-call shell.run {commit}\ntool-call filesystem.read {revision}\nstructured-result {result}"),
-            "agent_profile":"build","read_only":false,"worktree_directory":workspace,
+            "agent_profile":"build","read_only":false,"worktree_directory":reference(creation_index, "/path"),
             "tool_allowlist":["filesystem.write","filesystem.read","shell.run"],"resources":[{"resource":format!("checkout:{id}"),"access":"write"}],
             "model_selection":{"provider":"bcode.fake-provider","model":"fake-echo"}})
     };
@@ -67,15 +66,15 @@ pub(super) fn install_script(request: &mut PluginWorkflowStartRequest, root: &Pa
         ),
     );
     let group = serde_json::json!({
-        "version":2,"generated_ids":true,"mutation_id":"isolated-goal-workers",
-        "run_id":reference("run_id"),"expected_revision":reference("expected_revision"),
-        "source_node_id":reference("source_node_id"),"bind_source_activation":reference("bind_source_activation"),
-        "input":reference("input"),"preserve_source_output":true,"tasks":[task("left"),task("right")],
+        "mutation_id":"isolated-goal-workers",
+        "run_id":reference(0, "/run_id"),"expected_revision":reference(0, "/graph/revision"),
+        "bind_source_activation":reference(0, "/activation_id"),
+        // Results are newest first: execution context, integration, right, left.
+        "tasks":[task("left", 3),task("right", 2)],
         "continuation":{"objective":format!("Integrate both retained contributions. Inspect the actual conflict before resolving it; never overwrite the source checkout.\ntool-call-expect-error CONFLICT :: shell.run {probe}\ntool-call shell.run {inspect}\ntool-call filesystem.write {resolution}\ntool-call shell.run {verify}"),
-            "agent_profile":"build","read_only":false,"worktree_directory":integration,"tool_allowlist":["shell.run","filesystem.write"],
+            "agent_profile":"build","read_only":false,"worktree_directory":reference(1, "/path"),"tool_allowlist":["shell.run","filesystem.write"],
             "resources":[{"resource":"checkout:integration","access":"write"}],"model_selection":{"provider":"bcode.fake-provider","model":"fake-echo"}},
-        "first_edge_id":reference("first_edge_id"),"reconnect":reference("reconnect"),
-        "retain_source_edge_ids":reference("retain_source_edge_ids"),"reconciliation":reference("reconciliation")
+        "reconciliation":[]
     });
     let publication =
         serde_json::json!({"$fake_result":{"index":0,"pointer":"/publication_arguments"}});
@@ -95,7 +94,7 @@ pub(super) fn install_script(request: &mut PluginWorkflowStartRequest, root: &Pa
         })
         .join("\n");
     source.configuration["system_prompt"] = serde_json::json!(format!(
-        "{instructions}\n{preparation}\ntool-call workflow.execution_context {{\"delegation_part\":\"serialized\",\"$fake_json_pages\":{{\"chunk\":\"/delegation/chunk\",\"next\":\"/delegation/next_arguments\"}}}}\ntool-call workflow.stage_task_group {group}\ntool-call workflow.publish_run_graph_edit {publication}"
+        "{instructions}\n{preparation}\ntool-call workflow.execution_context {{\"compact\":true,\"limit\":1}}\ntool-call workflow.stage_delegation {group}\ntool-call workflow.publish_run_graph_edit {publication}"
     ));
     install_delivery_report(request, &integration, trees);
 }

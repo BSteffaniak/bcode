@@ -279,10 +279,9 @@ fn format_result(text: &mut String, view: &WorkflowRunView, output_id: &str) {
         for workspace in delivery.retained_workspaces.iter().take(DETAIL_LIMIT) {
             let _ = write!(text, "\n  Retained workspace: {}", preview(workspace));
         }
-        for output in delivery.contribution_output_ids.iter().take(DETAIL_LIMIT) {
-            let _ = write!(text, "\n  Contribution reference: {}", preview(output));
-        }
+        contribution_reviews(text, delivery);
         if [
+            delivery.resolutions.len(),
             delivery.integrated_targets.len(),
             delivery.criteria.len(),
             delivery.checks.len(),
@@ -309,10 +308,40 @@ fn format_result(text: &mut String, view: &WorkflowRunView, output_id: &str) {
     text.push_str("\nEvaluation evidence is reported, not independently verified by this display.");
 }
 
+fn contribution_reviews(text: &mut String, delivery: &crate::delivery::DeliveryReport) {
+    for output in delivery.contribution_output_ids.iter().take(DETAIL_LIMIT) {
+        let _ = write!(text, "\n  Contribution reference: {}", preview(output));
+    }
+    for resolution in delivery.resolutions.iter().take(DETAIL_LIMIT) {
+        let _ = write!(
+            text,
+            "\n  Resolution review: {} · checksum {} · {} historical items · {} referenced checks · {}",
+            preview(&resolution.output_id),
+            preview(&resolution.checksum_sha256),
+            resolution.item_paths.len(),
+            resolution.check_indices.len(),
+            preview(&resolution.evidence)
+        );
+    }
+}
+
 fn delivery_location(text: &mut String, delivery: &crate::delivery::DeliveryReport) {
     text.push_str("\nDelivery report (evaluator-reported):");
     if delivery.version == crate::delivery::ReportVersion::V2 {
         text.push_str("\n  Delivered location: canonical result delivery.delivered_snapshot (complete retained UTF-8 bytes). Not live checkout freshness or hermetic environment verification; reviews remain judgments.");
+    } else if delivery.version == crate::delivery::ReportVersion::V3 {
+        if let Some(repository) = &delivery.repository_delivery {
+            let _ = write!(
+                text,
+                "\n  Repository export: {} · commit {} · SHA-256 {}",
+                preview(&repository.artifact),
+                preview(&repository.target.commit),
+                preview(&repository.sha256)
+            );
+            text.push_str("\n  Delivered location: canonical result delivery.repository_delivery references the retained complete commit export, not uncommitted checkout files. Checks do not establish live checkout freshness or a hermetic environment. Resolution reviews retain historical evidence and remain judgments.");
+        } else {
+            text.push_str("\n  Repository delivery missing; target identity is unverified.");
+        }
     }
 }
 
@@ -454,6 +483,46 @@ pub mod tests {
             value: serde_json::json!({"summary":"success"}),
         };
         assert!(format(&snapshot).contains("unsupported result shape"));
+    }
+
+    #[test]
+    fn repository_delivery_and_resolution_reviews_remain_bounded_claims() {
+        let mut snapshot = view();
+        snapshot.terminal = Some(WorkflowTerminalView::Completed {
+            output_id: "final".into(),
+        });
+        snapshot.outputs = vec![serde_json::from_value(serde_json::json!({
+            "output_id":"final","node_id":"evaluation","activation_id":"a",
+            "schema_id":"loop","schema_version":1,"checksum_sha256":"checksum",
+            "artifact_reference":null,"created_at_ms":0,
+            "value":{"availability":"resolved","value":{
+                "implementation_prompt":"objective","stop_condition":"criteria",
+                "max_iterations":1,"iteration":1,"condition_met":false,
+                "summary":"Live acceptance unknown","evidence":["Retained target"],
+                "delivery":{
+                    "version":"3","integrated_targets":["artifact"],
+                    "repository_delivery":{"target":{"version":1,"commit":"a".repeat(40)},"artifact":"artifact","sha256":"b".repeat(64)},
+                    "contribution_output_ids":["worker"],"criteria":[],"checks":[],
+                    "retained_workspaces":["integration"],"unresolved_work":["Live acceptance"],
+                    "resolutions":vec![serde_json::json!({"output_id":"worker","checksum_sha256":"c".repeat(64),"item_paths":["/blockers/0"],"check_indices":[0],"evidence":format!("Reviewed\n{}", "界".repeat(400))}); 11]
+                }
+            }}
+        })).unwrap()];
+        let text = format(&snapshot);
+        assert!(text.contains(&format!(
+            "Repository export: artifact · commit {} · SHA-256 {}",
+            "a".repeat(40),
+            "b".repeat(64)
+        )));
+        assert!(text.contains("not uncommitted checkout files"));
+        assert!(text.contains("hermetic environment"));
+        assert!(text.contains("remain judgments"));
+        assert_eq!(text.matches("Resolution review:").count(), DETAIL_LIMIT);
+        assert!(text.contains("Additional delivery details omitted"));
+        assert!(text.contains("Reviewed 界"));
+        assert!(!text.contains(&"界".repeat(321)));
+        assert!(text.contains("Unresolved: Live acceptance"));
+        assert!(text.contains("not independently verified"));
     }
 
     #[test]
