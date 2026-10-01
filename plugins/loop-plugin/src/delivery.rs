@@ -9,6 +9,9 @@ use serde::{Deserialize, Serialize};
 #[serde(deny_unknown_fields)]
 pub struct DeliveryReport {
     pub version: ReportVersion,
+    /// V2 delivers these complete retained bytes, not a live workspace.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub delivered_snapshot: Option<bcode_shell_models::DeliveredSnapshot>,
     #[schemars(length(min = 1, max = 64), inner(length(min = 1, max = 4096)))]
     pub integrated_targets: Vec<String>,
     /// Optional explicit scope for every named target. Claims only, never freshness evidence.
@@ -19,6 +22,11 @@ pub struct DeliveryReport {
     pub contribution_output_ids: Vec<String>,
     #[schemars(length(min = 1, max = 64))]
     pub criteria: Vec<Criterion>,
+    /// Exact original stop condition this report evaluates. Absence in historical V1
+    /// reports means coverage is unknown, never that the original criteria were covered.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(length(min = 1, max = 65536))]
+    pub original_stop_condition: Option<String>,
     #[schemars(length(max = 32))]
     pub checks: Vec<Check>,
     #[schemars(length(max = 64), inner(length(min = 1, max = 4096)))]
@@ -28,6 +36,30 @@ pub struct DeliveryReport {
 }
 
 impl DeliveryReport {
+    pub(crate) fn snapshot_coverage(&self, stop_condition: &str) -> bool {
+        self.version == ReportVersion::V2
+            && self.identifies_original_criteria(stop_condition)
+            && self.content_scope.is_none()
+            && self.delivered_snapshot.as_ref().is_some_and(|snapshot| {
+                snapshot.validate().is_ok()
+                    && self.integrated_targets == snapshot.files.keys().cloned().collect::<Vec<_>>()
+            })
+            // An explicit whole-objective judgment prevents a selected subset from
+            // silently replacing the original stop condition. It remains a judgment.
+            && self.criteria.iter().any(|criterion| criterion.description == stop_condition)
+            && !self.checks.is_empty()
+            && self.criteria.iter().all(|criterion| match criterion.basis {
+                Some(CriterionBasis::ObservedCheck) => !criterion.check_indices.is_empty()
+                    && criterion.check_indices.iter().all(|index| (*index as usize) < self.checks.len()),
+                Some(CriterionBasis::Review) => criterion.check_indices.is_empty(),
+                _ => false,
+            })
+    }
+    pub(crate) fn identifies_original_criteria(&self, stop_condition: &str) -> bool {
+        self.original_stop_condition.as_deref() == Some(stop_condition)
+            && !stop_condition.trim().is_empty()
+    }
+
     /// Claims can rule out completion, but cannot establish verified delivery.
     pub(crate) fn precludes_completion(&self) -> bool {
         self.integrated_targets.is_empty()
@@ -133,10 +165,17 @@ pub fn contribution_precludes_completion(
         return true;
     };
     contributions.iter().any(|contribution| {
+        // An explicit removal is negative evidence even when the worker omitted
+        // remaining work. Absence/unknown retention remains unknown, not proof
+        // that any contribution was retained or integrated.
         contribution
-            .get("remaining_work")
-            .and_then(serde_json::Value::as_array)
-            .is_none_or(|remaining| !remaining.is_empty())
+            .get("retention")
+            .and_then(serde_json::Value::as_str)
+            == Some("removed")
+            || contribution
+                .get("remaining_work")
+                .and_then(serde_json::Value::as_array)
+                .is_none_or(|remaining| !remaining.is_empty())
     })
 }
 
@@ -144,17 +183,35 @@ pub fn contribution_precludes_completion(
 pub enum ReportVersion {
     #[serde(rename = "1")]
     V1,
+    #[serde(rename = "2")]
+    V2,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct Criterion {
-    #[schemars(length(min = 1, max = 2048))]
+    #[schemars(length(min = 1, max = 65536))]
     #[serde(rename = "criterion")]
     pub description: String,
     pub status: Observation,
+    /// How the evidence was obtained; omitted historical claims remain unknown.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub basis: Option<CriterionBasis>,
+    /// Indexes into this report's authenticated checks (required for observed basis).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[schemars(length(max = 32))]
+    pub check_indices: Vec<u32>,
     #[schemars(length(min = 1, max = 4096))]
     pub evidence: String,
+}
+
+/// Review is an explicit judgment, not mechanically observed verification.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum CriterionBasis {
+    ObservedCheck,
+    Review,
+    Unknown,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -206,6 +263,58 @@ mod tests {
     use serde_json::json;
 
     #[test]
+    fn original_coverage_and_review_basis_remain_explicit_claims() {
+        let value = json!({
+            "version":"1", "integrated_targets":["result"],
+            "contribution_output_ids":[],
+            "criteria":[{"criterion":"behavior", "status":"passed", "evidence":"review"}],
+            "checks":[], "retained_workspaces":[], "unresolved_work":[]
+        });
+        let mut report: DeliveryReport = serde_json::from_value(value).unwrap();
+        assert!(!report.identifies_original_criteria("original"));
+        assert_eq!(report.criteria[0].basis, None);
+        report.original_stop_condition = Some("original".into());
+        report.criteria[0].basis = Some(CriterionBasis::Review);
+        assert!(report.identifies_original_criteria("original"));
+        assert!(!report.identifies_original_criteria("narrowed"));
+        let encoded = serde_json::to_value(&report).unwrap();
+        assert_eq!(encoded["criteria"][0]["basis"], "review");
+        assert_eq!(
+            serde_json::from_value::<DeliveryReport>(encoded).unwrap(),
+            report
+        );
+    }
+
+    #[test]
+    fn snapshot_coverage_preserves_whole_objective_and_evidence_basis() {
+        let value = json!({
+            "version":"2", "delivered_snapshot":{"version":1,"files":{"result.txt":"bytes"}},
+            "integrated_targets":["result.txt"], "contribution_output_ids":[],
+            "original_stop_condition":"whole objective",
+            "criteria":[{"criterion":"whole objective","status":"passed","basis":"observed_check","check_indices":[0],"evidence":"check"}],
+            "checks":[{"command":"test","workspace":"snapshot","outcome":"passed","evidence":"canonical"}],
+            "retained_workspaces":[], "unresolved_work":[]
+        });
+        let report: DeliveryReport = serde_json::from_value(value.clone()).unwrap();
+        assert!(report.snapshot_coverage("whole objective"));
+        assert!(!report.snapshot_coverage("different original"));
+        for (pointer, replacement) in [
+            ("/version", json!("1")),
+            ("/criteria/0/criterion", json!("narrowed")),
+            ("/criteria/0/basis", json!("unknown")),
+            ("/criteria/0/check_indices", json!([])),
+            ("/criteria/0/check_indices", json!([1])),
+            ("/integrated_targets", json!(["other"])),
+            ("/delivered_snapshot/files", json!({})),
+        ] {
+            let mut changed = value.clone();
+            *changed.pointer_mut(pointer).unwrap() = replacement;
+            let report: DeliveryReport = serde_json::from_value(changed).unwrap();
+            assert!(!report.snapshot_coverage("whole objective"), "{pointer}");
+        }
+    }
+
+    #[test]
     fn explicit_scope_requires_complete_unambiguous_checked_targets() {
         let value = json!({
             "version":"1", "integrated_targets":["result"],
@@ -248,6 +357,12 @@ mod tests {
         }))
         .unwrap();
         assert!(!contribution_precludes_completion(&output));
+        output.value["contributions"][0]["retention"] = json!("removed");
+        assert!(contribution_precludes_completion(&output));
+        output.value["contributions"][0]["retention"] = json!("unknown");
+        assert!(!contribution_precludes_completion(&output)); // Unknown is not certification.
+        output.value["contributions"][0]["retention"] = json!("retained");
+        assert!(!contribution_precludes_completion(&output)); // A claim is not certification.
         output.value["blockers"] = json!(["permission denied"]);
         assert!(contribution_precludes_completion(&output));
         output.value["blockers"] = json!([]);
@@ -310,7 +425,7 @@ mod tests {
         assert!(validator.is_valid(&value));
         let report: DeliveryReport = serde_json::from_value(value.clone()).unwrap();
         assert_eq!(report.criteria[0].status, Observation::Unverified);
-        value["version"] = json!("2");
+        value["version"] = json!("3");
         assert!(!validator.is_valid(&value));
         assert!(serde_json::from_value::<DeliveryReport>(value.clone()).is_err());
         value["version"] = json!("1");

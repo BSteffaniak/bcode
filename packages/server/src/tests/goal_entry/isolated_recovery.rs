@@ -166,6 +166,7 @@ fn prepare_checkouts(root: &Path, trees: &Path) -> String {
 
 #[tokio::test]
 async fn goal_workers_recover_real_git_conflict_in_isolated_integration_checkout() {
+    let _execution = GOAL_ENTRY_EXECUTION.lock().await;
     let root = tempfile::tempdir().unwrap();
     let trees = tempfile::tempdir().unwrap();
     let base = prepare_checkouts(root.path(), trees.path());

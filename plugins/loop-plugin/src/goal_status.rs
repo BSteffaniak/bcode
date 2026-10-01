@@ -244,17 +244,23 @@ fn format_result(text: &mut String, view: &WorkflowRunView, output_id: &str) {
         );
     }
     if let Some(delivery) = &result.delivery {
-        text.push_str("\nDelivery report (evaluator-reported):");
+        delivery_location(text, delivery);
         for target in delivery.integrated_targets.iter().take(DETAIL_LIMIT) {
             let _ = write!(text, "\n  Integrated target: {}", preview(target));
         }
         for criterion in delivery.criteria.iter().take(DETAIL_LIMIT) {
             let _ = write!(
                 text,
-                "\n  Criterion [{}]: {} · {}",
+                "\n  Criterion [{}]: {} · {} · {}",
                 observation(&criterion.status),
                 preview(&criterion.description),
-                preview(&criterion.evidence)
+                preview(&criterion.evidence),
+                match criterion.basis {
+                    Some(crate::delivery::CriterionBasis::ObservedCheck) =>
+                        "claimed observed check",
+                    Some(crate::delivery::CriterionBasis::Review) => "review judgment",
+                    Some(crate::delivery::CriterionBasis::Unknown) | None => "unknown basis",
+                }
             );
         }
         for check in delivery.checks.iter().take(DETAIL_LIMIT) {
@@ -301,6 +307,13 @@ fn format_result(text: &mut String, view: &WorkflowRunView, output_id: &str) {
         );
     }
     text.push_str("\nEvaluation evidence is reported, not independently verified by this display.");
+}
+
+fn delivery_location(text: &mut String, delivery: &crate::delivery::DeliveryReport) {
+    text.push_str("\nDelivery report (evaluator-reported):");
+    if delivery.version == crate::delivery::ReportVersion::V2 {
+        text.push_str("\n  Delivered location: canonical result delivery.delivered_snapshot (complete retained UTF-8 bytes). Not live checkout freshness or hermetic environment verification; reviews remain judgments.");
+    }
 }
 
 const fn observation(value: &crate::delivery::Observation) -> &'static str {

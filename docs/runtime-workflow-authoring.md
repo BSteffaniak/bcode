@@ -258,12 +258,19 @@ Idempotent run admission compares the original attempt cap from the first bounde
 event, not the renewed execution cap; invalid or unsupported admission evidence rejects.
 Public history exposes only those reviewed fields, requires positive increasing signed-range
 caps and version 1, and reports unavailable details for malformed or unsupported observations.
-This storage capability is not yet exposed through public authorization/control or `/goal`
-commands and does not itself resume dispatch. Existing
-continuation requests for non-eligible run status or failure reason return the normalized
-`workflow_continuation_ineligible` error rather than generic workflow unavailability.
-This rejection preserves the run and explicitly reports that active allowance exhaustion is not
-yet supported. These options alone do not deliver swarm execution. Dispatch reports run/root execution-allowance
+Public application controls expose this through `IncreaseExecutionAllowance`,
+`bcode workflow increase-allowance --run-id <id> --expected-cap <old> --target-cap <new>`,
+and `/goal.continue --worker-attempts N`. The goal command observes the exact associated
+run and retries the same cap pair on transport uncertainty; it never silently recomputes a grant.
+The server reserves a scheduler wake before committing and wakes the exact run after the
+transaction, including identical retries. An unavailable/full scheduler rejects without increasing
+the cap. The driver still enforces paused state, ownership, cancellation and receipt reconciliation;
+a grant neither approves tools nor retries failed or ambiguous effects. Paused runs require an
+explicit resume. No wire or durable schema changes are required.
+Successor continuation requests for non-eligible run status or failure reason still return the
+normalized `workflow_continuation_ineligible` error rather than generic workflow unavailability;
+active runs use the explicit cap control instead. These options alone do not deliver swarm execution.
+Dispatch reports run/root execution-allowance
 exhaustion separately from concurrency contention and leaves blocked activations pending without
 admitting attempts. This allows the driver to reconcile already-admitted receipts despite exhausted
 allowance. Settlement does not replenish execution allowance; no automatic grant or successor

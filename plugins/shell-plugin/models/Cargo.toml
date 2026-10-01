@@ -1,0 +1,19 @@
+[package]
+authors     = { workspace = true }
+categories  = ["data-structures"]
+description = "Portable shell-owned delivered snapshot contracts"
+edition     = { workspace = true }
+keywords    = ["bcode", "shell", "verification"]
+license     = { workspace = true }
+name        = "bcode_shell_models"
+readme      = { workspace = true }
+repository  = { workspace = true }
+version     = { workspace = true }
+
+[features]
+default          = []
+fail-on-warnings = []
+
+[dependencies]
+schemars = { workspace = true }
+serde    = { workspace = true, features = ["derive", "std"] }

@@ -73,6 +73,47 @@ pub fn observed_check(
     }
     let plan = &evidence.admitted_input;
     let result = &evidence.provenance.output.value;
+    command_identity(evidence, reference)
+        && reference.content_roots.as_ref().is_none_or(|roots| {
+            !roots.is_empty()
+                && roots.len() <= 64
+                && plan.get("observe_files") == Some(&serde_json::json!(roots))
+        })
+        && unchanged_observation(plan, result, &check.workspace)
+}
+
+/// Accept only complete retained bytes authenticated against the exact admitted plan.
+/// This says nothing about live checkout freshness or external command inputs.
+pub fn delivered_check(
+    evidence: &WorkflowOutputExecutionEvidence,
+    reference: &CheckExecution,
+    delivered: &bcode_shell_models::DeliveredSnapshot,
+) -> bool {
+    if !shell_observation(evidence, &reference.output_id)
+        || !command_identity(evidence, reference)
+        || reference.content_roots.is_some()
+        || reference.observation_output_id.is_some()
+        || evidence.admitted_input.get("delivered_snapshot") != Some(&serde_json::json!(delivered))
+    {
+        return false;
+    }
+    evidence
+        .provenance
+        .output
+        .value
+        .get("snapshot_verification")
+        .and_then(|value| {
+            serde_json::from_value::<bcode_shell_models::SnapshotVerification>(value.clone()).ok()
+        })
+        .is_some_and(|verification| verification.accept(delivered).is_ok())
+}
+
+fn command_identity(
+    evidence: &WorkflowOutputExecutionEvidence,
+    reference: &CheckExecution,
+) -> bool {
+    let plan = &evidence.admitted_input;
+    let result = &evidence.provenance.output.value;
     let Some(commands) = plan.get("commands").and_then(Value::as_array) else {
         return false;
     };
@@ -104,14 +145,7 @@ pub fn observed_check(
     {
         return false;
     }
-    if reference.content_roots.as_ref().is_some_and(|roots| {
-        roots.is_empty()
-            || roots.len() > 64
-            || plan.get("observe_files") != Some(&serde_json::json!(roots))
-    }) {
-        return false;
-    }
-    unchanged_observation(plan, result, &check.workspace)
+    true
 }
 
 /// Match an authorized later observation to the exact checked snapshot and scope.
@@ -289,6 +323,61 @@ mod tests {
                 "output_id":"check-output","command_index":0,"argv":["cargo","test"]}}))
             .unwrap();
         (evidence, check)
+    }
+
+    #[test]
+    fn immutable_delivery_authenticates_plan_and_rejects_stale_failed_incomplete_evidence() {
+        let (mut evidence, mut check) = fixture();
+        let snapshot: bcode_shell_models::DeliveredSnapshot = serde_json::from_value(json!({
+            "version":1, "files":{"result.txt":"retained bytes"}
+        }))
+        .unwrap();
+        let reference = check.execution.as_mut().unwrap();
+        reference.content_roots = None;
+        reference.observation_output_id = None;
+        evidence.admitted_input["delivered_snapshot"] = json!(snapshot);
+        evidence.provenance.output.value["snapshot_verification"] = json!({
+            "version":1, "target":snapshot, "commands_passed":true, "target_unchanged":true
+        });
+        assert!(delivered_check(&evidence, reference, &snapshot));
+        for (pointer, replacement) in [
+            (
+                "/admitted_input/delivered_snapshot/files/result.txt",
+                json!("stale"),
+            ),
+            (
+                "/provenance/output/value/snapshot_verification/target/files/result.txt",
+                json!("stale"),
+            ),
+            (
+                "/provenance/output/value/snapshot_verification/commands_passed",
+                json!(false),
+            ),
+            (
+                "/provenance/output/value/snapshot_verification/target_unchanged",
+                json!(false),
+            ),
+            (
+                "/provenance/output/value/snapshot_verification/target/files",
+                json!({}),
+            ),
+            (
+                "/provenance/producer/configuration/plugin_id",
+                json!("forged"),
+            ),
+            ("/admitted_input/commands/0/argv", json!(["different"])),
+        ] {
+            let mut value = serde_json::to_value(&evidence).unwrap();
+            *value.pointer_mut(pointer).unwrap() = replacement;
+            assert!(
+                !delivered_check(
+                    &serde_json::from_value(value).unwrap(),
+                    reference,
+                    &snapshot
+                ),
+                "{pointer}"
+            );
+        }
     }
 
     #[test]

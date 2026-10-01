@@ -94,6 +94,18 @@ The Actions pane shows available shortcuts and disabled explanations from the po
 
 Destructive and reconciliation-sensitive actions use explicit confirmation. A submitted action remains pending until an authoritative projection refresh confirms the resulting state. Stale or ambiguous targets fail closed.
 
+## Explicit execution allowance renewal
+
+An exhausted active goal can use `/goal.continue --worker-attempts <positive integer>`.
+For an exact workflow run, inspect its current allowance and use
+`bcode workflow increase-allowance --run-id <RUN_ID> --expected-cap <CURRENT_CAP> --target-cap <NEW_CAP>`.
+This is an explicit compare-and-set grant, not a retry of failed work. Reuse the exact
+run and caps after an uncertain response; do not recompute an additive grant. The server
+queues a durable-driver wake after committing, including an identical retry. Queue
+unavailability rejects before changing the allowance. Paused runs remain paused until
+explicitly resumed; cancellation, permissions, ambiguous receipts and separate root caps
+remain independent blockers. Completed contributions and attempt history are retained.
+
 ## Typed input
 
 The input dialog displays the exact run, node, and activation, plus its bounded prompt and expected schema. Supported simple object schemas use field controls. Complex schemas retain a JSON editor fallback. Local validation is advisory; canonical server validation remains authoritative, and rejected input stays available for correction.

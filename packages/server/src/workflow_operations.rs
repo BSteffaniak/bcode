@@ -9631,19 +9631,38 @@ async fn increase_allowance(
             "execution allowance increase requires verified ownership".into(),
         )
     })?;
-    let mut store = state
-        .workflow_store
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    let previous = store.execution_allowance_observation(run_id)?;
-    store.increase_execution_allowance(
-        run_id,
-        &authority.authority,
-        expected_cap,
-        target_cap,
-        super::current_unix_millis(),
-    )?;
-    Ok(previous != store.execution_allowance_observation(run_id)?)
+    // Reserve a wake before committing, including for exact retries: a previous
+    // response or wake may have been lost. This does not resume a paused run or
+    // replay attempts; the durable driver still checks status, receipts and authority.
+    state.start_workflow_driver().await;
+    let sender = state.workflow_driver_sender.get().ok_or_else(|| {
+        super::ServerError::WorkflowApplicationOperationUnauthorized(
+            "workflow scheduler is unavailable".to_string(),
+        )
+    })?;
+    let permit = sender.try_reserve().map_err(|_| {
+        super::ServerError::WorkflowApplicationOperationUnauthorized(
+            "workflow scheduler is unavailable or full; retry the exact allowance request"
+                .to_string(),
+        )
+    })?;
+    let changed = {
+        let mut store = state
+            .workflow_store
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let previous = store.execution_allowance_observation(run_id)?;
+        store.increase_execution_allowance(
+            run_id,
+            &authority.authority,
+            expected_cap,
+            target_cap,
+            super::current_unix_millis(),
+        )?;
+        previous != store.execution_allowance_observation(run_id)?
+    };
+    permit.send(run_id.to_string());
+    Ok(changed)
 }
 
 /// Control an exact run, preserving its identity across asynchronous ownership checks.

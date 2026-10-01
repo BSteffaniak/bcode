@@ -37,6 +37,7 @@ members = [
     "packages/agent-policy",
     "packages/agent-policy/models",
     "packages/shell-command-analysis",
+    "plugins/shell-plugin/models",
     "packages/shell-command-analysis/models",
     "packages/agent-permissions",
     "packages/code-review/models",
@@ -240,6 +241,7 @@ bcode_session_view_models               = { version = "0.0.1-alpha.0", default-f
 bcode_settings                          = { version = "0.0.1-alpha.0", default-features = false, path = "packages/settings" }
 bcode_shell_command_analysis            = { version = "0.0.1-alpha.0", default-features = false, path = "packages/shell-command-analysis" }
 bcode_shell_command_analysis_models     = { version = "0.0.1-alpha.0", default-features = false, path = "packages/shell-command-analysis/models" }
+bcode_shell_models                      = { version = "0.0.1-alpha.0", default-features = false, path = "plugins/shell-plugin/models" }
 bcode_shell_plugin                      = { version = "0.0.1-alpha.0", default-features = false, path = "plugins/shell-plugin" }
 bcode_skill                             = { version = "0.0.1-alpha.0", default-features = false, path = "packages/skill" }
 bcode_skill_models                      = { version = "0.0.1-alpha.0", default-features = false, path = "packages/skill/models" }

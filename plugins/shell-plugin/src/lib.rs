@@ -17,6 +17,7 @@ mod contracts;
 pub mod recording;
 #[cfg(feature = "static-bundled")]
 pub mod shell_run_tui;
+mod snapshot;
 mod terminal_clean;
 
 use bcode_config::{
@@ -621,6 +622,7 @@ fn shell_script_command_plan(
     }
     shell.push(script);
     Ok(ShellWorkflowCommandPlan {
+        delivered_snapshot: None,
         observe_files: Vec::new(),
         expected_content: None,
         version: contracts::SHELL_COMMAND_PLAN_VERSION,
@@ -689,6 +691,10 @@ fn execute_workflow_command_plan(
         return Err("workflow cwd escapes the immutable workspace".to_string());
     }
     validate_workflow_environment(&plan.environment)?;
+    let snapshot_directory = snapshot::prepare(plan)?;
+    let cwd = snapshot_directory
+        .as_ref()
+        .map_or(cwd, |directory| directory.path().to_path_buf());
     let content_before = if plan.observe_files.is_empty() {
         None
     } else {
@@ -722,6 +728,9 @@ fn execute_workflow_command_plan(
         let should_stop = result.status != ShellWorkflowCommandStatus::Exited
             || !accepted_exit && !continue_on_unaccepted;
         commands.push(result);
+        if let Some(target) = &plan.delivered_snapshot {
+            content_invalidated |= !snapshot::matches(&cwd, target);
+        }
         artifacts.extend(command_artifacts);
         if plan.expected_content.is_some() {
             // Preserve completed effects, but never run later checks against a
@@ -746,6 +755,14 @@ fn execute_workflow_command_plan(
             result.status == ShellWorkflowCommandStatus::Exited && result.exit_accepted
         });
     Ok(ShellWorkflowCommandPlanResult {
+        snapshot_verification: plan.delivered_snapshot.as_ref().map(|target| {
+            bcode_shell_models::SnapshotVerification {
+                version: 1,
+                target: target.clone(),
+                commands_passed: passed,
+                target_unchanged: !content_invalidated && snapshot::matches(&cwd, target),
+            }
+        }),
         content_before,
         // Missing or unreadable post-execution content is explicitly unknown. Do not
         // hide the already observed command outcomes or imply that effects did not occur.
@@ -2809,6 +2826,7 @@ mod tests {
                 preparation: None,
             },
             ShellWorkflowCommandPlan {
+                delivered_snapshot: None,
                 observe_files: Vec::new(),
                 expected_content: None,
                 version: contracts::SHELL_COMMAND_PLAN_VERSION,
@@ -3309,6 +3327,55 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn delivered_snapshot_execution_success_failure_and_mutation() {
+        let workspace = tempfile::tempdir().unwrap();
+        std::fs::write(workspace.path().join("target"), "dirty user content").unwrap();
+        for (script, accepted) in [
+            ("test $(cat target) = delivered", true),
+            ("exit 1", false),
+            ("printf changed > target", false),
+            ("touch uncovered", false),
+        ] {
+            let (invocation, mut plan) = workflow_command_plan(
+                workspace.path(),
+                vec![contracts::ShellWorkflowCommand {
+                    argv: vec!["sh".into(), "-c".into(), script.into()],
+                    timeout_ms: 5_000,
+                    accepted_exit_codes: None,
+                    continue_on_unaccepted_exit: false,
+                }],
+            );
+            let target = bcode_shell_models::DeliveredSnapshot {
+                version: 1,
+                files: [("target".into(), "delivered".into())].into(),
+            };
+            plan.delivered_snapshot = Some(target.clone());
+            let result = execute_workflow_command_plan(
+                &workflow_context(
+                    &invocation,
+                    bcode_plugin_sdk::ServiceCancellation::default(),
+                ),
+                &invocation,
+                &plan,
+            )
+            .unwrap();
+            assert_eq!(
+                result
+                    .snapshot_verification
+                    .unwrap()
+                    .accept(&target)
+                    .is_ok(),
+                accepted
+            );
+            assert_eq!(
+                std::fs::read_to_string(workspace.path().join("target")).unwrap(),
+                "dirty user content"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn workflow_content_observation_records_actual_execution_not_claims() {
         let workspace = tempfile::tempdir().unwrap();
         std::fs::write(workspace.path().join("target"), "before").unwrap();
@@ -3670,6 +3737,7 @@ mod tests {
             value: serde_json::json!(false),
         };
         let result = ShellWorkflowCommandPlanResult {
+            snapshot_verification: None,
             content_before: None,
             content_after: None,
             version: contracts::SHELL_COMMAND_PLAN_VERSION,

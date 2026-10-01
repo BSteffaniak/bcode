@@ -3,6 +3,12 @@ use super::*;
 use bcode_plugin_sdk::tui::*;
 
 mod isolated_recovery;
+mod snapshot_delivery;
+
+// These production-driver fixtures each run several real plugin sessions and
+// subprocesses. Keep their bounded execution deadlines independent of parallel
+// copies of the same expensive fixture; waiting for admission is not execution.
+static GOAL_ENTRY_EXECUTION: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 struct GoalEntryHost {
     session: SessionId,
@@ -12,6 +18,7 @@ struct GoalEntryHost {
     starts: StdMutex<Vec<PluginWorkflowStartRequest>>,
     execution_cap: Option<u64>,
     isolated_workspace: Option<PathBuf>,
+    snapshot_case: Option<snapshot_delivery::Case>,
 }
 
 impl PluginTuiHost for GoalEntryHost {
@@ -84,7 +91,10 @@ impl PluginTuiHost for GoalEntryHost {
         if let Some(trees) = &self.isolated_workspace {
             isolated_recovery::install_script(&mut request, &self.workspace, trees);
         } else {
-            install_goal_script(&mut request, &self.workspace);
+            install_goal_script(&mut request, &self.workspace, self.snapshot_case.is_some());
+        }
+        if let Some(case) = self.snapshot_case {
+            snapshot_delivery::install(&mut request, &self.workspace, case);
         }
         if let Some(cap) = self.execution_cap {
             request.limits.node_execution_cap = cap;
@@ -154,12 +164,21 @@ fn contribution_result(workspace: &Path, id: &str) -> serde_json::Value {
     })
 }
 
-fn install_goal_script(request: &mut PluginWorkflowStartRequest, workspace: &Path) {
+fn snapshot_contribution_result(workspace: &Path, id: &str, snapshot: bool) -> serde_json::Value {
+    let mut result = contribution_result(workspace, id);
+    if snapshot {
+        // The file contribution is complete; integration and checks remain independent.
+        result["contributions"][0]["remaining_work"] = serde_json::json!([]);
+    }
+    result
+}
+
+fn install_goal_script(request: &mut PluginWorkflowStartRequest, workspace: &Path, snapshot: bool) {
     let reference =
         |pointer: &str| serde_json::json!({"$fake_result":{"index":0,"pointer":pointer}});
     let task = |id: &str| {
         serde_json::json!({
-            "task_id":id,"objective":format!("Implement {id}.\ntool-call filesystem.write {}\nstructured-result {}", serde_json::json!({"path":workspace.join(format!("{id}.sh")),"contents":if id == "left" { LEFT_MODULE } else { RIGHT_MODULE }}), contribution_result(workspace, id)),
+            "task_id":id,"objective":format!("Implement {id}.\ntool-call filesystem.write {}\nstructured-result {}", serde_json::json!({"path":workspace.join(format!("{id}.sh")),"contents":if id == "left" { LEFT_MODULE } else { RIGHT_MODULE }}), snapshot_contribution_result(workspace, id, snapshot)),
             "agent_profile":"build","read_only":false,
             "tool_allowlist":["filesystem.write"],
             "resources":[{"resource":format!("contribution:{id}"),"access":"write"}],
@@ -180,7 +199,7 @@ fn install_goal_script(request: &mut PluginWorkflowStartRequest, workspace: &Pat
         "continuation":{"objective":format!("Integrate the actual contributions and verify the combined result.\ntool-call shell.run {integrate}"), "agent_profile":"build", "read_only":false, "tool_allowlist":["shell.run"], "resources":[{"resource":"integration","access":"write"}], "model_selection":{"provider":"bcode.fake-provider","model":"fake-echo"}},
         "reconciliation":[]
     });
-    install_corrective_script(&mut group, workspace, &integrate);
+    install_corrective_script(&mut group, workspace, &integrate, snapshot);
     let publication =
         serde_json::json!({"$fake_result":{"index":0,"pointer":"/publication_arguments"}});
     let source = request
@@ -222,6 +241,7 @@ fn install_corrective_script(
     group: &mut serde_json::Value,
     workspace: &Path,
     integrate: &serde_json::Value,
+    snapshot: bool,
 ) {
     let failed_output = bcode_workflow::ValueSchema {
         type_name: "receipt".into(),
@@ -239,7 +259,7 @@ fn install_corrective_script(
         "run_id":reference("/delegation/arguments/run_id"),"expected_revision":reference("/delegation/arguments/expected_revision"),
         "source_node_id":reference("/delegation/arguments/source_node_id"),"bind_source_activation":reference("/delegation/arguments/bind_source_activation"),
         "input":reference("/delegation/arguments/input"),"preserve_source_output":true,
-        "tasks":[{"task_id":"repair-right","objective":format!("Fix contribution.\ntool-call filesystem.write {fix}\nstructured-result {}", contribution_result(workspace, "right")),
+        "tasks":[{"task_id":"repair-right","objective":format!("Fix contribution.\ntool-call filesystem.write {fix}\nstructured-result {}", snapshot_contribution_result(workspace, "right", snapshot)),
             "agent_profile":"build","read_only":false,"tool_allowlist":["filesystem.write"],
             "resources":[{"resource":"contribution:right","access":"write"}],
             "model_selection":{"provider":"bcode.fake-provider","model":"fake-echo"}}],
@@ -300,6 +320,25 @@ async fn goal_entry_request_with_workspace(
     execution_cap: Option<u64>,
     isolated_workspace: Option<PathBuf>,
 ) -> PluginWorkflowStartRequest {
+    goal_entry_request_with_snapshot(
+        session,
+        root,
+        state,
+        execution_cap,
+        isolated_workspace,
+        None,
+    )
+    .await
+}
+
+async fn goal_entry_request_with_snapshot(
+    session: SessionId,
+    root: &Path,
+    state: Arc<ServerState>,
+    execution_cap: Option<u64>,
+    isolated_workspace: Option<PathBuf>,
+    snapshot_case: Option<snapshot_delivery::Case>,
+) -> PluginWorkflowStartRequest {
     let registry = bcode_bundled_plugins::tui_registry("bcode.loop").unwrap();
     let mut surface = registry
         .open(
@@ -322,6 +361,7 @@ async fn goal_entry_request_with_workspace(
         starts: StdMutex::default(),
         execution_cap,
         isolated_workspace,
+        snapshot_case,
     };
     let key = |key, ctrl| {
         bmux_tui::event::Event::Key(bmux_keyboard::KeyStroke {
@@ -580,6 +620,73 @@ fn assert_corrected_contributions(
     }));
 }
 
+// Continuation must settle the corrected execution, not turn a V1 delivery
+// assertion into successful goal completion. Inspect canonical outputs and
+// receipt-backed attempts as well as independently executing the retained files.
+fn resumed_goal_reached_delivery_guard(
+    state: &ServerState,
+    run_id: &str,
+    root: &Path,
+    input: &serde_json::Value,
+) -> bool {
+    let (outputs, attempts, terminal) = {
+        let store = state.workflow_store.lock().unwrap();
+        (
+            store.validated_outputs(run_id, 100).unwrap(),
+            store.attempt_history(run_id, None, 100).unwrap(),
+            store.canonical_terminal_output(run_id).unwrap(),
+        )
+    };
+    assert!(
+        terminal.is_none(),
+        "V1 assertions must not complete the goal"
+    );
+    if !outputs.iter().any(|output| {
+        output.node_id == "loop.judgement.evaluate" && output.value["delivery"].is_object()
+    }) {
+        return false;
+    }
+    // Approval recovery retains the earlier denied evaluation too. Validate the
+    // delivery-bearing round rather than mistaking that historical output for it.
+    let outputs: Vec<_> = outputs
+        .into_iter()
+        .filter(|output| {
+            !matches!(
+                output.node_id.as_str(),
+                "loop.evaluation" | "loop.judgement.evaluate"
+            ) || output.value["delivery"].is_object()
+        })
+        .collect();
+    assert_goal_evaluation(&outputs, input);
+    let collected = outputs
+        .iter()
+        .find(|output| {
+            output.value["results"].get("left").is_some() && output.value.get("source").is_some()
+        })
+        .expect("resumed goal must retain collected contributions");
+    assert_corrected_contributions(root, &outputs, collected);
+    // Approval recovery retains earlier denied tool rounds, whose agent attempts
+    // may still succeed with a blocker report. Receipt settlement, not attempt
+    // success alone, is the assertion here; files prove the corrected result.
+    for node in [
+        "left",
+        "repair-right",
+        "loop.evaluation",
+        "loop.judgement.evaluate",
+    ] {
+        assert!(
+            attempts.iter().any(|attempt| {
+                attempt.node_id == node
+                    && attempt.status == "succeeded"
+                    && attempt.has_receipt
+                    && attempt.terminal_at_ms.is_some()
+            }),
+            "missing settled receipt for {node}: {attempts:?}"
+        );
+    }
+    true
+}
+
 fn assert_goal_evaluation(
     outputs: &[bcode_workflow_store::ValidatedOutput],
     input: &serde_json::Value,
@@ -619,7 +726,8 @@ fn assert_goal_evaluation(
     for (index, node) in ["left", "repair-right"].iter().enumerate() {
         let contribution = outputs
             .iter()
-            .find(|output| output.node_id == *node)
+            .filter(|output| output.node_id == *node)
+            .max_by_key(|output| output.created_at_ms)
             .unwrap();
         assert_eq!(
             delivery["contribution_output_ids"][index],
@@ -665,6 +773,7 @@ async fn approve_goal_permissions(state: &ServerState, session: SessionId) {
 
 #[tokio::test]
 async fn real_goal_entry_denied_delegation_prevents_worker_effects() {
+    let _execution = GOAL_ENTRY_EXECUTION.lock().await;
     let root = tempfile::tempdir().unwrap();
     let sessions = publication_fixture_sessions(root.path(), true);
     let session = sessions
@@ -745,7 +854,8 @@ async fn real_goal_entry_denied_delegation_prevents_worker_effects() {
 }
 
 #[tokio::test]
-async fn real_goal_entry_approval_resumes_correction_and_verified_completion() {
+async fn real_goal_entry_approval_resumes_correction_without_false_completion() {
+    let _execution = GOAL_ENTRY_EXECUTION.lock().await;
     let root = tempfile::tempdir().unwrap();
     let sessions = publication_fixture_sessions(root.path(), true);
     let session = sessions
@@ -801,27 +911,21 @@ async fn real_goal_entry_approval_resumes_correction_and_verified_completion() {
     tokio::time::timeout(Duration::from_mins(1), async {
         loop {
             approve_goal_permissions(&state, session.id).await;
-            let terminal = state
-                .workflow_store
-                .lock()
-                .unwrap()
-                .canonical_terminal_output(run_id)
-                .unwrap();
-            if let Some(terminal) = terminal {
-                assert_eq!(terminal.value["condition_met"], true);
+            if resumed_goal_reached_delivery_guard(&state, run_id, root.path(), &request.input) {
                 break;
             }
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
     })
     .await
-    .expect("approved resumed work must integrate, correct and verify");
+    .expect("approved goal must settle correction and the conservative delivery decision");
     drop(state);
     assert_integrated_files(root.path());
 }
 
 #[tokio::test]
 async fn real_goal_entry_denied_verification_does_not_delegate_correction() {
+    let _execution = GOAL_ENTRY_EXECUTION.lock().await;
     let root = tempfile::tempdir().unwrap();
     let sessions = publication_fixture_sessions(root.path(), true);
     let session = sessions
@@ -1115,6 +1219,7 @@ async fn assert_goal_config_mismatch_rejected(
 
 #[tokio::test]
 async fn exhausted_goal_resumes_after_idempotent_ipc_allowance_grant() {
+    let _execution = GOAL_ENTRY_EXECUTION.lock().await;
     let root = tempfile::tempdir().unwrap();
     let sessions = publication_fixture_sessions(root.path(), true);
     let session = sessions
@@ -1180,21 +1285,14 @@ async fn exhausted_goal_resumes_after_idempotent_ipc_allowance_grant() {
     tokio::time::timeout(Duration::from_secs(30), async {
         loop {
             approve_goal_permissions(&state, session.id).await;
-            let terminal = state
-                .workflow_store
-                .lock()
-                .unwrap()
-                .canonical_terminal_output(&run_id)
-                .unwrap();
-            if let Some(terminal) = terminal {
-                assert_eq!(terminal.value["condition_met"], true);
+            if resumed_goal_reached_delivery_guard(&state, &run_id, root.path(), &request.input) {
                 break;
             }
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
     })
     .await
-    .unwrap();
+    .expect("renewed goal must settle correction and the conservative delivery decision");
     let attempts = state
         .workflow_store
         .lock()
@@ -1218,6 +1316,7 @@ async fn goal_stale_verification_marker_does_not_prove_delivery() {
 }
 
 async fn assert_goal_integration_conflict(stale_marker: bool) {
+    let _execution = GOAL_ENTRY_EXECUTION.lock().await;
     let root = tempfile::tempdir().unwrap();
     let sessions = publication_fixture_sessions(root.path(), true);
     let session = sessions
@@ -1290,6 +1389,7 @@ async fn assert_goal_integration_conflict(stale_marker: bool) {
 
 #[tokio::test]
 async fn real_goal_entry_publishes_and_executes_two_workers() {
+    let _execution = GOAL_ENTRY_EXECUTION.lock().await;
     let root = tempfile::tempdir().unwrap();
     let sessions = publication_fixture_sessions(root.path(), true);
     let session = sessions
@@ -1304,12 +1404,8 @@ async fn real_goal_entry_publishes_and_executes_two_workers() {
     std::fs::write(root.path().join("user.txt"), "uncommitted user work").unwrap();
     state.start_workflow_driver().await;
     let request = goal_entry_request(session.id, root.path(), Arc::clone(&state)).await;
-    assert!(
-        request.input["implementation_prompt"]
-            .as_str()
-            .unwrap()
-            .contains("Implement two collaborating contributions")
-    );
+    let objective = request.input["implementation_prompt"].as_str().unwrap();
+    assert!(objective.contains("Implement two collaborating contributions"));
     let run_id = request.run_id.unwrap();
     // Admission is not execution: observe the real production driver settlement.
     tokio::time::timeout(Duration::from_mins(1), async {

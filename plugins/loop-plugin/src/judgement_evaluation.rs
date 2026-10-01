@@ -210,7 +210,10 @@ pub fn invoke(context: &NativeServiceContext) -> ServiceResponse {
     if context.cancellation.is_cancelled() {
         return ServiceResponse::error("cancelled", "loop evaluation cancelled");
     }
-    if missing_required_delivery(&mut input) || negative_delivery(&mut input) {
+    if mismatched_delivery_criteria(&mut input)
+        || missing_required_delivery(&mut input)
+        || negative_delivery(&mut input)
+    {
         return json_response(&input);
     }
     if input.condition_met
@@ -224,16 +227,10 @@ pub fn invoke(context: &NativeServiceContext) -> ServiceResponse {
         input.summary = "Completion withheld: canonical contribution references could not be authenticated in this run or report unresolved work".into();
         return json_response(&input);
     }
-    if reject_unobserved_checks(&mut input, &context.bridge, &invocation.dispatch_identity) {
+    if reject_snapshot_delivery(&mut input, &context.bridge, &invocation.dispatch_identity) {
         return json_response(&input);
     }
-    // V1 records evaluator assertions only. Even authenticated output identities
-    // do not bind a successful check to the delivered content. Preserve the report
-    // for inspection, but do not let confidence or fallback certify those claims.
-    // Apply even to a negative agent verdict: judgement may otherwise promote it.
-    if input.delivery.is_some() {
-        input.condition_met = false;
-        input.summary = "Completion withheld: delivery V1 has no target-bound observed verification; retain the report and contributions until canonical verification support is available".into();
+    if reject_legacy_delivery(&mut input, &context.bridge, &invocation.dispatch_identity) {
         return json_response(&input);
     }
     // Agent-only loops use the same deterministic safeguard without provider dispatch.
@@ -289,6 +286,72 @@ pub fn invoke(context: &NativeServiceContext) -> ServiceResponse {
 }
 
 // Negative evidence cannot be overridden by model confidence or provider fallback.
+fn reject_legacy_delivery(
+    input: &mut LoopWorkflowIteration,
+    bridge: &ServiceBridge,
+    dispatch_identity: &str,
+) -> bool {
+    if input
+        .delivery
+        .as_ref()
+        .is_none_or(|report| report.version == delivery::ReportVersion::V1)
+        && reject_unobserved_checks(input, bridge, dispatch_identity)
+    {
+        return true;
+    }
+    // V1 records evaluator assertions only. Even authenticated output identities
+    // do not bind a successful check to the delivered content. Preserve the report
+    // for inspection, but do not let confidence or fallback certify those claims.
+    // Apply even to a negative agent verdict: judgement may otherwise promote it.
+    if input
+        .delivery
+        .as_ref()
+        .is_some_and(|report| report.version == delivery::ReportVersion::V1)
+    {
+        input.condition_met = false;
+        input.summary = "Completion withheld: delivery V1 has no target-bound observed verification; retain the report and contributions until canonical verification support is available".into();
+        return true;
+    }
+    false
+}
+
+fn reject_snapshot_delivery(
+    input: &mut LoopWorkflowIteration,
+    bridge: &ServiceBridge,
+    dispatch_identity: &str,
+) -> bool {
+    if let Some(report) = &input.delivery
+        && report.version == delivery::ReportVersion::V2
+    {
+        let verified = !report.precludes_completion()
+            && report.snapshot_coverage(&input.stop_condition)
+            && report
+                .contribution_output_ids
+                .iter()
+                .all(|id| authenticate_output(bridge, dispatch_identity, id))
+            && report.checks.iter().all(|check| {
+                check.execution.as_ref().is_some_and(|reference| {
+                    inspect_execution(bridge, dispatch_identity, &reference.output_id).is_some_and(
+                        |evidence| {
+                            report.delivered_snapshot.as_ref().is_some_and(|snapshot| {
+                                super::delivery_execution::delivered_check(
+                                    &evidence, reference, snapshot,
+                                )
+                            })
+                        },
+                    )
+                })
+            });
+        if !verified {
+            input.condition_met = false;
+            input.summary = "Completion withheld: incomplete original-criterion coverage or unauthenticated, failed, stale immutable delivery verification".into();
+            return true;
+        }
+        input.summary.push_str("; delivery is the exact retained UTF-8 snapshot, not live checkout freshness or hermetic environment verification; criterion reviews remain judgments");
+    }
+    false
+}
+
 fn negative_delivery(input: &mut LoopWorkflowIteration) -> bool {
     if input.external_blocker == LoopExternalBlocker::None
         && !input
@@ -301,6 +364,20 @@ fn negative_delivery(input: &mut LoopWorkflowIteration) -> bool {
     input.condition_met = false;
     input.summary = "Completion withheld: resolve the reported blocker, failed or unverified delivery evidence, or unresolved work before reevaluation".into();
     true
+}
+
+fn mismatched_delivery_criteria(input: &mut LoopWorkflowIteration) -> bool {
+    if input.delivery.as_ref().is_some_and(|report| {
+        report.original_stop_condition.is_some()
+            && !report.identifies_original_criteria(&input.stop_condition)
+    }) {
+        input.condition_met = false;
+        input.summary =
+            "Completion withheld: delivery coverage does not identify the original stop condition"
+                .into();
+        return true;
+    }
+    false
 }
 
 fn missing_required_delivery(input: &mut LoopWorkflowIteration) -> bool {

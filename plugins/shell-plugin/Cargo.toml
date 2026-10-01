@@ -19,6 +19,7 @@ bcode_config = { workspace = true }
 bcode_plugin_sdk = { workspace = true, features = ["tui"] }
 bcode_shell_command_analysis = { workspace = true }
 bcode_shell_command_analysis_models = { workspace = true }
+bcode_shell_models = { workspace = true }
 bcode_tool = { workspace = true }
 bcode_tool_runtime = { workspace = true }
 bcode_tui_components = { workspace = true, features = [
@@ -35,6 +36,7 @@ serde = { workspace = true, features = ["derive", "std"] }
 serde_json = { workspace = true }
 sha2 = { workspace = true }
 shuck-formatter = { workspace = true, optional = true }
+tempfile = { workspace = true }
 tokio = { workspace = true, features = ["rt"] }
 url = { workspace = true }
 vte = { workspace = true }
@@ -42,7 +44,6 @@ vte = { workspace = true }
 [dev-dependencies]
 bcode_session        = { workspace = true }
 bcode_session_models = { workspace = true }
-tempfile             = { workspace = true }
 
 [features]
 default = []

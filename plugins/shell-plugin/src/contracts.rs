@@ -118,6 +118,9 @@ pub struct ShellWorkflowOutputPolicy {
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct ShellWorkflowCommandPlan {
+    /// Complete inline target materialized in a private temporary command directory.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub delivered_snapshot: Option<bcode_shell_models::DeliveredSnapshot>,
     /// Optional bounded files/directory scopes observed around execution. Empty preserves legacy behavior.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub observe_files: Vec<PathBuf>,
@@ -183,6 +186,9 @@ pub struct ShellWorkflowCommandResult {
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct ShellWorkflowCommandPlanResult {
+    /// Authenticated only by the enclosing canonical shell output.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub snapshot_verification: Option<bcode_shell_models::SnapshotVerification>,
     /// Owner-observed content; absence means unknown, not verified.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub content_before: Option<crate::content_observation::ContentObservation>,
@@ -288,6 +294,7 @@ mod tests {
     #[test]
     fn workflow_command_plan_contract_is_versioned_bounded_and_argv_explicit() {
         let plan = ShellWorkflowCommandPlan {
+            delivered_snapshot: None,
             observe_files: Vec::new(),
             expected_content: None,
             version: SHELL_COMMAND_PLAN_VERSION,
@@ -322,6 +329,7 @@ mod tests {
     #[test]
     fn workflow_command_plan_result_carries_terminal_detail_and_artifacts() {
         let result = ShellWorkflowCommandPlanResult {
+            snapshot_verification: None,
             content_before: None,
             content_after: None,
             version: SHELL_COMMAND_PLAN_VERSION,

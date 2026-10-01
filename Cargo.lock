@@ -2094,6 +2094,7 @@ dependencies = [
  "bcode_session_models",
  "bcode_session_view",
  "bcode_session_view_models",
+ "bcode_shell_models",
  "bcode_tool",
  "bcode_workflow",
  "bcode_workflow_plugin",
@@ -2825,6 +2826,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "bcode_shell_models"
+version = "0.0.1-alpha.0"
+dependencies = [
+ "schemars",
+ "serde",
+]
+
+[[package]]
 name = "bcode_shell_plugin"
 version = "0.0.1-alpha.0"
 dependencies = [
@@ -2835,6 +2844,7 @@ dependencies = [
  "bcode_session_models",
  "bcode_shell_command_analysis",
  "bcode_shell_command_analysis_models",
+ "bcode_shell_models",
  "bcode_tool",
  "bcode_tool_runtime",
  "bcode_tui_components",

@@ -79349,12 +79349,12 @@ event_symbol = "bcode_plugin_handle_event_v1"
 
     #[tokio::test]
     async fn associated_resume_completes_quiescent_recovery_before_admission() {
-        assert_associated_resume_pending(true).await;
+        assert_associated_resume_pending(true, false).await;
     }
 
     #[tokio::test]
     async fn associated_resume_drives_pending_activation() {
-        assert_associated_resume_pending(false).await;
+        assert_associated_resume_pending(false, false).await;
     }
 
     fn enter_test_run_recovery(state: &ServerState, run_id: &str) {
@@ -79677,6 +79677,8 @@ event_symbol = "bcode_plugin_handle_event_v1"
             expected_cap,
             target_cap: expected_cap + 1,
         };
+        let (sender, mut wakes) = mpsc::channel(1);
+        state.workflow_driver_sender.set(sender).expect("scheduler");
         let application =
             workflow_operations::WorkflowAuthoringApplication::new(state, ClientId::new());
         let (run, changed) = bcode_workflow::WorkflowRunApplication::control_workflow_run(
@@ -79686,6 +79688,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
         )
         .await
         .expect("explicit operator grant");
+        assert_eq!(wakes.try_recv().unwrap(), run_id);
         assert!(changed);
         assert_eq!(run.unwrap().status, bcode_workflow_store::RunStatus::Paused);
         let (_, changed) = bcode_workflow::WorkflowRunApplication::control_workflow_run(
@@ -79696,12 +79699,47 @@ event_symbol = "bcode_plugin_handle_event_v1"
         .await
         .expect("identical retry");
         assert!(!changed);
+        // An identical retry reissues a lost wake, not an additional grant.
+        assert_eq!(wakes.try_recv().unwrap(), run_id);
+        state
+            .workflow_driver_sender
+            .get()
+            .unwrap()
+            .try_send(run_id.into())
+            .unwrap();
+        assert!(
+            bcode_workflow::WorkflowRunApplication::control_workflow_run(
+                &application,
+                run_id.into(),
+                bcode_workflow::WorkflowRunControlAction::IncreaseExecutionAllowance {
+                    expected_cap: expected_cap + 1,
+                    target_cap: expected_cap + 2,
+                },
+            )
+            .await
+            .is_err()
+        );
+        assert_eq!(wakes.try_recv().unwrap(), run_id);
         assert!(
             bcode_workflow::WorkflowRunApplication::control_workflow_run(
                 &application,
                 run_id.into(),
                 bcode_workflow::WorkflowRunControlAction::IncreaseExecutionAllowance {
                     expected_cap,
+                    target_cap: expected_cap + 2,
+                },
+            )
+            .await
+            .is_err()
+        );
+        assert!(wakes.try_recv().is_err());
+        drop(wakes);
+        assert!(
+            bcode_workflow::WorkflowRunApplication::control_workflow_run(
+                &application,
+                run_id.into(),
+                bcode_workflow::WorkflowRunControlAction::IncreaseExecutionAllowance {
+                    expected_cap: expected_cap + 1,
                     target_cap: expected_cap + 2,
                 },
             )
@@ -79720,7 +79758,12 @@ event_symbol = "bcode_plugin_handle_event_v1"
         );
     }
 
-    async fn assert_associated_resume_pending(recovering: bool) {
+    #[tokio::test]
+    async fn workflow_allowance_control_wakes_exact_retries_and_rejects_full_scheduler() {
+        assert_associated_resume_pending(false, true).await;
+    }
+
+    async fn assert_associated_resume_pending(recovering: bool, allowance_only: bool) {
         let sessions = SessionManager::default();
         let session = sessions
             .create_session(Some("resume pending".to_string()), PathBuf::from("."))
@@ -79798,8 +79841,9 @@ event_symbol = "bcode_plugin_handle_event_v1"
         ));
 
         assert_no_pending_replacement_withdrawal(&state, &key).await;
-        if !recovering {
+        if allowance_only {
             assert_operator_allowance_grant(&state, "resume-pending-run").await;
+            return;
         }
         if recovering {
             enter_test_run_recovery(&state, "resume-pending-run");
