@@ -94,6 +94,7 @@ webbrowser = { workspace = true }
 zeroize = { workspace = true }
 
 [dev-dependencies]
+bcode_daemon_lifecycle = { workspace = true }
 bcode_filesystem_plugin = { workspace = true, features = ["static-bundled"] }
 bcode_git_plugin        = { workspace = true, features = ["static-bundled"] }
 bcode_hello_plugin      = { workspace = true }

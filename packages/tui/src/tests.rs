@@ -7153,7 +7153,11 @@ async fn live_shell_recording_chunk_renders_once_from_contribution_artifact() {
                             protocol_version: u32::from(bcode_ipc::ProtocolVersion::current().0),
                             artifact_id: Some(bcode_ipc::ArtifactId::current()),
                             build_fingerprint: bcode_ipc::BUILD_FINGERPRINT.to_owned(),
-                            executable_digest: None,
+                            executable_digest: Some(
+                                bcode_daemon_lifecycle::current_executable_identity()
+                                    .expect("test executable identity")
+                                    .1,
+                            ),
                             storage_writer_epoch: Some(
                                 bcode_ipc::CURRENT_SESSION_STORAGE_WRITER_EPOCH,
                             ),

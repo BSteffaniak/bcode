@@ -113,6 +113,72 @@ async fn prepare_generation_session(
     }
 }
 
+// The portable control is an atomic flag, not a runtime-specific notification.
+// Poll only the flag while retaining (not restarting) the in-flight IPC future.
+async fn generation_cancelled(control: &PluginStructuredGenerationControl) {
+    while !control.is_cancelled() {
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+}
+
+async fn observe_generation(
+    client: &BcodeClient,
+    session_id: SessionId,
+    prepared: Option<bcode_session_models::PreparedContextGeneration>,
+    terminal_observed: &mut bool,
+) -> Result<PluginStructuredGenerationResult, ClientError> {
+    let mut cursor = None;
+    let mut assistant = GenerationAssistantOutput::default();
+    loop {
+        let page = client
+            .session_history_page(
+                session_id,
+                bcode_session_models::SessionHistoryQuery {
+                    cursor,
+                    limit: 100,
+                    direction: bcode_session_models::SessionHistoryDirection::Forward,
+                },
+            )
+            .await?;
+        for event in page.events {
+            cursor = Some(bcode_session_models::SessionHistoryCursor {
+                sequence: event.sequence,
+            });
+            assistant.observe(&event.kind);
+            if let bcode_session_models::SessionEventKind::ModelTurnFinished {
+                turn_id,
+                outcome,
+                message,
+                ..
+            } = event.kind
+            {
+                *terminal_observed = true;
+                if outcome != bcode_session_models::ModelTurnOutcome::Completed {
+                    return Err(ClientError::Protocol(format!(
+                        "structured generation ended with {outcome:?}: {}",
+                        message.unwrap_or_default()
+                    )));
+                }
+                let text = assistant.for_turn(&turn_id).ok_or_else(|| {
+                    ClientError::Protocol(
+                        "structured generation returned no assistant payload".into(),
+                    )
+                })?;
+                let output = serde_json::from_str(text).map_err(|error| {
+                    ClientError::Protocol(format!(
+                        "structured generation returned invalid JSON: {error}"
+                    ))
+                })?;
+                return Ok(PluginStructuredGenerationResult {
+                    output,
+                    source: prepared.map(|prepared| prepared.source),
+                });
+            }
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+}
+
 impl BcodeClient {
     /// Generate schema-validated output using an isolated session and ordinary permissions.
     ///
@@ -123,11 +189,25 @@ impl BcodeClient {
         request: PluginStructuredGenerationRequest,
         control: PluginStructuredGenerationControl,
     ) -> Result<PluginStructuredGenerationResult, ClientError> {
+        if request.timeout_ms == 0 {
+            return Err(ClientError::Protocol(
+                "structured generation timeout must be positive".into(),
+            ));
+        }
+        let deadline = tokio::time::Instant::now()
+            .checked_add(std::time::Duration::from_millis(request.timeout_ms))
+            .ok_or_else(|| {
+                ClientError::Protocol("structured generation deadline overflow".into())
+            })?;
         let client = self.clone();
-        async move {
+        let mut submitted_session = None;
+        let mut terminal_observed = false;
+        let operation = async {
             let (session_id, prepared) =
                 prepare_observable_generation(&client, &request, &control).await?;
             let prompt = format!("{}\n\n{}", request.system_prompt, request.prompt);
+            // Admission may commit even if its response is lost. Never retry it.
+            submitted_session = Some(session_id);
             client
                 .send_user_message_with_execution(
                     session_id,
@@ -151,75 +231,56 @@ impl BcodeClient {
                 )
                 .await
                 .map_err(|error| ClientError::Protocol(error.to_string()))?;
-            let started = std::time::Instant::now();
-            let mut cursor = None;
-            let mut assistant = GenerationAssistantOutput::default();
-            let mut cancellation_sent = false;
-            loop {
-                if control.is_cancelled() && !cancellation_sent {
-                    client
-                        .cancel_session_turn(session_id)
-                        .await
-                        .map_err(|error| ClientError::Protocol(error.to_string()))?;
-                    cancellation_sent = true;
-                }
-                let page = client
-                    .session_history_page(
-                        session_id,
-                        bcode_session_models::SessionHistoryQuery {
-                            cursor,
-                            limit: 100,
-                            direction: bcode_session_models::SessionHistoryDirection::Forward,
-                        },
-                    )
-                    .await
-                    .map_err(|error| ClientError::Protocol(error.to_string()))?;
-                for event in page.events {
-                    cursor = Some(bcode_session_models::SessionHistoryCursor {
-                        sequence: event.sequence,
-                    });
-                    assistant.observe(&event.kind);
-                    if let bcode_session_models::SessionEventKind::ModelTurnFinished {
-                        turn_id,
-                        outcome,
-                        message,
-                        ..
-                    } = event.kind
-                    {
-                        if outcome != bcode_session_models::ModelTurnOutcome::Completed {
-                            return Err(ClientError::Protocol(format!(
-                                "structured generation ended with {outcome:?}: {}",
-                                message.unwrap_or_default()
-                            )));
-                        }
-                        let text = assistant.for_turn(&turn_id).ok_or_else(|| {
-                            ClientError::Protocol(
-                                "structured generation returned no assistant payload".to_string(),
-                            )
-                        })?;
-                        let output = serde_json::from_str(text).map_err(|error| {
-                            ClientError::Protocol(format!(
-                                "structured generation returned invalid JSON: {error}"
-                            ))
-                        })?;
-                        return Ok(
-                            bcode_plugin_sdk::generation::PluginStructuredGenerationResult {
-                                output,
-                                source: prepared.map(|prepared| prepared.source),
-                            },
-                        );
+            observe_generation(&client, session_id, prepared, &mut terminal_observed).await
+        };
+        let result = tokio::select! {
+            biased;
+            () = generation_cancelled(&control) => Err(ClientError::Protocol(
+                "structured generation cancellation requested".into(),
+            )),
+            () = tokio::time::sleep_until(deadline) => Err(ClientError::Protocol(
+                "structured generation timed out".into(),
+            )),
+            result = operation => result,
+        };
+        // A cancellation arriving with a ready response must not produce a goal.
+        let result = if control.is_cancelled() {
+            Err(ClientError::Protocol(
+                "structured generation cancellation requested".into(),
+            ))
+        } else if tokio::time::Instant::now() >= deadline {
+            Err(ClientError::Protocol(
+                "structured generation timed out".into(),
+            ))
+        } else {
+            result
+        };
+        match (result, submitted_session) {
+            (Err(error), Some(session_id)) if !terminal_observed => {
+                // Separate bounded cleanup allowance; neither an RPC response nor false
+                // (no active turn yet) proves an ambiguously admitted turn has stopped.
+                let cleanup = tokio::time::timeout(
+                    std::time::Duration::from_millis(250),
+                    client.cancel_session_turn(session_id),
+                )
+                .await;
+                let status = match cleanup {
+                    Ok(Ok(true)) => {
+                        "cancellation request accepted; terminal acknowledgement unobserved"
                     }
-                }
-                if started.elapsed() >= std::time::Duration::from_millis(request.timeout_ms) {
-                    let _ = client.cancel_session_turn(session_id).await;
-                    return Err(ClientError::Protocol(
-                        "structured generation timed out".to_string(),
-                    ));
-                }
-                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                    Ok(Ok(false)) => {
+                        "no active turn reported; admission/terminal outcome unresolved"
+                    }
+                    Ok(Err(_)) => "cancellation request failed; turn outcome unresolved",
+                    Err(_) => "cancellation request timed out; turn outcome unresolved",
+                };
+                Err(ClientError::Protocol(format!("{error}; {status}")))
             }
+            (Err(error), None) => Err(ClientError::Protocol(format!(
+                "{error}; no submission attempted; preparation outcome may be unresolved"
+            ))),
+            (result, _) => result,
         }
-        .await
     }
 }
 
