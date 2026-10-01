@@ -55,6 +55,7 @@ use serde::{Deserialize, Serialize};
 const PLUGIN_ID: &str = "bcode.loop";
 const WORKFLOW_KIND: &str = "bcode.loop";
 mod activity;
+mod cli;
 mod continuation;
 mod goal;
 mod goal_document_view;
@@ -795,7 +796,9 @@ fn json_response<T: Serialize>(value: &T) -> ServiceResponse {
 
 #[must_use]
 pub fn static_plugin() -> StaticPluginVtable {
-    static_plugin_vtable!(LoopPlugin, include_str!("../bcode-plugin.toml"))
+    let mut vtable = static_plugin_vtable!(LoopPlugin, include_str!("../bcode-plugin.toml"));
+    vtable.cli_registration = Some(cli::registration);
+    vtable
 }
 
 #[must_use]
@@ -958,6 +961,67 @@ struct LoopSurface {
     progress_checkbox: std::cell::Cell<bmux_tui_components::checkbox::CheckboxState>,
     review_button: std::cell::Cell<bmux_tui_components::button::ButtonState>,
     theme: Option<PluginTuiTheme>,
+}
+
+fn build_start_request(
+    input: &LoopWorkflowInput,
+    session_id: SessionId,
+    origin: SetupKind,
+    collaboration: CollaborationMode,
+    progress_document: bool,
+    worker_attempts: Option<u64>,
+) -> Result<PluginWorkflowStartRequest, String> {
+    let spec = if progress_document {
+        goal_workflow_spec(input)?
+    } else if origin == SetupKind::Goal {
+        optional_goal_spec(&loop_workflow_spec(input)?)?
+    } else {
+        loop_workflow_spec(input)?
+    };
+    let spec = if collaboration == CollaborationMode::Requested {
+        collaborating_goal_spec(&spec)?
+    } else {
+        spec
+    };
+    let initial = loop_workflow_initial_value(input);
+    let mut request = PluginWorkflowStartRequest::typed(
+        &spec,
+        &initial,
+        session_id,
+        PluginWorkflowBinding {
+            owner_plugin_id: PLUGIN_ID.to_string(),
+            workflow_kind: WORKFLOW_KIND.to_string(),
+            scope_key: session_id.to_string(),
+            display_label: Some("Loop".to_string()),
+            single_active: true,
+        },
+        Some(uuid::Uuid::new_v4().to_string()),
+    )
+    .map_err(|error| format!("invalid durable loop request: {error}"))?;
+    request.limits.cycle_cap = input.max_iterations;
+    // Reserve initialization attempts and every node of each implementation iteration.
+    // Blocker-resolution retries remain subject to the ordinary run budgets.
+    let initialization = u64::from(progress_document);
+    let per_iteration = continuation::executable_node_count(&request.definition)?
+        .checked_sub(initialization)
+        .ok_or("initialization node allowance mismatch")?;
+    request.limits.node_execution_cap = u64::from(input.max_iterations)
+        .checked_mul(per_iteration)
+        .and_then(|count| count.checked_add(initialization))
+        .and_then(|count| count.checked_mul(u64::from(request.limits.retry_cap) + 1))
+        .ok_or("loop node allowance overflow")?;
+    if let Some(worker_attempts) = worker_attempts
+        .filter(|_| origin == SetupKind::Goal || collaboration == CollaborationMode::Requested)
+    {
+        request.limits.node_execution_cap = request
+            .limits
+            .node_execution_cap
+            .checked_add(worker_attempts)
+            .ok_or("delegated execution allowance overflow")?;
+    }
+    i64::try_from(request.limits.node_execution_cap)
+        .map_err(|_| "node allowance exceeds the supported storage integer range")?;
+    Ok(request)
 }
 
 impl LoopSurface {
@@ -1173,57 +1237,14 @@ impl LoopSurface {
             judgement_evaluation::parse_config(&evaluation).inspect_err(|_| {
                 self.field = Field::Evaluation;
             })?;
-        let spec = if self.progress_document.is_some() {
-            goal_workflow_spec(&input)?
-        } else if self.origin == SetupKind::Goal {
-            optional_goal_spec(&loop_workflow_spec(&input)?)?
-        } else {
-            loop_workflow_spec(&input)?
-        };
-        let spec = if self.collaboration == CollaborationMode::Requested {
-            collaborating_goal_spec(&spec)?
-        } else {
-            spec
-        };
-        let initial = loop_workflow_initial_value(&input);
-        let mut request = PluginWorkflowStartRequest::typed(
-            &spec,
-            &initial,
+        build_start_request(
+            &input,
             session_id,
-            PluginWorkflowBinding {
-                owner_plugin_id: PLUGIN_ID.to_string(),
-                workflow_kind: WORKFLOW_KIND.to_string(),
-                scope_key: session_id.to_string(),
-                display_label: Some("Loop".to_string()),
-                single_active: true,
-            },
-            Some(uuid::Uuid::new_v4().to_string()),
+            self.origin,
+            self.collaboration,
+            self.progress_document.is_some(),
+            self.worker_attempts,
         )
-        .map_err(|error| format!("invalid durable loop request: {error}"))?;
-        request.limits.cycle_cap = input.max_iterations;
-        // Reserve initialization attempts and every node of each implementation iteration.
-        // Blocker-resolution retries remain subject to the ordinary run budgets.
-        let initialization = u64::from(self.progress_document.is_some());
-        let per_iteration = continuation::executable_node_count(&request.definition)?
-            .checked_sub(initialization)
-            .ok_or("initialization node allowance mismatch")?;
-        request.limits.node_execution_cap = u64::from(input.max_iterations)
-            .checked_mul(per_iteration)
-            .and_then(|count| count.checked_add(initialization))
-            .and_then(|count| count.checked_mul(u64::from(request.limits.retry_cap) + 1))
-            .ok_or("loop node allowance overflow")?;
-        if let Some(worker_attempts) = self.worker_attempts.filter(|_| {
-            self.origin == SetupKind::Goal || self.collaboration == CollaborationMode::Requested
-        }) {
-            request.limits.node_execution_cap = request
-                .limits
-                .node_execution_cap
-                .checked_add(worker_attempts)
-                .ok_or("delegated execution allowance overflow")?;
-        }
-        i64::try_from(request.limits.node_execution_cap)
-            .map_err(|_| "node allowance exceeds the supported storage integer range")?;
-        Ok(request)
     }
 
     fn begin_replace_cancel(&mut self, host: &dyn PluginTuiHost) {

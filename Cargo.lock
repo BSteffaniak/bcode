@@ -2104,6 +2104,7 @@ dependencies = [
  "bmux_text_edit",
  "bmux_tui",
  "bmux_tui_components",
+ "clap",
  "jsonschema",
  "pulldown-cmark",
  "schemars",

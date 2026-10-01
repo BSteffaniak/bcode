@@ -41,7 +41,7 @@ struct GeneratedGoalPrompts {
     stop_condition: String,
 }
 
-fn generation_request(
+pub fn generation_request(
     objective: &str,
     guidance: &str,
     progress_document: bool,
@@ -100,6 +100,37 @@ fn decode_prompts(
     )
 }
 
+pub fn decode_generation(
+    mut value: serde_json::Value,
+    objective: &str,
+    guidance: &str,
+    limit: u64,
+    provenance: &str,
+) -> Result<LoopWorkflowInput, String> {
+    if value.get("outcome").and_then(serde_json::Value::as_str) == Some("clarification_required") {
+        return Err(format!(
+            "Clarify the goal: {}",
+            value
+                .get("clarification")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("Please specify the intended outcome")
+        ));
+    }
+    if value.get("outcome").and_then(serde_json::Value::as_str) != Some("ready") {
+        return Err("Unknown goal generation outcome".into());
+    }
+    if let Some(object) = value.as_object_mut() {
+        object.remove("outcome");
+        object.remove("clarification");
+    }
+    let input = decode_prompts(value, objective, guidance, limit)?;
+    LoopWorkflowInput::new(
+        format!("{provenance}{}", input.implementation_prompt),
+        format!("{provenance}{}", input.stop_condition),
+        limit,
+    )
+}
+
 #[derive(Default)]
 pub struct ProgressDocumentSetup {
     objective: String,
@@ -109,6 +140,18 @@ pub struct ProgressDocumentSetup {
 }
 
 impl ProgressDocumentSetup {
+    pub const fn headless(
+        objective: String,
+        guidance: String,
+        context: bcode_session_models::SessionDerivationSourceSnapshot,
+    ) -> Self {
+        Self {
+            objective,
+            guidance,
+            context: Some(context),
+            path: None,
+        }
+    }
     pub fn request(
         &self,
         session_id: SessionId,
@@ -916,31 +959,7 @@ impl PluginTuiSurface for GoalSurface {
             if let Some(setup) = &mut self.editor.progress_document {
                 setup.context = Some(source);
             }
-            let mut value = result.output;
-            if value.get("outcome").and_then(serde_json::Value::as_str)
-                == Some("clarification_required")
-            {
-                return Err(format!(
-                    "Clarify the goal: {}",
-                    value
-                        .get("clarification")
-                        .and_then(serde_json::Value::as_str)
-                        .unwrap_or("Please specify the intended outcome")
-                ));
-            }
-            if value.get("outcome").and_then(serde_json::Value::as_str) != Some("ready") {
-                return Err("Unknown goal generation outcome".into());
-            }
-            if let Some(object) = value.as_object_mut() {
-                object.remove("outcome");
-                object.remove("clarification");
-            }
-            let input = decode_prompts(value, &objective, &guidance, limit)?;
-            LoopWorkflowInput::new(
-                format!("{provenance}{}", input.implementation_prompt),
-                format!("{provenance}{}", input.stop_condition),
-                limit,
-            )
+            decode_generation(result.output, &objective, &guidance, limit, &provenance)
         });
         match result {
             Ok(input) => {

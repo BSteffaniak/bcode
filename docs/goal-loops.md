@@ -175,6 +175,28 @@ generation or workflow dispatch. Configuration and attachment retries reuse the 
 session. Existing-session invocations continue using that session. Control commands still
 require a session. Closing after creation may leave an empty session but does not launch work.
 
+### Noninteractive goal entry
+
+Bundled builds also expose `bcode goal`, owned by the loop plugin:
+
+```sh
+bcode session create --cwd /path/to/repository --json goal-work
+bcode goal --session <session-id> --collaborate --worker-attempts 20 --objective 'Your coding goal'
+```
+
+The command shares the modal's generation prompts, output validation, delegation preflight,
+and workflow request builder. It uses ordinary invocation configuration and permissions;
+the source session supplies bounded context and the parent workspace/association, not an
+extra permission grant. A progress document is enabled unless `--no-progress-document` is set.
+Clarification or unavailable prerequisites fail rather than silently launching a plain loop.
+Success prints a run ID and means **admitted, not completed**. Inspect with
+`bcode workflow inspect-run --run-id <run-id>` and `bcode workflow run-output --run-id <run-id>`;
+request cancellation with `bcode workflow cancel-run --run-id <run-id>`.
+Generation and document preparation can leave retained session state even when admission fails;
+do not blindly retry an ambiguous transport failure. This command does not approve pending
+permissions or provide an interactive permission responder. Older installed binaries need rebuilding
+with the bundled loop plugin before this command exists.
+
 `/goal` opens a goal setup modal owned by the bundled loop plugin. Goals receive
 plugin-owned optional coordination guidance during implementation, whether or not progress
 notes are enabled: work directly when appropriate, or use authorized graph publication and a

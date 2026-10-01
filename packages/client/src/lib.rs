@@ -4,6 +4,8 @@
 
 //! Programmatic client API for Bcode.
 
+mod generation;
+
 use bcode_agent_profile::{AgentInfo, PolicyStatusResponse};
 use bcode_daemon_lifecycle::{DaemonStartError, EnsureDaemonOptions, ensure_daemon_running};
 use bcode_ipc::{

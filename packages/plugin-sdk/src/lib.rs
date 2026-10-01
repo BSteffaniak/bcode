@@ -5,6 +5,7 @@
 
 //! Plugin author SDK for Bcode native plugins.
 
+pub mod generation;
 pub mod interaction;
 pub mod path;
 #[doc(hidden)]
