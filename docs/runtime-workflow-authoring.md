@@ -17,7 +17,21 @@ are unchanged. Dependent-worker groups and homogeneous fan-out do not support th
 mode and reject it. Old runtimes reject the unknown policy rather than interpreting
 it as success-only behavior. Live-model recovery remains unverified.
 
-## Source-preserving integration
+## Ordinary source-bound delegation
+
+Prefer `workflow.stage_delegation` for ordinary coordinator work. First inspect
+`workflow.execution_context` for the authenticated run, activation and revision.
+Supply `run_id`, `expected_revision`, `bind_source_activation`, `mutation_id`,
+semantic `tasks`, a `continuation` objective/profile and explicit `reconciliation`.
+The tool obtains the source schema, allocation and source-preserving successor
+transform internally; callers do not reconstruct goal state or transport schemas.
+Workspace selection, access, criteria and integration strategy remain caller-owned.
+Staging does not dispatch: separately publish the exact returned publication
+arguments with authorization, then finish the source activation normally. On
+revision conflict, rediscover rather than silently rebasing. Unsupported topologies
+require the advanced recipe below; no Git workspace or delivery report is required.
+
+## Advanced source-preserving integration
 
 Compact v2 staging receipts retain publication arguments and named result paths,
 but omit the redundant reconnect transform/schema. Corrective authors inspect the

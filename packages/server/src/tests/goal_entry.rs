@@ -324,8 +324,8 @@ async fn goal_entry_request_with_workspace(
     for character in "Implement two collaborating contributions".chars() {
         surface.handle_event(&key(bmux_keyboard::KeyCode::Char(character), false), &host);
     }
-    // Disable the optional progress document; this test owns only its temporary workspace.
-    surface.handle_event(&key(bmux_keyboard::KeyCode::Char('p'), true), &host);
+    // Progress-document planning is opt-in; leave it disabled so this test owns
+    // only its temporary workspace.
     surface.handle_event(&key(bmux_keyboard::KeyCode::Enter, true), &host);
     for _ in 0..16 {
         let tasks = std::mem::take(&mut *host.tasks.lock().unwrap());
@@ -718,7 +718,11 @@ async fn real_goal_entry_denied_delegation_prevents_worker_effects() {
                 }
                 assert_eq!(evaluation.value["condition_met"], false);
                 assert_eq!(evaluation.value["external_blocker"], "approval_required");
-                assert!(waits.iter().any(|wait| wait.node_id == "loop.blocked"));
+                assert!(
+                    waits
+                        .iter()
+                        .any(|wait| wait.kind == bcode_workflow::WorkflowWaitKind::Approval)
+                );
                 break;
             }
             tokio::time::sleep(Duration::from_millis(20)).await;
@@ -785,7 +789,7 @@ async fn real_goal_entry_approval_resumes_correction_without_false_completion() 
                 .waiting_activations(run_id, 10)
                 .unwrap()
                 .into_iter()
-                .find(|wait| wait.node_id == "loop.blocked");
+                .find(|wait| wait.kind == bcode_workflow::WorkflowWaitKind::Approval);
             if let Some(wait) = wait {
                 break wait;
             }
@@ -877,7 +881,10 @@ async fn real_goal_entry_denied_verification_does_not_delegate_correction() {
                     .unwrap()
                     .waiting_activations(run_id, 10)
                     .unwrap();
-                if waits.iter().any(|wait| wait.node_id == "loop.blocked") {
+                if waits
+                    .iter()
+                    .any(|wait| wait.kind == bcode_workflow::WorkflowWaitKind::Approval)
+                {
                     break;
                 }
             }

@@ -447,6 +447,67 @@ pub mod tests {
     }
 
     #[test]
+    fn approval_and_input_waits_offer_distinct_controls() {
+        use bcode_workflow_view_models::{WorkflowWaitKind, WorkflowWaitView};
+
+        let mut snapshot = view();
+        snapshot.waits.push(WorkflowWaitView {
+            node_id: "loop.decision".into(),
+            activation_id: "decision-activation".into(),
+            kind: WorkflowWaitKind::Approval,
+            prompt: "Approve continuation?".into(),
+            expected_schema: None,
+            input: None,
+            requested_at_ms: 1,
+        });
+        let approval = format(&snapshot);
+        assert!(approval.contains("Approve continuation?"));
+        assert!(approval.contains("/goal.unblock decision-activation approve|deny"));
+        assert!(approval.contains("continuation only, not tool authorization"));
+        assert!(!approval.contains("Provide input"));
+
+        snapshot.waits[0].node_id = "loop.requirement".into();
+        snapshot.waits[0].kind = WorkflowWaitKind::Input;
+        snapshot.waits[0].prompt = "Supply the missing dependency".into();
+        let input = format(&snapshot);
+        assert!(input.contains("Supply the missing dependency"));
+        assert!(input.contains("/workflow → Provide input"));
+        assert!(!input.contains("/goal.unblock"));
+
+        snapshot.waits[0].node_id = "loop.blocked".into();
+        snapshot.waits[0].kind = WorkflowWaitKind::Approval;
+        snapshot.waits[0].input = Some(serde_json::json!({"summary":"Dependency unavailable"}));
+        let legacy = format(&snapshot);
+        assert!(legacy.contains("Dependency unavailable"));
+        assert!(legacy.contains("Consent does not resolve missing evidence or dependencies"));
+        assert!(legacy.contains("/goal.unblock decision-activation approve|deny"));
+    }
+
+    #[test]
+    fn repair_required_does_not_present_retained_positive_output_as_success() {
+        let mut snapshot = view();
+        snapshot.terminal = Some(WorkflowTerminalView::RepairRequired);
+        snapshot.outputs = vec![
+            serde_json::from_value(serde_json::json!({
+                "output_id":"prior","node_id":"evaluation","activation_id":"a",
+                "schema_id":"loop","schema_version":1,"checksum_sha256":"checksum",
+                "artifact_reference":null,"created_at_ms":0,
+                "value":{"availability":"resolved","value":{
+                    "implementation_prompt":"objective","stop_condition":"criteria",
+                    "max_iterations":1,"iteration":1,"condition_met":true,
+                    "summary":"Earlier successful result", "evidence":[]
+                }}
+            }))
+            .unwrap(),
+        ];
+        let text = format(&snapshot);
+        assert!(text.contains("Repair required: do not retry ambiguous effects"));
+        assert!(!text.contains("criteria reported satisfied"));
+        assert!(!text.contains("Earlier successful result"));
+        assert!(!text.contains("Workflow finished"));
+    }
+
+    #[test]
     fn approvals_and_failures_remain_actionable() {
         let mut view = view();
         view.tool_permissions
