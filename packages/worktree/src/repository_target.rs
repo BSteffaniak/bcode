@@ -3,6 +3,9 @@ use std::io::{Read, Write};
 use std::path::Path;
 use std::process::{Command, Stdio};
 
+mod disk;
+pub use disk::{RepositoryExportLimits, RepositorySpool, export_spooled};
+
 /// One complete regular Git blob, including its executable mode.
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct RepositoryFile {
@@ -234,21 +237,51 @@ impl RepositoryExport {
             }
             std::fs::symlink_metadata(&path)
                 .is_ok_and(|metadata| metadata.is_file() && mode_matches(&metadata, &file.mode))
-                && std::fs::File::open(&path).is_ok_and(|input| {
-                    let mut bytes = Vec::new();
-                    input
-                        .take(file.bytes.len() as u64 + 1)
-                        .read_to_end(&mut bytes)
-                        .is_ok()
-                        && bytes == file.bytes
-                })
+                && std::fs::File::open(&path).is_ok_and(|input| content_matches(input, &file.bytes))
         })
+    }
+}
+
+// Compare exact bytes with fixed additional memory, including an EOF check so
+// appended content cannot be mistaken for unchanged source.
+fn content_matches(mut input: impl Read, expected: &[u8]) -> bool {
+    let mut buffer = [0_u8; 8192];
+    for chunk in expected.chunks(buffer.len()) {
+        let actual = &mut buffer[..chunk.len()];
+        if input.read_exact(actual).is_err() || actual != chunk {
+            return false;
+        }
+    }
+    loop {
+        match input.read(&mut buffer[..1]) {
+            Ok(0) => return true,
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+            _ => return false,
+        }
     }
 }
 
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
+
+    #[test]
+    fn exact_content_comparison_handles_boundaries_and_rejects_mutations() {
+        for length in [0, 1, 8191, 8192, 8193, 32_769] {
+            let expected = vec![42; length];
+            assert!(content_matches(expected.as_slice(), &expected));
+            let mut changed = expected.clone();
+            changed.push(42);
+            assert!(!content_matches(changed.as_slice(), &expected));
+            if length > 0 {
+                assert!(!content_matches(&expected[..length - 1], &expected));
+                changed.truncate(length);
+                changed[length - 1] ^= 1;
+                assert!(!content_matches(changed.as_slice(), &expected));
+            }
+        }
+    }
+
     fn run(root: &Path, args: &[&str]) -> String {
         let output = Command::new("git")
             .arg("-C")

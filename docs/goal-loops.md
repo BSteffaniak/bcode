@@ -22,8 +22,9 @@ The handoff supports one direct successor with optional nested `source`
 selection or paired left-hand source selectors retained by an earlier repository
 handoff. Repeated verification composes that selection without selecting prior check
 or report results; stale revisions or unsupported topology fail closed. Failed checks do not
-automatically replay. Normal goal-entry execution with historical resolution still
-needs acceptance coverage beyond the current graph-lowering tests.
+automatically replay. Scripted normal goal-entry tests cover authenticated historical
+resolution and rejection of missing, mismatched or incomplete evidence. Real-model
+canonical acceptance remains outstanding; deterministic coverage does not establish it.
 
 
 ## Repository delivery V3
@@ -101,8 +102,10 @@ combined verification; this does not independently rerun validation or certify w
 commit provenance. New evaluator guidance distinguishes base, contribution and integrated
 revisions, asks for working-tree state, and forbids creating commits just for reporting.
 
-New goal evaluations may retain an optional `delivery` report in their canonical
-output: `version: "1"`, integrated targets, inspected canonical contribution output
+Goal evaluations may retain an optional `delivery` report in their canonical output.
+Historical `version: "1"` reports remain readable but do not certify completion;
+V2 supports bounded UTF-8 delivery, while V3 supports whole-repository delivery subject
+to unchanged admitted criteria. Report fields include integrated targets, inspected canonical contribution output
 IDs, original criteria with passed/failed/unverified evidence, combined commands and
 workspaces with observed outcomes, retained workspaces, and unresolved work. Lists
 and text are schema-bounded. `/goal.status` previews targets, contribution references,
