@@ -46,6 +46,15 @@ macOS signing, Linux stripping, Windows signing when configured, copy/staging, a
 extraction without treating signatures or executable digests as identity. Artifact identity is
 daemon routing metadata and is distinct from the archive checksum and executable SHA-256.
 
+For executable builds, prefer `cargo xtask build` (or the distribution commands above). Raw
+`cargo build`/`cargo rustc` generates its fallback identity in the IPC dependency's build script;
+Cargo can reuse that output when only the final executable is recompiled or relinked. Consequently,
+two different raw-Cargo executables can carry the same identity. If raw Cargo is necessary, supply
+a fresh, portable `BCODE_ARTIFACT_ID` for each independently produced executable; never reuse a
+label for different artifacts. This is a raw-build limitation, not permission to disable executable
+digest verification or stop a different artifact's daemon. The `xtask` build path already supplies
+a fresh identity per build.
+
 macOS and Windows artifacts are `.zip` archives; Linux artifacts are `.tar.gz` archives. Portable ZIP
 is the complete initial Windows distribution format; an installer, Store package, package-manager
 publication, and auto-updater are outside the v1 Windows milestone. Every archive contains

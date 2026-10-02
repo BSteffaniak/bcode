@@ -2410,7 +2410,7 @@ fn loop_workflow_spec(
             |state: LoopWorkflowIteration, _context| async move { Ok(state) },
         );
         // The agent gathers bounded repository evidence; the block supplies the final verdict.
-        // A false agent verdict may still be independently examined by the judgement model.
+        // Judgement confidence cannot promote an unresolved or unverified agent verdict.
         implementation
             .agent_execution_target(bcode_workflow::PromptContextTarget::SharedParentSequential)
             .then(evaluation)

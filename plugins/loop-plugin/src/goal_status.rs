@@ -363,6 +363,51 @@ pub mod tests {
     }
 
     #[test]
+    fn missing_terminal_evidence_never_uses_a_successful_sibling() {
+        let mut snapshot = view();
+        snapshot.terminal = Some(WorkflowTerminalView::Completed {
+            output_id: "final".into(),
+        });
+        let sibling = serde_json::from_value(serde_json::json!({
+            "output_id":"sibling", "node_id":"worker", "activation_id":"a",
+            "schema_id":"loop", "schema_version":1, "checksum_sha256":"checksum",
+            "artifact_reference":null, "created_at_ms":0,
+            "value":{"availability":"resolved","value":{
+                "implementation_prompt":"objective", "stop_condition":"criteria",
+                "max_iterations":1, "iteration":1, "condition_met":true,
+                "summary":"sibling-positive-sentinel", "evidence":[]
+            }}
+        }))
+        .unwrap();
+        snapshot.outputs = vec![sibling];
+        let mut unresolved = snapshot.outputs[0].clone();
+        unresolved.output_id = "final".into();
+        unresolved.value = WorkflowOutputValue::Unresolved;
+        for include_unresolved in [false, true] {
+            if include_unresolved {
+                snapshot.outputs.push(unresolved.clone());
+            }
+            let text = format(&snapshot);
+            assert!(text.contains("Goal result detail unavailable"));
+            assert!(!text.contains("criteria reported satisfied"));
+            assert!(!text.contains("sibling-positive-sentinel"));
+        }
+
+        // A retained positive result must not override a non-success terminal state.
+        snapshot.outputs[0].output_id = "final".into();
+        for terminal in [
+            WorkflowTerminalView::Failed,
+            WorkflowTerminalView::Cancelled,
+            WorkflowTerminalView::RepairRequired,
+        ] {
+            snapshot.terminal = Some(terminal);
+            let text = format(&snapshot);
+            assert!(!text.contains("Goal evaluation:"));
+            assert!(!text.contains("sibling-positive-sentinel"));
+        }
+    }
+
+    #[test]
     fn final_result_uses_terminal_identity_and_preserves_incomplete_verdict() {
         let mut snapshot = view();
         snapshot.terminal = Some(WorkflowTerminalView::Completed {
@@ -484,9 +529,8 @@ pub mod tests {
     }
 
     #[test]
-    fn repair_required_does_not_present_retained_positive_output_as_success() {
+    fn non_success_terminal_states_do_not_present_retained_positive_output_as_success() {
         let mut snapshot = view();
-        snapshot.terminal = Some(WorkflowTerminalView::RepairRequired);
         snapshot.outputs = vec![
             serde_json::from_value(serde_json::json!({
                 "output_id":"prior","node_id":"evaluation","activation_id":"a",
@@ -500,11 +544,22 @@ pub mod tests {
             }))
             .unwrap(),
         ];
-        let text = format(&snapshot);
-        assert!(text.contains("Repair required: do not retry ambiguous effects"));
-        assert!(!text.contains("criteria reported satisfied"));
-        assert!(!text.contains("Earlier successful result"));
-        assert!(!text.contains("Workflow finished"));
+        for (terminal, expected) in [
+            (
+                Some(WorkflowTerminalView::RepairRequired),
+                "Repair required: do not retry ambiguous effects",
+            ),
+            (Some(WorkflowTerminalView::Failed), "Workflow failed"),
+            (Some(WorkflowTerminalView::Cancelled), "Workflow cancelled"),
+            (None, "No terminal result in this snapshot"),
+        ] {
+            snapshot.terminal = terminal;
+            let text = format(&snapshot);
+            assert!(text.contains(expected), "{text}");
+            assert!(!text.contains("criteria reported satisfied"));
+            assert!(!text.contains("Earlier successful result"));
+            assert!(!text.contains("Workflow finished"));
+        }
     }
 
     #[test]
