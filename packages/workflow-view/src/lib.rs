@@ -74,6 +74,84 @@ pub struct WorkflowRunProjectionInput {
     pub child_sessions: Vec<WorkflowChildSessionView>,
 }
 
+/// Restrict execution controls using application-observed ownership. This never grants authority.
+pub fn restrict_execution_actions(view: &mut WorkflowRunView, reason: Option<&str>) {
+    let Some(reason) = reason else {
+        return;
+    };
+    for action in &mut view.actions {
+        if matches!(
+            action.kind,
+            WorkflowActionKind::Pause
+                | WorkflowActionKind::Resume
+                | WorkflowActionKind::Cancel
+                | WorkflowActionKind::ProvideInput
+                | WorkflowActionKind::Approve
+                | WorkflowActionKind::Deny
+                | WorkflowActionKind::ApproveMutation
+                | WorkflowActionKind::DenyMutation
+                | WorkflowActionKind::RetryNode
+        ) {
+            action.enabled = false;
+            action.unavailable_reason = Some(reason.into());
+        }
+    }
+}
+
+/// Project an owner-authored gate explanation without interpreting domain payloads.
+/// Missing/unsupported presentation preserves the generic node prompt.
+#[must_use]
+pub fn gate_prompt(
+    node: &bcode_workflow::NodeDefinition,
+    input: Option<&serde_json::Value>,
+) -> String {
+    let Some(presentation) = node.configuration.get("presentation") else {
+        return node.name.clone();
+    };
+    let Ok(presentation) =
+        serde_json::from_value::<bcode_workflow::WorkflowGatePresentation>(presentation.clone())
+    else {
+        return format!(
+            "{} · explanation unavailable: invalid presentation",
+            node.name
+        );
+    };
+    if presentation.version != 1 {
+        return format!(
+            "{} · explanation unavailable: unsupported presentation",
+            node.name
+        );
+    }
+    let mut lines = vec![node.name.chars().take(512).collect::<String>()];
+    if let Some(reason) = input
+        .and_then(|value| value.get(&presentation.reason_field))
+        .and_then(serde_json::Value::as_str)
+    {
+        lines.push(reason.chars().take(2048).collect());
+    } else {
+        lines.push(
+            "Reported reason unavailable; inspect the retained input before continuing.".into(),
+        );
+    }
+    if let Some(evidence) = input
+        .and_then(|value| value.get(&presentation.evidence_field))
+        .and_then(serde_json::Value::as_array)
+    {
+        for item in evidence
+            .iter()
+            .take(5)
+            .filter_map(serde_json::Value::as_str)
+        {
+            lines.push(item.chars().take(1024).collect());
+        }
+        if evidence.len() > 5 {
+            lines.push("Additional evidence omitted; inspect retained input.".into());
+        }
+    }
+    lines.push(presentation.next_action.chars().take(2048).collect());
+    lines.join("\n")
+}
+
 /// Build a bounded portable workflow catalog page.
 #[must_use]
 pub fn project_catalog(
@@ -487,6 +565,26 @@ mod tests {
     }
 
     #[test]
+    fn owner_gate_explanation_is_bounded_and_future_versions_are_not_guessed() {
+        let spec = bcode_workflow::WorkflowBuilder::new(
+            "gate",
+            bcode_workflow::Step::<String, String>::input("Question"),
+        )
+        .build()
+        .unwrap();
+        let mut node = spec.definition().nodes.values().next().unwrap().clone();
+        node.configuration["presentation"] = serde_json::json!({"version":1,"reason_field":"reason","evidence_field":"evidence","next_action":"Supply an answer"});
+        let input = serde_json::json!({"reason":"Which environment?", "evidence": ["a".repeat(9000),"b","c","d","e","f"]});
+        let prompt = gate_prompt(&node, Some(&input));
+        assert!(prompt.contains("Which environment?"));
+        assert!(prompt.contains("Supply an answer"));
+        assert!(prompt.contains("Additional evidence omitted"));
+        assert!(prompt.len() < 8000);
+        node.configuration["presentation"]["version"] = 2.into();
+        assert!(gate_prompt(&node, Some(&input)).contains("unsupported presentation"));
+    }
+
+    #[test]
     fn catalog_cursors_are_deterministic_for_every_sort_and_query_identity() {
         let runs = vec![
             catalog_item("run-a", WorkflowRunStatus::Running, 10, 30),
@@ -654,6 +752,21 @@ mod tests {
         assert_eq!(
             view.waits[0].kind,
             bcode_workflow_view_models::WorkflowWaitKind::Input
+        );
+        let mut view = view;
+        restrict_execution_actions(&mut view, Some("Another daemon owns this run"));
+        assert!(
+            view.actions
+                .iter()
+                .filter(|action| matches!(
+                    action.kind,
+                    WorkflowActionKind::ProvideInput
+                        | WorkflowActionKind::Pause
+                        | WorkflowActionKind::Cancel
+                ))
+                .all(|action| !action.enabled
+                    && action.unavailable_reason.as_deref()
+                        == Some("Another daemon owns this run"))
         );
         assert_eq!(view.outputs[0].value, WorkflowOutputValue::Unresolved);
         assert_eq!(view.failure_diagnostics.len(), 1);

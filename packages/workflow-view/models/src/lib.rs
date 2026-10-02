@@ -472,6 +472,27 @@ pub struct WorkflowToolPermissionView {
 }
 
 impl WorkflowRunView {
+    /// User-facing lifecycle label, distinguishing outstanding decisions from active work.
+    /// This bounded observation does not change the durable lifecycle or authorize controls.
+    #[must_use]
+    pub const fn status_label(&self) -> &'static str {
+        match self.run.status {
+            WorkflowRunStatus::Running
+                if !self.waits.is_empty()
+                    || !self.mutation_approvals.is_empty()
+                    || !self.tool_permissions.is_empty() =>
+            {
+                "Waiting — action needed"
+            }
+            WorkflowRunStatus::Running => "Running",
+            WorkflowRunStatus::Paused => "Paused",
+            WorkflowRunStatus::Completed => "Completed",
+            WorkflowRunStatus::Failed => "Failed",
+            WorkflowRunStatus::Cancelled => "Cancelled",
+            WorkflowRunStatus::RepairRequired => "Repair required",
+        }
+    }
+
     /// Project bounded semantic detail for one exact selected node/activation/attempt.
     #[allow(clippy::too_many_lines)]
     #[must_use]
@@ -943,6 +964,24 @@ mod live_event_tests {
             event_sequence,
             changed_at_ms: event_sequence,
         }
+    }
+
+    #[test]
+    fn waiting_label_does_not_override_terminal_outcomes() {
+        let mut view = run_view(WORKFLOW_VIEW_VERSION);
+        view.run.status = WorkflowRunStatus::Running;
+        view.waits.push(WorkflowWaitView {
+            node_id: "gate".into(),
+            activation_id: "activation".into(),
+            kind: WorkflowWaitKind::Input,
+            prompt: "Supply dependency".into(),
+            expected_schema: None,
+            input: None,
+            requested_at_ms: 1,
+        });
+        assert_eq!(view.status_label(), "Waiting — action needed");
+        view.run.status = WorkflowRunStatus::Completed;
+        assert_eq!(view.status_label(), "Completed");
     }
 
     fn run_view(version: u32) -> WorkflowRunView {

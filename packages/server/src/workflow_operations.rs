@@ -2495,9 +2495,22 @@ pub async fn run_view(
                     node_id: wait.node_id,
                     activation_id: wait.activation_id,
                     kind,
-                    prompt: node.name.clone(),
+                    prompt: bcode_workflow_view::gate_prompt(node, wait.input.as_ref()),
                     expected_schema: (kind == bcode_workflow_view_models::WorkflowWaitKind::Input)
-                        .then(|| node.output.schema.clone()),
+                        .then(|| {
+                            node.configuration
+                                .get("input_resolution")
+                                .and_then(|value| {
+                                    serde_json::from_value::<
+                                            bcode_workflow::WorkflowInputResolution,
+                                        >(value.clone())
+                                        .ok()
+                                })
+                                .map_or_else(
+                                    || node.output.schema.clone(),
+                                    |resolution| resolution.supplied.schema,
+                                )
+                        }),
                     input: wait.input,
                     requested_at_ms: wait.requested_at_ms,
                 })
@@ -2677,7 +2690,76 @@ pub async fn run_view(
         limit,
     );
     drop(permissions);
+    let run = state
+        .workflow_store
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .run_summary(run_id)?
+        .ok_or_else(|| {
+            bcode_workflow_store::WorkflowStoreError::InvalidData(
+                "run disappeared during observation".into(),
+            )
+        })?;
+    let coordinator = coordinator_status(state, &run).await?;
+    let unavailable = match coordinator {
+        Some(owner) if !owner.controllable_from_this_daemon => Some(format!(
+            "Controlled by daemon {} (artifact {}). Inspect that owner; this daemon cannot resolve the wait.",
+            owner.daemon_instance_id, owner.target_artifact_id
+        )),
+        Some(owner) if owner.recovery_only == Some(true) => Some(
+            "Recovery required: inspect unresolved operation outcomes before continuing execution."
+                .into(),
+        ),
+        None => Some(
+            "Execution ownership unavailable; inspect workflow recovery before continuing.".into(),
+        ),
+        Some(_) => None,
+    };
+    bcode_workflow_view::restrict_execution_actions(&mut view, unavailable.as_deref());
     Ok(view)
+}
+
+async fn coordinator_status(
+    state: &ServerState,
+    run: &bcode_workflow_store::WorkflowRunSummary,
+) -> Result<Option<bcode_workflow::WorkflowCoordinatorStatus>, super::ServerError> {
+    let authority = state
+        .workflow_store
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .execution_authority(&run.run_id)?;
+    let Some(authority) = authority else {
+        return Ok(None);
+    };
+    let owned_by_this_daemon = authority_targets_current_daemon(state, &authority);
+    let controllable_from_this_daemon = if owned_by_this_daemon {
+        true
+    } else if authority.daemon_instance_id == state.daemon_status.instance_id {
+        false
+    } else if let Some(session_id) = run
+        .parent_session_id
+        .as_deref()
+        .and_then(|value| value.parse::<super::SessionId>().ok())
+    {
+        matches!(
+            prior_owner_liveness(state, session_id, &authority).await?,
+            PriorOwnerLiveness::ObservedEnded
+        )
+    } else {
+        false
+    };
+    let store = state
+        .workflow_store
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    Ok(Some(bcode_workflow::WorkflowCoordinatorStatus {
+        target_artifact_id: authority.target_artifact_id,
+        daemon_instance_id: authority.daemon_instance_id,
+        owned_by_this_daemon,
+        recovery_only: Some(store.is_recovery_only(&run.run_id)?),
+        recovery_source_artifact_id: store.recovery_source_artifact(&run.run_id)?,
+        controllable_from_this_daemon,
+    }))
 }
 
 fn project_tool_permissions<'a>(
@@ -11428,53 +11510,7 @@ pub async fn inspect_run(
         }
         child_sessions.push(summary);
     }
-    let authority = state
-        .workflow_store
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .execution_authority(run_id)?;
-    let coordinator = match authority {
-        Some(authority) => {
-            let owned_by_this_daemon = authority_targets_current_daemon(state, &authority);
-            let controllable_from_this_daemon = if owned_by_this_daemon {
-                true
-            } else if authority.daemon_instance_id == state.daemon_status.instance_id {
-                // Conflicting artifact identity is inconsistent state, not an ended foreign owner.
-                false
-            } else {
-                match run
-                    .parent_session_id
-                    .as_deref()
-                    .and_then(|value| value.parse::<super::SessionId>().ok())
-                {
-                    Some(session_id) => matches!(
-                        prior_owner_liveness(state, session_id, &authority).await?,
-                        PriorOwnerLiveness::ObservedEnded
-                    ),
-                    None => false,
-                }
-            };
-            let (recovery_only, recovery_source_artifact_id) = {
-                let store = state
-                    .workflow_store
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner);
-                (
-                    store.is_recovery_only(run_id)?,
-                    store.recovery_source_artifact(run_id)?,
-                )
-            };
-            Some(bcode_workflow::WorkflowCoordinatorStatus {
-                target_artifact_id: authority.target_artifact_id,
-                daemon_instance_id: authority.daemon_instance_id,
-                owned_by_this_daemon,
-                recovery_only: Some(recovery_only),
-                recovery_source_artifact_id,
-                controllable_from_this_daemon,
-            })
-        }
-        None => None,
-    };
+    let coordinator = coordinator_status(state, &run).await?;
     let replacement_readiness = Some(
         state
             .workflow_store

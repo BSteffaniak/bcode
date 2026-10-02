@@ -13,11 +13,11 @@ pub fn overview(view: &WorkflowRunView) -> String {
     if view.version != bcode_workflow_view_models::WORKFLOW_VIEW_VERSION {
         return "Execution observation unavailable: unsupported view · /workflow".into();
     }
-    let mut text = format!(
-        "{} · {:?}",
-        preview(&view.run.display_title),
-        view.run.status
-    );
+    let label = view.status_label();
+    let mut text = format!("{} · {label}", preview(&view.run.display_title));
+    if let Some(wait) = view.waits.first() {
+        let _ = write!(text, " · {}", preview(&wait.prompt));
+    }
     if view.health != WorkflowProjectionHealth::Current {
         text.push_str(" · observation degraded");
     }
@@ -47,6 +47,52 @@ pub fn overview(view: &WorkflowRunView) -> String {
     }
     text.push_str(" · Click activity to inspect · /goal.watch · /workflow for decisions");
     text
+}
+
+fn format_waits(text: &mut String, view: &WorkflowRunView) {
+    for wait in view.waits.iter().take(DETAIL_LIMIT) {
+        let _ = write!(
+            text,
+            "\nWaiting for {:?}: {} · {}",
+            wait.kind,
+            preview(&wait.node_id),
+            wait.prompt
+        );
+        if wait.node_id == "loop.blocked" {
+            if let Some(reason) = wait
+                .input
+                .as_ref()
+                .and_then(|input| input.get("summary"))
+                .and_then(serde_json::Value::as_str)
+            {
+                let _ = write!(
+                    text,
+                    "\n  Reported reason: {}",
+                    reason.chars().take(2048).collect::<String>()
+                );
+            }
+            text.push_str("\n  Existing graph: this checkpoint uses approval for every external blocker. Consent does not resolve missing evidence or dependencies.");
+        }
+        if wait.kind == bcode_workflow_view_models::WorkflowWaitKind::Approval
+            && matches!(wait.node_id.as_str(), "loop.decision" | "loop.blocked")
+        {
+            let _ = write!(
+                text,
+                "\n  /goal.unblock {} approve|deny — continuation only, not tool authorization",
+                wait.activation_id
+            );
+        } else if wait.kind == bcode_workflow_view_models::WorkflowWaitKind::Input {
+            text.push_str("\n  Use /workflow → Provide input to submit the required update.");
+        }
+    }
+    let reasons = view
+        .actions
+        .iter()
+        .filter_map(|action| action.unavailable_reason.as_deref())
+        .collect::<std::collections::BTreeSet<_>>();
+    for reason in reasons {
+        let _ = write!(text, "\nControl unavailable: {reason}");
+    }
 }
 
 const DETAIL_LIMIT: usize = 10;
@@ -139,15 +185,7 @@ pub fn format(view: &WorkflowRunView) -> String {
             let _ = write!(text, "\n  Reconciliation warning: {}", preview(warning));
         }
     }
-    for wait in view.waits.iter().take(DETAIL_LIMIT) {
-        let _ = write!(
-            text,
-            "\nWaiting for {:?}: {} · {}",
-            wait.kind,
-            preview(&wait.node_id),
-            preview(&wait.prompt)
-        );
-    }
+    format_waits(&mut text, view);
     for failure in view.failure_diagnostics.iter().rev().take(DETAIL_LIMIT) {
         let _ = write!(
             text,

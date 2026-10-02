@@ -266,16 +266,6 @@ fn associated_workflow_run(
     })
 }
 
-fn associated_workflow_inspection(
-    session_id: SessionId,
-) -> Result<Option<bcode_ipc::WorkflowRunInspection>, LoopIpcError> {
-    run_async(async move {
-        BcodeClient::default_endpoint()
-            .inspect_associated_workflow_run(workflow_binding_key(session_id), 100)
-            .await
-    })
-}
-
 fn control_associated_workflow_run(
     session_id: SessionId,
     action: bcode_ipc::WorkflowRunControlAction,
@@ -349,9 +339,18 @@ fn format_workflow_inspection_status(inspection: &bcode_ipc::WorkflowRunInspecti
     for wait in &inspection.waits {
         if wait.node_id == "loop.blocked" && wait.kind == bcode_workflow::WorkflowWaitKind::Approval
         {
+            let input = wait.input.as_ref();
+            let reason = input
+                .and_then(|value| value.get("summary"))
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("Reported reason unavailable; inspect retained evaluator evidence.");
+            let kind = input
+                .and_then(|value| value.get("external_blocker"))
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("unknown");
             let _ = write!(
                 status,
-                "\nBlocked: external decision required. Resolve the original request first, then /goal.unblock {} approve (or deny to stop). Resume consent does not authorize the original operation.",
+                "\nWaiting for continuation consent (existing workflow; reported blocker: {kind}): {reason}\nThis older graph represents all external blockers as approvals. Approval does not resolve missing evidence or dependencies. Resolve the reported requirement first, then /goal.unblock {} approve (or deny to stop).",
                 wait.activation_id
             );
         }
@@ -421,31 +420,7 @@ const fn unsupported_legacy_message() -> &'static str {
 }
 
 fn status_for_session(session_id: SessionId) -> InvokeCommandResponse {
-    match associated_workflow_inspection(session_id) {
-        Ok(Some(inspection)) => {
-            let mut message = format_workflow_inspection_status(&inspection);
-            if inspection.run.status == bcode_workflow_store::RunStatus::Failed {
-                let run_id = inspection.run.run_id;
-                if let Ok(source) = run_async(async move {
-                    BcodeClient::default_endpoint()
-                        .workflow_continuation_source(run_id)
-                        .await
-                }) {
-                    let _ = write!(
-                        message,
-                        "\nIteration allowance exhausted · {} iterations completed overall · /loop.continue <additional_iterations>",
-                        source.total_iterations_completed
-                    );
-                }
-            }
-            status_response(&message)
-        }
-        Ok(None) if legacy_state_exists(session_id) => {
-            status_response(unsupported_legacy_message())
-        }
-        Ok(None) => status_response("no loop found for this session"),
-        Err(error) => status_response(&format!("workflow status unavailable: {error}")),
-    }
+    goal::progress_status(session_id)
 }
 
 fn format_control_outcome(
@@ -2135,7 +2110,7 @@ impl LoopWorkflowInput {
 
 /// Why a loop must yield to an external actor instead of spending another iteration.
 /// This is a reported blocker, not an authenticated resolution or permission grant.
-#[derive(Debug, Default, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 #[schemars(description = "")]
 enum LoopExternalBlocker {
@@ -2391,7 +2366,7 @@ fn loop_workflow_spec(
         "loop.evaluation",
         bcode_workflow::NodeKind::Agent,
         serde_json::to_value(loop_agent_configuration::<LoopWorkflowEvaluation>(
-            "Read-only loop completion evaluation. Inspect existing state against the complete pinned stop_condition. Inspect checksum-verified canonical worker outputs and actual integrated artifacts, not worker summaries or coordinator completion alone. Use workflow.execution_context outputs_only pages followed by output_only inspection. Report concrete evidence, validation commands and outcomes, unresolved work and blockers. Missing or truncated evidence remains unverified. A successful worker or completed run is not goal completion. Do not mutate files, perform integration, commission work, or weaken the original goal. Return condition_met only when all original requirements are supported by inspected evidence.",
+            "Read-only loop completion evaluation. Inspect existing state against the complete pinned stop_condition. Inspect checksum-verified canonical worker outputs and actual integrated artifacts, not worker summaries or coordinator completion alone. Use workflow.execution_context outputs_only pages followed by output_only inspection. Report concrete evidence, validation commands and outcomes, unresolved work and blockers. Missing or truncated evidence remains unverified. If authorized implementation can collect missing evidence, inspect full outputs, run validation, or finish a review, report external_blocker=none and concrete corrective work; your read-only role alone is not an external dependency. Use approval_required only for an actual external decision, input_required for a specific unanswered question, and dependency_required for a dependency outside authorized implementation control. For any external blocker, the summary must identify what is missing, who can resolve it, and the next action; evidence must identify exact known request or run identities without inventing them. A successful worker or completed run is not goal completion. Do not mutate files, perform integration, commission work, or weaken the original goal. Return condition_met only when all original requirements are supported by inspected evidence.",
             "plan",
             true,
         ))
@@ -2405,9 +2380,18 @@ fn loop_workflow_spec(
         bcode_workflow::Step::<LoopWorkflowIteration, LoopWorkflowIteration>::input(
             "loop.continuing",
         ),
-        bcode_workflow::Step::<LoopWorkflowIteration, LoopWorkflowIteration>::approval(
-            "loop.blocked",
-        ),
+        bcode_workflow::Step::<LoopWorkflowIteration, LoopWorkflowIteration>::input("loop.route")
+            .branch(
+                "loop.blocker_kind",
+                bcode_workflow::field::<LoopWorkflowIteration>("external_blocker")
+                    .eq(LoopExternalBlocker::ApprovalRequired),
+                bcode_workflow::Step::<LoopWorkflowIteration, LoopWorkflowIteration>::approval(
+                    "loop.decision",
+                ),
+                bcode_workflow::Step::<LoopWorkflowIteration, LoopWorkflowIteration>::input(
+                    "loop.requirement",
+                ),
+            ),
     );
     let cycle = {
         let block = judgement_evaluation::manifest_block();
@@ -2443,10 +2427,9 @@ fn loop_workflow_spec(
         .definition()
         .clone();
     bypass_unblocked_input(&mut definition);
+    configure_blocker_gates(&mut definition);
     for edge in &mut definition.edges {
-        // Resume approval forwards retained input, not caller-supplied goal state.
-        // Keep the admitted objective, limit and judgement policy pinned as well.
-        if edge.from == "loop.blocked" {
+        if matches!(edge.from.as_str(), "loop.decision" | "loop.requirement") {
             edge.transform = Some(judgement_evaluation::resume_input_transform());
         } else if edge.from == "loop.progress" && edge.to == "loop.judgement.evaluate" {
             edge.transform = Some(judgement_evaluation::pinned_input_transform());
@@ -2454,6 +2437,85 @@ fn loop_workflow_spec(
     }
     bcode_workflow::WorkflowSpec::from_definition(WORKFLOW_KIND, definition)
         .map_err(|error| error.to_string())
+}
+
+fn configure_blocker_gates(definition: &mut bcode_workflow::WorkflowDefinition) {
+    definition.nodes.remove("loop.route");
+    definition.edges.retain(|edge| edge.from != "loop.route");
+    for edge in &mut definition.edges {
+        if edge.to == "loop.route" {
+            edge.to = "loop.blocker_kind".into();
+        }
+    }
+    let progress = definition.nodes.get_mut("loop.progress").expect("progress");
+    progress.configuration["false_entries"] = serde_json::json!(["loop.blocker_kind"]);
+    if let Some(nodes) = progress.configuration["false_nodes"].as_array_mut() {
+        nodes.retain(|node| node != "loop.route");
+    }
+
+    for (id, name, next_action) in [
+        (
+            "loop.decision",
+            "Decision needed",
+            "Review the reported reason and resolve the original request before approving continuation. Approval does not grant tool permissions or establish completion.",
+        ),
+        (
+            "loop.requirement",
+            "External input or dependency needed",
+            "Resolve the reported dependency or supply the missing answer, then provide a nonempty text update. Missing verification evidence that implementation can collect is corrective work, not an approval request.",
+        ),
+    ] {
+        let node = definition.nodes.get_mut(id).expect("blocker gate");
+        node.name = name.into();
+        node.configuration["presentation"] =
+            serde_json::to_value(bcode_workflow::WorkflowGatePresentation {
+                version: 1,
+                reason_field: "summary".into(),
+                evidence_field: "evidence".into(),
+                next_action: next_action.into(),
+            })
+            .expect("gate presentation");
+        if id == "loop.requirement" {
+            node.dataflow = bcode_workflow::WorkflowNodeDataflowPolicy::RetainedInputV1;
+            let update = bcode_workflow::ValueSchema {
+                type_name: "bcode.loop.requirement_update.v1".into(),
+                schema: serde_json::json!({"type":"string", "minLength":1, "maxLength":8192, "pattern":"\\S"}),
+            };
+            node.configuration["input_resolution"] =
+                serde_json::to_value(bcode_workflow::WorkflowInputResolution {
+                    version: 1,
+                    supplied: update,
+                    transform: requirement_resume_transform(),
+                })
+                .expect("input resolution");
+        }
+    }
+}
+
+fn requirement_resume_transform() -> bcode_workflow::WorkflowTransform {
+    use bcode_workflow::WorkflowTransformExpression as Expr;
+    let mut transform = judgement_evaluation::resume_input_transform();
+    if let Expr::Object { fields } = &mut transform.expression {
+        // Exact predecessor evidence is retained; external input cannot replace the objective,
+        // iteration count, or completion verdict.
+        for field in ["iteration", "evidence"] {
+            fields.insert(
+                field.into(),
+                Expr::Input {
+                    source: bcode_workflow::WORKFLOW_TRANSFORM_SOURCE_STATE.into(),
+                    path: field.into(),
+                },
+            );
+        }
+        fields.insert(
+            "summary".into(),
+            Expr::Input {
+                source: bcode_workflow::WORKFLOW_TRANSFORM_SOURCE_CURRENT.into(),
+                path: String::new(),
+            },
+        );
+    }
+    transform
 }
 
 // The unblocked branch passes through without an interaction or model turn.
@@ -3014,7 +3076,7 @@ mod tests {
             );
             safeguarded += 1;
         }
-        assert_eq!(safeguarded, 2, "normal and approval-resume entries");
+        assert_eq!(safeguarded, 3, "normal, decision and requirement entries");
     }
 
     #[test]
@@ -4168,11 +4230,34 @@ mod tests {
     #[test]
     fn blocked_evaluation_yields_durably_until_explicit_resolution() {
         for approved in [false, true] {
-            verify_blocked_evaluation_resolution(approved);
+            verify_blocked_evaluation_resolution(approved, LoopExternalBlocker::ApprovalRequired);
         }
     }
 
-    fn verify_blocked_evaluation_resolution(approved: bool) {
+    #[test]
+    fn retained_input_contract_rejects_unknown_versions_and_missing_adaptation() {
+        let input = LoopWorkflowInput::new("implement".into(), "done".into(), 3).unwrap();
+        let spec = loop_workflow_spec(&input).unwrap();
+        let mut node = spec.definition().nodes["loop.requirement"].clone();
+        node.validate_structure().unwrap();
+        node.configuration["input_resolution"]["version"] = 2.into();
+        assert!(node.validate_structure().is_err());
+        node.configuration["input_resolution"]["version"] = 1.into();
+        node.dataflow = bcode_workflow::WorkflowNodeDataflowPolicy::Direct;
+        assert!(node.validate_structure().is_err());
+    }
+
+    #[test]
+    fn dependencies_and_questions_wait_for_narrow_input_not_approval() {
+        for blocker in [
+            LoopExternalBlocker::DependencyRequired,
+            LoopExternalBlocker::InputRequired,
+        ] {
+            verify_blocked_evaluation_resolution(true, blocker);
+        }
+    }
+
+    fn verify_blocked_evaluation_resolution(approved: bool, blocker: LoopExternalBlocker) {
         let temp = tempfile::tempdir().expect("temp");
         let mut store =
             bcode_workflow_store::WorkflowStore::open_in_state_dir(temp.path()).expect("store");
@@ -4215,7 +4300,7 @@ mod tests {
             assert_eq!(pending.len(), 1);
             assert_eq!(pending[0].node_id, node);
             if node == "loop.evaluation" {
-                state.external_blocker = LoopExternalBlocker::ApprovalRequired;
+                state.external_blocker = blocker;
                 state.evidence = vec!["Original request requires an authorized decision".into()];
                 state.summary = "Approval required".into();
             }
@@ -4246,13 +4331,77 @@ mod tests {
             assert!(store.pending_activations(10).unwrap().is_empty());
             let waiting = store.waiting_activations("blocked-loop", 10).unwrap();
             assert_eq!(waiting.len(), 1);
-            assert_eq!(waiting[0].node_id, "loop.blocked");
+            assert_eq!(
+                waiting[0].kind,
+                if blocker == LoopExternalBlocker::ApprovalRequired {
+                    bcode_workflow::WorkflowWaitKind::Approval
+                } else {
+                    bcode_workflow::WorkflowWaitKind::Input
+                }
+            );
         }
-        if approved {
+        if blocker != LoopExternalBlocker::ApprovalRequired {
+            verify_requirement_resolution(store, &state);
+        } else if approved {
             verify_blocked_loop_resolution(store, &state);
         } else {
             verify_blocked_loop_denial(store);
         }
+    }
+
+    fn verify_requirement_resolution(
+        mut store: bcode_workflow_store::WorkflowStore,
+        state: &LoopWorkflowIteration,
+    ) {
+        let wait = store
+            .waiting_activations("blocked-loop", 10)
+            .unwrap()
+            .remove(0);
+        assert!(
+            store
+                .resolve_approval("blocked-loop", &wait.node_id, &wait.activation_id, true, 18)
+                .is_err()
+        );
+        for invalid in [
+            serde_json::json!({"condition_met":true}),
+            serde_json::json!(" "),
+        ] {
+            assert!(
+                store
+                    .provide_input(
+                        "blocked-loop",
+                        &wait.node_id,
+                        &wait.activation_id,
+                        invalid,
+                        18
+                    )
+                    .is_err()
+            );
+        }
+        store
+            .provide_input(
+                "blocked-loop",
+                &wait.node_id,
+                &wait.activation_id,
+                serde_json::json!("Dependency supplied; verify it before proceeding"),
+                18,
+            )
+            .unwrap();
+        store
+            .settle_pending_control_nodes("blocked-loop", 20, 19)
+            .unwrap();
+        let pending = store.pending_activations(10).unwrap();
+        let resumed: LoopWorkflowIteration =
+            serde_json::from_value(pending[0].input.clone().unwrap()).unwrap();
+        assert_eq!(resumed.iteration, state.iteration);
+        assert_eq!(resumed.stop_condition, state.stop_condition);
+        assert_eq!(resumed.evidence, state.evidence);
+        assert!(!resumed.condition_met);
+        assert_eq!(resumed.external_blocker, LoopExternalBlocker::None);
+        assert_eq!(
+            resumed.summary,
+            "Dependency supplied; verify it before proceeding"
+        );
     }
 
     fn verify_blocked_loop_denial(mut store: bcode_workflow_store::WorkflowStore) {
@@ -4260,7 +4409,7 @@ mod tests {
         let resolution = store
             .resolve_approval(
                 "blocked-loop",
-                "loop.blocked",
+                "loop.decision",
                 &waiting[0].activation_id,
                 false,
                 18,
@@ -4275,7 +4424,7 @@ mod tests {
             store
                 .resolve_approval(
                     "blocked-loop",
-                    "loop.blocked",
+                    "loop.decision",
                     &waiting[0].activation_id,
                     true,
                     19
@@ -4309,7 +4458,7 @@ mod tests {
             store
                 .provide_input(
                     "blocked-loop",
-                    "loop.blocked",
+                    "loop.decision",
                     &waiting[0].activation_id,
                     value,
                     18,
@@ -4320,7 +4469,7 @@ mod tests {
         store
             .resolve_approval(
                 "blocked-loop",
-                "loop.blocked",
+                "loop.decision",
                 &waiting[0].activation_id,
                 true,
                 18,
@@ -4347,7 +4496,7 @@ mod tests {
             store
                 .provide_input(
                     "blocked-loop",
-                    "loop.blocked",
+                    "loop.decision",
                     &waiting[0].activation_id,
                     serde_json::to_value(state).unwrap(),
                     20

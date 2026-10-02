@@ -102,6 +102,33 @@ Parent/child workflow status includes bounded child identity and stable outcome,
 not poll child owners, load child artifacts, or replay either history. The detailed product behavior
 is specified in [`composable-coding-workflows.md`](composable-coding-workflows.md).
 
+## Goal blockers and continuation
+
+The run lifecycle remains distinct from its bounded activity observation: a durable `running`
+run with pending waits is presented as **Waiting — action needed**, not proof of active work.
+`workflow run-view`, the control center, and goal status consume the same gate prompts and
+ownership-restricted action affordances. The application revalidates authority on every action.
+
+New loop definitions route actual decisions to approval and external questions/dependencies to
+input gates. The evaluator must identify the missing requirement, resolving actor, and next action.
+Evidence that authorized implementation can collect is corrective work (`external_blocker: none`),
+not a request for human approval merely because evaluation itself is read-only.
+
+Input gates may declare `RetainedInputV1` dataflow with `WorkflowInputResolution` version 1. The
+supplied answer is validated against its narrow schema, then transformed using `current` (answer)
+and `state` (retained activation input). The declared gate output is validated before publication.
+Loop requirement gates accept a nonblank text update and preserve the objective, iteration and
+prior evidence; an answer cannot establish completion. Older executors reject the unknown dataflow
+variant rather than treating an answer as replacement state. Direct input gates retain their existing
+behavior; unsupported resolution versions fail closed. No store migration or historical graph rewrite
+is involved.
+
+Owner-authored `WorkflowGatePresentation` version 1 selects bounded reason/evidence fields and next
+action text. This is presentation only and never changes authorization or gate resolution. Existing
+`loop.blocked` approval gates remain explicit continuation consent, including when the old evaluator
+reported a dependency. Goal status explains this distinction and retains their exact activation IDs.
+No status read approves, repairs, or resumes an existing run.
+
 ## Diagnosing a run
 
 Run explicit doctor for a suspected damaged or ambiguous run. Doctor is bounded and non-mutating. It reports:

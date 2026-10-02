@@ -225,8 +225,16 @@ pub fn unblock_response(session_id: SessionId, arguments: &str) -> InvokeCommand
         else {
             return Ok("No associated goal".to_string());
         };
+        let inspection = client.inspect_workflow_run(run.run_id.clone(), 100).await?;
+        let Some(wait) = inspection.waits.iter().find(|wait| {
+            wait.activation_id == activation_id
+                && matches!(wait.node_id.as_str(), "loop.blocked" | "loop.decision")
+                && wait.kind == bcode_workflow::WorkflowWaitKind::Approval
+        }) else {
+            return Ok("No matching decision checkpoint in this bounded observation. Refresh /goal.status; input/dependency waits require an input update in /workflow, not approval.".into());
+        };
         client
-            .resolve_workflow_approval(run.run_id, "loop.blocked".into(), activation_id, approved)
+            .resolve_workflow_approval(run.run_id, wait.node_id.clone(), activation_id, approved)
             .await?;
         Ok(if approved {
             "Goal resume checkpoint approved. Original tool permissions remain enforced."

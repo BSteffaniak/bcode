@@ -1587,6 +1587,9 @@ pub enum WorkflowNodeDataflowPolicy {
     Direct,
     /// Dispatch only `value` while retaining explicit state and artifact references.
     StateEnvelopeV1,
+    /// Input gate accepts a narrow answer and applies its explicit retained-input transform.
+    /// Older executors reject this variant rather than interpreting the answer as complete state.
+    RetainedInputV1,
 }
 
 impl WorkflowNodeDataflowPolicy {
@@ -1645,6 +1648,10 @@ pub fn prepare_workflow_node_dataflow(
             owner_input.validate_value("owner.input", value)?;
             Ok(WorkflowPreparedDataflow::Direct(value.clone()))
         }
+        WorkflowNodeDataflowPolicy::RetainedInputV1 => Err(WorkflowError::Build {
+            path: "node.dataflow".into(),
+            message: "retained input adaptation is resolved only by a durable input gate".into(),
+        }),
         WorkflowNodeDataflowPolicy::StateEnvelopeV1 => {
             let parts = validate_workflow_state_envelope(value)?;
             owner_input.validate_value("owner.input", &parts.value)?;
@@ -12893,6 +12900,34 @@ impl NodeDefinition {
     }
 }
 
+/// Explicit input-gate adaptation. Version 1 validates a narrow supplied value and
+/// transforms it with the retained activation input (`state`) and supplied value (`current`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WorkflowInputResolution {
+    /// Contract version; only 1 is supported.
+    pub version: u32,
+    /// Schema of the externally supplied answer.
+    pub supplied: ValueSchema,
+    /// Adaptation into the gate's declared output.
+    pub transform: WorkflowTransform,
+}
+
+/// Versioned, renderer-neutral explanation for a durable gate. Presentation never
+/// changes resolution, authorization, or execution semantics.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WorkflowGatePresentation {
+    /// Supported presentation contract version (1).
+    pub version: u32,
+    /// Object field containing the owner's reported reason in the retained input.
+    pub reason_field: String,
+    /// Object field containing the owner's reported evidence array.
+    pub evidence_field: String,
+    /// Owner-authored instructions for resolving this gate.
+    pub next_action: String,
+}
+
 /// Generic workflow node kind.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -16837,6 +16872,67 @@ fn validate_repeat_outcome_configuration(node: &NodeDefinition) -> Result<(), Wo
 
 #[allow(clippy::too_many_lines)]
 fn validate_control_node(node: &NodeDefinition) -> Result<(), WorkflowError> {
+    if let Some(presentation) = node.configuration.get("presentation") {
+        let presentation: WorkflowGatePresentation = serde_json::from_value(presentation.clone())
+            .map_err(|error| WorkflowError::Build {
+            path: node.id.clone(),
+            message: format!("invalid gate presentation: {error}"),
+        })?;
+        if !matches!(node.kind, NodeKind::Input | NodeKind::Approval)
+            || presentation.version != 1
+            || presentation.reason_field.trim().is_empty()
+            || presentation.evidence_field.trim().is_empty()
+            || presentation.next_action.trim().is_empty()
+        {
+            return Err(WorkflowError::Build {
+                path: node.id.clone(),
+                message: "unsupported or incomplete gate presentation".into(),
+            });
+        }
+    }
+    if (node.dataflow == WorkflowNodeDataflowPolicy::RetainedInputV1)
+        != node.configuration.get("input_resolution").is_some()
+    {
+        return Err(WorkflowError::Build {
+            path: node.id.clone(),
+            message: "retained input adaptation requires an explicit input resolution contract"
+                .into(),
+        });
+    }
+    if let Some(resolution) = node.configuration.get("input_resolution") {
+        let resolution: WorkflowInputResolution = serde_json::from_value(resolution.clone())
+            .map_err(|error| WorkflowError::Build {
+                path: node.id.clone(),
+                message: format!("invalid input resolution: {error}"),
+            })?;
+        if node.kind != NodeKind::Input
+            || resolution.version != 1
+            || resolution.transform.output != node.output
+        {
+            return Err(WorkflowError::Build {
+                path: node.id.clone(),
+                message: "unsupported input resolution or output schema mismatch".into(),
+            });
+        }
+        resolution.transform.validate()?;
+        if resolution
+            .transform
+            .referenced_sources()
+            .iter()
+            .any(|source| {
+                !matches!(
+                    source.as_str(),
+                    WORKFLOW_TRANSFORM_SOURCE_STATE | WORKFLOW_TRANSFORM_SOURCE_CURRENT
+                )
+            })
+        {
+            return Err(WorkflowError::Build {
+                path: node.id.clone(),
+                message: "input resolution may reference only retained state and supplied input"
+                    .into(),
+            });
+        }
+    }
     if matches!(node.kind, NodeKind::Branch | NodeKind::Repeat) {
         let declared_version = node
             .configuration

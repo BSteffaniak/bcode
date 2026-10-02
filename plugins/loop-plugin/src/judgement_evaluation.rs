@@ -400,7 +400,10 @@ mod tests {
                 assert_eq!(output["stop_condition"], state["stop_condition"]);
                 evaluated += 1;
             }
-            assert_eq!(evaluated, 2, "normal and approval entry both pinned");
+            assert_eq!(
+                evaluated, 3,
+                "normal, decision and requirement entries pinned"
+            );
         }
     }
 

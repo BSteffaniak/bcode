@@ -487,10 +487,19 @@ struct WorkflowInputForm {
 
 impl WorkflowInputForm {
     fn new(run_id: String, wait: &bcode_workflow_view_models::WorkflowWaitView) -> Self {
-        let initial = wait.input.as_ref().map_or_else(
-            || default_input_value(wait.expected_schema.as_ref()).to_string(),
-            serde_json::Value::to_string,
-        );
+        let initial = wait
+            .input
+            .as_ref()
+            .filter(|value| {
+                wait.expected_schema.as_ref().is_none_or(|schema| {
+                    jsonschema::validator_for(schema)
+                        .is_ok_and(|validator| validator.is_valid(value))
+                })
+            })
+            .map_or_else(
+                || default_input_value(wait.expected_schema.as_ref()).to_string(),
+                serde_json::Value::to_string,
+            );
         let fields = simple_object_fields(wait.expected_schema.as_ref(), wait.input.as_ref());
         Self {
             run_id,
@@ -6336,7 +6345,7 @@ fn inspector_overview_lines(run: &bcode_workflow_view_models::WorkflowRunView) -
     let mut lines = vec![
         Line::from(run.run.display_title.clone()),
         Line::from(format!("Run: {}", run.run.run_id)),
-        Line::from(format!("Status: {:?}", run.run.status)),
+        Line::from(format!("Status: {}", run.status_label())),
         Line::from(format!(
             "Created: {} · Updated: {}",
             run.run.created_at_ms, run.run.updated_at_ms

@@ -13024,9 +13024,42 @@ impl WorkflowStore {
             ));
         }
         let value = match kind {
-            WorkflowWaitKind::Input => supplied_value.ok_or_else(|| {
-                WorkflowStoreError::InvalidData("input gate requires a value".to_string())
-            })?,
+            WorkflowWaitKind::Input => {
+                let supplied = supplied_value.ok_or_else(|| {
+                    WorkflowStoreError::InvalidData("input gate requires a value".into())
+                })?;
+                if let Some(resolution) = node.configuration.get("input_resolution") {
+                    let resolution: bcode_workflow::WorkflowInputResolution =
+                        serde_json::from_value(resolution.clone())?;
+                    node.validate_structure()
+                        .map_err(|error| WorkflowStoreError::InvalidData(error.to_string()))?;
+                    validate_json_schema(
+                        "supplied gate input",
+                        &resolution.supplied.schema,
+                        &supplied,
+                    )?;
+                    let retained = input_json
+                        .as_deref()
+                        .map(serde_json::from_str)
+                        .transpose()?
+                        .unwrap_or(serde_json::Value::Null);
+                    resolution
+                        .transform
+                        .evaluate(&[
+                            bcode_workflow::WorkflowTransformInput {
+                                name: bcode_workflow::WORKFLOW_TRANSFORM_SOURCE_STATE,
+                                value: &retained,
+                            },
+                            bcode_workflow::WorkflowTransformInput {
+                                name: bcode_workflow::WORKFLOW_TRANSFORM_SOURCE_CURRENT,
+                                value: &supplied,
+                            },
+                        ])
+                        .map_err(|error| WorkflowStoreError::InvalidData(error.to_string()))?
+                } else {
+                    supplied
+                }
+            }
             WorkflowWaitKind::Approval => input_json
                 .map(|value| serde_json::from_str(&value))
                 .transpose()?

@@ -8029,7 +8029,7 @@ async fn handle_workflow_run_request(
             send_response(writer, request_id, response).await
         }
         RuntimeAndModelRequest::WorkflowRunView { run_id, limit } => {
-            let view = workflow_operations::run_view(state, &run_id, limit).await?;
+            let view = Box::pin(workflow_operations::run_view(state, &run_id, limit)).await?;
             send_response(
                 writer,
                 request_id,
