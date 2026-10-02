@@ -214,7 +214,7 @@ fn unblock_decision(arguments: &str) -> Result<(&str, bool), &'static str> {
 pub fn unblock_response(session_id: SessionId, arguments: &str) -> InvokeCommandResponse {
     let (activation_id, approved) = match unblock_decision(arguments) {
         Ok(decision) => decision,
-        Err(message) => return status_response(message),
+        Err(message) => return unblock_result_response(Err(message.into())),
     };
     let activation_id = activation_id.to_owned();
     let result = run_async(async move {
@@ -223,7 +223,7 @@ pub fn unblock_response(session_id: SessionId, arguments: &str) -> InvokeCommand
             .associated_workflow_run(workflow_binding_key(session_id))
             .await?
         else {
-            return Ok("No associated goal".to_string());
+            return Ok(Err("No associated goal".to_string()));
         };
         let inspection = client.inspect_workflow_run(run.run_id.clone(), 100).await?;
         let Some(wait) = inspection.waits.iter().find(|wait| {
@@ -231,21 +231,34 @@ pub fn unblock_response(session_id: SessionId, arguments: &str) -> InvokeCommand
                 && matches!(wait.node_id.as_str(), "loop.blocked" | "loop.decision")
                 && wait.kind == bcode_workflow::WorkflowWaitKind::Approval
         }) else {
-            return Ok("No matching decision checkpoint in this bounded observation. Refresh /goal.status; input/dependency waits require an input update in /workflow, not approval.".into());
+            return Ok(Err("No matching decision checkpoint in this bounded observation. Refresh /goal.status; input/dependency waits require an input update in /workflow, not approval.".into()));
         };
         client
             .resolve_workflow_approval(run.run_id, wait.node_id.clone(), activation_id, approved)
             .await?;
-        Ok(if approved {
+        Ok(Ok(if approved {
             "Goal resume checkpoint approved. Original tool permissions remain enforced."
                 .to_string()
         } else {
             "Goal resume checkpoint denied.".to_string()
-        })
+        }))
     });
+    unblock_result_response(
+        result
+            .map_err(|error| error.to_string())
+            .and_then(|result| result),
+    )
+}
+
+fn unblock_result_response(result: Result<String, String>) -> InvokeCommandResponse {
     match result {
         Ok(message) => status_response(&message),
-        Err(error) => status_response(&format!("Goal blocker resolution unavailable: {error}")),
+        Err(error) => {
+            let mut response =
+                status_response(&format!("Goal blocker resolution unavailable: {error}"));
+            response.success = false;
+            response
+        }
     }
 }
 
@@ -380,9 +393,17 @@ pub fn progress_status(session_id: SessionId) -> InvokeCommandResponse {
         }
         Ok(status)
     });
+    progress_status_response(result.map_err(|error| error.to_string()))
+}
+
+fn progress_status_response(result: Result<String, String>) -> InvokeCommandResponse {
     match result {
         Ok(status) => status_response(&status),
-        Err(error) => status_response(&format!("Goal status unavailable: {error}")),
+        Err(error) => {
+            let mut response = status_response(&format!("Goal status unavailable: {error}"));
+            response.success = false;
+            response
+        }
     }
 }
 
@@ -1110,6 +1131,38 @@ mod tests {
         for arguments in ["", "worker", "approve", "worker extra"] {
             assert!(!worker_response(SessionId::new(), arguments).success);
         }
+    }
+
+    #[test]
+    fn unavailable_goal_status_is_not_a_successful_observation() {
+        for error in ["permission denied", "workflow state is unavailable"] {
+            let response = progress_status_response(Err(error.into()));
+            assert!(!response.success);
+            assert!(response.message.as_deref().is_some_and(|message| {
+                message.contains("Goal status unavailable") && message.contains(error)
+            }));
+        }
+        for status in ["No associated loop", "Workflow failed", "Workflow running"] {
+            assert!(progress_status_response(Ok(status.into())).success);
+        }
+    }
+
+    #[test]
+    fn unblock_failures_are_not_successful_commands() {
+        for error in [
+            "No associated goal",
+            "No matching decision checkpoint in this bounded observation",
+            "workflow state is unavailable",
+            "permission denied",
+        ] {
+            assert!(!unblock_result_response(Err(error.into())).success);
+        }
+        for decision in ["approved", "denied"] {
+            assert!(
+                unblock_result_response(Ok(format!("Goal resume checkpoint {decision}."))).success
+            );
+        }
+        assert!(!unblock_response(SessionId::new(), "invalid").success);
     }
 
     #[test]
