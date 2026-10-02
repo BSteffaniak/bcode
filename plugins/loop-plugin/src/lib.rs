@@ -453,31 +453,43 @@ fn control_loop(
     session_id: SessionId,
     action: bcode_ipc::WorkflowRunControlAction,
 ) -> InvokeCommandResponse {
-    match control_associated_workflow_run(session_id, action) {
+    control_loop_response(
+        control_associated_workflow_run(session_id, action),
+        action,
+        || legacy_state_exists(session_id),
+        || associated_workflow_run(session_id),
+    )
+}
+
+fn control_loop_response(
+    result: Result<(Option<bcode_workflow_store::WorkflowRunSummary>, bool), LoopIpcError>,
+    action: bcode_ipc::WorkflowRunControlAction,
+    legacy_exists: impl FnOnce() -> bool,
+    observe: impl FnOnce() -> Result<Option<bcode_workflow_store::WorkflowRunSummary>, LoopIpcError>,
+) -> InvokeCommandResponse {
+    let failure = |message: &str| {
+        let mut response = status_response(message);
+        response.success = false;
+        response
+    };
+    match result {
         Ok((Some(run), changed)) => status_response(&format_control_outcome(&run, action, changed)),
-        Ok((None, _)) if legacy_state_exists(session_id) => {
-            status_response(unsupported_legacy_message())
-        }
-        Ok((None, _)) => status_response("no loop found for this session"),
+        Ok((None, _)) if legacy_exists() => failure(unsupported_legacy_message()),
+        Ok((None, _)) => failure("no loop found for this session"),
         Err(LoopIpcError::Client(ClientError::Server { code, .. }))
             if code == "workflow_invalid_transition" =>
         {
-            match associated_workflow_run(session_id) {
+            match observe() {
                 Ok(Some(run)) => terminal_workflow_control_message(&run).map_or_else(
-                    || status_response(&format_workflow_status(&run)),
-                    |message| status_response(&message),
+                    || failure(&format_workflow_status(&run)),
+                    |message| failure(&message),
                 ),
-                Ok(None) => status_response("no loop found for this session"),
-                Err(error) => status_response(&format!("workflow lifecycle unavailable: {error}")),
+                Ok(None) => failure("no loop found for this session"),
+                Err(error) => failure(&format!("workflow lifecycle unavailable: {error}")),
             }
         }
-        Err(LoopIpcError::Client(ClientError::Server { code, message }))
-            if code == "workflow_owned_by_live_daemon" =>
-        {
-            status_response(&message)
-        }
-        Err(LoopIpcError::Client(ClientError::Server { message, .. })) => status_response(&message),
-        Err(error) => status_response(&format!("workflow lifecycle unavailable: {error}")),
+        Err(LoopIpcError::Client(ClientError::Server { message, .. })) => failure(&message),
+        Err(error) => failure(&format!("workflow lifecycle unavailable: {error}")),
     }
 }
 
@@ -3380,6 +3392,65 @@ mod tests {
         };
 
         assert!(format_workflow_status(&run).contains("status Cancelling"));
+    }
+
+    #[test]
+    fn rejected_controls_are_unsuccessful_with_only_diagnostic_effects() {
+        use bcode_ipc::WorkflowRunControlAction as Action;
+        for code in [
+            "permission_denied",
+            "workflow_owned_by_live_daemon",
+            "workflow_allowance_exhausted",
+        ] {
+            let response = control_loop_response(
+                Err(LoopIpcError::Client(ClientError::Server {
+                    code: code.into(),
+                    message: "control rejected".into(),
+                })),
+                Action::Resume,
+                || panic!("rejected controls do not inspect legacy state"),
+                || panic!("rejected controls do not retry"),
+            );
+            assert!(!response.success);
+            assert_eq!(response.message.as_deref(), Some("control rejected"));
+            assert!(matches!(
+                response.effects.as_slice(),
+                [CommandEffect::AppendText { .. }]
+            ));
+        }
+        for legacy in [false, true] {
+            let response = control_loop_response(
+                Ok((None, false)),
+                Action::Cancel,
+                || legacy,
+                || panic!("no follow-up"),
+            );
+            assert!(!response.success);
+            assert!(matches!(
+                response.effects.as_slice(),
+                [CommandEffect::AppendText { .. }]
+            ));
+        }
+        let response = control_loop_response(
+            Err(LoopIpcError::Client(ClientError::Server {
+                code: "workflow_invalid_transition".into(),
+                message: "transition rejected".into(),
+            })),
+            Action::Resume,
+            || false,
+            || Err(LoopIpcError::Worker("observation unavailable".into())),
+        );
+        assert!(!response.success);
+        assert!(
+            response
+                .message
+                .unwrap()
+                .contains("observation unavailable")
+        );
+        assert!(matches!(
+            response.effects.as_slice(),
+            [CommandEffect::AppendText { .. }]
+        ));
     }
 
     #[test]

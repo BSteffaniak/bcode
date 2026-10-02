@@ -87,6 +87,9 @@ Status also explains the controls appropriate to the observed run state:
 * Failed: continuation is offered only when the application recognizes a supported source.
   Completed and cancelled runs do not offer resume; inspect retained results and workspaces.
 These hints are not authorization or a promise that a control will succeed against a newer state.
+Rejected lifecycle commands return an unsuccessful command response while retaining their diagnostic
+text, including ownership conflicts, denied requests and unavailable follow-up observations.
+A successful status observation does not imply that the goal itself succeeded.
 
 `/goal` and `/loop` can open from a fresh sessionless screen. Opening or cancelling an
 unsubmitted modal creates nothing. Valid submission creates a session in the current working
