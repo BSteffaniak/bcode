@@ -540,7 +540,6 @@ impl GoalSurface {
         let mut editor = LoopSurface::new(session);
         editor.setup_kind = SetupKind::Goal;
         editor.origin = SetupKind::Goal;
-        editor.progress_document = Some(ProgressDocumentSetup::default());
         editor.limit = text_state("");
         Self {
             editor,
@@ -1475,6 +1474,7 @@ mod tests {
             let mut surface = GoalSurface::new(Some(SessionId::new()));
             surface.editor.collaboration = CollaborationMode::Requested;
             surface.editor.worker_attempts = Some(12);
+            surface.editor.progress_document = Some(ProgressDocumentSetup::default());
             surface.editor.prompt = text_state("Coordinate review");
             surface.editor.condition = text_state("Verified evidence");
             surface.editor.limit = text_state("2");
@@ -1641,6 +1641,7 @@ mod tests {
     async fn generation_starts_existing_loop_once_with_default_limit() {
         let host = Host::default();
         let mut surface = GoalSurface::new(Some(SessionId::new()));
+        surface.editor.progress_document = Some(ProgressDocumentSetup::default());
         surface.editor.prompt = text_state("日本語 👩‍💻 e\u{301}");
         surface.generate(&host, false);
         surface.generate(&host, false);
@@ -1683,6 +1684,7 @@ mod tests {
     async fn generated_goal_failed_admission_preserves_prompts_and_retries_exact_request() {
         let host = Host::default();
         let mut surface = GoalSurface::new(Some(SessionId::new()));
+        surface.editor.progress_document = Some(ProgressDocumentSetup::default());
         surface.editor.prompt = text_state("complete the goal");
         assert_eq!(surface.generate(&host, true), PluginTuiAction::Redraw);
         host.finish().await;
@@ -1728,6 +1730,7 @@ mod tests {
     async fn failed_preparation_retries_same_run_without_launching() {
         let host = Host::default();
         let mut surface = GoalSurface::new(Some(SessionId::new()));
+        surface.editor.progress_document = Some(ProgressDocumentSetup::default());
         surface.editor.prompt = text_state("goal");
         surface.generate(&host, false);
         host.finish().await;
@@ -1758,10 +1761,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn disabled_document_does_not_prepare_storage() {
+    async fn default_goal_does_not_prepare_storage() {
         let host = Host::default();
         let mut surface = GoalSurface::new(Some(SessionId::new()));
-        surface.editor.progress_document = None;
+        assert!(surface.editor.progress_document.is_none());
         surface.editor.prompt = text_state("goal");
         surface.generate(&host, false);
         host.finish().await;
@@ -1774,6 +1777,7 @@ mod tests {
     async fn closing_during_document_preparation_never_launches() {
         let host = Host::default();
         let mut surface = GoalSurface::new(Some(SessionId::new()));
+        surface.editor.progress_document = Some(ProgressDocumentSetup::default());
         surface.editor.prompt = text_state("goal");
         surface.generate(&host, false);
         host.finish().await;
@@ -1936,26 +1940,27 @@ mod tests {
                 Point::new(rect.x, rect.y),
             ))
         };
+        assert!(surface.editor.progress_document.is_none());
         let checkbox = surface.editor.progress_document_area;
         assert!(checkbox.height > 0);
         let outside = Rect::new(0, 0, 1, 1);
         surface.handle_event(&click(checkbox), &host);
         surface.handle_event(&release(outside), &host);
-        assert!(surface.editor.progress_document.is_some());
+        assert!(surface.editor.progress_document.is_none());
         let right_click = Event::Mouse(MouseEvent::new(
             MouseEventKind::Down(MouseButton::Right),
             Point::new(checkbox.x, checkbox.y),
         ));
         surface.handle_event(&right_click, &host);
         surface.handle_event(&release(checkbox), &host);
-        assert!(surface.editor.progress_document.is_some());
-        surface.handle_event(&click(checkbox), &host);
-        assert!(surface.editor.progress_document.is_some());
-        surface.handle_event(&release(checkbox), &host);
         assert!(surface.editor.progress_document.is_none());
         surface.handle_event(&click(checkbox), &host);
+        assert!(surface.editor.progress_document.is_none());
         surface.handle_event(&release(checkbox), &host);
         assert!(surface.editor.progress_document.is_some());
+        surface.handle_event(&click(checkbox), &host);
+        surface.handle_event(&release(checkbox), &host);
+        assert!(surface.editor.progress_document.is_none());
         surface.handle_event(&click(surface.editor.review_area), &host);
         surface.handle_event(&release(surface.editor.review_area), &host);
         assert!(matches!(
@@ -1964,7 +1969,7 @@ mod tests {
         ));
         assert!(host.starts.lock().unwrap().is_empty());
         surface.handle_event(&click(checkbox), &host);
-        assert!(surface.editor.progress_document.is_some());
+        assert!(surface.editor.progress_document.is_none());
     }
 
     #[test]
@@ -1986,7 +1991,7 @@ mod tests {
         surface.handle_event(&key(KeyCode::Tab, true), &host);
         assert!(surface.editor.goal_option_focus == Some(GoalOption::Progress));
         surface.handle_event(&key(KeyCode::Char(' '), false), &host);
-        assert!(surface.editor.progress_document.is_none());
+        assert!(surface.editor.progress_document.is_some());
         surface.handle_event(&key(KeyCode::Tab, true), &host);
         assert!(surface.editor.goal_option_focus.is_none());
         assert_eq!(surface.editor.field, Field::Evaluation);

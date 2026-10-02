@@ -28,7 +28,10 @@ struct GoalCli {
     max_iterations: u64,
     #[arg(long)]
     worker_attempts: Option<std::num::NonZeroU64>,
-    /// Disable the normally enabled living progress document.
+    /// Opt in to a living progress document and its planning phase.
+    #[arg(long, conflicts_with = "no_progress_document")]
+    progress_document: bool,
+    /// Keep progress-document planning disabled (the default).
     #[arg(long)]
     no_progress_document: bool,
 }
@@ -81,7 +84,7 @@ async fn run(args: GoalCli) -> Result<(), String> {
     if args.collaborate {
         check_delegation(&client).await?;
     }
-    let progress = !args.no_progress_document;
+    let progress = args.progress_document;
     let mut generation =
         goal::generation_request(&args.objective, &args.guidance, progress, collaboration);
     generation.source_session_id = Some(args.session);
@@ -211,7 +214,28 @@ mod tests {
         .unwrap();
         assert!(args.collaborate);
         assert!(!args.no_progress_document);
+        assert!(!args.progress_document);
         assert_eq!(args.max_iterations, DEFAULT_MAX_ITERATIONS);
+    }
+
+    #[test]
+    fn progress_document_requires_explicit_opt_in() {
+        let session = SessionId::new().to_string();
+        let base = ["goal", "--session", &session, "--objective", "Implement"];
+        assert!(!GoalCli::try_parse_from(base).unwrap().progress_document);
+        let enabled =
+            GoalCli::try_parse_from(base.into_iter().chain(["--progress-document"])).unwrap();
+        assert!(enabled.progress_document);
+        let disabled =
+            GoalCli::try_parse_from(base.into_iter().chain(["--no-progress-document"])).unwrap();
+        assert!(!disabled.progress_document);
+        assert!(
+            GoalCli::try_parse_from(
+                base.into_iter()
+                    .chain(["--progress-document", "--no-progress-document"]),
+            )
+            .is_err()
+        );
     }
 
     #[test]

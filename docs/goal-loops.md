@@ -107,7 +107,9 @@ bcode goal --session <session-id> --collaborate --worker-attempts 20 --objective
 The command shares the modal's generation prompts, output validation, delegation preflight,
 and workflow request builder. It uses ordinary invocation configuration and permissions;
 the source session supplies bounded context and the parent workspace/association, not an
-extra permission grant. A progress document is enabled unless `--no-progress-document` is set.
+extra permission grant. Progress-document planning is opt-in with `--progress-document`.
+`--no-progress-document` remains accepted for existing callers; it matches the default.
+The two flags are mutually exclusive.
 Clarification or unavailable prerequisites fail rather than silently launching a plain loop.
 Success prints a run ID and means **admitted, not completed**. Inspect with
 `bcode workflow inspect-run --run-id <run-id>` and `bcode workflow run-output --run-id <run-id>`;
@@ -139,7 +141,7 @@ exchanges. It does not scan the repository or replay the full session history.
 * **Ctrl+Enter** generates prompts and starts the loop after validation.
 * **Ctrl+R** generates prompts for review. Edit the iteration prompt and stop
   condition, then use **Ctrl+Enter** to start.
-* **Ctrl+P** toggles the default-on living progress document (`[x]` in the modal title).
+* **Ctrl+P** toggles the opt-in living progress document (off for new goals).
 * **Esc** closes setup. A late generation response cannot start a loop after closing.
 
 Inputs are frozen while generation is pending. Failure preserves the draft for retry.
@@ -266,7 +268,7 @@ host method and explicit observation/cancellation handle. ABI 4 libraries are re
 
 ## Living progress document
 
-By default, starting a goal prepares a Markdown document under the owning session
+When explicitly enabled, starting a goal prepares a Markdown document under the owning session
 store's `session-artifacts/<session-id>/working-documents/<workflow-run-id>/progress.md`.
 The application resolves the path; the modal never guesses a state root. The existing
 workflow run UUID is the document scope. Independent new runs get distinct documents; explicit
