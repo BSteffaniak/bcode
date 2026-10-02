@@ -47,13 +47,14 @@ extraction without treating signatures or executable digests as identity. Artifa
 daemon routing metadata and is distinct from the archive checksum and executable SHA-256.
 
 For executable builds, prefer `cargo xtask build` (or the distribution commands above). Raw
-`cargo build`/`cargo rustc` generates its fallback identity in the IPC dependency's build script;
-Cargo can reuse that output when only the final executable is recompiled or relinked. Consequently,
-two different raw-Cargo executables can carry the same identity. If raw Cargo is necessary, supply
-a fresh, portable `BCODE_ARTIFACT_ID` for each independently produced executable; never reuse a
-label for different artifacts. This is a raw-build limitation, not permission to disable executable
-digest verification or stop a different artifact's daemon. The `xtask` build path already supplies
-a fresh identity per build.
+`cargo build`/`cargo rustc` without an explicit `BCODE_ARTIFACT_ID` resolves a `cargo-sha256-`
+identity from the final executable bytes once per process, before daemon routing. Dependency
+build-script reuse therefore cannot collapse different final-target relinks into one namespace.
+This costs one executable read at startup and fails closed if the executable is unreadable.
+Copying unchanged bytes preserves this identity; signing or stripping changes it. Use the xtask
+path for production's stable post-link identity and cheaper startup. Explicit IDs remain the
+producer's responsibility: never reuse a label for different artifacts. Executable digest
+verification remains enabled on both paths.
 
 macOS and Windows artifacts are `.zip` archives; Linux artifacts are `.tar.gz` archives. Portable ZIP
 is the complete initial Windows distribution format; an installer, Store package, package-manager

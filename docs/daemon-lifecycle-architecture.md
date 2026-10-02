@@ -4,7 +4,7 @@
 
 Bcode daemon availability is split across explicit owners:
 
-* Artifact production embeds one exact `ArtifactId` in each produced `bcode` executable.
+* Artifact production embeds an explicit `ArtifactId` for packaged executables; raw Cargo builds resolve identity from final executable bytes.
 * IPC owns the portable artifact identity contract, protocol version, `Hello`, status payloads, and endpoint derivation.
 * Daemon lifecycle owns executable integrity evidence, image materialization, startup locking, spawning, readiness, records, stale endpoint handling, and conservative cleanup.
 * The client owns connection, auto-start, and transparent replacement-daemon reconnection policy.
@@ -59,8 +59,12 @@ The exact produced-artifact identity is distinct from:
 Default namespaces derive from protocol version plus exact artifact ID. Default endpoints derive from
 protocol version, exact artifact ID, and the identity of the resolved **runtime scope** — the pair
 `(state root, config directory)` — so daemons serving different scopes coexist without sharing
-endpoints, registries, or coordination state. Endpoint discovery is O(1) and does not inspect
-executable bytes. `Hello` advertises the intended artifact ID and runtime scope identity, and both
+endpoints, registries, or coordination state. Endpoint discovery is O(1) after process identity
+initialization. Production builds embed an explicit unique identity; raw Cargo builds without an
+explicit identity hash their final executable once per process and cache a `cargo-sha256-` identity.
+This avoids dependency build-script label reuse after final-target-only relinks; unreadable bytes
+fail closed. Raw-build signing or stripping changes identity, whereas explicit production IDs
+remain stable through those operations. `Hello` advertises the intended artifact ID and runtime scope identity, and both
 peers reject a mismatch. Build fingerprints and compatibility epochs remain independently checked
 rather than serving as artifact identity.
 

@@ -119,7 +119,8 @@ pub const CURRENT_SESSION_STORAGE_WRITER_EPOCH: u32 =
 /// Build-scoped daemon fingerprint generated at compile time.
 pub const BUILD_FINGERPRINT: &str = env!("BCODE_BUILD_FINGERPRINT");
 
-/// Exact identity embedded in this produced executable artifact.
+/// Producer label embedded at compilation; raw builds resolve final-byte identity at runtime.
+/// Use [`ArtifactId::current`] for routing rather than this label.
 pub const ARTIFACT_ID: &str = env!("BCODE_ARTIFACT_ID");
 
 /// Exact produced-artifact identity used for daemon routing.
@@ -150,10 +151,61 @@ impl ArtifactId {
         Ok(Self(value))
     }
 
-    /// Return the embedded identity of the current produced artifact.
+    /// Return the identity of the current produced artifact.
+    ///
+    /// Raw Cargo builds resolve identity from final executable bytes once per process:
+    /// a dependency build script cannot observe final-target-only relinks. Release
+    /// automation instead supplies an explicit, unique embedded identity.
+    ///
+    /// # Panics
+    ///
+    /// Panics if a raw build's executable cannot be located or read. An unverifiable
+    /// executable must not fall back to a potentially shared build-script label.
     #[must_use]
     pub fn current() -> Self {
-        Self(ARTIFACT_ID.to_owned())
+        static CURRENT: std::sync::OnceLock<ArtifactId> = std::sync::OnceLock::new();
+        CURRENT
+            .get_or_init(|| {
+                if env!("BCODE_ARTIFACT_ID_EXPLICIT") == "true" {
+                    return Self(ARTIFACT_ID.to_owned());
+                }
+                let path = std::env::current_exe().expect("locate raw-build executable identity");
+                let mut file =
+                    std::fs::File::open(path).expect("open raw-build executable identity");
+                Self::for_executable(&mut file).expect("read raw-build executable identity")
+            })
+            .clone()
+    }
+
+    /// Resolve identity for a retained executable handle.
+    ///
+    /// Explicit producer IDs are preserved; raw builds hash the supplied bytes.
+    /// The reader is consumed from its current position.
+    ///
+    /// # Errors
+    ///
+    /// Returns an I/O error if raw executable bytes cannot be read.
+    pub fn for_executable(reader: &mut impl std::io::Read) -> std::io::Result<Self> {
+        if env!("BCODE_ARTIFACT_ID_EXPLICIT") == "true" {
+            return Ok(Self(ARTIFACT_ID.to_owned()));
+        }
+        Self::from_executable(reader)
+    }
+
+    fn from_executable(reader: &mut impl std::io::Read) -> std::io::Result<Self> {
+        let mut digest = Sha256::new();
+        let mut buffer = vec![0_u8; 65536].into_boxed_slice();
+        loop {
+            let read = reader.read(&mut buffer)?;
+            if read == 0 {
+                break;
+            }
+            digest.update(&buffer[..read]);
+        }
+        Ok(Self(format!(
+            "cargo-sha256-{}",
+            hex::encode(digest.finalize())
+        )))
     }
 
     /// Return the artifact identity as text.
@@ -3551,6 +3603,33 @@ mod tests {
         let decoded: bcode_session_models::PendingToolExchangeSummary =
             serde_json::from_value(wire).unwrap();
         assert_eq!(decoded, domain);
+    }
+
+    #[test]
+    fn raw_artifact_identity_tracks_final_bytes_and_survives_copy() {
+        let first = b"final target a with cached dependency label";
+        let second = b"final target b with cached dependency label";
+        let identity = ArtifactId::from_executable(&mut first.as_slice()).unwrap();
+        assert_eq!(
+            identity,
+            ArtifactId::from_executable(&mut first.to_vec().as_slice()).unwrap()
+        );
+        assert_ne!(
+            identity,
+            ArtifactId::from_executable(&mut second.as_slice()).unwrap()
+        );
+        assert_eq!(ArtifactId::parse(identity.as_str()).unwrap(), identity);
+    }
+
+    #[test]
+    fn raw_artifact_identity_rejects_unreadable_bytes() {
+        struct Unreadable;
+        impl std::io::Read for Unreadable {
+            fn read(&mut self, _: &mut [u8]) -> std::io::Result<usize> {
+                Err(std::io::Error::other("unreadable artifact"))
+            }
+        }
+        assert!(ArtifactId::from_executable(&mut Unreadable).is_err());
     }
 
     #[test]

@@ -778,7 +778,8 @@ pub fn initialize_artifact_bootstrap() -> Result<&'static ArtifactBootstrap, Dae
         path: PathBuf::from("<current_exe>"),
         source,
     })?;
-    let bootstrap = ArtifactBootstrap::open(source_path, bcode_ipc::ArtifactId::current())?;
+    let artifact_id = bcode_ipc::ArtifactId::current();
+    let bootstrap = ArtifactBootstrap::open_verified(source_path, artifact_id)?;
     let _ = ARTIFACT_BOOTSTRAP.set(bootstrap);
     Ok(ARTIFACT_BOOTSTRAP
         .get()
@@ -786,6 +787,34 @@ pub fn initialize_artifact_bootstrap() -> Result<&'static ArtifactBootstrap, Dae
 }
 
 impl ArtifactBootstrap {
+    fn open_verified(
+        source_path: PathBuf,
+        artifact_id: bcode_ipc::ArtifactId,
+    ) -> Result<Self, DaemonLifecycleError> {
+        let bootstrap = Self::open(source_path, artifact_id)?;
+        let mut source = bootstrap
+            .source
+            .lock()
+            .map_err(|_| DaemonLifecycleError::Io {
+                path: bootstrap.source_path.clone(),
+                source: std::io::Error::other("artifact bootstrap lock poisoned"),
+            })?;
+        let observed = bcode_ipc::ArtifactId::for_executable(&mut *source).map_err(|source| {
+            DaemonLifecycleError::Io {
+                path: bootstrap.source_path.clone(),
+                source,
+            }
+        })?;
+        if observed != bootstrap.artifact_id {
+            return Err(DaemonLifecycleError::Io {
+                path: bootstrap.source_path.clone(),
+                source: std::io::Error::other("executable changed during artifact bootstrap"),
+            });
+        }
+        drop(source);
+        Ok(bootstrap)
+    }
+
     fn open(
         source_path: PathBuf,
         artifact_id: bcode_ipc::ArtifactId,
@@ -2170,6 +2199,29 @@ mod tests {
                 .join("abc123")
                 .join(if cfg!(windows) { "bcode.exe" } else { "bcode" })
         );
+    }
+
+    #[test]
+    fn bootstrap_rejects_identity_from_different_executable_bytes() {
+        let root = std::env::temp_dir().join(format!(
+            "bcode-bootstrap-identity-{}-{}",
+            std::process::id(),
+            unix_time_millis().unwrap()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let path = root.join("bcode");
+        fs::write(&path, b"retained bytes").unwrap();
+        let identity =
+            bcode_ipc::ArtifactId::for_executable(&mut b"retained bytes".as_slice()).unwrap();
+        let bootstrap = ArtifactBootstrap::open_verified(path.clone(), identity.clone()).unwrap();
+        assert_eq!(bootstrap.artifact_id(), &identity);
+        assert_eq!(
+            bootstrap.digest().unwrap(),
+            executable_sha256(&path).unwrap()
+        );
+        let foreign = bcode_ipc::ArtifactId::parse("foreign-bootstrap-identity").unwrap();
+        assert!(ArtifactBootstrap::open_verified(path, foreign).is_err());
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[cfg(unix)]

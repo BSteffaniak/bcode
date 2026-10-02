@@ -14,6 +14,10 @@ const ROOT_SOURCE_FILES: &[&str] = &[
 fn main() {
     println!("cargo:rerun-if-env-changed=BCODE_BUILD_FINGERPRINT");
     println!("cargo:rerun-if-env-changed=BCODE_ARTIFACT_ID");
+    println!(
+        "cargo:rustc-env=BCODE_ARTIFACT_ID_EXPLICIT={}",
+        std::env::var_os("BCODE_ARTIFACT_ID").is_some()
+    );
     let artifact_id = match std::env::var("BCODE_ARTIFACT_ID") {
         Ok(value) if is_valid_artifact_id(&value) => value,
         Ok(value) => panic!("invalid BCODE_ARTIFACT_ID {value:?}"),
