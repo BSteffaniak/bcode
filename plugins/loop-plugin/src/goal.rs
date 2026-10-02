@@ -5,21 +5,23 @@ use bcode_plugin_sdk::tui::PluginStructuredGenerationRequest;
 pub const SURFACE_KIND: &str = "goal.start";
 
 pub fn start_response(arguments: &str) -> InvokeCommandResponse {
-    let tokens: Vec<_> = arguments.split_whitespace().collect();
-    let allowance = match tokens.as_slice() {
-        [] | ["--collaborate"] => Ok(None),
-        ["--worker-attempts", count] | ["--collaborate", "--worker-attempts", count] => count
-            .parse::<std::num::NonZeroU64>()
-            .map(|count| Some(count.get()))
-            .map_err(|_| ()),
-        _ => Err(()),
+    #[derive(clap::Parser)]
+    struct Options {
+        #[command(flatten)]
+        swarm: swarm::Arguments,
+    }
+    use clap::Parser as _;
+    let parsed =
+        Options::try_parse_from(std::iter::once("goal").chain(arguments.split_whitespace()));
+    let arguments = match parsed {
+        Ok(options) => options.swarm,
+        Err(error) => {
+            let mut response = status_response(&error.to_string());
+            response.success = false;
+            return response;
+        }
     };
-    let Ok(allowance) = allowance else {
-        let mut response =
-            status_response("Usage: /goal [--collaborate] [--worker-attempts <positive integer>]");
-        response.success = false;
-        return response;
-    };
+    let allowance = arguments.worker_attempts.map(std::num::NonZeroU64::get);
     InvokeCommandResponse {
         success: true,
         message: None,
@@ -29,7 +31,7 @@ pub fn start_response(arguments: &str) -> InvokeCommandResponse {
         effects: vec![CommandEffect::OpenPluginSurface {
             surface_kind: SURFACE_KIND.into(),
             instance_id: "goal-start".into(),
-            options: serde_json::json!({"collaboration":tokens.first() == Some(&"--collaborate"), "worker_attempts":allowance}),
+            options: serde_json::json!({"collaboration":arguments.collaborate, "agents": match arguments.mode() { swarm::Mode::Auto => "auto", swarm::Mode::Collaborate => "collaborate", swarm::Mode::NoDelegation => "no-delegation" }, "worker_attempts":allowance, "concurrency":arguments.concurrency, "swarm_instructions":arguments.swarm_instructions}),
         }],
     }
 }
@@ -53,6 +55,8 @@ pub fn generation_request(
         system_prompt: [
             if collaboration == CollaborationMode::Requested {
                 "The user explicitly requested collaborating agents. Preserve this requirement in both generated prompts: use the existing goal/workflow delegation mechanisms, collect worker evidence, revise or delegate follow-up work, integrate contributions and verify the original objective. Do not silently substitute a single-agent result. Missing collaboration support, permissions or verified results are blockers, not completion. Collaboration does not grant tools. For repository coding, preserve the authorable default of separately retained worker and integration worktrees created through authorized worktree tools; inspect source changes, never discard or implicitly include dirty user work, and verify matching creation bases before delegation. Explicit user workspace strategies override this default; it is not runtime policy."
+            } else if collaboration == CollaborationMode::NoDelegation {
+                "The user prohibits delegation. Preserve that restriction in both generated prompts. Do not propose workers. Surface conflicting requirements."
             } else { "Preserve the user's objective. Collaboration is optional by default, but explicit requests for multiple agents or independent reviewers in the objective must remain requirements. Do not invent a collaboration requirement when the objective does not contain one." },
             include_str!("../prompts/goal-generation.md"),
             include_str!("../prompts/goal-iteration-guidance.md"),
@@ -452,20 +456,51 @@ impl PluginTuiSurfaceFactory for GoalSurfaceFactory {
                     .and_then(|s| SessionId::from_str(s).ok())
             });
             let mut surface = GoalSurface::new(session);
-            surface.editor.collaboration = if request
+            surface.editor.collaboration = match request
                 .options
-                .get("collaboration")
-                .and_then(serde_json::Value::as_bool)
-                .unwrap_or(false)
+                .get("agents")
+                .and_then(serde_json::Value::as_str)
             {
-                CollaborationMode::Requested
-            } else {
-                CollaborationMode::Disabled
+                Some("auto") => CollaborationMode::Auto,
+                Some("collaborate") => CollaborationMode::Requested,
+                Some("no-delegation") => CollaborationMode::NoDelegation,
+                Some(_) => return Err("Unsupported goal agent mode".into()),
+                None => {
+                    if request
+                        .options
+                        .get("collaboration")
+                        .and_then(serde_json::Value::as_bool)
+                        == Some(true)
+                    {
+                        CollaborationMode::Requested
+                    } else {
+                        CollaborationMode::Auto
+                    }
+                }
             };
             surface.editor.worker_attempts = request
                 .options
                 .get("worker_attempts")
                 .and_then(serde_json::Value::as_u64);
+            surface.editor.swarm_ui.configure(&swarm::Arguments {
+                worker_attempts: surface
+                    .editor
+                    .worker_attempts
+                    .and_then(std::num::NonZeroU64::new),
+                concurrency: request
+                    .options
+                    .get("concurrency")
+                    .and_then(serde_json::Value::as_u64)
+                    .and_then(|n| u32::try_from(n).ok())
+                    .and_then(std::num::NonZeroU32::new),
+                swarm_instructions: request
+                    .options
+                    .get("swarm_instructions")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or_default()
+                    .into(),
+                ..swarm::Arguments::default()
+            });
             Ok(Box::new(surface) as BoxedPluginTuiSurface)
         })
     }
@@ -483,6 +518,7 @@ pub enum GoalPhase {
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum GoalOption {
+    Swarm,
     Progress,
     Review,
 }
@@ -495,6 +531,7 @@ struct GoalSurface {
     phase: GoalPhase,
     pending_review: Option<bool>,
     source: Option<(String, String, u64)>,
+    draft_guidance: String,
     completion: Arc<Mutex<Option<GenerationResult>>>,
     live: Option<crate::goal_live::GenerationView>,
     generation_preflight: Arc<Mutex<Option<Result<(), String>>>>,
@@ -561,12 +598,14 @@ impl GoalSurface {
         let mut editor = LoopSurface::new(session);
         editor.setup_kind = SetupKind::Goal;
         editor.origin = SetupKind::Goal;
+        editor.collaboration = CollaborationMode::Auto;
         editor.limit = text_state("");
         Self {
             editor,
             phase: GoalPhase::Draft,
             pending_review: None,
             source: None,
+            draft_guidance: String::new(),
             completion: Arc::default(),
             live: None,
             generation_preflight: Arc::default(),
@@ -592,15 +631,23 @@ impl GoalSurface {
         self.editor.review_button.set(button);
     }
 
-    fn handle_options(
-        &mut self,
-        event: &Event,
-        host: &dyn PluginTuiHost,
-    ) -> Option<PluginTuiAction> {
-        use bmux_tui_components::button::{Button, ButtonOutcome, ButtonPolicy};
-        use bmux_tui_components::checkbox::{Checkbox, CheckboxOutcome};
+    fn open_swarm(&mut self) {
+        if self.phase == GoalPhase::Generated {
+            if let Some((objective, _, limit)) = self.source.take() {
+                self.editor.prompt = text_state(&objective);
+                self.editor.condition = text_state(&self.draft_guidance);
+                self.editor.limit = text_state(&limit.to_string());
+            }
+            self.phase = GoalPhase::Draft;
+            self.editor.setup_kind = SetupKind::Goal;
+            self.editor.failed_workflow_start = None;
+            self.editor.status =
+                "Swarm settings changed: regenerate instructions before starting.".into();
+        }
+        self.editor.swarm_ui.open = true;
+    }
 
-        self.prepare_controls();
+    fn tab_options(&mut self, event: &Event) -> Option<PluginTuiAction> {
         let editor = &mut self.editor;
         if let Event::Key(stroke) = event
             && stroke.key == KeyCode::Tab
@@ -622,8 +669,15 @@ impl GoalSurface {
                 (Some(GoalOption::Progress), _, false) | (None, Field::Prompt, true) => {
                     Some(GoalOption::Review)
                 }
-                (Some(GoalOption::Review), _, true) | (None, Field::Evaluation, false) => {
+                (None, Field::Evaluation, false) | (Some(GoalOption::Progress), _, true) => {
+                    Some(GoalOption::Swarm)
+                }
+                (Some(GoalOption::Swarm), _, false) | (Some(GoalOption::Review), _, true) => {
                     Some(GoalOption::Progress)
+                }
+                (Some(GoalOption::Swarm), _, true) => {
+                    editor.field = Field::Evaluation;
+                    None
                 }
                 (Some(_), _, reverse) => {
                     editor.field = if reverse {
@@ -633,13 +687,39 @@ impl GoalSurface {
                     };
                     None
                 }
-
                 (None, _, _) => return None,
             };
             editor.sync_goal_controls();
             return Some(PluginTuiAction::Redraw);
         }
+        None
+    }
+
+    fn handle_options(
+        &mut self,
+        event: &Event,
+        host: &dyn PluginTuiHost,
+    ) -> Option<PluginTuiAction> {
+        use bmux_tui_components::button::{Button, ButtonOutcome, ButtonPolicy};
+        use bmux_tui_components::checkbox::{Checkbox, CheckboxOutcome};
+
+        self.prepare_controls();
+        if let Some(action) = self.tab_options(event) {
+            return Some(action);
+        }
+        let editor = &mut self.editor;
         editor.sync_goal_controls();
+        if editor.swarm_ui.launch_event(
+            editor.collaboration,
+            editor.goal_option_focus == Some(GoalOption::Swarm),
+            true,
+            event,
+        ) {
+            if editor.swarm_ui.open {
+                self.open_swarm();
+            }
+            return Some(PluginTuiAction::Redraw);
+        }
         let mut checkbox = editor.progress_checkbox.get();
         let mut button = editor.review_button.get();
         let checkbox_outcome = if !matches!(event, Event::Key(_) | Event::Paste(_))
@@ -776,7 +856,23 @@ impl GoalSurface {
             return PluginTuiAction::None;
         }
         let objective = input_text(&self.editor.prompt);
-        let guidance = input_text(&self.editor.condition);
+        self.draft_guidance = input_text(&self.editor.condition);
+        let guidance = swarm::guidance(
+            &self.draft_guidance,
+            &input_text(&self.editor.swarm_ui.instructions),
+        );
+        if let Err(error) = self.editor.swarm_ui.validate() {
+            self.editor.status = error;
+            return PluginTuiAction::Redraw;
+        }
+        match self.editor.swarm_ui.attempts() {
+            Ok(Some(attempts)) => self.editor.worker_attempts = Some(attempts),
+            Ok(None) => {}
+            Err(error) => {
+                self.editor.status = error;
+                return PluginTuiAction::Redraw;
+            }
+        }
         let limit = input_text(&self.editor.limit);
         let limit = if limit.is_empty() {
             Ok(DEFAULT_MAX_ITERATIONS)
@@ -917,7 +1013,14 @@ impl PluginTuiSurface for GoalSurface {
     }
     fn render(&mut self, area: Rect, frame: &mut PaintCx<'_, '_>) {
         self.prepare_controls();
-        if let Some(live) = &mut self.live {
+        if self.editor.swarm_ui.open {
+            self.editor.swarm_ui.paint(
+                self.editor.collaboration,
+                area,
+                frame,
+                self.editor.theme.as_ref(),
+            );
+        } else if let Some(live) = &mut self.live {
             paint_generation(live, area, frame);
         } else {
             self.editor.render(area, frame);
@@ -991,6 +1094,7 @@ impl PluginTuiSurface for GoalSurface {
         });
         match result {
             Ok(input) => {
+                self.source = Some((objective, guidance, limit));
                 self.editor.prompt = text_state(&input.implementation_prompt);
                 self.editor.condition = text_state(&input.stop_condition);
                 self.editor.limit = text_state(&limit.to_string());
@@ -1011,6 +1115,25 @@ impl PluginTuiSurface for GoalSurface {
         PluginTuiAction::Redraw
     }
     fn handle_event(&mut self, event: &Event, host: &dyn PluginTuiHost) -> PluginTuiAction {
+        if self.editor.swarm_ui.open {
+            if let Err(error) = self
+                .editor
+                .swarm_ui
+                .event(&mut self.editor.collaboration, event)
+            {
+                self.editor.swarm_ui.error.clone_from(&error);
+                self.editor.status = error;
+            }
+            self.editor.worker_attempts = self.editor.swarm_ui.attempts().ok().flatten();
+            self.editor.delegation_readiness = None;
+            return PluginTuiAction::Redraw;
+        }
+        if matches!(self.phase, GoalPhase::Draft | GoalPhase::Generated)
+            && matches!(event, Event::Key(key) if key.modifiers.ctrl && key.key == KeyCode::Char('s'))
+        {
+            self.open_swarm();
+            return PluginTuiAction::Redraw;
+        }
         if let Some(live) = &mut self.live {
             if let Event::Key(stroke) = event {
                 if stroke.key == KeyCode::Escape {
@@ -1086,7 +1209,10 @@ impl PluginTuiSurface for GoalSurface {
             return action;
         }
         // Freeze source inputs during generation; no stale response can replace newer edits.
-        if matches!(self.phase, GoalPhase::Generating { .. } | GoalPhase::Closed) {
+        if matches!(
+            self.phase,
+            GoalPhase::CheckingDelegation { .. } | GoalPhase::Generating { .. } | GoalPhase::Closed
+        ) {
             return PluginTuiAction::None;
         }
         self.editor.handle_event(event, host)
@@ -1096,6 +1222,51 @@ impl PluginTuiSurface for GoalSurface {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn swarm_layout_is_confined_and_mode_clicks_use_visible_regions() {
+        use bmux_tui::event::{MouseButton, MouseEvent};
+        use bmux_tui::geometry::Point;
+        let mut ui = swarm_ui::SwarmUi::default();
+        let mode = CollaborationMode::Auto;
+        ui.instructions = text_state("日本語 👩‍💻 e\u{301}");
+        for (width, height) in [(0, 0), (1, 1), (8, 4), (40, 18), (100, 40)] {
+            let area = Rect::new(0, 0, width, height);
+            let mut buffer = bmux_tui::buffer::Buffer::empty(area);
+            let mut frame = Frame::new(&mut buffer);
+            ui.paint(mode, area, &mut PaintCx::new(&mut frame), None);
+        }
+        let mut surface = GoalSurface::new(Some(SessionId::new()));
+        let mut buffer = bmux_tui::buffer::Buffer::empty(Rect::new(0, 0, 100, 40));
+        let mut frame = Frame::new(&mut buffer);
+        surface.render(Rect::new(0, 0, 100, 40), &mut PaintCx::new(&mut frame));
+        let rect = surface.editor.swarm_ui.launcher_area;
+        for kind in [
+            MouseEventKind::Down(MouseButton::Left),
+            MouseEventKind::Up(MouseButton::Left),
+        ] {
+            surface.handle_event(
+                &Event::Mouse(MouseEvent::new(kind, Point::new(rect.x, rect.y))),
+                &Host::default(),
+            );
+        }
+        assert!(surface.editor.swarm_ui.open);
+    }
+
+    #[test]
+    fn swarm_changes_after_review_restore_original_task_and_require_regeneration() {
+        let mut surface = GoalSurface::new(Some(SessionId::new()));
+        surface.source = Some(("Original task".into(), "merged guidance".into(), 4));
+        surface.draft_guidance = "Original guidance".into();
+        surface.editor.prompt = text_state("Generated implementation");
+        surface.editor.condition = text_state("Generated stop condition");
+        surface.phase = GoalPhase::Generated;
+        surface.open_swarm();
+        assert_eq!(surface.phase, GoalPhase::Draft);
+        assert_eq!(input_text(&surface.editor.prompt), "Original task");
+        assert_eq!(input_text(&surface.editor.condition), "Original guidance");
+        assert!(surface.editor.swarm_ui.open);
+    }
 
     #[test]
     fn worker_navigation_requires_current_goal_membership_and_known_version() {
@@ -2046,8 +2217,11 @@ mod tests {
         surface.handle_event(&key(KeyCode::Char(' '), false), &host);
         assert!(surface.editor.progress_document.is_some());
         surface.handle_event(&key(KeyCode::Tab, true), &host);
+        assert!(surface.editor.goal_option_focus == Some(GoalOption::Swarm));
+        surface.handle_event(&key(KeyCode::Tab, true), &host);
         assert!(surface.editor.goal_option_focus.is_none());
         assert_eq!(surface.editor.field, Field::Evaluation);
+        surface.handle_event(&key(KeyCode::Tab, false), &host);
         surface.handle_event(&key(KeyCode::Tab, false), &host);
         surface.handle_event(&key(KeyCode::Tab, false), &host);
         surface.handle_event(&key(KeyCode::Enter, false), &host);

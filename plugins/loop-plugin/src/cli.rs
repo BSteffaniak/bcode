@@ -1,8 +1,7 @@
 //! Plugin-owned noninteractive goal entry. No slash-command emulation.
 use super::{
-    BcodeClient, CollaborationMode, DEFAULT_MAX_ITERATIONS, LoopWorkflowInput, MAX_PROMPT_BYTES,
-    SessionId, SetupKind, build_start_request, goal, legacy_state_exists,
-    unsupported_legacy_message,
+    BcodeClient, DEFAULT_MAX_ITERATIONS, LoopWorkflowInput, MAX_PROMPT_BYTES, SessionId, SetupKind,
+    build_start_request, goal, legacy_state_exists, unsupported_legacy_message,
 };
 use bcode_plugin_sdk::{StaticCliFuture, StaticCliOutcome, StaticCliRegistration};
 use clap::{CommandFactory, FromArgMatches, Parser};
@@ -22,12 +21,11 @@ struct GoalCli {
     objective: String,
     #[arg(long, default_value = "")]
     guidance: String,
-    #[arg(long)]
-    collaborate: bool,
+    #[command(flatten)]
+    swarm: super::swarm::Arguments,
     #[arg(long, default_value_t = DEFAULT_MAX_ITERATIONS)]
     max_iterations: u64,
-    #[arg(long)]
-    worker_attempts: Option<std::num::NonZeroU64>,
+
     /// Opt in to a living progress document and its planning phase.
     #[arg(long, conflicts_with = "no_progress_document")]
     progress_document: bool,
@@ -76,17 +74,17 @@ async fn run(args: GoalCli) -> Result<(), String> {
         return Err(unsupported_legacy_message().into());
     }
     let client = BcodeClient::default_endpoint();
-    let collaboration = if args.collaborate {
-        CollaborationMode::Requested
-    } else {
-        CollaborationMode::Disabled
-    };
-    if args.collaborate {
+    let collaboration = args.swarm.mode().collaboration();
+    let guidance = super::swarm::guidance(&args.guidance, &args.swarm.swarm_instructions);
+    if guidance.len() > MAX_PROMPT_BYTES {
+        return Err("combined guidance is too large".into());
+    }
+    if collaboration == crate::CollaborationMode::Requested {
         check_delegation(&client).await?;
     }
     let progress = args.progress_document;
     let mut generation =
-        goal::generation_request(&args.objective, &args.guidance, progress, collaboration);
+        goal::generation_request(&args.objective, &guidance, progress, collaboration);
     generation.source_session_id = Some(args.session);
     let generated = client
         .generate_structured_output(
@@ -108,7 +106,7 @@ async fn run(args: GoalCli) -> Result<(), String> {
     let input = goal::decode_generation(
         generated.output,
         &args.objective,
-        &args.guidance,
+        &guidance,
         args.max_iterations,
         &provenance,
     )?;
@@ -118,13 +116,16 @@ async fn run(args: GoalCli) -> Result<(), String> {
         SetupKind::Goal,
         collaboration,
         progress,
-        args.worker_attempts.map(std::num::NonZeroU64::get),
+        args.swarm.worker_attempts.map(std::num::NonZeroU64::get),
     )?;
-    if args.collaborate {
+    if let Some(concurrency) = args.swarm.concurrency {
+        request.limits.concurrency_cap = concurrency.get();
+    }
+    if collaboration == crate::CollaborationMode::Requested {
         check_delegation(&client).await?;
     }
     if progress {
-        let setup = goal::ProgressDocumentSetup::headless(args.objective, args.guidance, source);
+        let setup = goal::ProgressDocumentSetup::headless(args.objective, guidance, source);
         let document = client
             .session_working_document(setup.request(
                 args.session,
@@ -212,10 +213,69 @@ mod tests {
             "--collaborate",
         ])
         .unwrap();
-        assert!(args.collaborate);
+        assert!(args.swarm.collaborate);
         assert!(!args.no_progress_document);
         assert!(!args.progress_document);
         assert_eq!(args.max_iterations, DEFAULT_MAX_ITERATIONS);
+    }
+
+    #[test]
+    fn agent_modes_and_limits_have_cli_surface_parity() {
+        let session = SessionId::new();
+        let id = session.to_string();
+        let base = ["goal", "--session", &id, "--objective", "Implement"];
+        assert_eq!(
+            GoalCli::try_parse_from(base).unwrap().swarm.mode(),
+            crate::swarm::Mode::Auto
+        );
+        assert!(
+            GoalCli::try_parse_from(
+                base.into_iter()
+                    .chain(["--agents", "auto", "--collaborate"])
+            )
+            .is_err()
+        );
+        assert!(GoalCli::try_parse_from(base.into_iter().chain(["--concurrency", "0"])).is_err());
+        for mode in ["auto", "collaborate", "no-delegation"] {
+            let args = GoalCli::try_parse_from(base.into_iter().chain([
+                "--agents",
+                mode,
+                "--worker-attempts",
+                "9",
+                "--concurrency",
+                "2",
+                "--swarm-instructions",
+                "Review independently",
+            ]))
+            .unwrap();
+            let mut surface = crate::LoopSurface::new(Some(session));
+            surface.origin = SetupKind::Goal;
+            surface.collaboration = args.swarm.mode().collaboration();
+            surface.worker_attempts = args.swarm.worker_attempts.map(std::num::NonZeroU64::get);
+            surface.swarm_ui.configure(&args.swarm);
+            surface.prompt = crate::text_state("Implement");
+            surface.condition = crate::text_state("Verify");
+            let ui = surface.build_start_request(session).unwrap();
+            let input = LoopWorkflowInput::new(
+                crate::swarm::guidance("Implement", &args.swarm.swarm_instructions),
+                crate::swarm::guidance("Verify", &args.swarm.swarm_instructions),
+                DEFAULT_MAX_ITERATIONS,
+            )
+            .unwrap();
+            let mut cli = build_start_request(
+                &input,
+                session,
+                SetupKind::Goal,
+                args.swarm.mode().collaboration(),
+                false,
+                Some(9),
+            )
+            .unwrap();
+            cli.limits.concurrency_cap = 2;
+            assert_eq!(ui.definition, cli.definition);
+            assert_eq!(ui.input, cli.input);
+            assert_eq!(ui.limits, cli.limits);
+        }
     }
 
     #[test]
@@ -243,7 +303,7 @@ mod tests {
         let session = SessionId::new();
         let mut surface = crate::LoopSurface::new(Some(session));
         surface.origin = SetupKind::Goal;
-        surface.collaboration = CollaborationMode::Requested;
+        surface.collaboration = crate::CollaborationMode::Requested;
         surface.worker_attempts = Some(12);
         surface.prompt = crate::text_state("Implement");
         surface.condition = crate::text_state("Verify");
@@ -255,7 +315,7 @@ mod tests {
             &input,
             session,
             SetupKind::Goal,
-            CollaborationMode::Requested,
+            crate::CollaborationMode::Requested,
             false,
             Some(12),
         )

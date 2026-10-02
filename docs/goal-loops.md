@@ -1,5 +1,35 @@
 # Goal setup for prompt loops
 
+## Agent strategy and swarm settings
+
+`/goal` defaults to **Auto**: the model may work directly or delegate, and may revise
+its strategy during execution. Open **Swarm settings** with the visible button or
+**Ctrl+S**. The mode button cycles Auto, Collaborate (workers required), and No delegation.
+Tab moves between mode, strategy instructions, additional attempts, concurrent nodes,
+and Done. Strategy instructions are retained as user requirements in generated
+implementation and evaluation inputs; they do not grant permissions. For example,
+request isolated worktrees, specific roles/models, or parallel investigation followed
+by serialized edits. Unsupported or conflicting requirements must be surfaced.
+
+Auto and Collaborate default to 20 additional run-wide node attempts. This is not a
+worker count, concurrency limit, or spending cap. Concurrent nodes is a separate,
+runtime-enforced per-run limit; blank retains the runtime default. Auto can start
+without delegation prerequisites and attempt direct work; required collaboration
+retains blocking preflight. Tool publication remains independently authorized.
+
+No delegation removes workflow mutation/delegation tools through an explicit tool
+allowlist and disables descendant runs. It retains ordinary shell execution under
+normal permissions: this is not a sandbox against starting external programs.
+Changing swarm settings after reviewing generated instructions restores the original
+task for regeneration; generated prompt edits must be redone.
+
+CLI equivalents are `--agents auto|collaborate|no-delegation`, `--swarm-instructions`,
+`--worker-attempts`, and `--concurrency`. `--collaborate` remains shorthand for required
+collaboration. These settings apply to new goals, not existing runs, and do not modify
+configuration files. Multiword strategy instructions are best entered in the modal;
+the standalone CLI supports normal shell quoting.
+
+
 ## Collaboration completion
 
 New collaboration goals finish against the user's criteria using actual worker

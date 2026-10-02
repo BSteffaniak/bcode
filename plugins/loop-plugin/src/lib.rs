@@ -61,6 +61,8 @@ mod goal_status;
 mod goal_supervision;
 mod judgement_evaluation;
 mod progress;
+mod swarm;
+mod swarm_ui;
 
 const START_COMMAND: &str = "loop";
 const STATUS_COMMAND: &str = "loop.status";
@@ -902,16 +904,25 @@ enum FreshSessionState {
     Ready,
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum CollaborationMode {
     Disabled,
+    Auto,
+    NoDelegation,
     Requested,
+}
+
+impl CollaborationMode {
+    const fn enabled(self) -> bool {
+        matches!(self, Self::Auto | Self::Requested)
+    }
 }
 
 struct LoopSurface {
     origin: SetupKind,
     collaboration: CollaborationMode,
     worker_attempts: Option<u64>,
+    swarm_ui: swarm_ui::SwarmUi,
     delegation_readiness: Option<()>,
     session_id: Option<SessionId>,
     fresh_session: FreshSessionState,
@@ -957,13 +968,18 @@ fn build_start_request(
 ) -> Result<PluginWorkflowStartRequest, String> {
     let spec = if progress_document {
         goal_workflow_spec(input)?
-    } else if origin == SetupKind::Goal {
+    } else if origin == SetupKind::Goal && collaboration != CollaborationMode::NoDelegation {
         optional_goal_spec(&loop_workflow_spec(input)?)?
     } else {
         loop_workflow_spec(input)?
     };
     let spec = if collaboration == CollaborationMode::Requested {
         collaborating_goal_spec(&spec)?
+    } else {
+        spec
+    };
+    let spec = if collaboration == CollaborationMode::NoDelegation {
+        swarm::no_delegation_spec(&spec)?
     } else {
         spec
     };
@@ -994,6 +1010,14 @@ fn build_start_request(
         .and_then(|count| count.checked_add(initialization))
         .and_then(|count| count.checked_mul(u64::from(request.limits.retry_cap) + 1))
         .ok_or("loop node allowance overflow")?;
+    if collaboration == CollaborationMode::NoDelegation {
+        request.limits.descendant_cap = 0;
+    }
+    let worker_attempts = worker_attempts.or_else(|| {
+        collaboration
+            .enabled()
+            .then_some(swarm::DEFAULT_WORKER_ATTEMPTS)
+    });
     if let Some(worker_attempts) = worker_attempts
         .filter(|_| origin == SetupKind::Goal || collaboration == CollaborationMode::Requested)
     {
@@ -1015,6 +1039,7 @@ impl LoopSurface {
             origin: SetupKind::Loop,
             collaboration: CollaborationMode::Disabled,
             worker_attempts: None,
+            swarm_ui: swarm_ui::SwarmUi::default(),
             delegation_readiness: None,
             fresh_session: FreshSessionState::Idle,
             prompt: text_state(""),
@@ -1217,18 +1242,33 @@ impl LoopSurface {
         };
         let evaluation = input_text(&self.evaluation);
         let mut input = LoopWorkflowInput::new(prompt, condition, max_iterations)?;
+        if self.origin == SetupKind::Goal {
+            let instructions = input_text(&self.swarm_ui.instructions);
+            input.implementation_prompt =
+                swarm::guidance(&input.implementation_prompt, &instructions);
+            input.stop_condition = swarm::guidance(&input.stop_condition, &instructions);
+            LoopWorkflowInput::new(
+                input.implementation_prompt.clone(),
+                input.stop_condition.clone(),
+                max_iterations,
+            )?;
+        }
         input.judgement_evaluation =
             judgement_evaluation::parse_config(&evaluation).inspect_err(|_| {
                 self.field = Field::Evaluation;
             })?;
-        build_start_request(
+        let mut request = build_start_request(
             &input,
             session_id,
             self.origin,
             self.collaboration,
             self.progress_document.is_some(),
             self.worker_attempts,
-        )
+        )?;
+        if self.origin == SetupKind::Goal {
+            self.swarm_ui.apply_limits(&mut request)?;
+        }
+        Ok(request)
     }
 
     fn begin_replace_cancel(&mut self, host: &dyn PluginTuiHost) {
@@ -1550,6 +1590,22 @@ impl LoopSurface {
         self.review_button.set(button);
     }
 
+    fn paint_swarm_launcher(&mut self, content: Rect, frame: &mut PaintCx<'_, '_>) -> Rect {
+        let mut launcher = self.swarm_ui.launcher.get();
+        launcher.set_focused(self.goal_option_focus == Some(goal::GoalOption::Swarm));
+        launcher.set_disabled(!matches!(
+            self.goal_phase,
+            goal::GoalPhase::Draft | goal::GoalPhase::Generated
+        ));
+        self.swarm_ui.launcher.set(launcher);
+        if self.origin == SetupKind::Goal {
+            self.swarm_ui
+                .paint_launcher(self.collaboration, content, frame)
+        } else {
+            content
+        }
+    }
+
     fn paint_goal_options(&mut self, mut content: Rect, frame: &mut PaintCx<'_, '_>) -> Rect {
         self.progress_document_area = Rect::new(0, 0, 0, 0);
         self.review_area = Rect::new(0, 0, 0, 0);
@@ -1791,7 +1847,8 @@ impl PluginTuiSurface for LoopSurface {
             LocalRect::new(0, 0, area.width, area.height),
             |cx| shell.paint(&layout, cx),
         );
-        let content = self.paint_goal_options(content.intersection(area), frame);
+        let content = self.paint_swarm_launcher(content.intersection(area), frame);
+        let content = self.paint_goal_options(content, frame);
         let available = content.height.saturating_sub(12);
         let prompt_rows = available.saturating_mul(3) / 5;
         let condition_rows = available.saturating_sub(prompt_rows).max(3);
