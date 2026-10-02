@@ -1436,12 +1436,23 @@ impl Drop for DaemonImageUseGuard {
     }
 }
 
+struct DaemonImageCleanupGuard {
+    file: fs::File,
+}
+
+impl Drop for DaemonImageCleanupGuard {
+    fn drop(&mut self) {
+        // Closing alone can leave the lock held by a duplicated/inherited handle.
+        let _ = self.file.unlock();
+    }
+}
+
 fn try_acquire_daemon_image_cleanup_lock(
     state_dir: &Path,
-) -> Result<Option<fs::File>, DaemonLifecycleError> {
+) -> Result<Option<DaemonImageCleanupGuard>, DaemonLifecycleError> {
     let file = open_daemon_image_cleanup_lock(state_dir)?;
     match file.try_lock() {
-        Ok(()) => Ok(Some(file)),
+        Ok(()) => Ok(Some(DaemonImageCleanupGuard { file })),
         Err(std::fs::TryLockError::WouldBlock) => Ok(None),
         Err(std::fs::TryLockError::Error(source)) => Err(DaemonLifecycleError::Io {
             path: daemon_image_cleanup_lock_path(state_dir),
@@ -1780,6 +1791,31 @@ mod tests {
                 ..matching
             }
         ));
+    }
+
+    #[test]
+    fn daemon_image_cleanup_releases_lock_with_a_duplicated_handle() {
+        let state_dir = std::env::temp_dir().join(format!(
+            "bcode-daemon-image-cleanup-release-test-{}-{}",
+            std::process::id(),
+            unix_time_millis().expect("time")
+        ));
+        let guard = try_acquire_daemon_image_cleanup_lock(&state_dir)
+            .expect("lock")
+            .expect("acquired");
+        let duplicate = guard.file.try_clone().expect("duplicate handle");
+        assert!(
+            try_acquire_daemon_image_cleanup_lock(&state_dir)
+                .expect("contended lock")
+                .is_none()
+        );
+        drop(guard);
+        let next = try_acquire_daemon_image_cleanup_lock(&state_dir)
+            .expect("released lock")
+            .expect("reacquired despite duplicate");
+        drop(next);
+        drop(duplicate);
+        fs::remove_dir_all(state_dir).expect("state cleanup");
     }
 
     #[test]
