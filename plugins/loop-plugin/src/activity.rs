@@ -356,7 +356,7 @@ mod tests {
     #[test]
     fn exact_details_preserve_input_and_disclose_oversized_omission() {
         let mut input = request("implementation");
-        input.input["extension"] = serde_json::json!({"literal": "<user>🦀</user>"});
+        input.input["summary"] = serde_json::json!("<user>🦀</user>");
         let original = input.input.clone();
         let view = project(input).unwrap();
         assert_eq!(view.payload["exact_structured_input"], original);

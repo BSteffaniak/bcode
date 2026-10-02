@@ -87,6 +87,9 @@ fn request_with_allowance(
         .checked_add(u64::from(additional))
         .and_then(|value| u32::try_from(value).ok())
         .ok_or("Cumulative iteration allowance exceeds supported range")?;
+    // Advance the existing block boundary rather than replaying historical delivery
+    // contracts under weaker semantics, including allowance-resume paths.
+    super::judgement_evaluation::validate_definition_contract(&source.definition)?;
     let mut input: LoopWorkflowIteration =
         serde_json::from_value(source.input).map_err(|error| error.to_string())?;
     if input.condition_met {

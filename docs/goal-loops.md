@@ -1,80 +1,12 @@
 # Goal setup for prompt loops
 
-## Repository verification handoff
+## Collaboration completion
 
-`loop.stage_repository_verification` accepts inspected run/revision/activation identity,
-a fresh mutation ID, `repository_target {version:1,commit}`, relative repository `cwd`,
-argv-vector `commands`, `report_objective`, and explicit reconciliation. It stages a
-direct shell-owner producer and dependent read-only structured report collector using
-the shell plugin's declared block contract. Normal admission checks owner availability
-and compatibility. Staging performs no export, checks or publication. Separately
-publish the exact candidate with `workflow.publish_run_graph_edit`, then finish the
-source activation. Shell checks retain their normal preparation and permission gates.
-
-Canonical joins preserve source state separately from producer and report outputs.
-The original successor receives its unchanged source selection; the evaluator discovers
-the collector's checksum-verified canonical output and authenticates its direct-shell
-and historical checksum/item references. Reports are claims, not completion. Unknown
-evidence blocks completion. V1/V2 and pinned conditions are unchanged; a V2-only pinned
-condition cannot be satisfied merely by producing a V3 report.
-
-The handoff supports one direct successor with optional nested `source`
-selection or paired left-hand source selectors retained by an earlier repository
-handoff. Repeated verification composes that selection without selecting prior check
-or report results; stale revisions or unsupported topology fail closed. Failed checks do not
-automatically replay. Scripted normal goal-entry tests cover authenticated historical
-resolution and rejection of missing, mismatched or incomplete evidence. Real-model
-canonical acceptance remains outstanding; deterministic coverage does not establish it.
-
-
-## Repository delivery V3
-
-Normal goal generation, collaboration guidance and the read-only completion evaluator support
-repository delivery V3. `/goal.status` previews the retained repository artifact, commit and
-SHA-256 identity, plus bounded later-resolution reviews referencing historical outputs.
-These are evaluator-reported claims, not independent authentication by the display; the
-canonical report retains full item paths and check references. Missing repository identity
-and unresolved live acceptance remain explicit. The evaluator preserves the original stop condition: support for V3
-does not authorize upgrading an existing V2-only pinned condition. Checkout locations belong
-in `retained_workspaces`, revision observations in evidence, and the retained artifact alone
-in V3 `integrated_targets`.
-
-Use `repository_target` on a direct
-`shell.exec` command-plan V2. This is an additive input, not a reinterpretation of
-`delivered_snapshot` or delivery report V2. The target is `{version:1,commit:<full lowercase OID>}`
-at the plan's confined repository cwd. Creating an integrated commit requires ordinary Git
-permission; this operation itself never stages, commits, updates refs, or changes user files.
-Uncommitted, ignored and untracked files are not silently represented as delivered: this
-contract explicitly delivers only the requested complete commit. Required work outside that
-commit remains unresolved.
-
-The workspace owner exports every regular Git blob without checkout filters/attributes,
-preserving binary content and executable modes. Symlinks, submodules, LFS pointers,
-non-UTF-8/unsafe paths, unavailable objects, empty trees, and exports exceeding 100,000 files
-or 16 MiB of blob bytes fail explicitly. Export version 1 is retained as a complete JSON
-artifact (`bcode.repository.export`, file bytes encoded as arrays), with SHA-256 identity.
-The shell owner materializes it privately, retains it before commands, checks all original
-bytes/modes after each command, and records the exact environment limitation contract.
-Generated build files are allowed but not delivered. This is not a sandbox: tools,
-dependencies, network, external inputs and writers are not isolated; checks that require
-`.git` metadata need a different supported procedure and cannot be reported as passing here.
-
-A V3 report copies `repository_verification.delivery` into `repository_delivery`, names its
-artifact as the sole `integrated_targets` entry, omits snapshot/content-scope fields, and
-references canonical direct shell outputs with exact command indexes/argv. The loop verifies
-producer identity, admitted target, retained artifact identity, successful zero-exit commands,
-unchanged sources, supported evidence versions and full unchanged original criteria. Reviews
-remain judgments. Historical unresolved contribution evidence blocks completion unless V3
-supplies a later `resolutions` review: exact canonical `output_id` and `checksum_sha256`,
-`item_paths` covering every negative JSON pointer (blockers first, then each contribution's
-remaining_work, failed/not_run validation outcomes (`/contributions/N/validation/M/outcome`),
-and removed retention), a concrete `evidence` explanation, and `check_indices`
-into the final target's authenticated checks. Malformed/unknown history, partial coverage,
-stale identities, duplicate resolutions and failed/missing checks cannot resolve it. This
-retains history and records a review judgment; commands do not prove arbitrary prose.
-V1 cannot certify; V2 retains
-its exact bounded UTF-8 semantics. Existing runs with explicitly V2-only pinned criteria are
-not silently rewritten. New guidance does not override their original stop condition.
+New collaboration goals finish against the user's criteria using actual worker
+results and continuation validation. They do not require Git or repository delivery.
+Retired delivery certification and repository-verification tools are no longer available.
+Historical delivery contracts fail closed; they are not silently converted into ordinary execution.
+Use current shell commands for checks and report observed evidence against the user's criteria.
 
 ## Live supervision
 
@@ -91,125 +23,35 @@ This is not a completion verifier, and absent child links or evidence are not su
 
 New goal evaluators use a fresh authenticated workflow context for canonical-output
 inspection (not filesystem isolation); plain loop context behavior is unchanged.
-Production-path deterministic tests discover revision-pinned output pages, inspect
-exact contribution values, retain their IDs in delivery, and compare the report to
-canonical outputs and the combined artifact. This is scripted coverage, not live-model
-acceptance or host verification of positive evaluator claims. The isolated Git
-conflict scenario also retains the observed integrated commit and checkout,
-references both inspected canonical worker outputs, and lists all retained checkouts.
-Its read-only evaluator inspects the resolved artifact and the revision recorded after
-combined verification; this does not independently rerun validation or certify worker
-commit provenance. New evaluator guidance distinguishes base, contribution and integrated
-revisions, asks for working-tree state, and forbids creating commits just for reporting.
+Production-path deterministic tests discover revision-pinned output pages and inspect
+exact contribution values and the combined artifact. This is scripted coverage, not
+live-model acceptance or host verification of positive evaluator claims. An optional
+Git conflict fixture retains isolated checkout recovery coverage, but Git is not a
+goal requirement. Its read-only evaluator inspects the resolved artifact and recorded
+revision; it does not rerun validation or certify worker commit provenance.
 
-Goal evaluations may retain an optional `delivery` report in their canonical output.
-Historical `version: "1"` reports remain readable but do not certify completion;
-V2 supports bounded UTF-8 delivery, while V3 supports whole-repository delivery subject
-to unchanged admitted criteria. Report fields include integrated targets, inspected canonical contribution output
-IDs, original criteria with passed/failed/unverified evidence, combined commands and
-workspaces with observed outcomes, retained workspaces, and unresolved work. Lists
-and text are schema-bounded. `/goal.status` previews targets, contribution references,
-criterion statuses and evidence, combined check commands/workspaces/outcomes, unresolved
-work and retained workspaces. Each category is limited to ten entries and each text
-field to 320 characters; omissions are explicit.
-`/workflow` retains the full result. Worker, approval, wait, failure and execution-session
-previews also show at most ten entries each. Omission notices count only entries hidden
-from the current snapshot, not the whole run; use `/workflow` for further inspection.
-These are evaluator-reported observations, not
-host-verified receipts or automatic Git integration. Missing reports remain unknown;
-ordinary goals do not require collaboration. Unknown report versions reject.
-Existing admitted graphs are not rewritten. The judgement block is version 4 for
-the extended state schema; incompatible older bindings require normal compatibility
-handling, not silent reinterpretation. Newly authored collaboration goals pin
-`delivery_required=true` on normal and approval-resume safeguard entries. Evaluators
-cannot bypass delivery safeguards by omitting or nulling the report (or returning
-`delivery_required=false`). This requirement is authored graph policy, preserved by
-source-preserving delegation; authorized graph revision remains possible. Historical
-state without the field defaults to false; ordinary goals retain their existing policy.
-New loops always run the loop-owned completion safeguard after agent evaluation,
-including agent-only loops with no judgement provider configured. Reported blockers,
-failed or unverified criteria/checks, empty target/criterion lists, blank target or supplied
-contribution identities, blank criterion descriptions or check commands/workspaces, and unresolved work
-withhold completion. The optional judgement evaluator additionally receives the delivery
-report along with prose evidence and cannot override those negatives, even with fallback
-enabled. Model confidence is an additional gate: it cannot promote an agent evaluator's
-`condition_met=false` into completion, even at probability 1.0. Agent-only safeguarding
-makes no provider request. It also withholds an affirmative decision with empty,
-blank, or oversized prose evidence, using the judgement-backed evidence bounds.
-The service boundary validates supplied delivery reports against the declared V1 schema
-before interpreting them; deserialization alone does not enforce list or string bounds.
-This is conservative rejection,
-not independent verification of positive claims. Supplied contribution IDs are now
-resolved through the versioned, invocation-scoped workflow evidence application service
-before an affirmative decision. The host checksum-verifies each exact output in the
-invoking run; callers cannot select a different run. Missing, corrupt, unsupported or
-unavailable evidence withholds completion even with judgement fallback. The additive
-`inspect_output_provenance` operation returns the bounded, checksum-verified canonical value
-and its immutable activation-bound producer; older hosts reject the unsupported operation.
-The loop consumer checks envelope compatibility, producer identity and revision, and currently
-rejects adapted contribution dataflow rather than risk hiding blockers inside an envelope.
-It rejects explicit blockers and
-remaining work in standard `bcode.delegated_task_result.v2` contributions, including malformed
-required fields. Custom contribution schemas remain authorable but unknown; neither an
-unknown schema nor an empty blocker list proves success. Integrated-target identity,
-criterion coverage and freshness of checks remain unverified by this safeguard.
-Consequently new affirmative evaluations carrying a
-V1 delivery report are withheld with an explicit target-bound-verification blocker, even
-when references authenticate, checks claim success, or judgement fallback is configured.
-Reports may additionally declare `content_scope`: one `{target, workspace, roots}`
-entry for every `integrated_targets` label. The loop rejects duplicate/missing targets,
-relative workspaces, overlapping or non-normalized roots, and scopes without an exact
-workspace/root match in a check execution reference. This is an explicit coverage claim,
-not proof that the chosen scope includes every relevant input, or a freshness certificate.
-Historical reports omit it; positive delivery remains withheld in either case.
-Check execution references may additionally declare `content_roots` (1–64 relative
-paths). When supplied, these must exactly match the canonical admitted shell plan's
-`observe_files`, including order; omitted roots preserve historical reports. This
-binds a scope assertion to the executed observation, not to current filesystem state
-or the entire delivered target. It does not enable positive completion. Shell advanced
-command plans may also supply `expected_content`, an exact previously observed content
-object, alongside `observe_files`. The shell owner re-observes those scopes after normal
-execution authorization and rejects mismatches before running any command. With a
-precondition, it also re-observes after each command: changed or unreadable content
-stops the batch, retains executed command outcomes, and makes the plan unsuccessful,
-even if the last command exited successfully or requested continuation. A final
-observation checks the precondition again. This binds verification to selected integrated
-content (including directory additions), not an arbitrary claim of success. Omitting observations while supplying a precondition fails
-closed. The precondition is part of the prepared command plan identity; omitted
-preconditions preserve existing behavior. It neither locks files against concurrent writers
-nor certifies delivery-time freshness or complete target coverage. The loop evidence
-consumer requires that exact precondition when recognizing a check: equal before/after
-snapshots alone can conceal a batch that changes content, checks it, and restores it.
-This does not detect changes restored within a single command and does not establish
-complete input coverage or delivery-time freshness. Older shell plugins
-reject the new field. Advanced plans may use empty `commands` with nonempty
-`observe_files` for an observation-only execution. This retains the existing exact
-preparation, approval, workspace confinement, and cancellation path; preparation
-exposes absolute workspace-bound read-path policy facts rather than an empty shell
-command. Traversing or absolute observation paths are rejected during preparation,
-before policy or filesystem access. No process is
-spawned, and successful output requires equal before/after observations. Empty
-commands without observation scopes remain invalid. Older shell plugins reject
-empty commands. This gives callers an authorized current observation at that
-activation, not a delivery-time freshness certificate or a successful executed check.
-A check reference may supply `observation_output_id` for a later observation-only
-shell execution. The loop resolves it through the same invocation-scoped execution
-evidence service and requires the same run, supported shell producer, successful
-empty command plan, unchanged precondition, exact selected roots, workspace and
-checked content. Missing or mismatched references reject the check; omission retains
-historical report behavior. Timestamp ordering rejects older observations but does
-not prove causal ordering or exclude intervening writes. This linkage does not
-remove the positive-delivery safeguard or establish complete target coverage.
-The report and original criteria are retained. This is a conservative safety restriction,
-not a positive verification implementation: a canonical target/content-bound observation
-path is still required before such delivery can be certified. The safeguard applies
-even when the incoming agent verdict is negative: a configured judgement provider
-must not promote an omitted required report or an unverified V1 report into
-completion. Such reports return before provider dispatch. Historical reports remain
-readable and terminal outcomes are not rewritten. Ordinary goals without delivery reports
-retain their existing behavior and do not gain a collaboration requirement.
-Existing admitted graphs are unchanged;
-new graph-derived execution allowances account for the additional block.
+`/workflow` retains full canonical results. Goal status previews generic evidence,
+workers, approvals, waits, failures and execution sessions with explicit bounded
+omission notices. These are reported observations, not host verification or automatic
+integration. Ordinary goals do not require collaboration.
+The loop judgement block is now version 5. Versions 1–4 and their repository-delivery
+contracts are retired, not migrated or reinterpreted. Exact block admission and dispatch
+reject unavailable historical contracts. Allowance continuation rejects an incompatible
+retained loop block before constructing a successor; strict state decoding also rejects
+`delivery_required` (including `true`) and `delivery`, rather than dropping requirements.
+The service rejects these fields even when called directly. Use a compatible historical
+plugin to operate an affected run; this release does not rewrite its graph, criteria,
+outputs, or terminal outcomes. Generic workflow inspection retains historical output;
+the goal display surfaces unsupported detail instead of guessing its meaning.
+
+New goals do not require Git, worktrees, commits, repository exports, or specialized
+delivery reports. Explicit collaboration requirements remain in the pinned objective and
+read-only evaluator instructions. Evaluation uses generic evidence, summary, and blockers.
+The completion safeguard rejects empty/unbounded evidence. Optional judgement is an
+additional gate, never authority to promote an evaluator's unresolved verdict. Evaluation
+remains read-only; integration belongs to authorized implementation work. The repository
+verification staging tool, delivery report schemas, and delivery authentication stack have
+been removed, not retained as alternate defaults.
 
 Large nested corrective inputs can exceed the default tool-output context budget.
 Use revision-pinned recipe parts and retained-output inspection, not guessed fields.

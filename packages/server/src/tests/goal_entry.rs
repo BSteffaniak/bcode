@@ -3,8 +3,6 @@ use super::*;
 use bcode_plugin_sdk::tui::*;
 
 mod isolated_recovery;
-mod repository_delivery;
-mod snapshot_delivery;
 
 // These production-driver fixtures each run several real plugin sessions and
 // subprocesses. Keep their bounded execution deadlines independent of parallel
@@ -19,7 +17,6 @@ struct GoalEntryHost {
     starts: StdMutex<Vec<PluginWorkflowStartRequest>>,
     execution_cap: Option<u64>,
     isolated_workspace: Option<PathBuf>,
-    snapshot_case: Option<snapshot_delivery::Case>,
 }
 
 impl PluginTuiHost for GoalEntryHost {
@@ -92,16 +89,7 @@ impl PluginTuiHost for GoalEntryHost {
         if let Some(trees) = &self.isolated_workspace {
             isolated_recovery::install_script(&mut request, &self.workspace, trees);
         } else {
-            install_goal_script(
-                &mut request,
-                &self.workspace,
-                self.snapshot_case.is_some(),
-                self.snapshot_case
-                    .and_then(snapshot_delivery::Case::repository),
-            );
-        }
-        if let Some(case) = self.snapshot_case {
-            snapshot_delivery::install(&mut request, &self.workspace, case);
+            install_goal_script(&mut request, &self.workspace);
         }
         if let Some(cap) = self.execution_cap {
             request.limits.node_execution_cap = cap;
@@ -161,36 +149,18 @@ const COMBINED_CHECK: &str = ". ./integrated.sh; actual=$(total 3 8); test \"$ac
 
 fn contribution_result(workspace: &Path, id: &str) -> serde_json::Value {
     serde_json::json!({
-        "summary":format!("Implemented {id}"), "evidence":[format!("{id}.sh written")], "blockers":[],
-        "contributions":[{
-            "workspace":workspace, "base_revision":null, "source_directory":null,
-            "source_had_local_changes":null, "produced_revisions":[],
-            "artifacts":[workspace.join(format!("{id}.sh"))], "validation":[],
-            "remaining_work":["Integrate and run combined check"], "retention":"retained"
-        }]
+        "summary":format!("Implemented {id}"),
+        "evidence":[format!("{} written", workspace.join(format!("{id}.sh")).display())],
+        "blockers":[]
     })
 }
 
-fn snapshot_contribution_result(workspace: &Path, id: &str, snapshot: bool) -> serde_json::Value {
-    let mut result = contribution_result(workspace, id);
-    if snapshot {
-        // The file contribution is complete; integration and checks remain independent.
-        result["contributions"][0]["remaining_work"] = serde_json::json!([]);
-    }
-    result
-}
-
-fn install_goal_script(
-    request: &mut PluginWorkflowStartRequest,
-    workspace: &Path,
-    snapshot: bool,
-    repository: Option<repository_delivery::Case>,
-) {
+fn install_goal_script(request: &mut PluginWorkflowStartRequest, workspace: &Path) {
     let reference =
         |pointer: &str| serde_json::json!({"$fake_result":{"index":0,"pointer":pointer}});
     let task = |id: &str| {
         serde_json::json!({
-            "task_id":id,"objective":format!("Implement {id}.\ntool-call filesystem.write {}\nstructured-result {}", serde_json::json!({"path":workspace.join(format!("{id}.sh")),"contents":if id == "left" { LEFT_MODULE } else { RIGHT_MODULE }}), snapshot_contribution_result(workspace, id, snapshot)),
+            "task_id":id,"objective":format!("Implement {id}.\ntool-call filesystem.write {}\nstructured-result {}", serde_json::json!({"path":workspace.join(format!("{id}.sh")),"contents":if id == "left" { LEFT_MODULE } else { RIGHT_MODULE }}), contribution_result(workspace, id)),
             "agent_profile":"build","read_only":false,
             "tool_allowlist":["filesystem.write"],
             "resources":[{"resource":format!("contribution:{id}"),"access":"write"}],
@@ -211,26 +181,7 @@ fn install_goal_script(
         "continuation":{"objective":format!("Integrate the actual contributions and verify the combined result.\ntool-call shell.run {integrate}"), "agent_profile":"build", "read_only":false, "tool_allowlist":["shell.run"], "resources":[{"resource":"integration","access":"write"}], "model_selection":{"provider":"bcode.fake-provider","model":"fake-echo"}},
         "reconciliation":[]
     });
-    if repository.is_some() {
-        let mut historical = snapshot_contribution_result(workspace, "left", true);
-        historical["blockers"] = serde_json::json!([
-            "Combined repository not checked",
-            "Immutable delivery not retained"
-        ]);
-        group["tasks"][0]["objective"] = serde_json::json!(format!(
-            "Implement left.\ntool-call filesystem.write {}\nstructured-result {historical}",
-            serde_json::json!({"path":workspace.join("left.sh"),"contents":LEFT_MODULE})
-        ));
-    }
-    install_corrective_script(
-        &mut group,
-        workspace,
-        &integrate,
-        snapshot,
-        repository.map(|case| {
-            repository_delivery::handoff(workspace, &request.input["stop_condition"], case)
-        }),
-    );
+    install_corrective_script(&mut group, workspace, &integrate);
     let publication =
         serde_json::json!({"$fake_result":{"index":0,"pointer":"/publication_arguments"}});
     let source = request
@@ -254,17 +205,8 @@ fn install_goal_script(
     };
     let left = inspect(0, "left");
     let repaired = inspect(1, "repair-right");
-    let output_id =
-        |index| serde_json::json!({"$fake_result":{"index":index,"pointer":"/output/output_id"}});
-    let report = serde_json::json!({
-        "version":"1", "integrated_targets":[workspace.join("integrated.sh")],
-        "contribution_output_ids":[output_id(2),output_id(1)],
-        "criteria":[{"criterion":request.input["stop_condition"],"status":"passed","evidence":"Inspected canonical left and repaired right outputs and the combined artifact"}],
-        "checks":[{"command":COMBINED_CHECK,"workspace":workspace,"outcome":"passed","evidence":"Combined integration check succeeded; evaluator independently read the expected artifact"}],
-        "retained_workspaces":[workspace],"unresolved_work":[]
-    });
     evaluation.configuration["system_prompt"] = serde_json::json!(format!(
-        "{instructions}\ntool-call workflow.execution_context {{\"outputs_only\":true,\"limit\":3,\"$fake_json_pages\":{{\"items\":\"/outputs\",\"next\":\"/next_page_arguments\"}}}}\ntool-call workflow.execution_context {left}\ntool-call workflow.execution_context {repaired}\ntool-call filesystem.read {read}\nloop-delivery {report}"
+        "{instructions}\ntool-call workflow.execution_context {{\"outputs_only\":true,\"limit\":3,\"$fake_json_pages\":{{\"items\":\"/outputs\",\"next\":\"/next_page_arguments\"}}}}\ntool-call workflow.execution_context {left}\ntool-call workflow.execution_context {repaired}\ntool-call filesystem.read {read}"
     ));
 }
 
@@ -272,8 +214,6 @@ fn install_corrective_script(
     group: &mut serde_json::Value,
     workspace: &Path,
     integrate: &serde_json::Value,
-    snapshot: bool,
-    repository_handoff: Option<String>,
 ) {
     let failed_output = bcode_workflow::ValueSchema {
         type_name: "receipt".into(),
@@ -291,12 +231,12 @@ fn install_corrective_script(
         "mutation_id":"goal-correction",
         "run_id":reference("/run_id"),"expected_revision":reference("/graph/revision"),
         "bind_source_activation":reference("/activation_id"),
-        "tasks":[{"task_id":"repair-right","objective":format!("Fix contribution.\ntool-call filesystem.write {fix}\nstructured-result {}", snapshot_contribution_result(workspace, "right", snapshot)),
+        "tasks":[{"task_id":"repair-right","objective":format!("Fix contribution.\ntool-call filesystem.write {fix}\nstructured-result {}", contribution_result(workspace, "right")),
             "agent_profile":"build","read_only":false,"tool_allowlist":["filesystem.write"],
             "resources":[{"resource":"contribution:right","access":"write"}],
             "model_selection":{"provider":"bcode.fake-provider","model":"fake-echo"}}],
-        "continuation":{"objective":format!("verify\ntool-call shell.run {integrate}{}", repository_handoff.unwrap_or_default()),
-            "agent_profile":"build","read_only":false,"tool_allowlist":["shell.run","workflow.execution_context","loop.stage_repository_verification","workflow.publish_run_graph_edit"],
+        "continuation":{"objective":format!("verify\ntool-call shell.run {integrate}"),
+            "agent_profile":"build","read_only":false,"tool_allowlist":["shell.run","workflow.execution_context","workflow.publish_run_graph_edit"],
             "resources":[{"resource":"integration","access":"write"}],
             "model_selection":{"provider":"bcode.fake-provider","model":"fake-echo"}},
         "reconciliation":[]
@@ -318,7 +258,6 @@ fn install_corrective_script(
         "shell.run",
         "workflow.execution_context",
         "workflow.stage_delegation",
-        "loop.stage_repository_verification",
         "workflow.publish_run_graph_edit"
     ]);
     group["continuation"]["objective"] = serde_json::json!(format!(
@@ -350,25 +289,6 @@ async fn goal_entry_request_with_workspace(
     execution_cap: Option<u64>,
     isolated_workspace: Option<PathBuf>,
 ) -> PluginWorkflowStartRequest {
-    goal_entry_request_with_snapshot(
-        session,
-        root,
-        state,
-        execution_cap,
-        isolated_workspace,
-        None,
-    )
-    .await
-}
-
-async fn goal_entry_request_with_snapshot(
-    session: SessionId,
-    root: &Path,
-    state: Arc<ServerState>,
-    execution_cap: Option<u64>,
-    isolated_workspace: Option<PathBuf>,
-    snapshot_case: Option<snapshot_delivery::Case>,
-) -> PluginWorkflowStartRequest {
     let registry = bcode_bundled_plugins::tui_registry("bcode.loop").unwrap();
     let mut surface = registry
         .open(
@@ -391,7 +311,6 @@ async fn goal_entry_request_with_snapshot(
         starts: StdMutex::default(),
         execution_cap,
         isolated_workspace,
-        snapshot_case,
     };
     let key = |key, ctrl| {
         bmux_tui::event::Event::Key(bmux_keyboard::KeyStroke {
@@ -615,11 +534,8 @@ fn assert_named_contributions(
         .iter()
         .find(|output| output.node_id == "left")
         .unwrap();
-    assert_eq!(left.value["contributions"][0]["retention"], "retained");
-    assert_eq!(
-        left.value["contributions"][0]["source_had_local_changes"],
-        serde_json::Value::Null
-    );
+    assert_eq!(left.value["summary"], "Implemented left");
+    assert_eq!(left.value["blockers"], serde_json::json!([]));
     assert_eq!(
         collected.value["results"],
         serde_json::json!({"left":{"status":"completed","value":left.value},"right":{"status":"failed"}})
@@ -645,10 +561,10 @@ fn assert_corrected_contributions(
             .find(|output| output.node_id == node)
             .unwrap();
         assert_eq!(output.value, contribution_result(root, id));
-        let artifact = output.value["contributions"][0]["artifacts"][0]
-            .as_str()
-            .unwrap();
-        assert_eq!(std::fs::read_to_string(artifact).unwrap(), expected);
+        assert_eq!(
+            std::fs::read_to_string(root.join(format!("{id}.sh"))).unwrap(),
+            expected
+        );
     }
     assert!(outputs.iter().any(|output| {
         output.value["results"].get("repair-right").is_some()
@@ -656,10 +572,8 @@ fn assert_corrected_contributions(
     }));
 }
 
-// Continuation must settle the corrected execution, not turn a V1 delivery
-// assertion into successful goal completion. Inspect canonical outputs and
-// receipt-backed attempts as well as independently executing the retained files.
-fn resumed_goal_reached_delivery_guard(
+// Inspect canonical completion and settled attempts, not only worker claims.
+fn resumed_goal_reached_completion(
     state: &ServerState,
     run_id: &str,
     root: &Path,
@@ -673,26 +587,9 @@ fn resumed_goal_reached_delivery_guard(
             store.canonical_terminal_output(run_id).unwrap(),
         )
     };
-    assert!(
-        terminal.is_none(),
-        "V1 assertions must not complete the goal"
-    );
-    if !outputs.iter().any(|output| {
-        output.node_id == "loop.judgement.evaluate" && output.value["delivery"].is_object()
-    }) {
+    if terminal.is_none() {
         return false;
     }
-    // Approval recovery retains the earlier denied evaluation too. Validate the
-    // delivery-bearing round rather than mistaking that historical output for it.
-    let outputs: Vec<_> = outputs
-        .into_iter()
-        .filter(|output| {
-            !matches!(
-                output.node_id.as_str(),
-                "loop.evaluation" | "loop.judgement.evaluate"
-            ) || output.value["delivery"].is_object()
-        })
-        .collect();
     assert_goal_evaluation(&outputs, input);
     let collected = outputs
         .iter()
@@ -729,58 +626,18 @@ fn assert_goal_evaluation(
 ) {
     let evaluated = outputs
         .iter()
+        .rev()
         .find(|output| output.node_id == "loop.evaluation")
         .expect("run retains evaluator output");
     assert_eq!(evaluated.value["condition_met"], true);
     let guarded = outputs
         .iter()
+        .rev()
         .find(|output| output.node_id == "loop.judgement.evaluate")
-        .expect("run retains production delivery decision");
-    assert_eq!(guarded.value["condition_met"], false);
-    assert_eq!(guarded.value["delivery"], evaluated.value["delivery"]);
-    // Workers explicitly retain integration/check work in their immutable reports.
-    // Current delivery policy rejects that unresolved contribution before reaching
-    // the independent target-verification safeguard; integration cannot rewrite it.
-    assert!(
-        outputs
-            .iter()
-            .filter(|output| matches!(output.node_id.as_str(), "left" | "repair-right"))
-            .all(|output| !output.value["contributions"][0]["remaining_work"]
-                .as_array()
-                .unwrap()
-                .is_empty())
-    );
-    assert!(
-        guarded.value["summary"]
-            .as_str()
-            .unwrap()
-            .contains("canonical contribution references could not be authenticated in this run or report unresolved work"),
-        "delivery safeguard: {}", guarded.value["summary"]
-    );
-    let delivery = &evaluated.value["delivery"];
-    assert_eq!(delivery["version"], "1");
-    for (index, node) in ["left", "repair-right"].iter().enumerate() {
-        let contribution = outputs
-            .iter()
-            .filter(|output| output.node_id == *node)
-            .max_by_key(|output| output.created_at_ms)
-            .unwrap();
-        assert_eq!(
-            delivery["contribution_output_ids"][index],
-            contribution.output_id
-        );
-        assert_eq!(
-            delivery["retained_workspaces"][0],
-            contribution.value["contributions"][0]["workspace"]
-        );
-    }
-    assert_eq!(delivery["checks"][0]["command"], COMBINED_CHECK);
-    assert_eq!(delivery["checks"][0]["outcome"], "passed");
-    assert_eq!(
-        delivery["criteria"][0]["criterion"],
-        input["stop_condition"]
-    );
-    assert_eq!(delivery["unresolved_work"], serde_json::json!([]));
+        .expect("run retains production completion decision");
+    assert_eq!(guarded.value["condition_met"], true);
+    assert_eq!(guarded.value["evidence"], evaluated.value["evidence"]);
+    assert!(!guarded.value["evidence"].as_array().unwrap().is_empty());
     for field in [
         "implementation_prompt",
         "stop_condition",
@@ -947,14 +804,14 @@ async fn real_goal_entry_approval_resumes_correction_without_false_completion() 
     tokio::time::timeout(Duration::from_mins(1), async {
         loop {
             approve_goal_permissions(&state, session.id).await;
-            if resumed_goal_reached_delivery_guard(&state, run_id, root.path(), &request.input) {
+            if resumed_goal_reached_completion(&state, run_id, root.path(), &request.input) {
                 break;
             }
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
     })
     .await
-    .expect("approved goal must settle correction and the conservative delivery decision");
+    .expect("approved goal must settle correction and the completion decision");
     drop(state);
     assert_integrated_files(root.path());
 }
@@ -1321,7 +1178,7 @@ async fn exhausted_goal_resumes_after_idempotent_ipc_allowance_grant() {
     tokio::time::timeout(Duration::from_secs(30), async {
         loop {
             approve_goal_permissions(&state, session.id).await;
-            if resumed_goal_reached_delivery_guard(&state, &run_id, root.path(), &request.input) {
+            if resumed_goal_reached_completion(&state, &run_id, root.path(), &request.input) {
                 break;
             }
             tokio::time::sleep(Duration::from_millis(20)).await;
@@ -1336,7 +1193,7 @@ async fn exhausted_goal_resumes_after_idempotent_ipc_allowance_grant() {
             .attempt_history(&run_id, None, 100)
             .unwrap();
         panic!(
-            "renewed goal must settle correction and the conservative delivery decision: {error}; attempts: {attempts:?}"
+            "renewed goal must settle correction and the completion decision: {error}; attempts: {attempts:?}"
         );
     });
     let attempts = state
@@ -1424,7 +1281,7 @@ async fn assert_goal_integration_conflict(stale_marker: bool) {
         .attempt_history(&run_id, None, 100)
         .unwrap();
     drop(state);
-    assert!(contributions_settled(&attempts));
+    assert!(contributions_settled(&attempts), "{attempts:#?}");
     assert!(
         !attempts
             .iter()
@@ -1489,9 +1346,7 @@ async fn real_goal_entry_publishes_and_executes_two_workers() {
                     attempt.node_id == collected.node_id && attempt.status == "succeeded"
                 }));
                 assert_worker_sessions(&state, &run_id, session.id);
-                // The scripted V1 report is an assertion, not target-bound observed
-                // verification. Wait for evaluation, not a positive terminal output:
-                // production must retain the contributions and continue the goal.
+                // Wait for the read-only evaluator and canonical goal terminal output.
                 if !outputs
                     .iter()
                     .any(|output| output.node_id == "loop.judgement.evaluate")
@@ -1509,8 +1364,8 @@ async fn real_goal_entry_publishes_and_executes_two_workers() {
                         .unwrap()
                         .canonical_terminal_output(&run_id)
                         .unwrap()
-                        .is_none(),
-                    "V1 evaluator assertions must not terminalize the goal as delivered"
+                        .is_some(),
+                    "the supported evaluation must terminalize the completed goal"
                 );
                 break;
             }

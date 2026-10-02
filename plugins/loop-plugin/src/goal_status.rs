@@ -71,7 +71,7 @@ pub const fn controls(status: bcode_workflow::RunStatus) -> &'static str {
             "\nGoal cancelled: completed effects and retained workspaces are not undone. Inspect /workflow and the workspace before starting another /goal."
         }
         RunStatus::Completed => {
-            "\nExecution finished: inspect the goal evaluation and delivery evidence below; a completed run alone does not establish that the original criteria were satisfied."
+            "\nExecution finished: inspect the goal evaluation evidence below; a completed run alone does not establish that the original criteria were satisfied."
         }
     }
 }
@@ -243,114 +243,7 @@ fn format_result(text: &mut String, view: &WorkflowRunView, output_id: &str) {
             "\n  Additional evidence omitted; inspect the canonical result in /workflow.",
         );
     }
-    if let Some(delivery) = &result.delivery {
-        delivery_location(text, delivery);
-        for target in delivery.integrated_targets.iter().take(DETAIL_LIMIT) {
-            let _ = write!(text, "\n  Integrated target: {}", preview(target));
-        }
-        for criterion in delivery.criteria.iter().take(DETAIL_LIMIT) {
-            let _ = write!(
-                text,
-                "\n  Criterion [{}]: {} · {} · {}",
-                observation(&criterion.status),
-                preview(&criterion.description),
-                preview(&criterion.evidence),
-                match criterion.basis {
-                    Some(crate::delivery::CriterionBasis::ObservedCheck) =>
-                        "claimed observed check",
-                    Some(crate::delivery::CriterionBasis::Review) => "review judgment",
-                    Some(crate::delivery::CriterionBasis::Unknown) | None => "unknown basis",
-                }
-            );
-        }
-        for check in delivery.checks.iter().take(DETAIL_LIMIT) {
-            let _ = write!(
-                text,
-                "\n  Check [{}]: {} · workspace {} · {}",
-                observation(&check.outcome),
-                preview(&check.command),
-                preview(&check.workspace),
-                preview(&check.evidence)
-            );
-        }
-        for unresolved in delivery.unresolved_work.iter().take(DETAIL_LIMIT) {
-            let _ = write!(text, "\n  Unresolved: {}", preview(unresolved));
-        }
-        for workspace in delivery.retained_workspaces.iter().take(DETAIL_LIMIT) {
-            let _ = write!(text, "\n  Retained workspace: {}", preview(workspace));
-        }
-        contribution_reviews(text, delivery);
-        if [
-            delivery.resolutions.len(),
-            delivery.integrated_targets.len(),
-            delivery.criteria.len(),
-            delivery.checks.len(),
-            delivery.unresolved_work.len(),
-            delivery.retained_workspaces.len(),
-            delivery.contribution_output_ids.len(),
-        ]
-        .into_iter()
-        .any(|count| count > DETAIL_LIMIT)
-        {
-            text.push_str(
-                "\n  Additional delivery details omitted; inspect /workflow for the full report.",
-            );
-        }
-        let _ = write!(
-            text,
-            "\n  {} contribution references · {} criteria · {} checks · {} unresolved items. Inspect /workflow for full delivery evidence.",
-            delivery.contribution_output_ids.len(),
-            delivery.criteria.len(),
-            delivery.checks.len(),
-            delivery.unresolved_work.len()
-        );
-    }
     text.push_str("\nEvaluation evidence is reported, not independently verified by this display.");
-}
-
-fn contribution_reviews(text: &mut String, delivery: &crate::delivery::DeliveryReport) {
-    for output in delivery.contribution_output_ids.iter().take(DETAIL_LIMIT) {
-        let _ = write!(text, "\n  Contribution reference: {}", preview(output));
-    }
-    for resolution in delivery.resolutions.iter().take(DETAIL_LIMIT) {
-        let _ = write!(
-            text,
-            "\n  Resolution review: {} · checksum {} · {} historical items · {} referenced checks · {}",
-            preview(&resolution.output_id),
-            preview(&resolution.checksum_sha256),
-            resolution.item_paths.len(),
-            resolution.check_indices.len(),
-            preview(&resolution.evidence)
-        );
-    }
-}
-
-fn delivery_location(text: &mut String, delivery: &crate::delivery::DeliveryReport) {
-    text.push_str("\nDelivery report (evaluator-reported):");
-    if delivery.version == crate::delivery::ReportVersion::V2 {
-        text.push_str("\n  Delivered location: canonical result delivery.delivered_snapshot (complete retained UTF-8 bytes). Not live checkout freshness or hermetic environment verification; reviews remain judgments.");
-    } else if delivery.version == crate::delivery::ReportVersion::V3 {
-        if let Some(repository) = &delivery.repository_delivery {
-            let _ = write!(
-                text,
-                "\n  Repository export: {} · commit {} · SHA-256 {}",
-                preview(&repository.artifact),
-                preview(&repository.target.commit),
-                preview(&repository.sha256)
-            );
-            text.push_str("\n  Delivered location: canonical result delivery.repository_delivery references the retained complete commit export, not uncommitted checkout files. Checks do not establish live checkout freshness or a hermetic environment. Resolution reviews retain historical evidence and remain judgments.");
-        } else {
-            text.push_str("\n  Repository delivery missing; target identity is unverified.");
-        }
-    }
-}
-
-const fn observation(value: &crate::delivery::Observation) -> &'static str {
-    match value {
-        crate::delivery::Observation::Passed => "passed",
-        crate::delivery::Observation::Failed => "failed",
-        crate::delivery::Observation::Unverified => "unverified",
-    }
 }
 
 #[cfg(test)]
@@ -411,6 +304,25 @@ pub mod tests {
         assert!(super::controls(RunStatus::Cancelled).contains("not undone"));
     }
     use super::*;
+    pub fn view() -> WorkflowRunView {
+        serde_json::from_value(serde_json::json!({
+            "version": bcode_workflow_view_models::WORKFLOW_VIEW_VERSION,
+            "run": {"run_id":"run", "display_title":"Goal", "binding_label":null,
+                "definition_id":"goal", "definition_version":1, "authored_source":null,
+                "definition_disposition": bcode_workflow_view_models::WorkflowDefinitionDisposition::CompiledOnly,
+                "progress": bcode_workflow_view_models::WorkflowRunProgress::default(),
+                "attention": bcode_workflow_view_models::WorkflowAttentionSummary::default(),
+                "parent_run_id":null, "descendant_count":0, "status":"running",
+                "created_at_ms":0, "updated_at_ms":0},
+            "nodes": [{"node_id":"worker", "name":"Implement change", "kind":"agent",
+                "activation_id":"active", "status":"completed"}],
+            "activations":[], "edges":[], "waits":[], "mutation_approvals":[],
+            "attempts":[], "retry_schedules":[], "outputs":[], "failure_diagnostics":[],
+            "descendant_runs":[], "tool_permissions":[], "child_sessions":[], "actions":[],
+            "terminal":null, "health":{"state":"current"}
+        }))
+        .unwrap()
+    }
 
     #[test]
     fn final_result_uses_terminal_identity_and_preserves_incomplete_verdict() {
@@ -427,13 +339,8 @@ pub mod tests {
                 "implementation_prompt":"Implement objective","stop_condition":"Combined checks pass",
                 "max_iterations":1,"iteration":1,"condition_met":met,
                 "summary":"Combined check failed\nRetain both contributions",
-                "evidence":["integrated.sh: expected 27, observed 28"],
-                "delivery": {
-                    "version":"1", "integrated_targets":["integrated.sh"],
-                    "contribution_output_ids":["left", "right"],
-                    "criteria":[{"criterion":"total is 27", "status":"failed", "evidence":"observed 28"}],
-                    "checks":[{"command":"sh verify.sh", "workspace":"integration", "outcome":"failed", "evidence":"exit 1"}], "retained_workspaces":["worker-right"], "unresolved_work":["fix surcharge"]
-                }
+                "evidence":["integrated.sh: expected 27, observed 28"]
+
             }}
         })).unwrap()
         };
@@ -442,16 +349,7 @@ pub mod tests {
         assert!(text.contains("criteria not satisfied"));
         assert!(!text.contains("criteria reported satisfied"));
         assert!(text.contains("Combined check failed Retain both contributions"));
-        assert!(text.contains("Criterion [failed]: total is 27 · observed 28"));
-        assert!(text.contains("Check [failed]: sh verify.sh · workspace integration · exit 1"));
-        assert!(text.contains("Unresolved: fix surcharge"));
-        assert!(text.contains("Retained workspace: worker-right"));
-        assert!(text.contains("Contribution reference: right"));
         assert!(text.contains("integrated.sh: expected 27, observed 28"));
-        assert!(text.contains("Integrated target: integrated.sh"));
-        assert!(
-            text.contains("2 contribution references · 1 criteria · 1 checks · 1 unresolved items")
-        );
         snapshot.outputs[1].value = WorkflowOutputValue::Unresolved;
         let text = format(&snapshot);
         assert!(text.contains("Goal result detail unavailable"));
@@ -483,108 +381,6 @@ pub mod tests {
             value: serde_json::json!({"summary":"success"}),
         };
         assert!(format(&snapshot).contains("unsupported result shape"));
-    }
-
-    #[test]
-    fn repository_delivery_and_resolution_reviews_remain_bounded_claims() {
-        let mut snapshot = view();
-        snapshot.terminal = Some(WorkflowTerminalView::Completed {
-            output_id: "final".into(),
-        });
-        snapshot.outputs = vec![serde_json::from_value(serde_json::json!({
-            "output_id":"final","node_id":"evaluation","activation_id":"a",
-            "schema_id":"loop","schema_version":1,"checksum_sha256":"checksum",
-            "artifact_reference":null,"created_at_ms":0,
-            "value":{"availability":"resolved","value":{
-                "implementation_prompt":"objective","stop_condition":"criteria",
-                "max_iterations":1,"iteration":1,"condition_met":false,
-                "summary":"Live acceptance unknown","evidence":["Retained target"],
-                "delivery":{
-                    "version":"3","integrated_targets":["artifact"],
-                    "repository_delivery":{"target":{"version":1,"commit":"a".repeat(40)},"artifact":"artifact","sha256":"b".repeat(64)},
-                    "contribution_output_ids":["worker"],"criteria":[],"checks":[],
-                    "retained_workspaces":["integration"],"unresolved_work":["Live acceptance"],
-                    "resolutions":vec![serde_json::json!({"output_id":"worker","checksum_sha256":"c".repeat(64),"item_paths":["/blockers/0"],"check_indices":[0],"evidence":format!("Reviewed\n{}", "界".repeat(400))}); 11]
-                }
-            }}
-        })).unwrap()];
-        let text = format(&snapshot);
-        assert!(text.contains(&format!(
-            "Repository export: artifact · commit {} · SHA-256 {}",
-            "a".repeat(40),
-            "b".repeat(64)
-        )));
-        assert!(text.contains("not uncommitted checkout files"));
-        assert!(text.contains("hermetic environment"));
-        assert!(text.contains("remain judgments"));
-        assert_eq!(text.matches("Resolution review:").count(), DETAIL_LIMIT);
-        assert!(text.contains("Additional delivery details omitted"));
-        assert!(text.contains("Reviewed 界"));
-        assert!(!text.contains(&"界".repeat(321)));
-        assert!(text.contains("Unresolved: Live acceptance"));
-        assert!(text.contains("not independently verified"));
-    }
-
-    #[test]
-    fn delivery_details_are_bounded_and_do_not_upgrade_unknown_checks() {
-        let mut snapshot = view();
-        snapshot.terminal = Some(WorkflowTerminalView::Completed {
-            output_id: "final".into(),
-        });
-        snapshot.outputs = vec![serde_json::from_value(serde_json::json!({
-            "output_id":"final","node_id":"evaluation","activation_id":"a",
-            "schema_id":"loop","schema_version":1,"checksum_sha256":"checksum",
-            "artifact_reference":null,"created_at_ms":0,
-            "value":{"availability":"resolved","value":{
-                "implementation_prompt":"objective","stop_condition":"criteria",
-                "max_iterations":1,"iteration":1,"condition_met":false,
-                "summary":"verification pending", "evidence":["check not run"],
-                "delivery": {
-                    "version":"1", "integrated_targets":vec!["target"; 11],
-                    "contribution_output_ids":vec!["output"; 11],
-                    "criteria":vec![serde_json::json!({"criterion":"required", "status":"unverified", "evidence":"not checked"}); 11],
-                    "checks":vec![serde_json::json!({"command":"verify", "workspace":"workspace", "outcome":"unverified", "evidence":"not run"}); 11],
-                    "retained_workspaces":vec!["worker"; 11],
-                    "unresolved_work":vec![format!("repair\n{}", "界".repeat(400)); 11]
-                }
-            }}
-        })).unwrap()];
-        let text = format(&snapshot);
-        for label in [
-            "Integrated target:",
-            "Contribution reference:",
-            "Criterion [unverified]:",
-            "Check [unverified]:",
-            "Retained workspace:",
-            "Unresolved:",
-        ] {
-            assert_eq!(text.matches(label).count(), DETAIL_LIMIT, "{label}");
-        }
-        assert!(text.contains("Additional delivery details omitted"));
-        assert!(text.contains("Unresolved: repair 界"));
-        assert!(!text.contains(&"界".repeat(321)));
-        assert!(!text.contains("Check [passed]"));
-        assert!(text.contains("not independently verified"));
-    }
-
-    pub fn view() -> WorkflowRunView {
-        serde_json::from_value(serde_json::json!({
-            "version": bcode_workflow_view_models::WORKFLOW_VIEW_VERSION,
-            "run": {"run_id":"run", "display_title":"Goal", "binding_label":null,
-                "definition_id":"goal", "definition_version":1, "authored_source":null,
-                "definition_disposition": bcode_workflow_view_models::WorkflowDefinitionDisposition::CompiledOnly,
-                "progress": bcode_workflow_view_models::WorkflowRunProgress::default(),
-                "attention": bcode_workflow_view_models::WorkflowAttentionSummary::default(),
-                "parent_run_id":null, "descendant_count":0, "status":"running",
-                "created_at_ms":0, "updated_at_ms":0},
-            "nodes": [{"node_id":"worker", "name":"Implement change", "kind":"agent",
-                "activation_id":"active", "status":"completed"}],
-            "activations":[], "edges":[], "waits":[], "mutation_approvals":[],
-            "attempts":[], "retry_schedules":[], "outputs":[], "failure_diagnostics":[],
-            "descendant_runs":[], "tool_permissions":[], "child_sessions":[], "actions":[],
-            "terminal":null, "health":{"state":"current"}
-        }))
-        .unwrap()
     }
 
     #[test]

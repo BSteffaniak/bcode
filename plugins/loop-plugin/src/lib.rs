@@ -4,10 +4,6 @@
 
 //! Workflow-native deterministic prompt loops for Bcode sessions.
 
-mod delivery;
-mod delivery_execution;
-mod repository_verification;
-
 use std::collections::BTreeSet;
 use std::fmt::Write as _;
 use std::fs;
@@ -90,9 +86,6 @@ impl RustPlugin for LoopPlugin {
     }
 
     fn invoke_service(&mut self, context: NativeServiceContext) -> ServiceResponse {
-        if context.request.interface_id == "bcode.tool/v1" {
-            return repository_verification::invoke(&context);
-        }
         if context.request.interface_id == bcode_workflow::WORKFLOW_BLOCK_INTERFACE_ID {
             return judgement_evaluation::invoke(&context);
         }
@@ -2095,6 +2088,7 @@ impl ReferenceWorkflowState {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 struct LoopWorkflowInput {
     implementation_prompt: String,
     stop_condition: String,
@@ -2153,14 +2147,13 @@ enum LoopExternalBlocker {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 struct LoopWorkflowIteration {
     implementation_prompt: String,
     stop_condition: String,
     max_iterations: u32,
     #[serde(default)]
     planning_ready: bool,
-    #[serde(default)]
-    delivery_required: bool,
     #[serde(default)]
     external_blocker: LoopExternalBlocker,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -2169,11 +2162,10 @@ struct LoopWorkflowIteration {
     condition_met: bool,
     evidence: Vec<String>,
     summary: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    delivery: Option<delivery::DeliveryReport>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 struct LoopWorkflowEvaluation {
     external_blocker: LoopExternalBlocker,
     implementation_prompt: String,
@@ -2187,8 +2179,6 @@ struct LoopWorkflowEvaluation {
     evidence: Vec<String>,
     #[schemars(length(min = 1))]
     summary: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    delivery: Option<delivery::DeliveryReport>,
 }
 
 #[allow(dead_code)]
@@ -2401,7 +2391,7 @@ fn loop_workflow_spec(
         "loop.evaluation",
         bcode_workflow::NodeKind::Agent,
         serde_json::to_value(loop_agent_configuration::<LoopWorkflowEvaluation>(
-            "Read-only loop completion evaluation. Inspect repository/session state against stop_condition. For delegated coding work, inspect checksum-verified canonical worker outputs and actual integrated artifacts, not just worker summaries or coordinator completion. Use workflow.execution_context with outputs_only:true and a small limit for bounded contribution discovery without graph/delegation overhead, then use the listed inspection_arguments for each contribution: output_only returns the exact verified value without unrelated graph/delegation payloads. Follow revision-pinned pages for discovery; missing or truncated output is not inspected evidence. Discover retained delivery-report collector outputs as well as worker contributions: repository verification preserves source state, so a collector report may not be present in your input. Inspect the collector's checksum-verified canonical value, authenticate its referenced contributions and direct-shell checks, and independently review it before carrying its report into delivery; a collector's success is not completion. Independently inspect the integrated artifact and observed combined checks; a marker file alone is not proof that the current artifact passes. Identify the integrated target or revision, observed combined validation commands and outcomes, original criteria covered, unresolved work and retained workspaces in evidence. For isolated Git work, inspect the actual integrated commit and working-tree state; retain the checkout location in retained_workspaces and the revision in evidence. integrated_targets is version-specific: sorted file paths for V2, or the sole retained repository artifact for V3. Reference inspected worker outputs for contribution provenance; distinguish their base and produced revisions from the integrated revision, and disclose uncommitted changes or unknown provenance. A branch name alone is not an immutable revision. Do not create commits merely to populate a report. For coding delivery, V1 reports cannot certify completion. Use V2 only for an exact complete bounded UTF-8 delivered_snapshot retained in the canonical result, authenticated by a direct shell.exec V2 plan with the identical delivered_snapshot. This certifies retained bytes, not live checkout freshness or hermetic environment. Preserve the whole original stop condition verbatim in original_stop_condition and one whole-objective criterion; detail all requirements, label basis observed_check/review/unknown, and supply check_indices for observed_check criteria. Reviews remain judgments, unknown blocks completion. Set integrated_targets to sorted snapshot file paths, omit content_scope, and give each check execution its canonical output_id, command_index and exact argv without content_roots or observation_output_id. Never narrow the objective to fit the bounded contract. For repository delivery use V3 only when compatible with the unchanged original stop condition. Copy repository_delivery from the authenticated canonical shell repository_verification.delivery; set integrated_targets to [repository_delivery.artifact], omit delivered_snapshot and content_scope, and reference exact command output_id, command_index and argv without content_roots or observation_output_id. Require a direct shell.exec command-plan V2 with the identical repository_target and successful zero-exit checks. This certifies the retained complete commit export, not dirty checkout contents or a hermetic environment. Required work outside the commit remains unresolved. V3 may resolve historical delegated-task blockers only through explicit resolutions carrying the exact inspected output_id, checksum_sha256, every negative item_paths JSON pointer (blockers, each contribution's remaining_work, failed or not_run validation outcome paths, and removed retention; order is immaterial but duplicates are rejected), a concrete review judgment covering those items, and check_indices into authenticated final-target checks. Retain the original contribution_output_ids and never rewrite history; missing identity, incomplete resolution or unauthenticated checks blocks completion. Do not upgrade a pinned V2-only stop condition to V3. Populate the delivery report with canonical contribution output IDs you actually inspected, integrated targets, each original criterion and its observed status, combined check commands/workspaces/outcomes/evidence, retained workspaces and unresolved work. These references are claims, not verified receipts; never invent identities or infer validation from worker success. Omit delivery when no integrated target is inspectable; failed or unverified required criteria and unresolved work preclude condition_met. Missing provenance is unknown, and unverified required criteria or unresolved conflicts preclude completion. Preserve implementation_prompt, stop_condition, max_iterations, iteration, and judgement_evaluation unchanged. Return condition_met, external_blocker, non-empty concrete evidence, and a concise non-empty summary in the exact structured schema. Set external_blocker to none for useful incomplete work or verified completion. When progress requires an external approval, input, or dependency, report the matching blocker and identify the original request/dependency and authorized next action in evidence; do not infer associations from prose or treat this report as approval. A blocker parks the loop until explicit authorized workflow resume approval; that approval does not approve the underlying tool or resolve the external dependency. it does not poll or automatically resolve dependencies. A blocked result is not completion. If a judgement evaluator is selected, your condition_met is provisional: gather concrete bounded evidence for that evaluator; do not change its configuration.",
+            "Read-only loop completion evaluation. Inspect existing state against the complete pinned stop_condition. Inspect checksum-verified canonical worker outputs and actual integrated artifacts, not worker summaries or coordinator completion alone. Use workflow.execution_context outputs_only pages followed by output_only inspection. Report concrete evidence, validation commands and outcomes, unresolved work and blockers. Missing or truncated evidence remains unverified. A successful worker or completed run is not goal completion. Do not mutate files, perform integration, commission work, or weaken the original goal. Return condition_met only when all original requirements are supported by inspected evidence.",
             "plan",
             true,
         ))
@@ -2525,24 +2515,8 @@ fn collaborating_goal_spec(
         .push_str(include_str!("../prompts/goal-collaboration-evaluation.md"));
     evaluator.configuration =
         serde_json::to_value(evaluation).map_err(|error| error.to_string())?;
-    // Pin authored collaboration policy at every safeguard entry, including resume.
-    // The evaluator cannot relax it by omitting the optional delivery report.
-    for edge in &mut definition.edges {
-        if edge.to != "loop.judgement.evaluate" {
-            continue;
-        }
-        let Some(bcode_workflow::WorkflowTransform {
-            expression: bcode_workflow::WorkflowTransformExpression::Object { fields },
-            ..
-        }) = &mut edge.transform
-        else {
-            return Err("collaboration safeguard entry lacks a pinned state transform".into());
-        };
-        fields.insert(
-            "delivery_required".into(),
-            bcode_workflow::WorkflowTransformExpression::Constant { value: true.into() },
-        );
-    }
+    // Collaboration changes agent instructions, not completion policy. Existing
+    // Historical graphs are not rewritten; incompatible blocks fail at admission.
     bcode_workflow::WorkflowSpec::from_definition(WORKFLOW_KIND, definition)
         .map_err(|error| error.to_string())
 }
@@ -2678,13 +2652,11 @@ fn loop_workflow_initial_value(input: &LoopWorkflowInput) -> LoopWorkflowIterati
         max_iterations: input.max_iterations,
         judgement_evaluation: input.judgement_evaluation.clone(),
         planning_ready: false,
-        delivery_required: false,
         external_blocker: LoopExternalBlocker::None,
         iteration: 1,
         condition_met: false,
         evidence: Vec::new(),
         summary: String::new(),
-        delivery: None,
     }
 }
 
@@ -3006,12 +2978,11 @@ mod tests {
         base: &bcode_workflow::WorkflowDefinition,
         collaborating: &bcode_workflow::WorkflowDefinition,
     ) {
-        assert_eq!(base.edges.len(), collaborating.edges.len());
+        assert_eq!(base.edges, collaborating.edges);
         let input = LoopWorkflowInput::new("implement".into(), "done".into(), 2).unwrap();
         let state = serde_json::to_value(loop_workflow_initial_value(&input)).unwrap();
         let mut current = state.clone();
         current["condition_met"] = true.into();
-        current["delivery_required"] = false.into();
         let mut safeguarded = 0;
         for (plain, requested) in base.edges.iter().zip(&collaborating.edges) {
             if requested.to != "loop.judgement.evaluate" {
@@ -3031,8 +3002,7 @@ mod tests {
                     value: &current,
                 },
             ];
-            let mut expected = plain.transform.as_ref().unwrap().evaluate(&inputs).unwrap();
-            expected["delivery_required"] = true.into();
+            let expected = plain.transform.as_ref().unwrap().evaluate(&inputs).unwrap();
             assert_eq!(
                 requested
                     .transform
@@ -3565,13 +3535,6 @@ mod tests {
         model_output["judgement_evaluation"]["provider_plugin_id"] =
             serde_json::json!("bcode.other");
         model_output["stop_condition"] = serde_json::json!("weaker condition");
-        model_output["delivery"] = serde_json::json!({
-            "version":"1", "integrated_targets":["integrated.sh"],
-            "contribution_output_ids":["left-output", "right-output"],
-            "criteria":[{"criterion":"combined result", "status":"failed", "evidence":"check exited 1"}],
-            "checks":[{"command":"sh check.sh", "workspace":"/workspace", "outcome":"failed", "evidence":"exit 1"}],
-            "retained_workspaces":["/worker-left"], "unresolved_work":["fix combined result"]
-        });
         let pinned = serde_json::to_value(loop_workflow_initial_value(&input)).unwrap();
         let adapted = transform
             .evaluate(&[
@@ -3591,12 +3554,6 @@ mod tests {
         );
         assert_eq!(adapted["stop_condition"], pinned["stop_condition"]);
         assert_eq!(adapted["evidence"], model_output["evidence"]);
-        assert_eq!(adapted["delivery"], model_output["delivery"]);
-        let decoded: LoopWorkflowIteration = serde_json::from_value(adapted).unwrap();
-        assert_eq!(
-            decoded.delivery.unwrap().checks[0].outcome,
-            delivery::Observation::Failed
-        );
         assert_eq!(
             node.configuration,
             serde_json::to_value(judgement_evaluation::manifest_block()).unwrap()
@@ -4541,8 +4498,8 @@ mod tests {
             ["schema"]["schema"];
         assert!(
             bcode_model_schema::normalize(evaluation_schema, &bedrock_schema_dialect_for_test())
-                .is_err(),
-            "Bedrock must reject the dynamic map rather than silently erase delivered files"
+                .is_ok(),
+            "Generic evaluation must fit the provider dialect"
         );
         assert!(
             definition.nodes["loop.implementation"].configuration["tools"].is_null(),
@@ -4581,13 +4538,13 @@ mod tests {
             let source = serde_json::to_value(schema).expect("serialize loop schema");
             let encoding = bcode_model_schema::ObjectMapEncoding::compile(&source)
                 .expect("loop maps have a reversible provider representation");
-            assert!(encoding.is_adapted());
-            let normalized = bcode_model_schema::normalize(encoding.schema(), &dialect)
+            assert!(!encoding.is_adapted());
+            bcode_model_schema::normalize(encoding.schema(), &dialect)
                 .expect("loop schema must fit the strict provider dialect");
             let canonical = serde_json::json!({
                 "implementation_prompt":"work", "stop_condition":"done", "max_iterations":1,
                 "iteration":0, "condition_met":false,"external_blocker":"none",
-                "evidence":["pending"],"summary":"pending", "delivery":null
+                "evidence":["pending"],"summary":"pending"
             });
             let decoded = encoding.decode(canonical.clone()).unwrap();
             assert_eq!(decoded, canonical);
@@ -4595,36 +4552,6 @@ mod tests {
                 jsonschema::validator_for(&source)
                     .unwrap()
                     .is_valid(&decoded)
-            );
-            // Exercise the real nested delivery schema, not just a null optional report.
-            let snapshot = serde_json::json!({"version":1,"files":[{"key":"src/a.rs","value":"fn a() {}\n"},{"key":"README.md","value":"hello"}]});
-            let mut with_delivery = canonical.clone();
-            with_delivery["delivery"] = serde_json::json!({
-                "version":"2", "delivered_snapshot":snapshot, "integrated_targets":["README.md","src/a.rs"],
-                "contribution_output_ids":[],"criteria":[{"criterion":"done","status":"passed","evidence":"check"}],
-                "checks":[],"retained_workspaces":[],"unresolved_work":[]
-            });
-            let decoded = encoding.decode(with_delivery).unwrap();
-            assert_eq!(
-                decoded["delivery"]["delivered_snapshot"]["files"]["src/a.rs"],
-                "fn a() {}\n"
-            );
-            assert!(
-                jsonschema::validator_for(&source)
-                    .unwrap()
-                    .is_valid(&decoded)
-            );
-            let blocker = &normalized["properties"]["external_blocker"];
-            assert!(blocker.get("$ref").is_some());
-            assert!(blocker.get("default").is_none());
-            assert_eq!(
-                normalized["$defs"]["LoopExternalBlocker"]["enum"],
-                serde_json::json!([
-                    "none",
-                    "approval_required",
-                    "input_required",
-                    "dependency_required"
-                ])
             );
         }
     }

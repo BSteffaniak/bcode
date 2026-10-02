@@ -12,13 +12,10 @@
 //! carrying bounded recording artifact revisions; durable replay uses shell-owned artifact
 //! references.
 
-mod content_observation;
 mod contracts;
 pub mod recording;
-mod repository;
 #[cfg(feature = "static-bundled")]
 pub mod shell_run_tui;
-mod snapshot;
 mod terminal_clean;
 
 use bcode_config::{
@@ -320,8 +317,14 @@ fn shell_workflow_command_plan(
         };
         shell_script_command_plan(request)
     } else {
-        serde_json::from_value::<ShellWorkflowCommandPlan>(input.clone())
-            .map_err(|error| error.to_string())
+        let plan: ShellWorkflowCommandPlan =
+            serde_json::from_value(input.clone()).map_err(|error| error.to_string())?;
+        if plan.version != contracts::SHELL_COMMAND_PLAN_VERSION {
+            return Err(
+                "unsupported shell command-plan version; author a new version 3 plan".into(),
+            );
+        }
+        Ok(plan)
     }
 }
 
@@ -340,28 +343,8 @@ fn posix_quote_workflow_word(word: &str) -> String {
 fn workflow_command_analysis(
     input: &serde_json::Value,
     plan: &ShellWorkflowCommandPlan,
-    workspace_root: &std::path::Path,
+    _workspace_root: &std::path::Path,
 ) -> bcode_plugin_sdk::ToolPolicyOperation {
-    if plan.commands.is_empty() {
-        // Observation-only plans still pass through exact workflow preparation and
-        // approval. Expose their filesystem reads rather than an empty shell command.
-        return bcode_plugin_sdk::ToolPolicyOperation::Read {
-            paths: plan
-                .observe_files
-                .iter()
-                .map(|path| {
-                    workspace_root
-                        .join(&plan.cwd)
-                        .join(path)
-                        .components()
-                        .filter(|part| !matches!(part, std::path::Component::CurDir))
-                        .collect::<PathBuf>()
-                        .to_string_lossy()
-                        .into_owned()
-                })
-                .collect(),
-        };
-    }
     let command = input
         .as_str()
         .or_else(|| input.get("script").and_then(serde_json::Value::as_str))
@@ -382,17 +365,6 @@ fn workflow_command_analysis(
             },
             ToString::to_string,
         );
-    let command = if let Some(target) = &plan.repository_target {
-        format!(
-            "{} ; {command}",
-            bcode_worktree::repository_target::authorization_command(
-                &workspace_root.join(&plan.cwd),
-                &target.commit
-            )
-        )
-    } else {
-        command
-    };
     let (analysis, analysis_error) = match bcode_shell_command_analysis::analyze(
         &bcode_shell_command_analysis_models::ShellAnalysisRequest::posix(command.clone()),
     ) {
@@ -439,15 +411,10 @@ fn prepare_workflow_block_contract(request: &ServiceRequest) -> ServiceResponse 
             part,
             std::path::Component::Normal(_) | std::path::Component::CurDir
         )
-    }) || plan.observe_files.iter().any(|path| {
-        path.as_os_str().is_empty()
-            || path
-                .components()
-                .any(|part| !matches!(part, std::path::Component::Normal(_)))
     }) {
         return ServiceResponse::error(
             "invalid_preparation",
-            "observation paths must remain relative to the workflow workspace",
+            "command paths must remain relative to the workflow workspace",
         );
     }
     let operation =
@@ -555,7 +522,7 @@ fn invoke_workflow_block_contract(context: &NativeServiceContext) -> ServiceResp
         Err(error) => return ServiceResponse::error("invalid_request", error),
     };
     if plan.version != contracts::SHELL_COMMAND_PLAN_VERSION
-        || (plan.commands.is_empty() && plan.observe_files.is_empty())
+        || plan.commands.is_empty()
         || plan.commands.len() > 64
         || plan.cwd.is_absolute()
         || plan.cwd.components().any(|component| {
@@ -634,10 +601,6 @@ fn shell_script_command_plan(
     }
     shell.push(script);
     Ok(ShellWorkflowCommandPlan {
-        repository_target: None,
-        delivered_snapshot: None,
-        observe_files: Vec::new(),
-        expected_content: None,
         version: contracts::SHELL_COMMAND_PLAN_VERSION,
         cwd,
         commands: vec![contracts::ShellWorkflowCommand {
@@ -712,29 +675,8 @@ fn execute_workflow_command_plan(
     );
     let cwd = workflow_command_directory(invocation, plan)?;
     validate_workflow_environment(&plan.environment)?;
-    let repository = repository::PreparedRepository::prepare(context, invocation, plan, &cwd)?;
-    let snapshot_directory = snapshot::prepare(plan)?;
-    let cwd = repository
-        .as_ref()
-        .map(|prepared| &prepared.directory)
-        .or(snapshot_directory.as_ref())
-        .map_or(cwd, |directory| directory.path().to_path_buf());
-    let content_before = if plan.observe_files.is_empty() {
-        None
-    } else {
-        Some(content_observation::observe(&cwd, &plan.observe_files)?)
-    };
-    if plan.expected_content.is_some() && plan.expected_content != content_before {
-        return Err("verification content precondition does not match current observation".into());
-    }
     let mut commands = Vec::with_capacity(plan.commands.len());
-    let mut artifacts = repository
-        .as_ref()
-        .map(|prepared| prepared.artifact.clone())
-        .into_iter()
-        .collect::<Vec<_>>();
-    let mut content_after = content_before.clone();
-    let mut content_invalidated = false;
+    let mut artifacts = Vec::new();
     for (index, command) in plan.commands.iter().enumerate() {
         let _ = progress.upsert_if_ready(&serde_json::json!({
             "state": "running",
@@ -756,50 +698,18 @@ fn execute_workflow_command_plan(
         let should_stop = result.status != ShellWorkflowCommandStatus::Exited
             || !accepted_exit && !continue_on_unaccepted;
         commands.push(result);
-        if repository.as_ref().is_some_and(|export| !export.matches()) {
-            content_invalidated = true;
-        }
-        if let Some(target) = &plan.delivered_snapshot {
-            content_invalidated |= !snapshot::matches(&cwd, target);
-        }
         artifacts.extend(command_artifacts);
-        if plan.expected_content.is_some() {
-            // Preserve completed effects, but never run later checks against a
-            // target that no longer matches the caller's verification precondition.
-            content_after = content_observation::observe(&cwd, &plan.observe_files).ok();
-            content_invalidated = plan.expected_content != content_after;
-        }
-        if should_stop || content_invalidated {
+        if should_stop {
             break;
         }
     }
     let _ = progress.finish();
-    if !plan.observe_files.is_empty() {
-        content_after = content_observation::observe(&cwd, &plan.observe_files).ok();
-    }
     let passed = !context.cancellation.is_cancelled()
-        && !content_invalidated
-        && (!plan.commands.is_empty() || content_before == content_after)
         && commands.len() == plan.commands.len()
-        && (plan.expected_content.is_none() || plan.expected_content == content_after)
         && commands.iter().all(|result| {
             result.status == ShellWorkflowCommandStatus::Exited && result.exit_accepted
         });
     Ok(ShellWorkflowCommandPlanResult {
-        repository_verification: repository
-            .map(|prepared| prepared.verification(passed, content_invalidated)),
-        snapshot_verification: plan.delivered_snapshot.as_ref().map(|target| {
-            bcode_shell_models::SnapshotVerification {
-                version: 1,
-                target: target.clone(),
-                commands_passed: passed,
-                target_unchanged: !content_invalidated && snapshot::matches(&cwd, target),
-            }
-        }),
-        content_before,
-        // Missing or unreadable post-execution content is explicitly unknown. Do not
-        // hide the already observed command outcomes or imply that effects did not occur.
-        content_after,
         version: plan.version,
         plan_sha256: canonical_command_plan_sha256(plan)?,
         passed,
@@ -2716,131 +2626,37 @@ mod tests {
     use super::*;
     use std::collections::BTreeMap;
 
-    fn assert_observation_preparation_paths(
-        request: &bcode_workflow::WorkflowBlockPreparationRequest,
-        plan: &ShellWorkflowCommandPlan,
-        workspace: &std::path::Path,
-    ) {
-        // Policy paths must not depend on the daemon's current directory.
-        let mut nested = plan.clone();
-        nested.cwd = PathBuf::from("nested");
-        assert_eq!(
-            workflow_command_analysis(&request.input, &nested, workspace),
-            bcode_plugin_sdk::ToolPolicyOperation::Read {
-                paths: vec![
-                    workspace
-                        .join("nested/result")
-                        .to_string_lossy()
-                        .into_owned()
-                ],
-            }
-        );
-        for (cwd, observed) in [
-            ("../escape", "result"),
-            ("/outside", "result"),
-            (".", "../secret"),
-            (".", "/secret"),
-            (".", ""),
-        ] {
-            let mut invalid = request.clone();
-            let mut invalid_plan = plan.clone();
-            invalid_plan.cwd = PathBuf::from(cwd);
-            invalid_plan.observe_files = vec![PathBuf::from(observed)];
-            invalid.input = serde_json::to_value(invalid_plan).unwrap();
-            assert!(
-                prepare_workflow_block_contract(&ServiceRequest {
-                    interface_id: bcode_workflow::WORKFLOW_BLOCK_INTERFACE_ID.into(),
-                    operation: bcode_workflow::WORKFLOW_BLOCK_PREPARE_OPERATION.into(),
-                    payload: serde_json::to_vec(&invalid).unwrap(),
-                })
-                .error
-                .is_some()
-            );
-        }
-    }
-
     #[test]
-    fn observation_only_workflow_requires_preparation_and_reports_current_content() {
+    fn retired_plans_and_preconditions_fail_closed() {
         let workspace = tempfile::tempdir().unwrap();
-        std::fs::write(workspace.path().join("result"), "integrated").unwrap();
-        let (mut invocation, mut plan) = workflow_command_plan(workspace.path(), vec![]);
-        plan.observe_files = vec![PathBuf::from("result")];
-        invocation.input = serde_json::to_value(&plan).unwrap();
-        assert!(
-            invoke_workflow_block_contract(&workflow_context(
-                &invocation,
-                bcode_plugin_sdk::ServiceCancellation::default(),
-            ))
-            .error
-            .is_some()
-        );
-        let request = bcode_workflow::WorkflowBlockPreparationRequest {
-            version: bcode_workflow::WORKFLOW_BLOCK_PREPARATION_VERSION,
-            block: shell_workflow_block_definition("exec"),
-            context: bcode_workflow::WorkflowBlockPreparationContext {
-                run_id: "run".into(),
-                node_id: "node".into(),
-                activation_id: "activation".into(),
-                attempt: 0,
-                preparation_identity: "preparation".into(),
-                workspace_root: workspace.path().to_path_buf(),
-            },
-            input: invocation.input.clone(),
-        };
-        assert_observation_preparation_paths(&request, &plan, workspace.path());
-        let response = prepare_workflow_block_contract(&ServiceRequest {
-            interface_id: bcode_workflow::WORKFLOW_BLOCK_INTERFACE_ID.into(),
-            operation: bcode_workflow::WORKFLOW_BLOCK_PREPARE_OPERATION.into(),
-            payload: serde_json::to_vec(&request).unwrap(),
-        });
-        let preparation: bcode_workflow::WorkflowBlockPreparationResponse =
-            serde_json::from_slice(&response.payload).unwrap();
-        let policy: bcode_agent_profile::ToolPolicyAuthorizationMetadata =
-            serde_json::from_value(preparation.operation_facts.clone()).unwrap();
-        assert!(policy.requires_permission);
-        assert_eq!(
-            policy.operation,
-            bcode_plugin_sdk::ToolPolicyOperation::Read {
-                paths: vec![
-                    workspace
-                        .path()
-                        .join("result")
-                        .to_string_lossy()
-                        .into_owned()
-                ],
+        let (_, plan) = workflow_command_plan(workspace.path(), vec![]);
+        let current = serde_json::to_value(plan).unwrap();
+        for version in [0, 1, 2, 4] {
+            let mut input = current.clone();
+            input["version"] = version.into();
+            assert!(shell_workflow_command_plan(&input).is_err());
+        }
+        for field in [
+            "repository_target",
+            "delivered_snapshot",
+            "observe_files",
+            "expected_content",
+        ] {
+            for value in [
+                serde_json::Value::Null,
+                serde_json::json!({}),
+                serde_json::json!([]),
+            ] {
+                let mut input = current.clone();
+                input[field] = value.clone();
+                assert!(shell_workflow_command_plan(&input).is_err());
+                let mut script = serde_json::json!({"script": "echo safe"});
+                script[field] = value;
+                assert!(shell_workflow_command_plan(&script).is_err());
             }
-        );
-        invocation.preparation = Some(preparation);
-        let response = invoke_workflow_block_contract(&workflow_context(
-            &invocation,
-            bcode_plugin_sdk::ServiceCancellation::default(),
-        ));
-        assert!(response.error.is_none(), "{:?}", response.error);
-        let result: ShellWorkflowCommandPlanResult =
-            serde_json::from_slice(&response.payload).unwrap();
-        assert!(result.passed);
-        assert!(result.commands.is_empty());
-        assert_eq!(result.content_before, result.content_after);
-        assert_eq!(
-            result.content_before,
-            Some(content_observation::observe(workspace.path(), &plan.observe_files).unwrap())
-        );
-        let cancelled = bcode_plugin_sdk::ServiceCancellation::default();
-        cancelled.cancel();
-        assert!(
-            invoke_workflow_block_contract(&workflow_context(&invocation, cancelled,))
-                .error
-                .is_some()
-        );
-        std::fs::remove_file(workspace.path().join("result")).unwrap();
-        assert!(
-            invoke_workflow_block_contract(&workflow_context(
-                &invocation,
-                bcode_plugin_sdk::ServiceCancellation::default(),
-            ))
-            .error
-            .is_some()
-        );
+        }
+        assert!(shell_workflow_command_plan(&current).is_ok());
+        assert!(shell_workflow_command_plan(&serde_json::json!("echo safe")).is_ok());
     }
 
     fn workflow_command_plan(
@@ -2859,10 +2675,6 @@ mod tests {
                 preparation: None,
             },
             ShellWorkflowCommandPlan {
-                repository_target: None,
-                delivered_snapshot: None,
-                observe_files: Vec::new(),
-                expected_content: None,
                 version: contracts::SHELL_COMMAND_PLAN_VERSION,
                 cwd: PathBuf::from("."),
                 commands,
@@ -3141,7 +2953,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn workflow_command_plan_v2_accepts_declared_exit_codes_and_controls_continuation() {
+    fn workflow_command_plan_accepts_declared_exit_codes_and_controls_continuation() {
         let workspace = tempfile::tempdir().expect("workspace");
         let command = |script: &str, accepted_exit_codes, continue_on_unaccepted_exit| {
             contracts::ShellWorkflowCommand {
@@ -3191,277 +3003,6 @@ mod tests {
         assert_eq!(continued.commands.len(), 2);
         assert_eq!(continued.commands[0].accepted_exit_codes, vec![7]);
         assert!(!continued.commands[0].exit_accepted);
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn workflow_content_precondition_rejects_stale_targets_before_commands() {
-        let workspace = tempfile::tempdir().unwrap();
-        std::fs::create_dir(workspace.path().join("src")).unwrap();
-        std::fs::write(workspace.path().join("src/input"), "integrated").unwrap();
-        let (invocation, mut plan) = workflow_command_plan(
-            workspace.path(),
-            vec![contracts::ShellWorkflowCommand {
-                argv: vec!["sh".into(), "-c".into(), "printf ran > marker".into()],
-                timeout_ms: 5_000,
-                accepted_exit_codes: None,
-                continue_on_unaccepted_exit: false,
-            }],
-        );
-        plan.observe_files = vec![PathBuf::from("src")];
-        plan.expected_content =
-            Some(content_observation::observe(workspace.path(), &plan.observe_files).unwrap());
-        let context = workflow_context(
-            &invocation,
-            bcode_plugin_sdk::ServiceCancellation::default(),
-        );
-        std::fs::write(workspace.path().join("src/input"), "changed").unwrap();
-        assert!(execute_workflow_command_plan(&context, &invocation, &plan).is_err());
-        assert!(!workspace.path().join("marker").exists());
-        std::fs::write(workspace.path().join("src/input"), "integrated").unwrap();
-        std::fs::write(workspace.path().join("src/extra"), "added").unwrap();
-        assert!(execute_workflow_command_plan(&context, &invocation, &plan).is_err());
-        assert!(!workspace.path().join("marker").exists());
-        plan.observe_files.clear();
-        assert!(execute_workflow_command_plan(&context, &invocation, &plan).is_err());
-        assert!(!workspace.path().join("marker").exists());
-        plan.observe_files.push(PathBuf::from("src"));
-        plan.expected_content =
-            Some(content_observation::observe(workspace.path(), &plan.observe_files).unwrap());
-        let result = execute_workflow_command_plan(&context, &invocation, &plan).unwrap();
-        assert!(result.passed);
-        assert_eq!(result.content_before, plan.expected_content);
-        assert_eq!(
-            std::fs::read_to_string(workspace.path().join("marker")).unwrap(),
-            "ran"
-        );
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn workflow_content_precondition_stops_after_changed_or_missing_content() {
-        for script in ["printf changed > target", "rm target"] {
-            for following_command in [false, true] {
-                let workspace = tempfile::tempdir().unwrap();
-                std::fs::write(workspace.path().join("target"), "integrated").unwrap();
-                let command = |script: &str| contracts::ShellWorkflowCommand {
-                    argv: vec!["sh".into(), "-c".into(), script.into()],
-                    timeout_ms: 5_000,
-                    accepted_exit_codes: None,
-                    continue_on_unaccepted_exit: true,
-                };
-                let mut commands = vec![command(script)];
-                if following_command {
-                    commands.push(command("printf ran > marker"));
-                }
-                let (invocation, mut plan) = workflow_command_plan(workspace.path(), commands);
-                plan.observe_files = vec![PathBuf::from("target")];
-                plan.expected_content = Some(
-                    content_observation::observe(workspace.path(), &plan.observe_files).unwrap(),
-                );
-                let result = execute_workflow_command_plan(
-                    &workflow_context(
-                        &invocation,
-                        bcode_plugin_sdk::ServiceCancellation::default(),
-                    ),
-                    &invocation,
-                    &plan,
-                )
-                .unwrap();
-                assert!(!result.passed);
-                assert_eq!(result.commands.len(), 1);
-                assert_eq!(result.commands[0].exit_code, Some(0));
-                assert!(result.commands[0].exit_accepted);
-                assert_ne!(result.content_before, result.content_after);
-                assert!(!workspace.path().join("marker").exists());
-            }
-        }
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn verification_precondition_stops_change_check_restore_batches() {
-        let workspace = tempfile::tempdir().unwrap();
-        std::fs::write(workspace.path().join("target"), "integrated").unwrap();
-        let commands = [
-            "printf altered > target",
-            "test $(cat target) = altered",
-            "printf integrated > target",
-        ]
-        .map(|script| contracts::ShellWorkflowCommand {
-            argv: vec!["sh".into(), "-c".into(), script.into()],
-            timeout_ms: 5_000,
-            accepted_exit_codes: None,
-            continue_on_unaccepted_exit: true,
-        });
-        let (invocation, mut plan) = workflow_command_plan(workspace.path(), commands.to_vec());
-        plan.observe_files = vec![PathBuf::from("target")];
-        let context = workflow_context(
-            &invocation,
-            bcode_plugin_sdk::ServiceCancellation::default(),
-        );
-        // Historical endpoint-only observations cannot distinguish this batch
-        // from checks performed throughout on the integrated content.
-        let unguarded = execute_workflow_command_plan(&context, &invocation, &plan).unwrap();
-        assert!(unguarded.passed);
-        assert_eq!(unguarded.commands.len(), 3);
-        assert_eq!(unguarded.content_before, unguarded.content_after);
-
-        plan.expected_content = unguarded.content_after;
-        let guarded = execute_workflow_command_plan(&context, &invocation, &plan).unwrap();
-        assert!(!guarded.passed);
-        assert_eq!(guarded.commands.len(), 1);
-        assert_eq!(guarded.commands[0].exit_code, Some(0));
-        assert_ne!(guarded.content_before, guarded.content_after);
-        assert_eq!(
-            std::fs::read_to_string(workspace.path().join("target")).unwrap(),
-            "altered"
-        );
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn workflow_directory_observation_records_added_files() {
-        let workspace = tempfile::tempdir().unwrap();
-        std::fs::create_dir(workspace.path().join("src")).unwrap();
-        let (invocation, mut plan) = workflow_command_plan(
-            workspace.path(),
-            vec![contracts::ShellWorkflowCommand {
-                argv: vec!["sh".into(), "-c".into(), "printf added > src/new".into()],
-                timeout_ms: 5_000,
-                accepted_exit_codes: None,
-                continue_on_unaccepted_exit: false,
-            }],
-        );
-        plan.observe_files = vec![PathBuf::from("src")];
-        let result = execute_workflow_command_plan(
-            &workflow_context(
-                &invocation,
-                bcode_plugin_sdk::ServiceCancellation::default(),
-            ),
-            &invocation,
-            &plan,
-        )
-        .unwrap();
-        assert!(result.passed);
-        let before = result.content_before.as_ref().unwrap();
-        let after = result.content_after.as_ref().unwrap();
-        assert_eq!(before.version, 2);
-        assert!(before.files.is_empty());
-        assert_eq!(after.files[0].path, PathBuf::from("src/new"));
-        assert_ne!(before, after);
-        assert_eq!(
-            serde_json::from_value::<ShellWorkflowCommandPlanResult>(
-                serde_json::to_value(&result).unwrap()
-            )
-            .unwrap(),
-            result
-        );
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn delivered_snapshot_execution_success_failure_and_mutation() {
-        let workspace = tempfile::tempdir().unwrap();
-        std::fs::write(workspace.path().join("target"), "dirty user content").unwrap();
-        for (script, accepted) in [
-            ("test $(cat target) = delivered", true),
-            ("exit 1", false),
-            ("printf changed > target", false),
-            ("touch uncovered", false),
-        ] {
-            let (invocation, mut plan) = workflow_command_plan(
-                workspace.path(),
-                vec![contracts::ShellWorkflowCommand {
-                    argv: vec!["sh".into(), "-c".into(), script.into()],
-                    timeout_ms: 5_000,
-                    accepted_exit_codes: None,
-                    continue_on_unaccepted_exit: false,
-                }],
-            );
-            let target = bcode_shell_models::DeliveredSnapshot {
-                version: 1,
-                files: [("target".into(), "delivered".into())].into(),
-            };
-            plan.delivered_snapshot = Some(target.clone());
-            let result = execute_workflow_command_plan(
-                &workflow_context(
-                    &invocation,
-                    bcode_plugin_sdk::ServiceCancellation::default(),
-                ),
-                &invocation,
-                &plan,
-            )
-            .unwrap();
-            assert_eq!(
-                result
-                    .snapshot_verification
-                    .unwrap()
-                    .accept(&target)
-                    .is_ok(),
-                accepted
-            );
-            assert_eq!(
-                std::fs::read_to_string(workspace.path().join("target")).unwrap(),
-                "dirty user content"
-            );
-        }
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn workflow_content_observation_records_actual_execution_not_claims() {
-        let workspace = tempfile::tempdir().unwrap();
-        std::fs::write(workspace.path().join("target"), "before").unwrap();
-        let (invocation, mut plan) = workflow_command_plan(
-            workspace.path(),
-            vec![contracts::ShellWorkflowCommand {
-                argv: vec!["sh".into(), "-c".into(), "printf after > target".into()],
-                timeout_ms: 5_000,
-                accepted_exit_codes: None,
-                continue_on_unaccepted_exit: false,
-            }],
-        );
-        plan.observe_files = vec![PathBuf::from("target")];
-        let result = execute_workflow_command_plan(
-            &workflow_context(
-                &invocation,
-                bcode_plugin_sdk::ServiceCancellation::default(),
-            ),
-            &invocation,
-            &plan,
-        )
-        .unwrap();
-        assert!(result.passed);
-        assert_ne!(result.content_before, result.content_after);
-        assert_eq!(
-            result.content_after,
-            Some(content_observation::observe(workspace.path(), &plan.observe_files).unwrap())
-        );
-        plan.commands[0].argv[2] = "test $(cat target) = after".into();
-        let result = execute_workflow_command_plan(
-            &workflow_context(
-                &invocation,
-                bcode_plugin_sdk::ServiceCancellation::default(),
-            ),
-            &invocation,
-            &plan,
-        )
-        .unwrap();
-        assert!(result.passed);
-        assert_eq!(result.content_before, result.content_after);
-        plan.commands[0].argv[2] = "exit 1".into();
-        let result = execute_workflow_command_plan(
-            &workflow_context(
-                &invocation,
-                bcode_plugin_sdk::ServiceCancellation::default(),
-            ),
-            &invocation,
-            &plan,
-        )
-        .unwrap();
-        assert!(!result.passed);
-        assert_eq!(result.content_before, result.content_after);
     }
 
     #[cfg(unix)]
@@ -3669,76 +3210,6 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn repository_checks_bind_binary_revision_and_preserve_dirty_user_work() {
-        let workspace = tempfile::tempdir().unwrap();
-        let git = |args: &[&str]| {
-            let output = std::process::Command::new("git")
-                .arg("-C")
-                .arg(workspace.path())
-                .args(args)
-                .output()
-                .unwrap();
-            assert!(output.status.success());
-            String::from_utf8_lossy(&output.stdout).trim().to_owned()
-        };
-        git(&["init", "-q"]);
-        std::fs::write(workspace.path().join("source"), b"retained").unwrap();
-        std::fs::write(workspace.path().join("binary"), [0, 255]).unwrap();
-        git(&["add", "."]);
-        git(&[
-            "-c",
-            "user.name=Test",
-            "-c",
-            "user.email=test@example.test",
-            "commit",
-            "-qm",
-            "fixture",
-        ]);
-        let commit = git(&["rev-parse", "HEAD"]);
-        std::fs::write(workspace.path().join("source"), b"dirty user work").unwrap();
-        for (script, passed) in [
-            (
-                "test $(cat source) = retained; mkdir build; echo generated > build/result",
-                true,
-            ),
-            ("exit 1", false),
-            ("echo changed > source", false),
-        ] {
-            let (invocation, mut plan) = workflow_command_plan(
-                workspace.path(),
-                vec![contracts::ShellWorkflowCommand {
-                    argv: vec!["sh".into(), "-c".into(), script.into()],
-                    timeout_ms: 5000,
-                    accepted_exit_codes: None,
-                    continue_on_unaccepted_exit: false,
-                }],
-            );
-            plan.repository_target = Some(bcode_shell_models::RepositoryTarget {
-                version: 1,
-                commit: commit.clone(),
-            });
-            let context = workflow_context_with_bridge(
-                &invocation,
-                bcode_plugin_sdk::ServiceCancellation::default(),
-                ServiceBridge::new(
-                    Some(workflow_artifact_bridge),
-                    std::ptr::null_mut(),
-                    bcode_plugin_sdk::ServiceCancellation::default(),
-                ),
-            );
-            let result = execute_workflow_command_plan(&context, &invocation, &plan).unwrap();
-            let verification = result.repository_verification.unwrap();
-            assert_eq!(verification.accepts(&verification.delivery), passed);
-            assert_eq!(result.artifacts.len(), 1);
-            assert_eq!(
-                std::fs::read(workspace.path().join("source")).unwrap(),
-                b"dirty user work"
-            );
-        }
-    }
-
-    #[cfg(unix)]
-    #[test]
     fn workflow_command_plan_spills_truncated_output_to_artifact() {
         let workspace = tempfile::tempdir().expect("workspace");
         let (invocation, mut plan) = workflow_command_plan(
@@ -3841,10 +3312,6 @@ mod tests {
             value: serde_json::json!(false),
         };
         let result = ShellWorkflowCommandPlanResult {
-            repository_verification: None,
-            snapshot_verification: None,
-            content_before: None,
-            content_after: None,
             version: contracts::SHELL_COMMAND_PLAN_VERSION,
             plan_sha256: "a".repeat(64),
             passed: false,

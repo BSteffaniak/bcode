@@ -52,23 +52,7 @@ schema = { "x-bcode-allow-dynamic-complete-input" = false, "x-bcode-dynamic-bind
         "commands",
         "environment",
         "output",
-    ], properties = { version = { const = 2 }, repository_target = { type = "object", additionalProperties = false, required = [
-        "version",
-        "commit",
-    ], properties = { version = { const = 1 }, commit = { type = "string", pattern = "^([0-9a-f]{40}|[0-9a-f]{64})$" } } }, delivered_snapshot = { type = "object", additionalProperties = false, required = [
-        "version",
-        "files",
-    ], properties = { version = { const = 1 }, files = { type = "object", minProperties = 1, maxProperties = 64, additionalProperties = { type = "string", maxLength = 262144 } } } }, expected_content = { type = "object", additionalProperties = false, required = [
-        "version",
-        "workspace",
-        "files",
-    ], properties = { version = { enum = [
-        1,
-        2,
-    ] }, workspace = { type = "string", minLength = 1, maxLength = 4096 }, files = { type = "array", maxItems = 64, items = { type = "object", additionalProperties = false, required = [
-        "path",
-        "sha256",
-    ], properties = { path = { type = "string", minLength = 1, maxLength = 4096 }, sha256 = { type = "string", pattern = "^[0-9a-f]{64}$" } } } }, directories = { type = "array", maxItems = 64, uniqueItems = true, items = { type = "string", minLength = 1, maxLength = 4096 } } } }, observe_files = { type = "array", maxItems = 64, uniqueItems = true, items = { type = "string", minLength = 1, maxLength = 4096 } }, cwd = { type = "string", minLength = 1, maxLength = 1024 }, commands = { type = "array", minItems = 0, maxItems = 64, items = { type = "object", additionalProperties = false, required = [
+    ], properties = { version = { const = 3 }, cwd = { type = "string", minLength = 1, maxLength = 1024 }, commands = { type = "array", minItems = 1, maxItems = 64, items = { type = "object", additionalProperties = false, required = [
         "argv",
         "timeout_ms",
     ], properties = { argv = { type = "array", minItems = 1, maxItems = 256, items = { type = "string", maxLength = 65536 } }, timeout_ms = { type = "integer", minimum = 1, maximum = 300000 }, accepted_exit_codes = { type = "array", minItems = 1, maxItems = 64, uniqueItems = true, items = { type = "integer" } }, continue_on_unaccepted_exit = { type = "boolean" } } } }, environment = { type = "object", additionalProperties = false, required = [
@@ -82,50 +66,13 @@ schema = { "x-bcode-allow-dynamic-complete-input" = false, "x-bcode-dynamic-bind
 type_name = "bcode.shell.exec/v1"
 
 [services.workflow_blocks.output]
-schema = { "$defs" = { content_observation = { type = "object", allOf = [
-    { if = { properties = { version = { const = 1 } } }, then = { not = { required = [
-        "directories",
-    ] }, properties = { files = { minItems = 1 } } }, else = { required = [
-        "directories",
-    ] } },
-], additionalProperties = false, required = [
-    "version",
-    "workspace",
-    "files",
-], properties = { version = { enum = [
-    1,
-    2,
-] }, workspace = { type = "string" }, directories = { type = "array", minItems = 1, maxItems = 64, uniqueItems = true, items = { type = "string", minLength = 1, maxLength = 4096 } }, files = { type = "array", maxItems = 64, items = { type = "object", additionalProperties = false, required = [
-    "path",
-    "sha256",
-], properties = { path = { type = "string", minLength = 1, maxLength = 4096 }, sha256 = { type = "string", pattern = "^[0-9a-f]{64}$" } } } } } } }, type = "object", additionalProperties = false, required = [
+schema = { type = "object", additionalProperties = false, required = [
     "version",
     "plan_sha256",
     "passed",
     "commands",
     "artifacts",
-], properties = { repository_verification = { type = "object", additionalProperties = false, required = [
-    "version",
-    "delivery",
-    "commands_passed",
-    "sources_unchanged",
-    "environment",
-], properties = { version = { const = 1 }, commands_passed = { type = "boolean" }, sources_unchanged = { type = "boolean" }, environment = { type = "string", maxLength = 4096 }, delivery = { type = "object", additionalProperties = false, required = [
-    "target",
-    "artifact",
-    "sha256",
-], properties = { target = { type = "object", additionalProperties = false, required = [
-    "version",
-    "commit",
-], properties = { version = { const = 1 }, commit = { type = "string", pattern = "^([0-9a-f]{40}|[0-9a-f]{64})$" } } }, artifact = { type = "string", minLength = 1, maxLength = 4096 }, sha256 = { type = "string", pattern = "^[0-9a-f]{64}$" } } } } }, snapshot_verification = { type = "object", additionalProperties = false, required = [
-    "version",
-    "target",
-    "commands_passed",
-    "target_unchanged",
-], properties = { version = { const = 1 }, commands_passed = { type = "boolean" }, target_unchanged = { type = "boolean" }, target = { type = "object", additionalProperties = false, required = [
-    "version",
-    "files",
-], properties = { version = { const = 1 }, files = { type = "object", minProperties = 1, maxProperties = 64, additionalProperties = { type = "string", maxLength = 262144 } } } } } }, content_before = { "$ref" = "#/$defs/content_observation" }, content_after = { "$ref" = "#/$defs/content_observation" }, version = { const = 2 }, plan_sha256 = { type = "string", pattern = "^[0-9a-f]{64}$" }, passed = { type = "boolean" }, commands = { type = "array", maxItems = 64, items = { type = "object", additionalProperties = false, required = [
+], properties = { version = { const = 3 }, plan_sha256 = { type = "string", pattern = "^[0-9a-f]{64}$" }, passed = { type = "boolean" }, commands = { type = "array", maxItems = 64, items = { type = "object", additionalProperties = false, required = [
     "index",
     "status",
     "exit_code",

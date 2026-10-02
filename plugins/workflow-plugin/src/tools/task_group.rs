@@ -153,7 +153,7 @@ fn node(task: Prompt, input: ValueSchema) -> Result<NodeDefinition, String> {
     }
     let mut instructions = task_instructions(task.objective, &task.acceptance_criteria)?;
     if task.output == default_worker_output() {
-        instructions.push_str("\n\nFor coding contributions, return contributions with observed workspace, creation-time base_revision, source_directory and source_had_local_changes from worktree creation provenance when available (null for unknown; never infer clean). Identify produced revisions or artifacts, exact observed validation commands/outcomes, remaining work and workspace retention. If work produced commits, inspect and report their actual revision identities; creation-time base_revision is not a produced revision, and a successful commit command alone does not identify it. For uncommitted work, identify changed artifacts explicitly rather than inventing a revision. Do not create commits or remove workspaces merely to populate this report. Records are claims, not integration or completion proof; preserve existing user changes and report conflicts as blockers.");
+        instructions.push_str("\n\nIdentify the useful result and changed artifacts, observed validation commands and outcomes, and remaining work. Preserve user changes and report conflicts or unknown evidence as blockers. Results are evidence for the continuation, not integration or completion proof. Workspace strategy and optional Git actions belong to the task instructions; do not create commits or workspaces merely to populate a report.");
     }
     let mut configuration = WorkflowPromptConfiguration::structured(
         task.agent_profile,
@@ -218,7 +218,7 @@ fn continuation_node(
         .collect();
     let order = serde_json::to_string(&members).map_err(|error| error.to_string())?;
     task.objective.push_str("\n\nThe assignments below describe requested context, access and dependencies, not proof of execution or filesystem isolation. Resource claims coordinate scheduling only; inspect actual contributions and workspace state before integration.");
-    task.objective.push_str("\n\nThe optional contributions evidence path contains worker-reported provenance, produced revisions/artifacts, validation and retention. Missing records or null provenance mean unknown. Inspect these claims against actual workspaces and canonical outputs before integration. Preserve dirty source work, surface conflicts without discarding either contribution, and inspect the intended destination before any integration write. An existing destination is not permission to overwrite: establish its baseline and distinguish user edits from prior integration effects; if that cannot be verified, retain both sides and report the conflicting paths and a supported next action. A conflict is not a failed acceptance check and must not trigger blind replay of successful workers. Verify the combined target against the original acceptance criteria, and report the integrated target/revision or artifacts, actual combined checks, unresolved criteria and retained workspaces in your ordinary completion response. Worker validation alone is not combined verification; do not remove unintegrated or ambiguous workspaces.");
+    task.objective.push_str("\n\nInspect worker claims against actual results before integration. Preserve user work and surface conflicts without discarding either side. Do not blindly replay successful workers to resolve conflicts. Verify the combined result against the original acceptance criteria and report useful artifacts, observed checks and unresolved criteria. Worker success alone does not establish integration or completion. Follow explicit task requirements for collaboration, workspace strategy and any optional Git actions.");
     task.objective
         .push_str("\n\nDelegated assignments (JSON): ");
     task.objective
@@ -263,40 +263,14 @@ fn member_ids(group: &Group) -> Vec<String> {
 
 pub(super) fn default_worker_output() -> ValueSchema {
     ValueSchema {
-        type_name: "bcode.delegated_task_result.v2".into(),
+        type_name: "bcode.delegated_task_result.v3".into(),
         schema: json!({
             "type":"object", "additionalProperties":false,
             "required":["summary","evidence","blockers"],
             "properties":{
                 "summary":{"type":"string","maxLength":4096},
                 "evidence":{"type":"array","maxItems":32,"items":{"type":"string","maxLength":2048}},
-                "blockers":{"type":"array","maxItems":32,"items":{"type":"string","maxLength":2048}},
-                "contributions":{
-                    "description":"Optional observed contribution records. Omission means unknown, not no changes. Claims require independent integration verification.",
-                    "type":"array","maxItems":32,"items":{
-                        "type":"object","additionalProperties":false,
-                        "required":["workspace","base_revision","source_directory","source_had_local_changes","produced_revisions","artifacts","validation","remaining_work","retention"],
-                        "properties":{
-                            "workspace":{"type":"string","minLength":1,"maxLength":4096},
-                            "base_revision":{"type":["string","null"],"maxLength":256},
-                            "source_directory":{"type":["string","null"],"maxLength":4096},
-                            "source_had_local_changes":{"type":["boolean","null"]},
-                            "produced_revisions":{"type":"array","maxItems":32,"items":{"type":"string","minLength":1,"maxLength":256}},
-                            "artifacts":{"type":"array","maxItems":64,"items":{"type":"string","minLength":1,"maxLength":4096}},
-                            "validation":{"type":"array","maxItems":32,"items":{
-                                "type":"object","additionalProperties":false,
-                                "required":["command","outcome","evidence"],
-                                "properties":{
-                                    "command":{"type":"string","minLength":1,"maxLength":2048},
-                                    "outcome":{"enum":["passed","failed","not_run"]},
-                                    "evidence":{"type":"string","minLength":1,"maxLength":2048}
-                                }
-                            }},
-                            "remaining_work":{"type":"array","maxItems":32,"items":{"type":"string","minLength":1,"maxLength":2048}},
-                            "retention":{"enum":["retained","removed","unknown"]}
-                        }
-                    }
-                }
+                "blockers":{"type":"array","maxItems":32,"items":{"type":"string","maxLength":2048}}
             }
         }),
     }
@@ -510,7 +484,6 @@ fn result_mapping(group: &Group) -> serde_json::Value {
                     "summary": extended_result_path(path, "summary"),
                     "evidence": extended_result_path(path, "evidence"),
                     "blockers": extended_result_path(path, "blockers"),
-                    "contributions": extended_result_path(path, "contributions"),
                 });
             }
             assignment
@@ -1102,7 +1075,7 @@ pub(super) fn definition() -> bcode_tool::ToolDefinition {
         "output":worker["properties"]["output"]
     }});
     worker["properties"]["output"]["description"] = json!(
-        "Optional ValueSchema. Omission uses v2 worker_defaults.output when supplied, otherwise bounded bcode.delegated_task_result.v2: summary, evidence, blockers and optional contribution provenance. Explicit null rejects. Continuation output may be omitted only with v2 preserve_source_output."
+        "Optional ValueSchema. Omission uses v2 worker_defaults.output when supplied, otherwise bounded bcode.delegated_task_result.v3: summary, evidence and blockers. Explicit null rejects. Continuation output may be omitted only with v2 preserve_source_output."
     );
     let mut continuation = task;
     continuation["required"] = json!(["objective", "agent_profile"]);
@@ -1259,12 +1232,7 @@ mod tests {
             request["tasks"][0]["output"] = json!(default_worker_output());
             let (_, receipt) = mapped_candidate(&request).unwrap();
             let worker = &receipt["workers"][0];
-            let mut contribution_path = worker["input_path"].as_array().unwrap().clone();
-            contribution_path.push(json!("contributions"));
-            assert_eq!(
-                worker["evidence_paths"]["contributions"],
-                json!(contribution_path)
-            );
+            assert!(worker["evidence_paths"].get("contributions").is_none());
             let mut expected = worker["input_path"].as_array().unwrap().clone();
             expected.push(json!("blockers"));
             assert_eq!(worker["evidence_paths"]["blockers"], json!(expected));
@@ -1376,6 +1344,42 @@ mod tests {
                 })
                 .unwrap();
             request["input"] = serde_json::to_value(output).unwrap();
+        }
+    }
+
+    #[test]
+    fn explicit_historical_and_unknown_result_contracts_are_not_reinterpreted() {
+        for type_name in ["bcode.delegated_task_result.v2", "caller.future.v99"] {
+            let mut request = request();
+            let output = ValueSchema {
+                type_name: type_name.into(),
+                schema: json!({"type":"object", "required":["contributions"],
+                    "properties":{"contributions":{"type":"array"}}}),
+            };
+            request["tasks"][0]["output"] = json!(output);
+            let (batch, receipt) = mapped_candidate(&request).unwrap();
+            let worker_id = request["tasks"][0]["task_id"].as_str().unwrap();
+            let worker = batch
+                .edits
+                .iter()
+                .find_map(|edit| match edit {
+                    WorkflowRunGraphEdit::AddNode { node, .. } if node.id == worker_id => {
+                        Some(node)
+                    }
+                    _ => None,
+                })
+                .unwrap();
+            assert_eq!(worker.output, output);
+            let restored: NodeDefinition =
+                serde_json::from_value(serde_json::to_value(worker).unwrap()).unwrap();
+            assert_eq!(restored.output, output);
+            assert!(
+                restored
+                    .output
+                    .validate_value("result", &json!({"contributions":[]}))
+                    .is_ok()
+            );
+            assert!(receipt["workers"][0].get("evidence_paths").is_none());
         }
     }
 
@@ -2162,28 +2166,29 @@ mod tests {
     }
 
     #[test]
-    fn contribution_contract_preserves_unknown_provenance_and_checks_observed_results() {
+    fn default_result_is_bounded_and_does_not_require_repository_bookkeeping() {
         let schema = default_worker_output();
         let validator = jsonschema::validator_for(&schema.schema).unwrap();
-        let mut result = json!({"summary":"change", "evidence":[], "blockers":[]});
+        let result = json!({"summary":"combined result", "evidence":[], "blockers":[]});
         assert!(validator.is_valid(&result));
-        result["contributions"] = json!([{
-            "workspace":"/work/worker", "base_revision":null,
-            "source_directory":null, "source_had_local_changes":null,
-            "produced_revisions":[], "artifacts":["src/lib.rs"],
-            "validation":[{"command":"cargo test", "outcome":"failed", "evidence":"conflict remains"}],
-            "remaining_work":["resolve integration conflict"], "retention":"retained"
-        }]);
-        assert!(validator.is_valid(&result));
-        result["contributions"][0]["validation"][0]["outcome"] = json!("probably passed");
-        assert!(!validator.is_valid(&result));
-        result["contributions"][0]["validation"][0]["outcome"] = json!("not_run");
-        result["contributions"][0]["source_had_local_changes"] = json!("unknown");
-        assert!(!validator.is_valid(&result));
-        result["contributions"][0]["source_had_local_changes"] = json!(true);
-        assert!(validator.is_valid(&result));
-        result["contributions"][0]["produced_revisions"] = json!(vec!["revision"; 33]);
-        assert!(!validator.is_valid(&result));
+        for field in ["summary", "evidence", "blockers"] {
+            let mut missing = result.clone();
+            missing.as_object_mut().unwrap().remove(field);
+            assert!(!validator.is_valid(&missing));
+        }
+        for field in ["evidence", "blockers"] {
+            let mut oversized = result.clone();
+            oversized[field] = json!(vec!["entry"; 33]);
+            assert!(!validator.is_valid(&oversized));
+            oversized[field] = json!(["x".repeat(2049)]);
+            assert!(!validator.is_valid(&oversized));
+        }
+        let mut oversized = result.clone();
+        oversized["summary"] = json!("x".repeat(4097));
+        assert!(!validator.is_valid(&oversized));
+        let mut bookkeeping = result;
+        bookkeeping["contributions"] = json!([]);
+        assert!(!validator.is_valid(&bookkeeping));
     }
 
     #[test]

@@ -31,7 +31,7 @@ pub const SHELL_RECORDING_MEDIA_TYPE: &str = "application/x-bcode-shell-recordin
 pub const SHELL_RECORDING_CONTENT_TYPE: &str = "application/x-bcode-shell-recording; version=3";
 
 /// Current typed command-plan workflow block contract version.
-pub const SHELL_COMMAND_PLAN_VERSION: u32 = 2;
+pub const SHELL_COMMAND_PLAN_VERSION: u32 = 3;
 /// Current typed script workflow block contract version.
 pub const SHELL_SCRIPT_VERSION: u32 = 1;
 
@@ -118,21 +118,9 @@ pub struct ShellWorkflowOutputPolicy {
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct ShellWorkflowCommandPlan {
-    /// Complete immutable repository revision exported by the workspace owner.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub repository_target: Option<bcode_shell_models::RepositoryTarget>,
-    /// Complete inline target materialized in a private temporary command directory.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub delivered_snapshot: Option<bcode_shell_models::DeliveredSnapshot>,
-    /// Optional bounded files/directory scopes observed around execution. Empty preserves legacy behavior.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub observe_files: Vec<PathBuf>,
-    /// Optional exact observation required before any command runs. Requires `observe_files`.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub expected_content: Option<crate::content_observation::ContentObservation>,
     pub version: u32,
     pub cwd: PathBuf,
-    /// Commands to execute; empty is an observation-only plan requiring nonempty `observe_files`.
+    /// Commands to execute; at least one command is required.
     pub commands: Vec<ShellWorkflowCommand>,
     pub environment: ShellWorkflowEnvironment,
     pub output: ShellWorkflowOutputPolicy,
@@ -189,17 +177,6 @@ pub struct ShellWorkflowCommandResult {
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct ShellWorkflowCommandPlanResult {
-    /// Retained repository identity and owner-observed check scope.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub repository_verification: Option<bcode_shell_models::RepositoryVerification>,
-    /// Authenticated only by the enclosing canonical shell output.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub snapshot_verification: Option<bcode_shell_models::SnapshotVerification>,
-    /// Owner-observed content; absence means unknown, not verified.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub content_before: Option<crate::content_observation::ContentObservation>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub content_after: Option<crate::content_observation::ContentObservation>,
     pub version: u32,
     /// Canonical SHA-256 of the exact normalized command plan executed by the shell owner.
     pub plan_sha256: String,
@@ -300,10 +277,6 @@ mod tests {
     #[test]
     fn workflow_command_plan_contract_is_versioned_bounded_and_argv_explicit() {
         let plan = ShellWorkflowCommandPlan {
-            repository_target: None,
-            delivered_snapshot: None,
-            observe_files: Vec::new(),
-            expected_content: None,
             version: SHELL_COMMAND_PLAN_VERSION,
             cwd: PathBuf::from("workspace"),
             commands: vec![ShellWorkflowCommand {
@@ -336,10 +309,6 @@ mod tests {
     #[test]
     fn workflow_command_plan_result_carries_terminal_detail_and_artifacts() {
         let result = ShellWorkflowCommandPlanResult {
-            repository_verification: None,
-            snapshot_verification: None,
-            content_before: None,
-            content_after: None,
             version: SHELL_COMMAND_PLAN_VERSION,
             plan_sha256: "a".repeat(64),
             passed: false,

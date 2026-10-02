@@ -45,6 +45,7 @@ pub(super) fn install_script(request: &mut PluginWorkflowStartRequest, root: &Pa
             "remaining_work":["Resolve integration conflict and verify combined result"],"retention":"retained"
         }]});
         serde_json::json!({"task_id":id,"objective":format!("Contribute in the assigned checkout.\ntool-call filesystem.write {write}\ntool-call shell.run {commit}\ntool-call filesystem.read {revision}\nstructured-result {result}"),
+            "output":{"type_name":"test.git_contribution.v1","schema":{"type":"object","additionalProperties":false,"required":["summary","evidence","blockers","contributions"],"properties":{"summary":{"type":"string"},"evidence":{"type":"array","items":{"type":"string"}},"blockers":{"type":"array","items":{"type":"string"}},"contributions":{"type":"array","items":{"type":"object"}}}}},
             "agent_profile":"build","read_only":false,"worktree_directory":reference(creation_index, "/path"),
             "acceptance_criteria":["Creation-time base commit (verify before editing):",reference(creation_index, "/provenance/base_commit"),"Canonical source checkout (do not modify):",reference(creation_index, "/provenance/source_directory"),"Creation provenance does not include uncommitted inputs; inspect source dirtiness and report required missing inputs rather than copying or overwriting user work."],
             "tool_allowlist":["filesystem.write","filesystem.read","shell.run"],"resources":[{"resource":format!("checkout:{id}"),"access":"write"}],
@@ -98,22 +99,16 @@ pub(super) fn install_script(request: &mut PluginWorkflowStartRequest, root: &Pa
     source.configuration["system_prompt"] = serde_json::json!(format!(
         "{instructions}\n{preparation}\ntool-call workflow.execution_context {{\"compact\":true,\"limit\":1}}\ntool-call workflow.stage_delegation {group}\ntool-call workflow.publish_run_graph_edit {publication}"
     ));
-    install_delivery_report(request, &integration, trees);
+    install_evaluation_inspection(request, &integration);
 }
 
-fn install_delivery_report(
-    request: &mut PluginWorkflowStartRequest,
-    integration: &Path,
-    trees: &Path,
-) {
+fn install_evaluation_inspection(request: &mut PluginWorkflowStartRequest, integration: &Path) {
     let inspect = |index, node| {
         serde_json::json!({"$fake_result":{
             "index":index,"pointer":"/outputs","where":{"node_id":node},
             "select":"/inspection_arguments","latest_by":"created_at_ms"
         }})
     };
-    let result =
-        |index, pointer| serde_json::json!({"$fake_result":{"index":index,"pointer":pointer}});
     let left = inspect(0, "left");
     let right = inspect(1, "right");
     // Evaluation remains read-only: inspect the revision recorded after the
@@ -121,18 +116,10 @@ fn install_delivery_report(
     let revision =
         serde_json::json!({"path":integration.join("revision.txt"),"offset":1,"limit":1});
     let read = serde_json::json!({"path":integration.join("integrated.sh"),"offset":1,"limit":100});
-    let report = serde_json::json!({
-        "version":"1","integrated_targets":[integration, result(1,"")],
-        "contribution_output_ids":[result(3,"/output/output_id"),result(2,"/output/output_id")],
-        "criteria":[{"criterion":request.input["stop_condition"],"status":"passed","evidence":"Inspected both canonical contributions, resolved artifact and current integrated revision"}],
-        "checks":[{"command":COMBINED_CHECK,"workspace":integration,"outcome":"passed","evidence":"Continuation verified combined artifact and clean tracked checkout before recording revision; evaluator independently inspected artifact and recorded revision"}],
-        "retained_workspaces":[trees.join("left"),trees.join("right"),integration],
-        "unresolved_work":[]
-    });
     let evaluation = request.definition.nodes.get_mut("loop.evaluation").unwrap();
     let instructions = evaluation.configuration["system_prompt"].as_str().unwrap();
     evaluation.configuration["system_prompt"] = serde_json::json!(format!(
-        "{instructions}\ntool-call workflow.execution_context {{\"outputs_only\":true,\"limit\":3,\"$fake_json_pages\":{{\"items\":\"/outputs\",\"next\":\"/next_page_arguments\"}}}}\ntool-call workflow.execution_context {left}\ntool-call workflow.execution_context {right}\ntool-call filesystem.read {revision}\ntool-call filesystem.read {read}\nloop-delivery {report}"
+        "{instructions}\ntool-call workflow.execution_context {{\"outputs_only\":true,\"limit\":3,\"$fake_json_pages\":{{\"items\":\"/outputs\",\"next\":\"/next_page_arguments\"}}}}\ntool-call workflow.execution_context {left}\ntool-call workflow.execution_context {right}\ntool-call filesystem.read {revision}\ntool-call filesystem.read {read}"
     ));
 }
 
@@ -215,21 +202,8 @@ async fn goal_workers_recover_real_git_conflict_in_isolated_integration_checkout
                 .find(|output| output.node_id == "loop.evaluation")
             {
                 assert_eq!(evaluation.value["condition_met"], true, "{outputs:?}");
-                let delivery = &evaluation.value["delivery"];
-                assert_eq!(
-                    delivery["integrated_targets"][0],
-                    trees.path().join("integration").to_str().unwrap()
-                );
-                assert_eq!(
-                    delivery["integrated_targets"][1],
-                    git(&trees.path().join("integration"), &["rev-parse", "HEAD"])
-                );
-                assert_eq!(delivery["criteria"][0]["status"], "passed");
-                assert_eq!(delivery["checks"][0]["outcome"], "passed");
-                assert_eq!(delivery["retained_workspaces"].as_array().unwrap().len(), 3);
-                for (index, id) in ["left", "right"].into_iter().enumerate() {
+                for id in ["left", "right"] {
                     let output = outputs.iter().find(|output| output.node_id == id).unwrap();
-                    assert_eq!(delivery["contribution_output_ids"][index], output.output_id);
                     assert_eq!(output.value["contributions"][0]["base_revision"], base);
                     let worker_revision = git(&trees.path().join(id), &["rev-parse", "HEAD"]);
                     assert_ne!(worker_revision, base);

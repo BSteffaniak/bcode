@@ -2,6 +2,25 @@ use super::*;
 use crate::{LoopExternalBlocker, LoopWorkflowInput, goal_workflow_spec, loop_workflow_spec};
 
 #[test]
+fn allowance_resume_rejects_retired_contracts_and_retained_delivery_requirements() {
+    for version in 1..=4 {
+        let mut historical = source(true);
+        historical
+            .definition
+            .nodes
+            .get_mut("loop.judgement.evaluate")
+            .unwrap()
+            .configuration["block_version"] = version.into();
+        assert!(request(historical, 2).is_err());
+    }
+    for field in ["delivery_required", "delivery"] {
+        let mut historical = source(true);
+        historical.input[field] = serde_json::json!(true);
+        assert!(request(historical, 2).is_err());
+    }
+}
+
+#[test]
 fn continuation_failures_are_not_successful_commands() {
     for error in [
         "No associated loop",
@@ -140,12 +159,10 @@ fn source(progress: bool) -> bcode_workflow::WorkflowContinuationSource {
             judgement_evaluation: None,
             iteration: 2,
             planning_ready: true,
-            delivery_required: false,
             external_blocker: LoopExternalBlocker::None,
             condition_met: false,
             evidence: vec!["remaining work".into()],
             summary: "incomplete".into(),
-            delivery: None,
         })
         .unwrap(),
         repeat_node_id: "loop.repeat".into(),

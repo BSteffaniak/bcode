@@ -1241,28 +1241,6 @@ fn apply_loop_tool_evidence(
     value["summary"] = serde_json::json!(evidence);
 }
 
-fn apply_loop_delivery(
-    value: &mut serde_json::Value,
-    request: &ModelTurnRequest,
-    user_text: &str,
-) -> Result<(), ProviderError> {
-    if value["condition_met"] == true
-        && let Some(report) = user_text
-            .lines()
-            .find_map(|line| line.strip_prefix("loop-delivery "))
-    {
-        let mut report =
-            serde_json::from_str(report).map_err(|error| fake_structured_output_error(&error))?;
-        if bind_request_results(&mut report, request).is_some() {
-            value["delivery"] = report;
-        } else {
-            value["condition_met"] = serde_json::json!(false);
-            value["evidence"] = serde_json::json!(["Delivery references could not be resolved"]);
-        }
-    }
-    Ok(())
-}
-
 fn configured_fake_structured_output(
     request: &ModelTurnRequest,
     structured: &bcode_model::StructuredOutputRequest,
@@ -1306,9 +1284,10 @@ fn configured_fake_structured_output(
             .and_then(serde_json::Value::as_u64)
             .unwrap_or_default();
         if evaluation {
+            // The evaluator contract is closed and does not own initialization readiness.
+            value.as_object_mut().unwrap().remove("planning_ready");
             if let Some(expected) = configured.strip_prefix("loop_tool_evidence:") {
                 apply_loop_tool_evidence(&mut value, &request.messages, expected);
-                apply_loop_delivery(&mut value, request, user_text)?;
             } else {
                 value["condition_met"] =
                     serde_json::json!(iteration >= threshold.unwrap_or_default());
