@@ -11,6 +11,20 @@ pub(super) enum Case {
 }
 
 impl Case {
+    const fn expects_report_failure(self) -> bool {
+        matches!(
+            self,
+            Self::Repository(super::repository_delivery::Case::MissingChecksum)
+        )
+    }
+
+    const fn expects_completion(self) -> bool {
+        matches!(
+            self,
+            Self::Complete | Self::Repository(super::repository_delivery::Case::Complete)
+        )
+    }
+
     pub(super) const fn repository(self) -> Option<super::repository_delivery::Case> {
         if let Self::Repository(case) = self {
             Some(case)
@@ -158,10 +172,7 @@ pub(super) async fn exercise(case: Case) {
                 .iter()
                 .find(|attempt| attempt.status == "failed" && attempt.node_id != "right")
             {
-                if matches!(
-                    case,
-                    Case::Repository(super::repository_delivery::Case::MissingChecksum)
-                ) && failed.node_id == "repository-regression.report"
+                if case.expects_report_failure() && failed.node_id == "repository-regression.report"
                 {
                     assert!(
                         !outputs
@@ -182,14 +193,7 @@ pub(super) async fn exercise(case: Case) {
                 .iter()
                 .find(|output| output.node_id == "loop.judgement.evaluate")
             {
-                let complete = matches!(
-                    case,
-                    Case::Complete
-                        | Case::Repository(
-                            super::repository_delivery::Case::Complete
-                                | super::repository_delivery::Case::ReorderedItems
-                        )
-                );
+                let complete = case.expects_completion();
                 assert_eq!(
                     judgement.value["condition_met"], complete,
                     "{case:?}: {:?}",
@@ -222,16 +226,27 @@ pub(super) async fn exercise(case: Case) {
         }
     })
     .await;
-    outcome.unwrap_or_else(|error| {
-        let store = state.workflow_store.lock().unwrap();
-        let attempts = store.attempt_history(&run_id, None, 100).unwrap();
-        let statuses: Vec<_> = attempts
-            .iter()
-            .map(|attempt| (&attempt.node_id, &attempt.status))
-            .collect();
-        panic!("{case:?}: {error}; attempt statuses {statuses:?}");
-    });
+    outcome.unwrap_or_else(|error| report_timeout(&state, &run_id, case, &error));
     drop(state);
+}
+
+fn report_timeout(
+    state: &ServerState,
+    run_id: &str,
+    case: Case,
+    error: &tokio::time::error::Elapsed,
+) -> ! {
+    let attempts = state
+        .workflow_store
+        .lock()
+        .unwrap()
+        .attempt_history(run_id, None, 100)
+        .unwrap();
+    let statuses: Vec<_> = attempts
+        .iter()
+        .map(|attempt| (&attempt.node_id, &attempt.status))
+        .collect();
+    panic!("{case:?}: {error}; attempt statuses {statuses:?}");
 }
 
 #[tokio::test]
