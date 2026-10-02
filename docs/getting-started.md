@@ -18,22 +18,26 @@ Clone Bcode and build the TUI with its statically bundled providers, tools, comm
 ```sh
 git clone https://github.com/BSteffaniak/bcode.git
 cd bcode
-cargo build --locked --release -p bcode \
-  --no-default-features \
-  --features app,static-bundled-plugins \
-  --bin bcode
+cargo xtask build --features static-bundled-plugins
 ```
 
-Run it:
+The helper includes the `app` feature and assigns a fresh artifact identity for each
+build, allowing it to coexist with existing daemon artifacts. Do not substitute a
+raw Cargo invocation without following the identity requirements in
+[Release builds](release-builds.md).
+
+Run `target/<host-target>/release/bcode`, replacing `<host-target>` with the
+`host` value printed by `rustc -vV` (the build's default target). For example, on
+Apple Silicon macOS:
 
 ```sh
-./target/release/bcode
+./target/aarch64-apple-darwin/release/bcode
 ```
 
-On Windows:
+On Windows with the MSVC toolchain:
 
 ```powershell
-.\target\release\bcode.exe
+.\target\x86_64-pc-windows-msvc\release\bcode.exe
 ```
 
 The first normal interactive launch opens Bcode's setup flow. It detects existing configuration and environment hints, then walks through provider, model, authentication, permissions, optional session imports, and plugin choices.

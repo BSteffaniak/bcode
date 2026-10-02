@@ -23,14 +23,16 @@ Bcode currently requires the [stable Rust toolchain](https://www.rust-lang.org/t
 ```sh
 git clone https://github.com/BSteffaniak/bcode.git
 cd bcode
-cargo build --locked --release -p bcode \
-  --no-default-features \
-  --features app,static-bundled-plugins \
-  --bin bcode
-./target/release/bcode
+cargo xtask build --features static-bundled-plugins
 ```
 
-On Windows, run `target\release\bcode.exe` instead.
+Run `target/<host-target>/release/bcode` (or `bcode.exe` on Windows), replacing
+`<host-target>` with the `host` value printed by `rustc -vV`, for example
+`aarch64-apple-darwin`. The build uses this host target by default.
+
+Use the build helper for executable builds: it assigns a fresh artifact identity so
+new builds can coexist with already-running daemons. See
+[Release builds](docs/release-builds.md) for raw-Cargo identity requirements.
 
 The first interactive launch opens Bcode's setup flow for provider, model, authentication, and permission choices. The bundled provider integrations cover OpenAI-compatible APIs—including OpenAI API keys and ChatGPT subscription login—and Amazon Bedrock.
 
