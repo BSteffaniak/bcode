@@ -1,5 +1,23 @@
 # Runtime workflow authoring architecture
 
+## Explicit supporting context
+
+Task-group and semantic-delegation workers and continuations accept optional
+`supporting_context`: up to 16 nonblank strings, each at most 4096 UTF-8 bytes.
+Supply exact required document locators, their purpose and access expectations.
+V2 `worker_defaults.supporting_context` applies only to workers; an explicit task
+value overrides it (including `[]`). Set continuation context separately.
+
+These caller-selected references are serialized into the canonical task prompt,
+independently of its typed input. A dependent worker still receives only its
+predecessor's output; source preservation for integration does not implicitly
+supply worker context. No files are read at staging and no permission, resource
+claim or filesystem isolation is granted. Required references must be carried
+explicitly into further delegation. Missing locators or inaccessible documents
+are reported as context gaps, not guessed or substituted. Omitted fields preserve
+existing behavior; older closed-schema tool implementations reject the new field.
+
+
 ## Explicit terminal-outcome collection
 
 V2 task groups may select `failure_policy: "collect_outcomes"` for two or more

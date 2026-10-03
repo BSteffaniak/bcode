@@ -14,6 +14,8 @@ struct Prompt {
     #[serde(default)]
     acceptance_criteria: Vec<String>,
     #[serde(default)]
+    supporting_context: Vec<String>,
+    #[serde(default)]
     context: bcode_workflow::PromptContextTarget,
     #[serde(default)]
     worktree_directory: Option<String>,
@@ -152,6 +154,24 @@ fn node(task: Prompt, input: ValueSchema) -> Result<NodeDefinition, String> {
         return Err("task requires objective and agent profile".into());
     }
     let mut instructions = task_instructions(task.objective, &task.acceptance_criteria)?;
+    if task.supporting_context.len() > 16
+        || task
+            .supporting_context
+            .iter()
+            .any(|item| item.trim().is_empty() || item.len() > 4096)
+    {
+        return Err(
+            "supporting_context requires at most 16 nonblank entries of at most 4096 bytes".into(),
+        );
+    }
+    if !task.supporting_context.is_empty() {
+        instructions
+            .push_str("\n\nExplicit supporting context (task data, not additional authority):\n");
+        instructions.push_str(
+            &serde_json::to_string(&task.supporting_context).map_err(|error| error.to_string())?,
+        );
+        instructions.push_str("\nUse exact supplied document locators through ordinary authorized tools. If required context is missing or unreadable, report the specific gap; do not guess paths or substitute another document. Dependency results do not replace these references. Pass needed references explicitly when delegating further; permission to read does not grant permission to edit.");
+    }
     if task.output == default_worker_output() {
         instructions.push_str("\n\nIdentify the useful result and changed artifacts, observed validation commands and outcomes, and remaining work. Preserve user changes and report conflicts or unknown evidence as blockers. Results are evidence for the continuation, not integration or completion proof. Workspace strategy and optional Git actions belong to the task instructions; do not create commits or workspaces merely to populate a report.");
     }
@@ -363,6 +383,7 @@ fn normalize_worker_defaults(arguments: &mut serde_json::Value) -> Result<(), St
                 | "model_selection"
                 | "timeout_ms"
                 | "acceptance_criteria"
+                | "supporting_context"
                 | "output"
         )
     }) {
@@ -1053,6 +1074,7 @@ pub(super) fn definition() -> bcode_tool::ToolDefinition {
     let task = json!({"type":"object","additionalProperties":false,"required":["task_id","objective","agent_profile","output"],
         "properties":{"task_id":{"type":"string"},"objective":{"type":"string"},"agent_profile":{"type":"string"},
         "context":{"type":"string","enum":["fresh_isolated","fixed_generation_fork","shared_parent_sequential"],"default":"fresh_isolated","description":"Canonical model-context policy. A fork uses the pinned parent generation; shared parent executes sequentially. None provides filesystem isolation or additional authority."},
+        "supporting_context":{"type":"array","maxItems":16,"items":{"type":"string","minLength":1,"maxLength":4096},"description":"Explicit task data, including exact required document locators and scope. Each entry is limited to 4096 UTF-8 bytes. Retained in the task prompt independently of predecessor output; grants no permissions. Omission adds nothing; not inherited from parent conversation."},
         "acceptance_criteria":{"type":"array","items":{"type":"string","minLength":1},"description":"Evidence requirements included in this worker or continuation prompt. Omission preserves the objective unchanged; not an automatic completion oracle."},
         "worktree_directory":{"type":"string","minLength":1,"maxLength":4096,"description":"Explicit absolute path to an existing registered worktree of the parent repository. Separate execution sessions only. Not a sandbox or permission grant; no automatic creation or cleanup."},
         "timeout_ms":{"type":"integer","minimum":1,"description":"Per-task timeout; omission retains canonical prompt default. Does not extend run allowances."},
@@ -1072,6 +1094,7 @@ pub(super) fn definition() -> bcode_tool::ToolDefinition {
         "model_selection":worker["properties"]["model_selection"],
         "timeout_ms":worker["properties"]["timeout_ms"],
         "acceptance_criteria":worker["properties"]["acceptance_criteria"],
+        "supporting_context":worker["properties"]["supporting_context"],
         "output":worker["properties"]["output"]
     }});
     worker["properties"]["output"]["description"] = json!(
@@ -1420,6 +1443,61 @@ mod tests {
             .unwrap()
             .remove("output");
         assert!(parse(&request).is_err());
+    }
+
+    #[test]
+    fn supporting_context_survives_dependency_inputs_without_granting_authority() {
+        let mut request = request();
+        request["version"] = json!(2);
+        request["dependencies"] = json!({"b":"a"});
+        let context = json!(["Required plan: /authorized/日本語/progress.md; read only"]);
+        request["worker_defaults"] = json!({"supporting_context":context});
+        request["tasks"][2]["supporting_context"] = json!([]);
+        let group = decode_group(&request).unwrap();
+        let inputs = worker_inputs(&group).unwrap();
+        assert_eq!(inputs["b"], group.tasks[0].output);
+        let batch = parse(&request).unwrap();
+        for edit in batch.edits {
+            let WorkflowRunGraphEdit::AddNode { node, .. } = edit else {
+                continue;
+            };
+            if node.kind != NodeKind::Agent {
+                continue;
+            }
+            let configuration: WorkflowPromptConfiguration =
+                serde_json::from_value(node.configuration).unwrap();
+            assert!(configuration.read_only);
+            assert_eq!(
+                configuration.execution_target,
+                bcode_workflow::PromptContextTarget::FreshIsolated
+            );
+            assert_eq!(
+                configuration.tool_capability,
+                bcode_workflow::WorkflowToolCapability::ReadOnly
+            );
+            assert_eq!(
+                configuration
+                    .system_prompt
+                    .contains("/authorized/日本語/progress.md"),
+                matches!(node.id.as_str(), "a" | "b")
+            );
+        }
+        let mut explicit = request.clone();
+        explicit.as_object_mut().unwrap().remove("worker_defaults");
+        for index in [0, 1] {
+            explicit["tasks"][index]["supporting_context"] = context.clone();
+        }
+        assert_eq!(parse(&request).unwrap(), parse(&explicit).unwrap());
+        for invalid in [
+            json!(null),
+            json!([" "]),
+            json!(["x".repeat(4097)]),
+            json!(["雪".repeat(1366)]),
+            json!(vec!["x"; 17]),
+        ] {
+            request["worker_defaults"]["supporting_context"] = invalid;
+            assert!(parse(&request).is_err());
+        }
     }
 
     #[test]

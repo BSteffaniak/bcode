@@ -3,15 +3,20 @@ use super::*;
 
 #[tokio::test]
 async fn published_workers_write_contributions_without_overwriting_user_work() {
-    Box::pin(published_workers_preserve_user_work(false)).await;
+    Box::pin(published_workers_preserve_user_work(false, false)).await;
 }
 
 #[tokio::test]
 async fn published_workers_execute_in_explicit_registered_worktrees() {
-    Box::pin(published_workers_preserve_user_work(true)).await;
+    Box::pin(published_workers_preserve_user_work(true, false)).await;
 }
 
-async fn published_workers_preserve_user_work(isolated: bool) {
+#[tokio::test]
+async fn dependent_worker_reads_explicit_supporting_context() {
+    Box::pin(published_workers_preserve_user_work(false, true)).await;
+}
+
+async fn published_workers_preserve_user_work(isolated: bool, dependent: bool) {
     let (mut state, session, root) = active_edit_execution_fixture_with_graph(
         bcode_workflow_store::DispatchSideEffect::ReadOnly,
         true,
@@ -33,6 +38,8 @@ async fn published_workers_preserve_user_work(isolated: bool) {
         .execution
         .unwrap()
         .provenance;
+    let document = trees.path().join("progress.md");
+    std::fs::write(&document, "required external task context").unwrap();
     let task = |id: &str| {
         let directory = if isolated {
             trees.path().join(id)
@@ -47,12 +54,22 @@ async fn published_workers_preserve_user_work(isolated: bool) {
             "model_selection":{"provider":"bcode.fake-provider","model":"fake-echo"},
             "output":{"type_name":"boolean","schema":{"type":"boolean"}}
         });
+        if dependent && id == "right" {
+            task["supporting_context"] =
+                serde_json::json!([format!("Required plan (read only): {}", document.display())]);
+            task["tool_allowlist"] = serde_json::json!(["filesystem.read", "filesystem.write"]);
+            task["objective"] = serde_json::json!(format!(
+                "Read required context, then produce a contribution.\ntool-call filesystem.read {}\ntool-call filesystem.write {}",
+                serde_json::json!({"path":document,"offset":1,"limit":10}),
+                serde_json::json!({"path":directory.join("right.txt"),"contents":"right"})
+            ));
+        }
         if isolated {
             task["worktree_directory"] = serde_json::json!(directory);
         }
         task
     };
-    let call = bcode_model::ToolCall {
+    let mut call = bcode_model::ToolCall {
         id: "stage-coding".into(),
         name: "workflow.stage_task_group".into(),
         arguments: serde_json::json!({
@@ -64,6 +81,9 @@ async fn published_workers_preserve_user_work(isolated: bool) {
             "first_edge_id":1,"reconnect":{"edge_id":0,"node_id":"waiting-successor"},"reconciliation":[]
         }),
     };
+    if dependent {
+        call.arguments["dependencies"] = serde_json::json!({"right":"left"});
+    }
     let staged = invoke_task_with_permission(&state, session, &call, true)
         .await
         .unwrap();
@@ -88,11 +108,15 @@ async fn published_workers_preserve_user_work(isolated: bool) {
         verify_worker_directories(&state, root.path(), trees.path()).await;
     }
     drop(state);
+    assert_contributions(root.path(), trees.path(), isolated);
+}
+
+fn assert_contributions(root: &Path, trees: &Path, isolated: bool) {
     for id in ["left", "right"] {
         let directory = if isolated {
-            trees.path().join(id)
+            trees.join(id)
         } else {
-            root.path().to_path_buf()
+            root.to_path_buf()
         };
         assert_eq!(
             std::fs::read_to_string(directory.join(format!("{id}.txt"))).unwrap(),
@@ -100,7 +124,7 @@ async fn published_workers_preserve_user_work(isolated: bool) {
         );
     }
     assert_eq!(
-        std::fs::read_to_string(root.path().join("user.txt")).unwrap(),
+        std::fs::read_to_string(root.join("user.txt")).unwrap(),
         "uncommitted user work"
     );
 }
