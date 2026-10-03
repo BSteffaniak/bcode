@@ -23,13 +23,14 @@ switchy = { workspace = true, features = [
 switchy_database = { workspace = true, features = ["cascade", "schema"] }
 
 [dev-dependencies]
-rusqlite = { workspace = true }
 serde_json = { workspace = true }
 switchy = { workspace = true, features = [
     "async",
     "async-sync",
     "async-tokio",
     "database-sqlite-rusqlite",
+    "database-connection",
+    "database-connection-sqlite-rusqlite",
 ] }
 tokio = { workspace = true, features = ["macros", "rt"] }
 

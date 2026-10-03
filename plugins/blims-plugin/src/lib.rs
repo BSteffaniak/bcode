@@ -3290,7 +3290,11 @@ fn set_company_lifecycle(
 
 async fn initialize_schema(database: &dyn Database) -> Result<(), switchy_database::DatabaseError> {
     create_core_tables(database).await?;
-    seed_core_rows(database).await
+    // Keep seed existence checks and inserts on one transaction snapshot. A
+    // competing initializer must conflict rather than commit duplicate seeds.
+    let transaction = database.begin_transaction().await?;
+    seed_core_rows(&*transaction).await?;
+    transaction.commit().await
 }
 
 async fn create_core_tables(
@@ -3738,22 +3742,41 @@ fn now_column(name: &str) -> Column {
 }
 
 async fn seed_core_rows(database: &dyn Database) -> Result<(), switchy_database::DatabaseError> {
-    database
-        .exec_raw(&format!(
-            "INSERT INTO blims_schema_version (version) SELECT {SCHEMA_VERSION} \
-             WHERE NOT EXISTS (SELECT 1 FROM blims_schema_version WHERE version = {SCHEMA_VERSION})"
-        ))
-        .await?;
-    database
-        .exec_raw(
-            "INSERT INTO companies (id, name, mission, culture, lifecycle_status) \
-             SELECT 'default', 'Blims', \
-             'Build a cozy autonomous AI company inside Bcode.', \
-             'cozy, fun, dynamic, productive', \
-             'running' \
-             WHERE NOT EXISTS (SELECT 1 FROM companies WHERE id = 'default')",
-        )
-        .await?;
+    if database
+        .select("blims_schema_version")
+        .filter(Box::new(where_eq("version", SCHEMA_VERSION)))
+        .limit(1)
+        .execute_first(database)
+        .await?
+        .is_none()
+    {
+        database
+            .insert("blims_schema_version")
+            .value("version", SCHEMA_VERSION)
+            .execute(database)
+            .await?;
+    }
+    if database
+        .select("companies")
+        .filter(Box::new(where_eq("id", "default")))
+        .limit(1)
+        .execute_first(database)
+        .await?
+        .is_none()
+    {
+        database
+            .insert("companies")
+            .value("id", "default")
+            .value("name", "Blims")
+            .value(
+                "mission",
+                "Build a cozy autonomous AI company inside Bcode.",
+            )
+            .value("culture", "cozy, fun, dynamic, productive")
+            .value("lifecycle_status", "running")
+            .execute(database)
+            .await?;
+    }
     seed_default_config(database).await?;
     seed_default_world(database).await?;
     seed_company_created_event(database).await?;
@@ -3817,11 +3840,21 @@ async fn seed_default_config(
         ("report_cadence", "on-entry,on-request"),
     ];
     for (key, value) in defaults {
-        database
-            .exec_raw(&format!(
-                "INSERT INTO blims_config (key, value) SELECT '{key}', '{value}' WHERE NOT EXISTS (SELECT 1 FROM blims_config WHERE key = '{key}')"
-            ))
-            .await?;
+        if database
+            .select("blims_config")
+            .filter(Box::new(where_eq("key", key)))
+            .limit(1)
+            .execute_first(database)
+            .await?
+            .is_none()
+        {
+            database
+                .insert("blims_config")
+                .value("key", key)
+                .value("value", value)
+                .execute(database)
+                .await?;
+        }
     }
     Ok(())
 }
@@ -3829,13 +3862,30 @@ async fn seed_default_config(
 async fn seed_company_created_event(
     database: &dyn Database,
 ) -> Result<(), switchy_database::DatabaseError> {
-    database
-        .exec_raw(
-            "INSERT INTO events (company_id, kind, summary, payload_json, correlation_id, causation_id, event_version) \
-             SELECT 'default', 'company.created', 'Blims company state initialized.', '{\"type\":\"company_lifecycle_set\",\"lifecycle_status\":\"running\"}', 'bootstrap', 'bootstrap', 1 \
-             WHERE NOT EXISTS (SELECT 1 FROM events WHERE kind = 'company.created')",
-        )
-        .await
+    if database
+        .select("events")
+        .filter(Box::new(where_eq("kind", "company.created")))
+        .limit(1)
+        .execute_first(database)
+        .await?
+        .is_none()
+    {
+        database
+            .insert("events")
+            .value("company_id", "default")
+            .value("kind", "company.created")
+            .value("summary", "Blims company state initialized.")
+            .value(
+                "payload_json",
+                "{\"type\":\"company_lifecycle_set\",\"lifecycle_status\":\"running\"}",
+            )
+            .value("correlation_id", "bootstrap")
+            .value("causation_id", "bootstrap")
+            .value("event_version", 1_i64)
+            .execute(database)
+            .await?;
+    }
+    Ok(())
 }
 
 async fn append_bootstrap_event_once(
@@ -9945,6 +9995,16 @@ mod tests {
             std::fs::remove_dir_all(&temp).expect("stale temp state should be removable");
         }
         create_company_state(&temp).expect("company state should initialize");
+        let event_count = with_database(&temp, |database| {
+            Box::pin(async move { Ok(load_event_stream(database).await?.len()) })
+        })
+        .expect("seed events should load");
+        create_company_state(&temp).expect("company initialization should be idempotent");
+        let reopened_event_count = with_database(&temp, |database| {
+            Box::pin(async move { Ok(load_event_stream(database).await?.len()) })
+        })
+        .expect("seed events should reload");
+        assert_eq!(event_count, reopened_event_count);
 
         let world = world_snapshot(&temp).expect("world snapshot should load after create");
         let interactions =

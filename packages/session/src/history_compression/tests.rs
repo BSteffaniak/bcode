@@ -35,10 +35,10 @@ async fn compressed_history_rejects_legacy_json_decoder_without_changing_logical
         .expect("open");
     let rows = db
         .database()
-        .query_raw(&format!(
-            "SELECT payload FROM events WHERE event_seq = {}",
-            event.sequence
-        ))
+        .select("events")
+        .columns(&["payload"])
+        .where_eq("event_seq", event.sequence)
+        .execute(db.database())
         .await
         .expect("stored payload");
     let value = rows[0].get("payload").expect("payload column");

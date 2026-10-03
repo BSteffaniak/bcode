@@ -95,6 +95,41 @@ impl ObservedDatabase {
 
 #[async_trait]
 impl Database for ObservedDatabase {
+    async fn check_connection(&self) -> Result<(), DatabaseError> {
+        let started = self.metrics.started_at();
+        let result = self.inner.check_connection().await;
+        self.record(DatabaseOperation::RawQuery, None, started, &result);
+        result
+    }
+
+    async fn sqlite_integrity_check(&self) -> Result<Vec<Row>, DatabaseError> {
+        let started = self.metrics.started_at();
+        let result = self.inner.sqlite_integrity_check().await;
+        self.record(DatabaseOperation::RawQuery, None, started, &result);
+        result
+    }
+
+    async fn sqlite_foreign_key_check(&self) -> Result<Vec<Row>, DatabaseError> {
+        let started = self.metrics.started_at();
+        let result = self.inner.sqlite_foreign_key_check().await;
+        self.record(DatabaseOperation::RawQuery, None, started, &result);
+        result
+    }
+
+    async fn sqlite_checkpoint_truncate(&self) -> Result<Vec<Row>, DatabaseError> {
+        let started = self.metrics.started_at();
+        let result = self.inner.sqlite_checkpoint_truncate().await;
+        self.record(DatabaseOperation::RawQuery, None, started, &result);
+        result
+    }
+
+    async fn sqlite_temp_store_memory(&self) -> Result<(), DatabaseError> {
+        let started = self.metrics.started_at();
+        let result = self.inner.sqlite_temp_store_memory().await;
+        self.record(DatabaseOperation::RawExec, None, started, &result);
+        result
+    }
+
     async fn exec_update_count(
         &self,
         statement: &UpdateStatement<'_>,
@@ -490,6 +525,41 @@ impl Database for ObservedDatabase {
 
 #[async_trait]
 impl Database for ObservedTransaction {
+    async fn check_connection(&self) -> Result<(), DatabaseError> {
+        let started = self.metrics.started_at();
+        let result = self.inner.check_connection().await;
+        self.record(DatabaseOperation::RawQuery, None, started, &result);
+        result
+    }
+
+    async fn sqlite_integrity_check(&self) -> Result<Vec<Row>, DatabaseError> {
+        let started = self.metrics.started_at();
+        let result = self.inner.sqlite_integrity_check().await;
+        self.record(DatabaseOperation::RawQuery, None, started, &result);
+        result
+    }
+
+    async fn sqlite_foreign_key_check(&self) -> Result<Vec<Row>, DatabaseError> {
+        let started = self.metrics.started_at();
+        let result = self.inner.sqlite_foreign_key_check().await;
+        self.record(DatabaseOperation::RawQuery, None, started, &result);
+        result
+    }
+
+    async fn sqlite_checkpoint_truncate(&self) -> Result<Vec<Row>, DatabaseError> {
+        let started = self.metrics.started_at();
+        let result = self.inner.sqlite_checkpoint_truncate().await;
+        self.record(DatabaseOperation::RawQuery, None, started, &result);
+        result
+    }
+
+    async fn sqlite_temp_store_memory(&self) -> Result<(), DatabaseError> {
+        let started = self.metrics.started_at();
+        let result = self.inner.sqlite_temp_store_memory().await;
+        self.record(DatabaseOperation::RawExec, None, started, &result);
+        result
+    }
+
     async fn exec_update_count(
         &self,
         statement: &UpdateStatement<'_>,
@@ -990,15 +1060,55 @@ mod tests {
     };
 
     fn observed_with_registry(metrics: MetricsRegistry) -> ObservedDatabase {
-        let connection = rusqlite::Connection::open_in_memory().expect("in-memory sqlite");
-        let database = RusqliteDatabase::new(vec![Arc::new(switchy::unsync::sync::Mutex::new(
-            connection,
-        ))]);
-        ObservedDatabase::new(Box::new(database), metrics, "test", "sqlite")
+        ObservedDatabase::new(Box::new(direct_database()), metrics, "test", "sqlite")
     }
 
     fn observed(metrics: &MetricsRegistry) -> ObservedDatabase {
         observed_with_registry(metrics.clone())
+    }
+
+    #[tokio::test]
+    async fn typed_maintenance_preserves_results_and_closed_errors() {
+        let metrics = MetricsRegistry::in_memory();
+        let database = observed(&metrics);
+        database.check_connection().await.expect("healthy");
+        database
+            .sqlite_temp_store_memory()
+            .await
+            .expect("temporary storage");
+        let integrity = database.sqlite_integrity_check().await.expect("integrity");
+        assert_eq!(integrity.len(), 1);
+        assert!(
+            database
+                .sqlite_foreign_key_check()
+                .await
+                .expect("foreign keys")
+                .is_empty()
+        );
+        assert_eq!(
+            database
+                .sqlite_checkpoint_truncate()
+                .await
+                .expect("checkpoint")
+                .len(),
+            1
+        );
+        assert_eq!(
+            metrics
+                .report()
+                .snapshot
+                .counters
+                .get("database.operation.total"),
+            Some(&5)
+        );
+        database.close().await.expect("close");
+        assert!(
+            database
+                .check_connection()
+                .await
+                .expect_err("closed")
+                .is_connection_error()
+        );
     }
 
     async fn run_benchmark_workload(database: &dyn Database, samples: u32) {
@@ -1033,10 +1143,18 @@ mod tests {
     }
 
     fn direct_database() -> RusqliteDatabase {
-        let connection = rusqlite::Connection::open_in_memory().expect("direct sqlite");
-        RusqliteDatabase::new(vec![Arc::new(switchy::unsync::sync::Mutex::new(
-            connection,
-        ))])
+        use switchy::database_connection::{SqliteAccess, SqliteOpenOptions, open_sqlite_rusqlite};
+        open_sqlite_rusqlite(
+            std::path::Path::new(":memory:"),
+            &SqliteOpenOptions {
+                access: SqliteAccess::ReadWriteCreate,
+                allow_uri: false,
+                busy_timeout: std::time::Duration::from_secs(5),
+                foreign_keys: false,
+                connections: std::num::NonZeroUsize::new(1).expect("one connection"),
+            },
+        )
+        .expect("in-memory sqlite")
     }
 
     async fn benchmark_elapsed(database: &dyn Database, samples: u32) -> u128 {

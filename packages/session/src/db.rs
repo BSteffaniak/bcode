@@ -714,8 +714,8 @@ impl GlobalSessionDb {
     ///
     /// Returns an error when the probe operation fails for a reason other than terminal close.
     pub async fn is_closed(&self) -> SessionDbResult<bool> {
-        match self.db.query_raw("SELECT 1").await {
-            Ok(_) => Ok(false),
+        match self.db.check_connection().await {
+            Ok(()) => Ok(false),
             Err(error) if error.is_connection_error() => Ok(true),
             Err(error) => Err(error.into()),
         }
@@ -1350,7 +1350,7 @@ impl SessionDb {
             commit_timer.elapsed_ms(),
         );
         let checkpoint_timer = metrics.timer();
-        db.db.query_raw("PRAGMA wal_checkpoint(TRUNCATE)").await?;
+        db.db.sqlite_checkpoint_truncate().await?;
         metrics.record_histogram(
             "session.migration.wal_checkpoint_duration_ms",
             checkpoint_timer.elapsed_ms(),
@@ -1473,8 +1473,8 @@ impl SessionDb {
     ///
     /// Returns an error when the probe fails for a reason other than a terminal close.
     pub(crate) async fn is_closed(&self) -> SessionDbResult<bool> {
-        match self.db.query_raw("SELECT 1").await {
-            Ok(_) => Ok(false),
+        match self.db.check_connection().await {
+            Ok(()) => Ok(false),
             Err(error) if error.is_connection_error() => Ok(true),
             Err(error) => Err(error.into()),
         }
@@ -2767,9 +2767,7 @@ impl SessionDb {
             .validate()
             .map_err(|column| SessionDbError::InvalidRow { column })?;
         let initial = self.session_usage_summary().await?;
-        self.db
-            .exec_raw("DELETE FROM usage_valuation_staging")
-            .await?;
+        self.clear_usage_staging().await?;
         let mut cursor = String::new();
         let mut count = 0;
         loop {
@@ -2836,7 +2834,8 @@ impl SessionDb {
     /// Returns an error if the disposable staging table cannot be cleared.
     pub async fn clear_usage_staging(&self) -> SessionDbResult<()> {
         self.db
-            .exec_raw("DELETE FROM usage_valuation_staging")
+            .delete("usage_valuation_staging")
+            .execute(&**self.db)
             .await?;
         Ok(())
     }
@@ -2917,7 +2916,7 @@ impl SessionDb {
             .where_eq("projection_id", 1)
             .execute(&*tx)
             .await?;
-        tx.exec_raw("DELETE FROM usage_valuation_staging").await?;
+        tx.delete("usage_valuation_staging").execute(&*tx).await?;
         tx.commit().await?;
         summary.through_sequence = initial.through_sequence;
         Ok((count, summary))

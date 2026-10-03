@@ -13,7 +13,7 @@ use brouter_provider_models::ModelId;
 use brouter_telemetry_models::{RoutingEvent, RoutingEventKind, SessionSummary, UsageEvent};
 use serde_json::Value;
 use switchy_database::query::{FilterableQuery, SortDirection};
-use switchy_database::schema::{DataType, alter_table};
+use switchy_database::schema::{Column, DataType, alter_table, create_table};
 use switchy_database::{Database, DatabaseError, DatabaseValue, Row};
 use thiserror::Error;
 
@@ -58,8 +58,7 @@ impl TelemetryStore {
             let _ = std::fs::create_dir_all(parent);
         }
         let database = switchy_database_connection::init_sqlite_rusqlite(Some(path))?;
-        database.exec_raw(CREATE_USAGE_EVENTS_TABLE).await?;
-        database.exec_raw(CREATE_ROUTING_EVENTS_TABLE).await?;
+        create_telemetry_tables(&*database).await?;
         for (name, data_type) in ADD_USAGE_EVENT_COLUMNS {
             if let Err(error) = alter_table("usage_events")
                 .add_column((*name).to_owned(), data_type.clone(), true, None)
@@ -365,47 +364,71 @@ fn session_summaries(events: &[RoutingEvent]) -> Vec<SessionSummary> {
         .collect()
 }
 
-const CREATE_USAGE_EVENTS_TABLE: &str = "\
-CREATE TABLE IF NOT EXISTS usage_events (\
-    id INTEGER PRIMARY KEY AUTOINCREMENT,\
-    timestamp_ms INTEGER NOT NULL,\
-    session_id TEXT NULL,\
-    selected_model TEXT NOT NULL,\
-    provider TEXT NULL,\
-    upstream_model TEXT NULL,\
-    service_tier TEXT NULL,\
-    reasoning_effort TEXT NULL,\
-    resource_pools TEXT NULL,\
-    judge_model TEXT NULL,\
-    judge_overridden INTEGER NULL,\
-    judge_error TEXT NULL,\
-    judge_rationale TEXT NULL,\
-    routing_reasons TEXT NULL,\
-    fallback_used INTEGER NULL,\
-    estimated_cost REAL NOT NULL,\
-    latency_ms INTEGER NULL,\
-    status_code INTEGER NULL,\
-    provider_error TEXT NULL,\
-    prompt_tokens INTEGER NULL,\
-    completion_tokens INTEGER NULL,\
-    total_tokens INTEGER NULL,\
-    context_tokens INTEGER NULL,\
-    context_window INTEGER NULL,\
-    context_source TEXT NULL,\
-    success INTEGER NOT NULL\
-)";
-
-const CREATE_ROUTING_EVENTS_TABLE: &str = "\
-CREATE TABLE IF NOT EXISTS routing_events (\
-    id INTEGER PRIMARY KEY AUTOINCREMENT,\
-    timestamp_ms INTEGER NOT NULL,\
-    event_id TEXT NOT NULL UNIQUE,\
-    session_id TEXT NULL,\
-    request_id TEXT NOT NULL,\
-    kind TEXT NOT NULL,\
-    client TEXT NULL,\
-    payload_json TEXT NOT NULL\
-)";
+async fn create_telemetry_tables(database: &dyn Database) -> Result<(), DatabaseError> {
+    let mut usage = create_table("usage_events").if_not_exists(true);
+    for (name, data_type, nullable) in [
+        ("id", DataType::BigInt, false),
+        ("timestamp_ms", DataType::BigInt, false),
+        ("session_id", DataType::Text, true),
+        ("selected_model", DataType::Text, false),
+        ("provider", DataType::Text, true),
+        ("upstream_model", DataType::Text, true),
+        ("service_tier", DataType::Text, true),
+        ("reasoning_effort", DataType::Text, true),
+        ("resource_pools", DataType::Text, true),
+        ("judge_model", DataType::Text, true),
+        ("judge_overridden", DataType::Int, true),
+        ("judge_error", DataType::Text, true),
+        ("judge_rationale", DataType::Text, true),
+        ("routing_reasons", DataType::Text, true),
+        ("fallback_used", DataType::Int, true),
+        ("estimated_cost", DataType::Real, false),
+        ("latency_ms", DataType::BigInt, true),
+        ("status_code", DataType::Int, true),
+        ("provider_error", DataType::Text, true),
+        ("prompt_tokens", DataType::BigInt, true),
+        ("completion_tokens", DataType::BigInt, true),
+        ("total_tokens", DataType::BigInt, true),
+        ("context_tokens", DataType::BigInt, true),
+        ("context_window", DataType::BigInt, true),
+        ("context_source", DataType::Text, true),
+        ("success", DataType::Int, false),
+    ] {
+        usage = usage.column(Column {
+            name: name.to_owned(),
+            nullable,
+            auto_increment: name == "id",
+            data_type,
+            default: None,
+        });
+    }
+    usage.primary_key("id").execute(database).await?;
+    let mut routing = create_table("routing_events").if_not_exists(true);
+    for (name, data_type, nullable) in [
+        ("id", DataType::BigInt, false),
+        ("timestamp_ms", DataType::BigInt, false),
+        ("event_id", DataType::Text, false),
+        ("session_id", DataType::Text, true),
+        ("request_id", DataType::Text, false),
+        ("kind", DataType::Text, false),
+        ("client", DataType::Text, true),
+        ("payload_json", DataType::Text, false),
+    ] {
+        routing = routing.column(Column {
+            name: name.to_owned(),
+            nullable,
+            auto_increment: name == "id",
+            data_type,
+            default: None,
+        });
+    }
+    routing
+        .primary_key("id")
+        .unique_columns(["event_id"])
+        .execute(database)
+        .await?;
+    Ok(())
+}
 
 const ADD_USAGE_EVENT_COLUMNS: &[(&str, DataType)] = &[
     ("provider", DataType::Text),
