@@ -15,10 +15,13 @@ bcode_shell_command_analysis_models = { workspace = true }
 brush-parser                        = { workspace = true }
 
 [dev-dependencies]
-proptest   = { workspace = true }
-rusqlite   = { workspace = true }
-serde      = { workspace = true, features = ["derive"] }
-serde_json = { workspace = true }
+proptest                    = { workspace = true }
+serde                       = { workspace = true, features = ["derive"] }
+serde_json                  = { workspace = true }
+switchy_database            = { workspace = true }
+switchy_database_connection = { workspace = true }
+tempfile                    = { workspace = true }
+tokio                       = { workspace = true, features = ["macros", "rt"] }
 
 [features]
 default          = []

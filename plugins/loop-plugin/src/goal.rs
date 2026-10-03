@@ -1608,7 +1608,7 @@ mod tests {
         assert!(surface.editor.status.contains("missing"));
         assert_eq!(*host.generations.lock().unwrap(), 0);
         assert_eq!(*host.created_sessions.lock().unwrap(), 0);
-        assert!(surface.phase == GoalPhase::Draft);
+        assert_eq!(surface.phase, GoalPhase::Draft);
     }
 
     #[tokio::test]
@@ -1624,7 +1624,7 @@ mod tests {
         assert_eq!(*host.generations.lock().unwrap(), 0);
         host.finish().await;
         surface.poll(&host);
-        assert!(surface.phase == GoalPhase::Draft);
+        assert_eq!(surface.phase, GoalPhase::Draft);
         assert!(surface.editor.status.contains("generation blocked"));
         assert_eq!(*host.created_sessions.lock().unwrap(), 0);
         assert_eq!(*host.generations.lock().unwrap(), 0);
@@ -1644,7 +1644,7 @@ mod tests {
         surface.phase = GoalPhase::Closed;
         *surface.generation_preflight.lock().unwrap() = Some(Ok(()));
         surface.poll(&host);
-        assert!(surface.phase == GoalPhase::Closed);
+        assert_eq!(surface.phase, GoalPhase::Closed);
         assert_eq!(*host.created_sessions.lock().unwrap(), 0);
         assert_eq!(*host.generations.lock().unwrap(), 0);
     }
@@ -1661,7 +1661,7 @@ mod tests {
         assert_eq!(*host.generations.lock().unwrap(), 1);
         host.finish().await;
         surface.poll(&host);
-        assert!(surface.phase == GoalPhase::Generated);
+        assert_eq!(surface.phase, GoalPhase::Generated);
         assert!(host.starts.lock().unwrap().is_empty());
         assert!(host.documents.lock().unwrap().is_empty());
     }

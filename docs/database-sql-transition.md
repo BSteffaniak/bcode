@@ -16,7 +16,10 @@ patching upstream without opt-ins can break unmigrated consumers. Do not enable 
 Existing Switchy migration scope: session, database-observability, router telemetry,
 blims, CLI/server database operations and existing settings/ralph/code-review database consumers.
 Usage has been removed from the transition envelope after actual-source isolated production/test
-compilation with no raw activation (13 tests). Observability now has an explicit default-off
+compilation with no raw activation (13 tests). Shell-command-analysis's historical shadow reader
+now uses typed read-only Switchy access, keyset-paged queries and structured fixtures. Its direct-driver
+allowance is removed; actual-source isolated tests (22 passed, one local-corpus harness ignored)
+and strict all-target clippy pass with no raw activation. Observability now has an explicit default-off
 `raw-sql` forwarding feature for its existing decorator methods; session's workspace dependency
 selects it during transition. The root Switchy database dependency no longer enables raw for
 all consumers: telemetry and BLIMS retain their existing calls through leaf opt-ins. This moves,
@@ -34,8 +37,10 @@ Existing direct rusqlite edges (the guard distinguishes normal from dev dependen
 | bcode_workflow_store | normal | typed affinity/immediate transaction, errors, locking and ownership-release parity |
 | bcode_workflow_discovery | normal | typed bounded read-only discovery and error parity |
 | bcode_opencode_session_import_plugin | normal | typed foreign-schema read-only import |
-| bcode_database_observability | dev | structured fixtures and decorator tests migrated |
-| bcode_shell_command_analysis | dev | existing database fixtures migrated/replaced |
+
+The observability direct-driver dev allowance has been removed. Current actual-source isolated
+no-raw tests pass (five tests; manual benchmark ignored); its default-off raw forwarding remains
+only for the existing session transition, not permission to restore a driver dependency.
 
 These are migration debt under the user's migration request, not independently approved enduring
 exceptions. A future malformed fixture needs precise approval and isolation, not this table.

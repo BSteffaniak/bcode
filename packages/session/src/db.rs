@@ -4742,7 +4742,7 @@ async fn validate_storage_writer_contract(db: &dyn Database) -> SessionDbResult<
 /// buffers here hold at most a handful of rows, so memory-backed temp storage is strictly cheaper
 /// and has no durability implications: temp objects never outlive the statement.
 async fn configure_turso_connection(db: &dyn Database) -> SessionDbResult<()> {
-    db.exec_raw("PRAGMA temp_store = MEMORY").await?;
+    db.sqlite_temp_store_memory().await?;
     Ok(())
 }
 

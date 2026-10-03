@@ -34,9 +34,6 @@ fn transitional_driver(owner: &str, dependency: &str, kind: Option<&str>) -> boo
                     | "bcode_workflow_discovery"
                     | "bcode_opencode_session_import_plugin",
                 None
-            ) | (
-                "bcode_database_observability" | "bcode_shell_command_analysis",
-                Some("dev")
             )
         )
 }
@@ -152,30 +149,37 @@ mod tests {
     #[test]
     fn transition_is_kind_specific_and_strict_closure_rejects_it() {
         let mut failures = Vec::new();
-        graph("bcode_database_observability", Some("dev"), "raw-sql").check_sql(
-            false,
-            "test",
-            &mut failures,
-        );
+        graph("bcode_workflow_store", None, "raw-sql").check_sql(false, "test", &mut failures);
         assert!(failures.is_empty());
-        graph("bcode_database_observability", None, "schema").check_sql(
+        graph("bcode_workflow_store", Some("dev"), "schema").check_sql(
             false,
             "test",
             &mut failures,
         );
         assert_eq!(failures.len(), 1);
         failures.clear();
-        graph("bcode_database_observability", Some("dev"), "raw-sql").check_sql(
-            true,
-            "test",
-            &mut failures,
-        );
+        graph("bcode_workflow_store", None, "raw-sql").check_sql(true, "test", &mut failures);
         assert_eq!(failures.len(), 2);
+    }
+
+    #[test]
+    fn migrated_observability_rejects_driver_edges_in_every_dependency_kind() {
+        for kind in [None, Some("dev"), Some("build")] {
+            let mut failures = Vec::new();
+            graph("bcode_database_observability", kind, "schema").check_sql(
+                false,
+                "test",
+                &mut failures,
+            );
+            assert_eq!(failures.len(), 1);
+            assert!(failures[0].contains("bcode_database_observability -> rusqlite"));
+        }
     }
 
     #[test]
     fn observability_forwarder_remains_transition_only() {
         let mut graph = graph("bcode_database_observability", Some("dev"), "raw-sql");
+        graph.nodes.get_mut("owner").unwrap().deps.clear();
         graph.nodes.get_mut("owner").unwrap().features = vec!["raw-sql".into()];
         graph
             .packages
@@ -187,7 +191,7 @@ mod tests {
         graph.check_sql(false, "test", &mut failures);
         assert!(failures.is_empty());
         graph.check_sql(true, "test", &mut failures);
-        assert_eq!(failures.len(), 4);
+        assert_eq!(failures.len(), 3);
     }
 
     #[test]

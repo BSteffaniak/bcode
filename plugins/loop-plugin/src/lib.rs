@@ -2893,7 +2893,7 @@ mod tests {
     #[test]
     fn collaboration_readiness_retains_the_coordinator_request() {
         let mut surface = LoopSurface::new(Some(SessionId::new()));
-        assert!(surface.collaboration == CollaborationMode::Disabled);
+        assert_eq!(surface.collaboration, CollaborationMode::Disabled);
         surface.collaboration = CollaborationMode::Requested;
         surface.prompt = text_state("implement a goal");
         surface.condition = text_state("verified result");
@@ -3006,7 +3006,7 @@ mod tests {
             let mut limits = baseline.limits;
             limits.node_execution_cap += 17;
             assert_eq!(extended.limits, limits);
-            assert!(surface.collaboration == CollaborationMode::Disabled);
+            assert_eq!(surface.collaboration, CollaborationMode::Disabled);
             surface.worker_attempts = Some(u64::MAX);
             assert!(
                 surface

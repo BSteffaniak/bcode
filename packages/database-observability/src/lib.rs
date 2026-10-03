@@ -95,6 +95,15 @@ impl ObservedDatabase {
 
 #[async_trait]
 impl Database for ObservedDatabase {
+    async fn sqlite_change_observation(
+        &self,
+    ) -> Result<switchy_database::SqliteChangeObservation, DatabaseError> {
+        let started = self.metrics.started_at();
+        let result = self.inner.sqlite_change_observation().await;
+        self.record(DatabaseOperation::RawQuery, None, started, &result);
+        result
+    }
+
     async fn check_connection(&self) -> Result<(), DatabaseError> {
         let started = self.metrics.started_at();
         let result = self.inner.check_connection().await;
@@ -525,6 +534,15 @@ impl Database for ObservedDatabase {
 
 #[async_trait]
 impl Database for ObservedTransaction {
+    async fn sqlite_change_observation(
+        &self,
+    ) -> Result<switchy_database::SqliteChangeObservation, DatabaseError> {
+        let started = self.metrics.started_at();
+        let result = self.inner.sqlite_change_observation().await;
+        self.record(DatabaseOperation::RawQuery, None, started, &result);
+        result
+    }
+
     async fn check_connection(&self) -> Result<(), DatabaseError> {
         let started = self.metrics.started_at();
         let result = self.inner.check_connection().await;
@@ -1065,6 +1083,25 @@ mod tests {
 
     fn observed(metrics: &MetricsRegistry) -> ObservedDatabase {
         observed_with_registry(metrics.clone())
+    }
+
+    #[tokio::test]
+    async fn change_observations_are_forwarded_without_mutation() {
+        let metrics = MetricsRegistry::in_memory();
+        let database = observed(&metrics);
+        let before = database
+            .sqlite_change_observation()
+            .await
+            .expect("observation");
+        assert_eq!(
+            before,
+            database.sqlite_change_observation().await.expect("stable")
+        );
+        database.close().await.expect("close");
+        assert!(matches!(
+            database.sqlite_change_observation().await,
+            Err(DatabaseError::ConnectionClosed)
+        ));
     }
 
     #[tokio::test]
