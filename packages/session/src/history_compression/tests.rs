@@ -2,6 +2,7 @@
 
 use super::*;
 use bcode_session_models::{SessionEventKind, SessionHistoryDirection, SessionHistoryQuery};
+use switchy::database::query::FilterableQuery as _;
 
 #[tokio::test]
 async fn compressed_history_rejects_legacy_json_decoder_without_changing_logical_event() {
@@ -286,7 +287,10 @@ async fn incompatible_writer_cannot_recompress_canonical_payloads() {
         .expect("db");
     let logical = db.canonical_rows_page(0, 1).await.expect("before");
     db.database()
-        .exec_raw("UPDATE session_storage_contract SET writer_epoch = 9 WHERE contract_id = 1")
+        .update("session_storage_contract")
+        .value("writer_epoch", 9)
+        .where_eq("contract_id", 1)
+        .execute(db.database())
         .await
         .expect("old writer fixture");
     db.database().close().await.expect("close");

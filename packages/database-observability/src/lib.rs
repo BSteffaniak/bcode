@@ -8,13 +8,15 @@ use async_trait::async_trait;
 use bcode_metrics::{DatabaseMetrics, DatabaseOperation};
 use std::sync::Arc;
 use std::time::Instant;
+#[cfg(feature = "raw-sql")]
+use switchy_database::DatabaseValue;
 use switchy_database::query::{
     DeleteStatement, InsertStatement, SelectQuery, UpdateStatement, UpsertMultiStatement,
     UpsertStatement,
 };
 use switchy_database::schema;
 use switchy_database::{
-    Database, DatabaseError, DatabaseTransaction, DatabaseValue, Row, Savepoint,
+    Database, DatabaseError, DatabaseTransaction, Row, Savepoint, TransactionMode,
 };
 
 fn elapsed_ms(started: Option<Instant>) -> u64 {
@@ -93,6 +95,51 @@ impl ObservedDatabase {
 
 #[async_trait]
 impl Database for ObservedDatabase {
+    async fn exec_update_count(
+        &self,
+        statement: &UpdateStatement<'_>,
+    ) -> Result<u64, DatabaseError> {
+        let started = self.metrics.started_at();
+        let result = self.inner.exec_update_count(statement).await;
+        self.record(
+            DatabaseOperation::Update,
+            Some(statement.table_name),
+            started,
+            &result,
+        );
+        result
+    }
+
+    async fn exec_delete_count(
+        &self,
+        statement: &DeleteStatement<'_>,
+    ) -> Result<u64, DatabaseError> {
+        let started = self.metrics.started_at();
+        let result = self.inner.exec_delete_count(statement).await;
+        self.record(
+            DatabaseOperation::Delete,
+            Some(statement.table_name),
+            started,
+            &result,
+        );
+        result
+    }
+
+    async fn begin_transaction_with_mode(
+        &self,
+        mode: TransactionMode,
+    ) -> Result<Box<dyn DatabaseTransaction>, DatabaseError> {
+        let started = self.metrics.started_at();
+        let result = self.inner.begin_transaction_with_mode(mode).await;
+        self.record(DatabaseOperation::Begin, None, started, &result);
+        result.map(|inner| {
+            Box::new(ObservedTransaction {
+                inner,
+                metrics: self.metrics.clone(),
+            }) as Box<dyn DatabaseTransaction>
+        })
+    }
+
     async fn query(&self, query: &SelectQuery<'_>) -> Result<Vec<Row>, DatabaseError> {
         let started = self.metrics.started_at();
         let result = self.inner.query(query).await;
@@ -234,6 +281,7 @@ impl Database for ObservedDatabase {
         result
     }
 
+    #[cfg(feature = "raw-sql")]
     async fn exec_raw(&self, statement: &str) -> Result<(), DatabaseError> {
         let started = self.metrics.started_at();
         let result = self.inner.exec_raw(statement).await;
@@ -241,6 +289,7 @@ impl Database for ObservedDatabase {
         result
     }
 
+    #[cfg(feature = "raw-sql")]
     async fn query_raw(&self, query: &str) -> Result<Vec<Row>, DatabaseError> {
         let started = self.metrics.started_at();
         let result = self.inner.query_raw(query).await;
@@ -248,6 +297,7 @@ impl Database for ObservedDatabase {
         result
     }
 
+    #[cfg(feature = "raw-sql")]
     async fn exec_raw_params(
         &self,
         query: &str,
@@ -259,6 +309,7 @@ impl Database for ObservedDatabase {
         result
     }
 
+    #[cfg(feature = "raw-sql")]
     async fn query_raw_params(
         &self,
         query: &str,
@@ -439,6 +490,51 @@ impl Database for ObservedDatabase {
 
 #[async_trait]
 impl Database for ObservedTransaction {
+    async fn exec_update_count(
+        &self,
+        statement: &UpdateStatement<'_>,
+    ) -> Result<u64, DatabaseError> {
+        let started = self.metrics.started_at();
+        let result = self.inner.exec_update_count(statement).await;
+        self.record(
+            DatabaseOperation::Update,
+            Some(statement.table_name),
+            started,
+            &result,
+        );
+        result
+    }
+
+    async fn exec_delete_count(
+        &self,
+        statement: &DeleteStatement<'_>,
+    ) -> Result<u64, DatabaseError> {
+        let started = self.metrics.started_at();
+        let result = self.inner.exec_delete_count(statement).await;
+        self.record(
+            DatabaseOperation::Delete,
+            Some(statement.table_name),
+            started,
+            &result,
+        );
+        result
+    }
+
+    async fn begin_transaction_with_mode(
+        &self,
+        mode: TransactionMode,
+    ) -> Result<Box<dyn DatabaseTransaction>, DatabaseError> {
+        let started = self.metrics.started_at();
+        let result = self.inner.begin_transaction_with_mode(mode).await;
+        self.record(DatabaseOperation::Begin, None, started, &result);
+        result.map(|inner| {
+            Box::new(Self {
+                inner,
+                metrics: self.metrics.clone(),
+            }) as Box<dyn DatabaseTransaction>
+        })
+    }
+
     async fn query(&self, query: &SelectQuery<'_>) -> Result<Vec<Row>, DatabaseError> {
         let started = self.metrics.started_at();
         let result = self.inner.query(query).await;
@@ -580,6 +676,7 @@ impl Database for ObservedTransaction {
         result
     }
 
+    #[cfg(feature = "raw-sql")]
     async fn exec_raw(&self, statement: &str) -> Result<(), DatabaseError> {
         let started = self.metrics.started_at();
         let result = self.inner.exec_raw(statement).await;
@@ -587,6 +684,7 @@ impl Database for ObservedTransaction {
         result
     }
 
+    #[cfg(feature = "raw-sql")]
     async fn query_raw(&self, query: &str) -> Result<Vec<Row>, DatabaseError> {
         let started = self.metrics.started_at();
         let result = self.inner.query_raw(query).await;
@@ -594,6 +692,7 @@ impl Database for ObservedTransaction {
         result
     }
 
+    #[cfg(feature = "raw-sql")]
     async fn exec_raw_params(
         &self,
         query: &str,
@@ -605,6 +704,7 @@ impl Database for ObservedTransaction {
         result
     }
 
+    #[cfg(feature = "raw-sql")]
     async fn query_raw_params(
         &self,
         query: &str,
@@ -1000,6 +1100,82 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn transaction_modes_and_affected_counts_are_forwarded() {
+        let metrics = MetricsRegistry::in_memory();
+        let database = observed(&metrics);
+        database
+            .exec_create_table(&create_table("items").column(Column {
+                name: "id".to_owned(),
+                nullable: false,
+                auto_increment: false,
+                data_type: DataType::Int,
+                default: None,
+            }))
+            .await
+            .expect("create");
+        database
+            .exec_insert(&insert("items").value("id", 1))
+            .await
+            .expect("insert");
+        assert_eq!(
+            database
+                .exec_update_count(&update("items").value("id", 2))
+                .await
+                .expect("update"),
+            1
+        );
+        for mode in [
+            TransactionMode::Deferred,
+            TransactionMode::Immediate,
+            TransactionMode::Exclusive,
+        ] {
+            let transaction = database
+                .begin_transaction_with_mode(mode)
+                .await
+                .expect("mode");
+            assert_eq!(
+                transaction
+                    .exec_update_count(&update("items").value("id", 3))
+                    .await
+                    .expect("transaction update"),
+                1
+            );
+            assert_eq!(
+                transaction
+                    .exec_delete_count(&delete("items"))
+                    .await
+                    .expect("transaction delete"),
+                1
+            );
+            transaction.rollback().await.expect("rollback");
+        }
+        assert_eq!(
+            database
+                .exec_delete_count(&delete("items"))
+                .await
+                .expect("delete"),
+            1
+        );
+        assert_eq!(
+            database
+                .exec_delete_count(&delete("items"))
+                .await
+                .expect("empty delete"),
+            0
+        );
+        database
+            .exec_update_count(&update("missing_table").value("id", "count-operation-secret"))
+            .await
+            .expect_err("forward error");
+        assert_eq!(
+            metrics.snapshot().counters.get("database.operation.total"),
+            Some(&18)
+        );
+        let serialized = serde_json::to_string(&metrics.snapshot()).expect("metrics snapshot");
+        assert!(!serialized.contains("count-operation-secret"));
+    }
+
+    #[tokio::test]
     async fn close_is_forwarded_and_observed() {
         let metrics = MetricsRegistry::in_memory();
         let database = observed(&metrics);
@@ -1101,28 +1277,31 @@ mod tests {
                 .len(),
             1
         );
-        database
-            .query_raw("INVALID secret-user-value")
-            .await
-            .expect_err("invalid raw query should fail");
-        database
-            .exec_raw("INVALID raw-exec-secret")
-            .await
-            .expect_err("invalid raw exec should fail");
-        database
-            .exec_raw_params(
-                "INVALID parameterized-exec-secret",
-                &[DatabaseValue::String("exec-parameter-secret".to_owned())],
-            )
-            .await
-            .expect_err("invalid parameterized raw exec should fail");
-        database
-            .query_raw_params(
-                "INVALID parameterized-query-secret",
-                &[DatabaseValue::String("parameter-value-secret".to_owned())],
-            )
-            .await
-            .expect_err("invalid parameterized raw query should fail");
+        #[cfg(feature = "raw-sql")]
+        {
+            database
+                .query_raw("INVALID secret-user-value")
+                .await
+                .expect_err("invalid raw query should fail");
+            database
+                .exec_raw("INVALID raw-exec-secret")
+                .await
+                .expect_err("invalid raw exec should fail");
+            database
+                .exec_raw_params(
+                    "INVALID parameterized-exec-secret",
+                    &[DatabaseValue::String("exec-parameter-secret".to_owned())],
+                )
+                .await
+                .expect_err("invalid parameterized raw exec should fail");
+            database
+                .query_raw_params(
+                    "INVALID parameterized-query-secret",
+                    &[DatabaseValue::String("parameter-value-secret".to_owned())],
+                )
+                .await
+                .expect_err("invalid parameterized raw query should fail");
+        }
         let transaction = database.begin_transaction().await.expect("begin");
         transaction
             .query(&select("missing_table"))
@@ -1179,7 +1358,7 @@ mod tests {
                 .snapshot
                 .counters
                 .get("database.operation.total")
-                .is_some_and(|count| *count >= 28)
+                .is_some_and(|count| *count >= 24 + u64::from(cfg!(feature = "raw-sql")) * 4)
         );
         let descriptors = &report.descriptors;
         let aggregate = descriptors
@@ -1205,6 +1384,7 @@ mod tests {
         assert!(!serialized.contains("parameter-value-secret"));
         assert!(!serialized.contains("second"));
         assert!(!serialized.contains("SELECT *"));
+        #[cfg(feature = "raw-sql")]
         assert!(serialized.contains("raw_query"));
 
         let timeline_events = report
@@ -1229,15 +1409,20 @@ mod tests {
             assert!(event.labels.contains_key("operation"));
             assert!(event.labels.contains_key("transaction"));
         }
-        let raw = timeline_events
-            .iter()
-            .find(|event| event.labels.get("operation").map(String::as_str) == Some("raw_query"))
-            .expect("raw query timeline event");
-        assert_eq!(
-            raw.labels.get("transaction").map(String::as_str),
-            Some("none")
-        );
-        assert!(!raw.labels.contains_key("table"));
+        #[cfg(feature = "raw-sql")]
+        {
+            let raw = timeline_events
+                .iter()
+                .find(|event| {
+                    event.labels.get("operation").map(String::as_str) == Some("raw_query")
+                })
+                .expect("raw query timeline event");
+            assert_eq!(
+                raw.labels.get("transaction").map(String::as_str),
+                Some("none")
+            );
+            assert!(!raw.labels.contains_key("table"));
+        }
         let transaction_select = timeline_events
             .iter()
             .find(|event| {

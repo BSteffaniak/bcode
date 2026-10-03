@@ -32,7 +32,7 @@ clap = { workspace = true, features = ["derive", "std"] }
 crossterm = { workspace = true }
 serde = { workspace = true, features = ["derive", "std"] }
 serde_json = { workspace = true }
-switchy_database = { workspace = true }
+switchy_database = { workspace = true, features = ["raw-sql"] }
 switchy_database_connection = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true, features = ["rt", "time"] }

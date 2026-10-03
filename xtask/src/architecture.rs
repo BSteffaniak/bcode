@@ -1,5 +1,7 @@
 //! Dependency boundaries over Cargo's resolved package graph, never repository source text.
 
+mod sql;
+
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::process::Command;
 
@@ -18,6 +20,20 @@ struct Metadata {
 struct Package {
     id: String,
     name: String,
+    #[serde(default)]
+    manifest_path: String,
+    #[serde(default)]
+    dependencies: Vec<DeclaredDependency>,
+    #[serde(default)]
+    features: BTreeMap<String, Vec<String>>,
+}
+
+#[derive(Deserialize)]
+struct DeclaredDependency {
+    name: String,
+    #[serde(default)]
+    features: Vec<String>,
+    uses_default_features: bool,
 }
 
 #[derive(Deserialize)]
@@ -28,6 +44,8 @@ struct Resolve {
 #[derive(Deserialize)]
 struct Node {
     id: String,
+    #[serde(default)]
+    features: Vec<String>,
     deps: Vec<Dependency>,
 }
 
@@ -46,6 +64,8 @@ struct Graph {
     names: BTreeMap<String, String>,
     edges: BTreeMap<String, Vec<String>>,
     members: BTreeSet<String>,
+    packages: BTreeMap<String, Package>,
+    nodes: BTreeMap<String, Node>,
 }
 
 impl From<Metadata> for Graph {
@@ -53,28 +73,39 @@ impl From<Metadata> for Graph {
         Self {
             names: metadata
                 .packages
-                .into_iter()
-                .map(|p| (p.id, p.name))
+                .iter()
+                .map(|p| (p.id.clone(), p.name.clone()))
                 .collect(),
             edges: metadata
                 .resolve
                 .nodes
-                .into_iter()
+                .iter()
                 .map(|node| {
                     let deps = node
                         .deps
-                        .into_iter()
+                        .iter()
                         .filter(|dep| {
                             dep.dep_kinds
                                 .iter()
                                 .any(|kind| kind.kind.as_deref() != Some("dev"))
                         })
-                        .map(|dep| dep.pkg)
+                        .map(|dep| dep.pkg.clone())
                         .collect();
-                    (node.id, deps)
+                    (node.id.clone(), deps)
                 })
                 .collect(),
             members: metadata.workspace_members.into_iter().collect(),
+            packages: metadata
+                .packages
+                .into_iter()
+                .map(|p| (p.id.clone(), p))
+                .collect(),
+            nodes: metadata
+                .resolve
+                .nodes
+                .into_iter()
+                .map(|n| (n.id.clone(), n))
+                .collect(),
         }
     }
 }
@@ -190,6 +221,7 @@ fn forbidden_dependency(owner: &str, dependency: &str) -> bool {
 pub fn check(target: &str) -> Result<()> {
     let graph = load(metadata_command(target).arg("--locked"))?;
     let mut failures = Vec::new();
+    check_sql_profiles(&graph, target, &mut failures)?;
     for root in &graph.members {
         let name = &graph.names[root];
         let forbidden = |dep: &str| forbidden_dependency(name, dep);
@@ -273,6 +305,33 @@ pub fn check(target: &str) -> Result<()> {
     Ok(())
 }
 
+fn check_sql_profiles(graph: &Graph, target: &str, failures: &mut Vec<String>) -> Result<()> {
+    let strict = std::env::var_os("BCODE_ARCHITECTURE_SQL_CLOSURE").is_some();
+    graph.check_sql(strict, "workspace (including dev/build)", failures);
+    for id in &graph.members {
+        let package = &graph.packages[id];
+        if std::path::Path::new(&package.manifest_path)
+            .starts_with(workspace_root().join("plugins"))
+        {
+            let directory = std::path::Path::new(&package.manifest_path)
+                .parent()
+                .ok_or_else(|| format_error("plugin manifest has no parent"))?;
+            let plugin = profile_graph(
+                target,
+                &package.name,
+                &directory.to_string_lossy(),
+                "default",
+            )?;
+            plugin.check_sql(
+                strict,
+                &format!("independent plugin {}", package.name),
+                failures,
+            );
+        }
+    }
+    Ok(())
+}
+
 fn check_profile(
     target: &str,
     package: &str,
@@ -284,6 +343,11 @@ fn check_profile(
 ) -> Result<()> {
     let graph = profile_graph(target, package, directory, features)?;
     let root = graph.root(package)?;
+    graph.check_sql(
+        std::env::var_os("BCODE_ARCHITECTURE_SQL_CLOSURE").is_some(),
+        &format!("{package} [{features}]"),
+        failures,
+    );
     for dep in denied {
         if let Some(path) = graph.path(root, |name| name == *dep) {
             failures.push(format!("{package} [{features}]: {}", path.join(" -> ")));
@@ -308,7 +372,33 @@ fn profile_graph(target: &str, package: &str, directory: &str, features: &str) -
             .filter(|f| !f.is_empty())
             .collect::<Vec<_>>()
     );
-    std::fs::write(temp.path().join("Cargo.toml"), manifest)?;
+    // Cargo does not inherit patches from a path dependency's workspace root.
+    // Preserve coordinator-owned local integration identities in every isolated probe.
+    let workspace_manifest = std::fs::read_to_string(workspace_root().join("Cargo.toml"))?
+        .parse::<toml_edit::DocumentMut>()
+        .map_err(|error| format_error(format!("invalid workspace manifest: {error}")))?;
+    let mut probe_manifest = manifest
+        .parse::<toml_edit::DocumentMut>()
+        .map_err(|error| format_error(format!("invalid probe manifest: {error}")))?;
+    if let Some(patches) = workspace_manifest.get("patch") {
+        let mut patches = patches.clone();
+        if let Some(sources) = patches.as_table_mut() {
+            for (_, source) in sources.iter_mut() {
+                if let Some(dependencies) = source.as_table_mut() {
+                    for (_, dependency) in dependencies.iter_mut() {
+                        if let Some(path) = dependency.get("path").and_then(toml_edit::Item::as_str)
+                        {
+                            let absolute = workspace_root().join(path);
+                            dependency["path"] =
+                                toml_edit::value(absolute.to_string_lossy().as_ref());
+                        }
+                    }
+                }
+            }
+        }
+        probe_manifest["patch"] = patches;
+    }
+    std::fs::write(temp.path().join("Cargo.toml"), probe_manifest.to_string())?;
     std::fs::write(temp.path().join("lib.rs"), "")?;
     std::fs::copy(
         workspace_root().join("Cargo.lock"),

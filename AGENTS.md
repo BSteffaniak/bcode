@@ -145,6 +145,23 @@ Every Rust crate should include these crate-level attributes unless there is a d
 - Full replay/rebuild behavior belongs behind explicit repair, doctor, reindex, or migration commands.
 - Missing, stale, corrupt, or inconsistent indexes should surface degraded or repair-required state unless they can be caught up incrementally from trustworthy sidecars.
 
+## Durable SQL contribution policy
+
+Use Switchy structured query/schema APIs and narrow typed configuration/maintenance APIs.
+Introducing or broadening `raw-sql` feature enablement, direct-driver SQL access, or SQL-fragment
+bypasses requires the actual user's explicit approval for that specific use. Missing upstream
+capability is not approval: implement the typed capability upstream or report the blocker.
+Do not hide SQL in identifiers, projections, joins, schema strings, generic pragma wrappers,
+or a replacement driver. This applies to production, migrations, imports, tests and fixtures.
+
+The finite existing migration scope and removal conditions are recorded in
+[`docs/database-sql-transition.md`](docs/database-sql-transition.md). Transitional enablement
+covers only those existing usages, not new raw calls. Record any separately approved exception's
+precise scope, rationale, removal condition and actual user approval; do not invent approvals
+or blanket fixture exceptions. Shrink transition entries as consumers migrate. Run the resolved
+architecture checks and isolated no-raw compilation before claiming closure; Cargo's additive
+feature unification makes a passing transition allowlist insufficient proof of no new raw calls.
+
 ## Plugin Architecture Expectations
 
 - Initial plugin runtime is native Rust dynamic libraries.

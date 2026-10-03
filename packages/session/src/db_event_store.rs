@@ -86,10 +86,12 @@ pub fn strict_event_from_row(
 
 pub async fn last_sequence(db: &dyn Database) -> SessionDbResult<Option<u64>> {
     let row = db
-        .query_raw("SELECT MAX(event_seq) AS event_seq FROM events")
-        .await?
-        .into_iter()
-        .next();
+        .select("events")
+        .columns(&["event_seq"])
+        .sort("event_seq", SortDirection::Desc)
+        .limit(1)
+        .execute_first(db)
+        .await?;
     let value = row
         .as_ref()
         .and_then(|row| row.get("event_seq"))

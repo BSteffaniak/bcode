@@ -12,6 +12,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use brouter_provider_models::ModelId;
 use brouter_telemetry_models::{RoutingEvent, RoutingEventKind, SessionSummary, UsageEvent};
 use serde_json::Value;
+use switchy_database::query::{FilterableQuery, SortDirection};
+use switchy_database::schema::{DataType, alter_table};
 use switchy_database::{Database, DatabaseError, DatabaseValue, Row};
 use thiserror::Error;
 
@@ -58,8 +60,12 @@ impl TelemetryStore {
         let database = switchy_database_connection::init_sqlite_rusqlite(Some(path))?;
         database.exec_raw(CREATE_USAGE_EVENTS_TABLE).await?;
         database.exec_raw(CREATE_ROUTING_EVENTS_TABLE).await?;
-        for statement in ADD_USAGE_EVENT_COLUMNS {
-            if let Err(error) = database.exec_raw(statement).await {
+        for (name, data_type) in ADD_USAGE_EVENT_COLUMNS {
+            if let Err(error) = alter_table("usage_events")
+                .add_column((*name).to_owned(), data_type.clone(), true, None)
+                .execute(&*database)
+                .await
+            {
                 drop(error);
             }
         }
@@ -86,44 +92,49 @@ impl TelemetryStore {
             }
             TelemetryBackend::Database(database) => {
                 database
-                    .exec_raw_params(
-                        INSERT_USAGE_EVENT,
-                        &[
-                            DatabaseValue::Int64(
-                                i64::try_from(event.timestamp_ms).unwrap_or(i64::MAX),
-                            ),
-                            optional_string_value(event.session_id.as_deref()),
-                            DatabaseValue::String(event.selected_model.to_string()),
-                            optional_string_value(event.provider.as_deref()),
-                            optional_string_value(event.upstream_model.as_deref()),
-                            optional_string_value(event.service_tier.as_deref()),
-                            optional_string_value(event.reasoning_effort.as_deref()),
-                            json_vec_value(&event.resource_pools),
-                            optional_string_value(
-                                event
-                                    .judge_model
-                                    .as_ref()
-                                    .map(ToString::to_string)
-                                    .as_deref(),
-                            ),
-                            optional_bool_value(event.judge_overridden),
-                            optional_string_value(event.judge_error.as_deref()),
-                            optional_string_value(event.judge_rationale.as_deref()),
-                            json_vec_value(&event.routing_reasons),
-                            optional_bool_value(event.fallback_used),
-                            DatabaseValue::Real64(event.estimated_cost),
-                            optional_u64_value(event.latency_ms),
-                            optional_u16_value(event.status_code),
-                            optional_string_value(event.provider_error.as_deref()),
-                            optional_u64_value(event.prompt_tokens),
-                            optional_u64_value(event.completion_tokens),
-                            optional_u64_value(event.total_tokens),
-                            optional_u64_value(event.context_tokens),
-                            optional_u64_value(event.context_window),
-                            optional_string_value(event.context_source.as_deref()),
-                            DatabaseValue::Bool(event.success),
-                        ],
+                    .insert("usage_events")
+                    .values(
+                        USAGE_EVENT_COLUMNS
+                            .iter()
+                            .copied()
+                            .zip([
+                                DatabaseValue::Int64(
+                                    i64::try_from(event.timestamp_ms).unwrap_or(i64::MAX),
+                                ),
+                                optional_string_value(event.session_id.as_deref()),
+                                DatabaseValue::String(event.selected_model.to_string()),
+                                optional_string_value(event.provider.as_deref()),
+                                optional_string_value(event.upstream_model.as_deref()),
+                                optional_string_value(event.service_tier.as_deref()),
+                                optional_string_value(event.reasoning_effort.as_deref()),
+                                json_vec_value(&event.resource_pools),
+                                optional_string_value(
+                                    event
+                                        .judge_model
+                                        .as_ref()
+                                        .map(ToString::to_string)
+                                        .as_deref(),
+                                ),
+                                optional_bool_value(event.judge_overridden),
+                                optional_string_value(event.judge_error.as_deref()),
+                                optional_string_value(event.judge_rationale.as_deref()),
+                                json_vec_value(&event.routing_reasons),
+                                optional_bool_value(event.fallback_used),
+                                DatabaseValue::Real64(event.estimated_cost),
+                                optional_u64_value(event.latency_ms),
+                                optional_u16_value(event.status_code),
+                                optional_string_value(event.provider_error.as_deref()),
+                                optional_u64_value(event.prompt_tokens),
+                                optional_u64_value(event.completion_tokens),
+                                optional_u64_value(event.total_tokens),
+                                optional_u64_value(event.context_tokens),
+                                optional_u64_value(event.context_window),
+                                optional_string_value(event.context_source.as_deref()),
+                                DatabaseValue::Bool(event.success),
+                            ])
+                            .collect(),
                     )
+                    .execute(&***database)
                     .await?;
                 Ok(())
             }
@@ -148,20 +159,25 @@ impl TelemetryStore {
             }
             TelemetryBackend::Database(database) => {
                 database
-                    .exec_raw_params(
-                        INSERT_ROUTING_EVENT,
-                        &[
-                            DatabaseValue::Int64(
-                                i64::try_from(event.timestamp_ms).unwrap_or(i64::MAX),
-                            ),
-                            DatabaseValue::String(event.event_id.clone()),
-                            optional_string_value(event.session_id.as_deref()),
-                            DatabaseValue::String(event.request_id.clone()),
-                            DatabaseValue::String(event.kind.as_str().to_string()),
-                            optional_string_value(event.client.as_deref()),
-                            DatabaseValue::String(event.payload.to_string()),
-                        ],
+                    .insert("routing_events")
+                    .values(
+                        ROUTING_EVENT_COLUMNS
+                            .iter()
+                            .copied()
+                            .zip([
+                                DatabaseValue::Int64(
+                                    i64::try_from(event.timestamp_ms).unwrap_or(i64::MAX),
+                                ),
+                                DatabaseValue::String(event.event_id.clone()),
+                                optional_string_value(event.session_id.as_deref()),
+                                DatabaseValue::String(event.request_id.clone()),
+                                DatabaseValue::String(event.kind.as_str().to_string()),
+                                optional_string_value(event.client.as_deref()),
+                                DatabaseValue::String(event.payload.to_string()),
+                            ])
+                            .collect(),
                     )
+                    .execute(&***database)
                     .await?;
                 Ok(())
             }
@@ -181,7 +197,9 @@ impl TelemetryStore {
                 .usage_events
                 .clone()),
             TelemetryBackend::Database(database) => Ok(database
-                .query_raw(SELECT_USAGE_EVENTS)
+                .select("usage_events")
+                .sort("id", SortDirection::Asc)
+                .execute(&***database)
                 .await?
                 .iter()
                 .map(row_to_usage_event)
@@ -202,7 +220,9 @@ impl TelemetryStore {
                 .routing_events
                 .clone()),
             TelemetryBackend::Database(database) => Ok(database
-                .query_raw(SELECT_ROUTING_EVENTS)
+                .select("routing_events")
+                .sort("id", SortDirection::Asc)
+                .execute(&***database)
                 .await?
                 .iter()
                 .map(row_to_routing_event)
@@ -258,19 +278,21 @@ impl TelemetryStore {
             }
             TelemetryBackend::Database(database) => {
                 let rows = database
-                    .query_raw_params(
-                        SELECT_SESSION_EXISTS,
-                        &[DatabaseValue::String(session_id.to_string())],
-                    )
+                    .select("usage_events")
+                    .columns(&["id"])
+                    .where_eq("session_id", session_id)
+                    .limit(1)
+                    .execute(&***database)
                     .await?;
                 if !rows.is_empty() {
                     return Ok(true);
                 }
                 let rows = database
-                    .query_raw_params(
-                        SELECT_ROUTING_SESSION_EXISTS,
-                        &[DatabaseValue::String(session_id.to_string())],
-                    )
+                    .select("routing_events")
+                    .columns(&["id"])
+                    .where_eq("session_id", session_id)
+                    .limit(1)
+                    .execute(&***database)
                     .await?;
                 Ok(!rows.is_empty())
             }
@@ -385,55 +407,61 @@ CREATE TABLE IF NOT EXISTS routing_events (\
     payload_json TEXT NOT NULL\
 )";
 
-const ADD_USAGE_EVENT_COLUMNS: &[&str] = &[
-    "ALTER TABLE usage_events ADD COLUMN provider TEXT NULL",
-    "ALTER TABLE usage_events ADD COLUMN upstream_model TEXT NULL",
-    "ALTER TABLE usage_events ADD COLUMN service_tier TEXT NULL",
-    "ALTER TABLE usage_events ADD COLUMN reasoning_effort TEXT NULL",
-    "ALTER TABLE usage_events ADD COLUMN resource_pools TEXT NULL",
-    "ALTER TABLE usage_events ADD COLUMN judge_model TEXT NULL",
-    "ALTER TABLE usage_events ADD COLUMN judge_overridden INTEGER NULL",
-    "ALTER TABLE usage_events ADD COLUMN judge_error TEXT NULL",
-    "ALTER TABLE usage_events ADD COLUMN judge_rationale TEXT NULL",
-    "ALTER TABLE usage_events ADD COLUMN routing_reasons TEXT NULL",
-    "ALTER TABLE usage_events ADD COLUMN fallback_used INTEGER NULL",
-    "ALTER TABLE usage_events ADD COLUMN total_tokens INTEGER NULL",
-    "ALTER TABLE usage_events ADD COLUMN context_tokens INTEGER NULL",
-    "ALTER TABLE usage_events ADD COLUMN context_window INTEGER NULL",
-    "ALTER TABLE usage_events ADD COLUMN context_source TEXT NULL",
+const ADD_USAGE_EVENT_COLUMNS: &[(&str, DataType)] = &[
+    ("provider", DataType::Text),
+    ("upstream_model", DataType::Text),
+    ("service_tier", DataType::Text),
+    ("reasoning_effort", DataType::Text),
+    ("resource_pools", DataType::Text),
+    ("judge_model", DataType::Text),
+    ("judge_overridden", DataType::Int),
+    ("judge_error", DataType::Text),
+    ("judge_rationale", DataType::Text),
+    ("routing_reasons", DataType::Text),
+    ("fallback_used", DataType::Int),
+    ("total_tokens", DataType::Int),
+    ("context_tokens", DataType::Int),
+    ("context_window", DataType::Int),
+    ("context_source", DataType::Text),
 ];
 
-const INSERT_USAGE_EVENT: &str = "\
-INSERT INTO usage_events (\
-    timestamp_ms, session_id, selected_model, provider, upstream_model, service_tier,\
-    reasoning_effort, resource_pools, judge_model, judge_overridden, judge_error,\
-    judge_rationale, routing_reasons, fallback_used, estimated_cost, latency_ms,\
-    status_code, provider_error, prompt_tokens, completion_tokens, total_tokens, context_tokens,\
-    context_window, context_source, success\
-) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)";
+const USAGE_EVENT_COLUMNS: &[&str] = &[
+    "timestamp_ms",
+    "session_id",
+    "selected_model",
+    "provider",
+    "upstream_model",
+    "service_tier",
+    "reasoning_effort",
+    "resource_pools",
+    "judge_model",
+    "judge_overridden",
+    "judge_error",
+    "judge_rationale",
+    "routing_reasons",
+    "fallback_used",
+    "estimated_cost",
+    "latency_ms",
+    "status_code",
+    "provider_error",
+    "prompt_tokens",
+    "completion_tokens",
+    "total_tokens",
+    "context_tokens",
+    "context_window",
+    "context_source",
+    "success",
+];
 
-const INSERT_ROUTING_EVENT: &str = "\
-INSERT INTO routing_events (\
-    timestamp_ms, event_id, session_id, request_id, kind, client, payload_json\
-) VALUES (?, ?, ?, ?, ?, ?, ?)";
-
-const SELECT_USAGE_EVENTS: &str = "\
-SELECT timestamp_ms, session_id, selected_model, provider, upstream_model, service_tier,\
-    reasoning_effort, resource_pools, judge_model, judge_overridden, judge_error,\
-    judge_rationale, routing_reasons, fallback_used, estimated_cost, latency_ms,\
-    status_code, provider_error, prompt_tokens, completion_tokens, total_tokens, context_tokens,\
-    context_window, context_source, success \
-FROM usage_events ORDER BY id ASC";
-
-const SELECT_ROUTING_EVENTS: &str = "\
-SELECT timestamp_ms, event_id, session_id, request_id, kind, client, payload_json \
-FROM routing_events ORDER BY id ASC";
-
-const SELECT_SESSION_EXISTS: &str = "\
-SELECT 1 FROM usage_events WHERE session_id = ? LIMIT 1";
-
-const SELECT_ROUTING_SESSION_EXISTS: &str = "\
-SELECT 1 FROM routing_events WHERE session_id = ? LIMIT 1";
+const ROUTING_EVENT_COLUMNS: &[&str] = &[
+    "timestamp_ms",
+    "event_id",
+    "session_id",
+    "request_id",
+    "kind",
+    "client",
+    "payload_json",
+];
 
 fn optional_string_value(value: Option<&str>) -> DatabaseValue {
     DatabaseValue::StringOpt(value.map(ToOwned::to_owned))
@@ -577,6 +605,59 @@ mod tests {
     use serde_json::json;
 
     #[tokio::test]
+    async fn sqlite_store_adds_nullable_historical_columns_without_losing_rows() {
+        use switchy_database::schema::{Column, create_table};
+
+        let path =
+            std::env::temp_dir().join(format!("brouter-telemetry-upgrade-{}.db", now_millis()));
+        let database = switchy_database_connection::init_sqlite_rusqlite(Some(&path)).unwrap();
+        create_table("usage_events")
+            .column(Column {
+                name: "id".to_owned(),
+                nullable: false,
+                auto_increment: false,
+                data_type: DataType::Int,
+                default: None,
+            })
+            .primary_key("id")
+            .execute(&*database)
+            .await
+            .unwrap();
+        database
+            .insert("usage_events")
+            .value("id", 7_i64)
+            .execute(&*database)
+            .await
+            .unwrap();
+        drop(database);
+
+        for _ in 0..2 {
+            let store = TelemetryStore::sqlite(&path).await.unwrap();
+            let TelemetryBackend::Database(database) = &store.backend else {
+                panic!("expected database backend");
+            };
+            let mut columns = vec!["id"];
+            columns.extend(ADD_USAGE_EVENT_COLUMNS.iter().map(|(name, _)| *name));
+            let rows = database
+                .select("usage_events")
+                .columns(&columns)
+                .execute(&***database)
+                .await
+                .unwrap();
+            assert_eq!(rows.len(), 1);
+            assert_eq!(rows[0].get("id"), Some(DatabaseValue::Int64(7)));
+            for (name, _) in ADD_USAGE_EVENT_COLUMNS {
+                assert_eq!(
+                    rows[0].get(name),
+                    Some(DatabaseValue::Null),
+                    "{name}: {rows:?}"
+                );
+            }
+        }
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[tokio::test]
     async fn sqlite_store_persists_usage_and_routing_events() {
         let path = std::env::temp_dir().join(format!("brouter-telemetry-{}.db", now_millis()));
         let store = TelemetryStore::sqlite(&path)
@@ -634,6 +715,13 @@ mod tests {
                 .await
                 .expect("session lookup should work")
         );
+        assert!(
+            !store
+                .has_session("missing' OR 1=1 --")
+                .await
+                .expect("literal session lookup")
+        );
+        assert!(store.record_routing_event(&routing_event).await.is_err());
         let usage_events = store.events().await.expect("events should load");
         assert_eq!(usage_events, vec![usage_event]);
         let routing_events = store

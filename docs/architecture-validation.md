@@ -46,6 +46,28 @@ The minimal app already uses the bundled-plugin registry and `zstd` through `bmu
 Registry plumbing and codec compression are not evidence that optional search providers are enabled;
 the checker bans concrete optional implementations instead of those overbroad package exclusions.
 
+## SQL migration boundary
+
+`architecture` also checks resolved SQL feature activation, explicit requests/default enablement,
+and Bcode-owned direct-driver edges. This check includes dev/build edges in workspace metadata;
+the portable contract checks above intentionally continue to ignore dev-only edges. Shipped
+app/distribution/CLI/web profiles and each independently resolved plugin run the SQL check too.
+Isolated probes copy root Cargo patches (including absolute local paths) so they inspect the
+coordinator's actual integration rather than silently selecting unpatched upstream code.
+
+See [database SQL transition](database-sql-transition.md) for the finite existing scope and
+approval/removal requirements. Use
+`BCODE_ARCHITECTURE_SQL_CLOSURE=1 cargo run -p xtask -- architecture [--target <triple>]`
+to reject all raw activation/requests and all Bcode driver edges now. The default transition gate
+is not final absence; remove its allowances and make closure unconditional after migration.
+Run `cargo test -p xtask architecture` for metadata behavior tests (normal/dev/build edges,
+feature forwarding/defaults, strict closure and allowed Switchy internals).
+
+Cargo metadata describes additive feature resolution, not per-call authorization or API exclusion.
+Compile upstream no-raw probes and migrated downstream consumers/tests in isolated workspaces;
+ordinary workspace compilation can mask missing opt-outs. Run relevant domain tests and plugin
+builds as well. No fixture is exempt merely because it is a dev dependency.
+
 ## Behavioral and compiler protection
 
 Keep tests in the domain that owns the behavior. Existing lease/process tests, artifact identity

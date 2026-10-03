@@ -8,10 +8,7 @@ use switchy::database::{
 /// Reconstruct exact aggregates from existing reporting contributions under the caller's
 /// exclusive file lock and transaction. Canonical session stores are never accessed.
 pub(super) async fn upgrade_v1(db: &dyn Database) -> Result<(), String> {
-    db.query_raw("CREATE TABLE usage_time_nodes (node_key TEXT PRIMARY KEY, tree TEXT NOT NULL, totals_json TEXT NOT NULL)").await.map_err(error)?;
-    db.query_raw("CREATE INDEX usage_time_tree ON usage_time_nodes(tree)")
-        .await
-        .map_err(error)?;
+    super::create_time_schema(db).await?;
     let mut after = 0_i64;
     loop {
         let rows = db

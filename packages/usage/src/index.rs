@@ -6,11 +6,73 @@ use std::path::{Path, PathBuf};
 use switchy::database::{
     Database, DatabaseValue, Row,
     query::{FilterableQuery, SortDirection},
+    schema::{Column, DataType, create_index, create_table},
 };
 
 mod upgrade;
 
 const SCHEMA: i64 = 2;
+
+fn column(name: &str, data_type: DataType, nullable: bool) -> Column {
+    Column {
+        name: name.into(),
+        nullable,
+        auto_increment: false,
+        data_type,
+        default: None,
+    }
+}
+
+async fn create_row_schema(db: &dyn Database) -> Result<(), String> {
+    create_table("usage_rows")
+        .columns(vec![
+            column("ordinal", DataType::BigInt, true),
+            column("session_id", DataType::Text, false),
+            column("request_key", DataType::Text, false),
+            column("entry_json", DataType::Text, false),
+            column("staged", DataType::BigInt, false),
+        ])
+        .primary_key("ordinal")
+        .unique_columns(["session_id", "request_key", "staged"])
+        .execute(db)
+        .await
+        .map_err(error)?;
+    for (name, columns) in [
+        (
+            "usage_session_rows",
+            vec!["session_id", "staged", "ordinal"],
+        ),
+        ("usage_published_rows", vec!["staged", "ordinal"]),
+    ] {
+        create_index(name)
+            .table("usage_rows")
+            .columns(columns)
+            .execute(db)
+            .await
+            .map_err(error)?;
+    }
+    Ok(())
+}
+
+async fn create_time_schema(db: &dyn Database) -> Result<(), String> {
+    create_table("usage_time_nodes")
+        .columns(vec![
+            // SQLite TEXT PRIMARY KEY permits NULL unless NOT NULL is explicit.
+            column("node_key", DataType::Text, true),
+            column("tree", DataType::Text, false),
+            column("totals_json", DataType::Text, false),
+        ])
+        .primary_key("node_key")
+        .execute(db)
+        .await
+        .map_err(error)?;
+    create_index("usage_time_tree")
+        .table("usage_time_nodes")
+        .column("tree")
+        .execute(db)
+        .await
+        .map_err(error)
+}
 
 /// State-location-local reporting storage. Opening a dashboard never initializes or repairs it.
 #[derive(Debug)]
@@ -143,20 +205,49 @@ impl UsageIndex {
             .await
             .map_err(error)?;
         let tx = db.begin_transaction().await.map_err(error)?;
-        let tables = tx.query_raw("SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%' LIMIT 8").await.map_err(error)?;
+        let tables = tx
+            .select("sqlite_master")
+            .columns(&["name"])
+            .where_eq("type", "table")
+            .where_not_like("name", "sqlite_%")
+            .limit(8)
+            .execute(&*tx)
+            .await
+            .map_err(error)?;
         if tables.is_empty() && initialize {
-            for statement in [
-                "CREATE TABLE usage_meta (id INTEGER PRIMARY KEY CHECK(id=1), version INTEGER NOT NULL, revision INTEGER NOT NULL, ordinal INTEGER NOT NULL)",
-                "INSERT INTO usage_meta VALUES (1,2,0,0)",
-                "CREATE TABLE usage_time_nodes (node_key TEXT PRIMARY KEY, tree TEXT NOT NULL, totals_json TEXT NOT NULL)",
-                "CREATE INDEX usage_time_tree ON usage_time_nodes(tree)",
-                "CREATE TABLE usage_sessions (session_id TEXT PRIMARY KEY, generation TEXT NOT NULL, next_key TEXT, collecting INTEGER NOT NULL)",
-                "CREATE TABLE usage_rows (ordinal INTEGER PRIMARY KEY, session_id TEXT NOT NULL, request_key TEXT NOT NULL, entry_json TEXT NOT NULL, staged INTEGER NOT NULL, UNIQUE(session_id,request_key,staged))",
-                "CREATE INDEX usage_session_rows ON usage_rows(session_id,staged,ordinal)",
-                "CREATE INDEX usage_published_rows ON usage_rows(staged,ordinal)",
-            ] {
-                tx.query_raw(statement).await.map_err(error)?;
-            }
+            create_table("usage_meta")
+                .columns(vec![
+                    column("id", DataType::BigInt, true),
+                    column("version", DataType::BigInt, false),
+                    column("revision", DataType::BigInt, false),
+                    column("ordinal", DataType::BigInt, false),
+                ])
+                .primary_key("id")
+                .check_integer_equals("id", 1)
+                .execute(&*tx)
+                .await
+                .map_err(error)?;
+            tx.insert("usage_meta")
+                .value("id", 1)
+                .value("version", SCHEMA)
+                .value("revision", 0)
+                .value("ordinal", 0)
+                .execute(&*tx)
+                .await
+                .map_err(error)?;
+            create_time_schema(&*tx).await?;
+            create_table("usage_sessions")
+                .columns(vec![
+                    column("session_id", DataType::Text, true),
+                    column("generation", DataType::Text, false),
+                    column("next_key", DataType::Text, true),
+                    column("collecting", DataType::Int, false),
+                ])
+                .primary_key("session_id")
+                .execute(&*tx)
+                .await
+                .map_err(error)?;
+            create_row_schema(&*tx).await?;
         }
         let meta = tx
             .select("usage_meta")
@@ -622,6 +713,139 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn structured_schema_preserves_constraints_and_indexes() {
+        let root = tempfile::tempdir().unwrap();
+        let root = root.path().canonicalize().unwrap();
+        let index = UsageIndex::in_state_root(&root);
+        let (_lock, db) = index.open(true).await.unwrap();
+        for name in [
+            "usage_time_tree",
+            "usage_session_rows",
+            "usage_published_rows",
+        ] {
+            assert!(
+                db.select("sqlite_master")
+                    .where_eq("type", "index")
+                    .where_eq("name", name)
+                    .limit(1)
+                    .execute_first(&*db)
+                    .await
+                    .unwrap()
+                    .is_some()
+            );
+        }
+        // Preserve SQLite's nullable TEXT primary keys, not an implicit NOT NULL.
+        db.insert("usage_time_nodes")
+            .value("node_key", DatabaseValue::Null)
+            .value("tree", "tree")
+            .value("totals_json", "{}")
+            .execute(&*db)
+            .await
+            .unwrap();
+        assert!(
+            db.insert("usage_time_nodes")
+                .value("node_key", "key")
+                .value("tree", DatabaseValue::Null)
+                .value("totals_json", "{}")
+                .execute(&*db)
+                .await
+                .is_err()
+        );
+        db.insert("usage_sessions")
+            .value("session_id", DatabaseValue::Null)
+            .value("generation", "generation")
+            .value("next_key", DatabaseValue::Null)
+            .value("collecting", 0)
+            .execute(&*db)
+            .await
+            .unwrap();
+        assert!(
+            db.update("usage_meta")
+                .value("id", 2)
+                .where_eq("id", 1)
+                .execute(&*db)
+                .await
+                .is_err()
+        );
+        for ordinal in [1, 2] {
+            let result = db
+                .insert("usage_rows")
+                .value("ordinal", ordinal)
+                .value("session_id", "session")
+                .value("request_key", "request")
+                .value("entry_json", "{}")
+                .value("staged", 0)
+                .execute(&*db)
+                .await;
+            assert_eq!(result.is_ok(), ordinal == 1);
+        }
+        // The staged copy is distinct from the published copy of the same request.
+        db.insert("usage_rows")
+            .value("ordinal", DatabaseValue::Null)
+            .value("session_id", "session")
+            .value("request_key", "request")
+            .value("entry_json", "{}")
+            .value("staged", 1)
+            .execute(&*db)
+            .await
+            .unwrap();
+        let rows = db.select("usage_rows").execute(&*db).await.unwrap();
+        assert_eq!(rows.len(), 2);
+        assert!(rows.iter().all(|row| integer(row, "ordinal").is_ok()));
+    }
+
+    #[tokio::test]
+    async fn unrelated_schema_is_not_initialized() {
+        let root = tempfile::tempdir().unwrap();
+        let root = root.path().canonicalize().unwrap();
+        let index = UsageIndex::in_state_root(&root);
+        std::fs::create_dir_all(index.path.parent().unwrap()).unwrap();
+        let db = switchy::database_connection::builder()
+            .turso()
+            .with_path(&index.path)
+            .with_multiprocess_wal(false)
+            .build()
+            .await
+            .unwrap();
+        for n in 0..10 {
+            create_table(&format!("unrelated_{n}"))
+                .column(column("id", DataType::BigInt, true))
+                .execute(&*db)
+                .await
+                .unwrap();
+        }
+        drop(db);
+        assert!(index.open(true).await.is_err());
+        let db = switchy::database_connection::builder()
+            .turso()
+            .with_path(&index.path)
+            .with_multiprocess_wal(false)
+            .build()
+            .await
+            .unwrap();
+        assert!(
+            db.select("sqlite_master")
+                .where_eq("name", "usage_meta")
+                .limit(1)
+                .execute(&*db)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            db.select("sqlite_master")
+                .where_eq("type", "table")
+                .where_not_like("name", "sqlite_%")
+                .limit(8)
+                .execute(&*db)
+                .await
+                .unwrap()
+                .len(),
+            8
+        );
+    }
+
+    #[tokio::test]
     async fn v1_upgrade_is_explicit_and_preserves_contributions() {
         let root = tempfile::tempdir().unwrap();
         let root = root.path().canonicalize().unwrap();
@@ -629,8 +853,14 @@ mod tests {
         let id = SessionId::new();
         index.collect(id, None, page("a", None)).await.unwrap();
         let (lock, db) = index.open(false).await.unwrap();
-        db.query_raw("DROP TABLE usage_time_nodes").await.unwrap();
-        db.query_raw("UPDATE usage_meta SET version=1 WHERE id=1")
+        switchy::database::schema::drop_table("usage_time_nodes")
+            .execute(&*db)
+            .await
+            .unwrap();
+        db.update("usage_meta")
+            .value("version", 1)
+            .where_eq("id", 1)
+            .execute(&*db)
             .await
             .unwrap();
         drop(db);
@@ -658,7 +888,10 @@ mod tests {
             .await
             .unwrap();
         let (lock, db) = index.open(false).await.unwrap();
-        db.query_raw("UPDATE usage_meta SET version=999 WHERE id=1")
+        db.update("usage_meta")
+            .value("version", 999)
+            .where_eq("id", 1)
+            .execute(&*db)
             .await
             .unwrap();
         drop(db);

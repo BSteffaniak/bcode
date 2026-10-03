@@ -1980,10 +1980,15 @@ impl SessionDb {
     /// Returns an error if the query fails or its row is malformed.
     pub async fn first_non_current_event_envelope(&self) -> SessionDbResult<Option<(u16, String)>> {
         let current = bcode_session_models::CURRENT_SESSION_EVENT_SCHEMA_VERSION;
-        let query = format!(
-            "SELECT schema_version, event_type FROM events WHERE schema_version != {current} ORDER BY event_seq ASC LIMIT 1"
-        );
-        let row = self.db.query_raw(&query).await?.into_iter().next();
+        let row = self
+            .db
+            .select("events")
+            .columns(&["schema_version", "event_type"])
+            .where_not_eq("schema_version", i64::from(current))
+            .sort("event_seq", SortDirection::Asc)
+            .limit(1)
+            .execute_first(&**self.db)
+            .await?;
         row.as_ref()
             .map(|row| {
                 Ok((
@@ -2066,10 +2071,15 @@ impl SessionDb {
     /// Returns an error if the query fails or its row is malformed.
     pub async fn first_non_current_event_schema(&self) -> SessionDbResult<Option<u16>> {
         let current = bcode_session_models::CURRENT_SESSION_EVENT_SCHEMA_VERSION;
-        let query = format!(
-            "SELECT MIN(schema_version) AS schema_version FROM events WHERE schema_version != {current}"
-        );
-        let row = self.db.query_raw(&query).await?.into_iter().next();
+        let row = self
+            .db
+            .select("events")
+            .columns(&["schema_version"])
+            .where_not_eq("schema_version", i64::from(current))
+            .sort("schema_version", SortDirection::Asc)
+            .limit(1)
+            .execute_first(&**self.db)
+            .await?;
         row.as_ref()
             .and_then(|row| optional_i64(row, "schema_version"))
             .map(i64_to_u64)
@@ -3715,10 +3725,12 @@ impl SessionDb {
     pub async fn last_event_sequence(&self) -> SessionDbResult<Option<u64>> {
         let row = self
             .db
-            .query_raw("SELECT MAX(event_seq) AS event_seq FROM events")
-            .await?
-            .into_iter()
-            .next();
+            .select("events")
+            .columns(&["event_seq"])
+            .sort("event_seq", SortDirection::Desc)
+            .limit(1)
+            .execute_first(&**self.db)
+            .await?;
         row.as_ref()
             .and_then(|row| optional_i64(row, "event_seq"))
             .map(i64_to_u64)
@@ -6494,8 +6506,8 @@ mod tests {
         let db = SessionDb::open_turso_in_root(session_id, temp_dir.path())
             .await
             .expect("open session db");
-        db.database()
-            .exec_raw("DROP TABLE session_storage_contract")
+        switchy::database::schema::drop_table("session_storage_contract")
+            .execute(db.database())
             .await
             .expect("drop contract table");
 
@@ -6535,8 +6547,8 @@ mod tests {
             .execute(db.database())
             .await
             .expect("remove contract migrations");
-        db.database()
-            .exec_raw("DROP TABLE session_storage_contract")
+        switchy::database::schema::drop_table("session_storage_contract")
+            .execute(db.database())
             .await
             .expect("drop contract table");
 
@@ -9628,12 +9640,12 @@ mod tests {
     }
 
     async fn remove_usage_staging_fixture(db: &SessionDb) {
-        db.database()
-            .exec_raw("DROP TABLE turn_evidence")
+        switchy::database::schema::drop_table("turn_evidence")
+            .execute(db.database())
             .await
             .unwrap();
-        db.database()
-            .exec_raw("DROP TABLE usage_valuation_staging")
+        switchy::database::schema::drop_table("usage_valuation_staging")
+            .execute(db.database())
             .await
             .unwrap();
     }
@@ -9683,18 +9695,20 @@ mod tests {
         );
         db.append_event(&legacy).await.unwrap();
         let bytes = usage_fixture_payload(&db).await;
-        db.database()
-            .exec_raw("DROP INDEX idx_session_usage_timestamp")
-            .await
-            .unwrap();
-        db.database()
-            .exec_raw("ALTER TABLE session_usage_requests DROP COLUMN cost_json")
-            .await
-            .unwrap();
-        db.database()
-            .exec_raw("ALTER TABLE session_usage_requests DROP COLUMN first_observed_at_ms")
-            .await
-            .unwrap();
+        switchy::database::schema::drop_index(
+            "idx_session_usage_timestamp",
+            "session_usage_requests",
+        )
+        .execute(db.database())
+        .await
+        .unwrap();
+        for column in ["cost_json", "first_observed_at_ms"] {
+            switchy::database::schema::alter_table("session_usage_requests")
+                .drop_column(column.to_owned())
+                .execute(db.database())
+                .await
+                .unwrap();
+        }
         remove_usage_staging_fixture(&db).await;
         db.database()
             .delete(SESSION_MIGRATIONS_TABLE)
@@ -9728,11 +9742,8 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        assert!(
-            required_string(&row, "cost_json")
-                .unwrap()
-                .contains("original")
-        );
+        let cost_json = required_string(&row, "cost_json").unwrap();
+        assert!(cost_json.contains("original"));
         assert_eq!(
             required_i64(&row, "first_observed_at_ms")
                 .unwrap()
@@ -10309,15 +10320,20 @@ mod tests {
             vec![0, 1]
         );
         assert!(db.turn_evidence("absent").await.expect("absent").is_empty());
-        db.database()
-            .exec_raw("DROP INDEX idx_turn_evidence_sequence")
+        switchy::database::schema::drop_index("idx_turn_evidence_sequence", "turn_evidence")
+            .execute(db.database())
             .await
             .expect("remove index");
         assert!(matches!(
             db.turn_evidence("target").await,
             Err(SessionDbError::InvalidData(_))
         ));
-        db.database().exec_raw("CREATE INDEX idx_turn_evidence_sequence ON turn_evidence(turn_id, evidence_kind, event_seq)").await.expect("restore fixture index");
+        switchy::database::schema::create_index("idx_turn_evidence_sequence")
+            .table("turn_evidence")
+            .columns(vec!["turn_id", "evidence_kind", "event_seq"])
+            .execute(db.database())
+            .await
+            .expect("restore fixture index");
         db.database()
             .delete("projection_checkpoints")
             .where_eq("projection_name", "turn_evidence")

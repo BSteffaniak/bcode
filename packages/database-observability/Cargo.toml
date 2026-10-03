@@ -36,3 +36,5 @@ tokio = { workspace = true, features = ["macros", "rt"] }
 [features]
 default          = []
 fail-on-warnings = []
+# Existing raw forwarding only; remove after session migration.
+raw-sql = ["switchy_database/raw-sql"]
