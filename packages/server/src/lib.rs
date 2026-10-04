@@ -5523,8 +5523,29 @@ async fn recover_abandoned_session_runtime_work(
         .iter()
         .map(|work| work.work_id.clone())
         .collect::<std::collections::BTreeSet<_>>();
+    // An execution owner can outlive the session's current-turn slot (for example
+    // while a tool drains). Its ancestors are not abandoned merely because their
+    // own registry entry is absent. Recovery must not terminalize that live tree.
+    let parents = active
+        .iter()
+        .filter_map(|work| {
+            work.parent_work_id
+                .as_ref()
+                .map(|parent| (work.work_id.clone(), parent.clone()))
+        })
+        .collect::<BTreeMap<_, _>>();
+    let mut owned_tree = active_runtime_ids.clone();
+    for owned in &active_runtime_ids {
+        let mut child = owned;
+        while let Some(parent) = parents.get(child) {
+            if !owned_tree.insert(parent.clone()) {
+                break;
+            }
+            child = parent;
+        }
+    }
     for work in active {
-        if active_runtime_ids.contains(&work.work_id) {
+        if owned_tree.contains(&work.work_id) {
             continue;
         }
         if work.kind == RuntimeWorkKind::ModelTurn
@@ -61016,6 +61037,78 @@ event_symbol = "bcode_plugin_handle_event_v1"
                 .unwrap(),
             generation + 1
         );
+    }
+
+    #[tokio::test]
+    async fn recovery_preserves_ancestors_of_owned_execution_without_current_turn() {
+        let root = tempfile::tempdir().expect("session root");
+        let sessions = SessionManager::persistent(root.path()).expect("sessions");
+        let session = sessions
+            .create_session(None, test_working_directory())
+            .await
+            .expect("session");
+        let state = Arc::new(test_server_state(sessions));
+        let parent = WorkId::new("model-draining");
+        let child = WorkId::new("tool-draining");
+        register_runtime_work(
+            &state,
+            session.id,
+            RuntimeWorkSpec::new(
+                parent.clone(),
+                RuntimeWorkKind::ModelTurn,
+                "model turn draining".into(),
+                CancellationHandle::Test(Arc::new(AtomicUsize::new(0))),
+            ),
+        )
+        .await;
+        let mut spec = RuntimeWorkSpec::new(
+            child.clone(),
+            RuntimeWorkKind::Tool,
+            "draining tool".into(),
+            CancellationHandle::Test(Arc::new(AtomicUsize::new(0))),
+        );
+        spec.parent_work_id = Some(parent.clone());
+        register_runtime_work(&state, session.id, spec).await;
+        state.runtime_work.finish(session.id, &parent).await;
+        assert!(state.session_current_turn(session.id).await.is_none());
+        let generation = state
+            .sessions
+            .current_session_generation(session.id)
+            .await
+            .unwrap();
+        recover_abandoned_session_runtime_work(&state, session.id)
+            .await
+            .unwrap();
+        assert_eq!(
+            state
+                .sessions
+                .current_session_generation(session.id)
+                .await
+                .unwrap(),
+            generation
+        );
+        assert_eq!(
+            state
+                .sessions
+                .active_runtime_work(session.id)
+                .await
+                .unwrap()
+                .len(),
+            2
+        );
+        // Once the actual child owner releases execution, ordinary recovery can
+        // resolve the historical tree; the protection is not another durable lease.
+        state.runtime_work.finish(session.id, &child).await;
+        recover_abandoned_session_runtime_work(&state, session.id)
+            .await
+            .unwrap();
+        let remaining = state
+            .sessions
+            .active_runtime_work(session.id)
+            .await
+            .unwrap();
+        drop(state);
+        assert!(remaining.is_empty());
     }
 
     #[tokio::test]
