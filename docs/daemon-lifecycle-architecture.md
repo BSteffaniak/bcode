@@ -13,6 +13,23 @@ Bcode daemon availability is split across explicit owners:
 
 The embedded plugin-surface server is a separate explicit integration mode. It does not publish a normal daemon record and is not an availability fallback.
 
+## Runtime-work observations
+
+The server's runtime-work registry holds execution cancellation and session ownership.
+Durable runtime-work rows retain historical observations; a `Running` row alone is not
+proof of current execution. Runtime-work subscriptions intersect durable seed rows with
+currently registered ownership and use the registry's cancellation status. Unowned rows
+remain available through bounded history, but are not seeded as live work. This read
+neither repairs history nor infers successful completion, absent effects, or safe replay.
+Missing registry ownership is not proof that a foreign or unknown process has exited.
+
+Tool result completion releases execution ownership and attempts a terminal runtime-work
+observation even when result persistence fails. Result persistence errors still propagate;
+no result or effects are replayed. If terminal persistence also fails, live subscription
+seeding still cannot revive the historical row. Existing live subscriptions can miss that
+terminal observation on persistence failure; explicit unknown-liveness observations need
+an independently compatible public contract rather than fabricated terminal events.
+
 ## Session stream continuity and diagnostics
 
 The TUI retains an in-flight IPC receive across progress-flush timers. Framed reads

@@ -31353,27 +31353,31 @@ async fn append_tool_finished_event_inner(
                 result: semantic_result.clone(),
             },
         )
-        .await?;
-    transition_finalized_active_artifacts(state, session_id, semantic_result.as_ref());
-    publish_session_event(state, &generic_event).await;
-    retire_tool_request_draft_after_result(state, session_id, &tool_call_id).await;
-    if owned_runtime_work.is_some()
-        && let Ok(runtime_event) = state
-            .sessions
-            .append_runtime_work_finished(
-                session_id,
-                runtime_work_id,
-                runtime_status,
-                Some(current_unix_millis()),
-                None,
-            )
-            .await
-    {
-        publish_session_event(state, &runtime_event).await;
+        .await;
+    if let Ok(event) = &generic_event {
+        transition_finalized_active_artifacts(state, session_id, semantic_result.as_ref());
+        publish_session_event(state, event).await;
+        retire_tool_request_draft_after_result(state, session_id, &tool_call_id).await;
+    }
+    if owned_runtime_work.is_some() {
+        // Execution ended even if storing its result failed. Do not leave a historical
+        // Running projection merely because outcome persistence is unavailable. This
+        // does not make the missing result replayable or prove that effects were absent.
+        append_runtime_work_finished_event(
+            state,
+            session_id,
+            runtime_work_id,
+            runtime_status,
+            generic_event.as_ref().err().map(|_| {
+                "execution ended; tool result persistence failed, effects must not be replayed"
+                    .to_owned()
+            }),
+        )
+        .await;
     }
     drop(owned_runtime_work);
     state.release_session_resources_if_idle(session_id).await;
-    Ok(generic_event)
+    generic_event
 }
 
 fn tool_result_content_model_note(tool_call_id: &str, content: &[ToolResultContent]) -> String {
@@ -81856,6 +81860,64 @@ event_symbol = "bcode_plugin_handle_event_v1"
             .expect("minimum history");
         assert_eq!(latest.as_slice(), &history[maximum - 1..]);
         drop(state);
+    }
+
+    #[tokio::test]
+    async fn runtime_work_subscription_does_not_revive_unowned_history() {
+        let session_root = tempfile::tempdir().expect("session root");
+        let sessions =
+            SessionManager::persistent(session_root.path().to_path_buf()).expect("sessions");
+        let session = sessions
+            .create_session(None, session_root.path().to_path_buf())
+            .await
+            .expect("session");
+        let state = test_server_state(sessions);
+        let work_id = WorkId::new("ended-tool-with-missing-terminal-event");
+        register_runtime_work(
+            &state,
+            session.id,
+            RuntimeWorkSpec::new(
+                work_id.clone(),
+                RuntimeWorkKind::Tool,
+                "validation shell".to_owned(),
+                CancellationHandle::Test(Arc::new(AtomicUsize::new(0))),
+            ),
+        )
+        .await;
+        assert_eq!(
+            runtime_work_operations::subscribe(&state, session.id)
+                .await
+                .expect("owned subscription")
+                .initial_events
+                .len(),
+            1
+        );
+        // The execution owner has released work, but terminal persistence was lost.
+        state.runtime_work.finish(session.id, &work_id).await;
+        assert!(
+            runtime_work_operations::list(&state, session.id)
+                .await
+                .is_empty()
+        );
+        assert!(
+            runtime_work_operations::subscribe(&state, session.id)
+                .await
+                .expect("unowned subscription")
+                .initial_events
+                .is_empty()
+        );
+        // A live read neither repairs canonical history nor invents a terminal outcome.
+        let history = runtime_work_operations::history(&state, session.id, 10)
+            .await
+            .expect("history");
+        drop(state);
+        assert!(matches!(
+            history.as_slice(),
+            [SessionEvent {
+                kind: SessionEventKind::RuntimeWorkStarted { .. },
+                ..
+            }]
+        ));
     }
 
     #[tokio::test]

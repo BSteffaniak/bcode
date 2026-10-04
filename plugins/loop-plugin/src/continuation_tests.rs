@@ -2,6 +2,44 @@ use super::*;
 use crate::{LoopExternalBlocker, LoopWorkflowInput, goal_workflow_spec, loop_workflow_spec};
 
 #[test]
+fn replanning_instructions_survive_allowance_resume_in_both_collaboration_modes() {
+    for required in [false, true] {
+        let mut checkpoint = source(true);
+        if required {
+            let base = bcode_workflow::WorkflowSpec::<LoopWorkflowIteration>::from_definition(
+                WORKFLOW_KIND,
+                checkpoint.definition.clone(),
+            )
+            .unwrap();
+            checkpoint.definition = crate::collaborating_goal_spec(&base)
+                .unwrap()
+                .definition()
+                .clone();
+        }
+        let configuration = checkpoint.definition.nodes["loop.implementation"]
+            .configuration
+            .clone();
+        let prompt = configuration["system_prompt"].as_str().unwrap();
+        // Prompts are the product delivered to the model, not Rust source assertions.
+        assert!(prompt.contains(include_str!("../prompts/goal-iteration-guidance.md")));
+        let input = checkpoint.input.clone();
+        let continued = request(checkpoint, 2).unwrap();
+        assert_eq!(
+            continued.successor.definition.nodes["loop.implementation"].configuration,
+            configuration
+        );
+        for field in [
+            "implementation_prompt",
+            "stop_condition",
+            "evidence",
+            "summary",
+        ] {
+            assert_eq!(continued.successor.input[field], input[field]);
+        }
+    }
+}
+
+#[test]
 fn allowance_resume_rejects_retired_contracts_and_retained_delivery_requirements() {
     for version in 1..=4 {
         let mut historical = source(true);

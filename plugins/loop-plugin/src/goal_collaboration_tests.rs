@@ -140,6 +140,13 @@ async fn generated_goal_collects_named_workers_and_preserves_state_through_corre
                 surface.poll(&host);
             }
             let start = host.starts.lock().unwrap().first().unwrap().clone();
+            let configuration = &start.definition.nodes["loop.implementation"].configuration;
+            assert!(
+                configuration["system_prompt"]
+                    .as_str()
+                    .unwrap()
+                    .contains(include_str!("../prompts/goal-iteration-guidance.md"))
+            );
             // The scripted generator is deliberately generic: original task data must
             // survive independently of its response, through launch and correction.
             for field in ["implementation_prompt", "stop_condition"] {

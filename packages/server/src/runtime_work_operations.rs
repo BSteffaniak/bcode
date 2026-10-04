@@ -21,9 +21,23 @@ pub async fn subscribe(
     session_id: SessionId,
 ) -> Result<RuntimeWorkSubscription, bcode_session::SessionError> {
     let subscription = state.sessions.subscribe_session_events(session_id).await?;
+    // Durable projections retain historical observations, not execution ownership. A failed
+    // terminal append (or an old daemon) can leave a Running row after its owner has ended.
+    // Never revive that row as live work, and never repair history on this read path.
     let runtime_work = state.sessions.active_runtime_work(session_id).await?;
+    let owners = state
+        .runtime_work
+        .active_for_session(session_id)
+        .await
+        .into_iter()
+        .map(|owner| (owner.work_id, owner.status))
+        .collect::<std::collections::BTreeMap<_, _>>();
     let initial_events = runtime_work
         .into_iter()
+        .filter_map(|mut work| {
+            work.status = *owners.get(&work.work_id)?;
+            Some(work)
+        })
         .flat_map(|work| super::runtime_work_projection_to_events(session_id, work))
         .collect();
     Ok(RuntimeWorkSubscription {

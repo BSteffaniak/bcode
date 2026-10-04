@@ -2624,7 +2624,11 @@ fn collaborating_goal_spec(
     let mut configuration: bcode_workflow::WorkflowPromptConfiguration =
         serde_json::from_value(coordinator.configuration.clone())
             .map_err(|error| error.to_string())?;
-    configuration.system_prompt = include_str!("../prompts/goal-coordination.md").into();
+    configuration.system_prompt = format!(
+        "{}\n\n{}",
+        include_str!("../prompts/goal-coordination.md"),
+        include_str!("../prompts/goal-iteration-guidance.md")
+    );
     configuration.activity_producer = Some(bcode_workflow::WorkflowActivityProducer {
         plugin: PLUGIN_ID.into(),
         stage: "coordination".into(),
@@ -2669,6 +2673,10 @@ fn optional_goal_spec(
     implementation_configuration
         .system_prompt
         .push_str(include_str!("../prompts/goal-optional-coordination.md"));
+    implementation_configuration.system_prompt.push_str("\n\n");
+    implementation_configuration
+        .system_prompt
+        .push_str(include_str!("../prompts/goal-iteration-guidance.md"));
     implementation.configuration =
         serde_json::to_value(implementation_configuration).map_err(|error| error.to_string())?;
     // Evaluators need their own authenticated activation to inspect canonical outputs.
