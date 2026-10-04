@@ -6,4 +6,17 @@ Use the **Evaluation** control in **Start Loop** or **Start Goal**. It defaults 
 
 A validated YesNo probability at or above the threshold sets `condition_met`; a lower probability continues the loop. The agent's evidence is retained for review, and the summary records the probability, threshold and decision; vendor wire metadata is not retained. The agent's own completion vote is provisional when judgement is enabled. Goal **readiness** remains a separate agent planning decision: judgement applies to the subsequent per-iteration completion decision only, not to permission or authorization policy. Iteration continuations retain the evaluator configuration and reserve the extra block execution allowance. Existing runs keep their pinned workflow definitions and behavior. A failed or interrupted read-only external call has repair-required reconciliation, rather than silently repeating a possibly billed request after daemon restart.
 
+Noninteractive `bcode goal` supports the same opt-in gate:
+
+```sh
+bcode goal --session <session-id> --objective 'Your goal' \
+  --judge-provider bcode.jev --judge-model jev-latest --judge-account jev
+```
+
+All three selection flags are required together. `--judge-threshold` defaults to 90;
+`--judge-failure pause|agent-fallback` defaults to `pause`. An explicitly empty
+`--judge-account ''` selects declared daemon environment credentials. The CLI checks
+the exact selection before generation and again before launch; it never takes an API
+key as an argument or lets generated instructions choose the judge.
+
 This opt-in feature requires the loop plugin and the chosen judgement provider to be enabled. Provider failures are normalized; `pause` terminates the current attempt as a failed workflow needing operator attention rather than asserting completion or automatically retrying. The provider does not inspect your repository itself: completeness depends on the read-only agent's concrete evidence. Do not put secrets, excessive logs, or untrusted instructions in the stop condition or evidence. Goal/loop runtime does not implicitly persist the full judgement request as a session turn.

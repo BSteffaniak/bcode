@@ -25,6 +25,21 @@ struct GoalCli {
     swarm: super::swarm::Arguments,
     #[arg(long, default_value_t = DEFAULT_MAX_ITERATIONS)]
     max_iterations: u64,
+    /// Opt into a judgement provider plugin (for example bcode.jev).
+    #[arg(long, requires_all = ["judge_model", "judge_account"])]
+    judge_provider: Option<String>,
+    /// Exact judgement model ID; does not change the conversational model.
+    #[arg(long, requires = "judge_provider")]
+    judge_model: Option<String>,
+    /// Provider-owned account; an explicit empty value selects daemon environment credentials.
+    #[arg(long, requires = "judge_provider")]
+    judge_account: Option<String>,
+    /// Required completion probability percentage.
+    #[arg(long, requires = "judge_provider", value_parser = clap::value_parser!(u8).range(1..=100))]
+    judge_threshold: Option<u8>,
+    /// Behavior if judgement fails (default: pause).
+    #[arg(long, requires = "judge_provider", value_enum)]
+    judge_failure: Option<JudgeFailure>,
 
     /// Opt in to a living progress document and its planning phase.
     #[arg(long, conflicts_with = "no_progress_document")]
@@ -32,6 +47,34 @@ struct GoalCli {
     /// Keep progress-document planning disabled (the default).
     #[arg(long)]
     no_progress_document: bool,
+}
+
+#[derive(Debug, Clone, Copy, clap::ValueEnum)]
+enum JudgeFailure {
+    Pause,
+    AgentFallback,
+}
+
+impl GoalCli {
+    fn judgement(&self) -> Result<Option<super::judgement_evaluation::EvaluationConfig>, String> {
+        let Some(provider) = &self.judge_provider else {
+            return Ok(None);
+        };
+        let config = super::judgement_evaluation::EvaluationConfig {
+            provider_plugin_id: provider.clone(),
+            model_id: self.judge_model.clone().ok_or("Missing judge model")?,
+            auth_profile: self.judge_account.clone().ok_or("Missing judge account")?,
+            threshold_percent: self.judge_threshold.unwrap_or(90),
+            on_failure: match self.judge_failure.unwrap_or(JudgeFailure::Pause) {
+                JudgeFailure::Pause => super::judgement_evaluation::FailurePolicy::Pause,
+                JudgeFailure::AgentFallback => {
+                    super::judgement_evaluation::FailurePolicy::AgentFallback
+                }
+            },
+        };
+        config.validate().map_err(str::to_string)?;
+        Ok(Some(config))
+    }
 }
 
 pub fn registration() -> StaticCliRegistration {
@@ -74,6 +117,8 @@ async fn run(args: GoalCli) -> Result<(), String> {
         return Err(unsupported_legacy_message().into());
     }
     let client = BcodeClient::default_endpoint();
+    let judgement = args.judgement()?;
+    check_judgement(&client, judgement.as_ref()).await?;
     let collaboration = args.swarm.mode().collaboration();
     let guidance = super::swarm::guidance(&args.guidance, &args.swarm.swarm_instructions);
     if guidance.len() > MAX_PROMPT_BYTES {
@@ -103,13 +148,14 @@ async fn run(args: GoalCli) -> Result<(), String> {
         "Generation source session {} at sequence {} (generation {}).\n",
         source.session_id, source.latest_sequence, source.generation
     );
-    let input = goal::decode_generation(
+    let mut input = goal::decode_generation(
         generated.output,
         &args.objective,
         &guidance,
         args.max_iterations,
         &provenance,
     )?;
+    input.judgement_evaluation = judgement;
     let mut request = build_start_request(
         &input,
         args.session,
@@ -124,6 +170,7 @@ async fn run(args: GoalCli) -> Result<(), String> {
     if collaboration == crate::CollaborationMode::Requested {
         check_delegation(&client).await?;
     }
+    check_judgement(&client, input.judgement_evaluation.as_ref()).await?;
     if progress {
         let setup = goal::ProgressDocumentSetup::headless(args.objective, guidance, source);
         let document = client
@@ -142,6 +189,29 @@ async fn run(args: GoalCli) -> Result<(), String> {
         serde_json::json!({"session_id": args.session, "run_id": started.run.run_id, "runtime_work_id": started.runtime_work_id, "status": "admitted (not completed)"})
     );
     Ok(())
+}
+
+async fn check_judgement(
+    client: &BcodeClient,
+    config: Option<&super::judgement_evaluation::EvaluationConfig>,
+) -> Result<(), String> {
+    let Some(config) = config else {
+        return Ok(());
+    };
+    let selection = bcode_model::judgement::SetupSelection {
+        provider_plugin_id: config.provider_plugin_id.clone(),
+        model_id: config.model_id.clone(),
+        auth_profile: config.auth_profile.clone(),
+    };
+    if client
+        .validate_judgement_setup(&selection)
+        .await
+        .map_err(|error| error.to_string())?
+    {
+        Ok(())
+    } else {
+        Err("Judgement model or account is unavailable; check provider enablement and authentication".into())
+    }
 }
 
 async fn admit(
@@ -187,6 +257,97 @@ async fn admit(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn judgement_arguments_are_explicit_and_compile_into_the_goal() {
+        let id = SessionId::new().to_string();
+        let base = ["goal", "--session", &id, "--objective", "Implement"];
+        assert!(
+            GoalCli::try_parse_from(base)
+                .unwrap()
+                .judgement()
+                .unwrap()
+                .is_none()
+        );
+        for extra in [
+            vec!["--judge-provider", "bcode.jev"],
+            vec!["--judge-model", "jev-latest"],
+            vec!["--judge-account", "jev"],
+            vec!["--judge-threshold", "90"],
+            vec!["--judge-failure", "pause"],
+        ] {
+            assert!(GoalCli::try_parse_from(base.into_iter().chain(extra)).is_err());
+        }
+        let judge = [
+            "--judge-provider",
+            "bcode.jev",
+            "--judge-model",
+            "jev-latest",
+            "--judge-account",
+            "jev",
+        ];
+        let args = GoalCli::try_parse_from(base.into_iter().chain(judge)).unwrap();
+        let config = args.judgement().unwrap().unwrap();
+        assert_eq!(config.threshold_percent, 90);
+        assert_eq!(
+            config.on_failure,
+            super::super::judgement_evaluation::FailurePolicy::Pause
+        );
+        for threshold in ["0", "101"] {
+            assert!(
+                GoalCli::try_parse_from(
+                    base.into_iter()
+                        .chain(judge)
+                        .chain(["--judge-threshold", threshold])
+                )
+                .is_err()
+            );
+        }
+        let args = GoalCli::try_parse_from(base.into_iter().chain(judge).chain([
+            "--judge-threshold",
+            "95",
+            "--judge-failure",
+            "agent-fallback",
+        ]))
+        .unwrap();
+        let custom = args.judgement().unwrap().unwrap();
+        assert_eq!(custom.threshold_percent, 95);
+        assert_eq!(
+            custom.on_failure,
+            super::super::judgement_evaluation::FailurePolicy::AgentFallback
+        );
+        let mut input = LoopWorkflowInput::new("Implement".into(), "Verify".into(), 1).unwrap();
+        input.judgement_evaluation = Some(config.clone());
+        let request = build_start_request(
+            &input,
+            SessionId::new(),
+            SetupKind::Goal,
+            crate::CollaborationMode::Disabled,
+            false,
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            request.input["judgement_evaluation"],
+            serde_json::to_value(config).unwrap()
+        );
+        assert!(
+            request
+                .definition
+                .nodes
+                .contains_key("loop.judgement.evaluate")
+        );
+        let ambient = GoalCli::try_parse_from(base.into_iter().chain([
+            "--judge-provider",
+            "bcode.jev",
+            "--judge-model",
+            "jev-latest",
+            "--judge-account",
+            "",
+        ]))
+        .unwrap();
+        assert_eq!(ambient.judgement().unwrap().unwrap().auth_profile, "");
+    }
 
     #[test]
     fn headless_arguments_require_source_and_positive_worker_allowance() {
