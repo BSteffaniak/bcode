@@ -4,6 +4,49 @@ use bcode_model_catalog::{ModelCatalog, price_session_usage};
 use bcode_session_models::{SessionCostEstimate, SessionTokenUsage};
 
 #[test]
+fn gpt_6_1_sol_catalog_metadata_and_pricing() {
+    let catalog = ModelCatalog::load_bundled().unwrap();
+    let entry = catalog.model("openai", "gpt-6.1-sol").unwrap();
+    assert_eq!(entry.model_id, "gpt-6.1-sol");
+    assert_eq!(entry.context_window, Some(1_050_000));
+    assert_eq!(entry.max_output_tokens, Some(128_000));
+    assert!(entry.capabilities.tool_use);
+    assert_eq!(
+        entry.reasoning.as_ref().unwrap().effort_values,
+        ["low", "medium", "high", "xhigh", "max"]
+            .into_iter()
+            .map(str::to_owned)
+            .collect()
+    );
+    let target = bcode_model_catalog_models::ModelSupportTarget {
+        provider: "openai".to_owned(),
+        auth_mode: "api_key".to_owned(),
+        api_surface: "responses_api".to_owned(),
+        integration: Some("bcode".to_owned()),
+    };
+    assert!(
+        catalog
+            .provider_models_for_support_target("openai", &target, false)
+            .iter()
+            .any(|model| model.model_id == "gpt-6.1-sol")
+    );
+    for (input, expected) in [(272_000, 552_600), (272_001, 1_100_204)] {
+        let usage: SessionTokenUsage = serde_json::from_value(serde_json::json!({
+            "catalog_provider_id":"openai", "catalog_entry_id":"gpt-6.1-sol",
+            "pricing_target":target,
+            "input_tokens":input, "output_tokens":1_000, "total_tokens":input + 1_000,
+            "cached_input_tokens":1_000, "cache_write_input_tokens":1_000,
+            "pricing_context":{"service_tier":"standard","invocation_class":"ondemand","request_input_tokens":input}
+        })).unwrap();
+        assert!(
+            matches!(price_session_usage(&catalog, &usage), SessionCostEstimate::Estimated { total_micros, .. } if total_micros == expected),
+            "input={input}: {:?}",
+            price_session_usage(&catalog, &usage)
+        );
+    }
+}
+
+#[test]
 fn sol_and_luna_catalog_metadata_and_pricing() {
     let catalog = ModelCatalog::load_bundled().unwrap();
     let target = bcode_model_catalog_models::ModelSupportTarget {
