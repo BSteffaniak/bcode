@@ -3321,6 +3321,63 @@ async fn stream_chat_completion(request: &ModelTurnRequest, turn: &TurnState) {
     }
 }
 
+/// `OpenAI` requires an object root even when the canonical result is a scalar or array.
+struct StructuredWireEncoding {
+    maps: bcode_model_schema::ObjectMapEncoding,
+    enveloped: bool,
+}
+
+impl StructuredWireEncoding {
+    fn compile(schema: &serde_json::Value) -> Result<Self, ProviderError> {
+        let enveloped = schema.get("type").and_then(serde_json::Value::as_str) != Some("object");
+        let mut wire = schema.clone();
+        if enveloped {
+            let mut envelope = serde_json::json!({
+                "type": "object", "properties": {"result": wire},
+                "required": ["result"], "additionalProperties": false
+            });
+            // Local references still resolve from the document root, not the result property.
+            for key in ["$schema", "$defs", "definitions"] {
+                if let Some(value) = envelope["properties"]["result"]
+                    .as_object_mut()
+                    .and_then(|object| object.remove(key))
+                {
+                    envelope[key] = value;
+                }
+            }
+            wire = envelope;
+        }
+        let maps = bcode_model_schema::ObjectMapEncoding::compile(&wire).map_err(|error| {
+            provider_error(
+                "invalid_structured_output_schema",
+                ProviderErrorCategory::InvalidRequest,
+                error.to_string(),
+            )
+        })?;
+        Ok(Self { maps, enveloped })
+    }
+
+    const fn is_adapted(&self) -> bool {
+        self.enveloped || self.maps.is_adapted()
+    }
+
+    fn decode(&self, value: serde_json::Value) -> Result<serde_json::Value, String> {
+        let value = self.maps.decode(value).map_err(|error| error.to_string())?;
+        if !self.enveloped {
+            return Ok(value);
+        }
+        let serde_json::Value::Object(mut object) = value else {
+            return Err("structured result envelope must be an object".into());
+        };
+        if object.len() != 1 {
+            return Err("structured result envelope must contain only result".into());
+        }
+        object
+            .remove("result")
+            .ok_or_else(|| "structured result envelope is missing result".into())
+    }
+}
+
 async fn stream_encoded_completion(
     request: &ModelTurnRequest,
     turn: &TurnState,
@@ -3329,27 +3386,20 @@ async fn stream_encoded_completion(
         .structured_output
         .as_ref()
         .filter(|output| output.strict)
-        .map(|output| bcode_model_schema::ObjectMapEncoding::compile(&output.schema))
-        .transpose()
-        .map_err(|error| {
-            provider_error(
-                "invalid_structured_output_schema",
-                ProviderErrorCategory::InvalidRequest,
-                error.to_string(),
-            )
-        })?;
-    let Some(encoding) = encoding.filter(bcode_model_schema::ObjectMapEncoding::is_adapted) else {
+        .map(|output| StructuredWireEncoding::compile(&output.schema))
+        .transpose()?;
+    let Some(encoding) = encoding.filter(StructuredWireEncoding::is_adapted) else {
         return stream_chat_completion_with_failover(request, turn).await;
     };
-    strict_openai_schema(encoding.schema())?;
+    strict_openai_schema(encoding.maps.schema())?;
     let mut wire = request.clone();
     wire.structured_output
         .as_mut()
         .expect("structured request")
-        .schema = encoding.schema().clone();
+        .schema = encoding.maps.schema().clone();
     wire.messages.push(bcode_model::ModelMessage {
         role: bcode_model::MessageRole::System,
-        content: vec![bcode_model::ContentBlock::Text { text: "For this structured response, dynamic JSON maps are represented on the wire as arrays of {\"key\": string, \"value\": value} records as specified by the response schema. Use unique keys. The provider adapter restores these arrays to the original maps.".into() }],
+        content: vec![bcode_model::ContentBlock::Text { text: "For this structured response, follow the wire response schema: when a result envelope is present, put the requested result in its result field. Dynamic JSON maps are represented on the wire as arrays of {\"key\": string, \"value\": value} records. Use unique keys. The provider adapter restores the original result representation.".into() }],
     });
     *turn.structured_text.lock().expect("structured text lock") = Some(Ok(String::new()));
     let outcome = stream_chat_completion_with_failover(&wire, turn).await;
@@ -3364,7 +3414,7 @@ async fn stream_encoded_completion(
             .and_then(|text| {
                 serde_json::from_str(&text).map_err(|_| "invalid encoded structured JSON".into())
             })
-            .and_then(|value| encoding.decode(value).map_err(|error| error.to_string()))
+            .and_then(|value| encoding.decode(value))
             .and_then(|value| serde_json::to_string(&value).map_err(|error| error.to_string()))
             .map_err(|message| {
                 provider_error(
@@ -11649,6 +11699,118 @@ mod tests {
             assert!(execution.get("$ref").is_none());
         }
         assert_eq!(request.structured_output.unwrap().schema, canonical);
+    }
+
+    #[tokio::test]
+    async fn scalar_structured_result_streams_through_an_object_wire_envelope() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let worker = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            let body: serde_json::Value =
+                serde_json::from_slice(&read_http_request_body(&mut stream)).unwrap();
+            let schema = &body["response_format"]["json_schema"]["schema"];
+            assert_eq!(schema["type"], "object");
+            assert_eq!(schema["properties"]["result"]["type"], "string");
+            write_http_response(
+                &mut stream,
+                "text/event-stream",
+                "data: {\"choices\":[{\"delta\":{\"content\":\"{\\\"result\\\":\\\"verified contribution\\\"}\"},\"finish_reason\":null}]}\n\ndata: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n",
+            );
+        });
+        let mut request = test_request(Vec::new());
+        request
+            .provider_context
+            .settings
+            .insert("base_url".into(), format!("http://{address}/v1"));
+        request
+            .provider_context
+            .settings
+            .insert("dialect".into(), "chat_completions".into());
+        request
+            .provider_context
+            .env
+            .insert("BCODE_OPENAI_API_KEY".into(), "test-key".into());
+        request.structured_output = Some(bcode_model::StructuredOutputRequest {
+            name: "contribution".into(),
+            schema: serde_json::json!({"type":"string","minLength":1}),
+            strict: true,
+        });
+        let turn = TurnState::default();
+        assert!(matches!(
+            stream_encoded_completion(&request, &turn).await.unwrap(),
+            StreamOutcome::Finished
+        ));
+        let text: String = turn
+            .events
+            .lock()
+            .unwrap()
+            .iter()
+            .filter_map(|event| match event {
+                ProviderTurnEvent::TextDelta { text } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&text).unwrap(),
+            serde_json::json!("verified contribution")
+        );
+        worker.join().unwrap();
+    }
+
+    #[test]
+    fn structured_wire_envelope_preserves_scalar_array_and_map_results() {
+        for (schema, value) in [
+            (
+                serde_json::json!({"type":"string", "minLength":1}),
+                serde_json::json!("concrete contribution"),
+            ),
+            (
+                serde_json::json!({"type":"boolean"}),
+                serde_json::json!(false),
+            ),
+            (
+                serde_json::json!({"type":"array","items":{"type":"integer"}}),
+                serde_json::json!([1, 2]),
+            ),
+            (
+                serde_json::json!({"anyOf":[{"type":"string"},{"type":"null"}]}),
+                serde_json::Value::Null,
+            ),
+        ] {
+            let encoding = StructuredWireEncoding::compile(&schema).unwrap();
+            assert!(encoding.is_adapted());
+            let wire = strict_openai_schema(encoding.maps.schema()).unwrap();
+            assert_eq!(wire["type"], "object");
+            assert_eq!(
+                encoding
+                    .decode(serde_json::json!({"result":value}))
+                    .unwrap(),
+                value
+            );
+            assert!(encoding.decode(serde_json::json!({"wrong":value})).is_err());
+            assert!(
+                encoding
+                    .decode(serde_json::json!({"result":value,"extra":true}))
+                    .is_err()
+            );
+        }
+        let schema = serde_json::json!({"type":"array","items":{"$ref":"#/$defs/Map"},"$defs":{"Map":{"type":"object","additionalProperties":{"type":"string"}}}});
+        let encoding = StructuredWireEncoding::compile(&schema).unwrap();
+        assert!(strict_openai_schema(encoding.maps.schema()).is_ok());
+        assert_eq!(
+            encoding
+                .decode(serde_json::json!({"result":[[{"key":"a","value":"b"}]]}))
+                .unwrap(),
+            serde_json::json!([{"a":"b"}])
+        );
+        let object = serde_json::json!({"type":"object","properties":{"ok":{"type":"boolean"}}});
+        let encoding = StructuredWireEncoding::compile(&object).unwrap();
+        assert!(!encoding.is_adapted());
+        assert_eq!(encoding.maps.schema(), &object);
     }
 
     #[test]
