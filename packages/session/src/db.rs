@@ -2013,13 +2013,21 @@ impl SessionDb {
     /// Returns an error if the query fails or a row is malformed.
     pub async fn event_envelope_inventory(&self) -> SessionDbResult<(Vec<(u16, String)>, bool)> {
         const MAX_ENVELOPES: usize = 256;
-        let query = format!(
-            "SELECT event_type, schema_version, MIN(event_seq) AS first_event_seq \
-             FROM events GROUP BY event_type, schema_version \
-             ORDER BY first_event_seq ASC LIMIT {}",
-            MAX_ENVELOPES + 1
-        );
-        let rows = self.db.query_raw(&query).await?;
+        let rows = self
+            .db
+            .select("events")
+            .project(switchy::database::query::identifier("event_type"))
+            .project(switchy::database::query::identifier("schema_version"))
+            .project_as(
+                switchy::database::query::min(switchy::database::query::identifier("event_seq")),
+                "first_event_seq",
+            )
+            .group_by(switchy::database::query::identifier("event_type"))
+            .group_by(switchy::database::query::identifier("schema_version"))
+            .sort("first_event_seq", SortDirection::Asc)
+            .limit(MAX_ENVELOPES + 1)
+            .execute(&**self.db)
+            .await?;
         let truncated = rows.len() > MAX_ENVELOPES;
         let mut envelopes = Vec::with_capacity(rows.len().min(MAX_ENVELOPES));
         for row in rows.into_iter().take(MAX_ENVELOPES) {
@@ -3948,9 +3956,19 @@ async fn canonical_payload_fetch_limit(
     start: u64,
     limit: usize,
 ) -> SessionDbResult<usize> {
-    // Numeric inputs only. A bounded metadata query avoids materializing every selected payload
-    // just to discover that its aggregate physical size exceeds the page allowance.
-    let rows = db.query_raw(&format!("SELECT length(CAST(payload AS BLOB)) AS payload_bytes FROM events WHERE event_seq >= {start} ORDER BY event_seq ASC LIMIT {}", limit.min(MIGRATION_EVENT_PAGE_SIZE))).await?;
+    // A bounded metadata query avoids materializing every selected payload just to discover
+    // that its aggregate physical size exceeds the page allowance.
+    let rows = db
+        .select("events")
+        .project_as(
+            switchy::database::query::byte_length(switchy::database::query::identifier("payload")),
+            "payload_bytes",
+        )
+        .where_gte("event_seq", seq_to_value(start))
+        .sort("event_seq", SortDirection::Asc)
+        .limit(limit.min(MIGRATION_EVENT_PAGE_SIZE))
+        .execute(db)
+        .await?;
     let mut remaining = CANONICAL_PAGE_DECODED_BYTES as u64;
     let mut count = 0;
     for row in rows {
@@ -12347,6 +12365,88 @@ mod tests {
         );
         db.append_event(&next).await.expect("continue writing");
         assert_eq!(db.all_events_strict().await.expect("continued")[1], next);
+    }
+
+    #[tokio::test]
+    async fn envelope_inventory_groups_orders_and_reports_truncation() {
+        let root = tempfile::tempdir().expect("root");
+        let db = SessionDb::open_turso_in_root(SessionId::new(), root.path())
+            .await
+            .expect("database");
+        assert_eq!(
+            db.event_envelope_inventory().await.expect("empty"),
+            (vec![], false)
+        );
+        for sequence in 0..258_i64 {
+            // Duplicate the last envelope at the tail; order must follow first sequence,
+            // not the lexical ordering of the envelope names.
+            let kind = format!("fixture-{}", 256 - sequence.min(256));
+            db.database()
+                .insert("events")
+                .value("event_seq", sequence)
+                .value("event_type", kind)
+                .value("schema_version", 1)
+                .value("payload", "{}")
+                .execute(db.database())
+                .await
+                .expect("fixture");
+            if sequence == 255 {
+                let (inventory, truncated) = db.event_envelope_inventory().await.expect("full");
+                assert_eq!(inventory.len(), 256);
+                assert!(!truncated);
+            }
+        }
+        let (inventory, truncated) = db.event_envelope_inventory().await.expect("truncated");
+        assert!(truncated);
+        assert_eq!(inventory.len(), 256);
+        for (index, (version, kind)) in inventory.iter().enumerate() {
+            assert_eq!(*version, 1);
+            assert_eq!(*kind, format!("fixture-{}", 256 - index));
+        }
+    }
+
+    #[tokio::test]
+    async fn canonical_physical_budget_counts_utf8_and_embedded_nul() {
+        let root = tempfile::tempdir().expect("root");
+        let db = SessionDb::open_turso_in_root(SessionId::new(), root.path())
+            .await
+            .expect("database");
+        let payload = format!("\0{}", "🦀".repeat(CANONICAL_PAGE_DECODED_BYTES / 8));
+        for sequence in 0..2_i64 {
+            db.database()
+                .insert("events")
+                .value("event_seq", sequence)
+                .value("event_type", "fixture")
+                .value("schema_version", 1)
+                .value("payload", payload.clone())
+                .execute(db.database())
+                .await
+                .expect("fixture");
+        }
+        assert_eq!(
+            canonical_payload_fetch_limit(db.database(), 0, 2)
+                .await
+                .expect("bounded"),
+            1
+        );
+        assert_eq!(
+            canonical_payload_fetch_limit(db.database(), 1, 2)
+                .await
+                .expect("resume"),
+            1
+        );
+        assert_eq!(
+            canonical_payload_fetch_limit(db.database(), 0, 0)
+                .await
+                .expect("zero"),
+            0
+        );
+        assert_eq!(
+            canonical_payload_fetch_limit(db.database(), 2, 2)
+                .await
+                .expect("end"),
+            0
+        );
     }
 
     #[tokio::test]

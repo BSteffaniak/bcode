@@ -660,6 +660,9 @@ fn invalid_request(error: &serde_json::Error) -> ServiceResponse {
     ServiceResponse::error("invalid_request", error.to_string())
 }
 
+#[cfg(test)]
+mod tests;
+
 #[cfg(not(feature = "static-bundled"))]
 export_plugin!(OpenCodeSessionImportPlugin, MANIFEST);
 

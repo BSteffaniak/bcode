@@ -3,27 +3,72 @@
 //! This module defines the current database shape. It contains no source-format interpretation or
 //! historical migration policy.
 
+#[cfg(test)]
+mod tests;
+
+use switchy::database::query::{FilterableQuery, delete, update};
+use switchy::database::schema::{
+    Column, DataType, alter_table, create_index, create_table, drop_index, drop_table,
+};
+use switchy::database::{Database, DatabaseError, DatabaseValue, Executable};
 use switchy::schema::discovery::code::{CodeMigration, CodeMigrationSource};
 
 pub fn global_migrations() -> CodeMigrationSource<'static> {
     let mut source = CodeMigrationSource::new();
-    add_sql_migration(
+    add_migration(
         &mut source,
         "001_global_sessions_table",
-        "CREATE TABLE IF NOT EXISTS sessions (\n    session_id TEXT PRIMARY KEY NOT NULL,\n    db_path TEXT NOT NULL,\n    title TEXT,\n    working_directory TEXT,\n    created_at_ms INTEGER NOT NULL,\n    updated_at_ms INTEGER NOT NULL,\n    state TEXT NOT NULL DEFAULT 'active',\n    projection_status TEXT NOT NULL DEFAULT 'fresh'\n)",
-        "DROP TABLE IF EXISTS sessions",
+        create_table("sessions")
+            .if_not_exists(true)
+            .column(schema_column("session_id", DataType::Text, false))
+            .primary_key("session_id")
+            .column(schema_column("db_path", DataType::Text, false))
+            .column(schema_column("title", DataType::Text, true))
+            .column(schema_column("working_directory", DataType::Text, true))
+            .column(schema_column("created_at_ms", DataType::Int, false))
+            .column(schema_column("updated_at_ms", DataType::Int, false))
+            .column(Column {
+                name: "state".into(),
+                data_type: DataType::Text,
+                nullable: false,
+                auto_increment: false,
+                default: Some("active".into()),
+            })
+            .column(Column {
+                name: "projection_status".into(),
+                data_type: DataType::Text,
+                nullable: false,
+                auto_increment: false,
+                default: Some("fresh".into()),
+            }),
+        drop_table("sessions").if_exists(true),
     );
-    add_sql_migration(
+    add_migration(
         &mut source,
         "002_global_sessions_updated_at_index",
-        "CREATE INDEX IF NOT EXISTS idx_sessions_updated_at_ms ON sessions(updated_at_ms)",
-        "DROP INDEX IF EXISTS idx_sessions_updated_at_ms",
+        create_index("idx_sessions_updated_at_ms")
+            .table("sessions")
+            .if_not_exists(true)
+            .columns(vec!["updated_at_ms"]),
+        drop_index("idx_sessions_updated_at_ms", "sessions").if_exists(),
     );
-    add_sql_migration(
+    add_migration(
         &mut source,
         "003_global_composer_drafts_table",
-        "CREATE TABLE IF NOT EXISTS composer_drafts (\n    scope_kind TEXT NOT NULL,\n    scope_key TEXT NOT NULL,\n    launch_working_directory TEXT,\n    session_id TEXT,\n    text TEXT NOT NULL,\n    updated_at_ms INTEGER NOT NULL,\n    PRIMARY KEY(scope_kind, scope_key)\n)",
-        "DROP TABLE IF EXISTS composer_drafts",
+        create_table("composer_drafts")
+            .if_not_exists(true)
+            .column(schema_column("scope_kind", DataType::Text, false))
+            .column(schema_column("scope_key", DataType::Text, false))
+            .column(schema_column(
+                "launch_working_directory",
+                DataType::Text,
+                true,
+            ))
+            .column(schema_column("session_id", DataType::Text, true))
+            .column(schema_column("text", DataType::Text, false))
+            .column(schema_column("updated_at_ms", DataType::Int, false))
+            .primary_key_columns(["scope_kind", "scope_key"]),
+        drop_table("composer_drafts").if_exists(true),
     );
     source
 }
@@ -37,287 +82,684 @@ pub fn session_migrations() -> CodeMigrationSource<'static> {
 }
 
 fn add_session_execution_migrations(source: &mut CodeMigrationSource<'static>) {
-    add_sql_migration(
+    add_migration(
         source,
         "030_session_state_visibility_column",
-        "ALTER TABLE session_state ADD COLUMN visibility TEXT",
-        "ALTER TABLE session_state DROP COLUMN visibility",
+        alter_table("session_state").add_column("visibility".into(), DataType::Text, true, None),
+        alter_table("session_state").drop_column("visibility".into()),
     );
-    add_sql_migration(
+    add_migration(
         source,
         "031_session_state_execution_provenance_column",
-        "ALTER TABLE session_state ADD COLUMN execution_provenance TEXT",
-        "ALTER TABLE session_state DROP COLUMN execution_provenance",
+        alter_table("session_state").add_column(
+            "execution_provenance".into(),
+            DataType::Text,
+            true,
+            None,
+        ),
+        alter_table("session_state").drop_column("execution_provenance".into()),
     );
-    add_sql_migration(
+    add_migration(
         source,
         "032_terminal_tool_lifecycle_projection",
-        "UPDATE session_storage_contract SET writer_epoch = writer_epoch WHERE contract_id = 1",
-        "UPDATE session_storage_contract SET writer_epoch = writer_epoch WHERE contract_id = 1",
+        update("session_storage_contract")
+            .value(
+                "writer_epoch",
+                switchy::database::query::identifier("writer_epoch"),
+            )
+            .where_eq("contract_id", 1_i64),
+        update("session_storage_contract")
+            .value(
+                "writer_epoch",
+                switchy::database::query::identifier("writer_epoch"),
+            )
+            .where_eq("contract_id", 1_i64),
     );
-    add_sql_migration(
+    add_migration(
         source,
         "033_session_migration_receipts_table",
-        "CREATE TABLE IF NOT EXISTS session_migration_receipts (\n    operation_id TEXT PRIMARY KEY NOT NULL,\n    session_id TEXT NOT NULL,\n    source_writer_epoch INTEGER NOT NULL,\n    target_writer_epoch INTEGER NOT NULL,\n    receipt TEXT NOT NULL,\n    completed_at_ms INTEGER NOT NULL\n)",
-        "DROP TABLE IF EXISTS session_migration_receipts",
+        create_table("session_migration_receipts")
+            .if_not_exists(true)
+            .column(schema_column("operation_id", DataType::Text, false))
+            .primary_key("operation_id")
+            .column(schema_column("session_id", DataType::Text, false))
+            .column(schema_column("source_writer_epoch", DataType::Int, false))
+            .column(schema_column("target_writer_epoch", DataType::Int, false))
+            .column(schema_column("receipt", DataType::Text, false))
+            .column(schema_column("completed_at_ms", DataType::Int, false)),
+        drop_table("session_migration_receipts").if_exists(true),
     );
-    add_sql_migration(
+    add_migration(
         source,
         "034_session_state_model_selection_source_column",
-        "ALTER TABLE session_state ADD COLUMN model_selection_source TEXT",
-        "ALTER TABLE session_state DROP COLUMN model_selection_source",
+        alter_table("session_state").add_column(
+            "model_selection_source".into(),
+            DataType::Text,
+            true,
+            None,
+        ),
+        alter_table("session_state").drop_column("model_selection_source".into()),
     );
-    add_sql_migration(
+    add_migration(
         source,
         "035_session_state_reasoning_by_model_column",
-        "ALTER TABLE session_state ADD COLUMN reasoning_by_model TEXT",
-        "ALTER TABLE session_state DROP COLUMN reasoning_by_model",
+        alter_table("session_state").add_column(
+            "reasoning_by_model".into(),
+            DataType::Text,
+            true,
+            None,
+        ),
+        alter_table("session_state").drop_column("reasoning_by_model".into()),
     );
-    add_sql_migration(
+    add_session_usage_migrations(source);
+}
+
+fn add_session_usage_migrations(source: &mut CodeMigrationSource<'static>) {
+    add_migration(
         source,
         "036_session_usage_projection_table",
-        "CREATE TABLE IF NOT EXISTS session_usage_projection (\n    projection_id INTEGER PRIMARY KEY NOT NULL,\n    summary_json TEXT NOT NULL\n)",
-        "DROP TABLE IF EXISTS session_usage_projection",
+        create_table("session_usage_projection")
+            .if_not_exists(true)
+            .column(schema_column("projection_id", DataType::Int, false))
+            .primary_key("projection_id")
+            .column(schema_column("summary_json", DataType::Text, false)),
+        drop_table("session_usage_projection").if_exists(true),
     );
-    add_sql_migration(
+    add_migration(
         source,
         "037_session_usage_requests_table",
-        "CREATE TABLE IF NOT EXISTS session_usage_requests (\n    request_key TEXT PRIMARY KEY NOT NULL,\n    usage_json TEXT NOT NULL,\n    event_seq INTEGER NOT NULL,\n    FOREIGN KEY(event_seq) REFERENCES events(event_seq)\n)",
-        "DROP TABLE IF EXISTS session_usage_requests",
+        create_table("session_usage_requests")
+            .if_not_exists(true)
+            .column(schema_column("request_key", DataType::Text, false))
+            .primary_key("request_key")
+            .column(schema_column("usage_json", DataType::Text, false))
+            .column(schema_column("event_seq", DataType::Int, false))
+            .foreign_key_column("event_seq", "events", "event_seq"),
+        drop_table("session_usage_requests").if_exists(true),
     );
-    add_sql_migration(
+    add_migration(
         source,
         "038_session_usage_request_timestamp",
-        "ALTER TABLE session_usage_requests ADD COLUMN first_observed_at_ms INTEGER NOT NULL DEFAULT 0",
-        "ALTER TABLE session_usage_requests DROP COLUMN first_observed_at_ms",
+        alter_table("session_usage_requests").add_column(
+            "first_observed_at_ms".into(),
+            DataType::Int,
+            false,
+            Some(0_i64.into()),
+        ),
+        alter_table("session_usage_requests").drop_column("first_observed_at_ms".into()),
     );
-    add_sql_migration(
+    add_migration(
         source,
         "039_session_usage_derived_cost",
-        "ALTER TABLE session_usage_requests ADD COLUMN cost_json TEXT",
-        "ALTER TABLE session_usage_requests DROP COLUMN cost_json",
+        alter_table("session_usage_requests").add_column(
+            "cost_json".into(),
+            DataType::Text,
+            true,
+            None,
+        ),
+        alter_table("session_usage_requests").drop_column("cost_json".into()),
     );
-    add_sql_migration(
+    add_migration(
         source,
         "040_session_usage_timestamp_index",
-        "CREATE INDEX idx_session_usage_timestamp ON session_usage_requests(first_observed_at_ms, request_key)",
-        "DROP INDEX idx_session_usage_timestamp",
+        create_index("idx_session_usage_timestamp")
+            .table("session_usage_requests")
+            .if_not_exists(false)
+            .columns(vec!["first_observed_at_ms", "request_key"]),
+        drop_index("idx_session_usage_timestamp", "session_usage_requests"),
     );
-    add_sql_migration(
+    add_migration(
         source,
         "041_usage_valuation_staging",
-        "CREATE TABLE usage_valuation_staging (request_key TEXT PRIMARY KEY, usage_json TEXT NOT NULL, cost_json TEXT NOT NULL)",
-        "DROP TABLE usage_valuation_staging",
+        create_table("usage_valuation_staging")
+            .if_not_exists(false)
+            .column(schema_column("request_key", DataType::Text, true))
+            .primary_key("request_key")
+            .column(schema_column("usage_json", DataType::Text, false))
+            .column(schema_column("cost_json", DataType::Text, false)),
+        drop_table("usage_valuation_staging").if_exists(false),
     );
-    add_sql_migration(
+    add_migration(
         source,
         "042_turn_evidence",
-        "CREATE TABLE turn_evidence (turn_id TEXT NOT NULL, evidence_kind TEXT NOT NULL, segment_order INTEGER NOT NULL, event_seq INTEGER NOT NULL, PRIMARY KEY(turn_id, evidence_kind, segment_order, event_seq), FOREIGN KEY(event_seq) REFERENCES events(event_seq))",
-        "DROP TABLE turn_evidence",
+        create_table("turn_evidence")
+            .if_not_exists(false)
+            .column(schema_column("turn_id", DataType::Text, false))
+            .column(schema_column("evidence_kind", DataType::Text, false))
+            .column(schema_column("segment_order", DataType::Int, false))
+            .column(schema_column("event_seq", DataType::Int, false))
+            .primary_key_columns(["turn_id", "evidence_kind", "segment_order", "event_seq"])
+            .foreign_key_column("event_seq", "events", "event_seq"),
+        drop_table("turn_evidence").if_exists(false),
     );
-    add_sql_migration(
+    add_migration(
         source,
         "043_turn_evidence_terminal_index",
-        "CREATE INDEX idx_turn_evidence_sequence ON turn_evidence(turn_id, evidence_kind, event_seq)",
-        "DROP INDEX idx_turn_evidence_sequence",
+        create_index("idx_turn_evidence_sequence")
+            .table("turn_evidence")
+            .if_not_exists(false)
+            .columns(vec!["turn_id", "evidence_kind", "event_seq"]),
+        drop_index("idx_turn_evidence_sequence", "turn_evidence"),
     );
 }
 
 fn add_session_base_migrations(source: &mut CodeMigrationSource<'static>) {
-    add_sql_migration(
+    add_migration(
         source,
         "001_events_table",
-        "CREATE TABLE IF NOT EXISTS events (\n    event_seq INTEGER PRIMARY KEY NOT NULL,\n    event_type TEXT NOT NULL,\n    schema_version INTEGER NOT NULL,\n    created_at_ms INTEGER,\n    causation_id TEXT,\n    correlation_id TEXT,\n    payload TEXT NOT NULL\n)",
-        "DROP TABLE IF EXISTS events",
+        create_table("events")
+            .if_not_exists(true)
+            .column(schema_column("event_seq", DataType::Int, false))
+            .primary_key("event_seq")
+            .column(schema_column("event_type", DataType::Text, false))
+            .column(schema_column("schema_version", DataType::Int, false))
+            .column(schema_column("created_at_ms", DataType::Int, true))
+            .column(schema_column("causation_id", DataType::Text, true))
+            .column(schema_column("correlation_id", DataType::Text, true))
+            .column(schema_column("payload", DataType::Text, false)),
+        drop_table("events").if_exists(true),
     );
-    add_sql_migration(
+    add_migration(
         source,
         "002_events_event_type_index",
-        "CREATE INDEX IF NOT EXISTS idx_events_event_type ON events(event_type)",
-        "DROP INDEX IF EXISTS idx_events_event_type",
+        create_index("idx_events_event_type")
+            .table("events")
+            .if_not_exists(true)
+            .columns(vec!["event_type"]),
+        drop_index("idx_events_event_type", "events").if_exists(),
     );
-    add_sql_migration(
+    add_migration(
         source,
         "003_session_state_table",
-        "CREATE TABLE IF NOT EXISTS session_state (\n    session_id TEXT PRIMARY KEY NOT NULL,\n    last_event_seq INTEGER NOT NULL,\n    current_model TEXT,\n    current_provider TEXT,\n    working_directory TEXT,\n    title TEXT,\n    updated_at_ms INTEGER\n)",
-        "DROP TABLE IF EXISTS session_state",
+        create_table("session_state")
+            .if_not_exists(true)
+            .column(schema_column("session_id", DataType::Text, false))
+            .primary_key("session_id")
+            .column(schema_column("last_event_seq", DataType::Int, false))
+            .column(schema_column("current_model", DataType::Text, true))
+            .column(schema_column("current_provider", DataType::Text, true))
+            .column(schema_column("working_directory", DataType::Text, true))
+            .column(schema_column("title", DataType::Text, true))
+            .column(schema_column("updated_at_ms", DataType::Int, true)),
+        drop_table("session_state").if_exists(true),
     );
-    add_sql_migration(
+    add_migration(
         source,
         "004_input_messages_table",
-        "CREATE TABLE IF NOT EXISTS input_messages (\n    input_seq INTEGER PRIMARY KEY NOT NULL,\n    event_seq INTEGER NOT NULL,\n    created_at_ms INTEGER,\n    text TEXT NOT NULL,\n    working_directory TEXT,\n    model TEXT,\n    FOREIGN KEY(event_seq) REFERENCES events(event_seq)\n)",
-        "DROP TABLE IF EXISTS input_messages",
+        create_table("input_messages")
+            .if_not_exists(true)
+            .column(schema_column("input_seq", DataType::Int, false))
+            .primary_key("input_seq")
+            .column(schema_column("event_seq", DataType::Int, false))
+            .column(schema_column("created_at_ms", DataType::Int, true))
+            .column(schema_column("text", DataType::Text, false))
+            .column(schema_column("working_directory", DataType::Text, true))
+            .column(schema_column("model", DataType::Text, true))
+            .foreign_key_column("event_seq", "events", "event_seq"),
+        drop_table("input_messages").if_exists(true),
     );
-    add_sql_migration(
+    add_migration(
         source,
         "005_input_messages_event_seq_index",
-        "CREATE INDEX IF NOT EXISTS idx_input_messages_event_seq ON input_messages(event_seq)",
-        "DROP INDEX IF EXISTS idx_input_messages_event_seq",
+        create_index("idx_input_messages_event_seq")
+            .table("input_messages")
+            .if_not_exists(true)
+            .columns(vec!["event_seq"]),
+        drop_index("idx_input_messages_event_seq", "input_messages").if_exists(),
     );
-    add_sql_migration(
+    add_migration(
         source,
         "006_transcript_items_table",
-        "CREATE TABLE IF NOT EXISTS transcript_items (\n    transcript_seq INTEGER PRIMARY KEY NOT NULL,\n    event_seq_start INTEGER NOT NULL,\n    event_seq_end INTEGER NOT NULL,\n    role TEXT NOT NULL,\n    kind TEXT NOT NULL,\n    status TEXT NOT NULL,\n    content TEXT,\n    created_at_ms INTEGER,\n    FOREIGN KEY(event_seq_start) REFERENCES events(event_seq)\n)",
-        "DROP TABLE IF EXISTS transcript_items",
+        create_table("transcript_items")
+            .if_not_exists(true)
+            .column(schema_column("transcript_seq", DataType::Int, false))
+            .primary_key("transcript_seq")
+            .column(schema_column("event_seq_start", DataType::Int, false))
+            .column(schema_column("event_seq_end", DataType::Int, false))
+            .column(schema_column("role", DataType::Text, false))
+            .column(schema_column("kind", DataType::Text, false))
+            .column(schema_column("status", DataType::Text, false))
+            .column(schema_column("content", DataType::Text, true))
+            .column(schema_column("created_at_ms", DataType::Int, true))
+            .foreign_key_column("event_seq_start", "events", "event_seq"),
+        drop_table("transcript_items").if_exists(true),
     );
-    add_sql_migration(
+    add_session_projection_migrations(source);
+}
+
+fn add_session_projection_migrations(source: &mut CodeMigrationSource<'static>) {
+    add_migration(
         source,
         "007_transcript_items_event_range_index",
-        "CREATE INDEX IF NOT EXISTS idx_transcript_items_event_range ON transcript_items(event_seq_start, event_seq_end)",
-        "DROP INDEX IF EXISTS idx_transcript_items_event_range",
+        create_index("idx_transcript_items_event_range")
+            .table("transcript_items")
+            .if_not_exists(true)
+            .columns(vec!["event_seq_start", "event_seq_end"]),
+        drop_index("idx_transcript_items_event_range", "transcript_items").if_exists(),
     );
-    add_sql_migration(
+    add_migration(
         source,
         "008_tool_runs_table",
-        "CREATE TABLE IF NOT EXISTS tool_runs (\n    tool_call_id TEXT PRIMARY KEY NOT NULL,\n    event_seq_start INTEGER NOT NULL,\n    event_seq_end INTEGER,\n    status TEXT NOT NULL,\n    tool_name TEXT,\n    started_at_ms INTEGER,\n    completed_at_ms INTEGER,\n    output_bytes INTEGER,\n    is_error INTEGER,\n    FOREIGN KEY(event_seq_start) REFERENCES events(event_seq)\n)",
-        "DROP TABLE IF EXISTS tool_runs",
+        create_table("tool_runs")
+            .if_not_exists(true)
+            .column(schema_column("tool_call_id", DataType::Text, false))
+            .primary_key("tool_call_id")
+            .column(schema_column("event_seq_start", DataType::Int, false))
+            .column(schema_column("event_seq_end", DataType::Int, true))
+            .column(schema_column("status", DataType::Text, false))
+            .column(schema_column("tool_name", DataType::Text, true))
+            .column(schema_column("started_at_ms", DataType::Int, true))
+            .column(schema_column("completed_at_ms", DataType::Int, true))
+            .column(schema_column("output_bytes", DataType::Int, true))
+            .column(schema_column("is_error", DataType::Int, true))
+            .foreign_key_column("event_seq_start", "events", "event_seq"),
+        drop_table("tool_runs").if_exists(true),
     );
-    add_sql_migration(
+    add_migration(
         source,
         "009_tool_runs_status_index",
-        "CREATE INDEX IF NOT EXISTS idx_tool_runs_status ON tool_runs(status)",
-        "DROP INDEX IF EXISTS idx_tool_runs_status",
+        create_index("idx_tool_runs_status")
+            .table("tool_runs")
+            .if_not_exists(true)
+            .columns(vec!["status"]),
+        drop_index("idx_tool_runs_status", "tool_runs").if_exists(),
     );
-    add_sql_migration(
+    add_migration(
         source,
         "010_projection_checkpoints_table",
-        "CREATE TABLE IF NOT EXISTS projection_checkpoints (\n    projection_name TEXT PRIMARY KEY NOT NULL,\n    last_event_seq INTEGER NOT NULL,\n    projection_version INTEGER NOT NULL,\n    updated_at_ms INTEGER\n)",
-        "DROP TABLE IF EXISTS projection_checkpoints",
+        create_table("projection_checkpoints")
+            .if_not_exists(true)
+            .column(schema_column("projection_name", DataType::Text, false))
+            .primary_key("projection_name")
+            .column(schema_column("last_event_seq", DataType::Int, false))
+            .column(schema_column("projection_version", DataType::Int, false))
+            .column(schema_column("updated_at_ms", DataType::Int, true)),
+        drop_table("projection_checkpoints").if_exists(true),
     );
-    add_sql_migration(
+    add_migration(
         source,
         "011_snapshots_table",
-        "CREATE TABLE IF NOT EXISTS snapshots (\n    snapshot_name TEXT PRIMARY KEY NOT NULL,\n    last_event_seq INTEGER NOT NULL,\n    schema_version INTEGER NOT NULL,\n    payload TEXT NOT NULL,\n    updated_at_ms INTEGER\n)",
-        "DROP TABLE IF EXISTS snapshots",
+        create_table("snapshots")
+            .if_not_exists(true)
+            .column(schema_column("snapshot_name", DataType::Text, false))
+            .primary_key("snapshot_name")
+            .column(schema_column("last_event_seq", DataType::Int, false))
+            .column(schema_column("schema_version", DataType::Int, false))
+            .column(schema_column("payload", DataType::Text, false))
+            .column(schema_column("updated_at_ms", DataType::Int, true)),
+        drop_table("snapshots").if_exists(true),
     );
 }
 
 #[allow(clippy::too_many_lines)]
 fn add_session_runtime_migrations(source: &mut CodeMigrationSource<'static>) {
-    add_sql_migration(
+    add_migration(
         source,
         "012_runtime_work_table",
-        "CREATE TABLE IF NOT EXISTS runtime_work (\n    work_id TEXT PRIMARY KEY NOT NULL,\n    event_seq_start INTEGER NOT NULL,\n    event_seq_end INTEGER,\n    parent_work_id TEXT,\n    kind TEXT NOT NULL,\n    label TEXT NOT NULL,\n    status TEXT NOT NULL,\n    started_at_ms INTEGER,\n    finished_at_ms INTEGER,\n    message TEXT,\n    cancellable INTEGER NOT NULL DEFAULT 0,\n    FOREIGN KEY(event_seq_start) REFERENCES events(event_seq)\n)",
-        "DROP TABLE IF EXISTS runtime_work",
+        create_table("runtime_work")
+            .if_not_exists(true)
+            .column(schema_column("work_id", DataType::Text, false))
+            .primary_key("work_id")
+            .column(schema_column("event_seq_start", DataType::Int, false))
+            .column(schema_column("event_seq_end", DataType::Int, true))
+            .column(schema_column("parent_work_id", DataType::Text, true))
+            .column(schema_column("kind", DataType::Text, false))
+            .column(schema_column("label", DataType::Text, false))
+            .column(schema_column("status", DataType::Text, false))
+            .column(schema_column("started_at_ms", DataType::Int, true))
+            .column(schema_column("finished_at_ms", DataType::Int, true))
+            .column(schema_column("message", DataType::Text, true))
+            .column(Column {
+                name: "cancellable".into(),
+                data_type: DataType::Int,
+                nullable: false,
+                auto_increment: false,
+                default: Some(0_i64.into()),
+            })
+            .foreign_key_column("event_seq_start", "events", "event_seq"),
+        drop_table("runtime_work").if_exists(true),
     );
-    add_sql_migration(
+    add_migration(
         source,
         "013_runtime_work_status_index",
-        "CREATE INDEX IF NOT EXISTS idx_runtime_work_status ON runtime_work(status)",
-        "DROP INDEX IF EXISTS idx_runtime_work_status",
+        create_index("idx_runtime_work_status")
+            .table("runtime_work")
+            .if_not_exists(true)
+            .columns(vec!["status"]),
+        drop_index("idx_runtime_work_status", "runtime_work").if_exists(),
     );
-    add_sql_migration(
+    add_migration(
         source,
         "014_runtime_work_parent_index",
-        "CREATE INDEX IF NOT EXISTS idx_runtime_work_parent_work_id ON runtime_work(parent_work_id)",
-        "DROP INDEX IF EXISTS idx_runtime_work_parent_work_id",
+        create_index("idx_runtime_work_parent_work_id")
+            .table("runtime_work")
+            .if_not_exists(true)
+            .columns(vec!["parent_work_id"]),
+        drop_index("idx_runtime_work_parent_work_id", "runtime_work").if_exists(),
     );
-    add_sql_migration(
+    add_migration(
         source,
         "015_session_drafts_table",
-        "CREATE TABLE IF NOT EXISTS session_drafts (\n    session_id TEXT PRIMARY KEY NOT NULL,\n    text TEXT NOT NULL,\n    updated_at_ms INTEGER NOT NULL\n)",
-        "DROP TABLE IF EXISTS session_drafts",
+        create_table("session_drafts")
+            .if_not_exists(true)
+            .column(schema_column("session_id", DataType::Text, false))
+            .primary_key("session_id")
+            .column(schema_column("text", DataType::Text, false))
+            .column(schema_column("updated_at_ms", DataType::Int, false)),
+        drop_table("session_drafts").if_exists(true),
     );
-    add_sql_migration(
+    add_migration(
         source,
         "016_session_state_reasoning_effort_column",
-        "ALTER TABLE session_state ADD COLUMN reasoning_effort TEXT",
-        "ALTER TABLE session_state DROP COLUMN reasoning_effort",
+        alter_table("session_state").add_column(
+            "reasoning_effort".into(),
+            DataType::Text,
+            true,
+            None,
+        ),
+        alter_table("session_state").drop_column("reasoning_effort".into()),
     );
-    add_sql_migration(
+    add_migration(
         source,
         "017_session_state_reasoning_summary_column",
-        "ALTER TABLE session_state ADD COLUMN reasoning_summary TEXT",
-        "ALTER TABLE session_state DROP COLUMN reasoning_summary",
+        alter_table("session_state").add_column(
+            "reasoning_summary".into(),
+            DataType::Text,
+            true,
+            None,
+        ),
+        alter_table("session_state").drop_column("reasoning_summary".into()),
     );
-    add_sql_migration(
+    add_migration(
         source,
         "018_model_context_projection_state_table",
-        "CREATE TABLE IF NOT EXISTS model_context_projection_state (\n    projection_id INTEGER PRIMARY KEY NOT NULL,\n    schema_version INTEGER NOT NULL,\n    last_event_seq INTEGER NOT NULL\n)",
-        "DROP TABLE IF EXISTS model_context_projection_state",
+        create_table("model_context_projection_state")
+            .if_not_exists(true)
+            .column(schema_column("projection_id", DataType::Int, false))
+            .primary_key("projection_id")
+            .column(schema_column("schema_version", DataType::Int, false))
+            .column(schema_column("last_event_seq", DataType::Int, false)),
+        drop_table("model_context_projection_state").if_exists(true),
     );
-    add_sql_migration(
+    add_migration(
         source,
         "019_model_context_entries_table",
-        "CREATE TABLE IF NOT EXISTS model_context_entries (\n    event_seq INTEGER PRIMARY KEY NOT NULL,\n    event_type TEXT NOT NULL,\n    payload TEXT NOT NULL,\n    FOREIGN KEY(event_seq) REFERENCES events(event_seq)\n)",
-        "DROP TABLE IF EXISTS model_context_entries",
+        create_table("model_context_entries")
+            .if_not_exists(true)
+            .column(schema_column("event_seq", DataType::Int, false))
+            .primary_key("event_seq")
+            .column(schema_column("event_type", DataType::Text, false))
+            .column(schema_column("payload", DataType::Text, false))
+            .foreign_key_column("event_seq", "events", "event_seq"),
+        drop_table("model_context_entries").if_exists(true),
     );
-    add_sql_migration(
+    add_migration(
         source,
         "020_model_context_entries_event_type_index",
-        "CREATE INDEX IF NOT EXISTS idx_model_context_entries_event_type ON model_context_entries(event_type)",
-        "DROP INDEX IF EXISTS idx_model_context_entries_event_type",
+        create_index("idx_model_context_entries_event_type")
+            .table("model_context_entries")
+            .if_not_exists(true)
+            .columns(vec!["event_type"]),
+        drop_index(
+            "idx_model_context_entries_event_type",
+            "model_context_entries",
+        )
+        .if_exists(),
     );
-    add_sql_migration(
+    add_migration(
         source,
         "021_artifact_references_table",
-        "CREATE TABLE IF NOT EXISTS artifact_references (\n    artifact_id TEXT NOT NULL,\n    reference_key TEXT NOT NULL,\n    producer_plugin_id TEXT NOT NULL,\n    schema TEXT NOT NULL,\n    schema_version INTEGER NOT NULL,\n    storage_uri TEXT,\n    content_type TEXT,\n    byte_len INTEGER,\n    availability TEXT,\n    complete INTEGER,\n    checksum_sha256 TEXT,\n    finalized_event_seq INTEGER NOT NULL,\n    PRIMARY KEY(artifact_id, reference_key),\n    FOREIGN KEY(finalized_event_seq) REFERENCES events(event_seq)\n)",
-        "DROP TABLE IF EXISTS artifact_references",
+        create_table("artifact_references")
+            .if_not_exists(true)
+            .column(schema_column("artifact_id", DataType::Text, false))
+            .column(schema_column("reference_key", DataType::Text, false))
+            .column(schema_column("producer_plugin_id", DataType::Text, false))
+            .column(schema_column("schema", DataType::Text, false))
+            .column(schema_column("schema_version", DataType::Int, false))
+            .column(schema_column("storage_uri", DataType::Text, true))
+            .column(schema_column("content_type", DataType::Text, true))
+            .column(schema_column("byte_len", DataType::Int, true))
+            .column(schema_column("availability", DataType::Text, true))
+            .column(schema_column("complete", DataType::Int, true))
+            .column(schema_column("checksum_sha256", DataType::Text, true))
+            .column(schema_column("finalized_event_seq", DataType::Int, false))
+            .primary_key_columns(["artifact_id", "reference_key"])
+            .foreign_key_column("finalized_event_seq", "events", "event_seq"),
+        drop_table("artifact_references").if_exists(true),
     );
-    add_sql_migration(
+    add_migration(
         source,
         "022_context_occupancy_projection_table",
-        "CREATE TABLE IF NOT EXISTS context_occupancy_projection (\n    projection_id INTEGER PRIMARY KEY NOT NULL,\n    schema_version INTEGER NOT NULL,\n    context_epoch INTEGER NOT NULL,\n    occupancy_json TEXT\n);\nINSERT OR IGNORE INTO context_occupancy_projection (projection_id, schema_version, context_epoch, occupancy_json) SELECT 1, 1, COALESCE(MAX(event_seq), 0), NULL FROM events WHERE event_type IN ('model_changed', 'context_compacted', 'provider_context_compacted');\nINSERT OR IGNORE INTO projection_checkpoints (projection_name, last_event_seq, projection_version, updated_at_ms) SELECT 'context_occupancy', COALESCE(MAX(event_seq), 0), 1, 0 FROM events",
-        "DROP TABLE IF EXISTS context_occupancy_projection",
+        InitializeOccupancy,
+        drop_table("context_occupancy_projection").if_exists(true),
     );
-    add_sql_migration(
+    add_migration(
         source,
         "023_reset_legacy_context_occupancy_projection",
-        "UPDATE context_occupancy_projection SET schema_version = 3, occupancy_json = NULL WHERE schema_version < 3",
-        "UPDATE context_occupancy_projection SET schema_version = 2, occupancy_json = NULL WHERE schema_version = 3",
+        update("context_occupancy_projection")
+            .value("schema_version", 3_i64)
+            .value("occupancy_json", DatabaseValue::Null)
+            .where_lt("schema_version", 3_i64),
+        update("context_occupancy_projection")
+            .value("schema_version", 2_i64)
+            .value("occupancy_json", DatabaseValue::Null)
+            .where_eq("schema_version", 3_i64),
     );
-    add_sql_migration(
+    add_migration(
         source,
         "024_reset_request_context_occupancy_projection",
-        "UPDATE context_occupancy_projection SET schema_version = 4, occupancy_json = NULL WHERE schema_version < 4",
-        "UPDATE context_occupancy_projection SET schema_version = 3, occupancy_json = NULL WHERE schema_version = 4",
+        update("context_occupancy_projection")
+            .value("schema_version", 4_i64)
+            .value("occupancy_json", DatabaseValue::Null)
+            .where_lt("schema_version", 4_i64),
+        update("context_occupancy_projection")
+            .value("schema_version", 3_i64)
+            .value("occupancy_json", DatabaseValue::Null)
+            .where_eq("schema_version", 4_i64),
     );
-    add_sql_migration(
+    add_migration(
         source,
         "025_turn_receipts_table",
-        "CREATE TABLE IF NOT EXISTS turn_receipts (\n    producer TEXT NOT NULL,\n    idempotency_key TEXT NOT NULL,\n    accepted_event_seq INTEGER NOT NULL,\n    turn_id TEXT NOT NULL,\n    work_id TEXT NOT NULL,\n    PRIMARY KEY(producer, idempotency_key),\n    FOREIGN KEY(accepted_event_seq) REFERENCES events(event_seq)\n)",
-        "DROP TABLE IF EXISTS turn_receipts",
+        create_table("turn_receipts")
+            .if_not_exists(true)
+            .column(schema_column("producer", DataType::Text, false))
+            .column(schema_column("idempotency_key", DataType::Text, false))
+            .column(schema_column("accepted_event_seq", DataType::Int, false))
+            .column(schema_column("turn_id", DataType::Text, false))
+            .column(schema_column("work_id", DataType::Text, false))
+            .primary_key_columns(["producer", "idempotency_key"])
+            .foreign_key_column("accepted_event_seq", "events", "event_seq"),
+        drop_table("turn_receipts").if_exists(true),
     );
-    add_sql_migration(
+    add_migration(
         source,
         "026_session_storage_contract_table",
-        "CREATE TABLE IF NOT EXISTS session_storage_contract (\n    contract_id INTEGER PRIMARY KEY NOT NULL,\n    schema_version INTEGER NOT NULL,\n    writer_epoch INTEGER NOT NULL,\n    updated_by_build TEXT\n)",
-        "DROP TABLE IF EXISTS session_storage_contract",
+        create_table("session_storage_contract")
+            .if_not_exists(true)
+            .column(schema_column("contract_id", DataType::Int, false))
+            .primary_key("contract_id")
+            .column(schema_column("schema_version", DataType::Int, false))
+            .column(schema_column("writer_epoch", DataType::Int, false))
+            .column(schema_column("updated_by_build", DataType::Text, true)),
+        drop_table("session_storage_contract").if_exists(true),
     );
-    add_sql_migration(
+    add_migration(
         source,
         "027_initialize_session_storage_contract",
-        "INSERT OR IGNORE INTO session_storage_contract (contract_id, schema_version, writer_epoch, updated_by_build) VALUES (1, 1, 1, NULL)",
-        "DELETE FROM session_storage_contract WHERE contract_id = 1",
+        InitializeStorageContract,
+        delete("session_storage_contract").where_eq("contract_id", 1_i64),
     );
     add_session_compatibility_ledger_markers(source);
 }
 
 fn add_session_compatibility_ledger_markers(source: &mut CodeMigrationSource<'static>) {
     // Preserve released ledger identities without materializing superseded compatibility tables.
-    add_sql_migration(
+    add_migration(
         source,
         "028_session_compatibility_state",
-        "UPDATE session_storage_contract SET contract_id = contract_id WHERE 0",
-        "UPDATE session_storage_contract SET contract_id = contract_id WHERE 0",
+        update("session_storage_contract")
+            .value(
+                "contract_id",
+                switchy::database::query::identifier("contract_id"),
+            )
+            .where_eq("contract_id", 0_i64)
+            .where_eq("contract_id", 1_i64),
+        update("session_storage_contract")
+            .value(
+                "contract_id",
+                switchy::database::query::identifier("contract_id"),
+            )
+            .where_eq("contract_id", 0_i64)
+            .where_eq("contract_id", 1_i64),
     );
-    add_sql_migration(
+    add_migration(
         source,
         "029_session_compatibility_issues",
-        "UPDATE session_storage_contract SET contract_id = contract_id WHERE 0",
-        "UPDATE session_storage_contract SET contract_id = contract_id WHERE 0",
+        update("session_storage_contract")
+            .value(
+                "contract_id",
+                switchy::database::query::identifier("contract_id"),
+            )
+            .where_eq("contract_id", 0_i64)
+            .where_eq("contract_id", 1_i64),
+        update("session_storage_contract")
+            .value(
+                "contract_id",
+                switchy::database::query::identifier("contract_id"),
+            )
+            .where_eq("contract_id", 0_i64)
+            .where_eq("contract_id", 1_i64),
     );
 }
 
-fn add_sql_migration(
+fn add_migration(
     source: &mut CodeMigrationSource<'static>,
     id: &str,
-    up_sql: &str,
-    down_sql: &str,
+    up: impl switchy::database::Executable + 'static,
+    down: impl switchy::database::Executable + 'static,
 ) {
     source.add_migration(CodeMigration::new(
         id.to_string(),
-        Box::new(up_sql.to_string()),
-        Some(Box::new(down_sql.to_string())),
+        Box::new(up),
+        Some(Box::new(down)),
     ));
+}
+#[derive(Debug)]
+struct InitializeStorageContract;
+
+#[async_trait::async_trait]
+impl Executable for InitializeStorageContract {
+    async fn execute(&self, db: &dyn Database) -> Result<(), DatabaseError> {
+        if db
+            .select("session_storage_contract")
+            .where_eq("contract_id", 1_i64)
+            .execute_first(db)
+            .await?
+            .is_none()
+        {
+            db.insert("session_storage_contract")
+                .value("contract_id", 1_i64)
+                .value("schema_version", 1_i64)
+                .value("writer_epoch", 1_i64)
+                .value("updated_by_build", DatabaseValue::Null)
+                .execute(db)
+                .await?;
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug)]
+struct InitializeOccupancy;
+
+#[async_trait::async_trait]
+impl Executable for InitializeOccupancy {
+    async fn execute(&self, db: &dyn Database) -> Result<(), DatabaseError> {
+        create_table("context_occupancy_projection")
+            .if_not_exists(true)
+            .column(schema_column("projection_id", DataType::Int, false))
+            .column(schema_column("schema_version", DataType::Int, false))
+            .column(schema_column("context_epoch", DataType::Int, false))
+            .column(schema_column("occupancy_json", DataType::Text, true))
+            .primary_key("projection_id")
+            .execute(db)
+            .await?;
+        if db
+            .select("context_occupancy_projection")
+            .where_eq("projection_id", 1_i64)
+            .execute_first(db)
+            .await?
+            .is_none()
+        {
+            let row = db
+                .select("events")
+                .project_as(
+                    switchy::database::query::max(switchy::database::query::identifier(
+                        "event_seq",
+                    )),
+                    "sequence",
+                )
+                .where_in(
+                    "event_type",
+                    vec![
+                        "model_changed",
+                        "context_compacted",
+                        "provider_context_compacted",
+                    ],
+                )
+                .execute_first(db)
+                .await?;
+            let sequence = row
+                .and_then(|row| row.get("sequence"))
+                .filter(|v| *v != DatabaseValue::Null)
+                .unwrap_or(DatabaseValue::Int64(0));
+            db.insert("context_occupancy_projection")
+                .value("projection_id", 1_i64)
+                .value("schema_version", 1_i64)
+                .value("context_epoch", sequence)
+                .value("occupancy_json", DatabaseValue::Null)
+                .execute(db)
+                .await?;
+        }
+        if db
+            .select("projection_checkpoints")
+            .where_eq("projection_name", "context_occupancy")
+            .execute_first(db)
+            .await?
+            .is_none()
+        {
+            let row = db
+                .select("events")
+                .project_as(
+                    switchy::database::query::max(switchy::database::query::identifier(
+                        "event_seq",
+                    )),
+                    "sequence",
+                )
+                .execute_first(db)
+                .await?;
+            let sequence = row
+                .and_then(|row| row.get("sequence"))
+                .filter(|v| *v != DatabaseValue::Null)
+                .unwrap_or(DatabaseValue::Int64(0));
+            db.insert("projection_checkpoints")
+                .value("projection_name", "context_occupancy")
+                .value("last_event_seq", sequence)
+                .value("projection_version", 1_i64)
+                .value("updated_at_ms", 0_i64)
+                .execute(db)
+                .await?;
+        }
+        Ok(())
+    }
+}
+
+fn schema_column(name: &str, data_type: DataType, nullable: bool) -> Column {
+    Column {
+        name: name.into(),
+        data_type,
+        nullable,
+        auto_increment: false,
+        default: None,
+    }
 }

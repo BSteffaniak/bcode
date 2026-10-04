@@ -1,5 +1,20 @@
 # Database SQL transition
 
+## Verified local integration status (2026-10-03)
+
+Root Cargo patches now select the modified sibling MoosicBox Switchy implementation and
+required type-sharing dependencies; the lockfile records local resolution. Workspace check,
+strict all-target clippy and seven xtask architecture unit tests pass. The architecture command
+still FAILS because `switchy_schema/raw-sql` is activated in workspace and shipped profiles.
+No allowance was broadened. Session still has two raw queries, and workflow-store, discovery
+and OpenCode import production still use rusqlite. First-wave fixtures and upstream lifecycle
+hardening are prerequisites, not completed consumer migrations. Current SelectQuery lacks typed
+expression projections/aliases/grouping needed by session/import despite existing aggregate
+expression types. Implement and wire these capabilities before removing opt-ins. Independent
+actual-source consumer own-test raw-off proof and unconditional strict closure remain required.
+Local patches are development-only and must be reconciled before release; no push is required
+for this local task.
+
 ## Authority and scope
 
 The current user-directed cross-repository migration authorizes a compatibility transition for

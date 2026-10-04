@@ -26,7 +26,6 @@ serde_json = { workspace = true }
 sha2 = { workspace = true }
 switchy = { workspace = true, features = [
     "database",
-    "database-raw-sql",
     "database-schema",
     "database-connection",
     "database-connection-turso",
