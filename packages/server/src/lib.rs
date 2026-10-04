@@ -31538,6 +31538,32 @@ async fn register_runtime_work(
     }
 }
 
+fn completed_workflow_prompt_output(
+    request: &bcode_workflow_store::PreparedActivationDispatch,
+    output: Option<String>,
+) -> Result<serde_json::Value, WorkflowStoreError> {
+    let configuration = workflow_prompt_configuration_from_intent(request)?;
+    if configuration.output == bcode_workflow::WorkflowPromptOutputPolicy::PreserveInput {
+        return request.activation.input.clone().ok_or_else(|| {
+            WorkflowStoreError::InvalidData(
+                "input-preserving workflow prompt has no activation input".into(),
+            )
+        });
+    }
+    let output = output.ok_or_else(|| {
+        WorkflowStoreError::InvalidData(
+            "completed workflow prompt turn has no structured output".into(),
+        )
+    })?;
+    configuration
+        .output
+        .retain_contribution(
+            request.activation.input.as_ref(),
+            serde_json::from_str(&output)?,
+        )
+        .map_err(WorkflowStoreError::InvalidData)
+}
+
 fn workflow_attempt_observation_from_completion(
     state: &ServerState,
     request: &bcode_workflow_store::PreparedActivationDispatch,
@@ -31545,24 +31571,7 @@ fn workflow_attempt_observation_from_completion(
 ) -> Result<bcode_workflow_store::AttemptObservation, WorkflowStoreError> {
     match completion.outcome {
         ModelTurnOutcome::Completed => {
-            let configuration = workflow_prompt_configuration_from_intent(request)?;
-            let output = match configuration.output {
-                bcode_workflow::WorkflowPromptOutputPolicy::Structured { .. } => {
-                    let output = completion.output.ok_or_else(|| {
-                        WorkflowStoreError::InvalidData(
-                            "completed workflow prompt turn has no structured output".to_string(),
-                        )
-                    })?;
-                    serde_json::from_str(&output)?
-                }
-                bcode_workflow::WorkflowPromptOutputPolicy::PreserveInput => {
-                    request.activation.input.clone().ok_or_else(|| {
-                        WorkflowStoreError::InvalidData(
-                            "input-preserving workflow prompt has no activation input".to_string(),
-                        )
-                    })?
-                }
-            };
+            let output = completed_workflow_prompt_output(request, completion.output)?;
             let output_schema = workflow_prompt_output_schema(request);
             if let Err(error) = output_schema.validate_value("workflow prompt output", &output) {
                 return Ok(bcode_workflow_store::AttemptObservation::Failed {
@@ -32144,22 +32153,34 @@ async fn observe_workflow_turn(
                             "input-preserving workflow prompt has no activation input".into(),
                         )
                     })?,
-                bcode_workflow::WorkflowPromptOutputPolicy::Structured { .. } => {
+                bcode_workflow::WorkflowPromptOutputPolicy::Structured { .. }
+                | bcode_workflow::WorkflowPromptOutputPolicy::RetainedContribution { .. } => {
                     let Some(output) = workflow_turn_output(&events, turn_id) else {
                         return Ok(bcode_workflow_store::AttemptObservation::Deferred {
                             reason: "completed turn output not established by bounded session observation".into(),
                         });
                     };
-                    let validator = jsonschema::validator_for(&output_schema.schema)
+                    let result_schema = &configuration
+                        .output
+                        .structured()
+                        .expect("structured output")
+                        .schema;
+                    let validator = jsonschema::validator_for(&result_schema.schema)
                         .map_err(|error| WorkflowStoreError::InvalidData(error.to_string()))?;
-                    bcode_model_provider_runtime::extract_structured_json_candidate(
-                        &output,
-                        |value| {
-                            validator.is_valid(value)
-                                && validate_workflow_output_semantics(&output_schema, value).is_ok()
-                        },
-                    )
-                    .map_err(WorkflowStoreError::InvalidData)?
+                    let contribution =
+                        bcode_model_provider_runtime::extract_structured_json_candidate(
+                            &output,
+                            |value| {
+                                validator.is_valid(value)
+                                    && validate_workflow_output_semantics(result_schema, value)
+                                        .is_ok()
+                            },
+                        )
+                        .map_err(WorkflowStoreError::InvalidData)?;
+                    configuration
+                        .output
+                        .retain_contribution(intent.get("input"), contribution)
+                        .map_err(WorkflowStoreError::InvalidData)?
                 }
             };
             if let Err(error) = output_schema.validate_value("workflow prompt output", &output) {

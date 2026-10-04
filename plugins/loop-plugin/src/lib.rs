@@ -2423,7 +2423,17 @@ fn loop_workflow_spec(
         "build",
         false,
     );
-    implementation_configuration.output = bcode_workflow::WorkflowPromptOutputPolicy::PreserveInput;
+    implementation_configuration.output =
+        bcode_workflow::WorkflowPromptOutputPolicy::RetainedContribution {
+            field: "summary".into(),
+            result: bcode_workflow::PromptStructuredOutputPolicy::strict(
+                bcode_workflow::ValueSchema {
+                    type_name: "bcode.loop.implementation_contribution.v1".into(),
+                    schema: serde_json::json!({"type":"string","minLength":1,"maxLength":16384}),
+                },
+            ),
+        };
+    implementation_configuration.system_prompt.push_str("\nReturn a JSON string describing this attempt's actual contribution, not the previous evaluation: the action attempted, identifiable changes, validation actually run, remaining constraints, and next concrete action. Notes-only and inspection-only work must be labelled as such. The host preserves the original goal, permissions, iteration and evidence; your report cannot establish completion. Use prior evaluation feedback to choose useful work rather than repeating a denied workaround. When one scope is blocked, consider independent safe contributions before declaring the entire goal blocked.");
     let implementation = bcode_workflow::Step::configured_task(
         "loop.implementation",
         bcode_workflow::NodeKind::Agent,
@@ -2625,7 +2635,8 @@ fn collaborating_goal_spec(
         serde_json::from_value(coordinator.configuration.clone())
             .map_err(|error| error.to_string())?;
     configuration.system_prompt = format!(
-        "{}\n\n{}",
+        "{}\n\n{}\n\n{}",
+        configuration.system_prompt,
         include_str!("../prompts/goal-coordination.md"),
         include_str!("../prompts/goal-iteration-guidance.md")
     );
@@ -3215,7 +3226,7 @@ mod tests {
             );
             assert!(matches!(
                 configuration.output,
-                bcode_workflow::WorkflowPromptOutputPolicy::PreserveInput
+                bcode_workflow::WorkflowPromptOutputPolicy::RetainedContribution { .. }
             ));
             assert!(
                 configuration
@@ -4790,7 +4801,7 @@ mod tests {
         );
         assert_eq!(
             definition.nodes["loop.implementation"].configuration["output"]["mode"],
-            serde_json::json!("preserve_input")
+            serde_json::json!("retained_contribution")
         );
         let evaluation_schema = &definition.nodes["loop.evaluation"].configuration["output"]["result"]
             ["schema"]["schema"];
@@ -4855,6 +4866,51 @@ mod tests {
     }
 
     #[test]
+    fn implementation_contribution_retains_goal_and_updates_current_attempt() {
+        let input = LoopWorkflowInput {
+            implementation_prompt: "Implement independent packages in parallel".into(),
+            stop_condition: "Integrated changes pass tests".into(),
+            max_iterations: 20,
+            judgement_evaluation: None,
+        };
+        let spec = loop_workflow_spec(&input).unwrap();
+        let config: bcode_workflow::WorkflowPromptConfiguration = serde_json::from_value(
+            spec.definition().nodes["loop.implementation"]
+                .configuration
+                .clone(),
+        )
+        .unwrap();
+        let mut state = serde_json::to_value(loop_workflow_initial_value(&input)).unwrap();
+        state["summary"] =
+            serde_json::json!("Previous evaluator: implement parser, not another audit");
+        let report = serde_json::json!(
+            "Implemented parser and formatter in independent sessions; combined tests passed"
+        );
+        let output = config
+            .output
+            .retain_contribution(Some(&state), report.clone())
+            .unwrap();
+        assert_eq!(output["summary"], report);
+        assert_eq!(
+            output["implementation_prompt"],
+            state["implementation_prompt"]
+        );
+        assert_eq!(output["stop_condition"], state["stop_condition"]);
+        assert_eq!(output["condition_met"], false);
+        assert_eq!(output["iteration"], state["iteration"]);
+        assert!(
+            config
+                .output
+                .retain_contribution(Some(&state), serde_json::json!({"condition_met":true}))
+                .is_err()
+        );
+        assert!(config.output.retain_contribution(None, report).is_err());
+        let restored: bcode_workflow::WorkflowPromptConfiguration =
+            serde_json::from_value(serde_json::to_value(&config).unwrap()).unwrap();
+        assert_eq!(restored.output, config.output);
+    }
+
+    #[test]
     fn loop_implementation_allows_empty_evidence_but_evaluation_requires_it() {
         let envelope = serde_json::json!({
             "implementation_prompt": "continue implementation",
@@ -4882,7 +4938,7 @@ mod tests {
         let definition = spec.definition();
         assert_eq!(
             definition.nodes["loop.implementation"].configuration["output"]["mode"],
-            serde_json::json!("preserve_input")
+            serde_json::json!("retained_contribution")
         );
         let evaluation_schema = &definition.nodes["loop.evaluation"].configuration["output"]["result"]
             ["schema"]["schema"];

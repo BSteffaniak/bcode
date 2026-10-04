@@ -12201,6 +12201,14 @@ pub enum WorkflowPromptOutputPolicy {
     },
     /// Treat successful model completion as a side-effect-only operation and forward the input.
     PreserveInput,
+    /// Preserve the activation object and replace one explicitly designated result field.
+    /// The model produces only the contribution; it cannot rewrite other input fields.
+    RetainedContribution {
+        /// Schema and correction policy for the model-produced contribution.
+        result: PromptStructuredOutputPolicy,
+        /// Literal top-level field owned by this contribution.
+        field: String,
+    },
 }
 
 impl WorkflowPromptOutputPolicy {
@@ -12216,15 +12224,45 @@ impl WorkflowPromptOutputPolicy {
     #[must_use]
     pub const fn structured(&self) -> Option<&PromptStructuredOutputPolicy> {
         match self {
-            Self::Structured { result } => Some(result),
+            Self::Structured { result } | Self::RetainedContribution { result, .. } => Some(result),
             Self::PreserveInput => None,
         }
     }
 
     /// Return the canonical output schema for this policy.
     #[must_use]
-    pub fn output_schema<'a>(&'a self, input: &'a ValueSchema) -> &'a ValueSchema {
-        self.structured().map_or(input, |result| &result.schema)
+    pub const fn output_schema<'a>(&'a self, input: &'a ValueSchema) -> &'a ValueSchema {
+        match self {
+            Self::Structured { result } => &result.schema,
+            Self::PreserveInput | Self::RetainedContribution { .. } => input,
+        }
+    }
+
+    /// Combine a validated model contribution with its exact activation input.
+    ///
+    /// # Errors
+    /// Rejects missing/non-object input, absent designated fields, and invalid contributions.
+    pub fn retain_contribution(
+        &self,
+        input: Option<&serde_json::Value>,
+        contribution: serde_json::Value,
+    ) -> Result<serde_json::Value, String> {
+        let Self::RetainedContribution { result, field } = self else {
+            return Ok(contribution);
+        };
+        result
+            .schema
+            .validate_value("contribution", &contribution)
+            .map_err(|e| e.to_string())?;
+        let mut object = input
+            .and_then(serde_json::Value::as_object)
+            .cloned()
+            .ok_or("retained contribution requires object activation input")?;
+        if field.trim().is_empty() || !object.contains_key(field) {
+            return Err("retained contribution requires an existing designated field".into());
+        }
+        object.insert(field.clone(), contribution);
+        Ok(serde_json::Value::Object(object))
     }
 }
 
@@ -12468,7 +12506,9 @@ impl WorkflowPromptConfiguration {
     /// supported bound.
     #[must_use]
     pub const fn with_max_result_corrections(mut self, max_attempts: u32) -> Self {
-        if let WorkflowPromptOutputPolicy::Structured { result } = &mut self.output {
+        if let WorkflowPromptOutputPolicy::Structured { result }
+        | WorkflowPromptOutputPolicy::RetainedContribution { result, .. } = &mut self.output
+        {
             result.correction =
                 WorkflowStructuredResultCorrectionPolicy::with_max_attempts(max_attempts);
         }
