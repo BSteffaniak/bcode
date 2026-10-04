@@ -19,6 +19,9 @@ struct GoalCli {
     /// User objective; generated instructions retain this verbatim as task data.
     #[arg(long)]
     objective: String,
+    /// Use an authored stop condition instead of model-generated goal instructions.
+    #[arg(long)]
+    stop_condition: Option<String>,
     #[arg(long, default_value = "")]
     guidance: String,
     #[command(flatten)]
@@ -104,7 +107,7 @@ async fn check_delegation(client: &BcodeClient) -> Result<(), String> {
     .await
 }
 
-async fn run(args: GoalCli) -> Result<(), String> {
+fn validate_args(args: &GoalCli) -> Result<(), String> {
     LoopWorkflowInput::new(
         args.objective.clone(),
         "validation".into(),
@@ -116,6 +119,11 @@ async fn run(args: GoalCli) -> Result<(), String> {
     if legacy_state_exists(args.session) {
         return Err(unsupported_legacy_message().into());
     }
+    Ok(())
+}
+
+async fn run(args: GoalCli) -> Result<(), String> {
+    validate_args(&args)?;
     let client = BcodeClient::default_endpoint();
     let judgement = args.judgement()?;
     check_judgement(&client, judgement.as_ref()).await?;
@@ -128,33 +136,50 @@ async fn run(args: GoalCli) -> Result<(), String> {
         check_delegation(&client).await?;
     }
     let progress = args.progress_document;
-    let mut generation =
-        goal::generation_request(&args.objective, &guidance, progress, collaboration);
-    generation.source_session_id = Some(args.session);
-    let generated = client
-        .generate_structured_output(
-            generation,
-            bcode_plugin_sdk::generation::PluginStructuredGenerationControl::default(),
+    let (mut input, source) = if let Some(condition) = &args.stop_condition {
+        if progress {
+            return Err(
+                "Authored stop conditions cannot be combined with progress-document generation"
+                    .into(),
+            );
+        }
+        let prompt = format!("{}\n\n{}", args.objective, guidance);
+        (
+            LoopWorkflowInput::new(prompt, condition.clone(), args.max_iterations)?,
+            None,
         )
-        .await
-        .map_err(|error| error.to_string())?;
-    let source = generated
-        .source
-        .ok_or("Generation returned no source context provenance")?;
-    if source.session_id != args.session {
-        return Err("Generation context belongs to another session".into());
-    }
-    let provenance = format!(
-        "Generation source session {} at sequence {} (generation {}).\n",
-        source.session_id, source.latest_sequence, source.generation
-    );
-    let mut input = goal::decode_generation(
-        generated.output,
-        &args.objective,
-        &guidance,
-        args.max_iterations,
-        &provenance,
-    )?;
+    } else {
+        let mut generation =
+            goal::generation_request(&args.objective, &guidance, progress, collaboration);
+        generation.source_session_id = Some(args.session);
+        let generated = client
+            .generate_structured_output(
+                generation,
+                bcode_plugin_sdk::generation::PluginStructuredGenerationControl::default(),
+            )
+            .await
+            .map_err(|error| error.to_string())?;
+        let source = generated
+            .source
+            .ok_or("Generation returned no source context provenance")?;
+        if source.session_id != args.session {
+            return Err("Generation context belongs to another session".into());
+        }
+        let provenance = format!(
+            "Generation source session {} at sequence {} (generation {}).\n",
+            source.session_id, source.latest_sequence, source.generation
+        );
+        (
+            goal::decode_generation(
+                generated.output,
+                &args.objective,
+                &guidance,
+                args.max_iterations,
+                &provenance,
+            )?,
+            Some(source),
+        )
+    };
     input.judgement_evaluation = judgement;
     let mut request = build_start_request(
         &input,
@@ -172,7 +197,11 @@ async fn run(args: GoalCli) -> Result<(), String> {
     }
     check_judgement(&client, input.judgement_evaluation.as_ref()).await?;
     if progress {
-        let setup = goal::ProgressDocumentSetup::headless(args.objective, guidance, source);
+        let setup = goal::ProgressDocumentSetup::headless(
+            args.objective,
+            guidance,
+            source.ok_or("Missing generation source")?,
+        );
         let document = client
             .session_working_document(setup.request(
                 args.session,

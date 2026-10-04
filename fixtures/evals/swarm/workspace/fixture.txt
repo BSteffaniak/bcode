@@ -1,0 +1,2 @@
+Jev end-to-end smoke test fixture.
+2 + 2 = 4.

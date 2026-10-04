@@ -4,6 +4,9 @@
 
 //! Serializable schema types for Bcode eval suites, runs, and reports.
 
+mod workflow;
+pub use workflow::{WorkflowEvalConfig, WorkflowEvalJudge};
+
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::path::PathBuf;
@@ -345,6 +348,8 @@ pub enum EvalExecutorKind {
     Agent,
     /// Direct tool invocation adapter.
     DirectTool,
+    /// Durable goal execution through an explicitly selected binary.
+    Workflow,
     /// Replay/analyze existing artifacts.
     Replay,
 }

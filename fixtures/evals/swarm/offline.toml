@@ -1,0 +1,30 @@
+schema_version = 1
+id = "swarm-offline-loop"
+name = "Workflow executor deterministic product smoke"
+[run]
+repetitions = 1
+timeout_ms = 120000
+isolation = "temp_copy"
+randomize_case_order = false
+fail_fast = false
+[[variants]]
+id = "single"
+executor = "workflow"
+[variants.metadata.workflow]
+binary = "/Volumes/ehdd/GitHub/bcode/target/aarch64-apple-darwin/release/bcode"
+strategy = "no-delegation"
+stop_condition = "Scripted evaluator completes at iteration 1."
+max_iterations = 1
+concurrency = 1
+worker_attempts = 4
+expected_contains = ["evaluated"]
+preserve_files = ["fixture.txt"]
+[[cases]]
+id = "retained-contribution"
+fixture = "workspace"
+prompt = "Return a scripted contribution and evaluate completion."
+[[cases.judges]]
+type = "metric_threshold"
+metric = "workflow.oracle_passed"
+min = 1
+required = true

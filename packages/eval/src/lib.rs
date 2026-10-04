@@ -11,7 +11,10 @@
 
 //! Leaf eval runner, judges, reports, comparisons, and baselines for Bcode.
 
+mod paired;
+mod process;
 mod sdk;
+mod workflow;
 
 pub use sdk::{
     AgentStepCount, LatencyAtMost, NoopSdkEvalObserver, OutputContains, SDK_EVAL_RUN_FILENAME,
@@ -182,9 +185,12 @@ pub fn validate_suite(suite: &EvalSuite) -> Result<(), EvalError> {
             )));
         }
         if let Some(config_toml) = &variant.config_toml {
-            if variant.executor != EvalExecutorKind::Agent {
+            if !matches!(
+                variant.executor,
+                EvalExecutorKind::Agent | EvalExecutorKind::Workflow
+            ) {
                 return Err(EvalError::Validation(format!(
-                    "variant {} sets config_toml but only agent variants accept a config overlay",
+                    "variant {} sets config_toml but only agent/workflow variants accept a config overlay",
                     variant.id
                 )));
             }
@@ -369,11 +375,18 @@ pub fn run_suite(options: &EvalRunOptions) -> Result<EvalRunResult, EvalError> {
             comparison.id, comparison.passed, comparison.detail
         ));
     }
+    let paired = paired::report(&variants);
+    write_json(output_dir.join("paired.json"), &paired)?;
+    let paired_passed = !suite
+        .metadata
+        .get("require_paired_quality")
+        .is_some_and(|value| value == true)
+        || paired["passed"] == true;
     let result = EvalRunResult {
         manifest,
         variants,
         comparisons,
-        passed: variants_passed && comparisons_passed,
+        passed: variants_passed && comparisons_passed && paired_passed,
     };
     write_json(output_dir.join("summary.json"), &result)?;
     fs::write(
@@ -624,6 +637,29 @@ fn execute_variant(
         EvalExecutorKind::DirectTool => {
             execute_direct_tool_variant(suite, case, variant, repetition, rep_dir, workspace)
         }
+        EvalExecutorKind::Workflow => {
+            match workflow::execute(suite, case, variant, rep_dir, workspace) {
+                Ok(output) => Ok(output),
+                Err(error) => {
+                    write_json(
+                        rep_dir.join("execution-failure.json"),
+                        &serde_json::json!({"schema_version":1,"error":error.to_string(),"outcome":"execution_failed","capture_complete":false}),
+                    )?;
+                    Ok(ExecutionOutput {
+                        exit_code: Some(1),
+                        measurements: EvalMeasurementSet::new(),
+                        diagnostics: vec![EvalDiagnostic {
+                            severity: EvalDiagnosticSeverity::Error,
+                            message: error.to_string(),
+                        }],
+                        artifacts: vec![EvalArtifactRef {
+                            kind: "execution_failure".into(),
+                            path: "execution-failure.json".into(),
+                        }],
+                    })
+                }
+            }
+        }
         EvalExecutorKind::Replay => {
             execute_replay_variant(suite, case, variant, repetition, rep_dir, workspace)
         }
@@ -663,7 +699,8 @@ fn execute_command_variant(
         },
     )?;
     let start = Instant::now();
-    let output = shell_command(&command)
+    let mut process = shell_command(&command);
+    process
         .current_dir(workspace)
         .envs(&variant.env)
         .envs(&case.env)
@@ -682,20 +719,24 @@ fn execute_command_variant(
                 .get("suite_dir")
                 .and_then(serde_json::Value::as_str)
                 .unwrap_or(""),
-        )
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .output()?;
-    fs::write(&stdout_path, &output.stdout)?;
-    fs::write(&stderr_path, &output.stderr)?;
+        );
+    let (exit_code, timed_out, stdout, stderr) = process::bounded_command(
+        process,
+        std::time::Duration::from_millis(case.timeout_ms.unwrap_or(suite.run.timeout_ms)),
+        rep_dir,
+        "command",
+    )?;
+    fs::write(&stdout_path, &stdout)?;
+    fs::write(&stderr_path, &stderr)?;
     let mut measurements = EvalMeasurementSet::new();
     measurements.insert(
         "command_wall_time_ms".into(),
         start.elapsed().as_millis() as f64,
     );
-    measurements.insert("stdout_bytes".into(), output.stdout.len() as f64);
-    measurements.insert("stderr_bytes".into(), output.stderr.len() as f64);
-    if let Some(code) = output.status.code() {
+    measurements.insert("command.timed_out".into(), f64::from(timed_out));
+    measurements.insert("stdout_bytes".into(), stdout.len() as f64);
+    measurements.insert("stderr_bytes".into(), stderr.len() as f64);
+    if let Some(code) = exit_code {
         measurements.insert("command_exit_code".into(), f64::from(code));
     }
     let artifacts = vec![
@@ -713,13 +754,20 @@ fn execute_command_variant(
         &EvalObservation {
             unix_ms: unix_ms(),
             source: "command_finished".into(),
-            payload: serde_json::json!({"exit_code": output.status.code()}),
+            payload: serde_json::json!({"exit_code": exit_code, "timed_out":timed_out}),
         },
     )?;
     Ok(ExecutionOutput {
-        exit_code: output.status.code(),
+        exit_code,
         measurements,
-        diagnostics: Vec::new(),
+        diagnostics: if timed_out {
+            vec![EvalDiagnostic {
+                severity: EvalDiagnosticSeverity::Error,
+                message: "command deadline exceeded".into(),
+            }]
+        } else {
+            Vec::new()
+        },
         artifacts,
     })
 }

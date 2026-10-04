@@ -1,0 +1,96 @@
+schema_version = 1
+id = "swarm-live-parity"
+name = "Swarm verified completion parity"
+[run]
+repetitions = 2
+timeout_ms = 600000
+isolation = "temp_copy"
+randomize_case_order = false
+fail_fast = false
+[metadata]
+require_paired_quality = true
+
+[[variants]]
+id = "single"
+executor = "workflow"
+config_toml = """
+[workflows]
+run_edit_plugins = ["bcode.workflow"]
+run_publication_plugins = ["bcode.workflow"]
+"""
+[variants.metadata.workflow]
+binary = "/Volumes/ehdd/GitHub/bcode/target/aarch64-apple-darwin/release/bcode"
+strategy = "no-delegation"
+stop_condition = "A delivered report quotes both exact lines of fixture.txt and correctly confirms 2 + 2 = 4. The fixture remains unchanged."
+max_iterations = 2
+concurrency = 2
+worker_attempts = 12
+expected_contains = ["Jev end-to-end smoke test fixture.", "2 + 2 = 4."]
+preserve_files = ["fixture.txt"]
+[variants.metadata.workflow.judge]
+provider = "bcode.jev"
+model = "jev-1.13.0"
+account = "jev"
+threshold = 90
+
+[[variants]]
+id = "auto"
+executor = "workflow"
+config_toml = """
+[workflows]
+run_edit_plugins = ["bcode.workflow"]
+run_publication_plugins = ["bcode.workflow"]
+"""
+[variants.metadata.workflow]
+binary = "/Volumes/ehdd/GitHub/bcode/target/aarch64-apple-darwin/release/bcode"
+strategy = "auto"
+stop_condition = "A delivered report quotes both exact lines of fixture.txt and correctly confirms 2 + 2 = 4. The fixture remains unchanged."
+max_iterations = 2
+concurrency = 2
+worker_attempts = 12
+expected_contains = ["Jev end-to-end smoke test fixture.", "2 + 2 = 4."]
+preserve_files = ["fixture.txt"]
+[variants.metadata.workflow.judge]
+provider = "bcode.jev"
+model = "jev-1.13.0"
+account = "jev"
+threshold = 90
+
+[[variants]]
+id = "collaborate"
+executor = "workflow"
+config_toml = """
+[workflows]
+run_edit_plugins = ["bcode.workflow"]
+run_publication_plugins = ["bcode.workflow"]
+"""
+[variants.metadata.workflow]
+binary = "/Volumes/ehdd/GitHub/bcode/target/aarch64-apple-darwin/release/bcode"
+strategy = "collaborate"
+stop_condition = "A delivered report quotes both exact lines of fixture.txt and correctly confirms 2 + 2 = 4. The fixture remains unchanged."
+max_iterations = 2
+concurrency = 2
+worker_attempts = 12
+guidance = "Use a read-only worker. Keep reports concise. Inspect and reuse valid completed contributions during correction."
+expected_contains = ["Jev end-to-end smoke test fixture.", "2 + 2 = 4."]
+preserve_files = ["fixture.txt"]
+[variants.metadata.workflow.judge]
+provider = "bcode.jev"
+model = "jev-1.13.0"
+account = "jev"
+threshold = 90
+
+[[cases]]
+id = "exact-report"
+fixture = "workspace"
+prompt = "Read fixture.txt and deliver a concise report quoting both lines exactly and verifying the arithmetic. Do not modify fixture.txt."
+[[cases.judges]]
+type = "metric_threshold"
+metric = "workflow.oracle_passed"
+min = 1
+required = true
+[[cases.judges]]
+type = "metric_threshold"
+metric = "workflow.false_completion"
+max = 0
+required = true

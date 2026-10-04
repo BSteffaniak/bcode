@@ -299,6 +299,9 @@ fn run(command: EvalCommand) -> Result<StaticCliOutcome, CliError> {
                 println!("passed: {}", result.passed);
             }
             if let Some(threshold) = fail_under_pass_rate {
+                if !result.passed {
+                    return Err(CliError::EvalCheckFailed("required execution, judge or comparison gate failed; inspect summary and paired.json".into()));
+                }
                 let pass_rate = result
                     .variants
                     .iter()
