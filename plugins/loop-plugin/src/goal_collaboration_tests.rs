@@ -1,6 +1,10 @@
 use super::*;
 use bcode_workflow_store::{ValidatedOutput, WorkflowExecutionAuthority, WorkflowStore};
 
+fn collaboration_cases() -> Vec<serde_json::Value> {
+    serde_json::from_str(include_str!("../prompts/goal-collaboration-cases.json")).unwrap()
+}
+
 fn prepare_group(value: serde_json::Value) -> bcode_workflow::WorkflowRunGraphEditBatch {
     let response = bcode_workflow_plugin::WorkflowPlugin.invoke_service(NativeServiceContext {
         plugin_id: "bcode.workflow".into(),
@@ -118,22 +122,36 @@ fn publish_group(
 // simulates agent outputs. It is not daemon, permission, provider or filesystem acceptance.
 #[tokio::test]
 async fn generated_goal_collects_named_workers_and_preserves_state_through_correction() {
-    let host = Host {
-        prerequisites: true,
-        ..Host::default()
-    };
-    let mut surface = GoalSurface::new(Some(SessionId::new()));
-    surface.editor.collaboration = CollaborationMode::Requested;
-    surface.editor.worker_attempts = Some(30);
-    surface.editor.prompt = text_state("Implement and verify two collaborating contributions");
-    surface.editor.limit = text_state("2");
-    surface.generate(&host, false);
-    for _ in 0..8 {
-        host.finish().await;
-        surface.poll(&host);
+    for case in collaboration_cases() {
+        for mode in [CollaborationMode::Disabled, CollaborationMode::Requested] {
+            let host = Host {
+                prerequisites: true,
+                ..Host::default()
+            };
+            let mut surface = GoalSurface::new(Some(SessionId::new()));
+            surface.editor.collaboration = mode;
+            surface.editor.worker_attempts = Some(30);
+            surface.editor.prompt = text_state(case["objective"].as_str().unwrap());
+            surface.editor.condition = text_state(case["guidance"].as_str().unwrap());
+            surface.editor.limit = text_state("2");
+            surface.generate(&host, false);
+            for _ in 0..8 {
+                host.finish().await;
+                surface.poll(&host);
+            }
+            let start = host.starts.lock().unwrap().first().unwrap().clone();
+            // The scripted generator is deliberately generic: original task data must
+            // survive independently of its response, through launch and correction.
+            for field in ["implementation_prompt", "stop_condition"] {
+                let prompt = start.input[field].as_str().unwrap();
+                let line = prompt.lines().find(|line| line.starts_with('{')).unwrap();
+                let retained: serde_json::Value = serde_json::from_str(line).unwrap();
+                assert_eq!(retained["objective"], case["objective"]);
+                assert_eq!(retained["additional_guidance"], case["guidance"]);
+            }
+            verify_generated_goal(&start);
+        }
     }
-    let start = host.starts.lock().unwrap().first().unwrap().clone();
-    verify_generated_goal(&start);
 }
 
 fn verify_generated_goal(start: &PluginWorkflowStartRequest) {

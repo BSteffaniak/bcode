@@ -1,0 +1,6 @@
+[
+  {"objective":"Implement the parser and formatter in parallel with multiple agents, then integrate and validate both.","guidance":"Do not invent a fixed worker count.","review_focus":"Parallel implementation remains required; identifiable contributions, overlap and combined validation, not session counts."},
+  {"objective":"Implement the parser and obtain an independent review before completion.","guidance":"The reviewer must evaluate the actual implementation.","review_focus":"Independent review remains required and cannot be replaced by self-review."},
+  {"objective":"Fix the parser bug and run its tests.","guidance":"","review_focus":"No invented collaboration requirement or agent count."},
+  {"objective":"Implement independent package changes in parallel after the shared schema is ready.","guidance":"The schema prerequisite is now complete. The last two auditor assignments produced no changes; replan remaining implementation scopes.","review_focus":"Do not repeat completed prerequisites or nonproductive scopes. Identify remaining useful contributions and integrated validation."}
+]

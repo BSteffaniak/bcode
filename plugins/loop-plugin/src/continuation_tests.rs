@@ -179,6 +179,41 @@ fn source(progress: bool) -> bcode_workflow::WorkflowContinuationSource {
 }
 
 #[test]
+fn continuation_retains_original_intent_and_nonproductive_scope_evidence() {
+    let cases: Vec<serde_json::Value> =
+        serde_json::from_str(include_str!("../prompts/goal-collaboration-cases.json")).unwrap();
+    for case in cases {
+        let mut checkpoint = source(true);
+        let accepted = crate::goal::decode_generation(
+            serde_json::json!({"outcome":"ready", "clarification":"", "implementation_prompt":"Implement", "stop_condition":"Verify"}),
+            case["objective"].as_str().unwrap(),
+            case["guidance"].as_str().unwrap(),
+            2,
+            "",
+        )
+        .unwrap();
+        checkpoint.input["implementation_prompt"] = accepted.implementation_prompt.into();
+        checkpoint.input["stop_condition"] = accepted.stop_condition.into();
+        checkpoint.input["evidence"] = serde_json::json!([
+            "Shared schema prerequisite completed and validated",
+            "Repeated audit scopes produced no implementation contributions",
+            "Remaining package contributions need integration and combined validation"
+        ]);
+        let expected = checkpoint.input.clone();
+        let evaluator = checkpoint.definition.nodes["loop.evaluation"].clone();
+        let continued = request(checkpoint, 2).unwrap();
+        for field in ["implementation_prompt", "stop_condition", "evidence"] {
+            assert_eq!(continued.successor.input[field], expected[field]);
+        }
+        assert_eq!(
+            continued.successor.definition.nodes["loop.evaluation"],
+            evaluator
+        );
+        assert_eq!(continued.successor.input["condition_met"], false);
+    }
+}
+
+#[test]
 fn graph_allowance_counts_initialization_once_and_excludes_controls() {
     let input = LoopWorkflowInput::new("implement".into(), "done".into(), 2).unwrap();
     let plain = loop_workflow_spec(&input).unwrap();

@@ -2680,6 +2680,12 @@ fn optional_goal_spec(
         serde_json::from_value(evaluator.configuration.clone())
             .map_err(|error| error.to_string())?;
     evaluation.execution_target = bcode_workflow::PromptContextTarget::FreshIsolated;
+    // Evaluation must not depend on the generator having copied evidence policy.
+    // This guidance is conditional on the original request, including in auto mode.
+    evaluation.system_prompt.push_str("\n\n");
+    evaluation
+        .system_prompt
+        .push_str(include_str!("../prompts/goal-stop-condition-guidance.md"));
     evaluator.configuration =
         serde_json::to_value(evaluation).map_err(|error| error.to_string())?;
     bcode_workflow::WorkflowSpec::from_definition(WORKFLOW_KIND, definition)
@@ -3053,11 +3059,18 @@ mod tests {
             .configuration = request.definition.nodes["loop.implementation"]
             .configuration
             .clone();
-        expected
+        let evaluation = &mut expected
             .nodes
             .get_mut("loop.evaluation")
             .unwrap()
-            .configuration["execution_target"] = serde_json::json!("fresh_isolated");
+            .configuration;
+        evaluation["execution_target"] = serde_json::json!("fresh_isolated");
+        evaluation["system_prompt"] = format!(
+            "{}\n\n{}",
+            evaluation["system_prompt"].as_str().unwrap(),
+            include_str!("../prompts/goal-stop-condition-guidance.md")
+        )
+        .into();
         assert_eq!(request.definition, expected);
     }
 

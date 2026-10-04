@@ -16508,27 +16508,13 @@ fn enforce_attempt_limits(
             ))
         },
     )?;
-    let run_status = run_status.as_str();
-    if run_status != RunStatus::Running.as_str() {
-        return Err(WorkflowStoreError::InvalidData(format!(
-            "workflow run does not accept attempts while {run_status}"
-        )));
-    }
-    if cancellation_requested {
-        return Err(WorkflowStoreError::InvalidData(
-            "workflow cancellation has been requested".to_string(),
-        ));
-    }
-    if deadline_at_ms.is_some_and(|deadline| attempt.prepared_at_ms >= deadline) {
-        return Err(WorkflowStoreError::InvalidData(
-            "workflow wall-clock deadline has elapsed".to_string(),
-        ));
-    }
-    if attempt.attempt > retry_cap.saturating_add(1) {
-        return Err(WorkflowStoreError::InvalidData(
-            "workflow retry cap exceeded".to_string(),
-        ));
-    }
+    validate_attempt_admission_state(
+        run_status,
+        cancellation_requested,
+        deadline_at_ms,
+        retry_cap,
+        attempt,
+    )?;
     let execution_count: u64 = connection.query_row(
         "SELECT COUNT(*) FROM (
             SELECT 1 FROM workflow_attempts WHERE run_id = ?1 LIMIT ?2
@@ -16551,6 +16537,39 @@ fn enforce_attempt_limits(
     )?;
     if active_count >= concurrency_cap {
         return Err(WorkflowStoreError::ConcurrencyCapacityReached);
+    }
+    Ok(())
+}
+
+// Keep admission policy independent of the query adapter. Callers must obtain these
+// facts inside the same immediate transaction that reserves the attempt.
+fn validate_attempt_admission_state(
+    status: RunStatus,
+    cancellation_requested: bool,
+    deadline_at_ms: Option<u64>,
+    retry_cap: u32,
+    attempt: &PreparedAttempt,
+) -> Result<(), WorkflowStoreError> {
+    if status != RunStatus::Running {
+        return Err(WorkflowStoreError::InvalidData(format!(
+            "workflow run does not accept attempts while {}",
+            status.as_str()
+        )));
+    }
+    if cancellation_requested {
+        return Err(WorkflowStoreError::InvalidData(
+            "workflow cancellation has been requested".to_string(),
+        ));
+    }
+    if deadline_at_ms.is_some_and(|deadline| attempt.prepared_at_ms >= deadline) {
+        return Err(WorkflowStoreError::InvalidData(
+            "workflow wall-clock deadline has elapsed".to_string(),
+        ));
+    }
+    if attempt.attempt > retry_cap.saturating_add(1) {
+        return Err(WorkflowStoreError::InvalidData(
+            "workflow retry cap exceeded".to_string(),
+        ));
     }
     Ok(())
 }
@@ -39154,6 +39173,46 @@ mod tests {
             assert!(!error.to_string().contains("future-secret-status"));
         }
         assert_eq!(store.connection.total_changes(), before);
+    }
+
+    #[test]
+    fn attempt_admission_state_preserves_deadline_retry_and_cancellation_boundaries() {
+        let mut attempt = PreparedAttempt {
+            run_id: "run-1".to_string(),
+            node_id: "review".to_string(),
+            activation_id: activation_id(),
+            attempt: 1,
+            side_effect: DispatchSideEffect::ReadOnly,
+            intent: serde_json::json!({}),
+            prepared_at_ms: 12,
+        };
+        validate_attempt_admission_state(RunStatus::Running, false, Some(13), 0, &attempt)
+            .expect("first attempt before deadline");
+        for status in [
+            RunStatus::Paused,
+            RunStatus::RepairRequired,
+            RunStatus::Failed,
+            RunStatus::Completed,
+            RunStatus::Cancelled,
+        ] {
+            assert!(validate_attempt_admission_state(status, false, None, 0, &attempt).is_err());
+        }
+        assert!(
+            validate_attempt_admission_state(RunStatus::Running, true, None, 0, &attempt).is_err()
+        );
+        assert!(
+            validate_attempt_admission_state(RunStatus::Running, false, Some(12), 0, &attempt)
+                .is_err()
+        );
+        attempt.attempt = 2;
+        assert!(
+            validate_attempt_admission_state(RunStatus::Running, false, None, 0, &attempt).is_err()
+        );
+        validate_attempt_admission_state(RunStatus::Running, false, None, 1, &attempt)
+            .expect("one permitted retry");
+        attempt.attempt = u32::MAX;
+        validate_attempt_admission_state(RunStatus::Running, false, None, u32::MAX, &attempt)
+            .expect("retry allowance addition saturates");
     }
 
     #[test]
