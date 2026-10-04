@@ -337,6 +337,10 @@ pub struct EvalVariant {
     pub replay: Option<EvalReplayConfig>,
 }
 
+const fn default_timeout_ms() -> u64 {
+    60_000
+}
+
 /// Executor kind.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -421,6 +425,9 @@ pub enum EvalJudgeConfig {
     Command {
         /// Command to execute with the platform shell.
         command: String,
+        /// Independent validation deadline in milliseconds.
+        #[serde(default = "default_timeout_ms")]
+        timeout_ms: u64,
         /// Expected exit code.
         #[serde(default)]
         expected_exit_code: i32,

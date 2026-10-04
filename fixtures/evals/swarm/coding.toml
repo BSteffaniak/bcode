@@ -1,0 +1,75 @@
+schema_version = 1
+id = "swarm-coding-functional"
+name = "Hidden functional grading across goal strategies"
+[run]
+repetitions = 3
+timeout_ms = 600000
+isolation = "temp_copy"
+randomize_case_order = false
+fail_fast = false
+[metadata]
+paired_schedule_seed = 417
+require_paired_quality = true
+
+[[variants]]
+id = "direct"
+executor = "agent"
+
+[[variants]]
+id = "single"
+executor = "workflow"
+[variants.metadata.workflow]
+binary = "/Volumes/ehdd/GitHub/bcode/target/aarch64-apple-darwin/release/bcode"
+strategy = "no-delegation"
+stop_condition = "operations.py correctly implements its documented behavior, including empty and repeated input. Deliver the corrected file."
+max_iterations = 2
+concurrency = 2
+worker_attempts = 12
+
+[[variants]]
+id = "auto"
+executor = "workflow"
+config_toml = "[workflows]\nrun_edit_plugins = [\"bcode.workflow\"]\nrun_publication_plugins = [\"bcode.workflow\"]\n"
+[variants.metadata.workflow]
+binary = "/Volumes/ehdd/GitHub/bcode/target/aarch64-apple-darwin/release/bcode"
+strategy = "auto"
+stop_condition = "operations.py correctly implements its documented behavior, including empty and repeated input. Deliver the corrected file."
+max_iterations = 2
+concurrency = 2
+worker_attempts = 12
+
+[[variants]]
+id = "collaborate"
+executor = "workflow"
+config_toml = "[workflows]\nrun_edit_plugins = [\"bcode.workflow\"]\nrun_publication_plugins = [\"bcode.workflow\"]\n"
+[variants.metadata.workflow]
+binary = "/Volumes/ehdd/GitHub/bcode/target/aarch64-apple-darwin/release/bcode"
+strategy = "collaborate"
+stop_condition = "operations.py correctly implements its documented behavior, including empty and repeated input. Deliver the corrected file."
+max_iterations = 2
+concurrency = 2
+worker_attempts = 12
+
+[[variants]]
+id = "generated"
+executor = "workflow"
+[variants.metadata.workflow]
+binary = "/Volumes/ehdd/GitHub/bcode/target/aarch64-apple-darwin/release/bcode"
+strategy = "no-delegation"
+generated_entry = true
+stop_condition = "Ignored in generated-entry mode."
+max_iterations = 2
+concurrency = 2
+worker_attempts = 12
+
+[[cases]]
+id = "operations"
+fixture = "coding-workspace"
+prompt = "Fix total and unique_sorted in operations.py to satisfy their docstrings, including empty input and repeated values. Deliver corrected code."
+[cases.metadata.workflow_oracle]
+oracle_command = "python3 '{{suite_dir}}/oracles/operations.py'"
+[[cases.judges]]
+type = "command"
+command = "python3 '{{suite_dir}}/oracles/operations.py'"
+timeout_ms = 60000
+required = true

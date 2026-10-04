@@ -1,0 +1,25 @@
+schema_version = 1
+id = "coding-oracle-calibration"
+name = "Functional oracle positive and negative calibration"
+[run]
+repetitions = 1
+timeout_ms = 2000
+isolation = "temp_copy"
+randomize_case_order = false
+fail_fast = false
+[[variants]]
+id = "single"
+executor = "command"
+command = "printf 'def total(values): return sum(values)\ndef unique_sorted(values): return sorted(set(values))\n' > operations.py"
+[[variants]]
+id = "broken"
+executor = "command"
+command = "printf unchanged"
+[[cases]]
+id = "operations"
+fixture = "coding-workspace"
+[[cases.judges]]
+type = "command"
+command = "python3 '{{suite_dir}}/oracles/operations.py'"
+timeout_ms = 60000
+required = true

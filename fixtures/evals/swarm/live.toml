@@ -8,6 +8,7 @@ isolation = "temp_copy"
 randomize_case_order = false
 fail_fast = false
 [metadata]
+paired_schedule_seed = 20261004
 require_paired_quality = true
 
 [[variants]]

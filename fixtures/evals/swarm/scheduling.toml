@@ -1,0 +1,28 @@
+schema_version = 1
+id = "paired-scheduler-offline"
+name = "Interleaved paired quality gates"
+[run]
+repetitions = 3
+timeout_ms = 2000
+isolation = "temp_copy"
+randomize_case_order = false
+fail_fast = false
+[metadata]
+paired_schedule_seed = 42
+require_paired_quality = true
+[[variants]]
+id = "single"
+executor = "command"
+command = "printf verified"
+[[variants]]
+id = "candidate"
+executor = "command"
+command = "printf verified"
+[[cases]]
+id = "exact"
+fixture = "workspace"
+[[cases.judges]]
+type = "regex"
+target = "stdout"
+pattern = "^verified$"
+required = true

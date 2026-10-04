@@ -14,13 +14,29 @@ pub fn bounded_command(
     command
         .stdout(Stdio::from(fs::File::create(&stdout)?))
         .stderr(Stdio::from(fs::File::create(&stderr)?));
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        command.process_group(0);
+    }
     let mut child = command.spawn()?;
     let started = Instant::now();
     let (code, timed_out) = loop {
         if let Some(status) = child.try_wait()? {
-            break (status.code(), false);
+            break (Some(status.code().unwrap_or(-1)), false);
         }
         if started.elapsed() >= timeout {
+            #[cfg(unix)]
+            {
+                let group = format!("-{}", child.id());
+                let status = Command::new("/bin/kill")
+                    .args(["-KILL", "--", &group])
+                    .status()?;
+                if !status.success() && child.try_wait()?.is_none() {
+                    child.kill()?;
+                }
+            }
+            #[cfg(not(unix))]
             child.kill()?;
             child.wait()?;
             break (None, true);
@@ -41,4 +57,26 @@ pub fn bounded_command(
         Ok(bytes)
     };
     Ok((code, timed_out, read(&stdout)?, read(&stderr)?))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::bounded_command;
+    use std::{process::Command, time::Duration};
+    #[test]
+    fn a_child_deadline_is_observed_and_output_retained() {
+        let directory =
+            std::env::temp_dir().join(format!("bcode-process-test-{}", std::process::id()));
+        std::fs::create_dir_all(&directory).unwrap();
+        let mut command = Command::new("sh");
+        command.args(["-c", "printf started; sleep 10"]);
+        let (code, expired, output, _) =
+            bounded_command(command, Duration::from_millis(50), &directory, "test").unwrap();
+        assert!(expired);
+        assert!(code.is_none());
+        assert_eq!(output, b"started");
+        std::fs::remove_file(directory.join("test.stdout")).unwrap();
+        std::fs::remove_file(directory.join("test.stderr")).unwrap();
+        std::fs::remove_dir(directory).unwrap();
+    }
 }

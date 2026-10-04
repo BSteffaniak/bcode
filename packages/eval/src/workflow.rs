@@ -24,9 +24,28 @@ pub fn execute(
         if let Some(value) = oracle.get("expected_contains") {
             config.expected_contains = serde_json::from_value(value.clone())?;
         }
+        if let Some(value) = oracle.get("answer_file") {
+            config.answer_file = serde_json::from_value(value.clone())?;
+        }
+        if let Some(value) = oracle.get("expected_json") {
+            config.expected_json = Some(value.clone());
+        }
+        if let Some(value) = oracle.get("oracle_command") {
+            config.oracle_command = serde_json::from_value(value.clone())?;
+        }
         if let Some(value) = oracle.get("expect_rejection") {
             config.expect_rejection = serde_json::from_value(value.clone())?;
         }
+    }
+    if let Some(command) = &mut config.oracle_command {
+        let suite_dir = suite
+            .metadata
+            .get("suite_dir")
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| {
+                EvalError::Validation("oracle requires resolved suite directory".into())
+            })?;
+        *command = command.replace("{{suite_dir}}", suite_dir);
     }
     if !config.binary.is_absolute()
         || !config.binary.is_file()
@@ -37,6 +56,11 @@ pub fn execute(
         return Err(EvalError::Validation(
             "invalid workflow executable, strategy or allowances".into(),
         ));
+    }
+    if let Some(profile) = &variant.profile {
+        return Err(EvalError::Validation(format!(
+            "workflow profile {profile} requires an explicit config_toml overlay; profile metadata is not applied by the external CLI"
+        )));
     }
     let _environment = prepare_agent_daemon_isolation(variant, rep_dir)?;
     let preserved: Vec<_> = config
@@ -55,10 +79,23 @@ pub fn execute(
             Ok((path.clone(), fs::read(workspace.join(path))?))
         })
         .collect::<Result<_, EvalError>>()?;
-    let bytes = fs::read(&config.binary)?;
+    let mut hasher = sha2::Sha256::new();
+    {
+        use std::io::Read;
+        let mut file = fs::File::open(&config.binary)?;
+        let mut buffer = vec![0_u8; 65_536];
+        loop {
+            let length = file.read(&mut buffer)?;
+            if length == 0 {
+                break;
+            }
+            hasher.update(&buffer[..length]);
+        }
+    }
+    let digest = hex::encode(hasher.finalize());
     write_json(
         rep_dir.join("subject.json"),
-        &serde_json::json!({"schema_version":1,"binary":config.binary,"sha256":hex::encode(sha2::Sha256::digest(bytes)),"strategy":config.strategy,"judge":config.judge,"acceptance":config.stop_condition}),
+        &serde_json::json!({"schema_version":1,"binary":config.binary,"sha256":digest,"strategy":config.strategy,"judge":config.judge,"acceptance":config.stop_condition}),
     )?;
     let deadline =
         Instant::now() + Duration::from_millis(case.timeout_ms.unwrap_or(suite.run.timeout_ms));
@@ -96,6 +133,19 @@ pub fn execute(
     let session_id = session["id"]
         .as_str()
         .ok_or_else(|| EvalError::Validation("session response missing identity".into()))?;
+    if let Some(model) = &variant.model {
+        invoke(
+            &[
+                "session".into(),
+                "set-model".into(),
+                session_id.into(),
+                model.clone(),
+                "--json".into(),
+            ],
+            "model-selection",
+            remaining(),
+        )?;
+    }
     let mut args = vec![
         "goal".into(),
         "--session".into(),
@@ -115,6 +165,13 @@ pub fn execute(
         "--swarm-instructions".into(),
         config.guidance.clone(),
     ];
+    if config.generated_entry {
+        let position = args
+            .iter()
+            .position(|value| value == "--stop-condition")
+            .expect("authored condition argument");
+        args.drain(position..position + 2);
+    }
     if let Some(judge) = &config.judge {
         args.extend([
             "--judge-provider".into(),
@@ -142,18 +199,23 @@ pub fn execute(
             timed_out = true;
             break;
         }
-        inspection = invoke(
-            &[
-                "workflow".into(),
-                "inspect-run".into(),
-                "--run-id".into(),
-                run_id.into(),
-                "--limit".into(),
-                "100".into(),
-            ],
-            "inspection",
-            remaining(),
-        )?;
+        let inspection_args = vec![
+            "workflow".into(),
+            "inspect-run".into(),
+            "--run-id".into(),
+            run_id.into(),
+            "--limit".into(),
+            "100".into(),
+        ];
+        inspection = match invoke(&inspection_args, "inspection", remaining()) {
+            Ok(value) => value,
+            Err(error) if remaining().is_zero() => {
+                timed_out = true;
+                write_json(rep_dir.join("observation-error.json"), &error.to_string())?;
+                break;
+            }
+            Err(error) => return Err(error),
+        };
         write_json(rep_dir.join("inspection.json"), &inspection)?;
         let status = inspection
             .pointer("/run/status")
@@ -175,9 +237,39 @@ pub fn execute(
             "cancellation",
             Duration::from_secs(15),
         );
+        let requested = cancel.is_ok();
+        let cancellation_deadline = Instant::now() + Duration::from_secs(15);
+        let mut terminal_verified = false;
+        while requested && Instant::now() < cancellation_deadline {
+            let state = invoke(
+                &[
+                    "workflow".into(),
+                    "inspect-run".into(),
+                    "--run-id".into(),
+                    run_id.into(),
+                    "--limit".into(),
+                    "100".into(),
+                ],
+                "cancel-status",
+                Duration::from_secs(5),
+            );
+            if state
+                .as_ref()
+                .ok()
+                .and_then(|value| value.pointer("/run/status"))
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(|status| {
+                    ["completed", "failed", "cancelled", "repair_required"].contains(&status)
+                })
+            {
+                terminal_verified = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
         write_json(
             rep_dir.join("cancellation.json"),
-            &serde_json::json!({"requested":cancel.is_ok(),"error":cancel.err().map(|e|e.to_string()),"terminal_verified":false}),
+            &serde_json::json!({"requested":requested,"error":cancel.err().map(|e|e.to_string()),"terminal_verified":terminal_verified}),
         )?;
     }
     let outputs = invoke(
@@ -225,6 +317,19 @@ pub fn execute(
         Duration::from_secs(15),
     )?;
     write_json(rep_dir.join("inspection.json"), &final_inspection)?;
+    if let Some(revision) = final_inspection
+        .pointer("/graph/revision")
+        .and_then(serde_json::Value::as_u64)
+        && let Err(error) = super::capture::capture(run_id, revision, rep_dir, invoke)
+    {
+        write_json(rep_dir.join("graph-capture-error.json"), &error.to_string())?;
+    }
+    if let Err(error) = super::capture::capture_history(run_id, rep_dir, invoke) {
+        write_json(
+            rep_dir.join("history-capture-error.json"),
+            &error.to_string(),
+        )?;
+    }
     let mut event_sessions = vec![session_id.to_owned()];
     event_sessions.extend(
         final_inspection["child_sessions"]
@@ -234,7 +339,18 @@ pub fn execute(
             .filter_map(|value| value["id"].as_str().map(str::to_owned)),
     );
     let mut telemetry = EvalMeasurementSet::new();
-    let mut capture_complete = true;
+    let mut capture_complete = final_inspection.pointer("/graph/nodes_complete")
+        == Some(&serde_json::Value::Bool(true))
+        && final_inspection.pointer("/graph/edges_complete")
+            == Some(&serde_json::Value::Bool(true))
+        && ["activations", "child_sessions", "events", "attempts"]
+            .iter()
+            .all(|key| {
+                final_inspection[*key]
+                    .as_array()
+                    .is_some_and(|values| values.len() < 100)
+            })
+        && outputs.as_array().is_some_and(|values| values.len() < 100);
     for (index, identity) in event_sessions.iter().enumerate() {
         let mut after = 0_u64;
         let mut events = Vec::new();
@@ -319,20 +435,21 @@ pub fn execute(
         && final_inspection.pointer("/terminal_output/value/condition_met")
             == Some(&serde_json::Value::Bool(true));
     measurements.insert("workflow.completion_claimed".into(), f64::from(completed));
-    let output_text = outputs
-        .as_array()
-        .into_iter()
-        .flatten()
-        .filter_map(|v| {
-            v.pointer("/value/summary")
-                .and_then(serde_json::Value::as_str)
-        })
-        .collect::<Vec<_>>()
-        .join("\n");
-    let artifact_correct = config
-        .expected_contains
-        .iter()
-        .all(|expected| output_text.contains(expected));
+    let completed_value = final_inspection.pointer("/terminal_output/value");
+    let output_text = completed_value.map_or_else(String::new, |value| {
+        serde_json::to_string(
+            &serde_json::json!({"summary":value["summary"],"evidence":value["evidence"]}),
+        )
+        .unwrap_or_default()
+    });
+    let artifact_correct = if config.expected_contains.is_empty()
+        && config.expected_json.is_none()
+        && config.oracle_command.is_none()
+    {
+        false
+    } else {
+        super::oracle::grade(&config, workspace, rep_dir, &output_text)?
+    };
     let preservation = preserved
         .iter()
         .all(|(path, bytes)| fs::read(workspace.join(path)).is_ok_and(|current| current == *bytes));
@@ -356,7 +473,12 @@ pub fn execute(
     }
     write_json(
         rep_dir.join("oracle.json"),
-        &serde_json::json!({"schema_version":1,"passed":oracle_passed,"artifact_correct":artifact_correct,"preservation_passed":preservation,"completion_claimed":completed,"false_completion":false_completion,"completion_failure":completion_failure,"status":status,"timed_out":timed_out,"capture_complete":false}),
+        &serde_json::json!({"schema_version":1,"passed":oracle_passed,"artifact_correct":artifact_correct,"preservation_passed":preservation,"completion_claimed":completed,"false_completion":false_completion,"completion_failure":completion_failure,"status":status,"timed_out":timed_out,"capture_complete":capture_complete}),
+    )?;
+    let oracle_value = serde_json::json!({"timed_out":timed_out,"artifact_correct":artifact_correct,"false_completion":false_completion,"preservation_passed":preservation,"completion_failure":completion_failure});
+    write_json(
+        rep_dir.join("diagnosis.json"),
+        &super::diagnosis::classify(&oracle_value, &outputs, &measurements),
     )?;
     let diagnostics = if timed_out {
         vec![EvalDiagnostic {severity:EvalDiagnosticSeverity::Error,message:"workflow deadline exceeded; cancellation requested, terminal state requires verification".into()}]

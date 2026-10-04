@@ -4,6 +4,9 @@ The eval package remains a leaf. `executor = "workflow"` exercises an explicitly
 identified executable through public CLI boundaries, never canonical databases.
 `metadata.workflow` contains the strategy, authored stop condition, allowances,
 optional judge selection, expected report substrings and preservation paths.
+Explicit variant models are selected through the public session API. External
+workflow trials reject unapplied `profile` metadata; use an explicit configuration
+overlay rather than silently claiming a model profile was exercised.
 
 `bcode goal --stop-condition` bypasses generation so controlled variants use the
 same authored objective and acceptance condition. The normal generated entry path
@@ -60,17 +63,63 @@ fake-provider prompt caching. A prior live admission failure identified missing
 publication authorization in isolated config; execution failures now persist as
 trial failures instead of aborting the report.
 
+## Expanded measurement and grading
+
+`metadata.paired_schedule_seed` enables deterministic interleaving by case and
+repetition, with variant order shuffled inside each block. `schedule.json` records
+the exact order. Pair reports now include Wilson 95% intervals and nearest-rank
+p50/p95 latency ratios for successful pairs. These descriptive intervals do not
+establish noninferiority or independent-task generalization.
+
+Workflow oracles support `answer_file`, `expected_json`, and `oracle_command` in
+variant configuration or case `metadata.workflow_oracle`. Exact JSON comparison
+rejects extra/missing/wrong fields. Hidden validation commands run only after the
+subject, with a separate deadline; keep their sources outside the workspace.
+Report-only grading uses only terminal summary/evidence, excluding copied task
+and stop-condition fields so echoing acceptance text cannot satisfy the oracle.
+It never concatenates
+intermediate summaries. Failed runs cannot pass from an intermediate correct quote.
+`generated_entry = true` exercises ordinary goal generation rather than authored
+controlled input. `diagnosis.json` records deterministic failure labels without
+claiming a verified root cause.
+
+On timeout, cancellation is requested for the exact admitted run and terminal
+state is polled; failure to verify is preserved. Unix subprocesses run in their
+own process group, which is killed on timeout. This does not fence detached
+processes that deliberately create another group.
+
+Validated interleaving fixture: `fixtures/evals/swarm/scheduling.toml` (six
+command trials passed). `scripts/check-swarm-eval.sh` also runs a scripted false
+completion control: the fake evaluator claims completion without delivering its
+required JSON artifact, and the independent oracle must reject the trial with
+`workflow.false_completion = 1`. A failed CLI invocation alone is not accepted as
+proof; the script verifies retained result measurements.
+
+Exact-JSON oracle and deadline behavior have deterministic
+behavioral tests. Offline real-product workflow smoke remains passing.
+
+`fixtures/evals/swarm/coding.toml` adds direct-agent, controlled no-delegation,
+auto, collaborate, and generated-entry trials against hidden Python functional
+checks outside the workspace. `oracle-calibration.toml` and the offline script
+verify that corrected code passes and the intentionally broken fixture fails.
+All variants receive the same task; grading checks
+empty inputs, duplicate handling and complete summation. Command judges accept an
+explicit `timeout_ms` and `{{suite_dir}}` locator. These task-level checks are
+independent of the goal completion gate. The fixture is not yet a held-out benchmark.
+
+Final graph pages are captured at one pinned revision through the public CLI.
+Workflow event and attempt histories are paginated through their existing public
+keyset APIs and retained as separate artifact pages.
+Aggregate collection saturation marks capture incomplete rather than claiming
+complete descendant/activation/output coverage.
+
 ## Scope still requiring expansion
 
-This initial implementation is not the complete proposed research harness. The
-substring oracle is appropriate only for tiny exact-report fixtures; it does not
-prove arbitrary correctness and can match intermediate reports. Full structural
-answer/hidden-test grading, four-way direct/goal entry comparisons, interleaved
-randomized paired scheduling, confidence intervals, equal-resource policies,
-parallel speed fixtures, held-out coding scenarios, scripted swarm/judge faults,
-complete large-graph output/descendant pagination, cancellation terminal verification
-and automatic failure diagnosis remain to be implemented. Capture limits are not
-proof of complete composed-run history. Worker-ID repetition is an observation,
-not itself proof that repeated work was unnecessary. Command deadlines terminate
-the direct child; generic detached descendants require stronger process-group handling.
-Do not promote the live suite to a calibrated release quality claim yet.
+This is not yet the complete proposed research harness. Equal-resource policies,
+parallel speed fixtures, held-out coding scenarios, scripted swarm/judge faults and
+complete output/descendant pagination remain. Current public aggregate inspection
+and output CLI boundaries do not expose cursors for those collections; extending
+them requires typed application/IPC support, not private database access. Capture limits are not proof of complete composed-run history.
+Worker-ID repetition is an observation, not proof of unnecessary work. Failure
+labels do not establish root cause. Do not promote the live suite to a calibrated
+release quality claim yet.

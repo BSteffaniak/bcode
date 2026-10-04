@@ -11,9 +11,14 @@
 
 //! Leaf eval runner, judges, reports, comparisons, and baselines for Bcode.
 
+mod capture;
+mod diagnosis;
+mod oracle;
 mod paired;
 mod process;
+mod schedule;
 mod sdk;
+mod statistics;
 mod workflow;
 
 pub use sdk::{
@@ -167,6 +172,24 @@ pub fn validate_suite(suite: &EvalSuite) -> Result<(), EvalError> {
     if suite.cases.is_empty() {
         return Err(EvalError::Validation(
             "suite must define at least one case".into(),
+        ));
+    }
+    if suite
+        .metadata
+        .get("paired_schedule_seed")
+        .is_some_and(|value| value.as_u64().is_none())
+    {
+        return Err(EvalError::Validation(
+            "paired_schedule_seed must be an unsigned integer".into(),
+        ));
+    }
+    if suite
+        .metadata
+        .get("require_paired_quality")
+        .is_some_and(|value| value.as_bool().is_none())
+    {
+        return Err(EvalError::Validation(
+            "require_paired_quality must be boolean".into(),
         ));
     }
     let mut variant_ids = std::collections::BTreeSet::new();
@@ -346,25 +369,36 @@ pub fn run_suite(options: &EvalRunOptions) -> Result<EvalRunResult, EvalError> {
         total_repetitions
     ));
 
-    let mut variants = Vec::new();
-    for variant in &suite.variants {
-        let mut case_results = Vec::new();
-        for case in &suite.cases {
-            let result = run_case_variant(&suite, &suite_dir, &output_dir, case, variant)?;
-            let failed = result.repetitions.iter().any(|rep| !rep.passed);
-            case_results.push(result);
-            if failed && suite.run.fail_fast {
-                break;
+    let variants = if let Some(seed) = suite
+        .metadata
+        .get("paired_schedule_seed")
+        .and_then(serde_json::Value::as_u64)
+    {
+        schedule::run(&suite, &suite_dir, &output_dir, seed)?
+    } else {
+        let mut variants = Vec::new();
+        for variant in &suite.variants {
+            let mut case_results = Vec::new();
+            for case in &suite.cases {
+                let result = run_case_variant(&suite, &suite_dir, &output_dir, case, variant)?;
+                let failed = result.repetitions.iter().any(|rep| !rep.passed);
+                case_results.push(result);
+                if failed && suite.run.fail_fast {
+                    break;
+                }
             }
+            variants.push(aggregate_variant(&suite, variant, case_results));
         }
-        variants.push(aggregate_variant(&suite, variant, case_results));
-    }
-    let variants_passed = variants.iter().all(|variant| {
-        variant
-            .cases
-            .iter()
-            .all(|case| case.repetitions.iter().all(|rep| rep.passed))
-    });
+        variants
+    };
+    let variants_passed = variants.len() == suite.variants.len()
+        && variants.iter().all(|variant| {
+            variant.cases.len() == suite.cases.len()
+                && variant.cases.iter().all(|case| {
+                    case.repetitions.len() == suite.run.repetitions as usize
+                        && case.repetitions.iter().all(|rep| rep.passed)
+                })
+        });
     let comparisons = evaluate_comparisons(&suite, &variants);
     let comparisons_passed = comparisons
         .iter()
@@ -542,7 +576,27 @@ fn run_repetition(
         "executing: variant={} case={} rep={} executor={:?}",
         variant.id, case.id, repetition, variant.executor
     ));
-    let execution = execute_variant(suite, case, variant, repetition, rep_dir, &workspace)?;
+    let execution = match execute_variant(suite, case, variant, repetition, rep_dir, &workspace) {
+        Ok(output) => output,
+        Err(error) => {
+            write_json(
+                rep_dir.join("execution-failure.json"),
+                &serde_json::json!({"schema_version":1,"error":error.to_string(),"outcome":"execution_failed","capture_complete":false}),
+            )?;
+            ExecutionOutput {
+                exit_code: Some(1),
+                diagnostics: vec![EvalDiagnostic {
+                    severity: EvalDiagnosticSeverity::Error,
+                    message: error.to_string(),
+                }],
+                artifacts: vec![EvalArtifactRef {
+                    kind: "execution_failure".into(),
+                    path: "execution-failure.json".into(),
+                }],
+                ..ExecutionOutput::default()
+            }
+        }
+    };
     measurements.extend(execution.measurements);
     diagnostics.extend(execution.diagnostics);
     artifacts.extend(execution.artifacts);
@@ -637,29 +691,7 @@ fn execute_variant(
         EvalExecutorKind::DirectTool => {
             execute_direct_tool_variant(suite, case, variant, repetition, rep_dir, workspace)
         }
-        EvalExecutorKind::Workflow => {
-            match workflow::execute(suite, case, variant, rep_dir, workspace) {
-                Ok(output) => Ok(output),
-                Err(error) => {
-                    write_json(
-                        rep_dir.join("execution-failure.json"),
-                        &serde_json::json!({"schema_version":1,"error":error.to_string(),"outcome":"execution_failed","capture_complete":false}),
-                    )?;
-                    Ok(ExecutionOutput {
-                        exit_code: Some(1),
-                        measurements: EvalMeasurementSet::new(),
-                        diagnostics: vec![EvalDiagnostic {
-                            severity: EvalDiagnosticSeverity::Error,
-                            message: error.to_string(),
-                        }],
-                        artifacts: vec![EvalArtifactRef {
-                            kind: "execution_failure".into(),
-                            path: "execution-failure.json".into(),
-                        }],
-                    })
-                }
-            }
-        }
+        EvalExecutorKind::Workflow => workflow::execute(suite, case, variant, rep_dir, workspace),
         EvalExecutorKind::Replay => {
             execute_replay_variant(suite, case, variant, repetition, rep_dir, workspace)
         }
@@ -1987,15 +2019,22 @@ fn run_judge(
         }
         EvalJudgeConfig::Command {
             command,
+            timeout_ms,
             expected_exit_code,
             required,
         } => {
-            let output = shell_command(command)
+            let command = command.replace("{{suite_dir}}", &suite_dir.display().to_string());
+            let mut child = shell_command(&command);
+            child
                 .current_dir(workspace)
-                .stdout(Stdio::piped())
-                .stderr(Stdio::piped())
-                .output()?;
-            let code = output.status.code().unwrap_or(-1);
+                .env("BCODE_EVAL_WORKSPACE", workspace);
+            let (exit_code, timed_out, stdout, stderr) = process::bounded_command(
+                child,
+                std::time::Duration::from_millis(*timeout_ms),
+                rep_dir,
+                &format!("judge-command-{}", start.elapsed().as_nanos()),
+            )?;
+            let code = exit_code.unwrap_or(-1);
             let stdout_path = rep_dir.join(format!(
                 "judge-command-{}.stdout.log",
                 start.elapsed().as_nanos()
@@ -2004,10 +2043,10 @@ fn run_judge(
                 "judge-command-{}.stderr.log",
                 start.elapsed().as_nanos()
             ));
-            fs::write(&stdout_path, &output.stdout)?;
-            fs::write(&stderr_path, &output.stderr)?;
+            fs::write(&stdout_path, &stdout)?;
+            fs::write(&stderr_path, &stderr)?;
             judge_measurements.insert("judge_command_exit_code".into(), f64::from(code));
-            let passed = code == *expected_exit_code;
+            let passed = !timed_out && code == *expected_exit_code;
             EvalJudgeResult {
                 kind: "command".into(),
                 passed,

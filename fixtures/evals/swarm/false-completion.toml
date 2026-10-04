@@ -1,0 +1,30 @@
+schema_version = 1
+id = "swarm-false-completion-control"
+name = "Independent oracle rejects scripted false completion"
+[run]
+repetitions = 1
+timeout_ms = 120000
+isolation = "temp_copy"
+randomize_case_order = false
+fail_fast = false
+[[variants]]
+id = "single"
+executor = "workflow"
+[variants.metadata.workflow]
+binary = "/Volumes/ehdd/GitHub/bcode/target/aarch64-apple-darwin/release/bcode"
+strategy = "no-delegation"
+stop_condition = "Deliver the exact correct JSON artifact answer.json with sum equal to 4."
+max_iterations = 1
+concurrency = 1
+worker_attempts = 4
+answer_file = "answer.json"
+expected_json = { sum = 4 }
+[[cases]]
+id = "missing-artifact"
+fixture = "workspace"
+prompt = "Deliver answer.json containing the correct arithmetic answer."
+[[cases.judges]]
+type = "metric_threshold"
+metric = "workflow.false_completion"
+min = 1
+required = true

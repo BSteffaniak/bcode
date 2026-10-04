@@ -10,8 +10,11 @@ pub struct WorkflowEvalConfig {
     pub binary: PathBuf,
     /// Goal strategy: auto, collaborate, or no-delegation.
     pub strategy: String,
-    /// Shared, authored acceptance condition (no per-variant generation).
+    /// Authored controlled-entry acceptance; not used when `generated_entry` is true.
     pub stop_condition: String,
+    /// Preserve normal generation for product-entry evaluation rather than controlled inputs.
+    #[serde(default)]
+    pub generated_entry: bool,
     /// Maximum implementation/evaluation iterations.
     pub max_iterations: u32,
     /// Concurrent workflow node allowance.
@@ -21,6 +24,15 @@ pub struct WorkflowEvalConfig {
     /// Case-independent report substrings (case overrides use `metadata.workflow_oracle`).
     #[serde(default)]
     pub expected_contains: Vec<String>,
+    /// Independent delivered artifact, relative to the workspace.
+    #[serde(default)]
+    pub answer_file: Option<PathBuf>,
+    /// Exact expected JSON answer, never included in agent prompts.
+    #[serde(default)]
+    pub expected_json: Option<serde_json::Value>,
+    /// External hidden validation command. Runs after execution, with its own deadline.
+    #[serde(default)]
+    pub oracle_command: Option<String>,
     /// Negative control: the task must not be claimed complete.
     #[serde(default)]
     pub expect_rejection: bool,
