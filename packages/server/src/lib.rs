@@ -17175,8 +17175,27 @@ fn runtime_work_projection_to_events(
             cancellable: work.cancellable,
         },
     };
-    if work.status == RuntimeWorkStatus::Running {
-        return vec![start];
+    match work.status {
+        RuntimeWorkStatus::Queued | RuntimeWorkStatus::Running => return vec![start],
+        RuntimeWorkStatus::Cancelling => {
+            // Cancellation is a request, not evidence that execution has stopped. The
+            // projection does not retain its original sequence or timestamp; do not
+            // invent terminal evidence (or a cancellation time) from the start row.
+            let cancellation = bcode_session_models::SessionEvent {
+                schema_version: CURRENT_SESSION_EVENT_SCHEMA_VERSION,
+                sequence: work.event_seq_start,
+                timestamp_ms: work.started_at_ms.unwrap_or(0),
+                session_id,
+                provenance: None,
+                kind: SessionEventKind::RuntimeWorkCancelRequested {
+                    work_id: work.work_id,
+                    requested_at_ms: None,
+                    client_id: None,
+                },
+            };
+            return vec![start, cancellation];
+        }
+        _ => {}
     }
     let finish = bcode_session_models::SessionEvent {
         schema_version: CURRENT_SESSION_EVENT_SCHEMA_VERSION,
@@ -81863,6 +81882,82 @@ event_symbol = "bcode_plugin_handle_event_v1"
     }
 
     #[tokio::test]
+    async fn cancelling_runtime_work_remains_live_in_subscription_and_history() {
+        let session_root = tempfile::tempdir().expect("session root");
+        let sessions =
+            SessionManager::persistent(session_root.path().to_path_buf()).expect("sessions");
+        let session = sessions
+            .create_session(None, session_root.path().to_path_buf())
+            .await
+            .expect("session");
+        let state = test_server_state(sessions);
+        let work_id = WorkId::new("cancelling-tool");
+        register_runtime_work(
+            &state,
+            session.id,
+            RuntimeWorkSpec::new(
+                work_id.clone(),
+                RuntimeWorkKind::Tool,
+                "validation shell".to_owned(),
+                CancellationHandle::Test(Arc::new(AtomicUsize::new(0))),
+            ),
+        )
+        .await;
+        assert!(runtime_work_operations::cancel(&state, session.id, work_id.clone(), None).await);
+        let active = runtime_work_operations::list(&state, session.id).await;
+        assert_eq!(active.len(), 1);
+        assert_eq!(active[0].status, RuntimeWorkStatus::Cancelling);
+        let subscription = runtime_work_operations::subscribe(&state, session.id)
+            .await
+            .expect("subscription");
+        let history = runtime_work_operations::history(&state, session.id, 10)
+            .await
+            .expect("history");
+        for events in [&subscription.initial_events, &history] {
+            assert!(matches!(
+                events.as_slice(),
+                [
+                    SessionEvent {
+                        kind: SessionEventKind::RuntimeWorkStarted { .. },
+                        ..
+                    },
+                    SessionEvent {
+                        kind: SessionEventKind::RuntimeWorkCancelRequested { .. },
+                        ..
+                    },
+                ]
+            ));
+        }
+        finish_registered_runtime_work(
+            &state,
+            session.id,
+            work_id,
+            RuntimeWorkStatus::Cancelled,
+            None,
+        )
+        .await;
+        assert!(
+            runtime_work_operations::list(&state, session.id)
+                .await
+                .is_empty()
+        );
+        let history = runtime_work_operations::history(&state, session.id, 10)
+            .await
+            .expect("terminal history");
+        drop(state);
+        assert!(matches!(
+            history.last(),
+            Some(SessionEvent {
+                kind: SessionEventKind::RuntimeWorkFinished {
+                    status: RuntimeWorkStatus::Cancelled,
+                    ..
+                },
+                ..
+            })
+        ));
+    }
+
+    #[tokio::test]
     async fn runtime_work_subscription_does_not_revive_unowned_history() {
         let session_root = tempfile::tempdir().expect("session root");
         let sessions =
@@ -82207,7 +82302,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
             .expect("late snapshot status deadline")
             .expect("late snapshot status");
         assert!(matches!(status.kind,
-            SessionEventKind::RuntimeWorkFinished { work_id: id, status: RuntimeWorkStatus::Cancelling, .. }
+            SessionEventKind::RuntimeWorkCancelRequested { work_id: id, .. }
                 if &id == work_id));
         watcher
     }
@@ -82329,21 +82424,19 @@ event_symbol = "bcode_plugin_handle_event_v1"
             .await
             .expect("bounded IPC history");
         assert_eq!(events.len(), 1);
-        let SessionEventKind::RuntimeWorkFinished {
+        let SessionEventKind::RuntimeWorkCancelRequested {
             work_id: id,
-            status,
-            finished_at_ms,
+            requested_at_ms,
             ..
         } = &events[0].kind
         else {
             panic!(
-                "expected bounded projection status event: {:?}",
+                "expected bounded cancellation request: {:?}",
                 events[0].kind
             );
         };
         assert_eq!(id, work_id);
-        assert_eq!(*status, RuntimeWorkStatus::Cancelling);
-        assert!(!status.is_terminal());
+        assert_eq!(*requested_at_ms, None);
         let spans = client
             .runtime_work_spans(session_id, 1)
             .await
@@ -82352,8 +82445,9 @@ event_symbol = "bcode_plugin_handle_event_v1"
         assert_eq!(&spans[0].work_id, work_id);
         assert!(spans[0].label.is_empty());
         assert_eq!(spans[0].started_at_ms, None);
-        assert_eq!(spans[0].finished_at_ms, *finished_at_ms);
-        assert_eq!(spans[0].status, Some(RuntimeWorkStatus::Cancelling));
+        assert_eq!(spans[0].finished_at_ms, None);
+        assert_eq!(spans[0].status, None);
+        assert!(spans[0].cancelled);
         assert_eq!(spans[0].duration_ms(), None);
     }
 
