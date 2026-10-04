@@ -4,6 +4,11 @@
 
 //! Normalization of portable workflow application data into semantic projections.
 
+mod scheduling;
+pub use scheduling::{
+    WorkflowSchedulingObservation, classify_scheduling_activation, project_scheduling,
+};
+
 use std::collections::BTreeMap;
 
 use bcode_workflow_view_models::{
@@ -260,6 +265,7 @@ pub fn project_run(input: WorkflowRunProjectionInput) -> WorkflowRunView {
     );
 
     WorkflowRunView {
+        scheduling: None,
         version: WORKFLOW_VIEW_VERSION,
         run: input.run,
         nodes,

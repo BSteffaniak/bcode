@@ -3234,7 +3234,10 @@ fn inspector_lines(
         lines.push(format!(
             "  bounds: nodes={} · concurrency={} · cycles={} · retries={}",
             compiled.run_limits.node_execution_cap,
-            compiled.run_limits.concurrency_cap,
+            compiled
+                .run_limits
+                .concurrency_cap
+                .map_or_else(|| "uncapped".to_owned(), |cap| cap.to_string()),
             compiled.run_limits.cycle_cap,
             compiled.run_limits.retry_cap
         ));

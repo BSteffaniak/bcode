@@ -35,7 +35,7 @@ pub struct Arguments {
     /// Additional run-wide node attempts, not worker count or a spending cap (default: 20).
     #[arg(long)]
     pub worker_attempts: Option<std::num::NonZeroU64>,
-    /// Maximum concurrent nodes in this run, including coordinator and evaluation work.
+    /// Maximum concurrent nodes, including coordinator/evaluation work (omitted: uncapped).
     #[arg(long)]
     pub concurrency: Option<std::num::NonZeroU32>,
 }
@@ -126,6 +126,8 @@ mod tests {
         };
         let plain = request(CollaborationMode::Disabled);
         let auto = request(Mode::Auto.collaboration());
+        assert_eq!(auto.limits.concurrency_cap, None);
+        assert_eq!(plain.limits.concurrency_cap, None);
         assert_eq!(auto.definition, plain.definition);
         assert_eq!(
             auto.limits.node_execution_cap,

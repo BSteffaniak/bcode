@@ -1,5 +1,27 @@
 # Database SQL transition
 
+## Large-swarm integration scope (2026-10-04)
+
+The current local patch selects sibling `switchy_database`. Workflow admission counts,
+run-scoped scheduler keyset pages and scheduling observations now use structured
+Switchy selections borrowed onto the existing transaction connection. Optional
+concurrency uses a typed upstream nullable-column operation; schema 43/compatibility 3
+preserves prior numeric caps and refuses unsupported storage contracts.
+
+This is an incremental typed adapter, **not completion of the requested async store
+migration**: workflow-store still owns rusqlite connections and existing transaction
+writes, graph and recovery paths retain raw SQL. No new raw consumer allowance is
+authorized, and no full isolated no-raw consumer closure is claimed. Passing ordinary
+architecture checks verifies the existing transition envelope, not migration completion.
+The remaining production lifecycle conversion and its isolated production/test proof
+must be completed before retiring the workflow-store transition entry.
+
+Current combined checks after space recovery: workspace check/strict clippy and normal
+architecture pass; workflow-store 541 and server 983 tests passed (6 server tests ignored).
+The new scheduling-snapshot assertion passed subsequently. These results do not certify
+unimplemented async conversion or unsupported diagnostic facts. Earlier status below
+is historical and must not override these scope distinctions.
+
 ## Verified local integration status (2026-10-03)
 
 Root Cargo patches now select the modified sibling MoosicBox Switchy implementation and

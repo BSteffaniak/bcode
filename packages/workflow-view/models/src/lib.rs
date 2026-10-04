@@ -4,10 +4,13 @@
 
 //! Portable, renderer-neutral workflow projection contracts.
 
+mod scheduling;
+pub use scheduling::*;
+
 use serde::{Deserialize, Serialize};
 
 /// Current workflow projection schema version.
-pub const WORKFLOW_VIEW_VERSION: u32 = 5;
+pub const WORKFLOW_VIEW_VERSION: u32 = 6;
 
 /// Current workflow live-event contract version.
 pub const WORKFLOW_LIVE_EVENT_VERSION: u32 = 1;
@@ -450,6 +453,9 @@ pub struct WorkflowRunView {
     pub outputs: Vec<WorkflowOutputView>,
     /// Bounded canonical diagnostics explaining terminal or node failure.
     pub failure_diagnostics: Vec<WorkflowFailureDiagnostic>,
+    /// None means scheduler observations are unavailable.
+    #[serde(default)]
+    pub scheduling: Option<WorkflowSchedulingView>,
     pub descendant_runs: Vec<WorkflowDescendantRunView>,
     /// Live tool permission requests correlated to bounded execution-session links.
     pub tool_permissions: Vec<WorkflowToolPermissionView>,
@@ -1026,6 +1032,7 @@ mod live_event_tests {
             retry_schedules: Vec::new(),
             outputs: Vec::new(),
             failure_diagnostics: Vec::new(),
+            scheduling: None,
             descendant_runs: Vec::new(),
             tool_permissions: Vec::new(),
             child_sessions: Vec::new(),

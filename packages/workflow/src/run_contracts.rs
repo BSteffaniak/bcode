@@ -840,8 +840,10 @@ pub struct WorkflowRunLimits {
     pub deadline_at_ms: Option<u64>,
     /// Maximum total node attempts in the run.
     pub node_execution_cap: u64,
-    /// Maximum concurrently running nodes.
-    pub concurrency_cap: u32,
+    /// Maximum concurrently running nodes; `None` means no configured cap.
+    /// Numeric legacy values retain their exact cap; the field must be present.
+    #[serde(deserialize_with = "deserialize_concurrency_cap")]
+    pub concurrency_cap: Option<u32>,
     /// Maximum cycle/repeat activations.
     pub cycle_cap: u32,
     /// Maximum attempts per activation.
@@ -852,6 +854,15 @@ pub struct WorkflowRunLimits {
     /// Maximum descendants of the root run.
     #[serde(default = "default_descendant_cap")]
     pub descendant_cap: u32,
+}
+
+/// Decode an explicitly present optional cap, preserving historical numeric limits.
+/// Missing fields are rejected by Serde rather than interpreted as uncapped policy.
+pub fn deserialize_concurrency_cap<'de, D>(deserializer: D) -> Result<Option<u32>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Option::<u32>::deserialize(deserializer)
 }
 
 pub const fn default_recursion_depth_cap() -> u32 {
@@ -866,7 +877,7 @@ impl Default for WorkflowRunLimits {
         Self {
             deadline_at_ms: None,
             node_execution_cap: 1_000,
-            concurrency_cap: 8,
+            concurrency_cap: None,
             cycle_cap: 100,
             retry_cap: 3,
             recursion_depth_cap: default_recursion_depth_cap(),
@@ -2016,6 +2027,34 @@ mod tests {
     }
 
     #[test]
+    fn persisted_concurrency_requires_explicit_policy_and_preserves_numeric_caps() {
+        for cap in [None, Some(1), Some(8), Some(100)] {
+            let limits = WorkflowRunLimits {
+                concurrency_cap: cap,
+                ..Default::default()
+            };
+            let wire = serde_json::to_value(&limits).unwrap();
+            assert_eq!(wire["concurrency_cap"], serde_json::json!(cap));
+            assert_eq!(
+                serde_json::from_value::<WorkflowRunLimits>(wire.clone()).unwrap(),
+                limits
+            );
+            let mut missing = wire;
+            missing.as_object_mut().unwrap().remove("concurrency_cap");
+            assert!(serde_json::from_value::<WorkflowRunLimits>(missing).is_err());
+        }
+        for invalid in [
+            serde_json::json!(-1),
+            serde_json::json!(4_294_967_296_u64),
+            serde_json::json!({"unlimited":true}),
+        ] {
+            let mut wire = serde_json::to_value(WorkflowRunLimits::default()).unwrap();
+            wire["concurrency_cap"] = invalid;
+            assert!(serde_json::from_value::<WorkflowRunLimits>(wire).is_err());
+        }
+    }
+
+    #[test]
     fn run_start_defaults_preserve_allowances() {
         let request: WorkflowRunStartRequest = serde_json::from_value(serde_json::json!({
             "definition_id":"definition", "definition_version":1,
@@ -2023,7 +2062,7 @@ mod tests {
         })).unwrap();
         assert_eq!(request.limits, WorkflowRunLimits::default());
         assert_eq!(request.limits.node_execution_cap, 1_000);
-        assert_eq!(request.limits.concurrency_cap, 8);
+        assert_eq!(request.limits.concurrency_cap, None);
         assert_eq!(request.limits.cycle_cap, 100);
         assert_eq!(request.limits.retry_cap, 3);
         assert!(request.parent_session_generation.is_none());

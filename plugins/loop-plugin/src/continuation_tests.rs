@@ -107,14 +107,34 @@ fn active_grants_preserve_exact_caps_and_reject_unknown_or_terminal_state() {
 }
 
 #[test]
+fn uncapped_continuation_preserves_policy_without_inventing_a_limit() {
+    let mut checkpoint = source(false);
+    checkpoint.limits.concurrency_cap = None;
+    let continued = request(checkpoint, 1).unwrap();
+    assert_eq!(continued.successor.limits.concurrency_cap, None);
+    assert!(continued.successor.limits.node_execution_cap > 0);
+
+    let mut checkpoint = source(false);
+    checkpoint.limits.concurrency_cap = Some(1);
+    assert_eq!(
+        request(checkpoint, 2)
+            .unwrap()
+            .successor
+            .limits
+            .concurrency_cap,
+        Some(1)
+    );
+}
+
+#[test]
 fn short_continuation_concurrency_does_not_exceed_total_attempt_allowance() {
     let mut checkpoint = source(false);
-    checkpoint.limits.concurrency_cap = 100;
+    checkpoint.limits.concurrency_cap = Some(100);
     checkpoint.limits.retry_cap = 0;
     let continued = request(checkpoint, 1).unwrap();
     assert!(continued.successor.limits.node_execution_cap < 100);
     assert_eq!(
-        u64::from(continued.successor.limits.concurrency_cap),
+        u64::from(continued.successor.limits.concurrency_cap.unwrap()),
         continued.successor.limits.node_execution_cap
     );
 }

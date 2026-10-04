@@ -93,7 +93,7 @@ impl PluginTuiHost for GoalEntryHost {
         }
         if let Some(cap) = self.execution_cap {
             request.limits.node_execution_cap = cap;
-            request.limits.concurrency_cap = 1;
+            request.limits.concurrency_cap = Some(1);
         }
         request.identity = bcode_workflow::WorkflowDefinitionIdentity::for_definition(
             request.identity.kind.clone(),
@@ -1361,19 +1361,20 @@ async fn real_goal_entry_publishes_and_executes_two_workers() {
                     tokio::time::sleep(Duration::from_millis(20)).await;
                     continue;
                 }
+                if state
+                    .workflow_store
+                    .lock()
+                    .unwrap()
+                    .canonical_terminal_output(&run_id)
+                    .unwrap()
+                    .is_none()
+                {
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                    continue;
+                }
                 assert_corrected_contributions(root.path(), &outputs, collected);
                 assert_correction_without_replay(&attempts);
                 assert_goal_evaluation(&outputs, &request.input);
-                assert!(
-                    state
-                        .workflow_store
-                        .lock()
-                        .unwrap()
-                        .canonical_terminal_output(&run_id)
-                        .unwrap()
-                        .is_some(),
-                    "the supported evaluation must terminalize the completed goal"
-                );
                 break;
             }
             assert!(

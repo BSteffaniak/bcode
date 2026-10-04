@@ -190,7 +190,7 @@ async fn run(args: GoalCli) -> Result<(), String> {
         args.swarm.worker_attempts.map(std::num::NonZeroU64::get),
     )?;
     if let Some(concurrency) = args.swarm.concurrency {
-        request.limits.concurrency_cap = concurrency.get();
+        request.limits.concurrency_cap = Some(concurrency.get());
     }
     if collaboration == crate::CollaborationMode::Requested {
         check_delegation(&client).await?;
@@ -426,6 +426,25 @@ mod tests {
             .is_err()
         );
         assert!(GoalCli::try_parse_from(base.into_iter().chain(["--concurrency", "0"])).is_err());
+        let mut uncapped_surface = crate::LoopSurface::new(Some(session));
+        uncapped_surface.origin = SetupKind::Goal;
+        uncapped_surface.prompt = crate::text_state("Implement");
+        uncapped_surface.condition = crate::text_state("Verify");
+        assert_eq!(
+            uncapped_surface
+                .build_start_request(session)
+                .unwrap()
+                .limits
+                .concurrency_cap,
+            None
+        );
+        assert!(
+            GoalCli::try_parse_from(base)
+                .unwrap()
+                .swarm
+                .concurrency
+                .is_none()
+        );
         for mode in ["auto", "collaborate", "no-delegation"] {
             let args = GoalCli::try_parse_from(base.into_iter().chain([
                 "--agents",
@@ -461,7 +480,7 @@ mod tests {
                 Some(9),
             )
             .unwrap();
-            cli.limits.concurrency_cap = 2;
+            cli.limits.concurrency_cap = Some(2);
             assert_eq!(ui.definition, cli.definition);
             assert_eq!(ui.input, cli.input);
             assert_eq!(ui.limits, cli.limits);

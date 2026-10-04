@@ -139,9 +139,11 @@ fn request_with_allowance(
         .and_then(|value| value.checked_mul(u64::from(limits.retry_cap) + 1))
         .and_then(|value| value.checked_add(worker_attempts))
         .ok_or("Node allowance overflow")?;
-    limits.concurrency_cap =
-        u32::try_from(u64::from(limits.concurrency_cap).min(limits.node_execution_cap))
-            .map_err(|_| "Concurrency allowance exceeds supported range")?;
+    limits.concurrency_cap = limits
+        .concurrency_cap
+        .map(|cap| u32::try_from(u64::from(cap).min(limits.node_execution_cap)))
+        .transpose()
+        .map_err(|_| "Concurrency allowance exceeds supported range")?;
     i64::try_from(limits.node_execution_cap)
         .map_err(|_| "Node allowance exceeds the supported storage integer range")?;
     let session = source

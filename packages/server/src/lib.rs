@@ -16811,30 +16811,22 @@ async fn retry_prepared_workflow_dispatches(
     store_path: &Path,
     run_id: &str,
     authority: &bcode_workflow_store::WorkflowExecutionAuthority,
+    cursor: &mut Option<String>,
 ) -> Result<(), ServerError> {
     if state.shutdown_requested.load(Ordering::SeqCst) {
         return Ok(());
     }
     let mut store = bcode_workflow_store::WorkflowStore::open_at_path(store_path)?;
-    match store
-        .redispatch_owned_prepared_read_only_for_run(
+    let (_, next) = store
+        .redispatch_owned_prepared_read_only_page_for_run(
             &WorkflowActivationOwner { state },
             run_id,
             authority,
-            1_000,
+            (cursor.as_deref(), WORKFLOW_SCHEDULER_PAGE_SIZE),
             current_unix_millis(),
         )
-        .await
-    {
-        Ok(_) => {}
-        Err(WorkflowStoreError::OwnerDispatch(error))
-            if matches!(*error, WorkflowStoreError::OwnerAccessDeferred) =>
-        {
-            tracing::debug!(run_id, "prepared workflow owner dispatch deferred");
-        }
-        Err(error) => return Err(error.into()),
-    }
-    // A deferred owner must not block unrelated pending work, but lost authority must.
+        .await?;
+    *cursor = next;
     store.verify_execution_authority(run_id, authority)?;
     Ok(())
 }
@@ -16848,6 +16840,9 @@ async fn drive_workflow_run(state: &Arc<ServerState>, run_id: &str) -> Result<()
     drive_workflow_run_exclusive(state, run_id).await
 }
 
+// Internal work quantum, deliberately independent of configured run concurrency.
+const WORKFLOW_SCHEDULER_PAGE_SIZE: usize = 128;
+
 async fn drive_workflow_run_exclusive(
     state: &Arc<ServerState>,
     run_id: &str,
@@ -16860,6 +16855,9 @@ async fn drive_workflow_run_exclusive(
     let started_at = std::time::Instant::now();
     let store_path = workflow_store_path(state);
     let mut retry_preparations = true;
+    let mut prepared_cursor = None;
+    let mut control_cursor = None;
+    let mut pending_cursor = None;
     let mut publication_cursor = None;
     let mut receipt_cursor = None;
     let (mut cancellation_cursor, mut run_cancellation_cursor) = (None, None);
@@ -16880,47 +16878,38 @@ async fn drive_workflow_run_exclusive(
             cancellation_sweep_complete,
         )
         .await?;
-        if bcode_workflow_store::WorkflowStore::open_at_path(&store_path)?
-            .is_recovery_only(run_id)?
-        {
-            // Recovery may observe/cancel existing work, but never enter ordinary
-            // scheduling, deadline terminalization, or automatic retry admission.
-            break;
-        }
-        if bcode_workflow_store::WorkflowStore::open_at_path(&store_path)?
-            .expire_run_deadline(run_id, now_ms)?
-        {
+        if workflow_scheduling_stopped(&store_path, run_id, now_ms)? {
             break;
         }
         if retry_preparations && cancellation_sweep_complete {
-            retry_prepared_workflow_dispatches(state, &store_path, run_id, &authority.authority)
-                .await?;
-            retry_preparations = false;
-        }
-        let settled = bcode_workflow_store::WorkflowStore::open_at_path(&store_path)?
-            .settle_pending_control_nodes(run_id, 1_000, now_ms)?;
-        let dispatched = bcode_workflow_store::WorkflowStore::open_at_path(&store_path)?
-            .dispatch_owned_pending_activations_for_run(
-                &WorkflowActivationOwner { state },
+            retry_prepared_workflow_dispatches(
+                state,
+                &store_path,
                 run_id,
                 &authority.authority,
-                1_000,
-                now_ms,
+                &mut prepared_cursor,
             )
             .await?;
-        let (reconciled, next_receipt_cursor) =
-            bcode_workflow_store::WorkflowStore::open_at_path(&store_path)?
-                .reconcile_owned_receipts_page_async(
-                    &WorkflowTurnReceiptObserver { state },
-                    run_id,
-                    &authority.authority,
-                    (receipt_cursor.as_deref(), 1_000),
-                    now_ms,
-                )
-                .await?;
-        receipt_cursor = next_receipt_cursor;
-        propagate_fail_fast_sibling_cancellation(state, reconciled.sibling_cancellations.clone())
-            .await?;
+            retry_preparations = prepared_cursor.is_some();
+        }
+        let (settled, dispatched) = dispatch_workflow_pending_page(
+            state,
+            &store_path,
+            run_id,
+            &authority.authority,
+            (&mut control_cursor, &mut pending_cursor),
+            now_ms,
+        )
+        .await?;
+        let reconciled = reconcile_workflow_receipt_page(
+            state,
+            &store_path,
+            run_id,
+            &authority.authority,
+            &mut receipt_cursor,
+            now_ms,
+        )
+        .await?;
         let published = finalize_workflow_publication_page(
             &store_path,
             run_id,
@@ -16934,6 +16923,9 @@ async fn drive_workflow_run_exclusive(
         record_workflow_iteration_duration(state, iteration_started_at);
         if !published
             && cancellation_sweep_complete
+            && !retry_preparations
+            && control_cursor.is_none()
+            && pending_cursor.is_none()
             && publication_cursor.is_none()
             && receipt_cursor.is_none()
             && settled.settled.is_empty()
@@ -16948,8 +16940,80 @@ async fn drive_workflow_run_exclusive(
         {
             break;
         }
+        // Even immediately-ready dispatch/observation futures must not monopolize an
+        // executor thread. The page size bounds each admission scan, not run concurrency.
+        tokio::task::yield_now().await;
     }
     finish_workflow_drive(state, run_id, started_at).await
+}
+
+fn workflow_scheduling_stopped(
+    path: &Path,
+    run_id: &str,
+    now_ms: u64,
+) -> Result<bool, WorkflowStoreError> {
+    let mut store = bcode_workflow_store::WorkflowStore::open_at_path(path)?;
+    // Short-circuit before deadline mutation: recovery-only runs may observe/cancel
+    // existing work, but cannot enter ordinary scheduling or terminalization.
+    Ok(store.is_recovery_only(run_id)? || store.expire_run_deadline(run_id, now_ms)?)
+}
+
+async fn dispatch_workflow_pending_page(
+    state: &Arc<ServerState>,
+    path: &Path,
+    run_id: &str,
+    authority: &bcode_workflow_store::WorkflowExecutionAuthority,
+    cursors: (&mut Option<String>, &mut Option<String>),
+    now_ms: u64,
+) -> Result<
+    (
+        bcode_workflow_store::ControlSettlementSummary,
+        bcode_workflow_store::ActivationDispatchSummary,
+    ),
+    ServerError,
+> {
+    let (control_cursor, pending_cursor) = cursors;
+    let (settled, next_control) = bcode_workflow_store::WorkflowStore::open_at_path(path)?
+        .settle_owned_pending_control_nodes_page(
+            run_id,
+            authority,
+            (control_cursor.as_deref(), WORKFLOW_SCHEDULER_PAGE_SIZE),
+            now_ms,
+        )?;
+    *control_cursor = next_control;
+    let (dispatched, next_pending) = bcode_workflow_store::WorkflowStore::open_at_path(path)?
+        .dispatch_owned_pending_activations_page_for_run(
+            &WorkflowActivationOwner { state },
+            run_id,
+            authority,
+            (pending_cursor.as_deref(), WORKFLOW_SCHEDULER_PAGE_SIZE),
+            now_ms,
+        )
+        .await?;
+    *pending_cursor = next_pending;
+    Ok((settled, dispatched))
+}
+
+async fn reconcile_workflow_receipt_page(
+    state: &Arc<ServerState>,
+    path: &Path,
+    run_id: &str,
+    authority: &bcode_workflow_store::WorkflowExecutionAuthority,
+    cursor: &mut Option<String>,
+    now_ms: u64,
+) -> Result<bcode_workflow_store::ReceiptReconciliationSummary, ServerError> {
+    let (summary, next) = bcode_workflow_store::WorkflowStore::open_at_path(path)?
+        .reconcile_owned_receipts_page_async(
+            &WorkflowTurnReceiptObserver { state },
+            run_id,
+            authority,
+            (cursor.as_deref(), WORKFLOW_SCHEDULER_PAGE_SIZE),
+            now_ms,
+        )
+        .await?;
+    *cursor = next;
+    propagate_fail_fast_sibling_cancellation(state, summary.sibling_cancellations.clone()).await?;
+    Ok(summary)
 }
 
 fn workflow_store_path(state: &ServerState) -> PathBuf {
@@ -33025,7 +33089,10 @@ async fn dispatch_workflow_child(
             node_execution_cap: parent_limits
                 .node_execution_cap
                 .min(child.node_execution_cap),
-            concurrency_cap: parent_limits.concurrency_cap.min(child.concurrency_cap),
+            concurrency_cap: bcode_workflow::intersect_concurrency_caps(
+                parent_limits.concurrency_cap,
+                child.concurrency_cap,
+            ),
             cycle_cap: parent_limits.cycle_cap.min(child.cycle_cap),
             retry_cap: parent_limits.retry_cap.min(child.retry_cap),
             recursion_depth_cap: parent_limits
@@ -37392,6 +37459,7 @@ fn default_session_artifact_dir(session_id: SessionId) -> PathBuf {
 mod tests {
     mod collaboration_execution;
     mod goal_entry;
+    mod scheduler;
     // Destructured bindings below avoid significant_drop_tightening false positives on moved
     // owners and non-owning adapters. Actual resource owners retain explicit teardown drops.
     #[test]

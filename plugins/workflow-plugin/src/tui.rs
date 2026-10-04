@@ -6372,6 +6372,11 @@ fn inspector_overview_lines(run: &bcode_workflow_view_models::WorkflowRunView) -
     if let Some(terminal) = &run.terminal {
         lines.push(Line::from(format!("Terminal: {terminal:?}")));
     }
+    if let Some(scheduling) = &run.scheduling {
+        lines.extend(scheduling.summary_lines().into_iter().map(Line::from));
+    } else {
+        lines.push(Line::from("Scheduling observations unavailable"));
+    }
     if !run.failure_diagnostics.is_empty() {
         lines.push(Line::from("Failure diagnostics:"));
         for diagnostic in run.failure_diagnostics.iter().rev().take(5) {
@@ -7622,6 +7627,7 @@ mod tests {
     #[allow(clippy::too_many_lines)]
     fn projected_surface() -> WorkflowStatusSurface {
         let run = bcode_workflow_view_models::WorkflowRunView {
+            scheduling: None,
             version: bcode_workflow_view_models::WORKFLOW_VIEW_VERSION,
             run: bcode_workflow_view_models::WorkflowRunListItem {
                 run_id: "run-1".to_string(),

@@ -224,9 +224,9 @@ fn short_continuation_bounds_concurrency_without_expanding_authority() {
     let (_temp, mut store, original, definition) = fixture();
     execute(&mut store, &original, &definition, 2, false);
     let (mut request, mut run, _) = successor(&mut store, &original);
-    assert!(original.limits.concurrency_cap > 3);
+    assert_eq!(original.limits.concurrency_cap, None);
     run.limits.node_execution_cap = 3;
-    run.limits.concurrency_cap = 3;
+    run.limits.concurrency_cap = None;
     request.successor.limits = run.limits.clone();
     let authority = original.execution_authority.as_ref().unwrap();
     assert!(store.continue_run_owned(&request, &run, authority).unwrap());
@@ -238,7 +238,7 @@ fn continuation_rejects_increased_concurrency() {
     let (_temp, mut store, original, definition) = fixture();
     execute(&mut store, &original, &definition, 2, false);
     let (mut request, mut run, _) = successor(&mut store, &original);
-    run.limits.concurrency_cap += 1;
+    run.limits.concurrency_cap = Some(1);
     request.successor.limits = run.limits.clone();
     let before = store.run_summary(&original.run_id).unwrap();
     assert!(

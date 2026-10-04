@@ -186,6 +186,13 @@ pub fn format(view: &WorkflowRunView) -> String {
         }
     }
     format_waits(&mut text, view);
+    if let Some(scheduling) = &view.scheduling {
+        for line in scheduling.summary_lines() {
+            let _ = write!(text, "\n{line}");
+        }
+    } else {
+        text.push_str("\nScheduling observations unavailable");
+    }
     for failure in view.failure_diagnostics.iter().rev().take(DETAIL_LIMIT) {
         let _ = write!(
             text,
@@ -360,6 +367,28 @@ pub mod tests {
             "terminal":null, "health":{"state":"current"}
         }))
         .unwrap()
+    }
+
+    #[test]
+    fn scheduling_observations_are_visible_without_inventing_readiness() {
+        let mut snapshot = view();
+        assert!(format(&snapshot).contains("Scheduling observations unavailable"));
+        snapshot.scheduling = Some(bcode_workflow_view_models::WorkflowSchedulingView {
+            graph_revision: 3,
+            observed_at_ms: 42,
+            policy: Some(bcode_workflow_view_models::WorkflowSchedulingPolicy {
+                max_running: None,
+                running: 32,
+                scope: bcode_workflow_view_models::WorkflowCapacityScope::Run,
+            }),
+            activations: vec![],
+            has_more: true,
+            details_truncated: false,
+        });
+        let text = format(&snapshot);
+        assert!(text.contains("uncapped"));
+        assert!(text.contains("partial page"));
+        assert!(text.contains("32 reserved/running"));
     }
 
     #[test]

@@ -27,6 +27,12 @@ pub fn initialize(connection: &Connection) -> Result<(), WorkflowStoreError> {
 #[path = "continuation_tests.rs"]
 mod tests;
 
+fn continued_concurrency_cap(limits: &WorkflowRunLimits, allowance: u64) -> Option<u32> {
+    limits
+        .concurrency_cap
+        .map(|cap| cap.min(u32::try_from(allowance).unwrap_or(u32::MAX)))
+}
+
 fn invalid(message: &str) -> WorkflowStoreError {
     WorkflowStoreError::InvalidData(message.into())
 }
@@ -384,8 +390,8 @@ impl WorkflowStore {
             || successor.limits.cycle_cap != request.additional_iterations
             || successor.limits.deadline_at_ms != source.limits.deadline_at_ms
             || successor.limits.retry_cap != source.limits.retry_cap
-            || u64::from(successor.limits.concurrency_cap)
-                != u64::from(source.limits.concurrency_cap).min(successor.limits.node_execution_cap)
+            || successor.limits.concurrency_cap
+                != continued_concurrency_cap(&source.limits, successor.limits.node_execution_cap)
             || successor.authorization_ceiling > source.run.authorization_ceiling
         {
             return Err(invalid(

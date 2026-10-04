@@ -2683,6 +2683,7 @@ pub async fn run_view(
                 .collect(),
         })
     };
+    view.scheduling = observe_scheduling_page(state, run_id, limit)?;
     let permissions = state.pending_permissions.lock().await;
     project_tool_permissions(
         &mut view,
@@ -2717,6 +2718,74 @@ pub async fn run_view(
     };
     bcode_workflow_view::restrict_execution_actions(&mut view, unavailable.as_deref());
     Ok(view)
+}
+
+fn observe_scheduling_page(
+    state: &ServerState,
+    run_id: &str,
+    limit: usize,
+) -> Result<Option<bcode_workflow_view_models::WorkflowSchedulingView>, super::ServerError> {
+    let store = state
+        .workflow_store
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let snapshot = store.scheduling_snapshot(run_id, (None, limit.clamp(1, 100)))?;
+    drop(store);
+    let observed_at_ms = super::current_unix_millis();
+    let revision = snapshot.capacity.graph_revision;
+    let policy = Some(bcode_workflow_view_models::WorkflowSchedulingPolicy {
+        max_running: snapshot.capacity.concurrency_cap.map(u64::from),
+        running: snapshot.capacity.occupied_count,
+        scope: bcode_workflow_view_models::WorkflowCapacityScope::Run,
+    });
+    let has_more = snapshot.next_activation_id.is_some();
+    let activations = snapshot
+        .activations
+        .into_iter()
+        .map(|activation| {
+            let attempt = activation.latest_attempt.map(|attempt| {
+                bcode_workflow_view_models::WorkflowAttemptView {
+                    node_id: attempt.node_id,
+                    activation_id: attempt.activation_id,
+                    attempt: attempt.attempt,
+                    dispatch_identity: attempt.dispatch_identity,
+                    status: attempt.status,
+                    has_receipt: attempt.has_receipt,
+                    prepared_at_ms: attempt.prepared_at_ms,
+                    admitted_at_ms: attempt.admitted_at_ms,
+                    terminal_at_ms: attempt.terminal_at_ms,
+                }
+            });
+            let input = bcode_workflow_view::WorkflowActivationProjectionInput {
+                node_id: activation.node_id,
+                activation_id: activation.activation_id,
+                dependency_generation: 0,
+                status: activation.status,
+                has_output: false,
+                input_summary: bcode_workflow_view_models::WorkflowInputSummary::Absent,
+                created_at_ms: 0,
+            };
+            bcode_workflow_view::classify_scheduling_activation(
+                &input,
+                attempt.as_ref(),
+                snapshot.paused,
+                activation
+                    .automatic_retry
+                    .map(|retry| retry.next_attempt_at_ms),
+                observed_at_ms,
+            )
+        })
+        .collect();
+    Ok(Some(bcode_workflow_view::project_scheduling(
+        bcode_workflow_view::WorkflowSchedulingObservation {
+            graph_revision: revision,
+            observed_at_ms,
+            policy,
+            activations,
+            has_more,
+        },
+        limit,
+    )))
 }
 
 async fn coordinator_status(
@@ -6808,7 +6877,11 @@ async fn resolve_replacement_authored_selection(
         .unwrap_or(&compiled.run_limits);
     let requested = &request.successor.limits;
     if requested.node_execution_cap > limits.node_execution_cap
-        || requested.concurrency_cap > limits.concurrency_cap
+        || limits.concurrency_cap.is_some_and(|cap| {
+            requested
+                .concurrency_cap
+                .is_none_or(|requested| requested > cap)
+        })
         || requested.cycle_cap > limits.cycle_cap
         || requested.retry_cap > limits.retry_cap
         || limits.maximum_duration_ms.is_some_and(|duration| {

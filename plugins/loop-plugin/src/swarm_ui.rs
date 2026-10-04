@@ -82,7 +82,7 @@ impl SwarmUi {
 
     pub fn apply_limits(&self, request: &mut PluginWorkflowStartRequest) -> Result<(), String> {
         if let Some(concurrency) = self.concurrency()? {
-            request.limits.concurrency_cap = concurrency;
+            request.limits.concurrency_cap = Some(concurrency);
         }
         Ok(())
     }
@@ -211,7 +211,7 @@ impl SwarmUi {
             ),
             (
                 3,
-                "Concurrent nodes (blank = runtime default; enforced)",
+                "Concurrent nodes (blank = uncapped; explicit cap enforced)",
                 &mut self.concurrency,
             ),
         ] {

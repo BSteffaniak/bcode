@@ -29,7 +29,9 @@ mod continuation;
 mod offline_recovery;
 mod recovery;
 mod run_graph;
+mod scheduler_pages;
 pub use run_graph::{RunGraphCandidateValidation, RunGraphEdge, RunGraphNode, RunGraphPage};
+pub use scheduler_pages::WorkflowConcurrencySnapshot;
 
 const DATABASE_FILE: &str = "workflow.db";
 const LOCK_FILE: &str = "workflow.lock";
@@ -41,9 +43,9 @@ const RESET_BACKUP_DIRECTORY: &str = "reset-backups";
 /// Stable destructive confirmation required by public workflow-store reset surfaces.
 pub const WORKFLOW_STORE_RESET_CONFIRMATION: &str = "DELETE-INCOMPATIBLE-WORKFLOW-STATE";
 /// Current clean-break workflow store schema version.
-pub const WORKFLOW_STORE_SCHEMA_VERSION: u32 = 42;
+pub const WORKFLOW_STORE_SCHEMA_VERSION: u32 = 43;
 // Changes only when existing readers/writers would become unsafe, not for additive DDL.
-const WORKFLOW_STORE_COMPATIBILITY: u32 = 2;
+const WORKFLOW_STORE_COMPATIBILITY: u32 = 3;
 /// Current bounded workflow-store reset receipt version.
 pub const WORKFLOW_STORE_RESET_RECEIPT_VERSION: u32 = 1;
 /// Current explicit workflow-store migration receipt contract.
@@ -1241,7 +1243,7 @@ impl WorkflowStore {
                     match Self::open_with_ownership(&path, ownership) {
                         Ok(store) => return Ok(store),
                         Err(WorkflowStoreError::UnsupportedStore {
-                            actual: Some(14..=41),
+                            actual: Some(14..=42),
                             ..
                         }) => {}
                         Err(error) => return Err(error),
@@ -1423,18 +1425,18 @@ impl WorkflowStore {
                 "workflow store migration cannot read the source schema".to_string(),
             )
         })?;
-        if !matches!(previous_schema_version, 14..=41) {
+        if !matches!(previous_schema_version, 14..=42) {
             return Err(WorkflowStoreError::UnsupportedStore {
                 actual: Some(previous_schema_version),
                 expected: WORKFLOW_STORE_SCHEMA_VERSION,
             });
         }
         verify_upgrade_recovery_source(&transaction, previous_schema_version)?;
-        if previous_schema_version == 41
+        if previous_schema_version >= 41
             && read_storage_contract_value(
                 &transaction,
                 "SELECT compatibility FROM workflow_storage_compatibility WHERE contract_id = 1",
-            )? != Some(1)
+            )? != Some(previous_schema_version - 40)
         {
             return Err(WorkflowStoreError::UnsupportedStore {
                 actual: Some(previous_schema_version),
@@ -4666,7 +4668,7 @@ impl WorkflowStore {
                         row.get::<_, Option<String>>(5)?,
                         row.get::<_, Option<u64>>(6)?,
                         row.get::<_, u64>(7)?,
-                        row.get::<_, u32>(8)?,
+                        row.get::<_, Option<u32>>(8)?,
                         row.get::<_, u32>(9)?,
                         row.get::<_, u32>(10)?,
                         row.get::<_, Option<String>>(11)?,
@@ -5419,7 +5421,13 @@ impl WorkflowStore {
         };
         if deadline_exceeds
             || request.run.limits.node_execution_cap > parent_limits.node_execution_cap
-            || request.run.limits.concurrency_cap > parent_limits.concurrency_cap
+            || parent_limits.concurrency_cap.is_some_and(|parent| {
+                request
+                    .run
+                    .limits
+                    .concurrency_cap
+                    .is_none_or(|child| child > parent)
+            })
             || request.run.limits.cycle_cap > parent_limits.cycle_cap
             || request.run.limits.retry_cap > parent_limits.retry_cap
             || request.run.limits.recursion_depth_cap > parent_limits.recursion_depth_cap
@@ -10560,22 +10568,26 @@ impl WorkflowStore {
         settled_at_ms: u64,
     ) -> Result<ControlSettlementSummary, WorkflowStoreError> {
         validate_id("run_id", run_id)?;
-        let pending = self.pending_activations(limit)?;
+        let pending = self.pending_activations_for_run(run_id, limit)?;
+        self.settle_control_activations(pending, settled_at_ms)
+    }
+
+    fn settle_control_activations(
+        &mut self,
+        pending: Vec<PendingActivation>,
+        settled_at_ms: u64,
+    ) -> Result<ControlSettlementSummary, WorkflowStoreError> {
         let mut summary = ControlSettlementSummary::default();
-        for activation in pending
-            .into_iter()
-            .filter(|activation| activation.run_id == run_id)
-            .filter(|activation| {
-                matches!(
-                    activation.node.kind,
-                    bcode_workflow::NodeKind::Branch
-                        | bcode_workflow::NodeKind::Repeat
-                        | bcode_workflow::NodeKind::Retry
-                        | bcode_workflow::NodeKind::Parallel
-                        | bcode_workflow::NodeKind::FanOut
-                )
-            })
-        {
+        for activation in pending.into_iter().filter(|activation| {
+            matches!(
+                activation.node.kind,
+                bcode_workflow::NodeKind::Branch
+                    | bcode_workflow::NodeKind::Repeat
+                    | bcode_workflow::NodeKind::Retry
+                    | bcode_workflow::NodeKind::Parallel
+                    | bcode_workflow::NodeKind::FanOut
+            )
+        }) {
             let input = activation.input.clone().ok_or_else(|| {
                 WorkflowStoreError::InvalidData(format!(
                     "workflow control node has no input: {}",
@@ -16493,7 +16505,7 @@ fn enforce_attempt_limits(
         retry_cap,
         cancellation_requested,
         run_status,
-    ): (Option<u64>, u64, u32, u32, bool, RunStatus) = connection.query_row(
+    ): (Option<u64>, u64, Option<u32>, u32, bool, RunStatus) = connection.query_row(
         "SELECT deadline_at_ms, node_execution_cap, concurrency_cap, retry_cap, \
          cancellation_requested_at_ms IS NOT NULL, status FROM workflow_runs WHERE run_id = ?1",
         [&attempt.run_id],
@@ -16515,30 +16527,58 @@ fn enforce_attempt_limits(
         retry_cap,
         attempt,
     )?;
-    let execution_count: u64 = connection.query_row(
-        "SELECT COUNT(*) FROM (
-            SELECT 1 FROM workflow_attempts WHERE run_id = ?1 LIMIT ?2
-         )",
-        rusqlite::params![&attempt.run_id, node_execution_cap],
-        |row| row.get(0),
-    )?;
+    let execution_count =
+        typed_attempt_count(connection, &attempt.run_id, node_execution_cap, false)?;
     if execution_count >= node_execution_cap {
         return Err(WorkflowStoreError::NodeExecutionAllowanceExhausted);
     }
     enforce_root_attempt_limit(connection, &attempt.run_id)?;
-    let active_count: u32 = connection.query_row(
-        "SELECT COUNT(*) FROM (
-            SELECT 1 FROM workflow_attempts WHERE run_id = ?1
-            AND status IN ('prepared', 'admitted', 'running', 'cancelling', 'sibling_cancelling')
-            LIMIT ?2
-         )",
-        rusqlite::params![&attempt.run_id, concurrency_cap],
-        |row| row.get(0),
-    )?;
-    if active_count >= concurrency_cap {
+    if let Some(cap) = concurrency_cap
+        && typed_attempt_count(connection, &attempt.run_id, u64::from(cap), true)? >= u64::from(cap)
+    {
         return Err(WorkflowStoreError::ConcurrencyCapacityReached);
     }
     Ok(())
+}
+
+fn typed_attempt_count(
+    connection: &Connection,
+    run_id: &str,
+    limit: u64,
+    active_only: bool,
+) -> Result<u64, WorkflowStoreError> {
+    use switchy_database::query::{FilterableQuery as _, count_all, select};
+    let mut members = select("workflow_attempts")
+        .columns(&["dispatch_identity"])
+        .where_eq("run_id", run_id)
+        .limit(usize::try_from(limit).unwrap_or(usize::MAX));
+    if active_only {
+        members = members.where_in(
+            "status",
+            vec![
+                "prepared",
+                "admitted",
+                "running",
+                "cancelling",
+                "sibling_cancelling",
+            ],
+        );
+    }
+    let query = select("workflow_attempts")
+        .project_as(count_all(), "attempt_count")
+        .where_in("dispatch_identity", members);
+    let rows =
+        switchy_database::rusqlite::select_on_connection(connection, &query).map_err(|error| {
+            WorkflowStoreError::InvalidData(format!("typed attempt count failed: {error}"))
+        })?;
+    match rows.first().and_then(|row| row.get("attempt_count")) {
+        Some(switchy_database::DatabaseValue::Int64(value)) if value >= 0 => {
+            Ok(value.cast_unsigned())
+        }
+        _ => Err(WorkflowStoreError::InvalidData(
+            "typed attempt count is invalid".to_string(),
+        )),
+    }
 }
 
 // Keep admission policy independent of the query adapter. Callers must obtain these
@@ -18121,12 +18161,6 @@ fn create_run_in_transaction_diagnosed(
             "workflow definition has no entry nodes".to_string(),
         ));
     }
-    if definition.entries.len() > usize::try_from(run.limits.concurrency_cap).unwrap_or(usize::MAX)
-    {
-        return Err(WorkflowStoreError::InvalidData(
-            "workflow entry set exceeds run concurrency cap".to_string(),
-        ));
-    }
     for node_id in &definition.entries {
         *operation = "read_entry_node";
         let node =
@@ -18585,7 +18619,10 @@ fn validate_run_limits(limits: &WorkflowRunLimits) -> Result<(), WorkflowStoreEr
     }
     for (label, value) in [
         ("node_execution_cap", limits.node_execution_cap),
-        ("concurrency_cap", u64::from(limits.concurrency_cap)),
+        (
+            "concurrency_cap",
+            u64::from(limits.concurrency_cap.unwrap_or(1)),
+        ),
         ("cycle_cap", u64::from(limits.cycle_cap)),
         ("recursion_depth_cap", u64::from(limits.recursion_depth_cap)),
     ] {
@@ -19086,10 +19123,12 @@ fn validate_workflow_preset(preset: &WorkflowPreset) -> Result<(), WorkflowStore
         && (limits.maximum_duration_ms == Some(0)
             || limits.node_execution_cap == 0
             || limits.node_execution_cap > i64::MAX as u64
-            || limits.concurrency_cap == 0
+            || limits.concurrency_cap == Some(0)
             || limits.cycle_cap == 0
             || limits.retry_cap == 0
-            || u64::from(limits.concurrency_cap) > limits.node_execution_cap)
+            || limits
+                .concurrency_cap
+                .is_some_and(|cap| u64::from(cap) > limits.node_execution_cap))
     {
         return Err(WorkflowStoreError::InvalidData(
             "workflow preset run limits are invalid".to_string(),
@@ -19195,8 +19234,16 @@ fn migrate_run_package_bindings(transaction: &Transaction<'_>) -> Result<(), Wor
     Ok(())
 }
 
-#[allow(clippy::too_many_lines)]
 fn initialize_schema(connection: &mut Connection) -> Result<(), WorkflowStoreError> {
+    initialize_schema_version(connection, WORKFLOW_STORE_SCHEMA_VERSION)
+}
+
+#[allow(clippy::too_many_lines)]
+fn initialize_schema_version(
+    connection: &mut Connection,
+    version: u32,
+) -> Result<(), WorkflowStoreError> {
+    assert!(matches!(version, 42 | 43));
     let transaction = connection.transaction()?;
     transaction.execute_batch(
         "CREATE TABLE IF NOT EXISTS workflow_store_contract (\
@@ -19524,19 +19571,36 @@ fn initialize_schema(connection: &mut Connection) -> Result<(), WorkflowStoreErr
              ON workflow_authoring_events(workflow_id, event_seq);",
     )?;
     continuation::initialize(&transaction)?;
+    if version == 43 {
+        migrate_optional_concurrency(&transaction)?;
+    }
     run_graph::initialize(&transaction)?;
     run_graph::initialize_edit_candidates(&transaction)?;
     recovery::initialize(&transaction)?;
-    initialize_compatibility_contract(&transaction)?;
+    initialize_compatibility_contract_version(&transaction, version - 40)?;
     transaction.execute(
         "INSERT INTO workflow_store_contract (contract_id, schema_version) VALUES (1, ?1)",
-        [WORKFLOW_STORE_SCHEMA_VERSION],
+        [version],
     )?;
     transaction.commit()?;
     Ok(())
 }
 
+fn migrate_optional_concurrency(connection: &Connection) -> Result<(), WorkflowStoreError> {
+    switchy_database::rusqlite::relax_integer_nullability_on_connection(
+        connection,
+        "workflow_runs",
+        "concurrency_cap",
+    )
+    .map_err(|error| {
+        WorkflowStoreError::InvalidData(format!(
+            "workflow concurrency schema upgrade failed: {error}"
+        ))
+    })
+}
+
 fn migrate_recursion_policy(transaction: &Connection) -> Result<(), WorkflowStoreError> {
+    migrate_optional_concurrency(transaction)?;
     let columns = transaction
         .prepare("PRAGMA table_info(workflow_runs)")?
         .query_map([], |row| row.get::<_, String>(1))?
@@ -19555,6 +19619,13 @@ fn migrate_recursion_policy(transaction: &Connection) -> Result<(), WorkflowStor
 }
 
 fn initialize_compatibility_contract(connection: &Connection) -> Result<(), WorkflowStoreError> {
+    initialize_compatibility_contract_version(connection, WORKFLOW_STORE_COMPATIBILITY)
+}
+
+fn initialize_compatibility_contract_version(
+    connection: &Connection,
+    compatibility: u32,
+) -> Result<(), WorkflowStoreError> {
     connection.execute_batch(
         "CREATE TABLE IF NOT EXISTS workflow_storage_compatibility (
              contract_id INTEGER PRIMARY KEY CHECK (contract_id = 1),
@@ -19564,7 +19635,7 @@ fn initialize_compatibility_contract(connection: &Connection) -> Result<(), Work
     connection.execute(
         "INSERT INTO workflow_storage_compatibility(contract_id, compatibility) VALUES (1, ?1)
          ON CONFLICT(contract_id) DO NOTHING",
-        [WORKFLOW_STORE_COMPATIBILITY],
+        [compatibility],
     )?;
     Ok(())
 }
@@ -23433,6 +23504,64 @@ mod tests {
             input: Some(serde_json::json!(1)),
             created_at_ms: 11,
         }
+    }
+
+    #[test]
+    fn genuine_schema_42_upgrade_preserves_cap_and_defers_to_old_owner() {
+        let temp = tempfile::tempdir().expect("temp");
+        let root = temp.path().join("workflows");
+        std::fs::create_dir_all(&root).expect("root");
+        let path = root.join(DATABASE_FILE);
+        let mut connection = Connection::open(&path).expect("connection");
+        initialize_schema_version(&mut connection, 42).expect("actual old schema");
+        let mut old = WorkflowStore {
+            path,
+            connection,
+            _ownership: None,
+            read_identity: std::sync::Arc::new(()),
+        };
+        old.persist_definition("example", 1, &definition("example"))
+            .expect("definition");
+        let mut run = new_run();
+        run.limits.concurrency_cap = Some(7);
+        old.create_run(&run).expect("numeric cap");
+        let before = old.connection.total_changes();
+        let ownership = open_ownership_file(&root).expect("ownership");
+        ownership.lock_shared().expect("old reader");
+        assert!(WorkflowStore::migrate_to_current_in_state_dir(temp.path(), 20).is_err());
+        assert_eq!(detected_store_schema(&old.connection), Some(42));
+        assert_eq!(old.connection.total_changes(), before);
+        assert_eq!(
+            old.run_limits(&run.run_id)
+                .unwrap()
+                .unwrap()
+                .concurrency_cap,
+            Some(7)
+        );
+        drop(ownership);
+        drop(old);
+        WorkflowStore::migrate_to_current_in_state_dir(temp.path(), 20).expect("exclusive upgrade");
+        let upgraded = WorkflowStore::open_in_state_dir(temp.path()).expect("new reader");
+        assert_eq!(
+            upgraded
+                .run_limits(&run.run_id)
+                .unwrap()
+                .unwrap()
+                .concurrency_cap,
+            Some(7)
+        );
+        assert_eq!(detected_store_schema(&upgraded.connection), Some(43));
+        let contracts = switchy_database::rusqlite::select_on_connection(
+            &upgraded.connection,
+            &switchy_database::query::select("workflow_storage_compatibility")
+                .columns(&["compatibility"])
+                .limit(1),
+        )
+        .unwrap();
+        assert_eq!(
+            contracts[0].get("compatibility"),
+            Some(switchy_database::DatabaseValue::Int64(3))
+        );
     }
 
     fn initialized_store() -> (tempfile::TempDir, WorkflowStore) {
@@ -38914,7 +39043,7 @@ mod tests {
         run.limits = WorkflowRunLimits {
             deadline_at_ms: Some(20),
             node_execution_cap: 1,
-            concurrency_cap: 1,
+            concurrency_cap: Some(1),
             cycle_cap: 1,
             retry_cap: 0,
             ..WorkflowRunLimits::default()
@@ -39251,6 +39380,45 @@ mod tests {
                 .to_string()
                 .contains("workflow node-execution cap exceeded")
         );
+    }
+
+    #[test]
+    fn concurrency_snapshot_tracks_uncapped_reservations_without_mutation() {
+        let (_temp, mut store) = initialized_store();
+        let empty = store.concurrency_snapshot("run-1").expect("snapshot");
+        assert_eq!(empty.concurrency_cap, None);
+        assert_eq!(empty.occupied_count, 0);
+        store
+            .prepare_attempt(&PreparedAttempt {
+                run_id: "run-1".into(),
+                node_id: "review".into(),
+                activation_id: activation_id(),
+                attempt: 1,
+                side_effect: DispatchSideEffect::ReadOnly,
+                intent: serde_json::json!({}),
+                prepared_at_ms: 12,
+            })
+            .expect("reserve");
+        let before = store.connection.total_changes();
+        let occupied = store.concurrency_snapshot("run-1").expect("snapshot");
+        assert_eq!(occupied.occupied_count, 1);
+        let scheduling = store
+            .scheduling_snapshot("run-1", (None, 1))
+            .expect("scheduling snapshot");
+        assert_eq!(scheduling.capacity, occupied);
+        assert_eq!(scheduling.activations.len(), 1);
+        assert_eq!(scheduling.activations[0].node_id, "review");
+        let reserved = scheduling.activations[0]
+            .latest_attempt
+            .as_ref()
+            .expect("exact attempt");
+        assert_eq!(reserved.activation_id, activation_id());
+        assert_eq!(reserved.status, "prepared");
+        assert!(!reserved.has_receipt);
+        assert!(reserved.terminal_at_ms.is_none());
+        assert_eq!(occupied.graph_revision, empty.graph_revision);
+        assert_eq!(store.connection.total_changes(), before);
+        assert!(store.connection.is_autocommit());
     }
 
     #[test]
@@ -40549,7 +40717,7 @@ mod tests {
                 },
                 authorization_ceiling: bcode_workflow::WorkflowToolCapability::Mutating,
                 limits: WorkflowRunLimits {
-                    concurrency_cap: 2,
+                    concurrency_cap: Some(2),
                     ..WorkflowRunLimits::default()
                 },
             })
@@ -47898,7 +48066,7 @@ mod tests {
                 },
                 authorization_ceiling: bcode_workflow::WorkflowToolCapability::Mutating,
                 limits: WorkflowRunLimits {
-                    concurrency_cap: 2,
+                    concurrency_cap: Some(2),
                     ..WorkflowRunLimits::default()
                 },
             })

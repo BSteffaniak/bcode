@@ -198,6 +198,9 @@ pub type StepFuture<T> = Pin<Box<dyn Future<Output = Result<T, WorkflowError>> +
 
 type StepFn<I, O> = dyn Fn(I, StepContext) -> StepFuture<O> + Send + Sync;
 
+#[cfg(test)]
+mod scheduler_tests;
+
 const DEFAULT_MAX_CONCURRENCY: usize = Semaphore::MAX_PERMITS;
 const MAX_DEFINITION_NODES: usize = 10_000;
 const MAX_DEFINITION_EDGES: usize = 100_000;
@@ -3413,8 +3416,9 @@ pub struct WorkflowRunLimitPolicy {
     pub maximum_duration_ms: Option<u64>,
     /// Maximum total node attempts in a run.
     pub node_execution_cap: u64,
-    /// Maximum concurrently running nodes.
-    pub concurrency_cap: u32,
+    /// Maximum concurrently running nodes; `None` means no configured cap.
+    #[serde(deserialize_with = "run_contracts::deserialize_concurrency_cap")]
+    pub concurrency_cap: Option<u32>,
     /// Maximum cycle/repeat activations.
     pub cycle_cap: u32,
     /// Maximum attempts per activation.
@@ -3432,7 +3436,7 @@ impl Default for WorkflowRunLimitPolicy {
         Self {
             maximum_duration_ms: None,
             node_execution_cap: 1_000,
-            concurrency_cap: 8,
+            concurrency_cap: None,
             cycle_cap: 100,
             retry_cap: 3,
             recursion_depth_cap: run_contracts::default_recursion_depth_cap(),
@@ -3441,16 +3445,38 @@ impl Default for WorkflowRunLimitPolicy {
     }
 }
 
+/// Intersect requested concurrency with inherited policy without introducing a cap.
+///
+/// `None` means uncapped. This preserves every explicit ancestor restriction;
+/// callers must separately validate that explicit caps are positive.
+#[must_use]
+pub const fn intersect_concurrency_caps(
+    parent: Option<u32>,
+    requested: Option<u32>,
+) -> Option<u32> {
+    match (parent, requested) {
+        (Some(parent), Some(requested)) => Some(if parent < requested {
+            parent
+        } else {
+            requested
+        }),
+        (Some(cap), None) | (None, Some(cap)) => Some(cap),
+        (None, None) => None,
+    }
+}
+
 impl WorkflowRunLimitPolicy {
     fn validate(&self) -> Result<(), WorkflowError> {
         if self.maximum_duration_ms == Some(0)
             || self.node_execution_cap == 0
             || self.node_execution_cap > i64::MAX as u64
-            || self.concurrency_cap == 0
+            || self.concurrency_cap == Some(0)
             || self.cycle_cap == 0
             || self.retry_cap == 0
             || self.recursion_depth_cap == 0
-            || u64::from(self.concurrency_cap) > self.node_execution_cap
+            || self
+                .concurrency_cap
+                .is_some_and(|cap| u64::from(cap) > self.node_execution_cap)
         {
             return Err(authoring_error(
                 "run_limits",
@@ -3462,10 +3488,50 @@ impl WorkflowRunLimitPolicy {
 }
 
 #[test]
+fn optional_concurrency_policy_preserves_explicit_limits() {
+    assert_eq!(WorkflowRunLimitPolicy::default().concurrency_cap, None);
+    for cap in [None, Some(1), Some(8), Some(100)] {
+        let policy = WorkflowRunLimitPolicy {
+            concurrency_cap: cap,
+            ..Default::default()
+        };
+        policy.validate().unwrap();
+        let wire = serde_json::to_value(&policy).unwrap();
+        assert_eq!(wire["concurrency_cap"], serde_json::json!(cap));
+        assert_eq!(
+            serde_json::from_value::<WorkflowRunLimitPolicy>(wire.clone()).unwrap(),
+            policy
+        );
+        let mut missing = wire;
+        missing.as_object_mut().unwrap().remove("concurrency_cap");
+        assert!(serde_json::from_value::<WorkflowRunLimitPolicy>(missing).is_err());
+    }
+    for cap in [0, 1_001] {
+        assert!(
+            WorkflowRunLimitPolicy {
+                concurrency_cap: Some(cap),
+                ..Default::default()
+            }
+            .validate()
+            .is_err()
+        );
+    }
+    for (parent, requested, expected) in [
+        (None, None, None),
+        (Some(8), None, Some(8)),
+        (None, Some(100), Some(100)),
+        (Some(8), Some(100), Some(8)),
+        (Some(100), Some(8), Some(8)),
+    ] {
+        assert_eq!(intersect_concurrency_caps(parent, requested), expected);
+    }
+}
+#[test]
 fn authored_recursion_policy_preserves_explicit_values_and_historical_defaults() {
     let old = serde_json::json!({"node_execution_cap":1000,"concurrency_cap":8,"cycle_cap":100,"retry_cap":3});
     let mut policy: WorkflowRunLimitPolicy =
         serde_json::from_value(old).expect("historical policy");
+    assert_eq!(policy.concurrency_cap, Some(8));
     assert_eq!(policy.recursion_depth_cap, 8);
     assert_eq!(policy.descendant_cap, 64);
     policy.recursion_depth_cap = 24;
@@ -8855,7 +8921,9 @@ fn validate_structured_source_fan_out(
         validate_runtime_value_schema(&format!("steps[{index}].fan_out.{suffix}"), schema)?;
     }
     let members_fit_run = u64::from(fan_out.max_members) <= limits.node_execution_cap;
-    let concurrency_fits_run = fan_out.max_concurrency <= limits.concurrency_cap;
+    let concurrency_fits_run = limits
+        .concurrency_cap
+        .is_none_or(|cap| fan_out.max_concurrency <= cap);
     if fan_out.max_members == 0
         || !members_fit_run
         || fan_out.max_concurrency == 0
@@ -10635,7 +10703,7 @@ fn apply_authoring_binding(
             match field.as_str() {
                 "maximum_duration_ms" => run_limits.maximum_duration_ms = Some(value),
                 "node_execution_cap" => run_limits.node_execution_cap = value,
-                "concurrency_cap" => run_limits.concurrency_cap = bounded_u32(field, value)?,
+                "concurrency_cap" => run_limits.concurrency_cap = Some(bounded_u32(field, value)?),
                 "cycle_cap" => run_limits.cycle_cap = bounded_u32(field, value)?,
                 "retry_cap" => run_limits.retry_cap = bounded_u32(field, value)?,
                 "recursion_depth_cap" => {
@@ -15613,7 +15681,14 @@ where
                     context.ensure_active(fan_out_id.clone())?;
                     let mut inputs = inputs.into_iter().enumerate();
                     let mut tasks = FuturesUnordered::new();
-                    for _ in 0..max_concurrency {
+                    for slot in 0..max_concurrency {
+                        // Prime in bounded quanta, without turning the quantum into a
+                        // concurrency cap. Huge fan-outs must remain cancellable before
+                        // every member future has been allocated.
+                        if slot % 128 == 0 {
+                            switchy::unsync::task::yield_now().await;
+                            context.ensure_active(fan_out_id.clone())?;
+                        }
                         let Some((index, input)) = inputs.next() else {
                             break;
                         };
@@ -15640,6 +15715,10 @@ where
                             step: fan_out_id.clone(),
                         })??;
                         outputs.insert(index, output);
+                        if outputs.len() % 128 == 0 {
+                            switchy::unsync::task::yield_now().await;
+                            context.ensure_active(fan_out_id.clone())?;
+                        }
                         if let Some((next_index, input)) = inputs.next() {
                             tasks.push(futures::FutureExt::catch_unwind(
                                 std::panic::AssertUnwindSafe(fan_out_member(

@@ -76,6 +76,18 @@ Failed runs show bounded canonical diagnostics in Overview and associate recorde
 with exact attempts when dispatch or activation identity is available. Diagnostics come from the
 server-owned workflow event history; the TUI does not reinterpret raw workflow events.
 
+Scheduling observations are a separate bounded snapshot, labeled with graph revision and observation
+time. The overview and goal status fallback show observed running/blocked/unknown activations
+and effective concurrency. The current application adapter supplies consistent capacity, exact
+attempt and retry facts; full readiness, resource-conflict, dependency-count and provider-backpressure
+observations are not yet supplied and must not be inferred from their absence. The portable contract
+can represent those reasons when their owning domain provides verified facts.
+An absent policy observation means unknown; an observed null cap means explicitly uncapped. Partial
+pages and shortened details are labeled, never treated as whole-run totals. Missing eligibility facts
+remain unknown rather than being inferred from a prefix of graph nodes or resource leases. These
+observations are explanatory only and never authorize an action. Workflow view contract version 6
+adds these scheduling observations; unsupported view versions continue to fail closed.
+
 ## Exact workflow actions
 
 The Actions pane shows available shortcuts and disabled explanations from the portable workflow projection. The application revalidates every operation against canonical state before mutation.
