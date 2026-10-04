@@ -42852,7 +42852,14 @@ mod tests {
                     );
                 }
             };
-            let delay_ms = request
+            let input = request.get("input").unwrap_or(&request);
+            if input.get("fail").and_then(serde_json::Value::as_bool) == Some(true) {
+                return bcode_plugin_sdk::ServiceResponse::error(
+                    "test_failure",
+                    "explicit test failure",
+                );
+            }
+            let delay_ms = input
                 .get("delay_ms")
                 .and_then(serde_json::Value::as_u64)
                 .unwrap_or(1_000);
@@ -54134,8 +54141,18 @@ library = "test"
         .expect("context deadline")
         .expect("context transport");
         assert!(!response.is_error, "{}", response.output);
+        let mut envelope: serde_json::Value =
+            serde_json::from_str(&response.output).expect("tool context envelope");
+        envelope
+            .as_object_mut()
+            .expect("context object")
+            .remove("delegation");
+        envelope
+            .as_object_mut()
+            .expect("context object")
+            .remove("next_page_arguments");
         let context: bcode_workflow::WorkflowExecutionContext =
-            serde_json::from_str(&response.output).expect("typed context");
+            serde_json::from_value(envelope).expect("typed context");
         assert_eq!(context.run_id, "edit-run");
         assert_eq!(
             context.execution_allowance,
@@ -74224,7 +74241,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
                 parent_session_generation: None,
                 binding: None,
                 authored_provenance: None,
-                input: Some(serde_json::json!({"delay_ms": 5_000})),
+                input: Some(serde_json::json!({"delay_ms": 0, "fail": true})),
                 execution_authority: Some(test_workflow_execution_authority()),
                 created_at_ms: 1,
                 authorization_profile: bcode_workflow::WorkflowAuthorizationProfileIdentity {
@@ -74253,8 +74270,10 @@ event_symbol = "bcode_plugin_handle_event_v1"
         );
         let (mut state,) = (test_server_state(sessions),);
         state.daemon_status.instance_id = test_workflow_execution_authority().daemon_instance_id;
+        state.state_root = workflow_root.path().to_path_buf();
         state.plugins = plugins;
         state.workflow_store = StdMutex::new(store).into();
+        *state.workflow_store_unavailable.lock().unwrap() = None;
         let state = Arc::new(state);
         let owner = WorkflowActivationOwner { state: &state };
         let store_path = state
@@ -74274,6 +74293,36 @@ event_symbol = "bcode_plugin_handle_event_v1"
             .reconcile_receipt_backed_attempts_async(&observer, 10, 3)
             .await
             .expect("reconcile");
+        for _ in 0..100 {
+            let status = state
+                .workflow_store
+                .lock()
+                .unwrap()
+                .run_summary("retry-run")
+                .unwrap()
+                .unwrap()
+                .status;
+            if status == bcode_workflow_store::RunStatus::Failed {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            bcode_workflow_store::WorkflowStore::open_at_path(&store_path)
+                .unwrap()
+                .reconcile_receipt_backed_attempts_async(&observer, 10, current_unix_millis())
+                .await
+                .unwrap();
+        }
+        assert_eq!(
+            state
+                .workflow_store
+                .lock()
+                .unwrap()
+                .run_summary("retry-run")
+                .unwrap()
+                .unwrap()
+                .status,
+            bcode_workflow_store::RunStatus::Failed
+        );
         let activation_id = bcode_workflow_store::activation_identity("retry-run", "test.delay", 0);
         let result = bcode_workflow::WorkflowRunApplication::retry_workflow_node(
             &workflow_operations::WorkflowAuthoringApplication::new(&state, ClientId::new()),

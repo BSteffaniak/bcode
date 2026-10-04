@@ -28,7 +28,7 @@ name         = "Loop Judgement Evaluation"
 
 [[services.workflow_blocks]]
 block_id               = "loop.judgement.evaluate"
-block_version          = 5
+block_version          = 6
 cancellation_supported = true
 effect                 = "read_only"
 operation              = "loop.judgement.evaluate"
@@ -37,10 +37,31 @@ reconciliation         = "repair_required"
 timeout_ms             = 60000
 
 [services.workflow_blocks.input]
-schema = { "$schema" = "https://json-schema.org/draft/2020-12/schema", "title" = "LoopWorkflowIteration", "type" = "object", "properties" = { "condition_met" = { "type" = "boolean" }, "evidence" = { "type" = "array", "items" = { "type" = "string" } }, "external_blocker" = { "$ref" = "#/$defs/LoopExternalBlocker", "default" = "none" }, "implementation_prompt" = { "type" = "string" }, "iteration" = { "type" = "integer", "format" = "uint32", "minimum" = 0 }, "judgement_evaluation" = { "anyOf" = [
+schema = { "$defs" = { "EvaluationConfig" = { "additionalProperties" = false, "properties" = { "auth_profile" = { "type" = "string" }, "model_id" = { "type" = "string" }, "on_failure" = { "$ref" = "#/$defs/FailurePolicy", "description" = "The existing read-only agent evaluator can be retained on service failure." }, "provider_plugin_id" = { "type" = "string" }, "threshold_percent" = { "description" = "Completion requires at least this probability, plus concrete agent-collected evidence.", "format" = "uint8", "maximum" = 255, "minimum" = 0, "type" = "integer" } }, "required" = [
+    "provider_plugin_id",
+    "model_id",
+    "auth_profile",
+    "threshold_percent",
+    "on_failure",
+], "type" = "object" }, "FailurePolicy" = { "enum" = [
+    "pause",
+    "agent_fallback",
+], "type" = "string" }, "LoopExternalBlocker" = { "enum" = [
+    "none",
+    "approval_required",
+    "input_required",
+    "dependency_required",
+], "type" = "string" }, "ProgressFeedback" = { "additionalProperties" = false, "properties" = { "attempted_action" = { "maxLength" = 4096, "minLength" = 1, "type" = "string" }, "made_progress" = { "type" = "boolean" }, "next_action" = { "maxLength" = 4096, "minLength" = 1, "type" = "string" } }, "required" = [
+    "attempted_action",
+    "made_progress",
+    "next_action",
+], "type" = "object" } }, "$schema" = "https://json-schema.org/draft/2020-12/schema", "additionalProperties" = false, "properties" = { "condition_met" = { "type" = "boolean" }, "evidence" = { "items" = { "type" = "string" }, "type" = "array" }, "external_blocker" = { "$ref" = "#/$defs/LoopExternalBlocker", "default" = "none" }, "feedback" = { "anyOf" = [
+    { "$ref" = "#/$defs/ProgressFeedback" },
+    { "type" = "null" },
+], "description" = "Bounded corrective handoff; historical states without one remain readable." }, "implementation_prompt" = { "type" = "string" }, "iteration" = { "format" = "uint32", "minimum" = 0, "type" = "integer" }, "judgement_evaluation" = { "anyOf" = [
     { "$ref" = "#/$defs/EvaluationConfig" },
     { "type" = "null" },
-] }, "max_iterations" = { "type" = "integer", "format" = "uint32", "minimum" = 0 }, "planning_ready" = { "type" = "boolean", "default" = false }, "stop_condition" = { "type" = "string" }, "summary" = { "type" = "string" } }, "required" = [
+] }, "max_iterations" = { "format" = "uint32", "minimum" = 0, "type" = "integer" }, "planning_ready" = { "default" = false, "type" = "boolean" }, "stop_condition" = { "type" = "string" }, "summary" = { "type" = "string" } }, "required" = [
     "implementation_prompt",
     "stop_condition",
     "max_iterations",
@@ -48,28 +69,35 @@ schema = { "$schema" = "https://json-schema.org/draft/2020-12/schema", "title" =
     "condition_met",
     "evidence",
     "summary",
-], "$defs" = { "EvaluationConfig" = { "type" = "object", "properties" = { "auth_profile" = { "type" = "string" }, "model_id" = { "type" = "string" }, "on_failure" = { "description" = "The existing read-only agent evaluator can be retained on service failure.", "$ref" = "#/$defs/FailurePolicy" }, "provider_plugin_id" = { "type" = "string" }, "threshold_percent" = { "description" = "Completion requires at least this probability, plus concrete agent-collected evidence.", "type" = "integer", "format" = "uint8", "maximum" = 255, "minimum" = 0 } }, "additionalProperties" = false, "required" = [
-    "provider_plugin_id",
-    "model_id",
-    "auth_profile",
-    "threshold_percent",
-    "on_failure",
-] }, "FailurePolicy" = { "type" = "string", "enum" = [
-    "pause",
-    "agent_fallback",
-] }, "LoopExternalBlocker" = { "type" = "string", "enum" = [
-    "none",
-    "approval_required",
-    "input_required",
-    "dependency_required",
-] } }, "additionalProperties" = false }
+], "title" = "LoopWorkflowIteration", "type" = "object" }
 type_name = "bcode_loop_plugin::LoopWorkflowIteration"
 
 [services.workflow_blocks.output]
-schema = { "$schema" = "https://json-schema.org/draft/2020-12/schema", "title" = "LoopWorkflowIteration", "type" = "object", "properties" = { "condition_met" = { "type" = "boolean" }, "evidence" = { "type" = "array", "items" = { "type" = "string" } }, "external_blocker" = { "$ref" = "#/$defs/LoopExternalBlocker", "default" = "none" }, "implementation_prompt" = { "type" = "string" }, "iteration" = { "type" = "integer", "format" = "uint32", "minimum" = 0 }, "judgement_evaluation" = { "anyOf" = [
+schema = { "$defs" = { "EvaluationConfig" = { "additionalProperties" = false, "properties" = { "auth_profile" = { "type" = "string" }, "model_id" = { "type" = "string" }, "on_failure" = { "$ref" = "#/$defs/FailurePolicy", "description" = "The existing read-only agent evaluator can be retained on service failure." }, "provider_plugin_id" = { "type" = "string" }, "threshold_percent" = { "description" = "Completion requires at least this probability, plus concrete agent-collected evidence.", "format" = "uint8", "maximum" = 255, "minimum" = 0, "type" = "integer" } }, "required" = [
+    "provider_plugin_id",
+    "model_id",
+    "auth_profile",
+    "threshold_percent",
+    "on_failure",
+], "type" = "object" }, "FailurePolicy" = { "enum" = [
+    "pause",
+    "agent_fallback",
+], "type" = "string" }, "LoopExternalBlocker" = { "enum" = [
+    "none",
+    "approval_required",
+    "input_required",
+    "dependency_required",
+], "type" = "string" }, "ProgressFeedback" = { "additionalProperties" = false, "properties" = { "attempted_action" = { "maxLength" = 4096, "minLength" = 1, "type" = "string" }, "made_progress" = { "type" = "boolean" }, "next_action" = { "maxLength" = 4096, "minLength" = 1, "type" = "string" } }, "required" = [
+    "attempted_action",
+    "made_progress",
+    "next_action",
+], "type" = "object" } }, "$schema" = "https://json-schema.org/draft/2020-12/schema", "additionalProperties" = false, "properties" = { "condition_met" = { "type" = "boolean" }, "evidence" = { "items" = { "type" = "string" }, "type" = "array" }, "external_blocker" = { "$ref" = "#/$defs/LoopExternalBlocker", "default" = "none" }, "feedback" = { "anyOf" = [
+    { "$ref" = "#/$defs/ProgressFeedback" },
+    { "type" = "null" },
+], "description" = "Bounded corrective handoff; historical states without one remain readable." }, "implementation_prompt" = { "type" = "string" }, "iteration" = { "format" = "uint32", "minimum" = 0, "type" = "integer" }, "judgement_evaluation" = { "anyOf" = [
     { "$ref" = "#/$defs/EvaluationConfig" },
     { "type" = "null" },
-] }, "max_iterations" = { "type" = "integer", "format" = "uint32", "minimum" = 0 }, "planning_ready" = { "type" = "boolean", "default" = false }, "stop_condition" = { "type" = "string" }, "summary" = { "type" = "string" } }, "required" = [
+] }, "max_iterations" = { "format" = "uint32", "minimum" = 0, "type" = "integer" }, "planning_ready" = { "default" = false, "type" = "boolean" }, "stop_condition" = { "type" = "string" }, "summary" = { "type" = "string" } }, "required" = [
     "implementation_prompt",
     "stop_condition",
     "max_iterations",
@@ -77,21 +105,7 @@ schema = { "$schema" = "https://json-schema.org/draft/2020-12/schema", "title" =
     "condition_met",
     "evidence",
     "summary",
-], "$defs" = { "EvaluationConfig" = { "type" = "object", "properties" = { "auth_profile" = { "type" = "string" }, "model_id" = { "type" = "string" }, "on_failure" = { "description" = "The existing read-only agent evaluator can be retained on service failure.", "$ref" = "#/$defs/FailurePolicy" }, "provider_plugin_id" = { "type" = "string" }, "threshold_percent" = { "description" = "Completion requires at least this probability, plus concrete agent-collected evidence.", "type" = "integer", "format" = "uint8", "maximum" = 255, "minimum" = 0 } }, "additionalProperties" = false, "required" = [
-    "provider_plugin_id",
-    "model_id",
-    "auth_profile",
-    "threshold_percent",
-    "on_failure",
-] }, "FailurePolicy" = { "type" = "string", "enum" = [
-    "pause",
-    "agent_fallback",
-] }, "LoopExternalBlocker" = { "type" = "string", "enum" = [
-    "none",
-    "approval_required",
-    "input_required",
-    "dependency_required",
-] } }, "additionalProperties" = false }
+], "title" = "LoopWorkflowIteration", "type" = "object" }
 type_name = "bcode_loop_plugin::LoopWorkflowIteration"
 
 [services.workflow_blocks.authorization]

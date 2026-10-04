@@ -2206,11 +2206,25 @@ struct LoopWorkflowIteration {
     condition_met: bool,
     evidence: Vec<String>,
     summary: String,
+    /// Bounded corrective handoff; historical states without one remain readable.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    feedback: Option<ProgressFeedback>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct ProgressFeedback {
+    #[schemars(length(min = 1, max = 4096))]
+    attempted_action: String,
+    made_progress: bool,
+    #[schemars(length(min = 1, max = 4096))]
+    next_action: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 struct LoopWorkflowEvaluation {
+    feedback: ProgressFeedback,
     external_blocker: LoopExternalBlocker,
     implementation_prompt: String,
     stop_condition: String,
@@ -2426,6 +2440,7 @@ fn loop_workflow_spec(
     implementation_configuration.output =
         bcode_workflow::WorkflowPromptOutputPolicy::RetainedContribution {
             field: "summary".into(),
+            path: Vec::new(),
             result: bcode_workflow::PromptStructuredOutputPolicy::strict(
                 bcode_workflow::ValueSchema {
                     type_name: "bcode.loop.implementation_contribution.v1".into(),
@@ -2433,7 +2448,7 @@ fn loop_workflow_spec(
                 },
             ),
         };
-    implementation_configuration.system_prompt.push_str("\nReturn a JSON string describing this attempt's actual contribution, not the previous evaluation: the action attempted, identifiable changes, validation actually run, remaining constraints, and next concrete action. Notes-only and inspection-only work must be labelled as such. The host preserves the original goal, permissions, iteration and evidence; your report cannot establish completion. Use prior evaluation feedback to choose useful work rather than repeating a denied workaround. When one scope is blocked, consider independent safe contributions before declaring the entire goal blocked.");
+    implementation_configuration.system_prompt.push_str("\nReturn a JSON string describing this attempt's actual contribution, not the previous evaluation. Treat feedback.next_action as the current corrective handoff; compare it with feedback.attempted_action and do not repeat an unchanged no-progress approach. Report the action attempted, identifiable changes, validation actually run, remaining constraints, and next concrete action. Notes-only and inspection-only work must be labelled as such. The host preserves the original goal, permissions, iteration and evidence; your report cannot establish completion. Use prior evaluation feedback to choose useful work rather than repeating a denied workaround. When one scope is blocked, consider independent safe contributions before declaring the entire goal blocked.");
     let implementation = bcode_workflow::Step::configured_task(
         "loop.implementation",
         bcode_workflow::NodeKind::Agent,
@@ -2445,7 +2460,7 @@ fn loop_workflow_spec(
         "loop.evaluation",
         bcode_workflow::NodeKind::Agent,
         serde_json::to_value(loop_agent_configuration::<LoopWorkflowEvaluation>(
-            "Read-only loop completion evaluation. Inspect existing state against the complete pinned stop_condition. Inspect checksum-verified canonical worker outputs and actual integrated artifacts, not worker summaries or coordinator completion alone. Use workflow.execution_context outputs_only pages followed by output_only inspection. Report concrete evidence, validation commands and outcomes, unresolved work and blockers. Missing or truncated evidence remains unverified. If authorized implementation can collect missing evidence, inspect full outputs, run validation, or finish a review, report external_blocker=none and concrete corrective work; your read-only role alone is not an external dependency. Use approval_required only for an actual external decision, input_required for a specific unanswered question, and dependency_required for a dependency outside authorized implementation control. For any external blocker, the summary must identify what is missing, who can resolve it, and the next action; evidence must identify exact known request or run identities without inventing them. A successful worker or completed run is not goal completion. Do not mutate files, perform integration, commission work, or weaken the original goal. Return condition_met only when all original requirements are supported by inspected evidence.",
+            "Read-only loop completion evaluation. Evaluate the current summary as the latest implementation contribution, not the prior evaluation. Return feedback with attempted_action, made_progress (verified product progress, not note updates or repeated inspection), and next_action. If there was no progress, next_action must change the approach: select a concrete safe independent scope, a new bounded investigation that resolves the actual uncertainty, or a specific external intervention with owner and reason. Do not send another copy of the entire unfinished objective. Use the incoming feedback to recognize repeated unsuccessful actions. Inspect existing state against the complete pinned stop_condition. Inspect checksum-verified canonical worker outputs and actual integrated artifacts, not worker summaries or coordinator completion alone. Use workflow.execution_context outputs_only pages followed by output_only inspection. Report concrete evidence, validation commands and outcomes, unresolved work and blockers. Missing or truncated evidence remains unverified. If authorized implementation can collect missing evidence, inspect full outputs, run validation, or finish a review, report external_blocker=none and concrete corrective work; your read-only role alone is not an external dependency. Use approval_required only for an actual external decision, input_required for a specific unanswered question, and dependency_required for a dependency outside authorized implementation control. For any external blocker, the summary must identify what is missing, who can resolve it, and the next action; evidence must identify exact known request or run identities without inventing them. A successful worker or completed run is not goal completion. Do not mutate files, perform integration, commission work, or weaken the original goal. Return condition_met only when all original requirements are supported by inspected evidence.",
             "plan",
             true,
         ))
@@ -2813,6 +2828,7 @@ fn loop_workflow_initial_value(input: &LoopWorkflowInput) -> LoopWorkflowIterati
         condition_met: false,
         evidence: Vec::new(),
         summary: String::new(),
+        feedback: None,
     }
 }
 
@@ -4853,7 +4869,8 @@ mod tests {
             let canonical = serde_json::json!({
                 "implementation_prompt":"work", "stop_condition":"done", "max_iterations":1,
                 "iteration":0, "condition_met":false,"external_blocker":"none",
-                "evidence":["pending"],"summary":"pending"
+                "evidence":["pending"],"summary":"pending",
+                "feedback":{"attempted_action":"inspect","made_progress":false,"next_action":"implement parser"}
             });
             let decoded = encoding.decode(canonical.clone()).unwrap();
             assert_eq!(decoded, canonical);
@@ -4863,6 +4880,44 @@ mod tests {
                     .is_valid(&decoded)
             );
         }
+    }
+
+    #[test]
+    fn no_progress_feedback_changes_retry_without_inventing_external_blocker() {
+        let goal = LoopWorkflowInput {
+            implementation_prompt: "parallel package implementation".into(),
+            stop_condition: "integrated tests pass".into(),
+            max_iterations: 20,
+            judgement_evaluation: None,
+        };
+        let mut state = loop_workflow_initial_value(&goal);
+        state.feedback = Some(ProgressFeedback {
+            attempted_action: "create denied worktree".into(),
+            made_progress: false,
+            next_action: "create denied worktree".into(),
+        });
+        let original = state.implementation_prompt.clone();
+        judgement_evaluation::enforce_progress_feedback(&mut state);
+        assert_eq!(state.external_blocker, LoopExternalBlocker::None);
+        assert!(!state.condition_met);
+        let feedback = state.feedback.as_ref().unwrap();
+        assert_ne!(feedback.next_action, feedback.attempted_action);
+        assert_eq!(state.implementation_prompt, original);
+        let transform = judgement_evaluation::pinned_input_transform();
+        let value = serde_json::to_value(&state).unwrap();
+        let output = transform
+            .evaluate(&[
+                bcode_workflow::WorkflowTransformInput {
+                    name: bcode_workflow::WORKFLOW_TRANSFORM_SOURCE_STATE,
+                    value: &value,
+                },
+                bcode_workflow::WorkflowTransformInput {
+                    name: bcode_workflow::WORKFLOW_TRANSFORM_SOURCE_CURRENT,
+                    value: &value,
+                },
+            ])
+            .unwrap();
+        assert_eq!(output["feedback"], value["feedback"]);
     }
 
     #[test]

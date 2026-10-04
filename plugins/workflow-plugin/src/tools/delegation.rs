@@ -29,6 +29,7 @@ pub(super) fn definition() -> ToolDefinition {
         "input",
         "source_node_id",
         "include_source_output",
+        "source_contribution",
         "preserve_source_output",
         "join_id",
         "first_edge_id",

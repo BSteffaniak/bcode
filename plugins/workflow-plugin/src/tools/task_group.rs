@@ -72,6 +72,8 @@ struct Group {
     /// Forward canonical source state after side-effect-only integration.
     #[serde(default)]
     preserve_source_output: bool,
+    #[serde(default)]
+    source_contribution: Option<bcode_workflow::WorkflowPromptOutputPolicy>,
     tasks: Vec<Prompt>,
     /// Opt-in scheduler coordination for every worker and the integrator.
     #[serde(default)]
@@ -729,7 +731,12 @@ fn lower_group(mut group: Group) -> Result<WorkflowRunGraphEditBatch, String> {
         group.version == 2,
     )?;
     if preserve_source_output {
-        preserve_source(&mut continuation, &mut reconnect, source_schema)?;
+        preserve_source(
+            &mut continuation,
+            &mut reconnect,
+            source_schema,
+            group.source_contribution,
+        )?;
     }
     append_successor_context(&mut continuation, reconnect.as_ref())?;
     edges.push((aggregate_id, continuation.id.clone()));
@@ -775,6 +782,9 @@ fn validate_source_preservation(group: &Group) -> Result<(), String> {
     {
         return Err("retained source edges require bind_source_activation and must exclude the replaced reconnect edge".into());
     }
+    if group.source_contribution.is_some() && !group.preserve_source_output {
+        return Err("source_contribution requires source preservation".into());
+    }
     if group.preserve_source_output
         && (group.version != 2
             || !group.include_source_output
@@ -790,11 +800,28 @@ fn preserve_source(
     continuation: &mut NodeDefinition,
     reconnect: &mut Option<WorkflowRunGraphEdit>,
     source_schema: ValueSchema,
+    contribution: Option<bcode_workflow::WorkflowPromptOutputPolicy>,
 ) -> Result<(), String> {
     let mut configuration: WorkflowPromptConfiguration =
         serde_json::from_value(continuation.configuration.clone())
             .map_err(|error| error.to_string())?;
-    configuration.output = bcode_workflow::WorkflowPromptOutputPolicy::PreserveInput;
+    configuration.output = match contribution {
+        Some(bcode_workflow::WorkflowPromptOutputPolicy::RetainedContribution {
+            result,
+            field,
+            mut path,
+        }) => {
+            path.insert(0, "source".into());
+            configuration.system_prompt.push_str("\nReturn the requested structured contribution describing actual integrated worker changes, validation and remaining constraints. The host applies it only to the designated retained-state field; all other source and worker results remain protected.");
+            bcode_workflow::WorkflowPromptOutputPolicy::RetainedContribution {
+                result,
+                field,
+                path,
+            }
+        }
+        Some(_) => return Err("source_contribution requires retained_contribution policy".into()),
+        None => bcode_workflow::WorkflowPromptOutputPolicy::PreserveInput,
+    };
     configuration.system_prompt.push_str("\n\nComplete integration and verification, then report ordinary completion. Record the integrated workspace/state, changed artifacts, exact checks and their outcomes, unresolved conflicts and blockers as inspectable evidence using ordinary authorized tools. Identify which worker contributions were actually integrated; worker success or statements alone are not verification. If verification fails, commission corrective work or report an actionable blocker rather than asserting success. The host forwards canonical source state; do not reconstruct it from worker results. Completion here does not establish that the original goal is satisfied; the downstream evaluator must verify that independently.");
     continuation.configuration =
         serde_json::to_value(configuration).map_err(|error| error.to_string())?;
@@ -1121,6 +1148,7 @@ pub(super) fn definition() -> bcode_tool::ToolDefinition {
                 "failure_policy":{"type":"string","enum":["wait_all","fail_fast","collect_outcomes"],"default":"wait_all","description":"Canonical join failure policy. collect_outcomes requires v2 independent workers and delivers named terminal outcomes to the continuation; it does not retry effects. Fail-fast requests cooperative cancellation; it does not undo effects."},
                 "include_source_output":{"type":"boolean","description":"Requires source_node_id. Continuation input becomes [canonical source output, worker result pairs]. Reserves join_id.context."},
                 "preserve_source_output":{"type":"boolean","description":"V2 side-effect-only integration: requires reconnect and continuation.output equal to input; omitted include_source_output defaults to true and omitted continuation.output derives input. Explicit false or incompatible schemas reject. Host preserves the named envelope and reconnect selects canonical source; continuation cannot rewrite source state or claim goal completion. Existing current-input source-only selections are composed for corrective delegation; other transforms reject."},
+                "source_contribution":{"type":["object","null"],"description":"Retained contribution policy copied from the authenticated source configuration; applies only with preserve_source_output."},
                 "workspace_resource":{"type":"string","minLength":1,"description":"Optional shared scheduler resource identity. Adds a read claim to read-only workers/integrator and a write claim to mutating ones; preserves stronger existing claims. Writers serialize against matching claims. Not filesystem isolation, path confinement, cross-run locking or tool authorization; all cooperating work must use the same identity."},
                 "source_node_id":{"type":"string","description":"Optional existing source node; workers depend on its settled output matching input. Does not remove existing successors."},
                 "input":{"type":"object","description":"Run or source output ValueSchema: type_name and schema"},"tasks":{"type":"array","minItems":1,"items":worker},
@@ -1724,6 +1752,74 @@ mod tests {
                 request["tasks"].as_array_mut().expect("tasks").truncate(1);
                 assert!(parse(&request).is_err());
             }
+        }
+    }
+
+    #[test]
+    fn integration_contribution_survives_nested_parallel_envelopes() {
+        let mut request = request();
+        request["version"] = json!(2);
+        request["source_node_id"] = json!("planner");
+        request["preserve_source_output"] = json!(true);
+        request["reconnect"] = json!({"edge_id":3,"node_id":"evaluate"});
+        let source = ValueSchema {
+            type_name: "goal".into(),
+            schema: json!({"type":"object","properties":{"summary":{"type":"string"},"goal":{"type":"string"}},"required":["summary","goal"],"additionalProperties":false}),
+        };
+        request["input"] = json!(source);
+        request["continuation"]["output"] = json!(source);
+        let mut policy = bcode_workflow::WorkflowPromptOutputPolicy::RetainedContribution {
+            result: bcode_workflow::PromptStructuredOutputPolicy::strict(ValueSchema {
+                type_name: "report".into(),
+                schema: json!({"type":"string","minLength":1}),
+            }),
+            field: "summary".into(),
+            path: Vec::new(),
+        };
+        let mut envelope =
+            json!({"summary":"prior review","goal":"implement independent packages"});
+        for _ in 0..3 {
+            request["source_contribution"] = json!(policy);
+            let batch = parse(&request).unwrap();
+            let continuation = batch
+                .edits
+                .iter()
+                .find_map(|edit| match edit {
+                    WorkflowRunGraphEdit::AddNode { node, .. } if node.id == "resume" => Some(node),
+                    _ => None,
+                })
+                .unwrap();
+            let config: WorkflowPromptConfiguration =
+                serde_json::from_value(continuation.configuration.clone()).unwrap();
+            let workers = json!({"a":{"summary":"parser implemented"},"b":{"summary":"formatter implemented"}});
+            envelope = json!({"source":envelope,"results":workers});
+            let output = config
+                .output
+                .retain_contribution(
+                    Some(&envelope),
+                    json!("Integrated parser and formatter; tests passed"),
+                )
+                .unwrap();
+            assert_eq!(output["results"], workers);
+            let mut retained = &output;
+            let bcode_workflow::WorkflowPromptOutputPolicy::RetainedContribution {
+                ref path, ..
+            } = config.output
+            else {
+                panic!("contribution policy lost")
+            };
+            for key in path {
+                retained = &retained[key];
+            }
+            assert_eq!(retained["goal"], "implement independent packages");
+            assert_eq!(
+                retained["summary"],
+                "Integrated parser and formatter; tests passed"
+            );
+            policy = config.output;
+            request["input"] = json!(continuation.output);
+            request["continuation"]["output"] = json!(continuation.output);
+            envelope = output;
         }
     }
 

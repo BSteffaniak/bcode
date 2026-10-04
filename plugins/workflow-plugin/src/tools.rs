@@ -857,6 +857,10 @@ fn delegation_recipe(
             "source_node_id":context.node_id,"bind_source_activation":context.activation_id,
             "input":source.node.output,"first_edge_id":first_edge_id,
             "preserve_source_output":true,"retain_source_edge_ids":[],"reconciliation":[],
+            "source_contribution": serde_json::from_value::<bcode_workflow::WorkflowPromptConfiguration>(source.node.configuration.clone()).ok().and_then(|config| match config.output {
+                policy @ bcode_workflow::WorkflowPromptOutputPolicy::RetainedContribution { .. } => Some(policy),
+                _ => None,
+            }),
             "reconnect":{"edge_id":successor.edge_id,"node_id":successor.edge.to,"transform":successor.edge.transform}
         },
         "instructions":"Copy arguments and add a fresh mutation_id, semantic tasks and continuation objective/agent_profile. Choose workspace safety, access, dependencies and criteria explicitly. This advice grants no authority and does not reserve identities. Staging validates affected active work; explicitly reconcile any additional affected activations. Publish the returned publication_arguments separately, then finish this source turn without waiting. On revision conflict rediscover; never silently rebase."

@@ -118,6 +118,15 @@ pub fn pinned_input_transform() -> bcode_workflow::WorkflowTransform {
         ("external_blocker", current("external_blocker")),
         ("evidence", current("evidence")),
         ("summary", current("summary")),
+        (
+            "feedback",
+            Expr::Default {
+                value: Box::new(current("feedback")),
+                default: Box::new(Expr::Constant {
+                    value: serde_json::Value::Null,
+                }),
+            },
+        ),
     ]
     .into_iter()
     .map(|(field, expression)| (field.into(), expression))
@@ -208,6 +217,7 @@ pub fn invoke(context: &NativeServiceContext) -> ServiceResponse {
     let Ok(mut input) = invocation.typed_input::<LoopWorkflowIteration>() else {
         return ServiceResponse::error("invalid_request", "invalid loop evaluation input");
     };
+    enforce_progress_feedback(&mut input);
     if input
         .judgement_evaluation
         .as_ref()
@@ -267,6 +277,30 @@ pub fn invoke(context: &NativeServiceContext) -> ServiceResponse {
             "judgement_unavailable",
             "loop judgement unavailable; workflow requires attention",
         ),
+    }
+}
+
+pub fn enforce_progress_feedback(input: &mut LoopWorkflowIteration) {
+    if input.condition_met || input.external_blocker != LoopExternalBlocker::None {
+        return;
+    }
+    let Some(feedback) = &mut input.feedback else {
+        return;
+    };
+    if !feedback.made_progress
+        && feedback
+            .attempted_action
+            .trim()
+            .eq_ignore_ascii_case(feedback.next_action.trim())
+    {
+        feedback.next_action = format!(
+            "Replan before retrying '{}': choose a different independent implementation scope, or identify the exact unavailable authority/input and responsible owner. Do not repeat the denied or unproductive action.",
+            feedback.attempted_action,
+        );
+        input.summary = format!(
+            "No-progress cycle requires a revised action, not another identical attempt. Last action: {}. Supply a different authorized scope or the concrete intervention needed. Original goal remains incomplete. {}",
+            feedback.attempted_action, input.summary,
+        );
     }
 }
 

@@ -1241,6 +1241,13 @@ fn apply_loop_tool_evidence(
     value["summary"] = serde_json::json!(evidence);
 }
 
+fn scripted_contribution(schema: &serde_json::Value) -> Option<String> {
+    (schema.get("type").and_then(serde_json::Value::as_str) == Some("string")).then(|| {
+        serde_json::to_string("Scripted implementation contribution; inspect tool evidence")
+            .expect("string JSON")
+    })
+}
+
 fn configured_fake_structured_output(
     request: &ModelTurnRequest,
     structured: &bcode_model::StructuredOutputRequest,
@@ -1278,6 +1285,9 @@ fn configured_fake_structured_output(
         .cloned() else {
             return Ok(None);
         };
+        if let Some(report) = scripted_contribution(&structured.schema) {
+            return Ok(Some(report));
+        }
         let evaluation = user_text.starts_with("Read-only loop completion evaluation.");
         let iteration = value
             .get("iteration")
@@ -1286,6 +1296,9 @@ fn configured_fake_structured_output(
         if evaluation {
             // The evaluator contract is closed and does not own initialization readiness.
             value.as_object_mut().unwrap().remove("planning_ready");
+            if structured.schema["properties"].get("feedback").is_some() {
+                value["feedback"] = serde_json::json!({"attempted_action":"scripted implementation", "made_progress":true, "next_action":"inspect and integrate remaining contributions"});
+            }
             if let Some(expected) = configured.strip_prefix("loop_tool_evidence:") {
                 apply_loop_tool_evidence(&mut value, &request.messages, expected);
             } else {

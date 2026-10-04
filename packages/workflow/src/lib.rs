@@ -12208,6 +12208,9 @@ pub enum WorkflowPromptOutputPolicy {
         result: PromptStructuredOutputPolicy,
         /// Literal top-level field owned by this contribution.
         field: String,
+        /// Literal object keys locating retained state inside a composition envelope.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        path: Vec<String>,
     },
 }
 
@@ -12247,22 +12250,36 @@ impl WorkflowPromptOutputPolicy {
         input: Option<&serde_json::Value>,
         contribution: serde_json::Value,
     ) -> Result<serde_json::Value, String> {
-        let Self::RetainedContribution { result, field } = self else {
+        let Self::RetainedContribution {
+            result,
+            field,
+            path,
+        } = self
+        else {
             return Ok(contribution);
         };
         result
             .schema
             .validate_value("contribution", &contribution)
             .map_err(|e| e.to_string())?;
-        let mut object = input
-            .and_then(serde_json::Value::as_object)
+        let mut retained = input
             .cloned()
+            .ok_or("retained contribution requires activation input")?;
+        let mut target = &mut retained;
+        for key in path {
+            target = target
+                .as_object_mut()
+                .and_then(|object| object.get_mut(key))
+                .ok_or("retained contribution path does not select existing object state")?;
+        }
+        let object = target
+            .as_object_mut()
             .ok_or("retained contribution requires object activation input")?;
         if field.trim().is_empty() || !object.contains_key(field) {
             return Err("retained contribution requires an existing designated field".into());
         }
         object.insert(field.clone(), contribution);
-        Ok(serde_json::Value::Object(object))
+        Ok(retained)
     }
 }
 
