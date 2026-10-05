@@ -23,6 +23,16 @@ a snapshot from a disabled/replaced runtime cannot authorize routing.
 
 Failed providers are recorded separately and their stale lists are excluded. Successful
 stable provider lists remain reusable; a partial snapshot is not a complete catalog.
+Discovery uses `tools.execution.preparation_timeout_ms` for each provider, including
+admission waiting. The cancellable whole sweep has no competing deadline, so later
+provider waves cannot be starved by earlier timeouts. Concurrent refresh failures are
+shared only for matching deadline policies.
+Malformed response/host contract failures are permanent; unknown infrastructure and
+service failures remain retryable. Mixed failures still allow recoverable providers
+to recover. Before dispatching any sibling call, an unresolved requested name in a
+partial snapshot triggers recovery; known pinned names retain their original producer.
+Only complete discovery can establish that a requested name does not exist.
+Tools-disabled turns skip discovery, and invalid model targets fail before catalog retries.
 Cold unavailable discovery retries with cancellable host-preparation backoff before
 model startup. Partial discovery can expose healthy providers; unavailable requested
 names remain distinguishable from a complete-catalog tool-not-found result. A failed

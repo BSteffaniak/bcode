@@ -47,7 +47,7 @@ fn retry_delay(config: &ToolExecutionConfig, attempt: u64, jitter: u64) -> Durat
 pub async fn prepare_with_retry<T, F, Fut, N, Notice>(
     config: &ToolExecutionConfig,
     cancel: &TurnCancelState,
-    timeout: Duration,
+    timeout: impl Into<Option<Duration>>,
     mut prepare: F,
     mut notice: N,
 ) -> Result<T, ToolBatchOutcome>
@@ -57,15 +57,21 @@ where
     N: FnMut(PreparationFailure, u64, Duration) -> Notice,
     Notice: Future<Output = ()>,
 {
+    let timeout = timeout.into();
     let mut attempt = 0_u64;
     loop {
         let failure = tokio::select! {
             biased;
             () = cancel.cancelled() => return Err(ToolBatchOutcome::Cancelled),
-            result = tokio::time::timeout(timeout, prepare()) => match result {
-                Ok(Ok(value)) => return Ok(value),
-                Ok(Err(failure)) => failure,
-                Err(_) => PreparationFailure::Timeout,
+            result = async {
+                match timeout {
+                    Some(timeout) => tokio::time::timeout(timeout, prepare()).await
+                        .unwrap_or(Err(PreparationFailure::Timeout)),
+                    None => prepare().await,
+                }
+            } => match result {
+                Ok(value) => return Ok(value),
+                Err(failure) => failure,
             },
         };
         if failure == PreparationFailure::Permanent
@@ -96,7 +102,7 @@ pub async fn prepare_catalog<'a>(
     context: &mut crate::RuntimeCommandContext<'_>,
     cancel: &TurnCancelState,
     config: &ToolExecutionConfig,
-    timeout: Duration,
+    timeout: Option<Duration>,
     prepare: impl FnMut() -> crate::ProviderCallFuture<
         'a,
         Result<crate::UnifiedToolCatalog, PreparationFailure>,
@@ -152,7 +158,7 @@ pub async fn prepare_host_context(
     }
 }
 
-async fn retry_notice(
+pub async fn retry_notice(
     state: &crate::ServerState,
     session_id: crate::SessionId,
     failure: PreparationFailure,

@@ -31,6 +31,7 @@ This inventory classifies Bcode operational limits so hardcoded defaults do not 
 
 `[tools.execution]` controls retries of side-effect-free host preparation:
 
+* `preparation_timeout_ms`: bounds each provider discovery attempt (including admission), not the entire multi-provider sweep. The sweep remains cancellable; different timeout policies do not coalesce failed refreshes.
 * `host_retry_initial_delay_ms = 250`: initial exponential backoff ceiling.
 * `host_retry_max_delay_ms = 30000`: maximum delay, including equal jitter (between half the exponential ceiling and the ceiling). Zero delays normalize to one millisecond.
 * `host_max_retries`: omitted means unlimited; `0` disables retries.

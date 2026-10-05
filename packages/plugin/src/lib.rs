@@ -2272,28 +2272,70 @@ impl PluginResourceLimiter {
         }
     }
 
+    #[cfg(test)]
     async fn acquire(
         &self,
         scope: &PluginInvocationScope,
+    ) -> Result<PluginResourcePermit, PluginLoadError> {
+        self.acquire_with_plugin(scope, None).await
+    }
+
+    async fn acquire_with_plugin(
+        &self,
+        scope: &PluginInvocationScope,
+        plugin: Option<&Arc<Semaphore>>,
     ) -> Result<PluginResourcePermit, PluginLoadError> {
         let started_at = Instant::now();
         let session = match scope {
             PluginInvocationScope::Global => None,
             PluginInvocationScope::Session { session_id, .. } => {
-                let semaphore = self.session_semaphore(session_id);
-                Some(semaphore.acquire_owned().await.map_err(|_| {
-                    PluginLoadError::PluginNotLoaded("plugin resource limiter".to_string())
-                })?)
+                Some(self.session_semaphore(session_id))
             }
         };
-        let global =
-            self.global.clone().acquire_owned().await.map_err(|_| {
-                PluginLoadError::PluginNotLoaded("plugin resource limiter".to_string())
-            })?;
+        // Only the contended semaphore is awaited. All other reservations are
+        // attempted synchronously and released before waiting again. In particular,
+        // a session backlog cannot reserve an idle plugin, and a plugin backlog
+        // cannot reserve the shared execution lane.
+        let mut semaphores = vec![Arc::clone(&self.global)];
+        semaphores.extend(session.iter().cloned());
+        semaphores.extend(plugin.cloned());
+        let mut blocked = 0;
+        let mut permits = loop {
+            let ready = Arc::clone(&semaphores[blocked])
+                .acquire_owned()
+                .await
+                .map_err(|_| PluginLoadError::PluginNotLoaded("plugin resource limiter".into()))?;
+            let mut permits = (0..semaphores.len()).map(|_| None).collect::<Vec<_>>();
+            permits[blocked] = Some(ready);
+            let mut contention = None;
+            for (index, semaphore) in semaphores.iter().enumerate() {
+                if permits[index].is_some() {
+                    continue;
+                }
+                match Arc::clone(semaphore).try_acquire_owned() {
+                    Ok(permit) => permits[index] = Some(permit),
+                    Err(tokio::sync::TryAcquireError::NoPermits) => {
+                        contention = Some(index);
+                        break;
+                    }
+                    Err(tokio::sync::TryAcquireError::Closed) => {
+                        return Err(PluginLoadError::PluginNotLoaded(
+                            "plugin resource limiter".into(),
+                        ));
+                    }
+                }
+            }
+            if let Some(index) = contention {
+                drop(permits);
+                blocked = index;
+            } else {
+                break permits.into_iter();
+            }
+        };
         Ok(PluginResourcePermit {
-            _global: global,
-            _session: session,
-            plugin: None,
+            _global: permits.next().flatten().expect("global permit acquired"),
+            _session: session.and_then(|_| permits.next().flatten()),
+            plugin: plugin.and_then(|_| permits.next().flatten()),
             wait_ms: started_at.elapsed().as_millis(),
             active_global: self
                 .max_global
@@ -3769,8 +3811,8 @@ impl PluginRuntimeHost {
         scope: &PluginInvocationScope,
         class: PluginInvocationClass,
     ) -> Result<PluginResourcePermit, PluginLoadError> {
-        // Wait for plugin-local capacity before consuming shared capacity. A saturated
-        // plugin must not reserve every global slot with work it cannot execute.
+        // Admission reserves the full resource set without holding partial permits
+        // across waits; plugin shutdown also cancels any queued acquisition.
         let closed = executor.admission_closed.notified();
         if executor.closing.load(Ordering::Acquire) {
             return Err(PluginLoadError::PluginNotLoaded(
@@ -3787,11 +3829,6 @@ impl PluginRuntimeHost {
             biased;
             () = closed => Err(PluginLoadError::PluginNotLoaded(executor.manifest.id.clone())),
             result = async {
-                let plugin = match &executor.service_admission {
-                    Some(semaphore) => Some(Arc::clone(semaphore).acquire_owned().await
-                        .map_err(|_| PluginLoadError::PluginNotLoaded(executor.manifest.id.clone()))?),
-                    None => None,
-                };
                 // Operation metadata classification survives service-wide policy overrides.
                 // Query/control capacity is bounded independently of long-running work;
                 // the plugin's declared concurrency limit still applies to both lanes.
@@ -3799,9 +3836,7 @@ impl PluginRuntimeHost {
                     PluginInvocationClass::Query | PluginInvocationClass::Control => &self.query_resources,
                     _ => &self.resources,
                 };
-                let mut permit = resources.acquire(scope).await?;
-                permit.plugin = plugin;
-                Ok(permit)
+                resources.acquire_with_plugin(scope, executor.service_admission.as_ref()).await
             } => result,
         };
         queued.dispatched = result.is_ok();
@@ -9474,6 +9509,122 @@ library = "libexample_plugin.dylib"
     }
 
     #[tokio::test]
+    async fn admission_session_backlog_does_not_reserve_idle_plugin() {
+        let mut host = PluginRuntimeHost::from(PluginHost::default());
+        host.resources = Arc::new(PluginResourceLimiter::new(8, 4));
+        let unrelated = admission_test_executor("unrelated", None);
+        let plugin = admission_test_executor("limited", Some(1));
+        let session = |id: &str| PluginInvocationScope::Session {
+            session_id: id.to_owned(),
+            client_id: None,
+            turn_id: None,
+            work_id: None,
+        };
+        let a = session("a");
+        let b = session("b");
+        let mut occupied = Vec::new();
+        for _ in 0..4 {
+            occupied.push(
+                host.acquire_service_resources(
+                    &unrelated,
+                    &a,
+                    PluginInvocationClass::ToolExecution,
+                )
+                .await
+                .unwrap(),
+            );
+        }
+        let mut waiting = Box::pin(host.acquire_service_resources(
+            &plugin,
+            &a,
+            PluginInvocationClass::ToolExecution,
+        ));
+        assert_admission_pending(waiting.as_mut()).await;
+        let query = tokio::time::timeout(
+            Duration::from_secs(1),
+            host.acquire_service_resources(&plugin, &b, PluginInvocationClass::Query),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(host.resources.global.available_permits(), 4);
+        drop(occupied.pop());
+        // Now session capacity is free but plugin capacity is not. Neither the
+        // global nor session permit may be retained while awaiting the query.
+        assert_admission_pending(waiting.as_mut()).await;
+        assert_eq!(host.resources.active_session_count(&a), Some(3));
+        assert_eq!(host.resources.global.available_permits(), 5);
+        drop(query);
+        let admitted = tokio::time::timeout(Duration::from_secs(1), waiting)
+            .await
+            .unwrap()
+            .unwrap();
+        drop(admitted);
+        drop(occupied);
+        assert_eq!(host.resources.global.available_permits(), 8);
+        assert_eq!(host.resources.active_session_count(&a), Some(0));
+        assert_eq!(
+            plugin
+                .service_admission
+                .as_ref()
+                .unwrap()
+                .available_permits(),
+            1
+        );
+        assert_eq!(plugin.status().queued, 0);
+        drop(plugin);
+        drop(unrelated);
+        drop(host);
+    }
+
+    #[tokio::test]
+    async fn admission_global_backlog_does_not_reserve_session_or_plugin() {
+        let mut host = PluginRuntimeHost::from(PluginHost::default());
+        host.resources = Arc::new(PluginResourceLimiter::new(1, 1));
+        let plugin = admission_test_executor("limited", Some(1));
+        let scope = PluginInvocationScope::Session {
+            session_id: "a".into(),
+            client_id: None,
+            turn_id: None,
+            work_id: None,
+        };
+        let occupied = host
+            .resources
+            .acquire(&PluginInvocationScope::Global)
+            .await
+            .unwrap();
+        let mut waiting = Box::pin(host.acquire_service_resources(
+            &plugin,
+            &scope,
+            PluginInvocationClass::ToolExecution,
+        ));
+        assert_admission_pending(waiting.as_mut()).await;
+        assert_eq!(host.resources.active_session_count(&scope), Some(0));
+        let query = tokio::time::timeout(
+            Duration::from_secs(1),
+            host.acquire_service_resources(&plugin, &scope, PluginInvocationClass::Query),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        drop(waiting);
+        drop(query);
+        drop(occupied);
+        assert_eq!(plugin.status().queued, 0);
+        assert_eq!(
+            plugin
+                .service_admission
+                .as_ref()
+                .unwrap()
+                .available_permits(),
+            1
+        );
+        assert_eq!(host.resources.global.available_permits(), 1);
+        drop(plugin);
+        drop(host);
+    }
+
+    #[tokio::test]
     async fn cancelled_admission_releases_plugin_slot_while_waiting_for_resources() {
         let mut host = PluginRuntimeHost::from(PluginHost::default());
         host.query_resources = Arc::new(PluginResourceLimiter::new(1, 1));
@@ -9492,7 +9643,7 @@ library = "libexample_plugin.dylib"
                 .as_ref()
                 .unwrap()
                 .available_permits(),
-            0
+            1
         );
         drop(waiting);
         assert_eq!(
