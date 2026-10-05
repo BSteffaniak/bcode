@@ -1,5 +1,17 @@
 # Database SQL transition
 
+## Approved old-writer guard conformance tests (2026-10-04)
+
+Actual user approval: “yes, but make sure its only enabled for tests if possible”, in
+response to a request limited to direct SQL in upstream write-guard tests exercising
+unchanged old-writer INSERT/UPDATE/UPSERT, conflict clauses and prepared statements.
+Scope is sibling Switchy `packages/switchy/database/tests/write_guard.rs` only; fixtures
+remain typed. Literal caller statements are integration-test inputs, not a new public raw
+API or production feature. No `raw-sql` enablement or Bcode direct-driver expansion is
+approved. Keep direct callers confined to test compilation. Remove this exception if
+those exact compatibility cases can be exercised through a faithful old-artifact harness
+or typed conformance API without weakening coverage. It grants no blanket fixture exception.
+
 ## Large-swarm integration scope (2026-10-04)
 
 The current local patch selects sibling `switchy_database`. Workflow admission counts,
@@ -41,7 +53,8 @@ for this local task.
 
 The current user-directed cross-repository migration authorizes a compatibility transition for
 **existing usages**, followed by removal. It does not approve new arbitrary SQL, permanent
-exceptions, or raw corruption fixtures. No separate fixture exception has been approved.
+exceptions, or raw corruption fixtures. The sole separately approved conformance-test
+exception is scoped above; it does not authorize arbitrary fixtures.
 The durable contribution policy is in AGENTS.md; this document records temporary mechanics,
 not an invariant change or a certificate of completed migration.
 

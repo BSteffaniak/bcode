@@ -997,6 +997,30 @@ struct LoopSurface {
     theme: Option<PluginTuiTheme>,
 }
 
+#[cfg(feature = "test-fixtures")]
+/// Produce an authentic plugin loop request for cross-domain acceptance tests.
+///
+/// # Errors
+/// Rejects invalid iteration limits or invalid generated workflow configuration.
+pub fn test_loop_start_request(
+    session_id: SessionId,
+    max_iterations: u64,
+) -> Result<PluginWorkflowStartRequest, String> {
+    let input = LoopWorkflowInput::new(
+        "Implement acceptance task".into(),
+        "Verify acceptance task".into(),
+        max_iterations,
+    )?;
+    build_start_request(
+        &input,
+        session_id,
+        SetupKind::Loop,
+        CollaborationMode::Disabled,
+        false,
+        None,
+    )
+}
+
 fn build_start_request(
     input: &LoopWorkflowInput,
     session_id: SessionId,
@@ -3292,6 +3316,9 @@ fn legacy_state_path(session_id: SessionId) -> PathBuf {
 fn legacy_state_root() -> PathBuf {
     bcode_config::default_state_dir().join("loop")
 }
+
+#[cfg(test)]
+mod representation_tests;
 
 #[cfg(test)]
 mod tests {

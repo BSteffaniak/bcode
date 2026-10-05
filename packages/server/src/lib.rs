@@ -35,6 +35,7 @@ pub mod storage_read_admission;
 mod workflow_admission_tests;
 mod workflow_operations;
 mod workflow_receipts;
+mod workflow_representation;
 pub use workflow_operations::{
     WorkflowApplicationAuthorizationDecision, WorkflowRunGraphEditPolicy,
     WorkflowRunGraphPublicationPolicy,
@@ -258,6 +259,9 @@ pub enum ServerError {
     /// Workflow storage initialization failed with a normalized, secret-safe diagnostic.
     #[error("{0}")]
     WorkflowStorageUnavailable(String),
+    /// Bounded persistence backpressure exhausted; durable work remains unchanged or pending.
+    #[error("workflow storage is busy; retry the exact operation")]
+    WorkflowStorageBusy,
     #[error("authored-workflow application operation is unauthorized: {0}")]
     WorkflowApplicationOperationUnauthorized(String),
     #[error("authored-workflow computation timed out: {0}")]
@@ -1690,18 +1694,23 @@ impl ServerState {
             ));
         }
         self.require_workflow_store()?;
-        let session = self.sessions.session_summary(session_id).await?;
-        let provenance = session.execution.ok_or_else(denied)?.provenance;
-        if provenance.version != bcode_session_models::EXECUTION_SESSION_PROVENANCE_VERSION
-            || provenance.owner != "bcode.workflow"
-            || provenance.run_id != facts.request.run_id
-        {
-            return Err(denied());
-        }
+        let provenance = self
+            .publication_provenance(session_id, &facts.request.run_id)
+            .await?;
         let activation_id = provenance.activation_id.as_deref().ok_or_else(denied)?;
         // Cancellation closes admission immediately and waits for this boundary before returning.
         // Acquire it before the store lock; never hold a database handle across this await.
         let commit = cancellation.marker_commit.lock().await;
+        if let Some(execution) =
+            workflow_representation::graph::authenticate(self, session_id, &provenance).await?
+        {
+            if cancellation.is_cancelled() {
+                return Err(denied());
+            }
+            let result = execution.stage(&facts.request).await;
+            drop(commit);
+            return result;
+        }
         let mut store = self
             .workflow_store
             .lock()
@@ -1779,6 +1788,16 @@ impl ServerState {
         }
         let activation_id = provenance.activation_id.as_deref().ok_or_else(denied)?;
         let commit = cancellation.marker_commit.lock().await;
+        if let Some(execution) =
+            workflow_representation::graph::authenticate(self, session_id, &provenance).await?
+        {
+            if cancellation.is_cancelled() {
+                return Err(denied());
+            }
+            let context = execution.context(&request).await;
+            drop(commit);
+            return context;
+        }
         let store = self
             .workflow_store
             .lock()
@@ -1890,6 +1909,44 @@ impl ServerState {
         Ok(())
     }
 
+    async fn publication_provenance(
+        &self,
+        session_id: SessionId,
+        run_id: &str,
+    ) -> Result<bcode_session_models::ExecutionSessionProvenance, ServerError> {
+        let denied = || {
+            ServerError::WorkflowApplicationOperationUnauthorized(
+                "publication requires an authorized current workflow execution".into(),
+            )
+        };
+        let session = self.sessions.session_summary(session_id).await?;
+        let provenance = session.execution.ok_or_else(denied)?.provenance;
+        if provenance.version != bcode_session_models::EXECUTION_SESSION_PROVENANCE_VERSION
+            || provenance.owner != "bcode.workflow"
+            || provenance.run_id != run_id
+        {
+            return Err(denied());
+        }
+        Ok(provenance)
+    }
+
+    fn invocation_publication_facts(
+        &self,
+        plugin_id: &str,
+        request: bcode_workflow::WorkflowRunGraphEditBatch,
+    ) -> Result<bcode_workflow::WorkflowRunGraphPublicationFacts, ServerError> {
+        let facts = bcode_workflow::WorkflowRunGraphPublicationFacts {
+            version: 1,
+            actor: bcode_workflow::WorkflowApplicationActor {
+                kind: bcode_workflow::WorkflowApplicationActorKind::Plugin,
+                actor_id: plugin_id.to_owned(),
+            },
+            request,
+        };
+        self.authorize_invocation_publication(&facts)?;
+        Ok(facts)
+    }
+
     async fn run_graph_publication_from_invocation(
         &self,
         session_id: SessionId,
@@ -1903,30 +1960,29 @@ impl ServerState {
                 "publication requires an authorized current workflow execution".to_string(),
             )
         };
-        let facts = bcode_workflow::WorkflowRunGraphPublicationFacts {
-            version: 1,
-            actor: bcode_workflow::WorkflowApplicationActor {
-                kind: bcode_workflow::WorkflowApplicationActorKind::Plugin,
-                actor_id: plugin_id.to_string(),
-            },
-            request,
-        };
-        self.authorize_invocation_publication(&facts)?;
+        let facts = self.invocation_publication_facts(plugin_id, request)?;
         self.require_workflow_store()?;
-        let session = self.sessions.session_summary(session_id).await?;
-        let provenance = session.execution.ok_or_else(denied)?.provenance;
-        if provenance.version != bcode_session_models::EXECUTION_SESSION_PROVENANCE_VERSION
-            || provenance.owner != "bcode.workflow"
-            || provenance.run_id != facts.request.run_id
-        {
-            return Err(denied());
-        }
+        let provenance = self
+            .publication_provenance(session_id, &facts.request.run_id)
+            .await?;
         let activation_id = provenance.activation_id.as_deref().ok_or_else(denied)?;
         let commit = cancellation.marker_commit.lock().await;
         if cancellation.is_cancelled() {
             return Err(ServerError::WorkflowComputationCancelled(
                 facts.request.mutation_id,
             ));
+        }
+        if let Some(outcome) = workflow_representation::graph::publish_authenticated(
+            self,
+            session_id,
+            &provenance,
+            &facts.request,
+            accept_pending,
+        )
+        .await?
+        {
+            drop(commit);
+            return Ok(outcome);
         }
         let mut store = self
             .workflow_store
@@ -2958,6 +3014,8 @@ impl ServerState {
             let mut workers = tokio::task::JoinSet::<String>::new();
             let mut active = BTreeSet::new();
             let capacity = state.startup_config.workflows.continuation_workers.get();
+            let mut representation_cursor = None;
+            let mut discover_representation = false;
             loop {
                 tokio::select! {
                     biased;
@@ -2985,9 +3043,14 @@ impl ServerState {
                             settle_restored_quiescent_workflow_runtime_work(&state).await;
                             state.workflow_restore_pending.store(false, Ordering::SeqCst);
                         }
-                        let page = state.workflow_store.lock()
-                            .unwrap_or_else(std::sync::PoisonError::into_inner)
-                            .advance_continuation_discovery(&discovery_artifact, capacity.saturating_sub(workers.len()).min(16));
+                        let limit = capacity.saturating_sub(workers.len()).min(16);
+                        let page = if discover_representation {
+                            workflow_representation::recovery::discover(&state, &mut representation_cursor, limit).await
+                        } else {
+                            state.workflow_store.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+                                .advance_continuation_discovery(&discovery_artifact, limit).map_err(ServerError::from)
+                        };
+                        discover_representation = !discover_representation;
                         // A slow page must not leave the biased timer perpetually ready,
                         // starving queued publications between discovery passes.
                         recovery_tick.reset();
@@ -5676,6 +5739,10 @@ fn request_error_response(error: &ServerError) -> ErrorResponse {
             "workflow_definition_unsupported",
             "workflow definition is unsupported by this host",
         ),
+        ServerError::WorkflowStorageBusy => (
+            "workflow_storage_busy",
+            "workflow storage is busy; retry the exact operation",
+        ),
         ServerError::WorkflowStorageUnavailable(message) => {
             return ErrorResponse::new("workflow_capability_unavailable", message.clone());
         }
@@ -6145,6 +6212,8 @@ const fn request_kind(request: &Request) -> &'static str {
         Request::StageWorkflowRunGraphEdit { .. } => "stage_workflow_run_graph_edit",
         Request::InspectWorkflowRunGraph { .. } => "inspect_workflow_run_graph",
         Request::InspectWorkflowRun { .. } => "inspect_workflow_run",
+        Request::WorkflowIdentityCatalog { .. } => "workflow_identity_catalog",
+        Request::WorkflowSchedulingPage { .. } => "workflow_scheduling_page",
         Request::WorkflowRunView { .. } => "workflow_run_view",
         Request::WorkflowCatalogView { .. } => "workflow_catalog_view",
         Request::WorkflowRunStatus { .. } => "workflow_run_status",
@@ -8051,6 +8120,24 @@ async fn handle_workflow_run_request(
             };
             send_response(writer, request_id, response).await
         }
+        RuntimeAndModelRequest::WorkflowIdentityCatalog { request } => {
+            let page = Box::pin(workflow_representation::catalog::page(state, &request)).await?;
+            Box::pin(send_response(
+                writer,
+                request_id,
+                Response::Ok(ResponsePayload::WorkflowIdentityCatalog { page }),
+            ))
+            .await
+        }
+        RuntimeAndModelRequest::WorkflowSchedulingPage { request } => {
+            let page = Box::pin(workflow_representation::scheduling::page(state, request)).await?;
+            Box::pin(send_response(
+                writer,
+                request_id,
+                Response::Ok(ResponsePayload::WorkflowSchedulingPage { page }),
+            ))
+            .await
+        }
         RuntimeAndModelRequest::WorkflowRunView { run_id, limit } => {
             let view = Box::pin(workflow_operations::run_view(state, &run_id, limit)).await?;
             send_response(
@@ -8063,7 +8150,7 @@ async fn handle_workflow_run_request(
             .await
         }
         RuntimeAndModelRequest::WorkflowCatalogView { request } => {
-            let view = workflow_operations::catalog_view(state, &request).await?;
+            let view = Box::pin(workflow_operations::catalog_view(state, &request)).await?;
             send_response(
                 writer,
                 request_id,
@@ -8072,10 +8159,10 @@ async fn handle_workflow_run_request(
             .await
         }
         RuntimeAndModelRequest::WorkflowRunStatus { run_id } => {
-            let result = bcode_workflow::WorkflowRunApplication::workflow_run_status(
+            let result = Box::pin(bcode_workflow::WorkflowRunApplication::workflow_run_status(
                 &workflow_operations::WorkflowAuthoringApplication::new(state, client_id),
                 run_id,
-            )
+            ))
             .await;
             let response = match result {
                 Ok(run) => Response::Ok(ResponsePayload::WorkflowRunStatus { run }),
@@ -8126,10 +8213,12 @@ async fn handle_workflow_run_request(
             send_response(writer, request_id, response).await
         }
         RuntimeAndModelRequest::ControlAssociatedWorkflowRun { key, action } => {
-            let result = bcode_workflow::WorkflowRunApplication::control_associated_workflow_run(
-                &workflow_operations::WorkflowAuthoringApplication::new(state, client_id),
-                key,
-                action,
+            let result = Box::pin(
+                bcode_workflow::WorkflowRunApplication::control_associated_workflow_run(
+                    &workflow_operations::WorkflowAuthoringApplication::new(state, client_id),
+                    key,
+                    action,
+                ),
             )
             .await;
             let response = match result {
@@ -16761,6 +16850,16 @@ async fn broadcast_workflow_event(
 }
 
 async fn recover_workflow_continuation(state: &Arc<ServerState>, run_id: &str) {
+    match workflow_representation::recovery::is_represented(state, run_id).await {
+        Ok(true) => {
+            if let Err(error) = drive_workflow_run(state, run_id).await {
+                tracing::debug!(%run_id, %error, "typed workflow continuation deferred");
+            }
+            return;
+        }
+        Ok(false) => {}
+        Err(_) => return,
+    }
     workflow_operations::recover_parent_cancellation(state, run_id).await;
     let runnable = {
         let store = state
@@ -16843,15 +16942,26 @@ async fn drive_workflow_run(state: &Arc<ServerState>, run_id: &str) -> Result<()
 // Internal work quantum, deliberately independent of configured run concurrency.
 const WORKFLOW_SCHEDULER_PAGE_SIZE: usize = 128;
 
+async fn required_workflow_drive_authority(
+    state: &Arc<ServerState>,
+    run_id: &str,
+) -> Result<workflow_operations::AuthorityGuard, ServerError> {
+    workflow_operations::execution_authority(state, run_id)
+        .await?
+        .ok_or_else(|| {
+            WorkflowStoreError::InvalidData("workflow driving requires execution authority".into())
+                .into()
+        })
+}
+
 async fn drive_workflow_run_exclusive(
     state: &Arc<ServerState>,
     run_id: &str,
 ) -> Result<(), ServerError> {
-    let authority = workflow_operations::execution_authority(state, run_id)
-        .await?
-        .ok_or_else(|| {
-            WorkflowStoreError::InvalidData("workflow driving requires execution authority".into())
-        })?;
+    if Box::pin(workflow_representation::drive_if_represented(state, run_id)).await? {
+        return Ok(());
+    }
+    let authority = required_workflow_drive_authority(state, run_id).await?;
     let started_at = std::time::Instant::now();
     let store_path = workflow_store_path(state);
     let mut retry_preparations = true;
@@ -17260,12 +17370,7 @@ async fn drive_workflow_run_and_parents(
             ));
         }
         drive_workflow_run(state, &run_id).await?;
-        next = state
-            .workflow_store
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .parent_run_link(&run_id)?
-            .map(|link| link.parent_run_id);
+        next = Box::pin(workflow_representation::child::parent_run(state, &run_id)).await?;
     }
     Ok(())
 }
@@ -28681,17 +28786,10 @@ async fn resolve_invocation_graph_edit(
     if reference.version != 1 || reference.run_id != context.run_id {
         return Err(denied());
     }
-    let store = state
-        .workflow_store
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    let authority = store
-        .execution_authority(&context.run_id)?
-        .ok_or_else(denied)?;
-    let edit = store
-        .staged_run_graph_edit(&reference.run_id, &reference.mutation_id, &authority)?
-        .ok_or_else(denied)?;
-    drop(store);
+    let edit =
+        workflow_representation::graph::candidate(state, &reference.run_id, &reference.mutation_id)
+            .await?
+            .ok_or_else(denied)?;
     if bcode_workflow::WorkflowRunGraphCandidateReference::from_edit(&edit).map_err(|_| denied())?
         != reference
     {
@@ -31845,6 +31943,17 @@ impl bcode_workflow_store::AsyncAttemptStatusObserver for WorkflowTurnReceiptObs
                 .and_then(serde_json::Value::as_str)
                 == Some("bcode.server.workflow-child/v1")
             {
+                if let Some(observation) =
+                    Box::pin(workflow_representation::child::observe(self.state, request))
+                        .await
+                        .map_err(|_| {
+                            WorkflowStoreError::InvalidData(
+                                "child workflow observation unavailable".into(),
+                            )
+                        })?
+                {
+                    return Ok(observation);
+                }
                 // Scope the blocking guard so it cannot be held across a later await point.
                 let observation = {
                     let store = self
@@ -32114,21 +32223,19 @@ fn workflow_session_has_foreign_owner(state: &ServerState, session_id: SessionId
     })
 }
 
-fn verify_workflow_observation_session(
+async fn verify_workflow_observation_session(
     state: &ServerState,
     session_id: SessionId,
     request: &bcode_workflow_store::AttemptReconciliationRequest,
 ) -> Result<(), WorkflowStoreError> {
-    let link = state
-        .workflow_store
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .execution_session_link(
-            &request.run_id,
-            &request.node_id,
-            &request.activation_id,
-            request.attempt,
-        )?;
+    let link = workflow_representation::owner::execution_session_link(
+        state,
+        &request.run_id,
+        &request.node_id,
+        &request.activation_id,
+        request.attempt,
+    )
+    .await?;
     if link.is_some_and(|link| link.session_id != session_id.to_string()) {
         return Err(WorkflowStoreError::InvalidData(
             "workflow receipt session does not match its durable execution link".into(),
@@ -32145,7 +32252,7 @@ async fn observe_workflow_turn(
     output_schema_id: &str,
     request: &bcode_workflow_store::AttemptReconciliationRequest,
 ) -> Result<bcode_workflow_store::AttemptObservation, WorkflowStoreError> {
-    verify_workflow_observation_session(state, session_id, request)?;
+    verify_workflow_observation_session(state, session_id, request).await?;
     let Ok(events) = state
         .sessions
         .session_turn_evidence(session_id, turn_id)
@@ -32219,11 +32326,12 @@ async fn observe_workflow_turn(
     };
     match outcome {
         ModelTurnOutcome::Completed => {
-            let intent = state
-                .workflow_store
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .dispatch_intent(&request.dispatch_identity)?;
+            let intent = workflow_representation::owner::dispatch_intent(
+                state,
+                &request.run_id,
+                &request.dispatch_identity,
+            )
+            .await?;
             let configuration =
                 workflow_prompt_configuration(intent.get("configuration").ok_or_else(|| {
                     WorkflowStoreError::InvalidData(
@@ -32303,20 +32411,13 @@ async fn observe_workflow_turn(
             })
         }
         ModelTurnOutcome::Cancelled => {
-            let run = state
-                .workflow_store
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .run_summary(&request.run_id)?
-                .ok_or_else(|| {
-                    WorkflowStoreError::InvalidData("workflow run not found".to_string())
-                })?;
-            let publication_cancelled = state
-                .workflow_store
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .has_publication_cancellation_intent(&request.run_id, &request.dispatch_identity)?;
-            if run.cancellation_requested_at_ms.is_some() || publication_cancelled {
+            if workflow_representation::owner::cancellation_intended(
+                state,
+                &request.run_id,
+                &request.dispatch_identity,
+            )
+            .await?
+            {
                 Ok(bcode_workflow_store::AttemptObservation::Cancelled)
             } else {
                 Ok(bcode_workflow_store::AttemptObservation::Paused {
@@ -32666,13 +32767,16 @@ impl WorkflowActivationOwner<'_> {
             )));
         }
         let owner_input = workflow_plugin_block_input_from_activation(activation, &block)?;
-        let run = self
-            .state
-            .workflow_store
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .run_summary(&activation.run_id)?
-            .ok_or_else(|| WorkflowStoreError::InvalidData("workflow run not found".to_string()))?;
+        let represented = workflow_representation::plugin::check_supported(
+            self.state,
+            &activation.run_id,
+            &block,
+        )
+        .await?;
+        let run = workflow_representation::status(self.state, &activation.run_id)
+            .await
+            .map_err(|_| WorkflowStoreError::InvalidData("workflow run status unavailable".into()))?
+            .ok_or_else(|| WorkflowStoreError::InvalidData("workflow run not found".into()))?;
         let parent_session_id = run
             .parent_session_id
             .as_deref()
@@ -32779,20 +32883,21 @@ impl WorkflowActivationOwner<'_> {
         } else {
             None
         };
-        let awaiting_authorization = self
-            .state
-            .workflow_store
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .pending_mutation_approvals(&activation.run_id, 1_000)?
-            .into_iter()
-            .any(|approval| {
-                approval.node_id == activation.node_id
-                    && approval.activation_id == activation.activation_id
-                    && expected_scope
-                        .as_ref()
-                        .is_some_and(|scope| &approval.scope == scope)
-            });
+        let awaiting_authorization = !represented
+            && self
+                .state
+                .workflow_store
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .pending_mutation_approvals(&activation.run_id, 1_000)?
+                .into_iter()
+                .any(|approval| {
+                    approval.node_id == activation.node_id
+                        && approval.activation_id == activation.activation_id
+                        && expected_scope
+                            .as_ref()
+                            .is_some_and(|scope| &approval.scope == scope)
+                });
         if awaiting_authorization {
             return Ok(WorkflowPluginBlockPlan::AwaitingAuthorization);
         }
@@ -32935,6 +33040,14 @@ async fn dispatch_workflow_child(
     state: &Arc<ServerState>,
     request: &bcode_workflow_store::PreparedActivationDispatch,
 ) -> Result<serde_json::Value, WorkflowStoreError> {
+    if let Some(receipt) = Box::pin(workflow_representation::child::dispatch(state, request))
+        .await
+        .map_err(|_| {
+            WorkflowStoreError::InvalidData("child workflow admission unavailable".into())
+        })?
+    {
+        return Ok(receipt);
+    }
     let configuration: bcode_workflow::WorkflowCallConfiguration =
         serde_json::from_value(request.activation.node.configuration.clone())?;
     configuration
@@ -33224,12 +33337,22 @@ async fn dispatch_workflow_plugin_block(
             "workflow block invocation is missing its persisted owner preparation".to_string(),
         ));
     }
-    let run = state
-        .workflow_store
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .run_summary(&request.activation.run_id)?
-        .ok_or_else(|| WorkflowStoreError::InvalidData("workflow run not found".to_string()))?;
+    workflow_representation::plugin::check_supported(state, &request.activation.run_id, &block)
+        .await?;
+    let guard = workflow_operations::execution_authority(state, &request.activation.run_id)
+        .await
+        .map_err(|_| WorkflowStoreError::InvalidData("workflow authority unavailable".into()))?
+        .ok_or_else(|| WorkflowStoreError::InvalidData("workflow authority required".into()))?;
+    if let Some(receipt) =
+        workflow_representation::owner::check_owner_admission(state, request, &guard.authority)
+            .await?
+    {
+        return Ok(receipt);
+    }
+    let run = workflow_representation::status(state, &request.activation.run_id)
+        .await
+        .map_err(|_| WorkflowStoreError::InvalidData("workflow run status unavailable".into()))?
+        .ok_or_else(|| WorkflowStoreError::InvalidData("workflow run not found".into()))?;
     let parent_session_id = run
         .parent_session_id
         .as_deref()
@@ -33503,11 +33626,14 @@ async fn workflow_child_session_for_activation(
     activation_id: &str,
     attempt: u32,
 ) -> Result<Option<bcode_session_models::SessionSummary>, WorkflowStoreError> {
-    let link = state
-        .workflow_store
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .execution_session_link(run_id, node_id, activation_id, attempt)?;
+    let link = workflow_representation::owner::execution_session_link(
+        state,
+        run_id,
+        node_id,
+        activation_id,
+        attempt,
+    )
+    .await?;
     if let Some(link) = link {
         let session_id = SessionId::from_str(&link.session_id)
             .map_err(|error| WorkflowStoreError::InvalidData(error.to_string()))?;
@@ -33621,28 +33747,23 @@ async fn settle_workflow_prompt_observation(
     receipt: &serde_json::Value,
     observation: bcode_workflow_store::AttemptObservation,
 ) {
-    let store_path = state
-        .workflow_store
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .path()
-        .to_path_buf();
-    if bcode_workflow_store::WorkflowStore::open_at_path(&store_path)
-        .and_then(|store| {
-            store.persist_owned_dispatch_receipt(
-                &bcode_workflow_store::DispatchReceipt {
-                    run_id: request.activation.run_id.clone(),
-                    node_id: request.activation.node_id.clone(),
-                    activation_id: request.activation.activation_id.clone(),
-                    attempt: request.attempt,
-                    dispatch_identity: request.dispatch_identity.clone(),
-                    receipt: receipt.clone(),
-                    admitted_at_ms: current_unix_millis(),
-                },
-                authority,
-            )
-        })
-        .is_err()
+    let completion_gate = workflow_drive_gate(state, &request.activation.run_id);
+    let completion_guard = completion_gate.lock().await;
+    if workflow_representation::owner::persist_receipt(
+        state,
+        &bcode_workflow_store::DispatchReceipt {
+            run_id: request.activation.run_id.clone(),
+            node_id: request.activation.node_id.clone(),
+            activation_id: request.activation.activation_id.clone(),
+            attempt: request.attempt,
+            dispatch_identity: request.dispatch_identity.clone(),
+            receipt: receipt.clone(),
+            admitted_at_ms: current_unix_millis(),
+        },
+        authority,
+    )
+    .await
+    .is_err()
     {
         tracing::warn!(
             run_id = %request.activation.run_id,
@@ -33650,15 +33771,13 @@ async fn settle_workflow_prompt_observation(
         );
         return;
     }
-    match persist_workflow_prompt_completion(
-        &store_path,
-        &request.dispatch_identity,
-        authority,
-        observation,
-    )
-    .await
+    match workflow_representation::owner::settle_observation(state, request, authority, observation)
+        .await
     {
         Ok(summary) => {
+            // Settlement and page driving share the per-run gate. Release it before
+            // scheduling successors so the continuation can acquire the same gate.
+            drop(completion_guard);
             if let Err(error) =
                 propagate_fail_fast_sibling_cancellation(state, summary.sibling_cancellations).await
             {
@@ -33978,11 +34097,9 @@ async fn dispatch_workflow_prompt_turn_after_admission(
                 )
             })?;
     let dispatch_authority = dispatch_guard.authority.clone();
-    let existing_receipt = state
-        .workflow_store
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .check_owner_admission(request, &dispatch_authority)?;
+    let existing_receipt =
+        workflow_representation::owner::check_owner_admission(state, request, &dispatch_authority)
+            .await?;
     if let Some(receipt) = existing_receipt {
         return Ok(receipt);
     }
@@ -33996,12 +34113,13 @@ async fn dispatch_workflow_prompt_turn_after_admission(
         &workflow_skill_catalog_instruction(state),
         input,
     )?;
-    let run = state
-        .workflow_store
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .run_summary(&request.activation.run_id)?
-        .ok_or_else(|| WorkflowStoreError::InvalidData("workflow run not found".to_string()))?;
+    let run = Box::pin(workflow_representation::status(
+        state,
+        &request.activation.run_id,
+    ))
+    .await
+    .map_err(|_| WorkflowStoreError::InvalidData("workflow run status unavailable".into()))?
+    .ok_or_else(|| WorkflowStoreError::InvalidData("workflow run not found".to_string()))?;
     let parent_session_id = run
         .parent_session_id
         .as_deref()
@@ -34135,21 +34253,20 @@ async fn dispatch_workflow_prompt_turn_after_admission(
                     }
                     .map_err(|error| WorkflowStoreError::InvalidData(error.to_string()))?,
                 };
-                state
-                    .workflow_store
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .link_execution_session(
-                        &bcode_workflow_store::WorkflowExecutionSessionLink::new(
-                            request.activation.run_id.clone(),
-                            request.activation.node_id.clone(),
-                            request.activation.activation_id.clone(),
-                            request.attempt,
-                            child.id.to_string(),
-                            run.workspace_snapshot.clone(),
-                            current_unix_millis(),
-                        ),
-                    )?;
+                workflow_representation::owner::link_execution_session(
+                    state,
+                    &dispatch_authority,
+                    &bcode_workflow_store::WorkflowExecutionSessionLink::new(
+                        request.activation.run_id.clone(),
+                        request.activation.node_id.clone(),
+                        request.activation.activation_id.clone(),
+                        request.attempt,
+                        child.id.to_string(),
+                        run.workspace_snapshot.clone(),
+                        current_unix_millis(),
+                    ),
+                )
+                .await?;
                 child
             };
             (child.id, None)
@@ -34230,6 +34347,7 @@ async fn dispatch_workflow_prompt_turn_after_admission(
             ..TurnExecutionOptions::default()
         },
     };
+    let admission_started_at_ms = current_unix_millis();
     let submitted = tokio::time::timeout(
         Duration::from_millis(configuration.timeout_ms),
         submit_session_model_turn_with_admission(
@@ -34269,22 +34387,20 @@ async fn dispatch_workflow_prompt_turn_after_admission(
         "accepted_event_sequence": receipt.accepted_event_sequence,
         "output_schema_id": request.activation.node.output.type_name,
     });
-    let receipt_commit = state
-        .workflow_store
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .persist_owned_dispatch_receipt(
-            &bcode_workflow_store::DispatchReceipt {
-                run_id: request.activation.run_id.clone(),
-                node_id: request.activation.node_id.clone(),
-                activation_id: request.activation.activation_id.clone(),
-                attempt: request.attempt,
-                dispatch_identity: request.dispatch_identity.clone(),
-                receipt: owner_receipt.clone(),
-                admitted_at_ms: current_unix_millis(),
-            },
-            &dispatch_authority,
-        );
+    let receipt_commit = workflow_representation::owner::persist_receipt(
+        state,
+        &bcode_workflow_store::DispatchReceipt {
+            run_id: request.activation.run_id.clone(),
+            node_id: request.activation.node_id.clone(),
+            activation_id: request.activation.activation_id.clone(),
+            attempt: request.attempt,
+            dispatch_identity: request.dispatch_identity.clone(),
+            receipt: owner_receipt.clone(),
+            admitted_at_ms: admission_started_at_ms,
+        },
+        &dispatch_authority,
+    )
+    .await;
     // Admission has already committed in the session domain. Even when its workflow
     // receipt write fails, keep observing the admitted turn and retain its shared permit.
     // The caller still receives the persistence failure; observation cannot bypass fencing.
@@ -34304,11 +34420,13 @@ async fn dispatch_workflow_prompt_turn_after_admission(
                 ),
             };
             drop(shared_permit);
-            let observation = match workflow_attempt_observation_from_completion(
+            let observation = match workflow_representation::owner::completion_observation(
                 &state_for_completion,
                 &request_for_completion,
                 completion,
-            ) {
+            )
+            .await
+            {
                 Ok(observation) => observation,
                 Err(error) => {
                     finish_registered_runtime_work(
@@ -62550,7 +62668,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
     }
 
     #[allow(clippy::too_many_arguments)]
-    async fn invoke_prepared_tool_for_test(
+    pub async fn invoke_prepared_tool_for_test(
         state: &ServerState,
         session_id: SessionId,
         call: &bcode_model::ToolCall,
@@ -68900,7 +69018,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
     /// is unavailable. Only tests that start workflows need it: loading the agents plugin makes
     /// agent nodes resolve real profiles and dispatch turns, which changes behaviour for tests that
     /// drive node execution themselves.
-    fn test_server_state_with_workflow_authorization(
+    pub fn test_server_state_with_workflow_authorization(
         sessions: SessionManager,
         workflow_store: bcode_workflow_store::WorkflowStore,
     ) -> ServerState {
@@ -69041,6 +69159,10 @@ event_symbol = "bcode_plugin_handle_event_v1"
         .expect("load Jev");
         let mut state = test_server_state(SessionManager::default());
         state.plugins = plugins;
+        // An explicit context excludes the user's runtime auth registry. Otherwise
+        // a persisted Jev account turns this unconfigured fixture into a live account.
+        state.startup_config.active_context = Some("judgement-unconfigured-fixture".into());
+        state.startup_config.auth.profiles.clear();
         let catalog = judgement::setup_catalog(&state).await;
         let jev = catalog
             .providers
@@ -69118,8 +69240,14 @@ event_symbol = "bcode_plugin_handle_event_v1"
         .expect("load Jev");
         let mut server_state = test_server_state(SessionManager::default());
         server_state.plugins = plugins;
+        // Restrict setup discovery to this fixture's explicit account, not the
+        // user's runtime profiles (whose first account could select a live URL).
+        server_state.startup_config.active_context = Some("judgement-loopback-fixture".into());
+        server_state.startup_config.auth.profiles.clear();
+        let profile = bcode_config::contexts::qualify("judgement-loopback-fixture", "jev-fixture")
+            .expect("fixture profile namespace");
         server_state.startup_config.auth.profiles.insert(
-            "jev-fixture".into(),
+            profile.clone(),
             bcode_config::AuthProfileConfig {
                 backend: "aws".into(),
                 owner_plugin_id: Some("bcode.jev".into()),
@@ -69156,7 +69284,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
             .find(|provider| provider.plugin_id == "bcode.jev")
             .expect("enabled Jev");
         assert_eq!(jev.auth_provider_id, "jev");
-        assert!(jev.profiles.contains(&"jev-fixture".into()));
+        assert_eq!(jev.profiles, vec![profile.clone()]);
         assert!(jev.models.iter().any(|model| {
             model.model_id == "jev-1"
                 && model
@@ -69166,7 +69294,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
         let selection = bcode_model::judgement::SetupSelection {
             provider_plugin_id: "bcode.jev".into(),
             model_id: "jev-1".into(),
-            auth_profile: "jev-fixture".into(),
+            auth_profile: profile.clone(),
         };
         assert!(client.validate_judgement_setup(&selection).await.unwrap());
         let mut missing = selection;
@@ -69175,7 +69303,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
         let result = client
             .judge(
                 "bcode.jev".into(),
-                "jev-fixture".into(),
+                profile,
                 bcode_model::judgement::Request {
                     model_id: "jev-1".into(),
                     state: bcode_model::judgement::State::Text("example".into()),
@@ -74240,7 +74368,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
                 binding: None,
                 authored_provenance: None,
                 input: Some(serde_json::json!({"delay_ms": 5_000})),
-                execution_authority: None,
+                execution_authority: Some(test_workflow_execution_authority()),
                 created_at_ms: 1,
                 authorization_profile: bcode_workflow::WorkflowAuthorizationProfileIdentity {
                     version: 1,
@@ -80823,14 +80951,19 @@ event_symbol = "bcode_plugin_handle_event_v1"
         }
         tokio::time::timeout(Duration::from_secs(15), async {
             loop {
-                let complete = {
-                    let store = states[0].workflow_store.lock().unwrap();
-                    ["baseline-run-0", "baseline-run-1"].iter().all(|id| {
-                        store.run_summary(id).unwrap().is_some_and(|run| {
-                            run.status == bcode_workflow_store::RunStatus::Completed
-                        })
-                    })
-                };
+                let mut complete = true;
+                for id in ["baseline-run-0", "baseline-run-1"] {
+                    complete &= bcode_workflow::WorkflowRunApplication::workflow_run_status(
+                        &workflow_operations::WorkflowAuthoringApplication::new(
+                            &states[0],
+                            ClientId::new(),
+                        ),
+                        id.into(),
+                    )
+                    .await
+                    .unwrap()
+                    .is_some_and(|run| run.status == bcode_workflow_store::RunStatus::Completed);
+                }
                 if complete {
                     break;
                 }
@@ -88381,6 +88514,44 @@ event_symbol = "bcode_plugin_handle_event_v1"
         drop(state);
     }
 
+    fn repeated_tool_compaction_context() -> bcode_model::ProviderRequestContext {
+        bcode_model::ProviderRequestContext {
+            settings: BTreeMap::from([
+                (
+                    "model_metadata.fake-echo.context_window".to_owned(),
+                    "16000".to_owned(),
+                ),
+                ("fake_tool_rounds".to_owned(), "5".to_owned()),
+                (
+                    "fake_event_scripts_by_prompt_marker".to_owned(),
+                    serde_json::to_string(&BTreeMap::from([(
+                        "Compact this Bcode session transcript".to_owned(),
+                        bcode_fake_provider_plugin::FakeProviderEventScript {
+                            steps: vec![
+                                bcode_fake_provider_plugin::FakeProviderEventScriptStep {
+                                    gate: None,
+                                    delay_ms: None,
+                                    event: ProviderTurnEvent::TextDelta {
+                                        text: "Historical fixture exchanges completed; continue the active tool turn.".to_owned(),
+                                    },
+                                },
+                                bcode_fake_provider_plugin::FakeProviderEventScriptStep {
+                                    gate: None,
+                                    delay_ms: None,
+                                    event: ProviderTurnEvent::TurnFinished {
+                                        stop_reason: bcode_model::StopReason::EndTurn,
+                                    },
+                                },
+                            ],
+                        },
+                    )]))
+                    .expect("bounded deterministic compaction summary"),
+                ),
+            ]),
+            ..bcode_model::ProviderRequestContext::default()
+        }
+    }
+
     #[tokio::test]
     async fn repeated_tool_rounds_do_not_recompact_an_unchanged_boundary() {
         let temp_dir = tempfile::tempdir().expect("temp dir");
@@ -88393,14 +88564,23 @@ event_symbol = "bcode_plugin_handle_event_v1"
             .await
             .expect("session")
             .id;
-        append_test_history(&sessions, session_id, 12, 1_000).await;
+        // Force compaction from history, not the size of the evolving bundled tool catalog.
+        append_test_history(&sessions, session_id, 12, 4_000).await;
         let trigger = sessions
             .append_event(
                 session_id,
                 SessionEventKind::UserMessage {
                     client_id: ClientId::new(),
                     text: "run repeated fake tools".to_owned(),
-                    admission: bcode_session_models::TurnAdmissionMetadata::default(),
+                    admission: bcode_session_models::TurnAdmissionMetadata {
+                        execution: bcode_session_models::TurnExecutionOptions {
+                            // The fake provider emits missing-tool calls deliberately. No real
+                            // tool schemas are needed to exercise the five result/continuation rounds.
+                            tool_allowlist: Some(Vec::new()),
+                            ..bcode_session_models::TurnExecutionOptions::default()
+                        },
+                        ..bcode_session_models::TurnAdmissionMetadata::default()
+                    },
                 },
             )
             .await
@@ -88408,16 +88588,9 @@ event_symbol = "bcode_plugin_handle_event_v1"
         let mut state = test_server_state_with_fake_provider(sessions);
         state.startup_config.model.compaction.mode = bcode_config::CompactionMode::Proactive;
         state.startup_config.model.compaction.keep_recent_tokens = 1;
-        let provider_context = bcode_model::ProviderRequestContext {
-            settings: BTreeMap::from([
-                (
-                    "model_metadata.fake-echo.context_window".to_owned(),
-                    "16000".to_owned(),
-                ),
-                ("fake_tool_rounds".to_owned(), "5".to_owned()),
-            ]),
-            ..bcode_model::ProviderRequestContext::default()
-        };
+        // fake-echo otherwise repeats the entire compaction transcript rather than summarizing
+        // it. Pin only the compaction response; ordinary missing-tool rounds remain unscripted.
+        let provider_context = repeated_tool_compaction_context();
         let selection = SessionModelSelection {
             provider_plugin_id: Some("bcode.fake-provider".to_owned()),
             model_id: Some("fake-echo".to_owned()),
@@ -88452,6 +88625,11 @@ event_symbol = "bcode_plugin_handle_event_v1"
             .session_history(session_id)
             .await
             .expect("history");
+        assert!(history.iter().any(|event| matches!(
+            &event.kind,
+            SessionEventKind::ContextCompacted { summary, .. }
+                if summary == "Historical fixture exchanges completed; continue the active tool turn."
+        )), "compaction must use the bounded fixture summary, not echo its transcript");
         assert_eq!(
             history
                 .iter()

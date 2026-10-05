@@ -4,13 +4,18 @@
 
 //! Portable, renderer-neutral workflow projection contracts.
 
+mod basic_catalog;
+pub use basic_catalog::*;
+mod identity_catalog;
+pub use identity_catalog::*;
+
 mod scheduling;
 pub use scheduling::*;
 
 use serde::{Deserialize, Serialize};
 
 /// Current workflow projection schema version.
-pub const WORKFLOW_VIEW_VERSION: u32 = 6;
+pub const WORKFLOW_VIEW_VERSION: u32 = 10;
 
 /// Current workflow live-event contract version.
 pub const WORKFLOW_LIVE_EVENT_VERSION: u32 = 1;
@@ -180,6 +185,9 @@ pub struct WorkflowCatalogRequest {
 pub struct WorkflowCatalogView {
     /// Projection schema version.
     pub version: u32,
+    /// Explicit reduced-query semantics for mixed-family basic discovery.
+    #[serde(default)]
+    pub basic_discovery: Option<WorkflowBasicCatalogAvailability>,
     /// Runs ordered by the application catalog query.
     pub runs: Vec<WorkflowRunListItem>,
     /// Cursor for the next deterministic page.
@@ -946,6 +954,7 @@ mod live_event_tests {
     #[test]
     fn projection_versions_fail_closed() {
         let catalog = WorkflowCatalogView {
+            basic_discovery: None,
             version: WORKFLOW_VIEW_VERSION + 1,
             runs: Vec::new(),
             next_cursor: None,

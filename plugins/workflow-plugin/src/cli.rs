@@ -34,6 +34,12 @@ struct WorkflowCli {
     /// Maximum nodes and edges returned by `graph`.
     #[arg(long)]
     limit: Option<usize>,
+    /// Exact opaque continuation token returned by `scheduling-page` (never a display ID).
+    #[arg(long)]
+    cursor: Option<String>,
+    /// Exact exclusive run identity returned by `identity-catalog` as `next_after`.
+    #[arg(long)]
+    after: Option<String>,
     /// Exact positive definition version.
     #[arg(long)]
     version: Option<u32>,
@@ -172,6 +178,8 @@ fn invoke(matches: clap::ArgMatches) -> StaticCliFuture {
                 "expected_revision",
                 cli.expected_revision.map(|value| value.to_string()),
             ),
+            ("after", cli.after),
+            ("cursor", cli.cursor),
             ("after_node_id", cli.after_node_id),
             (
                 "after_edge_id",

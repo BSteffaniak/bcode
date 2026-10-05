@@ -257,6 +257,8 @@ impl PluginTuiSurfaceFactory for WorkflowStatusFactory {
                 launch_workspace: request.repo_path,
                 parent_session_id: request.session_id,
                 launch_catalog_updates: None,
+                scheduling_origin: None,
+                scheduling_updates: None,
                 updates: None,
                 catalog: None,
                 runs: std::collections::BTreeMap::new(),
@@ -713,6 +715,17 @@ struct WorkflowStatusSurface {
         tokio::sync::mpsc::Receiver<
             Result<
                 bcode_workflow::WorkflowLaunchCatalogPage,
+                bcode_plugin_sdk::tui::PluginTuiHostError,
+            >,
+        >,
+    >,
+    scheduling_origin: Option<(String, bcode_workflow_view_models::WorkflowSchedulingView)>,
+    scheduling_updates: Option<
+        tokio::sync::mpsc::Receiver<
+            Result<
+                bcode_workflow::WorkflowSchedulingPage<
+                    bcode_workflow_view_models::WorkflowSchedulingView,
+                >,
                 bcode_plugin_sdk::tui::PluginTuiHostError,
             >,
         >,
@@ -1596,6 +1609,7 @@ impl WorkflowStatusSurface {
             KeyHint::new("[/]", "section"),
             KeyHint::new("/", "search"),
             KeyHint::new("f/s/g", "filter/sort/group"),
+            KeyHint::new("N", "next scheduling page"),
             KeyHint::new("m", "more"),
         ];
         if footer.width >= 120 {
@@ -1794,7 +1808,11 @@ impl WorkflowStatusSurface {
             .runs
             .iter()
             .map(|run| {
-                let group = match catalog.group {
+                let group = match if catalog.basic_discovery.is_some() {
+                    bcode_workflow_view_models::WorkflowCatalogGroup::None
+                } else {
+                    catalog.group
+                } {
                     bcode_workflow_view_models::WorkflowCatalogGroup::None => String::new(),
                     bcode_workflow_view_models::WorkflowCatalogGroup::AuthoredWorkflow => {
                         run.authored_source.as_ref().map_or_else(
@@ -2850,6 +2868,44 @@ impl WorkflowStatusSurface {
         PluginTuiAction::None
     }
 
+    fn request_scheduling_page(&mut self, host: &dyn PluginTuiHost) -> PluginTuiAction {
+        if self.scheduling_updates.is_some() {
+            return PluginTuiAction::None;
+        }
+        let Some(run) = self.selected_run_view() else {
+            return PluginTuiAction::None;
+        };
+        let Some(cursor) = run
+            .scheduling
+            .as_ref()
+            .and_then(|page| page.next_cursor.clone())
+        else {
+            self.live_status = "No next scheduling page; refresh to restart observation".into();
+            return PluginTuiAction::Redraw;
+        };
+        let request = bcode_workflow::WorkflowSchedulingPageRequest {
+            version: bcode_workflow::WORKFLOW_SCHEDULING_PAGE_VERSION,
+            run_id: run.run.run_id.clone(),
+            limit: 100,
+            cursor: Some(cursor),
+        };
+        self.scheduling_origin = run
+            .scheduling
+            .clone()
+            .map(|page| (run.run.run_id.clone(), page));
+        let (sender, receiver) = tokio::sync::mpsc::channel(1);
+        self.scheduling_updates = Some(receiver);
+        let future = host.workflow_scheduling_page(request);
+        host.spawn(Box::pin(async move {
+            tokio::select! {
+                () = sender.closed() => {},
+                result = future => { let _ = sender.send(result).await; }
+            }
+        }));
+        self.live_status = "Loading next scheduling page".into();
+        PluginTuiAction::Redraw
+    }
+
     fn request_launch_catalog(
         &mut self,
         host: &dyn PluginTuiHost,
@@ -3703,6 +3759,9 @@ impl WorkflowStatusSurface {
                     search: catalog.search.clone(),
                 }
             }
+            KeyCode::Char('N') => host.map_or(PluginTuiAction::None, |host| {
+                self.request_scheduling_page(host)
+            }),
             KeyCode::Char('m') => self
                 .catalog
                 .as_ref()
@@ -4478,6 +4537,45 @@ impl PluginTuiSurface for WorkflowStatusSurface {
 
     #[allow(clippy::too_many_lines)]
     fn poll(&mut self, host: &dyn PluginTuiHost) -> PluginTuiAction {
+        if let Some(receiver) = self.scheduling_updates.as_mut()
+            && let Ok(result) = receiver.try_recv()
+        {
+            self.scheduling_updates = None;
+            let origin = self.scheduling_origin.take();
+            let current = origin.as_ref().is_some_and(|(run_id, observed)| {
+                self.selected_run_id.as_ref() == Some(run_id)
+                    && self
+                        .runs
+                        .get(run_id)
+                        .and_then(|run| run.scheduling.as_ref())
+                        == Some(observed)
+            });
+            if !current {
+                self.live_status =
+                    "Discarded stale scheduling completion; selection or observation changed"
+                        .into();
+                return PluginTuiAction::Redraw;
+            }
+            self.live_status = match result {
+                Ok(page) => match self.runs.get_mut(&page.run_id) {
+                    Some(run) => {
+                        let revision = run
+                            .scheduling
+                            .as_ref()
+                            .map(|current| current.graph_revision);
+                        match bcode_workflow_view::apply_scheduling_page(run, page, revision) {
+                            Ok(()) => "Scheduling page replaced; N next page".into(),
+                            Err(error) => {
+                                format!("Scheduling page rejected: {error}; refresh to restart")
+                            }
+                        }
+                    }
+                    None => "Scheduling target no longer observed; refresh to restart".into(),
+                },
+                Err(error) => format!("Scheduling page unavailable: {error}; refresh to restart"),
+            };
+            return PluginTuiAction::Redraw;
+        }
         let session_changed = self.reconcile_session_subscription(host);
         let activity_changed = self.poll_session_activity();
         if session_changed || activity_changed {
@@ -4640,8 +4738,8 @@ impl PluginTuiSurface for WorkflowStatusSurface {
                     self.catalog_loading = false;
                     self.catalog_stale = false;
                     self.catalog_error = None;
+                    self.live_status = catalog.basic_discovery.as_ref().map_or_else(|| "live".to_string(), |basic| format!("Basic run-ID discovery: requested filters/sort/search not applied; progress/ancestry unknown; legacy {:?}, new {:?}; {} unavailable identities", basic.legacy, basic.version2, basic.unavailable_run_ids.len()));
                     self.catalog = Some(catalog);
-                    self.live_status = "live".to_string();
                 }
                 PluginTuiSurfaceUpdate::WorkflowCatalogPage(page) => {
                     if let Err(error) = page.validate_version() {
@@ -4667,6 +4765,7 @@ impl PluginTuiSurface for WorkflowStatusSurface {
                         catalog.runs.extend(additions);
                         catalog.next_cursor = page.next_cursor;
                         catalog.has_more = page.has_more;
+                        catalog.basic_discovery = page.basic_discovery;
                     }
                     self.catalog_loading = false;
                     self.catalog_stale = false;
@@ -6276,6 +6375,18 @@ fn selected_node_detail_lines(
         Span::styled(format!(" · {}", detail.key.node_id), theme.focused),
         Span::styled(format!(" · {:?}", detail.availability), theme.text),
     ])];
+    if let Some(scheduling) = &run.scheduling {
+        lines.extend(
+            scheduling
+                .selected_activation_lines(&key.node_id, key.activation_id.as_deref())
+                .into_iter()
+                .map(Line::from),
+        );
+    } else {
+        lines.push(Line::from(
+            "Scheduling observations unavailable for this selection",
+        ));
+    }
     if let Some(node) = &detail.node {
         lines.push(Line::from(format!("{:?} · {:?}", node.kind, node.status)));
     }
@@ -6350,23 +6461,35 @@ fn inspector_overview_lines(run: &bcode_workflow_view_models::WorkflowRunView) -
             "Created: {} · Updated: {}",
             run.run.created_at_ms, run.run.updated_at_ms
         )),
-        Line::from(format!(
-            "Progress: {}/{} completed · {} active · {} blocked · {} failed",
-            run.run.progress.completed,
-            run.run.progress.total_nodes,
-            run.run.progress.active,
-            run.run.progress.blocked,
-            run.run.progress.failed
-        )),
+        Line::from(
+            if run.health == bcode_workflow_view_models::WorkflowProjectionHealth::Current {
+                format!(
+                    "Progress: {}/{} completed · {} active · {} blocked · {} failed",
+                    run.run.progress.completed,
+                    run.run.progress.total_nodes,
+                    run.run.progress.active,
+                    run.run.progress.blocked,
+                    run.run.progress.failed
+                )
+            } else {
+                "Progress totals unavailable in this degraded observation".into()
+            },
+        ),
         Line::from(format!(
             "Definition: {} v{}",
             run.run.definition_id, run.run.definition_version
         )),
-        Line::from(format!(
-            "Parent: {} · descendants: {}",
-            run.run.parent_run_id.as_deref().unwrap_or("root"),
-            run.run.descendant_count
-        )),
+        Line::from(
+            if run.health == bcode_workflow_view_models::WorkflowProjectionHealth::Current {
+                format!(
+                    "Parent: {} · descendants: {}",
+                    run.run.parent_run_id.as_deref().unwrap_or("root"),
+                    run.run.descendant_count
+                )
+            } else {
+                "Ancestry totals unavailable in this degraded observation".into()
+            },
+        ),
         Line::from(format!("Health: {:?}", run.health)),
     ];
     if let Some(terminal) = &run.terminal {
@@ -6909,6 +7032,38 @@ fn surface_lines(options: &serde_json::Value, selected_approval: usize) -> Vec<S
         .and_then(serde_json::Value::as_str)
         .unwrap_or("workflow.status");
     let mut lines = vec![format!("Workflow · {command}"), String::new()];
+    if let Some(value) = options.get("identity_catalog") {
+        match serde_json::from_value::<bcode_workflow_view_models::WorkflowIdentityCatalogPage>(
+            value.clone(),
+        ) {
+            Ok(page)
+                if page.version
+                    == bcode_workflow_view_models::WORKFLOW_IDENTITY_CATALOG_VERSION =>
+            {
+                lines.push(format!(
+                    "Identity discovery only · legacy {:?} · version2 {:?}",
+                    page.legacy, page.version2
+                ));
+                lines.push("No rich filters, status or execution authority inferred.".into());
+                lines.extend(
+                    page.entries
+                        .iter()
+                        .take(100)
+                        .map(|entry| format!("{} · {:?}", entry.run_id, entry.membership)),
+                );
+                if let Some(after) = page.next_after {
+                    lines.push(format!(
+                        "Next page: /workflow identity-catalog limit=100 after={after}"
+                    ));
+                }
+                lines.push(
+                    "An exhausted page does not establish completeness when a family is degraded."
+                        .into(),
+                );
+            }
+            _ => lines.push("Unsupported or malformed identity catalog response".into()),
+        }
+    }
     if let Some(definitions) = options
         .get("definitions")
         .and_then(serde_json::Value::as_array)
@@ -7855,8 +8010,11 @@ mod tests {
             launch_workspace: None,
             parent_session_id: None,
             launch_catalog_updates: None,
+            scheduling_origin: None,
+            scheduling_updates: None,
             updates: None,
             catalog: Some(bcode_workflow_view_models::WorkflowCatalogView {
+                basic_discovery: None,
                 version: bcode_workflow_view_models::WORKFLOW_VIEW_VERSION,
                 runs: vec![run.run.clone()],
                 next_cursor: None,
@@ -10398,6 +10556,96 @@ mod tests {
             .expect("disconnect update");
         assert_eq!(surface.poll(&TestHost), PluginTuiAction::Redraw);
         assert!(surface.live_status.contains("offline"));
+    }
+
+    #[test]
+    fn scheduling_completion_replaces_page_and_rejects_revision_change() {
+        let mut surface = projected_surface();
+        let run_id = surface.runs.keys().next().unwrap().clone();
+        let observation = bcode_workflow_view_models::WorkflowSchedulingView {
+            graph_revision: 3,
+            observed_at_ms: 42,
+            policy: None,
+            activations: vec![],
+            has_more: false,
+            details_truncated: false,
+            next_cursor: None,
+        };
+        surface.runs.get_mut(&run_id).unwrap().scheduling = Some(observation.clone());
+        surface.selected_run_id = Some(run_id.clone());
+        surface.scheduling_origin = Some((run_id.clone(), observation.clone()));
+        let (sender, receiver) = tokio::sync::mpsc::channel(1);
+        surface.scheduling_updates = Some(receiver);
+        let mut page = bcode_workflow::WorkflowSchedulingPage {
+            version: 1,
+            run_id: run_id.clone(),
+            graph_revision: 3,
+            observation,
+            next_cursor: None,
+        };
+        page.observation.observed_at_ms = 43;
+        sender.try_send(Ok(page.clone())).unwrap();
+        assert_eq!(surface.poll(&TestHost), PluginTuiAction::Redraw);
+        assert_eq!(
+            surface.runs[&run_id]
+                .scheduling
+                .as_ref()
+                .unwrap()
+                .observed_at_ms,
+            43
+        );
+        let (sender, receiver) = tokio::sync::mpsc::channel(1);
+        surface.scheduling_updates = Some(receiver);
+        surface.scheduling_origin = Some((
+            run_id.clone(),
+            surface.runs[&run_id].scheduling.clone().unwrap(),
+        ));
+        page.graph_revision = 4;
+        page.observation.graph_revision = 4;
+        page.observation.observed_at_ms = 44;
+        sender.try_send(Ok(page)).unwrap();
+        surface.poll(&TestHost);
+        assert_eq!(
+            surface.runs[&run_id]
+                .scheduling
+                .as_ref()
+                .unwrap()
+                .observed_at_ms,
+            43
+        );
+        assert!(surface.live_status.contains("rejected"));
+        // A refresh at the same graph revision still invalidates the in-flight observation.
+        let (sender, receiver) = tokio::sync::mpsc::channel(1);
+        surface.scheduling_updates = Some(receiver);
+        let before = surface.runs[&run_id].scheduling.clone().unwrap();
+        surface.scheduling_origin = Some((run_id.clone(), before.clone()));
+        surface
+            .runs
+            .get_mut(&run_id)
+            .unwrap()
+            .scheduling
+            .as_mut()
+            .unwrap()
+            .observed_at_ms = 99;
+        sender
+            .try_send(Ok(bcode_workflow::WorkflowSchedulingPage {
+                version: 1,
+                run_id: run_id.clone(),
+                graph_revision: 3,
+                observation: before,
+                next_cursor: None,
+            }))
+            .unwrap();
+        surface.poll(&TestHost);
+        assert_eq!(
+            surface.runs[&run_id]
+                .scheduling
+                .as_ref()
+                .unwrap()
+                .observed_at_ms,
+            99
+        );
+        assert!(surface.live_status.contains("Discarded stale"));
     }
 
     struct TestHost;

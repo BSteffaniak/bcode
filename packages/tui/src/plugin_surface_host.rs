@@ -324,6 +324,30 @@ impl PluginTuiHost for BcodePluginTuiHost {
         })
     }
 
+    fn workflow_scheduling_page(
+        &self,
+        request: bcode_workflow::WorkflowSchedulingPageRequest,
+    ) -> std::pin::Pin<
+        Box<
+            dyn std::future::Future<
+                    Output = Result<
+                        bcode_workflow::WorkflowSchedulingPage<
+                            bcode_workflow_view_models::WorkflowSchedulingView,
+                        >,
+                        PluginTuiHostError,
+                    >,
+                > + Send,
+        >,
+    > {
+        let client = self.client.clone();
+        Box::pin(async move {
+            client
+                .workflow_scheduling_page(request)
+                .await
+                .map_err(|error| PluginTuiHostError::Internal(error.to_string()))
+        })
+    }
+
     fn workflow_launch_catalog(
         &self,
         request: bcode_workflow::WorkflowLaunchCatalogRequest,
@@ -1523,6 +1547,7 @@ mod tests {
     #[test]
     fn bounded_resync_preserves_exact_selection_or_uses_documented_first_fallback() {
         let catalog = bcode_workflow_view_models::WorkflowCatalogView {
+            basic_discovery: None,
             version: bcode_workflow_view_models::WORKFLOW_VIEW_VERSION,
             runs: ["run-a", "run-b"]
                 .into_iter()

@@ -574,6 +574,12 @@ pub enum RuntimeAndModelRequest {
         limit: usize,
     },
     /// Return one bounded renderer-neutral workflow run projection.
+    WorkflowIdentityCatalog {
+        request: bcode_workflow_view_models::WorkflowIdentityCatalogRequest,
+    },
+    WorkflowSchedulingPage {
+        request: bcode_workflow::WorkflowSchedulingPageRequest,
+    },
     WorkflowRunView {
         run_id: String,
         limit: usize,
@@ -1306,6 +1312,16 @@ impl RoutedRequest {
                 Self::RuntimeAndModel(Box::new(RuntimeAndModelRequest::InspectWorkflowRun {
                     run_id,
                     limit,
+                }))
+            }
+            Request::WorkflowIdentityCatalog { request } => {
+                Self::RuntimeAndModel(Box::new(RuntimeAndModelRequest::WorkflowIdentityCatalog {
+                    request,
+                }))
+            }
+            Request::WorkflowSchedulingPage { request } => {
+                Self::RuntimeAndModel(Box::new(RuntimeAndModelRequest::WorkflowSchedulingPage {
+                    request,
                 }))
             }
             Request::WorkflowRunView { run_id, limit } => {

@@ -6,7 +6,8 @@
 
 mod scheduling;
 pub use scheduling::{
-    WorkflowSchedulingObservation, classify_scheduling_activation, project_scheduling,
+    WorkflowSchedulingObservation, apply_scheduling_page, classify_scheduling_activation,
+    project_scheduling,
 };
 
 use std::collections::BTreeMap;
@@ -177,6 +178,7 @@ pub fn project_catalog(
         }
     });
     WorkflowCatalogView {
+        basic_discovery: None,
         version: WORKFLOW_VIEW_VERSION,
         runs,
         next_cursor,
@@ -494,7 +496,9 @@ const fn enabled_action(
     }
 }
 
-const fn project_node_kind(kind: bcode_workflow::NodeKind) -> WorkflowNodeKind {
+/// Normalize a portable domain node kind for frontend projection.
+#[must_use]
+pub const fn project_node_kind(kind: bcode_workflow::NodeKind) -> WorkflowNodeKind {
     match kind {
         bcode_workflow::NodeKind::Task => WorkflowNodeKind::Task,
         bcode_workflow::NodeKind::Agent => WorkflowNodeKind::Agent,

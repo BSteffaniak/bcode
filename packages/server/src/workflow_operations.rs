@@ -600,7 +600,11 @@ impl bcode_workflow::WorkflowRunApplication for WorkflowAuthoringApplication<'_>
         self.state
             .require_workflow_store()
             .map_err(run_operation_failure)?;
-        run_outputs(self.state, &run_id, limit).map_err(|error| run_operation_failure(error.into()))
+        Box::pin(crate::workflow_representation::outputs::run_outputs(
+            self.state, &run_id, limit,
+        ))
+        .await
+        .map_err(run_operation_failure)
     }
     async fn workflow_run_status(
         &self,
@@ -609,7 +613,9 @@ impl bcode_workflow::WorkflowRunApplication for WorkflowAuthoringApplication<'_>
         self.state
             .require_workflow_store()
             .map_err(run_operation_failure)?;
-        run_status(self.state, &run_id).map_err(|error| run_operation_failure(error.into()))
+        Box::pin(crate::workflow_representation::status(self.state, &run_id))
+            .await
+            .map_err(run_operation_failure)
     }
     async fn pause_workflow_run(&self, run_id: String) -> Result<bool, Self::Error> {
         self.state
@@ -2417,6 +2423,13 @@ pub async fn run_view(
     limit: usize,
 ) -> Result<bcode_workflow_view_models::WorkflowRunView, super::ServerError> {
     let limit = run_view_collection_limit(limit);
+    if let Some(view) = Box::pin(crate::workflow_representation::read_view::run_view(
+        state, run_id, limit,
+    ))
+    .await?
+    {
+        return Ok(view);
+    }
     let mut view = {
         let store = state
             .workflow_store
@@ -2725,11 +2738,85 @@ fn observe_scheduling_page(
     run_id: &str,
     limit: usize,
 ) -> Result<Option<bcode_workflow_view_models::WorkflowSchedulingView>, super::ServerError> {
+    Ok(Some(
+        scheduling_page(
+            state,
+            bcode_workflow::WorkflowSchedulingPageRequest {
+                version: bcode_workflow::WORKFLOW_SCHEDULING_PAGE_VERSION,
+                run_id: run_id.into(),
+                limit: limit.clamp(1, 100),
+                cursor: None,
+            },
+        )?
+        .observation,
+    ))
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SchedulingCursor {
+    version: u32,
+    run_id: String,
+    revision: u64,
+    representation: u32,
+    after: String,
+}
+
+fn decode_scheduling_cursor(
+    request: &bcode_workflow::WorkflowSchedulingPageRequest,
+) -> Result<Option<SchedulingCursor>, bcode_workflow_store::WorkflowStoreError> {
+    let invalid = || {
+        bcode_workflow_store::WorkflowStoreError::InvalidData(
+            "invalid or unsupported scheduling cursor".into(),
+        )
+    };
+    request
+        .cursor
+        .as_ref()
+        .map(|token| {
+            let bytes = hex::decode(token).map_err(|_| invalid())?;
+            let cursor: SchedulingCursor = serde_json::from_slice(&bytes).map_err(|_| invalid())?;
+            if cursor.version != 1
+                || cursor.run_id != request.run_id
+                || cursor.representation != 1
+                || cursor.after.is_empty()
+            {
+                return Err(invalid());
+            }
+            Ok(cursor)
+        })
+        .transpose()
+}
+
+/// Read a bounded scheduling page without granting execution authority.
+///
+/// # Errors
+/// Rejects invalid requests, malformed or stale cursors and unavailable storage.
+pub fn scheduling_page(
+    state: &ServerState,
+    request: bcode_workflow::WorkflowSchedulingPageRequest,
+) -> Result<
+    bcode_workflow::WorkflowSchedulingPage<bcode_workflow_view_models::WorkflowSchedulingView>,
+    super::ServerError,
+> {
+    state.require_workflow_store()?;
+    let invalid = |message: String| bcode_workflow_store::WorkflowStoreError::InvalidData(message);
+    request.validate().map_err(invalid)?;
+    let cursor = decode_scheduling_cursor(&request)?;
     let store = state
         .workflow_store
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    let snapshot = store.scheduling_snapshot(run_id, (None, limit.clamp(1, 100)))?;
+    let snapshot = store.scheduling_snapshot(
+        &request.run_id,
+        (cursor.as_ref().map(|c| c.after.as_str()), request.limit),
+    )?;
+    if cursor
+        .as_ref()
+        .is_some_and(|cursor| cursor.revision != snapshot.capacity.graph_revision)
+    {
+        return Err(invalid("scheduling graph revision changed; restart inspection".into()).into());
+    }
     drop(store);
     let observed_at_ms = super::current_unix_millis();
     let revision = snapshot.capacity.graph_revision;
@@ -2776,7 +2863,21 @@ fn observe_scheduling_page(
             )
         })
         .collect();
-    Ok(Some(bcode_workflow_view::project_scheduling(
+    let next_cursor = snapshot
+        .next_activation_id
+        .map(|after| {
+            serde_json::to_vec(&SchedulingCursor {
+                version: 1,
+                run_id: request.run_id.clone(),
+                revision,
+                representation: 1,
+                after,
+            })
+            .map(hex::encode)
+        })
+        .transpose()
+        .map_err(|_| invalid("scheduling cursor encoding failed".into()))?;
+    let mut observation = bcode_workflow_view::project_scheduling(
         bcode_workflow_view::WorkflowSchedulingObservation {
             graph_revision: revision,
             observed_at_ms,
@@ -2784,8 +2885,19 @@ fn observe_scheduling_page(
             activations,
             has_more,
         },
-        limit,
-    )))
+        request.limit,
+    );
+    observation.next_cursor.clone_from(&next_cursor);
+    let page = bcode_workflow::WorkflowSchedulingPage {
+        version: bcode_workflow::WORKFLOW_SCHEDULING_PAGE_VERSION,
+        run_id: request.run_id,
+        graph_revision: revision,
+        observation,
+        next_cursor,
+    };
+    page.validate(&page.run_id, Some(revision))
+        .map_err(invalid)?;
+    Ok(page)
 }
 
 async fn coordinator_status(
@@ -5954,7 +6066,7 @@ pub struct AuthorityGuard {
 
 /// How the current daemon relates to a run's recorded coordinator.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum PriorOwnerLiveness {
+pub enum PriorOwnerLiveness {
     /// Canonical evidence shows the recorded coordinator is still live.
     Live,
     /// Termination cannot be established from supported evidence.
@@ -5980,7 +6092,7 @@ impl PriorOwnerLiveness {
 /// Two independent canonical sources are consulted: session-owner lease observations for the
 /// run's parent session, and the daemon registry's live records. A daemon whose lease was lost
 /// but whose process is still registered as live counts as live. Ambiguity fails closed.
-async fn prior_owner_liveness(
+pub async fn prior_owner_liveness(
     state: &ServerState,
     session_id: super::SessionId,
     current: &bcode_workflow_store::WorkflowExecutionAuthority,
@@ -6179,6 +6291,13 @@ pub async fn can_observe_recovered_agent_turn(
     state: &ServerState,
     request: &bcode_workflow_store::AttemptReconciliationRequest,
 ) -> Result<bool, super::ServerError> {
+    if let Some(allowed) = Box::pin(crate::workflow_representation::recovery::can_observe(
+        state, request,
+    ))
+    .await?
+    {
+        return Ok(allowed);
+    }
     if request
         .receipt
         .get("owner")
@@ -6339,6 +6458,13 @@ pub async fn execution_authority(
     state: &std::sync::Arc<ServerState>,
     run_id: &str,
 ) -> Result<Option<AuthorityGuard>, super::ServerError> {
+    if let Some(authority) = Box::pin(crate::workflow_representation::owner::local_authority(
+        state, run_id,
+    ))
+    .await?
+    {
+        return Ok(Some(authority));
+    }
     let current = state
         .workflow_store
         .lock()
@@ -7148,7 +7274,13 @@ async fn start_run_with_stage(
         .map_err(|_| {
             bcode_workflow_store::WorkflowStoreError::InvalidData("invalid prepared parent".into())
         })?;
-    let run = {
+    let represented = Box::pin(crate::workflow_representation::admit_prepared(
+        state, &new_run,
+    ))
+    .await?;
+    let run = if let Some(run) = represented {
+        run
+    } else {
         let mut store = state
             .workflow_store
             .lock()
@@ -7463,6 +7595,11 @@ pub async fn cancel_run(
     state: &std::sync::Arc<ServerState>,
     run_id: &str,
 ) -> Result<bool, super::ServerError> {
+    if let Some(changed) =
+        Box::pin(crate::workflow_representation::owner::cancel(state, run_id)).await?
+    {
+        return Ok(changed);
+    }
     let targets = {
         let store = state
             .workflow_store
@@ -7670,6 +7807,13 @@ pub async fn pause_run(
     state: &std::sync::Arc<ServerState>,
     run_id: &str,
 ) -> Result<bool, super::ServerError> {
+    if let Some(changed) = Box::pin(crate::workflow_representation::controls::pause(
+        state, run_id, true,
+    ))
+    .await?
+    {
+        return Ok(changed);
+    }
     let authority = execution_authority(state, run_id).await?.ok_or_else(|| {
         bcode_workflow_store::WorkflowStoreError::InvalidData(
             "active workflow has no durable execution authority".to_string(),
@@ -7694,6 +7838,13 @@ pub async fn resume_run(
     state: &std::sync::Arc<ServerState>,
     run_id: &str,
 ) -> Result<bool, super::ServerError> {
+    if let Some(changed) = Box::pin(crate::workflow_representation::controls::pause(
+        state, run_id, false,
+    ))
+    .await?
+    {
+        return Ok(changed);
+    }
     let run = state
         .workflow_store
         .lock()
@@ -7773,6 +7924,17 @@ pub async fn retry_node(
     activation_id: &str,
     failed_attempt: u32,
 ) -> Result<bcode_workflow_store::WorkflowNodeRetryResult, super::ServerError> {
+    if let Some(result) = Box::pin(crate::workflow_representation::controls::retry_node(
+        state,
+        run_id,
+        node_id,
+        activation_id,
+        failed_attempt,
+    ))
+    .await?
+    {
+        return Ok(result);
+    }
     let started_at = std::time::Instant::now();
     let authority = execution_authority(state, run_id).await?.ok_or_else(|| {
         super::ServerError::WorkflowApplicationOperationUnauthorized(
@@ -7820,6 +7982,17 @@ pub async fn provide_input(
     activation_id: &str,
     value: serde_json::Value,
 ) -> Result<bcode_workflow_store::WaitingResolutionResult, super::ServerError> {
+    if let Some(result) = Box::pin(crate::workflow_representation::controls::resolve_gate(
+        state,
+        run_id,
+        node_id,
+        activation_id,
+        bcode_workflow_store::representation::controls::GateDecision::Input(value.clone()),
+    ))
+    .await?
+    {
+        return Ok(result);
+    }
     let started_at = std::time::Instant::now();
     let guard = execution_authority(state, run_id).await?.ok_or_else(|| {
         super::ServerError::WorkflowApplicationOperationUnauthorized(
@@ -7854,6 +8027,21 @@ pub async fn resolve_approval(
     activation_id: &str,
     approved: bool,
 ) -> Result<bcode_workflow_store::WaitingResolutionResult, super::ServerError> {
+    if let Some(result) = Box::pin(crate::workflow_representation::controls::resolve_gate(
+        state,
+        run_id,
+        node_id,
+        activation_id,
+        if approved {
+            bcode_workflow_store::representation::controls::GateDecision::Approve
+        } else {
+            bcode_workflow_store::representation::controls::GateDecision::Deny
+        },
+    ))
+    .await?
+    {
+        return Ok(result);
+    }
     let started_at = std::time::Instant::now();
     let guard = execution_authority(state, run_id).await?.ok_or_else(|| {
         super::ServerError::WorkflowApplicationOperationUnauthorized(
@@ -9820,12 +10008,56 @@ async fn increase_allowance(
     Ok(changed)
 }
 
+async fn route_exact_control(
+    state: &std::sync::Arc<ServerState>,
+    run_id: &str,
+    action: &bcode_workflow::WorkflowRunControlAction,
+) -> Result<Option<bool>, super::ServerError> {
+    if let bcode_workflow::WorkflowRunControlAction::IncreaseExecutionAllowance {
+        expected_cap,
+        target_cap,
+    } = action
+    {
+        return Box::pin(
+            crate::workflow_representation::controls::increase_allowance(
+                state,
+                run_id,
+                *expected_cap,
+                *target_cap,
+            ),
+        )
+        .await;
+    }
+    if *action == bcode_workflow::WorkflowRunControlAction::Detach {
+        // Do not turn a successful association-only detach into an execution-status failure.
+        crate::workflow_representation::detach(state, run_id).await
+    } else if *action == bcode_workflow::WorkflowRunControlAction::Cancel {
+        Box::pin(crate::workflow_representation::owner::cancel(state, run_id)).await
+    } else if *action == bcode_workflow::WorkflowRunControlAction::Pause {
+        Box::pin(crate::workflow_representation::controls::pause(
+            state, run_id, true,
+        ))
+        .await
+    } else if *action == bcode_workflow::WorkflowRunControlAction::Resume {
+        Box::pin(crate::workflow_representation::controls::pause(
+            state, run_id, false,
+        ))
+        .await
+    } else {
+        crate::workflow_representation::require_legacy(state, run_id).await?;
+        Ok(None)
+    }
+}
+
 /// Control an exact run, preserving its identity across asynchronous ownership checks.
 pub async fn control_exact_run(
     state: &std::sync::Arc<ServerState>,
     run_id: &str,
     action: bcode_workflow::WorkflowRunControlAction,
 ) -> Result<(Option<bcode_workflow_store::WorkflowRunSummary>, bool), super::ServerError> {
+    if let Some(changed) = route_exact_control(state, run_id, &action).await? {
+        return Ok((None, changed));
+    }
     let run = run_status(state, run_id)?;
     let changed = if let Some(run) = &run {
         match action {
@@ -9993,6 +10225,17 @@ pub async fn repair_attempt(
 
 /// Project a bounded workflow catalog page without transport framing.
 pub async fn catalog_view(
+    state: &ServerState,
+    request: &bcode_workflow_view_models::WorkflowCatalogRequest,
+) -> Result<bcode_workflow_view_models::WorkflowCatalogView, bcode_workflow_store::WorkflowStoreError>
+{
+    if let Some(view) = crate::workflow_representation::catalog::basic_view(state, request).await? {
+        return Ok(view);
+    }
+    catalog_view_legacy(state, request).await
+}
+
+async fn catalog_view_legacy(
     state: &ServerState,
     request: &bcode_workflow_view_models::WorkflowCatalogRequest,
 ) -> Result<bcode_workflow_view_models::WorkflowCatalogView, bcode_workflow_store::WorkflowStoreError>
@@ -11446,6 +11689,7 @@ pub async fn inspect_run(
     run_id: &str,
     limit: usize,
 ) -> Result<bcode_workflow::WorkflowRunInspection, super::ServerError> {
+    crate::workflow_representation::require_legacy(state, run_id).await?;
     let (
         run,
         graph,

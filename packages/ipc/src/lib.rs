@@ -110,7 +110,8 @@ const MAX_CHUNK_DATA_SIZE: usize = MAX_FRAME_PAYLOAD_SIZE / 2;
 /// Version 39 adds bounded usage reporting and explicit snapshot collection.
 /// Version 40 adds bounded native usage catalog discovery.
 /// Version 41 combines session usage and publication acceptance with distinct positional tags.
-pub const CURRENT_PROTOCOL_VERSION: u16 = 41;
+/// Version 42 adds revision-pinned scheduling pages; older positional layouts reject.
+pub const CURRENT_PROTOCOL_VERSION: u16 = 42;
 
 /// Durable session-storage writer epoch expected by this IPC build.
 pub const CURRENT_SESSION_STORAGE_WRITER_EPOCH: u32 =
@@ -777,6 +778,14 @@ pub enum Request {
     InspectWorkflowRun {
         run_id: String,
         limit: usize,
+    },
+    /// Read mixed canonical run identities without legacy-only catalog omission.
+    WorkflowIdentityCatalog {
+        request: bcode_workflow_view_models::WorkflowIdentityCatalogRequest,
+    },
+    /// Read one revision-pinned scheduling observation page.
+    WorkflowSchedulingPage {
+        request: bcode_workflow::WorkflowSchedulingPageRequest,
     },
     /// Return one bounded renderer-neutral workflow run projection.
     WorkflowRunView {
@@ -2277,6 +2286,14 @@ pub enum ResponsePayload {
     },
     WorkflowRunInspection {
         inspection: Box<WorkflowRunInspection>,
+    },
+    WorkflowIdentityCatalog {
+        page: bcode_workflow_view_models::WorkflowIdentityCatalogPage,
+    },
+    WorkflowSchedulingPage {
+        page: bcode_workflow::WorkflowSchedulingPage<
+            bcode_workflow_view_models::WorkflowSchedulingView,
+        >,
     },
     WorkflowRunView {
         view: Box<bcode_workflow_view_models::WorkflowRunView>,

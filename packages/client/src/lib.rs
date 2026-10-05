@@ -5470,6 +5470,42 @@ impl BcodeClient {
         }
     }
 
+    /// Read canonical identities across supported workflow representations.
+    /// # Errors
+    /// Returns transport, invalid bounds, or unavailable storage errors.
+    pub async fn workflow_identity_catalog(
+        &self,
+        request: bcode_workflow_view_models::WorkflowIdentityCatalogRequest,
+    ) -> Result<bcode_workflow_view_models::WorkflowIdentityCatalogPage, ClientError> {
+        match self
+            .send_request(Request::WorkflowIdentityCatalog { request })
+            .await?
+        {
+            ResponsePayload::WorkflowIdentityCatalog { page } => Ok(page),
+            _ => Err(ClientError::UnexpectedResponse),
+        }
+    }
+
+    /// Read one bounded scheduling page using an opaque application cursor.
+    ///
+    /// # Errors
+    /// Returns transport, invalid request, or stale cursor errors.
+    pub async fn workflow_scheduling_page(
+        &self,
+        request: bcode_workflow::WorkflowSchedulingPageRequest,
+    ) -> Result<
+        bcode_workflow::WorkflowSchedulingPage<bcode_workflow_view_models::WorkflowSchedulingView>,
+        ClientError,
+    > {
+        match self
+            .send_request(Request::WorkflowSchedulingPage { request })
+            .await?
+        {
+            ResponsePayload::WorkflowSchedulingPage { page } => Ok(page),
+            _ => Err(ClientError::UnexpectedResponse),
+        }
+    }
+
     /// Return one bounded renderer-neutral workflow run catalog.
     ///
     /// # Errors

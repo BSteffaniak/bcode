@@ -381,14 +381,27 @@ pub mod tests {
                 running: 32,
                 scope: bcode_workflow_view_models::WorkflowCapacityScope::Run,
             }),
-            activations: vec![],
+            activations: vec![bcode_workflow_view_models::WorkflowSchedulingActivation {
+                node_id: "blocked-worker".into(),
+                activation_id: "blocked-activation".into(),
+                state: bcode_workflow_view_models::WorkflowSchedulingState::Blocked,
+                reasons: vec![
+                    bcode_workflow_view_models::WorkflowSchedulingBlocker::Policy {
+                        reason: bcode_workflow_view_models::WorkflowPolicyBlocker::Retry,
+                    },
+                ],
+            }],
             has_more: true,
             details_truncated: false,
+            next_cursor: None,
         });
         let text = format(&snapshot);
         assert!(text.contains("uncapped"));
         assert!(text.contains("partial page"));
         assert!(text.contains("32 reserved/running"));
+        assert!(text.contains("blocked-worker / blocked-activation: Blocked"));
+        assert!(text.contains("Policy: Retry"));
+        assert!(text.contains("no scheduling continuation cursor"));
     }
 
     #[test]

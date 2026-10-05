@@ -189,6 +189,16 @@ fn command_contributions() -> Vec<CommandContribution> {
             "Cancel a workflow run",
         ),
         (
+            "workflow.identity-catalog",
+            "Workflow: Identity Catalog",
+            "Discover exact run identities across representations with explicit family health",
+        ),
+        (
+            "workflow.scheduling-page",
+            "Workflow: Scheduling Page",
+            "Inspect bounded scheduling observations with an exact continuation cursor",
+        ),
+        (
             "workflow.inspect",
             "Workflow: Inspect",
             "Inspect workflow graph and history",
@@ -799,6 +809,42 @@ pub(crate) async fn execute_command(
             options.insert("graph".to_string(), serde_json::json!(graph));
             format!("workflow graph revision {}", graph.revision)
         }
+        "workflow.identity-catalog" => {
+            let query = identity_catalog_request(&request.args)?;
+            let page = client
+                .workflow_identity_catalog(query)
+                .await
+                .map_err(|error| error.to_string())?;
+            options.insert(
+                "identity_catalog".into(),
+                serde_json::to_value(&page).map_err(|error| error.to_string())?,
+            );
+            "Workflow identities (run-ID order; not a rich filtered catalog)".into()
+        }
+        "workflow.scheduling-page" => {
+            let run_id = required_arg(&request, "run_id")?;
+            let limit = request
+                .args
+                .get("limit")
+                .map(|value| value.parse::<usize>())
+                .transpose()
+                .map_err(|_| "invalid scheduling limit")?
+                .unwrap_or(100);
+            let page = client
+                .workflow_scheduling_page(bcode_workflow::WorkflowSchedulingPageRequest {
+                    version: bcode_workflow::WORKFLOW_SCHEDULING_PAGE_VERSION,
+                    run_id,
+                    limit,
+                    cursor: request.args.get("cursor").cloned(),
+                })
+                .await
+                .map_err(|error| error.to_string())?;
+            options.insert(
+                "scheduling_page".into(),
+                serde_json::to_value(&page).map_err(|error| error.to_string())?,
+            );
+            format!("workflow scheduling revision {}", page.graph_revision)
+        }
         "workflow.inspect" => {
             let run_id = required_arg(&request, "run_id")?;
             let inspection = client
@@ -1363,6 +1409,30 @@ fn inspection_allowance_status(
     }
 }
 
+fn identity_catalog_request(
+    args: &BTreeMap<String, String>,
+) -> Result<bcode_workflow_view_models::WorkflowIdentityCatalogRequest, String> {
+    let limit = args
+        .get("limit")
+        .map(|value| value.parse::<u16>())
+        .transpose()
+        .map_err(|_| "invalid identity catalog limit")?
+        .unwrap_or(100);
+    let after = args.get("after").cloned();
+    if !(1..=100).contains(&limit)
+        || after
+            .as_ref()
+            .is_some_and(|value| value.is_empty() || value.len() > 1024)
+    {
+        return Err("invalid identity catalog bounds".into());
+    }
+    Ok(bcode_workflow_view_models::WorkflowIdentityCatalogRequest {
+        version: bcode_workflow_view_models::WORKFLOW_IDENTITY_CATALOG_VERSION,
+        after,
+        limit,
+    })
+}
+
 fn required_arg(request: &InvokeCommandRequest, name: &str) -> Result<String, String> {
     request
         .args
@@ -1697,6 +1767,37 @@ mod tests {
         );
         request.args.remove("expected_revision");
         assert!(graph_page_request(&request).is_err());
+    }
+
+    #[test]
+    fn identity_catalog_preserves_cursor_health_and_rejects_bad_limits() {
+        use bcode_workflow_view_models::{
+            WorkflowCatalogFamilyHealth as Health, WorkflowIdentityCatalogPage,
+        };
+        let after = "exact-界-identity".to_owned();
+        let mut args = BTreeMap::from([
+            ("after".into(), after.clone()),
+            ("limit".into(), "31".into()),
+        ]);
+        let request = identity_catalog_request(&args).unwrap();
+        assert_eq!(request.after.as_ref(), Some(&after));
+        assert_eq!(request.limit, 31);
+        for limit in ["0", "101", "-1", "invalid", "65536"] {
+            args.insert("limit".into(), limit.into());
+            assert!(identity_catalog_request(&args).is_err());
+        }
+        let page = WorkflowIdentityCatalogPage {
+            version: 1,
+            entries: vec![],
+            next_after: Some(after),
+            legacy: Health::Available,
+            version2: Health::Unsupported,
+        };
+        let value = serde_json::to_value(&page).unwrap();
+        assert_eq!(
+            serde_json::from_value::<WorkflowIdentityCatalogPage>(value).unwrap(),
+            page
+        );
     }
 
     #[test]

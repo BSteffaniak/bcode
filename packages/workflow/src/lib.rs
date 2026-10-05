@@ -9,6 +9,11 @@
 //! Execution is intentionally host-neutral: agent, plugin, and application behavior enters through
 //! ordinary typed steps instead of scheduler-specific branches.
 
+mod scheduling_page;
+pub use scheduling_page::{
+    WORKFLOW_SCHEDULING_PAGE_VERSION, WorkflowSchedulingPage, WorkflowSchedulingPageRequest,
+};
+
 mod run_contracts;
 pub use run_contracts::{
     AUTHORED_WORKFLOW_RUN_PROVENANCE_VERSION, AttemptCursor, AttemptSummary,

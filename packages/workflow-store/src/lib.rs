@@ -28,6 +28,8 @@ use thiserror::Error;
 mod continuation;
 mod offline_recovery;
 mod recovery;
+/// Typed additive run-representation admission; executable lifecycle remains unavailable.
+pub mod representation;
 mod run_graph;
 mod scheduler_pages;
 pub use run_graph::{RunGraphCandidateValidation, RunGraphEdge, RunGraphNode, RunGraphPage};
@@ -1161,6 +1163,7 @@ pub struct WorkflowPublicationReadFence {
 #[derive(Debug)]
 struct StoreOwnership {
     file: File,
+    database_metadata: std::fs::Metadata,
     owner_pid: u32,
 }
 
@@ -1174,13 +1177,35 @@ impl Drop for StoreOwnership {
     }
 }
 
+fn verify_retained_database_identity(
+    expected: &std::fs::Metadata,
+    actual: &std::fs::Metadata,
+) -> Result<(), WorkflowStoreError> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt as _;
+        if expected.is_file()
+            && actual.is_file()
+            && expected.dev() == actual.dev()
+            && expected.ino() == actual.ino()
+        {
+            return Ok(());
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = (expected, actual);
+    Err(WorkflowStoreError::InvalidData(
+        "workflow database identity cannot be retained safely".into(),
+    ))
+}
+
 /// Durable workflow database.
 #[derive(Debug)]
 pub struct WorkflowStore {
     path: PathBuf,
     connection: Connection,
     // Declared after the connection so the database closes before fence release.
-    _ownership: Option<StoreOwnership>,
+    ownership: Option<std::sync::Arc<StoreOwnership>>,
     read_identity: std::sync::Arc<()>,
 }
 
@@ -1198,7 +1223,7 @@ impl WorkflowStore {
         Ok(Self {
             path: PathBuf::new(),
             connection,
-            _ownership: None,
+            ownership: None,
             read_identity: std::sync::Arc::new(()),
         })
     }
@@ -1278,7 +1303,10 @@ impl WorkflowStore {
             }
         }
         let lock = ownership.try_clone()?;
-        let store = Self::open_with_ownership(&path, ownership)?;
+        // Fresh production stores retain the coexistence baseline. Authorized admission
+        // installs the typed representation only after executable capability validation.
+        // Existing stores are verified above and are never downgraded here.
+        let store = Self::open_with_schema(&path, ownership, 42)?;
         bcode_metrics::startup::measure("workflow_store.downgrade_ownership", || {
             lock.lock_shared()
         })?;
@@ -1323,7 +1351,40 @@ impl WorkflowStore {
         Self::open_with_ownership(path, ownership)
     }
 
+    /// Create a fresh canonical compatibility2 baseline without converting existing storage.
+    ///
+    /// # Errors
+    /// Rejects any existing database, ownership contention or schema initialization failure.
+    pub fn create_coexistence_baseline(state_dir: &Path) -> Result<Self, WorkflowStoreError> {
+        let path = workflow_database_path(state_dir);
+        let root = path.parent().ok_or_else(|| {
+            WorkflowStoreError::InvalidData("workflow database root missing".into())
+        })?;
+        std::fs::create_dir_all(root)?;
+        let ownership = open_ownership_file(root)?;
+        ownership
+            .try_lock()
+            .map_err(|_| WorkflowStoreError::UpgradeOwnershipUnavailable)?;
+        if path.exists() {
+            return Err(WorkflowStoreError::InvalidData(
+                "coexistence baseline requires absent database".into(),
+            ));
+        }
+        let lock = ownership.try_clone()?;
+        let store = Self::open_with_schema(&path, ownership, 42)?;
+        lock.lock_shared()?;
+        Ok(store)
+    }
+
     fn open_with_ownership(path: &Path, ownership: File) -> Result<Self, WorkflowStoreError> {
+        Self::open_with_schema(path, ownership, WORKFLOW_STORE_SCHEMA_VERSION)
+    }
+
+    fn open_with_schema(
+        path: &Path,
+        ownership: File,
+        fresh_version: u32,
+    ) -> Result<Self, WorkflowStoreError> {
         use bcode_metrics::startup::measure;
         let existed = path.exists();
         let mut connection = measure("workflow_store.connection_open", || Connection::open(path))?;
@@ -1339,16 +1400,55 @@ impl WorkflowStore {
             })?;
         } else {
             measure("workflow_store.create_schema", || {
-                initialize_schema(&mut connection)
+                initialize_schema_version(&mut connection, fresh_version)
             })?;
         }
         Ok(Self {
             path: path.to_path_buf(),
             connection,
-            _ownership: Some(StoreOwnership {
+            ownership: Some(std::sync::Arc::new(StoreOwnership {
                 file: ownership,
+                database_metadata: std::fs::metadata(path)?,
                 owner_pid: std::process::id(),
-            }),
+            })),
+            read_identity: std::sync::Arc::new(()),
+        })
+    }
+
+    /// Retain a verified store's maintenance fence with an independent connection.
+    ///
+    /// Does not initialize, migrate or traverse schema. The originating fence remains
+    /// held until all retained handles close. Publication read fences remain connection-local.
+    /// # Errors
+    /// Rejects placeholders, inherited process ownership, replaced/missing database files,
+    /// unsupported file-identity platforms and connection/configuration failures.
+    pub fn retained_handle(&self) -> Result<Self, WorkflowStoreError> {
+        let ownership = self.ownership.as_ref().ok_or_else(|| {
+            WorkflowStoreError::InvalidData("cannot retain an unverified workflow store".into())
+        })?;
+        if ownership.owner_pid != std::process::id() {
+            return Err(WorkflowStoreError::InvalidData(
+                "cannot retain inherited workflow ownership".into(),
+            ));
+        }
+        verify_retained_database_identity(
+            &ownership.database_metadata,
+            &std::fs::metadata(&self.path)?,
+        )?;
+        let connection = Connection::open_with_flags(
+            &self.path,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        )?;
+        verify_retained_database_identity(
+            &ownership.database_metadata,
+            &std::fs::metadata(&self.path)?,
+        )?;
+        connection.pragma_update(None, "foreign_keys", true)?;
+        connection.busy_timeout(std::time::Duration::from_secs(5))?;
+        Ok(Self {
+            path: self.path.clone(),
+            connection,
+            ownership: Some(std::sync::Arc::clone(ownership)),
             read_identity: std::sync::Arc::new(()),
         })
     }
@@ -19673,9 +19773,11 @@ fn verify_store_schema(connection: &Connection) -> Result<(), WorkflowStoreError
         connection,
         "SELECT compatibility FROM workflow_storage_compatibility WHERE contract_id = 1",
     )?;
-    if actual.is_none_or(|revision| revision < WORKFLOW_STORE_SCHEMA_VERSION)
-        || compatibility != Some(WORKFLOW_STORE_COMPATIBILITY)
-    {
+    let supported = matches!(
+        (actual, compatibility),
+        (Some(42..), Some(2)) | (Some(43..), Some(3))
+    );
+    if !supported {
         return Err(WorkflowStoreError::UnsupportedStore {
             actual,
             expected: WORKFLOW_STORE_SCHEMA_VERSION,
@@ -23517,7 +23619,7 @@ mod tests {
         let mut old = WorkflowStore {
             path,
             connection,
-            _ownership: None,
+            ownership: None,
             read_identity: std::sync::Arc::new(()),
         };
         old.persist_definition("example", 1, &definition("example"))
@@ -23561,6 +23663,41 @@ mod tests {
         assert_eq!(
             contracts[0].get("compatibility"),
             Some(switchy_database::DatabaseValue::Int64(3))
+        );
+    }
+
+    #[test]
+    fn retained_handle_preserves_fence_after_origin_drop_and_rejects_missing_database() {
+        let (temp, store) = initialized_store();
+        let retained = store.retained_handle().expect("retain");
+        let path = store.path().to_path_buf();
+        let fence = store.publication_read_fence().expect("fence");
+        assert!(!std::sync::Arc::ptr_eq(
+            &fence.identity,
+            &retained.read_identity
+        ));
+        drop(store);
+        assert!(retained.run_summary("run-1").unwrap().is_some());
+        let lock = open_ownership_file(path.parent().unwrap()).unwrap();
+        assert!(lock.try_lock().is_err());
+        drop(retained);
+        lock.try_lock()
+            .expect("last retained connection releases ownership");
+        drop(lock);
+        let store = WorkflowStore::open_in_state_dir(temp.path()).unwrap();
+        let moved = path.with_extension("retention-test");
+        std::fs::rename(&path, &moved).unwrap();
+        assert!(store.retained_handle().is_err());
+        assert!(
+            !path.exists(),
+            "retention must never create a replacement database"
+        );
+        std::fs::rename(moved, path).unwrap();
+        assert!(
+            WorkflowStore::unavailable_placeholder()
+                .unwrap()
+                .retained_handle()
+                .is_err()
         );
     }
 

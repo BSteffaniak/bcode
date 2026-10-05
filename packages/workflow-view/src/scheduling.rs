@@ -49,6 +49,7 @@ pub fn project_scheduling(
         activations,
         has_more,
         details_truncated,
+        next_cursor: None,
     }
 }
 
@@ -114,6 +115,27 @@ pub fn classify_scheduling_activation(
             .push(WorkflowSchedulingBlocker::Policy { reason });
     }
     result
+}
+
+/// Validate and replace a scheduling observation page without accumulating unbounded history.
+/// The caller sends the prior exact `next_cursor` through the application boundary.
+/// # Errors
+/// Rejects unsupported/mismatched envelopes, inconsistent cursors, oversized pages and revisions.
+pub fn apply_scheduling_page(
+    view: &mut bcode_workflow_view_models::WorkflowRunView,
+    page: bcode_workflow::WorkflowSchedulingPage<WorkflowSchedulingView>,
+    expected_revision: Option<u64>,
+) -> Result<(), String> {
+    page.validate(&view.run.run_id, expected_revision)?;
+    if page.graph_revision != page.observation.graph_revision
+        || page.observation.activations.len() > 100
+        || page.observation.has_more != page.next_cursor.is_some()
+        || page.observation.next_cursor != page.next_cursor
+    {
+        return Err("inconsistent scheduling page".into());
+    }
+    view.scheduling = Some(page.observation);
+    Ok(())
 }
 
 fn bound_text(text: &mut String, truncated: &mut bool) {

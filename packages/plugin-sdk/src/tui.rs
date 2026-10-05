@@ -610,6 +610,29 @@ pub type PluginUsageCollectFuture = Pin<
 
 /// Host services available to native TUI plugin surfaces.
 pub trait PluginTuiHost: Send + Sync {
+    /// Read one revision-pinned scheduling observation page through the application boundary.
+    fn workflow_scheduling_page(
+        &self,
+        _request: bcode_workflow::WorkflowSchedulingPageRequest,
+    ) -> Pin<
+        Box<
+            dyn Future<
+                    Output = Result<
+                        bcode_workflow::WorkflowSchedulingPage<
+                            bcode_workflow_view_models::WorkflowSchedulingView,
+                        >,
+                        PluginTuiHostError,
+                    >,
+                > + Send,
+        >,
+    > {
+        Box::pin(async {
+            Err(PluginTuiHostError::Unsupported(
+                "scheduling pagination unavailable".into(),
+            ))
+        })
+    }
+
     /// Recheck one exact evaluator/account selection immediately before workflow launch.
     fn validate_judgement_setup(
         &self,

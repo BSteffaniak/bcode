@@ -900,14 +900,53 @@ fn dispatch_fake_turn(dispatch: FakeTurnDispatch<'_>) {
     }
 }
 
-fn fake_event_script(
-    request: &ModelTurnRequest,
-) -> Result<Option<FakeProviderEventScript>, String> {
+// Provider-owned fixture routing; exact marker strings are matched only in current user text.
+fn selected_event_script(request: &ModelTurnRequest) -> Result<Option<String>, String> {
     let Some(encoded) = request
         .provider_context
         .settings
-        .get(FAKE_EVENT_SCRIPT_SETTING)
+        .get("fake_event_scripts_by_prompt_marker")
     else {
+        return Ok(None);
+    };
+    if encoded.len() > 1_048_576 {
+        return Err("fake script selector exceeds byte budget".into());
+    }
+    let scripts: BTreeMap<String, FakeProviderEventScript> = serde_json::from_str(encoded)
+        .map_err(|_| "invalid fake prompt script selectors".to_owned())?;
+    if scripts.is_empty()
+        || scripts.len() > 32
+        || scripts
+            .keys()
+            .any(|marker| marker.is_empty() || marker.len() > 256)
+    {
+        return Err("fake script selectors require 1 to 32 nonempty bounded markers".into());
+    }
+    let text = last_user_text(&request.messages);
+    let mut matches = scripts
+        .iter()
+        .filter(|(marker, _)| text.contains(marker.as_str()));
+    let Some((_, script)) = matches.next() else {
+        return Ok(None);
+    };
+    if matches.next().is_some() {
+        return Err("ambiguous fake prompt script selectors".into());
+    }
+    serde_json::to_string(script)
+        .map(Some)
+        .map_err(|_| "invalid fake prompt script".to_owned())
+}
+
+fn fake_event_script(
+    request: &ModelTurnRequest,
+) -> Result<Option<FakeProviderEventScript>, String> {
+    let selected = selected_event_script(request)?;
+    let Some(encoded) = selected.as_ref().or_else(|| {
+        request
+            .provider_context
+            .settings
+            .get(FAKE_EVENT_SCRIPT_SETTING)
+    }) else {
         return Ok(None);
     };
     let script = serde_json::from_str::<FakeProviderEventScript>(encoded)
@@ -3561,6 +3600,45 @@ tool-call publish {"$fake_result":{"index":0,"pointer":"/publication_arguments"}
                 } if *actual == status
             )));
         }
+    }
+
+    #[test]
+    fn prompt_scripts_select_current_user_and_reject_ambiguity() {
+        let mut request: ModelTurnRequest = serde_json::from_value(serde_json::json!({
+            "session_id":"00000000-0000-0000-0000-000000000000", "turn_id":"turn", "model_id":"fake-echo", "messages":[]
+        })).unwrap();
+        let script = FakeProviderEventScript {
+            steps: vec![FakeProviderEventScriptStep {
+                gate: None,
+                delay_ms: None,
+                event: ProviderTurnEvent::TextDelta {
+                    text: "left".into(),
+                },
+            }],
+        };
+        request.provider_context.settings.insert(
+            FAKE_EVENT_SCRIPT_SETTING.into(),
+            serde_json::to_string(&script).unwrap(),
+        );
+        let mut blocked = script.clone();
+        blocked.steps[0].gate = Some("right-gate".into());
+        request.provider_context.settings.insert(
+            "fake_event_scripts_by_prompt_marker".into(),
+            serde_json::json!({"[left]":script,"[right]":blocked}).to_string(),
+        );
+        assert_eq!(fake_event_script(&request).unwrap(), Some(script));
+        request.messages = serde_json::from_value(
+            serde_json::json!([{"role":"user","content":[{"type":"text","text":"[right]"}]}]),
+        )
+        .unwrap();
+        assert_eq!(fake_event_script(&request).unwrap(), Some(blocked));
+        request.messages=serde_json::from_value(serde_json::json!([{"role":"user","content":[{"type":"text","text":"[left] [right]"}]}])).unwrap();
+        assert!(fake_event_script(&request).is_err());
+        request.provider_context.settings.insert(
+            "fake_event_scripts_by_prompt_marker".into(),
+            " ".repeat(1_048_577),
+        );
+        assert!(fake_event_script(&request).is_err());
     }
 
     #[test]
