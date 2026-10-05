@@ -60,6 +60,7 @@ pub(super) fn composer(
     container! {
         div #composer-region {
             form hx-post=(action) hx-target="#bcode-web-shell" hx-swap=this background=(surface::APP) border=((1, surface::BORDER)) border-radius=((radius::CARD)) padding=((space::MD)) {
+                input type=hidden name="submission_id" value=(bcode_session_models::SessionId::new().to_string());
                 @if let Some(session_id) = snapshot.session_id {
                     input type=hidden name="session_id" value=(session_id.to_string());
                 }

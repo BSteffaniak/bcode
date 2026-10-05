@@ -329,7 +329,8 @@ pub async fn restore_permission(
     state: &ServerState,
     checkpoint: bcode_session::InvocationRecoveryCheckpoint,
 ) -> Result<(), super::ServerError> {
-    let bcode_session_models::SessionEventKind::UserMessage { admission, .. } =
+    let (bcode_session_models::SessionEventKind::UserMessage { admission, .. }
+    | bcode_session_models::SessionEventKind::SubmissionActivated { admission, .. }) =
         &checkpoint.turn().kind
     else {
         return Ok(());

@@ -378,6 +378,7 @@ pub fn complete_switch_session(
                     has_older_history,
                 ),
             );
+            chat.app.apply_submission_records(&attached.submissions);
             chat.app.take_cross_session_state_from(&previous_app);
             chat.app
                 .take_same_session_transcript_state_from(&previous_app);

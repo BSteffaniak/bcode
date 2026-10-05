@@ -328,6 +328,20 @@ fn decode_for_migration(
         });
     }
     let source_kind = envelope.source_kind_name()?;
+    // Epoch-11 schema 47 is representation-compatible. Preserve its semantics, including
+    // historical user-message visibility and receipt identities; create no submissions.
+    if envelope.schema_version() == 47
+        && crate::is_released_event_kind_schema(source_kind, 47)
+        && current.is_ok()
+    {
+        return current.map(HistoricalDecode::Current).map_err(|reason| {
+            HistoricalSessionEventError::InvalidEvent {
+                schema_version: 47,
+                event_kind: source_kind.to_owned(),
+                reason,
+            }
+        });
+    }
     if source_kind == "model_usage" {
         return match current {
             Ok(mut event) => {
@@ -416,6 +430,33 @@ mod tests {
     }
 
     #[test]
+    fn schema_47_upgrade_preserves_user_admission_and_turn_identity() {
+        let payload = format!(
+            r#"{{"schema_version":47,"sequence":17,"timestamp_ms":2,"session_id":"{SESSION_ID}","kind":{{"user_message":{{"client_id":"00000000-0000-0000-0000-000000000002","text":"historical pending is not rescheduled","admission":{{}}}}}}}}"#
+        );
+        let before: SessionEvent = serde_json::from_str(&payload).unwrap();
+        let normalized =
+            normalize_canonical_event(&payload, crate::CURRENT_EVENT_SCHEMA, |value| {
+                serde_json::from_str(value).map_err(|error| error.to_string())
+            })
+            .unwrap();
+        assert_eq!(before.kind, normalized.event.kind);
+        assert_eq!(before.sequence, normalized.event.sequence);
+        assert_eq!(before.session_id, normalized.event.session_id);
+        assert_eq!(
+            bcode_session_models::TurnReceipt::from_accepted_event(
+                before.session_id,
+                before.sequence
+            ),
+            bcode_session_models::TurnReceipt::from_accepted_event(
+                normalized.event.session_id,
+                normalized.event.sequence
+            )
+        );
+        assert!(!normalized.retired_known);
+    }
+
+    #[test]
     fn historical_usage_without_trustworthy_attribution_is_explicitly_unavailable() {
         let payload = format!(
             r#"{{"schema_version":46,"sequence":1,"timestamp_ms":2,"session_id":"{SESSION_ID}","provenance":null,"kind":{{"model_usage":{{"turn_id":"turn","usage":{{"input_tokens":1,"output_tokens":2,"total_tokens":3}}}}}}}}"#
@@ -428,12 +469,9 @@ mod tests {
         let HistoricalDecode::Converted { event, metadata } = decoded else {
             panic!("historical usage should be migration-owned conversion");
         };
-        assert_eq!(crate::CURRENT_EVENT_SCHEMA, 47);
-        assert_eq!(crate::LATEST_HISTORICAL_EVENT_SCHEMA, 46);
-        assert_eq!(
-            metadata.source_schema,
-            crate::LATEST_HISTORICAL_EVENT_SCHEMA
-        );
+        assert_eq!(crate::CURRENT_EVENT_SCHEMA, 48);
+        assert_eq!(crate::LATEST_HISTORICAL_EVENT_SCHEMA, 47);
+        assert_eq!(metadata.source_schema, 46);
         let SessionEventKind::ModelUsage { usage, .. } = event.kind else {
             panic!("converted event should remain model usage");
         };

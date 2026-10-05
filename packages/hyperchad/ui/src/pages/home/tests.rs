@@ -615,6 +615,8 @@ fn markdown_messages_use_hyperchad_markdown_with_highlighting_and_xss_protection
             .to_owned(),
         display_label: None,
         activity: None,
+            submission_status: None,
+            submission_context: None,
         format: TextFormat::Markdown,
     };
 
@@ -684,6 +686,8 @@ fn plain_text_messages_do_not_parse_markdown() {
         text: "**literal**".to_owned(),
         display_label: None,
         activity: None,
+        submission_status: None,
+        submission_context: None,
         format: TextFormat::PlainText,
     };
 

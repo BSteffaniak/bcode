@@ -2281,6 +2281,25 @@ impl SessionDb {
     /// # Errors
     ///
     /// Returns an error if the bounded indexed query fails or contains malformed identity data.
+    pub(crate) async fn accepted_turn_event(
+        &self,
+        sequence: u64,
+    ) -> SessionDbResult<Option<SessionEvent>> {
+        self.validate_write_readiness().await?;
+        self.db
+            .select("events")
+            .columns(&["event_seq", "event_type", "schema_version", "payload"])
+            .where_eq("event_seq", seq_to_value(sequence))
+            .execute_first(&**self.db)
+            .await?
+            .as_ref()
+            .map(|row| strict_event_from_row(row, self.session_id))
+            .transpose()
+    }
+
+    /// Look up a producer's stable independent turn receipt.
+    /// # Errors
+    /// Returns storage errors.
     pub async fn turn_receipt(
         &self,
         producer: &str,
@@ -3361,6 +3380,92 @@ impl SessionDb {
     /// # Errors
     ///
     /// Returns an error if event queries or deserialization fail.
+    pub async fn submission(
+        &self,
+        id: &bcode_session_models::SubmissionId,
+    ) -> SessionDbResult<Option<bcode_session_models::SubmissionRecord>> {
+        self.validate_write_readiness().await?;
+        crate::submission::lookup(&**self.db, id).await
+    }
+
+    /// Read a bounded acceptance-ordered pending page, without replay or repair.
+    /// # Errors
+    /// Fails closed on stale projections or invalid storage.
+    pub async fn pending_submissions(
+        &self,
+        after: Option<u64>,
+        limit: usize,
+    ) -> SessionDbResult<Vec<bcode_session_models::SubmissionRecord>> {
+        self.validate_write_readiness().await?;
+        let mut query = self
+            .db
+            .select("submissions")
+            .columns(&["record"])
+            .where_eq("pending", 1_i64)
+            .sort("accepted_seq", SortDirection::Asc)
+            .limit(limit.min(256));
+        if let Some(after) = after {
+            query = query.where_gt("accepted_seq", seq_to_value(after));
+        }
+        query
+            .execute(&**self.db)
+            .await?
+            .iter()
+            .map(|row| Ok(serde_json::from_str(&required_string(row, "record")?)?))
+            .collect()
+    }
+
+    /// Read an indexed pending page for one exact resolved target.
+    /// # Errors
+    /// Returns stale projection or storage errors without replay or repair.
+    pub async fn pending_submissions_for_turn(
+        &self,
+        turn_id: &bcode_session_models::TurnId,
+        after: Option<u64>,
+        limit: usize,
+    ) -> SessionDbResult<Vec<bcode_session_models::SubmissionRecord>> {
+        self.validate_write_readiness().await?;
+        let mut query = self
+            .db
+            .select("submissions")
+            .columns(&["record"])
+            .where_eq("target_turn_id", turn_id.0.clone())
+            .where_eq("pending", 1_i64)
+            .sort("accepted_seq", SortDirection::Asc)
+            .limit(limit.min(256));
+        if let Some(after) = after {
+            query = query.where_gt("accepted_seq", seq_to_value(after));
+        }
+        query
+            .execute(&**self.db)
+            .await?
+            .iter()
+            .map(|row| Ok(serde_json::from_str(&required_string(row, "record")?)?))
+            .collect()
+    }
+
+    /// Read the current activated conversation; pending submissions are excluded.
+    /// # Errors
+    /// Returns projection or storage errors without repairing history.
+    pub async fn activated_conversation_snapshot(
+        &self,
+    ) -> SessionDbResult<bcode_session_models::ActivatedConversationSnapshot> {
+        let through_sequence = self.last_event_sequence().await?.unwrap_or_default();
+        let events = self.model_context_events().await?;
+        if self.last_event_sequence().await?.unwrap_or_default() != through_sequence {
+            return Err(SessionDbError::InvalidData(
+                "conversation changed during snapshot; retry".into(),
+            ));
+        }
+        Ok(bcode_session_models::ActivatedConversationSnapshot {
+            through_sequence,
+            events,
+        })
+    }
+
+    /// Read current activated conversation without repairing stale projections.
+    /// # Errors
+    /// Returns storage or projection errors.
     pub async fn model_context_events(&self) -> SessionDbResult<Vec<SessionEvent>> {
         if let Some(events) = self.projected_model_context_events().await? {
             return Ok(events);
@@ -3427,6 +3532,13 @@ impl SessionDb {
         validate_contiguous_canonical_events(&events)?;
         rebuild_model_context_projection_from_events(&*tx, &events).await?;
         rebuild_transcript_projection_from_events(&*tx, &events).await?;
+        tx.delete("submissions").execute(&*tx).await?;
+        for event in &events {
+            crate::submission::project(&*tx, event).await?;
+        }
+        if let Some(tail) = events.last() {
+            update_projection_checkpoint(&*tx, MaterializedProjection::Submissions, tail).await?;
+        }
         tx.commit().await?;
         Ok(events.len())
     }
@@ -4533,6 +4645,7 @@ impl bcode_session_migration_target::MigrationTarget for SessionMigrationTarget<
         for table in [
             "turn_evidence",
             "turn_receipts",
+            "submissions",
             "model_context_entries",
             "model_context_projection_state",
             "context_occupancy_projection",
@@ -4770,6 +4883,7 @@ async fn validate_append_preconditions_without_writer(
 ) -> SessionDbResult<()> {
     let canonical_tail = last_sequence(db).await?;
     validate_append_identity(event, canonical_tail)?;
+    crate::submission::validate_activation(db, event).await?;
     validate_model_context_precondition(
         db,
         event,
@@ -5102,9 +5216,26 @@ async fn project_turn_evidence(db: &dyn Database, event: &SessionEvent) -> Sessi
 }
 
 async fn project_turn_receipt(db: &dyn Database, event: &SessionEvent) -> SessionDbResult<()> {
+    crate::submission::project(db, event).await?;
     project_turn_evidence(db, event).await?;
-    let SessionEventKind::UserMessage { admission, .. } = &event.kind else {
-        return Ok(());
+    let admission = match &event.kind {
+        SessionEventKind::UserMessage { admission, .. } => admission,
+        SessionEventKind::SubmissionAccepted { submission }
+            if submission.target
+                == (bcode_session_models::SubmissionTarget::OwnTurn {
+                    turn_id: bcode_session_models::TurnId::from_accepted_event(
+                        event.session_id,
+                        event.sequence,
+                    ),
+                })
+                && submission.id
+                    == bcode_session_models::SubmissionId::for_queued_turn(
+                        submission.target.turn_id(),
+                    ) =>
+        {
+            &submission.admission
+        }
+        _ => return Ok(()),
     };
     let Some((producer, idempotency_key)) = admission.idempotency_identity() else {
         return Ok(());
@@ -5354,7 +5485,10 @@ async fn project_event(
                 .execute(db)
                 .await?;
         }
-        SessionEventKind::UserMessage { text, .. } => {
+        SessionEventKind::UserMessage { text, .. }
+        | SessionEventKind::SubmissionAccepted {
+            submission: bcode_session_models::PromptSubmission { text, .. },
+        } => {
             db.insert("input_messages")
                 .value("input_seq", seq_to_value(event.sequence))
                 .value("event_seq", seq_to_value(event.sequence))
@@ -6116,6 +6250,74 @@ mod tests {
                 (name, bytes)
             })
             .collect()
+    }
+
+    #[tokio::test]
+    async fn epoch_eleven_upgrade_preserves_user_receipt_and_empty_submission_projection() {
+        let root = tempfile::tempdir().unwrap();
+        let id = SessionId::new();
+        let db = SessionDb::open_turso_in_root(id, root.path())
+            .await
+            .unwrap();
+        let created = event(
+            id,
+            0,
+            SessionEventKind::SessionCreated {
+                name: None,
+                working_directory: root.path().to_path_buf(),
+            },
+        );
+        db.append_event(&created).await.unwrap();
+        let admission = bcode_session_models::TurnAdmissionMetadata {
+            origin: Some(bcode_session_models::TurnOrigin {
+                producer: "test".into(),
+                correlation_id: None,
+                display_label: None,
+            }),
+            idempotency_key: Some("old".into()),
+            ..Default::default()
+        };
+        let prompt = event(
+            id,
+            1,
+            SessionEventKind::UserMessage {
+                client_id: ClientId::new(),
+                text: "old prompt".into(),
+                admission,
+            },
+        );
+        db.append_event(&prompt).await.unwrap();
+        let receipt = db.turn_receipt("test", "old").await.unwrap();
+        db.database()
+            .update("session_storage_contract")
+            .value("writer_epoch", 11)
+            .execute(db.database())
+            .await
+            .unwrap();
+        drop(db);
+        let maintenance = crate::lease::acquire_session_maintenance_guard(root.path(), id).unwrap();
+        let write =
+            crate::lease::acquire_maintenance_session_write_lock(&maintenance, root.path(), id)
+                .unwrap();
+        let migrated = SessionDb::migrate_turso_in_root(id, root.path(), &maintenance, &write)
+            .await
+            .unwrap();
+        assert_eq!(migrated.turn_receipt("test", "old").await.unwrap(), receipt);
+        assert!(
+            migrated
+                .pending_submissions(None, 256)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(migrated.model_context_events().await.unwrap(), vec![prompt]);
+        assert_eq!(
+            migrated
+                .materialized_projection_checkpoint(MaterializedProjection::Submissions)
+                .await
+                .unwrap(),
+            Some(1)
+        );
     }
 
     #[tokio::test]
@@ -8768,7 +8970,10 @@ mod tests {
             ),
             (
                 "future-schema-v47.json",
-                include_str!("../fixtures/migrations/future-schema-v47.json"),
+                &include_str!("../fixtures/migrations/future-schema-v47.json").replace(
+                    "\"schema_version\":47",
+                    &format!("\"schema_version\":{CURRENT_SESSION_EVENT_SCHEMA_VERSION}"),
+                ),
                 ExpectedHistory::Sequences(&[0]),
             ),
             (

@@ -4,6 +4,84 @@ use bcode_session_models::{
 };
 
 #[tokio::test]
+async fn source_capture_excludes_pending_submission_and_pins_activation_order() {
+    use bcode_session_models::{
+        ClientId, PromptSubmission, SubmissionId, SubmissionPlacement, SubmissionTarget,
+        TurnAdmissionMetadata, TurnId,
+    };
+    let sessions = bcode_session::SessionManager::default();
+    let source = sessions
+        .create_session(
+            Some("submission capture".into()),
+            std::env::current_dir().unwrap(),
+        )
+        .await
+        .unwrap();
+    let prompt = PromptSubmission {
+        id: SubmissionId("capture-pending".into()),
+        client_id: ClientId::new(),
+        text: "not yet activated".into(),
+        admission: TurnAdmissionMetadata::default(),
+        execution_descriptor: None,
+        requested_placement: SubmissionPlacement::FollowUp,
+        target: SubmissionTarget::OwnTurn {
+            turn_id: TurnId("capture-turn".into()),
+        },
+    };
+    sessions
+        .accept_submission(source.id, prompt.clone())
+        .await
+        .unwrap();
+    let state = crate::tests::test_server_state_with_fake_provider(sessions);
+    let captured = prepare(
+        &state,
+        bcode_session_models::PrepareContextGeneration {
+            version: 1,
+            source_session_id: source.id,
+            name: "pending capture".into(),
+        },
+    )
+    .await
+    .unwrap();
+    state
+        .sessions
+        .activate_submission(source.id, prompt.id)
+        .await
+        .unwrap();
+    let execution = TurnExecutionOptions {
+        request_context_id: Some(captured.context_id.clone()),
+        tools: TurnToolPolicy::Disabled,
+        structured_output: Some(TurnStructuredOutputRequest {
+            name: "capture".into(),
+            schema: serde_json::json!({"type": "object"}),
+            strict: true,
+            max_corrections: 0,
+        }),
+        ..Default::default()
+    };
+    let pinned = events(&state, captured.session_id, &execution)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        !serde_json::to_string(&crate::session_events_to_model_messages(&pinned))
+            .unwrap()
+            .contains("not yet activated")
+    );
+    let activated = state
+        .sessions
+        .model_context_events(source.id)
+        .await
+        .unwrap();
+    assert!(
+        serde_json::to_string(&crate::session_events_to_model_messages(&activated))
+            .unwrap()
+            .contains("not yet activated")
+    );
+    drop(state);
+}
+
+#[tokio::test]
 async fn captured_generation_uses_submitting_client_model_and_auth() {
     let sessions = bcode_session::SessionManager::default();
     let source = sessions

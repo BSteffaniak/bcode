@@ -20,6 +20,7 @@ pub async fn execute_session_view_action(
 ) -> Result<SessionViewActionOutcome, ClientError> {
     match action {
         SessionViewAction::SubmitMessage {
+            submission_id,
             session_id,
             launch_working_directory,
             text,
@@ -28,6 +29,7 @@ pub async fn execute_session_view_action(
         } => {
             execute_submit_message(
                 client,
+                submission_id,
                 session_id,
                 launch_working_directory,
                 text,
@@ -254,6 +256,7 @@ async fn execute_resolve_interaction(
 
 async fn execute_submit_message(
     client: &BcodeClient,
+    submission_id: bcode_session_models::SubmissionId,
     session_id: Option<SessionId>,
     launch_working_directory: Option<std::path::PathBuf>,
     text: String,
@@ -273,10 +276,27 @@ async fn execute_submit_message(
             .await?
             .id
     };
-    let acceptance = client
-        .send_user_message_with_execution(session_id, text, placement, execution)
+    let receipt = client
+        .submit_prompt(
+            session_id,
+            submission_id,
+            text,
+            match placement {
+                PromptPlacementView::Steering => bcode_session_models::SubmissionPlacement::Steer,
+                PromptPlacementView::FollowUp => {
+                    bcode_session_models::SubmissionPlacement::FollowUp
+                }
+            },
+            bcode_session_models::TurnAdmissionMetadata {
+                execution,
+                ..Default::default()
+            },
+        )
         .await?;
-    Ok(message_accepted_outcome(session_id, acceptance))
+    Ok(SessionViewActionOutcome::SubmissionAccepted {
+        session_id,
+        receipt,
+    })
 }
 
 async fn execute_invoke_skill(

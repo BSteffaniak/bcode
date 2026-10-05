@@ -12,7 +12,8 @@ pub enum ContextHistoryRole {
 #[must_use]
 pub const fn context_history_role(kind: &SessionEventKind) -> ContextHistoryRole {
     match kind {
-        SessionEventKind::UserMessage { .. }
+        SessionEventKind::SubmissionActivated { .. }
+        | SessionEventKind::UserMessage { .. }
         | SessionEventKind::AssistantMessage { .. }
         | SessionEventKind::AssistantResponseSegment { .. }
         | SessionEventKind::PositionedAssistantResponseSegment { .. }
@@ -33,7 +34,8 @@ pub const fn context_history_role(kind: &SessionEventKind) -> ContextHistoryRole
 #[must_use]
 pub const fn context_history_role_from_name(event_type: &str) -> ContextHistoryRole {
     match event_type.as_bytes() {
-        b"user_message"
+        b"submission_activated"
+        | b"user_message"
         | b"assistant_message"
         | b"assistant_response_segment"
         | b"positioned_assistant_response_segment"
@@ -77,6 +79,7 @@ pub fn canonical_model_context_from_events(
         return events
             .into_iter()
             .filter(|event| is_model_context_event_type(model_context_event_kind_name(&event.kind)))
+            .map(crate::submission::context_event)
             .collect();
     };
     let boundary = match &marker.kind {
@@ -108,11 +111,15 @@ pub fn canonical_model_context_from_events(
     context.push(marker);
     context.extend(retained);
     context
+        .into_iter()
+        .map(crate::submission::context_event)
+        .collect()
 }
 
 #[must_use]
 pub const fn model_context_event_kind_name(kind: &SessionEventKind) -> &'static str {
     match kind {
+        SessionEventKind::SubmissionActivated { .. } => "submission_activated",
         SessionEventKind::UserMessage { .. } => "user_message",
         SessionEventKind::AssistantMessage { .. } => "assistant_message",
         SessionEventKind::AssistantResponseSegment { .. } => "assistant_response_segment",

@@ -400,8 +400,16 @@ async fn drive_page(
             progressed = true;
             continue;
         }
+        let started = std::time::Instant::now();
+        let diagnostic_node = activation.node_id.clone();
         progressed |=
             drive_activation(state, db, authority, run_id, revision, activation, node).await?;
+        #[cfg(test)]
+        if run_id == "normal-fanout" {
+            eprintln!("admission-cost {diagnostic_node} {:?}", started.elapsed());
+        }
+        #[cfg(not(test))]
+        let _ = (started, diagnostic_node);
     }
     Ok(progressed)
 }

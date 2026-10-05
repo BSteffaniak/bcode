@@ -58,6 +58,19 @@ impl GenerationAssistantOutput {
     }
 }
 
+fn validate_generation_admission(
+    admission: &bcode_session_models::TurnAdmission,
+) -> Result<(), ClientError> {
+    match admission {
+        bcode_session_models::TurnAdmission::Accepted(_)
+        | bcode_session_models::TurnAdmission::Existing(_)
+        | bcode_session_models::TurnAdmission::Deferred(_) => Ok(()),
+        _ => Err(ClientError::Protocol(format!(
+            "structured generation admission: {admission:?}"
+        ))),
+    }
+}
+
 async fn prepare_observable_generation(
     client: &BcodeClient,
     request: &PluginStructuredGenerationRequest,
@@ -208,29 +221,32 @@ impl BcodeClient {
             let prompt = format!("{}\n\n{}", request.system_prompt, request.prompt);
             // Admission may commit even if its response is lost. Never retry it.
             submitted_session = Some(session_id);
-            client
-                .send_user_message_with_execution(
+            let admission = client
+                .submit_turn(
                     session_id,
                     prompt,
-                    bcode_ipc::PromptPlacement::FollowUp,
-                    bcode_session_models::TurnExecutionOptions {
-                        request_context_id: prepared
-                            .as_ref()
-                            .map(|prepared| prepared.context_id.clone()),
-                        tools: bcode_session_models::TurnToolPolicy::Disabled,
-                        structured_output: Some(
-                            bcode_session_models::TurnStructuredOutputRequest {
-                                name: request.output_name,
-                                schema: request.output_schema,
-                                strict: true,
-                                max_corrections: 0,
-                            },
-                        ),
-                        ..bcode_session_models::TurnExecutionOptions::default()
+                    bcode_session_models::TurnAdmissionMetadata {
+                        execution: bcode_session_models::TurnExecutionOptions {
+                            request_context_id: prepared
+                                .as_ref()
+                                .map(|prepared| prepared.context_id.clone()),
+                            tools: bcode_session_models::TurnToolPolicy::Disabled,
+                            structured_output: Some(
+                                bcode_session_models::TurnStructuredOutputRequest {
+                                    name: request.output_name,
+                                    schema: request.output_schema,
+                                    strict: true,
+                                    max_corrections: 0,
+                                },
+                            ),
+                            ..bcode_session_models::TurnExecutionOptions::default()
+                        },
+                        ..Default::default()
                     },
                 )
                 .await
                 .map_err(|error| ClientError::Protocol(error.to_string()))?;
+            validate_generation_admission(&admission)?;
             observe_generation(&client, session_id, prepared, &mut terminal_observed).await
         };
         let result = tokio::select! {

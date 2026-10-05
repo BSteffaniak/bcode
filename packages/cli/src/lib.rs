@@ -3745,6 +3745,7 @@ async fn handle_session_io_command(
             file,
             stdin,
             follow_up,
+            steering,
             producer,
             idempotency_key,
             background,
@@ -3758,7 +3759,13 @@ async fn handle_session_io_command(
                         file,
                         stdin,
                     },
-                    follow_up,
+                    placement: if steering {
+                        Some(bcode_session_models::SubmissionPlacement::Steer)
+                    } else if follow_up {
+                        Some(bcode_session_models::SubmissionPlacement::FollowUp)
+                    } else {
+                        None
+                    },
                     producer,
                     idempotency_key,
                     background,
@@ -4221,10 +4228,12 @@ enum Commands {
         /// Read the prompt from bounded UTF-8 stdin.
         #[arg(long, conflicts_with_all = ["message", "file"])]
         stdin: bool,
-        /// Queue explicitly as a follow-up instead of default steering semantics.
-        /// Incompatible with turn-admission producer, idempotency, and priority options.
-        #[arg(long, conflicts_with_all = ["producer", "idempotency_key", "background"])]
+        /// Queue a conversational follow-up instead of the default independent turn.
+        #[arg(long, conflicts_with_all = ["steering", "background"])]
         follow_up: bool,
+        /// Steer a compatible active turn at its next safe provider boundary.
+        #[arg(long, conflicts_with = "background")]
+        steering: bool,
         /// Stable producer namespace for durable turn admission.
         #[arg(long, default_value = "bcode.cli")]
         producer: String,
@@ -17386,6 +17395,10 @@ const fn session_event_kind_name(kind: &SessionEventKind) -> &'static str {
         SessionEventKind::SessionCreated { .. } => "session_created",
         SessionEventKind::ClientAttached { .. } => "client_attached",
         SessionEventKind::ClientDetached { .. } => "client_detached",
+        SessionEventKind::SubmissionAccepted { .. } => "submission_accepted",
+        SessionEventKind::SubmissionActivated { .. } => "submission_activated",
+        SessionEventKind::SubmissionCancelled { .. } => "submission_cancelled",
+        SessionEventKind::SubmissionContextObserved { .. } => "submission_context_observed",
         SessionEventKind::UserMessage { .. } => "user_message",
         SessionEventKind::AssistantDelta { .. } => "assistant_delta",
         SessionEventKind::AssistantMessage { .. } => "assistant_message",
@@ -17996,7 +18009,7 @@ struct PromptInput {
 
 struct SendOptions {
     input: PromptInput,
-    follow_up: bool,
+    placement: Option<bcode_session_models::SubmissionPlacement>,
     producer: String,
     idempotency_key: Option<String>,
     background: bool,
@@ -18174,6 +18187,7 @@ fn prompt_too_large_error() -> CliError {
     CliError::InvalidArguments(format!("prompt input exceeds {MAX_CLI_PROMPT_BYTES} bytes"))
 }
 
+#[cfg(test)]
 fn write_follow_up_disposition(
     output: &mut impl std::io::Write,
     disposition: &impl std::fmt::Debug,
@@ -18186,7 +18200,7 @@ fn write_follow_up_disposition(
 async fn send_message(session_id: SessionId, options: SendOptions) -> Result<(), CliError> {
     let SendOptions {
         input,
-        follow_up,
+        placement,
         producer,
         idempotency_key,
         background,
@@ -18195,24 +18209,38 @@ async fn send_message(session_id: SessionId, options: SendOptions) -> Result<(),
     } = options;
     let text = input.read()?;
     let client = BcodeClient::default_endpoint();
-    if follow_up {
-        let acceptance = client
-            .send_user_message_with_execution(
+    if let Some(placement) = placement {
+        let submission_id = bcode_session_models::SubmissionId(
+            idempotency_key
+                .clone()
+                .unwrap_or_else(|| SessionId::new().to_string()),
+        );
+        let receipt = client
+            .submit_prompt(
                 session_id,
+                submission_id,
                 text,
-                bcode_session_models::PromptPlacement::FollowUp,
-                launch_options.turn_execution_options(),
+                placement,
+                bcode_session_models::TurnAdmissionMetadata {
+                    origin: Some(bcode_session_models::TurnOrigin {
+                        producer,
+                        correlation_id: None,
+                        display_label: Some("Bcode CLI".to_owned()),
+                    }),
+                    idempotency_key,
+                    execution: launch_options.turn_execution_options(),
+                    ..bcode_session_models::TurnAdmissionMetadata::default()
+                },
             )
             .await?;
         if json {
-            print_json(&serde_json::json!({
-                "session_id": session_id,
-                "queued": acceptance.queued,
-                "queue_position": acceptance.queue_position,
-                "disposition": acceptance.disposition,
-            }))?;
+            print_json(&serde_json::json!({ "session_id": session_id, "submission": receipt }))?;
         } else {
-            write_follow_up_disposition(&mut std::io::stdout().lock(), &acceptance.disposition)?;
+            writeln!(
+                std::io::stdout().lock(),
+                "Accepted submission {} (activation pending)",
+                receipt.submission_id.0
+            )?;
         }
     } else {
         let admission = client
@@ -18343,6 +18371,37 @@ fn reasoning_activity_description(
 #[allow(clippy::too_many_lines)]
 fn print_non_trace_session_event(event: &SessionEvent) {
     match &event.kind {
+        SessionEventKind::SubmissionContextObserved {
+            submission_id,
+            issue,
+        } => {
+            println!(
+                "#{} submission {} pending: execution context {issue:?}; restore accepted execution configuration before retrying recovery",
+                event.sequence, submission_id.0
+            );
+        }
+        SessionEventKind::SubmissionAccepted { submission } => {
+            println!(
+                "#{} submission {} accepted (activation pending)",
+                event.sequence, submission.id.0
+            );
+        }
+        SessionEventKind::SubmissionActivated {
+            submission_id,
+            text,
+            ..
+        } => {
+            println!(
+                "#{} submission {} activated: {text}",
+                event.sequence, submission_id.0
+            );
+        }
+        SessionEventKind::SubmissionCancelled { submission_id } => {
+            println!(
+                "#{} submission {} cancelled before activation",
+                event.sequence, submission_id.0
+            );
+        }
         SessionEventKind::SessionCreated { name, .. } => {
             let name = name.as_deref().unwrap_or("<unnamed>");
             println!("#{} session created: {name}", event.sequence);
@@ -23921,6 +23980,56 @@ mod cancellation_cli_tests {
 mod send_cli_tests {
     use super::{Cli, Commands};
     use clap::Parser as _;
+
+    #[test]
+    fn send_defaults_to_independent_turn_and_requires_explicit_steering() {
+        let session = bcode_session_models::SessionId::new().to_string();
+        let parsed = Cli::try_parse_from(["bcode", "send", &session, "hello"]).unwrap();
+        assert!(matches!(
+            parsed.command,
+            Some(Commands::Send {
+                steering: false,
+                follow_up: false,
+                ..
+            })
+        ));
+        let parsed = Cli::try_parse_from([
+            "bcode",
+            "send",
+            &session,
+            "hello",
+            "--steering",
+            "--idempotency-key",
+            "retry-1",
+        ])
+        .unwrap();
+        assert!(matches!(
+            parsed.command,
+            Some(Commands::Send { steering: true, .. })
+        ));
+        assert!(
+            Cli::try_parse_from([
+                "bcode",
+                "send",
+                &session,
+                "hello",
+                "--steering",
+                "--follow-up"
+            ])
+            .is_err()
+        );
+        assert!(
+            Cli::try_parse_from([
+                "bcode",
+                "send",
+                &session,
+                "hello",
+                "--steering",
+                "--background"
+            ])
+            .is_err()
+        );
+    }
 
     #[test]
     fn send_accepts_exact_prompt_sources_and_admission_controls() {

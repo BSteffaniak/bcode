@@ -135,7 +135,7 @@ pub async fn compact_session_context_before_sequence(
     first_kept_sequence: u64,
     cancel_state: &TurnCancelState,
 ) -> Result<CompactionCompletion, CompactionError> {
-    compact_session_context_with_policy(
+    Box::pin(compact_session_context_with_policy(
         state,
         session_id,
         selection,
@@ -144,7 +144,7 @@ pub async fn compact_session_context_before_sequence(
         cancel_state,
         None,
         CompactionPlanningPolicy::OverflowRecovery,
-    )
+    ))
     .await
 }
 
@@ -192,7 +192,11 @@ async fn compact_session_context_with_policy(
         return Err(CompactionError::Cancelled);
     }
 
-    let history = state.sessions.model_context_events(session_id).await?;
+    let history = state
+        .sessions
+        .activated_conversation_snapshot(session_id)
+        .await?
+        .events;
     let transcript_history = first_kept_sequence.map_or_else(
         || history.clone(),
         |first_kept_sequence| {
@@ -286,7 +290,7 @@ async fn compact_session_context_with_policy(
     )
     .await;
 
-    let result = async {
+    let result = Box::pin(async {
         let native_snapshot = compact_context_with_selected_backend(
             state,
             session_id,
@@ -370,7 +374,7 @@ async fn compact_session_context_with_policy(
             ),
             compacted_through_sequence: transcript.compacted_through_sequence,
         })
-    }
+    })
     .await;
 
     let (compacted, message) = match &result {
@@ -811,7 +815,11 @@ pub async fn maybe_auto_compact_session_context(
     }
 
     let config = state.session_config(session_id).await;
-    let history = state.sessions.model_context_events(session_id).await?;
+    let history = state
+        .sessions
+        .activated_conversation_snapshot(session_id)
+        .await?
+        .events;
     let projected_context_chars =
         projected_model_context_chars(&history, config.model.tool_output.context_chars);
     let projected_context_tokens = evaluation.candidate_input_tokens;
@@ -2088,6 +2096,75 @@ mod generic_result_tests {
             provenance: None,
             kind,
         }
+    }
+
+    #[tokio::test]
+    async fn pending_submission_is_excluded_from_compaction_until_activation() {
+        use bcode_session_models::{
+            PromptSubmission, SubmissionId, SubmissionPlacement, SubmissionTarget,
+            TurnAdmissionMetadata, TurnId,
+        };
+        let sessions = bcode_session::SessionManager::default();
+        let session = sessions
+            .create_session(
+                Some("activation compaction".into()),
+                std::env::current_dir().unwrap(),
+            )
+            .await
+            .unwrap();
+        let submission = PromptSubmission {
+            id: SubmissionId("pending-compaction".into()),
+            client_id: ClientId::new(),
+            text: "future instruction".into(),
+            admission: TurnAdmissionMetadata::default(),
+            execution_descriptor: None,
+            requested_placement: SubmissionPlacement::FollowUp,
+            target: SubmissionTarget::OwnTurn {
+                turn_id: TurnId("future-turn".into()),
+            },
+        };
+        sessions
+            .accept_submission(session.id, submission.clone())
+            .await
+            .unwrap();
+        sessions
+            .append_assistant_message(session.id, "preceding answer".into())
+            .await
+            .unwrap();
+        let pending = sessions.model_context_events(session.id).await.unwrap();
+        let units = conversational_units(&pending, 1_000);
+        assert!(
+            units
+                .iter()
+                .flat_map(|unit| &unit.summary_input)
+                .all(|line| !line.contains("future instruction"))
+        );
+        sessions
+            .activate_submission(session.id, submission.id)
+            .await
+            .unwrap();
+        let activated = sessions.model_context_events(session.id).await.unwrap();
+        let units = conversational_units(&activated, 1_000);
+        let lines = units
+            .iter()
+            .flat_map(|unit| &unit.summary_input)
+            .collect::<Vec<_>>();
+        let answer = lines
+            .iter()
+            .position(|line| line.contains("preceding answer"))
+            .unwrap();
+        let prompt = lines
+            .iter()
+            .position(|line| line.contains("future instruction"))
+            .unwrap();
+        assert!(answer < prompt);
+        assert_eq!(
+            lines
+                .iter()
+                .filter(|line| line.contains("future instruction"))
+                .count(),
+            1
+        );
     }
 
     #[test]

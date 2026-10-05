@@ -1278,6 +1278,10 @@ async fn takeover_uses_real_lifetime_evidence_and_preserves_ambiguous_mutating_i
 }
 
 async fn takeover_receipt_fixture(with_receipt: bool) {
+    Box::pin(takeover_receipt_fixture_inner(with_receipt)).await;
+}
+
+async fn takeover_receipt_fixture_inner(with_receipt: bool) {
     let (_root, _sessions, original, _) = typed_provider_fixture().await;
     let mut state =
         std::sync::Arc::try_unwrap(original).unwrap_or_else(|_| panic!("exclusive fixture"));

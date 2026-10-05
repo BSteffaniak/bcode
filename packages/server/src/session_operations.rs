@@ -363,13 +363,22 @@ pub async fn submit_turn(
             .await
             .map_err(SubmitTurnError::Admission)?,
     );
+    let admission_lock = super::turn_admission_lock(state, session_id).await;
+    let admission_guard = admission_lock.lock().await;
     let (admission, user_event) = super::admit_turn(state, session_id, client_id, text, admission)
         .await
         .map_err(SubmitTurnError::Admission)?;
-    if let bcode_session_models::TurnAdmission::Accepted(_) = &admission {
-        let user_event = user_event.ok_or_else(|| {
-            SubmitTurnError::Dispatch(bcode_session::SessionError::NotFound(session_id).into())
-        })?;
+    let user_event = match &admission {
+        bcode_session_models::TurnAdmission::Existing(receipt)
+        | bcode_session_models::TurnAdmission::Deferred(receipt) => {
+            super::pending_turn_acceptance_event(state, session_id, receipt)
+                .await
+                .map_err(SubmitTurnError::Admission)?
+        }
+        _ => user_event,
+    };
+    drop(admission_guard);
+    if let Some(user_event) = user_event {
         super::enqueue_followup_command(
             state,
             session_id,

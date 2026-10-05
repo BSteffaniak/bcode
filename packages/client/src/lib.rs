@@ -1188,6 +1188,8 @@ pub struct SessionList {
 /// History returned when attaching to a session.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AttachedSessionHistory {
+    /// Bounded current lifecycle records for submissions referenced by this window.
+    pub submissions: Vec<bcode_session_models::SubmissionRecord>,
     pub session: SessionSummary,
     pub history: Vec<SessionEvent>,
     pub input_history: Vec<SessionInputHistoryEntry>,
@@ -3496,6 +3498,90 @@ impl BcodeClient {
             .await?
         {
             ResponsePayload::SessionSearchBackfill { response } => Ok(response),
+            _ => Err(ClientError::UnexpectedResponse),
+        }
+    }
+
+    /// Accept a conversational prompt using a caller-retained identity for retries.
+    ///
+    /// Acceptance does not imply activation or independent turn execution.
+    /// # Errors
+    /// Returns transport, conflicting-duplicate, admission, or unexpected-response errors.
+    pub async fn submit_prompt(
+        &self,
+        session_id: SessionId,
+        submission_id: bcode_session_models::SubmissionId,
+        text: String,
+        placement: bcode_session_models::SubmissionPlacement,
+        admission: bcode_session_models::TurnAdmissionMetadata,
+    ) -> Result<bcode_session_models::SubmissionReceipt, ClientError> {
+        match self
+            .send_request(Request::SubmitPrompt {
+                session_id,
+                submission_id,
+                text,
+                placement,
+                admission,
+            })
+            .await?
+        {
+            ResponsePayload::SubmissionAccepted { receipt } => Ok(receipt),
+            _ => Err(ClientError::UnexpectedResponse),
+        }
+    }
+
+    /// Resolve lifecycle records referenced by one bounded history window.
+    /// # Errors
+    /// Returns lookup errors, or rejects windows exceeding the bounded lookup budget.
+    pub async fn submissions_for_history(
+        &self,
+        session_id: SessionId,
+        events: &[SessionEvent],
+    ) -> Result<Vec<bcode_session_models::SubmissionRecord>, ClientError> {
+        let mut ids = std::collections::BTreeSet::new();
+        for event in events {
+            match &event.kind {
+                SessionEventKind::SubmissionAccepted { submission } => {
+                    ids.insert(submission.id.clone());
+                }
+                SessionEventKind::SubmissionCancelled { submission_id }
+                | SessionEventKind::SubmissionContextObserved { submission_id, .. } => {
+                    ids.insert(submission_id.clone());
+                }
+                _ => {}
+            }
+            if ids.len() > 256 {
+                return Err(ClientError::Protocol("submission hydration window exceeds 256 identities; request a smaller history window".to_owned()));
+            }
+        }
+        let mut records = Vec::with_capacity(ids.len());
+        for id in ids {
+            let record = self.get_submission(session_id, id).await?.ok_or_else(|| {
+                ClientError::Protocol(
+                    "canonical submission referenced by history is unavailable".to_owned(),
+                )
+            })?;
+            records.push(record);
+        }
+        Ok(records)
+    }
+
+    /// Read one retained submission without replaying session history.
+    /// # Errors
+    /// Returns transport, unavailable-projection, or unexpected-response errors.
+    pub async fn get_submission(
+        &self,
+        session_id: SessionId,
+        submission_id: bcode_session_models::SubmissionId,
+    ) -> Result<Option<bcode_session_models::SubmissionRecord>, ClientError> {
+        match self
+            .send_request(Request::GetSubmission {
+                session_id,
+                submission_id,
+            })
+            .await?
+        {
+            ResponsePayload::Submission { record } => Ok(record),
             _ => Err(ClientError::UnexpectedResponse),
         }
     }
@@ -6737,6 +6823,62 @@ pub struct ClientConnection {
 }
 
 impl ClientConnection {
+    /// Resolve lifecycle records referenced by one bounded history window.
+    /// # Errors
+    /// Returns lookup errors, or rejects windows exceeding the bounded lookup budget.
+    pub async fn submissions_for_history(
+        &mut self,
+        session_id: SessionId,
+        events: &[SessionEvent],
+    ) -> Result<Vec<bcode_session_models::SubmissionRecord>, ClientError> {
+        let mut ids = std::collections::BTreeSet::new();
+        for event in events {
+            match &event.kind {
+                SessionEventKind::SubmissionAccepted { submission } => {
+                    ids.insert(submission.id.clone());
+                }
+                SessionEventKind::SubmissionCancelled { submission_id }
+                | SessionEventKind::SubmissionContextObserved { submission_id, .. } => {
+                    ids.insert(submission_id.clone());
+                }
+                _ => {}
+            }
+            if ids.len() > 256 {
+                return Err(ClientError::Protocol("submission hydration window exceeds 256 identities; request a smaller history window".to_owned()));
+            }
+        }
+        let mut records = Vec::with_capacity(ids.len());
+        for id in ids {
+            let record = self.get_submission(session_id, id).await?.ok_or_else(|| {
+                ClientError::Protocol(
+                    "canonical submission referenced by history is unavailable".to_owned(),
+                )
+            })?;
+            records.push(record);
+        }
+        Ok(records)
+    }
+
+    /// Read one retained submission without replaying session history.
+    /// # Errors
+    /// Returns transport, unavailable-projection, or unexpected-response errors.
+    pub async fn get_submission(
+        &mut self,
+        session_id: SessionId,
+        submission_id: bcode_session_models::SubmissionId,
+    ) -> Result<Option<bcode_session_models::SubmissionRecord>, ClientError> {
+        match self
+            .send_request(Request::GetSubmission {
+                session_id,
+                submission_id,
+            })
+            .await?
+        {
+            ResponsePayload::Submission { record } => Ok(record),
+            _ => Err(ClientError::UnexpectedResponse),
+        }
+    }
+
     /// Deliver input on this connection, retaining its invocation-control identity.
     ///
     /// # Errors
@@ -6957,7 +7099,7 @@ impl ClientConnection {
         &mut self,
         session_id: SessionId,
     ) -> Result<AttachedSessionHistory, ClientError> {
-        let attached = match self
+        let mut attached = match self
             .send_request(Request::AttachSession { session_id })
             .await?
         {
@@ -6972,6 +7114,7 @@ impl ClientConnection {
                 session,
                 ..
             } => AttachedSessionHistory {
+                submissions: Vec::new(),
                 session,
                 history,
                 input_history,
@@ -6987,6 +7130,9 @@ impl ClientConnection {
             _ => return Err(ClientError::UnexpectedResponse),
         };
         self.restore_state.attached_session = Some(SessionRestoreAttachment::Full { session_id });
+        attached.submissions = self
+            .submissions_for_history(attached.session.id, &attached.history)
+            .await?;
         Ok(attached)
     }
 
@@ -7251,7 +7397,7 @@ impl ClientConnection {
         session_id: SessionId,
         limit: usize,
     ) -> Result<AttachedSessionHistory, ClientError> {
-        let attached = match self
+        let mut attached = match self
             .send_request(Request::AttachSessionRecent { session_id, limit })
             .await?
         {
@@ -7266,6 +7412,7 @@ impl ClientConnection {
                 session,
                 ..
             } => AttachedSessionHistory {
+                submissions: Vec::new(),
                 session,
                 history,
                 input_history,
@@ -7282,6 +7429,9 @@ impl ClientConnection {
         };
         self.restore_state.attached_session =
             Some(SessionRestoreAttachment::Recent { session_id, limit });
+        attached.submissions = self
+            .submissions_for_history(attached.session.id, &attached.history)
+            .await?;
         Ok(attached)
     }
 
@@ -7320,7 +7470,7 @@ impl ClientConnection {
         request: ProjectionWindowRequest,
     ) -> Result<AttachedSessionHistory, ClientError> {
         let restore_request = request.clone();
-        let attached = match self
+        let mut attached = match self
             .send_request(Request::AttachSessionProjectionWindow {
                 session_id,
                 request,
@@ -7338,6 +7488,7 @@ impl ClientConnection {
                 session,
                 ..
             } => AttachedSessionHistory {
+                submissions: Vec::new(),
                 session,
                 history,
                 input_history,
@@ -7356,6 +7507,9 @@ impl ClientConnection {
             session_id,
             request: restore_request,
         });
+        attached.submissions = self
+            .submissions_for_history(attached.session.id, &attached.history)
+            .await?;
         Ok(attached)
     }
 

@@ -11,6 +11,7 @@ use switchy::database::{Database, DatabaseValue, query::FilterableQuery};
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MaterializedProjection {
     /// Projected current session state.
+    Submissions,
     SessionState,
     /// User-authored input history.
     InputHistory,
@@ -31,7 +32,8 @@ pub enum MaterializedProjection {
 }
 
 impl MaterializedProjection {
-    const ALL: [Self; 9] = [
+    const ALL: [Self; 10] = [
+        Self::Submissions,
         Self::TurnEvidence,
         Self::SessionState,
         Self::InputHistory,
@@ -56,7 +58,8 @@ impl MaterializedProjection {
             Self::RequestContextOccupancy => 4,
             Self::Transcript => 3,
             Self::ToolRuns => 2,
-            Self::SessionState
+            Self::Submissions
+            | Self::SessionState
             | Self::InputHistory
             | Self::ArtifactReferences
             | Self::RuntimeWork
@@ -69,6 +72,7 @@ impl MaterializedProjection {
     #[must_use]
     pub const fn as_str(self) -> &'static str {
         match self {
+            Self::Submissions => "submissions",
             Self::SessionState => "session_state",
             Self::InputHistory => "input_history",
             Self::Transcript => "transcript",
@@ -129,7 +133,8 @@ pub async fn update_projection_checkpoint(
 }
 
 /// Current projections finalized together for each canonical event.
-pub const BASE_MATERIALIZED_PROJECTIONS: [MaterializedProjection; 8] = [
+pub const BASE_MATERIALIZED_PROJECTIONS: [MaterializedProjection; 9] = [
+    MaterializedProjection::Submissions,
     MaterializedProjection::TurnEvidence,
     MaterializedProjection::SessionState,
     MaterializedProjection::InputHistory,
@@ -153,7 +158,7 @@ mod tests {
 
     #[test]
     fn projection_inventory_is_complete_and_stable() {
-        assert_eq!(MaterializedProjection::all().len(), 9);
+        assert_eq!(MaterializedProjection::all().len(), 10);
         assert_eq!(
             MaterializedProjection::RequestContextOccupancy.schema_version(),
             4

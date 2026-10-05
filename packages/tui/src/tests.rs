@@ -830,6 +830,21 @@ fn live_provider_tool_call_progress_updates_status() {
 }
 
 #[test]
+fn identical_pending_prompts_reconcile_by_identity() {
+    let mut pending = PendingSubmissions::default();
+    pending.stage("same".to_owned());
+    let first = pending.items()[0].id().clone();
+    pending.stage("same".to_owned());
+    let second = pending.items()[1].id().clone();
+    assert_ne!(first, second);
+    pending.remove_id(&second);
+    assert_eq!(pending.items().len(), 1);
+    assert_eq!(pending.items()[0].id(), &first);
+    pending.remove_id(&second);
+    assert_eq!(pending.items().len(), 1);
+}
+
+#[test]
 fn pending_submissions_mutations_bump_revision() {
     let mut pending = PendingSubmissions::default();
     assert_eq!(pending.revision(), 0);
@@ -2414,6 +2429,7 @@ async fn hydrated_search_hit_opens_canonical_around_sequence_window_and_anchors_
         true,
         Ok((
             AttachedSessionHistory {
+                submissions: Vec::new(),
                 session: session_summary(session_id),
                 history: vec![canonical_event],
                 input_history: Vec::new(),
@@ -2481,6 +2497,7 @@ async fn async_session_open_preserves_typed_draft() {
     )]));
     let (_event_sender, event_receiver) = tokio::sync::broadcast::channel::<SessionEvent>(1);
     let mut attached = AttachedSessionHistory {
+        submissions: Vec::new(),
         session: session_summary(session_id),
         history: vec![event(
             session_id,
@@ -2728,6 +2745,7 @@ async fn async_session_open_completion_preserves_plugin_host() {
     chat.app.set_plugin_host(Arc::new(filesystem_plugin_host()));
     let (_event_sender, event_receiver) = tokio::sync::broadcast::channel::<SessionEvent>(1);
     let attached = AttachedSessionHistory {
+        submissions: Vec::new(),
         session: session_summary(session_id),
         history: Vec::new(),
         input_history: Vec::new(),

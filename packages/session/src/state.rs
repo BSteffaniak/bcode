@@ -341,6 +341,16 @@ impl SessionState {
                     }
                 }
             }
+            SessionEventKind::SubmissionAccepted { submission } => {
+                self.has_user_message = true;
+                if self.summary.derived_title.is_none() {
+                    self.summary.derived_title = Some(title_from_first_prompt(&submission.text));
+                    if self.summary.explicit_name.is_none() {
+                        self.summary.name.clone_from(&self.summary.derived_title);
+                        self.summary.title_source = SessionTitleSource::FirstUserMessage;
+                    }
+                }
+            }
             SessionEventKind::WorkingDirectoryChanged {
                 new_working_directory,
                 ..

@@ -74,6 +74,12 @@ impl PendingSubmissions {
             .is_some_and(PendingSubmission::reveals_on_acceptance)
     }
 
+    /// Reconcile an authoritative acceptance by identity.
+    pub fn remove_id(&mut self, id: &bcode_session_models::SubmissionId) {
+        self.items.retain(|item| item.id() != id);
+        self.bump_revision();
+    }
+
     /// Remove a pending submission by text.
     pub fn remove(&mut self, text: &str) {
         if let Some(index) = self.items.iter().position(|pending| pending.text() == text) {

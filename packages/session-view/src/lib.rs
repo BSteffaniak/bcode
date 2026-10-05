@@ -100,6 +100,19 @@ impl LiveReasoningActivity {
     }
 }
 
+const fn submission_context_label(
+    issue: bcode_session_models::SubmissionContextIssue,
+) -> &'static str {
+    match issue {
+        bcode_session_models::SubmissionContextIssue::Unavailable => {
+            "Pending: execution context unavailable; restore the accepted execution context before retrying recovery"
+        }
+        bcode_session_models::SubmissionContextIssue::Incompatible => {
+            "Pending: execution context incompatible; restore compatible configuration before retrying recovery"
+        }
+    }
+}
+
 fn tool_invocation_id(event: &SessionEvent) -> Option<&str> {
     match &event.kind {
         SessionEventKind::ToolCallRequested { tool_call_id, .. }
@@ -1135,6 +1148,119 @@ impl SessionView {
                 self.snapshot.working_directory = Some(working_directory.clone());
                 self.bump_revision();
             }
+            SessionEventKind::SubmissionAccepted { submission } => {
+                let id = TranscriptViewItemId::new(format!("submission:{}", submission.id.0));
+                if !self
+                    .snapshot
+                    .transcript
+                    .items
+                    .iter()
+                    .any(|item| item.id == id)
+                {
+                    let mut message = ChatMessageView::markdown(submission.text.clone());
+                    message.submission_status =
+                        Some(bcode_session_models::SubmissionStatus::Pending);
+                    message.display_label = Some(
+                        match submission.requested_placement {
+                            bcode_session_models::SubmissionPlacement::Steer => "Steering pending",
+                            bcode_session_models::SubmissionPlacement::FollowUp => {
+                                "Follow-up pending"
+                            }
+                        }
+                        .to_owned(),
+                    );
+                    self.push_item(
+                        id,
+                        event.sequence,
+                        Some(event.timestamp_ms),
+                        false,
+                        TranscriptViewItemKind::UserMessage { message },
+                    );
+                }
+            }
+            SessionEventKind::SubmissionActivated {
+                submission_id,
+                turn_id,
+                text,
+                admission,
+                ..
+            } => {
+                let id = TranscriptViewItemId::new(format!("submission:{}", submission_id.0));
+                if self.snapshot.transcript.items.iter().any(|item| item.id == id &&
+                    (matches!(&item.kind, TranscriptViewItemKind::UserMessage { message } if matches!(message.submission_status, Some(bcode_session_models::SubmissionStatus::Cancelled { .. })))
+                    || item.sequence.is_some_and(|sequence| sequence >= event.sequence))) {
+                    return;
+                }
+                // Activation relocates the same logical item after preceding output.
+                self.snapshot.transcript.items.retain(|item| item.id != id);
+                let mut message = ChatMessageView::markdown(text.clone());
+                message.submission_status =
+                    Some(bcode_session_models::SubmissionStatus::Activated {
+                        turn_id: turn_id.clone(),
+                        conversation_sequence: event.sequence,
+                    });
+                message.display_label = admission
+                    .origin
+                    .as_ref()
+                    .and_then(|origin| origin.display_label.clone());
+                self.push_item(
+                    id,
+                    event.sequence,
+                    Some(event.timestamp_ms),
+                    false,
+                    TranscriptViewItemKind::UserMessage { message },
+                );
+            }
+            SessionEventKind::SubmissionContextObserved {
+                submission_id,
+                issue,
+            } => {
+                self.apply_submission_context(
+                    submission_id,
+                    bcode_session_models::SubmissionContextObservation {
+                        issue: *issue,
+                        event_sequence: event.sequence,
+                    },
+                );
+            }
+            SessionEventKind::SubmissionCancelled { submission_id } => {
+                let id = TranscriptViewItemId::new(format!("submission:{}", submission_id.0));
+                let message = self
+                    .snapshot
+                    .transcript
+                    .items
+                    .iter()
+                    .find(|item| item.id == id)
+                    .and_then(|item| match &item.kind {
+                        TranscriptViewItemKind::UserMessage { message } => Some(message.clone()),
+                        _ => None,
+                    });
+                if message.as_ref().is_some_and(|message| {
+                    matches!(
+                        message.submission_status,
+                        Some(
+                            bcode_session_models::SubmissionStatus::Activated { .. }
+                                | bcode_session_models::SubmissionStatus::Cancelled { .. }
+                        )
+                    )
+                }) {
+                    return;
+                }
+                let mut message =
+                    message.unwrap_or_else(|| ChatMessageView::plain("Submission cancelled"));
+                message.submission_status =
+                    Some(bcode_session_models::SubmissionStatus::Cancelled {
+                        event_sequence: event.sequence,
+                    });
+                message.display_label = Some("Cancelled before activation".to_owned());
+                self.upsert_item(
+                    id,
+                    event.sequence,
+                    Some(event.timestamp_ms),
+                    false,
+                    TranscriptViewItemKind::UserMessage { message },
+                );
+            }
             SessionEventKind::UserMessage {
                 text, admission, ..
             } => {
@@ -1966,6 +2092,8 @@ impl SessionView {
                         text: text.clone(),
                         display_label: None,
                         activity: None,
+                        submission_status: None,
+                        submission_context: None,
                         format: bcode_session_view_models::TextFormat::Json,
                     },
                     _ => ChatMessageView::plain(text.clone()),
@@ -3234,6 +3362,131 @@ impl SessionView {
         self.snapshot.revision = self.snapshot.revision.saturating_add(1);
     }
 
+    fn apply_submission_context(
+        &mut self,
+        submission_id: &bcode_session_models::SubmissionId,
+        observation: bcode_session_models::SubmissionContextObservation,
+    ) {
+        let id = TranscriptViewItemId::new(format!("submission:{}", submission_id.0));
+        let Some(item) = self
+            .snapshot
+            .transcript
+            .items
+            .iter_mut()
+            .find(|item| item.id == id)
+        else {
+            return;
+        };
+        let TranscriptViewItemKind::UserMessage { message } = &mut item.kind else {
+            return;
+        };
+        if !matches!(
+            message.submission_status,
+            Some(bcode_session_models::SubmissionStatus::Pending)
+        ) || message
+            .submission_context
+            .as_ref()
+            .is_some_and(|current| current.event_sequence >= observation.event_sequence)
+        {
+            return;
+        }
+        message.display_label = Some(submission_context_label(observation.issue).to_owned());
+        message.submission_context = Some(observation);
+        item.revision = item.revision.saturating_add(1);
+        self.snapshot.transcript.revision = self.snapshot.transcript.revision.saturating_add(1);
+        self.bump_revision();
+    }
+
+    /// Merge one bounded authoritative lookup into the resident transcript.
+    ///
+    /// Callers resolve missing acceptance payloads through the application client, never replay.
+    pub fn apply_submission_record(&mut self, record: &bcode_session_models::SubmissionRecord) {
+        let id = TranscriptViewItemId::new(format!("submission:{}", record.submission.id.0));
+        let sequence = match record.status {
+            bcode_session_models::SubmissionStatus::Pending => {
+                record.receipt.accepted_event_sequence
+            }
+            bcode_session_models::SubmissionStatus::Activated {
+                conversation_sequence,
+                ..
+            } => conversation_sequence,
+            bcode_session_models::SubmissionStatus::Cancelled { event_sequence } => event_sequence,
+        };
+        if self
+            .snapshot
+            .transcript
+            .items
+            .iter()
+            .any(|item| item.id == id && (item.sequence.is_some_and(|current| current > sequence)
+                || matches!(&item.kind, TranscriptViewItemKind::UserMessage { message } if message.submission_status.as_ref().is_some_and(|status| !matches!(status, bcode_session_models::SubmissionStatus::Pending) && status != &record.status))))
+        {
+            return;
+        }
+        let mut message = ChatMessageView::markdown(record.submission.text.clone());
+        message.submission_status = Some(record.status.clone());
+        let existing_context = self
+            .snapshot
+            .transcript
+            .items
+            .iter()
+            .find(|item| item.id == id)
+            .and_then(|item| match &item.kind {
+                TranscriptViewItemKind::UserMessage { message } => {
+                    message.submission_context.clone()
+                }
+                _ => None,
+            });
+        message.submission_context = existing_context
+            .into_iter()
+            .chain(record.context_observation.clone())
+            .max_by_key(|observation| observation.event_sequence);
+        message.display_label = match record.status {
+            bcode_session_models::SubmissionStatus::Pending => Some(
+                match record.submission.requested_placement {
+                    bcode_session_models::SubmissionPlacement::Steer => "Steering pending",
+                    bcode_session_models::SubmissionPlacement::FollowUp => "Follow-up pending",
+                }
+                .to_owned(),
+            ),
+            bcode_session_models::SubmissionStatus::Activated { .. } => record
+                .submission
+                .admission
+                .origin
+                .as_ref()
+                .and_then(|origin| origin.display_label.clone()),
+            bcode_session_models::SubmissionStatus::Cancelled { .. } => {
+                Some("Cancelled before activation".to_owned())
+            }
+        };
+        if matches!(
+            record.status,
+            bcode_session_models::SubmissionStatus::Pending
+        ) && let Some(observation) = &message.submission_context
+        {
+            message.display_label = Some(submission_context_label(observation.issue).to_owned());
+        }
+        self.upsert_item(
+            id,
+            sequence,
+            None,
+            false,
+            TranscriptViewItemKind::UserMessage { message },
+        );
+        if let Some(index) = self.snapshot.transcript.items.iter().position(|item| {
+            item.id == TranscriptViewItemId::new(format!("submission:{}", record.submission.id.0))
+        }) {
+            let item = self.snapshot.transcript.items.remove(index);
+            let position = self
+                .snapshot
+                .transcript
+                .items
+                .iter()
+                .position(|item| item.sequence.is_some_and(|current| current > sequence))
+                .unwrap_or(self.snapshot.transcript.items.len());
+            self.snapshot.transcript.items.insert(position, item);
+        }
+    }
+
     fn push_item(
         &mut self,
         id: TranscriptViewItemId,
@@ -4495,6 +4748,8 @@ impl StreamingMessageKind {
             text,
             display_label: None,
             activity: None,
+            submission_status: None,
+            submission_context: None,
             format: TextFormat::Markdown,
         };
         match self {
@@ -6067,6 +6322,227 @@ mod tests {
                 .and_then(|usage| usage.total_tokens),
             Some(15)
         );
+    }
+
+    #[test]
+    fn submission_activation_preserves_identity_and_cancellation_is_terminal() {
+        use bcode_session_models::{
+            PromptSubmission, SubmissionId, SubmissionPlacement, SubmissionReceipt,
+            SubmissionRecord, SubmissionStatus, SubmissionTarget, TurnId,
+        };
+        let session_id = SessionId::new();
+        let id = SubmissionId("same-text-distinct-identity".to_owned());
+        let turn_id = TurnId("turn-1".to_owned());
+        let submission = PromptSubmission {
+            execution_descriptor: None,
+            id: id.clone(),
+            client_id: bcode_session_models::ClientId::new(),
+            text: "hello".to_owned(),
+            admission: bcode_session_models::TurnAdmissionMetadata::default(),
+            requested_placement: SubmissionPlacement::Steer,
+            target: SubmissionTarget::Steering {
+                turn_id: turn_id.clone(),
+            },
+        };
+        let mut view = SessionView::new();
+        view.apply_event(&event(
+            session_id,
+            1,
+            SessionEventKind::SubmissionAccepted {
+                submission: submission.clone(),
+            },
+        ));
+        view.apply_event(&event(
+            session_id,
+            2,
+            SessionEventKind::AssistantMessage {
+                text: "prior output".to_owned(),
+            },
+        ));
+        let activation = event(
+            session_id,
+            3,
+            SessionEventKind::SubmissionActivated {
+                submission_id: id.clone(),
+                turn_id,
+                client_id: submission.client_id,
+                text: submission.text.clone(),
+                admission: submission.admission.clone(),
+            },
+        );
+        view.apply_event(&activation);
+        view.apply_event(&activation);
+        assert_eq!(view.snapshot().transcript.items.len(), 2);
+        assert_eq!(
+            view.snapshot().transcript.items[1].id,
+            TranscriptViewItemId::new(format!("submission:{}", id.0))
+        );
+
+        let mut hydrated = SessionView::new();
+        hydrated.apply_event(&event(
+            session_id,
+            1,
+            SessionEventKind::SubmissionAccepted {
+                submission: submission.clone(),
+            },
+        ));
+        hydrated.apply_event(&event(
+            session_id,
+            2,
+            SessionEventKind::AssistantMessage {
+                text: "prior output".to_owned(),
+            },
+        ));
+        hydrated.apply_submission_record(&SubmissionRecord {
+            context_observation: None,
+            receipt: SubmissionReceipt {
+                submission_id: id.clone(),
+                accepted_event_sequence: 1,
+            },
+            submission: submission.clone(),
+            status: SubmissionStatus::Activated {
+                turn_id: bcode_session_models::TurnId("turn-1".to_owned()),
+                conversation_sequence: 3,
+            },
+        });
+        assert_eq!(
+            hydrated
+                .snapshot()
+                .transcript
+                .items
+                .iter()
+                .map(|item| &item.id)
+                .collect::<Vec<_>>(),
+            view.snapshot()
+                .transcript
+                .items
+                .iter()
+                .map(|item| &item.id)
+                .collect::<Vec<_>>()
+        );
+        assert_cancelled_submission_stays_terminal(session_id, id, submission, &activation);
+    }
+
+    fn assert_cancelled_submission_stays_terminal(
+        session_id: SessionId,
+        id: bcode_session_models::SubmissionId,
+        submission: bcode_session_models::PromptSubmission,
+        activation: &SessionEvent,
+    ) {
+        use bcode_session_models::{SubmissionReceipt, SubmissionRecord, SubmissionStatus};
+        let mut cancelled = SessionView::new();
+        cancelled.apply_event(&event(
+            session_id,
+            2,
+            SessionEventKind::SubmissionCancelled {
+                submission_id: id.clone(),
+            },
+        ));
+        cancelled.apply_submission_record(&SubmissionRecord {
+            context_observation: None,
+            receipt: SubmissionReceipt {
+                submission_id: id,
+                accepted_event_sequence: 1,
+            },
+            submission,
+            status: SubmissionStatus::Cancelled { event_sequence: 2 },
+        });
+        cancelled.apply_event(activation);
+        let TranscriptViewItemKind::UserMessage { message } =
+            &cancelled.snapshot().transcript.items[0].kind
+        else {
+            panic!("user item")
+        };
+        assert!(matches!(
+            message.submission_status,
+            Some(SubmissionStatus::Cancelled { .. })
+        ));
+        assert_eq!(message.text, "hello");
+    }
+
+    #[test]
+    fn blocked_submission_hydration_is_actionable_and_does_not_activate() {
+        use bcode_session_models::{
+            PromptSubmission, SubmissionContextIssue, SubmissionContextObservation, SubmissionId,
+            SubmissionPlacement, SubmissionReceipt, SubmissionRecord, SubmissionStatus,
+            SubmissionTarget, TurnId,
+        };
+        let session_id = SessionId::new();
+        let id = SubmissionId("blocked".to_owned());
+        let mut view = SessionView::new();
+        let mut record = SubmissionRecord {
+            receipt: SubmissionReceipt {
+                submission_id: id.clone(),
+                accepted_event_sequence: 1,
+            },
+            submission: PromptSubmission {
+                id: id.clone(),
+                client_id: bcode_session_models::ClientId::new(),
+                text: "retained prompt".to_owned(),
+                admission: bcode_session_models::TurnAdmissionMetadata::default(),
+                requested_placement: SubmissionPlacement::FollowUp,
+                target: SubmissionTarget::OwnTurn {
+                    turn_id: TurnId("turn".to_owned()),
+                },
+                execution_descriptor: None,
+            },
+            status: SubmissionStatus::Pending,
+            context_observation: Some(SubmissionContextObservation {
+                issue: SubmissionContextIssue::Unavailable,
+                event_sequence: 2,
+            }),
+        };
+        view.apply_submission_record(&record);
+        view.apply_event(&event(
+            session_id,
+            3,
+            SessionEventKind::SubmissionContextObserved {
+                submission_id: id.clone(),
+                issue: SubmissionContextIssue::Incompatible,
+            },
+        ));
+        let TranscriptViewItemKind::UserMessage { message } =
+            &view.snapshot().transcript.items[0].kind
+        else {
+            panic!("user item")
+        };
+        assert_eq!(message.text, "retained prompt");
+        assert_eq!(message.submission_status, Some(SubmissionStatus::Pending));
+        assert!(
+            message
+                .display_label
+                .as_deref()
+                .unwrap()
+                .contains("restore compatible configuration")
+        );
+        assert_eq!(
+            message.submission_context.as_ref().unwrap().event_sequence,
+            3
+        );
+        record.status = SubmissionStatus::Cancelled { event_sequence: 4 };
+        view.apply_submission_record(&record);
+        view.apply_event(&event(
+            session_id,
+            5,
+            SessionEventKind::SubmissionContextObserved {
+                submission_id: id,
+                issue: SubmissionContextIssue::Unavailable,
+            },
+        ));
+        let TranscriptViewItemKind::UserMessage { message } =
+            &view.snapshot().transcript.items[0].kind
+        else {
+            panic!("user item")
+        };
+        assert!(matches!(
+            message.submission_status,
+            Some(SubmissionStatus::Cancelled { .. })
+        ));
+        assert_eq!(
+            message.display_label.as_deref(),
+            Some("Cancelled before activation")
+        );
+        assert_eq!(view.snapshot().transcript.items.len(), 1);
     }
 
     fn event(session_id: SessionId, sequence: u64, kind: SessionEventKind) -> SessionEvent {

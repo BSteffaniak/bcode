@@ -1231,6 +1231,12 @@ pub struct ActivityMessageView {
 /// Chat text plus renderer-neutral annotations.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ChatMessageView {
+    /// Latest durable context issue; only actionable while submission remains pending.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub submission_context: Option<bcode_session_models::SubmissionContextObservation>,
+    /// Durable lifecycle annotation for a conversational submission.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub submission_status: Option<bcode_session_models::SubmissionStatus>,
     /// Optional activity details; absent for ordinary chat and older snapshots.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub activity: Option<Box<ActivityMessageView>>,
@@ -1250,6 +1256,8 @@ impl ChatMessageView {
             text: text.into(),
             display_label: None,
             activity: None,
+            submission_status: None,
+            submission_context: None,
             format: TextFormat::Markdown,
         }
     }
@@ -1261,6 +1269,8 @@ impl ChatMessageView {
             text: text.into(),
             display_label: None,
             activity: None,
+            submission_status: None,
+            submission_context: None,
             format: TextFormat::PlainText,
         }
     }
@@ -1828,6 +1838,13 @@ pub use bcode_session_models::MessageAcceptanceDisposition as MessageAcceptanceD
 pub enum SessionViewActionOutcome {
     /// No response payload is required.
     None,
+    /// Durable conversational acceptance, not turn execution.
+    SubmissionAccepted {
+        /// Owning session.
+        session_id: SessionId,
+        /// Exact durable receipt.
+        receipt: bcode_session_models::SubmissionReceipt,
+    },
     /// A prompt was accepted and may have created a session.
     MessageAccepted {
         /// Session that received the message.
@@ -1865,6 +1882,8 @@ pub enum SessionViewActionOutcome {
 pub enum SessionViewAction {
     /// Submit a prompt for the active or specified session.
     SubmitMessage {
+        /// Caller-retained identity for retry-safe acceptance.
+        submission_id: bcode_session_models::SubmissionId,
         /// Target session, when already attached.
         session_id: Option<SessionId>,
         /// Working directory to use when a draft/new session must be created.

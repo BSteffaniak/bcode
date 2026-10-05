@@ -333,7 +333,7 @@ async fn workflow_admission_recovery_reuses_accepted_turn() {
     assert_eq!(
         history
             .iter()
-            .filter(|e| matches!(e.kind, SessionEventKind::UserMessage { .. }))
+            .filter(|e| matches!(e.kind, SessionEventKind::SubmissionAccepted { .. }))
             .count(),
         1
     );
@@ -382,7 +382,10 @@ async fn workflow_admission_cancelled_preparation_is_not_dispatched() {
             .await
             .unwrap()
             .iter()
-            .all(|e| !matches!(e.kind, SessionEventKind::UserMessage { .. }))
+            .all(|e| !matches!(
+                e.kind,
+                SessionEventKind::UserMessage { .. } | SessionEventKind::SubmissionAccepted { .. }
+            ))
     );
 }
 

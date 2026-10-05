@@ -3,6 +3,7 @@
 /// Pending user message not yet confirmed by the session stream.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PendingSubmission {
+    id: bcode_session_models::SubmissionId,
     text: String,
     reveal_on_acceptance: bool,
     state: PendingSubmissionState,
@@ -11,12 +12,21 @@ pub struct PendingSubmission {
 impl PendingSubmission {
     /// Create a pending submission in the sending state.
     #[must_use]
-    pub const fn new(text: String) -> Self {
+    pub fn new(text: String) -> Self {
         Self {
+            id: bcode_session_models::SubmissionId(
+                bcode_session_models::SessionId::new().to_string(),
+            ),
             text,
             reveal_on_acceptance: true,
             state: PendingSubmissionState::Sending,
         }
+    }
+
+    /// Stable submission identity.
+    #[must_use]
+    pub const fn id(&self) -> &bcode_session_models::SubmissionId {
+        &self.id
     }
 
     /// Supersede the positioning associated with this submission, but retain its data.

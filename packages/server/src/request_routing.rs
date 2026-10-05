@@ -336,6 +336,19 @@ pub enum SessionTurnRequest {
         placement: PromptPlacement,
         execution: bcode_session_models::TurnExecutionOptions,
     },
+    /// Accept conversational input independently of turn execution.
+    SubmitPrompt {
+        session_id: SessionId,
+        submission_id: bcode_session_models::SubmissionId,
+        text: String,
+        placement: bcode_session_models::SubmissionPlacement,
+        admission: bcode_session_models::TurnAdmissionMetadata,
+    },
+    /// Read one durable submission by identity.
+    GetSubmission {
+        session_id: SessionId,
+        submission_id: bcode_session_models::SubmissionId,
+    },
     /// Submit an ordinary turn through generic admission metadata.
     SubmitTurn {
         session_id: SessionId,
@@ -990,6 +1003,26 @@ impl RoutedRequest {
                 text,
                 placement,
                 execution,
+            }),
+            Request::SubmitPrompt {
+                session_id,
+                submission_id,
+                text,
+                placement,
+                admission,
+            } => Self::SessionTurn(SessionTurnRequest::SubmitPrompt {
+                session_id,
+                submission_id,
+                text,
+                placement,
+                admission,
+            }),
+            Request::GetSubmission {
+                session_id,
+                submission_id,
+            } => Self::SessionTurn(SessionTurnRequest::GetSubmission {
+                session_id,
+                submission_id,
             }),
             Request::SubmitTurn {
                 session_id,

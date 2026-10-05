@@ -599,7 +599,11 @@ struct PendingToolInvocation {
 
 fn non_streaming_item(event: &SessionEvent) -> Option<(TranscriptProjectionItemKind, usize)> {
     match &event.kind {
-        SessionEventKind::UserMessage { text, .. } | SessionEventKind::SystemMessage { text } => {
+        SessionEventKind::UserMessage { text, .. }
+        | SessionEventKind::SubmissionAccepted {
+            submission: bcode_session_models::PromptSubmission { text, .. },
+        }
+        | SessionEventKind::SystemMessage { text } => {
             Some((TranscriptProjectionItemKind::UserMessage, text.len()))
         }
         SessionEventKind::PluginStatusNote { text, .. } => {

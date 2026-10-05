@@ -8,6 +8,7 @@ fn prompt_action_preserves_session_owned_placement_contract() {
         (bcode_session_models::PromptPlacement::FollowUp, "follow_up"),
     ] {
         let action = SessionViewAction::SubmitMessage {
+            submission_id: bcode_session_models::SubmissionId(SessionId::new().to_string()),
             session_id: Some(SessionId::new()),
             launch_working_directory: None,
             text: "continue".to_owned(),

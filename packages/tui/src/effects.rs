@@ -24,6 +24,8 @@ use super::{
 
 /// Submit-message effect request payload.
 pub struct SubmitMessageRequest {
+    /// Stable identity allocated with the optimistic composer item.
+    pub submission_id: bcode_session_models::SubmissionId,
     /// Existing session, if already attached.
     pub session_id: Option<SessionId>,
     /// Working directory to use when creating a draft session.
@@ -530,14 +532,26 @@ pub enum TuiEffectResult {
         /// Session that was requested.
         session_id: SessionId,
         /// History page result.
-        result: Result<SessionHistoryPage, ClientError>,
+        result: Result<
+            (
+                SessionHistoryPage,
+                Vec<bcode_session_models::SubmissionRecord>,
+            ),
+            ClientError,
+        >,
     },
     /// Newer history page load completed.
     NewerHistoryLoaded {
         /// Session that was requested.
         session_id: SessionId,
         /// History page result.
-        result: Result<SessionHistoryPage, ClientError>,
+        result: Result<
+            (
+                SessionHistoryPage,
+                Vec<bcode_session_models::SubmissionRecord>,
+            ),
+            ClientError,
+        >,
     },
     /// Permission poll completed.
     PermissionList {
@@ -683,7 +697,15 @@ pub enum TuiEffectResult {
         /// Selected source sequence.
         sequence: u64,
         /// Loaded events and bounded-window flags.
-        result: Result<(Vec<bcode_session_models::SessionEvent>, bool, bool), TuiError>,
+        result: Result<
+            (
+                Vec<bcode_session_models::SessionEvent>,
+                bool,
+                bool,
+                Vec<bcode_session_models::SubmissionRecord>,
+            ),
+            TuiError,
+        >,
     },
     /// Plugin command invocation completed.
     PluginCommandInvoked {
@@ -694,6 +716,8 @@ pub enum TuiEffectResult {
     },
     /// Submit message completed.
     SubmitMessage {
+        /// Identity retained even when transport outcome is ambiguous.
+        submission_id: bcode_session_models::SubmissionId,
         /// Message text originally submitted.
         message: String,
         /// Submit result.
@@ -918,8 +942,10 @@ pub struct SubmitMessageResult {
     pub session_id: SessionId,
     /// Newly-created/attached session summary, if the submit created a session.
     pub created_session: Option<SessionSummary>,
+    /// Bounded lifecycle read following acceptance, when available.
+    pub submission: Result<Option<bcode_session_models::SubmissionRecord>, ClientError>,
     /// Server acceptance for the submitted message.
-    pub acceptance: MessageAcceptance,
+    pub receipt: bcode_session_models::SubmissionReceipt,
     /// Agent committed during submission.
     pub committed_agent_id: Option<String>,
     /// Pending reasoning effort generation committed during submission.
@@ -968,7 +994,7 @@ enum EffectKey {
     ThinkingDialog,
     TimelineJump,
     PluginCommand(String, String),
-    SubmitMessage(usize),
+    SubmitMessage(bcode_session_models::SubmissionId),
     SkillAction(SkillId),
     SetSessionModel(SessionId),
     SetSessionReasoning(SessionId),
@@ -1040,6 +1066,7 @@ impl TuiEffect {
                 agents: Err(client_error.to_string()),
             },
             Self::SubmitMessage { request } => TuiEffectResult::SubmitMessage {
+                submission_id: request.submission_id,
                 message: request.message,
                 result: Box::new(Err(client_error)),
             },
@@ -1451,7 +1478,9 @@ impl TuiEffect {
                 command_id,
                 ..
             } => EffectKey::PluginCommand(plugin_id.clone(), command_id.clone()),
-            Self::SubmitMessage { request } => EffectKey::SubmitMessage(request.message.len()),
+            Self::SubmitMessage { request } => {
+                EffectKey::SubmitMessage(request.submission_id.clone())
+            }
             Self::SkillAction { request } => EffectKey::SkillAction(request.skill_id.clone()),
             Self::SetSessionModel { session_id, .. } => EffectKey::SetSessionModel(*session_id),
             Self::SetSessionReasoning { session_id, .. } => {
@@ -1572,29 +1601,23 @@ impl TuiEffect {
             },
             Self::LoadOlderHistory { session_id, cursor } => TuiEffectResult::OlderHistoryLoaded {
                 session_id,
-                result: client
-                    .session_history_page(
-                        session_id,
-                        SessionHistoryQuery {
-                            cursor: Some(cursor),
-                            limit: super::OLDER_HISTORY_EVENT_LIMIT,
-                            direction: SessionHistoryDirection::Backward,
-                        },
-                    )
-                    .await,
+                result: load_hydrated_history(
+                    &client,
+                    session_id,
+                    cursor,
+                    SessionHistoryDirection::Backward,
+                )
+                .await,
             },
             Self::LoadNewerHistory { session_id, cursor } => TuiEffectResult::NewerHistoryLoaded {
                 session_id,
-                result: client
-                    .session_history_page(
-                        session_id,
-                        SessionHistoryQuery {
-                            cursor: Some(cursor),
-                            limit: super::OLDER_HISTORY_EVENT_LIMIT,
-                            direction: SessionHistoryDirection::Forward,
-                        },
-                    )
-                    .await,
+                result: load_hydrated_history(
+                    &client,
+                    session_id,
+                    cursor,
+                    SessionHistoryDirection::Forward,
+                )
+                .await,
             },
             Self::ListPermissions => TuiEffectResult::PermissionList {
                 result: client.list_permissions().await,
@@ -2247,12 +2270,41 @@ async fn skill_action(
     })
 }
 
+async fn load_hydrated_history(
+    client: &BcodeClient,
+    session_id: SessionId,
+    cursor: SessionHistoryCursor,
+    direction: SessionHistoryDirection,
+) -> Result<
+    (
+        SessionHistoryPage,
+        Vec<bcode_session_models::SubmissionRecord>,
+    ),
+    ClientError,
+> {
+    let page = client
+        .session_history_page(
+            session_id,
+            SessionHistoryQuery {
+                cursor: Some(cursor),
+                limit: super::OLDER_HISTORY_EVENT_LIMIT,
+                direction,
+            },
+        )
+        .await?;
+    let records = client
+        .submissions_for_history(session_id, &page.events)
+        .await?;
+    Ok((page, records))
+}
+
 async fn run_submit_message(
     client: &BcodeClient,
     request: SubmitMessageRequest,
 ) -> TuiEffectResult {
     let message = request.message.clone();
     TuiEffectResult::SubmitMessage {
+        submission_id: request.submission_id.clone(),
         message,
         result: Box::new(submit_message(client, request).await),
     }
@@ -2390,6 +2442,7 @@ async fn submit_message(
     request: SubmitMessageRequest,
 ) -> Result<SubmitMessageResult, ClientError> {
     let SubmitMessageRequest {
+        submission_id,
         session_id,
         launch_working_directory,
         message,
@@ -2459,13 +2512,10 @@ async fn submit_message(
     )
     .await
     .map_err(|error| submission_stage_error("applying model/agent/reasoning selections", error))?;
-    let placement = match placement {
-        PromptPlacement::Steering => bcode_session_view_models::PromptPlacementView::Steering,
-        PromptPlacement::FollowUp => bcode_session_view_models::PromptPlacementView::FollowUp,
-    };
     let outcome = execute_session_view_action(
         client,
         SessionViewAction::SubmitMessage {
+            submission_id,
             session_id: Some(session_id),
             launch_working_directory: None,
             text: message,
@@ -2475,16 +2525,28 @@ async fn submit_message(
     )
     .await
     .map_err(|error| submission_stage_error("waiting for message acceptance", error))?;
-    let acceptance = message_acceptance_from_action_outcome(&outcome)?;
+    let receipt = submission_receipt_from_action(outcome)?;
     Ok(SubmitMessageResult {
         session_id,
         created_session,
-        acceptance,
+        submission: client
+            .get_submission(session_id, receipt.submission_id.clone())
+            .await,
+        receipt,
         committed_agent_id: agent_id,
         committed_reasoning_effort_generation: reasoning_effort_generation,
         event_task,
         event_stream_release,
     })
+}
+
+fn submission_receipt_from_action(
+    outcome: SessionViewActionOutcome,
+) -> Result<bcode_session_models::SubmissionReceipt, ClientError> {
+    match outcome {
+        SessionViewActionOutcome::SubmissionAccepted { receipt, .. } => Ok(receipt),
+        _ => Err(ClientError::UnexpectedResponse),
+    }
 }
 
 async fn optional_client_result<T>(

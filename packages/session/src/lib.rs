@@ -59,6 +59,7 @@ pub mod storage_tracking_fence;
 pub mod storage_usage;
 mod store;
 mod store_executor;
+mod submission;
 mod subscription;
 mod tools;
 mod usage;
@@ -2888,7 +2889,11 @@ fn input_history_from_events(history: &[SessionEvent]) -> Vec<SessionInputHistor
     history
         .iter()
         .filter_map(|event| {
-            if let SessionEventKind::UserMessage { text, .. } = &event.kind {
+            if let SessionEventKind::UserMessage { text, .. }
+            | SessionEventKind::SubmissionAccepted {
+                submission: bcode_session_models::PromptSubmission { text, .. },
+            } = &event.kind
+            {
                 Some(SessionInputHistoryEntry {
                     sequence: event.sequence,
                     timestamp_ms: event.timestamp_ms,
@@ -2902,45 +2907,7 @@ fn input_history_from_events(history: &[SessionEvent]) -> Vec<SessionInputHistor
 }
 
 fn model_context_events_from_history(history: &[SessionEvent]) -> Vec<SessionEvent> {
-    let latest_compaction = history
-        .iter()
-        .filter(|event| {
-            matches!(
-                event.kind,
-                SessionEventKind::ContextCompacted { .. }
-                    | SessionEventKind::ProviderContextCompacted { .. }
-            )
-        })
-        .max_by_key(|event| event.sequence);
-    let Some(marker) = latest_compaction else {
-        return history.to_vec();
-    };
-    let compacted_through_sequence = match &marker.kind {
-        SessionEventKind::ContextCompacted {
-            compacted_through_sequence,
-            ..
-        }
-        | SessionEventKind::ProviderContextCompacted {
-            compacted_through_sequence,
-            ..
-        } => *compacted_through_sequence,
-        _ => unreachable!("marker selection accepts only compaction events"),
-    };
-    let mut retained = history
-        .iter()
-        .filter(|event| event.sequence > compacted_through_sequence)
-        .filter(|event| event.sequence != marker.sequence)
-        .filter(|event| {
-            !matches!(
-                event.kind,
-                SessionEventKind::ContextCompacted { .. }
-                    | SessionEventKind::ProviderContextCompacted { .. }
-            )
-        })
-        .cloned()
-        .collect::<Vec<_>>();
-    retained.sort_by_key(|event| event.sequence);
-    std::iter::once(marker.clone()).chain(retained).collect()
+    crate::db_context::canonical_model_context_from_events(history.iter().cloned())
 }
 
 fn current_unix_millis() -> u64 {

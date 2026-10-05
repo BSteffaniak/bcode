@@ -544,6 +544,19 @@ pub enum Request {
         placement: PromptPlacement,
         execution: bcode_session_models::TurnExecutionOptions,
     },
+    /// Accept a conversational submission without promising independent turn execution.
+    SubmitPrompt {
+        session_id: SessionId,
+        submission_id: bcode_session_models::SubmissionId,
+        text: String,
+        placement: bcode_session_models::SubmissionPlacement,
+        admission: bcode_session_models::TurnAdmissionMetadata,
+    },
+    /// Read one durable submission through a bounded indexed lookup.
+    GetSubmission {
+        session_id: SessionId,
+        submission_id: bcode_session_models::SubmissionId,
+    },
     /// Submit an ordinary turn through generic admission metadata.
     SubmitTurn {
         session_id: SessionId,
@@ -2024,6 +2037,14 @@ pub enum ResponsePayload {
         queued: bool,
         queue_position: Option<u32>,
         disposition: MessageAcceptanceDisposition,
+    },
+    /// Exact durable receipt for conversational acceptance, including an idempotent retry.
+    SubmissionAccepted {
+        receipt: bcode_session_models::SubmissionReceipt,
+    },
+    /// Bounded authoritative lookup; absence is not an inferred cancellation.
+    Submission {
+        record: Option<bcode_session_models::SubmissionRecord>,
     },
     TurnAdmission {
         admission: bcode_session_models::TurnAdmission,
@@ -5076,6 +5097,31 @@ mod tests {
                 } if actual == version
             ));
         }
+    }
+
+    #[test]
+    fn submission_receipt_and_bounded_lookup_round_trip() {
+        let id = bcode_session_models::SubmissionId("retry-1".to_owned());
+        let request = Request::GetSubmission {
+            session_id: SessionId::new(),
+            submission_id: id.clone(),
+        };
+        let encoded = encode(&request).unwrap();
+        let decoded: Request = decode(&encoded).unwrap();
+        assert!(
+            matches!(decoded, Request::GetSubmission { submission_id, .. } if submission_id == id)
+        );
+        let response = Response::Ok(ResponsePayload::SubmissionAccepted {
+            receipt: bcode_session_models::SubmissionReceipt {
+                submission_id: id.clone(),
+                accepted_event_sequence: 42,
+            },
+        });
+        let encoded = encode(&response).unwrap();
+        let decoded: Response = decode(&encoded).unwrap();
+        assert!(
+            matches!(decoded, Response::Ok(ResponsePayload::SubmissionAccepted { receipt }) if receipt.submission_id == id && receipt.accepted_event_sequence == 42)
+        );
     }
 
     #[test]

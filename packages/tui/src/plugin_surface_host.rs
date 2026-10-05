@@ -956,6 +956,9 @@ async fn attach_plugin_session_view(
         );
     }
     view.apply_history(&attached.history);
+    for record in &attached.submissions {
+        view.apply_submission_record(record);
+    }
     let permissions = client_permission_views(
         client.list_permissions().await.unwrap_or_default(),
         request.session_id,

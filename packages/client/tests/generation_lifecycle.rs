@@ -100,20 +100,21 @@ fn fixture_with_pending(fail_history: bool, hold: fn(&Request) -> bool) -> Fixtu
                     }))
                     .unwrap(),
                 },
-                Request::SendUserMessageWithExecution {
+                Request::SubmitTurn {
                     session_id: actual,
-                    execution,
+                    admission,
                     ..
                 } => {
                     assert_eq!(actual, session_id);
                     assert_eq!(
-                        execution.tools,
+                        admission.execution.tools,
                         bcode_session_models::TurnToolPolicy::Disabled
                     );
-                    assert!(execution.structured_output.is_some());
-                    ResponsePayload::MessageAccepted {
-                        queued: false,
-                        queue_position: None,
+                    assert!(admission.execution.structured_output.is_some());
+                    ResponsePayload::TurnAdmission {
+                        admission: bcode_session_models::TurnAdmission::Accepted(
+                            bcode_session_models::TurnReceipt::from_accepted_event(session_id, 1),
+                        ),
                     }
                 }
                 Request::SessionHistoryPage {
@@ -164,7 +165,7 @@ async fn deadline_bounds_preparation_and_ambiguous_submission() {
             if preparation {
                 |request| matches!(request, Request::CreateSession { .. })
             } else {
-                |request| matches!(request, Request::SendUserMessageWithExecution { .. })
+                |request| matches!(request, Request::SubmitTurn { .. })
             },
         );
         let control = PluginStructuredGenerationControl::default();

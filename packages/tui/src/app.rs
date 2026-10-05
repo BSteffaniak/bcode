@@ -3573,6 +3573,32 @@ impl BmuxApp {
             self.downgrade_sticky_entry_anchor();
         }
         match &event.kind {
+            SessionEventKind::SubmissionAccepted { submission } => {
+                self.pending_submissions.remove_id(&submission.id);
+                self.set_status(match submission.requested_placement {
+                    bcode_session_models::SubmissionPlacement::Steer => {
+                        "Steering pending".to_owned()
+                    }
+                    bcode_session_models::SubmissionPlacement::FollowUp => {
+                        "Follow-up pending".to_owned()
+                    }
+                });
+            }
+            SessionEventKind::SubmissionCancelled { .. } if application.live_activity() => {
+                self.set_status("Submission cancelled before activation".to_owned());
+            }
+            SessionEventKind::SubmissionActivated {
+                submission_id,
+                text,
+                ..
+            } => {
+                self.pending_submissions.remove_id(submission_id);
+                self.input_history
+                    .push_committed(event.sequence, event.timestamp_ms, text);
+                if application.live_activity() {
+                    self.set_status("Submission activated".to_owned());
+                }
+            }
             SessionEventKind::UserMessage { text, .. } => {
                 self.assistant_scroll_anchor = AssistantScrollAnchorState::Idle;
                 self.pending_assistant_stream_anchor = false;
@@ -4073,6 +4099,15 @@ impl BmuxApp {
         if application.live_activity() {
             self.set_activity(ActivityState::PreparingModelRequest);
         }
+    }
+
+    /// Apply bounded authoritative submission lifecycle hydration.
+    pub fn apply_submission_records(&mut self, records: &[bcode_session_models::SubmissionRecord]) {
+        for record in records {
+            self.pending_submissions.remove_id(&record.submission.id);
+            self.session_view.apply_submission_record(record);
+        }
+        let _ = self.apply_session_view_terminal_adapter();
     }
 
     /// Start a candidate from the last acknowledged navigation state.
@@ -5142,7 +5177,11 @@ const fn event_breaks_sticky_entry_anchor(event: &SessionEvent) -> bool {
 
 const fn event_affects_transcript_rows(event: &SessionEvent) -> bool {
     match &event.kind {
-        SessionEventKind::UserMessage { .. }
+        SessionEventKind::SubmissionAccepted { .. }
+        | SessionEventKind::SubmissionActivated { .. }
+        | SessionEventKind::SubmissionCancelled { .. }
+        | SessionEventKind::SubmissionContextObserved { .. }
+        | SessionEventKind::UserMessage { .. }
         | SessionEventKind::AssistantDelta { .. }
         | SessionEventKind::AssistantMessage { .. }
         | SessionEventKind::AssistantResponseSegment { .. }

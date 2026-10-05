@@ -3,6 +3,35 @@
 See [Session storage tiering](session-storage-tiering.md) for the implemented bounded storage
 measurement command and the remaining transparent-compression design.
 
+## Prompt acceptance and conversation activation
+
+Session event schema 48 and writer epoch 12 distinguish durable prompt acceptance from
+model-visible conversation input. `SubmissionAccepted` preserves the prompt, requested placement,
+resolved turn target, and immutable execution options. Acceptance is visible to transcript/history
+but excluded from model context. `SubmissionActivated` assigns that input to its consuming turn
+at its activation sequence; `SubmissionCancelled` terminalizes pending input without adding it to
+model context. Activation is not evidence that a provider request ran or that the instruction was
+fulfilled.
+
+The session-owned submission projection supports bounded exact lookup and acceptance-ordered
+pending pages. It is derived from canonical lifecycle events, checkpoint-validated, and rebuilt
+only through authorized maintenance or migration. Pending payload is retained independently of
+context compaction. Activated conversation snapshots feed request construction, compaction, and
+request-only context capture; a follow-up's conversation position is its activation, not its earlier
+acceptance. Presentation retains one submission identity rather than rendering activation as a
+second prompt.
+
+Independent queued-turn admission retains a `TurnReceipt` derived from the acceptance sequence;
+conversational steering instead has a `SubmissionReceipt` and an explicit target turn. Scheduling,
+execution-option compatibility, safe tool/provider boundaries, and ownership-authorized recovery
+remain application/runtime responsibilities. A durable pending record is not authority to repeat
+an ambiguous provider or tool effect.
+
+The known epoch-11 upgrade preserves historical events and turn receipts without synthesizing
+submission targets, cancellation, or replay obligations. Historical `UserMessage` events retain
+their original interpretation. Migration runs through exclusive domain-owned coordination, never
+as repair during an ordinary context/history read. Unsupported or ambiguous state fails closed.
+
 ## Turn environment snapshots
 
 Turn preparation explicitly records enabled dynamic environment and repository facts as a
@@ -481,7 +510,9 @@ owner blocks migration. Unknown, future, dirty, ambiguous, or corrupt storage st
 
 `session_storage_contract` contains a singleton versioned writer epoch. Mutation-capable processes
 advertise their epoch in session leases and validate the durable row before mutation. The current
-writer contract is epoch `9`; epoch `8` adds private original billing capture and disposable staging
+writer contract is epoch `12`, adding durable submission lifecycle projections. Epoch `11` histories
+upgrade without inferred submission obligations; earlier supported upgrades retain their existing
+migration chain. Epoch `8` adds private original billing capture and disposable staging
 through exclusive migration. Epoch `7` adds separated derived cost and first-observed request
 timestamps through exclusive migration. Epoch `6` sessions also rebuild the cumulative
 usage projection alongside every existing required projection. Earlier recognized legacy epochs

@@ -142,6 +142,7 @@ pub enum PersistedEventClassification {
 pub const fn classify_persisted_event(kind: &SessionEventKind) -> PersistedEventClassification {
     match kind {
         SessionEventKind::SessionCreated { name: Some(_), .. }
+        | SessionEventKind::SubmissionAccepted { .. }
         | SessionEventKind::UserMessage { .. }
         | SessionEventKind::AssistantMessage { .. }
         | SessionEventKind::SystemMessage { .. }
@@ -192,7 +193,10 @@ pub const fn classify_persisted_event(kind: &SessionEventKind) -> PersistedEvent
         | SessionEventKind::AssistantReasoningDelta { .. } => {
             PersistedEventClassification::NonFinal
         }
-        SessionEventKind::SessionCreated { name: None, .. }
+        SessionEventKind::SubmissionActivated { .. }
+        | SessionEventKind::SubmissionContextObserved { .. }
+        | SessionEventKind::SubmissionCancelled { .. }
+        | SessionEventKind::SessionCreated { name: None, .. }
         | SessionEventKind::ClientAttached { .. }
         | SessionEventKind::ClientDetached { .. }
         | SessionEventKind::ModelChanged { .. }
@@ -420,7 +424,10 @@ pub fn project_event(
         SessionEventKind::AssistantReasoningMessage { .. } => {
             EventProjection::Excluded(ProjectionExclusion::DisabledByPolicy)
         }
-        SessionEventKind::SessionCreated { name: None, .. }
+        SessionEventKind::SubmissionActivated { .. }
+        | SessionEventKind::SubmissionContextObserved { .. }
+        | SessionEventKind::SubmissionCancelled { .. }
+        | SessionEventKind::SessionCreated { name: None, .. }
         | SessionEventKind::SessionRenamed { name: None }
         | SessionEventKind::ClientAttached { .. }
         | SessionEventKind::ClientDetached { .. }
@@ -457,6 +464,7 @@ pub fn project_event(
         }
         SessionEventKind::SessionCreated { name: Some(_), .. }
         | SessionEventKind::SessionRenamed { name: Some(_) }
+        | SessionEventKind::SubmissionAccepted { .. }
         | SessionEventKind::UserMessage { .. }
         | SessionEventKind::AssistantMessage { .. }
         | SessionEventKind::SystemMessage { .. }
@@ -859,6 +867,12 @@ fn project_transcript_event(
             SearchField::Title,
             name,
         ),
+        SessionEventKind::SubmissionAccepted { submission } => (
+            "user-message",
+            SearchContentKind::UserMessage,
+            SearchField::Text,
+            &submission.text,
+        ),
         SessionEventKind::UserMessage { text, .. } => (
             "user-message",
             SearchContentKind::UserMessage,
@@ -919,9 +933,19 @@ fn project_transcript_event(
         content_kind,
         field,
         text,
-        BTreeMap::new(),
+        submission_search_attributes(&event.kind),
         policy.max_text_bytes_per_record,
     ))
+}
+
+fn submission_search_attributes(kind: &SessionEventKind) -> BTreeMap<String, String> {
+    match kind {
+        SessionEventKind::SubmissionAccepted { submission } => BTreeMap::from([
+            ("submission_id".to_owned(), submission.id.0.clone()),
+            ("content_stage".to_owned(), "accepted_submission".to_owned()),
+        ]),
+        _ => BTreeMap::new(),
+    }
 }
 
 fn tool_request(
@@ -1733,6 +1757,52 @@ mod tests {
             policy.max_text_bytes_per_record,
             DEFAULT_MAX_TEXT_BYTES_PER_RECORD
         );
+    }
+
+    #[test]
+    fn submission_lifecycle_indexes_accepted_text_once() {
+        let id = bcode_session_models::SubmissionId("prompt-1".to_owned());
+        let accepted = event(
+            1,
+            SessionEventKind::SubmissionAccepted {
+                submission: bcode_session_models::PromptSubmission {
+                    execution_descriptor: None,
+                    id: id.clone(),
+                    client_id: bcode_session_models::ClientId::new(),
+                    text: "pending prompt".to_owned(),
+                    admission: TurnAdmissionMetadata::default(),
+                    requested_placement: bcode_session_models::SubmissionPlacement::FollowUp,
+                    target: bcode_session_models::SubmissionTarget::OwnTurn {
+                        turn_id: bcode_session_models::TurnId("turn-1".to_owned()),
+                    },
+                },
+            },
+        );
+        assert!(
+            matches!(project_event(&accepted, &SearchProjectionPolicy::default()).unwrap(), EventProjection::Records(records) if records.len() == 1 && records[0].text.as_deref() == Some("pending prompt"))
+        );
+        let activated = event(
+            3,
+            SessionEventKind::SubmissionActivated {
+                submission_id: id.clone(),
+                turn_id: bcode_session_models::TurnId("turn-1".to_owned()),
+                client_id: bcode_session_models::ClientId::new(),
+                text: "activated prompt".to_owned(),
+                admission: TurnAdmissionMetadata::default(),
+            },
+        );
+        assert!(matches!(
+            project_event(&activated, &SearchProjectionPolicy::default()).unwrap(),
+            EventProjection::Excluded(ProjectionExclusion::NoSearchableContent)
+        ));
+        let cancelled = event(
+            4,
+            SessionEventKind::SubmissionCancelled { submission_id: id },
+        );
+        assert!(matches!(
+            project_event(&cancelled, &SearchProjectionPolicy::default()).unwrap(),
+            EventProjection::Excluded(ProjectionExclusion::NoSearchableContent)
+        ));
     }
 
     #[test]

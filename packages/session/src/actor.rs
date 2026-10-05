@@ -250,6 +250,10 @@ impl SessionHandle {
             memory_canonical_usage: BTreeMap::new(),
             memory_original_usage: BTreeMap::new(),
             pending_usage_cost: None,
+            memory_pending_by_turn: BTreeMap::new(),
+            memory_pending_submissions: BTreeMap::new(),
+            memory_running_turns: std::collections::BTreeSet::new(),
+            memory_submissions: BTreeMap::new(),
             memory_usage: bcode_session_models::SessionUsageSummary::default(),
             memory_usage_requests: BTreeMap::new(),
             commands: receiver,
@@ -452,6 +456,128 @@ impl SessionHandle {
         .await?
     }
 
+    /// Durably accept input without making it model-visible. Exact retries are idempotent.
+    /// # Errors
+    /// Returns storage, ownership, or conflicting identity errors.
+    pub async fn accept_submission(
+        &self,
+        submission: bcode_session_models::PromptSubmission,
+        timestamp_ms: u64,
+    ) -> Result<(bcode_session_models::SubmissionRecord, Option<SessionEvent>), SessionError> {
+        self.send(|reply| SessionCommand::SubmissionMutation {
+            mutation: SubmissionMutation::Accept(Box::new(submission)),
+            timestamp_ms,
+            reply,
+        })
+        .await?
+    }
+
+    /// Activate accepted input into its pre-resolved turn at the current conversation position.
+    /// The runtime must call this only at a compatible safe provider boundary.
+    /// # Errors
+    /// Returns an error for missing, cancelled, conflicting or terminal-target submissions.
+    pub async fn activate_submission(
+        &self,
+        id: bcode_session_models::SubmissionId,
+        timestamp_ms: u64,
+    ) -> Result<(bcode_session_models::SubmissionRecord, Option<SessionEvent>), SessionError> {
+        self.send(|reply| SessionCommand::SubmissionMutation {
+            mutation: SubmissionMutation::Activate(id),
+            timestamp_ms,
+            reply,
+        })
+        .await?
+    }
+
+    /// Cancel unactivated input. Activated input requires normal turn cancellation instead.
+    /// # Errors
+    /// Returns ownership, storage or conflicting transition errors.
+    pub async fn cancel_submission(
+        &self,
+        id: bcode_session_models::SubmissionId,
+        timestamp_ms: u64,
+    ) -> Result<(bcode_session_models::SubmissionRecord, Option<SessionEvent>), SessionError> {
+        self.send(|reply| SessionCommand::SubmissionMutation {
+            mutation: SubmissionMutation::Cancel(id),
+            timestamp_ms,
+            reply,
+        })
+        .await?
+    }
+
+    /// Exact bounded lookup independent of the visible history window.
+    /// # Errors
+    /// Returns storage or stale projection errors.
+    pub async fn submission(
+        &self,
+        id: bcode_session_models::SubmissionId,
+    ) -> Result<Option<bcode_session_models::SubmissionRecord>, SessionError> {
+        self.send(|reply| SessionCommand::SubmissionLookup { id, reply })
+            .await?
+    }
+
+    /// Bounded pending page ordered by acceptance, capped at 256 records.
+    /// # Errors
+    /// Returns storage or stale projection errors.
+    pub async fn pending_submissions(
+        &self,
+        after: Option<u64>,
+        limit: usize,
+    ) -> Result<Vec<bcode_session_models::SubmissionRecord>, SessionError> {
+        self.send(|reply| SessionCommand::PendingSubmissions {
+            after,
+            limit,
+            reply,
+        })
+        .await?
+    }
+
+    pub async fn pending_submissions_for_turn(
+        &self,
+        turn_id: bcode_session_models::TurnId,
+        after: Option<u64>,
+        limit: usize,
+    ) -> Result<Vec<bcode_session_models::SubmissionRecord>, SessionError> {
+        self.send(|reply| SessionCommand::PendingSubmissionsForTurn {
+            turn_id,
+            after,
+            limit,
+            reply,
+        })
+        .await?
+    }
+    pub async fn observe_submission_context(
+        &self,
+        id: bcode_session_models::SubmissionId,
+        issue: bcode_session_models::SubmissionContextIssue,
+        timestamp_ms: u64,
+    ) -> Result<(bcode_session_models::SubmissionRecord, Option<SessionEvent>), SessionError> {
+        self.send(|reply| SessionCommand::SubmissionMutation {
+            mutation: SubmissionMutation::Observe(id, issue),
+            timestamp_ms,
+            reply,
+        })
+        .await?
+    }
+    pub async fn admit_queued_turn(
+        &self,
+        client_id: ClientId,
+        text: String,
+        admission: bcode_session_models::TurnAdmissionMetadata,
+        descriptor: Option<bcode_session_models::SubmissionExecutionDescriptor>,
+        timestamp_ms: u64,
+    ) -> Result<TurnAdmissionResult, SessionError> {
+        self.send(|reply| SessionCommand::AdmitQueuedTurn {
+            client_id,
+            text,
+            admission: Box::new(admission),
+            descriptor: descriptor.map(Box::new),
+            timestamp_ms,
+            reply,
+        })
+        .await?
+    }
+
     pub async fn append_user_message(
         &self,
         client_id: ClientId,
@@ -625,6 +751,16 @@ impl SessionHandle {
             .await?
     }
 
+    /// Capture context and canonical tail in one serialized actor operation.
+    /// # Errors
+    /// Returns storage or projection errors.
+    pub async fn activated_conversation_snapshot(
+        &self,
+    ) -> Result<bcode_session_models::ActivatedConversationSnapshot, SessionError> {
+        self.send(SessionCommand::ActivatedConversationSnapshot)
+            .await?
+    }
+
     pub async fn model_context_events(&self) -> Result<Vec<SessionEvent>, SessionError> {
         self.send(SessionCommand::ModelContextEvents).await?
     }
@@ -781,7 +917,48 @@ pub type UsageNormalizer = Arc<
         + Sync,
 >;
 
+enum SubmissionMutation {
+    Observe(
+        bcode_session_models::SubmissionId,
+        bcode_session_models::SubmissionContextIssue,
+    ),
+    Accept(Box<bcode_session_models::PromptSubmission>),
+    Activate(bcode_session_models::SubmissionId),
+    Cancel(bcode_session_models::SubmissionId),
+}
+
 enum SessionCommand {
+    PendingSubmissionsForTurn {
+        turn_id: bcode_session_models::TurnId,
+        after: Option<u64>,
+        limit: usize,
+        reply: oneshot::Sender<Result<Vec<bcode_session_models::SubmissionRecord>, SessionError>>,
+    },
+    AdmitQueuedTurn {
+        client_id: ClientId,
+        text: String,
+        admission: Box<bcode_session_models::TurnAdmissionMetadata>,
+        descriptor: Option<Box<bcode_session_models::SubmissionExecutionDescriptor>>,
+        timestamp_ms: u64,
+        reply: oneshot::Sender<Result<TurnAdmissionResult, SessionError>>,
+    },
+    SubmissionMutation {
+        mutation: SubmissionMutation,
+        timestamp_ms: u64,
+        reply: oneshot::Sender<
+            Result<(bcode_session_models::SubmissionRecord, Option<SessionEvent>), SessionError>,
+        >,
+    },
+    SubmissionLookup {
+        id: bcode_session_models::SubmissionId,
+        reply:
+            oneshot::Sender<Result<Option<bcode_session_models::SubmissionRecord>, SessionError>>,
+    },
+    PendingSubmissions {
+        after: Option<u64>,
+        limit: usize,
+        reply: oneshot::Sender<Result<Vec<bcode_session_models::SubmissionRecord>, SessionError>>,
+    },
     UsagePage {
         query: bcode_session_models::SessionUsageQuery,
         reply: oneshot::Sender<Result<bcode_session_models::SessionUsagePage, SessionError>>,
@@ -898,6 +1075,9 @@ enum SessionCommand {
             Result<Option<bcode_session_models::RequestContextOccupancy>, SessionError>,
         >,
     ),
+    ActivatedConversationSnapshot(
+        oneshot::Sender<Result<bcode_session_models::ActivatedConversationSnapshot, SessionError>>,
+    ),
     ModelContextEvents(oneshot::Sender<Result<Vec<SessionEvent>, SessionError>>),
     ActiveToolRuns(oneshot::Sender<Result<Vec<crate::db::ToolRun>, SessionError>>),
     ActiveRuntimeWork {
@@ -953,6 +1133,12 @@ struct SessionActor {
     memory_canonical_usage: BTreeMap<String, bcode_session_models::SessionTokenUsage>,
     memory_original_usage: BTreeMap<String, bcode_session_models::OriginalUsage>,
     pending_usage_cost: Option<bcode_session_models::SessionCostEstimate>,
+    memory_submissions:
+        BTreeMap<bcode_session_models::SubmissionId, bcode_session_models::SubmissionRecord>,
+    memory_pending_by_turn:
+        BTreeMap<bcode_session_models::TurnId, BTreeMap<u64, bcode_session_models::SubmissionId>>,
+    memory_pending_submissions: BTreeMap<u64, bcode_session_models::SubmissionId>,
+    memory_running_turns: std::collections::BTreeSet<String>,
     memory_usage: bcode_session_models::SessionUsageSummary,
     memory_usage_requests: BTreeMap<String, bcode_session_models::SessionTokenUsage>,
     commands: mpsc::Receiver<SessionCommand>,
@@ -1149,6 +1335,93 @@ impl SessionActor {
             | SessionCommand::SetComposerDraft { .. } => {
                 unreachable!("write commands are handled before read commands")
             }
+            SessionCommand::AdmitQueuedTurn {
+                client_id,
+                text,
+                admission,
+                descriptor,
+                timestamp_ms,
+                reply,
+            } => {
+                let _ = reply.send(
+                    self.admit_queued_turn(
+                        client_id,
+                        text,
+                        *admission,
+                        descriptor.map(|d| *d),
+                        timestamp_ms,
+                    )
+                    .await,
+                );
+            }
+            SessionCommand::SubmissionMutation {
+                mutation,
+                timestamp_ms,
+                reply,
+            } => {
+                let _ = reply.send(self.mutate_submission(mutation, timestamp_ms).await);
+            }
+            SessionCommand::SubmissionLookup { id, reply } => {
+                let result = match self.existing_session_db().await {
+                    Ok(Some(db)) => db.submission(&id).await.map_err(Into::into),
+                    Ok(None) => Ok(self.memory_submissions.get(&id).cloned()),
+                    Err(error) => Err(error),
+                };
+                let _ = reply.send(result);
+            }
+            SessionCommand::PendingSubmissionsForTurn {
+                turn_id,
+                after,
+                limit,
+                reply,
+            } => {
+                let result = match self.existing_session_db().await {
+                    Ok(Some(db)) => db
+                        .pending_submissions_for_turn(&turn_id, after, limit)
+                        .await
+                        .map_err(Into::into),
+                    Ok(None) => {
+                        let lower =
+                            after.map_or(std::ops::Bound::Unbounded, std::ops::Bound::Excluded);
+                        Ok(self.memory_pending_by_turn.get(&turn_id).map_or_else(
+                            Vec::new,
+                            |index| {
+                                index
+                                    .range((lower, std::ops::Bound::Unbounded))
+                                    .take(limit.min(256))
+                                    .filter_map(|(_, id)| self.memory_submissions.get(id).cloned())
+                                    .collect()
+                            },
+                        ))
+                    }
+                    Err(error) => Err(error),
+                };
+                let _ = reply.send(result);
+            }
+            SessionCommand::PendingSubmissions {
+                after,
+                limit,
+                reply,
+            } => {
+                let result = match self.existing_session_db().await {
+                    Ok(Some(db)) => db
+                        .pending_submissions(after, limit)
+                        .await
+                        .map_err(Into::into),
+                    Ok(None) => {
+                        let lower =
+                            after.map_or(std::ops::Bound::Unbounded, std::ops::Bound::Excluded);
+                        Ok(self
+                            .memory_pending_submissions
+                            .range((lower, std::ops::Bound::Unbounded))
+                            .take(limit.min(256))
+                            .filter_map(|(_, id)| self.memory_submissions.get(id).cloned())
+                            .collect())
+                    }
+                    Err(error) => Err(error),
+                };
+                let _ = reply.send(result);
+            }
             SessionCommand::TurnReceipt {
                 producer,
                 idempotency_key,
@@ -1264,6 +1537,22 @@ impl SessionActor {
             }
             SessionCommand::CurrentRequestContextOccupancy(reply) => {
                 let _ = reply.send(self.current_context_occupancy().await);
+            }
+            SessionCommand::ActivatedConversationSnapshot(reply) => {
+                let result = match self.existing_session_db().await {
+                    Ok(Some(db)) => db
+                        .activated_conversation_snapshot()
+                        .await
+                        .map_err(Into::into),
+                    Ok(None) => self.model_context_events().await.map(|events| {
+                        bcode_session_models::ActivatedConversationSnapshot {
+                            through_sequence: self.state.next_sequence.saturating_sub(1),
+                            events,
+                        }
+                    }),
+                    Err(error) => Err(error),
+                };
+                let _ = reply.send(result);
             }
             SessionCommand::ModelContextEvents(reply) => {
                 let _ = reply.send(self.model_context_events().await);
@@ -2111,6 +2400,7 @@ impl SessionActor {
             event.provenance = provenance;
             event
         };
+        self.project_memory_submission(&event)?;
         self.state
             .apply_persisted_event(event.clone(), activity_timestamp_ms);
         self.retire_live_text_checkpoint_for_durable_event(&event.kind);
@@ -2138,6 +2428,61 @@ impl SessionActor {
             );
         }
         Ok(event)
+    }
+
+    fn project_memory_submission(&mut self, event: &SessionEvent) -> Result<(), SessionError> {
+        if self.store.is_none() {
+            match &event.kind {
+                SessionEventKind::SubmissionAccepted { .. }
+                | SessionEventKind::SubmissionActivated { .. }
+                | SessionEventKind::SubmissionCancelled { .. }
+                | SessionEventKind::SubmissionContextObserved { .. } => {
+                    let record = crate::submission::memory_transition(
+                        &event.kind,
+                        event.sequence,
+                        &self.memory_submissions,
+                        &self.state.turn_evidence,
+                        &self.memory_running_turns,
+                    )?;
+                    if record.status == bcode_session_models::SubmissionStatus::Pending {
+                        self.memory_pending_submissions.insert(
+                            record.receipt.accepted_event_sequence,
+                            record.receipt.submission_id.clone(),
+                        );
+                    } else {
+                        self.memory_pending_submissions
+                            .remove(&record.receipt.accepted_event_sequence);
+                    }
+                    let target_index = self
+                        .memory_pending_by_turn
+                        .entry(record.submission.target.turn_id().clone())
+                        .or_default();
+                    if record.status == bcode_session_models::SubmissionStatus::Pending {
+                        target_index.insert(
+                            record.receipt.accepted_event_sequence,
+                            record.receipt.submission_id.clone(),
+                        );
+                    } else {
+                        target_index.remove(&record.receipt.accepted_event_sequence);
+                    }
+                    self.memory_submissions
+                        .insert(record.receipt.submission_id.clone(), record);
+                }
+                SessionEventKind::RuntimeWorkStarted {
+                    work_id,
+                    kind: bcode_session_models::RuntimeWorkKind::ModelTurn,
+                    ..
+                } => {
+                    self.memory_running_turns.insert(work_id.to_string());
+                }
+                SessionEventKind::RuntimeWorkFinished { work_id, .. }
+                | SessionEventKind::RuntimeWorkCancelRequested { work_id, .. } => {
+                    self.memory_running_turns.remove(&work_id.to_string());
+                }
+                _ => {}
+            }
+        }
+        Ok(())
     }
 
     /// Write the manifest now if any deferred activity-only refresh is pending.
@@ -2200,6 +2545,208 @@ impl SessionActor {
                 .increment_counter("session.manifest.write_skipped_total");
         }
         store.schedule_catalog_summary(summary).await;
+    }
+
+    async fn mutate_submission(
+        &mut self,
+        mutation: SubmissionMutation,
+        timestamp_ms: u64,
+    ) -> Result<(bcode_session_models::SubmissionRecord, Option<SessionEvent>), SessionError> {
+        use bcode_session_models::{SessionEventKind, SubmissionStatus};
+        let invalid =
+            || SessionError::EventSerialization("conflicting or unavailable submission".into());
+        let id = match &mutation {
+            SubmissionMutation::Accept(value) => value.id.clone(),
+            SubmissionMutation::Activate(id)
+            | SubmissionMutation::Cancel(id)
+            | SubmissionMutation::Observe(id, _) => id.clone(),
+        };
+        let prior = if let Some(db) = self.existing_session_db().await? {
+            db.submission(&id).await?
+        } else {
+            self.memory_submissions.get(&id).cloned()
+        };
+        let kind = match mutation {
+            SubmissionMutation::Accept(mut submission) => {
+                if let Some(prior) = prior {
+                    submission.client_id = prior.submission.client_id;
+                    return if prior.submission == *submission {
+                        Ok((prior, None))
+                    } else {
+                        Err(invalid())
+                    };
+                }
+                SessionEventKind::SubmissionAccepted {
+                    submission: *submission,
+                }
+            }
+            SubmissionMutation::Activate(_) => {
+                let prior = prior.ok_or_else(invalid)?;
+                match prior.status {
+                    SubmissionStatus::Activated { .. } => return Ok((prior, None)),
+                    SubmissionStatus::Cancelled { .. } => return Err(invalid()),
+                    SubmissionStatus::Pending => {}
+                }
+                let submission = prior.submission;
+                SessionEventKind::SubmissionActivated {
+                    submission_id: id.clone(),
+                    turn_id: submission.target.turn_id().clone(),
+                    client_id: submission.client_id,
+                    text: submission.text,
+                    admission: submission.admission,
+                }
+            }
+            SubmissionMutation::Observe(_, issue) => {
+                let prior = prior.ok_or_else(invalid)?;
+                if prior.status != SubmissionStatus::Pending {
+                    return Err(invalid());
+                }
+                if prior
+                    .context_observation
+                    .as_ref()
+                    .is_some_and(|observation| observation.issue == issue)
+                {
+                    return Ok((prior, None));
+                }
+                SessionEventKind::SubmissionContextObserved {
+                    submission_id: id.clone(),
+                    issue,
+                }
+            }
+            SubmissionMutation::Cancel(_) => {
+                let prior = prior.ok_or_else(invalid)?;
+                match prior.status {
+                    SubmissionStatus::Cancelled { .. } => return Ok((prior, None)),
+                    SubmissionStatus::Activated { .. } => return Err(invalid()),
+                    SubmissionStatus::Pending => {}
+                }
+                SessionEventKind::SubmissionCancelled {
+                    submission_id: id.clone(),
+                }
+            }
+        };
+        let event = self.append_event(kind, None, timestamp_ms).await?;
+        let record = if self.store.is_none() {
+            self.memory_submissions
+                .get(&id)
+                .cloned()
+                .ok_or_else(invalid)?
+        } else {
+            self.existing_session_db()
+                .await?
+                .ok_or_else(invalid)?
+                .submission(&id)
+                .await?
+                .ok_or_else(invalid)?
+        };
+        Ok((record, Some(event)))
+    }
+
+    async fn admit_queued_turn(
+        &mut self,
+        client_id: ClientId,
+        text: String,
+        admission: bcode_session_models::TurnAdmissionMetadata,
+        descriptor: Option<bcode_session_models::SubmissionExecutionDescriptor>,
+        timestamp_ms: u64,
+    ) -> Result<TurnAdmissionResult, SessionError> {
+        use bcode_session_models::{
+            PromptSubmission, SubmissionId, SubmissionPlacement, SubmissionTarget, TurnAdmission,
+            TurnReceipt,
+        };
+        admission.validate()?;
+        self.ensure_ownership()?;
+        if self.store.is_some() {
+            self.ensure_session_db_for_write().await?;
+            self.refresh_state_from_db_for_write().await?;
+        }
+        if let Some((producer, key)) = admission.idempotency_identity() {
+            let prior = if let Some(db) = self.existing_session_db().await? {
+                if let Some(receipt) = db.turn_receipt(producer, key).await? {
+                    let event = db
+                        .accepted_turn_event(receipt.accepted_event_sequence)
+                        .await?;
+                    Some((receipt, event))
+                } else {
+                    None
+                }
+            } else {
+                self.state
+                    .turn_receipts
+                    .get(&(producer.to_owned(), key.to_owned()))
+                    .cloned()
+                    .map(|receipt| {
+                        let event = self
+                            .state
+                            .events
+                            .as_ref()
+                            .and_then(|events| {
+                                usize::try_from(receipt.accepted_event_sequence)
+                                    .ok()
+                                    .and_then(|index| events.get(index))
+                            })
+                            .cloned();
+                        (receipt, event)
+                    })
+            };
+            if let Some((receipt, event)) = prior {
+                let matches = event.is_some_and(|event| match event.kind {
+                    SessionEventKind::UserMessage {
+                        text: prior,
+                        admission: prior_admission,
+                        ..
+                    } => prior == text && prior_admission == admission && descriptor.is_none(),
+                    SessionEventKind::SubmissionAccepted { submission } => {
+                        submission.execution_descriptor == descriptor
+                            && submission.text == text
+                            && submission.admission == admission
+                            && submission.target
+                                == (SubmissionTarget::OwnTurn {
+                                    turn_id: receipt.turn_id.clone(),
+                                })
+                    }
+                    _ => false,
+                });
+                if !matches {
+                    return Err(SessionError::EventSerialization(
+                        "conflicting queued turn idempotency identity".into(),
+                    ));
+                }
+                return Ok(TurnAdmissionResult {
+                    admission: TurnAdmission::Existing(receipt),
+                    events: Vec::new(),
+                });
+            }
+        }
+        let receipt =
+            TurnReceipt::from_accepted_event(self.state.summary.id, self.state.next_sequence);
+        let submission = PromptSubmission {
+            execution_descriptor: descriptor,
+            id: SubmissionId::for_queued_turn(&receipt.turn_id),
+            client_id,
+            text,
+            admission: admission.clone(),
+            requested_placement: SubmissionPlacement::FollowUp,
+            target: SubmissionTarget::OwnTurn {
+                turn_id: receipt.turn_id.clone(),
+            },
+        };
+        let event = self
+            .append_event(
+                SessionEventKind::SubmissionAccepted { submission },
+                None,
+                timestamp_ms,
+            )
+            .await?;
+        if let Some((producer, key)) = admission.idempotency_identity() {
+            self.state
+                .turn_receipts
+                .insert((producer.to_owned(), key.to_owned()), receipt.clone());
+        }
+        Ok(TurnAdmissionResult {
+            admission: TurnAdmission::Accepted(receipt),
+            events: vec![event],
+        })
     }
 
     async fn append_user_message(

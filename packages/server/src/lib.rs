@@ -613,6 +613,24 @@ struct SessionRuntimeHandle {
     current_turn: Arc<Mutex<Option<RuntimeCurrentTurn>>>,
 }
 
+/// A retired actor must not remove a replacement installed for the same session.
+async fn remove_session_runtime_if_current(
+    state: &ServerState,
+    session_id: SessionId,
+    current_turn: &Arc<Mutex<Option<RuntimeCurrentTurn>>>,
+) -> bool {
+    let mut runtimes = state.session_runtimes.lock().await;
+    if runtimes
+        .get(&session_id)
+        .is_some_and(|handle| Arc::ptr_eq(&handle.current_turn, current_turn))
+    {
+        runtimes.remove(&session_id);
+        true
+    } else {
+        false
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 enum SessionRuntimePhase {
     #[default]
@@ -628,14 +646,6 @@ impl SessionRuntimePhase {
     const fn has_active_work(self) -> bool {
         !matches!(self, Self::Idle)
     }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum SteeringWindow {
-    Idle,
-    BeforeNextProviderRequest,
-    ProviderInFlight,
-    Finishing,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -718,6 +728,11 @@ impl<'a> RuntimeCommandContext<'a> {
 
 #[derive(Debug)]
 enum FollowupCommand {
+    ExecuteSubmission {
+        submission_id: bcode_session_models::SubmissionId,
+        runtime_context: Option<ClientRuntimeContext>,
+        ownership: bcode_session::SessionOwnershipGuard,
+    },
     ExecuteTurn {
         client_id: ClientId,
         runtime_context: Option<ClientRuntimeContext>,
@@ -876,9 +891,23 @@ struct RuntimeCurrentTurn {
     cancel_state: Arc<TurnCancelState>,
     model: Option<ModelRequestAttempt>,
     agent_profile: Option<String>,
+    /// None for operations which cannot accept conversational steering.
+    execution: Option<TurnExecutionOptions>,
+    selection: Option<SessionModelSelection>,
 }
 
 impl RuntimeCurrentTurn {
+    fn accepts_steering(&self, execution: &TurnExecutionOptions) -> bool {
+        self.kind == RuntimeOperationKind::ModelTurn
+            && !self.cancel_state.is_cancelled()
+            && self.execution.as_ref().is_some_and(|active| {
+                active == execution
+                    && active.correlation.is_none()
+                    && active.request_context_id.is_none()
+                    && active.structured_output.is_none()
+            })
+    }
+
     fn model_attempt_for_provider_turn(
         &self,
         provider_turn_id: &str,
@@ -1025,7 +1054,7 @@ impl ProviderStateStore {
     }
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 struct SessionModelSelection {
     provider_plugin_id: Option<String>,
     requested_model_id: Option<String>,
@@ -4113,7 +4142,9 @@ fn clear_persisted_invariant_guidance(state_root: &Path, session_id: SessionId) 
 
 fn user_message_text(event: &bcode_session_models::SessionEvent) -> Option<&str> {
     match &event.kind {
-        SessionEventKind::UserMessage { text, .. } => Some(text),
+        SessionEventKind::UserMessage { text, .. }
+        | SessionEventKind::SubmissionActivated { text, .. } => Some(text),
+        SessionEventKind::SubmissionAccepted { submission } => Some(&submission.text),
         _ => None,
     }
 }
@@ -4680,7 +4711,7 @@ async fn run_with_config(
         "plugins loaded"
     );
     plugin_phase.finish();
-    run_with_services(
+    Box::pin(run_with_services(
         endpoint,
         publish_daemon_record,
         config,
@@ -4694,7 +4725,7 @@ async fn run_with_config(
             locations: None,
             workflow_ready: None,
         },
-    )
+    ))
     .await
 }
 
@@ -5455,6 +5486,16 @@ async fn recover_abandoned_session_runtime_work_best_effort(
     state: &Arc<ServerState>,
     session_id: SessionId,
 ) {
+    Box::pin(recover_abandoned_session_runtime_work_best_effort_inner(
+        state, session_id,
+    ))
+    .await;
+}
+
+async fn recover_abandoned_session_runtime_work_best_effort_inner(
+    state: &Arc<ServerState>,
+    session_id: SessionId,
+) {
     if let Err(error) = recover_abandoned_session_runtime_work(state, session_id).await {
         state
             .metrics
@@ -5462,6 +5503,19 @@ async fn recover_abandoned_session_runtime_work_best_effort(
         tracing::warn!(
             "failed to recover abandoned runtime work for session {session_id}: {error}"
         );
+        return;
+    }
+    match state
+        .sessions
+        .pending_submissions(session_id, None, 1)
+        .await
+    {
+        Ok(pending) if !pending.is_empty() => {
+            // Dispatch still requires session ownership and exact execution-descriptor validation.
+            let _handle = session_runtime_handle(state, session_id).await;
+        }
+        Ok(_) => {}
+        Err(error) => tracing::warn!(%session_id, %error, "pending submission recovery deferred"),
     }
 }
 
@@ -5556,6 +5610,16 @@ async fn recover_abandoned_tool_runs(
 }
 
 async fn recover_abandoned_session_runtime_work(
+    state: &Arc<ServerState>,
+    session_id: SessionId,
+) -> Result<(), ServerError> {
+    Box::pin(recover_abandoned_session_runtime_work_inner(
+        state, session_id,
+    ))
+    .await
+}
+
+async fn recover_abandoned_session_runtime_work_inner(
     state: &Arc<ServerState>,
     session_id: SessionId,
 ) -> Result<(), ServerError> {
@@ -6029,6 +6093,8 @@ const fn request_session_id(request: &Request) -> Option<SessionId> {
         | Request::SendUserMessageWithPlacement { session_id, .. }
         | Request::SendUserMessageWithExecution { session_id, .. }
         | Request::SubmitTurn { session_id, .. }
+        | Request::SubmitPrompt { session_id, .. }
+        | Request::GetSubmission { session_id, .. }
         | Request::InvokeSkill { session_id, .. }
         | Request::InvokeSkillWithExecution { session_id, .. }
         | Request::CancelSessionTurn { session_id, .. }
@@ -6105,6 +6171,8 @@ const fn request_kind(request: &Request) -> &'static str {
         Request::SendUserMessageWithPlacement { .. } => "send_user_message_with_placement",
         Request::SendUserMessageWithExecution { .. } => "send_user_message_with_execution",
         Request::SubmitTurn { .. } => "submit_turn",
+        Request::SubmitPrompt { .. } => "submit_prompt",
+        Request::GetSubmission { .. } => "get_submission",
         Request::InvokeSkill { .. } => "invoke_skill",
         Request::InvokeSkillWithExecution { .. } => "invoke_skill_with_execution",
         Request::CancelSessionTurn { .. } => "cancel_session_turn",
@@ -6404,7 +6472,7 @@ async fn handle_request_inner(
             build_fingerprint,
             state_location_id,
         } => {
-            handle_hello(
+            Box::pin(handle_hello(
                 request_id,
                 client_id,
                 state,
@@ -6417,7 +6485,7 @@ async fn handle_request_inner(
                     build_fingerprint,
                     state_location_id,
                 },
-            )
+            ))
             .await
         }
         SessionLifecycleRequest::UpdateClientRuntimeContext { runtime_context } => {
@@ -7001,6 +7069,61 @@ async fn handle_turn_workflow_model_request(
                 request_id, client_id, state, writer, session_id, text, admission,
             )
             .await
+        }
+        SessionTurnRequest::SubmitPrompt {
+            session_id,
+            submission_id,
+            text,
+            placement,
+            admission,
+        } => {
+            if let Some(active_namespace) = state
+                .active_session_namespace_mismatch(session_id, client_id)
+                .await
+            {
+                return send_incompatible_active_session_response(
+                    writer,
+                    request_id,
+                    &active_namespace,
+                )
+                .await;
+            }
+            let response = match enqueue_prompt_submission(
+                state,
+                session_id,
+                client_id,
+                submission_id,
+                text,
+                placement,
+                admission,
+            )
+            .await
+            {
+                Ok(receipt) => Response::Ok(ResponsePayload::SubmissionAccepted { receipt }),
+                Err(error) => Response::Err(server_session_error_response(&error)),
+            };
+            send_response(writer, request_id, response).await
+        }
+        SessionTurnRequest::GetSubmission {
+            session_id,
+            submission_id,
+        } => {
+            if let Some(active_namespace) = state
+                .active_session_namespace_mismatch(session_id, client_id)
+                .await
+            {
+                return send_incompatible_active_session_response(
+                    writer,
+                    request_id,
+                    &active_namespace,
+                )
+                .await;
+            }
+            let response = match state.sessions.submission(session_id, submission_id).await {
+                Ok(record) => Response::Ok(ResponsePayload::Submission { record }),
+                Err(error) => Response::Err(session_error_response(&error)),
+            };
+            send_response(writer, request_id, response).await
         }
         SessionTurnRequest::InvokeSkill {
             session_id,
@@ -13998,6 +14121,424 @@ async fn validate_interaction_route(
     Ok(())
 }
 
+async fn activated_submission_event(
+    state: &ServerState,
+    session_id: SessionId,
+    submission_id: bcode_session_models::SubmissionId,
+) -> Result<Option<bcode_session_models::SessionEvent>, bcode_session::SessionError> {
+    Box::pin(activated_submission_event_inner(
+        state,
+        session_id,
+        submission_id,
+    ))
+    .await
+}
+
+async fn current_workflow_submission_authority(
+    state: &ServerState,
+    run_id: &str,
+) -> Result<Option<workflow_operations::AuthorityGuard>, WorkflowStoreError> {
+    if let Some(authority) = workflow_representation::owner::local_authority(state, run_id)
+        .await
+        .map_err(|error| WorkflowStoreError::InvalidData(error.to_string()))?
+    {
+        return Ok(Some(authority));
+    }
+    let authority = state
+        .workflow_store
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .execution_authority(run_id)?;
+    let Some(authority) = authority.filter(|authority| {
+        workflow_operations::authority_targets_current_daemon(state, authority)
+    }) else {
+        return Ok(None);
+    };
+    let parent = state
+        .workflow_store
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .run_summary(run_id)?
+        .and_then(|run| run.parent_session_id)
+        .and_then(|id| id.parse::<SessionId>().ok())
+        .ok_or_else(|| {
+            WorkflowStoreError::InvalidData("workflow has no canonical parent session".into())
+        })?;
+    let ownership = state
+        .sessions
+        .acquire_session_ownership(parent, bcode_session::SessionOwnershipKind::RuntimeWork)
+        .await
+        .map_err(|error| WorkflowStoreError::InvalidData(error.to_string()))?;
+    state
+        .workflow_store
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .verify_execution_authority(run_id, &authority)?;
+    Ok(Some(workflow_operations::AuthorityGuard {
+        authority,
+        _session_ownership: Some(ownership),
+    }))
+}
+
+async fn activated_submission_event_inner(
+    state: &ServerState,
+    session_id: SessionId,
+    submission_id: bcode_session_models::SubmissionId,
+) -> Result<Option<bcode_session_models::SessionEvent>, bcode_session::SessionError> {
+    let Some(record) = state
+        .sessions
+        .submission(session_id, submission_id.clone())
+        .await?
+    else {
+        return Err(bcode_session::SessionError::NotFound(session_id));
+    };
+    if !matches!(
+        record.status,
+        bcode_session_models::SubmissionStatus::Pending
+    ) {
+        return Ok(None);
+    }
+    let _workflow_authority = if let Some(correlation) =
+        &record.submission.admission.execution.correlation
+        && record
+            .submission
+            .admission
+            .origin
+            .as_ref()
+            .is_some_and(|origin| origin.producer == "bcode.workflow")
+    {
+        let authority = current_workflow_submission_authority(state, &correlation.execution_id)
+            .await
+            .map_err(|error| bcode_session::SessionError::EventSerialization(error.to_string()))?;
+        let Some(authority) = authority else {
+            return Ok(None);
+        };
+        let dispatch = record
+            .submission
+            .admission
+            .idempotency_key
+            .as_deref()
+            .unwrap_or_default();
+        if workflow_representation::owner::cancellation_intended(
+            state,
+            &correlation.execution_id,
+            dispatch,
+        )
+        .await
+        .map_err(|error| bcode_session::SessionError::EventSerialization(error.to_string()))?
+        {
+            state
+                .sessions
+                .cancel_submission(session_id, submission_id)
+                .await?;
+            return Ok(None);
+        }
+        Some(authority)
+    } else {
+        None
+    };
+    let record = state
+        .sessions
+        .activate_submission(session_id, submission_id)
+        .await?;
+    let bcode_session_models::SubmissionStatus::Activated {
+        conversation_sequence,
+        ..
+    } = record.status
+    else {
+        return Ok(None);
+    };
+    let event = state
+        .sessions
+        .session_events_range(session_id, conversation_sequence, conversation_sequence, 1)
+        .await?
+        .pop()
+        .ok_or(bcode_session::SessionError::NotFound(session_id))?;
+    publish_session_event(state, &event).await;
+    Ok(Some(event))
+}
+
+fn submission_execution_descriptor(
+    selection: &SessionModelSelection,
+    config: &bcode_config::BcodeConfig,
+    execution: &TurnExecutionOptions,
+) -> Option<bcode_session_models::SubmissionExecutionDescriptor> {
+    use sha2::{Digest, Sha256};
+    let context = &selection.provider_context;
+    // Arbitrary provider settings, request extensions and transient credentials cannot be
+    // reconstructed by a portable descriptor. Preserve acceptance but expose unavailable recovery.
+    if !context.settings.is_empty()
+        || !context.request.is_empty()
+        || !context.env.is_empty()
+        || context.auth.is_some()
+        || !context.auth_candidates.is_empty()
+        || context.auth_pool.is_some()
+        || execution.request_context_id.is_some()
+        || !config.plugins.config.is_empty()
+    {
+        return None;
+    }
+    let identity = serde_json::to_vec(&(
+        &config.active_context,
+        &config.agent,
+        &config.tools,
+        &config.system_prompt,
+        &config.prompt_profile,
+        &config.skills,
+        &config.invariants,
+        config.model.max_tool_rounds,
+        (
+            &config.model.context_strategy,
+            &config.model.retry,
+            &config.model.prompt_cache,
+            &config.plugins.default,
+            &config.plugins.enabled,
+            &config.plugins.disabled,
+        ),
+        &context.api_surface,
+        execution,
+    ))
+    .ok()?;
+    let mut config_identity = String::with_capacity(64);
+    for byte in Sha256::digest(identity) {
+        use std::fmt::Write as _;
+        write!(config_identity, "{byte:02x}").expect("writing a digest to a string");
+    }
+    Some(bcode_session_models::SubmissionExecutionDescriptor {
+        version: 1,
+        provider: selection.provider_plugin_id.clone()?,
+        model: selection.model_id.clone()?,
+        reasoning: Some(bcode_session_models::TurnReasoningOptions {
+            effort: selection.reasoning_effort.clone(),
+            summary: selection.reasoning_summary.clone(),
+        }),
+        model_profile: context.model_profile.clone(),
+        auth_profile: context.auth_profile.clone(),
+        config_identity,
+    })
+}
+
+async fn publish_submission_acceptance(
+    state: &ServerState,
+    session_id: SessionId,
+    receipt: &bcode_session_models::SubmissionReceipt,
+) -> Result<(), bcode_session::SessionError> {
+    let events = state
+        .sessions
+        .session_events_range(
+            session_id,
+            receipt.accepted_event_sequence,
+            receipt.accepted_event_sequence,
+            1,
+        )
+        .await?;
+    for event in events {
+        publish_session_event(state, &event).await;
+    }
+    Ok(())
+}
+
+async fn wake_pending_submission(
+    handle: &SessionRuntimeHandle,
+    submission_id: bcode_session_models::SubmissionId,
+    runtime_context: Option<ClientRuntimeContext>,
+    ownership: bcode_session::SessionOwnershipGuard,
+) {
+    handle.queued_followups.fetch_add(1, Ordering::AcqRel);
+    if handle
+        .followup_commands
+        .send(FollowupCommand::ExecuteSubmission {
+            submission_id,
+            runtime_context,
+            ownership,
+        })
+        .await
+        .is_err()
+    {
+        handle.queued_followups.fetch_sub(1, Ordering::AcqRel);
+        // The actor also discovers durable pending work; channels only carry dispatch hints.
+    }
+}
+
+async fn live_submission_runtime(
+    state: &Arc<ServerState>,
+    session_id: SessionId,
+) -> SessionRuntimeHandle {
+    let handle = session_runtime_handle(state, session_id).await;
+    if handle.followup_commands.is_closed()
+        || handle.steering_commands.is_closed()
+        || handle.cancel_commands.is_closed()
+    {
+        remove_session_runtime_if_current(state, session_id, &handle.current_turn).await;
+        session_runtime_handle(state, session_id).await
+    } else {
+        handle
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn enqueue_prompt_submission(
+    state: &Arc<ServerState>,
+    session_id: SessionId,
+    client_id: ClientId,
+    submission_id: bcode_session_models::SubmissionId,
+    text: String,
+    placement: bcode_session_models::SubmissionPlacement,
+    mut admission: bcode_session_models::TurnAdmissionMetadata,
+) -> Result<bcode_session_models::SubmissionReceipt, ServerError> {
+    admission.activity = None;
+    validate_interaction_route(state, session_id, &admission.execution).await?;
+    if admission.execution.agent_profile.is_none() {
+        admission.execution.agent_profile = Some(session_agent_selection(state, session_id).await);
+    }
+    admission
+        .validate()
+        .map_err(bcode_session::SessionError::from)?;
+    let ownership = state
+        .sessions
+        .acquire_session_ownership(
+            session_id,
+            bcode_session::SessionOwnershipKind::QueuedCommand,
+        )
+        .await?;
+    let runtime_context = state.client_runtime_context(client_id).await;
+    let mut requested_selection =
+        session_model_selection_with_runtime_context(state, session_id, runtime_context.clone())
+            .await;
+    apply_turn_model_selection(&mut requested_selection, &admission.execution);
+    let config = runtime_context
+        .as_ref()
+        .and_then(|context| context.effective_config_toml.as_deref())
+        .and_then(|contents| bcode_config::decode_effective_config(contents).ok())
+        .unwrap_or_else(|| state.startup_config.clone());
+    let execution_descriptor =
+        submission_execution_descriptor(&requested_selection, &config, &admission.execution);
+    let handle = live_submission_runtime(state, session_id).await;
+    let admission_lock = turn_admission_lock(state, session_id).await;
+    let admission_guard = admission_lock.lock().await;
+    let previous = state
+        .sessions
+        .submission(session_id, submission_id.clone())
+        .await?;
+    let phase = *handle.phase.lock().await;
+    let current = handle.current_turn.lock().await;
+    let steering_turn = current
+        .as_ref()
+        .filter(|turn| {
+            placement == bcode_session_models::SubmissionPlacement::Steer
+                && phase != SessionRuntimePhase::FinishingTurn
+                && turn.accepts_steering(&admission.execution)
+                && turn.selection.as_ref() == Some(&requested_selection)
+        })
+        .map(|turn| bcode_session_models::TurnId(turn.turn_id.clone()));
+    let target = previous.as_ref().map_or_else(
+        || {
+            steering_turn.map_or_else(
+                || bcode_session_models::SubmissionTarget::OwnTurn {
+                    turn_id: bcode_session_models::TurnId(format!(
+                        "{session_id}-submission-{}",
+                        submission_id.0
+                    )),
+                },
+                |turn_id| bcode_session_models::SubmissionTarget::Steering { turn_id },
+            )
+        },
+        |record| record.submission.target.clone(),
+    );
+    let record = state
+        .sessions
+        .accept_submission(
+            session_id,
+            bcode_session_models::PromptSubmission {
+                id: submission_id.clone(),
+                client_id,
+                text,
+                admission,
+                requested_placement: placement,
+                target,
+                execution_descriptor,
+            },
+        )
+        .await?;
+    let steering = matches!(
+        record.submission.target,
+        bcode_session_models::SubmissionTarget::Steering { .. }
+    );
+    drop(current);
+    drop(admission_guard);
+    if previous.is_none() {
+        publish_submission_acceptance(state, session_id, &record.receipt).await?;
+    }
+    if !steering
+        && matches!(
+            record.status,
+            bcode_session_models::SubmissionStatus::Pending
+        )
+    {
+        wake_pending_submission(&handle, submission_id, runtime_context, ownership).await;
+    }
+    Ok(record.receipt)
+}
+
+/// Serialize safe-boundary activation with acceptance and the decision to close steering.
+async fn activate_pending_steering(
+    state: &ServerState,
+    session_id: SessionId,
+    context: &RuntimeCommandContext<'_>,
+    close_if_empty: bool,
+) -> Result<bool, bcode_session::SessionError> {
+    Box::pin(activate_pending_steering_inner(
+        state,
+        session_id,
+        context,
+        close_if_empty,
+    ))
+    .await
+}
+
+async fn activate_pending_steering_inner(
+    state: &ServerState,
+    session_id: SessionId,
+    context: &RuntimeCommandContext<'_>,
+    close_if_empty: bool,
+) -> Result<bool, bcode_session::SessionError> {
+    let lock = turn_admission_lock(state, session_id).await;
+    let _guard = lock.lock().await;
+    let mut current = context.current_turn.lock().await;
+    let Some(turn) = current.as_mut() else {
+        return Ok(false);
+    };
+    if turn.cancel_state.is_cancelled() {
+        return Ok(false);
+    }
+    let pending = state
+        .sessions
+        .pending_submissions_for_turn(
+            session_id,
+            bcode_session_models::TurnId(turn.turn_id.clone()),
+            None,
+            32,
+        )
+        .await?;
+    let mut activated = false;
+    for record in pending {
+        if matches!(
+            record.submission.target,
+            bcode_session_models::SubmissionTarget::Steering { .. }
+        ) {
+            activated |=
+                activated_submission_event(state, session_id, record.receipt.submission_id)
+                    .await?
+                    .is_some();
+        }
+    }
+    if close_if_empty && !activated {
+        turn.execution = None;
+    }
+    drop(current);
+    Ok(activated)
+}
+
 async fn admit_turn(
     state: &ServerState,
     session_id: SessionId,
@@ -14011,14 +14552,52 @@ async fn admit_turn(
     ),
     bcode_session::SessionError,
 > {
+    let runtime_context = state.client_runtime_context(client_id).await;
+    Box::pin(admit_turn_inner(
+        state,
+        session_id,
+        client_id,
+        text,
+        admission,
+        runtime_context,
+    ))
+    .await
+}
+
+async fn admit_turn_inner(
+    state: &ServerState,
+    session_id: SessionId,
+    client_id: ClientId,
+    text: String,
+    admission: bcode_session_models::TurnAdmissionMetadata,
+    runtime_context: Option<ClientRuntimeContext>,
+) -> Result<
+    (
+        bcode_session_models::TurnAdmission,
+        Option<bcode_session_models::SessionEvent>,
+    ),
+    bcode_session::SessionError,
+> {
     let mut admission = admission;
     validate_interaction_route(state, session_id, &admission.execution).await?;
     if admission.execution.agent_profile.is_none() {
         admission.execution.agent_profile = Some(session_agent_selection(state, session_id).await);
     }
+    let mut selection =
+        session_model_selection_with_runtime_context(state, session_id, runtime_context.clone())
+            .await;
+    apply_turn_model_selection(&mut selection, &admission.execution);
+    let config = runtime_context
+        .as_ref()
+        .and_then(|context| context.effective_config_toml.as_deref())
+        .and_then(|contents| bcode_config::decode_effective_config(contents).ok())
+        .unwrap_or_else(|| state.startup_config.clone());
+    let descriptor = submission_execution_descriptor(&selection, &config, &admission.execution);
     let (admission, events) = state
         .sessions
-        .admit_turn_with_events(session_id, client_id, text, admission)
+        .admit_queued_turn_with_descriptor_and_events(
+            session_id, client_id, text, admission, descriptor,
+        )
         .await?;
     for event in &events {
         publish_session_event(state, event).await;
@@ -14028,13 +14607,16 @@ async fn admit_turn(
     {
         state.session_catalog.upsert_native_session(session).await;
     }
-    let user_event = events
-        .into_iter()
-        .rev()
-        .find(|event| matches!(event.kind, SessionEventKind::UserMessage { .. }));
+    let user_event = events.into_iter().rev().find(|event| {
+        matches!(
+            event.kind,
+            SessionEventKind::UserMessage { .. } | SessionEventKind::SubmissionAccepted { .. }
+        )
+    });
     Ok((admission, user_event))
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn enqueue_user_message_command(
     state: &Arc<ServerState>,
     session_id: SessionId,
@@ -14044,240 +14626,71 @@ async fn enqueue_user_message_command(
     placement: bcode_ipc::PromptPlacement,
     execution: bcode_session_models::TurnExecutionOptions,
 ) -> Result<MessageQueueStatus, ServerError> {
-    let mut execution = execution;
-    if execution.agent_profile.is_none() {
-        execution.agent_profile = Some(session_agent_selection(state, session_id).await);
-    }
-    let automation_lock = turn_admission_lock(state, session_id).await;
-    let _automation_guard = automation_lock.lock().await;
-    state.sessions.session_summary(session_id).await?;
-    let handle = session_runtime_handle(state, session_id).await;
-    let phase_snapshot = *handle.phase.lock().await;
-    let active_agent = handle
-        .current_turn
-        .lock()
-        .await
-        .as_ref()
-        .and_then(|turn| turn.agent_profile.clone());
-    let can_steer = !phase_snapshot.has_active_work()
-        || active_agent.as_ref() == execution.agent_profile.as_ref();
-    let steering_window = if placement == bcode_ipc::PromptPlacement::Steering && can_steer {
-        Some(steering_window(phase_snapshot, &handle.current_turn).await)
-    } else {
-        None
-    };
-    if let Some(window) = steering_window {
-        return enqueue_steering_message_command(
-            state,
-            &handle,
-            session_id,
-            client_id,
-            runtime_context,
-            text,
-            window,
-            execution,
-        )
-        .await;
-    }
-
-    let ownership = state
-        .sessions
-        .acquire_session_ownership(
-            session_id,
-            bcode_session::SessionOwnershipKind::QueuedCommand,
-        )
-        .await?;
-    let admission = bcode_session_models::TurnAdmissionMetadata {
+    Box::pin(enqueue_user_message_command_inner(
+        state,
+        session_id,
+        client_id,
+        runtime_context,
+        text,
+        placement,
         execution,
-        ..bcode_session_models::TurnAdmissionMetadata::default()
-    };
-    admission
-        .validate()
-        .map_err(bcode_session::SessionError::from)?;
-    let (_, user_event) = admit_turn(state, session_id, client_id, text, admission).await?;
-    let user_event = user_event.ok_or(bcode_session::SessionError::NotFound(session_id))?;
-    let pending_before = handle.queued_followups.fetch_add(1, Ordering::AcqRel);
-    let queued = pending_before > 0 || phase_snapshot.has_active_work();
-    let queue_position = queued.then(|| usize_to_u32_saturating(pending_before.saturating_add(1)));
-    let disposition = if queued && placement == bcode_ipc::PromptPlacement::FollowUp {
-        bcode_ipc::MessageAcceptanceDisposition::QueuedFollowUp
-    } else if queued {
-        bcode_ipc::MessageAcceptanceDisposition::QueuedTurn
-    } else {
-        bcode_ipc::MessageAcceptanceDisposition::StartedTurn
-    };
-    let send_result = handle
-        .followup_commands
-        .send(FollowupCommand::ExecuteTurn {
-            client_id,
-            runtime_context,
-            user_event: Box::new(user_event),
-            queued_steering: None,
-            cancel_state: None,
-            completion: None,
-            recovering: false,
-            ownership,
-        })
-        .await
-        .map_err(|error| error.to_string());
-    if send_result.is_ok() {
-        return Ok(MessageQueueStatus {
-            queued,
-            queue_position,
-            disposition,
-        });
-    }
-    handle.queued_followups.fetch_sub(1, Ordering::AcqRel);
-    *handle.phase.lock().await = SessionRuntimePhase::Idle;
-
-    state.session_runtimes.lock().await.remove(&session_id);
-    Err(bcode_session::SessionError::NotFound(session_id).into())
+    ))
+    .await
 }
 
-#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
-async fn enqueue_steering_message_command(
+async fn enqueue_user_message_command_inner(
     state: &Arc<ServerState>,
-    handle: &SessionRuntimeHandle,
     session_id: SessionId,
     client_id: ClientId,
     runtime_context: Option<ClientRuntimeContext>,
     text: String,
-    window: SteeringWindow,
+    placement: bcode_ipc::PromptPlacement,
     execution: bcode_session_models::TurnExecutionOptions,
 ) -> Result<MessageQueueStatus, ServerError> {
-    match window {
-        SteeringWindow::Idle => {
-            let ownership = state
-                .sessions
-                .acquire_session_ownership(
-                    session_id,
-                    bcode_session::SessionOwnershipKind::QueuedCommand,
-                )
-                .await?;
-            let admission = bcode_session_models::TurnAdmissionMetadata {
-                execution,
-                ..bcode_session_models::TurnAdmissionMetadata::default()
-            };
-            admission
-                .validate()
-                .map_err(bcode_session::SessionError::from)?;
-            let (_, user_event) = admit_turn(state, session_id, client_id, text, admission).await?;
-            let user_event = user_event.ok_or(bcode_session::SessionError::NotFound(session_id))?;
-            let pending_before = handle.queued_followups.fetch_add(1, Ordering::AcqRel);
-            let send_result = handle
-                .followup_commands
-                .send(FollowupCommand::ExecuteTurn {
-                    client_id,
-                    runtime_context,
-                    user_event: Box::new(user_event),
-                    queued_steering: None,
-                    cancel_state: None,
-                    completion: None,
-                    recovering: false,
-                    ownership,
-                })
-                .await
-                .map_err(|error| error.to_string());
-            if send_result.is_ok() {
-                return Ok(MessageQueueStatus {
-                    queued: false,
-                    queue_position: None,
-                    disposition: bcode_ipc::MessageAcceptanceDisposition::StartedTurn,
-                });
-            }
-            handle.queued_followups.fetch_sub(1, Ordering::AcqRel);
-            debug_assert_eq!(pending_before, 0);
-        }
-        SteeringWindow::BeforeNextProviderRequest => {
-            if handle
-                .steering_commands
-                .send(SteeringCommand {
-                    client_id,
-                    text,
-                    completion: None,
-                    execution: Box::new(execution),
-                })
-                .await
-                .is_ok()
-            {
-                return Ok(MessageQueueStatus {
-                    queued: false,
-                    queue_position: None,
-                    disposition: bcode_ipc::MessageAcceptanceDisposition::AppliedSteering,
-                });
-            }
-        }
-        SteeringWindow::ProviderInFlight | SteeringWindow::Finishing => {
-            let ownership = state
-                .sessions
-                .acquire_session_ownership(
-                    session_id,
-                    bcode_session::SessionOwnershipKind::QueuedCommand,
-                )
-                .await?;
-            let user_event =
-                append_steering_user_message(state, session_id, client_id, text, execution)
-                    .await?
-                    .ok_or_else(|| bcode_session::SessionError::NotFound(session_id))?;
-            let pending_before = handle.queued_followups.fetch_add(1, Ordering::AcqRel);
-            handle.queued_steering.fetch_add(1, Ordering::AcqRel);
-            let queue_position = Some(usize_to_u32_saturating(pending_before.saturating_add(1)));
-            let send_result = handle
-                .followup_commands
-                .send(FollowupCommand::ExecuteTurn {
-                    client_id,
-                    runtime_context,
-                    user_event: Box::new(user_event),
-                    queued_steering: Some(Arc::clone(&handle.queued_steering)),
-                    cancel_state: None,
-                    completion: None,
-                    recovering: false,
-                    ownership,
-                })
-                .await
-                .map_err(|error| error.to_string());
-            if send_result.is_ok() {
-                return Ok(MessageQueueStatus {
-                    queued: true,
-                    queue_position,
-                    disposition: bcode_ipc::MessageAcceptanceDisposition::QueuedFollowUp,
-                });
-            }
-            handle.queued_followups.fetch_sub(1, Ordering::AcqRel);
-            handle.queued_steering.fetch_sub(1, Ordering::AcqRel);
-        }
-    }
-
-    *handle.phase.lock().await = SessionRuntimePhase::Idle;
-    state.session_runtimes.lock().await.remove(&session_id);
-    Err(bcode_session::SessionError::NotFound(session_id).into())
-}
-
-async fn steering_window(
-    phase: SessionRuntimePhase,
-    current_turn: &Arc<Mutex<Option<RuntimeCurrentTurn>>>,
-) -> SteeringWindow {
-    match phase {
-        SessionRuntimePhase::Idle => SteeringWindow::Idle,
-        SessionRuntimePhase::AppendingUser | SessionRuntimePhase::PreparingModelRequest => {
-            SteeringWindow::BeforeNextProviderRequest
-        }
-        SessionRuntimePhase::ProviderActive => {
-            if current_turn
-                .lock()
-                .await
-                .as_ref()
-                .is_some_and(|turn| turn.model.is_some())
-            {
-                SteeringWindow::ProviderInFlight
-            } else {
-                SteeringWindow::BeforeNextProviderRequest
-            }
-        }
-        SessionRuntimePhase::Compacting | SessionRuntimePhase::FinishingTurn => {
-            SteeringWindow::Finishing
-        }
-    }
+    state
+        .set_session_config_from_runtime_context(session_id, runtime_context.as_ref())
+        .await;
+    let handle = session_runtime_handle(state, session_id).await;
+    let queued = handle.queued_followups.load(Ordering::Acquire) > 0
+        || handle.phase.lock().await.has_active_work();
+    let receipt = enqueue_prompt_submission(
+        state,
+        session_id,
+        client_id,
+        bcode_session_models::SubmissionId(uuid::Uuid::new_v4().to_string()),
+        text,
+        if placement == bcode_ipc::PromptPlacement::Steering {
+            bcode_session_models::SubmissionPlacement::Steer
+        } else {
+            bcode_session_models::SubmissionPlacement::FollowUp
+        },
+        bcode_session_models::TurnAdmissionMetadata {
+            execution,
+            ..Default::default()
+        },
+    )
+    .await?;
+    let record = state
+        .sessions
+        .submission(session_id, receipt.submission_id)
+        .await?
+        .ok_or(bcode_session::SessionError::NotFound(session_id))?;
+    let steering = matches!(
+        record.submission.target,
+        bcode_session_models::SubmissionTarget::Steering { .. }
+    );
+    Ok(MessageQueueStatus {
+        queued,
+        queue_position: (!steering && queued)
+            .then(|| usize_to_u32_saturating(handle.queued_followups.load(Ordering::Acquire))),
+        disposition: if steering {
+            bcode_ipc::MessageAcceptanceDisposition::AppliedSteering
+        } else if queued {
+            bcode_ipc::MessageAcceptanceDisposition::QueuedFollowUp
+        } else {
+            bcode_ipc::MessageAcceptanceDisposition::StartedTurn
+        },
+    })
 }
 
 async fn enqueue_cancel_turn_command(
@@ -14299,7 +14712,7 @@ async fn enqueue_cancel_turn_command(
         .await
         .is_err()
     {
-        state.session_runtimes.lock().await.remove(&session_id);
+        remove_session_runtime_if_current(state, session_id, &handle.current_turn).await;
         return Err(bcode_session::SessionError::NotFound(session_id).into());
     }
     completion.await.map_err(ServerError::from)
@@ -14329,7 +14742,7 @@ async fn enqueue_followup_command(
     }
     handle.queued_followups.fetch_sub(1, Ordering::AcqRel);
 
-    state.session_runtimes.lock().await.remove(&session_id);
+    remove_session_runtime_if_current(state, session_id, &handle.current_turn).await;
     Err(bcode_session::SessionError::NotFound(session_id).into())
 }
 
@@ -14416,8 +14829,219 @@ async fn session_runtime_handle(
     handle
 }
 
-#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+const MAX_RETAINED_DISPATCH_HINTS: usize = 128;
+
+fn retain_dispatch_hint(hints: &mut Vec<FollowupCommand>, command: FollowupCommand) {
+    if let Some(id) = command_submission_id(&command)
+        && hints
+            .iter()
+            .any(|hint| command_submission_id(hint) == Some(id))
+    {
+        return;
+    }
+    debug_assert!(hints.len() < MAX_RETAINED_DISPATCH_HINTS);
+    hints.push(command);
+}
+
+fn command_submission_id(command: &FollowupCommand) -> Option<&bcode_session_models::SubmissionId> {
+    match command {
+        FollowupCommand::ExecuteSubmission { submission_id, .. } => Some(submission_id),
+        FollowupCommand::ExecuteTurn { user_event, .. } => match &user_event.kind {
+            SessionEventKind::SubmissionAccepted { submission } => Some(&submission.id),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+async fn prune_settled_dispatch_hints(
+    state: &ServerState,
+    session_id: SessionId,
+    hints: &mut Vec<FollowupCommand>,
+) -> Result<(), bcode_session::SessionError> {
+    let mut index = 0;
+    while index < hints.len() {
+        if let Some(id) = command_submission_id(&hints[index]) {
+            let record = state.sessions.submission(session_id, id.clone()).await?;
+            if record.is_some_and(|record| {
+                !matches!(
+                    record.status,
+                    bcode_session_models::SubmissionStatus::Pending
+                )
+            }) {
+                hints.remove(index);
+                continue;
+            }
+        }
+        index += 1;
+    }
+    Ok(())
+}
+
+async fn recover_pending_submission_hint(
+    state: &ServerState,
+    session_id: SessionId,
+    record: &bcode_session_models::SubmissionRecord,
+) -> Result<Option<FollowupCommand>, bcode_session::SessionError> {
+    recover_pending_submission_hint_with_authority(state, session_id, record, false).await
+}
+
+async fn recover_pending_submission_hint_with_authority(
+    state: &ServerState,
+    session_id: SessionId,
+    record: &bcode_session_models::SubmissionRecord,
+    workflow_authorized: bool,
+) -> Result<Option<FollowupCommand>, bcode_session::SessionError> {
+    use bcode_session_models::SubmissionContextIssue;
+    // Workflow recovery must supply its ownership-fenced cancellation/completion association.
+    if record.submission.admission.execution.correlation.is_some() && !workflow_authorized {
+        return Ok(None);
+    }
+    let issue = if let Some(expected) = &record.submission.execution_descriptor {
+        let mut selection =
+            session_model_selection_with_runtime_context(state, session_id, None).await;
+        apply_turn_model_selection(&mut selection, &record.submission.admission.execution);
+        let actual = submission_execution_descriptor(
+            &selection,
+            &state.startup_config,
+            &record.submission.admission.execution,
+        );
+        if actual.as_ref() == Some(expected) {
+            let runtime_context = ClientRuntimeContext {
+                selected_provider_plugin_id: selection.provider_plugin_id.clone(),
+                selected_model_id: selection.model_id.clone(),
+                requested_model_id: selection.requested_model_id.clone(),
+                provider_context: selection.provider_context.clone(),
+                ..ClientRuntimeContext::default()
+            };
+            let ownership = state
+                .sessions
+                .acquire_session_ownership(
+                    session_id,
+                    bcode_session::SessionOwnershipKind::QueuedCommand,
+                )
+                .await?;
+            return Ok(Some(FollowupCommand::ExecuteSubmission {
+                submission_id: record.receipt.submission_id.clone(),
+                runtime_context: Some(runtime_context),
+                ownership,
+            }));
+        }
+        SubmissionContextIssue::Incompatible
+    } else {
+        SubmissionContextIssue::Unavailable
+    };
+    if record
+        .context_observation
+        .as_ref()
+        .is_none_or(|observation| observation.issue != issue)
+    {
+        state
+            .sessions
+            .observe_submission_context(session_id, record.receipt.submission_id.clone(), issue)
+            .await?;
+    }
+    Ok(None)
+}
+
+async fn next_pending_submission_command(
+    state: &ServerState,
+    session_id: SessionId,
+    after: &mut Option<u64>,
+    hints: &mut Vec<FollowupCommand>,
+) -> Result<Option<FollowupCommand>, bcode_session::SessionError> {
+    prune_settled_dispatch_hints(state, session_id, hints).await?;
+    let records = state
+        .sessions
+        .pending_submissions(session_id, *after, 32)
+        .await?;
+    if records.is_empty() {
+        *after = None;
+        return Ok(hints
+            .iter()
+            .position(|command| command_submission_id(command).is_none())
+            .map(|index| hints.remove(index)));
+    }
+    for record in records {
+        if matches!(
+            record.submission.target,
+            bcode_session_models::SubmissionTarget::OwnTurn { .. }
+        ) {
+            if let Some(correlation) = &record.submission.admission.execution.correlation
+                && record
+                    .submission
+                    .admission
+                    .origin
+                    .as_ref()
+                    .is_some_and(|origin| origin.producer == "bcode.workflow")
+                && current_workflow_submission_authority(state, &correlation.execution_id)
+                    .await
+                    .map_err(|error| {
+                        bcode_session::SessionError::EventSerialization(error.to_string())
+                    })?
+                    .is_some()
+                && workflow_representation::owner::cancellation_intended(
+                    state,
+                    &correlation.execution_id,
+                    record
+                        .submission
+                        .admission
+                        .idempotency_key
+                        .as_deref()
+                        .unwrap_or_default(),
+                )
+                .await
+                .map_err(|error| {
+                    bcode_session::SessionError::EventSerialization(error.to_string())
+                })?
+            {
+                state
+                    .sessions
+                    .cancel_submission(session_id, record.receipt.submission_id)
+                    .await?;
+                return Ok(None);
+            }
+            // Never skip the oldest independent acceptance. Missing execution context is
+            // not permission to use a reconnected client's or the daemon's defaults.
+            let selected = hints.iter().position(|command| {
+                command_submission_id(command) == Some(&record.receipt.submission_id)
+            });
+            if let Some(index) = selected {
+                return Ok(Some(hints.remove(index)));
+            }
+            return recover_pending_submission_hint(state, session_id, &record).await;
+        }
+        *after = Some(record.receipt.accepted_event_sequence);
+    }
+    Ok(None)
+}
+
+#[allow(clippy::too_many_arguments)]
 async fn run_session_runtime(
+    state: Arc<ServerState>,
+    session_id: SessionId,
+    followup_commands: Arc<Mutex<Option<mpsc::Receiver<FollowupCommand>>>>,
+    steering_commands: Arc<Mutex<Option<mpsc::Receiver<SteeringCommand>>>>,
+    cancel_commands: Arc<Mutex<Option<mpsc::Receiver<CancelCommand>>>>,
+    queued_followups: Arc<AtomicUsize>,
+    phase: Arc<Mutex<SessionRuntimePhase>>,
+    current_turn: Arc<Mutex<Option<RuntimeCurrentTurn>>>,
+) {
+    Box::pin(run_session_runtime_inner(
+        state,
+        session_id,
+        followup_commands,
+        steering_commands,
+        cancel_commands,
+        queued_followups,
+        phase,
+        current_turn,
+    ))
+    .await;
+}
+
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+async fn run_session_runtime_inner(
     state: Arc<ServerState>,
     session_id: SessionId,
     followup_commands: Arc<Mutex<Option<mpsc::Receiver<FollowupCommand>>>>,
@@ -14444,6 +15068,9 @@ async fn run_session_runtime(
         .take()
         .expect("session runtime cancel receiver should be present");
     let mut shutdown = state.subscribe_shutdown();
+    let mut pending_cursor = None;
+    let mut dispatch_hints = Vec::new();
+    let mut idle_since = Instant::now();
     loop {
         if state.shutdown_requested.load(Ordering::SeqCst) {
             break;
@@ -14459,14 +15086,75 @@ async fn run_session_runtime(
         while let Ok(command) = steering_commands.try_recv() {
             process_steering_message_command(&state, permit.session_id(), command).await;
         }
-        let command = tokio::select! {
-            biased;
-            _ = shutdown.recv() => break,
-            command = next_runtime_queue_command(
-                &mut cancel_commands,
-                &mut followup_commands,
-                queued_followups.as_ref(),
-            ) => command,
+        // Transfer a bounded channel page; durable acceptance chooses execution order.
+        for _ in 0..32.min(MAX_RETAINED_DISPATCH_HINTS.saturating_sub(dispatch_hints.len())) {
+            let Ok(command) = followup_commands.try_recv() else {
+                break;
+            };
+            queued_followups.fetch_sub(1, Ordering::AcqRel);
+            if let Some(counter) = queued_steering_counter(&command) {
+                counter.fetch_sub(1, Ordering::AcqRel);
+            }
+            retain_dispatch_hint(&mut dispatch_hints, command);
+        }
+        let pending = match Box::pin(next_pending_submission_command(
+            &state,
+            session_id,
+            &mut pending_cursor,
+            &mut dispatch_hints,
+        ))
+        .await
+        {
+            Ok(pending) => pending,
+            Err(error) => {
+                tracing::warn!(%session_id, %error, "pending submission discovery deferred");
+                None
+            }
+        };
+        if pending.is_some()
+            || !dispatch_hints.is_empty()
+            || queued_followups.load(Ordering::Acquire) > 0
+        {
+            idle_since = Instant::now();
+        } else if idle_since.elapsed() >= Duration::from_secs(2) {
+            let lock = turn_admission_lock(&state, session_id).await;
+            let _guard = lock.lock().await;
+            if followup_commands.is_empty()
+                && queued_followups.load(Ordering::Acquire) == 0
+                && current_turn.lock().await.is_none()
+                && state
+                    .sessions
+                    .pending_submissions(session_id, None, 1)
+                    .await
+                    .is_ok_and(|pending| pending.is_empty())
+            {
+                followup_commands.close();
+                steering_commands.close();
+                cancel_commands.close();
+                remove_session_runtime_if_current(&state, session_id, &current_turn).await;
+                break;
+            }
+            idle_since = Instant::now();
+        }
+        let command = if let Some(command) = pending {
+            Some(RuntimeQueueCommand::Followup(Box::new(command)))
+        } else {
+            let received = tokio::select! {
+                biased;
+                _ = shutdown.recv() => break,
+                command = cancel_commands.recv() => command.map(RuntimeQueueCommand::Cancel),
+                command = followup_commands.recv(), if dispatch_hints.len() < MAX_RETAINED_DISPATCH_HINTS => command.map(|command| {
+                    queued_followups.fetch_sub(1, Ordering::AcqRel);
+                    if let Some(counter) = queued_steering_counter(&command) { counter.fetch_sub(1, Ordering::AcqRel); }
+                    RuntimeQueueCommand::Followup(Box::new(command))
+                }),
+                () = tokio::time::sleep(Duration::from_millis(250)) => continue,
+            };
+            if let Some(RuntimeQueueCommand::Followup(command)) = received {
+                retain_dispatch_hint(&mut dispatch_hints, *command);
+                continue;
+            }
+            received
         };
         let Some(command) = command else {
             break;
@@ -14486,6 +15174,54 @@ async fn run_session_runtime(
             RuntimeQueueCommand::Followup(command) => *command,
         };
         match command {
+            FollowupCommand::ExecuteSubmission {
+                submission_id,
+                runtime_context,
+                ownership,
+            } => {
+                let admission_lock = turn_admission_lock(&state, session_id).await;
+                let guard = admission_lock.lock().await;
+                set_runtime_phase(&phase, SessionRuntimePhase::PreparingModelRequest).await;
+                let event = activated_submission_event(&state, session_id, submission_id).await;
+                drop(guard);
+                match event {
+                    Ok(Some(event)) => {
+                        let client_id = match &event.kind {
+                            SessionEventKind::SubmissionActivated { client_id, .. } => *client_id,
+                            _ => unreachable!(
+                                "submission activation must return its canonical event"
+                            ),
+                        };
+                        Box::pin(process_existing_user_event_command(
+                            &state,
+                            &mut permit,
+                            Arc::clone(&phase),
+                            &mut followup_commands,
+                            &mut steering_commands,
+                            &mut cancel_commands,
+                            queued_followups.as_ref(),
+                            Arc::clone(&current_turn),
+                            client_id,
+                            runtime_context,
+                            event,
+                            None,
+                            None,
+                            false,
+                        ))
+                        .await;
+                    }
+                    Ok(None) => {}
+                    Err(error) => {
+                        append_system_event(
+                            &state,
+                            session_id,
+                            format!("submission activation failed: {error}"),
+                        )
+                        .await;
+                    }
+                }
+                drop(ownership);
+            }
             FollowupCommand::ExecuteTurn {
                 client_id,
                 runtime_context,
@@ -14496,6 +15232,53 @@ async fn run_session_runtime(
                 ownership,
                 ..
             } => {
+                let user_event = if let SessionEventKind::SubmissionAccepted { submission } =
+                    &user_event.kind
+                {
+                    let lock = turn_admission_lock(&state, session_id).await;
+                    let _guard = lock.lock().await;
+                    set_runtime_phase(&phase, SessionRuntimePhase::PreparingModelRequest).await;
+                    if cancel_state
+                        .as_ref()
+                        .is_some_and(|cancel| cancel.is_cancelled())
+                    {
+                        if let Err(error) = state
+                            .sessions
+                            .cancel_submission(session_id, submission.id.clone())
+                            .await
+                        {
+                            tracing::warn!(%session_id, %error, "queued turn cancellation deferred");
+                        }
+                        if let Some(completion) = completion {
+                            let _ = completion.send(ModelTurnCompletion::with_message(
+                                ModelTurnOutcome::Cancelled,
+                                "turn cancelled before activation",
+                            ));
+                        }
+                        continue;
+                    }
+                    match activated_submission_event(&state, session_id, submission.id.clone())
+                        .await
+                    {
+                        Ok(Some(event)) => Box::new(event),
+                        Ok(None) => {
+                            // A repeated dispatch hint observes the original turn; it must not
+                            // synthesize cancellation or reopen an already activated turn.
+                            continue;
+                        }
+                        Err(error) => {
+                            if let Some(completion) = completion {
+                                let _ = completion.send(ModelTurnCompletion::with_message(
+                                    ModelTurnOutcome::Error,
+                                    format!("submission activation failed: {error}"),
+                                ));
+                            }
+                            continue;
+                        }
+                    }
+                } else {
+                    user_event
+                };
                 Box::pin(process_existing_user_event_command(
                     &state,
                     &mut permit,
@@ -14569,7 +15352,7 @@ async fn run_session_runtime(
             }
         }
     }
-    state.session_runtimes.lock().await.remove(&session_id);
+    remove_session_runtime_if_current(&state, session_id, &current_turn).await;
 }
 
 enum RuntimeQueueCommand {
@@ -14587,6 +15370,7 @@ fn queued_steering_counter(command: &FollowupCommand) -> Option<&AtomicUsize> {
     }
 }
 
+#[cfg(test)]
 async fn next_runtime_queue_command(
     cancel_commands: &mut mpsc::Receiver<CancelCommand>,
     followup_commands: &mut mpsc::Receiver<FollowupCommand>,
@@ -14635,6 +15419,34 @@ async fn service_cancel_commands(
     }
 }
 
+async fn cancel_pending_turn_submissions(
+    state: &ServerState,
+    session_id: SessionId,
+    turn_id: &str,
+) -> Result<(), bcode_session::SessionError> {
+    loop {
+        let pending = state
+            .sessions
+            .pending_submissions_for_turn(
+                session_id,
+                bcode_session_models::TurnId(turn_id.to_owned()),
+                None,
+                32,
+            )
+            .await?;
+        if pending.is_empty() {
+            return Ok(());
+        }
+        for record in pending {
+            state
+                .sessions
+                .cancel_submission(session_id, record.receipt.submission_id)
+                .await?;
+        }
+        tokio::task::yield_now().await;
+    }
+}
+
 async fn process_cancel_turn_command(
     state: &ServerState,
     session_id: SessionId,
@@ -14642,9 +15454,63 @@ async fn process_cancel_turn_command(
     queued_followups: &AtomicUsize,
     command: CancelCommand,
 ) {
+    Box::pin(process_cancel_turn_command_inner(
+        state,
+        session_id,
+        followup_commands,
+        queued_followups,
+        command,
+    ))
+    .await;
+}
+
+async fn process_cancel_turn_command_inner(
+    state: &ServerState,
+    session_id: SessionId,
+    followup_commands: &mut mpsc::Receiver<FollowupCommand>,
+    queued_followups: &AtomicUsize,
+    command: CancelCommand,
+) {
+    let lock = turn_admission_lock(state, session_id).await;
+    let admission_guard = lock.lock().await;
     let current_turn = close_session_turn(state, session_id).await;
+    if let Some(turn) = &current_turn
+        && let Err(error) = cancel_pending_turn_submissions(state, session_id, &turn.turn_id).await
+    {
+        tracing::warn!(%session_id, %error, "could not cancel pending steering");
+    }
     interaction_operations::cancel_pending_permissions_for_session(state, session_id).await;
     if command.clear_queue {
+        loop {
+            let pending = match state
+                .sessions
+                .pending_submissions(session_id, None, 128)
+                .await
+            {
+                Ok(pending) => pending,
+                Err(error) => {
+                    tracing::warn!(%session_id, %error, "could not read pending submissions for cancellation");
+                    break;
+                }
+            };
+            if pending.is_empty() {
+                break;
+            }
+            let mut failed = false;
+            for record in pending {
+                if let Err(error) = state
+                    .sessions
+                    .cancel_submission(session_id, record.receipt.submission_id)
+                    .await
+                {
+                    tracing::warn!(%session_id, %error, "could not cancel pending submission");
+                    failed = true;
+                }
+            }
+            if failed {
+                break;
+            }
+        }
         let cleared = drain_followup_commands(followup_commands);
         if cleared > 0 {
             queued_followups.fetch_sub(cleared, Ordering::AcqRel);
@@ -14656,6 +15522,7 @@ async fn process_cancel_turn_command(
             .await;
         }
     }
+    drop(admission_guard);
     let cancelled = current_turn.is_some();
     let requested_by = acknowledge_cancel_command(command, cancelled);
     if let Some(current_turn) = current_turn {
@@ -14874,9 +15741,11 @@ async fn begin_current_turn(
         "begin_current_turn requires no active current turn"
     );
     *current_turn = Some(RuntimeCurrentTurn {
-        interaction_route: execution.interaction_route,
+        interaction_route: execution.interaction_route.clone(),
         kind: RuntimeOperationKind::ModelTurn,
-        agent_profile: execution.agent_profile,
+        agent_profile: execution.agent_profile.clone(),
+        execution: Some(execution),
+        selection: None,
         client_id,
         turn_id,
         cancel_state,
@@ -15165,6 +16034,8 @@ async fn process_compact_session_command(
         interaction_route: None,
         kind: RuntimeOperationKind::ManualCompaction,
         agent_profile: None,
+        execution: None,
+        selection: None,
         client_id,
         turn_id: format!("{session_id}-manual-compact-{}", uuid::Uuid::new_v4()),
         cancel_state: Arc::clone(&cancel_state),
@@ -15289,6 +16160,36 @@ async fn handle_invoke_skill(
     send_response(writer, request_id, Response::Err(error)).await
 }
 
+async fn pending_turn_acceptance_event(
+    state: &ServerState,
+    session_id: SessionId,
+    receipt: &bcode_session_models::TurnReceipt,
+) -> Result<Option<bcode_session_models::SessionEvent>, bcode_session::SessionError> {
+    let id = bcode_session_models::SubmissionId::for_queued_turn(&receipt.turn_id);
+    let Some(record) = state.sessions.submission(session_id, id).await? else {
+        return Ok(None);
+    };
+    if record.receipt.accepted_event_sequence != receipt.accepted_event_sequence
+        || record.submission.target.turn_id() != &receipt.turn_id
+        || !matches!(
+            record.status,
+            bcode_session_models::SubmissionStatus::Pending
+        )
+    {
+        return Ok(None);
+    }
+    Ok(state
+        .sessions
+        .session_events_range(
+            session_id,
+            receipt.accepted_event_sequence,
+            receipt.accepted_event_sequence,
+            1,
+        )
+        .await?
+        .pop())
+}
+
 enum SubmittedModelTurn {
     Started {
         receipt: bcode_session_models::TurnReceipt,
@@ -15297,7 +16198,42 @@ enum SubmittedModelTurn {
     Existing(bcode_session_models::TurnReceipt),
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn submit_session_model_turn_with_admission(
+    state: &Arc<ServerState>,
+    session_id: SessionId,
+    text: String,
+    runtime_context: Option<ClientRuntimeContext>,
+    admission_metadata: bcode_session_models::TurnAdmissionMetadata,
+    cancel_state: Option<Arc<TurnCancelState>>,
+) -> Result<SubmittedModelTurn, ServerError> {
+    Box::pin(submit_session_model_turn_admission_inner(
+        state,
+        session_id,
+        text,
+        runtime_context,
+        admission_metadata,
+        cancel_state,
+    ))
+    .await
+}
+
+async fn lock_turn_admission<'a>(
+    lock: &'a Mutex<()>,
+    cancellation: Option<&TurnCancelState>,
+) -> Result<tokio::sync::MutexGuard<'a, ()>, ServerError> {
+    if let Some(cancellation) = cancellation {
+        tokio::select! {
+            biased;
+            () = cancellation.cancelled() => Err(WorkflowStoreError::CancellationPreventsControl.into()),
+            guard = lock.lock() => Ok(guard),
+        }
+    } else {
+        Ok(lock.lock().await)
+    }
+}
+
+async fn submit_session_model_turn_admission_inner(
     state: &Arc<ServerState>,
     session_id: SessionId,
     text: String,
@@ -15308,17 +16244,7 @@ async fn submit_session_model_turn_with_admission(
     let (sender, receiver) = oneshot::channel();
     let client_id = ClientId::new();
     let admission_lock = turn_admission_lock(state, session_id).await;
-    let _admission_guard = if let Some(cancellation) = &cancel_state {
-        tokio::select! {
-            biased;
-            () = cancellation.cancelled() => {
-                return Err(WorkflowStoreError::CancellationPreventsControl.into());
-            }
-            guard = admission_lock.lock() => guard,
-        }
-    } else {
-        admission_lock.lock().await
-    };
+    let admission_guard = lock_turn_admission(&admission_lock, cancel_state.as_deref()).await?;
     let ownership = state
         .sessions
         .acquire_session_ownership(
@@ -15337,12 +16263,39 @@ async fn submit_session_model_turn_with_admission(
     {
         return Err(WorkflowStoreError::CancellationPreventsControl.into());
     }
-    let (admission, user_event) =
-        admit_turn(state, session_id, client_id, text, admission_metadata).await?;
+    let (admission, user_event) = Box::pin(admit_turn_inner(
+        state,
+        session_id,
+        client_id,
+        text,
+        admission_metadata,
+        runtime_context.clone(),
+    ))
+    .await?;
     let receipt = match admission {
         bcode_session_models::TurnAdmission::Accepted(receipt) => receipt,
         bcode_session_models::TurnAdmission::Existing(receipt)
         | bcode_session_models::TurnAdmission::Deferred(receipt) => {
+            let event = pending_turn_acceptance_event(state, session_id, &receipt).await?;
+            drop(admission_commit);
+            drop(admission_guard);
+            if let Some(event) = event {
+                enqueue_followup_command(
+                    state,
+                    session_id,
+                    FollowupCommand::ExecuteTurn {
+                        client_id,
+                        runtime_context,
+                        user_event: Box::new(event),
+                        queued_steering: None,
+                        cancel_state: cancel_state.clone(),
+                        completion: None,
+                        recovering: false,
+                        ownership,
+                    },
+                )
+                .await?;
+            }
             return Ok(SubmittedModelTurn::Existing(receipt));
         }
         bcode_session_models::TurnAdmission::Rejected(reason) => {
@@ -15360,7 +16313,9 @@ async fn submit_session_model_turn_with_admission(
         }
     };
     let user_event = user_event.ok_or(bcode_session::SessionError::NotFound(session_id))?;
-    enqueue_followup_command(
+    drop(admission_commit);
+    drop(admission_guard);
+    Box::pin(enqueue_followup_command(
         state,
         session_id,
         FollowupCommand::ExecuteTurn {
@@ -15373,9 +16328,8 @@ async fn submit_session_model_turn_with_admission(
             recovering: false,
             ownership,
         },
-    )
+    ))
     .await?;
-    drop(admission_commit);
     Ok(SubmittedModelTurn::Started {
         receipt,
         completion: receiver,
@@ -15465,8 +16419,6 @@ async fn handle_submit_turn(
         )
         .await;
     }
-    let admission_lock = turn_admission_lock(state, session_id).await;
-    let _admission_guard = admission_lock.lock().await;
     let mut ownership = None;
     let admission = match session_operations::submit_turn(
         state,
@@ -18382,8 +19334,34 @@ impl ModelTurnCompletion {
     }
 }
 
-#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+#[allow(clippy::too_many_arguments)]
 async fn run_model_turn(
+    state: &ServerState,
+    permit: &mut SessionTurnPermit,
+    trigger_event: &bcode_session_models::SessionEvent,
+    client_id: ClientId,
+    runtime_context: Option<ClientRuntimeContext>,
+    command_context: &mut RuntimeCommandContext<'_>,
+    phase: &Arc<Mutex<SessionRuntimePhase>>,
+    supplied_cancel_state: Option<Arc<TurnCancelState>>,
+    recovering: bool,
+) -> ModelTurnCompletion {
+    Box::pin(run_model_turn_lifecycle(
+        state,
+        permit,
+        trigger_event,
+        client_id,
+        runtime_context,
+        command_context,
+        phase,
+        supplied_cancel_state,
+        recovering,
+    ))
+    .await
+}
+
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+async fn run_model_turn_lifecycle(
     state: &ServerState,
     permit: &mut SessionTurnPermit,
     trigger_event: &bcode_session_models::SessionEvent,
@@ -18399,7 +19377,7 @@ async fn run_model_turn(
         .set_session_config_from_runtime_context(session_id, runtime_context.as_ref())
         .await;
     let turn_config = state.session_config(session_id).await;
-    let turn_id = format!("{}-{}", session_id, trigger_event.sequence);
+    let turn_id = execution_turn_id(trigger_event);
     let mut turn_span = state
         .metrics
         .span("model.turn")
@@ -18493,7 +19471,15 @@ async fn run_model_turn(
         .await
         .retain(|_, capture| capture.session_id != session_id);
     service_runtime_priority_commands(state, session_id, command_context).await;
+    let terminal_lock = turn_admission_lock(state, session_id).await;
+    let terminal_guard = terminal_lock.lock().await;
     set_runtime_phase(phase, SessionRuntimePhase::FinishingTurn).await;
+    if let Some(turn) = command_context.current_turn.lock().await.as_mut() {
+        turn.execution = None;
+    }
+    if let Err(error) = cancel_pending_turn_submissions(state, session_id, &turn_id).await {
+        tracing::warn!(%session_id, %error, "terminal turn pending steering cancellation deferred");
+    }
     finish_current_turn(command_context).await;
     append_model_turn_finished_event(
         state,
@@ -18503,6 +19489,7 @@ async fn run_model_turn(
         completion.message.clone(),
     )
     .await;
+    drop(terminal_guard);
     service_runtime_priority_commands(state, session_id, command_context).await;
     finish_registered_runtime_work(
         state,
@@ -18570,12 +19557,15 @@ async fn run_model_turn_inner(
 ) -> ModelTurnCompletion {
     let execution = turn_execution_options(trigger_event);
     let turn_config = state.session_config(session_id).await;
-    let turn_id = format!("{}-{}", session_id, trigger_event.sequence);
+    let turn_id = execution_turn_id(trigger_event);
     let setup_labels = model_turn_metric_labels(session_id, &turn_id);
     let selection_timer = state.metrics.timer();
     let mut selection =
         session_model_selection_with_runtime_context(state, session_id, runtime_context).await;
     apply_turn_model_selection(&mut selection, &execution);
+    if let Some(turn) = command_context.current_turn.lock().await.as_mut() {
+        turn.selection = Some(selection.clone());
+    }
     state.metrics.record_histogram_with_labels(
         "model.turn.setup.model_selection_duration_ms",
         selection_timer.elapsed_ms(),
@@ -18698,7 +19688,7 @@ async fn run_model_turn_inner(
         }
     };
     let static_context_timer = state.metrics.timer();
-    let static_context = prepare_static_model_turn_context(
+    let static_context = Box::pin(prepare_static_model_turn_context(
         state,
         session_id,
         &turn_id,
@@ -18708,7 +19698,7 @@ async fn run_model_turn_inner(
         &target,
         !recovering,
         Some(prepared_catalog),
-    )
+    ))
     .await;
     state.metrics.record_histogram_with_labels(
         "model.turn.setup.static_context_duration_ms",
@@ -18754,7 +19744,15 @@ async fn run_model_turn_inner(
                 "model turn cancelled",
             );
         }
-        let prepared = match build_model_turn_request(
+        if let Err(error) =
+            activate_pending_steering(state, session_id, command_context, false).await
+        {
+            return ModelTurnCompletion::with_message(
+                ModelTurnOutcome::Error,
+                format!("steering activation failed: {error}"),
+            );
+        }
+        let prepared = match Box::pin(build_model_turn_request(
             state,
             session_id,
             trigger_event,
@@ -18767,7 +19765,7 @@ async fn run_model_turn_inner(
             &compaction_policy,
             &static_context,
             &turn_config,
-        )
+        ))
         .await
         {
             Ok(request) => request,
@@ -19061,6 +20059,7 @@ async fn run_model_turn_inner(
             &outcome,
             &mut recovery,
             retry_context,
+            command_context,
         ))
         .await
         {
@@ -19224,6 +20223,22 @@ async fn run_model_turn_inner(
                 return max_tokens_continuation_limit_completion(state, session_id).await;
             }
             Some(reason) => {
+                if reason == bcode_model::StopReason::EndTurn {
+                    match activate_pending_steering(state, session_id, command_context, true).await
+                    {
+                        Ok(true) => {
+                            rounds.complete_provider_round();
+                            continue;
+                        }
+                        Ok(false) => {}
+                        Err(error) => {
+                            return ModelTurnCompletion::with_message(
+                                ModelTurnOutcome::Error,
+                                format!("steering terminal arbitration failed: {error}"),
+                            );
+                        }
+                    }
+                }
                 if !structured_output_finalization
                     && structured_output_execution
                         == Some(bcode_model::CapabilityExecution::ToolFreeProviderRound)
@@ -19486,6 +20501,7 @@ async fn maybe_retry_after_provider_error(
     outcome: &ModelPollOutcome,
     recovery: &mut ModelTurnRecoveryState,
     context: ProviderErrorRetryContext<'_>,
+    command_context: &mut RuntimeCommandContext<'_>,
 ) -> ModelTurnRetry {
     let Some(error) = outcome.provider_error.as_ref() else {
         return ModelTurnRetry::None;
@@ -19550,11 +20566,11 @@ async fn maybe_retry_after_provider_error(
             return retry_after_provider_error(
                 state,
                 session_id,
-                context.turn_id,
+                (context.turn_id, *attempts),
                 error,
                 &policy,
-                *attempts,
                 context.cancel_state,
+                command_context,
             )
             .await;
         }
@@ -19925,11 +20941,11 @@ fn provider_error_category(category: &str) -> Option<bcode_model::ProviderErrorC
 async fn retry_after_provider_error(
     state: &ServerState,
     session_id: SessionId,
-    turn_id: &str,
+    (turn_id, attempt): (&str, u64),
     error: &bcode_model::ProviderError,
     policy: &ProviderRetryPolicy,
-    attempt: u64,
     cancel_state: &TurnCancelState,
+    command_context: &mut RuntimeCommandContext<'_>,
 ) -> ModelTurnRetry {
     let delay = provider_retry_delay(policy, error, attempt);
     append_provider_event_trace(
@@ -19957,12 +20973,27 @@ async fn retry_after_provider_error(
     )
     .await;
 
-    tokio::select! {
-        () = tokio::time::sleep(delay) => ModelTurnRetry::Continue,
-        () = cancel_state.cancelled() => ModelTurnRetry::Return(ModelTurnCompletion::with_message(
-            ModelTurnOutcome::Cancelled,
-            "model turn cancelled",
-        )),
+    let delay = tokio::time::sleep(delay);
+    tokio::pin!(delay);
+    loop {
+        tokio::select! {
+            () = &mut delay => return ModelTurnRetry::Continue,
+            command = command_context.cancel_commands.recv() => {
+                if let Some(command) = command {
+                    process_cancel_turn_command(
+                        state,
+                        session_id,
+                        command_context.followup_commands,
+                        command_context.queued_followups,
+                        command,
+                    ).await;
+                }
+            }
+            () = cancel_state.cancelled() => return ModelTurnRetry::Return(ModelTurnCompletion::with_message(
+                ModelTurnOutcome::Cancelled,
+                "model turn cancelled",
+            )),
+        }
     }
 }
 
@@ -20457,22 +21488,20 @@ async fn run_model_turn_round(
                 ));
             }
         };
-        let invocation = state
-            .plugins
-            .invoke_service_with_events_and_bridge_scoped(
+        let invocation = Box::pin(state.plugins.invoke_service_with_events_and_bridge_scoped(
+            &push_plugin_id,
+            push_interface_id,
+            OP_RUN_TURN,
+            payload,
+            scope,
+            Some(server_model_provider_bridge(
+                state.plugins.clone(),
+                config.clone(),
+                &request.turn_id,
                 &push_plugin_id,
-                push_interface_id,
-                OP_RUN_TURN,
-                payload,
-                scope,
-                Some(server_model_provider_bridge(
-                    state.plugins.clone(),
-                    config.clone(),
-                    &request.turn_id,
-                    &push_plugin_id,
-                )),
-            )
-            .await;
+            )),
+        ))
+        .await;
         state.metrics.record_histogram_with_labels(
             "model.provider.run_turn_start_duration_ms",
             start_timer.elapsed_ms(),
@@ -20583,24 +21612,24 @@ async fn run_model_turn_round(
     };
     let (mut assistant_text, mut outcome) = match delivery {
         ModelRoundDelivery::Push(invocation) => {
-            stream_model_turn_events(
+            Box::pin(stream_model_turn_events(
                 state,
                 session_id,
                 poll_context,
                 invocation,
                 Arc::clone(&cancel_state),
                 command_context,
-            )
+            ))
             .await
         }
         ModelRoundDelivery::Poll(()) => {
-            poll_model_turn_events(
+            Box::pin(poll_model_turn_events(
                 state,
                 session_id,
                 poll_context,
                 Arc::clone(&cancel_state),
                 command_context,
-            )
+            ))
             .await
         }
     };
@@ -24193,11 +25222,25 @@ struct StaticModelTurnContext {
     tool_description_overrides: Vec<String>,
 }
 
+fn execution_turn_id(trigger_event: &bcode_session_models::SessionEvent) -> String {
+    match &trigger_event.kind {
+        SessionEventKind::SubmissionActivated { turn_id, .. } => turn_id.0.clone(),
+        SessionEventKind::SubmissionAccepted { submission } => {
+            submission.target.turn_id().0.clone()
+        }
+        _ => format!("{}-{}", trigger_event.session_id, trigger_event.sequence),
+    }
+}
+
 fn turn_execution_options(
     trigger_event: &bcode_session_models::SessionEvent,
 ) -> bcode_session_models::TurnExecutionOptions {
     match &trigger_event.kind {
-        SessionEventKind::UserMessage { admission, .. } => admission.execution.clone(),
+        SessionEventKind::UserMessage { admission, .. }
+        | SessionEventKind::SubmissionActivated { admission, .. } => admission.execution.clone(),
+        SessionEventKind::SubmissionAccepted { submission } => {
+            submission.admission.execution.clone()
+        }
         _ => bcode_session_models::TurnExecutionOptions::default(),
     }
 }
@@ -24275,7 +25318,13 @@ async fn prepare_static_model_turn_context(
     } else {
         collect_tool_definitions(state).await
     };
-    let agent_context = agent_context_with_tools(state, session_id, &agent_id, agent_tools).await;
+    let agent_context = Box::pin(agent_context_with_tools(
+        state,
+        session_id,
+        &agent_id,
+        agent_tools,
+    ))
+    .await;
     state.metrics.record_histogram_with_labels(
         "model.turn.static_context.agent_duration_ms",
         agent_timer.elapsed_ms(),
@@ -24515,7 +25564,10 @@ async fn build_model_turn_request(
     #[cfg(any(target_os = "macos", target_os = "linux"))]
     let mut admission =
         storage_read_admission::RegisteredStorageRead::for_session(state, session_id).await?;
-    let history = state.sessions.model_context_events(session_id).await;
+    let history = state
+        .sessions
+        .activated_conversation_snapshot(session_id)
+        .await;
     #[cfg(any(target_os = "macos", target_os = "linux"))]
     let history =
         storage_read_admission::RegisteredStorageRead::finish_failed(&mut admission, history)
@@ -24546,11 +25598,8 @@ async fn build_model_turn_request(
         bcode_session::storage_access::StorageAccessKind::ModelContext,
     )
     .await;
-    let context_through_sequence = history
-        .iter()
-        .map(|event| event.sequence)
-        .max()
-        .unwrap_or(trigger_event.sequence);
+    let context_through_sequence = history.through_sequence;
+    let history = history.events;
     state.metrics.record_histogram_with_labels(
         "model.request_build.load_context_events_duration_ms",
         history_timer.elapsed_ms(),
@@ -24664,12 +25713,12 @@ async fn build_model_turn_request(
         metric_labels.clone(),
     );
     let model_id = target.model_id.clone();
-    let reasoning_capabilities = resolve_model_reasoning_info(
+    let reasoning_capabilities = Box::pin(resolve_model_reasoning_info(
         state,
         provider_plugin_id,
         selected_model_id,
         &selection.provider_context,
-    )
+    ))
     .await;
     let parameters_timer = state.metrics.timer();
     let resolved_max_output_tokens =
@@ -24709,13 +25758,13 @@ async fn build_model_turn_request(
         metric_labels.clone(),
     );
     let conversation_reuse_timer = state.metrics.timer();
-    let conversation_reuse = plan_conversation_reuse(
+    let conversation_reuse = Box::pin(plan_conversation_reuse(
         state,
         config.model.effective_conversation_reuse_mode(),
         &projection,
         messages.len(),
         Some(&model_cache_info),
-    )
+    ))
     .await;
     state.metrics.record_histogram_with_labels(
         "model.request_build.conversation_reuse_plan_duration_ms",
@@ -24740,7 +25789,7 @@ async fn build_model_turn_request(
     );
     metadata.insert(
         bcode_model::APPLICATION_TURN_ID_METADATA_KEY.to_string(),
-        format!("{session_id}-{}", trigger_event.sequence),
+        execution_turn_id(trigger_event),
     );
     insert_reasoning_metadata(&mut metadata, &parameters);
     insert_model_cache_metadata(&mut metadata, &model_cache_info);
@@ -24824,9 +25873,13 @@ async fn build_model_turn_request(
     // provider reports the claims for the surface this request will actually use. The client's
     // selection context leaves `api_surface` unset, which the provider reads as its default
     // surface and can report the wrong structured-output execution shape.
-    let feature_negotiation =
-        resolve_model_feature_negotiation(state, provider_plugin_id, &model_id, &provider_context)
-            .await;
+    let feature_negotiation = Box::pin(resolve_model_feature_negotiation(
+        state,
+        provider_plugin_id,
+        &model_id,
+        &provider_context,
+    ))
+    .await;
     let parallel_capabilities =
         parallel_tool_call_capabilities_from_negotiation(feature_negotiation.as_ref(), true);
     let desired_structured_output =
@@ -24860,7 +25913,7 @@ async fn build_model_turn_request(
     };
     let mut request = ModelTurnRequest {
         session_id,
-        turn_id: format!("{}-{}-{round}", session_id, trigger_event.sequence),
+        turn_id: format!("{}-{round}", execution_turn_id(trigger_event)),
         model_id,
         provider_context,
         system_prompt: Some(system_prompt),
@@ -24888,12 +25941,27 @@ async fn build_model_turn_request(
         build_timer.elapsed_ms(),
         metric_labels,
     );
-    let context_projection =
-        projected_request_context(state, session_id, provider_plugin_id, &request).await;
-    image_input::hydrate_tool_result_images(state, session_id, provider_plugin_id, &mut request)
-        .await;
-    append_negotiated_feature_fidelity_events(state, session_id, &request, &resolved_features)
-        .await;
+    let context_projection = Box::pin(projected_request_context(
+        state,
+        session_id,
+        provider_plugin_id,
+        &request,
+    ))
+    .await;
+    Box::pin(image_input::hydrate_tool_result_images(
+        state,
+        session_id,
+        provider_plugin_id,
+        &mut request,
+    ))
+    .await;
+    Box::pin(append_negotiated_feature_fidelity_events(
+        state,
+        session_id,
+        &request,
+        &resolved_features,
+    ))
+    .await;
     Ok(PreparedModelRequest {
         request,
         context_projection,
@@ -31381,6 +32449,19 @@ async fn append_trace_event(
     phase: SessionTracePhase,
     payload: SessionTracePayload,
 ) {
+    Box::pin(append_trace_event_inner(
+        state, session_id, turn_id, phase, payload,
+    ))
+    .await;
+}
+
+async fn append_trace_event_inner(
+    state: &ServerState,
+    session_id: SessionId,
+    turn_id: Option<String>,
+    phase: SessionTracePhase,
+    payload: SessionTracePayload,
+) {
     if !state.observability.enabled()
         || (!state.observability.debug_enabled() && !standard_trace_phase(phase))
     {
@@ -31392,7 +32473,7 @@ async fn append_trace_event(
         phase,
         payload,
     };
-    match state.sessions.append_trace_event(session_id, trace).await {
+    match Box::pin(state.sessions.append_trace_event(session_id, trace)).await {
         Ok(event) => publish_session_event(state, &event).await,
         Err(error) => tracing::warn!("failed to append trace event: {error}"),
     }
@@ -32507,6 +33588,90 @@ async fn verify_workflow_observation_session(
     Ok(())
 }
 
+async fn resume_pending_workflow_submission(
+    state: &ServerState,
+    session_id: SessionId,
+    record: &bcode_session_models::SubmissionRecord,
+    request: &bcode_workflow_store::AttemptReconciliationRequest,
+) -> Result<bcode_workflow_store::AttemptObservation, WorkflowStoreError> {
+    let Some(_authority) = current_workflow_submission_authority(state, &request.run_id).await?
+    else {
+        return Ok(bcode_workflow_store::AttemptObservation::Deferred {
+            reason: "pending workflow submission requires current execution authority".into(),
+        });
+    };
+    if workflow_representation::owner::cancellation_intended(
+        state,
+        &request.run_id,
+        &request.dispatch_identity,
+    )
+    .await?
+    {
+        state
+            .sessions
+            .cancel_submission(session_id, record.receipt.submission_id.clone())
+            .await
+            .map_err(|error| WorkflowStoreError::InvalidData(error.to_string()))?;
+        return Ok(bcode_workflow_store::AttemptObservation::Cancelled);
+    }
+    if request
+        .receipt
+        .get("owner_daemon_instance_id")
+        .and_then(serde_json::Value::as_str)
+        == Some(state.daemon_status.instance_id.as_str())
+    {
+        return Ok(bcode_workflow_store::AttemptObservation::Deferred {
+            reason: "accepted turn is owned by this daemon's original dispatch".into(),
+        });
+    }
+    if let Some(handle) = state
+        .session_runtimes
+        .lock()
+        .await
+        .get(&session_id)
+        .cloned()
+        && (handle.queued_followups.load(Ordering::Acquire) > 0
+            || handle.phase.lock().await.has_active_work())
+    {
+        return Ok(bcode_workflow_store::AttemptObservation::Deferred { reason: "accepted turn has a live local scheduler; recovery must not replace its execution context".into() });
+    }
+    let hint = recover_pending_submission_hint_with_authority(state, session_id, record, true)
+        .await
+        .map_err(|error| WorkflowStoreError::InvalidData(error.to_string()))?;
+    if let Some(command) = hint {
+        let handle = state
+            .session_runtimes
+            .lock()
+            .await
+            .get(&session_id)
+            .cloned();
+        if let Some(handle) = handle {
+            handle.queued_followups.fetch_add(1, Ordering::AcqRel);
+            if handle.followup_commands.try_send(command).is_err() {
+                handle.queued_followups.fetch_sub(1, Ordering::AcqRel);
+            }
+        }
+    }
+    if let Some(observation) = state
+        .sessions
+        .submission(session_id, record.receipt.submission_id.clone())
+        .await
+        .map_err(|error| WorkflowStoreError::InvalidData(error.to_string()))?
+        .and_then(|record| record.context_observation)
+    {
+        return Ok(bcode_workflow_store::AttemptObservation::Paused {
+            reason: bcode_workflow_store::AttemptPauseReason::ProviderUnavailable,
+            message: format!(
+                "accepted turn context {:?}; restore compatible named execution configuration and resume",
+                observation.issue
+            ),
+        });
+    }
+    Ok(bcode_workflow_store::AttemptObservation::Deferred {
+        reason: "pending workflow input retained for ownership-fenced activation".into(),
+    })
+}
+
 #[allow(clippy::too_many_lines)]
 async fn observe_workflow_turn(
     state: &ServerState,
@@ -32535,6 +33700,28 @@ async fn observe_workflow_turn(
         _ => None,
     });
     let Some((outcome, message, terminal_at_ms)) = terminal else {
+        let submission = state
+            .sessions
+            .submission(
+                session_id,
+                bcode_session_models::SubmissionId::for_queued_turn(&bcode_session_models::TurnId(
+                    turn_id.to_owned(),
+                )),
+            )
+            .await
+            .map_err(|error| WorkflowStoreError::InvalidData(error.to_string()))?;
+        if let Some(record) = submission {
+            match record.status {
+                bcode_session_models::SubmissionStatus::Pending => {
+                    return resume_pending_workflow_submission(state, session_id, &record, request)
+                        .await;
+                }
+                bcode_session_models::SubmissionStatus::Cancelled { .. } => {
+                    return Ok(bcode_workflow_store::AttemptObservation::Cancelled);
+                }
+                bcode_session_models::SubmissionStatus::Activated { .. } => {}
+            }
+        }
         let Some(owner) = request
             .receipt
             .get("owner_daemon_instance_id")
@@ -34818,6 +36005,34 @@ struct WorkflowAdmissionRecoveryPage {
     deferred: bool,
 }
 
+fn recovered_workflow_receipt(
+    session_id: SessionId,
+    receipt: &bcode_session_models::TurnReceipt,
+    output_schema_id: &str,
+) -> serde_json::Value {
+    serde_json::json!({
+        "owner": workflow_receipts::AGENT_TURN_OWNER, "session_id": session_id,
+        "work_id": receipt.work_id, "turn_id": receipt.turn_id,
+        "accepted_event_sequence": receipt.accepted_event_sequence,
+        "output_schema_id": output_schema_id,
+    })
+}
+
+const fn recoverable_workflow_observation(
+    observation: &bcode_workflow_store::AttemptObservation,
+) -> bool {
+    use bcode_workflow_store::AttemptObservation;
+    matches!(
+        observation,
+        AttemptObservation::Succeeded { .. }
+            | AttemptObservation::Failed { .. }
+            | AttemptObservation::RetryableFailure { .. }
+            | AttemptObservation::Paused { .. }
+            | AttemptObservation::Cancelled
+            | AttemptObservation::Unknown
+    )
+}
+
 async fn recover_completed_workflow_admission_page(
     state: &Arc<ServerState>,
     store_path: &Path,
@@ -34860,14 +36075,12 @@ async fn recover_completed_workflow_admission_page(
         else {
             continue;
         };
-        let owner_receipt = serde_json::json!({
-            "owner": "bcode.server.agent-turn/v1",
-            "session_id": session_id,
-            "work_id": receipt.work_id,
-            "turn_id": receipt.turn_id,
-            "accepted_event_sequence": receipt.accepted_event_sequence,
-            "output_schema_id": request.activation.node.output.type_name,
-        });
+        let owner_receipt = recovered_workflow_receipt(
+            session_id,
+            &receipt,
+            &request.activation.node.output.type_name,
+        );
+        let _runtime = session_runtime_handle(state, session_id).await;
         let observation = observe_workflow_turn(
             state,
             session_id,
@@ -34886,6 +36099,18 @@ async fn recover_completed_workflow_admission_page(
         .await?;
         // Advance discovery past deferred work without classifying or redispatching it.
         if let bcode_workflow_store::AttemptObservation::Deferred { .. } = observation {
+            store.persist_owned_dispatch_receipt(
+                &bcode_workflow_store::DispatchReceipt {
+                    run_id: run_id.to_owned(),
+                    node_id: request.activation.node_id.clone(),
+                    activation_id: request.activation.activation_id.clone(),
+                    attempt: request.attempt,
+                    dispatch_identity: request.dispatch_identity.clone(),
+                    receipt: owner_receipt,
+                    admitted_at_ms: current_unix_millis(),
+                },
+                authority,
+            )?;
             examined.classifiable.pop();
             examined.deferred = true;
             continue;
@@ -34893,15 +36118,7 @@ async fn recover_completed_workflow_admission_page(
         // Admission proves identity, not that a process is still executing. Preserve
         // the receipt even when its outcome is unknown so reconciliation cannot mistake
         // an accepted turn for a receipt-less preparation. Never invent executor identity.
-        if !matches!(
-            observation,
-            bcode_workflow_store::AttemptObservation::Succeeded { .. }
-                | bcode_workflow_store::AttemptObservation::Failed { .. }
-                | bcode_workflow_store::AttemptObservation::RetryableFailure { .. }
-                | bcode_workflow_store::AttemptObservation::Paused { .. }
-                | bcode_workflow_store::AttemptObservation::Cancelled
-                | bcode_workflow_store::AttemptObservation::Unknown
-        ) {
+        if !recoverable_workflow_observation(&observation) {
             continue;
         }
         let summary = store.recover_owned_dispatch_observation(
@@ -35094,27 +36311,27 @@ async fn restore_workflow_runs_with_receipt_limit(
             && cancellation_available
             && publication_available
             && sibling_available;
-        // Only startup recovery may classify admission gaps; periodic recovery can race
-        // a live handoff. Recovery-only authority must never redispatch preparations.
-        let admission_recovery =
-            if restore_prepared && !store.is_recovery_only(&run_id).unwrap_or(true) {
-                match recover_completed_workflow_admissions(
-                    state,
-                    &store_path,
-                    &run_id,
-                    &authority.authority,
-                )
-                .await
-                {
-                    Ok(outcome) => outcome,
-                    Err(error) => {
-                        tracing::warn!(run_id, %error, "failed to recover workflow preparations");
-                        continue;
-                    }
+        // Recover receipt identity during periodic observation too. The held drive gate
+        // excludes live handoffs; recovering canonical acceptance does not redispatch work.
+        // Recovery-only authority must never redispatch preparations.
+        let admission_recovery = if store.is_recovery_only(&run_id).unwrap_or(true) {
+            WorkflowAdmissionRecovery::Complete
+        } else {
+            match recover_completed_workflow_admissions(
+                state,
+                &store_path,
+                &run_id,
+                &authority.authority,
+            )
+            .await
+            {
+                Ok(outcome) => outcome,
+                Err(error) => {
+                    tracing::warn!(run_id, %error, "failed to recover workflow preparations");
+                    continue;
                 }
-            } else {
-                WorkflowAdmissionRecovery::Complete
-            };
+            }
+        };
         let reconciliation = async {
             let mut cursor = None;
             loop {
@@ -35361,15 +36578,53 @@ async fn signal_workflow_attempt_cancellation(
         // Never recursively traverse or signal descendants using the parent's fence.
         return Ok(());
     }
-    let work_id = WorkId::new(attempt.dispatch_identity.clone());
+    if let Some(receipt) = attempt.receipt.as_ref()
+        && receipt.get("owner").and_then(serde_json::Value::as_str)
+            == Some(workflow_receipts::AGENT_TURN_OWNER)
+    {
+        let receipt = workflow_receipts::AgentTurnReceipt::decode(receipt)
+            .map_err(|error| WorkflowStoreError::InvalidData(error.into()))?;
+        let id = bcode_session_models::SubmissionId::for_queued_turn(
+            &bcode_session_models::TurnId(receipt.turn_id),
+        );
+        let _authority = current_workflow_submission_authority(state, &attempt.run_id)
+            .await?
+            .ok_or(WorkflowStoreError::OwnerAccessDeferred)?;
+        if state
+            .sessions
+            .submission(receipt.session_id, id.clone())
+            .await
+            .map_err(|error| WorkflowStoreError::InvalidData(error.to_string()))?
+            .is_some_and(|record| {
+                matches!(
+                    record.status,
+                    bcode_session_models::SubmissionStatus::Pending
+                )
+            })
+        {
+            state
+                .sessions
+                .cancel_submission(receipt.session_id, id)
+                .await
+                .map_err(|error| WorkflowStoreError::InvalidData(error.to_string()))?;
+            return Ok(());
+        }
+    }
+    cancel_workflow_dispatch_runtime(state, &attempt.dispatch_identity).await
+}
+
+async fn cancel_workflow_dispatch_runtime(
+    state: &ServerState,
+    dispatch_identity: &str,
+) -> Result<(), WorkflowStoreError> {
+    let work_id = WorkId::new(dispatch_identity.to_owned());
     let cancelled = state
         .runtime_work
         .cancel_global_with_children(&work_id)
         .await;
     if cancelled.is_empty() {
         return Err(WorkflowStoreError::InvalidData(format!(
-            "active runtime work not found for workflow dispatch: {}",
-            attempt.dispatch_identity
+            "active runtime work not found for workflow dispatch: {dispatch_identity}"
         )));
     }
     for cancelled_work in cancelled {
@@ -36505,6 +37760,10 @@ const fn session_event_kind_name(kind: &SessionEventKind) -> &'static str {
         SessionEventKind::AssistantReasoningActivity { .. } => "assistant_reasoning_activity",
         SessionEventKind::RalphLifecycle { .. } => "ralph_lifecycle",
         SessionEventKind::PluginStatusNote { .. } => "plugin_status_note",
+        SessionEventKind::SubmissionAccepted { .. } => "submission_accepted",
+        SessionEventKind::SubmissionActivated { .. } => "submission_activated",
+        SessionEventKind::SubmissionContextObserved { .. } => "submission_context_observed",
+        SessionEventKind::SubmissionCancelled { .. } => "submission_cancelled",
         SessionEventKind::InertHistory { .. } => "inert_history",
     }
 }
@@ -37377,6 +38636,14 @@ pub(crate) async fn send_response(
     request_id: u64,
     response: Response,
 ) -> Result<(), ServerError> {
+    Box::pin(send_response_inner(writer, request_id, response)).await
+}
+
+async fn send_response_inner(
+    writer: &SharedWriter,
+    request_id: u64,
+    response: Response,
+) -> Result<(), ServerError> {
     let serialize_started_at = Instant::now();
     let envelope = response_envelope(request_id, &response)?;
     let mut labels = MetricLabels::new();
@@ -37610,7 +38877,7 @@ async fn suggest_skills_for_prompt(
     session_id: SessionId,
     user_event: &bcode_session_models::SessionEvent,
 ) {
-    let SessionEventKind::UserMessage { text, .. } = &user_event.kind else {
+    let Some(text) = user_message_text(user_event) else {
         return;
     };
     let Some(registry) = &state.skills else {
@@ -44095,6 +45362,8 @@ library = "test"
             cancel_state: Arc::clone(&cancellation),
             model: None,
             agent_profile: None,
+            execution: Some(TurnExecutionOptions::default()),
+            selection: None,
         })));
         let (followup_commands, mut followups) = mpsc::channel(1);
         let (steering_commands, mut steering) = mpsc::channel(1);
@@ -57200,7 +58469,15 @@ library = "test"
             .expect("driver");
         driver.abort();
         let _ = driver.await;
-        recovered.expect("background discovery recovers completed source without a wake");
+        assert!(
+            recovered.is_ok(),
+            "background discovery must recover completed source: {:?}",
+            state
+                .workflow_store
+                .lock()
+                .expect("store")
+                .attempt_history("edit-run", None, 10)
+        );
         let store = bcode_workflow_store::WorkflowStore::open_at_path(path).expect("reopen");
         assert!(store.dispatch_receipt_committed(identity).expect("receipt"));
         let attempts = store
@@ -57302,6 +58579,8 @@ library = "test"
                     client_id: ClientId::new(),
                     turn_id: turn_id.into(),
                     agent_profile: None,
+                    execution: Some(TurnExecutionOptions::default()),
+                    selection: None,
                     cancel_state: Arc::new(TurnCancelState::default()),
                     model: None,
                 }))),
@@ -57314,19 +58593,42 @@ library = "test"
         assert!(page.deferred);
         assert_eq!(page.last_scanned.as_deref(), Some(identity));
         assert!(page.classifiable.is_empty());
-        assert!(matches!(
-            recover_completed_workflow_admissions(state, path, "edit-run", authority).await,
-            Ok(WorkflowAdmissionRecovery::Deferred)
-        ));
         assert!(
-            !state
+            state
                 .workflow_store
                 .lock()
                 .expect("store")
                 .dispatch_receipt_committed(identity)
-                .expect("untouched receipt")
+                .expect("pending receipt preserved")
         );
         state.session_runtimes.lock().await.remove(&session_id);
+    }
+
+    fn receipt_recovery_fixture_link(
+        state: &ServerState,
+        request: &bcode_workflow_store::PreparedActivationDispatch,
+    ) -> (
+        PathBuf,
+        bcode_workflow_store::WorkflowExecutionAuthority,
+        bcode_workflow_store::WorkflowExecutionSessionLink,
+    ) {
+        let store = state.workflow_store.lock().expect("store");
+        (
+            store.path().to_path_buf(),
+            store
+                .execution_authority("edit-run")
+                .expect("authority")
+                .expect("owner"),
+            store
+                .execution_session_link(
+                    "edit-run",
+                    "agent",
+                    &request.activation.activation_id,
+                    request.attempt,
+                )
+                .expect("link")
+                .expect("session"),
+        )
     }
 
     async fn verify_session_admission_receipt_recovery(terminal: bool) {
@@ -57337,25 +58639,7 @@ library = "test"
         .await;
         let state = Arc::new(state);
         let request = receipt_owned_publication_request(&state);
-        let (path, authority, link) = {
-            let store = state.workflow_store.lock().expect("store");
-            (
-                store.path().to_path_buf(),
-                store
-                    .execution_authority("edit-run")
-                    .expect("authority")
-                    .expect("owner"),
-                store
-                    .execution_session_link(
-                        "edit-run",
-                        "agent",
-                        &request.activation.activation_id,
-                        request.attempt,
-                    )
-                    .expect("link")
-                    .expect("session"),
-            )
-        };
+        let (path, authority, link) = receipt_recovery_fixture_link(&state, &request);
         let session_id = SessionId::from_str(&link.session_id).expect("session id");
         let admission = state
             .sessions
@@ -57402,6 +58686,7 @@ library = "test"
         recover_completed_workflow_admissions(&state, &path, "edit-run", &authority)
             .await
             .expect("recover terminal admission");
+        restore_workflow_runs_observation_only(&state, vec!["edit-run".into()]).await;
         let reopened = bcode_workflow_store::WorkflowStore::open_at_path(&path).expect("reopen");
         assert!(
             reopened
@@ -57871,10 +59156,16 @@ library = "test"
             }).expect("actual admission receipt");
             drop(store);
         }
-        tokio::time::timeout(Duration::from_secs(10), completion)
+        let completion = tokio::time::timeout(Duration::from_secs(10), completion)
             .await
             .expect("completion timeout")
             .expect("completed");
+        assert_eq!(
+            completion.outcome,
+            ModelTurnOutcome::Completed,
+            "{:?}",
+            completion.message
+        );
         assert_existing_source_admission(&owner_state, session_id, identity, &receipt).await;
         drop(owner_state);
         let request = bcode_workflow_store::AttemptReconciliationRequest {
@@ -62272,7 +63563,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
         assert!(sessions.session_is_owned(session.id).await);
         assert_eq!(handle.queued_followups.load(Ordering::Acquire), 1);
         let queued = followup_receiver.try_recv().expect("queued command");
-        assert!(matches!(queued, FollowupCommand::ExecuteTurn { .. }));
+        assert!(matches!(queued, FollowupCommand::ExecuteSubmission { .. }));
         drop(queued);
         handle.queued_followups.fetch_sub(1, Ordering::AcqRel);
         state.release_session_resources_if_idle(session.id).await;
@@ -62488,9 +63779,11 @@ event_symbol = "bcode_plugin_handle_event_v1"
             explicit_session_ownership_release_outcome(&state, session.id)
                 .await
                 .expect("release before admission"),
-            bcode_ipc::SessionOwnershipReleaseOutcome::AlreadyUnowned
+            bcode_ipc::SessionOwnershipReleaseOutcome::Blocked {
+                blockers: vec![bcode_ipc::SessionOwnershipBlocker::QueuedCommand],
+            }
         );
-        assert!(!sessions.session_is_owned(session.id).await);
+        assert!(sessions.session_is_owned(session.id).await);
 
         drop(held_admission);
         admission
@@ -62511,12 +63804,12 @@ event_symbol = "bcode_plugin_handle_event_v1"
         assert!(history.iter().any(|event| {
             matches!(
                 &event.kind,
-                SessionEventKind::UserMessage { text, .. } if text == "request racing release"
+                SessionEventKind::SubmissionAccepted { submission } if submission.text == "request racing release"
             )
         }));
 
         let queued = followup_receiver.try_recv().expect("queued command");
-        assert!(matches!(queued, FollowupCommand::ExecuteTurn { .. }));
+        assert!(matches!(queued, FollowupCommand::ExecuteSubmission { .. }));
         drop(queued);
         handle.queued_followups.fetch_sub(1, Ordering::AcqRel);
         state.release_session_resources_if_idle(session.id).await;
@@ -62530,265 +63823,921 @@ event_symbol = "bcode_plugin_handle_event_v1"
         drop(state);
     }
 
+    #[test]
+    fn steering_requires_immutable_execution_compatibility() {
+        let execution = TurnExecutionOptions::default();
+        let mut turn = RuntimeCurrentTurn {
+            interaction_route: None,
+            kind: RuntimeOperationKind::ModelTurn,
+            client_id: ClientId::new(),
+            turn_id: "compatibility".into(),
+            cancel_state: Arc::new(TurnCancelState::default()),
+            model: None,
+            agent_profile: None,
+            execution: Some(execution.clone()),
+            selection: None,
+        };
+        assert!(turn.accepts_steering(&execution));
+        let variants = [
+            TurnExecutionOptions {
+                permission_mode: bcode_session_models::TurnPermissionMode::Bypass,
+                ..execution.clone()
+            },
+            TurnExecutionOptions {
+                tools: bcode_session_models::TurnToolPolicy::Disabled,
+                ..execution.clone()
+            },
+            TurnExecutionOptions {
+                tool_allowlist: Some(Vec::new()),
+                ..execution.clone()
+            },
+            TurnExecutionOptions {
+                allow_user_questions: false,
+                ..execution.clone()
+            },
+            TurnExecutionOptions {
+                provider_plugin_id: Some("different-provider".into()),
+                ..execution.clone()
+            },
+            TurnExecutionOptions {
+                model_id: Some("different-model".into()),
+                ..execution.clone()
+            },
+            TurnExecutionOptions {
+                agent_profile: Some("different-agent".into()),
+                ..execution.clone()
+            },
+            TurnExecutionOptions {
+                reasoning: Some(Box::new(bcode_session_models::TurnReasoningOptions {
+                    effort: Some("high".into()),
+                    summary: None,
+                })),
+                ..execution.clone()
+            },
+        ];
+        for changed in variants {
+            assert!(!turn.accepts_steering(&changed));
+        }
+        turn.kind = RuntimeOperationKind::ManualCompaction;
+        assert!(!turn.accepts_steering(&execution));
+        turn.kind = RuntimeOperationKind::ModelTurn;
+        turn.execution = None;
+        assert!(!turn.accepts_steering(&execution));
+        let captured = TurnExecutionOptions {
+            request_context_id: Some("request-only".into()),
+            ..execution.clone()
+        };
+        turn.execution = Some(captured.clone());
+        assert!(!turn.accepts_steering(&captured));
+        turn.execution = Some(execution.clone());
+        turn.cancel_state.close();
+        assert!(!turn.accepts_steering(&execution));
+    }
+
     #[tokio::test]
-    #[allow(clippy::too_many_lines)]
-    async fn queued_and_steered_message_admissions_cover_active_runtime_windows() {
-        let workspace = tempfile::tempdir().expect("message admission workspace");
-        let sessions = SessionManager::persistent(workspace.path().join("sessions"))
-            .expect("message admission session manager");
-        let session = sessions
-            .create_session(
-                Some("message admission fixture".to_owned()),
-                test_working_directory(),
-            )
-            .await
-            .expect("message admission session");
+    async fn retired_runtime_cleanup_preserves_replacement() {
+        let workspace = tempfile::tempdir().expect("runtime cleanup workspace");
+        let sessions =
+            SessionManager::persistent(workspace.path().join("sessions")).expect("sessions");
         let state = Arc::new(test_server_state(sessions));
-        let (followup_commands, mut followup_receiver) = mpsc::channel(8);
-        let (steering_commands, mut steering_receiver) = mpsc::channel(8);
-        let (cancel_commands, _cancel_receiver) = mpsc::channel(1);
+        let session_id = SessionId::new();
+        let (followup_commands, _followups) = mpsc::channel(1);
+        let (steering_commands, _steering) = mpsc::channel(1);
+        let (cancel_commands, _cancels) = mpsc::channel(1);
+        let old_turn = Arc::new(Mutex::new(None));
+        let replacement_turn = Arc::new(Mutex::new(None));
+        state.session_runtimes.lock().await.insert(
+            session_id,
+            SessionRuntimeHandle {
+                followup_commands,
+                steering_commands,
+                cancel_commands,
+                queued_followups: Arc::new(AtomicUsize::new(0)),
+                queued_steering: Arc::new(AtomicUsize::new(0)),
+                phase: Arc::new(Mutex::new(SessionRuntimePhase::Idle)),
+                current_turn: Arc::clone(&replacement_turn),
+            },
+        );
+        assert!(!remove_session_runtime_if_current(&state, session_id, &old_turn).await);
+        assert!(
+            state
+                .session_runtimes
+                .lock()
+                .await
+                .contains_key(&session_id)
+        );
+        assert!(remove_session_runtime_if_current(&state, session_id, &replacement_turn).await);
+        assert!(
+            !state
+                .session_runtimes
+                .lock()
+                .await
+                .contains_key(&session_id)
+        );
+    }
+
+    async fn assert_steering_terminal_arbitration(
+        state: &Arc<ServerState>,
+        session_id: SessionId,
+        client: ClientId,
+        admission: bcode_session_models::TurnAdmissionMetadata,
+        context: &RuntimeCommandContext<'_>,
+    ) {
+        let steer_id = bcode_session_models::SubmissionId("steer".into());
+        let receipt = enqueue_prompt_submission(
+            state,
+            session_id,
+            client,
+            steer_id.clone(),
+            "steering".into(),
+            bcode_session_models::SubmissionPlacement::Steer,
+            admission.clone(),
+        )
+        .await
+        .unwrap();
+        let record = state
+            .sessions
+            .submission(session_id, steer_id.clone())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(matches!(
+            record.status,
+            bcode_session_models::SubmissionStatus::Pending
+        ));
+        assert!(matches!(
+            record.submission.target,
+            bcode_session_models::SubmissionTarget::Steering { .. }
+        ));
+        assert!(
+            activate_pending_steering(state, session_id, context, true)
+                .await
+                .unwrap()
+        );
+        let activated = state
+            .sessions
+            .submission(session_id, steer_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(matches!(
+            activated.status,
+            bcode_session_models::SubmissionStatus::Activated { .. }
+        ));
+        assert_eq!(activated.receipt, receipt);
+        assert!(
+            !activate_pending_steering(state, session_id, context, true)
+                .await
+                .unwrap()
+        );
+        let next = enqueue_prompt_submission(
+            state,
+            session_id,
+            client,
+            bcode_session_models::SubmissionId("late".into()),
+            "late".into(),
+            bcode_session_models::SubmissionPlacement::Steer,
+            admission,
+        )
+        .await
+        .unwrap();
+        let pending = state
+            .sessions
+            .submission(session_id, next.submission_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(matches!(
+            pending.submission.target,
+            bcode_session_models::SubmissionTarget::OwnTurn { .. }
+        ));
+        assert!(matches!(
+            pending.status,
+            bcode_session_models::SubmissionStatus::Pending
+        ));
+    }
+
+    #[tokio::test]
+    async fn durable_submission_activation_and_terminal_arbitration() {
+        let workspace = tempfile::tempdir().unwrap();
+        let sessions = SessionManager::persistent(workspace.path().join("sessions")).unwrap();
+        let session = sessions
+            .create_session(None, test_working_directory())
+            .await
+            .unwrap();
+        let state = Arc::new(test_server_state(sessions));
+        let (followup_commands, mut followups) = mpsc::channel(8);
+        let (steering_commands, mut steering) = mpsc::channel(8);
+        let (cancel_commands, mut cancels) = mpsc::channel(8);
+        let current = Arc::new(Mutex::new(None));
+        let queued = Arc::new(AtomicUsize::new(0));
         let handle = SessionRuntimeHandle {
             followup_commands,
             steering_commands,
             cancel_commands,
-            queued_followups: Arc::new(AtomicUsize::new(0)),
+            queued_followups: Arc::clone(&queued),
             queued_steering: Arc::new(AtomicUsize::new(0)),
-            phase: Arc::new(Mutex::new(SessionRuntimePhase::Idle)),
-            current_turn: Arc::new(Mutex::new(None)),
+            phase: Arc::new(Mutex::new(SessionRuntimePhase::ProviderActive)),
+            current_turn: Arc::clone(&current),
         };
         state
             .session_runtimes
             .lock()
             .await
-            .insert(session.id, handle.clone());
-        let client_id = ClientId::new();
-
-        *handle.phase.lock().await = SessionRuntimePhase::ProviderActive;
-        *handle.current_turn.lock().await = Some(RuntimeCurrentTurn {
-            interaction_route: None,
-            kind: RuntimeOperationKind::ModelTurn,
-            client_id,
-            turn_id: "provider-active-turn".to_owned(),
-            agent_profile: Some("build".to_owned()),
-            cancel_state: Arc::new(TurnCancelState::default()),
-            model: Some(ModelRequestAttempt {
-                identity: bcode_session_models::ModelRequestIdentity {
-                    provider_plugin_id: "fixture-provider".to_owned(),
-                    requested_model_id: None,
-                    effective_model_id: "fixture-model".to_owned(),
-                    request_id: "provider-active-request".to_owned(),
-                    model_turn_id: "provider-active-turn".to_owned(),
-                    round: 0,
-                    request_fingerprint: "fixture-fingerprint".to_owned(),
-                    effective_auth_profile: None,
-                    context_format_version: None,
-                    compatibility_key: None,
-                    context_epoch: 0,
-                },
-                provider_turn_id: "provider-active-turn".to_owned(),
-                pricing: None,
-                catalog_provider_id: None,
-                catalog_entry_id: None,
-                catalog_family: None,
-                pricing_target: None,
-                catalog_api_surface: None,
-                reuse_key: None,
-                request_message_count: 1,
-                context_through_sequence: 1,
-                portable_context: String::new(),
-                local_estimate: bcode_session_models::LocalContextEstimate {
-                    tokens: 0,
-                    algorithm_version: 1,
-                },
-                original_usage: None,
-                managed_compaction_persisted: false,
-            }),
-        });
-        let steering = enqueue_user_message_command(
+            .insert(session.id, handle);
+        let client = ClientId::new();
+        let execution = TurnExecutionOptions {
+            agent_profile: Some("build".into()),
+            ..Default::default()
+        };
+        let mut selection =
+            session_model_selection_with_runtime_context(&state, session.id, None).await;
+        apply_turn_model_selection(&mut selection, &execution);
+        let context = RuntimeCommandContext::new(
+            &mut followups,
+            &mut steering,
+            &mut cancels,
+            &queued,
+            Arc::clone(&current),
+        );
+        append_model_runtime_work_started_event(
             &state,
             session.id,
-            client_id,
-            None,
-            "steer while streaming".to_owned(),
-            bcode_ipc::PromptPlacement::Steering,
-            bcode_session_models::TurnExecutionOptions::default(),
+            WorkId::new("model_active"),
+            "active".into(),
+            Arc::new(TurnCancelState::default()),
         )
-        .await
-        .expect("steering admission");
-        assert_eq!(
-            steering.disposition,
-            bcode_ipc::MessageAcceptanceDisposition::QueuedFollowUp
-        );
-        assert!(steering.queued);
-        assert!(matches!(
-            followup_receiver.try_recv(),
-            Ok(FollowupCommand::ExecuteTurn {
-                queued_steering: Some(_),
-                ..
-            })
-        ));
+        .await;
+        begin_current_turn(
+            &context,
+            client,
+            "active".into(),
+            Arc::new(TurnCancelState::default()),
+            execution.clone(),
+        )
+        .await;
+        current.lock().await.as_mut().unwrap().selection = Some(selection);
+        let admission = bcode_session_models::TurnAdmissionMetadata {
+            execution,
+            ..Default::default()
+        };
+        assert_steering_terminal_arbitration(&state, session.id, client, admission, &context).await;
+        assert_eq!(queued.load(Ordering::Acquire), 1);
+        drop(context);
+        drop(state);
+    }
 
-        let follow_up_execution = bcode_session_models::TurnExecutionOptions {
-            agent_profile: Some("build".to_owned()),
-            permission_mode: bcode_session_models::TurnPermissionMode::Bypass,
-            tools: bcode_session_models::TurnToolPolicy::Disabled,
-            reasoning: Some(Box::new(bcode_session_models::TurnReasoningOptions {
-                effort: Some("high".to_owned()),
-                summary: Some("detailed".to_owned()),
-            })),
-            ..bcode_session_models::TurnExecutionOptions::default()
-        };
-        let follow_up = enqueue_user_message_command(
-            &state,
-            session.id,
-            client_id,
-            None,
-            "explicit follow-up".to_owned(),
-            bcode_ipc::PromptPlacement::FollowUp,
-            follow_up_execution.clone(),
-        )
-        .await
-        .expect("follow-up admission");
-        assert_eq!(
-            follow_up.disposition,
-            bcode_ipc::MessageAcceptanceDisposition::QueuedFollowUp
-        );
-        assert!(follow_up.queued);
-        let Ok(FollowupCommand::ExecuteTurn {
-            user_event,
-            queued_steering: None,
-            ..
-        }) = followup_receiver.try_recv()
-        else {
-            panic!("follow-up should retain its admitted execution options");
-        };
-        assert_eq!(turn_execution_options(&user_event), follow_up_execution);
-        let durable_history = state
-            .sessions
-            .session_history(session.id)
+    #[tokio::test]
+    async fn pending_submission_retries_and_lost_hints_do_not_duplicate_activation() {
+        let workspace = tempfile::tempdir().unwrap();
+        let sessions = SessionManager::persistent(workspace.path().join("sessions")).unwrap();
+        let session = sessions
+            .create_session(None, test_working_directory())
             .await
-            .expect("durable admission history");
-        let durable_follow_up = durable_history
-            .iter()
-            .find(|event| {
-                matches!(
-                    &event.kind,
-                    SessionEventKind::UserMessage { text, .. } if text == "explicit follow-up"
+            .unwrap();
+        let state = Arc::new(test_server_state(sessions));
+        let (followup_commands, mut followups) = mpsc::channel(1);
+        let (steering_commands, _steering) = mpsc::channel(1);
+        let (cancel_commands, _cancels) = mpsc::channel(1);
+        let queued = Arc::new(AtomicUsize::new(0));
+        state.session_runtimes.lock().await.insert(
+            session.id,
+            SessionRuntimeHandle {
+                followup_commands,
+                steering_commands,
+                cancel_commands,
+                queued_followups: Arc::clone(&queued),
+                queued_steering: Arc::new(AtomicUsize::new(0)),
+                phase: Arc::new(Mutex::new(SessionRuntimePhase::Idle)),
+                current_turn: Arc::new(Mutex::new(None)),
+            },
+        );
+        let client = ClientId::new();
+        let id = bcode_session_models::SubmissionId("retry".into());
+        let receipt = enqueue_prompt_submission(
+            &state,
+            session.id,
+            client,
+            id.clone(),
+            "pending".into(),
+            bcode_session_models::SubmissionPlacement::FollowUp,
+            bcode_session_models::TurnAdmissionMetadata::default(),
+        )
+        .await
+        .unwrap();
+        drop(followups.try_recv().unwrap());
+        queued.fetch_sub(1, Ordering::AcqRel);
+        assert!(
+            next_pending_submission_command(&state, session.id, &mut None, &mut Vec::new())
+                .await
+                .unwrap()
+                .is_none()
+        );
+        let repeated = enqueue_prompt_submission(
+            &state,
+            session.id,
+            client,
+            id.clone(),
+            "pending".into(),
+            bcode_session_models::SubmissionPlacement::FollowUp,
+            bcode_session_models::TurnAdmissionMetadata::default(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(receipt, repeated);
+        assert_eq!(queued.load(Ordering::Acquire), 1);
+        let mut hints = vec![followups.try_recv().unwrap()];
+        queued.fetch_sub(1, Ordering::AcqRel);
+        let recovered = next_pending_submission_command(&state, session.id, &mut None, &mut hints)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(matches!(
+            recovered,
+            FollowupCommand::ExecuteSubmission { .. }
+        ));
+        let event = activated_submission_event(&state, session.id, id.clone())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(matches!(
+            event.kind,
+            SessionEventKind::SubmissionActivated { .. }
+        ));
+        assert!(
+            activated_submission_event(&state, session.id, id)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            next_pending_submission_command(&state, session.id, &mut None, &mut hints)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        drop(recovered);
+        drop(state);
+    }
+
+    #[tokio::test]
+    async fn steering_discovery_uses_durable_target_not_runtime_list() {
+        let sessions = SessionManager::default();
+        let session = sessions
+            .create_session(None, test_working_directory())
+            .await
+            .unwrap();
+        let state = test_server_state(sessions);
+        let (_followup_tx, mut followups) = mpsc::channel(1);
+        let (_steering_tx, mut steering) = mpsc::channel(1);
+        let (_cancel_tx, mut cancels) = mpsc::channel(1);
+        let queued = AtomicUsize::new(0);
+        let current = Arc::new(Mutex::new(None));
+        let context = RuntimeCommandContext::new(
+            &mut followups,
+            &mut steering,
+            &mut cancels,
+            &queued,
+            current,
+        );
+        append_model_runtime_work_started_event(
+            &state,
+            session.id,
+            WorkId::new("model_durable-target"),
+            "durable-target".into(),
+            Arc::new(TurnCancelState::default()),
+        )
+        .await;
+        begin_current_turn(
+            &context,
+            ClientId::new(),
+            "durable-target".into(),
+            Arc::new(TurnCancelState::default()),
+            TurnExecutionOptions::default(),
+        )
+        .await;
+        for index in 0..40 {
+            state
+                .sessions
+                .accept_submission(
+                    session.id,
+                    bcode_session_models::PromptSubmission {
+                        id: bcode_session_models::SubmissionId(format!("durable-{index}")),
+                        client_id: ClientId::new(),
+                        text: format!("input {index}"),
+                        admission: bcode_session_models::TurnAdmissionMetadata::default(),
+                        requested_placement: bcode_session_models::SubmissionPlacement::Steer,
+                        execution_descriptor: None,
+                        target: bcode_session_models::SubmissionTarget::Steering {
+                            turn_id: bcode_session_models::TurnId("durable-target".into()),
+                        },
+                    },
                 )
-            })
-            .expect("durable follow-up event");
-        assert_eq!(
-            turn_execution_options(durable_follow_up),
-            follow_up_execution
+                .await
+                .unwrap();
+        }
+        assert!(
+            activate_pending_steering(&state, session.id, &context, true)
+                .await
+                .unwrap()
         );
+        assert!(
+            activate_pending_steering(&state, session.id, &context, true)
+                .await
+                .unwrap()
+        );
+        assert!(
+            !activate_pending_steering(&state, session.id, &context, true)
+                .await
+                .unwrap()
+        );
+        assert!(
+            state
+                .sessions
+                .pending_submissions_for_turn(
+                    session.id,
+                    bcode_session_models::TurnId("durable-target".into()),
+                    None,
+                    32
+                )
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        drop(state);
+    }
 
-        let low_execution = bcode_session_models::TurnExecutionOptions {
-            agent_profile: Some("build".to_owned()),
-            permission_mode: bcode_session_models::TurnPermissionMode::Enforce,
-            tools: bcode_session_models::TurnToolPolicy::Enabled,
-            reasoning: Some(Box::new(bcode_session_models::TurnReasoningOptions {
-                effort: Some("low".to_owned()),
-                summary: Some("concise".to_owned()),
-            })),
-            ..bcode_session_models::TurnExecutionOptions::default()
-        };
-        let second_client_id = ClientId::new();
-        let second_follow_up = enqueue_user_message_command(
-            &state,
-            session.id,
-            second_client_id,
-            None,
-            "second explicit follow-up".to_owned(),
-            bcode_ipc::PromptPlacement::FollowUp,
-            low_execution.clone(),
-        )
-        .await
-        .expect("second follow-up admission");
-        assert!(second_follow_up.queued);
-        state
-            .session_model_selections
-            .lock()
+    #[tokio::test]
+    async fn pending_recovery_requires_exact_descriptor_and_reports_missing_context() {
+        let sessions = SessionManager::default();
+        let session = sessions
+            .create_session(None, test_working_directory())
             .await
-            .entry(session.id)
-            .or_default()
-            .reasoning_effort = Some("medium".to_owned());
-        let Ok(FollowupCommand::ExecuteTurn {
-            user_event: second_event,
-            queued_steering: None,
-            ..
-        }) = followup_receiver.try_recv()
-        else {
-            panic!("second follow-up should retain its admitted execution options");
-        };
-        assert_eq!(turn_execution_options(&user_event), follow_up_execution);
-        assert_eq!(turn_execution_options(&second_event), low_execution);
-        assert_eq!(
-            turn_execution_options(&user_event).permission_mode,
-            bcode_session_models::TurnPermissionMode::Bypass
-        );
-        assert_eq!(
-            turn_execution_options(&second_event).permission_mode,
-            bcode_session_models::TurnPermissionMode::Enforce
-        );
-
-        let active_turn = handle.current_turn.lock().await.clone();
-        *handle.phase.lock().await = SessionRuntimePhase::PreparingModelRequest;
-        *handle.current_turn.lock().await = active_turn;
-        let applied = enqueue_user_message_command(
-            &state,
+            .unwrap();
+        let state = test_server_state_with_fake_provider(sessions);
+        state.session_model_selections.lock().await.insert(
             session.id,
-            client_id,
-            None,
-            "steer before request".to_owned(),
-            bcode_ipc::PromptPlacement::Steering,
-            bcode_session_models::TurnExecutionOptions::default(),
-        )
-        .await
-        .expect("applied steering admission");
-        assert_eq!(
-            applied.disposition,
-            bcode_ipc::MessageAcceptanceDisposition::AppliedSteering
-        );
-        assert!(!applied.queued);
-        assert!(matches!(
-            steering_receiver.try_recv(),
-            Ok(SteeringCommand { text, .. }) if text == "steer before request"
-        ));
-        let changed = enqueue_user_message_command(
-            &state,
-            session.id,
-            client_id,
-            None,
-            "switch to plan".to_owned(),
-            bcode_ipc::PromptPlacement::Steering,
-            bcode_session_models::TurnExecutionOptions {
-                agent_profile: Some("plan".to_owned()),
+            SessionModelSelection {
+                provider_plugin_id: Some("bcode.fake-provider".into()),
+                model_id: Some("fake-echo".into()),
                 ..Default::default()
             },
+        );
+        let execution = TurnExecutionOptions::default();
+        let mut selection =
+            session_model_selection_with_runtime_context(&state, session.id, None).await;
+        apply_turn_model_selection(&mut selection, &execution);
+        let descriptor =
+            submission_execution_descriptor(&selection, &state.startup_config, &execution)
+                .expect("fake provider is recoverable");
+        let record = state
+            .sessions
+            .accept_submission(
+                session.id,
+                bcode_session_models::PromptSubmission {
+                    id: bcode_session_models::SubmissionId("recoverable".into()),
+                    client_id: ClientId::new(),
+                    text: "recover".into(),
+                    admission: bcode_session_models::TurnAdmissionMetadata {
+                        execution,
+                        ..Default::default()
+                    },
+                    requested_placement: bcode_session_models::SubmissionPlacement::FollowUp,
+                    target: bcode_session_models::SubmissionTarget::OwnTurn {
+                        turn_id: bcode_session_models::TurnId("recoverable-turn".into()),
+                    },
+                    execution_descriptor: Some(descriptor.clone()),
+                },
+            )
+            .await
+            .unwrap();
+        assert!(
+            recover_pending_submission_hint(&state, session.id, &record)
+                .await
+                .unwrap()
+                .is_some()
+        );
+        let mut mismatched = record.clone();
+        mismatched
+            .submission
+            .execution_descriptor
+            .as_mut()
+            .unwrap()
+            .config_identity
+            .push('x');
+        assert!(
+            recover_pending_submission_hint(&state, session.id, &mismatched)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        let observed = state
+            .sessions
+            .submission(session.id, record.receipt.submission_id.clone())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            observed.context_observation.unwrap().issue,
+            bcode_session_models::SubmissionContextIssue::Incompatible
+        );
+        let mut missing = record;
+        missing.submission.execution_descriptor = None;
+        assert!(
+            recover_pending_submission_hint(&state, session.id, &missing)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        let observed = state
+            .sessions
+            .submission(session.id, missing.receipt.submission_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            observed.context_observation.unwrap().issue,
+            bcode_session_models::SubmissionContextIssue::Unavailable
+        );
+        drop(state);
+    }
+
+    async fn wait_for_streaming_turn(state: &ServerState, session_id: SessionId) {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if state
+                    .session_current_turn(session_id)
+                    .await
+                    .is_some_and(|turn| turn.model.is_some())
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("provider request in flight");
+    }
+
+    async fn wait_for_terminal_turn(state: &ServerState, session_id: SessionId) {
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                let history = state.sessions.session_history(session_id).await.unwrap();
+                if history
+                    .iter()
+                    .any(|event| matches!(event.kind, SessionEventKind::ModelTurnFinished { .. }))
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("terminal turn");
+    }
+
+    #[tokio::test]
+    async fn streaming_steering_continues_same_turn_after_end_turn() {
+        let sessions = SessionManager::default();
+        let session = sessions
+            .create_session(None, test_working_directory())
+            .await
+            .unwrap();
+        let state = Arc::new(test_server_state_with_fake_provider(sessions));
+        let mut provider_context = bcode_model::ProviderRequestContext::default();
+        provider_context
+            .settings
+            .insert("fake_turn_delay_ms".into(), "250".into());
+        state.session_model_selections.lock().await.insert(
+            session.id,
+            SessionModelSelection {
+                provider_plugin_id: Some("bcode.fake-provider".into()),
+                model_id: Some("fake-echo".into()),
+                provider_context,
+                ..Default::default()
+            },
+        );
+        let initial = enqueue_prompt_submission(
+            &state,
+            session.id,
+            ClientId::new(),
+            bcode_session_models::SubmissionId("stream-first".into()),
+            "first".into(),
+            bcode_session_models::SubmissionPlacement::FollowUp,
+            bcode_session_models::TurnAdmissionMetadata::default(),
         )
         .await
-        .expect("changed agent queues separately");
+        .unwrap();
+        wait_for_streaming_turn(&state, session.id).await;
+        let steering = enqueue_prompt_submission(
+            &state,
+            session.id,
+            ClientId::new(),
+            bcode_session_models::SubmissionId("stream-steer".into()),
+            "second".into(),
+            bcode_session_models::SubmissionPlacement::Steer,
+            bcode_session_models::TurnAdmissionMetadata::default(),
+        )
+        .await
+        .unwrap();
+        wait_for_terminal_turn(&state, session.id).await;
+        let first = state
+            .sessions
+            .submission(session.id, initial.submission_id)
+            .await
+            .unwrap()
+            .unwrap();
+        let second = state
+            .sessions
+            .submission(session.id, steering.submission_id)
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(
-            changed.disposition,
-            bcode_ipc::MessageAcceptanceDisposition::QueuedTurn
+            first.submission.target.turn_id(),
+            second.submission.target.turn_id()
         );
-        let Ok(FollowupCommand::ExecuteTurn { user_event, .. }) = followup_receiver.try_recv()
-        else {
-            panic!("agent transition must not steer the current build turn");
-        };
+        assert!(matches!(
+            second.status,
+            bcode_session_models::SubmissionStatus::Activated { .. }
+        ));
+        let history = state.sessions.session_history(session.id).await.unwrap();
         assert_eq!(
-            turn_execution_options(&user_event).agent_profile.as_deref(),
-            Some("plan")
+            history
+                .iter()
+                .filter(|event| matches!(event.kind, SessionEventKind::ModelTurnStarted { .. }))
+                .count(),
+            1
         );
         assert_eq!(
-            handle
-                .current_turn
-                .lock()
+            history
+                .iter()
+                .filter(|event| matches!(event.kind, SessionEventKind::ModelTurnFinished { .. }))
+                .count(),
+            1
+        );
+        assert!(
+            history
+                .iter()
+                .filter(|event| matches!(
+                    event.kind,
+                    SessionEventKind::RequestContextObserved { .. }
+                ))
+                .count()
+                >= 2
+        );
+        state.shutdown_requested.store(true, Ordering::SeqCst);
+    }
+
+    #[tokio::test]
+    async fn repeated_dispatch_hints_retain_one_execution_context() {
+        let sessions = SessionManager::default();
+        let session = sessions
+            .create_session(None, test_working_directory())
+            .await
+            .unwrap();
+        let id = bcode_session_models::SubmissionId("same-submission".into());
+        let mut hints = Vec::new();
+        for _ in 0..=MAX_RETAINED_DISPATCH_HINTS {
+            let ownership = sessions
+                .acquire_session_ownership(
+                    session.id,
+                    bcode_session::SessionOwnershipKind::QueuedCommand,
+                )
                 .await
-                .as_ref()
-                .and_then(|turn| turn.agent_profile.as_deref()),
-            Some("build")
+                .unwrap();
+            retain_dispatch_hint(
+                &mut hints,
+                FollowupCommand::ExecuteSubmission {
+                    submission_id: id.clone(),
+                    runtime_context: None,
+                    ownership,
+                },
+            );
+        }
+        assert_eq!(hints.len(), 1);
+        assert_eq!(command_submission_id(&hints[0]), Some(&id));
+    }
+
+    #[tokio::test]
+    async fn durable_fifo_blocks_later_hints_when_oldest_context_is_missing() {
+        let sessions = SessionManager::default();
+        let session = sessions
+            .create_session(None, test_working_directory())
+            .await
+            .unwrap();
+        let state = test_server_state(sessions);
+        let (_, first) = admit_turn(
+            &state,
+            session.id,
+            ClientId::new(),
+            "first".into(),
+            bcode_session_models::TurnAdmissionMetadata::default(),
+        )
+        .await
+        .unwrap();
+        let (_, second) = admit_turn(
+            &state,
+            session.id,
+            ClientId::new(),
+            "second".into(),
+            bcode_session_models::TurnAdmissionMetadata::default(),
+        )
+        .await
+        .unwrap();
+        let first = first.unwrap();
+        let second = second.unwrap();
+        let id = |event: &SessionEvent| match &event.kind {
+            SessionEventKind::SubmissionAccepted { submission } => submission.id.clone(),
+            _ => panic!("acceptance"),
+        };
+        let make_hint = |event: SessionEvent, ownership| FollowupCommand::ExecuteTurn {
+            client_id: ClientId::new(),
+            runtime_context: None,
+            user_event: Box::new(event),
+            queued_steering: None,
+            cancel_state: None,
+            completion: None,
+            recovering: false,
+            ownership,
+        };
+        let second_ownership = state
+            .sessions
+            .acquire_session_ownership(
+                session.id,
+                bcode_session::SessionOwnershipKind::QueuedCommand,
+            )
+            .await
+            .unwrap();
+        let mut hints = vec![make_hint(second.clone(), second_ownership)];
+        assert!(
+            next_pending_submission_command(&state, session.id, &mut None, &mut hints)
+                .await
+                .unwrap()
+                .is_none()
         );
+        assert_eq!(hints.len(), 1);
+        let first_ownership = state
+            .sessions
+            .acquire_session_ownership(
+                session.id,
+                bcode_session::SessionOwnershipKind::QueuedCommand,
+            )
+            .await
+            .unwrap();
+        hints.push(make_hint(first.clone(), first_ownership));
+        let selected = next_pending_submission_command(&state, session.id, &mut None, &mut hints)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(command_submission_id(&selected), Some(&id(&first)));
+        activated_submission_event(&state, session.id, id(&first))
+            .await
+            .unwrap();
+        let selected = next_pending_submission_command(&state, session.id, &mut None, &mut hints)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(command_submission_id(&selected), Some(&id(&second)));
+        drop(state);
+    }
+
+    #[tokio::test]
+    async fn independent_queued_turn_activates_after_output_with_original_receipt() {
+        let sessions = SessionManager::default();
+        let session = sessions
+            .create_session(None, test_working_directory())
+            .await
+            .unwrap();
+        let state = test_server_state(sessions);
+        let (admission, accepted) = admit_turn(
+            &state,
+            session.id,
+            ClientId::new(),
+            "later input".into(),
+            bcode_session_models::TurnAdmissionMetadata::default(),
+        )
+        .await
+        .unwrap();
+        let bcode_session_models::TurnAdmission::Accepted(receipt) = admission else {
+            panic!("accepted turn");
+        };
+        let accepted = accepted.unwrap();
+        let SessionEventKind::SubmissionAccepted { submission } = &accepted.kind else {
+            panic!("durable acceptance, not conversation");
+        };
+        assert_eq!(execution_turn_id(&accepted), receipt.turn_id.0);
+        assert!(
+            state
+                .sessions
+                .activated_conversation_snapshot(session.id)
+                .await
+                .unwrap()
+                .events
+                .iter()
+                .all(|event| user_message_text(event) != Some("later input"))
+        );
+        let output = state
+            .sessions
+            .append_assistant_message(session.id, "previous output".into())
+            .await
+            .unwrap();
+        let activated = activated_submission_event(&state, session.id, submission.id.clone())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(activated.sequence > output.sequence);
+        assert_eq!(execution_turn_id(&activated), receipt.turn_id.0);
+        assert_eq!(receipt.accepted_event_sequence, accepted.sequence);
+        let snapshot = state
+            .sessions
+            .activated_conversation_snapshot(session.id)
+            .await
+            .unwrap();
+        assert!(
+            snapshot
+                .events
+                .iter()
+                .any(|event| user_message_text(event) == Some("later input"))
+        );
+        drop(state);
+    }
+
+    #[tokio::test]
+    async fn clear_queue_cancels_durable_submission_without_activation() {
+        let workspace = tempfile::tempdir().unwrap();
+        let sessions = SessionManager::persistent(workspace.path().join("sessions")).unwrap();
+        let session = sessions
+            .create_session(None, test_working_directory())
+            .await
+            .unwrap();
+        let state = Arc::new(test_server_state(sessions));
+        let (followup_commands, mut followups) = mpsc::channel(1);
+        let (steering_commands, _steering) = mpsc::channel(1);
+        let (cancel_commands, _cancels) = mpsc::channel(1);
+        let queued = Arc::new(AtomicUsize::new(0));
+        state.session_runtimes.lock().await.insert(
+            session.id,
+            SessionRuntimeHandle {
+                followup_commands,
+                steering_commands,
+                cancel_commands,
+                queued_followups: Arc::clone(&queued),
+                queued_steering: Arc::new(AtomicUsize::new(0)),
+                phase: Arc::new(Mutex::new(SessionRuntimePhase::Idle)),
+                current_turn: Arc::new(Mutex::new(None)),
+            },
+        );
+        let receipt = enqueue_prompt_submission(
+            &state,
+            session.id,
+            ClientId::new(),
+            bcode_session_models::SubmissionId("cancel-pending".into()),
+            "not conversation".into(),
+            bcode_session_models::SubmissionPlacement::FollowUp,
+            bcode_session_models::TurnAdmissionMetadata::default(),
+        )
+        .await
+        .unwrap();
+        let (response, completion) = oneshot::channel();
+        process_cancel_turn_command(
+            &state,
+            session.id,
+            &mut followups,
+            &queued,
+            CancelCommand {
+                clear_queue: true,
+                requested_by: None,
+                response,
+            },
+        )
+        .await;
+        assert!(!completion.await.unwrap());
+        assert!(matches!(
+            state
+                .sessions
+                .submission(session.id, receipt.submission_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .status,
+            bcode_session_models::SubmissionStatus::Cancelled { .. }
+        ));
+        assert!(
+            state
+                .sessions
+                .model_context_events(session.id)
+                .await
+                .unwrap()
+                .iter()
+                .all(|event| !matches!(
+                    event.kind,
+                    SessionEventKind::UserMessage { .. }
+                        | SessionEventKind::SubmissionActivated { .. }
+                ))
+        );
+        assert_eq!(queued.load(Ordering::Acquire), 0);
+        assert!(followups.try_recv().is_err());
         drop(state);
     }
 
@@ -63433,6 +65382,8 @@ event_symbol = "bcode_plugin_handle_event_v1"
                     cancel_state: Arc::new(TurnCancelState::default()),
                     model: None,
                     agent_profile: Some("build".into()),
+                    execution: None,
+                    selection: None,
                 }))),
             },
         );
@@ -65990,12 +67941,10 @@ event_symbol = "bcode_plugin_handle_event_v1"
                     .session_history(session_id)
                     .await
                     .expect("history");
-                if history.iter().any(|event| {
-                    matches!(
-                        &event.kind,
-                        SessionEventKind::UserMessage { text, .. } if text == expected
-                    )
-                }) {
+                if history
+                    .iter()
+                    .any(|event| user_message_text(event) == Some(expected))
+                {
                     break;
                 }
                 tokio::time::sleep(Duration::from_millis(10)).await;
@@ -66591,9 +68540,12 @@ event_symbol = "bcode_plugin_handle_event_v1"
             "application/x-www-form-urlencoded".to_owned(),
         );
         invalid_submit.body = Some(Arc::new(
-            format!("session_id={}&text=%20%20%20", session.id)
-                .into_bytes()
-                .into(),
+            format!(
+                "session_id={}&submission_id=empty-prompt-fixture&text=%20%20%20",
+                session.id
+            )
+            .into_bytes()
+            .into(),
         ));
         let invalid_submit = router
             .navigate(invalid_submit)
@@ -66603,6 +68555,28 @@ event_symbol = "bcode_plugin_handle_event_v1"
         let invalid_submit = format!("{invalid_submit:?}");
         assert!(invalid_submit.contains("prompt cannot be empty"));
         assert!(invalid_submit.contains("selected-session-draft"));
+
+        let mut missing_submission_id = hyperchad::router::RouteRequest::from_path(
+            "/actions/submit-message?token=route-token",
+            hyperchad::router::RequestInfo::default(),
+        );
+        missing_submission_id.headers.insert(
+            "content-type".to_owned(),
+            "application/x-www-form-urlencoded".to_owned(),
+        );
+        missing_submission_id.body = Some(Arc::new(
+            format!("session_id={}&text=%20%20%20", session.id)
+                .into_bytes()
+                .into(),
+        ));
+        let missing_submission_id = router
+            .navigate(missing_submission_id)
+            .await
+            .expect("missing submission identity route")
+            .expect("missing submission identity content");
+        let missing_submission_id = format!("{missing_submission_id:?}");
+        assert!(missing_submission_id.contains("The submitted form could not be read"));
+        assert!(!missing_submission_id.contains("prompt cannot be empty"));
 
         let reconnected_router =
             bcode_hyperchad::router_from_state(bcode_hyperchad::HyperChadAppState::new(
@@ -66715,16 +68689,19 @@ event_symbol = "bcode_plugin_handle_event_v1"
             "application/x-www-form-urlencoded".to_owned(),
         );
         submit.body = Some(Arc::new(
-            format!("session_id={}&text=web-route-message", session.id)
-                .into_bytes()
-                .into(),
+            format!(
+                "session_id={}&submission_id=web-route-submission&text=web-route-message",
+                session.id
+            )
+            .into_bytes()
+            .into(),
         ));
         let submit = router
             .navigate(submit)
             .await
             .expect("submit action route")
             .expect("submit action content");
-        assert!(format!("{submit:?}").contains("message started a new turn"));
+        assert!(format!("{submit:?}").contains("submission accepted; activation pending"));
         tokio::time::timeout(Duration::from_secs(2), async {
             loop {
                 let history = state
@@ -66735,7 +68712,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
                 if history.iter().any(|event| {
                     matches!(
                         &event.kind,
-                        SessionEventKind::UserMessage { text, .. } if text == "web-route-message"
+                        SessionEventKind::SubmissionAccepted { submission } if submission.text == "web-route-message"
                     )
                 }) {
                     break;
@@ -67444,7 +69421,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
                 .expect("first event after attach timeout")
                 .expect("first event after attach"),
             bcode_ipc::Event::Session(event)
-                if matches!(event.kind, SessionEventKind::UserMessage { ref text, .. } if text == "after attach")
+                if user_message_text(&event) == Some("after attach")
         ));
 
         for text in ["live ", "answer"] {
@@ -71968,7 +73945,10 @@ event_symbol = "bcode_plugin_handle_event_v1"
             assert_eq!(
                 history
                     .iter()
-                    .filter(|event| matches!(event.kind, SessionEventKind::UserMessage { .. }))
+                    .filter(|event| matches!(
+                        event.kind,
+                        SessionEventKind::SubmissionAccepted { .. }
+                    ))
                     .count(),
                 1
             );
@@ -72052,7 +74032,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
             .selected_provider_context
             .settings
             .insert("fake_structured_output_json".into(), "7".into());
-        let mut state = Arc::new(state);
+        let state = Arc::new(state);
         restore_workflow_runtime_work(&state).await;
         restore_workflow_runtime_work(&state).await;
         let attempts = {
@@ -72069,195 +74049,87 @@ event_symbol = "bcode_plugin_handle_event_v1"
         assert_eq!(attempts.len(), 1);
         assert_eq!(attempts[0].dispatch_identity, before[0].dispatch_identity);
         assert!(attempts[0].has_receipt, "{attempts:?}");
-        assert_eq!(attempts[0].status, "repair_required");
-        let resolution = bcode_workflow_store::RepairResolution::AbandonForExplicitRetry {
-            reason: "explicitly authorize a new attempt after verified process loss".into(),
-        };
-        let repair_allowed = Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let policy_allowed = Arc::clone(&repair_allowed);
-        Arc::get_mut(&mut state)
-            .expect("exclusive replacement")
-            .set_workflow_attempt_repair_policy(workflow_operations::WorkflowAttemptRepairPolicy {
-                evaluator: Arc::new(move |facts| {
-                    assert_eq!(facts.run_id, "redispatch-run");
-                    if policy_allowed.load(Ordering::SeqCst) {
-                        WorkflowApplicationAuthorizationDecision::Allow
-                    } else {
-                        WorkflowApplicationAuthorizationDecision::Deny {
-                            reason: "repair denied".into(),
-                        }
-                    }
-                }),
-            });
-        let socket_root = tempfile::tempdir().expect("socket root");
-        let endpoint = bcode_ipc::IpcEndpoint::unix_socket(socket_root.path().join("repair.sock"));
-        let listener = LocalIpcListener::bind(&endpoint).expect("listener");
-        let (shutdown, stopped) = tokio::sync::oneshot::channel();
-        let server = tokio::spawn(serve_runtime_test_clients(
-            listener,
-            Arc::clone(&state),
-            stopped,
-        ));
-        let client = bcode_client::BcodeClient::new(endpoint.clone());
+        assert_eq!(attempts[0].status, "paused");
+        let child = state
+            .sessions
+            .all_session_summaries()
+            .await
+            .into_iter()
+            .find(|session| session.execution.is_some())
+            .expect("execution session");
+        let pending = state
+            .sessions
+            .pending_submissions(child.id, None, 8)
+            .await
+            .expect("pending");
+        assert_eq!(pending.len(), 1);
+        assert!(pending[0].context_observation.is_some());
         assert!(
-            client
-                .repair_workflow_attempt(attempts[0].dispatch_identity.clone(), resolution.clone())
-                .await
-                .is_err()
-        );
-        assert_eq!(
             state
-                .workflow_store
-                .lock()
-                .expect("store")
-                .attempt_history("redispatch-run", None, 10)
-                .expect("attempts")[0]
-                .status,
-            "repair_required"
+                .sessions
+                .activated_conversation_snapshot(child.id)
+                .await
+                .unwrap()
+                .events
+                .iter()
+                .all(|event| user_message_text(event).is_none())
         );
-        repair_allowed.store(true, Ordering::SeqCst);
         if cancel {
+            let socket_root = tempfile::tempdir().expect("socket root");
+            let endpoint =
+                bcode_ipc::IpcEndpoint::unix_socket(socket_root.path().join("cancel.sock"));
+            let listener = LocalIpcListener::bind(&endpoint).expect("listener");
+            let (shutdown, stopped) = tokio::sync::oneshot::channel();
+            let server = tokio::spawn(serve_runtime_test_clients(
+                listener,
+                Arc::clone(&state),
+                stopped,
+            ));
+            let client = bcode_client::BcodeClient::new(endpoint);
             assert!(
                 client
                     .cancel_workflow_run("redispatch-run".into())
                     .await
                     .expect("IPC cancellation")
             );
-            assert!(
-                client
-                    .repair_workflow_attempt(attempts[0].dispatch_identity.clone(), resolution)
-                    .await
-                    .is_err()
-            );
+            restore_workflow_runtime_work(&state).await;
+            let record = tokio::time::timeout(Duration::from_secs(3), async {
+                loop {
+                    let record = state
+                        .sessions
+                        .submission(child.id, pending[0].receipt.submission_id.clone())
+                        .await
+                        .unwrap()
+                        .unwrap();
+                    if matches!(
+                        record.status,
+                        bcode_session_models::SubmissionStatus::Cancelled { .. }
+                    ) {
+                        break record;
+                    }
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+            })
+            .await
+            .expect("pending cancellation settles");
+            assert!(matches!(
+                record.status,
+                bcode_session_models::SubmissionStatus::Cancelled { .. }
+            ));
             shutdown.send(()).expect("stop IPC");
             server.await.expect("IPC stopped");
-            let attempts = state
+        }
+        assert_eq!(
+            state
                 .workflow_store
                 .lock()
                 .expect("store")
                 .attempt_history("redispatch-run", None, 10)
-                .expect("attempts");
-            assert_eq!(attempts.len(), 1);
-            assert_ne!(attempts[0].status, "abandoned");
-            return;
-        }
-        let proxy_endpoint =
-            bcode_ipc::IpcEndpoint::unix_socket(socket_root.path().join("loss.sock"));
-        let proxy_listener = LocalIpcListener::bind(&proxy_endpoint).expect("proxy");
-        let upstream_endpoint = endpoint.clone();
-        let proxy = tokio::spawn(async move {
-            let mut downstream = proxy_listener.accept().await.expect("proxy client");
-            let mut upstream = LocalIpcStream::connect(&upstream_endpoint)
-                .await
-                .expect("upstream");
-            let hello = bcode_ipc::recv_envelope(&mut downstream)
-                .await
-                .expect("hello");
-            bcode_ipc::send_envelope(&mut upstream, &hello)
-                .await
-                .expect("forward hello");
-            let hello_response = bcode_ipc::recv_envelope(&mut upstream)
-                .await
-                .expect("hello response");
-            bcode_ipc::send_envelope(&mut downstream, &hello_response)
-                .await
-                .expect("forward hello response");
-            let repair = bcode_ipc::recv_envelope(&mut downstream)
-                .await
-                .expect("repair");
-            bcode_ipc::send_envelope(&mut upstream, &repair)
-                .await
-                .expect("forward repair");
-            let response = bcode_ipc::recv_envelope(&mut upstream)
-                .await
-                .expect("committed response");
-            assert!(matches!(
-                bcode_ipc::decode_response(&response.payload).expect("response"),
-                Response::Ok(ResponsePayload::WorkflowAttemptRepaired { .. })
-            ));
-            // Close without forwarding the committed response: the client cannot know its outcome.
-        });
-        let lossy_client = bcode_client::BcodeClient::new(proxy_endpoint);
-        assert!(
-            lossy_client
-                .repair_workflow_attempt(attempts[0].dispatch_identity.clone(), resolution.clone())
-                .await
-                .is_err()
+                .unwrap()
+                .len(),
+            1
         );
-        let mut watcher = client
-            .watch_workflow_runs()
-            .await
-            .expect("workflow watcher");
-        proxy.await.expect("lost response proxy");
-        shutdown.send(()).expect("interrupt watcher transport");
-        server.await.expect("original IPC stopped");
-        // The listener fixture aborts handlers, so release their registered event sinks
-        // explicitly; a real process exit drops these along with the transport.
-        let disconnected_clients: Vec<_> = state.clients.lock().await.iter().copied().collect();
-        for client_id in disconnected_clients {
-            state
-                .close_client(client_id)
-                .await
-                .expect("close retired client");
-        }
-        assert!(
-            !socket_root.path().join("repair.sock").exists(),
-            "retired listener removes its socket"
-        );
-        let listener = LocalIpcListener::bind(&endpoint).expect("replacement listener");
-        let (shutdown, stopped) = tokio::sync::oneshot::channel();
-        let server = tokio::spawn(serve_runtime_test_clients(
-            listener,
-            Arc::clone(&state),
-            stopped,
-        ));
-        tokio::time::timeout(Duration::from_secs(10), async {
-            loop {
-                if matches!(
-                    watcher.next_event().await.expect("watcher reconnect"),
-                    bcode_client::WorkflowRunWatchEvent::ResyncRequired
-                ) {
-                    break;
-                }
-            }
-        })
-        .await
-        .expect("workflow resync after reconnect");
-        assert!(
-            client
-                .repair_workflow_attempt(attempts[0].dispatch_identity.clone(), resolution)
-                .await
-                .is_err()
-        );
-        tokio::time::timeout(Duration::from_secs(15), async {
-            loop {
-                let attempts = client
-                    .workflow_attempt_history("redispatch-run".into(), None, 10)
-                    .await
-                    .expect("reconnected history");
-                if attempts.iter().any(|attempt| attempt.status == "succeeded") {
-                    assert_eq!(attempts.len(), 2);
-                    assert!(attempts.iter().any(|attempt| attempt.status == "abandoned"
-                        && attempt.dispatch_identity == before[0].dispatch_identity));
-                    break;
-                }
-                tokio::time::sleep(Duration::from_millis(20)).await;
-            }
-        })
-        .await
-        .unwrap_or_else(|error| {
-            panic!(
-                "explicit replacement completes: {error}; {:?}",
-                state.workflow_store.lock().expect("store").attempt_history(
-                    "redispatch-run",
-                    None,
-                    10
-                )
-            )
-        });
-        shutdown.send(()).expect("stop IPC");
-        server.await.expect("IPC stopped");
-        drop(state);
+        state.request_shutdown();
     }
 
     #[tokio::test]
@@ -72583,7 +74455,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
             assert!(
                 attempts
                     .iter()
-                    .any(|attempt| attempt.status == "prepared" && !attempt.has_receipt),
+                    .any(|attempt| attempt.status == "admitted" && attempt.has_receipt),
                 "{attempts:?}"
             );
             tokio::time::sleep(Duration::from_millis(1800)).await;
@@ -72617,7 +74489,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
         assert_eq!(
             events
                 .iter()
-                .filter(|event| matches!(event.kind, SessionEventKind::UserMessage { .. }))
+                .filter(|event| matches!(event.kind, SessionEventKind::SubmissionAccepted { .. }))
                 .count(),
             1
         );
@@ -73975,7 +75847,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
         assert_eq!(
             history
                 .iter()
-                .filter(|event| matches!(event.kind, SessionEventKind::UserMessage { .. }))
+                .filter(|event| matches!(event.kind, SessionEventKind::SubmissionAccepted { .. }))
                 .count(),
             1
         );
@@ -76122,7 +77994,16 @@ event_symbol = "bcode_plugin_handle_event_v1"
             }
         })
         .await
-        .expect("workflow completed");
+        .unwrap_or_else(|error| {
+            panic!(
+                "workflow completed: {error}; {:?}",
+                state
+                    .workflow_store
+                    .lock()
+                    .unwrap()
+                    .attempt_history("shared-loop-run", None, 10)
+            )
+        });
 
         assert!(
             !state
@@ -76157,7 +78038,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
         assert_eq!(
             history
                 .iter()
-                .filter(|event| matches!(event.kind, SessionEventKind::UserMessage { .. }))
+                .filter(|event| matches!(event.kind, SessionEventKind::SubmissionAccepted { .. }))
                 .count(),
             2
         );
@@ -80946,6 +82827,14 @@ event_symbol = "bcode_plugin_handle_event_v1"
     }
 
     async fn assert_associated_resume_pending(recovering: bool, allowance_only: bool) {
+        Box::pin(assert_associated_resume_pending_inner(
+            recovering,
+            allowance_only,
+        ))
+        .await;
+    }
+
+    async fn assert_associated_resume_pending_inner(recovering: bool, allowance_only: bool) {
         let sessions = SessionManager::default();
         let session = sessions
             .create_session(Some("resume pending".to_string()), PathBuf::from("."))
@@ -81309,6 +83198,20 @@ event_symbol = "bcode_plugin_handle_event_v1"
 
     // This consumer deliberately accepts no daemon state, IPC request, or persistence handle.
     async fn exercise_associated_workflow_application<A>(
+        application: &A,
+        lookup: bcode_workflow::WorkflowRunBindingLookup,
+    ) where
+        A: bcode_workflow::WorkflowRunApplication,
+        A::Error: std::fmt::Debug,
+    {
+        Box::pin(exercise_associated_workflow_application_inner(
+            application,
+            lookup,
+        ))
+        .await;
+    }
+
+    async fn exercise_associated_workflow_application_inner<A>(
         application: &A,
         lookup: bcode_workflow::WorkflowRunBindingLookup,
     ) where
@@ -87234,16 +89137,13 @@ event_symbol = "bcode_plugin_handle_event_v1"
             .model_context_events(session_id)
             .await
             .expect("context after failure");
-        let before_non_trace = before
-            .iter()
-            .filter(|event| !matches!(event.kind, SessionEventKind::TraceEvent { .. }))
-            .collect::<Vec<_>>();
-        let after_non_trace = after
-            .iter()
-            .filter(|event| !matches!(event.kind, SessionEventKind::TraceEvent { .. }))
-            .collect::<Vec<_>>();
-        assert_eq!(after_non_trace, before_non_trace);
-        assert!(after.iter().any(|event| matches!(
+        assert_eq!(after, before);
+        let history = state
+            .sessions
+            .session_history(session_id)
+            .await
+            .expect("canonical failure trace");
+        assert!(history.iter().any(|event| matches!(
             &event.kind,
             SessionEventKind::TraceEvent { trace }
                 if trace.phase == SessionTracePhase::ContextCompactionFinished
@@ -88380,7 +90280,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
                     && matches!(
                         &trace.payload,
                         SessionTracePayload::ContextCompaction { reason, .. }
-                            if reason == "protected_tail_consumes_history"
+                            if reason == "nothing_to_compact"
                     )
         )));
         assert!(!history.iter().any(|event| matches!(
@@ -89214,6 +91114,28 @@ event_symbol = "bcode_plugin_handle_event_v1"
         }
     }
 
+    fn isolate_compaction_budget_fixture(state: &mut ServerState) {
+        // Keep budget fixtures independent of checkout guidance and in-progress diff size.
+        state.startup_config.invariants.enabled = false;
+        state
+            .startup_config
+            .system_prompt
+            .sections
+            .repository_context = false;
+        state
+            .startup_config
+            .system_prompt
+            .sections
+            .repository_invariants = false;
+        state
+            .startup_config
+            .system_prompt
+            .sections
+            .dynamic_repository_context = false;
+        state.startup_config.model.compaction.mode = bcode_config::CompactionMode::Proactive;
+        state.startup_config.model.compaction.keep_recent_tokens = 1;
+    }
+
     #[tokio::test]
     async fn repeated_tool_rounds_do_not_recompact_an_unchanged_boundary() {
         let temp_dir = tempfile::tempdir().expect("temp dir");
@@ -89248,8 +91170,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
             .await
             .expect("trigger");
         let mut state = test_server_state_with_fake_provider(sessions);
-        state.startup_config.model.compaction.mode = bcode_config::CompactionMode::Proactive;
-        state.startup_config.model.compaction.keep_recent_tokens = 1;
+        isolate_compaction_budget_fixture(&mut state);
         // fake-echo otherwise repeats the entire compaction transcript rather than summarizing
         // it. Pin only the compaction response; ordinary missing-tool rounds remain unscripted.
         let provider_context = repeated_tool_compaction_context();

@@ -78,6 +78,37 @@ pub fn session_migrations() -> CodeMigrationSource<'static> {
     add_session_base_migrations(&mut source);
     add_session_runtime_migrations(&mut source);
     add_session_execution_migrations(&mut source);
+    add_migration(
+        &mut source,
+        "043_submissions_table",
+        create_table("submissions")
+            .if_not_exists(true)
+            .column(schema_column("submission_id", DataType::Text, false))
+            .primary_key("submission_id")
+            .column(schema_column("accepted_seq", DataType::Int, false))
+            .column(schema_column("target_turn_id", DataType::Text, false))
+            .column(schema_column("pending", DataType::Int, false))
+            .column(schema_column("record", DataType::Text, false)),
+        drop_table("submissions").if_exists(true),
+    );
+    add_migration(
+        &mut source,
+        "044_submissions_pending_index",
+        create_index("idx_submissions_pending")
+            .if_not_exists(true)
+            .table("submissions")
+            .columns(vec!["pending", "accepted_seq"]),
+        drop_index("idx_submissions_pending", "submissions"),
+    );
+    add_migration(
+        &mut source,
+        "045_submissions_target_index",
+        create_index("idx_submissions_target_pending")
+            .if_not_exists(true)
+            .table("submissions")
+            .columns(vec!["target_turn_id", "pending", "accepted_seq"]),
+        drop_index("idx_submissions_target_pending", "submissions"),
+    );
     source
 }
 

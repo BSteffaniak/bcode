@@ -1457,7 +1457,7 @@ pub fn is_released_event_kind_schema(kind: &str, schema: u16) -> bool {
 ///
 /// Event kinds that the current build still persists remain historically decodable through this
 /// schema; the current schema itself is classified by [`classify_event_kind_schema`].
-pub const LATEST_HISTORICAL_EVENT_SCHEMA: u16 = 46;
+pub const LATEST_HISTORICAL_EVENT_SCHEMA: u16 = 47;
 
 fn released_event_schema_range(kind: &str) -> (u16, u16) {
     let live = LATEST_HISTORICAL_EVENT_SCHEMA;
@@ -1473,6 +1473,10 @@ fn released_event_schema_range(kind: &str) -> (u16, u16) {
         | "skill_invocation_failed"
         | "skill_invoked"
         | "skill_suggested" => (9, live),
+        "submission_accepted"
+        | "submission_activated"
+        | "submission_cancelled"
+        | "submission_context_observed" => (48, 48),
         "context_compacted" => (6, live),
         "context_usage_observed" => (26, 31),
         "provider_context_compacted" => (26, live),
@@ -1740,6 +1744,22 @@ pub const RELEASED_EVENT_VARIANTS: &[ReleasedEventVariantDescriptor] = &[
     },
     ReleasedEventVariantDescriptor {
         kind: "skill_suggested",
+        treatment: ReleasedEventTreatment::CurrentEquivalent,
+    },
+    ReleasedEventVariantDescriptor {
+        kind: "submission_accepted",
+        treatment: ReleasedEventTreatment::CurrentEquivalent,
+    },
+    ReleasedEventVariantDescriptor {
+        kind: "submission_activated",
+        treatment: ReleasedEventTreatment::CurrentEquivalent,
+    },
+    ReleasedEventVariantDescriptor {
+        kind: "submission_cancelled",
+        treatment: ReleasedEventTreatment::CurrentEquivalent,
+    },
+    ReleasedEventVariantDescriptor {
+        kind: "submission_context_observed",
         treatment: ReleasedEventTreatment::CurrentEquivalent,
     },
     ReleasedEventVariantDescriptor {
@@ -2163,7 +2183,12 @@ pub struct MigrationStepDescriptor {
     pub target_writer_epoch: u32,
 }
 
-pub const MIGRATION_STEPS: [MigrationStepDescriptor; 10] = [
+pub const MIGRATION_STEPS: [MigrationStepDescriptor; 11] = [
+    MigrationStepDescriptor {
+        id: "session-writer-epoch-11-to-12",
+        source_writer_epoch: 11,
+        target_writer_epoch: 12,
+    },
     MigrationStepDescriptor {
         id: "session-writer-epoch-10-to-11",
         source_writer_epoch: 10,
@@ -2282,7 +2307,7 @@ pub const RELEASED_WRITER_SCHEMA_COMBINATIONS: &[ReleasedWriterSchemaDescriptor]
 ];
 
 /// Released historical writer epochs that must migrate to [`CURRENT_WRITER_EPOCH`].
-pub const RELEASED_HISTORICAL_WRITER_EPOCHS: &[u32] = &[1, 2, 3, 4, 5, 6, 7, 8, 9, 10];
+pub const RELEASED_HISTORICAL_WRITER_EPOCHS: &[u32] = &[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11];
 
 /// Released historical event schemas currently evidenced by Git history.
 ///
@@ -2291,7 +2316,7 @@ pub const RELEASED_HISTORICAL_WRITER_EPOCHS: &[u32] = &[1, 2, 3, 4, 5, 6, 7, 8, 
 /// emitted by epoch-6 builds and migrate forward without a writer-epoch change.
 pub const RELEASED_HISTORICAL_EVENT_SCHEMAS: &[u16] = &[
     1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26,
-    27, 28, 29, 30, 31, 32, 35, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46,
+    27, 28, 29, 30, 31, 32, 35, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46, 47,
 ];
 
 /// Event schemas between the first released schema and the current schema that no writer emitted.
@@ -2479,7 +2504,7 @@ mod tests {
                 .windows(2)
                 .all(|pair| pair[0].kind < pair[1].kind)
         );
-        assert_eq!(RELEASED_EVENT_VARIANTS.len(), 67);
+        assert_eq!(RELEASED_EVENT_VARIANTS.len(), 71);
         assert_eq!(
             bcode_session_models::CURRENT_PERSISTED_SESSION_EVENT_KINDS
                 .iter()
@@ -2610,7 +2635,7 @@ mod tests {
             released_fixture_writer_coverage(&manifest)
                 .into_keys()
                 .collect::<BTreeSet<_>>(),
-            BTreeSet::from([1, 2, 3, 4, 5, 6, 7, 8, 9, 10])
+            BTreeSet::from([1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11])
         );
         assert_eq!(
             released_fixture_schema_coverage(&manifest).get(&28),

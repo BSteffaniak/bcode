@@ -11,7 +11,7 @@
 //! required fallback for every other surface.
 
 /// Durable session-storage writer epoch shared by runtime and daemon compatibility handshakes.
-pub const CURRENT_SESSION_STORAGE_WRITER_EPOCH: u32 = 11;
+pub const CURRENT_SESSION_STORAGE_WRITER_EPOCH: u32 = 12;
 
 /// Identifies retained turn observations in the existing system-message text contract.
 ///
@@ -35,6 +35,9 @@ use std::path::PathBuf;
 use std::str::FromStr;
 use std::time::{SystemTime, UNIX_EPOCH};
 use uuid::Uuid;
+
+mod submission;
+pub use submission::*;
 
 mod activity;
 pub use activity::{
@@ -611,13 +614,17 @@ fn tool_invocation_projection_mut<'a>(
 }
 
 /// Current persisted session event schema version.
-pub const CURRENT_SESSION_EVENT_SCHEMA_VERSION: u16 = 47;
+pub const CURRENT_SESSION_EVENT_SCHEMA_VERSION: u16 = 48;
 
 /// Stable persisted event kinds emitted by the current session schema.
 ///
 /// Historical schema ranges and conversion policy remain migration-owned. This list is the
 /// policy-free current-format capability inventory used to prevent migration classification drift.
 pub const CURRENT_PERSISTED_SESSION_EVENT_KINDS: &[&str] = &[
+    "submission_accepted",
+    "submission_activated",
+    "submission_cancelled",
+    "submission_context_observed",
     "agent_changed",
     "assistant_delta",
     "assistant_message",
@@ -680,6 +687,10 @@ pub const fn persisted_session_event_kind_name(kind: &SessionEventKind) -> &'sta
         SessionEventKind::SessionCreated { .. } => "session_created",
         SessionEventKind::ClientAttached { .. } => "client_attached",
         SessionEventKind::ClientDetached { .. } => "client_detached",
+        SessionEventKind::SubmissionAccepted { .. } => "submission_accepted",
+        SessionEventKind::SubmissionActivated { .. } => "submission_activated",
+        SessionEventKind::SubmissionCancelled { .. } => "submission_cancelled",
+        SessionEventKind::SubmissionContextObserved { .. } => "submission_context_observed",
         SessionEventKind::UserMessage { .. } => "user_message",
         SessionEventKind::AssistantDelta { .. } => "assistant_delta",
         SessionEventKind::AssistantMessage { .. } => "assistant_message",
@@ -4064,6 +4075,24 @@ pub enum SessionEventKind {
     ModelFeatureFidelityNegotiated {
         turn_id: String,
         feature: ModelFeatureFidelity,
+    },
+    SubmissionAccepted {
+        submission: PromptSubmission,
+    },
+    SubmissionActivated {
+        submission_id: SubmissionId,
+        turn_id: TurnId,
+        client_id: ClientId,
+        text: String,
+        admission: TurnAdmissionMetadata,
+    },
+    SubmissionCancelled {
+        submission_id: SubmissionId,
+    },
+    /// Nonterminal recovery observation; does not activate or remove pending input.
+    SubmissionContextObserved {
+        submission_id: SubmissionId,
+        issue: SubmissionContextIssue,
     },
 }
 

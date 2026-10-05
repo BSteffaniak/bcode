@@ -2989,9 +2989,10 @@ pub fn apply_effect_result(
             }
         },
         TuiEffectResult::TimelineJumpLoaded { sequence, result } => match result {
-            Ok((events, has_older, has_newer)) => {
+            Ok((events, has_older, has_newer, submissions)) => {
                 chat.app
                     .replace_transcript_window(&events, has_older, has_newer, sequence);
+                chat.app.apply_submission_records(&submissions);
                 if chat.app.transcript_index_for_sequence(sequence).is_some() {
                     chat.app.request_transcript_top_anchor_sequence(sequence);
                     chat.app.set_status("jumped to timeline message".to_owned());
@@ -3062,8 +3063,12 @@ pub fn apply_effect_result(
             }
             Err(error) => report_nonfatal_tui_error(chat, "Plugin command failed", &error),
         },
-        TuiEffectResult::SubmitMessage { message, result } => {
-            apply_submit_message_result(chat, &message, *result);
+        TuiEffectResult::SubmitMessage {
+            submission_id,
+            message,
+            result,
+        } => {
+            apply_submit_message_result(chat, &submission_id, &message, *result);
         }
         TuiEffectResult::SkillAction {
             action,
@@ -3358,12 +3363,19 @@ fn apply_older_history_result(
     chat: &mut ActiveChat,
     loop_state: &mut ChatLoopState,
     session_id: bcode_session_models::SessionId,
-    result: Result<bcode_session_models::SessionHistoryPage, ClientError>,
+    result: Result<
+        (
+            bcode_session_models::SessionHistoryPage,
+            Vec<bcode_session_models::SubmissionRecord>,
+        ),
+        ClientError,
+    >,
 ) {
     match result {
-        Ok(page) if Some(session_id) == chat.viewing_session_id() => {
+        Ok((page, submissions)) if Some(session_id) == chat.viewing_session_id() => {
             hydrate_history_artifacts(chat, loop_state, &page.events);
             chat.app.prepend_older_history(&page.events, page.has_more);
+            chat.app.apply_submission_records(&submissions);
         }
         Ok(_stale) => {}
         Err(error) => {
@@ -3379,12 +3391,19 @@ fn apply_newer_history_result(
     chat: &mut ActiveChat,
     loop_state: &mut ChatLoopState,
     session_id: bcode_session_models::SessionId,
-    result: Result<bcode_session_models::SessionHistoryPage, ClientError>,
+    result: Result<
+        (
+            bcode_session_models::SessionHistoryPage,
+            Vec<bcode_session_models::SubmissionRecord>,
+        ),
+        ClientError,
+    >,
 ) {
     match result {
-        Ok(page) if Some(session_id) == chat.viewing_session_id() => {
+        Ok((page, submissions)) if Some(session_id) == chat.viewing_session_id() => {
             hydrate_history_artifacts(chat, loop_state, &page.events);
             chat.app.append_newer_history(&page.events, page.has_more);
+            chat.app.apply_submission_records(&submissions);
         }
         Ok(_stale) => {}
         Err(error) => {
@@ -3816,7 +3835,8 @@ fn start_root_ralph_action(
 
 fn apply_submit_message_result(
     chat: &mut ActiveChat,
-    message: &str,
+    submission_id: &bcode_session_models::SubmissionId,
+    _message: &str,
     result: Result<super::effects::SubmitMessageResult, ClientError>,
 ) {
     match result {
@@ -3841,34 +3861,36 @@ fn apply_submit_message_result(
             if let Some(release) = result.event_stream_release {
                 let _released = release.send(());
             }
-            match result.acceptance.disposition {
-                bcode_ipc::MessageAcceptanceDisposition::AppliedSteering => {
-                    chat.app.mark_pending_submission_sent();
-                    chat.app.set_status("Steering sent".to_owned());
-                }
-                bcode_ipc::MessageAcceptanceDisposition::QueuedFollowUp
-                | bcode_ipc::MessageAcceptanceDisposition::QueuedTurn => {
-                    chat.app.set_idle();
+            match result.submission {
+                Ok(Some(record)) => {
                     chat.app
-                        .mark_pending_submission_queued(result.acceptance.queue_position);
+                        .apply_submission_records(std::slice::from_ref(&record));
                     chat.app.set_status(format!(
-                        "Message queued{}",
-                        result
-                            .acceptance
-                            .queue_position
-                            .map_or_else(String::new, |position| format!(" at #{position}"))
+                        "Submission {} accepted",
+                        result.receipt.submission_id.0
                     ));
                 }
-                bcode_ipc::MessageAcceptanceDisposition::StartedTurn => {
-                    chat.app.mark_pending_submission_sent();
-                    chat.app.set_status("Message sent".to_owned());
-                }
+                Ok(None) => chat
+                    .app
+                    .set_status("Submission accepted; lifecycle unavailable".to_owned()),
+                Err(error) => daemon_issue::report_client_issue(
+                    &mut chat.app,
+                    "Submission accepted; lifecycle lookup failed",
+                    &error,
+                ),
             }
             ensure_session_stream_after_foreground_wake(chat);
         }
         Err(error) => {
-            chat.app.restore_pending_submission(message);
-            daemon_issue::report_client_issue(&mut chat.app, "send failed", &error);
+            // An error can follow durable acceptance: retain identity and do not stage a duplicate.
+            daemon_issue::report_client_issue(
+                &mut chat.app,
+                &format!(
+                    "submission {} unresolved; retained pending",
+                    submission_id.0
+                ),
+                &error,
+            );
         }
     }
 }
@@ -5270,6 +5292,14 @@ fn absorb_session_stream_update(
     update: history_flow::SessionStreamUpdate,
 ) -> bool {
     match update {
+        history_flow::SessionStreamUpdate::Submission { session_id, record } => {
+            if chat.viewing_session_id() != Some(session_id) {
+                return false;
+            }
+            chat.app
+                .apply_submission_records(std::slice::from_ref(&record));
+            true
+        }
         history_flow::SessionStreamUpdate::Event(event) => {
             absorb_bcode_event(chat, loop_state, *event)
         }
@@ -5309,6 +5339,7 @@ fn apply_session_stream_resynchronization(
         .is_some_and(|window| window.has_older);
     chat.app
         .replace_latest_transcript_window(&attached.history, has_older);
+    chat.app.apply_submission_records(&attached.submissions);
     chat.app.apply_session_summary(&attached.session);
     chat.app.apply_usage_summary(&attached.usage_summary);
     chat.agents

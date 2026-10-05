@@ -63,9 +63,10 @@ pub async fn prepare(
         .map_err(|_| "Source snapshot unavailable")?;
     let events = state
         .sessions
-        .model_context_events(request.source_session_id)
+        .activated_conversation_snapshot(request.source_session_id)
         .await
-        .map_err(|_| "Source model context unavailable")?;
+        .map_err(|_| "Source model context unavailable")?
+        .events;
     let after = state
         .sessions
         .session_derivation_snapshot(request.source_session_id)

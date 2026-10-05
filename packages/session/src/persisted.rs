@@ -221,6 +221,23 @@ enum PersistedSessionEventKind {
     ClientDetached {
         client_id: ClientId,
     },
+    SubmissionContextObserved {
+        submission_id: bcode_session_models::SubmissionId,
+        issue: bcode_session_models::SubmissionContextIssue,
+    },
+    SubmissionAccepted {
+        submission: bcode_session_models::PromptSubmission,
+    },
+    SubmissionActivated {
+        submission_id: bcode_session_models::SubmissionId,
+        turn_id: bcode_session_models::TurnId,
+        client_id: ClientId,
+        text: String,
+        admission: TurnAdmissionMetadata,
+    },
+    SubmissionCancelled {
+        submission_id: bcode_session_models::SubmissionId,
+    },
     UserMessage {
         client_id: ClientId,
         text: String,
@@ -530,6 +547,32 @@ impl From<&SessionEventKind> for PersistedSessionEventKind {
             },
             SessionEventKind::ClientDetached { client_id } => Self::ClientDetached {
                 client_id: *client_id,
+            },
+            SessionEventKind::SubmissionContextObserved {
+                submission_id,
+                issue,
+            } => Self::SubmissionContextObserved {
+                submission_id: submission_id.clone(),
+                issue: *issue,
+            },
+            SessionEventKind::SubmissionAccepted { submission } => Self::SubmissionAccepted {
+                submission: submission.clone(),
+            },
+            SessionEventKind::SubmissionActivated {
+                submission_id,
+                turn_id,
+                client_id,
+                text,
+                admission,
+            } => Self::SubmissionActivated {
+                submission_id: submission_id.clone(),
+                turn_id: turn_id.clone(),
+                client_id: *client_id,
+                text: text.clone(),
+                admission: admission.clone(),
+            },
+            SessionEventKind::SubmissionCancelled { submission_id } => Self::SubmissionCancelled {
+                submission_id: submission_id.clone(),
             },
             SessionEventKind::UserMessage {
                 client_id,
@@ -953,6 +996,32 @@ impl PersistedSessionEventKind {
             },
             Self::ClientAttached { client_id } => SessionEventKind::ClientAttached { client_id },
             Self::ClientDetached { client_id } => SessionEventKind::ClientDetached { client_id },
+            Self::SubmissionContextObserved {
+                submission_id,
+                issue,
+            } => SessionEventKind::SubmissionContextObserved {
+                submission_id,
+                issue,
+            },
+            Self::SubmissionAccepted { submission } => {
+                SessionEventKind::SubmissionAccepted { submission }
+            }
+            Self::SubmissionActivated {
+                submission_id,
+                turn_id,
+                client_id,
+                text,
+                admission,
+            } => SessionEventKind::SubmissionActivated {
+                submission_id,
+                turn_id,
+                client_id,
+                text,
+                admission,
+            },
+            Self::SubmissionCancelled { submission_id } => {
+                SessionEventKind::SubmissionCancelled { submission_id }
+            }
             Self::UserMessage {
                 client_id,
                 text,

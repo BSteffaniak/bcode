@@ -211,22 +211,15 @@ impl SessionManager {
         {
             return Ok(None);
         }
-        let Some(sequence) = turn_id
-            .strip_prefix(&format!("{session_id}-"))
-            .and_then(|value| value.parse::<u64>().ok())
+        let Some(turn) = self
+            .recovery_turn_event(session_id, turn_id, request_sequence)
+            .await?
         else {
             return Ok(None);
         };
-        if sequence >= request_sequence || *turn_id != format!("{session_id}-{sequence}") {
-            return Ok(None);
-        }
-        let mut turns = self
-            .session_events_range(session_id, sequence, sequence, 1)
-            .await?;
-        let Some(turn) = turns.pop() else {
-            return Ok(None);
-        };
-        let SessionEventKind::UserMessage { admission, .. } = &turn.kind else {
+        let (SessionEventKind::UserMessage { admission, .. }
+        | SessionEventKind::SubmissionActivated { admission, .. }) = &turn.kind
+        else {
             return Ok(None);
         };
         if admission.validate().is_err() || admission.execution.request_context_id.is_some() {
@@ -252,6 +245,60 @@ impl SessionManager {
             permission,
             decision,
         }))
+    }
+
+    /// Resolve a receipt-backed turn without treating acceptance as execution evidence.
+    async fn recovery_turn_event(
+        &self,
+        session_id: SessionId,
+        turn_id: &str,
+        request_sequence: u64,
+    ) -> Result<Option<SessionEvent>, SessionError> {
+        let Some(sequence) = turn_id
+            .strip_prefix(&format!("{session_id}-"))
+            .and_then(|value| value.parse::<u64>().ok())
+        else {
+            return Ok(None);
+        };
+        if sequence >= request_sequence || turn_id != format!("{session_id}-{sequence}") {
+            return Ok(None);
+        }
+        let Some(turn) = self
+            .session_events_range(session_id, sequence, sequence, 1)
+            .await?
+            .pop()
+        else {
+            return Ok(None);
+        };
+        let SessionEventKind::SubmissionAccepted { submission } = &turn.kind else {
+            return Ok(matches!(turn.kind, SessionEventKind::UserMessage { .. }).then_some(turn));
+        };
+        if submission.target.turn_id().0 != turn_id {
+            return Ok(None);
+        }
+        let Some(record) = self.submission(session_id, submission.id.clone()).await? else {
+            return Ok(None);
+        };
+        let bcode_session_models::SubmissionStatus::Activated {
+            turn_id: bound,
+            conversation_sequence,
+        } = record.status
+        else {
+            return Ok(None);
+        };
+        if bound.0 != turn_id
+            || record.receipt.accepted_event_sequence != sequence
+            || record.submission != *submission
+            || conversation_sequence <= sequence
+            || conversation_sequence >= request_sequence
+        {
+            return Ok(None);
+        }
+        let activation = self
+            .session_events_range(session_id, conversation_sequence, conversation_sequence, 1)
+            .await?
+            .pop();
+        Ok(activation.filter(|event| matches!(&event.kind, SessionEventKind::SubmissionActivated { submission_id, turn_id: bound, client_id, text, admission } if *submission_id == submission.id && bound.0 == turn_id && *client_id == submission.client_id && *text == submission.text && *admission == submission.admission)))
     }
 
     /// Observe one invocation from its canonical request through a pinned session generation.
@@ -423,24 +470,82 @@ mod tests {
 
     #[tokio::test]
     async fn positioned_checkpoint_reopens_exact_turn_request_and_permission() {
-        verify_positioned_checkpoint(false).await;
+        verify_positioned_checkpoint(false, false).await;
     }
 
     #[tokio::test]
     async fn approved_checkpoint_dispatch_is_claimed_once_across_reopen() {
-        verify_positioned_checkpoint(true).await;
+        verify_positioned_checkpoint(true, false).await;
     }
 
-    async fn verify_positioned_checkpoint(approved: bool) {
-        let root = tempfile::tempdir().unwrap();
-        let manager = SessionManager::persistent(root.path()).unwrap();
-        let session = manager
-            .create_session(None, root.path().to_path_buf())
-            .await
-            .unwrap();
+    #[tokio::test]
+    async fn activated_checkpoint_preserves_acceptance_turn_id_across_reopen() {
+        verify_positioned_checkpoint(true, true).await;
+    }
+
+    async fn checkpoint_turn(
+        manager: &SessionManager,
+        session_id: SessionId,
+        queued: bool,
+    ) -> (SessionEvent, String) {
+        if queued {
+            let (admission, _) = manager
+                .admit_queued_turn_with_events(
+                    session_id,
+                    bcode_session_models::ClientId::new(),
+                    "implement".into(),
+                    bcode_session_models::TurnAdmissionMetadata::default(),
+                )
+                .await
+                .unwrap();
+            let bcode_session_models::TurnAdmission::Accepted(receipt) = admission else {
+                panic!("receipt")
+            };
+            let id = receipt.turn_id.to_string();
+            assert!(
+                manager
+                    .recovery_turn_event(session_id, &id, receipt.accepted_event_sequence + 10)
+                    .await
+                    .unwrap()
+                    .is_none()
+            );
+            let record = manager
+                .activate_submission(
+                    session_id,
+                    bcode_session_models::SubmissionId::for_queued_turn(&receipt.turn_id),
+                )
+                .await
+                .unwrap();
+            let bcode_session_models::SubmissionStatus::Activated {
+                conversation_sequence,
+                ..
+            } = record.status
+            else {
+                panic!("activation")
+            };
+            assert_ne!(conversation_sequence, receipt.accepted_event_sequence);
+            let event = manager
+                .session_events_range(session_id, conversation_sequence, conversation_sequence, 1)
+                .await
+                .unwrap()
+                .pop()
+                .unwrap();
+            assert!(
+                manager
+                    .recovery_turn_event(
+                        session_id,
+                        &format!("{session_id}-{conversation_sequence}"),
+                        conversation_sequence + 10
+                    )
+                    .await
+                    .unwrap()
+                    .is_none()
+            );
+            return (event, id);
+        }
         let turn = manager
             .append_event(
-                session.id,
+                session_id,
                 SessionEventKind::UserMessage {
                     client_id: bcode_session_models::ClientId::new(),
                     text: "implement".into(),
@@ -449,11 +554,23 @@ mod tests {
             )
             .await
             .unwrap();
+        let id = format!("{session_id}-{}", turn.sequence);
+        (turn, id)
+    }
+
+    async fn verify_positioned_checkpoint(approved: bool, queued: bool) {
+        let root = tempfile::tempdir().unwrap();
+        let manager = SessionManager::persistent(root.path()).unwrap();
+        let session = manager
+            .create_session(None, root.path().to_path_buf())
+            .await
+            .unwrap();
+        let (turn, turn_id) = checkpoint_turn(&manager, session.id, queued).await;
         let request = manager
             .append_event(
                 session.id,
                 SessionEventKind::PositionedToolCallRequested {
-                    turn_id: format!("{}-{}", session.id, turn.sequence),
+                    turn_id,
                     output_position: bcode_session_models::TurnOutputPosition::new(0),
                     tool_call_id: "call".into(),
                     producer_plugin_id: Some("example.tool".into()),

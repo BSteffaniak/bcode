@@ -80,6 +80,13 @@ pub fn stage_session_message(
         .flatten();
     chat.start_effect(TuiEffect::SubmitMessage {
         request: Box::new(SubmitMessageRequest {
+            submission_id: chat
+                .app
+                .pending_submissions()
+                .last()
+                .expect("staged submission")
+                .id()
+                .clone(),
             session_id,
             launch_working_directory: launch_working_directory.to_path_buf(),
             message,

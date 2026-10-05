@@ -30,6 +30,11 @@ pub fn session_stream_channel() -> (
 pub enum SessionStreamUpdate {
     /// Ordinary daemon event for the attached session.
     Event(Box<BcodeEvent>),
+    /// Bounded lifecycle lookup resolved a missing acceptance payload.
+    Submission {
+        session_id: SessionId,
+        record: Box<bcode_session_models::SubmissionRecord>,
+    },
     /// Event continuity was lost and the stream is reconnecting.
     ResyncStarted { session_id: SessionId },
     /// Fresh bounded state installed by a replacement attachment.
@@ -80,7 +85,15 @@ pub async fn load_timeline_jump_events(
     client: &BcodeClient,
     session_id: SessionId,
     sequence: u64,
-) -> Result<(Vec<bcode_session_models::SessionEvent>, bool, bool), TuiError> {
+) -> Result<
+    (
+        Vec<bcode_session_models::SessionEvent>,
+        bool,
+        bool,
+        Vec<bcode_session_models::SubmissionRecord>,
+    ),
+    TuiError,
+> {
     let half_limit = TIMELINE_JUMP_MAX_EVENTS_SCANNED / 2;
     let older = client
         .session_history_page(
@@ -113,7 +126,8 @@ pub async fn load_timeline_jump_events(
     );
     events.sort_by_key(|event| event.sequence);
     events.dedup_by_key(|event| event.sequence);
-    Ok((events, older.has_more, newer.has_more))
+    let submissions = client.submissions_for_history(session_id, &events).await?;
+    Ok((events, older.has_more, newer.has_more, submissions))
 }
 
 /// Attach to a session, but hold live event forwarding until the receiver is released.
@@ -429,6 +443,50 @@ async fn receive_with_progress_flush<T>(
     }
 }
 
+async fn send_canonical_event(
+    sender: &mpsc::Sender<SessionStreamUpdate>,
+    pending: &mut BTreeMap<SupersedableEventKey, BcodeEvent>,
+    event: BcodeEvent,
+) -> bool {
+    flush_superseded_progress(sender, pending).await
+        && sender
+            .send(SessionStreamUpdate::Event(Box::new(event)))
+            .await
+            .is_ok()
+}
+
+async fn hydrate_cancelled_submission(
+    client: &BcodeClient,
+    session_id: SessionId,
+    sender: &mpsc::Sender<SessionStreamUpdate>,
+    event: &BcodeEvent,
+) -> bool {
+    let BcodeEvent::Session(event) = event else {
+        return true;
+    };
+    let (bcode_session_models::SessionEventKind::SubmissionCancelled { submission_id }
+    | bcode_session_models::SessionEventKind::SubmissionContextObserved {
+        submission_id, ..
+    }) = &event.kind
+    else {
+        return true;
+    };
+    if let Ok(Some(record)) = client
+        .get_submission(session_id, submission_id.clone())
+        .await
+    {
+        sender
+            .send(SessionStreamUpdate::Submission {
+                session_id,
+                record: Box::new(record),
+            })
+            .await
+            .is_ok()
+    } else {
+        false
+    }
+}
+
 async fn reconnecting_event_stream<F>(
     client: BcodeClient,
     session_id: SessionId,
@@ -471,6 +529,12 @@ async fn reconnecting_event_stream<F>(
             Ok(BcodeEvent::SessionViewResyncRequired {
                 session_id: required,
             }) if required == session_id => true,
+            Ok(ref event)
+                if !hydrate_cancelled_submission(&client, session_id, &event_sender, event)
+                    .await =>
+            {
+                true
+            }
             Ok(event) => {
                 reconnect_delay = std::time::Duration::from_millis(100);
                 if let Some(key) = supersedable_event_key(&event) {
@@ -486,17 +550,8 @@ async fn reconnecting_event_stream<F>(
                             tokio::time::Instant::now() + SUPERSEDED_PROGRESS_FLUSH_INTERVAL,
                         );
                     }
-                } else {
-                    // Preserve canonical ordering at non-supersedable boundaries while collapsing
-                    // high-frequency progress updates to their latest state.
-                    if !flush_superseded_progress(&event_sender, &mut pending_progress).await
-                        || event_sender
-                            .send(SessionStreamUpdate::Event(Box::new(event)))
-                            .await
-                            .is_err()
-                    {
-                        return;
-                    }
+                } else if !send_canonical_event(&event_sender, &mut pending_progress, event).await {
+                    return;
                 }
                 false
             }

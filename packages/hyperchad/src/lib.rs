@@ -243,6 +243,7 @@ struct SessionWatchContext {
 
 #[derive(Debug, Deserialize)]
 struct PromptForm {
+    submission_id: String,
     session_id: Option<String>,
     text: String,
     #[serde(default)]
@@ -350,7 +351,7 @@ fn message_acceptance_status(
 ) -> String {
     match disposition {
         MessageAcceptanceDispositionView::AppliedSteering => {
-            "message applied to the active turn".to_owned()
+            "steering accepted; awaiting activation".to_owned()
         }
         MessageAcceptanceDispositionView::QueuedFollowUp => queue_position.map_or_else(
             || "message queued as a follow-up".to_owned(),
@@ -654,6 +655,9 @@ async fn hydrate_session_model_status(
 fn view_from_attached_history(attached: &AttachedSessionHistory) -> SessionView {
     let mut view = SessionView::new();
     view.apply_history(&attached.history);
+    for record in &attached.submissions {
+        view.apply_submission_record(record);
+    }
     view.set_usage_summary(attached.usage_summary.clone());
     apply_projection_window_metadata_to_view(&mut view, attached.projection_window.as_ref());
     let runtime = &attached.runtime_selection;
@@ -1182,6 +1186,7 @@ impl HyperChadAppState {
             .is_none()
             .then(|| self.launch_working_directory.as_ref().clone());
         let action = SessionViewAction::SubmitMessage {
+            submission_id: bcode_session_models::SubmissionId(form.submission_id),
             session_id,
             launch_working_directory,
             text: form.text,
@@ -1189,6 +1194,16 @@ impl HyperChadAppState {
             execution: Box::default(),
         };
         match execute_session_view_action(&self.client, action).await {
+            Ok(bcode_session_view_models::SessionViewActionOutcome::SubmissionAccepted {
+                session_id,
+                ..
+            }) => {
+                self.render_session_or_initial(
+                    Some(session_id),
+                    "submission accepted; activation pending",
+                )
+                .await
+            }
             Ok(bcode_session_view_models::SessionViewActionOutcome::MessageAccepted {
                 session_id,
                 queue_position,
@@ -2142,6 +2157,36 @@ async fn watch_session_updates(context: SessionWatchContext) -> Result<(), Clien
     Box::pin(watch_session_event_loop(&context, watcher, attached, view)).await
 }
 
+async fn apply_watched_event_hydrated(
+    context: &SessionWatchContext,
+    view: &mut SessionView,
+    session_id: SessionId,
+    event: SessionWatchEvent,
+) -> Result<bool, ClientError> {
+    let cancelled = match &event {
+        SessionWatchEvent::Durable(event) => match &event.kind {
+            bcode_session_models::SessionEventKind::SubmissionCancelled { submission_id }
+            | bcode_session_models::SessionEventKind::SubmissionContextObserved {
+                submission_id,
+                ..
+            } => Some(submission_id.clone()),
+            _ => None,
+        },
+        _ => None,
+    };
+    let resync = apply_watched_event(view, session_id, event);
+    if let Some(id) = cancelled {
+        let record = context
+            .client
+            .get_submission(session_id, id)
+            .await?
+            .ok_or_else(|| ClientError::Protocol("submission lifecycle unavailable".to_owned()))?;
+        view.apply_submission_record(&record);
+    }
+
+    Ok(resync)
+}
+
 async fn watch_session_event_loop(
     context: &SessionWatchContext,
     mut watcher: SessionWatcher,
@@ -2216,7 +2261,7 @@ async fn watch_session_event_loop(
             }
         };
 
-        let resync = apply_watched_event(&mut view, *session_id, *event);
+        let resync = apply_watched_event_hydrated(context, &mut view, *session_id, *event).await?;
 
         if resync {
             if !send_connection_update(
@@ -3484,6 +3529,7 @@ mod tests {
     fn attached_runtime_selection_populates_authoritative_agent() {
         let session_id = SessionId::new();
         let mut attached = AttachedSessionHistory {
+            submissions: Vec::new(),
             session: SessionSummary {
                 id: session_id,
                 name: Some("session".to_owned()),
@@ -3556,7 +3602,7 @@ mod tests {
     fn message_acceptance_status_preserves_every_authoritative_disposition() {
         assert_eq!(
             message_acceptance_status(MessageAcceptanceDispositionView::AppliedSteering, None),
-            "message applied to the active turn"
+            "steering accepted; awaiting activation"
         );
         assert_eq!(
             message_acceptance_status(MessageAcceptanceDispositionView::QueuedFollowUp, Some(2)),
