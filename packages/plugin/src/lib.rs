@@ -2242,6 +2242,8 @@ struct PluginResourceLimiter {
 struct PluginResourcePermit {
     _global: OwnedSemaphorePermit,
     _session: Option<OwnedSemaphorePermit>,
+    // Retained by the actual invocation, including detached blocking work.
+    plugin: Option<OwnedSemaphorePermit>,
     wait_ms: u128,
     active_global: usize,
     active_session: Option<usize>,
@@ -2291,6 +2293,7 @@ impl PluginResourceLimiter {
         Ok(PluginResourcePermit {
             _global: global,
             _session: session,
+            plugin: None,
             wait_ms: started_at.elapsed().as_millis(),
             active_global: self
                 .max_global
@@ -2546,7 +2549,7 @@ struct PluginInvocation {
     bridge: Option<PluginInvocationBridge>,
     response: oneshot::Sender<Result<ServiceResponse, PluginLoadError>>,
     event_sender: Option<mpsc::UnboundedSender<Vec<u8>>>,
-    _resource_permit: Option<Arc<PluginResourcePermit>>,
+    resource_permit: Option<Arc<PluginResourcePermit>>,
 }
 
 #[derive(Debug)]
@@ -2799,6 +2802,7 @@ pub struct PluginExecutorHandle {
     lifecycle: Arc<tokio::sync::RwLock<()>>,
     closing: std::sync::atomic::AtomicBool,
     admission_closed: tokio::sync::Notify,
+    service_admission: Option<Arc<Semaphore>>,
 }
 
 #[derive(Debug, Default)]
@@ -2823,7 +2827,12 @@ impl PluginExecutorHandle {
         executor: PluginExecutorKind,
         metrics: Arc<PluginExecutorMetrics>,
     ) -> Self {
+        let service_admission = match &executor {
+            PluginExecutorKind::Exclusive(_) => Some(Arc::new(Semaphore::new(1))),
+            PluginExecutorKind::Concurrent(_, semaphore) => semaphore.clone(),
+        };
         Self {
+            service_admission,
             manifest,
             concurrency,
             executor,
@@ -2904,19 +2913,19 @@ impl PluginExecutorHandle {
                     bridge: bridge.clone(),
                     response,
                     event_sender: Some(event_sender),
-                    _resource_permit: Some(resource_permit.clone()),
+                    resource_permit: Some(resource_permit.clone()),
                 };
                 self.enqueue_exclusive(sender, class, PluginExecutorMessage::Service(invocation))
                     .await?;
             }
             PluginExecutorKind::Concurrent(plugin, semaphore) => {
                 let permit = match semaphore {
-                    Some(semaphore) => {
+                    Some(semaphore) if resource_permit.plugin.is_none() => {
                         Some(semaphore.clone().acquire_owned().await.map_err(|_| {
                             PluginLoadError::PluginNotLoaded(self.manifest.id.clone())
                         })?)
                     }
-                    None => None,
+                    _ => None,
                 };
                 let (unused_response, _) = oneshot::channel();
                 let invocation = PluginInvocation {
@@ -2931,7 +2940,7 @@ impl PluginExecutorHandle {
                     bridge,
                     response: unused_response,
                     event_sender: Some(event_sender),
-                    _resource_permit: Some(resource_permit.clone()),
+                    resource_permit: Some(resource_permit.clone()),
                 };
                 let plugin = Arc::clone(plugin);
                 let metrics = Arc::clone(&self.metrics);
@@ -2987,7 +2996,7 @@ impl PluginExecutorHandle {
                 bridge,
                 response,
                 event_sender,
-                _resource_permit: Some(resource_permit),
+                resource_permit: Some(resource_permit),
             };
             match &self.executor {
                 PluginExecutorKind::Exclusive(sender) => {
@@ -3013,12 +3022,17 @@ impl PluginExecutorHandle {
                 }
                 PluginExecutorKind::Concurrent(plugin, semaphore) => {
                     let permit = match semaphore {
-                        Some(semaphore) => {
+                        Some(semaphore)
+                            if invocation
+                                .resource_permit
+                                .as_ref()
+                                .is_none_or(|permit| permit.plugin.is_none()) =>
+                        {
                             Some(semaphore.clone().acquire_owned().await.map_err(|_| {
                                 PluginLoadError::PluginNotLoaded(self.manifest.id.clone())
                             })?)
                         }
-                        None => None,
+                        _ => None,
                     };
                     let plugin = Arc::clone(plugin);
                     let metrics = Arc::clone(&self.metrics);
@@ -3706,9 +3720,22 @@ impl PluginEventDispatcher {
     }
 }
 
+/// Opaque identity of one loaded plugin runtime. Clones retain identity; reloads do not.
+#[derive(Debug, Clone)]
+pub struct PluginRuntimeGeneration(Arc<()>);
+
+impl PartialEq for PluginRuntimeGeneration {
+    fn eq(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.0, &other.0)
+    }
+}
+
+impl Eq for PluginRuntimeGeneration {}
+
 /// Concurrent plugin runtime with plugin-local execution isolation.
 #[derive(Debug, Clone)]
 pub struct PluginRuntimeHost {
+    generation: PluginRuntimeGeneration,
     registry: Arc<PluginRegistry>,
     executors: Arc<BTreeMap<String, Arc<PluginExecutorHandle>>>,
     cleanup_executors: Arc<Vec<PluginExecutorHandle>>,
@@ -3718,10 +3745,69 @@ pub struct PluginRuntimeHost {
     command_registry: Arc<bcode_command::CommandRegistry>,
     auth_provider_registry: Arc<AuthProviderRegistry>,
     resources: Arc<PluginResourceLimiter>,
+    query_resources: Arc<PluginResourceLimiter>,
     metrics: bcode_metrics::MetricsRegistry,
 }
 
 impl PluginRuntimeHost {
+    /// Whether both handles belong to the same loaded runtime generation.
+    /// Clones retain identity; reloading configuration, credentials, or plugin
+    /// selection creates a distinct runtime even when manifests are identical.
+    #[must_use]
+    pub fn same_runtime_generation(&self, other: &Self) -> bool {
+        self.generation == other.generation
+    }
+
+    /// Return the opaque identity of this loaded runtime, without retaining executors.
+    #[must_use]
+    pub fn runtime_generation(&self) -> PluginRuntimeGeneration {
+        self.generation.clone()
+    }
+    async fn acquire_service_resources(
+        &self,
+        executor: &PluginExecutorHandle,
+        scope: &PluginInvocationScope,
+        class: PluginInvocationClass,
+    ) -> Result<PluginResourcePermit, PluginLoadError> {
+        // Wait for plugin-local capacity before consuming shared capacity. A saturated
+        // plugin must not reserve every global slot with work it cannot execute.
+        let closed = executor.admission_closed.notified();
+        if executor.closing.load(Ordering::Acquire) {
+            return Err(PluginLoadError::PluginNotLoaded(
+                executor.manifest.id.clone(),
+            ));
+        }
+        executor.metrics.enqueue(class);
+        let mut queued = PluginQueueCount {
+            metrics: Arc::clone(&executor.metrics),
+            class,
+            dispatched: false,
+        };
+        let result = tokio::select! {
+            biased;
+            () = closed => Err(PluginLoadError::PluginNotLoaded(executor.manifest.id.clone())),
+            result = async {
+                let plugin = match &executor.service_admission {
+                    Some(semaphore) => Some(Arc::clone(semaphore).acquire_owned().await
+                        .map_err(|_| PluginLoadError::PluginNotLoaded(executor.manifest.id.clone()))?),
+                    None => None,
+                };
+                // Operation metadata classification survives service-wide policy overrides.
+                // Query/control capacity is bounded independently of long-running work;
+                // the plugin's declared concurrency limit still applies to both lanes.
+                let resources = match class {
+                    PluginInvocationClass::Query | PluginInvocationClass::Control => &self.query_resources,
+                    _ => &self.resources,
+                };
+                let mut permit = resources.acquire(scope).await?;
+                permit.plugin = plugin;
+                Ok(permit)
+            } => result,
+        };
+        queued.dispatched = result.is_ok();
+        result
+    }
+
     /// Discover, load, activate, and start plugin executors from default roots.
     ///
     /// # Errors
@@ -4068,7 +4154,11 @@ impl PluginRuntimeHost {
             .service_policy(plugin_id, &interface_id)
             .and_then(|policy| policy.class)
             .unwrap_or_else(|| classify_invocation(&interface_id, &operation));
-        let resource_permit = Arc::new(self.resources.acquire(&scope).await?);
+        let admission_class = admission_class(&interface_id, &operation, class);
+        let resource_permit = Arc::new(
+            self.acquire_service_resources(&executor, &scope, admission_class)
+                .await?,
+        );
         let metric_labels =
             plugin_runtime_metric_labels(plugin_id, &interface_id, &operation, class, &scope);
         self.metrics.record_histogram_with_labels(
@@ -4187,7 +4277,10 @@ impl PluginRuntimeHost {
             id: invocation_id,
             cancellation: bcode_plugin_sdk::ServiceCancellation::default(),
         };
-        let resource_permit = self.resources.acquire(&scope).await?;
+        let admission_class = admission_class(&interface_id, &operation, class);
+        let resource_permit = self
+            .acquire_service_resources(&executor, &scope, admission_class)
+            .await?;
         let metric_labels =
             plugin_runtime_metric_labels(plugin_id, &interface_id, &operation, class, &scope);
         self.metrics.record_histogram_with_labels(
@@ -4614,6 +4707,7 @@ impl PluginRuntimeHost {
         &self,
     ) -> impl std::future::Future<Output = Result<(), PluginLoadError>> + Send + '_ {
         self.resources.close();
+        self.query_resources.close();
         for dispatcher in self.event_dispatchers.values() {
             dispatcher.shutdown.send_replace(true);
         }
@@ -4704,6 +4798,7 @@ impl From<PluginHost> for PluginRuntimeHost {
             executors.insert(plugin_id, handle);
         }
         Self {
+            generation: PluginRuntimeGeneration(Arc::new(())),
             registry: Arc::new(PluginRegistry::from_manifests(manifests)),
             executors: Arc::new(executors),
             cleanup_executors: Arc::new(cleanup_executors),
@@ -4713,6 +4808,7 @@ impl From<PluginHost> for PluginRuntimeHost {
             command_registry: Arc::new(command_registry),
             auth_provider_registry: Arc::new(auth_provider_registry),
             resources: Arc::default(),
+            query_resources: Arc::default(),
             metrics: bcode_metrics::MetricsRegistry::disabled(),
         }
     }
@@ -5017,6 +5113,17 @@ fn spawn_exclusive_plugin_executor(
         .await
         .expect("exclusive plugin cleanup terminated without acknowledgment");
     })
+}
+
+fn admission_class(
+    interface_id: &str,
+    operation: &str,
+    policy_class: PluginInvocationClass,
+) -> PluginInvocationClass {
+    match classify_invocation(interface_id, operation) {
+        class @ (PluginInvocationClass::Query | PluginInvocationClass::Control) => class,
+        _ => policy_class,
+    }
 }
 
 fn classify_invocation(interface_id: &str, operation: &str) -> PluginInvocationClass {
@@ -7015,6 +7122,7 @@ library = "libexample_plugin.dylib"
             .validate_loaded_tool_presentation_ownership(
                 "bcode.catalog-owner",
                 &bcode_tool::ToolList {
+                    cache_policy: None,
                     discovery: BTreeMap::new(),
                     tools: vec![bcode_tool::ToolDefinition {
                         name: "different.tool".to_owned(),
@@ -9246,6 +9354,238 @@ library = "libexample_plugin.dylib"
         }
         drop(executor);
         assert!(messages.try_recv().is_err());
+    }
+
+    fn admission_test_executor(id: &str, limit: Option<usize>) -> PluginExecutorHandle {
+        PluginExecutorHandle::new(
+            test_manifest(id),
+            PluginConcurrency::Concurrent,
+            PluginExecutorKind::Concurrent(
+                Arc::new(LoadedPlugin {
+                    config: ResolvedPluginConfig::default(),
+                    manifest: test_manifest(id),
+                    backend: LoadedPluginBackend::Static {
+                        vtable: test_large_vtable(),
+                    },
+                }),
+                limit.map(|limit| Arc::new(Semaphore::new(limit))),
+            ),
+            Arc::new(PluginExecutorMetrics::default()),
+        )
+    }
+
+    async fn assert_admission_pending<F: std::future::Future>(future: std::pin::Pin<&mut F>) {
+        let mut future = future;
+        std::future::poll_fn(|cx| {
+            assert!(future.as_mut().poll(cx).is_pending());
+            std::task::Poll::Ready(())
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn saturated_plugin_waiters_leave_shared_capacity_available() {
+        let mut host = PluginRuntimeHost::from(PluginHost::default());
+        host.resources = Arc::new(PluginResourceLimiter::new(2, 2));
+        let busy = admission_test_executor("busy", Some(1));
+        let other = admission_test_executor("other", None);
+        let scope = PluginInvocationScope::Global;
+        let class = PluginInvocationClass::ToolExecution;
+        let running = host
+            .acquire_service_resources(&busy, &scope, class)
+            .await
+            .unwrap();
+        let mut waiters = Vec::new();
+        for _ in 0..64 {
+            let mut waiting = Box::pin(host.acquire_service_resources(&busy, &scope, class));
+            assert_admission_pending(waiting.as_mut()).await;
+            waiters.push(waiting);
+        }
+        assert_eq!(host.resources.global.available_permits(), 1);
+        let unrelated = tokio::time::timeout(
+            Duration::from_secs(1),
+            host.acquire_service_resources(&other, &scope, class),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        drop(waiters);
+        drop(running);
+        drop(unrelated);
+        assert_eq!(host.resources.global.available_permits(), 2);
+        assert_eq!(
+            busy.service_admission.as_ref().unwrap().available_permits(),
+            1
+        );
+        drop(busy);
+        drop(other);
+        drop(host);
+    }
+
+    #[tokio::test]
+    async fn metadata_lane_survives_execution_saturation_and_policy_override() {
+        let mut host = PluginRuntimeHost::from(PluginHost::default());
+        host.resources = Arc::new(PluginResourceLimiter::new(1, 1));
+        host.query_resources = Arc::new(PluginResourceLimiter::new(1, 1));
+        let executor = admission_test_executor("concurrent", None);
+        let scope = PluginInvocationScope::Session {
+            session_id: "metadata".to_owned(),
+            client_id: None,
+            turn_id: None,
+            work_id: None,
+        };
+        let execution = host
+            .acquire_service_resources(&executor, &scope, PluginInvocationClass::ToolExecution)
+            .await
+            .unwrap();
+        for (interface, operation, expected) in [
+            ("bcode.tool/v1", "list_tools", PluginInvocationClass::Query),
+            (
+                "bcode.model-provider/v1",
+                "models",
+                PluginInvocationClass::Query,
+            ),
+            (
+                "bcode.profile",
+                "policy_status",
+                PluginInvocationClass::Control,
+            ),
+        ] {
+            let class = admission_class(interface, operation, PluginInvocationClass::ToolExecution);
+            assert_eq!(class, expected);
+            let query = tokio::time::timeout(
+                Duration::from_secs(1),
+                host.acquire_service_resources(&executor, &scope, class),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+            let mut waiting = Box::pin(host.acquire_service_resources(&executor, &scope, class));
+            assert_admission_pending(waiting.as_mut()).await;
+            drop(waiting);
+            drop(query);
+            assert_eq!(host.query_resources.global.available_permits(), 1);
+            assert_eq!(host.query_resources.active_session_count(&scope), Some(0));
+        }
+        drop(execution);
+        assert_eq!(host.resources.global.available_permits(), 1);
+        drop(executor);
+        drop(host);
+    }
+
+    #[tokio::test]
+    async fn cancelled_admission_releases_plugin_slot_while_waiting_for_resources() {
+        let mut host = PluginRuntimeHost::from(PluginHost::default());
+        host.query_resources = Arc::new(PluginResourceLimiter::new(1, 1));
+        let executor = admission_test_executor("limited", Some(1));
+        let scope = PluginInvocationScope::Global;
+        let occupied = host.query_resources.acquire(&scope).await.unwrap();
+        let mut waiting = Box::pin(host.acquire_service_resources(
+            &executor,
+            &scope,
+            PluginInvocationClass::Query,
+        ));
+        assert_admission_pending(waiting.as_mut()).await;
+        assert_eq!(
+            executor
+                .service_admission
+                .as_ref()
+                .unwrap()
+                .available_permits(),
+            0
+        );
+        drop(waiting);
+        assert_eq!(
+            executor
+                .service_admission
+                .as_ref()
+                .unwrap()
+                .available_permits(),
+            1
+        );
+        drop(occupied);
+        let admitted = host
+            .acquire_service_resources(&executor, &scope, PluginInvocationClass::Control)
+            .await
+            .unwrap();
+        drop(admitted);
+        assert_eq!(host.query_resources.global.available_permits(), 1);
+        assert_eq!(
+            executor
+                .service_admission
+                .as_ref()
+                .unwrap()
+                .available_permits(),
+            1
+        );
+        drop(executor);
+        drop(host);
+    }
+
+    #[tokio::test]
+    async fn exclusive_admission_preserves_serialization_without_global_reservation() {
+        let mut host = PluginRuntimeHost::from(PluginHost::default());
+        host.resources = Arc::new(PluginResourceLimiter::new(2, 2));
+        let (sender, _receiver) = mpsc::channel(1);
+        let executor = PluginExecutorHandle::new(
+            test_manifest("exclusive"),
+            PluginConcurrency::Exclusive,
+            PluginExecutorKind::Exclusive(sender),
+            Arc::new(PluginExecutorMetrics::default()),
+        );
+        let scope = PluginInvocationScope::Global;
+        let running = host
+            .acquire_service_resources(&executor, &scope, PluginInvocationClass::ToolExecution)
+            .await
+            .unwrap();
+        let mut metadata = Box::pin(host.acquire_service_resources(
+            &executor,
+            &scope,
+            PluginInvocationClass::Query,
+        ));
+        assert_admission_pending(metadata.as_mut()).await;
+        assert_eq!(host.resources.global.available_permits(), 1);
+        assert_eq!(host.query_resources.global.available_permits(), 64);
+        drop(running);
+        drop(metadata.await.unwrap());
+        assert_eq!(
+            executor
+                .service_admission
+                .as_ref()
+                .unwrap()
+                .available_permits(),
+            1
+        );
+        drop(executor);
+        drop(host);
+    }
+
+    #[tokio::test]
+    async fn closing_plugin_wakes_pre_admission_waiters_without_leaks() {
+        let host = PluginRuntimeHost::from(PluginHost::default());
+        let executor = admission_test_executor("closing", Some(1));
+        let scope = PluginInvocationScope::Global;
+        let running = host
+            .acquire_service_resources(&executor, &scope, PluginInvocationClass::ToolExecution)
+            .await
+            .unwrap();
+        let mut waiting = Box::pin(host.acquire_service_resources(
+            &executor,
+            &scope,
+            PluginInvocationClass::Query,
+        ));
+        assert_admission_pending(waiting.as_mut()).await;
+        drop(executor.deactivate());
+        assert!(matches!(
+            waiting.await,
+            Err(PluginLoadError::PluginNotLoaded(_))
+        ));
+        assert_eq!(executor.status().queued, 0);
+        assert_eq!(host.query_resources.global.available_permits(), 64);
+        drop(running);
+        assert_eq!(host.resources.global.available_permits(), 64);
+        drop(executor);
+        drop(host);
     }
 
     #[tokio::test]

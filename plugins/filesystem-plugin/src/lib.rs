@@ -545,12 +545,15 @@ fn list_tools(request: &ServiceRequest) -> ServiceResponse {
     if let Err(error) = request.payload_json::<ListToolsRequest>() {
         return invalid_request(&error);
     }
-    json_response(&ToolList::with_discovery(tool_definitions(), |tool| {
-        bcode_tool::ToolDiscoveryPolicy::new(!matches!(
-            tool.name.as_str(),
-            "filesystem.write" | "filesystem.edit" | "filesystem.multi_edit"
-        ))
-    }))
+    json_response(&ToolList::with_runtime_stable_discovery(
+        tool_definitions(),
+        |tool| {
+            bcode_tool::ToolDiscoveryPolicy::new(!matches!(
+                tool.name.as_str(),
+                "filesystem.write" | "filesystem.edit" | "filesystem.multi_edit"
+            ))
+        },
+    ))
 }
 
 fn tool_definitions() -> Vec<ToolDefinition> {

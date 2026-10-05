@@ -4,6 +4,30 @@ Bcode uses plugins for domain behavior rather than treating extensibility as a t
 
 The initial plugin runtime loads native Rust dynamic libraries. Plugins are trusted native code, not sandboxed extensions. Invocation callback lifetime, unsafe-boundary, and performance migration requirements are defined in [Native plugin invocation safety and performance architecture](native-plugin-invocation-safety.md).
 
+## Tool catalog freshness
+
+`list_tools` may return `cache_policy: {"version": 1, "runtime_stable": true}`.
+This is a plugin-owned promise that tool definitions **and discovery policy** remain
+immutable for the loaded runtime, including configuration and credentials. Omitted,
+false, or unknown-version policies are volatile. Plugins whose definitions depend on
+mutable credentials, configuration, environment, or service state must not opt in.
+Invocation authorization is always separate from discovery and is never cached here.
+
+The server coalesces discovery for concurrent callers and reuses explicitly stable
+provider lists across turns. Volatile providers refresh at turn preparation. Each turn
+pins an immutable snapshot for model definitions, streamed producer routing, and tool
+batch routing; another session's discovery cannot change that mapping. Ordinary warm
+dispatch and streamed presentation do not initiate full-plugin catalog sweeps. Replacing
+the loaded runtime invalidates its snapshots, including when IDs/manifests are unchanged;
+a snapshot from a disabled/replaced runtime cannot authorize routing.
+
+Failed providers are recorded separately and their stale lists are excluded. Successful
+stable provider lists remain reusable; a partial snapshot is not a complete catalog.
+Cold unavailable discovery retries with cancellable host-preparation backoff before
+model startup. Partial discovery can expose healthy providers; unavailable requested
+names remain distinguishable from a complete-catalog tool-not-found result. A failed
+refresh does not mutate snapshots already pinned by earlier turns.
+
 ## Bundled and discovered plugins
 
 Release builds can statically bundle plugins into the Bcode executable. Bundling makes a plugin available; activation policy determines whether it is loaded. Bundled defaults can be disabled, and available plugins can be enabled explicitly.

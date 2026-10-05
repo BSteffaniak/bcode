@@ -738,7 +738,7 @@ fn list_tools(request: &ServiceRequest) -> ServiceResponse {
     if let Err(error) = request.payload_json::<ListToolsRequest>() {
         return invalid_request(&error);
     }
-    json_response(&ToolList::with_discovery(
+    json_response(&ToolList::with_runtime_stable_discovery(
         vec![extract_tool_definition(), status_tool_definition()],
         |_tool| bcode_tool::ToolDiscoveryPolicy::new(true),
     ))

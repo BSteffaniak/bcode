@@ -88,7 +88,7 @@ fn question_policy_preparation() -> bcode_plugin_sdk::ToolPolicyPreparation {
 
 fn list_tools(request: &ServiceRequest) -> ServiceResponse {
     match request.payload_json::<ListToolsRequest>() {
-        Ok(ListToolsRequest {}) => json_response(&ToolList::with_discovery(
+        Ok(ListToolsRequest {}) => json_response(&ToolList::with_runtime_stable_discovery(
             vec![question_tool_definition()],
             |_| bcode_tool::ToolDiscoveryPolicy {
                 capabilities: question_policy_preparation().identity.capabilities,

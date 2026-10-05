@@ -2981,6 +2981,51 @@ pub struct ToolExecutionConfig {
     /// Maximum duration of one side-effect-free preparation operation, in milliseconds. Zero is normalized to one.
     #[serde(default = "default_tool_preparation_timeout_ms")]
     pub preparation_timeout_ms: u64,
+    /// Initial backoff for side-effect-free host preparation retries, in milliseconds.
+    #[serde(default = "default_tool_host_retry_initial_delay_ms")]
+    pub host_retry_initial_delay_ms: u64,
+    /// Maximum host preparation retry delay, including jitter, in milliseconds.
+    #[serde(default = "default_tool_host_retry_max_delay_ms")]
+    pub host_retry_max_delay_ms: u64,
+    /// Maximum host preparation retries. Omit for unlimited retries; zero disables retries.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub host_max_retries: Option<u64>,
+}
+
+const fn default_tool_host_retry_initial_delay_ms() -> u64 {
+    250
+}
+
+const fn default_tool_host_retry_max_delay_ms() -> u64 {
+    30_000
+}
+
+#[cfg(test)]
+mod tool_host_retry_config_tests {
+    use super::ToolExecutionConfig;
+
+    #[test]
+    fn old_execution_config_keeps_unlimited_host_retry_default() {
+        let config: ToolExecutionConfig = toml::from_str("parallel = false").unwrap();
+        assert!(!config.parallel);
+        assert_eq!(config.host_max_retries, None);
+        assert_eq!(config.host_retry_initial_delay_ms, 250);
+        assert_eq!(config.host_retry_max_delay_ms, 30_000);
+    }
+
+    #[test]
+    fn explicit_retry_limits_roundtrip() {
+        for retries in [0, 3] {
+            let config: ToolExecutionConfig = toml::from_str(&format!(
+                "host_max_retries = {retries}\nhost_retry_initial_delay_ms = 4\nhost_retry_max_delay_ms = 50"
+            )).unwrap();
+            assert_eq!(config.host_max_retries, Some(retries));
+            assert_eq!(
+                toml::from_str::<ToolExecutionConfig>(&toml::to_string(&config).unwrap()).unwrap(),
+                config
+            );
+        }
+    }
 }
 
 impl ToolExecutionConfig {
@@ -3002,6 +3047,9 @@ impl Default for ToolExecutionConfig {
             parallel: default_tool_execution_parallel(),
             max_concurrency: None,
             preparation_timeout_ms: default_tool_preparation_timeout_ms(),
+            host_retry_initial_delay_ms: default_tool_host_retry_initial_delay_ms(),
+            host_retry_max_delay_ms: default_tool_host_retry_max_delay_ms(),
+            host_max_retries: None,
         }
     }
 }

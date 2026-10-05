@@ -180,6 +180,7 @@ async fn assert_generation_request(
     )
     .await;
     let static_context = crate::StaticModelTurnContext {
+        tool_catalog: None,
         recovery_context: None,
         system_prompt: String::new(),
         system_messages: vec![],

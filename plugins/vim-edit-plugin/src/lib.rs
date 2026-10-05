@@ -315,7 +315,7 @@ fn list_tools(request: &ServiceRequest) -> ServiceResponse {
     if let Err(error) = request.payload_json::<ListToolsRequest>() {
         return invalid_request(&error);
     }
-    json_response(&ToolList::with_discovery(
+    json_response(&ToolList::with_runtime_stable_discovery(
         vec![preview_tool_definition(), apply_tool_definition()],
         |tool| bcode_tool::ToolDiscoveryPolicy::new(tool.name == "vim_edit.preview"),
     ))
@@ -1197,6 +1197,7 @@ mod tests {
     #[test]
     fn tool_definitions_include_only_preview_and_apply() {
         let tools = ToolList {
+            cache_policy: None,
             discovery: std::collections::BTreeMap::new(),
             tools: vec![preview_tool_definition(), apply_tool_definition()],
         };

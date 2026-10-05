@@ -27,6 +27,16 @@ This inventory classifies Bcode operational limits so hardcoded defaults do not 
 | `model.tool_output.context_chars` | Model context | 4,000 chars | Configurable bounded default | Bounds normal tool-result projection. |
 | `model.tool_output.fallback_argument_chars` | Model context | 6,000 chars | Configurable bounded default | Bounds plain-text fallback for malformed or duplicate historical tool calls. |
 
+## Tool host preparation retries
+
+`[tools.execution]` controls retries of side-effect-free host preparation:
+
+* `host_retry_initial_delay_ms = 250`: initial exponential backoff ceiling.
+* `host_retry_max_delay_ms = 30000`: maximum delay, including equal jitter (between half the exponential ceiling and the ceiling). Zero delays normalize to one millisecond.
+* `host_max_retries`: omitted means unlimited; `0` disables retries.
+
+Retries preserve the pending tool calls and IDs without rerunning the model. Each retry emits a visible diagnostic and delay telemetry; cancellation interrupts preparation and backoff. Ownership/contract failures fail closed. Tool invocation errors remain per-call model-visible results. Invocation effects and result-persistence failures never enter this retry loop.
+
 ## Follow-up audit groups
 
 The following groups should be reviewed in focused domain changes rather than converted indiscriminately:

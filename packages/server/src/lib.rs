@@ -31,6 +31,8 @@ pub mod storage_maintenance;
 pub mod storage_maintenance_worker;
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 pub mod storage_read_admission;
+mod tool_catalog;
+mod tool_host_retry;
 #[cfg(test)]
 mod workflow_admission_tests;
 mod workflow_operations;
@@ -145,13 +147,12 @@ use bcode_skill_models::{
     SkillToolPolicyRequest, SkillToolPolicyTarget,
 };
 use bcode_tool::{
-    ListToolsRequest, OP_INVOKE_TOOL, OP_LIST_TOOLS, OP_PREPARE_TOOL, PreparedToolInvocation,
-    TOOL_SERVICE_INTERFACE_ID, ToolArtifactWriteRequest, ToolArtifactWriteResolution,
-    ToolDefinition as ServiceToolDefinition, ToolExchangeRequest, ToolExchangeResolution,
-    ToolInvocationDescriptor, ToolInvocationInput, ToolInvocationInputResolution,
-    ToolInvocationRequest, ToolInvocationResponse,
+    OP_INVOKE_TOOL, OP_PREPARE_TOOL, PreparedToolInvocation, TOOL_SERVICE_INTERFACE_ID,
+    ToolArtifactWriteRequest, ToolArtifactWriteResolution, ToolDefinition as ServiceToolDefinition,
+    ToolExchangeRequest, ToolExchangeResolution, ToolInvocationDescriptor, ToolInvocationInput,
+    ToolInvocationInputResolution, ToolInvocationRequest, ToolInvocationResponse,
     ToolInvocationResult as ServiceToolInvocationResult, ToolInvocationServiceRequest,
-    ToolInvocationServiceResolution, ToolList, ToolPreparationRequest, ToolPreparationResponse,
+    ToolInvocationServiceResolution, ToolPreparationRequest, ToolPreparationResponse,
     ToolResultContent,
 };
 use bcode_workflow::{
@@ -354,6 +355,7 @@ pub struct ServerState {
     session_migrations: bcode_session_migration::SessionMigrationService,
     pub session_catalog: Arc<session_catalog::SessionCatalog>,
     pub plugins: bcode_plugin::PluginRuntimeHost,
+    tool_catalog: tool_catalog::ToolCatalogCache,
     startup_plugin_selection: bcode_plugin::PluginSelection,
     default_plugin_ids: Vec<String>,
     session_search_enabled: bool,
@@ -2321,6 +2323,7 @@ impl ServerState {
             session_migrations,
             session_catalog: Arc::new(session_catalog::SessionCatalog::default()),
             plugins,
+            tool_catalog: tool_catalog::ToolCatalogCache::default(),
             startup_plugin_selection: init.startup_plugin_selection,
             default_plugin_ids: init.default_plugin_ids,
             session_search_enabled: init.session_search_enabled,
@@ -17629,6 +17632,7 @@ const STRUCTURED_RESULT_CORRECTION_INSTRUCTION: &str = "The previous structured 
 
 #[derive(Debug, Clone, Default)]
 struct ModelPollOutcome {
+    tool_catalog: Option<Arc<tool_catalog::Snapshot>>,
     reported_usage: Option<TokenUsage>,
     stop_reason: Option<bcode_model::StopReason>,
     completion: Option<ModelTurnCompletion>,
@@ -18630,6 +18634,54 @@ async fn run_model_turn_inner(
         target_timer.elapsed_ms(),
         setup_labels.clone(),
     );
+    let prepared_catalog = wait_for_provider_call(
+        state,
+        session_id,
+        command_context,
+        &cancel_state,
+        Box::pin(tool_host_retry::prepare_with_retry(
+            &turn_config.tools.execution,
+            &cancel_state,
+            Duration::from_secs(30),
+            || async {
+                let snapshot = state.tool_catalog.get(&state.plugins, true).await;
+                if snapshot.lists.is_empty() && !snapshot.failures.is_empty() {
+                    Err(tool_host_retry::PreparationFailure::Unavailable)
+                } else {
+                    Ok(snapshot)
+                }
+            },
+            |failure, attempt, delay| async move {
+                append_system_event(
+                    state,
+                    session_id,
+                    format!(
+                        "{}; retry {attempt} in {} ms",
+                        failure.diagnostic(),
+                        delay.as_millis()
+                    ),
+                )
+                .await;
+            },
+        )),
+    )
+    .await;
+    let prepared_catalog = match prepared_catalog {
+        ProviderCallWait::Completed(Ok(snapshot)) => snapshot,
+        ProviderCallWait::Cancelled
+        | ProviderCallWait::Completed(Err(tool_host_retry::ToolBatchOutcome::Cancelled)) => {
+            return ModelTurnCompletion::with_message(
+                ModelTurnOutcome::Cancelled,
+                "model turn cancelled during tool discovery",
+            );
+        }
+        ProviderCallWait::Completed(Err(_)) => {
+            return ModelTurnCompletion::with_message(
+                ModelTurnOutcome::Error,
+                "tool catalog preparation failed",
+            );
+        }
+    };
     let static_context_timer = state.metrics.timer();
     let static_context = match target {
         Ok(target) => {
@@ -18642,6 +18694,7 @@ async fn run_model_turn_inner(
                 &turn_config,
                 &target,
                 !recovering,
+                Some(prepared_catalog),
             )
             .await
         }
@@ -18956,6 +19009,7 @@ async fn run_model_turn_inner(
             state,
             session_id,
             ModelTurnRoundContext {
+                tool_catalog: static_context.tool_catalog.clone(),
                 turn_id: &turn_id,
                 next_assistant_segment_order: &mut next_assistant_segment_order,
                 next_output_position: &mut next_output_position,
@@ -19057,6 +19111,7 @@ async fn run_model_turn_inner(
                     command_context,
                     &execution,
                     turn_config.tools.execution.runtime_options(),
+                    static_context.tool_catalog.clone(),
                 )
                 .await;
                 state.metrics.record_histogram_with_labels(
@@ -19064,11 +19119,32 @@ async fn run_model_turn_inner(
                     elapsed_ms(tool_batch_started_at),
                     model_turn_metric_labels(session_id, &turn_id),
                 );
-                if !tool_batch_completed {
-                    return ModelTurnCompletion::with_message(
-                        ModelTurnOutcome::Cancelled,
-                        "model turn cancelled",
-                    );
+                match tool_batch_completed {
+                    tool_host_retry::ToolBatchOutcome::Completed => {}
+                    tool_host_retry::ToolBatchOutcome::Cancelled => {
+                        return ModelTurnCompletion::with_message(
+                            ModelTurnOutcome::Cancelled,
+                            "model turn cancelled",
+                        );
+                    }
+                    tool_host_retry::ToolBatchOutcome::PreparationFailed => {
+                        return ModelTurnCompletion::with_message(
+                            ModelTurnOutcome::Error,
+                            "tool host preparation failed before dispatch; no tools were executed",
+                        );
+                    }
+                    tool_host_retry::ToolBatchOutcome::PersistenceFailed => {
+                        return ModelTurnCompletion::with_message(
+                            ModelTurnOutcome::Error,
+                            "tool result persistence failed after possible effects; tools will not be replayed",
+                        );
+                    }
+                    tool_host_retry::ToolBatchOutcome::EffectsUncertain => {
+                        return ModelTurnCompletion::with_message(
+                            ModelTurnOutcome::Error,
+                            "tool batch outcomes could not be durably confirmed; tools will not be replayed",
+                        );
+                    }
                 }
             }
             Some(bcode_model::StopReason::MaxTokens)
@@ -20277,6 +20353,7 @@ async fn active_plugin_scope_for_tool_call(
 }
 
 struct ModelTurnRoundContext<'a> {
+    tool_catalog: Option<Arc<tool_catalog::Snapshot>>,
     turn_id: &'a str,
     next_assistant_segment_order: &'a mut u32,
     next_output_position: &'a mut u64,
@@ -20301,6 +20378,7 @@ async fn run_model_turn_round(
     command_context: &mut RuntimeCommandContext<'_>,
 ) -> Result<ModelPollOutcome, ModelTurnCompletion> {
     let ModelTurnRoundContext {
+        tool_catalog,
         turn_id,
         next_assistant_segment_order,
         next_output_position,
@@ -20486,6 +20564,7 @@ async fn run_model_turn_round(
     .await;
 
     let poll_context = ModelPollContext {
+        tool_catalog,
         turn_id,
         next_assistant_segment_order,
         next_output_position,
@@ -20972,6 +21051,7 @@ async fn append_model_provider_round_finished_trace(
 }
 
 struct ModelPollContext<'a> {
+    tool_catalog: Option<Arc<tool_catalog::Snapshot>>,
     turn_id: &'a str,
     next_assistant_segment_order: &'a mut u32,
     next_output_position: &'a mut u64,
@@ -21039,6 +21119,7 @@ async fn stream_model_turn_events(
     command_context: &mut RuntimeCommandContext<'_>,
 ) -> (Option<AssistantSegmentOutput>, ModelPollOutcome) {
     let ModelPollContext {
+        tool_catalog: _,
         turn_id,
         next_assistant_segment_order,
         next_output_position,
@@ -21054,7 +21135,10 @@ async fn stream_model_turn_events(
         !structured_output,
         Arc::clone(&cancel_state),
     );
-    let mut outcome = ModelPollOutcome::default();
+    let mut outcome = ModelPollOutcome {
+        tool_catalog: poll.tool_catalog.clone(),
+        ..ModelPollOutcome::default()
+    };
     outcome.stream.delivery = ProviderStreamDelivery::Push;
     let output_position_base = *next_output_position;
     let provider_context = session_model_selection(state, session_id)
@@ -21390,6 +21474,7 @@ async fn poll_model_turn_events(
     command_context: &mut RuntimeCommandContext<'_>,
 ) -> (Option<AssistantSegmentOutput>, ModelPollOutcome) {
     let ModelPollContext {
+        tool_catalog: _,
         turn_id,
         next_assistant_segment_order,
         next_output_position,
@@ -21405,7 +21490,10 @@ async fn poll_model_turn_events(
         !structured_output,
         Arc::clone(&cancel_state),
     );
-    let mut outcome = ModelPollOutcome::default();
+    let mut outcome = ModelPollOutcome {
+        tool_catalog: poll.tool_catalog.clone(),
+        ..ModelPollOutcome::default()
+    };
     outcome.stream.delivery = ProviderStreamDelivery::Poll;
     let output_position_base = *next_output_position;
     let provider_context = session_model_selection(state, session_id)
@@ -21889,25 +21977,16 @@ async fn handle_provider_turn_event(
                                 bcode_session_models::ToolContributionPlacement::Request,
                             )
                         });
-                let (producer_plugin_id, schema, schema_version, placement) =
-                    if let Some(presentation) = presentation {
-                        presentation
-                    } else {
-                        let producer_plugin_id = collect_server_tool_catalog(state)
-                            .await
-                            .ok()
-                            .and_then(|catalog| catalog.find_tool(&name))
-                            .and_then(|tool| match tool.source {
-                                ToolSource::Plugin { plugin_id } => Some(plugin_id),
-                                ToolSource::Inline => None,
-                            });
+                let (producer_plugin_id, schema, schema_version, placement) = presentation
+                    .unwrap_or_else(|| {
+                        let producer_plugin_id = pinned_tool_producer(state, outcome, &name);
                         (
                             producer_plugin_id,
                             "bcode.tool.request-draft".to_owned(),
                             0,
                             bcode_session_models::ToolContributionPlacement::Request,
                         )
-                    };
+                    });
                 stream_progress.start_tool_call_with_presentation(
                     Some(position),
                     call_id.clone(),
@@ -22223,25 +22302,16 @@ async fn handle_provider_turn_event(
                             bcode_session_models::ToolContributionPlacement::Request,
                         )
                     });
-            let (producer_plugin_id, schema, schema_version, placement) =
-                if let Some(presentation) = presentation {
-                    presentation
-                } else {
-                    let producer_plugin_id = collect_server_tool_catalog(state)
-                        .await
-                        .ok()
-                        .and_then(|catalog| catalog.find_tool(&name))
-                        .and_then(|tool| match tool.source {
-                            ToolSource::Plugin { plugin_id } => Some(plugin_id),
-                            ToolSource::Inline => None,
-                        });
+            let (producer_plugin_id, schema, schema_version, placement) = presentation
+                .unwrap_or_else(|| {
+                    let producer_plugin_id = pinned_tool_producer(state, outcome, &name);
                     (
                         producer_plugin_id,
                         "bcode.tool.request-draft".to_owned(),
                         0,
                         bcode_session_models::ToolContributionPlacement::Request,
                     )
-                };
+                });
             stream_progress.start_tool_call_with_presentation(
                 None,
                 call_id.clone(),
@@ -24104,6 +24174,7 @@ struct PreparedModelRequest {
 
 #[derive(Clone)]
 struct StaticModelTurnContext {
+    tool_catalog: Option<Arc<tool_catalog::Snapshot>>,
     system_prompt: String,
     system_messages: Vec<ModelMessage>,
     recovery_context: Option<ModelMessage>,
@@ -24174,6 +24245,7 @@ async fn prepare_static_model_turn_context(
     config: &bcode_config::BcodeConfig,
     model_target: &model_request_target::ResolvedModelRequestTarget,
     retain_environment_snapshot: bool,
+    prepared_catalog: Option<Arc<tool_catalog::Snapshot>>,
 ) -> Result<StaticModelTurnContext, bcode_session::SessionError> {
     let setup_labels = model_turn_metric_labels(session_id, turn_id);
     let agent_timer = state.metrics.timer();
@@ -24325,14 +24397,33 @@ async fn prepare_static_model_turn_context(
             .and_then(|context| context.enabled_tools.clone()),
         execution.tool_allowlist.as_ref(),
     );
-    let base_tools = collect_model_tools(
-        state,
-        session_id,
+    let tool_catalog = if let Some(snapshot) = prepared_catalog {
+        snapshot
+    } else {
+        state.tool_catalog.get(&state.plugins, true).await
+    };
+    if tool_catalog.lists.is_empty() && !tool_catalog.failures.is_empty() {
+        return Err(bcode_session::SessionError::EventSerialization(
+            "tool catalog discovery unavailable".to_owned(),
+        ));
+    }
+    if !tool_catalog.failures.is_empty() {
+        let message = format!(
+            "Tool discovery degraded: {} provider(s) unavailable; their tools are excluded for this turn.",
+            tool_catalog.failures.len()
+        );
+        append_system_event(state, session_id, message.clone()).await;
+        system_messages.push(ModelMessage {
+            role: MessageRole::System,
+            content: vec![ContentBlock::Text { text: message }],
+        });
+    }
+    let base_tools = filter_model_tools(
+        tool_catalog.discovery(),
         enabled_tools,
         execution.tools,
         execution.allow_user_questions,
-    )
-    .await;
+    );
     if !execution.allow_user_questions {
         system_messages.push(ModelMessage {
             role: MessageRole::System,
@@ -24358,6 +24449,7 @@ async fn prepare_static_model_turn_context(
     let tools = apply_tool_description_profile(base_tools, &profile);
     let tool_description_overrides = profile.tool_description_overrides.keys().cloned().collect();
     Ok(StaticModelTurnContext {
+        tool_catalog: Some(tool_catalog),
         system_prompt,
         system_messages,
         recovery_context,
@@ -26634,9 +26726,27 @@ fn apply_tool_description_profile(
     tools
 }
 
+#[cfg(test)]
 async fn collect_model_tools(
     state: &ServerState,
     _session_id: SessionId,
+    enabled_tools: Option<Vec<String>>,
+    policy: bcode_session_models::TurnToolPolicy,
+    allow_user_questions: bool,
+) -> Vec<bcode_model::ToolDefinition> {
+    filter_model_tools(
+        collect_tool_discovery(state).await,
+        enabled_tools,
+        policy,
+        allow_user_questions,
+    )
+}
+
+fn filter_model_tools(
+    discovery: Vec<(
+        ServiceToolDefinition,
+        Option<bcode_tool::ToolDiscoveryPolicy>,
+    )>,
     enabled_tools: Option<Vec<String>>,
     policy: bcode_session_models::TurnToolPolicy,
     allow_user_questions: bool,
@@ -26646,7 +26756,7 @@ async fn collect_model_tools(
         return Vec::new();
     }
     let mut tools = Vec::new();
-    for (tool, discovery) in collect_tool_discovery(state).await {
+    for (tool, discovery) in discovery {
         if enabled_tools
             .as_ref()
             .is_some_and(|enabled| !enabled.contains(&tool.name))
@@ -26684,28 +26794,11 @@ async fn collect_tool_discovery(
     ServiceToolDefinition,
     Option<bcode_tool::ToolDiscoveryPolicy>,
 )> {
-    let mut tools = Vec::new();
-    for plugin_id in tool_provider_plugin_ids(state) {
-        let response = state
-            .plugins
-            .invoke_service_json::<_, ToolList>(
-                &plugin_id,
-                TOOL_SERVICE_INTERFACE_ID,
-                OP_LIST_TOOLS,
-                &ListToolsRequest::default(),
-            )
-            .await;
-        match response {
-            Ok(mut list) => {
-                for tool in list.tools {
-                    let policy = list.discovery.remove(&tool.name);
-                    tools.push((tool, policy));
-                }
-            }
-            Err(error) => tracing::warn!("failed to list tools from {plugin_id}: {error}"),
-        }
+    let snapshot = state.tool_catalog.get(&state.plugins, true).await;
+    for plugin_id in snapshot.failures.keys() {
+        tracing::warn!(%plugin_id, "tool catalog discovery incomplete");
     }
-    tools
+    snapshot.discovery()
 }
 
 fn tool_error(output: impl Into<String>) -> ToolInvocationResponse {
@@ -27143,27 +27236,23 @@ async fn finish_server_registered_tool(
     Ok(result)
 }
 
+fn pinned_tool_producer(
+    state: &ServerState,
+    outcome: &ModelPollOutcome,
+    name: &str,
+) -> Option<String> {
+    outcome
+        .tool_catalog
+        .as_ref()?
+        .producer_for_runtime(&state.plugins, name)
+}
+
 async fn collect_server_tool_catalog(state: &ServerState) -> Result<UnifiedToolCatalog, String> {
-    let mut catalog = UnifiedToolCatalog::new();
-    let mut registered_names = BTreeSet::new();
-    for plugin_id in tool_provider_plugin_ids(state) {
-        let list = state
-            .plugins
-            .invoke_service_json::<_, ToolList>(
-                &plugin_id,
-                TOOL_SERVICE_INTERFACE_ID,
-                OP_LIST_TOOLS,
-                &ListToolsRequest::default(),
-            )
-            .await
-            .map_err(|error| error.to_string())?;
-        for definition in list.tools {
-            if registered_names.insert(definition.name.clone()) {
-                catalog.insert(RegisteredTool::plugin(definition, plugin_id.clone()));
-            }
-        }
+    let snapshot = state.tool_catalog.get(&state.plugins, false).await;
+    if !snapshot.failures.is_empty() {
+        return Err("tool catalog discovery incomplete".to_owned());
     }
-    Ok(catalog)
+    snapshot.catalog_for_runtime(&state.plugins)
 }
 
 #[cfg(test)]
@@ -27680,35 +27769,87 @@ fn execute_model_tool_batch<'a>(
     output_positions: &'a BTreeMap<String, (String, bcode_session_models::TurnOutputPosition)>,
     cancel_state: Arc<TurnCancelState>,
     command_context: &'a mut RuntimeCommandContext<'_>,
-    execution: &bcode_session_models::TurnExecutionOptions,
+    execution: &'a bcode_session_models::TurnExecutionOptions,
     tool_execution: bcode_tool::ToolExecutionOptions,
-) -> ProviderCallFuture<'a, bool> {
-    let tool_policy = execution.tools;
-    let permission_mode = execution.permission_mode;
-    let allow_user_questions = execution.allow_user_questions;
+    tool_catalog: Option<Arc<tool_catalog::Snapshot>>,
+) -> ProviderCallFuture<'a, tool_host_retry::ToolBatchOutcome> {
+    execute_model_tool_batch_with_catalog(
+        (
+            state,
+            session_id,
+            calls,
+            output_positions,
+            cancel_state,
+            command_context,
+            execution,
+            tool_execution,
+        ),
+        move || {
+            let snapshot = tool_catalog.clone();
+            Box::pin(async move {
+                if let Some(snapshot) = snapshot {
+                    snapshot
+                        .catalog_for_runtime(&state.plugins)
+                        .map_err(|_| tool_host_retry::PreparationFailure::Permanent)
+                } else {
+                    collect_server_tool_catalog(state)
+                        .await
+                        .map_err(|_| tool_host_retry::PreparationFailure::Unavailable)
+                }
+            })
+        },
+    )
+}
+
+type ModelToolBatchInput<'a, 'context> = (
+    &'a ServerState,
+    SessionId,
+    Vec<bcode_model::ToolCall>,
+    &'a BTreeMap<String, (String, bcode_session_models::TurnOutputPosition)>,
+    Arc<TurnCancelState>,
+    &'a mut RuntimeCommandContext<'context>,
+    &'a bcode_session_models::TurnExecutionOptions,
+    bcode_tool::ToolExecutionOptions,
+);
+
+fn execute_model_tool_batch_with_catalog<'a>(
+    input: ModelToolBatchInput<'a, '_>,
+    mut collect_catalog: impl FnMut() -> ProviderCallFuture<
+        'a,
+        Result<UnifiedToolCatalog, tool_host_retry::PreparationFailure>,
+    > + Send
+    + 'a,
+) -> ProviderCallFuture<'a, tool_host_retry::ToolBatchOutcome> {
+    let (
+        state,
+        session_id,
+        calls,
+        output_positions,
+        cancel_state,
+        command_context,
+        execution,
+        tool_execution,
+    ) = input;
     let tool_allowlist = execution
         .tool_allowlist
         .as_ref()
         .map(|tools| tools.iter().cloned().collect::<BTreeSet<_>>());
-    let profile = execution.agent_profile.clone();
     Box::pin(async move {
-        let catalog = match tokio::select! {
-            biased;
-            () = cancel_state.cancelled() => return false,
-            catalog = tokio::time::timeout(
-                Duration::from_millis(tool_execution.preparation_timeout_ms.get()),
-                collect_server_tool_catalog(state),
-            ) => catalog,
-        } {
-            Ok(Ok(catalog)) => catalog,
-            Ok(Err(message)) => {
-                tracing::warn!(%message, "failed to build server tool registry");
-                return false;
-            }
-            Err(_) => {
-                tracing::warn!("timed out building server tool registry");
-                return false;
-            }
+        use tool_host_retry::ToolBatchOutcome;
+        let retry_config = state.session_config(session_id).await.tools.execution;
+        let catalog = match tool_host_retry::prepare_catalog(
+            state,
+            session_id,
+            command_context,
+            cancel_state.as_ref(),
+            &retry_config,
+            Duration::from_millis(tool_execution.preparation_timeout_ms.get()),
+            &mut collect_catalog,
+        )
+        .await
+        {
+            Ok(catalog) => catalog,
+            Err(outcome) => return outcome,
         };
         let catalog = if let Some(tool_allowlist) = tool_allowlist {
             let mut filtered = UnifiedToolCatalog::new();
@@ -27721,15 +27862,66 @@ fn execute_model_tool_batch<'a>(
         } else {
             catalog
         };
+        // Session lookup establishes authority. Its errors are not availability hints.
         let Ok(working_directory) = state.sessions.session_working_directory(session_id).await
         else {
-            return false;
+            return ToolBatchOutcome::PreparationFailed;
         };
-        let Ok(host_context) =
-            invocation_service_host_context(state, session_id, &working_directory).await
-        else {
-            return false;
+        let host_context = match tool_host_retry::prepare_host_context(
+            state,
+            session_id,
+            command_context,
+            cancel_state.as_ref(),
+            &working_directory,
+            &retry_config,
+            Duration::from_millis(tool_execution.preparation_timeout_ms.get()),
+        )
+        .await
+        {
+            Ok(context) => context,
+            Err(outcome) => return outcome,
         };
+        dispatch_prepared_model_tool_batch(
+            (
+                state,
+                session_id,
+                calls,
+                output_positions,
+                cancel_state,
+                command_context,
+                execution,
+                tool_execution,
+            ),
+            catalog,
+            working_directory,
+            host_context,
+        )
+        .await
+    })
+}
+
+fn dispatch_prepared_model_tool_batch<'a>(
+    input: ModelToolBatchInput<'a, '_>,
+    catalog: UnifiedToolCatalog,
+    working_directory: PathBuf,
+    host_context: Vec<bcode_tool::ToolHostContextEntry>,
+) -> ProviderCallFuture<'a, tool_host_retry::ToolBatchOutcome> {
+    let (
+        state,
+        session_id,
+        calls,
+        output_positions,
+        cancel_state,
+        command_context,
+        execution,
+        tool_execution,
+    ) = input;
+    let tool_policy = execution.tools;
+    let permission_mode = execution.permission_mode;
+    let allow_user_questions = execution.allow_user_questions;
+    let profile = execution.agent_profile.clone();
+    Box::pin(async move {
+        use tool_host_retry::ToolBatchOutcome;
         let sink_capacity = calls.len().saturating_mul(256).max(1_024);
         let (sink, sink_receiver) = SessionInvocationSink::new(sink_capacity);
         let sink_drain = drain_session_invocation_sink(state, session_id, sink_receiver);
@@ -27789,31 +27981,55 @@ fn execute_model_tool_batch<'a>(
             flush.map(|()| batch)
         };
         let (batch, ()) = tokio::join!(batch_flow, sink_drain);
-        let Ok(Some(batch)) = batch else {
-            return false;
+        let batch = match batch {
+            Ok(Some(batch)) => batch,
+            Ok(None) if cancel_state.is_cancelled() => return ToolBatchOutcome::Cancelled,
+            Ok(None) => return ToolBatchOutcome::EffectsUncertain,
+            Err(_) => return ToolBatchOutcome::PersistenceFailed,
         };
 
-        for (call, result) in calls.clone().into_iter().zip(batch.results) {
-            let input = match result {
-                Ok(output) => ToolFinishedEventInput {
-                    tool_call_id: call.id,
-                    result: output.invocation.output,
-                    is_error: output.invocation.is_error,
-                    content: output.invocation.content,
-                    semantic_result: output.invocation.result.map(service_tool_result_to_session),
-                },
-                Err(error) => ToolFinishedEventInput {
-                    tool_call_id: call.id,
-                    result: error.to_string(),
-                    is_error: true,
-                    content: Vec::new(),
-                    semantic_result: None,
-                },
-            };
-            append_tool_finished_event(state, session_id, input).await;
-        }
-        !cancel_state.is_cancelled()
+        persist_model_tool_batch_results(state, session_id, calls, batch, cancel_state.as_ref())
+            .await
     })
+}
+
+async fn persist_model_tool_batch_results(
+    state: &ServerState,
+    session_id: SessionId,
+    calls: Vec<bcode_model::ToolCall>,
+    batch: bcode_agent_runtime::ToolBatchExecutionOutput,
+    cancel_state: &TurnCancelState,
+) -> tool_host_retry::ToolBatchOutcome {
+    use tool_host_retry::ToolBatchOutcome;
+    for (call, result) in calls.into_iter().zip(batch.results) {
+        let input = match result {
+            Ok(output) => ToolFinishedEventInput {
+                tool_call_id: call.id,
+                result: output.invocation.output,
+                is_error: output.invocation.is_error,
+                content: output.invocation.content,
+                semantic_result: output.invocation.result.map(service_tool_result_to_session),
+            },
+            Err(error) => ToolFinishedEventInput {
+                tool_call_id: call.id,
+                result: error.to_string(),
+                is_error: true,
+                content: Vec::new(),
+                semantic_result: None,
+            },
+        };
+        if append_tool_finished_event_inner(state, session_id, input)
+            .await
+            .is_err()
+        {
+            return ToolBatchOutcome::PersistenceFailed;
+        }
+    }
+    if cancel_state.is_cancelled() {
+        ToolBatchOutcome::Cancelled
+    } else {
+        ToolBatchOutcome::Completed
+    }
 }
 
 #[cfg(test)]
@@ -30289,22 +30505,6 @@ fn skill_tool_policy_reason(outcome: &SkillToolPolicyOutcome) -> Option<String> 
     }
 }
 
-fn tool_provider_plugin_ids(state: &ServerState) -> Vec<String> {
-    state
-        .plugins
-        .registry()
-        .manifests()
-        .values()
-        .filter(|manifest| {
-            manifest
-                .services
-                .iter()
-                .any(|service| service.interface_id == TOOL_SERVICE_INTERFACE_ID)
-        })
-        .map(|manifest| manifest.id.clone())
-        .collect()
-}
-
 #[derive(Debug, Clone, Default)]
 struct PermissionPolicyContext {
     source: Option<String>,
@@ -31529,6 +31729,7 @@ struct ToolFinishedEventInput {
     semantic_result: Option<ToolInvocationResult>,
 }
 
+#[cfg(test)]
 async fn append_tool_finished_event(
     state: &ServerState,
     session_id: SessionId,
@@ -43812,6 +44013,108 @@ library = "test"
         })
         .await
         .expect("provider worker should finish after release");
+    }
+
+    #[tokio::test]
+    async fn discovery_backoff_services_runtime_cancel_command_before_dispatch() {
+        let sessions = SessionManager::default();
+        let session_id = sessions
+            .create_session(None, test_working_directory())
+            .await
+            .unwrap()
+            .id;
+        let state = Arc::new(test_server_state(sessions));
+        let cancellation = Arc::new(TurnCancelState::default());
+        let current_turn = Arc::new(Mutex::new(Some(RuntimeCurrentTurn {
+            interaction_route: None,
+            kind: RuntimeOperationKind::ModelTurn,
+            client_id: ClientId::new(),
+            turn_id: "discovery-backoff".into(),
+            cancel_state: Arc::clone(&cancellation),
+            model: None,
+            agent_profile: None,
+        })));
+        let (followup_commands, mut followups) = mpsc::channel(1);
+        let (steering_commands, mut steering) = mpsc::channel(1);
+        let (cancel_commands, mut cancels) = mpsc::channel(1);
+        let queued = Arc::new(AtomicUsize::new(0));
+        state.session_runtimes.lock().await.insert(
+            session_id,
+            SessionRuntimeHandle {
+                followup_commands,
+                steering_commands,
+                cancel_commands,
+                queued_followups: Arc::clone(&queued),
+                queued_steering: Arc::new(AtomicUsize::new(0)),
+                phase: Arc::new(Mutex::new(SessionRuntimePhase::ProviderActive)),
+                current_turn: Arc::clone(&current_turn),
+            },
+        );
+        let mut context = RuntimeCommandContext::new(
+            &mut followups,
+            &mut steering,
+            &mut cancels,
+            &queued,
+            current_turn,
+        );
+        let config = bcode_config::ToolExecutionConfig {
+            host_retry_initial_delay_ms: 60_000,
+            host_retry_max_delay_ms: 60_000,
+            ..Default::default()
+        };
+        let attempts = AtomicUsize::new(0);
+        let notices = AtomicUsize::new(0);
+        let dispatches = AtomicUsize::new(0);
+        let preparation = async {
+            let result = tool_host_retry::prepare_with_retry::<(), _, _, _, _>(
+                &config,
+                &cancellation,
+                Duration::from_secs(30),
+                || {
+                    attempts.fetch_add(1, Ordering::SeqCst);
+                    std::future::ready(Err(tool_host_retry::PreparationFailure::Unavailable))
+                },
+                |_, _, _| {
+                    notices.fetch_add(1, Ordering::SeqCst);
+                    std::future::ready(())
+                },
+            )
+            .await;
+            if result.is_ok() {
+                dispatches.fetch_add(1, Ordering::SeqCst);
+            }
+            result
+        };
+        let mut waiting = Box::pin(wait_for_provider_call(
+            &state,
+            session_id,
+            &mut context,
+            &cancellation,
+            Box::pin(preparation),
+        ));
+        // Poll through the failure and notice into the long backoff before enqueueing.
+        std::future::poll_fn(|cx| {
+            assert!(std::future::Future::poll(waiting.as_mut(), cx).is_pending());
+            std::task::Poll::Ready(())
+        })
+        .await;
+        assert_eq!(notices.load(Ordering::SeqCst), 1);
+        assert!(!cancellation.is_cancelled());
+        let (outcome, acknowledged) = tokio::time::timeout(Duration::from_secs(1), async {
+            tokio::join!(
+                waiting,
+                enqueue_cancel_turn_command(&state, session_id, false, None)
+            )
+        })
+        .await
+        .expect("runtime command must interrupt discovery backoff");
+        assert!(acknowledged.unwrap());
+        assert!(matches!(outcome, ProviderCallWait::Cancelled));
+        assert!(cancellation.is_cancelled());
+        assert_eq!(attempts.load(Ordering::SeqCst), 1);
+        assert_eq!(dispatches.load(Ordering::SeqCst), 0);
+        drop(context);
+        drop(state);
     }
 
     #[tokio::test]
@@ -64616,6 +64919,148 @@ event_symbol = "bcode_plugin_handle_event_v1"
         assert!(!scope.accepts_work());
     }
 
+    #[tokio::test]
+    async fn server_tool_timeout_is_visible_and_persistence_failure_is_not_retried() {
+        let sessions = SessionManager::default();
+        let session_id = sessions
+            .create_session(None, std::env::temp_dir())
+            .await
+            .unwrap()
+            .id;
+        let state = test_server_state_with_filesystem_plugin(sessions);
+        let calls = || {
+            vec![bcode_model::ToolCall {
+                id: "timeout-original-id".to_owned(),
+                name: "filesystem.list".to_owned(),
+                arguments: serde_json::Value::Null,
+            }]
+        };
+        let batch = || bcode_agent_runtime::ToolBatchExecutionOutput {
+            results: vec![Err(RuntimeError::ToolPreparationTimeout {
+                tool_name: "filesystem.list".to_owned(),
+                timeout: Duration::from_millis(1),
+            })],
+        };
+        let result = persist_model_tool_batch_results(
+            &state,
+            session_id,
+            calls(),
+            batch(),
+            &TurnCancelState::default(),
+        )
+        .await;
+        assert_eq!(result, tool_host_retry::ToolBatchOutcome::Completed);
+        let history = state.sessions.session_history(session_id).await.unwrap();
+        let results = history
+            .iter()
+            .filter_map(|event| match &event.kind {
+                SessionEventKind::ToolInvocationResultRecorded { record } => Some(record),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(results.len(), 1);
+        assert!(results[0].is_error);
+        assert!(results[0].model_output.contains("timed out"));
+        assert_eq!(results[0].invocation_id, "timeout-original-id");
+        // A missing owner prevents durable confirmation. This post-dispatch boundary has
+        // no invoker or retry closure: the previously completed tools cannot be replayed.
+        let result = persist_model_tool_batch_results(
+            &state,
+            SessionId::new(),
+            calls(),
+            batch(),
+            &TurnCancelState::default(),
+        )
+        .await;
+        drop(state);
+        assert_eq!(result, tool_host_retry::ToolBatchOutcome::PersistenceFailed);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn server_catalog_retries_preserve_calls_and_do_not_terminalize_turn() {
+        let workspace = tempfile::tempdir().unwrap();
+        let sessions = SessionManager::persistent(workspace.path().join("sessions")).unwrap();
+        let session_id = sessions
+            .create_session(None, workspace.path().to_path_buf())
+            .await
+            .unwrap()
+            .id;
+        let mut state = test_server_state_with_filesystem_plugin(sessions);
+        state.trace_store = TraceStore::new(workspace.path().join("traces"));
+        state
+            .startup_config
+            .tools
+            .execution
+            .host_retry_initial_delay_ms = 1;
+        state.startup_config.tools.execution.host_retry_max_delay_ms = 1;
+        let (_followup_tx, mut followup_rx) = mpsc::channel(1);
+        let (_steering_tx, mut steering_rx) = mpsc::channel(1);
+        let (_cancel_tx, mut cancel_rx) = mpsc::channel(1);
+        let queued_followups = AtomicUsize::new(0);
+        let mut context = RuntimeCommandContext::new(
+            &mut followup_rx,
+            &mut steering_rx,
+            &mut cancel_rx,
+            &queued_followups,
+            Arc::new(Mutex::new(None)),
+        );
+        let attempts = AtomicUsize::new(0);
+        let options = bcode_tool::ToolExecutionOptions {
+            preparation_timeout_ms: std::num::NonZeroU64::new(2_000).unwrap(),
+            ..bcode_tool::ToolExecutionOptions::default()
+        };
+        let result = execute_model_tool_batch_with_catalog(
+            (
+                &state,
+                session_id,
+                vec![bcode_model::ToolCall {
+                    id: "original-retry-id".to_owned(),
+                    name: "filesystem.list".to_owned(),
+                    arguments: serde_json::json!({"path": workspace.path(), "max_entries": 10}),
+                }],
+                &BTreeMap::new(),
+                Arc::new(TurnCancelState::default()),
+                &mut context,
+                &bcode_session_models::TurnExecutionOptions::default(),
+                options,
+            ),
+            || {
+                Box::pin(async {
+                    let attempt = attempts.fetch_add(1, Ordering::SeqCst);
+                    let history = state.sessions.session_history(session_id).await.unwrap();
+                    assert!(!history.iter().any(|event| matches!(
+                        event.kind,
+                        SessionEventKind::ModelTurnFinished { .. }
+                            | SessionEventKind::ToolInvocationResultRecorded { .. }
+                    )));
+                    match attempt {
+                        0 | 1 => std::future::pending().await,
+                        2 => Err(tool_host_retry::PreparationFailure::Unavailable),
+                        _ => collect_server_tool_catalog(&state)
+                            .await
+                            .map_err(|_| tool_host_retry::PreparationFailure::Unavailable),
+                    }
+                })
+            },
+        )
+        .await;
+        assert_eq!(result, tool_host_retry::ToolBatchOutcome::Completed);
+        assert_eq!(attempts.load(Ordering::SeqCst), 4);
+        let history = state.sessions.session_history(session_id).await.unwrap();
+        drop(state);
+        let results = history
+            .iter()
+            .filter_map(|event| match &event.kind {
+                SessionEventKind::ToolInvocationResultRecorded { record } => Some(record),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].invocation_id, "original-retry-id");
+        assert!(!results[0].is_error, "{}", results[0].model_output);
+    }
+
     #[cfg(unix)]
     #[tokio::test]
     async fn server_registry_unknown_call_preserves_registered_sibling_and_provider_order() {
@@ -64644,7 +65089,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
             &queued_followups,
             current_turn,
         );
-        assert!(
+        assert_eq!(
             execute_model_tool_batch(
                 &state,
                 session_id,
@@ -64668,8 +65113,10 @@ event_symbol = "bcode_plugin_handle_event_v1"
                 &mut command_context,
                 &bcode_session_models::TurnExecutionOptions::default(),
                 bcode_tool::ToolExecutionOptions::default(),
+                None,
             )
-            .await
+            .await,
+            tool_host_retry::ToolBatchOutcome::Completed
         );
         assert_persisted_tool_results_in_order(
             &state,
@@ -64807,6 +65254,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
                 &mut context,
                 &bcode_session_models::TurnExecutionOptions::default(),
                 bcode_tool::ToolExecutionOptions::default(),
+                None,
             )
             .await
         };
@@ -64815,7 +65263,14 @@ event_symbol = "bcode_plugin_handle_event_v1"
         })
         .await
         .expect("authorized batch completes");
-        assert_eq!(completed, decision.is_some());
+        assert_eq!(
+            completed,
+            if decision.is_some() {
+                tool_host_retry::ToolBatchOutcome::Completed
+            } else {
+                tool_host_retry::ToolBatchOutcome::Cancelled
+            }
+        );
         assert!(state.pending_permissions.lock().await.is_empty());
         let history = state.sessions.session_history(session_id).await.unwrap();
         let results = history
@@ -64961,6 +65416,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
                 &mut command_context,
                 &bcode_session_models::TurnExecutionOptions::default(),
                 bcode_tool::ToolExecutionOptions::default(),
+                None,
             )
             .await
         });
@@ -64977,11 +65433,12 @@ event_symbol = "bcode_plugin_handle_event_v1"
         .await
         .expect("canonical shell side effect must precede cancellation");
         cancel_state.close();
-        assert!(
-            !tokio::time::timeout(Duration::from_secs(5), task)
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(5), task)
                 .await
                 .expect("canonical batch cancellation must complete locally")
-                .expect("canonical cancellation task must not panic")
+                .expect("canonical cancellation task must not panic"),
+            tool_host_retry::ToolBatchOutcome::Cancelled
         );
         let history = state
             .sessions
@@ -65148,6 +65605,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
                 &mut command_context,
                 &bcode_session_models::TurnExecutionOptions::default(),
                 bcode_tool::ToolExecutionOptions::default(),
+                None,
             )
             .await
         });
@@ -65241,7 +65699,10 @@ event_symbol = "bcode_plugin_handle_event_v1"
             .await
             .expect("parallel shell batch should finish")
             .expect("parallel shell batch task should not panic");
-        assert!(batch_completed);
+        assert_eq!(
+            batch_completed,
+            tool_host_retry::ToolBatchOutcome::Completed
+        );
         assert!(
             (0..5).all(|index| workspace.path().join(format!(".parallel-{index}")).exists()),
             "every authorized shell command must complete"
@@ -88284,6 +88745,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
             &state.session_config(session_id).await,
             &model_target,
             true,
+            None,
         )
         .await
         .expect("static turn context");
@@ -88316,6 +88778,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
                 &state.session_config(session_id).await,
                 &model_target,
                 false,
+                None,
             )
             .await
             .unwrap();
@@ -90159,6 +90622,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
 
     fn prefix_test_context() -> StaticModelTurnContext {
         StaticModelTurnContext {
+            tool_catalog: None,
             recovery_context: None,
             system_prompt: "stable instructions".into(),
             system_messages: vec![ModelMessage {
@@ -90377,6 +90841,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
             ..SessionModelSelection::default()
         };
         let static_context = StaticModelTurnContext {
+            tool_catalog: None,
             recovery_context: None,
             system_prompt: String::new(),
             system_messages: Vec::new(),

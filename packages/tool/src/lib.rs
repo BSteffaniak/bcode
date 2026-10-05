@@ -54,6 +54,20 @@ pub struct ToolList {
     /// Argument-independent discovery policy. Missing entries are unknown, not permissive.
     #[serde(default)]
     pub discovery: std::collections::BTreeMap<String, ToolDiscoveryPolicy>,
+    /// Optional cache contract. Missing or unknown policies require fresh discovery.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_policy: Option<ToolListCachePolicy>,
+}
+
+/// Plugin-owned catalog freshness contract, independent of invocation authorization.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ToolListCachePolicy {
+    /// Only version 1 is understood by current hosts.
+    pub version: u32,
+    /// True promises definitions and discovery policy are immutable for this loaded
+    /// runtime, including its resolved configuration and credential snapshot.
+    /// Plugins with changing definitions must leave this false or omit the policy.
+    pub runtime_stable: bool,
 }
 
 /// Plugin-owned discovery facts, never a substitute for invocation authorization.
@@ -79,7 +93,34 @@ impl ToolList {
             .iter()
             .map(|tool| (tool.name.clone(), policy(tool)))
             .collect();
-        Self { tools, discovery }
+        Self {
+            tools,
+            discovery,
+            cache_policy: None,
+        }
+    }
+
+    /// Declare immutable definitions and discovery facts for the loaded runtime.
+    /// Do not use when configuration, credentials, or plugin state can change them.
+    #[must_use]
+    pub fn with_runtime_stable_discovery(
+        tools: Vec<ToolDefinition>,
+        policy: impl Fn(&ToolDefinition) -> ToolDiscoveryPolicy,
+    ) -> Self {
+        let mut list = Self::with_discovery(tools, policy);
+        list.cache_policy = Some(ToolListCachePolicy {
+            version: 1,
+            runtime_stable: true,
+        });
+        list
+    }
+
+    /// Whether the host understands an explicit runtime-stability promise.
+    #[must_use]
+    pub fn is_runtime_stable(&self) -> bool {
+        self.cache_policy
+            .as_ref()
+            .is_some_and(|policy| policy.version == 1 && policy.runtime_stable)
     }
 }
 
