@@ -154,13 +154,13 @@ capability is not approval: implement the typed capability upstream or report th
 Do not hide SQL in identifiers, projections, joins, schema strings, generic pragma wrappers,
 or a replacement driver. This applies to production, migrations, imports, tests and fixtures.
 
-The finite existing migration scope and removal conditions are recorded in
-[`docs/database-sql-transition.md`](docs/database-sql-transition.md). Transitional enablement
-covers only those existing usages, not new raw calls. Record any separately approved exception's
-precise scope, rationale, removal condition and actual user approval; do not invent approvals
-or blanket fixture exceptions. Shrink transition entries as consumers migrate. Run the resolved
-architecture checks and isolated no-raw compilation before claiming closure; Cargo's additive
-feature unification makes a passing transition allowlist insufficient proof of no new raw calls.
+Existing SQL feature and direct-driver boundaries are enforced by
+`xtask/src/architecture/sql.rs`. Existing allowances cover only existing usages, not new raw
+calls. Keep authorization records and migration progress in session-scoped notes, not source
+comments or repository documents. Implementation documentation should describe technical scope,
+rationale, and compatibility behavior without conversation history. Shrink allowances as consumers
+migrate. Run resolved architecture checks and isolated no-raw compilation before claiming closure;
+Cargo's additive feature unification makes a passing allowlist insufficient proof of no new raw calls.
 
 ## Plugin Architecture Expectations
 

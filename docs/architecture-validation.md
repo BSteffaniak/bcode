@@ -53,10 +53,10 @@ and Bcode-owned direct-driver edges. This check includes dev/build edges in work
 the portable contract checks above intentionally continue to ignore dev-only edges. Shipped
 app/distribution/CLI/web profiles and each independently resolved plugin run the SQL check too.
 Isolated probes copy root Cargo patches (including absolute local paths) so they inspect the
-coordinator's actual integration rather than silently selecting unpatched upstream code.
+resolved dependency graph rather than silently selecting unpatched upstream code.
 
-See [database SQL transition](database-sql-transition.md) for the finite existing scope and
-approval/removal requirements. Use
+The existing SQL allowances are defined in `xtask/src/architecture/sql.rs`; contribution
+requirements are in `AGENTS.md`. Use
 `BCODE_ARCHITECTURE_SQL_CLOSURE=1 cargo run -p xtask -- architecture [--target <triple>]`
 to reject all raw activation/requests and all Bcode driver edges now. The default transition gate
 is not final absence; remove its allowances and make closure unconditional after migration.
