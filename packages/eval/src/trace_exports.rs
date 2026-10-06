@@ -2,10 +2,13 @@
 use bcode_client::BcodeClient;
 use bcode_session_models::{
     MAX_SESSION_TRACE_BLOB_BYTES, ReadSessionTraceBlobRequest, SESSION_TRACE_EXPORT_VERSION,
-    SessionEvent, SessionEventKind, SessionTracePayload,
+    SessionEvent,
 };
 use serde_json::json;
 use std::path::Path;
+
+#[cfg(test)]
+mod tests;
 
 pub fn export_cli(
     path: &Path,
@@ -19,31 +22,8 @@ pub fn export_cli(
     let root = path.with_extension("captures");
     let mut receipts = Vec::new();
     for capture in super::introspection::referenced_blobs(events) {
-        let result = invoke(
-            &[
-                "session".into(),
-                "trace-range".into(),
-                capture.session_id.to_string(),
-                capture.sequence.to_string(),
-                "--length".into(),
-                MAX_SESSION_TRACE_BLOB_BYTES.to_string(),
-            ],
-            &format!("capture-{}-{}", capture.session_id, capture.sequence),
-            std::time::Duration::from_secs(15),
-        );
-        let range = result.ok().and_then(|value| {
-            serde_json::from_value::<bcode_session_models::SessionTraceBlobRange>(value).ok()
-        });
-        if let Some(range) = range.filter(|range| {
-            range.version == SESSION_TRACE_EXPORT_VERSION
-                && range.session_id == capture.session_id
-                && range.sequence == capture.sequence
-                && range.sha256 == capture.blob.sha256
-                && range.byte_len == capture.blob.byte_len
-                && range.offset == 0
-                && range.eof
-                && range.bytes.len() as u64 == range.byte_len
-        }) {
+        let range = read_cli_capture(&capture, invoke);
+        if let Some(range) = range {
             std::fs::create_dir_all(&root)?;
             let name = format!("{}-{}.blob", capture.session_id, capture.sequence);
             std::fs::write(root.join(&name), &range.bytes)?;
@@ -58,6 +38,75 @@ pub fn export_cli(
     )
 }
 
+fn read_cli_capture(
+    capture: &super::introspection::CaptureReference,
+    invoke: &impl Fn(
+        &[String],
+        &str,
+        std::time::Duration,
+    ) -> Result<serde_json::Value, super::EvalError>,
+) -> Option<bcode_session_models::SessionTraceBlobRange> {
+    use sha2::{Digest as _, Sha256};
+    // Pretty-printed byte arrays expand on the CLI wire. Keep each response below
+    // the subprocess reader's budget independently of the retained blob budget.
+    const CHUNK: u32 = 32 * 1024;
+    if capture.blob.byte_len > u64::from(MAX_SESSION_TRACE_BLOB_BYTES) {
+        return None;
+    }
+    let mut bytes = Vec::new();
+    loop {
+        let offset = bytes.len() as u64;
+        let value = invoke(
+            &[
+                "session".into(),
+                "trace-range".into(),
+                capture.session_id.to_string(),
+                capture.sequence.to_string(),
+                "--offset".into(),
+                offset.to_string(),
+                "--length".into(),
+                CHUNK.to_string(),
+            ],
+            &format!(
+                "capture-{}-{}-{offset}",
+                capture.session_id, capture.sequence
+            ),
+            std::time::Duration::from_secs(15),
+        )
+        .ok()?;
+        let mut range: bcode_session_models::SessionTraceBlobRange =
+            serde_json::from_value(value).ok()?;
+        if range.version != SESSION_TRACE_EXPORT_VERSION
+            || range.session_id != capture.session_id
+            || range.sequence != capture.sequence
+            || range.sha256 != capture.blob.sha256
+            || range.byte_len != capture.blob.byte_len
+            || range.completeness != capture.blob.completeness
+            || range.redaction != capture.blob.redaction
+            || range.offset != offset
+            || range.bytes.len() > CHUNK as usize
+        {
+            return None;
+        }
+        let end = offset.checked_add(range.bytes.len() as u64)?;
+        if end > range.byte_len || range.eof != (end == range.byte_len) {
+            return None;
+        }
+        bytes.extend_from_slice(&range.bytes);
+        if range.eof {
+            if hex::encode(Sha256::digest(&bytes)) != capture.blob.sha256 {
+                return None;
+            }
+            range.offset = 0;
+            range.bytes = bytes;
+            return Some(range);
+        }
+        if end == offset {
+            return None;
+        }
+    }
+}
+
 pub async fn export(
     client: &BcodeClient,
     path: &Path,
@@ -65,33 +114,24 @@ pub async fn export(
 ) -> Result<(), super::EvalError> {
     let root = path.with_extension("captures");
     let mut receipts = Vec::new();
-    for event in events {
-        let SessionEventKind::TraceEvent { trace } = &event.kind else {
-            continue;
-        };
-        let reference = match &trace.payload {
-            SessionTracePayload::ModelRequestBuilt { request, .. } => request.as_ref(),
-            SessionTracePayload::ToolInvocationStarted { arguments, .. } => arguments.as_ref(),
-            SessionTracePayload::ToolInvocationFinished { output, .. } => output.as_ref(),
-            _ => None,
-        };
-        let Some(reference) = reference else { continue };
+    for capture in super::introspection::referenced_blobs(events) {
+        let reference = &capture.blob;
         let request = ReadSessionTraceBlobRequest {
             version: SESSION_TRACE_EXPORT_VERSION,
-            session_id: event.session_id,
-            sequence: event.sequence,
+            session_id: capture.session_id,
+            sequence: capture.sequence,
             offset: 0,
             length: MAX_SESSION_TRACE_BLOB_BYTES,
         };
         match client.session_trace_blob_range(request).await {
             Ok(range) if range.sha256 == reference.sha256 && range.byte_len == reference.byte_len && range.eof && range.bytes.len() as u64 == range.byte_len => {
                 std::fs::create_dir_all(&root)?;
-                let name = format!("{}-{}.blob", event.session_id, event.sequence);
+                let name = format!("{}-{}.blob", capture.session_id, capture.sequence);
                 std::fs::write(root.join(&name), &range.bytes)?;
-                receipts.push(json!({"session_id":event.session_id,"sequence":event.sequence,"status":"exported","file":name,"sha256":range.sha256,"byte_len":range.byte_len,"completeness":range.completeness,"redaction":range.redaction}));
+                receipts.push(json!({"session_id":capture.session_id,"sequence":capture.sequence,"status":"exported","file":name,"sha256":range.sha256,"byte_len":range.byte_len,"completeness":range.completeness,"redaction":range.redaction}));
             }
-            Ok(_) => receipts.push(json!({"session_id":event.session_id,"sequence":event.sequence,"status":"verification_failed"})),
-            Err(_) => receipts.push(json!({"session_id":event.session_id,"sequence":event.sequence,"status":"unavailable"})),
+            Ok(_) => receipts.push(json!({"session_id":capture.session_id,"sequence":capture.sequence,"status":"verification_failed"})),
+            Err(_) => receipts.push(json!({"session_id":capture.session_id,"sequence":capture.sequence,"status":"unavailable"})),
         }
     }
     super::write_json(

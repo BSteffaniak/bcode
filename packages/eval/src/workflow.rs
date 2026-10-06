@@ -403,6 +403,7 @@ pub fn execute(
                     .is_some_and(|values| values.len() < 100)
             })
         && outputs.as_array().is_some_and(|values| values.len() < 100);
+    let mut correlation_events = Vec::new();
     for (index, identity) in event_sessions.iter().enumerate() {
         let mut after = 0_u64;
         let mut events = Vec::new();
@@ -444,7 +445,12 @@ pub fn execute(
         for (key, value) in session_telemetry(&events).measurements {
             *telemetry.entry(key).or_default() += value;
         }
+        correlation_events.extend(events);
     }
+    write_json(
+        rep_dir.join("workflow-session-correlations.json"),
+        &super::workflow_correlations::project(&final_inspection["attempts"], &correlation_events),
+    )?;
     measurements.extend(telemetry);
     measurements.insert(
         "workflow.capture_complete".into(),

@@ -21,14 +21,18 @@ def verify_exports(summary, rows, enabled, gaps):
     assert receipt_document["sensitive"] is True
     receipts = receipt_document["receipts"]
     assert len(receipts) <= len(rows), "unexpected receipt count"
+    canonical_path = summary.parent / (stem + ".jsonl")
+    assert not canonical_path.is_symlink() and canonical_path.stat().st_size <= MAX_BYTES
+    canonical = [json.loads(line) for line in canonical_path.read_text().splitlines()]
     indexed = {(r["session_id"], r["sequence"]): r for r in rows}
+    retained = {(r["session_id"], r["sequence"]): r["kind"].get("trace_event", {}).get("trace", {}).get("payload", {}) for r in canonical}
     seen = set()
     exported_requests = 0
     for receipt in receipts:
         identity = (receipt["session_id"], receipt["sequence"])
         assert identity in indexed and identity not in seen, "unjoined/duplicate capture receipt"
         seen.add(identity)
-        payload = indexed[identity]["observation"].get("payload", {})
+        payload = retained[identity]
         reference = None
         for event, field in (("model_request_built", "request"),
                              ("tool_invocation_requested", "arguments"),
@@ -58,13 +62,13 @@ def verify_exports(summary, rows, enabled, gaps):
         assert receipt["completeness"] == reference["completeness"]
         assert receipt["completeness"] in ("complete", "retained", "truncated")
         assert receipt["redaction"] == reference["redaction"]
-        assert receipt["redaction"] in ("None", "Automatic", "ManualRequired")
+        assert receipt["redaction"] in ("none", "automatic", "manual_required")
         if receipt["completeness"] != "complete":
             gaps.append(stem + ": " + receipt["completeness"] + " blob content")
             print("CAPTURE GAP: " + stem + ": " + receipt["completeness"] + " blob content")
         if "model_request_built" in payload:
             assert receipt["completeness"] == "complete", "fixture request capture is incomplete"
-            assert receipt["redaction"] != "ManualRequired", "fixture request needs manual redaction"
+            assert receipt["redaction"] != "manual_required", "fixture request needs manual redaction"
             # Validate actual captured request content without printing it.
             request = json.loads(data)
             assert request.get("messages"), "export is not a populated model request"
@@ -101,11 +105,11 @@ def verify(root, require_complete=False):
         assert summaries, "missing direct introspection summary"
         for summary in summaries:
             info = load(summary)
-            assert info["schema_version"] == 1, "unsupported introspection version"
+            assert info["schema_version"] == 2, "unsupported introspection version"
             rows_path = summary.with_suffix(".jsonl")
             assert not rows_path.is_symlink() and rows_path.stat().st_size <= MAX_BYTES
             rows = [json.loads(line) for line in rows_path.read_text().splitlines()]
-            assert rows and all(row["schema_version"] == 1 for row in rows)
+            assert rows and all(row["schema_version"] == 2 for row in rows)
             assert all(row["session_id"] == info["session_id"] for row in rows)
             sequences = [row["sequence"] for row in rows]
             assert sequences == sorted(set(sequences)), "noncanonical index ordering"
@@ -122,30 +126,40 @@ def verify(root, require_complete=False):
             assert references + info["missing_request_capture"] == len(requests)
             if variant == "capture-on":
                 assert references == len(requests), "explicit capture did not retain request references"
-                assert all(p["tool_invocation_finished"]["output"] is not None
+                assert info["complete_model_inputs_exported"] is True
+                assert all(p["output_capture"]["status"] == "referenced_unverified"
                            for p in payloads if "tool_invocation_finished" in p)
             else:
+                assert info["complete_model_inputs_exported"] is False
                 assert references == 0, "capture-off unexpectedly persisted requests"
-                assert all(p["tool_invocation_finished"]["output"] is None
+                assert all(p["output_capture"]["status"] == "not_captured"
                            for p in payloads if "tool_invocation_finished" in p)
             request_counts[variant] = verify_exports(summary, rows, variant == "capture-on", gaps)
             # Export receipts, bytes and hashes are authoritative evidence; do not
             # infer availability from the older index summary's export flag.
-            if info["missing_request_capture"]:
+            if variant == "capture-on" and info["missing_request_capture"]:
                 gaps.append(variant + ": request capture intentionally unavailable")
     workflow = root / "offline-workflow/cases/scripted-loop/variants/single/repetitions/0001"
     assert load(workflow / "result.json")["passed"] is True
     inspection = load(workflow / "inspection.json")
     assert inspection.get("attempts"), "missing workflow attempt provenance"
     assert load(workflow / "timing.json")["schema_version"] == 1
+    correlations = load(workflow / "workflow-session-correlations.json")
+    assert correlations["schema"] == "bcode.eval.workflow_session_correlations.v1"
+    observed = {attempt["node_id"]: attempt for attempt in correlations["attempts"]}
+    for node in ("loop.implementation", "loop.evaluation"):
+        assert observed[node]["availability"] == "observed", "missing persisted agent turn correlation"
+        assert len(observed[node]["session_turns"]) == 1, "ambiguous agent turn correlation"
+    assert observed["loop.judgement.evaluate"]["availability"] == "not_observed", \
+        "plugin judgement must not fabricate an agent turn"
     workflow_summaries = list(workflow.glob("*.introspection.json"))
     assert workflow_summaries, "missing workflow session indexes"
     for summary in workflow_summaries:
-        assert load(summary)["schema_version"] == 1
+        assert load(summary)["schema_version"] == 2
         index_path = summary.with_suffix(".jsonl")
         assert not index_path.is_symlink() and index_path.stat().st_size <= MAX_BYTES
         rows = [json.loads(line) for line in index_path.read_text().splitlines()]
-        assert all(row["schema_version"] == 1 for row in rows)
+        assert all(row["schema_version"] == 2 for row in rows)
         verify_exports(summary, rows, True, gaps)
     oracle = load(workflow / "oracle.json")
     if not oracle["capture_complete"]:

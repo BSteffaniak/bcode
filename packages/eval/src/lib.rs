@@ -25,6 +25,7 @@ mod statistics;
 mod timing;
 mod trace_exports;
 mod workflow;
+mod workflow_correlations;
 
 pub use sdk::{
     AgentStepCount, LatencyAtMost, NoopSdkEvalObserver, OutputContains, SDK_EVAL_RUN_FILENAME,

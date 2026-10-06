@@ -69,17 +69,26 @@ for path in root.glob('*.toml'):
 PY
 ```
 
-After coordinator approval, use the execution host's canonical artifact only:
+For development validation, build the product binary with its app and bundled
+plugin features, then use its explicit path and SHA-256 with isolated test state.
+Use the canonical runtime for operational control of existing sessions; do not
+substitute a development binary for that runtime. For example:
 
 ```sh
-TMPDIR=/Volumes/ehdd/bcode-eval-artifacts/tmp bash scripts/check-eval-introspection.sh \
-  /Users/bsteffaniak/.local/state/bcode/daemon-images/bcode-d2b5928c1f9195b308ae7344e4224f73/168a7ae970bc0b430f80af8cb8f75e11a42758f0f0bb56bd952bd6fc1d465024/bcode \
-  168a7ae970bc0b430f80af8cb8f75e11a42758f0f0bb56bd952bd6fc1d465024
+cargo build -p bcode --features app,static-bundled-plugins --bin bcode
 ```
 
-If the artifact lacks the new APIs/plugins, stop: do not substitute a PATH or
-mutable target binary. Obtain an explicitly authorized identified artifact from
-the coordinator and use its absolute path/hash. The script verifies the hash
+Run the harness with the identified test artifact:
+
+```sh
+binary="$(pwd)/target/debug/bcode"
+sha256="$(shasum -a 256 "$binary" | awk '{print $1}')"
+bash scripts/check-eval-introspection.sh "$binary" "$sha256"
+```
+
+If the artifact lacks the new APIs/plugins, rebuild with the required features
+and record its new hash before rerunning. Do not silently fall back to PATH or
+an unrelated installed artifact. The script verifies the hash
 before any product invocation and launches only the fake provider, in a scrubbed
 environment with fresh private HOME/config/state. It deliberately does **not**
 load the live `sol` provider config/profile or connect to its state root: the
