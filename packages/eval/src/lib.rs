@@ -13,6 +13,7 @@
 
 mod capture;
 mod diagnosis;
+mod introspection;
 mod oracle;
 mod paired;
 mod process;
@@ -1765,6 +1766,11 @@ fn write_session_events_jsonl(
     path: &Path,
     events: &[bcode_session_models::SessionEvent],
 ) -> Result<(), EvalError> {
+    introspection::write(&path.with_extension("introspection.jsonl"), events)?;
+    write_json(
+        path.with_extension("introspection.json"),
+        &introspection::summary(events),
+    )?;
     let mut file = File::create(path)?;
     for event in events {
         writeln!(file, "{}", serde_json::to_string(event)?)?;
