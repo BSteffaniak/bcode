@@ -5356,6 +5356,16 @@ enum SessionCommand {
         #[arg(long)]
         json: bool,
     },
+    /// Explicitly reconcile durable child links/cards; never runs during ordinary reads.
+    ReconcileChildren {
+        parent_id: SessionId,
+        #[arg(long, required = true)]
+        apply: bool,
+        #[arg(long, required = true)]
+        yes: bool,
+        #[arg(long)]
+        json: bool,
+    },
     /// Observe own activity, optionally including one bounded direct-child page.
     Activity {
         session_id: SessionId,
@@ -7360,7 +7370,10 @@ async fn dispatch_session_command(command: Box<SessionCommand>) -> Result<(), Cl
             dry_run,
             json,
         } => {
-            run_session_compression(session_id, older_than, &tier, dry_run, json).await?;
+            Box::pin(run_session_compression(
+                session_id, older_than, &tier, dry_run, json,
+            ))
+            .await?;
         }
         SessionCommand::CompactLegacyAdmission {
             entry_budget,
@@ -7515,6 +7528,14 @@ async fn dispatch_session_command(command: Box<SessionCommand>) -> Result<(), Cl
             json,
         } => {
             Box::pin(create_session(name, cwd, parent, child_id, json)).await?;
+        }
+        SessionCommand::ReconcileChildren {
+            parent_id,
+            apply,
+            yes,
+            json,
+        } => {
+            Box::pin(reconcile_children(parent_id, apply, yes, json)).await?;
         }
         SessionCommand::Activity {
             session_id,
@@ -14837,6 +14858,34 @@ async fn session_read_client(session_id: SessionId) -> Result<BcodeClient, CliEr
     }
 }
 
+async fn reconcile_children(
+    parent_id: SessionId,
+    apply: bool,
+    yes: bool,
+    json: bool,
+) -> Result<(), CliError> {
+    if !yes || !apply {
+        return Err(CliError::InvalidArguments(
+            "relationship reconciliation requires --apply --yes".into(),
+        ));
+    }
+    let result = BcodeClient::default_endpoint()
+        .reconcile_session_children(parent_id, apply)
+        .await?;
+    let mut output = std::io::stdout().lock();
+    if json {
+        write_json_stream_record(&mut output, &result)
+    } else {
+        writeln!(
+            output,
+            "{} verified_children={}",
+            result.parent_id, result.verified_children
+        )?;
+        output.flush()?;
+        Ok(())
+    }
+}
+
 async fn refresh_session_catalog(
     cwd: Option<PathBuf>,
     sources: Vec<String>,
@@ -17673,6 +17722,9 @@ const fn session_event_kind_name(kind: &SessionEventKind) -> &'static str {
         SessionEventKind::ToolExchangeResolved { .. } => "tool_exchange_resolved",
         SessionEventKind::WorkingDirectoryChanged { .. } => "working_directory_changed",
         SessionEventKind::SessionImported { .. } => "session_imported",
+        SessionEventKind::SessionChildLinked { .. } => "session_child_linked",
+        SessionEventKind::SessionChildPublished { .. } => "session_child_published",
+        SessionEventKind::SessionChildrenReconciled { .. } => "session_children_reconciled",
         SessionEventKind::ChildSessionCreated { .. } => "child_session_created",
         SessionEventKind::SessionDerived { .. } => "session_derived",
         SessionEventKind::ExecutionSessionCreated { .. } => "execution_session_created",
@@ -18965,6 +19017,14 @@ fn print_non_trace_session_event(event: &SessionEvent) {
             event.sequence,
             message.as_deref().unwrap_or("")
         ),
+        SessionEventKind::SessionChildPublished { child_id, title } => {
+            println!(
+                "#{} child published: {} {}",
+                event.sequence,
+                child_id,
+                title.as_deref().unwrap_or("")
+            );
+        }
         SessionEventKind::ChildSessionCreated { request } => {
             println!(
                 "#{} child session: {} (parent: {})",
@@ -19009,7 +19069,9 @@ fn print_non_trace_session_event(event: &SessionEvent) {
         SessionEventKind::InertHistory { event_type, .. } => {
             println!("#{} legacy event: {event_type}", event.sequence);
         }
-        SessionEventKind::TraceEvent { .. } => {}
+        SessionEventKind::TraceEvent { .. }
+        | SessionEventKind::SessionChildLinked { .. }
+        | SessionEventKind::SessionChildrenReconciled { .. } => {}
     }
 }
 
@@ -24508,6 +24570,37 @@ mod session_configuration_cli_tests {
             Cli::try_parse_from(["bcode", "session", "create", "--child-id", &child_text,])
                 .is_err()
         );
+    }
+
+    #[test]
+    fn child_relationship_reconciliation_requires_explicit_confirmation() {
+        let parent = bcode_session_models::SessionId::new().to_string();
+        assert!(Cli::try_parse_from(["bcode", "session", "reconcile-children", &parent]).is_err());
+        assert!(
+            Cli::try_parse_from(["bcode", "session", "reconcile-children", &parent, "--apply"])
+                .is_err()
+        );
+        assert!(matches!(
+            Cli::try_parse_from([
+                "bcode",
+                "session",
+                "reconcile-children",
+                &parent,
+                "--apply",
+                "--yes",
+                "--json"
+            ])
+            .unwrap()
+            .command,
+            Some(Commands::Session {
+                command: SessionCommand::ReconcileChildren {
+                    apply: true,
+                    yes: true,
+                    json: true,
+                    ..
+                }
+            })
+        ));
     }
 
     #[test]

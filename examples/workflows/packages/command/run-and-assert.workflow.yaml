@@ -13,7 +13,7 @@ steps:
     name: Execute typed command plan
     uses: bcode.shell/exec@1
     with:
-      version: 2
+      version: 3
       cwd: .
       commands:
         - argv: [printf, source default is replaced by typed run input]

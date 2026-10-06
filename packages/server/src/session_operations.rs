@@ -1844,12 +1844,35 @@ async fn observe_activity(
             states.push(Status::Queued);
         }
     }
-    if state.runtime_work.has_active_for_session(session_id).await
-        && !states.contains(&Status::Running)
-    {
+    let (running_work, work_complete) = state
+        .runtime_work
+        .activity_count_for_session(session_id, 128)
+        .await;
+    if running_work > 0 && !states.contains(&Status::Running) {
         states.push(Status::Running);
     }
-    let (observed, complete) = state.activity_observations.lock().await.states(session_id);
+    let (observed, complete, mut evidence) = {
+        let observations = state.activity_observations.lock().await;
+        let (observed, complete) = observations.states(session_id);
+        (observed, complete, observations.evidence(session_id))
+    };
+    evidence.running = running_work.max(u32::from(states.contains(&Status::Running)));
+    if let Some(runtime) = &runtime {
+        let queued = runtime
+            .queued_followups
+            .load(std::sync::atomic::Ordering::Acquire)
+            .saturating_add(
+                runtime
+                    .queued_steering
+                    .load(std::sync::atomic::Ordering::Acquire),
+            );
+        evidence.queued = evidence
+            .queued
+            .max(u32::try_from(queued).unwrap_or(u32::MAX));
+    }
+    // Scheduler hints and work rows overlap; counts remain lower-bound observations,
+    // never a claim of complete canonical runtime inventory.
+    evidence.counts_complete = complete && work_complete && runtime.is_some();
     for status in observed {
         if !states.contains(&status)
             && (!matches!(status, Status::Failed | Status::Interrupted) || states.is_empty())
@@ -1869,6 +1892,7 @@ async fn observe_activity(
         session_id,
         parent_id: summary.parent_id,
         states,
+        evidence: Some(evidence),
     }
 }
 

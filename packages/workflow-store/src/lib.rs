@@ -1736,6 +1736,8 @@ impl WorkflowStore {
         definition: &WorkflowDefinition,
     ) -> Result<StoredWorkflowDefinition, WorkflowStoreError> {
         validate_id("definition_id", definition_id)?;
+        bcode_workflow::reject_definition_execution_parent_claims(definition)
+            .map_err(|error| WorkflowStoreError::InvalidData(error.to_string()))?;
         definition.validate().map_err(|error| {
             WorkflowStoreError::InvalidData(format!("invalid workflow definition: {error}"))
         })?;
@@ -20376,6 +20378,7 @@ mod tests {
                                 version: bcode_workflow::WORKFLOW_PROMPT_CONFIGURATION_VERSION,
                                 worktree_directory: None,
                                 activity_producer: None,
+                                execution_parent: None,
                                 execution_target:
                                     bcode_workflow::PromptContextTarget::FreshIsolated,
                                 agent_profile: "review".to_string(),
@@ -38885,6 +38888,203 @@ mod tests {
                 authority,
             )
             .expect("local pending work");
+    }
+
+    #[test]
+    fn legacy_execution_cancellation_retains_parent_after_caller_settlement() {
+        let (_temp, mut store, run, authority, _) = connected_publication_fixture();
+        let (caller, link, target, target_id) =
+            authenticated_cancellation_attempts(&mut store, &run, &authority);
+        let caller_id = link.activation_id.clone();
+        let mut node = store
+            .current_run_graph_node(&run.run_id, "second")
+            .unwrap()
+            .unwrap()
+            .node;
+        node.kind = bcode_workflow::NodeKind::Agent;
+        node.configuration = serde_json::to_value(
+            bcode_workflow::WorkflowPromptConfiguration::preserve_input("build", "observe"),
+        )
+        .unwrap();
+        let request = bcode_workflow::WorkflowRunGraphEditBatch {
+            version: bcode_workflow::WORKFLOW_RUN_GRAPH_EDIT_VERSION,
+            run_id: run.run_id.clone(),
+            mutation_id: "authenticated-cancel".into(),
+            expected_revision: 2,
+            edits: vec![
+                bcode_workflow::WorkflowRunGraphEdit::RemoveEdge { edge_id: 0 },
+                bcode_workflow::WorkflowRunGraphEdit::ReplaceNode {
+                    node,
+                    entry: false,
+                    exit: true,
+                },
+            ],
+            reconciliation: vec![
+                bcode_workflow::WorkflowRunGraphReconciliation::Retain {
+                    activation_id: caller_id,
+                },
+                bcode_workflow::WorkflowRunGraphReconciliation::Cancel {
+                    activation_id: target_id,
+                },
+            ],
+        };
+        store
+            .stage_run_graph_edit_from_execution(&request, &authority, &link, 28)
+            .unwrap();
+        assert!(matches!(
+            store
+                .accept_pending_run_graph_publication_from_execution(
+                    &request.mutation_id,
+                    &authority,
+                    &link,
+                    29
+                )
+                .unwrap(),
+            bcode_workflow::WorkflowRunGraphPublicationStatus::Pending { .. }
+        ));
+        assert_eq!(
+            store
+                .staged_run_graph_edit(&run.run_id, &request.mutation_id, &authority)
+                .unwrap(),
+            Some(request.clone())
+        );
+        assert!(matches!(
+            store
+                .accept_pending_run_graph_publication_from_execution(
+                    &request.mutation_id,
+                    &authority,
+                    &link,
+                    29
+                )
+                .unwrap(),
+            bcode_workflow::WorkflowRunGraphPublicationStatus::Pending { .. }
+        ));
+        settle_authenticated_publication_caller(&mut store, &run.run_id, &caller);
+        store
+            .apply_attempt_observation(&target.dispatch_identity, AttemptObservation::Cancelled, 31)
+            .unwrap();
+        assert!(matches!(
+            store
+                .finalize_pending_run_graph_publication(
+                    &run.run_id,
+                    &request.mutation_id,
+                    &authority,
+                    32
+                )
+                .unwrap(),
+            bcode_workflow::WorkflowRunGraphPublicationStatus::Committed { revision: 3 }
+        ));
+        let node = store
+            .current_run_graph_node(&run.run_id, "second")
+            .unwrap()
+            .unwrap()
+            .node;
+        assert_eq!(
+            node.configuration["execution_parent"]["session_id"],
+            link.session_id
+        );
+        assert_eq!(
+            store
+                .staged_run_graph_edit(&run.run_id, &request.mutation_id, &authority)
+                .unwrap(),
+            Some(request)
+        );
+    }
+
+    fn authenticated_cancellation_attempts(
+        store: &mut WorkflowStore,
+        run: &NewWorkflowRun,
+        authority: &WorkflowExecutionAuthority,
+    ) -> (
+        PreparedActivationDispatch,
+        WorkflowExecutionSessionLink,
+        PreparedActivationDispatch,
+        String,
+    ) {
+        let caller_id = activation_identity(&run.run_id, "first", 0);
+        let caller = store
+            .prepare_pending_activation(
+                &run.run_id,
+                "first",
+                &caller_id,
+                DispatchSideEffect::ReadOnly,
+                serde_json::json!({}),
+                25,
+            )
+            .unwrap()
+            .unwrap();
+        let link = WorkflowExecutionSessionLink::new(
+            run.run_id.clone(),
+            "first".into(),
+            caller_id.clone(),
+            caller.attempt,
+            "actual-delegator".into(),
+            "snapshot".into(),
+            26,
+        );
+        store
+            .persist_dispatch_receipt(&DispatchReceipt {
+                run_id: run.run_id.clone(),
+                node_id: "first".into(),
+                activation_id: caller_id.clone(),
+                attempt: caller.attempt,
+                dispatch_identity: caller.dispatch_identity.clone(),
+                receipt: serde_json::json!({}),
+                admitted_at_ms: 26,
+            })
+            .unwrap();
+        store.link_execution_session(&link).unwrap();
+        create_local_publication_target(store, &run.run_id, authority);
+        let target_id = activation_identity(&run.run_id, "second", 0);
+        let target = store
+            .prepare_pending_activation(
+                &run.run_id,
+                "second",
+                &target_id,
+                DispatchSideEffect::ReadOnly,
+                serde_json::json!({}),
+                26,
+            )
+            .unwrap()
+            .unwrap();
+        store
+            .persist_dispatch_receipt(&DispatchReceipt {
+                run_id: run.run_id.clone(),
+                node_id: "second".into(),
+                activation_id: target_id.clone(),
+                attempt: target.attempt,
+                dispatch_identity: target.dispatch_identity.clone(),
+                receipt: serde_json::json!({}),
+                admitted_at_ms: 27,
+            })
+            .unwrap();
+        (caller, link, target, target_id)
+    }
+
+    fn settle_authenticated_publication_caller(
+        store: &mut WorkflowStore,
+        run: &str,
+        caller: &PreparedActivationDispatch,
+    ) {
+        store
+            .apply_attempt_observation(
+                &caller.dispatch_identity,
+                AttemptObservation::Succeeded {
+                    output: ValidatedOutput {
+                        output_id: "caller-finished".into(),
+                        run_id: run.into(),
+                        node_id: "first".into(),
+                        activation_id: caller.activation.activation_id.clone(),
+                        schema_id: "u32".into(),
+                        schema_version: 1,
+                        value: serde_json::json!(1),
+                        artifact_reference: None,
+                        created_at_ms: 30,
+                    },
+                },
+                30,
+            )
+            .unwrap();
     }
 
     fn exercise_pending_publication(conflict: bool) {

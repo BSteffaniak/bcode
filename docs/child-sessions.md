@@ -1,8 +1,8 @@
 # Child sessions
 
-Any ordinary session can create a fresh ordinary child. Children may themselves create children; there is no fixed nesting-depth limit. Parentage is immutable and independent of workflow provenance, copied-context derivation, workspace selection, model selection, and execution authority.
+Sessions may have children, which can create further children without a fixed nesting-depth limit. Parentage is immutable and independent of workflow origin, copied context, workspace, model selection, and execution authority.
 
-## Creating and discovering children
+## Create and discover
 
 ```sh
 bcode session create "API implementation" --parent <parent-id> --child-id <retained-child-id> --cwd <absolute-checkout> --json
@@ -11,37 +11,40 @@ bcode session children <parent-id> --after <next-after-id> --limit 32 --json
 bcode session activity <session-id> --children --limit 32 --json
 ```
 
-`--child-id` is optional, but retaining it before creation allows an identical request to be retried after a lost response. Reusing an identity with different creation facts is rejected. Child creation does not submit a turn, copy conversation history, change permissions, create a worktree, or grant control over the child. The model's authenticated request-only session context supplies its current session ID for `--parent`.
+Retain `--child-id` to reconcile an identical creation request after a lost response. Conflicting retries fail closed. Creating an ordinary child does not submit work, copy the parent's conversation, change permissions, or create a worktree.
 
-Children remain independently openable sessions at their normal session-ID-derived canonical storage paths in the parent's verified state location. Stopping, archiving, or deleting a parent does not implicitly cancel or delete its descendants. No adoption or reparenting operation is provided.
+Children remain independently openable at their session-ID-derived canonical paths in the parent's verified state location. Parent lifecycle actions do not implicitly cancel or delete descendants. There is no adoption or reparenting operation.
 
-Discovery and activity use bounded direct-child pages. Recursively expand each returned child's page rather than requesting a full-tree replay. Follow `next_after` even when a candidate page contains no matching children. `complete` and `issues` describe discovery trust separately from pagination: an exhausted cursor does not prove that a damaged or incompletely indexed tree has no other children.
+Discovery uses bounded parent-local pages, not a full-tree replay or a global catalog scan. Follow `next_after`, including across sparse pages. `complete` and `issues` express discovery trust independently of pagination. Pending publication, missing or inconsistent child storage, and stale or damaged checkpoints are surfaced rather than treated as an empty tree.
 
-The global parent index is derived. Persistent discovery currently reports unverified completeness because canonical child publication and catalog publication are separate operations; a crash may publish the child before indexing it. Reads verify returned relationships against bounded canonical facts and do not repair, migrate, or scan all histories to conceal missing entries. An exact retry reconciles an already published child and refreshes its derived metadata.
+For historical or damaged relationship projections, explicit maintenance is available:
 
-## Terminal navigation and monitoring
+```sh
+bcode session reconcile-children <parent-id> --apply --yes --json
+```
 
-The session picker presents loaded parent/child relationships as a tree, preserves ancestry for search results, and supports lazy expansion and parent navigation. `Alt-N` loads the next child page.
+Maintenance requires exclusive verified ownership, preserves canonical history, and may scan the session location. Ordinary discovery, opening, and activity observation never invoke it automatically.
 
-`Ctrl-G` opens or closes the child monitor. Within it:
+## Parent experience
 
-* Up/down selects a loaded child.
-* Enter opens the selected session.
-* Right expands a coordinator's direct children.
-* Left opens the current session's parent.
-* `n` requests the next bounded child page.
-* Escape closes the panel.
+Confirmed child publication creates a durable parent transcript card with a stable child identity and a verified title snapshot. Its link opens the child through normal session navigation, not an external browser. Publication intent is not presented as successful creation. Child transcripts are not copied into the parent; refresh does not append history.
 
-The monitor shows titles and normalized activity evidence, refreshes observed coordinators incrementally, and preserves reading positions when returning between sessions. A compact statusline indicator reports **known active** children, not an inferred whole-subtree total. Deep nesting uses a compact depth label rather than unlimited indentation. Loaded monitoring state is a bounded disposable presentation cache, not a restriction on session-tree size.
+The TUI offers a compact child activity overview and a selectable monitor. Ctrl-G focuses the monitor; Escape returns focus to the composer. Attention-needed work is distinguished from running, queued, idle, and unknown work. Operation/count evidence and observation age remain explicitly scoped to bounded observations. Child navigation preserves parent presentation anchors.
 
-A child's canonical relationship produces a compact transcript parent link. Child transcripts are not copied into the coordinator and polling does not append transcript events. Parent-side delegation cards are not automatically persisted by creation.
+Hierarchy is explored incrementally, including loaded collapsed coordinators. Continuation cursors and incomplete coverage remain visible; a bounded resident view does not impose a limit on durable tree depth or size.
+
+## Workflow children
+
+Workflow execution-session parentage is separate from run-origin provenance. Authenticated graph publication binds generated work to the actual delegating session; callers cannot forge that binding through authored prompt metadata. Fresh isolated and pinned-generation execution sessions are children. Shared-parent sequential execution stays in its existing session and does not create a fictitious child. Context-copy and worktree policies remain independent of tree membership.
 
 ## Activity and authority
 
-Running, queued, permission wait, input wait, idle, failed, interrupted, and unknown are normalized observation facts. Multiple facts may coexist. Idle is not task completion or acceptance; an idle coordinator may have running descendants. Assignment review and acceptance remain orchestration-owned.
+Running, queued, permission wait, input wait, idle, failed, interrupted, and unknown are normalized observations; multiple facts may coexist. Idle does not mean accepted or completed, and an idle coordinator can have active descendants. Assignment acceptance remains orchestration-owned.
 
-Activity observation never installs a scheduler or acquires execution ownership. Nonresident sessions, event gaps, evicted observations, and incomplete evidence remain unknown or degraded. Refreshable activity pages carry observation timestamps; they are not a resumable subscription or durable reconnect cursor. Existing workflow execution ownership and cancellation fencing remain unchanged.
+Own-session evidence counts do not claim subtree totals. Nonresident sessions, event gaps, evicted evidence, and unobserved descendants remain unknown, partial, or degraded. Activity pages are timestamped observations, not durable subscriptions or reconnect checkpoints. Monitoring installs no scheduler and acquires no execution authority. Existing workflow ownership and cancellation fencing remain unchanged.
 
 ## Persistence and compatibility
 
-`ChildSessionCreated` is appended to both current public and persisted event enums. Its immutable creation request is canonical in the child history; `SessionSummary.parent_id` and the catalog parent index are projections. Session event schema 49 and writer epoch 13 protect this representation, with historical classification and upgrades owned by session migration. IPC protocol 43 adds typed creation, child-page, metadata, and activity application operations. Portable session models contain no terminal layout or daemon implementation types.
+The child's canonical `ChildSessionCreated` request records immutable parentage. Parent `SessionChildLinked` intent and `SessionChildPublished` acknowledgment fence publication; `SessionChildrenReconciled` records explicit maintenance coverage. The parent-local relationship projection advances atomically with canonical event checkpoints. Session summaries and catalogs remain derived.
+
+Session event schema 50 and writer epoch 14 protect this representation; historical classification and upgrade policy belong to session migration. IPC protocol 44 adds typed explicit reconciliation alongside creation, relationship pages, metadata, and activity operations. Portable session contracts contain no terminal layout or daemon implementation types.

@@ -365,14 +365,26 @@ impl RuntimeWorkManager {
     }
 
     /// Return active work snapshots for a session.
-    /// Check for active local work with one ordered lookup and no snapshot allocation.
-    pub async fn has_active_for_session(&self, session_id: SessionId) -> bool {
-        self.active
-            .lock()
-            .await
-            .range((session_id, WorkId::new(""))..)
-            .next()
-            .is_some_and(|((id, _), _)| *id == session_id)
+    /// Count observed local work within one session key range, bounded by `budget`.
+    /// The completeness flag is false when more work exists than the observation budget.
+    pub async fn activity_count_for_session(
+        &self,
+        session_id: SessionId,
+        budget: u32,
+    ) -> (u32, bool) {
+        let active = self.active.lock().await;
+        let result = {
+            let mut rows = active
+                .range((session_id, WorkId::new(""))..)
+                .take_while(|((id, _), _)| *id == session_id);
+            let mut count = 0;
+            while count < budget && rows.next().is_some() {
+                count += 1;
+            }
+            (count, rows.next().is_none())
+        };
+        drop(active);
+        result
     }
 
     pub async fn active_for_session(&self, session_id: SessionId) -> Vec<RuntimeWorkSnapshot> {

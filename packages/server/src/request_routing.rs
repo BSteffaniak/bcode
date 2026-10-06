@@ -98,6 +98,10 @@ pub enum SessionLifecycleRequest {
         session_id: SessionId,
         query: bcode_session_models::SessionActivityQuery,
     },
+    ReconcileSessionChildren {
+        parent_id: SessionId,
+        apply: bool,
+    },
     SessionChildren {
         query: bcode_session_models::SessionChildQuery,
     },
@@ -930,6 +934,9 @@ impl RoutedRequest {
                     query,
                 }))
             }
+            Request::ReconcileSessionChildren { parent_id, apply } => Self::SessionLifecycle(
+                Box::new(SessionLifecycleRequest::ReconcileSessionChildren { parent_id, apply }),
+            ),
             Request::SessionChildren { query } => {
                 Self::SessionLifecycle(Box::new(SessionLifecycleRequest::SessionChildren { query }))
             }

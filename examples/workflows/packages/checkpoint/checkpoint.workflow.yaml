@@ -12,7 +12,7 @@ steps:
   - id: checkpoint
     uses: bcode.shell/exec@1
     with:
-      version: 2
+      version: 3
       cwd: .
       commands:
         - argv: [git, diff, --check]

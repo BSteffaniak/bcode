@@ -11,7 +11,7 @@
 //! required fallback for every other surface.
 
 /// Durable session-storage writer epoch shared by runtime and daemon compatibility handshakes.
-pub const CURRENT_SESSION_STORAGE_WRITER_EPOCH: u32 = 13;
+pub const CURRENT_SESSION_STORAGE_WRITER_EPOCH: u32 = 14;
 
 /// Identifies retained turn observations in the existing system-message text contract.
 ///
@@ -620,7 +620,7 @@ fn tool_invocation_projection_mut<'a>(
 }
 
 /// Current persisted session event schema version.
-pub const CURRENT_SESSION_EVENT_SCHEMA_VERSION: u16 = 49;
+pub const CURRENT_SESSION_EVENT_SCHEMA_VERSION: u16 = 50;
 
 /// Stable persisted event kinds emitted by the current session schema.
 ///
@@ -664,6 +664,9 @@ pub const CURRENT_PERSISTED_SESSION_EVENT_KINDS: &[&str] = &[
     "runtime_work_progress",
     "runtime_work_started",
     "child_session_created",
+    "session_child_linked",
+    "session_child_published",
+    "session_children_reconciled",
     "session_created",
     "session_derived",
     "session_imported",
@@ -749,6 +752,9 @@ pub const fn persisted_session_event_kind_name(kind: &SessionEventKind) -> &'sta
         SessionEventKind::WorkingDirectoryChanged { .. } => "working_directory_changed",
         SessionEventKind::SessionImported { .. } => "session_imported",
         SessionEventKind::SessionDerived { .. } => "session_derived",
+        SessionEventKind::SessionChildrenReconciled { .. } => "session_children_reconciled",
+        SessionEventKind::SessionChildLinked { .. } => "session_child_linked",
+        SessionEventKind::SessionChildPublished { .. } => "session_child_published",
         SessionEventKind::ChildSessionCreated { .. } => "child_session_created",
         SessionEventKind::ExecutionSessionCreated { .. } => "execution_session_created",
         SessionEventKind::AssistantReasoningActivity { .. } => "assistant_reasoning_activity",
@@ -4109,6 +4115,23 @@ pub enum SessionEventKind {
     ChildSessionCreated {
         /// Complete immutable creation request; child identity matches the event envelope.
         request: Box<SessionChildCreateRequest>,
+    },
+    /// Parent-owned durable intent; unresolved child publication degrades all child pages.
+    SessionChildLinked {
+        /// Stable immediate child identity.
+        child_id: SessionId,
+    },
+    /// Parent acknowledgment after verifying canonical child storage.
+    SessionChildPublished {
+        /// Identity whose publication was verified.
+        child_id: SessionId,
+        /// Verified child title at publication; not inferred from later metadata.
+        title: Option<String>,
+    },
+    /// Explicit maintenance verified all canonical children under exclusive parent ownership.
+    SessionChildrenReconciled {
+        /// Number of verified child relationships at the maintenance boundary.
+        verified_children: u64,
     },
 }
 

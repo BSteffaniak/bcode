@@ -42,7 +42,7 @@ pub fn activity_evidence_label(activity: &SessionActivity) -> String {
     if activity.states.is_empty() {
         return "unknown".to_owned();
     }
-    activity
+    let states = activity
         .states
         .iter()
         .map(|state| match state {
@@ -56,5 +56,32 @@ pub fn activity_evidence_label(activity: &SessionActivity) -> String {
             SessionActivityState::Unknown => "unknown",
         })
         .collect::<Vec<_>>()
-        .join(", ")
+        .join(", ");
+    activity.evidence.as_ref().map_or_else(
+        || states.clone(),
+        |evidence| {
+            let counts = format!(
+                "{} running · {} queued · {} permission · {} input{}",
+                evidence.running,
+                evidence.queued,
+                evidence.permission_waits,
+                evidence.input_waits,
+                if evidence.counts_complete {
+                    ""
+                } else {
+                    " known/partial"
+                }
+            );
+            if evidence.counts_complete
+                || evidence.running > 0
+                || evidence.queued > 0
+                || evidence.permission_waits > 0
+                || evidence.input_waits > 0
+            {
+                format!("{states} · {counts}")
+            } else {
+                format!("{states} · counts unknown")
+            }
+        },
+    )
 }

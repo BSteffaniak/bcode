@@ -184,6 +184,7 @@ pub enum TuiEffect {
     /// Observe normalized activity without appending transcript events.
     LoadChildActivity {
         session_id: SessionId,
+        after: Option<SessionId>,
         generation: u64,
     },
     /// Load the bounded session catalog for the root session picker.
@@ -1069,6 +1070,7 @@ impl TuiEffect {
             Self::LoadChildActivity {
                 session_id,
                 generation,
+                ..
             } => TuiEffectResult::ChildActivityLoaded {
                 session_id,
                 generation,
@@ -1585,6 +1587,7 @@ impl TuiEffect {
             },
             Self::LoadChildActivity {
                 session_id,
+                after,
                 generation,
             } => TuiEffectResult::ChildActivityLoaded {
                 session_id,
@@ -1594,11 +1597,22 @@ impl TuiEffect {
                         session_id,
                         bcode_session_models::SessionActivityQuery {
                             scope: bcode_session_models::SessionActivityScope::DirectChildren,
-                            after: None,
+                            after,
                             limit: 64,
                         },
                     )
-                    .await,
+                    .await
+                    .map(|mut page| {
+                        // A terminal continuation is complete for its query, not for the
+                        // currently displayed window of the whole direct-child scope.
+                        if after.is_some()
+                            && page.coverage
+                                == bcode_session_models::SessionActivityCoverage::Complete
+                        {
+                            page.coverage = bcode_session_models::SessionActivityCoverage::Partial;
+                        }
+                        page
+                    }),
             },
             Self::OpenSession {
                 session_id,

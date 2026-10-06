@@ -532,12 +532,36 @@ enum PersistedSessionEventKind {
     ChildSessionCreated {
         request: Box<bcode_session_models::SessionChildCreateRequest>,
     },
+    SessionChildLinked {
+        child_id: SessionId,
+    },
+    SessionChildPublished {
+        child_id: SessionId,
+        title: Option<String>,
+    },
+    SessionChildrenReconciled {
+        verified_children: u64,
+    },
 }
 
 impl From<&SessionEventKind> for PersistedSessionEventKind {
     #[allow(clippy::too_many_lines)]
     fn from(value: &SessionEventKind) -> Self {
         match value {
+            SessionEventKind::SessionChildrenReconciled { verified_children } => {
+                Self::SessionChildrenReconciled {
+                    verified_children: *verified_children,
+                }
+            }
+            SessionEventKind::SessionChildLinked { child_id } => Self::SessionChildLinked {
+                child_id: *child_id,
+            },
+            SessionEventKind::SessionChildPublished { child_id, title } => {
+                Self::SessionChildPublished {
+                    child_id: *child_id,
+                    title: title.clone(),
+                }
+            }
             SessionEventKind::ChildSessionCreated { request } => Self::ChildSessionCreated {
                 request: request.clone(),
             },
@@ -993,6 +1017,15 @@ impl PersistedSessionEventKind {
     #[allow(clippy::too_many_lines)]
     fn into_domain(self) -> SessionEventKind {
         match self {
+            Self::SessionChildrenReconciled { verified_children } => {
+                SessionEventKind::SessionChildrenReconciled { verified_children }
+            }
+            Self::SessionChildLinked { child_id } => {
+                SessionEventKind::SessionChildLinked { child_id }
+            }
+            Self::SessionChildPublished { child_id, title } => {
+                SessionEventKind::SessionChildPublished { child_id, title }
+            }
             Self::ChildSessionCreated { request } => {
                 SessionEventKind::ChildSessionCreated { request }
             }

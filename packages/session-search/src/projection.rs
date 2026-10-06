@@ -226,7 +226,10 @@ pub const fn classify_persisted_event(kind: &SessionEventKind) -> PersistedEvent
         | SessionEventKind::PluginStatusNote { .. }
         | SessionEventKind::ToolInvocationLifecycle { .. }
         | SessionEventKind::ExecutionSessionCreated { .. }
-        | SessionEventKind::ChildSessionCreated { .. } => {
+        | SessionEventKind::ChildSessionCreated { .. }
+        | SessionEventKind::SessionChildLinked { .. }
+        | SessionEventKind::SessionChildPublished { .. }
+        | SessionEventKind::SessionChildrenReconciled { .. } => {
             PersistedEventClassification::MetadataOnly
         }
         SessionEventKind::InertHistory { .. }
@@ -406,7 +409,14 @@ pub fn project_event(
         });
     }
 
-    let projection = match &event.kind {
+    Ok(project_non_transcript_event(event, policy))
+}
+
+fn project_non_transcript_event(
+    event: &SessionEvent,
+    policy: &SearchProjectionPolicy,
+) -> EventProjection {
+    match &event.kind {
         SessionEventKind::AssistantDelta { .. }
         | SessionEventKind::AssistantReasoningDelta { .. } => {
             EventProjection::Excluded(ProjectionExclusion::NonFinalContent)
@@ -461,7 +471,10 @@ pub fn project_event(
         | SessionEventKind::ToolContribution { .. }
         | SessionEventKind::ToolContributionPlaced { .. }
         | SessionEventKind::ExecutionSessionCreated { .. }
-        | SessionEventKind::ChildSessionCreated { .. } => {
+        | SessionEventKind::ChildSessionCreated { .. }
+        | SessionEventKind::SessionChildLinked { .. }
+        | SessionEventKind::SessionChildPublished { .. }
+        | SessionEventKind::SessionChildrenReconciled { .. } => {
             EventProjection::Excluded(ProjectionExclusion::NoSearchableContent)
         }
         SessionEventKind::SessionCreated { name: Some(_), .. }
@@ -486,9 +499,7 @@ pub fn project_event(
         | SessionEventKind::PositionedAssistantResponseSegment { .. } => {
             unreachable!("searchable event variants must be handled by their focused projector")
         }
-    };
-
-    Ok(projection)
+    }
 }
 
 #[allow(clippy::too_many_lines)]

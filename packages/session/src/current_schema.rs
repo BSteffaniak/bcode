@@ -159,6 +159,36 @@ pub fn session_migrations() -> CurrentMigrationSource {
         alter_table("session_state").add_column("parent_id".into(), DataType::Text, true, None),
         alter_table("session_state").drop_column("parent_id".into()),
     );
+    add_migration(
+        &mut source,
+        "047_session_children",
+        create_table("session_children")
+            .if_not_exists(true)
+            .column(schema_column("child_id", DataType::Text, false))
+            .primary_key("child_id")
+            .column(schema_column("published", DataType::Int, false)),
+        drop_table("session_children").if_exists(true),
+    );
+    add_migration(
+        &mut source,
+        "048_session_children_checkpoint",
+        create_table("session_children_checkpoint")
+            .if_not_exists(true)
+            .column(schema_column("singleton", DataType::Int, false))
+            .primary_key("singleton")
+            .column(schema_column("event_seq", DataType::Int, false))
+            .column(schema_column("coverage", DataType::Int, false)),
+        drop_table("session_children_checkpoint").if_exists(true),
+    );
+    add_migration(
+        &mut source,
+        "049_session_children_pending_index",
+        create_index("idx_session_children_pending")
+            .if_not_exists(true)
+            .table("session_children")
+            .columns(vec!["published", "child_id"]),
+        drop_index("idx_session_children_pending", "session_children"),
+    );
     source
 }
 

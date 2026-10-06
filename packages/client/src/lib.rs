@@ -2338,6 +2338,24 @@ impl BcodeClient {
         }
     }
 
+    /// Explicitly reconcile relationship indexes/cards; this may perform maintenance scans.
+    ///
+    /// # Errors
+    /// Fails if maintenance is unconfirmed, ownership is live, or storage cannot be verified.
+    pub async fn reconcile_session_children(
+        &self,
+        parent_id: SessionId,
+        apply: bool,
+    ) -> Result<bcode_session_models::SessionChildReconciliation, ClientError> {
+        match self
+            .send_request(Request::ReconcileSessionChildren { parent_id, apply })
+            .await?
+        {
+            ResponsePayload::SessionChildrenReconciled { result } => Ok(result),
+            _ => Err(ClientError::UnexpectedResponse),
+        }
+    }
+
     /// Resolve exact canonical metadata and parent navigation without attaching.
     ///
     /// # Errors

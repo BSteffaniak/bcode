@@ -24,6 +24,7 @@ mod attachment;
 mod catalog;
 pub(crate) mod catalog_updates;
 mod child;
+mod child_projection;
 mod context;
 mod current_schema;
 pub mod db;
@@ -589,6 +590,8 @@ pub struct SessionManager {
     catalog_status_tx: watch::Sender<CatalogLoadStatus>,
     catalog_status_rx: watch::Receiver<CatalogLoadStatus>,
     mutation_tx: broadcast::Sender<SessionMutationCommitted>,
+    pending_child_counts: Arc<Mutex<BTreeMap<SessionId, usize>>>,
+    child_receipts: Arc<Mutex<BTreeMap<(SessionId, SessionId), bool>>>,
     shared_execution_locks: Arc<Mutex<BTreeMap<SessionId, Arc<Mutex<()>>>>>,
     derivation_operations: Arc<
         Mutex<
@@ -653,6 +656,8 @@ impl Default for SessionManager {
             catalog_status_tx,
             catalog_status_rx,
             mutation_tx: broadcast::channel(1024).0,
+            pending_child_counts: Arc::new(Mutex::new(BTreeMap::new())),
+            child_receipts: Arc::new(Mutex::new(BTreeMap::new())),
             shared_execution_locks: Arc::new(Mutex::new(BTreeMap::new())),
             derivation_operations: Arc::new(Mutex::new(BTreeMap::new())),
             metrics: MetricsRegistry::default(),
@@ -764,6 +769,8 @@ impl SessionManager {
             catalog_status_tx,
             catalog_status_rx,
             mutation_tx,
+            pending_child_counts: Arc::new(Mutex::new(BTreeMap::new())),
+            child_receipts: Arc::new(Mutex::new(BTreeMap::new())),
             shared_execution_locks: Arc::new(Mutex::new(BTreeMap::new())),
             derivation_operations: Arc::new(Mutex::new(BTreeMap::new())),
             metrics,

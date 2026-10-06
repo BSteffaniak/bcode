@@ -112,6 +112,7 @@ pub async fn stage_run_graph_edit_from_execution(
     link: &WorkflowExecutionSessionLink,
     now: u64,
 ) -> Result<bool, Error> {
+    bcode_workflow::reject_execution_parent_claims(batch).map_err(|_| Error::InvalidAdmission)?;
     validate(batch, link)?;
     let tx = db
         .begin_transaction_with_mode(TransactionMode::Immediate)
@@ -191,8 +192,14 @@ async fn publication_in(
     {
         return Err(Error::InvalidAdmission);
     }
-    super::graph_revision::publish_in(tx, owner, batch, super::GraphAdmissionPolicy::default())
-        .await
+    super::graph_revision::publish_with_parent_in(
+        tx,
+        owner,
+        batch,
+        super::GraphAdmissionPolicy::default(),
+        Some(&link.session_id),
+    )
+    .await
 }
 
 /// Inspect an authenticated active execution's independent bounded node/edge/output pages.

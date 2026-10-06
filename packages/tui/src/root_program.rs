@@ -241,7 +241,7 @@ pub struct BcodeRuntimeModel {
     theme_input_signature: u64,
     theme_reload_at: Instant,
     child_activity_at: Instant,
-    child_refresh_cursor: usize,
+    child_refresh_cursor: Option<bcode_session_models::SessionId>,
     scheduled_deadlines: BTreeMap<bmux_tui_runtime::TimerId, Instant>,
     temporal_registry: TemporalRegistry,
 }
@@ -339,7 +339,7 @@ impl BcodeRuntimeModel {
             theme_input_signature,
             theme_reload_at,
             child_activity_at: Instant::now() + Duration::from_secs(2),
-            child_refresh_cursor: 0,
+            child_refresh_cursor: None,
             scheduled_deadlines: BTreeMap::new(),
             temporal_registry: TemporalRegistry::default(),
         }
@@ -558,6 +558,13 @@ impl BcodeRuntimeModel {
     #[allow(clippy::let_and_return, clippy::too_many_lines)]
     fn route_terminal_event(&mut self, event: Event) -> super::invalidation::UiInvalidation {
         let damage = self.handle_basic_terminal_event(event);
+        if let Some(session_id) = self.chat.app.take_session_link_request() {
+            super::session_flow::start_switch_session(
+                &mut self.chat,
+                session_id,
+                super::history_flow::initial_transcript_window_request(self.committed_area),
+            );
+        }
         self.finish_terminal_route_update(damage)
     }
 
@@ -983,6 +990,7 @@ impl BcodeRuntimeModel {
                         self.chat
                             .replace_effect(super::effects::TuiEffect::LoadChildActivity {
                                 session_id,
+                                after: None,
                                 generation: 0,
                             });
                         self.chat
@@ -995,7 +1003,7 @@ impl BcodeRuntimeModel {
                     return super::invalidation::UiInvalidation::Structural;
                 }
                 if !self.loop_state.modal_foreground()
-                    && self.chat.app.child_panel_open()
+                    && self.chat.app.child_panel_focused()
                     && (matches!(
                         stroke.key,
                         bmux_keyboard::KeyCode::Up
@@ -1023,6 +1031,7 @@ impl BcodeRuntimeModel {
                                 self.chat.replace_effect(
                                     super::effects::TuiEffect::LoadChildActivity {
                                         session_id,
+                                        after: None,
                                         generation: 0,
                                     },
                                 );
@@ -1060,7 +1069,7 @@ impl BcodeRuntimeModel {
                                 );
                             }
                         }
-                        KeyCode::Escape => self.chat.app.toggle_child_panel(),
+                        KeyCode::Escape => self.chat.app.release_child_panel_focus(),
                         _ => return super::invalidation::UiInvalidation::None,
                     }
                     return super::invalidation::UiInvalidation::Structural;
@@ -1229,6 +1238,24 @@ impl BcodeRuntimeModel {
                 }
             }
             Event::Mouse(mouse) => {
+                if !self.loop_state.modal_foreground()
+                    && self.chat.app.child_panel_open()
+                    && matches!(
+                        mouse.kind,
+                        bmux_tui::event::MouseEventKind::Down(bmux_tui::event::MouseButton::Left)
+                    )
+                    && super::mouse_flow::mouse_hit_id(&self.committed_hits, mouse).as_deref()
+                        == Some("child-monitor-more")
+                    && let Some((parent_id, after)) = self.chat.app.monitor_next_page()
+                {
+                    self.chat
+                        .start_effect(super::effects::TuiEffect::LoadSessionChildren {
+                            parent_id,
+                            after: Some(after),
+                            generation: 0,
+                        });
+                    return super::invalidation::UiInvalidation::Structural;
+                }
                 if !self.loop_state.modal_foreground()
                     && self.chat.app.child_panel_open()
                     && matches!(
@@ -1915,6 +1942,59 @@ impl BcodeRuntimeModel {
         bmux_tui::damage::Damage::Full
     }
 
+    fn refresh_child_monitor(&mut self, now: Instant) {
+        self.child_activity_at = now + Duration::from_secs(2);
+        if let Some(session_id) = self.chat.attached_session_id() {
+            self.chat
+                .start_effect(super::effects::TuiEffect::LoadChildActivity {
+                    session_id,
+                    after: None,
+                    generation: 0,
+                });
+            let pending = self.chat.app.monitor_pending_activity_sessions();
+            let expanded = if pending.is_empty() {
+                self.chat.app.monitor_discovery_frontier()
+            } else {
+                pending.clone()
+            };
+            let next = expanded
+                .iter()
+                .copied()
+                .find(|id| self.child_refresh_cursor.is_none_or(|last| *id > last));
+            // Advance the root window only after servicing the loaded frontier once.
+            if pending.is_empty() && (next.is_none() || self.child_refresh_cursor.is_none()) {
+                self.chat
+                    .start_effect(super::effects::TuiEffect::LoadSessionChildren {
+                        parent_id: session_id,
+                        after: self.chat.app.monitor_frontier_cursor(session_id),
+                        generation: 0,
+                    });
+            }
+            if !expanded.is_empty() {
+                let child_id = if pending.is_empty() {
+                    next.unwrap_or(expanded[0])
+                } else {
+                    pending[0]
+                };
+                if pending.is_empty() {
+                    self.child_refresh_cursor = Some(child_id);
+                }
+                self.chat
+                    .start_effect(super::effects::TuiEffect::LoadSessionChildren {
+                        parent_id: child_id,
+                        after: self.chat.app.monitor_frontier_cursor(child_id),
+                        generation: 0,
+                    });
+                self.chat
+                    .start_effect(super::effects::TuiEffect::LoadChildActivity {
+                        session_id: child_id,
+                        after: None,
+                        generation: 0,
+                    });
+            }
+        }
+    }
+
     fn handle_timer(
         &mut self,
         timer: &bmux_tui_runtime::TimerId,
@@ -1961,24 +2041,7 @@ impl BcodeRuntimeModel {
                 super::invalidation::UiInvalidation::None
             }
             "bcode.child_activity" => {
-                self.child_activity_at = now + Duration::from_secs(2);
-                if let Some(session_id) = self.chat.attached_session_id() {
-                    self.chat
-                        .start_effect(super::effects::TuiEffect::LoadChildActivity {
-                            session_id,
-                            generation: 0,
-                        });
-                    let expanded = self.chat.app.expanded_monitor_sessions();
-                    if !expanded.is_empty() {
-                        let child_id = expanded[self.child_refresh_cursor % expanded.len()];
-                        self.child_refresh_cursor = self.child_refresh_cursor.wrapping_add(1);
-                        self.chat
-                            .start_effect(super::effects::TuiEffect::LoadChildActivity {
-                                session_id: child_id,
-                                generation: 0,
-                            });
-                    }
-                }
+                self.refresh_child_monitor(now);
                 super::invalidation::UiInvalidation::None
             }
             "bcode.theme_reload" => {
@@ -3301,6 +3364,10 @@ pub enum BcodeRuntimeScreen {
     /// Session-owned plugin interaction surface.
     InteractiveSurface,
 }
+
+#[cfg(test)]
+#[path = "child_product_tests.rs"]
+mod child_product_tests;
 
 #[cfg(test)]
 mod tests {
@@ -5402,7 +5469,7 @@ mod tests {
         }
     }
 
-    fn root_test_model_with_history(
+    pub(super) fn root_test_model_with_history(
         session_id: bcode_session_models::SessionId,
         history: &[bcode_session_models::SessionEvent],
     ) -> super::BcodeRuntimeModel {

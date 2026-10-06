@@ -8,15 +8,7 @@ use super::*;
 async fn execution_candidate_is_staged_exactly_and_fenced_at_publication() {
     let (db, run, owner, link, definition, dispatch) = fixture().await;
     let activation = link.activation_id.clone();
-    let request = bcode_workflow::WorkflowExecutionContextRequest {
-        source_local: true,
-        output_id: None,
-        after_output_id: None,
-        expected_revision: Some(1),
-        after_node_id: None,
-        after_edge_id: None,
-        limit: 1,
-    };
+    let request = source_context_request();
     let (page, _, _) = execution_context_graph_page(&*db, &link, &owner, &request)
         .await
         .unwrap();
@@ -24,6 +16,11 @@ async fn execution_candidate_is_staged_exactly_and_fenced_at_publication() {
     assert_eq!(page.next_edge_id, Some(2));
     let mut end = definition.nodes["end"].clone();
     end.name = "changed pending".into();
+    end.kind = bcode_workflow::NodeKind::Agent;
+    end.configuration = serde_json::to_value(
+        bcode_workflow::WorkflowPromptConfiguration::preserve_input("build", "observe"),
+    )
+    .unwrap();
     let batch = WorkflowRunGraphEditBatch {
         version: bcode_workflow::WORKFLOW_RUN_GRAPH_EDIT_VERSION,
         run_id: run.run_id.clone(),
@@ -43,6 +40,7 @@ async fn execution_candidate_is_staged_exactly_and_fenced_at_publication() {
             .await
             .is_err()
     );
+    assert_forged_parent_rejected(&*db, &batch, &owner, &link).await;
     assert!(
         stage_run_graph_edit_from_execution(&*db, &batch, &owner, &link, 3)
             .await
@@ -76,6 +74,7 @@ async fn execution_candidate_is_staged_exactly_and_fenced_at_publication() {
             .unwrap(),
         2
     );
+    assert_committed_prompt_parent(&*db, &run.run_id, &batch, &owner, &link).await;
     assert!(
         execution_context_graph_page(&*db, &link, &owner, &request)
             .await
@@ -195,4 +194,63 @@ async fn fixture_with_sibling(
     .await
     .unwrap();
     (db, run, owner, link, definition, dispatch)
+}
+
+async fn assert_committed_prompt_parent(
+    db: &dyn Database,
+    run: &str,
+    batch: &WorkflowRunGraphEditBatch,
+    owner: &WorkflowExecutionAuthority,
+    link: &WorkflowExecutionSessionLink,
+) {
+    let node = super::super::graph_pages::node(db, run, 2, "end")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        node.configuration["execution_parent"]["session_id"],
+        link.session_id
+    );
+    assert_eq!(
+        staged(db, run, &batch.mutation_id, owner).await.unwrap(),
+        Some(batch.clone())
+    );
+}
+
+async fn assert_forged_parent_rejected(
+    db: &dyn Database,
+    batch: &WorkflowRunGraphEditBatch,
+    owner: &WorkflowExecutionAuthority,
+    link: &WorkflowExecutionSessionLink,
+) {
+    let mut forged = batch.clone();
+    if let bcode_workflow::WorkflowRunGraphEdit::ReplaceNode { node, .. } = &mut forged.edits[0] {
+        node.kind = bcode_workflow::NodeKind::Agent;
+        node.configuration = serde_json::to_value(
+            bcode_workflow::WorkflowPromptConfiguration::preserve_input("build", "observe"),
+        )
+        .unwrap();
+        node.configuration.as_object_mut().unwrap().insert(
+            "execution_parent".into(),
+            serde_json::json!({"version": 1, "session_id": link.session_id}),
+        );
+        node.validate_structure().unwrap();
+    }
+    assert!(
+        stage_run_graph_edit_from_execution(db, &forged, owner, link, 3)
+            .await
+            .is_err()
+    );
+}
+
+fn source_context_request() -> bcode_workflow::WorkflowExecutionContextRequest {
+    bcode_workflow::WorkflowExecutionContextRequest {
+        source_local: true,
+        output_id: None,
+        after_output_id: None,
+        expected_revision: Some(1),
+        after_node_id: None,
+        after_edge_id: None,
+        limit: 1,
+    }
 }

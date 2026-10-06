@@ -94,6 +94,28 @@ pub struct SessionActivity {
     pub parent_id: Option<SessionId>,
     /// Concurrent activity facts, not a scalar winner chosen by presentation.
     pub states: Vec<SessionActivityState>,
+    /// Optional own-session evidence; never an aggregate subtree count.
+    #[serde(default)]
+    pub evidence: Option<SessionActivityEvidence>,
+}
+
+/// Bounded normalized activity evidence for one session only.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionActivityEvidence {
+    /// Observed executing operations.
+    pub running: u32,
+    /// Observed queued operations.
+    pub queued: u32,
+    /// Observed pending permission decisions.
+    pub permission_waits: u32,
+    /// Observed pending user-input requests.
+    pub input_waits: u32,
+    /// Whether these own-session counts cover the complete observation.
+    pub counts_complete: bool,
+    /// Canonical event checkpoint of this observation, when available.
+    pub observed_event_sequence: Option<u64>,
+    /// Optional bounded normalized runtime label, not raw tool arguments.
+    pub current_operation: Option<String>,
 }
 
 /// Observation coverage, separate from the presence of a pagination cursor.
@@ -123,4 +145,13 @@ pub struct SessionActivityPage {
     pub observed_at_ms: u64,
     /// Reasons for partial or degraded coverage.
     pub issues: Vec<String>,
+}
+
+/// Result of explicit relationship maintenance; canonical parent checkpoint is authoritative.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionChildReconciliation {
+    /// Parent whose canonical relationship set was reconciled.
+    pub parent_id: SessionId,
+    /// Verified direct children observed by maintenance.
+    pub verified_children: usize,
 }

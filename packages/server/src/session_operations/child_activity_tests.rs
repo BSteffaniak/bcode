@@ -25,7 +25,11 @@ async fn nonresident_session_is_unknown_without_installing_scheduler() {
     .await
     .unwrap();
     let no_scheduler = state.session_runtimes.lock().await.is_empty();
-    let no_work = !state.runtime_work.has_active_for_session(summary.id).await;
+    let no_work = state
+        .runtime_work
+        .activity_count_for_session(summary.id, 1)
+        .await
+        == (0, true);
     drop(state);
     assert_eq!(page.own.states, vec![SessionActivityState::Unknown]);
     assert_eq!(page.coverage, SessionActivityCoverage::Degraded);

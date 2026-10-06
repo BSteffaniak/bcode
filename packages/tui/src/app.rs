@@ -373,10 +373,11 @@ struct SavedSessionReadingPosition {
 /// State owned by the terminal user interface.
 #[derive(Debug, Clone)]
 pub struct BmuxApp {
+    pending_session_link: Option<SessionId>,
     child_request_fence: crate::child_request_fence::ChildRequestFence,
     child_activity: Option<bcode_session_models::SessionActivityPage>,
     child_activity_error: Option<String>,
-    child_panel_open: bool,
+    child_panel: ChildPanelPresentation,
     child_panel_selected: usize,
     child_summaries: Vec<bcode_session_models::SessionSummary>,
     child_expanded: BTreeSet<bcode_session_view::navigation::SessionNavigationKey>,
@@ -559,13 +560,27 @@ impl BmuxApp {
         input_history: &[SessionInputHistoryEntry],
         has_older_history: bool,
     ) -> Self {
+        Self::initial_session_state(
+            session_id,
+            input_history,
+            OlderHistoryState::new(history, has_older_history),
+        )
+        .with_initial_history(history)
+    }
+
+    fn initial_session_state(
+        session_id: Option<SessionId>,
+        input_history: &[SessionInputHistoryEntry],
+        older_history: OlderHistoryState,
+    ) -> Self {
         let now = Instant::now();
         let initial_theme = super::theme::resolve_initial_theme();
-        let app = Self {
+        Self {
+            pending_session_link: None,
             child_request_fence: crate::child_request_fence::ChildRequestFence::default(),
             child_activity: None,
             child_activity_error: None,
-            child_panel_open: false,
+            child_panel: ChildPanelPresentation::Hidden,
             child_panel_selected: 0,
             child_summaries: Vec::new(),
             child_expanded: BTreeSet::new(),
@@ -632,7 +647,7 @@ impl BmuxApp {
             assistant_scroll_anchor: AssistantScrollAnchorState::Idle,
             pending_assistant_stream_anchor: false,
             pending_transcript_top_anchor_sequence: None,
-            older_history: OlderHistoryState::new(history, has_older_history),
+            older_history,
             activity: ActivityState::Idle,
             activity_started_at: now,
             daemon_connection: DaemonConnectionState::Connecting,
@@ -657,8 +672,7 @@ impl BmuxApp {
             markdown_fragment_rows: BTreeMap::new(),
             #[cfg(test)]
             last_transcript_damage: TranscriptDocumentDamage::None,
-        };
-        app.with_initial_history(history)
+        }
     }
 
     fn with_initial_history(mut self, history: &[SessionEvent]) -> Self {
@@ -1161,6 +1175,20 @@ impl BmuxApp {
             | None => return false,
         };
 
+        self.activate_markdown_link(destination)
+    }
+
+    fn activate_markdown_link(
+        &mut self,
+        destination: bcode_markdown_render::MarkdownDestination,
+    ) -> bool {
+        if let bcode_markdown_render::MarkdownDestination::Fragment(fragment) = &destination
+            && let Some(child) = fragment.strip_prefix("bcode-session-")
+            && let Ok(session_id) = child.parse()
+        {
+            self.pending_session_link = Some(session_id);
+            return true;
+        }
         match crate::markdown_activation::activate_markdown_destination(&destination) {
             Ok(crate::markdown_activation::MarkdownActivation::External) => {
                 self.set_status("Opened Markdown destination".to_owned());
@@ -1188,7 +1216,12 @@ impl BmuxApp {
             .map(|(id, source)| (id.as_str(), source.as_str()))
     }
 
-    /// Activate the currently focused Markdown contribution.
+    /// Consume an internal navigation action produced by a rendered semantic link.
+    pub(crate) const fn take_session_link_request(&mut self) -> Option<SessionId> {
+        self.pending_session_link.take()
+    }
+
+    /// Activate the currently focused visible Markdown contribution.
     pub fn activate_focused_markdown_contribution(&mut self) -> bool {
         let Some(contribution_id) = self.focused_markdown_contribution().map(str::to_owned) else {
             return false;
@@ -1353,8 +1386,10 @@ impl BmuxApp {
             }
             super::effects::TuiEffect::LoadChildActivity {
                 session_id,
+                after,
                 generation,
             } => {
+                *after = self.monitor_activity_cursor(*session_id);
                 *generation = self.child_request_fence.begin(true, *session_id);
                 true
             }
@@ -1379,7 +1414,25 @@ impl BmuxApp {
     ) {
         match result {
             Ok(page) => {
+                let now_ms = u64::try_from(
+                    std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_millis(),
+                )
+                .unwrap_or(u64::MAX);
+                self.session_view.observe_child_card_activity(&page, now_ms);
+                let selected = self.selected_monitor_session();
                 self.child_activity = Some(page);
+                if let Some(selected) = selected {
+                    self.child_panel_selected = self
+                        .monitor_tree()
+                        .rows
+                        .iter()
+                        .position(|row| self.child_summaries[row.source_index].id == selected)
+                        .unwrap_or(0);
+                }
+                self.apply_session_view_terminal_adapter();
                 self.child_activity_error = None;
             }
             Err(error) => {
@@ -1404,7 +1457,7 @@ impl BmuxApp {
                 .child_activity
                 .as_ref()
                 .is_some_and(|page| !page.descendants.is_empty());
-        if !relationship_known && !self.child_panel_open {
+        if !relationship_known && !self.child_panel_open() {
             return String::new();
         }
         let mut observed = BTreeMap::new();
@@ -1449,15 +1502,32 @@ impl BmuxApp {
         })
     }
 
-    /// Toggle local monitor presentation without taking focus.
+    /// Toggle monitor visibility with explicitly requested keyboard focus.
     pub const fn toggle_child_panel(&mut self) {
-        self.child_panel_open = !self.child_panel_open;
+        self.child_panel = if self.child_panel_open() {
+            ChildPanelPresentation::Hidden
+        } else {
+            ChildPanelPresentation::Monitor
+        };
+    }
+
+    /// Release monitor keys without hiding its live overview.
+    pub const fn release_child_panel_focus(&mut self) {
+        if self.child_panel_open() {
+            self.child_panel = ChildPanelPresentation::Composer;
+        }
+    }
+
+    /// Whether explicit monitor navigation owns keys.
+    #[must_use]
+    pub const fn child_panel_focused(&self) -> bool {
+        matches!(self.child_panel, ChildPanelPresentation::Monitor)
     }
 
     /// Whether the local monitor accepts explicit navigation keys.
     #[must_use]
     pub const fn child_panel_open(&self) -> bool {
-        self.child_panel_open
+        !matches!(self.child_panel, ChildPanelPresentation::Hidden)
     }
 
     /// Merge explicitly requested child metadata, preserving selection and observed coverage.
@@ -1503,9 +1573,7 @@ impl BmuxApp {
             self.child_expanded.remove(
                 &bcode_session_view::navigation::SessionNavigationKey::from_summary(&evicted),
             );
-            if let Some(parent) = evicted.parent_id {
-                self.child_cursors.remove(&parent);
-            }
+            self.child_cursors.remove(&evicted.id);
         }
         self.child_cursors.retain(|id, _| {
             Some(*id) == self.session_id
@@ -1536,24 +1604,125 @@ impl BmuxApp {
             .collect()
     }
 
+    /// Rotating loaded discovery frontier includes collapsed coordinators; no recursive server scan.
+    #[must_use]
+    pub fn monitor_discovery_frontier(&self) -> Vec<SessionId> {
+        let mut frontier: Vec<_> = self
+            .child_summaries
+            .iter()
+            .map(|summary| summary.id)
+            .collect();
+        frontier.sort_unstable();
+        frontier
+    }
+
+    /// Loaded activity continuations are drained before the discovery window advances.
+    #[must_use]
+    pub fn monitor_pending_activity_sessions(&self) -> Vec<SessionId> {
+        self.child_pages
+            .iter()
+            .filter_map(|(id, page)| page.next_after.map(|_| *id))
+            .collect()
+    }
+
+    /// Continue the accepted bounded activity window; a terminal page restarts on the next refresh.
+    #[allow(clippy::must_use_candidate)] // Option carries the result-use contract.
+    pub fn monitor_activity_cursor(&self, session_id: SessionId) -> Option<SessionId> {
+        if self.session_id == Some(session_id) {
+            self.child_activity
+                .as_ref()
+                .and_then(|page| page.next_after)
+        } else {
+            self.child_pages
+                .get(&session_id)
+                .and_then(|page| page.next_after)
+        }
+    }
+
+    /// Resume the bounded direct-child frontier after sparse pages.
+    #[allow(clippy::must_use_candidate)] // Option already expresses the result-use contract.
+    pub fn monitor_frontier_cursor(&self, parent_id: SessionId) -> Option<SessionId> {
+        self.child_cursors.get(&parent_id).copied().flatten()
+    }
+
+    /// Surface failed coordinator observations without replacing accepted evidence with idle.
+    pub fn monitor_observation_failed(&mut self, session_id: SessionId, error: &str) {
+        self.child_activity_error = Some(format!("child {session_id}: stale/degraded · {error}"));
+    }
+
     /// Retain a bounded observation for an explicitly expanded coordinator.
     pub fn apply_monitor_activity(
         &mut self,
         session_id: SessionId,
         page: bcode_session_models::SessionActivityPage,
     ) {
+        let selected = self.selected_monitor_session();
+        if page
+            .descendants
+            .iter()
+            .any(bcode_session_view::child_activity::has_active_evidence)
+            && let Some(summary) = self
+                .child_summaries
+                .iter()
+                .find(|summary| summary.id == session_id)
+        {
+            self.child_expanded.insert(
+                bcode_session_view::navigation::SessionNavigationKey::from_summary(summary),
+            );
+        }
         self.child_pages.insert(session_id, page);
+        if let Some(selected) = selected {
+            self.child_panel_selected = self
+                .monitor_tree()
+                .rows
+                .iter()
+                .position(|row| self.child_summaries[row.source_index].id == selected)
+                .unwrap_or(0);
+        }
         self.child_pages
             .retain(|id, _| self.child_summaries.iter().any(|summary| summary.id == *id));
     }
 
     fn monitor_tree(&self) -> bcode_session_view::navigation::SessionTreeProjection {
-        bcode_session_view::navigation::project_session_tree(
+        let mut tree = bcode_session_view::navigation::project_session_tree(
             &self.child_summaries,
             &self.child_expanded,
             None,
             self.child_summaries.len(),
-        )
+        );
+        let observations = bcode_session_view::child_attention::newest_observations(
+            self.child_activity.iter().chain(self.child_pages.values()),
+        );
+        // Sort sibling groups, preserving preorder and ancestry. Priority belongs to the shared
+        // semantic evidence policy, never a renderer's interpretation of event logs.
+        let mut ranks: BTreeMap<usize, u8> = BTreeMap::new();
+        for row in &tree.rows {
+            let id = self.child_summaries[row.source_index].id;
+            ranks.insert(
+                row.source_index,
+                observations.get(&id).map_or(3, |(activity, _)| {
+                    bcode_session_view::child_attention::attention_rank(activity)
+                }),
+            );
+        }
+        // Roots may be detached after eviction; stable partition keeps each descendant block
+        // with its ancestor instead of flattening the semantic hierarchy.
+        let mut blocks = Vec::new();
+        for row in tree.rows {
+            if row.depth == 0 || blocks.is_empty() {
+                blocks.push(Vec::new());
+            }
+            blocks.last_mut().expect("root block exists").push(row);
+        }
+        blocks.sort_by_key(|block| {
+            block
+                .iter()
+                .map(|row| ranks[&row.source_index])
+                .min()
+                .unwrap_or(3)
+        });
+        tree.rows = blocks.into_iter().flatten().collect();
+        tree
     }
 
     /// Selected child identity for ordinary application-boundary opening.
@@ -1614,6 +1783,12 @@ impl BmuxApp {
             })
     }
 
+    /// Return the focused selection row within the bounded visible preview.
+    #[must_use]
+    pub fn monitor_selected_preview_row(&self) -> usize {
+        self.child_panel_selected.min(4).saturating_add(1)
+    }
+
     pub(crate) fn monitor_row_session(&self, row: usize) -> Option<SessionId> {
         if row == 0 || row > 8 {
             return None;
@@ -1631,30 +1806,70 @@ impl BmuxApp {
     /// Bounded accepted observation rows; selection scrolls the preview rather than imposing a total limit.
     #[must_use]
     pub fn child_panel_rows(&self) -> Vec<String> {
-        if !self.child_panel_open {
+        if !self.child_panel_open() {
             return Vec::new();
         }
+        let overview = self.child_activity.as_ref().map_or_else(
+            || "Attention unknown · descendants unscanned".to_owned(),
+            |root| {
+                bcode_session_view::child_attention::overview_label(
+                    root,
+                    self.child_activity.iter().chain(self.child_pages.values()),
+                )
+            },
+        );
         let mut rows = vec![format!(
-            "{} · ↑↓ select Enter open → expand ← parent Alt-N more Ctrl-G close · typing stays in composer",
-            self.child_activity_text()
+            "{overview} · {}",
+            if self.child_panel_focused() {
+                "MONITOR FOCUS · ↑↓ select Enter open → expand ← parent Alt-N more · Esc composer"
+            } else {
+                "COMPOSER FOCUS · click a child to open · Ctrl-G close"
+            }
         )];
         let tree = self.monitor_tree();
         let start = self.child_panel_selected.saturating_sub(4);
+        let observations = bcode_session_view::child_attention::newest_observations(
+            self.child_activity.iter().chain(self.child_pages.values()),
+        );
+        let now_ms = u64::try_from(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis(),
+        )
+        .unwrap_or(u64::MAX);
         for (index, row) in tree.rows.iter().enumerate().skip(start).take(8) {
             let summary = &self.child_summaries[row.source_index];
-            let activity = self
-                .child_pages
-                .values()
-                .flat_map(|page| std::iter::once(&page.own).chain(page.descendants.iter()))
-                .chain(
-                    self.child_activity
-                        .iter()
-                        .flat_map(|page| page.descendants.iter()),
-                )
-                .find(|activity| activity.session_id == summary.id);
-            let evidence = activity.map_or_else(
-                || "unknown".to_owned(),
-                bcode_session_view::child_activity::activity_evidence_label,
+            let evidence = observations.get(&summary.id).map_or_else(
+                || "unknown · unscanned".to_owned(),
+                |(activity, observed)| {
+                    let operation = activity
+                        .evidence
+                        .as_ref()
+                        .and_then(|evidence| evidence.current_operation.as_deref())
+                        .map_or(String::new(), |label| format!(" · {label}"));
+                    let nested = self.child_pages.get(&summary.id).map_or(0, |page| {
+                        page.descendants
+                            .iter()
+                            .filter(|child| {
+                                bcode_session_view::child_activity::has_active_evidence(child)
+                            })
+                            .count()
+                    });
+                    format!(
+                        "{}{}{} · {}",
+                        bcode_session_view::child_activity::activity_evidence_label(activity),
+                        operation,
+                        if nested > 0 {
+                            format!(" · {nested} known active descendants")
+                        } else {
+                            String::new()
+                        },
+                        bcode_session_view::child_attention::observation_age_label(
+                            *observed, now_ms
+                        )
+                    )
+                },
             );
             let depth = if row.depth > 4 {
                 format!("[{}] ", row.depth)
@@ -1673,8 +1888,12 @@ impl BmuxApp {
         }
         if let Some(page) = &self.child_activity {
             rows.push(format!(
-                "observed {} ms · assignment acceptance unavailable",
-                page.observed_at_ms
+                "own: {} · {} · descendants partial · acceptance unavailable",
+                bcode_session_view::child_activity::activity_evidence_label(&page.own),
+                bcode_session_view::child_attention::observation_age_label(
+                    page.observed_at_ms,
+                    now_ms
+                )
             ));
             rows.extend(page.issues.iter().take(2).cloned());
         }
@@ -5667,7 +5886,8 @@ const fn event_breaks_sticky_entry_anchor(event: &SessionEvent) -> bool {
 
 const fn event_affects_transcript_rows(event: &SessionEvent) -> bool {
     match &event.kind {
-        SessionEventKind::ChildSessionCreated { .. }
+        SessionEventKind::SessionChildPublished { .. }
+        | SessionEventKind::ChildSessionCreated { .. }
         | SessionEventKind::SubmissionAccepted { .. }
         | SessionEventKind::SubmissionActivated { .. }
         | SessionEventKind::SubmissionCancelled { .. }
@@ -5708,7 +5928,9 @@ const fn event_affects_transcript_rows(event: &SessionEvent) -> bool {
         | SessionEventKind::ModelTurnFinished { .. }
         | SessionEventKind::InertHistory { .. } => true,
         SessionEventKind::SkillSuggested { reason, .. } => reason.is_some(),
-        SessionEventKind::SessionCreated { .. }
+        SessionEventKind::SessionChildrenReconciled { .. }
+        | SessionEventKind::SessionChildLinked { .. }
+        | SessionEventKind::SessionCreated { .. }
         | SessionEventKind::ClientAttached { .. }
         | SessionEventKind::ClientDetached { .. }
         | SessionEventKind::ModelChanged { .. }
@@ -9970,4 +10192,12 @@ mod tests {
         drop(app);
         assert!(transcript_empty);
     }
+}
+
+/// Local monitor presentation and keyboard ownership.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ChildPanelPresentation {
+    Hidden,
+    Composer,
+    Monitor,
 }

@@ -9,6 +9,7 @@
 
 mod actions;
 pub mod child_activity;
+pub mod child_attention;
 pub mod navigation;
 pub mod presentation;
 
@@ -1149,6 +1150,28 @@ impl SessionView {
                 self.snapshot.title.clone_from(name);
                 self.snapshot.working_directory = Some(working_directory.clone());
                 self.bump_revision();
+            }
+            SessionEventKind::SessionChildPublished { child_id, title } => {
+                let id = TranscriptViewItemId::new(format!("child-session:{child_id}"));
+                if !self
+                    .snapshot
+                    .transcript
+                    .items
+                    .iter()
+                    .any(|item| item.id == id)
+                {
+                    let title = title
+                        .as_deref()
+                        .unwrap_or("Untitled child")
+                        .replace('\\', "\\\\")
+                        .replace('[', "\\[")
+                        .replace(']', "\\]")
+                        .replace(['\n', '\r'], " ");
+                    self.push_item(id, event.sequence, Some(event.timestamp_ms), false,
+                        TranscriptViewItemKind::SystemMessage {
+                            message: ChatMessageView::markdown(format!("### Child session\n\n[{title}](#bcode-session-{child_id})\n\nPublished · activity unobserved · assignment acceptance unavailable")),
+                        });
+                }
             }
             SessionEventKind::ChildSessionCreated { request } => {
                 self.push_item(TranscriptViewItemId::event(event.sequence), event.sequence,
@@ -2345,6 +2368,45 @@ impl SessionView {
                 self.bump_revision();
             }
             _ => {}
+        }
+    }
+
+    /// Update ephemeral evidence on canonical child cards without appending transcript noise.
+    pub fn observe_child_card_activity(
+        &mut self,
+        page: &bcode_session_models::SessionActivityPage,
+        now_ms: u64,
+    ) {
+        let mut changed = false;
+        for activity in &page.descendants {
+            let id = TranscriptViewItemId::new(format!("child-session:{}", activity.session_id));
+            if let Some(item) = self
+                .snapshot
+                .transcript
+                .items
+                .iter_mut()
+                .find(|item| item.id == id)
+                && let TranscriptViewItemKind::SystemMessage { message } = &mut item.kind
+            {
+                let title = message
+                    .text
+                    .split("\n\n")
+                    .nth(1)
+                    .unwrap_or("Child session")
+                    .to_owned();
+                let text = format!(
+                    "### Child session\n\n{title}\n\nPublished · {} · {} · assignment acceptance unavailable",
+                    child_activity::activity_evidence_label(activity),
+                    child_attention::observation_age_label(page.observed_at_ms, now_ms)
+                );
+                if message.text != text {
+                    message.text = text;
+                    changed = true;
+                }
+            }
+        }
+        if changed {
+            self.bump_revision();
         }
     }
 

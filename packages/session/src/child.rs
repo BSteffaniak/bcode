@@ -6,7 +6,57 @@ use bcode_session_models::{
     SessionChildQuery, SessionEvent, SessionEventKind, SessionId, SessionSummary,
 };
 use std::fs::{self, File};
-use std::ops::Bound::{Excluded, Unbounded};
+use std::ops::Bound::{Excluded, Included};
+
+fn child_staging_path(
+    root: &std::path::Path,
+    request: &SessionChildCreateRequest,
+) -> Result<std::path::PathBuf, SessionError> {
+    let parent = root.join(".child-staging");
+    if parent.exists() && !fs::symlink_metadata(&parent)?.is_dir() {
+        return Err(invalid("child staging root is not a regular directory"));
+    }
+    let staging = parent.join(request.child_id.to_string());
+    prepare_child_staging(&staging, request)?;
+    Ok(staging)
+}
+
+fn prepare_child_staging(
+    staging: &std::path::Path,
+    request: &SessionChildCreateRequest,
+) -> Result<(), SessionError> {
+    if staging.exists() {
+        if fs::symlink_metadata(staging)?.file_type().is_symlink() {
+            return Err(invalid("child staging path is a symlink"));
+        }
+        let retained: SessionChildCreateRequest = serde_json::from_slice(&fs::read(
+            staging.join("request.json"),
+        )?)
+        .map_err(|_| {
+            invalid(
+                "interrupted child staging request is unverifiable; explicit maintenance required",
+            )
+        })?;
+        if &retained != request {
+            return Err(invalid(
+                "child identity conflicts with interrupted creation request",
+            ));
+        }
+        // The staging session was never canonical. Exclusive verified ownership permits restart.
+        fs::remove_dir_all(staging)?;
+    }
+    fs::create_dir_all(staging)?;
+    let request_path = staging.join("request.json");
+    fs::write(
+        request_path.with_extension("tmp"),
+        serde_json::to_vec(request).map_err(|error| invalid(error.to_string()))?,
+    )?;
+    File::open(request_path.with_extension("tmp"))?.sync_all()?;
+    fs::rename(request_path.with_extension("tmp"), &request_path)?;
+    File::open(&request_path)?.sync_all()?;
+    File::open(staging)?.sync_all()?;
+    Ok(())
+}
 
 fn invalid(message: impl Into<String>) -> SessionError {
     SessionError::EventSerialization(message.into())
@@ -68,10 +118,9 @@ impl SessionManager {
 
     /// Read a bounded indexed child window without loading the catalog or owning sessions.
     ///
-    /// At most `limit` candidate projections are inspected. Empty pages can have a cursor.
-    /// Persistent discovery has no cross-store completeness checkpoint: its coverage is explicitly
-    /// incomplete even when the loaded candidate catalog is exhausted. A cursor is pagination,
-    /// not degradation. Consumers must not interpret exhausted incomplete coverage as no children.
+    /// At most `limit` child projections are inspected. The parent-local canonical checkpoint
+    /// establishes coverage independently of pagination. Unresolved publication intents or
+    /// historical/missing/damaged projection state remain incomplete until explicit maintenance.
     ///
     /// # Errors
     /// Returns an error for an invalid work budget; individual observation failures are page issues.
@@ -84,61 +133,63 @@ impl SessionManager {
         }
         self.session_summary_non_owning(query.parent_id).await?;
         let mut index_issue = None;
+        let coverage;
         let candidates = if let Some(store) = &self.store {
-            let root = store.root_path();
-            if root.join("catalog.db").exists() {
-                if let Ok(catalog) = db::GlobalSessionDb::open_existing_turso_in_root(&root).await {
-                    let result = catalog
-                        .child_session_ids_page(query.parent_id, query.after, query.limit + 1)
-                        .await;
-                    let close = catalog.close().await;
-                    if let (Ok(ids), Ok(())) = (result, close) {
-                        ids
-                    } else {
-                        index_issue = Some("child catalog is damaged, stale, or incompatible; explicit maintenance required".to_owned());
-                        Vec::new()
-                    }
-                } else {
-                    index_issue = Some(
-                        "child catalog cannot be verified; explicit maintenance required"
-                            .to_owned(),
-                    );
-                    Vec::new()
+            let database =
+                db::SessionDb::open_existing_turso_in_root(query.parent_id, &store.root_path())
+                    .await?;
+            let result = database
+                .direct_child_page(query.after, query.limit + 1)
+                .await;
+            let close = database.close().await;
+            if let (Ok((ids, complete)), Ok(())) = (result, close) {
+                coverage = complete;
+                if !complete {
+                    index_issue = Some("parent child publication is pending or historical coverage requires explicit reconciliation".into());
                 }
+                ids
             } else {
-                index_issue = Some(
-                    "child catalog is missing; explicit discovery/maintenance required".to_owned(),
-                );
+                coverage = false;
+                index_issue = Some("parent child index is missing, stale, or corrupt; explicit maintenance required".into());
                 Vec::new()
             }
         } else {
-            let inner = self.inner.lock().await;
-            inner
-                .sessions
-                .range((query.after.map_or(Unbounded, Excluded), Unbounded))
+            let receipts = self.child_receipts.lock().await;
+            let first = SessionId(uuid::Uuid::nil());
+            let last = SessionId(uuid::Uuid::from_u128(u128::MAX));
+            let start = query
+                .after
+                .map_or(Included((query.parent_id, first)), |id| {
+                    Excluded((query.parent_id, id))
+                });
+            let end = Included((query.parent_id, last));
+            let selected = receipts
+                .range((start, end))
                 .take(query.limit + 1)
-                .map(|(id, _)| *id)
-                .collect::<Vec<_>>()
+                .map(|((_, id), _)| *id)
+                .collect::<Vec<_>>();
+            coverage = self
+                .pending_child_counts
+                .lock()
+                .await
+                .get(&query.parent_id)
+                .copied()
+                .unwrap_or(0)
+                == 0;
+            if !coverage {
+                index_issue = Some("parent child publication is pending".into());
+            }
+            selected
         };
         let has_more = candidates.len() > query.limit;
         let mut page = SessionChildPage {
             children: Vec::new(),
             next_after: None,
-            complete: self.store.is_none() && self.catalog_loaded(),
+            complete: coverage,
             issues: Vec::new(),
         };
         if let Some(issue) = index_issue {
             page.issues.push(issue);
-        }
-        if self.store.is_some() {
-            page.issues.push("persistent catalog has no verified cross-session completeness checkpoint; missing or stale entries may be omitted".into());
-        }
-        if !self.catalog_loaded() {
-            page.complete = false;
-            page.issues.push(format!(
-                "catalog discovery is not complete: {:?}",
-                self.catalog_status()
-            ));
         }
         for id in candidates.into_iter().take(query.limit) {
             if has_more {
@@ -176,10 +227,121 @@ impl SessionManager {
     /// Returns an error for self-parenting, conflicting identity reuse, unavailable parent,
     /// unverifiable ownership, or damaged/incompatible storage. A failed derived-catalog update
     /// cannot change the already published canonical relationship.
-    #[allow(clippy::too_many_lines)]
     pub async fn create_child_session(
         &self,
+        request: SessionChildCreateRequest,
+    ) -> Result<SessionSummary, SessionError> {
+        self.create_child_session_inner(request, None).await
+    }
+
+    /// Create a fresh background execution child with explicit immediate parent.
+    /// # Errors
+    /// Fails for invalid provenance, conflicting retries, or publication/storage failures.
+    pub async fn create_child_execution_session(
+        &self,
+        request: SessionChildCreateRequest,
+        provenance: crate::ExecutionSessionProvenance,
+    ) -> Result<SessionSummary, SessionError> {
+        crate::validate_execution_session_provenance(Some(&provenance))?;
+        if provenance.context_mode
+            != bcode_session_models::ExecutionSessionContextMode::FreshIsolated
+        {
+            return Err(invalid(
+                "explicit-parent execution creation currently supports fresh isolated context only",
+            ));
+        }
+        self.create_child_session_inner(request, Some(provenance))
+            .await
+    }
+
+    /// Derive a context-preserving execution child from an admitted stable prefix, including worktrees.
+    /// Immediate tree parent and provenance source remain independent. Retain the child ID on retries.
+    /// # Errors
+    /// Fails for invalid provenance, conflicting identity, unavailable source prefix, or publication failure.
+    pub async fn create_pinned_child_execution_session(
+        &self,
         mut request: SessionChildCreateRequest,
+        mut provenance: crate::ExecutionSessionProvenance,
+        parent_generation: u64,
+    ) -> Result<SessionSummary, SessionError> {
+        request.working_directory = normalize_working_directory(&request.working_directory);
+        if request.parent_id == request.child_id {
+            return Err(invalid("child cannot parent itself"));
+        }
+        provenance.context_mode =
+            bcode_session_models::ExecutionSessionContextMode::FixedGenerationFork;
+        provenance.parent_generation = Some(parent_generation);
+        crate::validate_execution_session_provenance(Some(&provenance))?;
+        let root = self
+            .session_store_root()
+            .ok_or_else(|| invalid("pinned child requires persistent storage"))?;
+        validate_session_path(&root, request.child_id)?;
+        self.session_summary_non_owning(request.parent_id).await?;
+        if db::session_dir_path(&root, request.child_id).exists() {
+            let database =
+                db::SessionDb::open_existing_turso_in_root(request.child_id, &root).await?;
+            let result: Result<SessionSummary, SessionError> = async {
+                verify_request(&database.events_range(0, 1, 2).await?, &request)?;
+                let summary = self
+                    .load_db_session_state(request.child_id, &database)
+                    .await?
+                    .summary();
+                if summary
+                    .execution
+                    .as_ref()
+                    .map(|execution| &execution.provenance)
+                    != Some(&provenance)
+                {
+                    return Err(invalid(
+                        "pinned execution provenance conflicts with original creation",
+                    ));
+                }
+                Ok(summary)
+            }
+            .await;
+            let close = database.close().await;
+            let summary = result?;
+            close?;
+            self.link_child_session(request.parent_id, request.child_id)
+                .await?;
+            return Ok(summary);
+        }
+        let source = self
+            .session_summary_non_owning(provenance.parent_session_id)
+            .await?;
+        let mut derivation = Self::execution_derivation_request(
+            request.name.clone(),
+            &provenance,
+            &source,
+            parent_generation,
+        );
+        derivation.operation_id =
+            bcode_session_models::SessionDerivationOperationId(request.child_id.0);
+        derivation.idempotency_key = format!("execution-child:{}", request.child_id);
+        derivation.source_policy =
+            bcode_session_models::SessionDerivationSourcePolicy::StablePrefix;
+        derivation.destination_working_directory = Some(request.working_directory.clone());
+        self.record_child_link(request.parent_id, request.child_id, false)
+            .await?;
+        let ownership = lease::acquire_session_maintenance_guard(&root, request.child_id)?;
+        let outcome = self
+            .derive_session_with_execution(derivation, Some(provenance), Some(request.clone()))
+            .await;
+        drop(ownership);
+        let bcode_session_models::SessionDerivationTerminalOutcome::Succeeded { session } =
+            outcome?
+        else {
+            return Err(invalid("pinned execution child derivation did not succeed"));
+        };
+        self.link_child_session(request.parent_id, request.child_id)
+            .await?;
+        Ok(*session)
+    }
+
+    async fn create_child_session_inner(
+        &self,
+        mut request: SessionChildCreateRequest,
+        execution: Option<crate::ExecutionSessionProvenance>,
     ) -> Result<SessionSummary, SessionError> {
         request.working_directory = normalize_working_directory(&request.working_directory);
         if request.child_id == request.parent_id {
@@ -205,22 +367,40 @@ impl SessionManager {
             if let Some(handle) = existing {
                 let events = handle.events_range(0, 1, 2).await?;
                 verify_request(&events, &request)?;
-                return Ok(handle.snapshot().summary);
+                let summary = handle.snapshot().summary;
+                self.link_child_session(request.parent_id, request.child_id)
+                    .await?;
+                return Ok(summary);
             }
             self.session_summary_non_owning(request.parent_id).await?;
-            return self
+            self.record_child_link(request.parent_id, request.child_id, false)
+                .await?;
+            let summary = self
                 .create_session_record(
                     request.name.clone(),
                     request.working_directory.clone(),
-                    None,
-                    Some(request),
+                    execution,
+                    Some(request.clone()),
                 )
-                .await;
+                .await?;
+            self.link_child_session(request.parent_id, request.child_id)
+                .await?;
+            return Ok(summary);
         };
         let root = store.root_path();
         validate_session_path(&root, request.child_id)?;
         validate_session_path(&root, request.parent_id)?;
+        if db::session_dir_path(&root, request.child_id).exists() {
+            let child = self.session_summary_non_owning(request.child_id).await?;
+            if child.parent_id != Some(request.parent_id) {
+                return Err(invalid(
+                    "child identity already belongs to a different parent",
+                ));
+            }
+        }
         // This guard verifies all live owners and serializes both publication and crash recovery.
+        self.record_child_link(request.parent_id, request.child_id, false)
+            .await?;
         let ownership = lease::acquire_session_maintenance_guard(&root, request.child_id)?;
         let canonical = db::session_dir_path(&root, request.child_id);
         if canonical.exists() {
@@ -238,42 +418,39 @@ impl SessionManager {
             let close = database.close().await;
             let summary = result?;
             close?;
+            if summary.execution.as_ref().map(|value| &value.provenance) != execution.as_ref() {
+                return Err(invalid(
+                    "child execution provenance conflicts with original creation",
+                ));
+            }
             drop(ownership);
+            self.link_child_session(request.parent_id, request.child_id)
+                .await?;
             self.register_child_summary(summary.clone()).await;
             return Ok(summary);
         }
         // Only exact local canonical storage establishes the parent; catalog metadata is not authority.
         self.session_summary_non_owning(request.parent_id).await?;
-        let staging_parent = root.join(".child-staging");
-        if staging_parent.exists() && !fs::symlink_metadata(&staging_parent)?.is_dir() {
-            return Err(invalid("child staging root is not a regular directory"));
-        }
-        let staging = staging_parent.join(request.child_id.to_string());
-        if staging.exists() {
-            if fs::symlink_metadata(&staging)?.file_type().is_symlink() {
-                return Err(invalid("child staging path is a symlink"));
-            }
-            let retained: SessionChildCreateRequest = serde_json::from_slice(&fs::read(staging.join("request.json"))?)
-                .map_err(|_| invalid("interrupted child staging request is unverifiable; explicit maintenance required"))?;
-            if retained != request {
-                return Err(invalid(
-                    "child identity conflicts with interrupted creation request",
-                ));
-            }
-            // The staging session was never canonical. Exclusive verified ownership permits restart.
-            fs::remove_dir_all(&staging)?;
-        }
-        fs::create_dir_all(&staging)?;
-        let request_path = staging.join("request.json");
-        fs::write(
-            request_path.with_extension("tmp"),
-            serde_json::to_vec(&request).map_err(|error| invalid(error.to_string()))?,
-        )?;
-        File::open(request_path.with_extension("tmp"))?.sync_all()?;
-        fs::rename(request_path.with_extension("tmp"), &request_path)?;
-        File::open(&request_path)?.sync_all()?;
-        File::open(&staging)?.sync_all()?;
-        let database = db::SessionDb::initialize_turso_in_root(request.child_id, &staging).await?;
+        let staging = child_staging_path(&root, &request)?;
+        let summary = self
+            .prepare_child_storage(&staging, &request, execution.as_ref())
+            .await?;
+        fs::rename(db::session_dir_path(&staging, request.child_id), &canonical)?;
+        File::open(&root)?.sync_all()?;
+        drop(ownership);
+        self.link_child_session(request.parent_id, request.child_id)
+            .await?;
+        self.register_child_summary(summary.clone()).await;
+        Ok(summary)
+    }
+
+    async fn prepare_child_storage(
+        &self,
+        staging: &std::path::Path,
+        request: &SessionChildCreateRequest,
+        execution: Option<&crate::ExecutionSessionProvenance>,
+    ) -> Result<SessionSummary, SessionError> {
+        let database = db::SessionDb::initialize_turso_in_root(request.child_id, staging).await?;
         let now = self.next_activity_timestamp_ms();
         let created = SessionEvent {
             schema_version: CURRENT_SESSION_EVENT_SCHEMA_VERSION,
@@ -300,6 +477,20 @@ impl SessionManager {
             database
                 .append_event_batch(&[(created, Some(now)), (relationship, Some(now))])
                 .await?;
+            if let Some(provenance) = execution {
+                let event = SessionEvent {
+                    schema_version: CURRENT_SESSION_EVENT_SCHEMA_VERSION,
+                    sequence: 2,
+                    timestamp_ms: now,
+                    session_id: request.child_id,
+                    provenance: None,
+                    kind: SessionEventKind::ExecutionSessionCreated {
+                        provenance: Box::new(provenance.clone()),
+                        visibility: bcode_session_models::SessionVisibility::Background,
+                    },
+                };
+                database.append_event_batch(&[(event, Some(now))]).await?;
+            }
             database.validate_write_readiness().await?;
             Ok(self
                 .load_db_session_state(request.child_id, &database)
@@ -310,13 +501,154 @@ impl SessionManager {
         let close = database.close().await;
         let summary = result?;
         close?;
-        crate::derivation::write_staged_manifest(&staging, &summary)?;
-        fs::rename(db::session_dir_path(&staging, request.child_id), &canonical)?;
-        File::open(&root)?.sync_all()?;
-        // Preserve successful publication on cleanup/catalog failures; a retry verifies canonical facts.
-        drop(ownership);
-        self.register_child_summary(summary.clone()).await;
+        crate::derivation::write_staged_manifest(staging, &summary)?;
         Ok(summary)
+    }
+
+    /// Idempotently register a verified immediate child and acknowledge publication.
+    /// # Errors
+    /// Fails if child identity/parent cannot be verified or the parent writer cannot append.
+    pub async fn link_child_session(
+        &self,
+        parent_id: SessionId,
+        child_id: SessionId,
+    ) -> Result<(), SessionError> {
+        let child = self.session_summary_non_owning(child_id).await?;
+        if child.parent_id != Some(parent_id) {
+            return Err(invalid("child has a different immutable parent"));
+        }
+        self.record_child_link(parent_id, child_id, false).await?;
+        self.record_child_link(parent_id, child_id, true).await
+    }
+
+    async fn record_child_link(
+        &self,
+        parent: SessionId,
+        child: SessionId,
+        published: bool,
+    ) -> Result<(), SessionError> {
+        let handle = self.session_handle(parent).await?;
+        for _ in 0..8 {
+            let generation = self.current_session_generation(parent).await?;
+            let receipt = if let Some(store) = &self.store {
+                let database =
+                    db::SessionDb::open_existing_turso_in_root(parent, &store.root_path()).await?;
+                let result = database.child_publication_receipt(child).await;
+                let close = database.close().await;
+                let receipt = result?;
+                close?;
+                receipt
+            } else {
+                self.child_receipts
+                    .lock()
+                    .await
+                    .get(&(parent, child))
+                    .copied()
+            };
+            if receipt.is_some_and(|done| !published || done) {
+                return Ok(());
+            }
+            let kind = if published {
+                let summary = self.session_summary_non_owning(child).await?;
+                if summary.parent_id != Some(parent) {
+                    return Err(invalid("publication parent mismatch"));
+                }
+                SessionEventKind::SessionChildPublished {
+                    child_id: child,
+                    title: summary
+                        .name
+                        .map(|name| crate::bounded_utf8_prefix(&name, 256).0),
+                }
+            } else {
+                SessionEventKind::SessionChildLinked { child_id: child }
+            };
+            match handle
+                .append_event_at_generation(kind, generation, self.next_activity_timestamp_ms())
+                .await
+            {
+                Ok(event) => {
+                    if self.store.is_none() {
+                        let previous = self
+                            .child_receipts
+                            .lock()
+                            .await
+                            .insert((parent, child), published);
+                        let mut counts = self.pending_child_counts.lock().await;
+                        let count = counts.entry(parent).or_default();
+                        if !published && previous.is_none() {
+                            *count += 1;
+                        }
+                        if published && previous == Some(false) {
+                            *count = count.saturating_sub(1);
+                        }
+                    }
+                    self.publish_committed_mutation(event, handle.snapshot().summary);
+                    return Ok(());
+                }
+                Err(SessionError::AppendGenerationChanged { .. }) => {}
+                Err(error) => return Err(error),
+            }
+        }
+        Err(invalid(
+            "parent changed during bounded child registration; retry identical request",
+        ))
+    }
+
+    /// Explicitly reconcile historical or damaged relationship projections under exclusive ownership.
+    /// This maintenance scans canonical directories and replays parent history; normal reads never do.
+    /// # Errors
+    /// Fails while any parent owner remains, on unverifiable storage, or unresolved publication intents.
+    pub async fn reconcile_child_relationships(
+        &self,
+        parent_id: SessionId,
+    ) -> Result<bcode_session_models::SessionChildReconciliation, SessionError> {
+        let store = self
+            .store
+            .as_ref()
+            .ok_or_else(|| invalid("relationship maintenance requires persistent storage"))?;
+        let root = store.root_path();
+        validate_session_path(&root, parent_id)?;
+        let maintenance = lease::acquire_session_maintenance_guard(&root, parent_id)?;
+        let _write = lease::acquire_maintenance_session_write_lock(&maintenance, &root, parent_id)?;
+        let database = db::SessionDb::open_existing_turso_in_root(parent_id, &root).await?;
+        let result: Result<bcode_session_models::SessionChildReconciliation, SessionError> = async {
+            database.rebuild_child_projection_for_maintenance().await?;
+            let mut verified = std::collections::BTreeMap::new();
+            for entry in fs::read_dir(&root)? {
+                let entry = entry?;
+                let Ok(id) = entry.file_name().to_string_lossy().parse::<SessionId>() else { continue; };
+                if id == parent_id { continue; }
+                let summary = self.session_summary_non_owning(id).await?;
+                if summary.parent_id == Some(parent_id) { verified.insert(id, summary.name); }
+            }
+            let mut cursor = None;
+            loop {
+                let (ids, _) = database.direct_child_page(cursor, 128).await?;
+                if ids.is_empty() { break; }
+                for id in &ids {
+                    if !verified.contains_key(id) { return Err(invalid("unresolved parent child intent requires explicit recovery of its original creation request")); }
+                }
+                cursor = ids.last().copied();
+            }
+            for (id, title) in &verified {
+                if database.child_publication_receipt(*id).await?.is_none() {
+                    append_maintenance_relationship(&database, parent_id, SessionEventKind::SessionChildLinked { child_id: *id }).await?;
+                }
+                if database.child_publication_receipt(*id).await? != Some(true) {
+                    append_maintenance_relationship(&database, parent_id, SessionEventKind::SessionChildPublished {
+                        child_id: *id, title: title.as_ref().map(|title| crate::bounded_utf8_prefix(title, 256).0),
+                    }).await?;
+                }
+            }
+            append_maintenance_relationship(&database, parent_id, SessionEventKind::SessionChildrenReconciled {
+                verified_children: u64::try_from(verified.len()).map_err(|_| invalid("child count overflow"))?,
+            }).await?;
+            Ok(bcode_session_models::SessionChildReconciliation { parent_id, verified_children: verified.len() })
+        }.await;
+        let close = database.close().await;
+        let outcome = result?;
+        close?;
+        Ok(outcome)
     }
 
     async fn register_child_summary(&self, summary: SessionSummary) {
@@ -336,6 +668,26 @@ impl SessionManager {
             store.flush_catalog_updates().await;
         }
     }
+}
+
+async fn append_maintenance_relationship(
+    database: &db::SessionDb,
+    parent: SessionId,
+    kind: SessionEventKind,
+) -> Result<(), SessionError> {
+    let event = SessionEvent {
+        schema_version: CURRENT_SESSION_EVENT_SCHEMA_VERSION,
+        sequence: database
+            .last_event_sequence()
+            .await?
+            .map_or(0, |tail| tail + 1),
+        timestamp_ms: crate::current_unix_millis(),
+        session_id: parent,
+        provenance: None,
+        kind,
+    };
+    database.append_event_batch(&[(event, None)]).await?;
+    Ok(())
 }
 
 fn validate_session_path(root: &std::path::Path, id: SessionId) -> Result<(), SessionError> {
@@ -414,6 +766,201 @@ mod tests {
             name: Some("child".into()),
             working_directory: std::env::current_dir().unwrap(),
         }
+    }
+
+    #[tokio::test]
+    async fn parent_checkpoint_pending_intent_retry_and_explicit_repair() {
+        let root = tempfile::tempdir().unwrap();
+        let manager = SessionManager::persistent(root.path()).unwrap();
+        let parent = manager
+            .create_session(None, std::env::current_dir().unwrap())
+            .await
+            .unwrap();
+        let query = SessionChildQuery {
+            parent_id: parent.id,
+            after: None,
+            limit: 1,
+        };
+        assert!(
+            manager
+                .query_child_sessions(query.clone())
+                .await
+                .unwrap()
+                .complete
+        );
+        let request = request(parent.id);
+        manager
+            .record_child_link(parent.id, request.child_id, false)
+            .await
+            .unwrap();
+        let pending = manager.query_child_sessions(query.clone()).await.unwrap();
+        assert!(!pending.complete);
+        assert!(!pending.issues.is_empty());
+        let child = manager.create_child_session(request.clone()).await.unwrap();
+        assert!(
+            manager
+                .query_child_sessions(query.clone())
+                .await
+                .unwrap()
+                .complete
+        );
+        manager.create_child_session(request).await.unwrap();
+        let database = db::SessionDb::open_existing_turso_in_root(parent.id, root.path())
+            .await
+            .unwrap();
+        let events = database.events_range(0, 128, 128).await.unwrap();
+        assert_eq!(events.iter().filter(|event| matches!(&event.kind, SessionEventKind::SessionChildLinked { child_id } if *child_id == child.id)).count(), 1);
+        assert_eq!(events.iter().filter(|event| matches!(&event.kind, SessionEventKind::SessionChildPublished { child_id, .. } if *child_id == child.id)).count(), 1);
+        database
+            .database()
+            .delete("session_children_checkpoint")
+            .execute(database.database())
+            .await
+            .unwrap();
+        database.close().await.unwrap();
+        assert!(
+            !manager
+                .query_child_sessions(query.clone())
+                .await
+                .unwrap()
+                .complete
+        );
+        manager.release_session_ownership(parent.id).await.unwrap();
+        let maintenance = SessionManager::persistent(root.path()).unwrap();
+        let outcome = maintenance
+            .reconcile_child_relationships(parent.id)
+            .await
+            .unwrap();
+        assert_eq!(outcome.verified_children, 1);
+        assert!(
+            maintenance
+                .query_child_sessions(query)
+                .await
+                .unwrap()
+                .complete
+        );
+    }
+
+    #[tokio::test]
+    async fn pinned_child_preserves_context_worktree_and_distinct_tree_parent() {
+        let root = tempfile::tempdir().unwrap();
+        let worktree = tempfile::tempdir().unwrap();
+        let manager = SessionManager::persistent(root.path()).unwrap();
+        let source = manager
+            .create_session(Some("source".into()), std::env::current_dir().unwrap())
+            .await
+            .unwrap();
+        manager
+            .append_event(
+                source.id,
+                SessionEventKind::SystemMessage {
+                    text: "pinned source context".into(),
+                },
+            )
+            .await
+            .unwrap();
+        let generation = manager.current_session_generation(source.id).await.unwrap();
+        let parent = manager
+            .create_child_session(request(source.id))
+            .await
+            .unwrap();
+        let mut request = request(parent.id);
+        request.working_directory = worktree.path().to_path_buf();
+        let provenance = crate::ExecutionSessionProvenance {
+            version: bcode_session_models::EXECUTION_SESSION_PROVENANCE_VERSION,
+            owner: "workflow".into(),
+            run_id: "pinned-run".into(),
+            node_id: "pinned-node".into(),
+            activation_id: None,
+            attempt: 1,
+            parent_session_id: source.id,
+            workspace_snapshot: Some("worktree-snapshot".into()),
+            context_mode: bcode_session_models::ExecutionSessionContextMode::FixedGenerationFork,
+            parent_generation: Some(generation),
+        };
+        let child = manager
+            .create_pinned_child_execution_session(request.clone(), provenance.clone(), generation)
+            .await
+            .unwrap();
+        assert_eq!(child.id, request.child_id);
+        assert_eq!(child.parent_id, Some(parent.id));
+        assert_eq!(
+            child
+                .execution
+                .as_ref()
+                .unwrap()
+                .provenance
+                .parent_session_id,
+            source.id
+        );
+        assert_eq!(
+            child.working_directory,
+            normalize_working_directory(worktree.path())
+        );
+        let history = manager.session_history(child.id).await.unwrap();
+        assert!(history.iter().any(|event| matches!(&event.kind, SessionEventKind::SystemMessage { text } if text == "pinned source context")));
+        assert_eq!(
+            manager
+                .create_pinned_child_execution_session(request, provenance, generation)
+                .await
+                .unwrap()
+                .id,
+            child.id
+        );
+        let page = manager
+            .query_child_sessions(SessionChildQuery {
+                parent_id: parent.id,
+                after: None,
+                limit: 1,
+            })
+            .await
+            .unwrap();
+        assert!(page.complete);
+        assert_eq!(page.children[0].id, child.id);
+    }
+
+    #[tokio::test]
+    async fn corrupted_child_checkpoint_requires_explicit_reconciliation() {
+        use switchy::database::query::FilterableQuery;
+        let root = tempfile::tempdir().unwrap();
+        let manager = SessionManager::persistent(root.path()).unwrap();
+        let parent = manager
+            .create_session(None, std::env::current_dir().unwrap())
+            .await
+            .unwrap();
+        let query = SessionChildQuery {
+            parent_id: parent.id,
+            after: None,
+            limit: 1,
+        };
+        let database = db::SessionDb::open_existing_turso_in_root(parent.id, root.path())
+            .await
+            .unwrap();
+        database
+            .database()
+            .update("session_children_checkpoint")
+            .value("event_seq", 999_i64)
+            .where_eq("singleton", 1_i64)
+            .execute(database.database())
+            .await
+            .unwrap();
+        database.close().await.unwrap();
+        let before = manager.query_child_sessions(query.clone()).await.unwrap();
+        assert!(!before.complete);
+        assert!(!before.issues.is_empty());
+        manager.release_session_ownership(parent.id).await.unwrap();
+        let maintenance = SessionManager::persistent(root.path()).unwrap();
+        assert_eq!(
+            maintenance
+                .reconcile_child_relationships(parent.id)
+                .await
+                .unwrap()
+                .verified_children,
+            0
+        );
+        let after = maintenance.query_child_sessions(query).await.unwrap();
+        assert!(after.complete);
+        assert!(after.children.is_empty());
     }
 
     #[tokio::test]
@@ -508,7 +1055,7 @@ mod tests {
             })
             .await
             .unwrap();
-        assert!(!page.complete);
+        assert!(page.complete);
         assert_eq!(page.children[0].id, child.id);
         drop(manager);
         let restored = SessionManager::persistent(root.path()).unwrap();

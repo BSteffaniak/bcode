@@ -2605,10 +2605,13 @@ pub fn apply_effect_result(
             }
             if chat.attached_session_id() == Some(session_id) {
                 chat.app.apply_child_activity(result);
-            } else if let Ok(page) = result
-                && chat.app.expanded_monitor_sessions().contains(&session_id)
-            {
-                chat.app.apply_monitor_activity(session_id, page);
+            } else if chat.app.monitor_discovery_frontier().contains(&session_id) {
+                match result {
+                    Ok(page) => chat.app.apply_monitor_activity(session_id, page),
+                    Err(error) => chat
+                        .app
+                        .monitor_observation_failed(session_id, &error.to_string()),
+                }
             }
         }
         TuiEffectResult::SessionOpenProgress { snapshot } => {
@@ -2651,6 +2654,7 @@ pub fn apply_effect_result(
             if chat.attached_session_id() == Some(session_id) {
                 chat.replace_effect(TuiEffect::LoadChildActivity {
                     session_id,
+                    after: None,
                     generation: 0,
                 });
                 chat.replace_effect(TuiEffect::LoadSessionChildren {

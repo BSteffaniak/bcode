@@ -20,42 +20,7 @@ steps:
         correction pass or blocked when evidence is insufficient. Use no tools.
       input:
         type_name: bcode.shell.exec-result/v1
-        schema:
-          type: object
-          additionalProperties: false
-          required: [version, plan_sha256, passed, commands, artifacts]
-          properties:
-            version: {const: 2}
-            plan_sha256: {type: string, pattern: '^[0-9a-f]{64}$'}
-            passed: {type: boolean}
-            commands:
-              type: array
-              maxItems: 64
-              items:
-                type: object
-                additionalProperties: false
-                required: [index, status, exit_code, accepted_exit_codes, exit_accepted, signal, duration_ms, stdout_preview, stderr_preview, stdout_bytes, stderr_bytes, stdout_encoding, stderr_encoding, stdout_truncated, stderr_truncated]
-                properties:
-                  index: {type: integer, minimum: 0}
-                  status: {type: string, enum: [exited, signaled, spawn_failed, timed_out, cancelled]}
-                  exit_code: {type: [integer, 'null']}
-                  accepted_exit_codes: {type: array, minItems: 1, maxItems: 64, uniqueItems: true, items: {type: integer}}
-                  exit_accepted: {type: boolean}
-                  signal: {type: [integer, 'null']}
-                  duration_ms: {type: integer, minimum: 0}
-                  stdout_preview: {type: string, maxLength: 65536}
-                  stderr_preview: {type: string, maxLength: 65536}
-                  stdout_bytes: {type: integer, minimum: 0}
-                  stderr_bytes: {type: integer, minimum: 0}
-                  stdout_encoding: {type: string, enum: [utf8, binary]}
-                  stderr_encoding: {type: string, enum: [utf8, binary]}
-                  stdout_truncated: {type: boolean}
-                  stderr_truncated: {type: boolean}
-            artifacts:
-              type: array
-              items:
-                type: object
-                required: [artifact_id, schema, schema_version, content_type, reference_key]
+        schema: {"additionalProperties":false,"properties":{"artifacts":{"items":{"required":["artifact_id","schema","schema_version","content_type","reference_key"],"type":"object"},"type":"array"},"commands":{"items":{"additionalProperties":false,"properties":{"accepted_exit_codes":{"items":{"type":"integer"},"maxItems":64,"minItems":1,"type":"array","uniqueItems":true},"duration_ms":{"minimum":0,"type":"integer"},"exit_accepted":{"type":"boolean"},"exit_code":{"type":["integer","null"]},"index":{"minimum":0,"type":"integer"},"signal":{"type":["integer","null"]},"status":{"enum":["exited","signaled","spawn_failed","timed_out","cancelled"],"type":"string"},"stderr_bytes":{"minimum":0,"type":"integer"},"stderr_encoding":{"enum":["utf8","binary"],"type":"string"},"stderr_preview":{"maxLength":65536,"type":"string"},"stderr_truncated":{"type":"boolean"},"stdout_bytes":{"minimum":0,"type":"integer"},"stdout_encoding":{"enum":["utf8","binary"],"type":"string"},"stdout_preview":{"maxLength":65536,"type":"string"},"stdout_truncated":{"type":"boolean"}},"required":["index","status","exit_code","accepted_exit_codes","exit_accepted","signal","duration_ms","stdout_preview","stderr_preview","stdout_bytes","stderr_bytes","stdout_encoding","stderr_encoding","stdout_truncated","stderr_truncated"],"type":"object"},"maxItems":64,"type":"array"},"passed":{"type":"boolean"},"plan_sha256":{"pattern":"^[0-9a-f]{64}$","type":"string"},"version":{"const":3}},"required":["version","plan_sha256","passed","commands","artifacts"],"type":"object"}
       output:
         type_name: bcode.remediation.state/v1
         schema:

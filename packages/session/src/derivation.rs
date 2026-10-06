@@ -110,7 +110,7 @@ impl SessionManager {
         provenance: ExecutionSessionProvenance,
     ) -> Result<SessionDerivationTerminalOutcome, SessionError> {
         validate_execution_session_provenance(Some(&provenance))?;
-        self.derive_session_with_execution(request, Some(provenance))
+        self.derive_session_with_execution(request, Some(provenance), None)
             .await
     }
 
@@ -123,20 +123,38 @@ impl SessionManager {
         &self,
         request: SessionDerivationRequest,
     ) -> Result<SessionDerivationTerminalOutcome, SessionError> {
-        self.derive_session_with_execution(request, None).await
+        self.derive_session_with_execution(request, None, None)
+            .await
     }
 
-    async fn derive_session_with_execution(
+    fn validate_derivation_request(
         &self,
-        request: SessionDerivationRequest,
-        execution: Option<ExecutionSessionProvenance>,
-    ) -> Result<SessionDerivationTerminalOutcome, SessionError> {
+        request: &SessionDerivationRequest,
+        execution: Option<&ExecutionSessionProvenance>,
+        child: Option<&bcode_session_models::SessionChildCreateRequest>,
+    ) -> Result<String, SessionError> {
         request.validate().map_err(|error| {
             self.metrics
                 .increment_counter("session.derivation.validation_failed_total");
             SessionError::InvalidDerivationRequest(error.to_string())
         })?;
-        let fingerprint = derivation_request_fingerprint(&request)?;
+        if child.is_some() {
+            let bytes = serde_json::to_vec(&(request, execution, child))
+                .map_err(|error| SessionError::DerivationSerialization(error.to_string()))?;
+            Ok(hex::encode(Sha256::digest(bytes)))
+        } else {
+            derivation_request_fingerprint(request)
+        }
+    }
+
+    pub(super) async fn derive_session_with_execution(
+        &self,
+        request: SessionDerivationRequest,
+        execution: Option<ExecutionSessionProvenance>,
+        child: Option<bcode_session_models::SessionChildCreateRequest>,
+    ) -> Result<SessionDerivationTerminalOutcome, SessionError> {
+        let fingerprint =
+            self.validate_derivation_request(&request, execution.as_ref(), child.as_ref())?;
         let root = self
             .session_store_root()
             .ok_or(SessionError::DerivationRequiresPersistentStore)?;
@@ -155,7 +173,9 @@ impl SessionManager {
             }
             cleanup_interrupted_derivation(&root, &durable)?;
         }
-        let destination_id = SessionId::new();
+        let destination_id = child
+            .as_ref()
+            .map_or_else(SessionId::new, |request| request.child_id);
         let cancellation = {
             let mut operations = self.derivation_operations.lock().await;
             if let Some(existing) = operations.get(&request.operation_id) {
@@ -192,7 +212,13 @@ impl SessionManager {
             .increment_counter("session.derivation.started_total");
         let derivation_started_at = std::time::Instant::now();
         let result = self
-            .derive_session_inner(&request, destination_id, &cancellation, execution.as_ref())
+            .derive_session_inner(
+                &request,
+                destination_id,
+                &cancellation,
+                execution.as_ref(),
+                child.as_ref(),
+            )
             .await;
         let outcome = match result {
             Ok(summary) => SessionDerivationTerminalOutcome::Succeeded {
@@ -232,6 +258,7 @@ impl SessionManager {
         destination_id: SessionId,
         cancellation: &AtomicBool,
         execution: Option<&ExecutionSessionProvenance>,
+        child: Option<&bcode_session_models::SessionChildCreateRequest>,
     ) -> Result<SessionSummary, SessionError> {
         ensure_not_cancelled(request.operation_id, cancellation)?;
         self.update_derivation_progress(
@@ -269,6 +296,7 @@ impl SessionManager {
                 &staging_root,
                 cancellation,
                 execution,
+                child,
             )
             .await;
         if result.is_err() {
@@ -517,6 +545,7 @@ impl SessionManager {
         staging_root: &Path,
         cancellation: &AtomicBool,
         execution: Option<&ExecutionSessionProvenance>,
+        child: Option<&bcode_session_models::SessionChildCreateRequest>,
     ) -> Result<SessionSummary, SessionError> {
         let db = db::SessionDb::initialize_turso_in_root(destination_id, staging_root).await?;
         let created_at_ms = self.next_activity_timestamp_ms();
@@ -538,6 +567,21 @@ impl SessionManager {
         db.append_event_batch(&[(created, Some(created_at_ms))])
             .await?;
         destination_sequence += 1;
+        if let Some(request) = child {
+            let event = SessionEvent {
+                schema_version: CURRENT_SESSION_EVENT_SCHEMA_VERSION,
+                sequence: destination_sequence,
+                timestamp_ms: created_at_ms,
+                session_id: destination_id,
+                provenance: None,
+                kind: SessionEventKind::ChildSessionCreated {
+                    request: Box::new(request.clone()),
+                },
+            };
+            db.append_event_batch(&[(event, Some(created_at_ms))])
+                .await?;
+            destination_sequence += 1;
+        }
         if let Some(provenance) = execution {
             let execution_event = SessionEvent {
                 schema_version: CURRENT_SESSION_EVENT_SCHEMA_VERSION,
@@ -899,6 +943,9 @@ const fn is_copyable_derivation_event(kind: &SessionEventKind) -> bool {
             | SessionEventKind::ClientAttached { .. }
             | SessionEventKind::ClientDetached { .. }
             | SessionEventKind::SessionDerived { .. }
+            | SessionEventKind::SessionChildrenReconciled { .. }
+            | SessionEventKind::SessionChildLinked { .. }
+            | SessionEventKind::SessionChildPublished { .. }
             | SessionEventKind::ChildSessionCreated { .. }
             | SessionEventKind::ExecutionSessionCreated { .. }
     )

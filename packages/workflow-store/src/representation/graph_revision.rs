@@ -143,6 +143,17 @@ pub(super) async fn publish_in(
     batch: &WorkflowRunGraphEditBatch,
     policy: super::GraphAdmissionPolicy,
 ) -> Result<u64, Error> {
+    bcode_workflow::reject_execution_parent_claims(batch).map_err(|_| Error::InvalidAdmission)?;
+    publish_with_parent_in(tx, owner, batch, policy, None).await
+}
+
+pub(super) async fn publish_with_parent_in(
+    tx: &dyn switchy_database::DatabaseTransaction,
+    owner: &WorkflowExecutionAuthority,
+    batch: &WorkflowRunGraphEditBatch,
+    policy: super::GraphAdmissionPolicy,
+    immediate_parent: Option<&str>,
+) -> Result<u64, Error> {
     batch.validate().map_err(|_| Error::InvalidAdmission)?;
     let request = encode(batch)?;
     super::verified(tx).await?;
@@ -170,9 +181,19 @@ pub(super) async fn publish_in(
         rows.first().ok_or(Error::MaintenanceRequired)?,
         "edges_json",
     )?;
+    let admitted = immediate_parent
+        .map(|parent| bcode_workflow::bind_execution_parent(batch, parent))
+        .transpose()
+        .map_err(|_| Error::InvalidAdmission)?;
     let old_edges = edges.clone();
     let mut candidate = original.clone();
-    apply_edits(tx, batch, &mut candidate, &mut edges).await?;
+    apply_edits(
+        tx,
+        admitted.as_ref().unwrap_or(batch),
+        &mut candidate,
+        &mut edges,
+    )
+    .await?;
     candidate.edges = edges.values().cloned().collect();
     super::graph::validate(&candidate)?;
     let protected = protected_nodes(tx, batch, &original).await?;

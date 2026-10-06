@@ -4145,7 +4145,7 @@ async fn canonical_payload_fetch_limit(
     Ok(count)
 }
 
-async fn read_canonical_payload_page(
+pub(super) async fn read_canonical_payload_page(
     db: &dyn Database,
     start_sequence: u64,
     limit: usize,
@@ -4690,6 +4690,8 @@ impl bcode_session_migration_target::MigrationTarget for SessionMigrationTarget<
             "turn_evidence",
             "turn_receipts",
             "submissions",
+            "session_children",
+            "session_children_checkpoint",
             "model_context_entries",
             "model_context_projection_state",
             "context_occupancy_projection",
@@ -4804,6 +4806,13 @@ impl bcode_session_migration_target::MigrationTarget for SessionMigrationTarget<
     }
 
     async fn finalize_writer_contract(&mut self) -> Result<(), Self::Error> {
+        // Cross-session completeness is not established by a per-session historical replay.
+        self.db
+            .update("session_children_checkpoint")
+            .value("coverage", 0_i64)
+            .where_eq("singleton", 1_i64)
+            .execute(self.db)
+            .await?;
         set_storage_writer_contract(self.db, CURRENT_SESSION_STORAGE_WRITER_EPOCH).await
     }
 }
@@ -5228,6 +5237,7 @@ async fn append_event_projections(
 
 async fn project_appended_event(db: &dyn Database, event: &SessionEvent) -> SessionDbResult<()> {
     project_event(db, event, true).await?;
+    crate::child_projection::project(db, event).await?;
     project_model_context_event(db, event).await?;
     project_context_occupancy_row(db, event).await?;
     upsert_projection_checkpoints(db, MaterializedProjection::all(), event).await?;
@@ -5304,7 +5314,8 @@ async fn project_materialized_event_without_checkpoints(
     db: &dyn Database,
     event: &SessionEvent,
 ) -> SessionDbResult<()> {
-    project_event(db, event, false).await
+    project_event(db, event, false).await?;
+    crate::child_projection::project(db, event).await
 }
 
 async fn finalize_migration_session_state(
@@ -6376,6 +6387,9 @@ mod tests {
                     "044_submissions_pending_index",
                     "045_submissions_target_index",
                     "046_session_state_parent_column",
+                    "047_session_children",
+                    "048_session_children_checkpoint",
+                    "049_session_children_pending_index",
                 ],
             )
             .execute(db.database())
@@ -9960,6 +9974,12 @@ mod tests {
     }
 
     async fn remove_parent_relationship_fixture(db: &SessionDb) {
+        for table in ["session_children", "session_children_checkpoint"] {
+            switchy::database::schema::drop_table(table)
+                .execute(db.database())
+                .await
+                .unwrap();
+        }
         switchy::database::schema::alter_table("session_state")
             .drop_column("parent_id".into())
             .execute(db.database())

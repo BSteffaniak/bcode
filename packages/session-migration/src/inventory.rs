@@ -795,7 +795,10 @@ pub fn load_released_fixture_manifest(
                     event_kind: pair.event_kind.clone(),
                 });
             };
-            if !descriptor.supports_schema(pair.event_schema) {
+            if !descriptor.supports_schema(pair.event_schema)
+                && classify_event_kind_schema(&pair.event_kind, pair.event_schema)
+                    != ReleasedEventKindClassification::Current
+            {
                 return Err(
                     ReleasedFixtureInventoryError::EventKindNotReleasedInSchema {
                         path: fixture.path.clone(),
@@ -1457,12 +1460,15 @@ pub fn is_released_event_kind_schema(kind: &str, schema: u16) -> bool {
 ///
 /// Event kinds that the current build still persists remain historically decodable through this
 /// schema; the current schema itself is classified by [`classify_event_kind_schema`].
-pub const LATEST_HISTORICAL_EVENT_SCHEMA: u16 = 48;
+pub const LATEST_HISTORICAL_EVENT_SCHEMA: u16 = 49;
 
 fn released_event_schema_range(kind: &str) -> (u16, u16) {
     let live = LATEST_HISTORICAL_EVENT_SCHEMA;
     match kind {
         "child_session_created" => (49, CURRENT_EVENT_SCHEMA),
+        "session_child_linked" | "session_child_published" | "session_children_reconciled" => {
+            (50, CURRENT_EVENT_SCHEMA)
+        }
         "assistant_reasoning_activity" | "inert_history" => (40, live),
         "assistant_response_segment" => (41, live),
         "agent_changed" => (3, live),
@@ -1477,7 +1483,7 @@ fn released_event_schema_range(kind: &str) -> (u16, u16) {
         "submission_accepted"
         | "submission_activated"
         | "submission_cancelled"
-        | "submission_context_observed" => (48, 48),
+        | "submission_context_observed" => (48, live),
         "context_compacted" => (6, live),
         "context_usage_observed" => (26, 31),
         "provider_context_compacted" => (26, live),
@@ -1705,6 +1711,18 @@ pub const RELEASED_EVENT_VARIANTS: &[ReleasedEventVariantDescriptor] = &[
     },
     ReleasedEventVariantDescriptor {
         kind: "runtime_work_started",
+        treatment: ReleasedEventTreatment::CurrentEquivalent,
+    },
+    ReleasedEventVariantDescriptor {
+        kind: "session_child_linked",
+        treatment: ReleasedEventTreatment::CurrentEquivalent,
+    },
+    ReleasedEventVariantDescriptor {
+        kind: "session_child_published",
+        treatment: ReleasedEventTreatment::CurrentEquivalent,
+    },
+    ReleasedEventVariantDescriptor {
+        kind: "session_children_reconciled",
         treatment: ReleasedEventTreatment::CurrentEquivalent,
     },
     ReleasedEventVariantDescriptor {
@@ -2188,7 +2206,12 @@ pub struct MigrationStepDescriptor {
     pub target_writer_epoch: u32,
 }
 
-pub const MIGRATION_STEPS: [MigrationStepDescriptor; 12] = [
+pub const MIGRATION_STEPS: [MigrationStepDescriptor; 13] = [
+    MigrationStepDescriptor {
+        id: "session-writer-epoch-13-to-14",
+        source_writer_epoch: 13,
+        target_writer_epoch: 14,
+    },
     MigrationStepDescriptor {
         id: "session-writer-epoch-12-to-13",
         source_writer_epoch: 12,
@@ -2318,10 +2341,14 @@ pub const RELEASED_WRITER_SCHEMA_COMBINATIONS: &[ReleasedWriterSchemaDescriptor]
         writer_epoch: 12,
         event_schema: 48,
     },
+    ReleasedWriterSchemaDescriptor {
+        writer_epoch: 13,
+        event_schema: 49,
+    },
 ];
 
 /// Released historical writer epochs that must migrate to [`CURRENT_WRITER_EPOCH`].
-pub const RELEASED_HISTORICAL_WRITER_EPOCHS: &[u32] = &[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12];
+pub const RELEASED_HISTORICAL_WRITER_EPOCHS: &[u32] = &[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13];
 
 /// Released historical event schemas currently evidenced by Git history.
 ///
@@ -2330,7 +2357,7 @@ pub const RELEASED_HISTORICAL_WRITER_EPOCHS: &[u32] = &[1, 2, 3, 4, 5, 6, 7, 8, 
 /// emitted by epoch-6 builds and migrate forward without a writer-epoch change.
 pub const RELEASED_HISTORICAL_EVENT_SCHEMAS: &[u16] = &[
     1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26,
-    27, 28, 29, 30, 31, 32, 35, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46, 47, 48,
+    27, 28, 29, 30, 31, 32, 35, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46, 47, 48, 49,
 ];
 
 /// Event schemas between the first released schema and the current schema that no writer emitted.
@@ -2519,7 +2546,7 @@ mod tests {
                 .windows(2)
                 .all(|pair| pair[0].kind < pair[1].kind)
         );
-        assert_eq!(RELEASED_EVENT_VARIANTS.len(), 72);
+        assert_eq!(RELEASED_EVENT_VARIANTS.len(), 75);
         assert_eq!(
             bcode_session_models::CURRENT_PERSISTED_SESSION_EVENT_KINDS
                 .iter()
@@ -2883,6 +2910,10 @@ mod tests {
                 ReleasedWriterSchemaDescriptor {
                     writer_epoch: 12,
                     event_schema: 48
+                },
+                ReleasedWriterSchemaDescriptor {
+                    writer_epoch: 13,
+                    event_schema: 49
                 },
             ]
         );

@@ -247,6 +247,8 @@ pub(super) async fn initialize(
     run: &crate::NewWorkflowRun,
     definition: &WorkflowDefinition,
 ) -> Result<(), Error> {
+    bcode_workflow::reject_definition_execution_parent_claims(definition)
+        .map_err(|_| Error::InvalidAdmission)?;
     validate(definition)?;
     super::graph_pages::persist(db, &run.run_id, INITIAL_REVISION, definition).await?;
     let edges = definition

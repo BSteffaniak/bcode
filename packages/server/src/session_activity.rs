@@ -124,6 +124,26 @@ impl ActivityObservations {
             .observe(event);
     }
 
+    pub fn evidence(&self, id: SessionId) -> bcode_session_models::SessionActivityEvidence {
+        let observed = self.sessions.get(&id);
+        bcode_session_models::SessionActivityEvidence {
+            running: 0,
+            queued: observed.map_or(0, |facts| {
+                u32::try_from(facts.submissions.len()).unwrap_or(u32::MAX)
+            }),
+            permission_waits: observed.map_or(0, |facts| {
+                u32::try_from(facts.permissions.len()).unwrap_or(u32::MAX)
+            }),
+            input_waits: observed.map_or(0, |facts| {
+                u32::try_from(facts.exchanges.len()).unwrap_or(u32::MAX)
+            }),
+            counts_complete: observed.is_some_and(|facts| facts.complete),
+            observed_event_sequence: observed.and_then(|facts| facts.sequence),
+            // Raw tool names/arguments and arbitrary labels are not normalized public operation labels.
+            current_operation: None,
+        }
+    }
+
     pub fn states(&self, id: SessionId) -> (Vec<SessionActivityState>, bool) {
         self.sessions
             .get(&id)
@@ -335,6 +355,27 @@ mod tests {
             },
         ));
         assert_eq!(observations.states(id), (Vec::new(), true));
+    }
+
+    #[test]
+    fn permission_queue_evidence_counts_are_own_and_checkpointed() {
+        let id = SessionId::new();
+        let mut observations = ActivityObservations::default();
+        observations.observe(&event(
+            id,
+            0,
+            SessionEventKind::SessionCreated {
+                name: None,
+                working_directory: std::path::PathBuf::from("/"),
+            },
+        ));
+        observations.observe(&event(id, 1, accepted()));
+        let evidence = observations.evidence(id);
+        assert_eq!(evidence.queued, 1);
+        assert_eq!(evidence.observed_event_sequence, Some(1));
+        assert!(evidence.counts_complete);
+        assert!(!observations.evidence(SessionId::new()).counts_complete);
+        assert!(evidence.current_operation.is_none());
     }
 
     #[test]

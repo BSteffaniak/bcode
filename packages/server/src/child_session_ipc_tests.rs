@@ -24,6 +24,22 @@ fn created(response: Response) -> SessionSummary {
     session
 }
 
+async fn assert_maintenance_requires_confirmation(stream: &mut LocalIpcStream, parent: SessionId) {
+    let response = exchange(
+        stream,
+        40,
+        Request::ReconcileSessionChildren {
+            parent_id: parent,
+            apply: false,
+        },
+    )
+    .await;
+    assert!(
+        matches!(response, Response::Err(error) if error.code == "maintenance_confirmation_required")
+    );
+    assert_eq!(children(stream, parent).await.len(), 2);
+}
+
 async fn children(stream: &mut LocalIpcStream, parent_id: SessionId) -> Vec<SessionSummary> {
     let mut after = None;
     let mut result = Vec::new();
@@ -193,6 +209,7 @@ async fn child_sessions_typed_ipc_creation_retry_navigation_and_activity() {
     assert!(
         matches!(navigation, Response::Ok(ResponsePayload::SessionSummary { session }) if session.parent_id == Some(child_id))
     );
+    assert_maintenance_requires_confirmation(&mut stream, parent_id).await;
     for id in [parent_id, child_id, grandchild_id] {
         let response = exchange(
             &mut stream,
@@ -217,7 +234,10 @@ async fn child_sessions_typed_ipc_creation_retry_navigation_and_activity() {
                 .iter()
                 .all(|activity| activity.states.contains(&SessionActivityState::Unknown))
         );
-        assert!(!state.runtime_work.has_active_for_session(id).await);
+        assert_eq!(
+            state.runtime_work.activity_count_for_session(id, 1).await,
+            (0, true)
+        );
     }
     let no_scheduler = state.session_runtimes.lock().await.is_empty();
     let no_parent_control = state.active_session_namespaces.lock().await.is_empty();

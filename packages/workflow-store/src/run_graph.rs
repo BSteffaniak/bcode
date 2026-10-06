@@ -8,6 +8,13 @@ use std::collections::BTreeSet;
 
 const GRAPH_PAGE_LIMIT: usize = 100;
 
+/// Publication disposition and verified delegator share one immutable commit scope.
+#[derive(Clone, Copy)]
+struct PublicationBinding<'a> {
+    retain_active: bool,
+    immediate_parent: Option<&'a str>,
+}
+
 const fn editable_connected_kind(kind: bcode_workflow::NodeKind) -> bool {
     matches!(
         kind,
@@ -533,25 +540,34 @@ impl WorkflowStore {
         accepted_at_ms: u64,
     ) -> Result<bcode_workflow::WorkflowRunGraphPublicationStatus, WorkflowStoreError> {
         let transaction = self.connection.unchecked_transaction()?;
+        self.verify_execution_authority(&caller.run_id, authority)?;
         self.verify_active_graph_edit_caller(&caller.run_id, caller)?;
-        let status = self.run_graph_publication_status(&caller.run_id, mutation_id, authority)?;
-        let outcome = if let Some(status) = status {
-            status
-        } else {
-            self.accept_pending_publication(
-                &caller.run_id,
-                mutation_id,
-                authority,
-                accepted_at_ms,
-                &transaction,
-            )?;
+        if let Some(status) =
             self.run_graph_publication_status(&caller.run_id, mutation_id, authority)?
-                .ok_or_else(|| {
-                    WorkflowStoreError::InvalidData("accepted publication missing".into())
-                })?
-        };
+        {
+            return Ok(status);
+        }
+        self.accept_pending_publication(
+            &caller.run_id,
+            mutation_id,
+            authority,
+            accepted_at_ms,
+            &transaction,
+        )?;
+        self.bind_authenticated_candidate_parent(
+            &transaction,
+            &caller.run_id,
+            mutation_id,
+            authority,
+            &caller.session_id,
+        )?;
+        let status = self
+            .run_graph_publication_status(&caller.run_id, mutation_id, authority)?
+            .ok_or_else(|| {
+                WorkflowStoreError::InvalidData("accepted publication missing".into())
+            })?;
         transaction.commit()?;
-        Ok(outcome)
+        Ok(status)
     }
 
     fn accept_pending_publication(
@@ -994,7 +1010,10 @@ impl WorkflowStore {
             mutation_id,
             authority,
             created_at_ms,
-            true,
+            PublicationBinding {
+                retain_active: true,
+                immediate_parent: None,
+            },
             &transaction,
         )?;
         transaction.commit()?;
@@ -1019,11 +1038,70 @@ impl WorkflowStore {
             mutation_id,
             authority,
             created_at_ms,
-            retain_active,
+            PublicationBinding {
+                retain_active,
+                immediate_parent: caller.map(|link| link.session_id.as_str()),
+            },
             &transaction,
         )?;
         transaction.commit()?;
         Ok(revision)
+    }
+
+    fn bind_authenticated_candidate_parent(
+        &self,
+        transaction: &Transaction<'_>,
+        run_id: &str,
+        mutation_id: &str,
+        authority: &super::WorkflowExecutionAuthority,
+        session_id: &str,
+    ) -> Result<(), WorkflowStoreError> {
+        let request = self
+            .staged_run_graph_edit(run_id, mutation_id, authority)?
+            .ok_or_else(|| WorkflowStoreError::InvalidData("candidate missing".into()))?;
+        let admitted = bcode_workflow::bind_execution_parent(&request, session_id)
+            .map_err(|error| WorkflowStoreError::InvalidData(error.to_string()))?;
+        let page = self.current_run_graph_page(
+            run_id,
+            Some(request.expected_revision),
+            None,
+            None,
+            GRAPH_PAGE_LIMIT,
+        )?;
+        if !page.nodes_complete || !page.edges_complete {
+            return Err(WorkflowStoreError::InvalidData(
+                "execution-parent binding requires bounded complete publication validation".into(),
+            ));
+        }
+        let run = self
+            .run_summary(run_id)?
+            .ok_or_else(|| WorkflowStoreError::InvalidData("run missing".into()))?;
+        let definition = self
+            .definition(&run.definition_id, run.definition_version)?
+            .ok_or_else(|| WorkflowStoreError::InvalidData("definition missing".into()))?;
+        let mut graph: WorkflowDefinition = serde_json::from_str(&definition.definition_json)?;
+        graph.nodes.clear();
+        graph.entries.clear();
+        graph.exits.clear();
+        for record in page.nodes {
+            if record.entry {
+                graph.entries.push(record.node.id.clone());
+            }
+            if record.exit {
+                graph.exits.push(record.node.id.clone());
+            }
+            graph.nodes.insert(record.node.id.clone(), record.node);
+        }
+        let mut edges = page
+            .edges
+            .into_iter()
+            .map(|record| (record.edge_id, record.edge))
+            .collect();
+        for edit in &admitted.edits {
+            apply_candidate_edit(&mut graph, &mut edges, edit)?;
+        }
+        persist_candidate_delta(transaction, &admitted, &graph, &edges)?;
+        Ok(())
     }
 
     fn publish_leaf_run_graph_edit_in_transaction(
@@ -1032,9 +1110,13 @@ impl WorkflowStore {
         mutation_id: &str,
         authority: &super::WorkflowExecutionAuthority,
         created_at_ms: u64,
-        retain_active: bool,
+        binding: PublicationBinding<'_>,
         transaction: &Transaction<'_>,
     ) -> Result<u64, WorkflowStoreError> {
+        let PublicationBinding {
+            retain_active,
+            immediate_parent,
+        } = binding;
         let request = self
             .staged_run_graph_edit(run_id, mutation_id, authority)?
             .ok_or_else(|| {
@@ -1089,6 +1171,15 @@ impl WorkflowStore {
         self.validate_published_call_targets(&request)?;
         if connected {
             self.validate_connected_publication(&request)?;
+        }
+        if let Some(parent) = immediate_parent {
+            self.bind_authenticated_candidate_parent(
+                transaction,
+                run_id,
+                mutation_id,
+                authority,
+                parent,
+            )?;
         }
         let revision =
             persist_graph_publication(transaction, &request, &retentions, created_at_ms)?;
@@ -1719,6 +1810,8 @@ impl WorkflowStore {
         created_at_ms: u64,
         caller: Option<&super::WorkflowExecutionSessionLink>,
     ) -> Result<bool, WorkflowStoreError> {
+        bcode_workflow::reject_execution_parent_claims(request)
+            .map_err(|error| WorkflowStoreError::InvalidData(error.to_string()))?;
         request
             .validate()
             .map_err(|error| WorkflowStoreError::InvalidData(error.to_string()))?;
@@ -2416,6 +2509,9 @@ fn validate_leaf_retention(
         };
         if matches!(
             disposition,
+            bcode_workflow::WorkflowRunGraphReconciliation::Retain { .. }
+        ) || matches!(
+            disposition,
             bcode_workflow::WorkflowRunGraphReconciliation::RetainWithBindings { .. }
         ) {
             let completed: bool = connection.query_row(
@@ -2503,9 +2599,27 @@ pub fn validate_reconciliation_targets(
             let output: Option<String> = row.get(1)?;
             if status == "completed"
                 && output.is_some()
-                && matches!(disposition, Reconciliation::RetainWithBindings { .. })
+                && matches!(
+                    disposition,
+                    Reconciliation::Retain { .. } | Reconciliation::RetainWithBindings { .. }
+                )
             {
                 let node_id: String = row.get(2)?;
+                if matches!(disposition, Reconciliation::Retain { .. })
+                    && request.edits.iter().any(|edit| match edit {
+                        bcode_workflow::WorkflowRunGraphEdit::ReplaceNode { node, .. } => {
+                            node.id == node_id
+                        }
+                        bcode_workflow::WorkflowRunGraphEdit::RemoveNode { node_id: removed } => {
+                            removed == &node_id
+                        }
+                        _ => false,
+                    })
+                {
+                    return Err(WorkflowStoreError::InvalidData(
+                        "completed retention cannot rewrite its node".into(),
+                    ));
+                }
                 super::activation_output_value_by_identity(
                     connection,
                     &request.run_id,
@@ -2749,6 +2863,73 @@ fn validate_retained_bindings(
     Ok(())
 }
 
+// Retain only host-installed metadata on an otherwise exact authored candidate node.
+fn retained_candidate_node(
+    transaction: &Transaction<'_>,
+    request: &bcode_workflow::WorkflowRunGraphEditBatch,
+    node: &NodeDefinition,
+) -> Result<NodeDefinition, WorkflowStoreError> {
+    use switchy_database::query::FilterableQuery as _;
+    let query = switchy_database::query::select("workflow_graph_edit_nodes")
+        .columns(&["node_json"])
+        .where_eq("run_id", request.run_id.as_str())
+        .where_eq("mutation_id", request.mutation_id.as_str())
+        .where_eq("node_id", node.id.as_str())
+        .limit(1);
+    let rows = switchy_database::rusqlite::select_on_connection(transaction, &query)
+        .map_err(|error| WorkflowStoreError::InvalidData(error.to_string()))?;
+    let Some(switchy_database::DatabaseValue::String(payload)) =
+        rows.first().and_then(|row| row.get("node_json"))
+    else {
+        return Ok(node.clone());
+    };
+    if payload.len() > super::MAX_INLINE_JSON_BYTES {
+        return Err(WorkflowStoreError::InvalidData(
+            "candidate node exceeds bounds".into(),
+        ));
+    }
+    let mut retained: NodeDefinition = serde_json::from_str(&payload)?;
+    let Some(parent) = retained
+        .configuration
+        .as_object_mut()
+        .and_then(|object| object.remove("execution_parent"))
+    else {
+        return Ok(node.clone());
+    };
+    let binding: bcode_workflow::WorkflowExecutionParentBinding = serde_json::from_value(parent)?;
+    if node.kind != bcode_workflow::NodeKind::Agent
+        || binding.version != 1
+        || binding.session_id.trim().is_empty()
+        || binding.session_id.len() > 128
+    {
+        return Err(WorkflowStoreError::InvalidData(
+            "invalid retained execution parent".into(),
+        ));
+    }
+    if node.configuration.get("execution_parent").is_some() {
+        if node != &serde_json::from_str::<NodeDefinition>(&payload)? {
+            return Err(WorkflowStoreError::InvalidData(
+                "conflicting authenticated execution parent".into(),
+            ));
+        }
+        return Ok(node.clone());
+    }
+    if retained != *node {
+        return Err(WorkflowStoreError::InvalidData(
+            "retained execution parent candidate mismatch".into(),
+        ));
+    }
+    let mut admitted = node.clone();
+    admitted
+        .configuration
+        .as_object_mut()
+        .ok_or_else(|| {
+            WorkflowStoreError::InvalidData("prompt configuration must be object".into())
+        })?
+        .insert("execution_parent".into(), serde_json::to_value(binding)?);
+    Ok(admitted)
+}
+
 fn persist_candidate_delta(
     transaction: &Transaction<'_>,
     request: &bcode_workflow::WorkflowRunGraphEditBatch,
@@ -2777,6 +2958,9 @@ fn persist_candidate_delta(
         let payload = graph
             .nodes
             .get(node_id)
+            .map(|node| retained_candidate_node(transaction, request, node))
+            .transpose()?
+            .as_ref()
             .map(|node| super::bounded_json("validated graph node", node))
             .transpose()?;
         transaction.execute(

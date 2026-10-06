@@ -6157,6 +6157,7 @@ const fn request_kind(request: &Request) -> &'static str {
         Request::CreateChildSession { .. } => "create_child_session",
         Request::SessionSummary { .. } => "session_summary",
         Request::SessionActivity { .. } => "session_activity",
+        Request::ReconcileSessionChildren { .. } => "reconcile_session_children",
         Request::SessionChildren { .. } => "session_children",
         Request::ListSessions { .. } => "list_sessions",
         Request::SessionBulkMigrationStart { .. } => "session_bulk_migration_start",
@@ -6566,6 +6567,12 @@ async fn handle_request_inner(
         SessionLifecycleRequest::SessionActivity { session_id, query } => {
             Box::pin(handle_session_activity(
                 request_id, state, writer, session_id, query,
+            ))
+            .await
+        }
+        SessionLifecycleRequest::ReconcileSessionChildren { parent_id, apply } => {
+            Box::pin(handle_reconcile_session_children(
+                request_id, state, writer, parent_id, apply,
             ))
             .await
         }
@@ -9581,6 +9588,34 @@ async fn handle_create_session(
         Response::Ok(ResponsePayload::SessionCreated { session }),
     )
     .await
+}
+
+async fn handle_reconcile_session_children(
+    request_id: u64,
+    state: &ServerState,
+    writer: &SharedWriter,
+    parent_id: SessionId,
+    apply: bool,
+) -> Result<(), ServerError> {
+    if !apply {
+        return send_response(
+            writer,
+            request_id,
+            Response::Err(ErrorResponse::new(
+                "maintenance_confirmation_required",
+                "relationship reconciliation requires explicit apply confirmation",
+            )),
+        )
+        .await;
+    }
+    let response = Box::pin(state.sessions.reconcile_child_relationships(parent_id)).await.map_or_else(
+        |_| Response::Err(ErrorResponse::new(
+            "child_reconciliation_unavailable",
+            "relationship maintenance failed; release live parent ownership and inspect session health",
+        )),
+        |result| Response::Ok(ResponsePayload::SessionChildrenReconciled { result }),
+    );
+    send_response(writer, request_id, response).await
 }
 
 async fn handle_session_summary(
@@ -35595,6 +35630,20 @@ fn workflow_skill_catalog_instruction(state: &ServerState) -> String {
     })
 }
 
+fn workflow_execution_child_id(run: &str, node: &str, activation: &str, attempt: u32) -> SessionId {
+    use sha2::Digest as _;
+    let digest = sha2::Sha256::digest(
+        serde_json::to_vec(&("bcode.execution-child.v1", run, node, activation, attempt))
+            .expect("identity tuple serializes"),
+    );
+    let mut bytes = [0_u8; 16];
+    bytes.copy_from_slice(&digest[..16]);
+    // RFC variant with a deterministic name-derived UUID identity.
+    bytes[6] = (bytes[6] & 0x0f) | 0x50;
+    bytes[8] = (bytes[8] & 0x3f) | 0x80;
+    SessionId(uuid::Uuid::from_bytes(bytes))
+}
+
 fn workflow_prompt_input_message(
     system_prompt: &str,
     skill_catalog: &str,
@@ -35762,6 +35811,66 @@ fn workflow_prompt_admission_error(error: &ServerError) -> WorkflowStoreError {
 }
 
 #[allow(clippy::too_many_lines)]
+async fn prepare_workflow_execution_child(
+    state: &ServerState,
+    request: &bcode_workflow_store::PreparedActivationDispatch,
+    configuration: &bcode_workflow::WorkflowPromptConfiguration,
+    provenance: &ExecutionSessionProvenance,
+    immediate_parent_id: SessionId,
+) -> Result<bcode_session_models::SessionSummary, WorkflowStoreError> {
+    let parent = state
+        .sessions
+        .session_summary_non_owning(provenance.parent_session_id)
+        .await
+        .map_err(|error| WorkflowStoreError::InvalidData(error.to_string()))?;
+    let directory = if let Some(directory) = configuration.worktree_directory.as_deref() {
+        bcode_worktree::validate_registered_worktree(
+            &parent.working_directory,
+            Path::new(directory),
+        )
+        .map_err(|error| WorkflowStoreError::InvalidData(error.to_string()))?
+        .path()
+        .to_path_buf()
+    } else {
+        parent.working_directory
+    };
+    let child_request = bcode_session_models::SessionChildCreateRequest {
+        child_id: workflow_execution_child_id(
+            &request.activation.run_id,
+            &request.activation.node_id,
+            &request.activation.activation_id,
+            request.attempt,
+        ),
+        parent_id: immediate_parent_id,
+        name: Some(format!("workflow {}", request.activation.node.name)),
+        working_directory: directory,
+    };
+    match configuration.execution_target {
+        bcode_workflow::PromptContextTarget::FreshIsolated => {
+            state
+                .sessions
+                .create_child_execution_session(child_request, provenance.clone())
+                .await
+        }
+        bcode_workflow::PromptContextTarget::FixedGenerationFork => {
+            state
+                .sessions
+                .create_pinned_child_execution_session(
+                    child_request,
+                    provenance.clone(),
+                    provenance
+                        .parent_generation
+                        .expect("validated pinned generation"),
+                )
+                .await
+        }
+        bcode_workflow::PromptContextTarget::SharedParentSequential => {
+            unreachable!("shared execution handled separately")
+        }
+    }
+    .map_err(|error| WorkflowStoreError::InvalidData(error.to_string()))
+}
+
 async fn dispatch_workflow_prompt_turn(
     state: &Arc<ServerState>,
     request: &bcode_workflow_store::PreparedActivationDispatch,
@@ -35823,6 +35932,28 @@ async fn dispatch_workflow_prompt_turn_after_admission(
             SessionId::from_str(value)
                 .map_err(|error| WorkflowStoreError::InvalidData(error.to_string()))
         })?;
+    let immediate_parent_id = match request
+        .activation
+        .node
+        .configuration
+        .get("execution_parent")
+    {
+        Some(value) => {
+            let binding: bcode_workflow::WorkflowExecutionParentBinding =
+                serde_json::from_value(value.clone()).map_err(|_| {
+                    WorkflowStoreError::InvalidData("invalid execution parent binding".into())
+                })?;
+            if binding.version != 1 {
+                return Err(WorkflowStoreError::InvalidData(
+                    "unsupported execution parent binding".into(),
+                ));
+            }
+            SessionId::from_str(&binding.session_id).map_err(|_| {
+                WorkflowStoreError::InvalidData("invalid execution parent session".into())
+            })?
+        }
+        None => parent_session_id,
+    };
     let workflow_runtime_context = workflow_runtime_context(state, parent_session_id).await;
     let provenance = ExecutionSessionProvenance {
         version: bcode_session_models::EXECUTION_SESSION_PROVENANCE_VERSION,
@@ -35871,6 +36002,9 @@ async fn dispatch_workflow_prompt_turn_after_admission(
             )
             .await?
             {
+                if existing.parent_id != Some(immediate_parent_id) {
+                    return Err(WorkflowStoreError::InvalidData("recovered execution session has incompatible immediate parent; explicit maintenance required".into()));
+                }
                 if let Some(directory) = &configuration.worktree_directory {
                     let parent = state
                         .sessions
@@ -35893,59 +36027,14 @@ async fn dispatch_workflow_prompt_turn_after_admission(
                 }
                 existing
             } else {
-                let child = match (
-                    execution_target,
-                    configuration.worktree_directory.as_deref(),
-                ) {
-                    (bcode_workflow::PromptContextTarget::FreshIsolated, Some(directory)) => state
-                        .create_fresh_execution_session_in_registered_worktree(
-                            Some(format!("workflow {}", request.activation.node.name)),
-                            provenance.clone(),
-                            Path::new(directory),
-                        )
-                        .await
-                        .map_err(WorkflowStoreError::InvalidData)?,
-                    (bcode_workflow::PromptContextTarget::FixedGenerationFork, Some(directory)) => {
-                        state
-                            .create_fixed_generation_execution_session_in_registered_worktree(
-                                Some(format!("workflow {}", request.activation.node.name)),
-                                provenance.clone(),
-                                run.parent_session_generation
-                                    .expect("validated pinned generation"),
-                                Path::new(directory),
-                            )
-                            .await
-                            .map_err(WorkflowStoreError::InvalidData)?
-                    }
-                    _ => match execution_target {
-                        bcode_workflow::PromptContextTarget::FreshIsolated => {
-                            state
-                                .sessions
-                                .create_fresh_execution_session(
-                                    Some(format!("workflow {}", request.activation.node.name)),
-                                    provenance.clone(),
-                                    None,
-                                )
-                                .await
-                        }
-                        bcode_workflow::PromptContextTarget::FixedGenerationFork => {
-                            state
-                                .sessions
-                                .create_pinned_generation_execution_session(
-                                    Some(format!("workflow {}", request.activation.node.name)),
-                                    provenance.clone(),
-                                    run.parent_session_generation
-                                        .expect("validated pinned generation"),
-                                    None,
-                                )
-                                .await
-                        }
-                        bcode_workflow::PromptContextTarget::SharedParentSequential => {
-                            unreachable!("shared execution handled separately")
-                        }
-                    }
-                    .map_err(|error| WorkflowStoreError::InvalidData(error.to_string()))?,
-                };
+                let child = prepare_workflow_execution_child(
+                    state,
+                    request,
+                    &configuration,
+                    &provenance,
+                    immediate_parent_id,
+                )
+                .await?;
                 workflow_representation::owner::link_execution_session(
                     state,
                     &dispatch_authority,
@@ -37999,6 +38088,9 @@ const fn session_event_kind_name(kind: &SessionEventKind) -> &'static str {
         SessionEventKind::ToolExchangeResolved { .. } => "tool_exchange_resolved",
         SessionEventKind::WorkingDirectoryChanged { .. } => "working_directory_changed",
         SessionEventKind::SessionImported { .. } => "session_imported",
+        SessionEventKind::SessionChildLinked { .. } => "session_child_linked",
+        SessionEventKind::SessionChildPublished { .. } => "session_child_published",
+        SessionEventKind::SessionChildrenReconciled { .. } => "session_children_reconciled",
         SessionEventKind::ChildSessionCreated { .. } => "child_session_created",
         SessionEventKind::SessionDerived { .. } => "session_derived",
         SessionEventKind::ExecutionSessionCreated { .. } => "execution_session_created",
@@ -58882,6 +58974,82 @@ library = "test"
     }
 
     #[tokio::test]
+    async fn workflow_execution_children_keep_immediate_parent_and_pinned_source() {
+        let (state, origin, _root) = active_edit_execution_fixture_with_graph(
+            bcode_workflow_store::DispatchSideEffect::ReadOnly,
+            true,
+        )
+        .await;
+        let mut request = receipt_owned_publication_request(&state);
+        let mut config =
+            bcode_workflow::WorkflowPromptConfiguration::preserve_input("build", "observe");
+        let mut provenance = ExecutionSessionProvenance {
+            version: bcode_session_models::EXECUTION_SESSION_PROVENANCE_VERSION,
+            owner: "bcode.workflow".into(),
+            run_id: request.activation.run_id.clone(),
+            node_id: request.activation.node_id.clone(),
+            activation_id: Some(request.activation.activation_id.clone()),
+            attempt: request.attempt,
+            parent_session_id: origin,
+            context_mode: bcode_session_models::ExecutionSessionContextMode::FreshIsolated,
+            workspace_snapshot: Some("child-test-workspace".into()),
+            parent_generation: None,
+        };
+        state
+            .sessions
+            .append_event(
+                origin,
+                SessionEventKind::SystemMessage {
+                    text: "pinned workflow context".into(),
+                },
+            )
+            .await
+            .unwrap();
+        let child =
+            prepare_workflow_execution_child(&state, &request, &config, &provenance, origin)
+                .await
+                .unwrap();
+        assert_eq!(child.parent_id, Some(origin));
+        assert_eq!(
+            prepare_workflow_execution_child(&state, &request, &config, &provenance, origin)
+                .await
+                .unwrap()
+                .id,
+            child.id
+        );
+        request.activation.activation_id.push_str("-nested");
+        provenance.activation_id = Some(request.activation.activation_id.clone());
+        config.execution_target = bcode_workflow::PromptContextTarget::FixedGenerationFork;
+        provenance.context_mode =
+            bcode_session_models::ExecutionSessionContextMode::FixedGenerationFork;
+        provenance.parent_generation = Some(
+            state
+                .sessions
+                .current_session_generation(origin)
+                .await
+                .unwrap(),
+        );
+        let nested =
+            prepare_workflow_execution_child(&state, &request, &config, &provenance, child.id)
+                .await
+                .unwrap();
+        assert_eq!(nested.parent_id, Some(child.id));
+        assert_eq!(nested.execution.as_ref().unwrap().provenance, provenance);
+        let history = state.sessions.session_history(nested.id).await.unwrap();
+        assert!(history.iter().any(|event| matches!(&event.kind, SessionEventKind::SystemMessage { text } if text == "pinned workflow context")));
+        let fresh_history = state.sessions.session_history(child.id).await.unwrap();
+        assert!(!fresh_history.iter().any(|event| matches!(&event.kind, SessionEventKind::SystemMessage { text } if text == "pinned workflow context")));
+        assert_ne!(nested.id, child.id);
+        assert_eq!(
+            prepare_workflow_execution_child(&state, &request, &config, &provenance, child.id)
+                .await
+                .unwrap()
+                .id,
+            nested.id
+        );
+    }
+
+    #[tokio::test]
     async fn duplicate_workflow_prompt_admission_reuses_receipt() {
         let (state, _, _root) = active_edit_execution_fixture_with_graph(
             bcode_workflow_store::DispatchSideEffect::ReadOnly,
@@ -71855,6 +72023,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
             version: bcode_workflow::WORKFLOW_PROMPT_CONFIGURATION_VERSION,
             worktree_directory: None,
             activity_producer: None,
+            execution_parent: None,
             execution_target,
             agent_profile: "build".to_string(),
             provider: Some("bcode.fake-provider".to_string()),
@@ -75909,6 +76078,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
             version: bcode_workflow::WORKFLOW_PROMPT_CONFIGURATION_VERSION,
             worktree_directory: None,
             activity_producer: None,
+            execution_parent: None,
             execution_target: bcode_workflow::PromptContextTarget::FreshIsolated,
             agent_profile: "build".to_string(),
             provider: None,
@@ -78266,6 +78436,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
                 version: bcode_workflow::WORKFLOW_PROMPT_CONFIGURATION_VERSION,
                 worktree_directory: None,
                 activity_producer: None,
+                execution_parent: None,
                 execution_target: bcode_workflow::PromptContextTarget::SharedParentSequential,
                 agent_profile: "build".to_string(),
                 provider: None,
@@ -78482,6 +78653,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
                 version: bcode_workflow::WORKFLOW_PROMPT_CONFIGURATION_VERSION,
                 worktree_directory: None,
                 activity_producer: None,
+                execution_parent: None,
                 execution_target: bcode_workflow::PromptContextTarget::SharedParentSequential,
                 agent_profile: "build".to_string(),
                 provider: None,
@@ -78776,6 +78948,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
                                 version: bcode_workflow::WORKFLOW_PROMPT_CONFIGURATION_VERSION,
                                 worktree_directory: None,
                                 activity_producer: None,
+                                execution_parent: None,
                                 execution_target:
                                     bcode_workflow::PromptContextTarget::FreshIsolated,
                                 agent_profile: "plan".to_string(),
@@ -79673,6 +79846,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
             version: bcode_workflow::WORKFLOW_PROMPT_CONFIGURATION_VERSION,
             worktree_directory: None,
             activity_producer: None,
+            execution_parent: None,
             execution_target: bcode_workflow::PromptContextTarget::SharedParentSequential,
             agent_profile: "plan".to_string(),
             provider: None,
@@ -80158,6 +80332,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
                             version: bcode_workflow::WORKFLOW_PROMPT_CONFIGURATION_VERSION,
                             worktree_directory: None,
                             activity_producer: None,
+                            execution_parent: None,
                             execution_target: bcode_workflow::PromptContextTarget::FreshIsolated,
                             agent_profile: "build".to_string(),
                             provider: Some("bcode.fake-provider".to_string()),
@@ -80577,6 +80752,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
                             version: bcode_workflow::WORKFLOW_PROMPT_CONFIGURATION_VERSION,
                             worktree_directory: None,
                             activity_producer: None,
+                            execution_parent: None,
                             execution_target: bcode_workflow::PromptContextTarget::FreshIsolated,
                             agent_profile: "build".to_string(),
                             provider: Some("bcode.fake-provider".to_string()),
@@ -89314,7 +89490,12 @@ event_symbol = "bcode_plugin_handle_event_v1"
             false,
         )
         .await;
-        assert_eq!(completion.outcome, ModelTurnOutcome::Completed);
+        assert_eq!(
+            completion.outcome,
+            ModelTurnOutcome::Completed,
+            "{:?}",
+            completion.message
+        );
 
         let history = state
             .sessions

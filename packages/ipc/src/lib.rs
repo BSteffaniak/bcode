@@ -113,7 +113,8 @@ const MAX_CHUNK_DATA_SIZE: usize = MAX_FRAME_PAYLOAD_SIZE / 2;
 /// Version 42 adds revision-pinned scheduling pages; older positional layouts reject.
 /// Version 43 adds ordinary child creation, exact non-owning metadata, and bounded activity;
 /// changed positional layouts and parent-bearing summaries reject older peers.
-pub const CURRENT_PROTOCOL_VERSION: u16 = 43;
+/// Version 44 adds explicit child relationship maintenance and own-session activity evidence.
+pub const CURRENT_PROTOCOL_VERSION: u16 = 44;
 
 /// Durable session-storage writer epoch expected by this IPC build.
 pub const CURRENT_SESSION_STORAGE_WRITER_EPOCH: u32 =
@@ -1330,6 +1331,11 @@ pub enum Request {
     /// Bounded direct-child discovery.
     SessionChildren {
         query: bcode_session_models::SessionChildQuery,
+    },
+    /// Explicit maintenance; never called from discovery or activity reads.
+    ReconcileSessionChildren {
+        parent_id: SessionId,
+        apply: bool,
     },
 }
 
@@ -2558,6 +2564,10 @@ pub enum ResponsePayload {
     /// Bounded discovery; incomplete pages do not imply a complete tree.
     SessionChildren {
         page: bcode_session_models::SessionChildPage,
+    },
+    /// Explicit relationship maintenance result.
+    SessionChildrenReconciled {
+        result: bcode_session_models::SessionChildReconciliation,
     },
 }
 

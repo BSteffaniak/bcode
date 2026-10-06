@@ -533,6 +533,75 @@ pub fn render_prepared(app: &mut BmuxApp, frame: &mut PaintCx<'_, '_>, layout: F
     app.commit_transcript_presentation();
 }
 
+/// Paint the child monitor and its interactions using one BMUX list layout.
+fn paint_child_monitor(
+    app: &BmuxApp,
+    frame: &mut PaintCx<'_, '_>,
+    layout: FrameLayout,
+    intersects: impl Fn(Rect) -> bool,
+) {
+    let theme = TuiTheme::for_app(app);
+    let panel_rows = app.child_panel_rows();
+    let panel_height = layout.body.y.saturating_sub(layout.header.bottom());
+    let panel_area = Rect::new(
+        layout.area.x,
+        layout.header.bottom(),
+        layout.area.width,
+        panel_height,
+    );
+    if !panel_area.is_empty() && intersects(panel_area) {
+        let items: Vec<_> = panel_rows
+            .iter()
+            .enumerate()
+            .map(|(row, text)| {
+                bmux_tui_components::selectable_list::SelectableListItem::rich(
+                    app.monitor_row_session(row).map_or_else(
+                        || {
+                            if text.starts_with("Alt-N: load next") {
+                                "child-monitor-more".to_owned()
+                            } else {
+                                format!("monitor-chrome:{row}")
+                            }
+                        },
+                        |id| format!("child-monitor:{id}"),
+                    ),
+                    Line::from_spans(vec![Span::styled(
+                        text.clone(),
+                        if row == 0 { theme.info } else { theme.text },
+                    )]),
+                )
+            })
+            .collect();
+        let state = bmux_tui_components::selectable_list::SelectableListState::new(
+            app.child_panel_focused()
+                .then(|| app.monitor_selected_preview_row()),
+        );
+        let list = bmux_tui_components::selectable_list::SelectableList::new(&items).styles(
+            bmux_tui_components::selectable_list::SelectableListStyles {
+                normal: theme.text,
+                focused: theme.selection,
+                selected: theme.selection,
+                hovered: theme.focused,
+                pressed: theme.selection,
+                disabled: theme.muted,
+                background: app.presented_theme().canvas,
+                scrollbar: bmux_tui_components::scrollbar::ScrollbarStyles::default(),
+            },
+        );
+        list.paint(panel_area, &state, theme.text, frame);
+        // Hit identity comes from the same BMUX list geometry, not a second row layout.
+        for region in list.visible_semantic_regions(panel_area, &state) {
+            if region.key.starts_with("child-monitor:") || region.key == "child-monitor-more" {
+                frame.push_hit(
+                    HitRegion::new(region.key, region.rect)
+                        .role(HitRole::Action)
+                        .layer(2),
+                );
+            }
+        }
+    }
+}
+
 /// Render only prepared layout regions selected by terminal-space damage.
 pub fn render_prepared_damage(
     app: &mut BmuxApp,
@@ -545,30 +614,7 @@ pub fn render_prepared_damage(
     }
 
     let theme = TuiTheme::for_app(app);
-    for (index, text) in app.child_panel_rows().into_iter().enumerate() {
-        let y = layout
-            .header
-            .bottom()
-            .saturating_add(u16::try_from(index).unwrap_or(u16::MAX));
-        if y >= layout.body.y {
-            break;
-        }
-        let area = Rect::new(layout.area.x, y, layout.area.width, 1);
-        if intersects(area) {
-            if let Some(session_id) = app.monitor_row_session(index) {
-                frame.push_hit(
-                    HitRegion::new(format!("child-monitor:{session_id}"), area)
-                        .role(HitRole::Action)
-                        .layer(2),
-                );
-            }
-            frame.fill(LocalRect::terminal(area), " ", app.presented_theme().canvas);
-            frame.write_line(
-                LocalRect::terminal(area),
-                &Line::from_spans(vec![Span::styled(text, theme.info)]),
-            );
-        }
-    }
+    paint_child_monitor(app, frame, layout, &intersects);
     if intersects(layout.header) {
         frame.fill(
             LocalRect::terminal(layout.header),

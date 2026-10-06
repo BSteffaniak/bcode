@@ -204,6 +204,8 @@ pub type StepFuture<T> = Pin<Box<dyn Future<Output = Result<T, WorkflowError>> +
 type StepFn<I, O> = dyn Fn(I, StepContext) -> StepFuture<O> + Send + Sync;
 
 #[cfg(test)]
+mod execution_parent_tests;
+#[cfg(test)]
 mod scheduler_tests;
 
 const DEFAULT_MAX_CONCURRENCY: usize = Semaphore::MAX_PERMITS;
@@ -5399,6 +5401,7 @@ impl WorkflowStructuredSourceConcisePrompt {
             version: WORKFLOW_PROMPT_CONFIGURATION_VERSION,
             worktree_directory: None,
             activity_producer: None,
+            execution_parent: None,
             execution_target: self.execution_target,
             agent_profile: self.agent_profile.clone(),
             provider: self.provider.clone(),
@@ -12366,11 +12369,108 @@ pub struct WorkflowActivityProducer {
     pub stage: String,
 }
 
+/// Canonical immediate delegator binding installed by authenticated publication.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WorkflowExecutionParentBinding {
+    /// Independently evolving binding representation.
+    pub version: u32,
+    /// Authenticated execution session, not the root-run context origin.
+    pub session_id: String,
+}
+
+/// Reject execution-parent claims in authored definitions before durable admission.
+///
+/// # Errors
+/// Returns an error for caller-supplied host-owned metadata.
+pub fn reject_definition_execution_parent_claims(
+    definition: &WorkflowDefinition,
+) -> Result<(), WorkflowError> {
+    if definition
+        .nodes
+        .values()
+        .any(|node| node.configuration.get("execution_parent").is_some())
+    {
+        return Err(authoring_error(
+            "execution_parent",
+            "execution parent is authenticated publication metadata, not caller configuration",
+        ));
+    }
+    Ok(())
+}
+
+/// Reject caller-provided execution parent metadata before staging or root admission.
+///
+/// # Errors
+/// Returns an error when any new/replaced prompt attempts to supply host-owned binding facts.
+pub fn reject_execution_parent_claims(
+    batch: &WorkflowRunGraphEditBatch,
+) -> Result<(), WorkflowError> {
+    for edit in &batch.edits {
+        if let WorkflowRunGraphEdit::AddNode { node, .. }
+        | WorkflowRunGraphEdit::ReplaceNode { node, .. } = edit
+            && node.configuration.get("execution_parent").is_some()
+        {
+            return Err(authoring_error(
+                "execution_parent",
+                "execution parent is authenticated publication metadata, not caller configuration",
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Decorate admitted prompt nodes with a verified execution parent without changing the candidate.
+///
+/// # Errors
+/// Rejects malformed configuration or caller session identities.
+pub fn bind_execution_parent(
+    batch: &WorkflowRunGraphEditBatch,
+    session_id: &str,
+) -> Result<WorkflowRunGraphEditBatch, WorkflowError> {
+    let mut admitted = batch.clone();
+    if session_id.trim().is_empty() || session_id.len() > 128 {
+        return Err(authoring_error(
+            "execution_parent",
+            "invalid authenticated session identity",
+        ));
+    }
+    let binding = WorkflowExecutionParentBinding {
+        version: 1,
+        session_id: session_id.to_owned(),
+    };
+    for edit in &mut admitted.edits {
+        if let WorkflowRunGraphEdit::AddNode { node, .. }
+        | WorkflowRunGraphEdit::ReplaceNode { node, .. } = edit
+            && node.kind == NodeKind::Agent
+        {
+            let object =
+                node.configuration
+                    .as_object_mut()
+                    .ok_or_else(|| WorkflowError::Build {
+                        path: node.id.clone(),
+                        message: "prompt configuration must be an object".into(),
+                    })?;
+            object.insert(
+                "execution_parent".into(),
+                serde_json::to_value(&binding).map_err(|error| WorkflowError::Build {
+                    path: node.id.clone(),
+                    message: error.to_string(),
+                })?,
+            );
+        }
+    }
+    Ok(admitted)
+}
+
 /// Versioned serializable durable prompt-node configuration.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct WorkflowPromptConfiguration {
     pub version: u32,
+    /// Authenticated immediate delegator, installed only by the owning publication boundary.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub execution_parent: Option<WorkflowExecutionParentBinding>,
     pub execution_target: PromptContextTarget,
     /// Explicit existing registered worktree; absent inherits the parent workspace.
     /// This selects a filesystem location, not a sandbox or permission grant.
@@ -12398,6 +12498,8 @@ pub struct WorkflowPromptConfiguration {
 struct WorkflowPromptConfigurationWire {
     version: u32,
     execution_target: PromptContextTarget,
+    #[serde(default)]
+    execution_parent: Option<WorkflowExecutionParentBinding>,
     #[serde(default)]
     worktree_directory: Option<String>,
     agent_profile: String,
@@ -12427,6 +12529,15 @@ impl<'de> Deserialize<'de> for WorkflowPromptConfiguration {
         use serde::de::Error as _;
 
         let wire = WorkflowPromptConfigurationWire::deserialize(deserializer)?;
+        if let Some(binding) = &wire.execution_parent
+            && (binding.version != 1
+                || binding.session_id.trim().is_empty()
+                || binding.session_id.len() > 128)
+        {
+            return Err(D::Error::custom(
+                "unsupported or invalid execution parent binding",
+            ));
+        }
         if wire.worktree_directory.is_some()
             && wire.version != WORKFLOW_PROMPT_CONFIGURATION_VERSION
         {
@@ -12486,6 +12597,7 @@ impl<'de> Deserialize<'de> for WorkflowPromptConfiguration {
             prompt_mode: wire.prompt_mode,
             system_prompt: wire.system_prompt,
             activity_producer: wire.activity_producer,
+            execution_parent: wire.execution_parent,
         })
     }
 }
@@ -12531,6 +12643,7 @@ impl WorkflowPromptConfiguration {
             version: WORKFLOW_PROMPT_CONFIGURATION_VERSION,
             worktree_directory: None,
             activity_producer: None,
+            execution_parent: None,
             execution_target: PromptContextTarget::FreshIsolated,
             agent_profile: agent_profile.into(),
             provider: None,
@@ -17451,6 +17564,7 @@ mod tests {
             version: WORKFLOW_PROMPT_CONFIGURATION_VERSION,
             worktree_directory: None,
             activity_producer: None,
+            execution_parent: None,
             execution_target: PromptContextTarget::FreshIsolated,
             agent_profile: "build".to_string(),
             provider: None,
@@ -17654,6 +17768,7 @@ mod tests {
                             version: WORKFLOW_PROMPT_CONFIGURATION_VERSION,
                             worktree_directory: None,
                             activity_producer: None,
+                            execution_parent: None,
                             execution_target: PromptContextTarget::FreshIsolated,
                             agent_profile: "review".to_string(),
                             provider: None,
@@ -19276,6 +19391,7 @@ steps:
             version: WORKFLOW_PROMPT_CONFIGURATION_VERSION,
             worktree_directory: None,
             activity_producer: None,
+            execution_parent: None,
             execution_target: PromptContextTarget::FixedGenerationFork,
             agent_profile: "review".to_string(),
             provider: None,
@@ -23680,6 +23796,7 @@ steps:
             version: WORKFLOW_PROMPT_CONFIGURATION_VERSION,
             worktree_directory: None,
             activity_producer: None,
+            execution_parent: None,
             execution_target: PromptContextTarget::FreshIsolated,
             agent_profile: "build".to_string(),
             provider: Some("configured".to_string()),
@@ -25919,6 +26036,7 @@ steps:
             version: WORKFLOW_PROMPT_CONFIGURATION_VERSION,
             worktree_directory: None,
             activity_producer: None,
+            execution_parent: None,
             execution_target: PromptContextTarget::FreshIsolated,
             agent_profile: "build".to_string(),
             provider: None,

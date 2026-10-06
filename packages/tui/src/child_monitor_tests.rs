@@ -41,11 +41,13 @@ fn monitor_expands_idle_coordinator_and_preserves_transcript() {
         child.id,
         SessionActivityPage {
             own: SessionActivity {
+                evidence: None,
                 session_id: child.id,
                 parent_id: Some(root),
                 states: vec![SessionActivityState::Idle],
             },
             descendants: vec![SessionActivity {
+                evidence: None,
                 session_id: grandchild.id,
                 parent_id: Some(child.id),
                 states: vec![SessionActivityState::Running],
@@ -207,14 +209,20 @@ fn monitor_cache_evicts_and_reload_has_no_total_descendant_limit() {
             })
             .collect();
         first.get_or_insert_with(|| children[0].clone());
+        let next_after = children.last().map(|child| child.id);
         app.apply_monitor_children(
             root,
             &SessionChildPage {
-                next_after: children.last().map(|child| child.id),
+                next_after,
                 children,
                 complete: true,
                 issues: vec![],
             },
+        );
+        assert_eq!(
+            app.monitor_frontier_cursor(root),
+            next_after,
+            "eviction must not reset root continuation"
         );
     }
     app.toggle_child_panel();
@@ -245,11 +253,50 @@ fn monitor_cache_evicts_and_reload_has_no_total_descendant_limit() {
 }
 
 #[test]
+fn child_activity_refresh_advances_cursor_and_terminal_window_restarts() {
+    let root = SessionId::new();
+    let later = SessionId::new();
+    let mut app = BmuxApp::new_with_history(Some(root), &[], &[], false);
+    let mut page = SessionActivityPage {
+        own: SessionActivity {
+            session_id: root,
+            parent_id: None,
+            states: vec![],
+            evidence: None,
+        },
+        descendants: vec![],
+        next_after: Some(later),
+        coverage: SessionActivityCoverage::Partial,
+        observed_at_ms: 1,
+        issues: vec![],
+    };
+    app.apply_child_activity(Ok(page.clone()));
+    let mut request = super::super::effects::TuiEffect::LoadChildActivity {
+        session_id: root,
+        after: None,
+        generation: 0,
+    };
+    app.stamp_child_effect(&mut request);
+    assert!(
+        matches!(request, super::super::effects::TuiEffect::LoadChildActivity { after: Some(id), .. } if id == later)
+    );
+    page.next_after = None;
+    app.apply_child_activity(Ok(page));
+    app.stamp_child_effect(&mut request);
+    assert!(matches!(
+        request,
+        super::super::effects::TuiEffect::LoadChildActivity { after: None, .. }
+    ));
+    drop(app);
+}
+
+#[test]
 fn newer_monitor_request_rejects_stale_even_in_same_session() {
     let root = SessionId::new();
     let mut app = BmuxApp::new_with_history(Some(root), &[], &[], false);
     let mut request = super::super::effects::TuiEffect::LoadChildActivity {
         session_id: root,
+        after: None,
         generation: 0,
     };
     app.stamp_child_effect(&mut request);
@@ -272,6 +319,60 @@ fn newer_monitor_request_rejects_stale_even_in_same_session() {
     let reconstructed = BmuxApp::new_with_history(Some(root), &[], &[], false);
     assert!(!reconstructed.accepts_child_result(true, root, second));
     drop(reconstructed);
+}
+
+#[test]
+fn canonical_parent_intent_is_not_a_card_and_publication_retry_is_one_card() {
+    let parent = SessionId::new();
+    let child = SessionId::new();
+    let intent = event(
+        parent,
+        1,
+        SessionEventKind::SessionChildLinked { child_id: child },
+    );
+    let published = event(
+        parent,
+        2,
+        SessionEventKind::SessionChildPublished {
+            child_id: child,
+            title: Some("子 [safe] 👩‍💻 e\u{301}".to_owned()),
+        },
+    );
+    let mut app = BmuxApp::new_with_history(Some(parent), &[intent], &[], false);
+    assert!(app.session_view_snapshot().transcript.items.is_empty());
+    app.absorb_session_event(&published);
+    let mut retry = published.clone();
+    retry.sequence = 3;
+    app.absorb_session_event(&retry);
+    assert_eq!(app.session_view_snapshot().transcript.items.len(), 1);
+    app.apply_child_activity(Ok(SessionActivityPage {
+        own: SessionActivity {
+            session_id: parent,
+            parent_id: None,
+            states: vec![SessionActivityState::Idle],
+            evidence: None,
+        },
+        descendants: vec![SessionActivity {
+            session_id: child,
+            parent_id: Some(parent),
+            states: vec![SessionActivityState::PermissionWait],
+            evidence: None,
+        }],
+        next_after: None,
+        coverage: SessionActivityCoverage::Complete,
+        observed_at_ms: 1,
+        issues: vec![],
+    }));
+    assert_eq!(app.session_view_snapshot().transcript.items.len(), 1);
+    let bcode_session_view_models::TranscriptViewItemKind::SystemMessage { message } =
+        &app.session_view_snapshot().transcript.items[0].kind
+    else {
+        panic!("child card semantic content");
+    };
+    assert!(message.text.contains("permission wait"));
+    assert!(message.text.contains("stale"));
+    assert!(!message.text.contains("completed"));
+    drop(app);
 }
 
 #[test]
@@ -308,11 +409,13 @@ fn successful_activity_refresh_clears_error_and_counts_observed_grandchildren() 
     );
     app.apply_child_activity(Ok(SessionActivityPage {
         own: SessionActivity {
+            evidence: None,
             session_id: root,
             parent_id: None,
             states: vec![SessionActivityState::Idle],
         },
         descendants: vec![SessionActivity {
+            evidence: None,
             session_id: coordinator,
             parent_id: Some(root),
             states: vec![SessionActivityState::Idle],
@@ -327,11 +430,13 @@ fn successful_activity_refresh_clears_error_and_counts_observed_grandchildren() 
         coordinator,
         SessionActivityPage {
             own: SessionActivity {
+                evidence: None,
                 session_id: coordinator,
                 parent_id: Some(root),
                 states: vec![SessionActivityState::Idle],
             },
             descendants: vec![SessionActivity {
+                evidence: None,
                 session_id: grandchild,
                 parent_id: Some(coordinator),
                 states: vec![SessionActivityState::Running],

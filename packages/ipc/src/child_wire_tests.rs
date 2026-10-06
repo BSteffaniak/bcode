@@ -20,6 +20,10 @@ fn child_application_requests_json_and_binary_round_trip() {
                 working_directory: PathBuf::from("/workspace"),
             },
         },
+        Request::ReconcileSessionChildren {
+            parent_id: parent,
+            apply: true,
+        },
         Request::SessionSummary { session_id: child },
         Request::SessionChildren {
             query: SessionChildQuery {
@@ -37,7 +41,7 @@ fn child_application_requests_json_and_binary_round_trip() {
             },
         },
     ];
-    assert_eq!(CURRENT_PROTOCOL_VERSION, 43);
+    assert_eq!(CURRENT_PROTOCOL_VERSION, 44);
     for request in requests {
         let json = serde_json::to_vec(&request).unwrap();
         assert_eq!(serde_json::from_slice::<Request>(&json).unwrap(), request);
@@ -56,6 +60,12 @@ fn child_application_responses_json_and_binary_round_trip() {
     }))
     .unwrap();
     let responses = [
+        Response::Ok(ResponsePayload::SessionChildrenReconciled {
+            result: bcode_session_models::SessionChildReconciliation {
+                parent_id: parent,
+                verified_children: 2,
+            },
+        }),
         Response::Ok(ResponsePayload::SessionCreated {
             session: summary.clone(),
         }),
@@ -76,6 +86,7 @@ fn child_application_responses_json_and_binary_round_trip() {
                     session_id: parent,
                     parent_id: None,
                     states: vec![SessionActivityState::Unknown],
+                    evidence: None,
                 },
                 descendants: vec![SessionActivity {
                     session_id: child,
@@ -84,6 +95,7 @@ fn child_application_responses_json_and_binary_round_trip() {
                         SessionActivityState::Queued,
                         SessionActivityState::PermissionWait,
                     ],
+                    evidence: None,
                 }],
                 next_after: Some(child),
                 coverage: SessionActivityCoverage::Degraded,
