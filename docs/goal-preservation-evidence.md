@@ -18,6 +18,21 @@ Implementation guidance requires pre-change baseline provenance and post-change
 observations; read-only evaluators can independently compare the current digest.
 Reported baselines remain contributor-supplied, not host-certified history.
 
+The loop judgement request includes the evaluator's summary alongside its evidence
+and pinned stop condition. The summary is an untrusted evaluation conclusion, not
+completion authority; the agent completion gate and configured probability threshold
+still both apply. Judge output appends the probability decision instead of discarding
+the evaluator summary, retaining corrective context and the delivered report.
+Request bounds include the added summary. Fake-provider tests verify the handoff,
+threshold rejection, and that even 100% judgement cannot promote a negative agent
+assessment.
+
+Repeated live persisted-report trials still show oracle-correct artifacts rejected
+by judgement, including after the fresh evaluator accepts preservation. Summary
+handoff repairs missing context but does not establish judge calibration or eliminate
+rejections. Eval diagnosis explicitly reports independent-oracle/completion disagreement;
+it does not label it a verified provider root cause.
+
 A controlled rerun accepted artifact correctness in all six trials and fresh
 evaluators accepted preservation, but several completion judgements remained below
 the unchanged 90% threshold. The evidence gap fix therefore does not establish

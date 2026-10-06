@@ -239,7 +239,8 @@ pub fn invoke(context: &NativeServiceContext) -> ServiceResponse {
         Ok((completed, probability)) => {
             input.condition_met = completed;
             input.summary = format!(
-                "Judgement probability {probability:.3}; completion threshold {}%; {}",
+                "{}\nJudgement probability {probability:.3}; completion threshold {}%; {}",
+                input.summary,
                 config.threshold_percent,
                 if completed {
                     "condition met"
@@ -332,7 +333,8 @@ fn evaluate(
     if input.evidence.is_empty()
         || input.evidence.iter().any(|item| item.trim().is_empty())
         || evidence.len() > EVIDENCE_LIMIT
-        || input.stop_condition.len() + evidence.len() > judgement::MAX_REQUEST_BYTES / 2
+        || input.stop_condition.len() + evidence.len() + input.summary.len()
+            > judgement::MAX_REQUEST_BYTES / 2
     {
         return Err("insufficient or oversized evidence");
     }
@@ -347,6 +349,7 @@ fn evaluate(
             state: State::Structured(serde_json::json!({
                 "stop_condition": input.stop_condition,
                 "iteration": input.iteration,
+                "evaluation_summary": input.summary,
                 "evidence": input.evidence,
             })),
             questions: BTreeMap::from([("completion".into(), question)]),
@@ -521,6 +524,10 @@ mod tests {
                 request.interface_id,
                 judgement::WORKFLOW_APPLICATION_INTERFACE_ID
             );
+            assert_eq!(
+                request.payload["request"]["state"]["value"]["evaluation_summary"],
+                "Independent artifact review completed"
+            );
             let percentage = unsafe { *user_data.cast::<u8>() };
             let result = ServiceBridgeResponse::Service(
                 bcode_tool::ToolInvocationServiceResolution::Responded {
@@ -543,6 +550,7 @@ mod tests {
             parse_config("bcode.fake-provider/fake-judgement/-/90/pause").unwrap();
         let mut state = loop_workflow_initial_value(&input);
         state.evidence = vec!["test output reviewed".into()];
+        state.summary = "Independent artifact review completed".into();
         for (agent_completed, percentage, expected) in [
             (false, 89_u8, false),
             (false, 90_u8, false),
@@ -586,6 +594,7 @@ mod tests {
             assert_eq!(output.condition_met, expected);
             assert_eq!(output.stop_condition, state.stop_condition);
             assert_eq!(output.evidence, state.evidence);
+            assert!(output.summary.starts_with(&state.summary));
         }
     }
 

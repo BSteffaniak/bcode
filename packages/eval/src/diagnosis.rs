@@ -37,6 +37,12 @@ pub fn classify(
         .filter(|value| value["node_id"] == "loop.judgement.evaluate")
         .filter_map(|value| value.get("value"))
         .collect();
+    if oracle["artifact_correct"] == true
+        && oracle["completion_claimed"] == false
+        && !states.is_empty()
+    {
+        labels.push("independent_oracle_completion_disagreement");
+    }
     if states.iter().any(|state| state["condition_met"] == false) {
         labels.push("judgement_gate_withheld_completion");
     }
@@ -53,6 +59,24 @@ pub fn classify(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn correct_artifact_with_withheld_completion_is_an_explicit_disagreement() {
+        let result = super::classify(
+            &serde_json::json!({"artifact_correct":true,"completion_claimed":false}),
+            &serde_json::json!([{"node_id":"loop.judgement.evaluate","value":{"condition_met":false}}]),
+            &serde_json::json!({}),
+            &std::collections::BTreeMap::new(),
+        );
+        assert!(
+            result["labels"]
+                .as_array()
+                .unwrap()
+                .contains(&serde_json::json!(
+                    "independent_oracle_completion_disagreement"
+                ))
+        );
+        assert_eq!(result["root_cause_verified"], false);
+    }
     #[test]
     fn absent_terminal_report_is_not_proof_of_incorrect_work() {
         let result = super::classify(
