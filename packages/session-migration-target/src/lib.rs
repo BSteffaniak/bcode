@@ -277,18 +277,21 @@ pub enum StorageCompatibilityError {
 pub fn classify_storage_facts(
     facts: &StorageCompatibilityFacts,
 ) -> Result<StorageCompatibility, StorageCompatibilityError> {
-    let mut completed = Vec::with_capacity(facts.migration_rows.len());
+    let mut completed = BTreeSet::new();
     for row in &facts.migration_rows {
         if row.status != "completed" {
             return Err(StorageCompatibilityError::IncompleteLedger);
         }
-        completed.push(row.id.as_str());
+        if !completed.insert(row.id.as_str()) {
+            return Err(StorageCompatibilityError::Classification(
+                "source migration ledger contains duplicate identifiers".to_owned(),
+            ));
+        }
     }
     if completed.len() > facts.current_migration_ids.len()
-        || !completed
+        || facts.current_migration_ids[..completed.len()]
             .iter()
-            .zip(&facts.current_migration_ids)
-            .all(|(actual, expected)| *actual == expected)
+            .any(|expected| !completed.contains(expected.as_str()))
     {
         return Err(StorageCompatibilityError::Classification(
             "source migration ledger is not a known current-schema prefix".to_owned(),
@@ -400,6 +403,56 @@ mod tests {
         assert_eq!(
             CURRENT_WRITER_EPOCH,
             bcode_session_models::CURRENT_SESSION_STORAGE_WRITER_EPOCH
+        );
+    }
+
+    #[test]
+    fn storage_prefix_uses_contract_order_not_query_or_identifier_order() {
+        let mut facts = StorageCompatibilityFacts {
+            current_migration_ids: vec!["base".into(), "z_existing".into(), "a_new".into()],
+            migration_rows: vec![
+                MigrationLedgerRow {
+                    id: "z_existing".into(),
+                    status: "completed".into(),
+                },
+                MigrationLedgerRow {
+                    id: "base".into(),
+                    status: "completed".into(),
+                },
+            ],
+            contract_table_exists: true,
+            contract_schema_version: Some(1),
+            writer_epoch: Some(u64::from(CURRENT_WRITER_EPOCH - 1)),
+            expected_contract_schema_version: 1,
+            legacy_writer_epoch: 1,
+        };
+        assert!(matches!(
+            classify_storage_facts(&facts).unwrap(),
+            StorageCompatibility::MigrationRequired { .. }
+        ));
+        facts.migration_rows.push(MigrationLedgerRow {
+            id: "a_new".into(),
+            status: "completed".into(),
+        });
+        facts.writer_epoch = Some(u64::from(CURRENT_WRITER_EPOCH));
+        assert!(matches!(
+            classify_storage_facts(&facts).unwrap(),
+            StorageCompatibility::Current { .. }
+        ));
+        facts.migration_rows.remove(0);
+        assert!(classify_storage_facts(&facts).is_err());
+        facts.migration_rows.push(MigrationLedgerRow {
+            id: "future".into(),
+            status: "completed".into(),
+        });
+        assert!(classify_storage_facts(&facts).is_err());
+        facts.migration_rows.pop();
+        facts.migration_rows.push(facts.migration_rows[0].clone());
+        assert!(classify_storage_facts(&facts).is_err());
+        facts.migration_rows[0].status = "in_progress".into();
+        assert_eq!(
+            classify_storage_facts(&facts),
+            Err(StorageCompatibilityError::IncompleteLedger)
         );
     }
 

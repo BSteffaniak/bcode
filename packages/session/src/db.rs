@@ -6288,6 +6288,29 @@ mod tests {
         );
         db.append_event(&prompt).await.unwrap();
         let receipt = db.turn_receipt("test", "old").await.unwrap();
+        assert!(matches!(
+            db.storage_compatibility().await.unwrap(),
+            SessionStorageCompatibility::Current { .. }
+        ));
+        // Reproduce the released epoch-11 ledger, before submission migrations existed.
+        db.database()
+            .delete(SESSION_MIGRATIONS_TABLE)
+            .where_in(
+                "id",
+                vec![
+                    "043_submissions_table",
+                    "044_submissions_pending_index",
+                    "045_submissions_target_index",
+                ],
+            )
+            .execute(db.database())
+            .await
+            .unwrap();
+        let facts = db.storage_compatibility_facts().await.unwrap();
+        assert!(matches!(
+            bcode_session_migration_target::classify_storage_facts(&facts).unwrap(),
+            bcode_session_migration_target::StorageCompatibility::MigrationRequired { .. }
+        ));
         db.database()
             .update("session_storage_contract")
             .value("writer_epoch", 11)

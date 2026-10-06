@@ -6,15 +6,40 @@
 #[cfg(test)]
 mod tests;
 
+use std::sync::Arc;
 use switchy::database::query::{FilterableQuery, delete, update};
 use switchy::database::schema::{
     Column, DataType, alter_table, create_index, create_table, drop_index, drop_table,
 };
 use switchy::database::{Database, DatabaseError, DatabaseValue, Executable};
-use switchy::schema::discovery::code::{CodeMigration, CodeMigrationSource};
+use switchy::schema::discovery::code::CodeMigration;
+use switchy::schema::migration::{Migration, MigrationSource};
 
-pub fn global_migrations() -> CodeMigrationSource<'static> {
-    let mut source = CodeMigrationSource::new();
+/// Current schema operations in append-only contract order, independent of identifier spelling.
+#[derive(Default)]
+pub struct CurrentMigrationSource {
+    migrations: Vec<Arc<dyn Migration<'static>>>,
+}
+
+impl CurrentMigrationSource {
+    fn new() -> Self {
+        Self::default()
+    }
+
+    fn add_migration(&mut self, migration: CodeMigration<'static>) {
+        self.migrations.push(Arc::new(migration));
+    }
+}
+
+#[async_trait::async_trait]
+impl MigrationSource<'static> for CurrentMigrationSource {
+    async fn migrations(&self) -> switchy::schema::Result<Vec<Arc<dyn Migration<'static>>>> {
+        Ok(self.migrations.clone())
+    }
+}
+
+pub fn global_migrations() -> CurrentMigrationSource {
+    let mut source = CurrentMigrationSource::new();
     add_migration(
         &mut source,
         "001_global_sessions_table",
@@ -73,11 +98,15 @@ pub fn global_migrations() -> CodeMigrationSource<'static> {
     source
 }
 
-pub fn session_migrations() -> CodeMigrationSource<'static> {
-    let mut source = CodeMigrationSource::new();
+pub fn session_migrations() -> CurrentMigrationSource {
+    let mut source = CurrentMigrationSource::new();
     add_session_base_migrations(&mut source);
     add_session_runtime_migrations(&mut source);
     add_session_execution_migrations(&mut source);
+    // Preserve the established ledger prefix before appending newer schema operations.
+    // Identifiers are durable: sorting the entire catalog would insert submissions ahead
+    // of the already released terminal-evidence index.
+    source.migrations.sort_by(|a, b| a.id().cmp(b.id()));
     add_migration(
         &mut source,
         "043_submissions_table",
@@ -112,7 +141,7 @@ pub fn session_migrations() -> CodeMigrationSource<'static> {
     source
 }
 
-fn add_session_execution_migrations(source: &mut CodeMigrationSource<'static>) {
+fn add_session_execution_migrations(source: &mut CurrentMigrationSource) {
     add_migration(
         source,
         "030_session_state_visibility_column",
@@ -185,7 +214,7 @@ fn add_session_execution_migrations(source: &mut CodeMigrationSource<'static>) {
     add_session_usage_migrations(source);
 }
 
-fn add_session_usage_migrations(source: &mut CodeMigrationSource<'static>) {
+fn add_session_usage_migrations(source: &mut CurrentMigrationSource) {
     add_migration(
         source,
         "036_session_usage_projection_table",
@@ -274,7 +303,7 @@ fn add_session_usage_migrations(source: &mut CodeMigrationSource<'static>) {
     );
 }
 
-fn add_session_base_migrations(source: &mut CodeMigrationSource<'static>) {
+fn add_session_base_migrations(source: &mut CurrentMigrationSource) {
     add_migration(
         source,
         "001_events_table",
@@ -358,7 +387,7 @@ fn add_session_base_migrations(source: &mut CodeMigrationSource<'static>) {
     add_session_projection_migrations(source);
 }
 
-fn add_session_projection_migrations(source: &mut CodeMigrationSource<'static>) {
+fn add_session_projection_migrations(source: &mut CurrentMigrationSource) {
     add_migration(
         source,
         "007_transcript_items_event_range_index",
@@ -423,7 +452,7 @@ fn add_session_projection_migrations(source: &mut CodeMigrationSource<'static>) 
 }
 
 #[allow(clippy::too_many_lines)]
-fn add_session_runtime_migrations(source: &mut CodeMigrationSource<'static>) {
+fn add_session_runtime_migrations(source: &mut CurrentMigrationSource) {
     add_migration(
         source,
         "012_runtime_work_table",
@@ -623,7 +652,7 @@ fn add_session_runtime_migrations(source: &mut CodeMigrationSource<'static>) {
     add_session_compatibility_ledger_markers(source);
 }
 
-fn add_session_compatibility_ledger_markers(source: &mut CodeMigrationSource<'static>) {
+fn add_session_compatibility_ledger_markers(source: &mut CurrentMigrationSource) {
     // Preserve released ledger identities without materializing superseded compatibility tables.
     add_migration(
         source,
@@ -664,7 +693,7 @@ fn add_session_compatibility_ledger_markers(source: &mut CodeMigrationSource<'st
 }
 
 fn add_migration(
-    source: &mut CodeMigrationSource<'static>,
+    source: &mut CurrentMigrationSource,
     id: &str,
     up: impl switchy::database::Executable + 'static,
     down: impl switchy::database::Executable + 'static,

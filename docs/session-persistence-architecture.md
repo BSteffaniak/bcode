@@ -13,6 +13,13 @@ at its activation sequence; `SubmissionCancelled` terminalizes pending input wit
 model context. Activation is not evidence that a provider request ran or that the instruction was
 fulfilled.
 
+The current SQL migration catalog preserves append-only contract order independently of
+lexicographic identifier order. Existing durable identifiers remain unchanged; new operations
+follow the released ledger prefix even when their names sort before an existing operation.
+Ledger classification compares completed membership against that contract prefix, not the
+unspecified row order returned by storage. Unknown, incomplete, duplicate, or gapped histories
+remain rejected. Known prefixes continue through the exclusively owned automatic upgrade path.
+
 The session-owned submission projection supports bounded exact lookup and acceptance-ordered
 pending pages. It is derived from canonical lifecycle events, checkpoint-validated, and rebuilt
 only through authorized maintenance or migration. Pending payload is retained independently of
