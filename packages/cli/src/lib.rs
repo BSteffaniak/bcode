@@ -5180,6 +5180,20 @@ struct ArtifactRangeArgs {
     raw: bool,
 }
 
+#[derive(Debug, clap::Args)]
+struct TraceRangeArgs {
+    session_id: SessionId,
+    /// Canonical sequence of an event retaining a trace blob.
+    sequence: u64,
+    #[arg(long, default_value_t = 0)]
+    offset: u64,
+    #[arg(long, default_value_t = bcode_session_models::MAX_SESSION_TRACE_BLOB_BYTES)]
+    length: u32,
+    /// Emit raw bytes only. Captures may be sensitive or incomplete.
+    #[arg(long)]
+    raw: bool,
+}
+
 #[derive(Debug, Subcommand)]
 enum SessionCommand {
     /// Compact legacy global reader evidence while retaining a durable maintenance blocker.
@@ -5277,6 +5291,8 @@ enum SessionCommand {
         clear: bool,
     },
     /// Read a bounded artifact byte range as JSON, including reference and availability metadata.
+    /// Explicit sensitive diagnostic read of a retained canonical trace capture.
+    TraceRange(TraceRangeArgs),
     ArtifactRange(ArtifactRangeArgs),
     /// List agent profiles available from the daemon for session selection.
     Agents {
@@ -6816,6 +6832,27 @@ fn write_artifact_range(
     }
 }
 
+async fn read_trace_range(args: TraceRangeArgs) -> Result<(), CliError> {
+    ensure_server_running().await?;
+    let range = BcodeClient::default_endpoint()
+        .session_trace_blob_range(bcode_session_models::ReadSessionTraceBlobRequest {
+            version: bcode_session_models::SESSION_TRACE_EXPORT_VERSION,
+            session_id: args.session_id,
+            sequence: args.sequence,
+            offset: args.offset,
+            length: args.length,
+        })
+        .await?;
+    if args.raw {
+        let mut output = std::io::stdout().lock();
+        output.write_all(&range.bytes)?;
+        output.flush()?;
+    } else {
+        print_json(&range)?;
+    }
+    Ok(())
+}
+
 async fn read_artifact_range_to(
     client: &BcodeClient,
     args: ArtifactRangeArgs,
@@ -7377,6 +7414,9 @@ async fn dispatch_session_command(command: Box<SessionCommand>) -> Result<(), Cl
                 print_json(&Box::pin(client.composer_draft(scope)).await?)?;
             }
         }
+        SessionCommand::TraceRange(args) => {
+            Box::pin(read_trace_range(args)).await?;
+        }
         SessionCommand::ArtifactRange(args) => {
             Box::pin(read_artifact_range_to(
                 &BcodeClient::default_endpoint(),
@@ -7387,7 +7427,7 @@ async fn dispatch_session_command(command: Box<SessionCommand>) -> Result<(), Cl
         }
         SessionCommand::Agents { json } => {
             ensure_server_running().await?;
-            let agents = BcodeClient::default_endpoint().list_agents().await?;
+            let agents = Box::pin(BcodeClient::default_endpoint().list_agents()).await?;
             if json {
                 print_json(&agents)?;
             } else {

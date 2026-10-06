@@ -21,6 +21,7 @@ mod schedule;
 mod sdk;
 mod statistics;
 mod timing;
+mod trace_exports;
 mod workflow;
 
 pub use sdk::{
@@ -1404,6 +1405,7 @@ async fn execute_agent_variant_async(
     .await?;
     let transcript_path = rep_dir.join("transcript.jsonl");
     let tool_calls_path = rep_dir.join("tool-calls.jsonl");
+    trace_exports::export(&client, &transcript_path, &events).await?;
     write_session_events_jsonl(&transcript_path, &events)?;
     write_tool_calls_jsonl(&tool_calls_path, &events)?;
     let telemetry = session_telemetry(&events);
@@ -1554,6 +1556,7 @@ async fn run_agent_follow_up(
         rep_dir,
     )
     .await?;
+    trace_exports::export(client, &rep_dir.join("follow-up-transcript.jsonl"), &events).await?;
     write_session_events_jsonl(&rep_dir.join("follow-up-transcript.jsonl"), &events)?;
     let telemetry = session_telemetry(&events);
     let mut measurements = telemetry
@@ -1769,7 +1772,12 @@ fn write_session_events_jsonl(
     introspection::write(&path.with_extension("introspection.jsonl"), events)?;
     write_json(
         path.with_extension("introspection.json"),
-        &introspection::summary(events),
+        &introspection::summary_with_exports(
+            events,
+            &serde_json::from_slice::<serde_json::Value>(&std::fs::read(
+                path.with_extension("captures.json"),
+            )?)?,
+        ),
     )?;
     let mut file = File::create(path)?;
     for event in events {

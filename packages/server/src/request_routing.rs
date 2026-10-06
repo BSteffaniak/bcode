@@ -129,6 +129,7 @@ pub enum SessionLifecycleRequest {
     /// Read a bounded byte range from a generic session artifact reference.
     PrepareContextGeneration(bcode_session_models::PrepareContextGeneration),
     SessionWorkingDocument(bcode_session_models::SessionWorkingDocumentRequest),
+    ReadSessionTraceBlob(bcode_session_models::ReadSessionTraceBlobRequest),
     ReadSessionArtifact {
         session_id: SessionId,
         artifact_id: String,
@@ -1828,6 +1829,9 @@ impl RoutedRequest {
             )),
             Request::SessionWorkingDocument { request } => Self::SessionLifecycle(Box::new(
                 SessionLifecycleRequest::SessionWorkingDocument(request),
+            )),
+            Request::ReadSessionTraceBlob { request } => Self::SessionLifecycle(Box::new(
+                SessionLifecycleRequest::ReadSessionTraceBlob(request),
             )),
             Request::ReadSessionArtifact {
                 session_id,

@@ -1,0 +1,96 @@
+schema_version = 1
+id = "introspection-controlled"
+name = "Controlled task and handoff calibration"
+description = "Correctness-first paired observations; no efficiency thresholds or benchmark claim. Materialize @IDENTIFIED_BINARY@ before execution."
+[run]
+repetitions = 3
+timeout_ms = 180000
+isolation = "temp_copy"
+randomize_case_order = false
+fail_fast = false
+[metadata]
+paired_schedule_seed = 20261006
+require_paired_quality = true
+# These are experiment declarations, not additional runtime enforcement.
+input_capture = "explicit request-time observability overlay"
+claim_scope = "calibration only; incomplete capture blocks attribution"
+
+[[variants]]
+id = "direct"
+executor = "agent"
+config_toml = "[observability]\npersist_model_requests = true\npersist_tool_io = true\n"
+
+[[variants]]
+id = "single"
+executor = "workflow"
+config_toml = "[observability]\npersist_model_requests = true\npersist_tool_io = true\n"
+[variants.metadata.workflow]
+binary = "@IDENTIFIED_BINARY@"
+strategy = "no-delegation"
+stop_condition = "Deliver answer.json satisfying the task and normalized.json when requested; do not claim completion without the files."
+max_iterations = 2
+concurrency = 2
+worker_attempts = 12
+
+[[variants]]
+id = "auto"
+executor = "workflow"
+config_toml = "[observability]\npersist_model_requests = true\npersist_tool_io = true\n[workflows]\nrun_edit_plugins = [\"bcode.workflow\"]\nrun_publication_plugins = [\"bcode.workflow\"]\n"
+[variants.metadata.workflow]
+binary = "@IDENTIFIED_BINARY@"
+strategy = "auto"
+stop_condition = "Deliver answer.json satisfying the task and normalized.json when requested; do not claim completion without the files."
+max_iterations = 2
+concurrency = 2
+worker_attempts = 12
+
+[[variants]]
+id = "collaboration"
+executor = "workflow"
+config_toml = "[observability]\npersist_model_requests = true\npersist_tool_io = true\n[workflows]\nrun_edit_plugins = [\"bcode.workflow\"]\nrun_publication_plugins = [\"bcode.workflow\"]\n"
+[variants.metadata.workflow]
+binary = "@IDENTIFIED_BINARY@"
+strategy = "collaborate"
+stop_condition = "Deliver answer.json satisfying the task and normalized.json when requested; do not claim completion without the files."
+max_iterations = 2
+concurrency = 2
+worker_attempts = 12
+
+[[cases]]
+id = "tiny"
+fixture = "workspaces/tiny"
+prompt = "Read value.txt. Write answer.json with the integer under key total. Do not modify input files."
+[cases.metadata.workflow_oracle]
+oracle_command = "python3 '{{suite_dir}}/oracles/answer.py' tiny"
+preserve_files = ["value.txt"]
+[[cases.judges]]
+type = "command"
+command = "python3 '{{suite_dir}}/oracles/answer.py' tiny"
+timeout_ms = 5000
+required = true
+
+[[cases]]
+id = "separable"
+fixture = "workspaces/separable"
+prompt = "Independently sum the values arrays in east.json and west.json. Write answer.json with keys east and west and their integer sums. Do not modify input files."
+[cases.metadata.workflow_oracle]
+oracle_command = "python3 '{{suite_dir}}/oracles/answer.py' separable"
+preserve_files = ["east.json", "west.json"]
+[[cases.judges]]
+type = "command"
+command = "python3 '{{suite_dir}}/oracles/answer.py' separable"
+timeout_ms = 5000
+required = true
+
+[[cases]]
+id = "handoff"
+fixture = "workspaces/handoff"
+prompt = "Stage 1: normalize records.json values by stripping whitespace and parsing integers; deliver normalized.json mapping each id to its integer. Stage 2 must consume normalized.json: sort ids by ascending value, then compute checksum as sum of one-based position times value. Write answer.json with ordered_ids and checksum. Do not modify records.json."
+[cases.metadata.workflow_oracle]
+oracle_command = "python3 '{{suite_dir}}/oracles/answer.py' handoff"
+preserve_files = ["records.json"]
+[[cases.judges]]
+type = "command"
+command = "python3 '{{suite_dir}}/oracles/answer.py' handoff"
+timeout_ms = 5000
+required = true

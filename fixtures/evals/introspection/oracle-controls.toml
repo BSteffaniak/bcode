@@ -1,0 +1,52 @@
+schema_version = 1
+id = "introspection-oracle-controls"
+name = "Independent correct, wrong and missing artifact controls"
+[run]
+repetitions = 1
+timeout_ms = 5000
+isolation = "temp_copy"
+randomize_case_order = false
+fail_fast = false
+[metadata]
+paired_schedule_seed = 20261006
+
+[[variants]]
+id = "positive"
+executor = "command"
+command = "python3 '{{suite_dir}}/controls/produce.py' {{case_id}} positive"
+[[variants]]
+id = "wrong"
+executor = "command"
+command = "python3 '{{suite_dir}}/controls/produce.py' {{case_id}} wrong"
+[[variants]]
+id = "missing"
+executor = "command"
+command = "python3 '{{suite_dir}}/controls/produce.py' {{case_id}} missing"
+
+[[cases]]
+id = "tiny"
+fixture = "workspaces/tiny"
+prompt = "Independent artifact calibration, not model execution."
+[[cases.judges]]
+type = "command"
+command = "python3 '{{suite_dir}}/oracles/answer.py' tiny"
+timeout_ms = 5000
+required = true
+[[cases]]
+id = "separable"
+fixture = "workspaces/separable"
+prompt = "Independent artifact calibration, not model execution."
+[[cases.judges]]
+type = "command"
+command = "python3 '{{suite_dir}}/oracles/answer.py' separable"
+timeout_ms = 5000
+required = true
+[[cases]]
+id = "handoff"
+fixture = "workspaces/handoff"
+prompt = "Independent artifact calibration, not model execution."
+[[cases.judges]]
+type = "command"
+command = "python3 '{{suite_dir}}/oracles/answer.py' handoff"
+timeout_ms = 5000
+required = true

@@ -2918,16 +2918,43 @@ impl BcodeClient {
         }
     }
 
-    /// Read a bounded generic artifact range from canonical session metadata.
-    ///
-    /// `length` must be between 1 and
-    /// [`bcode_session_models::MAX_SESSION_ARTIFACT_RANGE_BYTES`] inclusive.
+    /// Explicitly read sensitive retained trace bytes referenced by a canonical event.
     ///
     /// # Errors
+    /// Fails for unsupported versions, damaged/unavailable references, invalid ranges,
+    /// transport errors, or a response that does not match the requested identity/range.
+    pub async fn session_trace_blob_range(
+        &self,
+        request: bcode_session_models::ReadSessionTraceBlobRequest,
+    ) -> Result<bcode_session_models::SessionTraceBlobRange, ClientError> {
+        let expected = request.clone();
+        match self
+            .send_request(Request::ReadSessionTraceBlob { request })
+            .await?
+        {
+            ResponsePayload::SessionTraceBlobRange { range }
+                if range.version == expected.version
+                    && range.session_id == expected.session_id
+                    && range.sequence == expected.sequence
+                    && range.offset == expected.offset
+                    && range.bytes.len() <= expected.length as usize
+                    && range
+                        .offset
+                        .checked_add(range.bytes.len() as u64)
+                        .is_some_and(|end| {
+                            end <= range.byte_len && range.eof == (end == range.byte_len)
+                        }) =>
+            {
+                Ok(range)
+            }
+            _ => Err(ClientError::UnexpectedResponse),
+        }
+    }
+
+    /// Read a bounded generic artifact range from canonical session metadata.
     ///
-    /// Returns an error before transport when `length` is outside the documented bounds.
-    /// Otherwise returns an error when the daemon cannot be reached, rejects the reference/range,
-    /// or returns an unexpected payload.
+    /// # Errors
+    /// Fails for invalid ranges, transport errors, rejected references, or unexpected responses.
     pub async fn session_artifact_range(
         &self,
         session_id: SessionId,

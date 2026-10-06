@@ -56,6 +56,9 @@ pub use working_document::{
 };
 
 pub use storage_admission::StorageAdmissionReport;
+mod trace_export;
+pub use trace_export::*;
+
 mod storage_compression;
 pub use storage_compression::*;
 mod storage;

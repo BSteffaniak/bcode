@@ -1136,6 +1136,10 @@ pub enum Request {
     SessionWorkingDocument {
         request: bcode_session_models::SessionWorkingDocumentRequest,
     },
+    /// Explicit sensitive diagnostic access to a canonical event's retained trace blob.
+    ReadSessionTraceBlob {
+        request: bcode_session_models::ReadSessionTraceBlobRequest,
+    },
     /// Read a bounded byte range from a generic session artifact reference.
     ReadSessionArtifact {
         session_id: SessionId,
@@ -2417,6 +2421,9 @@ pub enum ResponsePayload {
     },
     SessionWorkingDocument {
         document: Option<bcode_session_models::SessionWorkingDocument>,
+    },
+    SessionTraceBlobRange {
+        range: bcode_session_models::SessionTraceBlobRange,
     },
     SessionArtifactRange {
         range: SessionArtifactRange,

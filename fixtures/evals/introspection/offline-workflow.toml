@@ -1,0 +1,33 @@
+schema_version = 1
+id = "introspection-offline-workflow"
+name = "Scripted workflow retention smoke, not collaboration performance"
+[run]
+repetitions = 1
+timeout_ms = 120000
+isolation = "temp_copy"
+randomize_case_order = false
+fail_fast = false
+[metadata]
+paired_schedule_seed = 20261006
+[[variants]]
+id = "single"
+executor = "workflow"
+config_toml = "[observability]\npersist_model_requests = true\npersist_tool_io = true\n"
+[variants.metadata.workflow]
+binary = "@IDENTIFIED_BINARY@"
+strategy = "no-delegation"
+stop_condition = "Scripted evaluator completes at iteration 1."
+max_iterations = 1
+concurrency = 1
+worker_attempts = 4
+expected_contains = ["evaluated"]
+preserve_files = ["value.txt"]
+[[cases]]
+id = "scripted-loop"
+fixture = "workspaces/tiny"
+prompt = "Return a scripted contribution and evaluate completion."
+[[cases.judges]]
+type = "metric_threshold"
+metric = "workflow.oracle_passed"
+min = 1
+required = true

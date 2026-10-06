@@ -1,0 +1,36 @@
+schema_version = 1
+id = "introspection-offline-direct"
+name = "Real deterministic tool loop capture on and off"
+[run]
+repetitions = 1
+timeout_ms = 120000
+isolation = "temp_copy"
+randomize_case_order = false
+fail_fast = false
+[metadata]
+paired_schedule_seed = 20261006
+[[variants]]
+id = "capture-on"
+executor = "agent"
+allowed_tools = ["filesystem.read"]
+config_toml = "[observability]\npersist_model_requests = true\npersist_tool_io = true\n"
+[[variants]]
+id = "capture-off"
+executor = "agent"
+allowed_tools = ["filesystem.read"]
+config_toml = "[observability]\npersist_model_requests = false\npersist_tool_io = false\n"
+[[cases]]
+id = "read-loop"
+fixture = "workspaces/separable"
+prompt = "read-files east.json west.json"
+[[cases.judges]]
+type = "metric_threshold"
+metric = "tool_call_count"
+min = 2
+max = 2
+required = true
+[[cases.judges]]
+type = "metric_threshold"
+metric = "tool_error_count"
+max = 0
+required = true

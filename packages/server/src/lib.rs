@@ -33,6 +33,7 @@ pub mod storage_maintenance_worker;
 pub mod storage_read_admission;
 mod tool_catalog;
 mod tool_host_retry;
+mod trace_operations;
 #[cfg(test)]
 mod workflow_admission_tests;
 mod workflow_operations;
@@ -6088,6 +6089,9 @@ const fn request_session_id(request: &Request) -> Option<SessionId> {
         Request::SessionAdmission { session_id, .. }
         | Request::RenameSession { session_id, .. }
         | Request::DeleteSession { session_id }
+        | Request::ReadSessionTraceBlob {
+            request: bcode_session_models::ReadSessionTraceBlobRequest { session_id, .. },
+        }
         | Request::ReadSessionArtifact { session_id, .. }
         | Request::InvocationInput { session_id, .. }
         | Request::SessionHistory { session_id }
@@ -6154,6 +6158,7 @@ const fn request_kind(request: &Request) -> &'static str {
         Request::DeleteSession { .. } => "delete_session",
         Request::PrepareContextGeneration { .. } => "prepare_context_generation",
         Request::SessionWorkingDocument { .. } => "session_working_document",
+        Request::ReadSessionTraceBlob { .. } => "read_session_trace_blob",
         Request::ReadSessionArtifact { .. } => "read_session_artifact",
         Request::InvocationInput { .. } => "invocation_input",
         Request::SessionHistory { .. } => "session_history",
@@ -6678,6 +6683,26 @@ async fn handle_request_inner(
         }
         SessionLifecycleRequest::SessionWorkingDocument(request) => {
             Box::pin(handle_working_document(request_id, state, writer, request)).await
+        }
+        SessionLifecycleRequest::ReadSessionTraceBlob(request) => {
+            match trace_operations::read_range(state, request).await {
+                Ok(range) => {
+                    send_response(
+                        writer,
+                        request_id,
+                        Response::Ok(ResponsePayload::SessionTraceBlobRange { range }),
+                    )
+                    .await
+                }
+                Err(error) => {
+                    send_response(
+                        writer,
+                        request_id,
+                        Response::Err(ErrorResponse::new(error.code(), error.to_string())),
+                    )
+                    .await
+                }
+            }
         }
         SessionLifecycleRequest::ReadSessionArtifact {
             session_id,

@@ -435,6 +435,11 @@ pub fn execute(
                 break;
             }
         }
+        super::trace_exports::export_cli(
+            &rep_dir.join(format!("transcript-{index}.jsonl")),
+            &events,
+            &invoke,
+        )?;
         write_session_events_jsonl(&rep_dir.join(format!("transcript-{index}.jsonl")), &events)?;
         for (key, value) in session_telemetry(&events).measurements {
             *telemetry.entry(key).or_default() += value;
