@@ -38,13 +38,13 @@ pub(super) fn install_script(request: &mut PluginWorkflowStartRequest, root: &Pa
                 revision_path.display()
             ),
         );
-        let revision = serde_json::json!({"path":revision_path,"offset":1,"limit":1});
+        let revision = shell(&workspace, "printf '%s' \"$(git rev-parse HEAD)\"");
         let result = serde_json::json!({"summary":format!("Committed {id}"),"evidence":["Commit command succeeded"],"blockers":[],"contributions":[{
             "workspace":workspace,"base_revision":base,"source_directory":root,"source_had_local_changes":true,
-            "produced_revisions":[{"$fake_result":{"index":0,"pointer":""}}],"artifacts":[workspace.join("integrated.sh")],"validation":[],
+            "produced_revisions":[{"$fake_result":{"index":0,"pointer":"/output"}}],"artifacts":[workspace.join("integrated.sh")],"validation":[],
             "remaining_work":["Resolve integration conflict and verify combined result"],"retention":"retained"
         }]});
-        serde_json::json!({"task_id":id,"objective":format!("Contribute in the assigned checkout.\ntool-call filesystem.write {write}\ntool-call shell.run {commit}\ntool-call filesystem.read {revision}\nstructured-result {result}"),
+        serde_json::json!({"task_id":id,"objective":format!("Contribute in the assigned checkout.\ntool-call filesystem.write {write}\ntool-call shell.run {commit}\ntool-call shell.run {revision}\nstructured-result {result}"),
             "output":{"type_name":"test.git_contribution.v1","schema":{"type":"object","additionalProperties":false,"required":["summary","evidence","blockers","contributions"],"properties":{"summary":{"type":"string"},"evidence":{"type":"array","items":{"type":"string"}},"blockers":{"type":"array","items":{"type":"string"}},"contributions":{"type":"array","items":{"type":"object"}}}}},
             "agent_profile":"build","read_only":false,"worktree_directory":reference(creation_index, "/path"),
             "acceptance_criteria":["Creation-time base commit (verify before editing):",reference(creation_index, "/provenance/base_commit"),"Canonical source checkout (do not modify):",reference(creation_index, "/provenance/source_directory"),"Creation provenance does not include uncommitted inputs; inspect source dirtiness and report required missing inputs rather than copying or overwriting user work."],
@@ -207,9 +207,15 @@ async fn goal_workers_recover_real_git_conflict_in_isolated_integration_checkout
                     assert_eq!(output.value["contributions"][0]["base_revision"], base);
                     let worker_revision = git(&trees.path().join(id), &["rev-parse", "HEAD"]);
                     assert_ne!(worker_revision, base);
+                    let produced = output.value["contributions"][0]["produced_revisions"]
+                        .as_array()
+                        .unwrap();
+                    assert_eq!(produced.len(), 1);
+                    // Shell output is terminal text and can retain its final row break.
+                    // Compare the exact revision after removing only that presentation suffix.
                     assert_eq!(
-                        output.value["contributions"][0]["produced_revisions"],
-                        serde_json::json!([worker_revision])
+                        produced[0].as_str().unwrap().trim_end_matches(['\r', '\n']),
+                        worker_revision
                     );
                     assert_eq!(
                         output.value["contributions"][0]["workspace"],

@@ -89454,6 +89454,9 @@ event_symbol = "bcode_plugin_handle_event_v1"
             .system_prompt
             .sections
             .dynamic_repository_context = false;
+        // The small fake model tests history compaction, not a machine-dependent skill catalog
+        // retained in the protected current-turn environment snapshot.
+        state.startup_config.system_prompt.sections.skill_catalog = false;
         state.startup_config.model.compaction.mode = bcode_config::CompactionMode::Proactive;
         state.startup_config.model.compaction.backend = bcode_config::CompactionBackend::Local;
         state

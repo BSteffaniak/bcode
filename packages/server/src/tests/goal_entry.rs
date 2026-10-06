@@ -147,6 +147,19 @@ const RIGHT_MODULE: &str = "total() { echo $(( $(subtotal \"$1\" \"$2\") + 3 ));
 const BROKEN_RIGHT_MODULE: &str = "total() { echo $(( $(subtotal \"$1\" \"$2\") + 4 )); }\n";
 const COMBINED_CHECK: &str = ". ./integrated.sh; actual=$(total 3 8); test \"$actual\" = 27 || { printf \"expected total 27, got %s\\n\" \"$actual\"; exit 1; }; test \"$(total 0 8)\" = 3";
 
+// Expected evidence is derived from the intended artifact, never from the actual file.
+// Full text reads include canonical byte-count/digest provenance; keep exact matching.
+fn expected_integrated_read_evidence() -> String {
+    use sha2::Digest as _;
+    let source = format!("{LEFT_MODULE}{RIGHT_MODULE}");
+    let digest = hex::encode(sha2::Sha256::digest(source.as_bytes()));
+    format!(
+        "{}\n\n[Source bytes: {}; SHA-256: {digest}. Digest covers the entire file, not only displayed lines.]",
+        source.lines().collect::<Vec<_>>().join("\n"),
+        source.len()
+    )
+}
+
 fn contribution_result(workspace: &Path, id: &str) -> serde_json::Value {
     serde_json::json!({
         "summary":format!("Implemented {id}"),
@@ -426,10 +439,7 @@ fn configure_goal_execution(server: &mut ServerState, root: &Path) {
         .insert("fake_prompt_tool_directives".into(), "true".into());
     server.selected_provider_context.settings.insert(
         "fake_structured_output_json".into(),
-        format!(
-            "loop_tool_evidence:{LEFT_MODULE}{}",
-            RIGHT_MODULE.trim_end()
-        ),
+        format!("loop_tool_evidence:{}", expected_integrated_read_evidence()),
     );
     register_test_execution_lifetime(server, root);
 }
