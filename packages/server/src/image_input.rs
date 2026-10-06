@@ -165,13 +165,13 @@ async fn resolve_image_input_support(
     .await
     .ok()?;
     let model = select_model_info(&models.models, Some(model_id))?;
-    image_support_from_capabilities(&provider, &model)
+    Some(image_support_from_capabilities(&provider, &model))
 }
 
 fn image_support_from_capabilities(
     provider: &bcode_model::ProviderCapabilities,
     model: &bcode_model::ModelInfo,
-) -> Option<(bool, u64)> {
+) -> (bool, u64) {
     let feature = bcode_model::RequestedModelFeature::MediaInput(
         bcode_model::MediaInputFeature::ToolResultImage,
     );
@@ -181,7 +181,14 @@ fn image_support_from_capabilities(
             .negotiate(&model.feature_support, feature),
         bcode_model::NegotiatedFeatureSupport::Guaranteed { .. }
     );
-    Some((guaranteed, model.max_image_input_base64_bytes?))
+    // An absent catalog limit means unspecified, not unsupported. Capability
+    // negotiation still gates image input; the host ceiling bounds hydration.
+    (
+        guaranteed,
+        model
+            .max_image_input_base64_bytes
+            .unwrap_or(HOST_IMAGE_BASE64_SAFETY_CEILING),
+    )
 }
 
 fn artifact_identity_for_image_ref(
@@ -443,15 +450,39 @@ mod tests {
     fn image_support_fails_closed_unless_both_scopes_guarantee_it() {
         assert_eq!(
             image_support_from_capabilities(&provider_capabilities(true), &model_info(true)),
-            Some((true, 5_242_880))
+            (true, 5_242_880)
         );
         assert_eq!(
             image_support_from_capabilities(&provider_capabilities(false), &model_info(true)),
-            Some((false, 5_242_880))
+            (false, 5_242_880)
         );
         assert_eq!(
             image_support_from_capabilities(&provider_capabilities(true), &model_info(false)),
-            Some((false, 5_242_880))
+            (false, 5_242_880)
+        );
+    }
+
+    #[test]
+    fn unspecified_image_limit_uses_host_bound_without_bypassing_capabilities() {
+        let mut model = model_info(true);
+        model.max_image_input_base64_bytes = None;
+        assert_eq!(
+            image_support_from_capabilities(&provider_capabilities(true), &model),
+            (true, HOST_IMAGE_BASE64_SAFETY_CEILING)
+        );
+        assert_eq!(
+            image_support_from_capabilities(&provider_capabilities(false), &model),
+            (false, HOST_IMAGE_BASE64_SAFETY_CEILING)
+        );
+        model.max_image_input_base64_bytes = Some(0);
+        assert_eq!(
+            image_support_from_capabilities(&provider_capabilities(true), &model),
+            (true, 0)
+        );
+        model.max_image_input_base64_bytes = Some(1024);
+        assert_eq!(
+            image_support_from_capabilities(&provider_capabilities(true), &model),
+            (true, 1024)
         );
     }
 
