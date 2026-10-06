@@ -917,6 +917,43 @@ pub struct CompositionResolution {
     pub available_profiles: Vec<String>,
 }
 
+/// Non-secret configuration launch provenance. This contains no config contents or environment dump.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ConfigLaunchContext {
+    /// Explicit file layers, in application order; paths are absolute when captured.
+    pub config_files: Vec<PathBuf>,
+    /// Whether inline overrides prevent faithful file-only reproduction.
+    pub inline_overrides: bool,
+    /// Directory containing optional user-managed provider config files.
+    pub provider_config_directory: PathBuf,
+}
+
+/// Capture the initiating process's config sources without exposing their contents.
+#[must_use]
+pub fn config_launch_context(cwd: &Path) -> ConfigLaunchContext {
+    let overrides = effective_config_overrides(&ProcessConfigEnvironment);
+    ConfigLaunchContext {
+        config_files: [
+            overrides.base_config_path,
+            overrides.env_config_path,
+            overrides.cli_config_path,
+        ]
+        .into_iter()
+        .flatten()
+        .map(|path| {
+            if path.is_absolute() {
+                path
+            } else {
+                cwd.join(path)
+            }
+        })
+        .collect(),
+        inline_overrides: overrides.env_config_toml.is_some()
+            || overrides.cli_config_toml.is_some(),
+        provider_config_directory: default_config_dir().join("providers"),
+    }
+}
+
 /// Config loading overrides layered above discovered config files.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ConfigLoadOverrides {
@@ -1560,6 +1597,9 @@ pub struct SystemPromptSectionsConfig {
     /// Include the active declarative configuration profile name when one is selected.
     #[serde(default = "default_true")]
     pub config_profile: bool,
+    /// Include request-only, non-secret configuration discovery and execution selection guidance.
+    #[serde(default = "default_true")]
+    pub config_selection: bool,
     /// Include repository invariants independently of ordinary repository context.
     #[serde(default = "default_true")]
     pub repository_invariants: bool,
@@ -1595,6 +1635,7 @@ impl Default for SystemPromptSectionsConfig {
             toolchain_context: false,
             worktree_context: true,
             config_profile: true,
+            config_selection: true,
             repository_invariants: true,
             repository_context: true,
             dynamic_repository_context: true,
@@ -7863,6 +7904,9 @@ fn write_system_prompt_toml(output: &mut String, system_prompt: &SystemPromptCon
         if !system_prompt.sections.worktree_context {
             output.push_str("worktree_context = false\n");
         }
+        if !system_prompt.sections.config_selection {
+            output.push_str("config_selection = false\n");
+        }
         if !system_prompt.sections.config_profile {
             output.push_str("config_profile = false\n");
         }
@@ -10167,6 +10211,37 @@ enabled = false
     ];
 
     static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    #[test]
+    fn launch_provenance_and_selection_toggle_are_secret_safe() {
+        let _guard = crate::push_process_config_overrides(ConfigLoadOverrides {
+            env_config_path: Some(PathBuf::from("providers/sol.toml")),
+            env_config_toml: Some("secret-inline-value".into()),
+            ..Default::default()
+        });
+        let launch = crate::config_launch_context(std::path::Path::new("/client"));
+        assert_eq!(
+            launch.config_files,
+            vec![PathBuf::from("/client/providers/sol.toml")]
+        );
+        assert!(launch.inline_overrides);
+        assert!(
+            !serde_json::to_string(&launch)
+                .unwrap()
+                .contains("secret-inline-value")
+        );
+        let mut config = BcodeConfig::default();
+        config.system_prompt.sections.config_selection = false;
+        let encoded = crate::encode_effective_config(&config).unwrap();
+        let decoded: BcodeConfig = toml::from_str(&encoded).unwrap();
+        assert!(!decoded.system_prompt.sections.config_selection);
+        assert!(
+            BcodeConfig::default()
+                .system_prompt
+                .sections
+                .config_selection
+        );
+    }
 
     #[test]
     fn stable_config_doc_sections_are_derive_backed() {

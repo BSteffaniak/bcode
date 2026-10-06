@@ -1327,6 +1327,9 @@ pub struct ClientRuntimeContext {
     /// Canonical working directory of the client process.
     #[serde(default)]
     pub working_directory: Option<PathBuf>,
+    /// Non-secret client configuration provenance for reproduction guidance.
+    #[serde(default)]
+    pub config_launch: Option<Box<bcode_config::ConfigLaunchContext>>,
     /// Fully resolved declarative configuration encoded as TOML by the client.
     ///
     /// The IPC layer treats this as opaque portable data. The daemon's config owner validates and
@@ -5744,6 +5747,7 @@ mod tests {
             state_location_id: Some(state_location_id()),
             runtime_context: Some(ClientRuntimeContext {
                 working_directory: Some(PathBuf::from("/tmp/client")),
+                config_launch: None,
                 effective_config_toml: None,
                 selected_provider_plugin_id: Some("bcode.openai-compatible".to_string()),
                 selected_model_id: Some("model".to_string()),

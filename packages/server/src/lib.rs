@@ -19573,7 +19573,8 @@ async fn run_model_turn_inner(
     let setup_labels = model_turn_metric_labels(session_id, &turn_id);
     let selection_timer = state.metrics.timer();
     let mut selection =
-        session_model_selection_with_runtime_context(state, session_id, runtime_context).await;
+        session_model_selection_with_runtime_context(state, session_id, runtime_context.clone())
+            .await;
     apply_turn_model_selection(&mut selection, &execution);
     if let Some(turn) = command_context.current_turn.lock().await.as_mut() {
         turn.selection = Some(selection.clone());
@@ -19708,6 +19709,8 @@ async fn run_model_turn_inner(
         &execution,
         &turn_config,
         &target,
+        runtime_context.as_ref(),
+        &selection,
         !recovering,
         Some(prepared_catalog),
     ))
@@ -25308,6 +25311,8 @@ async fn prepare_static_model_turn_context(
     execution: &bcode_session_models::TurnExecutionOptions,
     config: &bcode_config::BcodeConfig,
     model_target: &model_request_target::ResolvedModelRequestTarget,
+    runtime_context: Option<&ClientRuntimeContext>,
+    selection: &SessionModelSelection,
     retain_environment_snapshot: bool,
     prepared_catalog: Option<Arc<tool_catalog::Snapshot>>,
 ) -> Result<StaticModelTurnContext, bcode_session::SessionError> {
@@ -25412,6 +25417,20 @@ async fn prepare_static_model_turn_context(
         .join("\n\n");
     let mut system_messages = Vec::new();
     let mut recovery_context = None;
+    if config.system_prompt.sections.config_selection {
+        system_messages.push(ModelMessage {
+            role: MessageRole::System,
+            content: vec![ContentBlock::Text {
+                text: config_selection_context(
+                    runtime_context.and_then(|context| context.config_launch.as_deref()),
+                    config.composition.active_profile.as_deref(),
+                    selection.provider_plugin_id.as_deref(),
+                    &model_target.model_id,
+                    &selection.provider_context,
+                ),
+            }],
+        });
+    }
     if !facts.is_empty() {
         let text = format!(
             "{}{facts}",
@@ -27156,6 +27175,36 @@ fn build_dynamic_system_context(
         ));
     }
     context.join("\n\n")
+}
+
+fn config_selection_context(
+    launch: Option<&bcode_config::ConfigLaunchContext>,
+    context: Option<&str>,
+    provider: Option<&str>,
+    model: &str,
+    request: &bcode_model::ProviderRequestContext,
+) -> String {
+    let launch = launch.map(|launch| {
+        serde_json::json!({
+            "config_files": launch.config_files.iter().take(8).collect::<Vec<_>>(),
+            "config_files_truncated": launch.config_files.len() > 8,
+            "inline_overrides": launch.inline_overrides,
+            "provider_config_directory": launch.provider_config_directory,
+            "file_only_reproduction": !launch.inline_overrides && launch.config_files.len() == 1,
+        })
+    });
+    let facts = serde_json::json!({
+        "launch": launch,
+        "configuration_context": context,
+        "effective_provider": provider,
+        "effective_model": model,
+        "model_profile": request.model_profile,
+        "auth_profile": request.auth_profile,
+        "auth_pool": request.auth_pool,
+    });
+    format!(
+        "Bcode configuration and execution selection (request-only):\n{facts}\nUse the canonical executable from the latest runtime snapshot. Provider config files are ordinary configuration inputs, not inferred model identities. Discover alternatives with bounded directory listing and Bcode model/profile APIs under the chosen config; never dump config contents or credentials into prompts. For a single explicit config file, supply BCODE_CONFIG=<absolute-file> to every Bcode invocation, preserve --context and --profile when selected, and preserve the serving --state-root. Default workers to this turn's selection and verify effective provider/model/profile before admitting work. Multiple file layers, inline overrides, unavailable provenance, or changed config files do not establish exact reproduction; resolve them explicitly rather than substituting daemon defaults. Profile names are references, not authentication material. Discovery does not authorize changing provider or spending."
+    )
 }
 
 fn append_bcode_runtime_context(mut context: String, enabled: bool, runtime: &str) -> String {
@@ -54779,6 +54828,49 @@ library = "test"
         assert!(
             build_dynamic_system_context(&cwd, None, &sections, "build", None, None).is_empty()
         );
+    }
+
+    #[test]
+    fn config_selection_guidance_is_client_specific_and_secret_safe() {
+        let first = bcode_config::ConfigLaunchContext {
+            config_files: vec![PathBuf::from("/configs/sol.toml")],
+            inline_overrides: false,
+            provider_config_directory: PathBuf::from("/configs/providers"),
+        };
+        let second = bcode_config::ConfigLaunchContext {
+            config_files: vec![PathBuf::from("/configs/other.toml")],
+            inline_overrides: true,
+            ..first.clone()
+        };
+        let request = bcode_model::ProviderRequestContext {
+            model_profile: Some("selected-profile".into()),
+            env: BTreeMap::from([("TOKEN".into(), "secret-value".into())]),
+            settings: BTreeMap::from([("private-setting".into(), "secret-setting".into())]),
+            ..Default::default()
+        };
+        let a = config_selection_context(
+            Some(&first),
+            Some("dev"),
+            Some("provider-a"),
+            "model-a",
+            &request,
+        );
+        let b =
+            config_selection_context(Some(&second), None, Some("provider-b"), "model-b", &request);
+        let a_facts: serde_json::Value = serde_json::from_str(a.lines().nth(1).unwrap()).unwrap();
+        let b_facts: serde_json::Value = serde_json::from_str(b.lines().nth(1).unwrap()).unwrap();
+        assert_eq!(a_facts["launch"]["config_files"][0], "/configs/sol.toml");
+        assert_eq!(b_facts["launch"]["config_files"][0], "/configs/other.toml");
+        assert_eq!(a_facts["effective_model"], "model-a");
+        assert_eq!(b_facts["effective_model"], "model-b");
+        assert_eq!(a_facts["launch"]["file_only_reproduction"], true);
+        assert_eq!(b_facts["launch"]["file_only_reproduction"], false);
+        assert!(!a.contains("secret-value"));
+        assert!(!a.contains("secret-setting"));
+        let unknown = config_selection_context(None, None, None, "model", &request);
+        let unknown: serde_json::Value =
+            serde_json::from_str(unknown.lines().nth(1).unwrap()).unwrap();
+        assert!(unknown["launch"].is_null());
     }
 
     #[test]
@@ -90943,6 +91035,13 @@ event_symbol = "bcode_plugin_handle_event_v1"
         };
         let turn_id =
             bcode_session_models::TurnId::from_accepted_event(session_id, trigger.sequence);
+        let runtime_context = ClientRuntimeContext {
+            config_launch: Some(Box::new(bcode_config::ConfigLaunchContext {
+                config_files: vec![PathBuf::from("/client-specific/sol.toml")],
+                ..Default::default()
+            })),
+            ..Default::default()
+        };
         let prepared = prepare_static_model_turn_context(
             &state,
             session_id,
@@ -90951,6 +91050,8 @@ event_symbol = "bcode_plugin_handle_event_v1"
             &execution,
             &state.session_config(session_id).await,
             &model_target,
+            Some(&runtime_context),
+            &session_model_selection_with_runtime_context(&state, session_id, None).await,
             true,
             None,
         )
@@ -90958,6 +91059,9 @@ event_symbol = "bcode_plugin_handle_event_v1"
         .expect("static turn context");
 
         assert!(prepared.tools.is_empty());
+        assert!(prepared.system_messages.iter().any(|message| message.content.iter().any(
+            |block| matches!(block, ContentBlock::Text { text } if text.contains("/client-specific/sol.toml"))
+        )));
         assert!(prepared.system_prompt.ends_with(USER_AUTHORITY_PROMPT));
         assert!(prepared.system_messages.iter().any(|message| {
             message
@@ -90975,6 +91079,8 @@ event_symbol = "bcode_plugin_handle_event_v1"
                 if text.starts_with("Turn environment snapshot") && text.contains("Later snapshots"))));
         assert!(!history.iter().any(|event| matches!(&event.kind,
             SessionEventKind::SystemMessage { text } if text.contains(&context))));
+        assert!(!history.iter().any(|event| matches!(&event.kind,
+            SessionEventKind::SystemMessage { text } if text.contains("/client-specific/sol.toml"))));
         for _ in 0..3 {
             let recovered = prepare_static_model_turn_context(
                 &state,
@@ -90984,6 +91090,8 @@ event_symbol = "bcode_plugin_handle_event_v1"
                 &execution,
                 &state.session_config(session_id).await,
                 &model_target,
+                None,
+                &session_model_selection_with_runtime_context(&state, session_id, None).await,
                 false,
                 None,
             )

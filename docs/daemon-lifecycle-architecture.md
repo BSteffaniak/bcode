@@ -28,6 +28,22 @@ including sub-session control, while preserving state/configuration selection. T
 execution identity plumbing, not a collaboration strategy or a permission grant. Snapshot
 retention follows the existing turn-context rules; replacing prompt text remains supported.
 
+## Agent configuration selection context
+
+Initiating clients carry non-secret config launch provenance through `ClientRuntimeContext`:
+explicit file layers, whether inline overrides exist, and the user provider-config directory.
+The execution host combines that provenance with the actual resolved turn provider/model
+and named profiles. It never substitutes daemon environment for missing client provenance
+or serializes provider settings, authentication material, or environment maps into this guidance.
+
+This guidance is request-only and controlled by
+`[system_prompt.sections] config_selection = false` (enabled by default). It advertises
+`BCODE_CONFIG`, context/profile usage, bounded directory discovery, and centralized model
+resolution. One file is a reproduction starting point, not proof that unchanged files,
+project layers, credentials, or profile settings match: worker selection must be verified.
+Multiple layers and inline overrides are explicitly distinguished from file-only reproduction.
+No config contents are copied into orchestration documents or durable prompt snapshots.
+
 ## Runtime-work observations
 
 The server's runtime-work registry holds execution cancellation and session ownership.

@@ -1333,6 +1333,9 @@ fn runtime_context_from_selection(
         .map(|key| (key, true))
         .collect();
     ClientRuntimeContext {
+        config_launch: Some(Box::new(bcode_config::config_launch_context(
+            &working_directory,
+        ))),
         working_directory: Some(working_directory),
         effective_config_toml: effective_config_toml.map(Box::new),
         selected_provider_plugin_id: resolved.provider_plugin_id,
