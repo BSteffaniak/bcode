@@ -3143,6 +3143,10 @@ fn collaborating_goal_spec(
     evaluation
         .system_prompt
         .push_str(include_str!("../prompts/goal-collaboration-evaluation.md"));
+    evaluation.system_prompt.push_str("\n\n");
+    evaluation
+        .system_prompt
+        .push_str(include_str!("../prompts/goal-stop-condition-guidance.md"));
     evaluator.configuration =
         serde_json::to_value(evaluation).map_err(|error| error.to_string())?;
     // Collaboration changes agent instructions, not completion policy. Existing

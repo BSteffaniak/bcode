@@ -26,6 +26,7 @@ bcode_tui_components = { workspace = true, features = [
 ], optional = true }
 bmux_tui = { workspace = true, optional = true }
 devicons = { workspace = true, optional = true }
+hex = { workspace = true }
 image = { workspace = true }
 png = { workspace = true }
 serde = { workspace = true, features = ["derive", "std"] }

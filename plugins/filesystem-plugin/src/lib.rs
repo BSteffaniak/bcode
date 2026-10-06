@@ -1157,6 +1157,8 @@ fn read_path_for_tool(
     }
 }
 
+use sha2::Digest;
+
 fn text_tool_response(
     path: &Path,
     request: &ReadRequest,
@@ -1197,6 +1199,7 @@ fn text_tool_response(
         selected.push(*line);
         retained_bytes = retained_bytes.saturating_add(line_bytes);
     }
+    let content_sha256 = hex::encode(sha2::Sha256::digest(bytes));
     let mut output = selected.join("\n");
     let next_line = start_line.saturating_add(selected.len()).saturating_add(1);
     if next_line <= total_lines || byte_truncated {
@@ -1207,6 +1210,11 @@ fn text_tool_response(
             start_line.saturating_add(selected.len())
         );
     }
+    let _ = write!(
+        output,
+        "\n\n[Source bytes: {}; SHA-256: {content_sha256}. Digest covers the entire file, not only displayed lines.]",
+        bytes.len()
+    );
     ToolInvocationResponse {
         output: output.clone(),
         is_error: false,
@@ -1224,6 +1232,7 @@ fn text_tool_response(
                 "total_lines": total_lines,
                 "returned_bytes": retained_bytes,
                 "total_bytes": bytes.len(),
+                "content_sha256": content_sha256,
                 "truncated": next_line <= total_lines || byte_truncated,
                 "contents": output,
             }),
@@ -2838,6 +2847,37 @@ bcode_plugin_sdk::export_plugin!(FilesystemPlugin, include_str!("../bcode-plugin
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn file_read_digest_covers_hidden_bytes_and_distinguishes_newlines() {
+        use sha2::Digest;
+        let request = super::ReadRequest {
+            path: "fixture.txt".into(),
+            offset: Some(1),
+            limit: Some(1),
+        };
+        let mut observed = Vec::new();
+        for bytes in [
+            b"line\nrest\n".as_slice(),
+            b"line\r\nrest\r\n".as_slice(),
+            b"line\nchanged\n".as_slice(),
+        ] {
+            let response = super::text_tool_response(
+                std::path::Path::new("fixture.txt"),
+                &request,
+                bytes,
+                std::path::Path::new("."),
+                "read",
+            );
+            let digest = hex::encode(sha2::Sha256::digest(bytes));
+            assert!(!response.is_error);
+            assert!(response.output.contains(&digest));
+            assert!(response.output.starts_with("line\n"));
+            observed.push(digest);
+        }
+        assert_ne!(observed[0], observed[1]);
+        assert_ne!(observed[0], observed[2]);
+    }
+
     use super::*;
     use std::ffi::c_void;
     use std::sync::Mutex;

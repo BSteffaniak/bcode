@@ -1,0 +1,103 @@
+schema_version = 1
+id = "swarm-persisted-report"
+name = "Persisted report independent correctness and completion parity"
+[run]
+repetitions = 2
+timeout_ms = 600000
+isolation = "temp_copy"
+randomize_case_order = false
+fail_fast = false
+[metadata]
+paired_schedule_seed = 20261004
+require_paired_quality = true
+
+[[variants]]
+id = "single"
+executor = "workflow"
+config_toml = """
+[workflows]
+run_edit_plugins = ["bcode.workflow"]
+run_publication_plugins = ["bcode.workflow"]
+"""
+[variants.metadata.workflow]
+binary = "/Volumes/ehdd/GitHub/bcode/target/aarch64-apple-darwin/release/bcode"
+strategy = "no-delegation"
+stop_condition = "report.json contains exactly a JSON object with lines equal to the two exact lines of fixture.txt and sum equal to 4. The fixture remains byte-identical."
+max_iterations = 2
+concurrency = 2
+worker_attempts = 12
+answer_file = "report.json"
+expected_json = { lines = ["Jev end-to-end smoke test fixture.", "2 + 2 = 4."], sum = 4 }
+oracle_command = "python3 '{{suite_dir}}/oracles/report.py'"
+preserve_files = ["fixture.txt"]
+[variants.metadata.workflow.judge]
+provider = "bcode.jev"
+model = "jev-1.13.0"
+account = "jev"
+threshold = 90
+
+[[variants]]
+id = "auto"
+executor = "workflow"
+config_toml = """
+[workflows]
+run_edit_plugins = ["bcode.workflow"]
+run_publication_plugins = ["bcode.workflow"]
+"""
+[variants.metadata.workflow]
+binary = "/Volumes/ehdd/GitHub/bcode/target/aarch64-apple-darwin/release/bcode"
+strategy = "auto"
+stop_condition = "report.json contains exactly a JSON object with lines equal to the two exact lines of fixture.txt and sum equal to 4. The fixture remains byte-identical."
+max_iterations = 2
+concurrency = 2
+worker_attempts = 12
+answer_file = "report.json"
+expected_json = { lines = ["Jev end-to-end smoke test fixture.", "2 + 2 = 4."], sum = 4 }
+oracle_command = "python3 '{{suite_dir}}/oracles/report.py'"
+preserve_files = ["fixture.txt"]
+[variants.metadata.workflow.judge]
+provider = "bcode.jev"
+model = "jev-1.13.0"
+account = "jev"
+threshold = 90
+
+[[variants]]
+id = "collaborate"
+executor = "workflow"
+config_toml = """
+[workflows]
+run_edit_plugins = ["bcode.workflow"]
+run_publication_plugins = ["bcode.workflow"]
+"""
+[variants.metadata.workflow]
+binary = "/Volumes/ehdd/GitHub/bcode/target/aarch64-apple-darwin/release/bcode"
+strategy = "collaborate"
+stop_condition = "report.json contains exactly a JSON object with lines equal to the two exact lines of fixture.txt and sum equal to 4. The fixture remains byte-identical."
+max_iterations = 2
+concurrency = 2
+worker_attempts = 12
+guidance = "Use a read-only verification worker. Integrate its results into report.json. Inspect and reuse valid completed contributions during correction."
+answer_file = "report.json"
+expected_json = { lines = ["Jev end-to-end smoke test fixture.", "2 + 2 = 4."], sum = 4 }
+oracle_command = "python3 '{{suite_dir}}/oracles/report.py'"
+preserve_files = ["fixture.txt"]
+[variants.metadata.workflow.judge]
+provider = "bcode.jev"
+model = "jev-1.13.0"
+account = "jev"
+threshold = 90
+
+[[cases]]
+id = "persisted-report"
+fixture = "workspace"
+prompt = "Read fixture.txt. Write report.json containing exactly {lines: [the two exact fixture lines], sum: 4} as valid JSON. Verify arithmetic and preserve fixture.txt byte-for-byte. Deliver the persisted report."
+[[cases.judges]]
+type = "metric_threshold"
+metric = "workflow.oracle_passed"
+min = 1
+required = true
+[[cases.judges]]
+type = "metric_threshold"
+metric = "workflow.false_completion"
+max = 0
+required = true

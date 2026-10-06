@@ -1936,6 +1936,7 @@ dependencies = [
  "bcode_tui_components",
  "bmux_tui",
  "devicons",
+ "hex",
  "image",
  "libc",
  "png",
