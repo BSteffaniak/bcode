@@ -3937,6 +3937,77 @@ impl BcodeClient {
         }
     }
 
+    /// Read bounded disposable advisory labels without replaying session history.
+    /// Labels may be absent after eviction or daemon restart; they confer no authority.
+    ///
+    /// # Errors
+    /// Returns an error for transport failure or an incompatible response.
+    pub async fn session_categorization(
+        &self,
+        session_id: SessionId,
+    ) -> Result<Option<bcode_session_models::SessionCategorization>, ClientError> {
+        match self
+            .send_request(Request::SessionCategorization { session_id })
+            .await?
+        {
+            ResponsePayload::SessionCategorization { categorization } => Ok(categorization),
+            _ => Err(ClientError::UnexpectedResponse),
+        }
+    }
+
+    /// Request an advisory judgement; absence retains baseline behavior.
+    ///
+    /// # Errors
+    /// Returns an error for oversized requests, transport failure or invalid responses.
+    pub async fn optional_judge(
+        &self,
+        request: &bcode_model::judgement::OptionalRequest,
+    ) -> Result<bcode_model::judgement::OptionalResponse, ClientError> {
+        let request_json =
+            serde_json::to_string(request).map_err(|_| ClientError::UnexpectedResponse)?;
+        if request_json.len() > bcode_model::judgement::MAX_REQUEST_BYTES {
+            return Err(ClientError::UnexpectedResponse);
+        }
+        match self
+            .send_request(Request::OptionalJudge { request_json })
+            .await?
+        {
+            ResponsePayload::OptionalJudgement { result_json }
+                if result_json.len() <= bcode_model::judgement::MAX_RESPONSE_BYTES =>
+            {
+                let response: bcode_model::judgement::OptionalResponse =
+                    serde_json::from_str(&result_json)
+                        .map_err(|_| ClientError::UnexpectedResponse)?;
+                Ok(response)
+            }
+            _ => Err(ClientError::UnexpectedResponse),
+        }
+    }
+
+    /// Probe one exact judgement selection without changing session state.
+    ///
+    /// # Errors
+    /// Returns an error for oversized selections, transport failure or invalid responses.
+    pub async fn verify_judgement(
+        &self,
+        selection: &bcode_model::judgement::SetupSelection,
+    ) -> Result<bcode_model::judgement::VerificationResult, ClientError> {
+        let selection_json =
+            serde_json::to_string(selection).map_err(|_| ClientError::UnexpectedResponse)?;
+        if selection_json.len() > 1024 {
+            return Err(ClientError::UnexpectedResponse);
+        }
+        match self
+            .send_request(Request::JudgementVerify { selection_json })
+            .await?
+        {
+            ResponsePayload::JudgementVerified { result_json } if result_json.len() <= 4096 => {
+                serde_json::from_str(&result_json).map_err(|_| ClientError::UnexpectedResponse)
+            }
+            _ => Err(ClientError::UnexpectedResponse),
+        }
+    }
+
     /// Return bounded, secret-free judgement setup options from the connected daemon.
     /// Discovery indicates advertised capability, not successful remote authentication.
     ///

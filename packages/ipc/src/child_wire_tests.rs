@@ -1,4 +1,4 @@
-//! Protocol-43 child application payload round trips through both supported codecs.
+//! Child application payload round trips through both supported codecs.
 
 use super::*;
 use bcode_session_models::{
@@ -41,7 +41,6 @@ fn child_application_requests_json_and_binary_round_trip() {
             },
         },
     ];
-    assert_eq!(CURRENT_PROTOCOL_VERSION, 44);
     for request in requests {
         let json = serde_json::to_vec(&request).unwrap();
         assert_eq!(serde_json::from_slice::<Request>(&json).unwrap(), request);

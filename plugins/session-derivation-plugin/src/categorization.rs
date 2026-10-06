@@ -1,0 +1,376 @@
+//! Advisory categorization of bounded, allowlisted newest-request facts.
+
+use bcode_model::judgement::{
+    self, Answer, Feature, OptionalRequest, OptionalResponse, Question, Request, State,
+};
+use bcode_plugin_sdk::{
+    NativeServiceContext, ServiceBridgeRequest, ServiceBridgeResponse, ServiceResponse,
+};
+use bcode_session_models::{
+    CategorizationRequest, CategorizationResponse, MAX_CATEGORIZATION_REQUEST_BYTES,
+    MAX_CATEGORIZATION_SOURCE_BYTES, SessionCategorization,
+};
+use bcode_tool::{ToolInvocationServiceRequest, ToolInvocationServiceResolution};
+use serde::{Deserialize, Serialize};
+use std::collections::{BTreeMap, BTreeSet};
+
+const TASKS: &[&str] = &[
+    "implementation",
+    "debugging",
+    "review",
+    "testing",
+    "documentation",
+    "planning",
+    "other",
+];
+const DOMAINS: &[&str] = &[
+    "frontend",
+    "backend",
+    "persistence",
+    "security",
+    "tooling",
+    "other",
+];
+
+/// Allowlisted semantic signals only; never raw input, paths, or provider metadata.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct NewestRequestFacts {
+    /// Recognized task signals.
+    pub tasks: BTreeSet<String>,
+    /// Recognized domain signals.
+    pub domains: BTreeSet<String>,
+}
+
+/// Extract signals from at most 8192 characters and 512 words of one request.
+/// The returned value contains only fixed vocabulary, regardless of input contents.
+#[must_use]
+pub fn newest_request_facts(input: &str) -> NewestRequestFacts {
+    let bounded: String = input.chars().take(8192).collect();
+    let mut facts = NewestRequestFacts::default();
+    for word in bounded.split_whitespace().take(512) {
+        let word = word
+            .trim_matches(|c: char| !c.is_ascii_alphabetic())
+            .to_ascii_lowercase();
+        let task = match word.as_str() {
+            "implement" | "add" | "build" => Some("implementation"),
+            "debug" | "fix" | "bug" => Some("debugging"),
+            "review" | "audit" => Some("review"),
+            "test" | "tests" | "testing" => Some("testing"),
+            "docs" | "documentation" | "document" => Some("documentation"),
+            "plan" | "design" => Some("planning"),
+            _ => None,
+        };
+        let domain = match word.as_str() {
+            "frontend" | "ui" | "tui" | "rendering" => Some("frontend"),
+            "backend" | "server" | "api" => Some("backend"),
+            "database" | "storage" | "persistence" => Some("persistence"),
+            "security" | "auth" | "permissions" => Some("security"),
+            "cli" | "tooling" | "cargo" | "plugin" => Some("tooling"),
+            _ => None,
+        };
+        if let Some(task) = task {
+            facts.tasks.insert(task.to_owned());
+        }
+        if let Some(domain) = domain {
+            facts.domains.insert(domain.to_owned());
+        }
+    }
+    facts
+}
+
+fn optional_request(facts: &NewestRequestFacts) -> Option<OptionalRequest> {
+    if facts.tasks.is_empty() && facts.domains.is_empty()
+        || facts
+            .tasks
+            .iter()
+            .any(|task| !TASKS[..TASKS.len() - 1].contains(&task.as_str()))
+        || facts
+            .domains
+            .iter()
+            .any(|domain| !DOMAINS[..DOMAINS.len() - 1].contains(&domain.as_str()))
+    {
+        return None;
+    }
+    let choice = |instructions: &str, labels: &[&str]| Question::Choice {
+        instructions: instructions.to_owned(),
+        options: labels
+            .iter()
+            .map(|label| ((*label).to_owned(), (*label).to_owned()))
+            .collect(),
+    };
+    Some(OptionalRequest {
+        feature: Feature::SessionCategorization,
+        selection: None,
+        request: Request {
+            model_id: "auto".to_owned(),
+            state: State::Structured(serde_json::to_value(facts).ok()?),
+            questions: BTreeMap::from([
+                (
+                    "task".to_owned(),
+                    choice(
+                        "Choose an advisory task label from these bounded signals; use other when ambiguous.",
+                        TASKS,
+                    ),
+                ),
+                (
+                    "domain".to_owned(),
+                    choice(
+                        "Choose an advisory domain label from these bounded signals; use other when ambiguous.",
+                        DOMAINS,
+                    ),
+                ),
+            ]),
+        },
+    })
+}
+
+fn labels(
+    request: &CategorizationRequest,
+    query: &Request,
+    result: OptionalResponse,
+) -> Option<SessionCategorization> {
+    let response = result.response?;
+    // Central access validates model capabilities and numerical values. Correlate the
+    // returned envelope with exactly our caller-owned questions, kinds, and options.
+    if query.questions.len() != 2 || response.answers.len() != query.questions.len() {
+        return None;
+    }
+    for (id, question) in &query.questions {
+        let Question::Choice { options, .. } = question else {
+            return None;
+        };
+        let Answer::Choice { selected, .. } = response.answers.get(id)? else {
+            return None;
+        };
+        if !options.contains_key(selected) {
+            return None;
+        }
+    }
+    let Answer::Choice { selected: task, .. } = response.answers.get("task")? else {
+        return None;
+    };
+    let Answer::Choice {
+        selected: domain, ..
+    } = response.answers.get("domain")?
+    else {
+        return None;
+    };
+    Some(SessionCategorization {
+        source_sequence: request.source_sequence,
+        task: task.clone(),
+        domain: domain.clone(),
+    })
+}
+
+pub(crate) fn invoke(context: &NativeServiceContext) -> ServiceResponse {
+    // Reject oversized or unknown fields without echoing untrusted payloads.
+    let result = (|| {
+        if context.request.payload.len() > MAX_CATEGORIZATION_REQUEST_BYTES {
+            return None;
+        }
+        let request = context
+            .request
+            .payload_json::<CategorizationRequest>()
+            .ok()?;
+        if request.newest_request.len() > MAX_CATEGORIZATION_SOURCE_BYTES {
+            return None;
+        }
+        let optional = optional_request(&newest_request_facts(&request.newest_request))?;
+        let query = optional.request.clone();
+        let response = context
+            .bridge
+            .request(&ServiceBridgeRequest::InvokeService(
+                ToolInvocationServiceRequest {
+                    invocation_id: format!(
+                        "categorize-{}-{}",
+                        request.session_id, request.source_sequence
+                    ),
+                    request_id: format!(
+                        "categorize-{}-{}",
+                        request.session_id, request.source_sequence
+                    ),
+                    route_id: None,
+                    interface_id: judgement::WORKFLOW_APPLICATION_INTERFACE_ID.to_owned(),
+                    operation: judgement::OP_OPTIONAL_JUDGE.to_owned(),
+                    payload: serde_json::to_value(optional).ok()?,
+                },
+            ))
+            .ok()?;
+        let ServiceBridgeResponse::Service(ToolInvocationServiceResolution::Responded { payload }) =
+            response
+        else {
+            return None;
+        };
+        labels(&request, &query, serde_json::from_value(payload).ok()?)
+    })();
+    serde_json::to_value(CategorizationResponse {
+        categorization: result,
+    })
+    .map_or_else(
+        |_| ServiceResponse::error("serialization_failed", "categorization unavailable"),
+        |payload| {
+            ServiceResponse::json(&payload).unwrap_or_else(|_| {
+                ServiceResponse::error("serialization_failed", "categorization unavailable")
+            })
+        },
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use bcode_session_models::SessionId;
+    #[test]
+    fn extraction_is_bounded_and_contains_only_fixed_signals() {
+        let facts = newest_request_facts("Fix backend auth token=SECRET /private/path");
+        assert_eq!(facts.tasks, BTreeSet::from(["debugging".into()]));
+        assert_eq!(
+            facts.domains,
+            BTreeSet::from(["backend".into(), "security".into()])
+        );
+        assert_eq!(
+            newest_request_facts(&format!("{} fix backend", "x".repeat(8192))),
+            NewestRequestFacts::default()
+        );
+    }
+    #[test]
+    fn raw_source_never_enters_provider_state() {
+        let source = "fix backend token=DO_NOT_SEND /private/customer";
+        let optional = optional_request(&newest_request_facts(source)).unwrap();
+        let encoded = serde_json::to_string(&optional).unwrap();
+        assert!(!encoded.contains("DO_NOT_SEND"));
+        assert!(!encoded.contains("/private/customer"));
+        assert!(!encoded.contains(source));
+    }
+
+    #[test]
+    fn empty_or_untrusted_signals_do_not_request_judgement() {
+        assert!(optional_request(&NewestRequestFacts::default()).is_none());
+        assert!(
+            optional_request(&NewestRequestFacts {
+                tasks: BTreeSet::from(["SECRET".into()]),
+                domains: BTreeSet::new()
+            })
+            .is_none()
+        );
+    }
+    #[test]
+    fn validated_labels_retain_source_identity_without_request_facts() {
+        let request = CategorizationRequest {
+            session_id: SessionId::new(),
+            source_sequence: 11,
+            newest_request: "fix backend".to_owned(),
+        };
+        let query = optional_request(&newest_request_facts(&request.newest_request))
+            .unwrap()
+            .request;
+        let response = OptionalResponse {
+            response: Some(judgement::Response {
+                answers: BTreeMap::from([
+                    (
+                        "task".into(),
+                        Answer::Choice {
+                            selected: "debugging".into(),
+                            probabilities: None,
+                            confidence: None,
+                        },
+                    ),
+                    (
+                        "domain".into(),
+                        Answer::Choice {
+                            selected: "backend".into(),
+                            probabilities: None,
+                            confidence: None,
+                        },
+                    ),
+                ]),
+                usage: None,
+            }),
+        };
+        assert_eq!(
+            labels(&request, &query, response),
+            Some(SessionCategorization {
+                source_sequence: 11,
+                task: "debugging".into(),
+                domain: "backend".into()
+            })
+        );
+    }
+
+    #[test]
+    fn mismatched_question_kind_option_or_count_is_rejected() {
+        let request = CategorizationRequest {
+            session_id: SessionId::new(),
+            source_sequence: 3,
+            newest_request: "fix backend".into(),
+        };
+        let query = optional_request(&newest_request_facts(&request.newest_request))
+            .unwrap()
+            .request;
+        let choice = |selected: &str| Answer::Choice {
+            selected: selected.into(),
+            probabilities: None,
+            confidence: None,
+        };
+        for answers in [
+            BTreeMap::from([
+                ("task".into(), choice("unknown")),
+                ("domain".into(), choice("backend")),
+            ]),
+            BTreeMap::from([
+                ("task".into(), Answer::YesNo { probability: 0.5 }),
+                ("domain".into(), choice("backend")),
+            ]),
+            BTreeMap::from([
+                ("task".into(), choice("debugging")),
+                ("wrong_id".into(), choice("backend")),
+            ]),
+            BTreeMap::from([
+                ("task".into(), choice("debugging")),
+                ("domain".into(), choice("backend")),
+                ("extra".into(), choice("backend")),
+            ]),
+        ] {
+            assert!(
+                labels(
+                    &request,
+                    &query,
+                    OptionalResponse {
+                        response: Some(judgement::Response {
+                            answers,
+                            usage: None
+                        })
+                    }
+                )
+                .is_none()
+            );
+        }
+    }
+
+    #[test]
+    fn unavailable_and_invalid_answers_retain_baseline() {
+        let request = CategorizationRequest {
+            session_id: SessionId::new(),
+            source_sequence: 7,
+            newest_request: "fix backend".to_owned(),
+        };
+        let query = optional_request(&newest_request_facts(&request.newest_request))
+            .unwrap()
+            .request;
+        assert!(labels(&request, &query, OptionalResponse { response: None }).is_none());
+        assert!(
+            labels(
+                &request,
+                &query,
+                OptionalResponse {
+                    response: Some(judgement::Response {
+                        answers: BTreeMap::new(),
+                        usage: None
+                    })
+                }
+            )
+            .is_none()
+        );
+    }
+}

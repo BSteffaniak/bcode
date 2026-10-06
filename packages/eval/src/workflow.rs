@@ -542,10 +542,29 @@ pub fn execute(
         &serde_json::json!({"schema_version":1,"passed":oracle_passed,"artifact_correct":artifact_correct,"artifact_observed":artifact_observed,"preservation_passed":preservation,"completion_claimed":completed,"false_completion":false_completion,"completion_failure":completion_failure,"status":status,"timed_out":timed_out,"capture_complete":capture_complete}),
     )?;
     let oracle_value = serde_json::json!({"completion_claimed":completed,"status":status,"capture_complete":capture_complete,"timed_out":timed_out,"artifact_correct":artifact_correct,"artifact_observed":artifact_observed,"false_completion":false_completion,"preservation_passed":preservation,"completion_failure":completion_failure});
-    write_json(
-        rep_dir.join("diagnosis.json"),
-        &super::diagnosis::classify(&oracle_value, &outputs, &final_inspection, &measurements),
-    )?;
+    let mut diagnosis =
+        super::diagnosis::classify(&oracle_value, &outputs, &final_inspection, &measurements);
+    if let Some(optional) = super::diagnosis::optional_request(&oracle_value, &diagnosis) {
+        // Only allowlisted measured facts enter this transient command argument. No request file,
+        // prompt, raw workflow output, credentials, or provider diagnostics are persisted here.
+        if let Ok(request_json) = serde_json::to_string(&optional) {
+            let args = [
+                "judgement".to_owned(),
+                "optional-judge".to_owned(),
+                "--request-json".to_owned(),
+                request_json,
+            ];
+            if let Ok(value) = invoke(
+                &args,
+                "optional-eval-categorization",
+                Duration::from_millis(case.timeout_ms.unwrap_or(suite.run.timeout_ms)),
+            ) && let Ok(result) = serde_json::from_value(value)
+            {
+                super::diagnosis::attach_advisory(&mut diagnosis, &optional.request, result);
+            }
+        }
+    }
+    write_json(rep_dir.join("diagnosis.json"), &diagnosis)?;
     let diagnostics = if timed_out {
         vec![EvalDiagnostic {severity:EvalDiagnosticSeverity::Error,message:"workflow deadline exceeded; cancellation requested, terminal state requires verification".into()}]
     } else {

@@ -222,6 +222,9 @@ pub enum SessionLifecycleRequest {
         session_id: SessionId,
         query: SessionHistoryAroundQuery,
     },
+    SessionCategorization {
+        session_id: SessionId,
+    },
     SessionInspection {
         session_id: SessionId,
         query: SessionInspectionQuery,
@@ -778,6 +781,12 @@ pub enum CoreRuntimeRequest {
     },
     JudgementSetup,
     JudgementSetupValidate {
+        selection_json: String,
+    },
+    OptionalJudge {
+        request_json: String,
+    },
+    JudgementVerify {
         selection_json: String,
     },
     Judge {
@@ -1593,6 +1602,14 @@ impl RoutedRequest {
                     selection_json,
                 }))
             }
+            Request::OptionalJudge { request_json } => {
+                Self::CoreRuntime(Box::new(CoreRuntimeRequest::OptionalJudge { request_json }))
+            }
+            Request::JudgementVerify { selection_json } => {
+                Self::CoreRuntime(Box::new(CoreRuntimeRequest::JudgementVerify {
+                    selection_json,
+                }))
+            }
             Request::Judge {
                 provider_plugin_id,
                 auth_profile,
@@ -1911,6 +1928,11 @@ impl RoutedRequest {
             }
             Request::ReleaseSessionOwnership { session_id } => {
                 Self::SessionLifecycle(Box::new(SessionLifecycleRequest::ReleaseSessionOwnership {
+                    session_id,
+                }))
+            }
+            Request::SessionCategorization { session_id } => {
+                Self::SessionLifecycle(Box::new(SessionLifecycleRequest::SessionCategorization {
                     session_id,
                 }))
             }

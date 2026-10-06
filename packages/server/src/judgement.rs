@@ -8,6 +8,13 @@ use bcode_plugin::PluginInvocationScope;
 
 use crate::ServerState;
 
+#[path = "judgement_optional.rs"]
+mod optional;
+pub use optional::OptionalJudgementAccess;
+
+/// Cache-only bridge suitable for credential-refresh closures.
+pub type JudgementInvalidationHandle = optional::JudgementInvalidationHandle;
+
 const DISCOVERY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 const JUDGEMENT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
@@ -95,6 +102,13 @@ pub async fn validate_setup_selection(
 }
 
 pub async fn setup_catalog(state: &ServerState) -> judgement::SetupCatalog {
+    setup_catalog_with_config(state, &state.startup_config).await
+}
+
+async fn setup_catalog_with_config(
+    state: &ServerState,
+    config: &bcode_config::BcodeConfig,
+) -> judgement::SetupCatalog {
     let mut providers = Vec::new();
     for (plugin_id, manifest) in state.plugins.registry().manifests() {
         if providers.len() >= 32 {
@@ -107,7 +121,7 @@ pub async fn setup_catalog(state: &ServerState) -> judgement::SetupCatalog {
         {
             continue;
         }
-        if let Some(provider) = setup_provider(state, plugin_id).await {
+        if let Some(provider) = setup_provider(state, config, plugin_id).await {
             providers.push(provider);
             if serde_json::to_vec(&judgement::SetupCatalog {
                 providers: providers.clone(),
@@ -121,16 +135,20 @@ pub async fn setup_catalog(state: &ServerState) -> judgement::SetupCatalog {
     judgement::SetupCatalog { providers }
 }
 
-fn setup_profiles(state: &ServerState, plugin_id: &str, provider_id: &str) -> Vec<String> {
+fn setup_profiles(
+    config: &bcode_config::BcodeConfig,
+    plugin_id: &str,
+    provider_id: &str,
+) -> Vec<String> {
     let mut profiles = Vec::new();
     let mut names: std::collections::BTreeSet<String> =
-        state.startup_config.auth.profiles.keys().cloned().collect();
-    let runtime = if state.startup_config.active_context.is_none() {
+        config.auth.profiles.keys().cloned().collect();
+    let runtime = if config.active_context.is_none() {
         bcode_config::try_load_runtime_auth_subscriptions().ok()
     } else {
         None
     };
-    if state.startup_config.active_context.is_none() && runtime.is_none() {
+    if config.active_context.is_none() && runtime.is_none() {
         return Vec::new();
     }
     if let Some(runtime) = runtime.as_ref() {
@@ -146,7 +164,7 @@ fn setup_profiles(state: &ServerState, plugin_id: &str, provider_id: &str) -> Ve
         let empty = bcode_config::RuntimeAuthSubscriptions::default();
         let registry = runtime.as_ref().unwrap_or(&empty);
         if bcode_provider_auth::resolve_auth_provider_profile(
-            &state.startup_config,
+            config,
             provider_id,
             plugin_id,
             Some(&name),
@@ -154,7 +172,7 @@ fn setup_profiles(state: &ServerState, plugin_id: &str, provider_id: &str) -> Ve
         )
         .is_ok()
             && bcode_provider_auth::resolve_owned_profile_context(
-                &state.startup_config,
+                config,
                 provider_id,
                 plugin_id,
                 &name,
@@ -167,7 +185,11 @@ fn setup_profiles(state: &ServerState, plugin_id: &str, provider_id: &str) -> Ve
     profiles
 }
 
-async fn setup_provider(state: &ServerState, plugin_id: &str) -> Option<judgement::SetupProvider> {
+async fn setup_provider(
+    state: &ServerState,
+    config: &bcode_config::BcodeConfig,
+    plugin_id: &str,
+) -> Option<judgement::SetupProvider> {
     let matching: Vec<_> = state
         .plugins
         .auth_provider_registry()
@@ -179,14 +201,14 @@ async fn setup_provider(state: &ServerState, plugin_id: &str) -> Option<judgemen
         return None;
     }
     let auth = matching[0];
-    let profiles = setup_profiles(state, plugin_id, &auth.contribution.provider_id);
+    let profiles = setup_profiles(config, plugin_id, &auth.contribution.provider_id);
     let environment_available =
         bcode_provider_auth::resolve_declared_environment_context(&auth.contribution).is_ok();
     let context = profiles
         .first()
         .and_then(|name| {
             bcode_provider_auth::resolve_owned_profile_context(
-                &state.startup_config,
+                config,
                 &auth.contribution.provider_id,
                 plugin_id,
                 name,
@@ -266,6 +288,23 @@ pub async fn invoke_judgement_model(
     auth_profile: &str,
     request: Request,
 ) -> Result<Response, &'static str> {
+    invoke_judgement_model_with_config(
+        state,
+        &state.startup_config,
+        provider_plugin_id,
+        auth_profile,
+        request,
+    )
+    .await
+}
+
+async fn invoke_judgement_model_with_config(
+    state: &ServerState,
+    config: &bcode_config::BcodeConfig,
+    provider_plugin_id: &str,
+    auth_profile: &str,
+    request: Request,
+) -> Result<Response, &'static str> {
     judgement::validate_request(&request)?;
     if provider_plugin_id.is_empty()
         || provider_plugin_id.len() > 256
@@ -300,7 +339,7 @@ pub async fn invoke_judgement_model(
         bcode_provider_auth::resolve_declared_environment_context(&registered.contribution)?
     } else {
         bcode_provider_auth::resolve_owned_profile_context(
-            &state.startup_config,
+            config,
             &registered.contribution.provider_id,
             provider_plugin_id,
             auth_profile,

@@ -360,6 +360,9 @@ pub struct ServerState {
     session_migrations: bcode_session_migration::SessionMigrationService,
     pub session_catalog: Arc<session_catalog::SessionCatalog>,
     pub plugins: bcode_plugin::PluginRuntimeHost,
+    optional_judgement: judgement::OptionalJudgementAccess,
+    advisory_categorizations:
+        StdMutex<BTreeMap<SessionId, bcode_session_models::SessionCategorization>>,
     tool_catalog: tool_catalog::ToolCatalogCache,
     startup_plugin_selection: bcode_plugin::PluginSelection,
     default_plugin_ids: Vec<String>,
@@ -834,13 +837,62 @@ impl WorkflowRunCancellationHandle {
     }
 }
 
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct DiagnosticAdvisory {
+    category: DiagnosticCategory,
+    message: String,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum DiagnosticCategory {
+    Code,
+    Environment,
+    Auth,
+    Transient,
+    Partial,
+    Inconclusive,
+}
+
+impl DiagnosticAdvisory {
+    fn model_message(&self) -> ModelMessage {
+        ModelMessage {
+            role: MessageRole::System,
+            content: vec![ContentBlock::Text {
+                text: format!(
+                    "Read-only diagnostic advisory {:?} (not permission, retry or completion authority): {}",
+                    self.category, self.message
+                ),
+            }],
+        }
+    }
+}
+
 #[derive(Debug, Default)]
 pub struct TurnCancelState {
     token: CancellationToken,
+    diagnostic_advisories: StdMutex<Vec<DiagnosticAdvisory>>,
     marker_commit: Mutex<()>,
 }
 
 impl TurnCancelState {
+    fn advisory_messages(&self) -> Vec<ModelMessage> {
+        self.diagnostic_advisories.lock().map_or_else(
+            |_| Vec::new(),
+            |advisories| {
+                advisories
+                    .iter()
+                    .map(DiagnosticAdvisory::model_message)
+                    .collect()
+            },
+        )
+    }
+
+    fn append_advisory_messages(&self, messages: &mut Vec<ModelMessage>) {
+        messages.extend(self.advisory_messages());
+    }
+
     fn close(&self) {
         self.token.cancel();
     }
@@ -2370,6 +2422,8 @@ impl ServerState {
             session_migrations,
             session_catalog: Arc::new(session_catalog::SessionCatalog::default()),
             plugins,
+            optional_judgement: judgement::OptionalJudgementAccess::new(),
+            advisory_categorizations: StdMutex::new(BTreeMap::new()),
             tool_catalog: tool_catalog::ToolCatalogCache::default(),
             startup_plugin_selection: init.startup_plugin_selection,
             default_plugin_ids: init.default_plugin_ids,
@@ -2692,6 +2746,7 @@ impl ServerState {
         client_id: ClientId,
         context: Option<ClientRuntimeContext>,
     ) {
+        self.optional_judgement.invalidate();
         let mut contexts = self.client_runtime_contexts.lock().await;
         if let Some(mut context) = context {
             if context.interaction_adapters.is_empty()
@@ -2737,6 +2792,7 @@ impl ServerState {
                 .unwrap_or_else(|_| PathBuf::from("."))
         };
         let skills = build_skill_registry(&config, &workspace);
+        self.optional_judgement.invalidate();
         self.session_configs.lock().await.insert(session_id, config);
         self.session_skills.lock().await.insert(session_id, skills);
     }
@@ -5919,7 +5975,13 @@ async fn run_client_operation(
     writer: &SharedWriter,
     attached_session: &mut Option<SessionId>,
 ) -> Option<Result<(), ServerError>> {
-    let cancel_on_disconnect = matches!(&request, Request::Judge { .. } | Request::JudgementSetup);
+    let cancel_on_disconnect = matches!(
+        &request,
+        Request::Judge { .. }
+            | Request::OptionalJudge { .. }
+            | Request::JudgementVerify { .. }
+            | Request::JudgementSetup
+    );
     let operation = Box::pin(handle_request(
         request,
         request_id,
@@ -6105,6 +6167,7 @@ const fn request_session_id(request: &Request) -> Option<SessionId> {
         | Request::SessionStorageUsage { session_id, .. }
         | Request::SessionHistoryPage { session_id, .. }
         | Request::SessionHistoryAround { session_id, .. }
+        | Request::SessionCategorization { session_id }
         | Request::SessionInspection { session_id, .. }
         | Request::PrepareSessionOpen { session_id }
         | Request::WaitSessionOpenProgress { session_id, .. }
@@ -6177,6 +6240,7 @@ const fn request_kind(request: &Request) -> &'static str {
         Request::SessionStorageUsage { .. } => "session_storage_usage",
         Request::SessionHistoryPage { .. } => "session_history_page",
         Request::SessionHistoryAround { .. } => "session_history_around",
+        Request::SessionCategorization { .. } => "session_categorization",
         Request::SessionInspection { .. } => "session_inspection",
         Request::SessionSearch { .. } => "session_search",
         Request::SessionSearchProviders => "session_search_providers",
@@ -6354,6 +6418,8 @@ const fn request_kind(request: &Request) -> &'static str {
         Request::SessionModelList { .. } => "session_model_list",
         Request::JudgementSetup => "judgement_setup",
         Request::JudgementSetupValidate { .. } => "judgement_setup_validate",
+        Request::OptionalJudge { .. } => "optional_judge",
+        Request::JudgementVerify { .. } => "judgement_verify",
         Request::Judge { .. } => "judge",
         Request::ListAgents => "list_agents",
         Request::ListSkills => "list_skills",
@@ -6870,6 +6936,20 @@ async fn handle_request_inner(
         SessionLifecycleRequest::SessionHistoryAround { session_id, query } => {
             handle_session_history_around(request_id, client_id, state, writer, session_id, query)
                 .await
+        }
+        SessionLifecycleRequest::SessionCategorization { session_id } => {
+            let categorization = state
+                .advisory_categorizations
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .get(&session_id)
+                .cloned();
+            send_response(
+                writer,
+                request_id,
+                Response::Ok(ResponsePayload::SessionCategorization { categorization }),
+            )
+            .await
         }
         SessionLifecycleRequest::SessionInspection { session_id, query } => {
             handle_session_inspection(request_id, client_id, state, writer, session_id, query).await
@@ -8838,6 +8918,51 @@ async fn handle_core_runtime_request(
                 Response::Ok(ResponsePayload::JudgementSetupValidated { available }),
             )
             .await
+        }
+        CoreRuntimeRequest::OptionalJudge { request_json } => {
+            let result = if request_json.len() <= bcode_model::judgement::MAX_REQUEST_BYTES
+                && let Ok(input) =
+                    serde_json::from_str::<bcode_model::judgement::OptionalRequest>(&request_json)
+            {
+                state.optional_judgement.judge(state, input).await
+            } else {
+                bcode_model::judgement::OptionalResponse { response: None }
+            };
+            let response = serde_json::to_string(&result).map_or_else(
+                |_| {
+                    Response::Err(ErrorResponse::new(
+                        "invalid_result",
+                        "optional judgement result cannot be encoded",
+                    ))
+                },
+                |result_json| Response::Ok(ResponsePayload::OptionalJudgement { result_json }),
+            );
+            send_response(writer, request_id, response).await
+        }
+        CoreRuntimeRequest::JudgementVerify { selection_json } => {
+            let result = if selection_json.len() <= 1024
+                && let Ok(selection) =
+                    serde_json::from_str::<bcode_model::judgement::SetupSelection>(&selection_json)
+            {
+                state.optional_judgement.verify(state, &selection).await
+            } else {
+                Err("invalid judgement selection")
+            };
+            let response = match result {
+                Ok(result) => serde_json::to_string(&result).map_or_else(
+                    |_| {
+                        Response::Err(ErrorResponse::new(
+                            "invalid_result",
+                            "verification result cannot be encoded",
+                        ))
+                    },
+                    |result_json| Response::Ok(ResponsePayload::JudgementVerified { result_json }),
+                ),
+                Err(message) => {
+                    Response::Err(ErrorResponse::new("verification_unavailable", message))
+                }
+            };
+            send_response(writer, request_id, response).await
         }
         CoreRuntimeRequest::Judge {
             provider_plugin_id,
@@ -19864,6 +19989,51 @@ async fn run_model_turn_inner(
         }
     };
     let static_context_timer = state.metrics.timer();
+    if !recovering
+        && execution.request_context_id.is_none()
+        && let SessionEventKind::SubmissionActivated { text, .. } = &trigger_event.kind
+    {
+        let end = text.floor_char_boundary(
+            text.len()
+                .min(bcode_session_models::MAX_CATEGORIZATION_SOURCE_BYTES),
+        );
+        let request = bcode_session_models::CategorizationRequest {
+            session_id,
+            source_sequence: trigger_event.sequence,
+            newest_request: text[..end].to_owned(),
+        };
+        if let Ok(payload) = serde_json::to_value(request)
+            && let Some(value) = invoke_optional_feature_service(
+                state,
+                bcode_session_models::CATEGORIZATION_INTERFACE_ID,
+                bcode_session_models::OP_CATEGORIZE,
+                payload,
+                &turn_config,
+                &cancel_state,
+            )
+            .await
+            && let Ok(response) =
+                serde_json::from_value::<bcode_session_models::CategorizationResponse>(value)
+            && let Some(labels) = response.categorization
+            && labels.source_sequence == trigger_event.sequence
+            && labels.task.len() <= 64
+            && labels.domain.len() <= 64
+        {
+            let mut cache = state
+                .advisory_categorizations
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if cache.len() >= 256 && !cache.contains_key(&session_id) {
+                cache.clear();
+            }
+            if cache
+                .get(&session_id)
+                .is_none_or(|current| current.source_sequence < labels.source_sequence)
+            {
+                cache.insert(session_id, labels);
+            }
+        }
+    }
     let static_context = Box::pin(prepare_static_model_turn_context(
         state,
         session_id,
@@ -19876,6 +20046,7 @@ async fn run_model_turn_inner(
         &selection,
         !recovering,
         Some(prepared_catalog),
+        &cancel_state,
     ))
     .await;
     state.metrics.record_histogram_with_labels(
@@ -21675,6 +21846,7 @@ async fn run_model_turn_round(
             Some(server_model_provider_bridge(
                 state.plugins.clone(),
                 config.clone(),
+                state.optional_judgement.invalidation_handle(),
                 &request.turn_id,
                 &push_plugin_id,
             )),
@@ -25225,6 +25397,7 @@ async fn invoke_model_provider_start_turn_scoped(
     let bridge = server_model_provider_bridge(
         state.plugins.clone(),
         config.clone(),
+        state.optional_judgement.invalidation_handle(),
         &request.turn_id,
         &provider_plugin_id,
     );
@@ -25478,6 +25651,7 @@ async fn prepare_static_model_turn_context(
     selection: &SessionModelSelection,
     retain_environment_snapshot: bool,
     prepared_catalog: Option<Arc<tool_catalog::Snapshot>>,
+    cancel_state: &TurnCancelState,
 ) -> Result<StaticModelTurnContext, bcode_session::SessionError> {
     let setup_labels = model_turn_metric_labels(session_id, turn_id);
     let agent_timer = state.metrics.timer();
@@ -25514,13 +25688,88 @@ async fn prepare_static_model_turn_context(
     let repository_root = session_repository_root(state, session_id, &working_directory).await;
     let skills_timer = state.metrics.timer();
     let skills = state.session_skills(session_id).await;
-    let skill_catalog = if config.system_prompt.sections.skill_catalog {
-        skills.as_ref().map_or_else(String::new, |registry| {
-            format_skill_catalog_for_prompt(
-                &registry.list(),
-                &skill_prompt_options_from_config(&config.skills.prompt),
-            )
+    let newest_task = state
+        .sessions
+        .session_events_range(
+            session_id,
+            trigger_event_sequence,
+            trigger_event_sequence,
+            1,
+        )
+        .await
+        .ok()
+        .and_then(|events| events.into_iter().next())
+        .and_then(|event| match event.kind {
+            SessionEventKind::SubmissionActivated { text, .. }
+            | SessionEventKind::UserMessage { text, .. } => Some(text),
+            _ => None,
         })
+        .unwrap_or_default();
+    let task_end = newest_task.floor_char_boundary(newest_task.len().min(8192));
+    let newest_task = &newest_task[..task_end];
+    let mut skill_summaries = skills
+        .as_ref()
+        .map_or_else(Vec::new, |registry| registry.list().skills);
+    let protected_skill = state
+        .turn_skills
+        .lock()
+        .await
+        .get(&(session_id, trigger_event_sequence))
+        .map(|invocation| invocation.skill_id.clone());
+    let shortlist: Vec<_> = skill_summaries.iter().enumerate().filter(|(_, skill)| !skill.disable_model_invocation).take(32).map(|(index, skill)| {
+        let description = skill.description.as_deref().unwrap_or(&skill.name);
+        serde_json::json!({ "id": index.to_string(), "description": &description[..description.floor_char_boundary(description.len().min(1024))], "protected": execution.skill_contexts.iter().any(|context| context.skill_id == skill.id) || protected_skill.as_ref() == Some(&skill.id) })
+    }).collect();
+    let skill_prompt_options = skill_prompt_options_from_config(&config.skills.prompt);
+    let skill_catalog_eligible = config.system_prompt.sections.skill_catalog
+        && skill_prompt_options.mode != SkillPromptCatalogMode::Off
+        && skill_prompt_options.max_bytes != Some(0);
+    let pressure = skill_catalog_eligible
+        && skill_prompt_options.max_bytes.is_some_and(|budget| {
+            let mut unbounded_options = skill_prompt_options.clone();
+            unbounded_options.max_bytes = None;
+            format_skill_catalog_for_prompt(
+                &bcode_skill_models::SkillList {
+                    skills: skill_summaries.clone(),
+                    diagnostics: Vec::new(),
+                },
+                &unbounded_options,
+            )
+            .len()
+                > budget
+        });
+    if let Some(purpose) =
+        skill_catalog_ranking_purpose(skill_catalog_eligible, pressure, &config.judgement)
+        && let Some(order) = optional_selection_order(
+            state,
+            newest_task,
+            purpose,
+            shortlist.clone(),
+            config,
+            cancel_state,
+        )
+        .await
+    {
+        let original = skill_summaries.clone();
+        for (slot, id) in shortlist.iter().zip(order) {
+            if let (Some(slot), Ok(index)) = (
+                slot.get("id")
+                    .and_then(serde_json::Value::as_str)
+                    .and_then(|id| id.parse::<usize>().ok()),
+                id.parse::<usize>(),
+            ) {
+                skill_summaries[slot] = original[index].clone();
+            }
+        }
+    }
+    let skill_catalog = if config.system_prompt.sections.skill_catalog {
+        format_skill_catalog_for_prompt(
+            &bcode_skill_models::SkillList {
+                skills: skill_summaries,
+                diagnostics: Vec::new(),
+            },
+            &skill_prompt_options,
+        )
     } else {
         String::new()
     };
@@ -25705,12 +25954,33 @@ async fn prepare_static_model_turn_context(
             content: vec![ContentBlock::Text { text: message }],
         });
     }
-    let base_tools = filter_model_tools(
+    let mut base_tools = filter_model_tools(
         tool_catalog.discovery(),
         enabled_tools,
         execution.tools,
         execution.allow_user_questions,
     );
+    let shortlist: Vec<_> = base_tools.iter().take(32).map(|tool| {
+        let description = &tool.description;
+        serde_json::json!({ "id": tool.name, "description": &description[..description.floor_char_boundary(description.len().min(1024))], "protected": execution.tool_allowlist.as_ref().is_some_and(|allowlist| allowlist.contains(&tool.name)) })
+    }).collect();
+    if let Some(order) = optional_selection_order(
+        state,
+        newest_task,
+        "recommendations",
+        shortlist,
+        config,
+        cancel_state,
+    )
+    .await
+    {
+        let original = base_tools.clone();
+        for (slot, id) in order.iter().enumerate() {
+            if let Some(tool) = original.iter().find(|tool| &tool.name == id) {
+                base_tools[slot] = tool.clone();
+            }
+        }
+    }
     if !execution.allow_user_questions {
         system_messages.push(ModelMessage {
             role: MessageRole::System,
@@ -25863,6 +26133,21 @@ async fn build_model_turn_request(
             .sum::<usize>() as u64,
         metric_labels.clone(),
     );
+    // Diagnostic advice is request-only and follows canonical tool/result chronology.
+    let runtime = state
+        .session_runtimes
+        .lock()
+        .await
+        .get(&session_id)
+        .cloned();
+    if let Some(runtime) = runtime {
+        let current = runtime.current_turn.lock().await;
+        if let Some(current) = current.as_ref()
+            && current.turn_id == execution_turn_id(trigger_event)
+        {
+            current.cancel_state.append_advisory_messages(&mut messages);
+        }
+    }
     // Recovery observations must follow historical snapshots to supersede them.
     if let Some(context) = &static_context.recovery_context {
         messages.push(context.clone());
@@ -28562,6 +28847,247 @@ async fn invoke_server_registered_tool(
     finish_server_registered_tool(invoker, call, result, tool_labels, tool_span, tool_start).await
 }
 
+fn skill_catalog_ranking_purpose(
+    rendered: bool,
+    budget_pressure: bool,
+    config: &bcode_config::JudgementConfig,
+) -> Option<&'static str> {
+    use bcode_model::judgement::Feature;
+    if !rendered {
+        return None;
+    }
+    if budget_pressure && config.enabled(Feature::ContextReranking) {
+        return Some("context");
+    }
+    config
+        .enabled(Feature::Recommendations)
+        .then_some("recommendations")
+}
+
+/// Apply a plugin-owned permutation only after verifying it preserves the entire shortlist
+/// and every protected position. Invalid or absent advice retains baseline order.
+async fn optional_selection_order(
+    state: &ServerState,
+    task: &str,
+    purpose: &str,
+    candidates: Vec<serde_json::Value>,
+    config: &bcode_config::BcodeConfig,
+    cancel: &TurnCancelState,
+) -> Option<Vec<String>> {
+    if candidates.len() < 2 || candidates.len() > 32 || task.is_empty() {
+        return None;
+    }
+    let selection =
+        serde_json::json!({ "purpose": purpose, "task": task, "candidates": candidates });
+    let prepared = invoke_optional_feature_service(
+        state,
+        "bcode.skills-selection/v1",
+        "prepare",
+        selection.clone(),
+        config,
+        cancel,
+    )
+    .await?;
+    let input = serde_json::from_value::<bcode_model::judgement::OptionalRequest>(
+        prepared.get("judgement")?.clone(),
+    )
+    .ok()?;
+    let judgement = tokio::select! {
+        biased;
+        () = cancel.cancelled() => return None,
+        result = state.optional_judgement.judge_with_config(state, config, input) => result,
+    };
+    let applied = invoke_optional_feature_service(
+        state,
+        "bcode.skills-selection/v1",
+        "apply",
+        serde_json::json!({ "selection": selection, "judgement": judgement }),
+        config,
+        cancel,
+    )
+    .await?;
+    let ids: Vec<String> = serde_json::from_value(applied.get("ordered_ids")?.clone()).ok()?;
+    valid_advisory_permutation(&candidates, &ids).then_some(ids)
+}
+
+fn valid_advisory_permutation(candidates: &[serde_json::Value], ids: &[String]) -> bool {
+    let Some(baseline) = candidates
+        .iter()
+        .map(|candidate| candidate.get("id").and_then(serde_json::Value::as_str))
+        .collect::<Option<Vec<_>>>()
+    else {
+        return false;
+    };
+    ids.len() == baseline.len()
+        && ids.iter().map(String::as_str).collect::<BTreeSet<_>>()
+            == baseline.iter().copied().collect::<BTreeSet<_>>()
+        && !candidates.iter().enumerate().any(|(index, candidate)| {
+            candidate
+                .get("protected")
+                .and_then(serde_json::Value::as_bool)
+                == Some(true)
+                && ids[index] != baseline[index]
+        })
+}
+
+#[cfg(test)]
+mod advisory_selection_boundary_tests {
+    #[test]
+    fn catalog_ranking_selects_one_meaningful_independently_enabled_feature() {
+        let mut config = bcode_config::JudgementConfig::default();
+        assert_eq!(
+            super::skill_catalog_ranking_purpose(false, true, &config),
+            None
+        );
+        assert_eq!(
+            super::skill_catalog_ranking_purpose(true, true, &config),
+            Some("context")
+        );
+        assert_eq!(
+            super::skill_catalog_ranking_purpose(true, false, &config),
+            Some("recommendations")
+        );
+        config.context_reranking = bcode_config::JudgementMode::Off;
+        assert_eq!(
+            super::skill_catalog_ranking_purpose(true, true, &config),
+            Some("recommendations")
+        );
+        config.recommendations = bcode_config::JudgementMode::Off;
+        assert_eq!(
+            super::skill_catalog_ranking_purpose(true, true, &config),
+            None
+        );
+        config.context_reranking = bcode_config::JudgementMode::Auto;
+        assert_eq!(
+            super::skill_catalog_ranking_purpose(true, false, &config),
+            None
+        );
+        assert_eq!(
+            super::skill_catalog_ranking_purpose(true, true, &config),
+            Some("context")
+        );
+        config.mode = bcode_config::JudgementMode::Off;
+        assert_eq!(
+            super::skill_catalog_ranking_purpose(true, true, &config),
+            None
+        );
+    }
+
+    #[test]
+    fn permutations_preserve_membership_and_protected_slots() {
+        let candidates = vec![
+            serde_json::json!({"id":"explicit","protected":true}),
+            serde_json::json!({"id":"optional-a","protected":false}),
+            serde_json::json!({"id":"optional-b","protected":false}),
+        ];
+        let ids = |ids: &[&str]| ids.iter().map(|id| (*id).to_owned()).collect::<Vec<_>>();
+        assert!(super::valid_advisory_permutation(
+            &candidates,
+            &ids(&["explicit", "optional-b", "optional-a"])
+        ));
+        assert!(!super::valid_advisory_permutation(
+            &candidates,
+            &ids(&["optional-a", "explicit", "optional-b"])
+        ));
+        assert!(!super::valid_advisory_permutation(
+            &candidates,
+            &ids(&["explicit", "optional-a", "optional-a"])
+        ));
+        assert!(!super::valid_advisory_permutation(
+            &candidates,
+            &ids(&["explicit", "optional-a"])
+        ));
+        assert!(!super::valid_advisory_permutation(
+            &candidates,
+            &ids(&["explicit", "optional-a", "foreign"])
+        ));
+    }
+}
+
+/// Invoke one uniquely discovered advisory service without granting tool or artifact authority.
+/// Only the central optional judgement application operation is available to the consumer.
+async fn invoke_optional_feature_service(
+    state: &ServerState,
+    interface_id: &str,
+    operation: &str,
+    payload: serde_json::Value,
+    config: &bcode_config::BcodeConfig,
+    cancel_state: &TurnCancelState,
+) -> Option<serde_json::Value> {
+    let plugin_id = state
+        .plugins
+        .registry()
+        .service_registry()
+        .unique_provider(interface_id)
+        .ok()?
+        .to_owned();
+    let payload = serde_json::to_vec(&payload).ok()?;
+    if payload.len() > bcode_model::judgement::MAX_REQUEST_BYTES || cancel_state.is_cancelled() {
+        return None;
+    }
+    let (bridge, mut calls) = server_plugin_bridge();
+    let mut invocation = state
+        .plugins
+        .invoke_service_with_events_and_bridge_scoped(
+            &plugin_id,
+            interface_id,
+            operation,
+            payload,
+            PluginInvocationScope::Global,
+            Some(bridge),
+        )
+        .await
+        .ok()?;
+    let mut bridge_open = true;
+    let deadline = tokio::time::sleep(Duration::from_secs(45));
+    tokio::pin!(deadline);
+    loop {
+        tokio::select! {
+            biased;
+            () = cancel_state.cancelled() => { invocation.cancel.cancel(); return None; }
+            () = &mut deadline => { invocation.cancel.cancel(); return None; }
+            call = calls.recv(), if bridge_open => {
+                let Some(call) = call else {
+                    bridge_open = false;
+                    continue;
+                };
+                let response = match call.request {
+                    ServiceBridgeRequest::InvokeService(request)
+                        if request.interface_id == bcode_model::judgement::WORKFLOW_APPLICATION_INTERFACE_ID
+                            && request.route_id.as_deref() == Some(bcode_model::judgement::WORKFLOW_APPLICATION_INTERFACE_ID)
+                            && request.operation == "optional_judge" => {
+                        let resolution = if call.cancellation.is_cancelled() {
+                            ToolInvocationServiceResolution::Cancelled
+                        } else if let Ok(input) = serde_json::from_value::<bcode_model::judgement::OptionalRequest>(request.payload) {
+                            let result = tokio::select! {
+                                biased;
+                                () = cancel_state.cancelled() => { invocation.cancel.cancel(); return None; }
+                                () = &mut deadline => { invocation.cancel.cancel(); return None; }
+                                result = state.optional_judgement.judge_with_config(state, config, input) => result,
+                            };
+                            serde_json::to_value(result).map_or(ToolInvocationServiceResolution::Unsupported, |payload| ToolInvocationServiceResolution::Responded { payload })
+                        } else { ToolInvocationServiceResolution::Unsupported };
+                        Ok(ServiceBridgeResponse::Service(resolution))
+                    }
+                    _ => Err("advisory service capability is unavailable".into()),
+                };
+                let _ = call.response.send(response);
+            }
+            event = invocation.next_event() => {
+                match event.ok()? {
+                    StreamingServiceInvocationEvent::Event(_) => {}
+                    StreamingServiceInvocationEvent::Response(response) => {
+                        drop(invocation);
+                        let response = response.ok()?;
+                        if response.error.is_some() || response.payload.len() > bcode_model::judgement::MAX_RESPONSE_BYTES { return None; }
+                        return serde_json::from_slice(&response.payload).ok();
+                    }
+                }
+            }
+        }
+    }
+}
+
 async fn finish_server_registered_tool(
     invoker: &ServerToolInvoker<'_>,
     call: bcode_model::ToolCall,
@@ -28618,7 +29144,7 @@ async fn finish_server_registered_tool(
         None,
         SessionTracePhase::ToolInvocationFinished,
         SessionTracePayload::ToolInvocationFinished {
-            tool_call_id: call.id,
+            tool_call_id: call.id.clone(),
             duration_ms: elapsed_ms(tool_start),
             is_error: result.is_error,
             output_bytes,
@@ -28626,7 +29152,100 @@ async fn finish_server_registered_tool(
         },
     )
     .await;
+    // Postsettlement advice cannot replace lifecycle, trace facts or the original outcome.
+    // Raw bounded output remains transient in the plugin; only allowlisted indicators
+    // may enter external judgement. No arguments or artifacts are reread.
+    if !invoker.cancel_state.is_cancelled() {
+        let end = result
+            .output
+            .floor_char_boundary(result.output.len().min(8192));
+        let advisory = invoke_optional_feature_service(
+            invoker.state,
+            "bcode.loop.tool-result-triage/v1",
+            "triage",
+            serde_json::json!({
+                "version": 1,
+                "invocation_id": call.id,
+                "tool_name": call.name,
+                "is_error": result.is_error,
+                "partial": false,
+                "excerpt_truncated": end < result.output.len(),
+                "output_excerpt": &result.output[..end],
+            }),
+            &invoker.state.session_config(invoker.session_id).await,
+            invoker.cancel_state,
+        )
+        .await;
+        if let Some(advisory) = advisory.and_then(|response| response.get("advisory").cloned()) {
+            deliver_diagnostic_advisory(invoker, &call.id, advisory).await;
+        }
+    }
     Ok(result)
+}
+
+async fn deliver_diagnostic_advisory(
+    invoker: &ServerToolInvoker<'_>,
+    invocation_id: &str,
+    payload: serde_json::Value,
+) {
+    let Ok(advisory) = serde_json::from_value::<DiagnosticAdvisory>(payload.clone()) else {
+        return;
+    };
+    if advisory.message.is_empty()
+        || advisory.message.len() > 512
+        || advisory.message.chars().any(char::is_control)
+        || invoker.cancel_state.is_cancelled()
+    {
+        return;
+    }
+    let accepted = invoker
+        .cancel_state
+        .diagnostic_advisories
+        .lock()
+        .is_ok_and(|mut advisories| {
+            if advisories.len() >= 16 {
+                return false;
+            }
+            advisories.push(advisory);
+            true
+        });
+    if !accepted {
+        return;
+    }
+    let Some(producer) = invoker
+        .state
+        .plugins
+        .registry()
+        .service_registry()
+        .unique_provider("bcode.loop.tool-result-triage/v1")
+        .ok()
+        .map(str::to_owned)
+    else {
+        return;
+    };
+    let envelope = bcode_session_models::ToolContributionEnvelope::new(
+        bcode_session_models::ToolContributionPlacement::Supplemental,
+        bcode_session_models::ToolContributionEvent {
+            invocation_id: invocation_id.to_owned(),
+            contribution_id: "diagnostic-advisory".into(),
+            sequence: 1,
+            producer_id: producer.clone(),
+            schema: "bcode.loop.diagnostic-advisory/v1".into(),
+            schema_version: 1,
+            operation: bcode_session_models::ToolContributionOperation::Upsert,
+            persistence: bcode_session_models::ToolContributionPersistence::Transient,
+            artifact: None,
+            payload,
+        },
+    );
+    append_tool_contribution_envelope(
+        invoker.state,
+        invoker.session_id,
+        invocation_id,
+        &producer,
+        envelope,
+    )
+    .await;
 }
 
 fn pinned_tool_producer(
@@ -29645,6 +30264,7 @@ fn auth_host_service_resolution(
 fn server_model_provider_bridge(
     plugins: bcode_plugin::PluginRuntimeHost,
     config: bcode_config::BcodeConfig,
+    invalidation: judgement::JudgementInvalidationHandle,
     turn_id: &str,
     caller_plugin_id: &str,
 ) -> PluginInvocationBridge {
@@ -29655,6 +30275,7 @@ fn server_model_provider_bridge(
             ServiceBridgeResponse::Service(ToolInvocationServiceResolution::Cancelled),
         ),
         ServiceBridgeRequest::InvokeService(request) if request.invocation_id == turn_id => {
+            invalidation.invalidate();
             Ok(ServiceBridgeResponse::Service(
                 auth_host_service_resolution(&plugins, &config, &caller_plugin_id, request),
             ))
@@ -29681,16 +30302,90 @@ fn server_model_provider_bridge(
     })
 }
 
+fn blocking_optional_judgement_resolution(
+    state: &Arc<ServerState>,
+    runtime: &tokio::runtime::Handle,
+    config: &bcode_config::BcodeConfig,
+    payload: serde_json::Value,
+    cancellation: &bcode_plugin_sdk::ServiceCancellation,
+) -> ToolInvocationServiceResolution {
+    if cancellation.is_cancelled() {
+        return ToolInvocationServiceResolution::Cancelled;
+    }
+    let state = Arc::clone(state);
+    let config = config.clone();
+    let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+    let task = runtime.spawn(async move {
+        let cancel = TurnCancelState::default();
+        let response =
+            optional_judgement_payload_resolution(&state, &config, payload, &cancel).await;
+        let _ = sender.send(response);
+    });
+    loop {
+        if cancellation.wait_cancelled(Duration::from_millis(25)) {
+            task.abort();
+            return ToolInvocationServiceResolution::Cancelled;
+        }
+        match receiver.try_recv() {
+            Ok(response) => return response,
+            Err(std::sync::mpsc::TryRecvError::Empty) => {}
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                return ToolInvocationServiceResolution::Cancelled;
+            }
+        }
+    }
+}
+
+async fn optional_judgement_payload_resolution(
+    state: &ServerState,
+    config: &bcode_config::BcodeConfig,
+    payload: serde_json::Value,
+    cancellation: &TurnCancelState,
+) -> ToolInvocationServiceResolution {
+    let Ok(input) = serde_json::from_value::<bcode_model::judgement::OptionalRequest>(payload)
+    else {
+        return ToolInvocationServiceResolution::Failed {
+            code: "invalid_request".into(),
+            message: "invalid optional judgement request".into(),
+        };
+    };
+    let response = tokio::select! {
+        biased;
+        () = cancellation.cancelled() => return ToolInvocationServiceResolution::Cancelled,
+        response = state.optional_judgement.judge_with_config(state, config, input) => response,
+    };
+    serde_json::to_value(response).map_or_else(
+        |_| ToolInvocationServiceResolution::Failed {
+            code: "invalid_result".into(),
+            message: "optional judgement result cannot be encoded".into(),
+        },
+        |payload| ToolInvocationServiceResolution::Responded { payload },
+    )
+}
+
 fn server_workflow_judgement_resolution(
     state: &Arc<ServerState>,
+    config: &bcode_config::BcodeConfig,
     runtime: &tokio::runtime::Handle,
     request: bcode_tool::ToolInvocationServiceRequest,
     cancellation: &bcode_plugin_sdk::ServiceCancellation,
 ) -> ToolInvocationServiceResolution {
-    if request.operation != bcode_model::judgement::OP_WORKFLOW_JUDGE
-        || request.route_id.as_deref()
-            != Some(bcode_model::judgement::WORKFLOW_APPLICATION_INTERFACE_ID)
+    if request.route_id.as_deref()
+        != Some(bcode_model::judgement::WORKFLOW_APPLICATION_INTERFACE_ID)
+        || request.interface_id != bcode_model::judgement::WORKFLOW_APPLICATION_INTERFACE_ID
     {
+        return ToolInvocationServiceResolution::Unsupported;
+    }
+    if request.operation == bcode_model::judgement::OP_OPTIONAL_JUDGE {
+        return blocking_optional_judgement_resolution(
+            state,
+            runtime,
+            config,
+            request.payload,
+            cancellation,
+        );
+    }
+    if request.operation != bcode_model::judgement::OP_WORKFLOW_JUDGE {
         return ToolInvocationServiceResolution::Unsupported;
     }
     if cancellation.is_cancelled() {
@@ -29882,12 +30577,19 @@ fn server_workflow_plugin_bridge(
                     == bcode_model::judgement::WORKFLOW_APPLICATION_INTERFACE_ID =>
         {
             Ok(ServiceBridgeResponse::Service(
-                server_workflow_judgement_resolution(&state, &runtime, request, &cancellation),
+                server_workflow_judgement_resolution(
+                    &state,
+                    &config,
+                    &runtime,
+                    request,
+                    &cancellation,
+                ),
             ))
         }
         ServiceBridgeRequest::InvokeService(request)
             if request.invocation_id == dispatch_identity =>
         {
+            state.optional_judgement.invalidate();
             Ok(ServiceBridgeResponse::Service(
                 auth_host_service_resolution(&state.plugins, &config, &caller_plugin_id, request),
             ))
@@ -30195,6 +30897,18 @@ impl InvocationServiceRouter for ServerServiceRouter<'_> {
             let Some(route_id) = request.route_id.as_deref() else {
                 return ToolInvocationServiceResolution::Unsupported;
             };
+            if route_id == bcode_model::judgement::WORKFLOW_APPLICATION_INTERFACE_ID
+                && request.interface_id == bcode_model::judgement::WORKFLOW_APPLICATION_INTERFACE_ID
+                && request.operation == "optional_judge"
+            {
+                return optional_judgement_payload_resolution(
+                    self.state,
+                    &self.state.session_config(self.session_id).await,
+                    request.payload,
+                    self.cancel_state,
+                )
+                .await;
+            }
             let Some(route) = invocation_service_routes(self.state, self.session_id)
                 .await
                 .into_iter()
@@ -44920,6 +45634,260 @@ mod tests {
                 );
             }
         }
+    }
+
+    static TRIAGE_FIXTURE_CALLS: AtomicUsize = AtomicUsize::new(0);
+    static OPTIONAL_OFF_PROVIDER_CALLS: AtomicUsize = AtomicUsize::new(0);
+
+    #[derive(Default)]
+    struct AdvisoryBoundaryFixture;
+
+    const ADVISORY_FIXTURE_MANIFEST: &str = r#"
+id = "bcode.test-advisory-boundary"
+name = "Advisory Boundary Fixture"
+version = "0.0.1"
+[[services]]
+interface_id = "bcode.loop.tool-result-triage/v1"
+[[services]]
+interface_id = "bcode.session-categorization/v1"
+[[services]]
+interface_id = "bcode.judgement-model-provider/v1"
+[runtime]
+type = "native"
+library = "libbcode_test_advisory_boundary.dylib"
+abi_version = 5
+event_symbol = "bcode_plugin_handle_event_v1"
+"#;
+
+    impl bcode_plugin_sdk::RustPlugin for AdvisoryBoundaryFixture {
+        fn invoke_service(
+            &mut self,
+            context: bcode_plugin_sdk::NativeServiceContext,
+        ) -> bcode_plugin_sdk::ServiceResponse {
+            if context.request.interface_id == bcode_model::judgement::INTERFACE_ID {
+                OPTIONAL_OFF_PROVIDER_CALLS.fetch_add(1, Ordering::SeqCst);
+                return bcode_plugin_sdk::ServiceResponse::error(
+                    "unexpected_call",
+                    "disabled provider called",
+                );
+            }
+            let payload: serde_json::Value = context.request.payload_json().unwrap();
+            if context.request.interface_id == bcode_session_models::CATEGORIZATION_INTERFACE_ID {
+                let request: bcode_session_models::CategorizationRequest =
+                    serde_json::from_value(payload).unwrap();
+                assert!(
+                    request.newest_request.len()
+                        <= bcode_session_models::MAX_CATEGORIZATION_SOURCE_BYTES
+                );
+                return bcode_plugin_sdk::ServiceResponse::json(
+                    &bcode_session_models::CategorizationResponse {
+                        categorization: Some(bcode_session_models::SessionCategorization {
+                            source_sequence: request.source_sequence,
+                            task: "implementation".into(),
+                            domain: "backend".into(),
+                        }),
+                    },
+                )
+                .unwrap();
+            }
+            assert_eq!(context.request.operation, "triage");
+            TRIAGE_FIXTURE_CALLS.fetch_add(1, Ordering::SeqCst);
+            assert!(payload.get("arguments").is_none());
+            assert!(payload.get("full_output").is_none());
+            let excerpt = payload["output_excerpt"].as_str().unwrap();
+            assert!(excerpt.len() <= 8192);
+            assert!(excerpt.starts_with("Authentication failed"));
+            if excerpt.contains("fixture-provider-failure") {
+                return bcode_plugin_sdk::ServiceResponse::error(
+                    "unavailable",
+                    "normalized fixture failure",
+                );
+            }
+            bcode_plugin_sdk::ServiceResponse::json(
+                &serde_json::json!({"advisory":{"category":"auth","message":"Fixture advisory"}}),
+            )
+            .unwrap()
+        }
+    }
+
+    fn advisory_boundary_fixture_state() -> ServerState {
+        let fixture = bcode_plugin::StaticBundledPlugin::new(
+            ADVISORY_FIXTURE_MANIFEST,
+            bcode_plugin_sdk::static_plugin_vtable!(
+                AdvisoryBoundaryFixture,
+                ADVISORY_FIXTURE_MANIFEST
+            ),
+        );
+        let plugins = bcode_plugin::PluginRuntimeHost::load_defaults_with_static_bundled(
+            &bcode_plugin::PluginSelection {
+                mode: bcode_plugin::PluginSelectionMode::Explicit,
+                enabled: BTreeSet::from(["bcode.test-advisory-boundary".into()]),
+                disabled: BTreeSet::new(),
+            },
+            &[fixture],
+        )
+        .unwrap();
+        test_server_state_with_plugins(SessionManager::default(), plugins)
+    }
+
+    async fn settle_advisory_fixture_tool(
+        state: &ServerState,
+        cancel: &TurnCancelState,
+        call: bcode_model::ToolCall,
+        result: ToolInvocationResponse,
+        span: bcode_metrics::MetricsSpan,
+    ) -> ToolInvocationResponse {
+        finish_server_registered_tool(
+            &ServerToolInvoker {
+                persist_lifecycle: false,
+                ..ServerToolInvoker::new(state, SessionId::new(), Path::new("."), cancel)
+            },
+            call,
+            result,
+            MetricLabels::new(),
+            span,
+            Instant::now(),
+        )
+        .await
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn postsettlement_advice_preserves_original_tool_result() {
+        TRIAGE_FIXTURE_CALLS.store(0, Ordering::SeqCst);
+        let state = advisory_boundary_fixture_state();
+        let cancel = TurnCancelState::default();
+        let (actual, expected) = {
+            let output = format!("Authentication failed {}", "界".repeat(4000));
+            let result = ToolInvocationResponse {
+                output,
+                is_error: true,
+                content: Vec::new(),
+                full_output: Some("private full output must not be reread".into()),
+                result: None,
+            };
+            let expected = serde_json::to_value(&result).unwrap();
+            let call = bcode_model::ToolCall {
+                id: "settled-fixture".into(),
+                name: "fixture.tool".into(),
+                arguments: serde_json::json!({"secret":"not forwarded"}),
+            };
+            let span = state.metrics.span("fixture.tool");
+            let actual = settle_advisory_fixture_tool(&state, &cancel, call, result, span).await;
+            assert_eq!(serde_json::to_value(actual).unwrap(), expected);
+            assert_eq!(TRIAGE_FIXTURE_CALLS.load(Ordering::SeqCst), 1);
+            let baseline = ModelMessage {
+                role: MessageRole::Tool,
+                content: vec![ContentBlock::Text {
+                    text: "original tool result".into(),
+                }],
+            };
+            let mut messages = vec![baseline.clone()];
+            cancel.append_advisory_messages(&mut messages);
+            assert_eq!(messages.len(), 2);
+            assert_eq!(messages[0], baseline);
+            assert!(
+                matches!(&messages[1].content[0], ContentBlock::Text { text } if text.contains("Fixture advisory") && text.contains("not permission"))
+            );
+            let result = ToolInvocationResponse {
+                output: "Authentication failed fixture-provider-failure".into(),
+                is_error: true,
+                content: Vec::new(),
+                full_output: None,
+                result: None,
+            };
+            let expected = serde_json::to_value(&result).unwrap();
+            let call = bcode_model::ToolCall {
+                id: "settled-failure".into(),
+                name: "fixture.tool".into(),
+                arguments: serde_json::Value::Null,
+            };
+            let actual = settle_advisory_fixture_tool(
+                &state,
+                &cancel,
+                call,
+                result,
+                state.metrics.span("fixture.failure"),
+            )
+            .await;
+            (actual, expected)
+        };
+        assert_eq!(serde_json::to_value(actual).unwrap(), expected);
+        assert_eq!(TRIAGE_FIXTURE_CALLS.load(Ordering::SeqCst), 2);
+        drop(state);
+    }
+
+    #[tokio::test]
+    async fn optional_judgement_off_never_calls_discoverable_provider() {
+        OPTIONAL_OFF_PROVIDER_CALLS.store(0, Ordering::SeqCst);
+        let mut state = advisory_boundary_fixture_state();
+        state.startup_config.judgement.mode = bcode_config::JudgementMode::Off;
+        let input = bcode_model::judgement::OptionalRequest {
+            feature: bcode_model::judgement::Feature::ToolResultTriage,
+            selection: Some(bcode_model::judgement::SetupSelection {
+                provider_plugin_id: "bcode.test-advisory-boundary".into(),
+                model_id: "fixture".into(),
+                auth_profile: String::new(),
+            }),
+            request: bcode_model::judgement::Request {
+                model_id: "fixture".into(),
+                state: bcode_model::judgement::State::Text("bounded".into()),
+                questions: BTreeMap::from([(
+                    "q".into(),
+                    bcode_model::judgement::Question::YesNo {
+                        instructions: "Does evidence support it?".into(),
+                    },
+                )]),
+            },
+        };
+        assert!(
+            state
+                .optional_judgement
+                .judge(&state, input.clone())
+                .await
+                .response
+                .is_none()
+        );
+        state.startup_config.judgement.mode = bcode_config::JudgementMode::Auto;
+        let mut effective_config = state.startup_config.clone();
+        effective_config.judgement.tool_result_triage = bcode_config::JudgementMode::Off;
+        assert!(
+            state
+                .optional_judgement
+                .judge_with_config(&state, &effective_config, input)
+                .await
+                .response
+                .is_none()
+        );
+        assert_eq!(OPTIONAL_OFF_PROVIDER_CALLS.load(Ordering::SeqCst), 0);
+        drop(state);
+    }
+
+    #[tokio::test]
+    async fn categorization_service_returns_sequence_correlated_portable_labels() {
+        let state = advisory_boundary_fixture_state();
+        let request = bcode_session_models::CategorizationRequest {
+            session_id: SessionId::new(),
+            source_sequence: 29,
+            newest_request: "Fix backend auth".into(),
+        };
+        let response = invoke_optional_feature_service(
+            &state,
+            bcode_session_models::CATEGORIZATION_INTERFACE_ID,
+            bcode_session_models::OP_CATEGORIZE,
+            serde_json::to_value(&request).unwrap(),
+            &state.startup_config,
+            &TurnCancelState::default(),
+        )
+        .await
+        .unwrap();
+        let response: bcode_session_models::CategorizationResponse =
+            serde_json::from_value(response).unwrap();
+        assert_eq!(
+            response.categorization.unwrap().source_sequence,
+            request.source_sequence
+        );
+        drop(state);
     }
 
     #[derive(Default)]
@@ -72603,6 +73571,52 @@ event_symbol = "bcode_plugin_handle_event_v1"
         );
     }
 
+    async fn assert_optional_judgement_ipc(
+        client: &bcode_client::BcodeClient,
+        request: &bcode_model::judgement::Request,
+    ) {
+        let selection = bcode_model::judgement::SetupSelection {
+            provider_plugin_id: "bcode.fake-provider".into(),
+            model_id: "fake-judgement".into(),
+            auth_profile: "judgement-fixture".into(),
+        };
+        let input = bcode_model::judgement::OptionalRequest {
+            feature: bcode_model::judgement::Feature::EvalCategorization,
+            selection: Some(selection.clone()),
+            request: request.clone(),
+        };
+        assert!(
+            client
+                .optional_judge(&input)
+                .await
+                .expect("optional IPC response")
+                .response
+                .is_some()
+        );
+        assert!(
+            client
+                .verify_judgement(&selection)
+                .await
+                .expect("verification IPC response")
+                .is_ready()
+        );
+        let input = bcode_model::judgement::OptionalRequest {
+            selection: Some(bcode_model::judgement::SetupSelection {
+                provider_plugin_id: "disabled-provider".into(),
+                ..selection
+            }),
+            ..input
+        };
+        assert!(
+            client
+                .optional_judge(&input)
+                .await
+                .expect("optional failure retains baseline")
+                .response
+                .is_none()
+        );
+    }
+
     #[tokio::test]
     #[allow(clippy::significant_drop_tightening)] // The test server owns the state until shutdown.
     async fn judgement_client_ipc_resolves_owned_profile_and_returns_typed_answers() {
@@ -72635,6 +73649,31 @@ event_symbol = "bcode_plugin_handle_event_v1"
             stopped,
         ));
         let client = bcode_client::BcodeClient::new(endpoint);
+        let advisory_session = SessionId::new();
+        let labels = bcode_session_models::SessionCategorization {
+            source_sequence: 17,
+            task: "implementation".into(),
+            domain: "backend".into(),
+        };
+        state
+            .advisory_categorizations
+            .lock()
+            .unwrap()
+            .insert(advisory_session, labels.clone());
+        assert_eq!(
+            client
+                .session_categorization(advisory_session)
+                .await
+                .unwrap(),
+            Some(labels)
+        );
+        assert_eq!(
+            client
+                .session_categorization(SessionId::new())
+                .await
+                .unwrap(),
+            None
+        );
         let request = bcode_model::judgement::Request {
             model_id: "fake-judgement".into(),
             state: bcode_model::judgement::State::Text("example".into()),
@@ -72645,6 +73684,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
                 },
             )]),
         };
+        assert_optional_judgement_ipc(&client, &request).await;
         let result = client
             .judge(
                 "bcode.fake-provider".into(),
@@ -77933,6 +78973,54 @@ event_symbol = "bcode_plugin_handle_event_v1"
             response.answers["completion"],
             bcode_model::judgement::Answer::YesNo { probability: 0.75 }
         ));
+        let optional_bridge = server_workflow_plugin_bridge(
+            Arc::clone(&state),
+            state.startup_config.clone(),
+            SessionId::new(),
+            "judgement-workflow",
+            "bcode.loop",
+            "test-run",
+        );
+        let optional_request = bcode_tool::ToolInvocationServiceRequest {
+            operation: bcode_model::judgement::OP_OPTIONAL_JUDGE.into(),
+            payload: serde_json::to_value(bcode_model::judgement::OptionalRequest {
+                feature: bcode_model::judgement::Feature::ProgressMonitoring,
+                selection: Some(bcode_model::judgement::SetupSelection {
+                    provider_plugin_id: "bcode.fake-provider".into(),
+                    model_id: "fake-judgement".into(),
+                    auth_profile: "judgement-fixture".into(),
+                }),
+                request: bcode_model::judgement::Request {
+                    model_id: "fake-judgement".into(),
+                    state: bcode_model::judgement::State::Text("tests passed".into()),
+                    questions: BTreeMap::from([(
+                        "progress".into(),
+                        bcode_model::judgement::Question::YesNo {
+                            instructions: "Is progress observable?".into(),
+                        },
+                    )]),
+                },
+            })
+            .unwrap(),
+            ..request()
+        };
+        let resolved = tokio::task::spawn_blocking(move || {
+            optional_bridge.request(
+                ServiceBridgeRequest::InvokeService(optional_request),
+                bcode_plugin_sdk::ServiceCancellation::default(),
+            )
+        })
+        .await
+        .unwrap()
+        .unwrap();
+        let ServiceBridgeResponse::Service(ToolInvocationServiceResolution::Responded { payload }) =
+            resolved
+        else {
+            panic!("expected optional bridge response");
+        };
+        let response: bcode_model::judgement::OptionalResponse =
+            serde_json::from_value(payload).unwrap();
+        assert!(response.response.is_some());
         let mismatch = server_workflow_plugin_bridge(
             Arc::clone(&state),
             state.startup_config.clone(),
@@ -78295,6 +79383,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
         let owner_bridge = server_model_provider_bridge(
             state.plugins.clone(),
             bcode_config::BcodeConfig::default(),
+            state.optional_judgement.invalidation_handle(),
             "turn-1",
             "bcode.fake-provider",
         );
@@ -78321,6 +79410,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
         let foreign_bridge = server_model_provider_bridge(
             state.plugins.clone(),
             bcode_config::BcodeConfig::default(),
+            state.optional_judgement.invalidation_handle(),
             "turn-1",
             "bcode.other-provider",
         );
@@ -91404,6 +92494,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
             &session_model_selection_with_runtime_context(&state, session_id, None).await,
             true,
             None,
+            &TurnCancelState::default(),
         )
         .await
         .expect("static turn context");
@@ -91444,6 +92535,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
                 &session_model_selection_with_runtime_context(&state, session_id, None).await,
                 false,
                 None,
+                &TurnCancelState::default(),
             )
             .await
             .unwrap();

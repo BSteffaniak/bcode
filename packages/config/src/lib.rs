@@ -25,6 +25,8 @@ pub const BCODE_CONFIG_ENV: &str = "BCODE_CONFIG";
 pub const BCODE_CONFIG_TOML_ENV: &str = "BCODE_CONFIG_TOML";
 pub mod contexts;
 pub mod edit;
+pub mod judgement;
+pub use judgement::{JudgementConfig, JudgementMode};
 
 /// Environment variable selecting the active model profile.
 pub const BCODE_MODEL_PROFILE_ENV: &str = "BCODE_MODEL_PROFILE";
@@ -219,6 +221,9 @@ pub struct BcodeConfig {
     pub composition: CompositionConfig,
     #[serde(default)]
     pub plugins: PluginConfig,
+    /// Global and per-feature optional judgement policy.
+    #[serde(default)]
+    pub judgement: JudgementConfig,
     #[serde(default)]
     pub model: ModelConfig,
     /// Per-agent permission and tool configuration.
@@ -282,6 +287,7 @@ impl Default for BcodeConfig {
             composition: CompositionConfig::default(),
             plugins: PluginConfig::default(),
             model: ModelConfig::default(),
+            judgement: JudgementConfig::default(),
             agent: BTreeMap::new(),
             auth: AuthConfig::default(),
             onboarding: OnboardingConfig::default(),

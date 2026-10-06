@@ -563,15 +563,23 @@ fn state_location_from_matches(
     )))
 }
 
-async fn handle_cli(cli: Cli) -> Result<(), CliError> {
-    let _ = (&cli.profile, cli.request_timeout_secs);
-    let _ = (&cli.state_root, &cli.state_profile);
-    let launch_options = cli.launch_options();
+fn validate_cli_execution_mode(
+    cli: &Cli,
+    launch_options: bcode_tui::TuiLaunchOptions,
+) -> Result<(), CliError> {
     if launch_options != bcode_tui::TuiLaunchOptions::default() && !cli.supports_execution_mode() {
         return Err(CliError::InvalidArguments(
             "execution-mode flags are supported only for TUI launches, --new, and send".to_owned(),
         ));
     }
+    Ok(())
+}
+
+async fn handle_cli(cli: Cli) -> Result<(), CliError> {
+    let _ = (&cli.profile, cli.request_timeout_secs);
+    let _ = (&cli.state_root, &cli.state_profile);
+    let launch_options = cli.launch_options();
+    validate_cli_execution_mode(&cli, launch_options)?;
     if cli.new {
         if cli.command.is_some() {
             return Err(CliError::NewSessionWithCommand);
@@ -644,6 +652,7 @@ async fn handle_cli(cli: Cli) -> Result<(), CliError> {
         } => handle_web_command(bind, port, allow_non_loopback).await?,
         Commands::Plugin { command } => handle_plugin_command(command).await?,
         Commands::Theme { command } => handle_theme_command(command)?,
+        Commands::Judgement { command } => handle_judgement_command(command).await?,
         Commands::Model { command } => handle_model_command(command).await?,
         Commands::Auth { command } => {
             if cli.no_credential_discovery && matches!(command, AuthCommand::Discover) {
@@ -3803,6 +3812,7 @@ async fn handle_session_io_command(
         | Commands::State { .. }
         | Commands::Plugin { .. }
         | Commands::Theme { .. }
+        | Commands::Judgement { .. }
         | Commands::Model { .. }
         | Commands::Auth { .. }
         | Commands::Login { .. }
@@ -4110,6 +4120,11 @@ impl Cli {
 
 #[derive(Debug, Subcommand)]
 enum Commands {
+    /// Bounded non-conversational advisory judgement operations.
+    Judgement {
+        #[command(subcommand)]
+        command: JudgementCommand,
+    },
     /// Review a scoped configuration change while preserving unrelated TOML.
     Settings {
         /// Exact configuration file to edit.
@@ -5216,6 +5231,12 @@ struct TraceRangeArgs {
 
 #[derive(Debug, Subcommand)]
 enum SessionCommand {
+    /// Read current disposable advisory task/domain labels (not canonical session state).
+    Categorization {
+        session_id: SessionId,
+        #[arg(long)]
+        json: bool,
+    },
     /// Compact legacy global reader evidence while retaining a durable maintenance blocker.
     CompactLegacyAdmission {
         /// Maximum entries inspected in this batch; repeat to drain large registries.
@@ -7102,6 +7123,37 @@ async fn handle_session_command(command: Box<SessionCommand>) -> Result<(), CliE
 }
 
 #[cfg(test)]
+mod optional_judgement_cli_tests {
+    use clap::Parser as _;
+
+    #[test]
+    fn optional_judge_requires_exactly_one_input_source() {
+        let prefix = ["bcode", "judgement", "optional-judge"];
+        assert!(super::Cli::try_parse_from(prefix).is_err());
+        assert!(
+            super::Cli::try_parse_from(prefix.into_iter().chain(["--request-json", "{}"])).is_ok()
+        );
+        assert!(
+            super::Cli::try_parse_from(prefix.into_iter().chain([
+                "--file",
+                "request.json",
+                "--json"
+            ]))
+            .is_ok()
+        );
+        assert!(
+            super::Cli::try_parse_from(prefix.into_iter().chain([
+                "--file",
+                "request.json",
+                "--request-json",
+                "{}"
+            ]))
+            .is_err()
+        );
+    }
+}
+
+#[cfg(test)]
 mod replacement_control_cli_tests {
     #[test]
     fn exact_replacement_control_requires_run_and_known_action() {
@@ -7360,9 +7412,30 @@ async fn run_session_compression(
     Ok(())
 }
 
+async fn print_session_categorization(session_id: SessionId, json: bool) -> Result<(), CliError> {
+    ensure_server_running().await?;
+    let labels = BcodeClient::default_endpoint()
+        .session_categorization(session_id)
+        .await?;
+    if json {
+        println!("{}", serde_json::to_string(&labels)?);
+    } else if let Some(labels) = labels {
+        println!(
+            "{} / {} (advisory; source {})",
+            labels.task, labels.domain, labels.source_sequence
+        );
+    } else {
+        println!("No current advisory categorization.");
+    }
+    Ok(())
+}
+
 #[allow(clippy::too_many_lines)]
 async fn dispatch_session_command(command: Box<SessionCommand>) -> Result<(), CliError> {
     match *command {
+        SessionCommand::Categorization { session_id, json } => {
+            Box::pin(print_session_categorization(session_id, json)).await?;
+        }
         SessionCommand::Compress {
             session_id,
             older_than,
@@ -8176,6 +8249,72 @@ fn list_ignored_models(provider: Option<&str>, json: bool) -> Result<(), CliErro
         }
     }
     output.flush()?;
+    Ok(())
+}
+
+#[derive(Debug, Subcommand)]
+enum JudgementCommand {
+    /// Request optional judgement; disabled or unavailable returns a null response.
+    OptionalJudge {
+        #[arg(long, required_unless_present = "file", conflicts_with = "file")]
+        request_json: Option<String>,
+        #[arg(long)]
+        file: Option<PathBuf>,
+        #[arg(long)]
+        json: bool,
+    },
+}
+
+async fn handle_judgement_command(command: JudgementCommand) -> Result<(), CliError> {
+    match command {
+        JudgementCommand::OptionalJudge {
+            request_json,
+            file,
+            json: _,
+        } => {
+            let text = if let Some(text) = request_json {
+                text
+            } else if let Some(path) = file {
+                use std::io::Read as _;
+                let file = std::fs::File::open(path).map_err(|_| {
+                    CliError::InvalidArguments("cannot open judgement request file".into())
+                })?;
+                let mut text = String::new();
+                file.take(
+                    u64::try_from(bcode_model::judgement::MAX_REQUEST_BYTES).unwrap_or(u64::MAX)
+                        + 1,
+                )
+                .read_to_string(&mut text)
+                .map_err(|_| {
+                    CliError::InvalidArguments("cannot read judgement request file".into())
+                })?;
+                text
+            } else {
+                return Err(CliError::InvalidArguments(
+                    "provide --request-json or --file".into(),
+                ));
+            };
+            if text.len() > bcode_model::judgement::MAX_REQUEST_BYTES {
+                return Err(CliError::InvalidArguments(
+                    "judgement request exceeds size limit".into(),
+                ));
+            }
+            let input: bcode_model::judgement::OptionalRequest = serde_json::from_str(&text)
+                .map_err(|_| {
+                    CliError::InvalidArguments("invalid optional judgement request".into())
+                })?;
+            ensure_server_running().await?;
+            let result = BcodeClient::default_endpoint()
+                .optional_judge(&input)
+                .await?;
+            println!(
+                "{}",
+                serde_json::to_string(&result).map_err(|_| CliError::InvalidArguments(
+                    "cannot encode optional judgement response".into()
+                ))?
+            );
+        }
+    }
     Ok(())
 }
 

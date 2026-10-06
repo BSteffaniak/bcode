@@ -2,6 +2,12 @@ id      = "bcode.skills"
 name    = "Bcode Skills Plugin"
 version = "0.0.1"
 
+[[services]]
+class        = "service"
+description  = "Plugin-owned optional context and skill/tool relevance ordering"
+interface_id = "bcode.skills-selection/v1"
+name         = "Bounded Advisory Selection"
+
 [[tui_surfaces]]
 description = "Plugin-owned available skills UI"
 kind        = "skills.list"

@@ -36,6 +36,13 @@ use std::str::FromStr;
 use std::time::{SystemTime, UNIX_EPOCH};
 use uuid::Uuid;
 
+mod categorization;
+pub use categorization::{
+    CATEGORIZATION_INTERFACE_ID, CategorizationRequest, CategorizationResponse,
+    MAX_CATEGORIZATION_REQUEST_BYTES, MAX_CATEGORIZATION_SOURCE_BYTES, OP_CATEGORIZE,
+    SessionCategorization,
+};
+
 mod submission;
 pub use submission::*;
 

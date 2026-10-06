@@ -7,6 +7,11 @@ description  = "Typed, non-conversational judgement model provider"
 interface_id = "bcode.judgement-model-provider/v1"
 name         = "TypeSafe Jev Judgement Model Provider"
 
+[[services]]
+description  = "Hosted fixed inference probe or official authenticated discovery"
+interface_id = "bcode.judgement-verification/v1"
+name         = "TypeSafe Jev Verification"
+
 [concurrency]
 type = "concurrent"
 

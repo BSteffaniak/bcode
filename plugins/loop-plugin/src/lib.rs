@@ -61,8 +61,10 @@ mod goal_status;
 mod goal_supervision;
 mod judgement_evaluation;
 mod progress;
+mod progress_monitoring;
 mod swarm;
 mod swarm_ui;
+mod tool_result_triage;
 
 const START_COMMAND: &str = "loop";
 const STATUS_COMMAND: &str = "loop.status";
@@ -88,6 +90,11 @@ impl RustPlugin for LoopPlugin {
     }
 
     fn invoke_service(&mut self, context: NativeServiceContext) -> ServiceResponse {
+        if context.request.interface_id == tool_result_triage::INTERFACE_ID
+            && context.request.operation == tool_result_triage::OP_TRIAGE
+        {
+            return tool_result_triage::invoke(&context);
+        }
         if context.request.interface_id == bcode_workflow::WORKFLOW_BLOCK_INTERFACE_ID {
             return judgement_evaluation::invoke(&context);
         }

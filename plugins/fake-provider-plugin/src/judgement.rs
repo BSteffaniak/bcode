@@ -7,6 +7,31 @@ use bcode_plugin_sdk::{ServiceRequest, ServiceResponse};
 use std::collections::BTreeSet;
 
 pub fn invoke(request: &ServiceRequest) -> ServiceResponse {
+    if request.interface_id == judgement::VERIFICATION_INTERFACE_ID {
+        if request.operation != judgement::OP_VERIFY {
+            return ServiceResponse::error(
+                "unsupported_operation",
+                "unsupported verification operation",
+            );
+        }
+        let Ok(envelope) = request.payload_json::<judgement::VerificationRequest>() else {
+            return ServiceResponse::error("invalid_request", "invalid verification request");
+        };
+        let authenticated = envelope.provider_context.auth.is_some();
+        return encode(&judgement::VerificationResult {
+            method: judgement::VerificationMethod::AuthenticatedDiscovery,
+            authentication: if authenticated {
+                judgement::AuthenticationStatus::Accepted
+            } else {
+                judgement::AuthenticationStatus::Unknown
+            },
+            model: if authenticated && envelope.model_id == "fake-judgement" {
+                judgement::ModelReadiness::Ready
+            } else {
+                judgement::ModelReadiness::Unavailable
+            },
+        });
+    }
     if request.interface_id != judgement::INTERFACE_ID {
         return ServiceResponse::error("unsupported_interface", "unsupported judgement interface");
     }
@@ -114,6 +139,30 @@ mod tests {
                     .unwrap(),
             });
             assert!(response.error.is_some());
+        }
+    }
+
+    #[test]
+    fn verification_is_typed_and_missing_auth_is_not_ready() {
+        for authenticated in [false, true] {
+            let request = ServiceRequest {
+                interface_id: judgement::VERIFICATION_INTERFACE_ID.into(),
+                operation: judgement::OP_VERIFY.into(),
+                payload: serde_json::to_vec(&judgement::VerificationRequest {
+                    model_id: "fake-judgement".into(),
+                    provider_context: bcode_model::ProviderRequestContext {
+                        auth: authenticated.then(bcode_model::ProviderAuthContext::default),
+                        ..Default::default()
+                    },
+                })
+                .unwrap(),
+            };
+            let result: judgement::VerificationResult = invoke(&request).payload_json().unwrap();
+            assert_eq!(result.is_ready(), authenticated);
+            assert_eq!(
+                result.method,
+                judgement::VerificationMethod::AuthenticatedDiscovery
+            );
         }
     }
 

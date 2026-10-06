@@ -4,6 +4,8 @@
 
 //! skills command palette plugin for Bcode.
 
+pub mod selection;
+
 #[cfg(feature = "static-bundled")]
 mod cli;
 
@@ -41,6 +43,9 @@ impl RustPlugin for SkillsPlugin {
     }
 
     fn invoke_service(&mut self, context: NativeServiceContext) -> ServiceResponse {
+        if context.request.interface_id == selection::INTERFACE_ID {
+            return selection_service(&context.request);
+        }
         if context.request.interface_id != COMMAND_INTERFACE_ID {
             return ServiceResponse::error(
                 "unsupported_interface",
@@ -114,6 +119,28 @@ fn skills_command(id: &str, title: &str, description: &str) -> CommandContributi
             plugin_id: "bcode.skills".to_string(),
             command_id: id.to_string(),
         },
+    }
+}
+
+fn selection_service(request: &ServiceRequest) -> ServiceResponse {
+    // Bound decoding before accepting caller-provided strings or candidate collections.
+    if request.payload.len() > 96 * 1024 {
+        return ServiceResponse::error("invalid_request", "selection input exceeds size limit");
+    }
+    match request.operation.as_str() {
+        selection::OP_PREPARE => request
+            .payload_json::<selection::SelectionRequest>()
+            .map_or_else(
+                |_| ServiceResponse::error("invalid_request", "invalid selection request"),
+                |input| json_response(&selection::prepare(&input)),
+            ),
+        selection::OP_APPLY => request
+            .payload_json::<selection::ApplyRequest>()
+            .map_or_else(
+                |_| ServiceResponse::error("invalid_request", "invalid selection result request"),
+                |input| json_response(&selection::apply(&input)),
+            ),
+        _ => ServiceResponse::error("unsupported_operation", "unknown selection operation"),
     }
 }
 

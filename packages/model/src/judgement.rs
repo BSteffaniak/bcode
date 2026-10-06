@@ -14,6 +14,124 @@ pub const OP_MODELS: &str = "models";
 /// Evaluate a batch of named questions against a single state.
 pub const OP_JUDGE: &str = "judge";
 
+/// Optional provider-owned authentication and model-readiness verification capability.
+/// Providers may advertise this alongside v1 judgement without changing that interface.
+pub const VERIFICATION_INTERFACE_ID: &str = "bcode.judgement-verification/v1";
+/// Verify credentials and readiness without evaluating application state.
+pub const OP_VERIFY: &str = "verify";
+/// Application operation for advisory, failure-optional judgement.
+pub const OP_OPTIONAL_JUDGE: &str = "optional_judge";
+
+/// Enhancement whose opt-out applies before any discovery or provider call.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Feature {
+    /// Classify a tool result before optional downstream processing.
+    ToolResultTriage,
+    /// Rank already retrieved context.
+    ContextReranking,
+    /// Advisory progress assessment, never execution authority.
+    ProgressMonitoring,
+    /// Recommend skills or tools, never authorize them.
+    Recommendations,
+    /// Categorize bounded session metadata.
+    SessionCategorization,
+    /// Categorize bounded evaluation evidence.
+    EvalCategorization,
+}
+
+/// Transient provider verification envelope. Never persist or echo credentials.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct VerificationRequest {
+    /// Exact centrally resolved model.
+    pub model_id: String,
+    /// Host-resolved account context.
+    pub provider_context: crate::ProviderRequestContext,
+}
+
+/// Authentication evidence independent of quota and model readiness.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AuthenticationStatus {
+    /// Upstream accepted these credentials.
+    Accepted,
+    /// Upstream explicitly rejected these credentials.
+    Rejected,
+    /// No conclusive authentication evidence.
+    Unknown,
+}
+
+/// Readiness of the exact requested model; failures must not imply rejected auth.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ModelReadiness {
+    /// Ready for judgement.
+    Ready,
+    /// Model is not available to the account.
+    Unavailable,
+    /// Quota or rate limit prevents use.
+    QuotaLimited,
+    /// Retryable upstream failure.
+    TemporaryFailure,
+    /// Verification is unsupported by this provider.
+    Unsupported,
+    /// Authentication checked, but model readiness was not checked.
+    NotChecked,
+}
+
+/// Provider-owned verification mechanism, without transport details.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum VerificationMethod {
+    /// Authentication-only discovery; no inference requested (billing is provider-owned).
+    AuthenticatedDiscovery,
+    /// A fixed harmless lightweight judgement was issued, potentially billed.
+    LightweightJudgement,
+}
+
+/// Secret-free, typed verification result.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct VerificationResult {
+    /// Provider-owned verification mechanism.
+    pub method: VerificationMethod,
+    /// Authentication evidence.
+    pub authentication: AuthenticationStatus,
+    /// Model readiness evidence.
+    pub model: ModelReadiness,
+}
+
+impl VerificationResult {
+    /// Whether authentication and readiness permit a first useful judgement.
+    /// `NotChecked` permits use only after independent central capability validation.
+    #[must_use]
+    pub const fn is_ready(self) -> bool {
+        matches!(self.authentication, AuthenticationStatus::Accepted)
+            && matches!(
+                self.model,
+                ModelReadiness::Ready | ModelReadiness::NotChecked
+            )
+    }
+}
+
+/// Caller-owned trigger and questions. The application owns optional routing policy.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OptionalRequest {
+    /// Feature opt-out to consult before provider work.
+    pub feature: Feature,
+    /// Exact selection, when explicitly pinned; never silently switch accounts.
+    #[serde(default)]
+    pub selection: Option<SetupSelection>,
+    /// Bounded state and typed questions. Auto replaces model ID centrally.
+    pub request: Request,
+}
+
+/// Advisory result; absence always means retain ordinary caller behavior.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct OptionalResponse {
+    /// Validated answer set, or unavailable/disabled/failed.
+    pub response: Option<Response>,
+}
+
 /// Host application service for bounded, non-conversational judgement from authorized workflow
 /// blocks. This is not a provider plugin interface and must not be routed to providers directly.
 pub const WORKFLOW_APPLICATION_INTERFACE_ID: &str = "bcode.judgement-application/v1";

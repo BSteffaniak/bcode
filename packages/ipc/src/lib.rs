@@ -114,7 +114,9 @@ const MAX_CHUNK_DATA_SIZE: usize = MAX_FRAME_PAYLOAD_SIZE / 2;
 /// Version 43 adds ordinary child creation, exact non-owning metadata, and bounded activity;
 /// changed positional layouts and parent-bearing summaries reject older peers.
 /// Version 44 adds explicit child relationship maintenance and own-session activity evidence.
-pub const CURRENT_PROTOCOL_VERSION: u16 = 44;
+/// Version 45 adds optional judgement, verification, and advisory session categorization;
+/// changed positional layouts reject older peers.
+pub const CURRENT_PROTOCOL_VERSION: u16 = 45;
 
 /// Durable session-storage writer epoch expected by this IPC build.
 pub const CURRENT_SESSION_STORAGE_WRITER_EPOCH: u32 =
@@ -961,6 +963,14 @@ pub enum Request {
         /// Bounded JSON encoding of a portable selection.
         selection_json: String,
     },
+    /// Failure-optional judgement without session mutation.
+    OptionalJudge {
+        request_json: String,
+    },
+    /// Verify authentication and model readiness for one exact selection.
+    JudgementVerify {
+        selection_json: String,
+    },
     /// Invoke a judgement model without creating or modifying a session turn.
     Judge {
         provider_plugin_id: String,
@@ -1177,6 +1187,10 @@ pub enum Request {
     },
     /// Ask this daemon to release runtime ownership when the session is quiescent.
     ReleaseSessionOwnership {
+        session_id: SessionId,
+    },
+    /// Read disposable advisory labels; never replays or modifies history.
+    SessionCategorization {
         session_id: SessionId,
     },
     SessionInspection {
@@ -2095,6 +2109,14 @@ pub enum ResponsePayload {
     JudgementSetupValidated {
         available: bool,
     },
+    /// Failure-optional normalized judgement result.
+    OptionalJudgement {
+        result_json: String,
+    },
+    /// Normalized authentication and model readiness result.
+    JudgementVerified {
+        result_json: String,
+    },
     /// Normalized judgement answers; no provider context or secret material.
     Judgement {
         /// Bounded JSON encoding of the validated portable judgement response.
@@ -2478,6 +2500,10 @@ pub enum ResponsePayload {
     SessionOwnershipReleased {
         session_id: SessionId,
         outcome: SessionOwnershipReleaseOutcome,
+    },
+    /// Current disposable advisory labels, absent after eviction or daemon restart.
+    SessionCategorization {
+        categorization: Option<bcode_session_models::SessionCategorization>,
     },
     SessionInspection {
         page: SessionInspectionPage,
@@ -5354,6 +5380,36 @@ mod tests {
             panic!("decoded response should be attached");
         };
         assert_eq!(session, summary);
+    }
+
+    #[test]
+    fn optional_judgement_and_verification_round_trip() {
+        for request in [
+            Request::OptionalJudge {
+                request_json: "{}".into(),
+            },
+            Request::JudgementVerify {
+                selection_json: "{}".into(),
+            },
+        ] {
+            assert_eq!(
+                decode_request(&encode_request(&request).unwrap()).unwrap(),
+                request
+            );
+        }
+        for response in [
+            Response::Ok(ResponsePayload::OptionalJudgement {
+                result_json: "{\"response\":null}".into(),
+            }),
+            Response::Ok(ResponsePayload::JudgementVerified {
+                result_json: "{}".into(),
+            }),
+        ] {
+            assert_eq!(
+                decode_response(&encode_response(&response).unwrap()).unwrap(),
+                response
+            );
+        }
     }
 
     #[test]

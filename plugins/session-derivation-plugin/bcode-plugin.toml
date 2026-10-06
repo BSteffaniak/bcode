@@ -10,6 +10,12 @@ description  = "Plugin-owned session fork and clone commands"
 interface_id = "bcode.command/v1"
 name         = "Session Derivation Commands"
 
+[[services]]
+class        = "control"
+description  = "Advisory task and domain labels from bounded newest-request facts"
+interface_id = "bcode.session-categorization/v1"
+name         = "Session Categorization"
+
 [[tui_surfaces]]
 description = "Select a user prompt for session fork"
 kind        = "session-derivation.fork-select"

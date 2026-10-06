@@ -371,7 +371,12 @@ fn configured_structured_output_execution(
 
 impl FakeProviderPlugin {
     fn invoke_provider_service(&self, context: &NativeServiceContext) -> ServiceResponse {
-        if context.request.interface_id == bcode_model::judgement::INTERFACE_ID {
+        if context.request.interface_id == bcode_model::judgement::INTERFACE_ID
+            || context.request.interface_id == bcode_model::judgement::VERIFICATION_INTERFACE_ID
+        {
+            if context.cancellation.is_cancelled() {
+                return ServiceResponse::error("cancelled", "judgement invocation cancelled");
+            }
             return judgement::invoke(&context.request);
         }
         if !matches!(

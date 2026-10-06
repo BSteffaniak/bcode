@@ -4,6 +4,8 @@
 
 //! Plugin-owned fork and clone product workflows over generic session derivation.
 
+pub mod categorization;
+
 use bcode_command::{
     COMMAND_INTERFACE_ID, CommandAction, CommandContribution, CommandEffect, CommandExecution,
     CommandOwner, CommandSessionRequirement, CommandSurface, InvokeCommandRequest,
@@ -47,6 +49,11 @@ impl RustPlugin for SessionDerivationPlugin {
     }
 
     fn invoke_service(&mut self, context: NativeServiceContext) -> ServiceResponse {
+        if context.request.interface_id == bcode_session_models::CATEGORIZATION_INTERFACE_ID
+            && context.request.operation == bcode_session_models::OP_CATEGORIZE
+        {
+            return categorization::invoke(&context);
+        }
         if context.request.interface_id != COMMAND_INTERFACE_ID
             || context.request.operation != OP_INVOKE_COMMAND
         {

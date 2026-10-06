@@ -1,11 +1,84 @@
-# Judgement model provider contract (in progress)
+# Judgement model provider contract
 
-`bcode.judgement-model-provider/v1` is a non-conversational, typed service separate from `bcode.model-provider/v1–v3`. It describes one bounded judgement over an application-provided state and a map of caller-owned question IDs. Providers advertise question kinds on both the provider and individual model; absent support is not inferred. A judgement provider does not acquire turn-stream, tool-call or chat capabilities by advertising this interface.
+`bcode.judgement-model-provider/v1` is a non-conversational typed service, separate from
+`bcode.model-provider/v1–v3`. It evaluates bounded application state against caller-owned
+question IDs. Advertising it does not grant chat, tool-call, turn-stream, permission, or
+completion capabilities. Portable types live in `bcode_model::judgement`; vendor wire schemas
+are not this contract.
 
-Portable types live in `bcode_model::judgement`: `State`, `Question` (Choice, Score, YesNo), `Answer`, `ModelList`, `Request`, `Response` and `Usage`. TypeSafe's wire schema is *not* this service's schema. Unknown question kinds fail decoding; unsupported kinds fail capability checks. Responses require exactly the requested IDs, matching answer kinds, finite in-range numeric values and consistent option IDs/cardinality. Encoded requests and responses are limited to 256 KiB, batches to 64 questions, and choice/rubric options to 128. Provider transports may enforce stricter limits.
+## Provider interface
 
-Service operations: `models` advertises the provider and its model capabilities; `judge` accepts the typed request and returns a typed response. Interface IDs delimit compatibility; unsupported future interfaces and variants fail closed rather than being treated as v1. Providers should ignore additive, non-semantic request fields, but must not silently reinterpret unsupported semantic controls. Public failures must be normalized, bounded and secret-safe. Do not persist judgement input, credentials or vendor-native metadata as session turns.
+* `models` returns provider/model question-kind capabilities. Absent support is not inferred.
+* `judge` receives a typed `Request` plus transient host-resolved `ProviderRequestContext`.
+  `Request` contains `model_id`, `State` (text or structured), and named `Question` values
+  (Choice, Score, YesNo). `Response` contains typed answers and optional normalized usage.
 
-The loop plugin offers optional judgement-backed per-iteration completion evaluation; see [Judgement evaluation in goals and loops](loop-judgement-evaluation.md). This does not change goal readiness, chat routing or the provider-neutral contract.
+Responses must have exactly the requested IDs, matching answer kinds, finite in-range values,
+and consistent option IDs/cardinality. Unknown variants fail decoding; unsupported capabilities
+fail before invocation. Encoded requests and responses are limited to 256 KiB, batches to 64
+questions, and choice/rubric options to 128; providers may impose stricter limits. Unsupported
+interfaces fail closed; additive non-semantic fields must not redefine semantic controls.
+Public errors are normalized, bounded, and secret-safe. Credentials, vendor-private metadata,
+and judgement input must not implicitly become conversational session content.
 
-**Implementation status:** portable contract and catalog resolver, typed client/IPC/server route, fake provider and TypeSafe/Jev plugin exist. The application accepts either an explicit provider-owned auth profile or an explicit empty profile selecting an enabled plugin's declared process-environment credentials (no implicit selection or chat routing change), and invokes the judgement service with a bounded timeout. IPC carries bounded JSON because the binary codec cannot decode JSON `Value`/tagged questions directly. Jev bounds HTTP reads, checks outbound size/response identity, and fake-loopback tests cover authenticated discovery, judgement, oversized responses and safe upstream auth errors. The plugin observes host service cancellation during discovery and judgement; a loopback HTTP test verifies cancellation closes a stalled discovery response socket when its runtime exits. Daemon application-route and loopback IPC client tests confirm a fake provider returns typed answers and usage with an owned auth profile; disabled/missing provider calls fail closed. The IPC handler drops transient judgement work on connection loss; an in-flight pending-future test verifies dropping the operation. A live `BcodeClient::judge` → daemon → Jev plugin call to the website API passed via the ignored, explicitly opt-in `judgement_client_ipc_live_jev` test using a temporary `JEV_API_KEY` in the daemon/test process environment with no stored auth profile: it returned a validated YesNo probability and usage. Direct bounded HTTPS calls to the same host returned HTTP 200 with mixed Choice/Score/Noul answers and usage; `jev-latest` resolved to `jev-1.13.0`. The separate `api.typesafe.ai` host returned 403/401 and is not the website-key endpoint. Jev's default endpoint now targets the website API and advertises only the verified alias and resolved model; that host did not expose a working model-list endpoint, so default-endpoint static capability discovery does not require a key; exact-account preflight checks credential presence and model support but cannot validate the key. Loopback client→daemon→Jev tests remain as deterministic coverage. Temporary key revocation remains unconfirmed; revoke it through the authorized TypeSafe account.
+## Optional verification interface
+
+Providers may additionally advertise `bcode.judgement-verification/v1`, operation `verify`.
+`VerificationRequest` names the exact centrally resolved model and transient provider context.
+`VerificationResult` independently reports authentication, model readiness, and verification
+method. Unsupported verification is explicit, not inferred from a successful model listing.
+
+Authenticated discovery and lightweight judgement are different methods. Model advertisement
+is not inference-readiness proof; `not_checked` requires independent central capability checks
+before use. Non-inference discovery is not guaranteed free. A hosted lightweight probe may
+be billed; it uses fixed probe state, not consumer application state. Rejected authentication,
+quota/rate limits, model unavailability, and temporary failure must remain distinct. The
+[Jev provider](jev-provider.md) documents its separate official and hosted credential backends.
+
+## Application access and optional consumers
+
+The host application interface is `bcode.judgement-application/v1`, not a provider interface:
+
+* `judge` accepts explicit `WorkflowJudgementRequest` with provider route, owned auth-profile
+  selection, and typed request. Empty profile explicitly selects provider-declared environment
+  credentials. Application/client explicit access uses the same central routing boundaries.
+* `optional_judge` accepts `OptionalRequest { feature, selection, request }`, where `selection`
+  is an optional exact `SetupSelection`. It returns `OptionalResponse { response }`; `None`
+  means retain ordinary caller behavior, never a negative answer or completion verdict.
+
+`Feature` has six independently gated variants: `ToolResultTriage`, `ContextReranking`,
+`ProgressMonitoring`, `Recommendations`, `SessionCategorization`, `EvalCategorization`.
+Global/per-feature modes default to auto. Off performs zero optional provider discovery,
+verification, or inference calls. Auto uses an eligible valid credential at meaningful bounded
+consumer triggers. Missing/ambiguous credentials, unsupported capabilities, busy access,
+verification failures, timeouts, or provider errors fall back without account guessing.
+An exact selection is not silently replaced with another account.
+
+Central application access owns model resolution, auth, verification/cache, timeout, backoff,
+and cancellation; consumers must not duplicate HTTP/auth or feature-local retry machinery.
+Feature prompts and semantic interpretation remain consumer-plugin/domain owned. The host
+checks deterministic eligibility and constrained output before applying advice. Session-bound
+consumers use resolved session policy/credentials; unscoped optional application calls use
+daemon startup configuration. See [automatic judgement](automatic-judgement.md) for actual triggers, limits,
+privacy, and persistence lifetimes.
+
+## Consumer scope
+
+`bcode.skills-selection/v1` prepares and applies bounded advisory ranking. Context mode ranks
+actual optional skill metadata before the prompt catalog's existing byte budget; it is not a
+general retrieval facility or chronological history reorder. The catalog chooses enabled context
+ranking under genuine byte-budget pressure, otherwise enabled recommendations, not two
+successive rankings that overwrite each other. Recommendations also order eligible tool
+definitions without activation or execution authority. Protected entries keep their slots,
+and a complete permutation preserves every candidate; uncertain/error results retain baseline.
+Loop-owned triage adds fixed request-only next-model diagnostic context and a live Supplemental
+Transient frontend contribution, not canonical history. Goal/loop iteration progress adds
+advisory probabilities, never retry/cancel/completion
+commands. Session and evaluation labels stay distinct from canonical events and measured
+oracle outcomes. Explicit loop judgement evaluation remains separately selected and does not
+turn automatic progress monitoring into completion authority.
+
+Application-route, IPC/client, plugin, and loopback tests exercise typed validation, owned auth,
+failures, and cancellation. Opt-in historical live hosted verification is evidence of that
+bounded call only—not a claim of current account readiness or official endpoint compatibility.
+Snapshots or transient replies do not establish durable replay/resume semantics.

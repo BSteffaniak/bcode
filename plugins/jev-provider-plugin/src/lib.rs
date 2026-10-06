@@ -16,6 +16,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::time::Duration;
 
 const DEFAULT_BASE_URL: &str = "https://jevtypesafeai.com";
+const OFFICIAL_BASE_URL: &str = "https://api.typesafe.ai";
 const VERIFIED_MODEL_ID: &str = "jev-1.13.0";
 const MODEL_ALIAS: &str = "jev-latest";
 
@@ -55,7 +56,7 @@ fn jev_auth_contribution() -> bcode_provider_auth_models::AuthProviderContributi
         AUTH_PROVIDER_CONTRIBUTION_SCHEMA_VERSION, AuthCredentialSource, AuthMethodContribution,
         AuthSecretField, AuthSecretValidation,
     };
-    bcode_provider_auth_models::AuthProviderContribution {
+    let mut contribution = bcode_provider_auth_models::AuthProviderContribution {
         schema_version: AUTH_PROVIDER_CONTRIBUTION_SCHEMA_VERSION,
         provider_id: "jev".into(),
         display_name: "TypeSafe Jev".into(),
@@ -80,12 +81,44 @@ fn jev_auth_contribution() -> bcode_provider_auth_models::AuthProviderContributi
             supports_verification: false,
             supports_revocation: false,
         }],
-    }
+    };
+    let AuthMethodContribution::SecretFields { fields, .. } = &contribution.methods[0] else {
+        unreachable!("hosted enrollment uses secret fields");
+    };
+    let mut official_fields = fields.clone();
+    let field = &mut official_fields[0];
+    field.credential_id = "typesafe_api_key".into();
+    field.storage_key = "BCODE_TYPESAFE_API_KEY".into();
+    field.prompt = "Official TypeSafe API key (not a hosted Jev key)".into();
+    field.discovery_sources = vec![AuthCredentialSource::Environment {
+        name: "TYPESAFE_API_KEY".into(),
+    }];
+    field.invocation_env = vec!["BCODE_TYPESAFE_API_KEY".into(), "TYPESAFE_API_KEY".into()];
+    contribution
+        .methods
+        .push(AuthMethodContribution::SecretFields {
+            method_id: "typesafe_api_key".into(),
+            display_name: "Official TypeSafe API key".into(),
+            fields: official_fields,
+            supports_verification: false,
+            supports_revocation: false,
+        });
+    contribution
 }
 
 fn invoke(request: &ServiceRequest, cancellation: &ServiceCancellation) -> ServiceResponse {
-    if request.interface_id != judgement::INTERFACE_ID {
+    let verification = request.interface_id == judgement::VERIFICATION_INTERFACE_ID;
+    if request.interface_id != judgement::INTERFACE_ID && !verification {
         return ServiceResponse::error("unsupported_interface", "unsupported judgement interface");
+    }
+    if verification && request.operation != judgement::OP_VERIFY {
+        return ServiceResponse::error(
+            "unsupported_operation",
+            "unsupported verification operation",
+        );
+    }
+    if !verification && request.operation == judgement::OP_VERIFY {
+        return ServiceResponse::error("unsupported_operation", "unsupported judgement operation");
     }
     let Ok(runtime) = tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -94,6 +127,15 @@ fn invoke(request: &ServiceRequest, cancellation: &ServiceCancellation) -> Servi
         return ServiceResponse::error("runtime_unavailable", "provider runtime unavailable");
     };
     match request.operation.as_str() {
+        judgement::OP_VERIFY => {
+            let Ok(envelope) = request.payload_json::<judgement::VerificationRequest>() else {
+                return ServiceResponse::error("invalid_request", "invalid verification request");
+            };
+            match runtime.block_on(cancel_on_signal(verify(&envelope), cancellation)) {
+                Ok(result) => encode(&result),
+                Err(error) => ServiceResponse::error("cancelled", error),
+            }
+        }
         judgement::OP_MODELS => {
             let Ok(context) = request.payload_json::<ProviderRequestContext>() else {
                 return ServiceResponse::error(
@@ -141,11 +183,64 @@ fn encode<T: Serialize>(value: &T) -> ServiceResponse {
     })
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Backend {
+    Hosted,
+    Official,
+}
+
+fn backend(context: &ProviderRequestContext) -> Result<Backend, &'static str> {
+    let selected = context.settings.get("backend").or_else(|| {
+        context
+            .auth
+            .as_ref()
+            .and_then(|auth| auth.attributes.get("backend"))
+    });
+    match selected.map(String::as_str) {
+        Some("hosted") => Ok(Backend::Hosted),
+        Some("official") => Ok(Backend::Official),
+        Some(_) => Err("unsupported provider backend"),
+        None => {
+            if let Some(scheme) = context
+                .auth
+                .as_ref()
+                .and_then(|auth| auth.scheme.as_deref())
+            {
+                match scheme {
+                    "typesafe_api_key" => return Ok(Backend::Official),
+                    "api_key" => return Ok(Backend::Hosted),
+                    _ => return Err("unsupported provider authentication method"),
+                }
+            }
+            let has_official = context
+                .auth
+                .as_ref()
+                .is_some_and(|auth| auth.credentials.contains_key("typesafe_api_key"));
+            let has_hosted = context
+                .auth
+                .as_ref()
+                .is_some_and(|auth| auth.credentials.contains_key("api_key"));
+            if has_official && has_hosted {
+                return Err("ambiguous provider backend");
+            }
+            Ok(if has_official {
+                Backend::Official
+            } else {
+                Backend::Hosted
+            })
+        }
+    }
+}
+
 fn credential(context: &ProviderRequestContext) -> Result<&str, &'static str> {
+    let id = match backend(context)? {
+        Backend::Hosted => "api_key",
+        Backend::Official => "typesafe_api_key",
+    };
     context
         .auth
         .as_ref()
-        .and_then(|auth| auth.credentials.get("api_key"))
+        .and_then(|auth| auth.credentials.get(id))
         .map(|credential| credential.value.as_str())
         .filter(|value| !value.is_empty())
         .ok_or("provider authentication is unavailable")
@@ -161,7 +256,13 @@ fn base_url(context: &ProviderRequestContext) -> Result<String, &'static str> {
                 .as_ref()
                 .and_then(|auth| auth.attributes.get("base_url"))
         })
-        .map_or(DEFAULT_BASE_URL, String::as_str);
+        .map_or(
+            match backend(context)? {
+                Backend::Hosted => DEFAULT_BASE_URL,
+                Backend::Official => OFFICIAL_BASE_URL,
+            },
+            String::as_str,
+        );
     let parsed = reqwest::Url::parse(url).map_err(|_| "invalid provider endpoint")?;
     if parsed.scheme() != "https"
         && !(parsed.scheme() == "http" && parsed.host_str() == Some("127.0.0.1"))
@@ -175,14 +276,41 @@ fn base_url(context: &ProviderRequestContext) -> Result<String, &'static str> {
     {
         return Err("invalid provider endpoint");
     }
+    if (parsed.host_str() == Some("api.typesafe.ai") && backend(context)? != Backend::Official)
+        || (parsed.host_str() == Some("jevtypesafeai.com") && backend(context)? != Backend::Hosted)
+    {
+        return Err("provider credential endpoint mismatch");
+    }
     Ok(url.trim_end_matches('/').to_owned())
 }
 
 fn http_client() -> Result<reqwest::Client, &'static str> {
     reqwest::Client::builder()
         .timeout(Duration::from_secs(20))
+        .redirect(reqwest::redirect::Policy::none())
         .build()
         .map_err(|_| "provider transport unavailable")
+}
+
+fn check_status(status: reqwest::StatusCode) -> Result<(), &'static str> {
+    if status.is_success() {
+        return Ok(());
+    }
+    Err(match status.as_u16() {
+        401 | 403 => "credential_rejected",
+        402 => "quota_exhausted",
+        429 => "rate_limited",
+        408 | 425 | 500..=599 => "temporarily_unavailable",
+        _ => "provider_rejected",
+    })
+}
+
+fn transport_error(error: &reqwest::Error) -> &'static str {
+    if error.is_timeout() {
+        "timeout"
+    } else {
+        "temporarily_unavailable"
+    }
 }
 
 async fn read_bounded(
@@ -236,16 +364,18 @@ async fn discover_models(context: &ProviderRequestContext) -> Result<ModelList, 
         });
     }
     let key = credential(context)?;
-    let url = format!("{}/api/v1/models", base_url(context)?);
+    let path = match backend(context)? {
+        Backend::Hosted => "/api/v1/models",
+        Backend::Official => "/v1/models",
+    };
+    let url = format!("{}{path}", base_url(context)?);
     let response = http_client()?
         .get(url)
         .bearer_auth(key)
         .send()
         .await
-        .map_err(|_| "model discovery failed")?;
-    if !response.status().is_success() {
-        return Err("model discovery failed");
-    }
+        .map_err(|error| transport_error(&error))?;
+    check_status(response.status())?;
     let bytes = read_bounded(response, "model discovery response exceeds size limit").await?;
     let wire: ModelsWire =
         serde_json::from_slice(&bytes).map_err(|_| "invalid model discovery response")?;
@@ -282,6 +412,100 @@ struct ModelWire {
     name: String,
 }
 
+async fn verify(
+    envelope: &judgement::VerificationRequest,
+) -> Result<judgement::VerificationResult, &'static str> {
+    use judgement::{AuthenticationStatus as Auth, ModelReadiness as Ready};
+    let ctx = &envelope.provider_context;
+    let selected = match backend(ctx) {
+        Ok(selected) => selected,
+        Err(error) => {
+            return Ok(verification_failure(
+                error,
+                judgement::VerificationMethod::AuthenticatedDiscovery,
+            ));
+        }
+    };
+    let method = match selected {
+        Backend::Hosted => judgement::VerificationMethod::LightweightJudgement,
+        Backend::Official => judgement::VerificationMethod::AuthenticatedDiscovery,
+    };
+    if let Err(error) = credential(ctx).and_then(|_| base_url(ctx)) {
+        return Ok(verification_failure(error, method));
+    }
+    match selected {
+        Backend::Official => match discover_models(ctx).await {
+            Ok(list) => Ok(judgement::VerificationResult {
+                method,
+                authentication: Auth::Accepted,
+                model: if list
+                    .models
+                    .iter()
+                    .any(|model| model.model_id == envelope.model_id)
+                {
+                    Ready::NotChecked
+                } else {
+                    Ready::Unavailable
+                },
+            }),
+            Err(error) => Ok(verification_failure(error, method)),
+        },
+        Backend::Hosted => {
+            if ![MODEL_ALIAS, VERIFIED_MODEL_ID].contains(&envelope.model_id.as_str()) {
+                return Ok(judgement::VerificationResult {
+                    method,
+                    authentication: Auth::Unknown,
+                    model: Ready::Unavailable,
+                });
+            }
+            // A single fixed inference probe, authorized by central access. No application
+            // state is transmitted; do not retry a potentially billable inference here.
+            match judge(&hosted_probe(ctx.clone())).await {
+                Ok(_) => Ok(judgement::VerificationResult {
+                    method,
+                    authentication: Auth::Accepted,
+                    model: Ready::Ready,
+                }),
+                Err(error) => Ok(verification_failure(error, method)),
+            }
+        }
+    }
+}
+
+fn verification_failure(
+    error: &str,
+    method: judgement::VerificationMethod,
+) -> judgement::VerificationResult {
+    use judgement::{AuthenticationStatus as Auth, ModelReadiness as Ready};
+    let (authentication, model) = match error {
+        "credential_rejected" => (Auth::Rejected, Ready::Unavailable),
+        "quota_exhausted" | "rate_limited" => (Auth::Unknown, Ready::QuotaLimited),
+        "temporarily_unavailable" | "timeout" => (Auth::Unknown, Ready::TemporaryFailure),
+        _ => (Auth::Unknown, Ready::Unavailable),
+    };
+    judgement::VerificationResult {
+        method,
+        authentication,
+        model,
+    }
+}
+
+fn hosted_probe(context: ProviderRequestContext) -> ProviderRequest {
+    ProviderRequest {
+        provider_context: context,
+        judgement: judgement::Request {
+            model_id: MODEL_ALIAS.into(),
+            state: judgement::State::Text("ok".into()),
+            questions: BTreeMap::from([(
+                "verification".into(),
+                Question::YesNo {
+                    instructions: "Is the state ok?".into(),
+                },
+            )]),
+        },
+    }
+}
+
 async fn judge(envelope: &ProviderRequest) -> Result<Response, &'static str> {
     let key = credential(&envelope.provider_context)?;
     judgement::validate_request(&envelope.judgement)?;
@@ -292,7 +516,11 @@ async fn judge(envelope: &ProviderRequest) -> Result<Response, &'static str> {
             return Err("score rubric exceeds provider limit");
         }
     }
-    let url = format!("{}/api/v1/decide", base_url(&envelope.provider_context)?);
+    let path = match backend(&envelope.provider_context)? {
+        Backend::Hosted => "/api/v1/decide",
+        Backend::Official => "/v1/systemone",
+    };
+    let url = format!("{}{path}", base_url(&envelope.provider_context)?);
     let questions = envelope.judgement.questions.iter().map(|(id, question)| {
         let wire = match question {
             Question::Choice { instructions, options } => serde_json::json!({"type":"choice", "instructions":instructions, "criteria":options}),
@@ -319,10 +547,8 @@ async fn judge(envelope: &ProviderRequest) -> Result<Response, &'static str> {
         .json(&payload)
         .send()
         .await
-        .map_err(|_| "judgement provider request failed")?;
-    if !response.status().is_success() {
-        return Err("judgement provider request failed");
-    }
+        .map_err(|error| transport_error(&error))?;
+    check_status(response.status())?;
     let bytes = read_bounded(response, "judgement provider response exceeds size limit").await?;
     let wire: JudgeWire =
         serde_json::from_slice(&bytes).map_err(|_| "invalid judgement provider response")?;
@@ -528,8 +754,18 @@ mod tests {
                     let payload: serde_json::Value =
                         serde_json::from_slice(&input[header_end..header_end + content_length])
                             .expect("request JSON");
-                    assert_eq!(payload["model"], "jev-1");
-                    assert_eq!(payload["questions"]["q"]["type"], "noul");
+                    if payload["questions"].get("verification").is_some() {
+                        assert_eq!(
+                            payload,
+                            serde_json::json!({
+                                "state":"ok", "model":MODEL_ALIAS,
+                                "questions":{"verification":{"type":"noul","instructions":"Is the state ok?"}}
+                            })
+                        );
+                    } else {
+                        assert_eq!(payload["model"], "jev-1");
+                        assert_eq!(payload["questions"]["q"]["type"], "noul");
+                    }
                 }
                 let reply = format!(
                     "HTTP/1.1 {status} Test\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
@@ -548,6 +784,194 @@ mod tests {
                 .map(|(path, body)| (path, body, 200))
                 .collect(),
         )
+    }
+
+    #[test]
+    fn verification_uses_one_fixed_hosted_probe_and_separates_official_readiness() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let (url, handle) = fake_http(vec![(
+            "POST /api/v1/decide".into(),
+            r#"{"model":"jev-1.13.0","answers":{"verification":{"type":"noul","noul":0.9}}}"#
+                .into(),
+        )]);
+        let result = runtime
+            .block_on(verify(&judgement::VerificationRequest {
+                model_id: MODEL_ALIAS.into(),
+                provider_context: context(url),
+            }))
+            .unwrap();
+        assert!(result.is_ready());
+        handle.join().unwrap();
+        let (url, handle) = fake_http(vec![(
+            "GET /v1/models".into(),
+            r#"{"models":[{"name":"jev-latest"}]}"#.into(),
+        )]);
+        let mut ctx = context(url);
+        let auth = ctx.auth.as_mut().unwrap();
+        let key = auth.credentials.remove("api_key").unwrap();
+        auth.credentials.insert("typesafe_api_key".into(), key);
+        let result = runtime
+            .block_on(verify(&judgement::VerificationRequest {
+                model_id: MODEL_ALIAS.into(),
+                provider_context: ctx,
+            }))
+            .unwrap();
+        assert_eq!(
+            result.authentication,
+            judgement::AuthenticationStatus::Accepted
+        );
+        assert_eq!(result.model, judgement::ModelReadiness::NotChecked);
+        assert!(result.is_ready());
+        assert_eq!(
+            result.method,
+            judgement::VerificationMethod::AuthenticatedDiscovery
+        );
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn verification_failures_preserve_independent_auth_evidence() {
+        use judgement::{AuthenticationStatus as Auth, ModelReadiness as Ready};
+        for (status, auth, model) in [
+            (401, Auth::Rejected, Ready::Unavailable),
+            (402, Auth::Unknown, Ready::QuotaLimited),
+            (429, Auth::Unknown, Ready::QuotaLimited),
+            (503, Auth::Unknown, Ready::TemporaryFailure),
+        ] {
+            let (url, handle) = fake_http_with_status(vec![(
+                "POST /api/v1/decide".into(),
+                "test-only-credential private".into(),
+                status,
+            )]);
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            let result = runtime
+                .block_on(verify(&judgement::VerificationRequest {
+                    model_id: MODEL_ALIAS.into(),
+                    provider_context: context(url),
+                }))
+                .unwrap();
+            assert_eq!(
+                result,
+                judgement::VerificationResult {
+                    method: judgement::VerificationMethod::LightweightJudgement,
+                    authentication: auth,
+                    model
+                }
+            );
+            handle.join().unwrap();
+        }
+    }
+
+    #[test]
+    fn cancelled_verification_does_not_issue_a_probe() {
+        let signal = ServiceCancellation::default();
+        signal.cancel();
+        let request = ServiceRequest {
+            interface_id: judgement::VERIFICATION_INTERFACE_ID.into(),
+            operation: judgement::OP_VERIFY.into(),
+            payload: serde_json::to_vec(&judgement::VerificationRequest {
+                model_id: MODEL_ALIAS.into(),
+                provider_context: context("http://127.0.0.1:1".into()),
+            })
+            .unwrap(),
+        };
+        let response = invoke(&request, &signal);
+        assert!(response.error.is_some());
+    }
+
+    #[test]
+    fn status_failures_are_normalized_without_upstream_content() {
+        for (status, expected) in [
+            (401, "credential_rejected"),
+            (403, "credential_rejected"),
+            (402, "quota_exhausted"),
+            (429, "rate_limited"),
+            (503, "temporarily_unavailable"),
+            (529, "temporarily_unavailable"),
+            (422, "provider_rejected"),
+            (302, "provider_rejected"),
+        ] {
+            assert_eq!(
+                check_status(reqwest::StatusCode::from_u16(status).unwrap()),
+                Err(expected)
+            );
+        }
+    }
+
+    #[test]
+    fn official_backend_never_uses_hosted_credentials() {
+        let mut ctx = context(OFFICIAL_BASE_URL.into());
+        assert_eq!(
+            base_url(&ctx).unwrap_err(),
+            "provider credential endpoint mismatch"
+        );
+        ctx.settings.insert("backend".into(), "official".into());
+        assert!(credential(&ctx).is_err());
+        ctx.auth.as_mut().unwrap().credentials.insert(
+            "typesafe_api_key".into(),
+            ProviderAuthCredential {
+                value: "official-test-key".into(),
+                ..Default::default()
+            },
+        );
+        assert_eq!(credential(&ctx).unwrap(), "official-test-key");
+        ctx.settings
+            .insert("base_url".into(), DEFAULT_BASE_URL.into());
+        assert_eq!(
+            base_url(&ctx).unwrap_err(),
+            "provider credential endpoint mismatch"
+        );
+        ctx.settings.remove("backend");
+        assert!(backend(&ctx).is_err());
+        ctx.auth.as_mut().unwrap().scheme = Some("typesafe_api_key".into());
+        assert_eq!(credential(&ctx).unwrap(), "official-test-key");
+    }
+
+    #[test]
+    fn official_discovery_and_judgement_use_distinct_routes_and_key() {
+        let (url, handle) = fake_http(vec![
+            (
+                "GET /v1/models".into(),
+                r#"{"models":[{"name":"jev-1"}]}"#.into(),
+            ),
+            (
+                "POST /v1/systemone".into(),
+                r#"{"model":"jev-1","answers":{"q":{"type":"noul","noul":0.7}}}"#.into(),
+            ),
+        ]);
+        let mut ctx = context(url);
+        let auth = ctx.auth.as_mut().unwrap();
+        let key = auth.credentials.remove("api_key").unwrap();
+        auth.credentials.insert("typesafe_api_key".into(), key);
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        assert_eq!(
+            runtime.block_on(discover_models(&ctx)).unwrap().models[0].model_id,
+            "jev-1"
+        );
+        let envelope = ProviderRequest {
+            provider_context: ctx,
+            judgement: judgement::Request {
+                model_id: "jev-1".into(),
+                state: judgement::State::Text("sample".into()),
+                questions: BTreeMap::from([(
+                    "q".into(),
+                    Question::YesNo {
+                        instructions: "true?".into(),
+                    },
+                )]),
+            },
+        };
+        assert!(runtime.block_on(judge(&envelope)).is_ok());
+        handle.join().unwrap();
     }
 
     #[test]
@@ -645,7 +1069,7 @@ mod tests {
             runtime
                 .block_on(discover_models(&context(url)))
                 .unwrap_err(),
-            "model discovery failed"
+            "credential_rejected"
         );
         handle.join().expect("fake server finished");
     }
@@ -674,7 +1098,7 @@ mod tests {
             (
                 "test-only-credential upstream secret",
                 422,
-                "judgement provider request failed",
+                "provider_rejected",
             ),
             (
                 r#"{"model":"jev-1","answers":{"unexpected":{"type":"noul","noul":0.7}}}"#,

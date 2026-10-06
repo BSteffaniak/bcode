@@ -229,9 +229,17 @@ pub fn invoke(context: &NativeServiceContext) -> ServiceResponse {
     if context.cancellation.is_cancelled() {
         return ServiceResponse::error("cancelled", "loop evaluation cancelled");
     }
-    // Agent-only loops use the same deterministic safeguard without provider dispatch.
+    // Agent-only loops retain the deterministic safeguard; optional monitoring is advisory.
     let Some(config) = input.judgement_evaluation.clone() else {
         safeguard_agent_evidence(&mut input);
+        super::progress_monitoring::annotate(
+            &context.bridge,
+            &invocation.dispatch_identity,
+            &mut input,
+        );
+        if context.cancellation.is_cancelled() {
+            return ServiceResponse::error("cancelled", "loop evaluation cancelled");
+        }
         return json_response(&input);
     };
     let result = evaluate(&context.bridge, &invocation.dispatch_identity, &input);

@@ -1,5 +1,83 @@
 //! Deterministic failure labels from observations; not an LLM verdict.
+use bcode_model::judgement::{
+    Answer, Feature, OptionalRequest, OptionalResponse, Question, Request, State,
+};
 use serde_json::{Value, json};
+
+const FAILURE_CATEGORIES: &[&str] = &[
+    "execution_failure",
+    "evidence_gap",
+    "deadline",
+    "artifact_failure",
+    "preservation_failure",
+    "completion_disagreement",
+    "coordination",
+    "uncertain",
+];
+
+/// Build one advisory request from measured failure facts, never raw output or prompts.
+pub fn optional_request(oracle: &Value, diagnosis: &Value) -> Option<OptionalRequest> {
+    if diagnosis["labels"].as_array()?.is_empty() {
+        return None;
+    }
+    let mut facts = serde_json::Map::new();
+    for key in [
+        "capture_complete",
+        "timed_out",
+        "artifact_correct",
+        "artifact_observed",
+        "false_completion",
+        "preservation_passed",
+        "completion_claimed",
+        "completion_failure",
+    ] {
+        if let Some(value) = oracle[key].as_bool() {
+            facts.insert(key.to_owned(), json!(value));
+        }
+    }
+    if let Some(status) = oracle["status"]
+        .as_str()
+        .filter(|status| ["completed", "failed", "cancelled", "unknown"].contains(status))
+    {
+        facts.insert("status".to_owned(), json!(status));
+    }
+    Some(OptionalRequest {
+        feature: Feature::EvalCategorization,
+        selection: None,
+        request: Request {
+            model_id: "auto".to_owned(),
+            state: State::Structured(Value::Object(facts)),
+            questions: std::collections::BTreeMap::from([("failure_category".to_owned(), Question::Choice {
+                instructions: "Label these measured evaluation failure facts for advisory grouping only. Do not infer root cause or change measured outcomes; choose uncertain when evidence is insufficient.".to_owned(),
+                options: FAILURE_CATEGORIES.iter().map(|label| ((*label).to_owned(), (*label).to_owned())).collect(),
+            })]),
+        },
+    })
+}
+
+/// Keep model labels distinct from deterministic observations and oracle verdicts.
+pub fn attach_advisory(diagnosis: &mut Value, query: &Request, result: OptionalResponse) {
+    let Some(response) = result.response else {
+        return;
+    };
+    // Provider capability and numeric validation belongs to central access; this consumer
+    // checks exact caller-owned question identity, answer kind, and option cardinality.
+    if query.questions.len() != 1 || response.answers.len() != 1 {
+        return;
+    }
+    let Some(Question::Choice { options, .. }) = query.questions.get("failure_category") else {
+        return;
+    };
+    let Some(Answer::Choice { selected, .. }) = response.answers.get("failure_category") else {
+        return;
+    };
+    if !options.contains_key(selected) {
+        return;
+    }
+    diagnosis["advisory_model_labels"] =
+        json!({"failure_category":selected,"root_cause_verified":false});
+}
+
 pub fn classify(
     oracle: &Value,
     outputs: &Value,
@@ -59,6 +137,133 @@ pub fn classify(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn advisory_labels_cannot_replace_measured_outcomes() {
+        use bcode_model::judgement::{Answer, OptionalResponse, Response};
+        let oracle = serde_json::json!({"status":"failed","artifact_correct":false,"capture_complete":true,"secret":"DO_NOT_SEND"});
+        let mut diagnosis = super::classify(
+            &oracle,
+            &serde_json::json!([]),
+            &serde_json::json!({}),
+            &std::collections::BTreeMap::new(),
+        );
+        let baseline = diagnosis.clone();
+        let optional = super::optional_request(&oracle, &diagnosis).unwrap();
+        assert!(
+            !serde_json::to_string(&optional)
+                .unwrap()
+                .contains("DO_NOT_SEND")
+        );
+        super::attach_advisory(
+            &mut diagnosis,
+            &optional.request,
+            OptionalResponse { response: None },
+        );
+        assert_eq!(diagnosis, baseline);
+        super::attach_advisory(
+            &mut diagnosis,
+            &optional.request,
+            OptionalResponse {
+                response: Some(Response {
+                    answers: std::collections::BTreeMap::from([(
+                        "failure_category".into(),
+                        Answer::Choice {
+                            selected: "evidence_gap".into(),
+                            probabilities: None,
+                            confidence: None,
+                        },
+                    )]),
+                    usage: None,
+                }),
+            },
+        );
+        assert_eq!(diagnosis["labels"], baseline["labels"]);
+        assert_eq!(diagnosis["root_cause_verified"], false);
+        assert_eq!(
+            diagnosis["advisory_model_labels"]["failure_category"],
+            "evidence_gap"
+        );
+    }
+
+    #[test]
+    fn successful_baseline_has_no_categorization_trigger() {
+        let oracle = serde_json::json!({"status":"completed","artifact_correct":true,"completion_claimed":true});
+        let diagnosis = super::classify(
+            &oracle,
+            &serde_json::json!([]),
+            &serde_json::json!({}),
+            &std::collections::BTreeMap::new(),
+        );
+        assert!(super::optional_request(&oracle, &diagnosis).is_none());
+    }
+
+    #[test]
+    fn advisory_question_kind_option_and_count_must_correlate() {
+        use bcode_model::judgement::{Answer, OptionalResponse, Response};
+        let oracle = serde_json::json!({"status":"failed"});
+        let baseline = super::classify(
+            &oracle,
+            &serde_json::json!([]),
+            &serde_json::json!({}),
+            &std::collections::BTreeMap::new(),
+        );
+        let query = super::optional_request(&oracle, &baseline).unwrap().request;
+        let choice = |selected: &str| Answer::Choice {
+            selected: selected.into(),
+            probabilities: None,
+            confidence: None,
+        };
+        for answers in [
+            std::collections::BTreeMap::from([("failure_category".into(), choice("unknown"))]),
+            std::collections::BTreeMap::from([(
+                "failure_category".into(),
+                Answer::YesNo { probability: 0.5 },
+            )]),
+            std::collections::BTreeMap::from([("wrong_id".into(), choice("evidence_gap"))]),
+            std::collections::BTreeMap::from([
+                ("failure_category".into(), choice("evidence_gap")),
+                ("extra".into(), choice("deadline")),
+            ]),
+        ] {
+            let mut diagnosis = baseline.clone();
+            super::attach_advisory(
+                &mut diagnosis,
+                &query,
+                OptionalResponse {
+                    response: Some(Response {
+                        answers,
+                        usage: None,
+                    }),
+                },
+            );
+            assert_eq!(diagnosis, baseline);
+        }
+    }
+
+    #[test]
+    fn malformed_advisory_does_not_change_baseline() {
+        let oracle = serde_json::json!({"status":"failed"});
+        let mut diagnosis = super::classify(
+            &oracle,
+            &serde_json::json!([]),
+            &serde_json::json!({}),
+            &std::collections::BTreeMap::new(),
+        );
+        let baseline = diagnosis.clone();
+        let optional = super::optional_request(&oracle, &diagnosis).unwrap();
+        super::attach_advisory(
+            &mut diagnosis,
+            &optional.request,
+            bcode_model::judgement::OptionalResponse {
+                response: Some(bcode_model::judgement::Response {
+                    answers: std::collections::BTreeMap::new(),
+                    usage: None,
+                }),
+            },
+        );
+        assert_eq!(diagnosis, baseline);
+    }
+
     #[test]
     fn correct_artifact_with_withheld_completion_is_an_explicit_disagreement() {
         let result = super::classify(
