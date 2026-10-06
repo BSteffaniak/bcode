@@ -1,7 +1,10 @@
 //! TUI session picker state.
 
+use std::collections::BTreeSet;
+
 use bcode_plugin_sdk::path::display_from_current_dir;
 use bcode_session_models::{SessionId, SessionSummary};
+use bcode_session_view::navigation::{SessionNavigationKey, SessionTreeRow, project_session_tree};
 use bmux_tui::prelude::Line as ListItem;
 use bmux_tui::prelude::{Line, Span, Style};
 use bmux_tui::style::Modifier;
@@ -27,6 +30,10 @@ pub enum SessionPickerMode {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SessionPickerApp {
     sessions: Vec<SessionSummary>,
+    child_loaded: Vec<SessionNavigationKey>,
+    expanded: BTreeSet<SessionNavigationKey>,
+    tree_rows: Vec<SessionTreeRow>,
+    child_cursors: std::collections::BTreeMap<SessionId, Option<SessionId>>,
     filter: TextInputState,
     rename: TextInputState,
     list: FilteredListState,
@@ -71,6 +78,10 @@ impl SessionPickerApp {
             migration_confirmation_armed: false,
             bulk_migration_operation_id: None,
             search_backfill_operation_id: None,
+            child_loaded: Vec::new(),
+            expanded: BTreeSet::new(),
+            tree_rows: Vec::new(),
+            child_cursors: std::collections::BTreeMap::new(),
             mode: SessionPickerMode::Filter,
         }
     }
@@ -421,7 +432,30 @@ impl SessionPickerApp {
         self.list
             .indices()
             .iter()
-            .map(|index| session_item(&self.sessions[*index], muted))
+            .map(|index| {
+                let mut item = session_item(&self.sessions[*index], muted);
+                if let Some(row) = self.tree_rows.iter().find(|row| row.source_index == *index) {
+                    // Fixed presentation cap, not a semantic tree-depth limit. BMUX clips the
+                    // combined prefix/content line together for narrow viewports.
+                    let marker = if self
+                        .expanded
+                        .contains(&SessionNavigationKey::from_summary(&self.sessions[*index]))
+                    {
+                        "▾"
+                    } else {
+                        "▸"
+                    };
+                    let context = if row.detached { "? " } else { "" };
+                    let depth = if row.depth > 4 {
+                        format!("[{}] ", row.depth)
+                    } else {
+                        "  ".repeat(row.depth)
+                    };
+                    item.spans
+                        .insert(0, Span::styled(format!("{depth}{marker} {context}"), muted));
+                }
+                item
+            })
             .collect()
     }
 
@@ -496,15 +530,132 @@ impl SessionPickerApp {
         self.status = status;
     }
 
+    /// Toggle selected loaded branch; the caller fetches a bounded child page when opening.
+    pub fn toggle_selected_branch(&mut self) -> Option<SessionId> {
+        let index = self.list.selected_source_index()?;
+        let key = SessionNavigationKey::from_summary(&self.sessions[index]);
+        let opening = if self.expanded.remove(&key) {
+            false
+        } else {
+            self.expanded.insert(key);
+            true
+        };
+        let id = self.sessions[index].id;
+        self.refresh_filter();
+        opening.then_some(id)
+    }
+
+    /// Continue the selected branch's bounded candidate window.
+    #[must_use]
+    pub fn next_child_page(&self) -> Option<(SessionId, SessionId)> {
+        let parent_id = self.selected_session_id()?;
+        self.child_cursors
+            .get(&parent_id)
+            .copied()
+            .flatten()
+            .map(|after| (parent_id, after))
+    }
+
+    /// Select a known parent without opening a session or stealing chat focus.
+    pub fn select_parent(&mut self) {
+        let Some(index) = self.list.selected_source_index() else {
+            return;
+        };
+        let Some(parent) = SessionNavigationKey::parent(&self.sessions[index]) else {
+            return;
+        };
+        if let Some(row) =
+            self.list.indices().iter().position(|index| {
+                SessionNavigationKey::from_summary(&self.sessions[*index]) == parent
+            })
+        {
+            self.list.select_visible(row);
+        } else {
+            self.set_status("Parent not loaded in this location".to_owned());
+        }
+    }
+
+    /// Merge one explicitly requested child page without changing the selected identity.
+    pub fn apply_children(
+        &mut self,
+        parent_id: SessionId,
+        page: bcode_session_models::SessionChildPage,
+    ) {
+        self.child_cursors.insert(parent_id, page.next_after);
+        let selected = self.selected_session_id();
+        for child in page.children {
+            let key = SessionNavigationKey::from_summary(&child);
+            self.child_loaded.retain(|loaded| loaded != &key);
+            self.child_loaded.push(key.clone());
+            if let Some(index) = self
+                .sessions
+                .iter()
+                .position(|summary| SessionNavigationKey::from_summary(summary) == key)
+            {
+                self.sessions[index] = child;
+            } else {
+                self.sessions.push(child);
+            }
+        }
+        while self.child_loaded.len() > 256 {
+            let evicted = self.child_loaded.remove(0);
+            if Some(evicted.session_id) == selected {
+                self.child_loaded.push(evicted);
+                continue;
+            }
+            if let Some(index) = self
+                .sessions
+                .iter()
+                .position(|summary| SessionNavigationKey::from_summary(summary) == evicted)
+            {
+                let summary = self.sessions.remove(index);
+                if let Some(parent) = summary.parent_id {
+                    self.child_cursors.remove(&parent);
+                }
+            }
+            self.expanded.remove(&evicted);
+            self.child_cursors.remove(&evicted.session_id);
+        }
+        self.refresh_filter();
+        if let Some(row) = self
+            .list
+            .indices()
+            .iter()
+            .position(|index| Some(self.sessions[*index].id) == selected)
+        {
+            self.list.select_visible(row);
+        }
+        let coverage = if !page.complete {
+            "degraded/incomplete"
+        } else if page.next_after.is_some() {
+            "partial; Alt-N loads more"
+        } else {
+            "complete"
+        };
+        self.set_status(format!(
+            "Children of {parent_id}: {coverage} {}",
+            page.issues.join("; ")
+        ));
+    }
+
     /// Recompute filtered sessions after filter edits.
     pub fn refresh_filter(&mut self) {
         let query = self.filter.buffer().text().trim().to_ascii_lowercase();
-        let filtered_indices = self
-            .sessions
-            .iter()
-            .enumerate()
-            .filter_map(|(index, session)| session_matches(session, &query).then_some(index))
-            .collect();
+        let matches = (!query.is_empty()).then(|| {
+            self.sessions
+                .iter()
+                .enumerate()
+                .filter_map(|(index, session)| session_matches(session, &query).then_some(index))
+                .collect::<BTreeSet<_>>()
+        });
+        let tree = project_session_tree(
+            &self.sessions,
+            &self.expanded,
+            matches.as_ref(),
+            self.sessions.len(),
+        );
+        let filtered_indices = tree.rows.iter().map(|row| row.source_index).collect();
+        self.tree_rows = tree.rows;
         self.list.replace_indices(filtered_indices);
     }
 
@@ -655,6 +806,7 @@ mod tests {
     fn summary(title: &str, working_directory: &str) -> SessionSummary {
         SessionSummary {
             id: SessionId::new(),
+            parent_id: None,
             name: Some(title.to_owned()),
             explicit_name: None,
             derived_title: None,

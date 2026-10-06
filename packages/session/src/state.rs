@@ -189,6 +189,7 @@ impl SessionState {
                 updated_at_ms,
                 working_directory: working_directory.clone(),
                 import: None,
+                parent_id: state.parent_id,
                 execution: state.execution.map(|provenance| {
                     Box::new(bcode_session_models::ExecutionSessionSummary {
                         provenance,
@@ -287,6 +288,9 @@ impl SessionState {
         self.next_sequence += 1;
         self.event_count = self.event_count.saturating_add(1);
         match &event.kind {
+            SessionEventKind::ChildSessionCreated { request } => {
+                self.summary.parent_id = Some(request.parent_id);
+            }
             SessionEventKind::ExecutionSessionCreated {
                 provenance,
                 visibility,

@@ -846,7 +846,7 @@ const fn derivation_error_code(error: &SessionError) -> &'static str {
     }
 }
 
-fn write_staged_manifest(root: &Path, summary: &SessionSummary) -> Result<(), SessionError> {
+pub fn write_staged_manifest(root: &Path, summary: &SessionSummary) -> Result<(), SessionError> {
     let store = crate::store::SessionStore::new(root.to_path_buf());
     store.write_session_manifest(summary)?;
     Ok(())
@@ -899,6 +899,7 @@ const fn is_copyable_derivation_event(kind: &SessionEventKind) -> bool {
             | SessionEventKind::ClientAttached { .. }
             | SessionEventKind::ClientDetached { .. }
             | SessionEventKind::SessionDerived { .. }
+            | SessionEventKind::ChildSessionCreated { .. }
             | SessionEventKind::ExecutionSessionCreated { .. }
     )
 }

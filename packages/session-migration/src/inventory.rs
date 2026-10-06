@@ -1457,11 +1457,12 @@ pub fn is_released_event_kind_schema(kind: &str, schema: u16) -> bool {
 ///
 /// Event kinds that the current build still persists remain historically decodable through this
 /// schema; the current schema itself is classified by [`classify_event_kind_schema`].
-pub const LATEST_HISTORICAL_EVENT_SCHEMA: u16 = 47;
+pub const LATEST_HISTORICAL_EVENT_SCHEMA: u16 = 48;
 
 fn released_event_schema_range(kind: &str) -> (u16, u16) {
     let live = LATEST_HISTORICAL_EVENT_SCHEMA;
     match kind {
+        "child_session_created" => (49, CURRENT_EVENT_SCHEMA),
         "assistant_reasoning_activity" | "inert_history" => (40, live),
         "assistant_response_segment" => (41, live),
         "agent_changed" => (3, live),
@@ -1560,6 +1561,10 @@ pub const RELEASED_EVENT_VARIANTS: &[ReleasedEventVariantDescriptor] = &[
     },
     ReleasedEventVariantDescriptor {
         kind: "assistant_response_segment",
+        treatment: ReleasedEventTreatment::CurrentEquivalent,
+    },
+    ReleasedEventVariantDescriptor {
+        kind: "child_session_created",
         treatment: ReleasedEventTreatment::CurrentEquivalent,
     },
     ReleasedEventVariantDescriptor {
@@ -2183,7 +2188,12 @@ pub struct MigrationStepDescriptor {
     pub target_writer_epoch: u32,
 }
 
-pub const MIGRATION_STEPS: [MigrationStepDescriptor; 11] = [
+pub const MIGRATION_STEPS: [MigrationStepDescriptor; 12] = [
+    MigrationStepDescriptor {
+        id: "session-writer-epoch-12-to-13",
+        source_writer_epoch: 12,
+        target_writer_epoch: 13,
+    },
     MigrationStepDescriptor {
         id: "session-writer-epoch-11-to-12",
         source_writer_epoch: 11,
@@ -2304,10 +2314,14 @@ pub const RELEASED_WRITER_SCHEMA_COMBINATIONS: &[ReleasedWriterSchemaDescriptor]
         writer_epoch: 9,
         event_schema: 47,
     },
+    ReleasedWriterSchemaDescriptor {
+        writer_epoch: 12,
+        event_schema: 48,
+    },
 ];
 
 /// Released historical writer epochs that must migrate to [`CURRENT_WRITER_EPOCH`].
-pub const RELEASED_HISTORICAL_WRITER_EPOCHS: &[u32] = &[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11];
+pub const RELEASED_HISTORICAL_WRITER_EPOCHS: &[u32] = &[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12];
 
 /// Released historical event schemas currently evidenced by Git history.
 ///
@@ -2316,7 +2330,7 @@ pub const RELEASED_HISTORICAL_WRITER_EPOCHS: &[u32] = &[1, 2, 3, 4, 5, 6, 7, 8, 
 /// emitted by epoch-6 builds and migrate forward without a writer-epoch change.
 pub const RELEASED_HISTORICAL_EVENT_SCHEMAS: &[u16] = &[
     1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26,
-    27, 28, 29, 30, 31, 32, 35, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46, 47,
+    27, 28, 29, 30, 31, 32, 35, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46, 47, 48,
 ];
 
 /// Event schemas between the first released schema and the current schema that no writer emitted.
@@ -2465,6 +2479,7 @@ mod tests {
     #[test]
     fn current_only_event_kinds_fail_closed_outside_their_released_schema_ranges() {
         for (kind, first_schema) in [
+            ("child_session_created", 49),
             ("inert_history", 40),
             ("positioned_assistant_reasoning_activity", 42),
             ("positioned_assistant_response_segment", 42),
@@ -2504,7 +2519,7 @@ mod tests {
                 .windows(2)
                 .all(|pair| pair[0].kind < pair[1].kind)
         );
-        assert_eq!(RELEASED_EVENT_VARIANTS.len(), 71);
+        assert_eq!(RELEASED_EVENT_VARIANTS.len(), 72);
         assert_eq!(
             bcode_session_models::CURRENT_PERSISTED_SESSION_EVENT_KINDS
                 .iter()
@@ -2635,7 +2650,10 @@ mod tests {
             released_fixture_writer_coverage(&manifest)
                 .into_keys()
                 .collect::<BTreeSet<_>>(),
-            BTreeSet::from([1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11])
+            RELEASED_HISTORICAL_WRITER_EPOCHS
+                .iter()
+                .copied()
+                .collect::<BTreeSet<_>>()
         );
         assert_eq!(
             released_fixture_schema_coverage(&manifest).get(&28),
@@ -2861,6 +2879,10 @@ mod tests {
                 ReleasedWriterSchemaDescriptor {
                     writer_epoch: 9,
                     event_schema: 47
+                },
+                ReleasedWriterSchemaDescriptor {
+                    writer_epoch: 12,
+                    event_schema: 48
                 },
             ]
         );

@@ -175,6 +175,17 @@ pub enum TuiEffect {
     },
     /// Load host and plugin command-palette contributions.
     LoadCommandPalette,
+    /// Load one bounded direct-child page; no recursive daemon traversal.
+    LoadSessionChildren {
+        parent_id: SessionId,
+        after: Option<SessionId>,
+        generation: u64,
+    },
+    /// Observe normalized activity without appending transcript events.
+    LoadChildActivity {
+        session_id: SessionId,
+        generation: u64,
+    },
     /// Load the bounded session catalog for the root session picker.
     LoadSessionPicker { generation: u64 },
     /// Import one external session selected by the root picker.
@@ -449,6 +460,16 @@ impl DaemonObservation {
 
 /// Completed TUI background work.
 pub enum TuiEffectResult {
+    SessionChildrenLoaded {
+        parent_id: SessionId,
+        generation: u64,
+        result: Result<bcode_session_models::SessionChildPage, ClientError>,
+    },
+    ChildActivityLoaded {
+        session_id: SessionId,
+        generation: u64,
+        result: Result<bcode_session_models::SessionActivityPage, ClientError>,
+    },
     /// Session-open preparation progress emitted while the open effect is running.
     SessionOpenProgress {
         snapshot: bcode_session_models::SessionOpenOperationSnapshot,
@@ -817,6 +838,12 @@ impl TuiEffectResult {
     #[must_use]
     pub fn daemon_observation(&self) -> DaemonObservation {
         match self {
+            Self::SessionChildrenLoaded { result, .. } => {
+                DaemonObservation::from_client_result(result)
+            }
+            Self::ChildActivityLoaded { result, .. } => {
+                DaemonObservation::from_client_result(result)
+            }
             Self::SessionOpenProgress { .. } => DaemonObservation::Success,
             Self::SessionOpened { result, .. } => DaemonObservation::from_tui_result(result),
             Self::DraftStatusLoaded {
@@ -974,6 +1001,8 @@ enum EffectKey {
     DraftSave,
     SlashPalette,
     CommandPalette,
+    SessionChildren(SessionId),
+    ChildActivity(SessionId),
     SessionPicker,
     ImportSession,
     RenameSession(SessionId),
@@ -1028,6 +1057,23 @@ impl TuiEffect {
     #[allow(clippy::too_many_lines, dead_code)]
     fn daemon_start_failed(self, client_error: ClientError) -> TuiEffectResult {
         match self {
+            Self::LoadSessionChildren {
+                parent_id,
+                generation,
+                ..
+            } => TuiEffectResult::SessionChildrenLoaded {
+                parent_id,
+                generation,
+                result: Err(client_error),
+            },
+            Self::LoadChildActivity {
+                session_id,
+                generation,
+            } => TuiEffectResult::ChildActivityLoaded {
+                session_id,
+                generation,
+                result: Err(client_error),
+            },
             Self::OpenSession { session_id, .. } => TuiEffectResult::SessionOpened {
                 session_id,
                 has_older_history: true,
@@ -1205,6 +1251,8 @@ impl TuiEffect {
                 allow_daemon_start: false,
                 ..
             }
+            | Self::LoadSessionChildren { .. }
+            | Self::LoadChildActivity { .. }
             | Self::LoadConfig
             | Self::PersistThemeSelection { .. }
             | Self::ClearThemeSelection
@@ -1450,6 +1498,8 @@ impl TuiEffect {
             Self::SaveDraft { .. } => EffectKey::DraftSave,
             Self::LoadSlashPalette { .. } => EffectKey::SlashPalette,
             Self::LoadCommandPalette => EffectKey::CommandPalette,
+            Self::LoadSessionChildren { parent_id, .. } => EffectKey::SessionChildren(*parent_id),
+            Self::LoadChildActivity { session_id, .. } => EffectKey::ChildActivity(*session_id),
             Self::LoadSessionPicker { .. } => EffectKey::SessionPicker,
             Self::ImportSession { .. } => EffectKey::ImportSession,
             Self::RenameSession { session_id, .. } => EffectKey::RenameSession(*session_id),
@@ -1518,6 +1568,38 @@ impl TuiEffect {
         streaming_sender: mpsc::Sender<TuiEffectResult>,
     ) -> TuiEffectResult {
         match self {
+            Self::LoadSessionChildren {
+                parent_id,
+                after,
+                generation,
+            } => TuiEffectResult::SessionChildrenLoaded {
+                parent_id,
+                generation,
+                result: client
+                    .query_child_sessions(bcode_session_models::SessionChildQuery {
+                        parent_id,
+                        after,
+                        limit: 64,
+                    })
+                    .await,
+            },
+            Self::LoadChildActivity {
+                session_id,
+                generation,
+            } => TuiEffectResult::ChildActivityLoaded {
+                session_id,
+                generation,
+                result: client
+                    .session_activity(
+                        session_id,
+                        bcode_session_models::SessionActivityQuery {
+                            scope: bcode_session_models::SessionActivityScope::DirectChildren,
+                            after: None,
+                            limit: 64,
+                        },
+                    )
+                    .await,
+            },
             Self::OpenSession {
                 session_id,
                 initial_window_request,

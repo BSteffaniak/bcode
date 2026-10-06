@@ -88,6 +88,19 @@ pub enum SessionLifecycleRequest {
         name: Option<String>,
         working_directory: PathBuf,
     },
+    CreateChildSession {
+        request: bcode_session_models::SessionChildCreateRequest,
+    },
+    SessionSummary {
+        session_id: SessionId,
+    },
+    SessionActivity {
+        session_id: SessionId,
+        query: bcode_session_models::SessionActivityQuery,
+    },
+    SessionChildren {
+        query: bcode_session_models::SessionChildQuery,
+    },
     ListSessions {
         working_directory: PathBuf,
     },
@@ -901,6 +914,25 @@ impl RoutedRequest {
                 name,
                 working_directory,
             })),
+            Request::CreateChildSession { request } => {
+                Self::SessionLifecycle(Box::new(SessionLifecycleRequest::CreateChildSession {
+                    request,
+                }))
+            }
+            Request::SessionSummary { session_id } => {
+                Self::SessionLifecycle(Box::new(SessionLifecycleRequest::SessionSummary {
+                    session_id,
+                }))
+            }
+            Request::SessionActivity { session_id, query } => {
+                Self::SessionLifecycle(Box::new(SessionLifecycleRequest::SessionActivity {
+                    session_id,
+                    query,
+                }))
+            }
+            Request::SessionChildren { query } => {
+                Self::SessionLifecycle(Box::new(SessionLifecycleRequest::SessionChildren { query }))
+            }
             Request::ListSessions { working_directory } => {
                 Self::SessionLifecycle(Box::new(SessionLifecycleRequest::ListSessions {
                     working_directory,

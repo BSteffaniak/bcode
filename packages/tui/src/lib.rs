@@ -11,6 +11,7 @@ mod auth_browser;
 pub(crate) mod auth_pool_picker;
 pub(crate) mod auth_pool_picker_render;
 pub(crate) mod chat_loop;
+mod child_request_fence;
 pub(crate) mod clipboard_image;
 pub mod code_review_launcher;
 pub(crate) mod command_palette;

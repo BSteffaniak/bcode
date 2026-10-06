@@ -529,12 +529,18 @@ enum PersistedSessionEventKind {
         turn_id: String,
         feature: bcode_session_models::ModelFeatureFidelity,
     },
+    ChildSessionCreated {
+        request: Box<bcode_session_models::SessionChildCreateRequest>,
+    },
 }
 
 impl From<&SessionEventKind> for PersistedSessionEventKind {
     #[allow(clippy::too_many_lines)]
     fn from(value: &SessionEventKind) -> Self {
         match value {
+            SessionEventKind::ChildSessionCreated { request } => Self::ChildSessionCreated {
+                request: request.clone(),
+            },
             SessionEventKind::SessionCreated {
                 name,
                 working_directory,
@@ -987,6 +993,9 @@ impl PersistedSessionEventKind {
     #[allow(clippy::too_many_lines)]
     fn into_domain(self) -> SessionEventKind {
         match self {
+            Self::ChildSessionCreated { request } => {
+                SessionEventKind::ChildSessionCreated { request }
+            }
             Self::SessionCreated {
                 name,
                 working_directory,

@@ -94,7 +94,7 @@ const fn input_placeholder(mode: SessionPickerMode) -> &'static str {
 fn header_line(mode: SessionPickerMode) -> Line {
     let help = match mode {
         SessionPickerMode::Filter => {
-            "  ↑↓ browse  ·  Enter open  ·  Ctrl-F search  ·  Ctrl-N new  ·  Ctrl-R rename  ·  Ctrl-D delete  ·  Esc close"
+            "  ↑↓ browse  ·  → expand  ·  ← parent  ·  Alt-N more children  ·  Enter open  ·  Ctrl-F search  ·  Ctrl-N new  ·  Ctrl-R rename  ·  Ctrl-D delete  ·  Esc close"
         }
         SessionPickerMode::Rename => "  Rename  ·  Enter save  ·  Esc cancel",
         SessionPickerMode::DeleteConfirm => "  Delete session?  ·  Y confirm  ·  N/Esc cancel",
@@ -185,6 +185,7 @@ mod tests {
             let theme = TuiTheme::for_theme_id(theme_id);
             let session = SessionSummary {
                 id: SessionId::new(),
+                parent_id: None,
                 name: Some("Design review".to_owned()),
                 explicit_name: None,
                 derived_title: None,

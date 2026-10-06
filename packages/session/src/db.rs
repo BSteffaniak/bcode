@@ -405,6 +405,8 @@ pub struct SessionDbState {
     /// Session picker visibility.
     pub visibility: SessionVisibility,
     /// Background execution provenance, when applicable.
+    /// Immutable ordinary-session parent, independent of execution provenance.
+    pub parent_id: Option<SessionId>,
     pub execution: Option<ExecutionSessionProvenance>,
 }
 
@@ -758,6 +760,7 @@ impl GlobalSessionDb {
         let db_path = db_path.to_string_lossy().to_string();
         if existing.is_some() {
             db.update("sessions")
+                .value("parent_id", summary.parent_id.map(|id| id.to_string()))
                 .value("db_path", db_path)
                 .value("title", title)
                 .value("working_directory", working_directory)
@@ -770,6 +773,7 @@ impl GlobalSessionDb {
                 .await?;
         } else {
             db.insert("sessions")
+                .value("parent_id", summary.parent_id.map(|id| id.to_string()))
                 .value("session_id", summary.id.to_string())
                 .value("db_path", db_path)
                 .value("title", title)
@@ -911,6 +915,39 @@ impl GlobalSessionDb {
             .await?
             .iter()
             .map(session_summary_from_catalog_row)
+            .collect()
+    }
+
+    /// Read at most 129 indexed direct-child identities; rows remain disposable candidates.
+    ///
+    /// # Errors
+    /// Returns an error for missing/incompatible catalog schema or malformed identities.
+    pub async fn child_session_ids_page(
+        &self,
+        parent: SessionId,
+        after: Option<SessionId>,
+        limit: usize,
+    ) -> SessionDbResult<Vec<SessionId>> {
+        self.db
+            .select("sessions")
+            .columns(&["session_id"])
+            .where_eq("parent_id", parent.to_string())
+            .where_gt(
+                "session_id",
+                after.map_or_else(String::new, |id| id.to_string()),
+            )
+            .sort("session_id", SortDirection::Asc)
+            .limit(limit.min(129))
+            .execute(&**self.db)
+            .await?
+            .iter()
+            .map(|row| {
+                required_string(row, "session_id")?.parse().map_err(|_| {
+                    SessionDbError::InvalidRow {
+                        column: "session_id".into(),
+                    }
+                })
+            })
             .collect()
     }
 
@@ -1705,6 +1742,7 @@ impl SessionDb {
                 "reasoning_by_model",
                 "updated_at_ms",
                 "visibility",
+                "parent_id",
                 "execution_provenance",
             ])
             .where_eq("session_id", self.session_id.to_string())
@@ -1764,6 +1802,12 @@ impl SessionDb {
             has_user_message,
             latest_compaction_sequence,
             visibility,
+            parent_id: optional_string(&row, "parent_id")
+                .map(|value| value.parse())
+                .transpose()
+                .map_err(|_| SessionDbError::InvalidRow {
+                    column: "parent_id".into(),
+                })?,
             execution,
         }))
     }
@@ -5401,6 +5445,35 @@ async fn project_event(
                 .execute(db)
                 .await?;
         }
+        SessionEventKind::ChildSessionCreated { request } => {
+            if request.child_id != event.session_id
+                || request.parent_id == event.session_id
+                || event.sequence != 1
+            {
+                return Err(SessionDbError::InvalidRow {
+                    column: "child_session_created".into(),
+                });
+            }
+            let row = db
+                .select("session_state")
+                .columns(&["parent_id"])
+                .where_eq("session_id", event.session_id.to_string())
+                .execute_first(db)
+                .await?
+                .ok_or_else(|| SessionDbError::InvalidRow {
+                    column: "missing child session state".into(),
+                })?;
+            if optional_string(&row, "parent_id").is_some() {
+                return Err(SessionDbError::InvalidRow {
+                    column: "immutable parent_id".into(),
+                });
+            }
+            db.update("session_state")
+                .value("parent_id", request.parent_id.to_string())
+                .where_eq("session_id", event.session_id.to_string())
+                .execute(db)
+                .await?;
+        }
         SessionEventKind::ExecutionSessionCreated {
             provenance,
             visibility,
@@ -6292,7 +6365,8 @@ mod tests {
             db.storage_compatibility().await.unwrap(),
             SessionStorageCompatibility::Current { .. }
         ));
-        // Reproduce the released epoch-11 ledger, before submission migrations existed.
+        // Reproduce the released epoch-11 shape, before submissions and parent relationships.
+        remove_parent_relationship_fixture(&db).await;
         db.database()
             .delete(SESSION_MIGRATIONS_TABLE)
             .where_in(
@@ -6301,6 +6375,7 @@ mod tests {
                     "043_submissions_table",
                     "044_submissions_pending_index",
                     "045_submissions_target_index",
+                    "046_session_state_parent_column",
                 ],
             )
             .execute(db.database())
@@ -9884,6 +9959,14 @@ mod tests {
         );
     }
 
+    async fn remove_parent_relationship_fixture(db: &SessionDb) {
+        switchy::database::schema::alter_table("session_state")
+            .drop_column("parent_id".into())
+            .execute(db.database())
+            .await
+            .unwrap();
+    }
+
     async fn remove_usage_staging_fixture(db: &SessionDb) {
         switchy::database::schema::drop_table("turn_evidence")
             .execute(db.database())
@@ -9955,6 +10038,7 @@ mod tests {
                 .unwrap();
         }
         remove_usage_staging_fixture(&db).await;
+        remove_parent_relationship_fixture(&db).await;
         db.database()
             .delete(SESSION_MIGRATIONS_TABLE)
             .where_gte("id", "038")

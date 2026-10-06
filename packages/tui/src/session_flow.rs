@@ -174,12 +174,17 @@ impl ActiveChat {
     }
 
     /// Queue a background effect to start when the chat loop effect runner is available.
-    pub fn start_effect(&mut self, effect: super::effects::TuiEffect) {
-        self.pending_effects.start(effect);
+    pub fn start_effect(&mut self, mut effect: super::effects::TuiEffect) {
+        if self.app.stamp_child_effect(&mut effect) {
+            self.pending_effects.replace(effect);
+        } else {
+            self.pending_effects.start(effect);
+        }
     }
 
     /// Queue a background effect that should replace stale in-flight work with the same key.
-    pub fn replace_effect(&mut self, effect: super::effects::TuiEffect) {
+    pub fn replace_effect(&mut self, mut effect: super::effects::TuiEffect) {
+        self.app.stamp_child_effect(&mut effect);
         self.pending_effects.replace(effect);
     }
 
@@ -285,8 +290,13 @@ pub fn initial_transcript_window_request(
 pub fn start_switch_session(
     chat: &mut ActiveChat,
     next_session_id: SessionId,
-    initial_window_request: bcode_session_models::ProjectionWindowRequest,
+    mut initial_window_request: bcode_session_models::ProjectionWindowRequest,
 ) {
+    let saved = chat.app.saved_reading_sequence(next_session_id);
+    if let Some(sequence) = saved {
+        initial_window_request.anchor =
+            bcode_session_models::ProjectionWindowAnchor::AroundSequence(sequence);
+    }
     start_switch_session_at_sequence(chat, next_session_id, initial_window_request, None);
 }
 
@@ -391,6 +401,9 @@ pub fn complete_switch_session(
                 chat.app.replace_composer_with(&draft);
             }
             chat.app.apply_session_summary(&attached.session);
+            if anchor_sequence.is_none() {
+                chat.app.restore_saved_reading_position();
+            }
             chat.app.apply_usage_summary(&attached.usage_summary);
             chat.agents
                 .apply_runtime_selection(&mut chat.app, attached.runtime_selection.clone());

@@ -1,5 +1,7 @@
 # Session Persistence Architecture
 
+See [Child sessions](child-sessions.md) for immutable recursive session relationships, bounded discovery, and activity observation semantics.
+
 See [Session storage tiering](session-storage-tiering.md) for the implemented bounded storage
 measurement command and the remaining transparent-compression design.
 

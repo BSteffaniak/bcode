@@ -3542,6 +3542,7 @@ mod tests {
                 working_directory: std::path::PathBuf::from("/tmp"),
                 import: None,
                 execution: None,
+                parent_id: None,
                 location: None,
             },
             history: Vec::new(),

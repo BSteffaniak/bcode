@@ -225,7 +225,8 @@ pub const fn classify_persisted_event(kind: &SessionEventKind) -> PersistedEvent
         | SessionEventKind::RequestContextObserved { .. }
         | SessionEventKind::PluginStatusNote { .. }
         | SessionEventKind::ToolInvocationLifecycle { .. }
-        | SessionEventKind::ExecutionSessionCreated { .. } => {
+        | SessionEventKind::ExecutionSessionCreated { .. }
+        | SessionEventKind::ChildSessionCreated { .. } => {
             PersistedEventClassification::MetadataOnly
         }
         SessionEventKind::InertHistory { .. }
@@ -459,7 +460,8 @@ pub fn project_event(
         | SessionEventKind::ToolInvocationLifecycle { .. }
         | SessionEventKind::ToolContribution { .. }
         | SessionEventKind::ToolContributionPlaced { .. }
-        | SessionEventKind::ExecutionSessionCreated { .. } => {
+        | SessionEventKind::ExecutionSessionCreated { .. }
+        | SessionEventKind::ChildSessionCreated { .. } => {
             EventProjection::Excluded(ProjectionExclusion::NoSearchableContent)
         }
         SessionEventKind::SessionCreated { name: Some(_), .. }

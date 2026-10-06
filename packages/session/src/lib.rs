@@ -23,6 +23,7 @@ mod attach;
 mod attachment;
 mod catalog;
 pub(crate) mod catalog_updates;
+mod child;
 mod context;
 mod current_schema;
 pub mod db;
@@ -1452,7 +1453,7 @@ impl SessionManager {
         name: Option<String>,
         working_directory: PathBuf,
     ) -> Result<SessionSummary, SessionError> {
-        self.create_session_record(name, working_directory, None)
+        self.create_session_record(name, working_directory, None, None)
             .await
     }
 
@@ -1462,16 +1463,20 @@ impl SessionManager {
         name: Option<String>,
         working_directory: PathBuf,
         execution: Option<ExecutionSessionProvenance>,
+        child: Option<bcode_session_models::SessionChildCreateRequest>,
     ) -> Result<SessionSummary, SessionError> {
         let started_at = std::time::Instant::now();
         self.metrics
             .increment_counter("session.manager.create.total");
         let working_directory = normalize_working_directory(&working_directory);
-        let id = SessionId::new();
+        let id = child
+            .as_ref()
+            .map_or_else(SessionId::new, |request| request.child_id);
         let (sender, _) = broadcast::channel(512);
         let live_events = SessionLiveEventBroker::new(512);
         let now_ms = self.next_activity_timestamp_ms();
         let summary = SessionSummary {
+            parent_id: child.as_ref().map(|request| request.parent_id),
             id,
             name: name.clone(),
             explicit_name: name.clone(),
@@ -1539,6 +1544,16 @@ impl SessionManager {
                 now_ms,
             )
             .await?;
+        if let Some(request) = child {
+            handle
+                .append_event(
+                    SessionEventKind::ChildSessionCreated {
+                        request: Box::new(request),
+                    },
+                    now_ms,
+                )
+                .await?;
+        }
         let execution_event = if let Some(execution) = summary.execution.clone() {
             Some(
                 handle
@@ -1628,7 +1643,7 @@ impl SessionManager {
             }
         };
         validate_execution_session_provenance(Some(&provenance))?;
-        self.create_session_record(name, working_directory, Some(provenance))
+        self.create_session_record(name, working_directory, Some(provenance), None)
             .await
     }
 
@@ -1651,8 +1666,13 @@ impl SessionManager {
         provenance.parent_generation = None;
         self.session_summary(provenance.parent_session_id).await?;
         validate_execution_session_provenance(Some(&provenance))?;
-        self.create_session_record(name, worktree_directory.to_path_buf(), Some(provenance))
-            .await
+        self.create_session_record(
+            name,
+            worktree_directory.to_path_buf(),
+            Some(provenance),
+            None,
+        )
+        .await
     }
 
     /// Clone a background execution session from one exact parent generation.
@@ -3528,6 +3548,7 @@ mod tests {
         coordinator.start();
         let session_id = SessionId::new();
         let summary = SessionSummary {
+            parent_id: None,
             id: session_id,
             name: Some("deleted".to_owned()),
             explicit_name: Some("deleted".to_owned()),
@@ -3567,6 +3588,7 @@ mod tests {
         coordinator.start();
         let session_id = SessionId::new();
         let summary = SessionSummary {
+            parent_id: None,
             id: session_id,
             name: Some("deleted".to_owned()),
             explicit_name: Some("deleted".to_owned()),

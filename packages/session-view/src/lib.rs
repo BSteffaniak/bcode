@@ -8,6 +8,8 @@
 //! terminal, web, and future renderers can consume without inheriting terminal layout concerns.
 
 mod actions;
+pub mod child_activity;
+pub mod navigation;
 pub mod presentation;
 
 pub use actions::execute_session_view_action;
@@ -1147,6 +1149,12 @@ impl SessionView {
                 self.snapshot.title.clone_from(name);
                 self.snapshot.working_directory = Some(working_directory.clone());
                 self.bump_revision();
+            }
+            SessionEventKind::ChildSessionCreated { request } => {
+                self.push_item(TranscriptViewItemId::event(event.sequence), event.sequence,
+                    Some(event.timestamp_ms), false, TranscriptViewItemKind::SystemMessage {
+                        message: ChatMessageView::markdown(format!("Child session of [parent {}](bcode://session/{}) · fresh context; Ctrl-G then Left opens this parent; relationship is not assignment acceptance", request.parent_id, request.parent_id)),
+                    });
             }
             SessionEventKind::SubmissionAccepted { submission } => {
                 let id = TranscriptViewItemId::new(format!("submission:{}", submission.id.0));

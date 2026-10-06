@@ -93,6 +93,7 @@ fn transcript_item_rows(
             item.kind(),
             super::transcript::TranscriptItemKind::AssistantMessage
                 | super::transcript::TranscriptItemKind::UserMessage
+                | super::transcript::TranscriptItemKind::System
         )
     {
         let container =

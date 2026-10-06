@@ -240,6 +240,8 @@ pub struct BcodeRuntimeModel {
     pub(crate) resurrection: Option<super::resurrection::Publisher>,
     theme_input_signature: u64,
     theme_reload_at: Instant,
+    child_activity_at: Instant,
+    child_refresh_cursor: usize,
     scheduled_deadlines: BTreeMap<bmux_tui_runtime::TimerId, Instant>,
     temporal_registry: TemporalRegistry,
 }
@@ -253,6 +255,7 @@ enum RootTimer {
     InteractiveSurfaceRetry,
     TelemetryFlush,
     ThemeReload,
+    ChildActivity,
 }
 
 impl RootTimer {
@@ -266,6 +269,7 @@ impl RootTimer {
             Self::InteractiveSurfaceRetry => "bcode.interactive_surface_retry",
             Self::TelemetryFlush => "bcode.telemetry_flush",
             Self::ThemeReload => "bcode.theme_reload",
+            Self::ChildActivity => "bcode.child_activity",
         })
     }
 }
@@ -334,6 +338,8 @@ impl BcodeRuntimeModel {
             resurrection: None,
             theme_input_signature,
             theme_reload_at,
+            child_activity_at: Instant::now() + Duration::from_secs(2),
+            child_refresh_cursor: 0,
             scheduled_deadlines: BTreeMap::new(),
             temporal_registry: TemporalRegistry::default(),
         }
@@ -969,6 +975,97 @@ impl BcodeRuntimeModel {
             }
             Event::Key(stroke) => {
                 if !self.loop_state.modal_foreground()
+                    && stroke.key == bmux_keyboard::KeyCode::Char('g')
+                    && stroke.modifiers.ctrl
+                {
+                    self.chat.app.toggle_child_panel();
+                    if let Some(session_id) = self.chat.attached_session_id() {
+                        self.chat
+                            .replace_effect(super::effects::TuiEffect::LoadChildActivity {
+                                session_id,
+                                generation: 0,
+                            });
+                        self.chat
+                            .replace_effect(super::effects::TuiEffect::LoadSessionChildren {
+                                parent_id: session_id,
+                                after: None,
+                                generation: 0,
+                            });
+                    }
+                    return super::invalidation::UiInvalidation::Structural;
+                }
+                if !self.loop_state.modal_foreground()
+                    && self.chat.app.child_panel_open()
+                    && (matches!(
+                        stroke.key,
+                        bmux_keyboard::KeyCode::Up
+                            | bmux_keyboard::KeyCode::Down
+                            | bmux_keyboard::KeyCode::Left
+                            | bmux_keyboard::KeyCode::Right
+                            | bmux_keyboard::KeyCode::Enter
+                            | bmux_keyboard::KeyCode::Escape
+                    ) || (stroke.key == bmux_keyboard::KeyCode::Char('n')
+                        && stroke.modifiers.alt))
+                {
+                    use bmux_keyboard::KeyCode;
+                    match stroke.key {
+                        KeyCode::Up => self.chat.app.move_monitor_selection(false),
+                        KeyCode::Down => self.chat.app.move_monitor_selection(true),
+                        KeyCode::Right => {
+                            if let Some(session_id) = self.chat.app.expand_monitor_selected() {
+                                self.chat.replace_effect(
+                                    super::effects::TuiEffect::LoadSessionChildren {
+                                        parent_id: session_id,
+                                        after: None,
+                                        generation: 0,
+                                    },
+                                );
+                                self.chat.replace_effect(
+                                    super::effects::TuiEffect::LoadChildActivity {
+                                        session_id,
+                                        generation: 0,
+                                    },
+                                );
+                            }
+                        }
+                        KeyCode::Char('n') => {
+                            if let Some((parent_id, after)) = self.chat.app.monitor_next_page() {
+                                self.chat.replace_effect(
+                                    super::effects::TuiEffect::LoadSessionChildren {
+                                        parent_id,
+                                        after: Some(after),
+                                        generation: 0,
+                                    },
+                                );
+                            }
+                        }
+                        KeyCode::Enter | KeyCode::Left => {
+                            let target = if stroke.key == KeyCode::Left {
+                                self.chat
+                                    .app
+                                    .session_view_snapshot()
+                                    .session_summary
+                                    .as_ref()
+                                    .and_then(|summary| summary.parent_id)
+                            } else {
+                                self.chat.app.selected_monitor_session()
+                            };
+                            if let Some(session_id) = target {
+                                super::session_flow::start_switch_session(
+                                    &mut self.chat,
+                                    session_id,
+                                    super::history_flow::initial_transcript_window_request(
+                                        self.committed_area,
+                                    ),
+                                );
+                            }
+                        }
+                        KeyCode::Escape => self.chat.app.toggle_child_panel(),
+                        _ => return super::invalidation::UiInvalidation::None,
+                    }
+                    return super::invalidation::UiInvalidation::Structural;
+                }
+                if !self.loop_state.modal_foreground()
                     && let Some(identity) = &self.focused_visual
                 {
                     if stroke.key == bmux_keyboard::KeyCode::Escape {
@@ -1132,6 +1229,23 @@ impl BcodeRuntimeModel {
                 }
             }
             Event::Mouse(mouse) => {
+                if !self.loop_state.modal_foreground()
+                    && self.chat.app.child_panel_open()
+                    && matches!(
+                        mouse.kind,
+                        bmux_tui::event::MouseEventKind::Down(bmux_tui::event::MouseButton::Left)
+                    )
+                    && let Some(hit) = super::mouse_flow::mouse_hit_id(&self.committed_hits, mouse)
+                    && let Some(id) = hit.strip_prefix("child-monitor:")
+                    && let Ok(session_id) = id.parse()
+                {
+                    super::session_flow::start_switch_session(
+                        &mut self.chat,
+                        session_id,
+                        super::history_flow::initial_transcript_window_request(self.committed_area),
+                    );
+                    return super::invalidation::UiInvalidation::Structural;
+                }
                 if !self.loop_state.modal_foreground()
                     && matches!(
                         mouse.kind,
@@ -1751,6 +1865,7 @@ impl BcodeRuntimeModel {
                 self.loop_state.next_telemetry_flush_at(),
             ),
             (RootTimer::ThemeReload, Some(self.theme_reload_at)),
+            (RootTimer::ChildActivity, Some(self.child_activity_at)),
         ];
         for (timer, deadline) in deadlines {
             let id = timer.id();
@@ -1843,6 +1958,27 @@ impl BcodeRuntimeModel {
                     self.loop_state.record_runtime_stats(&handle.stats());
                 }
                 self.loop_state.flush_telemetry_if_due(now);
+                super::invalidation::UiInvalidation::None
+            }
+            "bcode.child_activity" => {
+                self.child_activity_at = now + Duration::from_secs(2);
+                if let Some(session_id) = self.chat.attached_session_id() {
+                    self.chat
+                        .start_effect(super::effects::TuiEffect::LoadChildActivity {
+                            session_id,
+                            generation: 0,
+                        });
+                    let expanded = self.chat.app.expanded_monitor_sessions();
+                    if !expanded.is_empty() {
+                        let child_id = expanded[self.child_refresh_cursor % expanded.len()];
+                        self.child_refresh_cursor = self.child_refresh_cursor.wrapping_add(1);
+                        self.chat
+                            .start_effect(super::effects::TuiEffect::LoadChildActivity {
+                                session_id: child_id,
+                                generation: 0,
+                            });
+                    }
+                }
                 super::invalidation::UiInvalidation::None
             }
             "bcode.theme_reload" => {

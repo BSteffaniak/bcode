@@ -365,6 +365,16 @@ impl RuntimeWorkManager {
     }
 
     /// Return active work snapshots for a session.
+    /// Check for active local work with one ordered lookup and no snapshot allocation.
+    pub async fn has_active_for_session(&self, session_id: SessionId) -> bool {
+        self.active
+            .lock()
+            .await
+            .range((session_id, WorkId::new(""))..)
+            .next()
+            .is_some_and(|((id, _), _)| *id == session_id)
+    }
+
     pub async fn active_for_session(&self, session_id: SessionId) -> Vec<RuntimeWorkSnapshot> {
         self.active
             .lock()

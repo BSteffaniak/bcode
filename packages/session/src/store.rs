@@ -179,6 +179,7 @@ impl SessionStore {
 
     fn canonical_summary(&self, session_id: SessionId) -> SessionSummary {
         SessionSummary {
+            parent_id: None,
             id: session_id,
             name: None,
             explicit_name: None,

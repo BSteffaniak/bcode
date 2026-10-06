@@ -469,8 +469,8 @@ mod tests {
         let HistoricalDecode::Converted { event, metadata } = decoded else {
             panic!("historical usage should be migration-owned conversion");
         };
-        assert_eq!(crate::CURRENT_EVENT_SCHEMA, 48);
-        assert_eq!(crate::LATEST_HISTORICAL_EVENT_SCHEMA, 47);
+        assert_eq!(crate::CURRENT_EVENT_SCHEMA, 49);
+        assert_eq!(crate::LATEST_HISTORICAL_EVENT_SCHEMA, 48);
         assert_eq!(metadata.source_schema, 46);
         let SessionEventKind::ModelUsage { usage, .. } = event.kind else {
             panic!("converted event should remain model usage");
@@ -538,6 +538,58 @@ mod tests {
         state.ingest(&reset);
         assert_eq!(state.context_epoch, 2);
         assert!(state.context_occupancy.is_none());
+    }
+
+    #[test]
+    fn schema_48_submission_fixture_matches_domain_owned_models() {
+        use bcode_session_models::{
+            ClientId, PromptSubmission, SubmissionContextIssue, SubmissionId, SubmissionPlacement,
+            SubmissionTarget, TurnAdmissionMetadata, TurnId,
+        };
+        let client_id = ClientId("00000000-0000-0000-0000-000000000048".parse().unwrap());
+        let submission_id = SubmissionId("fixture-submission".into());
+        let turn_id = TurnId("fixture-submission-turn".into());
+        let text = "sanitized pending prompt".to_owned();
+        let expected = [
+            SessionEventKind::SubmissionAccepted {
+                submission: PromptSubmission {
+                    id: submission_id.clone(),
+                    client_id,
+                    text: text.clone(),
+                    admission: TurnAdmissionMetadata::default(),
+                    requested_placement: SubmissionPlacement::FollowUp,
+                    target: SubmissionTarget::OwnTurn {
+                        turn_id: turn_id.clone(),
+                    },
+                    execution_descriptor: None,
+                },
+            },
+            SessionEventKind::SubmissionContextObserved {
+                submission_id: submission_id.clone(),
+                issue: SubmissionContextIssue::Unavailable,
+            },
+            SessionEventKind::SubmissionActivated {
+                submission_id,
+                turn_id,
+                client_id,
+                text,
+                admission: TurnAdmissionMetadata::default(),
+            },
+            SessionEventKind::SubmissionCancelled {
+                submission_id: SubmissionId("fixture-cancelled-submission".into()),
+            },
+        ];
+        let fixture = include_str!("../fixtures/stores/epoch-12-schema-48-events.jsonl");
+        let events = fixture
+            .lines()
+            .skip(54)
+            .map(|line| serde_json::from_str::<SessionEvent>(line).expect("strict schema-48 model"))
+            .collect::<Vec<_>>();
+        assert_eq!(events.len(), expected.len());
+        for (event, kind) in events.into_iter().zip(expected) {
+            assert_eq!(event.schema_version, 48);
+            assert_eq!(event.kind, kind);
+        }
     }
 
     #[test]

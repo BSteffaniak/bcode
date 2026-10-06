@@ -362,9 +362,27 @@ struct TranscriptNavigationCheckpoint {
     bar_next_frame_at: Option<Instant>,
 }
 
+#[derive(Debug, Clone)]
+struct SavedSessionReadingPosition {
+    sequence: u64,
+    row_in_item: usize,
+    source_position: Option<usize>,
+    content: Option<(String, usize)>,
+}
+
 /// State owned by the terminal user interface.
 #[derive(Debug, Clone)]
 pub struct BmuxApp {
+    child_request_fence: crate::child_request_fence::ChildRequestFence,
+    child_activity: Option<bcode_session_models::SessionActivityPage>,
+    child_activity_error: Option<String>,
+    child_panel_open: bool,
+    child_panel_selected: usize,
+    child_summaries: Vec<bcode_session_models::SessionSummary>,
+    child_expanded: BTreeSet<bcode_session_view::navigation::SessionNavigationKey>,
+    child_pages: BTreeMap<SessionId, bcode_session_models::SessionActivityPage>,
+    child_cursors: BTreeMap<SessionId, Option<SessionId>>,
+    session_reading_positions: BTreeMap<SessionId, SavedSessionReadingPosition>,
     session_id: Option<SessionId>,
     selected_auth_profile: Option<String>,
     selected_context_format_version: Option<u16>,
@@ -543,7 +561,17 @@ impl BmuxApp {
     ) -> Self {
         let now = Instant::now();
         let initial_theme = super::theme::resolve_initial_theme();
-        let mut app = Self {
+        let app = Self {
+            child_request_fence: crate::child_request_fence::ChildRequestFence::default(),
+            child_activity: None,
+            child_activity_error: None,
+            child_panel_open: false,
+            child_panel_selected: 0,
+            child_summaries: Vec::new(),
+            child_expanded: BTreeSet::new(),
+            child_pages: BTreeMap::new(),
+            child_cursors: BTreeMap::new(),
+            session_reading_positions: BTreeMap::new(),
             session_id,
             selected_auth_profile: None,
             selected_context_format_version: None,
@@ -630,12 +658,46 @@ impl BmuxApp {
             #[cfg(test)]
             last_transcript_damage: TranscriptDocumentDamage::None,
         };
-        app.absorb_history(history);
-        app
+        app.with_initial_history(history)
+    }
+
+    fn with_initial_history(mut self, history: &[SessionEvent]) -> Self {
+        self.absorb_history(history);
+        self
     }
 
     /// Move app-level presentation/runtime state from another app after recreating session state.
     pub(crate) fn take_cross_session_state_from(&mut self, source: &Self) {
+        self.session_reading_positions
+            .clone_from(&source.session_reading_positions);
+        if source.scroll_offset() > 0
+            && let Some(session_id) = source.session_id
+            && let Some(line) = source
+                .transcript_layout
+                .visible_lines_from_top(source.transcript_top_row(source.viewport.height()), 1)
+                .first()
+            && line.source == VisibleTranscriptSource::Transcript
+            && let Some(sequence) = source
+                .transcript
+                .items()
+                .get(line.entry_index)
+                .and_then(super::transcript::TranscriptItem::event_sequence)
+        {
+            self.session_reading_positions.insert(
+                session_id,
+                SavedSessionReadingPosition {
+                    sequence,
+                    row_in_item: line.row_in_entry,
+                    source_position: source
+                        .transcript_layout
+                        .source_position(line.entry_index, line.row_in_entry),
+                    content: source
+                        .transcript_layout
+                        .content_anchor(line.entry_index, line.row_in_entry)
+                        .map(|(key, offset)| (key.to_owned(), offset)),
+                },
+            );
+        }
         self.apply_tui_config(source.tui_config().clone());
         self.set_daemon_connection(source.daemon_connection());
         self.set_agent_metadata_hydrated(source.is_agent_metadata_hydrated());
@@ -647,6 +709,47 @@ impl BmuxApp {
             self.theme_catalog_discovery_count = source.theme_catalog_discovery_count;
         }
         self.take_theme_transition_state_from(source);
+    }
+
+    /// Retained source position for a bounded return attach.
+    #[must_use]
+    pub fn saved_reading_sequence(&self, session_id: SessionId) -> Option<u64> {
+        self.session_reading_positions
+            .get(&session_id)
+            .map(|position| position.sequence)
+    }
+
+    /// Restore exact accepted source coordinates after a bounded centered return attach.
+    pub(crate) fn restore_saved_reading_position(&mut self) {
+        let Some(position) = self
+            .session_id
+            .and_then(|id| self.session_reading_positions.get(&id))
+            .cloned()
+        else {
+            return;
+        };
+        let Some(index) = self
+            .transcript
+            .items()
+            .iter()
+            .position(|item| item.event_sequence() == Some(position.sequence))
+        else {
+            return;
+        };
+        let Some(item_id) = self.transcript.presentation_id(index) else {
+            return;
+        };
+        // A newly attached app starts in follow-bottom mode, which deliberately ignores
+        // correspondence. Returning to an explicit reading position is anchored navigation;
+        // the accepted BMUX source mapping resolves its exact row during preparation.
+        self.viewport.follow_anchor(0);
+        self.pending_stable_transcript_anchor = Some(StableTranscriptAnchor {
+            item_id,
+            fallback_index: index,
+            row_in_item: position.row_in_item,
+            source_position: position.source_position,
+            content: position.content,
+        });
     }
 
     /// Preserve process-local transcript presentation across reconstruction of the same session.
@@ -1238,7 +1341,359 @@ impl BmuxApp {
     /// This ensures that bounded first-event discovery on the server side
     /// (which may populate `explicit_name` or `derived_title`) is reflected
     /// in the TUI cache without duplicating fallback logic.
+    pub(crate) fn stamp_child_effect(&mut self, effect: &mut super::effects::TuiEffect) -> bool {
+        match effect {
+            super::effects::TuiEffect::LoadSessionChildren {
+                parent_id,
+                generation,
+                ..
+            } => {
+                *generation = self.child_request_fence.begin(false, *parent_id);
+                true
+            }
+            super::effects::TuiEffect::LoadChildActivity {
+                session_id,
+                generation,
+            } => {
+                *generation = self.child_request_fence.begin(true, *session_id);
+                true
+            }
+            _ => false,
+        }
+    }
+
+    pub(crate) fn accepts_child_result(
+        &self,
+        activity: bool,
+        session_id: SessionId,
+        generation: u64,
+    ) -> bool {
+        self.child_request_fence
+            .accepts(activity, session_id, generation)
+    }
+
+    /// Apply normalized observations without modifying canonical transcript or focus.
+    pub fn apply_child_activity(
+        &mut self,
+        result: Result<bcode_session_models::SessionActivityPage, bcode_client::ClientError>,
+    ) {
+        match result {
+            Ok(page) => {
+                self.child_activity = Some(page);
+                self.child_activity_error = None;
+            }
+            Err(error) => {
+                self.child_activity_error = Some(format!("children: stale/degraded · {error}"));
+            }
+        }
+    }
+
+    /// Persistent known-active count, never an inferred subtree total.
+    #[must_use]
+    pub fn child_activity_text(&self) -> String {
+        let relationship_known = !self.child_summaries.is_empty()
+            || !self.child_pages.is_empty()
+            || self.child_activity_error.is_some()
+            || self
+                .session_view
+                .snapshot()
+                .session_summary
+                .as_ref()
+                .is_some_and(|summary| summary.parent_id.is_some())
+            || self
+                .child_activity
+                .as_ref()
+                .is_some_and(|page| !page.descendants.is_empty());
+        if !relationship_known && !self.child_panel_open {
+            return String::new();
+        }
+        let mut observed = BTreeMap::new();
+        if let Some(page) = &self.child_activity {
+            for activity in &page.descendants {
+                observed.insert(activity.session_id, activity);
+            }
+        }
+        for page in self.child_pages.values() {
+            observed.insert(page.own.session_id, &page.own);
+            for activity in &page.descendants {
+                observed.insert(activity.session_id, activity);
+            }
+        }
+        if !self.child_pages.is_empty() {
+            let count = observed
+                .values()
+                .filter(|activity| {
+                    bcode_session_view::child_activity::has_active_evidence(activity)
+                })
+                .count();
+            let degraded = self.child_pages.values().any(|page| {
+                page.coverage == bcode_session_models::SessionActivityCoverage::Degraded
+            });
+            return format!(
+                "children: {count} known active observed subtree · {}{}",
+                if degraded {
+                    "partial/degraded"
+                } else {
+                    "partial"
+                },
+                self.child_activity_error
+                    .as_ref()
+                    .map_or(String::new(), |error| format!(" · {error}"))
+            );
+        }
+        self.child_activity_error.clone().unwrap_or_else(|| {
+            self.child_activity.as_ref().map_or_else(
+                || "children: unknown · Ctrl-G monitor".to_owned(),
+                bcode_session_view::child_activity::child_activity_label,
+            )
+        })
+    }
+
+    /// Toggle local monitor presentation without taking focus.
+    pub const fn toggle_child_panel(&mut self) {
+        self.child_panel_open = !self.child_panel_open;
+    }
+
+    /// Whether the local monitor accepts explicit navigation keys.
+    #[must_use]
+    pub const fn child_panel_open(&self) -> bool {
+        self.child_panel_open
+    }
+
+    /// Merge explicitly requested child metadata, preserving selection and observed coverage.
+    pub fn apply_monitor_children(
+        &mut self,
+        parent_id: SessionId,
+        page: &bcode_session_models::SessionChildPage,
+    ) {
+        if self.session_id != Some(parent_id)
+            && !self
+                .child_summaries
+                .iter()
+                .any(|summary| summary.id == parent_id)
+        {
+            return;
+        }
+        let selected = self.selected_monitor_session();
+        self.child_cursors.insert(parent_id, page.next_after);
+        for child in &page.children {
+            if let Some(index) = self
+                .child_summaries
+                .iter()
+                .position(|summary| summary.id == child.id)
+            {
+                self.child_summaries[index] = child.clone();
+            } else {
+                self.child_summaries.push(child.clone());
+            }
+        }
+        // Sliding loaded window, not a descendant limit: evicted branches reload from their
+        // direct parent, and orphaned loaded rows remain navigable with detached semantics.
+        while self.child_summaries.len() > 256 {
+            let index = self
+                .child_summaries
+                .iter()
+                .position(|summary| {
+                    Some(summary.id) != selected
+                        && !page.children.iter().any(|child| child.id == summary.id)
+                })
+                .unwrap_or(0);
+            let evicted = self.child_summaries.remove(index);
+            self.child_pages.remove(&evicted.id);
+            self.child_expanded.remove(
+                &bcode_session_view::navigation::SessionNavigationKey::from_summary(&evicted),
+            );
+            if let Some(parent) = evicted.parent_id {
+                self.child_cursors.remove(&parent);
+            }
+        }
+        self.child_cursors.retain(|id, _| {
+            Some(*id) == self.session_id
+                || self.child_summaries.iter().any(|summary| summary.id == *id)
+        });
+        if let Some(selected) = selected {
+            self.child_panel_selected = self
+                .monitor_tree()
+                .rows
+                .iter()
+                .position(|row| self.child_summaries[row.source_index].id == selected)
+                .unwrap_or(0);
+        }
+        if !page.complete || !page.issues.is_empty() {
+            self.child_activity_error = Some(format!(
+                "children: degraded/incomplete · {}",
+                page.issues.join("; ")
+            ));
+        }
+    }
+
+    /// Loaded expanded frontier roots, used for bounded rotating refresh.
+    #[must_use]
+    pub fn expanded_monitor_sessions(&self) -> Vec<SessionId> {
+        self.child_expanded
+            .iter()
+            .map(|key| key.session_id)
+            .collect()
+    }
+
+    /// Retain a bounded observation for an explicitly expanded coordinator.
+    pub fn apply_monitor_activity(
+        &mut self,
+        session_id: SessionId,
+        page: bcode_session_models::SessionActivityPage,
+    ) {
+        self.child_pages.insert(session_id, page);
+        self.child_pages
+            .retain(|id, _| self.child_summaries.iter().any(|summary| summary.id == *id));
+    }
+
+    fn monitor_tree(&self) -> bcode_session_view::navigation::SessionTreeProjection {
+        bcode_session_view::navigation::project_session_tree(
+            &self.child_summaries,
+            &self.child_expanded,
+            None,
+            self.child_summaries.len(),
+        )
+    }
+
+    /// Selected child identity for ordinary application-boundary opening.
+    #[must_use]
+    pub fn selected_monitor_session(&self) -> Option<SessionId> {
+        let tree = self.monitor_tree();
+        tree.rows
+            .get(self.child_panel_selected)
+            .map(|row| self.child_summaries[row.source_index].id)
+    }
+
+    /// Move within loaded semantic rows; preview paging follows selection.
+    pub fn move_monitor_selection(&mut self, down: bool) {
+        let count = self.monitor_tree().rows.len();
+        self.child_panel_selected = if down {
+            self.child_panel_selected
+                .saturating_add(1)
+                .min(count.saturating_sub(1))
+        } else {
+            self.child_panel_selected.saturating_sub(1)
+        };
+    }
+
+    /// Expand selected coordinator and request only its direct-child frontier.
+    pub fn expand_monitor_selected(&mut self) -> Option<SessionId> {
+        let session_id = self.selected_monitor_session()?;
+        let summary = self
+            .child_summaries
+            .iter()
+            .find(|summary| summary.id == session_id)?;
+        let key = bcode_session_view::navigation::SessionNavigationKey::from_summary(summary);
+        if self.child_expanded.remove(&key) {
+            self.child_request_fence.begin(false, session_id);
+            self.child_request_fence.begin(true, session_id);
+            return None;
+        }
+        self.child_expanded.insert(key);
+        Some(session_id)
+    }
+
+    /// Selected branch continuation, or the attached root's continuation.
+    #[must_use]
+    pub fn monitor_next_page(&self) -> Option<(SessionId, SessionId)> {
+        let parent_id = self.selected_monitor_session().or(self.session_id)?;
+        self.child_cursors
+            .get(&parent_id)
+            .copied()
+            .flatten()
+            .map(|after| (parent_id, after))
+            .or_else(|| {
+                self.session_id.and_then(|root| {
+                    self.child_cursors
+                        .get(&root)
+                        .copied()
+                        .flatten()
+                        .map(|after| (root, after))
+                })
+            })
+    }
+
+    pub(crate) fn monitor_row_session(&self, row: usize) -> Option<SessionId> {
+        if row == 0 || row > 8 {
+            return None;
+        }
+        let tree = self.monitor_tree();
+        let index = self
+            .child_panel_selected
+            .saturating_sub(4)
+            .saturating_add(row - 1);
+        tree.rows
+            .get(index)
+            .map(|row| self.child_summaries[row.source_index].id)
+    }
+
+    /// Bounded accepted observation rows; selection scrolls the preview rather than imposing a total limit.
+    #[must_use]
+    pub fn child_panel_rows(&self) -> Vec<String> {
+        if !self.child_panel_open {
+            return Vec::new();
+        }
+        let mut rows = vec![format!(
+            "{} · ↑↓ select Enter open → expand ← parent Alt-N more Ctrl-G close · typing stays in composer",
+            self.child_activity_text()
+        )];
+        let tree = self.monitor_tree();
+        let start = self.child_panel_selected.saturating_sub(4);
+        for (index, row) in tree.rows.iter().enumerate().skip(start).take(8) {
+            let summary = &self.child_summaries[row.source_index];
+            let activity = self
+                .child_pages
+                .values()
+                .flat_map(|page| std::iter::once(&page.own).chain(page.descendants.iter()))
+                .chain(
+                    self.child_activity
+                        .iter()
+                        .flat_map(|page| page.descendants.iter()),
+                )
+                .find(|activity| activity.session_id == summary.id);
+            let evidence = activity.map_or_else(
+                || "unknown".to_owned(),
+                bcode_session_view::child_activity::activity_evidence_label,
+            );
+            let depth = if row.depth > 4 {
+                format!("[{}] ", row.depth)
+            } else {
+                "  ".repeat(row.depth)
+            };
+            rows.push(format!(
+                "{}{depth}{} · {evidence}",
+                if index == self.child_panel_selected {
+                    "› "
+                } else {
+                    "  "
+                },
+                summary.display_title()
+            ));
+        }
+        if let Some(page) = &self.child_activity {
+            rows.push(format!(
+                "observed {} ms · assignment acceptance unavailable",
+                page.observed_at_ms
+            ));
+            rows.extend(page.issues.iter().take(2).cloned());
+        }
+        if self.monitor_next_page().is_some() {
+            rows.push("Alt-N: load next bounded child page".to_owned());
+        }
+        rows
+    }
+
     pub fn apply_session_summary(&mut self, summary: &bcode_session_models::SessionSummary) {
+        if self.session_id != Some(summary.id) {
+            self.child_activity = None;
+            self.child_activity_error = None;
+            self.child_summaries.clear();
+            self.child_pages.clear();
+            self.child_cursors.clear();
+            self.child_expanded.clear();
+            self.child_panel_selected = 0;
+        }
         self.session_id = Some(summary.id);
         self.session_view.set_session_summary(summary.clone());
     }
@@ -2191,6 +2646,41 @@ impl BmuxApp {
         Some((
             self.transcript.presentation_id(line.entry_index)?,
             line.row_in_entry,
+        ))
+    }
+
+    #[cfg(test)]
+    pub fn transcript_row_for_source_position_for_test(
+        &self,
+        sequence: u64,
+        position: usize,
+    ) -> Option<usize> {
+        let index = self
+            .transcript
+            .items()
+            .iter()
+            .position(|item| item.event_sequence() == Some(sequence))?;
+        self.transcript_layout.source_row(index, position)
+    }
+
+    #[cfg(test)]
+    pub fn stable_transcript_source_position_for_test(&self) -> Option<(u64, usize)> {
+        let top_row = self.transcript_top_row(self.viewport.height());
+        let line = self
+            .transcript_layout
+            .visible_lines_from_top(top_row, 1)
+            .first()
+            .copied()?;
+        if line.source != VisibleTranscriptSource::Transcript {
+            return None;
+        }
+        Some((
+            self.transcript
+                .items()
+                .get(line.entry_index)?
+                .event_sequence()?,
+            self.transcript_layout
+                .source_position(line.entry_index, line.row_in_entry)?,
         ))
     }
 
@@ -5177,7 +5667,8 @@ const fn event_breaks_sticky_entry_anchor(event: &SessionEvent) -> bool {
 
 const fn event_affects_transcript_rows(event: &SessionEvent) -> bool {
     match &event.kind {
-        SessionEventKind::SubmissionAccepted { .. }
+        SessionEventKind::ChildSessionCreated { .. }
+        | SessionEventKind::SubmissionAccepted { .. }
         | SessionEventKind::SubmissionActivated { .. }
         | SessionEventKind::SubmissionCancelled { .. }
         | SessionEventKind::SubmissionContextObserved { .. }

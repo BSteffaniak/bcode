@@ -1804,6 +1804,30 @@ impl ChatLoopState {
                                 ..bmux_keyboard::Modifiers::NONE
                             },
                         );
+                    if stroke.key == bmux_keyboard::KeyCode::Char('n') && stroke.modifiers.alt {
+                        if let Some((parent_id, after)) = picker.next_child_page() {
+                            chat.replace_effect(TuiEffect::LoadSessionChildren {
+                                parent_id,
+                                after: Some(after),
+                                generation: 0,
+                            });
+                        }
+                        return SessionPickerRootOutcome::Handled;
+                    }
+                    if stroke.key == bmux_keyboard::KeyCode::Right {
+                        if let Some(parent_id) = picker.toggle_selected_branch() {
+                            chat.replace_effect(TuiEffect::LoadSessionChildren {
+                                parent_id,
+                                after: None,
+                                generation: 0,
+                            });
+                        }
+                        return SessionPickerRootOutcome::Handled;
+                    }
+                    if stroke.key == bmux_keyboard::KeyCode::Left {
+                        picker.select_parent();
+                        return SessionPickerRootOutcome::Handled;
+                    }
                     if search {
                         let query = picker.filter().buffer().text().trim().to_owned();
                         if query.is_empty() {
@@ -2551,6 +2575,42 @@ pub fn apply_effect_result(
     result: TuiEffectResult,
 ) {
     match result {
+        TuiEffectResult::SessionChildrenLoaded {
+            parent_id,
+            generation,
+            result,
+        } => {
+            if !chat.app.accepts_child_result(false, parent_id, generation) {
+                return;
+            }
+            if let Ok(page) = &result {
+                chat.app.apply_monitor_children(parent_id, page);
+            }
+            if let Some(picker) = loop_state.session_picker.as_mut() {
+                match result {
+                    Ok(page) => picker.apply_children(parent_id, page),
+                    Err(error) => {
+                        picker.set_status(format!("Children unavailable/degraded: {error}"));
+                    }
+                }
+            }
+        }
+        TuiEffectResult::ChildActivityLoaded {
+            session_id,
+            generation,
+            result,
+        } => {
+            if !chat.app.accepts_child_result(true, session_id, generation) {
+                return;
+            }
+            if chat.attached_session_id() == Some(session_id) {
+                chat.app.apply_child_activity(result);
+            } else if let Ok(page) = result
+                && chat.app.expanded_monitor_sessions().contains(&session_id)
+            {
+                chat.app.apply_monitor_activity(session_id, page);
+            }
+        }
         TuiEffectResult::SessionOpenProgress { snapshot } => {
             apply_session_open_progress(chat, &snapshot);
         }
@@ -2588,6 +2648,17 @@ pub fn apply_effect_result(
                 }
             }
             session_flow::complete_switch_session(chat, session_id, has_older_history, *result);
+            if chat.attached_session_id() == Some(session_id) {
+                chat.replace_effect(TuiEffect::LoadChildActivity {
+                    session_id,
+                    generation: 0,
+                });
+                chat.replace_effect(TuiEffect::LoadSessionChildren {
+                    parent_id: session_id,
+                    after: None,
+                    generation: 0,
+                });
+            }
             loop_state.interactive_surface = None;
             loop_state.interactive_surface_queue.clear();
         }

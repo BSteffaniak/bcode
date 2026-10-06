@@ -60,6 +60,16 @@ pub enum CliError {
     StartupReportUnavailable,
     #[error("client error: {0}")]
     Client(#[from] ClientError),
+    /// Child creation may have committed; retain this identity and retry the same request.
+    #[error(
+        "child creation failed (child_id={child_id}, parent_id={parent_id}); retry the identical request with --parent {parent_id} --child-id {child_id}: {source}"
+    )]
+    ChildSessionCreate {
+        child_id: SessionId,
+        parent_id: SessionId,
+        #[source]
+        source: ClientError,
+    },
     /// A normalized workflow application failure, independent of its transport.
     #[error("workflow operation failed ({code}): {message}")]
     WorkflowApplication { code: String, message: String },
@@ -176,32 +186,41 @@ impl CliError {
             | Self::InvalidExchangeResolution
             | Self::Json(_) => 2,
             Self::Client(ClientError::Server { code, .. })
-                if matches!(
-                    code.as_str(),
-                    "invalid_exchange_resolution"
-                        | "invalid_invocation_input_producer"
-                        | "invalid_invocation_input_schema"
-                        | "invalid_invocation_input_id"
-                        | "invocation_input_too_large"
-                ) =>
+            | Self::ChildSessionCreate {
+                source: ClientError::Server { code, .. },
+                ..
+            } if matches!(
+                code.as_str(),
+                "invalid_exchange_resolution"
+                    | "invalid_invocation_input_producer"
+                    | "invalid_invocation_input_schema"
+                    | "invalid_invocation_input_id"
+                    | "invocation_input_too_large"
+            ) =>
             {
                 2
             }
             Self::Client(ClientError::Server { code, .. })
-                if matches!(
-                    code.as_str(),
-                    "authorization_denied" | "workflow_operation_unauthorized"
-                ) =>
+            | Self::ChildSessionCreate {
+                source: ClientError::Server { code, .. },
+                ..
+            } if matches!(
+                code.as_str(),
+                "authorization_denied" | "workflow_operation_unauthorized"
+            ) =>
             {
                 3
             }
             Self::TurnRejected(bcode_session_models::TurnRejectionReason::ExecutionPolicy) => 3,
             Self::TurnRejected(bcode_session_models::TurnRejectionReason::SessionUnavailable) => 1,
             Self::Client(ClientError::Server { code, .. })
-                if matches!(
-                    code.as_str(),
-                    "cancelled" | "workflow_computation_cancelled" | "worktree_create_cancelled"
-                ) =>
+            | Self::ChildSessionCreate {
+                source: ClientError::Server { code, .. },
+                ..
+            } if matches!(
+                code.as_str(),
+                "cancelled" | "workflow_computation_cancelled" | "worktree_create_cancelled"
+            ) =>
             {
                 4
             }
@@ -212,6 +231,7 @@ impl CliError {
             Self::StartupReportUnavailable => 1,
             Self::Signal(_) => 1,
             Self::Client(_)
+            | Self::ChildSessionCreate { .. }
             | Self::DaemonLifecycle(_)
             | Self::DaemonStart(_)
             | Self::Config(_)
@@ -5315,6 +5335,12 @@ enum SessionCommand {
         /// Create the session in this working directory instead of the current directory.
         #[arg(long)]
         cwd: Option<PathBuf>,
+        /// Create an ordinary child of this session with fresh context.
+        #[arg(long)]
+        parent: Option<SessionId>,
+        /// Retained child identity for retry-safe creation; requires --parent.
+        #[arg(long, requires = "parent")]
+        child_id: Option<SessionId>,
         /// Print the created session summary as JSON.
         #[arg(long)]
         json: bool,
@@ -5327,6 +5353,29 @@ enum SessionCommand {
         #[arg(long, requires = "json")]
         with_status: bool,
         /// Print the session summaries as JSON.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Observe own activity, optionally including one bounded direct-child page.
+    Activity {
+        session_id: SessionId,
+        /// Include direct children; expand child IDs separately for deeper descendants.
+        #[arg(long)]
+        children: bool,
+        #[arg(long, requires = "children")]
+        after: Option<SessionId>,
+        #[arg(long, default_value_t = 50)]
+        limit: usize,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Discover one bounded page of direct children. Expand a child ID to traverse deeper.
+    Children {
+        parent_id: SessionId,
+        #[arg(long)]
+        after: Option<SessionId>,
+        #[arg(long, default_value_t = 50)]
+        limit: usize,
         #[arg(long)]
         json: bool,
     },
@@ -7458,8 +7507,34 @@ async fn dispatch_session_command(command: Box<SessionCommand>) -> Result<(), Cl
         SessionCommand::DescribeSkill { skill_id, json } => {
             Box::pin(describe_skill(skill_id, json)).await?;
         }
-        SessionCommand::Create { name, cwd, json } => {
-            Box::pin(create_session(name, cwd, json)).await?;
+        SessionCommand::Create {
+            name,
+            cwd,
+            parent,
+            child_id,
+            json,
+        } => {
+            Box::pin(create_session(name, cwd, parent, child_id, json)).await?;
+        }
+        SessionCommand::Activity {
+            session_id,
+            children,
+            after,
+            limit,
+            json,
+        } => {
+            Box::pin(show_session_activity(
+                session_id, children, after, limit, json,
+            ))
+            .await?;
+        }
+        SessionCommand::Children {
+            parent_id,
+            after,
+            limit,
+            json,
+        } => {
+            Box::pin(show_session_children(parent_id, after, limit, json)).await?;
         }
         SessionCommand::List {
             cwd,
@@ -7467,14 +7542,7 @@ async fn dispatch_session_command(command: Box<SessionCommand>) -> Result<(), Cl
             json,
         } => Box::pin(list_sessions(cwd, with_status, json)).await?,
         SessionCommand::Refresh { cwd, sources, json } => {
-            let directory = cwd.map_or_else(std::env::current_dir, std::path::absolute)?;
-            let catalog = BcodeClient::default_endpoint()
-                .refresh_session_catalog_in_working_directory(
-                    directory,
-                    (!sources.is_empty()).then_some(sources),
-                )
-                .await?;
-            write_catalog_refresh(&mut std::io::stdout().lock(), &catalog, json)?;
+            Box::pin(refresh_session_catalog(cwd, sources, json)).await?;
         }
         SessionCommand::Rename {
             session_id,
@@ -14769,12 +14837,128 @@ async fn session_read_client(session_id: SessionId) -> Result<BcodeClient, CliEr
     }
 }
 
+async fn refresh_session_catalog(
+    cwd: Option<PathBuf>,
+    sources: Vec<String>,
+    json: bool,
+) -> Result<(), CliError> {
+    let directory = cwd.map_or_else(std::env::current_dir, std::path::absolute)?;
+    let catalog = BcodeClient::default_endpoint()
+        .refresh_session_catalog_in_working_directory(
+            directory,
+            (!sources.is_empty()).then_some(sources),
+        )
+        .await?;
+    write_catalog_refresh(&mut std::io::stdout().lock(), &catalog, json)
+}
+
+async fn show_session_activity(
+    session_id: SessionId,
+    children: bool,
+    after: Option<SessionId>,
+    limit: usize,
+    json: bool,
+) -> Result<(), CliError> {
+    let page = BcodeClient::default_endpoint()
+        .session_activity(
+            session_id,
+            bcode_session_models::SessionActivityQuery {
+                scope: if children {
+                    bcode_session_models::SessionActivityScope::DirectChildren
+                } else {
+                    bcode_session_models::SessionActivityScope::Own
+                },
+                after,
+                limit,
+            },
+        )
+        .await?;
+    let mut output = std::io::stdout().lock();
+    if json {
+        return write_json_stream_record(&mut output, &page);
+    }
+    for observation in std::iter::once(&page.own).chain(&page.descendants) {
+        writeln!(
+            output,
+            "{}\t{}",
+            observation.session_id,
+            serde_json::to_string(&observation.states)?
+        )?;
+    }
+    writeln!(
+        output,
+        "coverage={} next_after={} observed_at_ms={}",
+        serde_json::to_string(&page.coverage)?,
+        page.next_after
+            .map_or_else(|| "none".to_owned(), |id| id.to_string()),
+        page.observed_at_ms
+    )?;
+    for issue in &page.issues {
+        writeln!(output, "issue: {issue}")?;
+    }
+    output.flush()?;
+    Ok(())
+}
+
+async fn show_session_children(
+    parent_id: SessionId,
+    after: Option<SessionId>,
+    limit: usize,
+    json: bool,
+) -> Result<(), CliError> {
+    let page = BcodeClient::default_endpoint()
+        .query_child_sessions(bcode_session_models::SessionChildQuery {
+            parent_id,
+            after,
+            limit,
+        })
+        .await?;
+    let mut output = std::io::stdout().lock();
+    if json {
+        return write_json_stream_record(&mut output, &page);
+    }
+    write_session_list(&mut output, &page.children, false)?;
+    writeln!(
+        output,
+        "complete={} next_after={}",
+        page.complete,
+        page.next_after
+            .map_or_else(|| "none".to_owned(), |id| id.to_string())
+    )?;
+    for issue in &page.issues {
+        writeln!(output, "issue: {issue}")?;
+    }
+    output.flush()?;
+    Ok(())
+}
+
 async fn create_session(
     name: Option<String>,
     cwd: Option<PathBuf>,
+    parent: Option<SessionId>,
+    child_id: Option<SessionId>,
     json: bool,
 ) -> Result<(), CliError> {
     let client = BcodeClient::default_endpoint();
+    if let Some(parent_id) = parent {
+        let child_id = child_id.unwrap_or_default();
+        // Print the retry identity before admission, including when the response is lost.
+        eprintln!("child_id={child_id}");
+        let session = client
+            .create_child_session(bcode_session_models::SessionChildCreateRequest {
+                child_id,
+                parent_id,
+                name,
+                working_directory: std::path::absolute(cwd.unwrap_or(std::env::current_dir()?))?,
+            })
+            .await
+            .map_err(|source| CliError::ChildSessionCreate {
+                child_id,
+                parent_id,
+                source,
+            })?;
+        return write_created_session(&mut std::io::stdout().lock(), &session, json);
+    }
     let session = match cwd {
         Some(directory) => {
             client
@@ -17489,6 +17673,7 @@ const fn session_event_kind_name(kind: &SessionEventKind) -> &'static str {
         SessionEventKind::ToolExchangeResolved { .. } => "tool_exchange_resolved",
         SessionEventKind::WorkingDirectoryChanged { .. } => "working_directory_changed",
         SessionEventKind::SessionImported { .. } => "session_imported",
+        SessionEventKind::ChildSessionCreated { .. } => "child_session_created",
         SessionEventKind::SessionDerived { .. } => "session_derived",
         SessionEventKind::ExecutionSessionCreated { .. } => "execution_session_created",
         SessionEventKind::AssistantReasoningActivity { .. } => "assistant_reasoning_activity",
@@ -18780,6 +18965,12 @@ fn print_non_trace_session_event(event: &SessionEvent) {
             event.sequence,
             message.as_deref().unwrap_or("")
         ),
+        SessionEventKind::ChildSessionCreated { request } => {
+            println!(
+                "#{} child session: {} (parent: {})",
+                event.sequence, request.child_id, request.parent_id
+            );
+        }
         SessionEventKind::SessionDerived {
             source_session_id,
             source_generation,
@@ -24255,7 +24446,7 @@ mod session_configuration_cli_tests {
         ])
         .unwrap();
         assert!(matches!(parsed.command, Some(Commands::Session {
-            command: SessionCommand::Create { name: Some(name), cwd: Some(cwd), json: true }
+            command: SessionCommand::Create { name: Some(name), cwd: Some(cwd), parent: None, child_id: None, json: true }
         }) if name == "named" && cwd == std::path::Path::new("workspace")));
         let session: bcode_session_models::SessionSummary =
             serde_json::from_value(serde_json::json!({
@@ -24291,6 +24482,101 @@ mod session_configuration_cli_tests {
                 .is_err()
             );
         }
+    }
+
+    #[test]
+    fn session_child_creation_retains_retry_identity_and_requires_parent() {
+        let parent = bcode_session_models::SessionId::new();
+        let child = bcode_session_models::SessionId::new();
+        let parent_text = parent.to_string();
+        let child_text = child.to_string();
+        let parsed = Cli::try_parse_from([
+            "bcode",
+            "session",
+            "create",
+            "--parent",
+            &parent_text,
+            "--child-id",
+            &child_text,
+            "--json",
+        ])
+        .unwrap();
+        assert!(matches!(parsed.command, Some(Commands::Session {
+            command: SessionCommand::Create { parent: Some(actual_parent), child_id: Some(actual_child), json: true, .. }
+        }) if actual_parent == parent && actual_child == child));
+        assert!(
+            Cli::try_parse_from(["bcode", "session", "create", "--child-id", &child_text,])
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn child_creation_exit_code_preserves_underlying_client_category() {
+        for code in [
+            "invalid_exchange_resolution",
+            "authorization_denied",
+            "cancelled",
+            "session_create_failed",
+        ] {
+            let source = || bcode_client::ClientError::Server {
+                code: code.into(),
+                message: "failure".into(),
+            };
+            let expected = CliError::Client(source()).exit_code();
+            let wrapped = CliError::ChildSessionCreate {
+                child_id: bcode_session_models::SessionId::new(),
+                parent_id: bcode_session_models::SessionId::new(),
+                source: source(),
+            };
+            assert_eq!(wrapped.exit_code(), expected);
+        }
+        let wrapped = CliError::ChildSessionCreate {
+            child_id: bcode_session_models::SessionId::new(),
+            parent_id: bcode_session_models::SessionId::new(),
+            source: bcode_client::ClientError::UnexpectedResponse,
+        };
+        assert_eq!(
+            wrapped.exit_code(),
+            CliError::Client(bcode_client::ClientError::UnexpectedResponse).exit_code()
+        );
+    }
+
+    #[test]
+    fn child_creation_error_retains_retry_identity() {
+        let child_id = bcode_session_models::SessionId::new();
+        let parent_id = bcode_session_models::SessionId::new();
+        let error = CliError::ChildSessionCreate {
+            child_id,
+            parent_id,
+            source: bcode_client::ClientError::UnexpectedResponse,
+        };
+        let rendered = error.to_string();
+        assert!(rendered.contains(&format!("--child-id {child_id}")));
+        assert!(rendered.contains(&format!("--parent {parent_id}")));
+        assert!(rendered.contains("identical request"));
+    }
+
+    #[test]
+    fn session_children_preserves_bounded_page_arguments() {
+        let parent = bcode_session_models::SessionId::new();
+        let after = bcode_session_models::SessionId::new();
+        let parent_text = parent.to_string();
+        let after_text = after.to_string();
+        let parsed = Cli::try_parse_from([
+            "bcode",
+            "session",
+            "children",
+            &parent_text,
+            "--after",
+            &after_text,
+            "--limit",
+            "7",
+            "--json",
+        ])
+        .unwrap();
+        assert!(matches!(parsed.command, Some(Commands::Session {
+            command: SessionCommand::Children { parent_id, after: Some(actual_after), limit: 7, json: true }
+        }) if parent_id == parent && actual_after == after));
     }
 
     #[test]

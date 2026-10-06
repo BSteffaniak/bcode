@@ -545,6 +545,30 @@ pub fn render_prepared_damage(
     }
 
     let theme = TuiTheme::for_app(app);
+    for (index, text) in app.child_panel_rows().into_iter().enumerate() {
+        let y = layout
+            .header
+            .bottom()
+            .saturating_add(u16::try_from(index).unwrap_or(u16::MAX));
+        if y >= layout.body.y {
+            break;
+        }
+        let area = Rect::new(layout.area.x, y, layout.area.width, 1);
+        if intersects(area) {
+            if let Some(session_id) = app.monitor_row_session(index) {
+                frame.push_hit(
+                    HitRegion::new(format!("child-monitor:{session_id}"), area)
+                        .role(HitRole::Action)
+                        .layer(2),
+                );
+            }
+            frame.fill(LocalRect::terminal(area), " ", app.presented_theme().canvas);
+            frame.write_line(
+                LocalRect::terminal(area),
+                &Line::from_spans(vec![Span::styled(text, theme.info)]),
+            );
+        }
+    }
     if intersects(layout.header) {
         frame.fill(
             LocalRect::terminal(layout.header),
@@ -669,6 +693,15 @@ fn frame_layout(app: &BmuxApp, area: Rect) -> Option<FrameLayout> {
     let composer = composer_area(area, composer_height);
     let body_height = composer.y.saturating_sub(area.y.saturating_add(2));
     let body = Rect::new(area.x, area.y.saturating_add(1), area.width, body_height);
+    let panel_height = u16::try_from(app.child_panel_rows().len())
+        .unwrap_or(u16::MAX)
+        .min(body.height.saturating_sub(1));
+    let body = Rect::new(
+        body.x,
+        body.y.saturating_add(panel_height),
+        body.width,
+        body.height.saturating_sub(panel_height),
+    );
     let latest_bar_height = u16::from(app.newer_transcript_content_below());
     let body = Rect::new(
         body.x,
@@ -5296,6 +5329,10 @@ fn statusline_spans(app: &BmuxApp, width: usize, theme: TuiTheme) -> Vec<Span> {
         line = line.optional(token_segment, muted, priority, false);
     }
 
+    let child_activity = app.child_activity_text();
+    if !child_activity.is_empty() {
+        line = line.optional(child_activity, theme.info, 20, true);
+    }
     let persistent_activity =
         bcode_session_view::presentation::persistent_activity_text(app.session_view_snapshot());
     if let Some(text) = &persistent_activity {

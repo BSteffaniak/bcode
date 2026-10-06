@@ -2314,6 +2314,88 @@ impl BcodeClient {
         }
     }
 
+    /// Create an ordinary child with fresh context. Retain `request.child_id` for retries.
+    ///
+    /// An identical retry reconciles the original creation; conflicting identity reuse fails.
+    /// Parentage does not grant execution control or cancellation authority.
+    ///
+    /// # Errors
+    /// Returns an error when the daemon is unavailable or rejects the creation.
+    pub async fn create_child_session(
+        &self,
+        mut request: bcode_session_models::SessionChildCreateRequest,
+    ) -> Result<SessionSummary, ClientError> {
+        request.working_directory = resolve_path_from(
+            Some(request.working_directory),
+            &current_working_directory(),
+        );
+        match self
+            .send_request(Request::CreateChildSession { request })
+            .await?
+        {
+            ResponsePayload::SessionCreated { session } => Ok(session),
+            _ => Err(ClientError::UnexpectedResponse),
+        }
+    }
+
+    /// Resolve exact canonical metadata and parent navigation without attaching.
+    ///
+    /// # Errors
+    /// Returns an error for unavailable, missing, or unverifiable metadata.
+    pub async fn session_summary(
+        &self,
+        session_id: SessionId,
+    ) -> Result<SessionSummary, ClientError> {
+        match self
+            .send_request(Request::SessionSummary { session_id })
+            .await?
+        {
+            ResponsePayload::SessionSummary { session } => Ok(session),
+            _ => Err(ClientError::UnexpectedResponse),
+        }
+    }
+
+    /// Read current activity without attaching, loading a runtime, or granting control.
+    ///
+    /// Expand descendant pages through `query_child_sessions`; no page claims subtree totals.
+    /// Unknown/degraded observations must not be interpreted as idle or completion.
+    ///
+    /// # Errors
+    /// Returns an error when the daemon is unavailable or rejects the bounded query.
+    pub async fn session_activity(
+        &self,
+        session_id: SessionId,
+        query: bcode_session_models::SessionActivityQuery,
+    ) -> Result<bcode_session_models::SessionActivityPage, ClientError> {
+        match self
+            .send_request(Request::SessionActivity { session_id, query })
+            .await?
+        {
+            ResponsePayload::SessionActivity { page } => Ok(page),
+            _ => Err(ClientError::UnexpectedResponse),
+        }
+    }
+
+    /// Discover a bounded page of direct children without opening or controlling them.
+    ///
+    /// Preserve `page.complete` and `page.next_after`: an incomplete result is not an
+    /// empty or complete subtree. Traverse deeper levels through separate bounded calls.
+    ///
+    /// # Errors
+    /// Returns an error when the daemon is unavailable or rejects the query.
+    pub async fn query_child_sessions(
+        &self,
+        query: bcode_session_models::SessionChildQuery,
+    ) -> Result<bcode_session_models::SessionChildPage, ClientError> {
+        match self
+            .send_request(Request::SessionChildren { query })
+            .await?
+        {
+            ResponsePayload::SessionChildren { page } => Ok(page),
+            _ => Err(ClientError::UnexpectedResponse),
+        }
+    }
+
     /// List sessions.
     ///
     /// # Errors

@@ -3926,6 +3926,7 @@ pub(crate) mod tests {
     fn projected_records_use_canonical_summary_scope_without_source_persistence_details() {
         let session_id = SessionId::new();
         let summary = bcode_session_models::SessionSummary {
+            parent_id: None,
             id: session_id,
             name: None,
             explicit_name: None,
@@ -3996,6 +3997,7 @@ pub(crate) mod tests {
     fn canonical_generation_fingerprint_binds_identity_import_and_fork_but_not_mutable_metadata() {
         let session_id = SessionId::new();
         let mut summary = bcode_session_models::SessionSummary {
+            parent_id: None,
             id: session_id,
             name: None,
             explicit_name: None,
@@ -4242,6 +4244,7 @@ pub(crate) mod tests {
     #[test]
     fn deadline_continuation_resumes_after_last_complete_session() {
         let first = bcode_session_models::SessionSummary {
+            parent_id: None,
             id: SessionId::new(),
             name: Some("first".to_owned()),
             explicit_name: None,
@@ -4256,6 +4259,7 @@ pub(crate) mod tests {
             location: None,
         };
         let second = bcode_session_models::SessionSummary {
+            parent_id: None,
             id: SessionId::new(),
             name: Some("second".to_owned()),
             explicit_name: None,

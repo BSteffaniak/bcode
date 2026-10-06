@@ -95,6 +95,21 @@ pub fn global_migrations() -> CurrentMigrationSource {
             .primary_key_columns(["scope_kind", "scope_key"]),
         drop_table("composer_drafts").if_exists(true),
     );
+    add_migration(
+        &mut source,
+        "004_global_session_parent_column",
+        alter_table("sessions").add_column("parent_id".into(), DataType::Text, true, None),
+        alter_table("sessions").drop_column("parent_id".into()),
+    );
+    add_migration(
+        &mut source,
+        "005_global_session_parent_index",
+        create_index("idx_sessions_parent_id")
+            .if_not_exists(true)
+            .table("sessions")
+            .columns(vec!["parent_id", "session_id"]),
+        drop_index("idx_sessions_parent_id", "sessions"),
+    );
     source
 }
 
@@ -137,6 +152,12 @@ pub fn session_migrations() -> CurrentMigrationSource {
             .table("submissions")
             .columns(vec!["target_turn_id", "pending", "accepted_seq"]),
         drop_index("idx_submissions_target_pending", "submissions"),
+    );
+    add_migration(
+        &mut source,
+        "046_session_state_parent_column",
+        alter_table("session_state").add_column("parent_id".into(), DataType::Text, true, None),
+        alter_table("session_state").drop_column("parent_id".into()),
     );
     source
 }

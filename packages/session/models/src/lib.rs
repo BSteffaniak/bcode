@@ -11,7 +11,7 @@
 //! required fallback for every other surface.
 
 /// Durable session-storage writer epoch shared by runtime and daemon compatibility handshakes.
-pub const CURRENT_SESSION_STORAGE_WRITER_EPOCH: u32 = 12;
+pub const CURRENT_SESSION_STORAGE_WRITER_EPOCH: u32 = 13;
 
 /// Identifies retained turn observations in the existing system-message text contract.
 ///
@@ -38,6 +38,9 @@ use uuid::Uuid;
 
 mod submission;
 pub use submission::*;
+
+mod child;
+pub use child::*;
 
 mod activity;
 pub use activity::{
@@ -617,7 +620,7 @@ fn tool_invocation_projection_mut<'a>(
 }
 
 /// Current persisted session event schema version.
-pub const CURRENT_SESSION_EVENT_SCHEMA_VERSION: u16 = 48;
+pub const CURRENT_SESSION_EVENT_SCHEMA_VERSION: u16 = 49;
 
 /// Stable persisted event kinds emitted by the current session schema.
 ///
@@ -660,6 +663,7 @@ pub const CURRENT_PERSISTED_SESSION_EVENT_KINDS: &[&str] = &[
     "runtime_work_finished",
     "runtime_work_progress",
     "runtime_work_started",
+    "child_session_created",
     "session_created",
     "session_derived",
     "session_imported",
@@ -745,6 +749,7 @@ pub const fn persisted_session_event_kind_name(kind: &SessionEventKind) -> &'sta
         SessionEventKind::WorkingDirectoryChanged { .. } => "working_directory_changed",
         SessionEventKind::SessionImported { .. } => "session_imported",
         SessionEventKind::SessionDerived { .. } => "session_derived",
+        SessionEventKind::ChildSessionCreated { .. } => "child_session_created",
         SessionEventKind::ExecutionSessionCreated { .. } => "execution_session_created",
         SessionEventKind::AssistantReasoningActivity { .. } => "assistant_reasoning_activity",
         SessionEventKind::RalphLifecycle { .. } => "ralph_lifecycle",
@@ -1168,6 +1173,9 @@ pub struct SessionLocationSummary {
 /// Session summary used by list/select flows.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SessionSummary {
+    /// Immutable direct parent; independent of workflow provenance and derivation.
+    #[serde(default)]
+    pub parent_id: Option<SessionId>,
     pub id: SessionId,
     pub name: Option<String>,
     #[serde(default)]
@@ -4096,6 +4104,11 @@ pub enum SessionEventKind {
     SubmissionContextObserved {
         submission_id: SubmissionId,
         issue: SubmissionContextIssue,
+    },
+    /// Immutable fresh-child relationship and original request for retry reconciliation.
+    ChildSessionCreated {
+        /// Complete immutable creation request; child identity matches the event envelope.
+        request: Box<SessionChildCreateRequest>,
     },
 }
 

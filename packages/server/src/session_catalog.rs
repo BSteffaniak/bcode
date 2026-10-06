@@ -1225,6 +1225,7 @@ fn importable_to_summary(
             .unwrap_or_else(|| summary.external_session_id.clone()),
     );
     SessionSummary {
+        parent_id: None,
         id,
         name: name.clone(),
         explicit_name: name,
@@ -2349,6 +2350,7 @@ mod tests {
 
     fn summary(id: SessionId, location: Option<SessionLocationSummary>) -> SessionSummary {
         SessionSummary {
+            parent_id: None,
             id,
             name: None,
             explicit_name: None,

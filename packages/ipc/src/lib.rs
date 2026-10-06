@@ -111,7 +111,9 @@ const MAX_CHUNK_DATA_SIZE: usize = MAX_FRAME_PAYLOAD_SIZE / 2;
 /// Version 40 adds bounded native usage catalog discovery.
 /// Version 41 combines session usage and publication acceptance with distinct positional tags.
 /// Version 42 adds revision-pinned scheduling pages; older positional layouts reject.
-pub const CURRENT_PROTOCOL_VERSION: u16 = 42;
+/// Version 43 adds ordinary child creation, exact non-owning metadata, and bounded activity;
+/// changed positional layouts and parent-bearing summaries reject older peers.
+pub const CURRENT_PROTOCOL_VERSION: u16 = 43;
 
 /// Durable session-storage writer epoch expected by this IPC build.
 pub const CURRENT_SESSION_STORAGE_WRITER_EPOCH: u32 =
@@ -1311,6 +1313,23 @@ pub enum Request {
     /// Inspect configured delegation prerequisites without granting execution authority.
     WorkflowDelegationPreflight {
         plugin_id: String,
+    },
+    /// Create an ordinary child with caller-retained retry identity.
+    CreateChildSession {
+        request: bcode_session_models::SessionChildCreateRequest,
+    },
+    /// Exact non-owning metadata and immutable parent navigation.
+    SessionSummary {
+        session_id: SessionId,
+    },
+    /// Bounded non-owning renderer-neutral activity observation.
+    SessionActivity {
+        session_id: SessionId,
+        query: bcode_session_models::SessionActivityQuery,
+    },
+    /// Bounded direct-child discovery.
+    SessionChildren {
+        query: bcode_session_models::SessionChildQuery,
     },
 }
 
@@ -2528,6 +2547,18 @@ pub enum ResponsePayload {
     WorkflowDelegationPreflight {
         result: bcode_workflow::WorkflowDelegationPreflight,
     },
+    /// Exact canonical metadata, including immutable parent navigation.
+    SessionSummary {
+        session: SessionSummary,
+    },
+    /// Renderer-neutral non-owning activity observation.
+    SessionActivity {
+        page: bcode_session_models::SessionActivityPage,
+    },
+    /// Bounded discovery; incomplete pages do not imply a complete tree.
+    SessionChildren {
+        page: bcode_session_models::SessionChildPage,
+    },
 }
 
 /// Stable reasons runtime ownership cannot currently be released.
@@ -3450,6 +3481,9 @@ fn socket_path_with_digest(base: &Path, digest: &str) -> Option<PathBuf> {
     let path = base.join(format!("bcode-{digest}.sock"));
     (path.as_os_str().as_bytes().len() <= MAX_PORTABLE_UNIX_SOCKET_PATH_BYTES).then_some(path)
 }
+
+#[cfg(test)]
+mod child_wire_tests;
 
 #[cfg(test)]
 mod tests {
@@ -5234,6 +5268,7 @@ mod tests {
         let response = Response::Ok(ResponsePayload::Attached {
             session_id,
             session: SessionSummary {
+                parent_id: None,
                 id: session_id,
                 name: None,
                 explicit_name: None,
@@ -5275,6 +5310,7 @@ mod tests {
             .parse()
             .expect("session id should parse");
         let summary = SessionSummary {
+            parent_id: None,
             id: session_id,
             name: Some("Canonical title".to_owned()),
             explicit_name: Some("Canonical title".to_owned()),
@@ -5699,6 +5735,7 @@ mod tests {
             .parse()
             .expect("session id should parse");
         SessionSummary {
+            parent_id: None,
             id: session_id,
             name: Some(name.to_owned()),
             explicit_name: Some(name.to_owned()),

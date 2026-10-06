@@ -427,6 +427,7 @@ mod tests {
 
         let mut summary = bcode_session_models::SessionSummary {
             id: session_id,
+            parent_id: None,
             name: Some("Canonical title".to_owned()),
             explicit_name: None,
             derived_title: None,

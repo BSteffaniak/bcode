@@ -56,6 +56,7 @@ pub fn session_summary_from_catalog_row(
     let working_directory = std::path::PathBuf::from(required_string(row, "working_directory")?);
     let name = optional_string(row, "title");
     Ok(SessionSummary {
+        parent_id: None,
         id: session_id,
         name: name.clone(),
         explicit_name: name,

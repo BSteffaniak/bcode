@@ -10,6 +10,8 @@
 //! captured before that request was sent rather than inferred from later session history.
 
 pub(crate) mod artifact_operations;
+#[cfg(test)]
+mod child_session_ipc_tests;
 mod context_accounting;
 pub(crate) mod context_compaction;
 mod image_input;
@@ -23,6 +25,7 @@ mod request_routing;
 mod runtime_work;
 mod runtime_work_operations;
 mod server_operations;
+mod session_activity;
 mod session_bulk_migration;
 mod session_compression;
 mod session_operations;
@@ -396,6 +399,8 @@ pub struct ServerState {
     active_skills: Mutex<BTreeMap<SessionId, BTreeSet<SkillId>>>,
     turn_skills: Mutex<BTreeMap<(SessionId, u64), SkillTurnInvocation>>,
     session_runtimes: Mutex<BTreeMap<SessionId, SessionRuntimeHandle>>,
+    // Disposable bounded observations of successfully committed terminal work.
+    activity_observations: Mutex<session_activity::ActivityObservations>,
     turn_admission_locks: Mutex<BTreeMap<SessionId, Arc<Mutex<()>>>>,
     workflow_prompt_admissions: StdMutex<BTreeMap<String, std::sync::Weak<Mutex<()>>>>,
     workflow_store: Arc<StdMutex<bcode_workflow_store::WorkflowStore>>,
@@ -2406,6 +2411,7 @@ impl ServerState {
             active_skills: Mutex::default(),
             turn_skills: Mutex::default(),
             session_runtimes: Mutex::default(),
+            activity_observations: Mutex::default(),
             turn_admission_locks: Mutex::default(),
             workflow_prompt_admissions: StdMutex::default(),
             workflow_store: StdMutex::new(workflow_store).into(),
@@ -6148,6 +6154,10 @@ const fn request_kind(request: &Request) -> &'static str {
         Request::ServerStop { .. } => "server_stop",
         Request::ReleaseSessionOwnership { .. } => "release_session_ownership",
         Request::CreateSession { .. } => "create_session",
+        Request::CreateChildSession { .. } => "create_child_session",
+        Request::SessionSummary { .. } => "session_summary",
+        Request::SessionActivity { .. } => "session_activity",
+        Request::SessionChildren { .. } => "session_children",
         Request::ListSessions { .. } => "list_sessions",
         Request::SessionBulkMigrationStart { .. } => "session_bulk_migration_start",
         Request::SessionBulkMigrationStatus { .. } => "session_bulk_migration_status",
@@ -6541,6 +6551,27 @@ async fn handle_request_inner(
             name,
             working_directory,
         } => handle_create_session(request_id, state, writer, name, working_directory).await,
+        SessionLifecycleRequest::CreateChildSession { request } => {
+            Box::pin(handle_create_child_session(
+                request_id, state, writer, request,
+            ))
+            .await
+        }
+        SessionLifecycleRequest::SessionSummary { session_id } => {
+            Box::pin(handle_session_summary(
+                request_id, state, writer, session_id,
+            ))
+            .await
+        }
+        SessionLifecycleRequest::SessionActivity { session_id, query } => {
+            Box::pin(handle_session_activity(
+                request_id, state, writer, session_id, query,
+            ))
+            .await
+        }
+        SessionLifecycleRequest::SessionChildren { query } => {
+            Box::pin(handle_session_children(request_id, state, writer, query)).await
+        }
         SessionLifecycleRequest::ListSessions { working_directory } => {
             handle_list_sessions(request_id, state, writer, &working_directory).await
         }
@@ -9550,6 +9581,78 @@ async fn handle_create_session(
         Response::Ok(ResponsePayload::SessionCreated { session }),
     )
     .await
+}
+
+async fn handle_session_summary(
+    request_id: u64,
+    state: &ServerState,
+    writer: &SharedWriter,
+    session_id: SessionId,
+) -> Result<(), ServerError> {
+    let response = match state.sessions.session_summary_non_owning(session_id).await {
+        Ok(session) => Response::Ok(ResponsePayload::SessionSummary { session }),
+        Err(bcode_session::SessionError::NotFound(_)) => {
+            Response::Err(ErrorResponse::new("session_not_found", "session not found"))
+        }
+        Err(_) => Response::Err(ErrorResponse::new(
+            "session_summary_unavailable",
+            "session metadata unavailable; inspect session health",
+        )),
+    };
+    send_response(writer, request_id, response).await
+}
+
+async fn handle_create_child_session(
+    request_id: u64,
+    state: &ServerState,
+    writer: &SharedWriter,
+    request: bcode_session_models::SessionChildCreateRequest,
+) -> Result<(), ServerError> {
+    let response = match session_operations::create_child(state, request).await {
+        Ok(session) => Response::Ok(ResponsePayload::SessionCreated { session }),
+        Err(error) => Response::Err(ErrorResponse::new(error.code(), error.message())),
+    };
+    send_response(writer, request_id, response).await
+}
+
+async fn handle_session_children(
+    request_id: u64,
+    state: &ServerState,
+    writer: &SharedWriter,
+    query: bcode_session_models::SessionChildQuery,
+) -> Result<(), ServerError> {
+    let response = match state.sessions.query_child_sessions(query).await {
+        Ok(page) => Response::Ok(ResponsePayload::SessionChildren { page }),
+        Err(bcode_session::SessionError::NotFound(_)) => Response::Err(ErrorResponse::new(
+            "session_not_found",
+            "parent session not found",
+        )),
+        Err(_) => Response::Err(ErrorResponse::new(
+            "session_children_unavailable",
+            "child discovery unavailable; verify the query budget and session health",
+        )),
+    };
+    send_response(writer, request_id, response).await
+}
+
+async fn handle_session_activity(
+    request_id: u64,
+    state: &ServerState,
+    writer: &SharedWriter,
+    session_id: SessionId,
+    query: bcode_session_models::SessionActivityQuery,
+) -> Result<(), ServerError> {
+    let response = match session_operations::activity(state, session_id, query).await {
+        Ok(page) => Response::Ok(ResponsePayload::SessionActivity { page }),
+        Err(bcode_session::SessionError::NotFound(_)) => {
+            Response::Err(ErrorResponse::new("session_not_found", "session not found"))
+        }
+        Err(_) => Response::Err(ErrorResponse::new(
+            "session_activity_unavailable",
+            "activity unavailable; verify the query budget and session health",
+        )),
+    };
+    send_response(writer, request_id, response).await
 }
 
 async fn handle_list_sessions(
@@ -25440,7 +25543,13 @@ async fn prepare_static_model_turn_context(
         .filter(|context| !context.is_empty())
         .collect::<Vec<_>>()
         .join("\n\n");
-    let mut system_messages = Vec::new();
+    // This session is already admitted for execution. Resolve identity from its canonical
+    // summary, never from client context, a display name, or a parent-supplied prompt.
+    let session_summary = state.sessions.session_summary(session_id).await?;
+    let mut system_messages = vec![session_identity_context(
+        session_id,
+        session_summary.parent_id,
+    )];
     let mut recovery_context = None;
     if config.system_prompt.sections.config_selection {
         system_messages.push(ModelMessage {
@@ -27200,6 +27309,18 @@ fn build_dynamic_system_context(
         ));
     }
     context.join("\n\n")
+}
+
+fn session_identity_context(session_id: SessionId, parent_id: Option<SessionId>) -> ModelMessage {
+    let facts = serde_json::json!({ "session_id": session_id, "parent_id": parent_id });
+    ModelMessage {
+        role: MessageRole::System,
+        content: vec![ContentBlock::Text {
+            text: format!(
+                "Session context (request-only, authenticated):\n{facts}\nUse session_id as --parent when creating an ordinary child session. Parentage does not grant control or cancellation authority; idle is not completion or acceptance."
+            ),
+        }],
+    }
 }
 
 fn config_selection_context(
@@ -37791,6 +37912,7 @@ fn plugin_service_response(
 }
 
 async fn publish_session_event(state: &ServerState, event: &bcode_session_models::SessionEvent) {
+    state.activity_observations.lock().await.observe(event);
     state
         .metrics
         .record_event("session.event", 1, session_event_metric_labels(event));
@@ -37877,6 +37999,7 @@ const fn session_event_kind_name(kind: &SessionEventKind) -> &'static str {
         SessionEventKind::ToolExchangeResolved { .. } => "tool_exchange_resolved",
         SessionEventKind::WorkingDirectoryChanged { .. } => "working_directory_changed",
         SessionEventKind::SessionImported { .. } => "session_imported",
+        SessionEventKind::ChildSessionCreated { .. } => "child_session_created",
         SessionEventKind::SessionDerived { .. } => "session_derived",
         SessionEventKind::ExecutionSessionCreated { .. } => "execution_session_created",
         SessionEventKind::AssistantReasoningActivity { .. } => "assistant_reasoning_activity",
@@ -39675,6 +39798,7 @@ mod tests {
         );
 
         let missing = SessionSummary {
+            parent_id: None,
             id: SessionId::new(),
             name: Some("missing".to_owned()),
             explicit_name: None,
@@ -54896,6 +55020,23 @@ library = "test"
         let unknown: serde_json::Value =
             serde_json::from_str(unknown.lines().nth(1).unwrap()).unwrap();
         assert!(unknown["launch"].is_null());
+    }
+
+    #[test]
+    fn session_identity_context_preserves_authenticated_ids_as_request_only_message() {
+        let current = SessionId::new();
+        for parent in [None, Some(SessionId::new())] {
+            let message = session_identity_context(current, parent);
+            assert_eq!(message.role, MessageRole::System);
+            let [ContentBlock::Text { text }] = message.content.as_slice() else {
+                panic!("session context must be one structured text message");
+            };
+            let facts: serde_json::Value =
+                serde_json::from_str(text.lines().nth(1).unwrap()).unwrap();
+            assert_eq!(facts["session_id"], serde_json::to_value(current).unwrap());
+            assert_eq!(facts["parent_id"], serde_json::to_value(parent).unwrap());
+            assert!(!text.starts_with(bcode_session_models::TURN_ENVIRONMENT_SNAPSHOT_PREFIX));
+        }
     }
 
     #[test]

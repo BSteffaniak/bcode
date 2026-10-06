@@ -1,5 +1,8 @@
 //! Transport-neutral application operations for session lifecycle behavior.
 
+#[cfg(test)]
+mod child_activity_tests;
+
 #[cfg(all(test, unix))]
 mod storage_access_tests;
 
@@ -1726,6 +1729,147 @@ pub async fn rename(
         .upsert_native_session(session.clone())
         .await;
     Ok(session)
+}
+
+/// Create an ordinary child without deriving context or controlling its parent.
+///
+/// # Errors
+/// Returns invalid-directory or canonical creation errors, including conflicting retries.
+pub async fn create_child(
+    state: &ServerState,
+    request: bcode_session_models::SessionChildCreateRequest,
+) -> Result<SessionSummary, CreateSessionError> {
+    if !request.working_directory.is_absolute() {
+        return Err(CreateSessionError::WorkingDirectoryMustBeAbsolute);
+    }
+    let session = state.sessions.create_child_session(request).await?;
+    state
+        .session_catalog
+        .upsert_native_session(session.clone())
+        .await;
+    Ok(session)
+}
+
+/// Observe bounded direct-child activity without acquiring execution authority.
+///
+/// # Errors
+/// Returns canonical lookup/query errors or an invalid work budget.
+pub async fn activity(
+    state: &ServerState,
+    session_id: bcode_session_models::SessionId,
+    query: bcode_session_models::SessionActivityQuery,
+) -> Result<bcode_session_models::SessionActivityPage, bcode_session::SessionError> {
+    use bcode_session_models::{SessionActivityCoverage as Coverage, SessionActivityScope};
+    if !(1..=128).contains(&query.limit) {
+        return Err(bcode_session::SessionError::EventSerialization(
+            "activity limit must be between 1 and 128".into(),
+        ));
+    }
+    let summary = state
+        .sessions
+        .session_summary_non_owning(session_id)
+        .await?;
+    let mut issues = Vec::new();
+    let own = observe_activity(state, &summary, &mut issues).await;
+    let mut descendants = Vec::new();
+    let mut next_after = None;
+    let mut coverage = Coverage::Complete;
+    if query.scope == SessionActivityScope::DirectChildren {
+        let page = state
+            .sessions
+            .query_child_sessions(bcode_session_models::SessionChildQuery {
+                parent_id: session_id,
+                after: query.after,
+                limit: query.limit,
+            })
+            .await?;
+        next_after = page.next_after;
+        issues.extend(page.issues);
+        coverage = if !page.complete {
+            Coverage::Degraded
+        } else if next_after.is_some() {
+            Coverage::Partial
+        } else {
+            Coverage::Complete
+        };
+        if !page.complete {
+            issues.push("child discovery is incomplete or degraded".into());
+        }
+        for child in page.children {
+            descendants.push(observe_activity(state, &child, &mut issues).await);
+        }
+    }
+    if !issues.is_empty() {
+        coverage = Coverage::Degraded;
+    }
+    Ok(bcode_session_models::SessionActivityPage {
+        own,
+        descendants,
+        next_after,
+        coverage,
+        observed_at_ms: super::current_time_ms(),
+        issues,
+    })
+}
+
+async fn observe_activity(
+    state: &ServerState,
+    summary: &SessionSummary,
+    issues: &mut Vec<String>,
+) -> bcode_session_models::SessionActivity {
+    use bcode_session_models::SessionActivityState as Status;
+    let session_id = summary.id;
+    let runtime = state
+        .session_runtimes
+        .lock()
+        .await
+        .get(&session_id)
+        .cloned();
+    let mut states = Vec::new();
+    if let Some(runtime) = &runtime {
+        if runtime.phase.lock().await.has_active_work()
+            || runtime.current_turn.lock().await.is_some()
+        {
+            states.push(Status::Running);
+        }
+        if runtime
+            .queued_followups
+            .load(std::sync::atomic::Ordering::Acquire)
+            > 0
+            || runtime
+                .queued_steering
+                .load(std::sync::atomic::Ordering::Acquire)
+                > 0
+        {
+            states.push(Status::Queued);
+        }
+    }
+    if state.runtime_work.has_active_for_session(session_id).await
+        && !states.contains(&Status::Running)
+    {
+        states.push(Status::Running);
+    }
+    let (observed, complete) = state.activity_observations.lock().await.states(session_id);
+    for status in observed {
+        if !states.contains(&status)
+            && (!matches!(status, Status::Failed | Status::Interrupted) || states.is_empty())
+        {
+            states.push(status);
+        }
+    }
+    if runtime.is_none() || !complete {
+        states.push(Status::Unknown);
+        issues.push(format!(
+            "{session_id}: nonresident scheduler or incomplete lifecycle observation"
+        ));
+    } else if states.is_empty() {
+        states.push(Status::Idle);
+    }
+    bcode_session_models::SessionActivity {
+        session_id,
+        parent_id: summary.parent_id,
+        states,
+    }
 }
 
 /// Create and publish one canonical session without transport framing.
