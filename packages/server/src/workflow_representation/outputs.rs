@@ -30,12 +30,14 @@ pub async fn run_outputs(
         .filter(|value| (1..=100).contains(value))
         .ok_or_else(unavailable)?;
     let db = open(retained.path(), false)?;
-    representation::graph::completion::outputs(&db, run_id, None, limit)
-        .await
-        .map_err(|_| unavailable())?
-        .into_iter()
-        .map(inspect)
-        .collect()
+    super::backpressure::retry(|| {
+        representation::graph::completion::outputs(&db, run_id, None, limit)
+    })
+    .await
+    .map_err(|_| unavailable())?
+    .into_iter()
+    .map(inspect)
+    .collect()
 }
 
 fn inspect(

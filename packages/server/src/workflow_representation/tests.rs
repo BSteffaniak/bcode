@@ -2,6 +2,8 @@
 mod child;
 #[path = "tests/fanout.rs"]
 mod fanout;
+#[path = "tests/inspection.rs"]
+mod inspection_tests;
 #[path = "tests/old_artifact.rs"]
 mod old_artifact;
 #[path = "tests/parallel.rs"]
@@ -100,6 +102,16 @@ async fn admit_extension(state: &ServerState) {
     .clone();
     let identity = bcode_workflow::WorkflowDefinitionIdentity::for_definition("new", &definition)
         .expect("identity");
+    state
+        .workflow_store
+        .lock()
+        .unwrap()
+        .persist_definition(
+            &identity.definition_id,
+            identity.definition_version,
+            &definition,
+        )
+        .unwrap();
     let mut run = request("new");
     run.definition_id = identity.definition_id;
     run.definition_version = identity.definition_version;

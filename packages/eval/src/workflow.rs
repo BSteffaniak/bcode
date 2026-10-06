@@ -9,6 +9,37 @@ use bcode_eval_models::WorkflowEvalConfig;
 use sha2::Digest;
 use std::time::Duration;
 
+fn verify_cancellation(
+    run_id: &str,
+    invoke: &impl Fn(&[String], &str, Duration) -> Result<serde_json::Value, EvalError>,
+) -> bool {
+    let deadline = Instant::now() + Duration::from_secs(15);
+    while Instant::now() < deadline {
+        let args = [
+            "workflow".into(),
+            "inspect-run".into(),
+            "--run-id".into(),
+            run_id.into(),
+            "--limit".into(),
+            "1".into(),
+        ];
+        if invoke(&args, "cancel-verification", Duration::from_secs(3))
+            .is_ok_and(|value| terminal_status(&value))
+        {
+            return true;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    false
+}
+
+pub fn terminal_status(value: &serde_json::Value) -> bool {
+    value
+        .pointer("/run/status")
+        .and_then(serde_json::Value::as_str)
+        .is_some_and(|status| ["completed", "failed", "cancelled"].contains(&status))
+}
+
 pub fn execute(
     suite: &EvalSuite,
     case: &EvalCase,
@@ -214,7 +245,25 @@ pub fn execute(
                 write_json(rep_dir.join("observation-error.json"), &error.to_string())?;
                 break;
             }
-            Err(error) => return Err(error),
+            Err(error) => {
+                write_json(rep_dir.join("observation-error.json"), &error.to_string())?;
+                let cancellation = invoke(
+                    &[
+                        "workflow".into(),
+                        "cancel-run".into(),
+                        "--run-id".into(),
+                        run_id.into(),
+                    ],
+                    "observation-cancellation",
+                    Duration::from_secs(15),
+                );
+                let verified = verify_cancellation(run_id, &invoke);
+                write_json(
+                    rep_dir.join("cancellation.json"),
+                    &serde_json::json!({"requested":cancellation.is_ok(),"error":cancellation.err().map(|error|error.to_string()),"terminal_verified":verified,"reason":"observation_failed"}),
+                )?;
+                return Err(error);
+            }
         };
         write_json(rep_dir.join("inspection.json"), &inspection)?;
         let status = inspection
@@ -253,15 +302,7 @@ pub fn execute(
                 "cancel-status",
                 Duration::from_secs(5),
             );
-            if state
-                .as_ref()
-                .ok()
-                .and_then(|value| value.pointer("/run/status"))
-                .and_then(serde_json::Value::as_str)
-                .is_some_and(|status| {
-                    ["completed", "failed", "cancelled", "repair_required"].contains(&status)
-                })
-            {
+            if state.as_ref().is_ok_and(terminal_status) {
                 terminal_verified = true;
                 break;
             }
@@ -317,14 +358,17 @@ pub fn execute(
         Duration::from_secs(15),
     )?;
     write_json(rep_dir.join("inspection.json"), &final_inspection)?;
+    let mut capture_failed = false;
     if let Some(revision) = final_inspection
         .pointer("/graph/revision")
         .and_then(serde_json::Value::as_u64)
         && let Err(error) = super::capture::capture(run_id, revision, rep_dir, invoke)
     {
+        capture_failed = true;
         write_json(rep_dir.join("graph-capture-error.json"), &error.to_string())?;
     }
     if let Err(error) = super::capture::capture_history(run_id, rep_dir, invoke) {
+        capture_failed = true;
         write_json(
             rep_dir.join("history-capture-error.json"),
             &error.to_string(),
@@ -339,8 +383,12 @@ pub fn execute(
             .filter_map(|value| value["id"].as_str().map(str::to_owned)),
     );
     let mut telemetry = EvalMeasurementSet::new();
-    let mut capture_complete = final_inspection.pointer("/graph/nodes_complete")
-        == Some(&serde_json::Value::Bool(true))
+    let mut capture_complete = !capture_failed
+        && final_inspection["unavailable_collections"]
+            .as_array()
+            .is_none_or(Vec::is_empty)
+        && final_inspection.pointer("/graph/nodes_complete")
+            == Some(&serde_json::Value::Bool(true))
         && final_inspection.pointer("/graph/edges_complete")
             == Some(&serde_json::Value::Bool(true))
         && ["activations", "child_sessions", "events", "attempts"]

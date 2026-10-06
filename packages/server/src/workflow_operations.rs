@@ -382,8 +382,14 @@ impl bcode_workflow::WorkflowRunApplication for WorkflowAuthoringApplication<'_>
         self.state
             .require_workflow_store()
             .map_err(run_operation_failure)?;
-        attempt_history(self.state, &run_id, cursor.as_ref(), limit)
-            .map_err(|error| run_operation_failure(error.into()))
+        crate::workflow_representation::discovery::attempts(
+            self.state,
+            &run_id,
+            cursor.as_ref(),
+            limit,
+        )
+        .await
+        .map_err(run_operation_failure)
     }
     async fn workflow_event_history(
         &self,
@@ -394,8 +400,14 @@ impl bcode_workflow::WorkflowRunApplication for WorkflowAuthoringApplication<'_>
         self.state
             .require_workflow_store()
             .map_err(run_operation_failure)?;
-        event_history(self.state, &run_id, after_sequence, limit)
-            .map_err(|error| run_operation_failure(error.into()))
+        crate::workflow_representation::discovery::events(
+            self.state,
+            &run_id,
+            after_sequence,
+            limit,
+        )
+        .await
+        .map_err(run_operation_failure)
     }
     async fn retry_workflow_node(
         &self,
@@ -579,8 +591,9 @@ impl bcode_workflow::WorkflowRunApplication for WorkflowAuthoringApplication<'_>
         self.state
             .require_workflow_store()
             .map_err(run_operation_failure)?;
-        inspect_graph_page(self.state, &request)
-            .map_err(|error| run_operation_failure(error.into()))
+        crate::workflow_representation::inspection_graph::page(self.state, &request)
+            .await
+            .map_err(run_operation_failure)
     }
     async fn list_workflow_runs(
         &self,
@@ -589,7 +602,11 @@ impl bcode_workflow::WorkflowRunApplication for WorkflowAuthoringApplication<'_>
         self.state
             .require_workflow_store()
             .map_err(run_operation_failure)?;
-        list_runs(self.state, limit).map_err(|error| run_operation_failure(error.into()))
+        Box::pin(crate::workflow_representation::discovery::list(
+            self.state, limit,
+        ))
+        .await
+        .map_err(run_operation_failure)
     }
 
     async fn workflow_run_outputs(
@@ -7036,6 +7053,7 @@ async fn request_replacement(
     state: &std::sync::Arc<ServerState>,
     request: bcode_workflow::WorkflowReplacementRequest,
 ) -> Result<bcode_workflow::WorkflowReplacementResponse, super::ServerError> {
+    crate::workflow_representation::require_legacy(state, &request.old_run_id).await?;
     let parent = run_parent_session_id(state, &request.old_run_id)?;
     if request.successor.parent_session_id != parent || request.successor.run_id.is_none() {
         return Err(bcode_workflow_store::WorkflowStoreError::InvalidData(
@@ -10162,6 +10180,8 @@ pub async fn repair_attempt(
     dispatch_identity: &str,
     resolution: &bcode_workflow_store::RepairResolution,
 ) -> Result<bcode_workflow_store::RepairResult, super::ServerError> {
+    crate::workflow_representation::discovery::check_repair_identity(state, dispatch_identity)
+        .await?;
     let attempt = state
         .workflow_store
         .lock()
@@ -11564,18 +11584,6 @@ pub async fn import_draft(
 }
 
 /// Return bounded workflow run summaries without transport framing.
-pub fn list_runs(
-    state: &ServerState,
-    limit: usize,
-) -> Result<Vec<bcode_workflow_store::WorkflowRunSummary>, bcode_workflow_store::WorkflowStoreError>
-{
-    state
-        .workflow_store
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .list_runs(limit)
-}
-
 /// Return checksum-verified bounded workflow outputs without transport framing.
 pub fn run_outputs(
     state: &ServerState,
@@ -11689,6 +11697,13 @@ pub async fn inspect_run(
     run_id: &str,
     limit: usize,
 ) -> Result<bcode_workflow::WorkflowRunInspection, super::ServerError> {
+    if let Some(inspection) = Box::pin(crate::workflow_representation::inspection::inspect(
+        state, run_id, limit,
+    ))
+    .await?
+    {
+        return Ok(inspection);
+    }
     crate::workflow_representation::require_legacy(state, run_id).await?;
     let (
         run,
@@ -11846,6 +11861,7 @@ pub async fn inspect_run(
         )
     };
     Ok(bcode_workflow::WorkflowRunInspection {
+        unavailable_collections: vec![],
         execution_allowance,
         continuation,
         replacement_readiness,

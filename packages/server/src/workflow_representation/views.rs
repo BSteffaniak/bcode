@@ -25,6 +25,10 @@ pub async fn populate_nodes(
     let nodes = representation::graph_pages::nodes(&*tx, run_id, revision, None, limit)
         .await
         .map_err(|_| unavailable())?;
+    let scheduling =
+        representation::scheduling::snapshot_in(&*tx, run_id, Some(revision), None, limit)
+            .await
+            .map_err(|_| unavailable())?;
     let mut projected = Vec::with_capacity(nodes.len());
     for node in nodes {
         let activation_id = representation::graph::activation_id(&*tx, run_id, &node.id)
@@ -34,8 +38,43 @@ pub async fn populate_nodes(
             node_id: node.id,
             name: node.name,
             kind: bcode_workflow_view::project_node_kind(node.kind),
+            status: scheduling
+                .activations
+                .iter()
+                .find(|activation| {
+                    Some(activation.activation_id.as_str()) == activation_id.as_deref()
+                })
+                .map_or_else(
+                    || {
+                        WorkflowNodeStatus::Unknown(
+                            "activation is outside bounded observation".into(),
+                        )
+                    },
+                    |activation| match activation.status {
+                        representation::scheduling::ActivationState::Skipped => {
+                            WorkflowNodeStatus::Skipped
+                        }
+                        representation::scheduling::ActivationState::OutputCommitted => {
+                            WorkflowNodeStatus::Completed
+                        }
+                        representation::scheduling::ActivationState::Unresolved => match activation
+                            .latest_attempt
+                            .as_ref()
+                            .and_then(|attempt| attempt.terminal.as_ref())
+                        {
+                            Some(representation::attempts::TerminalOutcome::Failed) => {
+                                WorkflowNodeStatus::Failed
+                            }
+                            Some(representation::attempts::TerminalOutcome::Cancelled) => {
+                                WorkflowNodeStatus::Cancelled
+                            }
+                            _ => WorkflowNodeStatus::Unknown(
+                                "attempt is unresolved; running not established".into(),
+                            ),
+                        },
+                    },
+                ),
             activation_id,
-            status: WorkflowNodeStatus::Unknown("activation lifecycle not observed".into()),
         });
     }
     tx.commit().await.map_err(|_| unavailable())?;

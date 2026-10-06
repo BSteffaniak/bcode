@@ -36,6 +36,12 @@ pub mod graph_revision;
 mod guards;
 /// Root allowance and child-lineage accounting.
 pub mod hierarchy;
+/// Exact activation observation metadata.
+pub mod inspection_activations;
+/// Bounded canonical attempt inspection.
+pub mod inspection_attempts;
+/// Bounded canonical execution-session links.
+pub mod inspection_sessions;
 /// Bounded lookup, association detachment and canonical terminalization.
 pub mod runs;
 /// Cancellation intent and transactional resource safety.

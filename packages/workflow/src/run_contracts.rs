@@ -1812,6 +1812,9 @@ impl WorkflowExecutionAllowanceObservation {
 /// Bounded aggregate workflow inspection snapshot.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WorkflowRunInspection {
+    /// Collections not supported by this representation; empty values are not evidence of absence.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub unavailable_collections: Vec<String>,
     /// Current allowance observation; absent on older senders means unknown.
     /// Does not imply runnable work or authorization to increase limits.
     #[serde(default, skip_serializing_if = "Option::is_none")]
