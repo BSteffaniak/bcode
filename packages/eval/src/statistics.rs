@@ -22,13 +22,15 @@ pub fn describe(pairs: &[Value]) -> Value {
         }
     }
     let summaries:Vec<_>=candidates.into_iter().map(|(id,pairs)| {
+        let total_pairs=pairs.len();
+        let pairs:Vec<_>=pairs.into_iter().filter(|pair|pair["quality_evaluable"]==true).collect();
         let success=pairs.iter().filter(|pair|pair["candidate_passed"]==true).count();
         let baseline_passes=pairs.iter().filter(|pair|pair["baseline_passed"]==true).count();
         let regressions=pairs.iter().filter(|pair|pair["quality_regression"]==true).count();
         let mut ratios:Vec<_>=pairs.iter().filter(|pair|pair["speed_eligible"]==true).filter_map(|pair|pair["latency_ratio"].as_f64()).filter(|value|value.is_finite()).collect();
         ratios.sort_by(f64::total_cmp);
         let quantile=|percent:usize| ratios.get(ratios.len().saturating_mul(percent).div_ceil(100).saturating_sub(1)).copied();
-        json!({"candidate":id,"trials":pairs.len(),"successes":success,"success_rate_wilson_95":wilson(success,pairs.len()),"regressions":regressions,"baseline_pass_trials":baseline_passes,"regression_rate_wilson_95":wilson(regressions,baseline_passes),"successful_pair_latency_ratio_p50":quantile(50),"successful_pair_latency_ratio_p95":quantile(95),"speed_sample_count":ratios.len(),"noninferiority_established":false})
+        json!({"candidate":id,"trials":pairs.len(),"unevaluable_pairs":total_pairs-pairs.len(),"successes":success,"success_rate_wilson_95":wilson(success,pairs.len()),"regressions":regressions,"baseline_pass_trials":baseline_passes,"regression_rate_wilson_95":wilson(regressions,baseline_passes),"successful_pair_latency_ratio_p50":quantile(50),"successful_pair_latency_ratio_p95":quantile(95),"speed_sample_count":ratios.len(),"noninferiority_established":false})
     }).collect();
     json!({"method":"Wilson 95% intervals; nearest-rank successful-pair latency quantiles; descriptive, not independent-task generalization","candidates":summaries})
 }

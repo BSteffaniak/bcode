@@ -65,61 +65,85 @@ pub fn capture_history(
     directory: &Path,
     invoke: impl Fn(&[String], &str, Duration) -> Result<Value, EvalError>,
 ) -> Result<(), EvalError> {
+    let mut failures = Vec::new();
     for collection in ["events", "attempts"] {
-        let mut cursor: Vec<String> = Vec::new();
-        let mut index = 0_u64;
-        loop {
-            let mut args = vec![
-                "workflow".into(),
-                collection.into(),
-                "--run-id".into(),
-                run_id.into(),
-                "--limit".into(),
-                "100".into(),
-            ];
-            args.extend(cursor.clone());
-            let page = invoke(&args, collection, Duration::from_secs(15))?;
+        if let Err(error) = capture_collection(run_id, directory, &invoke, collection) {
             write_json(
-                directory.join(format!("workflow-{collection}-{index:04}.json")),
-                &page,
+                directory.join(format!("{collection}-capture-error.json")),
+                &error.to_string(),
             )?;
-            let rows = page
-                .as_array()
-                .ok_or_else(|| EvalError::Validation("history response is not an array".into()))?;
-            if rows.len() < 100 {
-                break;
-            }
-            let last = rows.last().expect("nonempty full page");
-            let next = if collection == "events" {
-                vec![
-                    "--after-sequence".into(),
-                    last["event_seq"]
-                        .as_u64()
-                        .ok_or_else(|| EvalError::Validation("event cursor missing".into()))?
-                        .to_string(),
-                ]
-            } else {
-                vec![
-                    "--after-prepared-at-ms".into(),
-                    last["prepared_at_ms"]
-                        .as_u64()
-                        .ok_or_else(|| EvalError::Validation("attempt timestamp missing".into()))?
-                        .to_string(),
-                    "--after-dispatch-identity".into(),
-                    last["dispatch_identity"]
-                        .as_str()
-                        .ok_or_else(|| EvalError::Validation("attempt identity missing".into()))?
-                        .into(),
-                ]
-            };
-            if next == cursor {
-                return Err(EvalError::Validation(
-                    "history cursor did not advance".into(),
-                ));
-            }
-            cursor = next;
-            index += 1;
+            failures.push(collection);
         }
+    }
+    if failures.is_empty() {
+        Ok(())
+    } else {
+        Err(EvalError::Validation(format!(
+            "incomplete history collections: {}",
+            failures.join(", ")
+        )))
+    }
+}
+
+fn capture_collection(
+    run_id: &str,
+    directory: &Path,
+    invoke: &impl Fn(&[String], &str, Duration) -> Result<Value, EvalError>,
+    collection: &str,
+) -> Result<(), EvalError> {
+    let mut cursor: Vec<String> = Vec::new();
+    let mut index = 0_u64;
+    loop {
+        let mut args = vec![
+            "workflow".into(),
+            collection.into(),
+            "--run-id".into(),
+            run_id.into(),
+            "--limit".into(),
+            "100".into(),
+        ];
+        args.extend(cursor.clone());
+        let page = invoke(&args, collection, Duration::from_secs(15))?;
+        write_json(
+            directory.join(format!("workflow-{collection}-{index:04}.json")),
+            &page,
+        )?;
+        let rows = page
+            .as_array()
+            .ok_or_else(|| EvalError::Validation("history response is not an array".into()))?;
+        if rows.len() < 100 {
+            break;
+        }
+        let last = rows.last().expect("nonempty full page");
+        let next = if collection == "events" {
+            vec![
+                "--after-sequence".into(),
+                last["event_seq"]
+                    .as_u64()
+                    .ok_or_else(|| EvalError::Validation("event cursor missing".into()))?
+                    .to_string(),
+            ]
+        } else {
+            vec![
+                "--after-prepared-at-ms".into(),
+                last["prepared_at_ms"]
+                    .as_u64()
+                    .ok_or_else(|| EvalError::Validation("attempt timestamp missing".into()))?
+                    .to_string(),
+                "--after-dispatch-identity".into(),
+                last["dispatch_identity"]
+                    .as_str()
+                    .ok_or_else(|| EvalError::Validation("attempt identity missing".into()))?
+                    .into(),
+            ]
+        };
+        if next == cursor {
+            return Err(EvalError::Validation(
+                "history cursor did not advance".into(),
+            ));
+        }
+        cursor = next;
+        index += 1;
     }
     Ok(())
 }
@@ -128,6 +152,31 @@ pub fn capture_history(
 mod tests {
     use super::capture;
     use std::cell::Cell;
+    #[test]
+    fn unavailable_events_do_not_discard_available_attempts() {
+        let directory =
+            std::env::temp_dir().join(format!("bcode-partial-capture-{}", std::process::id()));
+        std::fs::create_dir_all(&directory).unwrap();
+        let result = super::capture_history("run", &directory, |_, kind, _| {
+            if kind == "events" {
+                Err(super::EvalError::Validation("unsupported".into()))
+            } else {
+                Ok(serde_json::json!([]))
+            }
+        });
+        assert!(result.is_err());
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(
+                &std::fs::read(directory.join("workflow-attempts-0000.json")).unwrap()
+            )
+            .unwrap(),
+            serde_json::json!([])
+        );
+        std::fs::remove_file(directory.join("workflow-attempts-0000.json")).unwrap();
+        std::fs::remove_file(directory.join("events-capture-error.json")).unwrap();
+        std::fs::remove_dir(directory).unwrap();
+    }
+
     #[test]
     fn history_pages_use_event_and_attempt_cursors() {
         let directory =

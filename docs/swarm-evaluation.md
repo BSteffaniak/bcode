@@ -113,6 +113,22 @@ keyset APIs and retained as separate artifact pages.
 Aggregate collection saturation marks capture incomplete rather than claiming
 complete descendant/activation/output coverage.
 
+## Evidence validity
+
+Paired report version 2 separates execution failures from observed quality failures.
+Missing trials and executor errors are unevaluable, not quality regressions or
+successes; they block the comparison gate and are excluded from quality confidence
+interval denominators. Incorrect independently graded artifacts still count as
+quality failures when execution was observed. Incomplete capture blocks efficiency
+eligibility and the comparison gate, even when the delivered artifact passes.
+
+History collections are captured independently: unavailable semantic events no
+longer prevent retention of canonical attempt pages. Capture failures remain
+explicit and never establish absence of effects. Diagnosis version 2 includes
+normalized attempt identities, statuses and timestamps with artifact locators;
+it still does not claim verified root causes. Persisted receipt admission time
+is retained rather than represented as missing.
+
 ## Scope still requiring expansion
 
 This is not yet the complete proposed research harness. Equal-resource policies,

@@ -584,6 +584,7 @@ fn run_repetition(
                 &serde_json::json!({"schema_version":1,"error":error.to_string(),"outcome":"execution_failed","capture_complete":false}),
             )?;
             ExecutionOutput {
+                measurements: [("eval.execution_failed".into(), 1.0)].into(),
                 exit_code: Some(1),
                 diagnostics: vec![EvalDiagnostic {
                     severity: EvalDiagnosticSeverity::Error,
@@ -593,7 +594,6 @@ fn run_repetition(
                     kind: "execution_failure".into(),
                     path: "execution-failure.json".into(),
                 }],
-                ..ExecutionOutput::default()
             }
         }
     };

@@ -78,7 +78,7 @@ pub async fn page(
             .into(),
             has_receipt: receipt.is_some(),
             prepared_at_ms: prepared.prepared_at_ms,
-            admitted_at_ms: None,
+            admitted_at_ms: receipt.as_ref().map(|value| value.admitted_at_ms),
             terminal_at_ms: match row.get("terminal_at_ms") {
                 Some(DatabaseValue::Int64(value)) => {
                     Some(u64::try_from(value).map_err(|_| Error::MaintenanceRequired)?)
