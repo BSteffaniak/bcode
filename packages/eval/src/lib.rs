@@ -19,6 +19,7 @@ mod process;
 mod schedule;
 mod sdk;
 mod statistics;
+mod timing;
 mod workflow;
 
 pub use sdk::{

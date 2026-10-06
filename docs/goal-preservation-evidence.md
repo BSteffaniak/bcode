@@ -18,6 +18,27 @@ Implementation guidance requires pre-change baseline provenance and post-change
 observations; read-only evaluators can independently compare the current digest.
 Reported baselines remain contributor-supplied, not host-certified history.
 
+## Timing and coordination cost
+
+Workflow trials retain `timing.json`, derived from observed admitted-to-terminal
+attempt intervals. It reports per-node elapsed sums, interval union, observed span,
+overlap and gaps. It is not provider CPU time or proof of useful parallelism, and
+missing or saturated attempt coverage is explicitly incomplete.
+
+Recorded tiny-report trials are primarily serial coordinator -> worker -> integration
+-> evaluation chains, sometimes repeated after judgement rejection. A single worker
+cannot shorten that chain by parallelism. Input-token totals count each model round's
+input, not unique task bytes; repeated graph discovery and growing tool context amplify
+those totals. Timing samples identify evaluation/integration/coordination as the bulk
+of elapsed time, rather than the short judgement-service calls.
+
+Coordination guidance favors minimal useful collaboration for indivisible work,
+concurrent staging for independent scopes, concrete locators and reuse of canonical
+results already supplied in continuation input. It does not remove user-requested
+collaboration, required verification, dependency ordering or conflict protection.
+Live reruns did not establish a consistent latency/token improvement: broader
+separable workloads and completion-gate calibration remain necessary.
+
 Execution-session discovery follows the indexed canonical attempt identities and
 looks up exact session links. The link table contains only dispatch identity and
 payload, not a run-ID column. Filtering it by run ID previously hid child sessions

@@ -358,6 +358,10 @@ pub fn execute(
         Duration::from_secs(15),
     )?;
     write_json(rep_dir.join("inspection.json"), &final_inspection)?;
+    write_json(
+        rep_dir.join("timing.json"),
+        &super::timing::describe(&final_inspection),
+    )?;
     let mut capture_failed = false;
     if let Some(revision) = final_inspection
         .pointer("/graph/revision")
