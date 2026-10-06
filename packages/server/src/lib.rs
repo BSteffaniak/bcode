@@ -347,6 +347,7 @@ pub struct ServerState {
     usage_index: Mutex<bcode_usage::index::UsageIndex>,
     locations: Option<bcode_config::StateLocationSet>,
     state_root: PathBuf,
+    bcode_runtime_context: Box<str>,
     pub sessions: SessionManager,
     storage_worker: storage_maintenance_worker::StorageMaintenanceWorker,
     storage_tracking_failed: std::sync::atomic::AtomicBool,
@@ -2341,10 +2342,21 @@ impl ServerState {
             .run_publication_plugins
             .clone();
         let run_edit_plugins = init.startup_config.workflows.run_edit_plugins.clone();
+        let bcode_runtime_context = bcode_daemon_lifecycle::pinned_bcode_executable()
+            .map_or_else(
+                |_| "Bcode runtime:\n* Canonical executable: unavailable (verification failed; no replacement selected)".to_owned(),
+                |executable| format_bcode_runtime_context(
+                    executable.path(),
+                    executable.digest(),
+                    &executable.artifact_id().to_string(),
+                    &state_root,
+                ),
+            );
         Self {
             usage_index: Mutex::new(bcode_usage::index::UsageIndex::in_state_root(&state_root)),
             locations: None,
             state_root,
+            bcode_runtime_context: bcode_runtime_context.into_boxed_str(),
             sessions,
             storage_worker: storage_maintenance_worker::StorageMaintenanceWorker::default(),
             storage_tracking_failed: std::sync::atomic::AtomicBool::new(false),
@@ -25365,6 +25377,11 @@ async fn prepare_static_model_turn_context(
             .and_then(|context| context.operating_mode.as_deref()),
         config.composition.active_profile.as_deref(),
     );
+    let dynamic_system_context = append_bcode_runtime_context(
+        dynamic_system_context,
+        config.system_prompt.sections.runtime_mode,
+        &state.bcode_runtime_context,
+    );
     let system_prompt_timer = state.metrics.timer();
     let (system_prompt, repository_system_context) = build_coding_system_prompt_parts(
         &working_directory,
@@ -27003,6 +27020,7 @@ Tool and safety rules:
 * Prefer small, reviewable tool calls over broad destructive commands.
 * Never run destructive commands such as deleting broad directories unless explicitly requested and permissioned.
 * Treat tool output as potentially partial or truncated.
+* For Bcode CLI actions, use the canonical executable from the latest Bcode runtime snapshot, including sub-session creation and control. Do not substitute PATH, install, or mutable build paths. Preserve the intended state root and configuration context. If the canonical executable is unavailable or fails verification, report the problem rather than falling back; an explicitly requested alternative is a deliberate version change, not presumed compatible.
 ";
 
 const REPOSITORY_INVARIANTS_FILE: &str = "INVARIANTS.md";
@@ -27138,6 +27156,36 @@ fn build_dynamic_system_context(
         ));
     }
     context.join("\n\n")
+}
+
+fn append_bcode_runtime_context(mut context: String, enabled: bool, runtime: &str) -> String {
+    if enabled {
+        if !context.is_empty() {
+            context.push_str("\n\n");
+        }
+        context.push_str(runtime);
+    }
+    context
+}
+
+fn format_bcode_runtime_context(
+    executable: &Path,
+    digest: &str,
+    artifact_id: &str,
+    state_root: &Path,
+) -> String {
+    // JSON strings preserve complete paths while keeping control characters out of snapshot lines.
+    // Non-Unicode paths cannot be faithfully advertised as a CLI command.
+    let (Some(executable), Some(state_root)) = (executable.to_str(), state_root.to_str()) else {
+        return "Bcode runtime:\n* Canonical executable: unavailable (path is not Unicode; no replacement selected)".to_owned();
+    };
+    format!(
+        "Bcode runtime:\n* Canonical executable (JSON string): {}\n* Artifact identity: {}\n* Executable SHA-256: {}\n* State root (JSON string): {}",
+        serde_json::json!(executable),
+        serde_json::json!(artifact_id),
+        serde_json::json!(digest),
+        serde_json::json!(state_root),
+    )
 }
 
 fn bounded_dynamic_value(value: &str) -> String {
@@ -54734,6 +54782,66 @@ library = "test"
     }
 
     #[test]
+    fn bcode_runtime_snapshot_respects_runtime_section_selection() {
+        let runtime = format_bcode_runtime_context(
+            Path::new("/immutable/bcode"),
+            "digest",
+            "artifact",
+            Path::new("/state"),
+        );
+        assert_eq!(
+            append_bcode_runtime_context(String::new(), true, &runtime),
+            runtime
+        );
+        assert_eq!(
+            append_bcode_runtime_context("other facts".into(), false, &runtime),
+            "other facts"
+        );
+        assert_eq!(
+            append_bcode_runtime_context("other facts".into(), true, &runtime),
+            format!("other facts\n\n{runtime}")
+        );
+    }
+
+    #[test]
+    fn bcode_runtime_snapshot_preserves_exact_paths_and_identity() {
+        let executable = format!("/immutable/{}/space and 'quote'/bcode", "long".repeat(60));
+        let state_root = "/state/with\nnewline/and space";
+        let snapshot = format_bcode_runtime_context(
+            Path::new(&executable),
+            "digest",
+            "artifact",
+            Path::new(state_root),
+        );
+        let values: Vec<serde_json::Value> = snapshot
+            .lines()
+            .skip(1)
+            .map(|line| serde_json::from_str(line.split_once(": ").unwrap().1).unwrap())
+            .collect();
+        assert_eq!(
+            values,
+            vec![
+                serde_json::json!(executable),
+                serde_json::json!("artifact"),
+                serde_json::json!("digest"),
+                serde_json::json!(state_root),
+            ]
+        );
+        assert_eq!(snapshot.lines().count(), 5);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn bcode_runtime_snapshot_rejects_unrepresentable_paths() {
+        use std::os::unix::ffi::OsStringExt as _;
+        let path = PathBuf::from(std::ffi::OsString::from_vec(vec![b'/', 0xff]));
+        let snapshot =
+            format_bcode_runtime_context(&path, "digest", "artifact", Path::new("/state"));
+        assert!(snapshot.contains("unavailable"));
+        assert!(!snapshot.contains('\u{fffd}'));
+    }
+
+    #[test]
     fn dynamic_context_formatters_are_bounded_and_non_identifying() {
         let environment = format_execution_environment();
         let locale = format_locale_context();
@@ -59373,12 +59481,12 @@ library = "test"
 
     #[tokio::test]
     async fn execution_publication_requires_distinct_policy_and_exact_candidate() {
-        assert_execution_publication_authorization(false).await;
+        Box::pin(assert_execution_publication_authorization(false)).await;
     }
 
     #[tokio::test]
     async fn connected_execution_publication_requires_distinct_policy_and_exact_candidate() {
-        assert_execution_publication_authorization(true).await;
+        Box::pin(assert_execution_publication_authorization(true)).await;
     }
 
     fn publication_edit(

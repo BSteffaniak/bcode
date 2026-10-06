@@ -1228,6 +1228,13 @@ pub fn pinned_bcode_executable() -> Result<&'static PinnedBcodeExecutable, Daemo
     let executable = PINNED_EXECUTABLE
         .get()
         .expect("pinned executable initialized");
+    verify_pinned_bcode_executable(executable)?;
+    Ok(executable)
+}
+
+fn verify_pinned_bcode_executable(
+    executable: &PinnedBcodeExecutable,
+) -> Result<(), DaemonLifecycleError> {
     if !daemon_image_is_valid(executable.path(), executable.digest())? {
         return Err(DaemonLifecycleError::Io {
             path: executable.path.clone(),
@@ -1237,7 +1244,7 @@ pub fn pinned_bcode_executable() -> Result<&'static PinnedBcodeExecutable, Daemo
             ),
         });
     }
-    Ok(executable)
+    Ok(())
 }
 
 /// Return the immutable process-pinned executable path.
@@ -2398,6 +2405,21 @@ mod tests {
         assert!(!interrupted.exists());
         assert!(daemon_image_is_valid(&cached, &digest).unwrap());
         fs::remove_dir_all(state_dir).unwrap();
+    }
+
+    #[test]
+    fn pinned_image_verification_never_repairs_or_substitutes() {
+        let root = tempfile::tempdir().unwrap();
+        let path = ensure_current_executable_cached_in_state(root.path()).unwrap();
+        let digest = executable_sha256(&path).unwrap();
+        let pinned = PinnedBcodeExecutable { path, digest };
+        assert!(verify_pinned_bcode_executable(&pinned).is_ok());
+        fs::write(pinned.path(), b"replacement").unwrap();
+        assert!(verify_pinned_bcode_executable(&pinned).is_err());
+        assert_eq!(fs::read(pinned.path()).unwrap(), b"replacement");
+        fs::remove_file(pinned.path()).unwrap();
+        assert!(verify_pinned_bcode_executable(&pinned).is_err());
+        assert!(!pinned.path().exists());
     }
 
     #[test]

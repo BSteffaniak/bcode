@@ -13,6 +13,21 @@ Bcode daemon availability is split across explicit owners:
 
 The embedded plugin-surface server is a separate explicit integration mode. It does not publish a normal daemon record and is not an availability fallback.
 
+## Agent runtime executable context
+
+The server resolves the lifecycle-owned `PinnedBcodeExecutable` during state initialization.
+Its immutable path, executable digest, artifact identity, and serving state root are included
+in turn environment snapshots when the runtime-mode section is enabled. Prompt construction
+uses the initialized context without rehashing or copying executable bytes per turn.
+Paths are complete JSON strings rather than truncated display values; paths that cannot be
+represented faithfully and failed image verification produce an explicit unavailable state,
+never a PATH-resolved substitute.
+
+Default coding guidance directs agents to use this executable for Bcode CLI operations,
+including sub-session control, while preserving state/configuration selection. This is
+execution identity plumbing, not a collaboration strategy or a permission grant. Snapshot
+retention follows the existing turn-context rules; replacing prompt text remains supported.
+
 ## Runtime-work observations
 
 The server's runtime-work registry holds execution cancellation and session ownership.
