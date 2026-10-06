@@ -27597,7 +27597,8 @@ Tool and safety rules:
 * Prefer small, reviewable tool calls over broad destructive commands.
 * Never run destructive commands such as deleting broad directories unless explicitly requested and permissioned.
 * Treat tool output as potentially partial or truncated.
-* For Bcode CLI actions, use the canonical executable from the latest Bcode runtime snapshot, including sub-session creation and control. Do not substitute PATH, install, or mutable build paths. Preserve the intended state root and configuration context. If the canonical executable is unavailable or fails verification, report the problem rather than falling back; an explicitly requested alternative is a deliberate version change, not presumed compatible.
+* For operational Bcode CLI actions, including current-session inspection and sub-session creation or control, use the canonical executable from the latest Bcode runtime snapshot. Preserve the intended state root and configuration context. Do not silently substitute PATH, install, or mutable build paths; if the canonical executable is unavailable or fails verification, report the problem rather than falling back.
+* When developing Bcode itself, building and running a local executable to validate the changed functionality is expected and does not require separate approval merely because it differs from the current runtime. Use an explicit executable path, record its artifact identity or hash, and isolate test state from the active session's state. Treat it as a distinct test version: verify client/daemon compatibility, select test configuration deliberately, and do not use it to manage existing sessions or replace the running daemon. Normal tool permissions and authorization for provider spending or other side effects still apply.
 ";
 
 const REPOSITORY_INVARIANTS_FILE: &str = "INVARIANTS.md";
