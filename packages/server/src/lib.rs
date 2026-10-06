@@ -361,6 +361,11 @@ pub struct ServerState {
     pub session_catalog: Arc<session_catalog::SessionCatalog>,
     pub plugins: bcode_plugin::PluginRuntimeHost,
     optional_judgement: judgement::OptionalJudgementAccess,
+    progress_windows: StdMutex<BTreeMap<SessionId, judgement::ProgressWindow>>,
+    workflow_progress_windows: StdMutex<BTreeMap<String, judgement::ProgressWindow>>,
+    optional_context: StdMutex<
+        BTreeMap<SessionId, Vec<(String, bcode_session_models::JudgementContextCandidate)>>,
+    >,
     advisory_categorizations:
         StdMutex<BTreeMap<SessionId, bcode_session_models::SessionCategorization>>,
     tool_catalog: tool_catalog::ToolCatalogCache,
@@ -2423,6 +2428,9 @@ impl ServerState {
             session_catalog: Arc::new(session_catalog::SessionCatalog::default()),
             plugins,
             optional_judgement: judgement::OptionalJudgementAccess::new(),
+            progress_windows: StdMutex::new(BTreeMap::new()),
+            workflow_progress_windows: StdMutex::new(BTreeMap::new()),
+            optional_context: StdMutex::new(BTreeMap::new()),
             advisory_categorizations: StdMutex::new(BTreeMap::new()),
             tool_catalog: tool_catalog::ToolCatalogCache::default(),
             startup_plugin_selection: init.startup_plugin_selection,
@@ -19678,6 +19686,9 @@ async fn run_model_turn_lifecycle(
         .await;
     let turn_config = state.session_config(session_id).await;
     let turn_id = execution_turn_id(trigger_event);
+    if let Ok(mut candidates) = state.optional_context.lock() {
+        candidates.remove(&session_id);
+    }
     let mut turn_span = state
         .metrics
         .span("model.turn")
@@ -26148,6 +26159,58 @@ async fn build_model_turn_request(
             current.cancel_state.append_advisory_messages(&mut messages);
         }
     }
+    // The active explicit user objective is gathered from the already bounded current context,
+    // never by replaying history. Only text is eligible; tool output is not an objective.
+    let objective = messages
+        .iter()
+        .rev()
+        .find(|message| message.role == MessageRole::User)
+        .and_then(|message| {
+            message.content.iter().find_map(|block| match block {
+                ContentBlock::Text { text } if !text.trim().is_empty() && text.len() <= 4096 => {
+                    Some(text.clone())
+                }
+                _ => None,
+            })
+        });
+    if let Ok(mut windows) = state.progress_windows.lock() {
+        if windows.len() >= 256 && !windows.contains_key(&session_id) {
+            windows.clear();
+        }
+        let window = windows.entry(session_id).or_default();
+        window.set_objective(objective.unwrap_or_default());
+        if config
+            .judgement
+            .enabled(bcode_model::judgement::Feature::ProgressMonitoring)
+            && let Some(advice) = &window.advice
+        {
+            messages.push(ModelMessage {
+                role: MessageRole::System,
+                content: vec![ContentBlock::Text {
+                    text: format!("Advisory observation only; not completion, permission or retry authority: {}", advice.message),
+                }],
+            });
+        }
+    }
+    // Optional evidence is request-local; canonical messages remain in their original order.
+    let cancel = state
+        .session_runtimes
+        .lock()
+        .await
+        .get(&session_id)
+        .cloned();
+    if let Some(runtime) = cancel {
+        let cancel = runtime
+            .current_turn
+            .lock()
+            .await
+            .as_ref()
+            .filter(|current| current.turn_id == execution_turn_id(trigger_event))
+            .map(|current| Arc::clone(&current.cancel_state));
+        if let Some(cancel) = cancel {
+            append_optional_context(state, session_id, &mut messages, config, &cancel).await;
+        }
+    }
     // Recovery observations must follow historical snapshots to supersede them.
     if let Some(context) = &static_context.recovery_context {
         messages.push(context.clone());
@@ -29004,6 +29067,165 @@ mod advisory_selection_boundary_tests {
     }
 }
 
+async fn append_optional_context(
+    state: &ServerState,
+    session_id: SessionId,
+    messages: &mut [ModelMessage],
+    config: &bcode_config::BcodeConfig,
+    cancel: &TurnCancelState,
+) {
+    let captured = state
+        .optional_context
+        .lock()
+        .ok()
+        .and_then(|registry| registry.get(&session_id).cloned())
+        .unwrap_or_default();
+    let candidates = captured
+        .iter()
+        .filter(|(_, candidate)| !candidate.protected)
+        .map(|(_, candidate)| candidate.clone())
+        .collect::<Vec<_>>();
+    let budget_bytes = config.model.tool_output.context_chars;
+    if candidates.is_empty() || cancel.is_cancelled() {
+        return;
+    }
+    let task = messages
+        .iter()
+        .rev()
+        .find(|message| message.role == MessageRole::User)
+        .and_then(|message| {
+            message.content.iter().find_map(|block| match block {
+                ContentBlock::Text { text } if text.len() <= 8192 => Some(text.clone()),
+                _ => None,
+            })
+        })
+        .unwrap_or_default();
+    let selection =
+        serde_json::json!({"task": task, "candidates": candidates, "budget_bytes": budget_bytes});
+    let judgement = if config
+        .judgement
+        .enabled(bcode_model::judgement::Feature::ContextReranking)
+        && let Some(prepared) = invoke_optional_feature_service(
+            state,
+            "bcode.context-selection/v1",
+            "prepare",
+            selection.clone(),
+            config,
+            cancel,
+        )
+        .await
+        && let Some(input) = prepared.get("judgement").cloned().and_then(|value| {
+            serde_json::from_value::<bcode_model::judgement::OptionalRequest>(value).ok()
+        })
+        && input.feature == bcode_model::judgement::Feature::ContextReranking
+    {
+        tokio::select! {
+            biased;
+            () = cancel.cancelled() => return,
+            reply = state.optional_judgement.judge_with_config(state, config, input) => reply,
+        }
+    } else {
+        bcode_model::judgement::OptionalResponse { response: None }
+    };
+    let baseline = || {
+        let mut remaining = budget_bytes;
+        candidates
+            .iter()
+            .filter_map(|candidate| {
+                if candidate.protected {
+                    return Some(candidate.id.clone());
+                }
+                if candidate.snippet.len() > remaining {
+                    return None;
+                }
+                remaining -= candidate.snippet.len();
+                Some(candidate.id.clone())
+            })
+            .collect::<Vec<_>>()
+    };
+    let included = if let Some(applied) = invoke_optional_feature_service(
+        state,
+        "bcode.context-selection/v1",
+        "apply",
+        serde_json::json!({"selection": selection, "judgement": judgement}),
+        config,
+        cancel,
+    )
+    .await
+        && let Some(admitted) = validated_context_admission(&candidates, &applied, budget_bytes)
+    {
+        admitted
+    } else {
+        baseline()
+    };
+    if cancel.is_cancelled() {
+        return;
+    }
+    incorporate_optional_context(messages, &captured, &included);
+}
+
+fn validated_context_admission(
+    candidates: &[bcode_session_models::JudgementContextCandidate],
+    applied: &serde_json::Value,
+    budget_bytes: usize,
+) -> Option<Vec<String>> {
+    let order: Vec<String> = serde_json::from_value(applied.get("ordered_ids")?.clone()).ok()?;
+    let admitted: Vec<String> =
+        serde_json::from_value(applied.get("included_ids")?.clone()).ok()?;
+    let originals = candidates
+        .iter()
+        .map(serde_json::to_value)
+        .collect::<Result<Vec<_>, _>>()
+        .ok()?;
+    (valid_advisory_permutation(&originals, &order)
+        && admitted.iter().collect::<BTreeSet<_>>().len() == admitted.len()
+        && admitted.iter().all(|id| order.contains(id))
+        && candidates
+            .iter()
+            .filter(|candidate| candidate.protected)
+            .all(|candidate| admitted.contains(&candidate.id))
+        && candidates
+            .iter()
+            .filter(|candidate| !candidate.protected && admitted.contains(&candidate.id))
+            .map(|candidate| candidate.snippet.len())
+            .sum::<usize>()
+            <= budget_bytes)
+        .then_some(admitted)
+}
+
+fn incorporate_optional_context(
+    messages: &mut [ModelMessage],
+    captured: &[(String, bcode_session_models::JudgementContextCandidate)],
+    included: &[String],
+) {
+    for id in included {
+        if let Some((invocation_id, candidate)) =
+            captured.iter().find(|(_, candidate)| candidate.id == *id)
+        {
+            // Extend only the already-correlated mandatory tool result, preserving provider
+            // call/result protocol. Never fabricate a tool call or privileged system message.
+            if let Some(result) = messages
+                .iter_mut()
+                .flat_map(|message| &mut message.content)
+                .find_map(|block| match block {
+                    ContentBlock::ToolResult { result } if result.call_id == *invocation_id => {
+                        Some(result)
+                    }
+                    _ => None,
+                })
+            {
+                let evidence = format!(
+                    "\nOptional retrieved evidence; source: {}\n{}",
+                    candidate.provenance, candidate.snippet
+                );
+                if !result.output.contains(&candidate.snippet) {
+                    result.output.push_str(&evidence);
+                }
+            }
+        }
+    }
+}
+
 /// Invoke one uniquely discovered advisory service without granting tool or artifact authority.
 /// Only the central optional judgement application operation is available to the consumer.
 async fn invoke_optional_feature_service(
@@ -29180,7 +29402,236 @@ async fn finish_server_registered_tool(
             deliver_diagnostic_advisory(invoker, &call.id, advisory).await;
         }
     }
+    observe_settled_session_tool(invoker, &call, &result).await;
     Ok(result)
+}
+
+async fn observe_settled_workflow_activation(
+    state: &ServerState,
+    session_id: SessionId,
+    dispatch: &bcode_workflow_store::PreparedActivationDispatch,
+    authority: &bcode_workflow_store::WorkflowExecutionAuthority,
+    failed: bool,
+) {
+    // Only an already-authored prompt objective is applicable; arbitrary dataflow input
+    // and node display names cannot invent an objective.
+    let Ok(configuration) = workflow_prompt_configuration_from_intent(dispatch) else {
+        return;
+    };
+    let objective = configuration.system_prompt;
+    if objective.trim().is_empty() || objective.len() > 4096 {
+        return;
+    }
+    let config = state.session_config(session_id).await;
+    if !config
+        .judgement
+        .enabled(bcode_model::judgement::Feature::ProgressMonitoring)
+    {
+        return;
+    }
+    let run_id = &dispatch.activation.run_id;
+    if !workflow_representation::advisory_authority_current(state, run_id, authority).await {
+        return;
+    }
+    let scope = serde_json::json!({"kind":"workflow", "id":run_id});
+    let request = state
+        .workflow_progress_windows
+        .lock()
+        .ok()
+        .and_then(|mut windows| {
+            if windows.len() >= 256 && !windows.contains_key(run_id) {
+                windows.clear();
+            }
+            let window = windows.entry(run_id.clone()).or_default();
+            window.set_objective(objective);
+            window.observe(
+                &scope,
+                &dispatch.activation.node_id,
+                failed.then(|| dispatch.dispatch_identity.clone()),
+            )
+        });
+    let Some(request) = request else {
+        return;
+    };
+    let reply = invoke_workflow_advisory_fenced(state, run_id, authority, &request, &config).await;
+    let Some(reply) = reply else {
+        return;
+    };
+    if !workflow_representation::advisory_authority_current(state, run_id, authority).await {
+        return;
+    }
+    let payload = state
+        .workflow_progress_windows
+        .lock()
+        .ok()
+        .and_then(|mut windows| windows.get_mut(run_id)?.accept(&scope, &request, &reply));
+    let Some(payload) = payload else {
+        return;
+    };
+    let Some(producer) = state
+        .plugins
+        .registry()
+        .service_registry()
+        .unique_provider("bcode.loop.progress-monitoring/v1")
+        .ok()
+        .map(str::to_owned)
+    else {
+        return;
+    };
+    let envelope = bcode_session_models::ToolContributionEnvelope::new(
+        bcode_session_models::ToolContributionPlacement::Supplemental,
+        bcode_session_models::ToolContributionEvent {
+            invocation_id: dispatch.dispatch_identity.clone(),
+            contribution_id: "progress-advisory".into(),
+            sequence: 1,
+            producer_id: producer.clone(),
+            schema: "bcode.loop.progress-monitoring/v1".into(),
+            schema_version: 1,
+            operation: bcode_session_models::ToolContributionOperation::Upsert,
+            persistence: bcode_session_models::ToolContributionPersistence::Transient,
+            artifact: None,
+            payload,
+        },
+    );
+    append_tool_contribution_envelope(
+        state,
+        session_id,
+        &dispatch.dispatch_identity,
+        &producer,
+        envelope,
+    )
+    .await;
+}
+
+async fn invoke_workflow_advisory_fenced(
+    state: &ServerState,
+    run_id: &str,
+    authority: &bcode_workflow_store::WorkflowExecutionAuthority,
+    request: &serde_json::Value,
+    config: &bcode_config::BcodeConfig,
+) -> Option<serde_json::Value> {
+    let cancel = TurnCancelState::default();
+    let operation = invoke_optional_feature_service(
+        state,
+        "bcode.loop.progress-monitoring/v1",
+        "observe",
+        request.clone(),
+        config,
+        &cancel,
+    );
+    tokio::pin!(operation);
+    let mut fence = tokio::time::interval(Duration::from_millis(50));
+    loop {
+        tokio::select! {
+            biased;
+            _ = fence.tick() => {
+                if !workflow_representation::advisory_authority_current(state, run_id, authority).await {
+                    cancel.close();
+                    return None;
+                }
+            }
+            reply = &mut operation => return reply,
+        }
+    }
+}
+
+async fn observe_settled_session_tool(
+    invoker: &ServerToolInvoker<'_>,
+    call: &bcode_model::ToolCall,
+    result: &ToolInvocationResponse,
+) {
+    let config = invoker.state.session_config(invoker.session_id).await;
+    if invoker.cancel_state.is_cancelled()
+        || !config
+            .judgement
+            .enabled(bcode_model::judgement::Feature::ProgressMonitoring)
+    {
+        return;
+    }
+    let scope = serde_json::json!({"kind": "session", "id": invoker.session_id.to_string()});
+    let request = invoker
+        .state
+        .progress_windows
+        .lock()
+        .ok()
+        .and_then(|mut windows| {
+            windows.get_mut(&invoker.session_id)?.observe(
+                &scope,
+                &call.name,
+                result.is_error.then(|| {
+                    use sha2::{Digest as _, Sha256};
+                    let end = result
+                        .output
+                        .floor_char_boundary(result.output.len().min(8192));
+                    hex::encode(Sha256::digest(&result.output.as_bytes()[..end]))
+                }),
+            )
+        });
+    let Some(request) = request else {
+        return;
+    };
+    let Some(reply) = invoke_optional_feature_service(
+        invoker.state,
+        "bcode.loop.progress-monitoring/v1",
+        "observe",
+        request.clone(),
+        &config,
+        invoker.cancel_state,
+    )
+    .await
+    else {
+        return;
+    };
+    if invoker.cancel_state.is_cancelled() {
+        return;
+    }
+    let payload = invoker
+        .state
+        .progress_windows
+        .lock()
+        .ok()
+        .and_then(|mut windows| {
+            windows
+                .get_mut(&invoker.session_id)?
+                .accept(&scope, &request, &reply)
+        });
+    let Some(payload) = payload else {
+        return;
+    };
+    let Some(producer) = invoker
+        .state
+        .plugins
+        .registry()
+        .service_registry()
+        .unique_provider("bcode.loop.progress-monitoring/v1")
+        .ok()
+        .map(str::to_owned)
+    else {
+        return;
+    };
+    let envelope = bcode_session_models::ToolContributionEnvelope::new(
+        bcode_session_models::ToolContributionPlacement::Supplemental,
+        bcode_session_models::ToolContributionEvent {
+            invocation_id: call.id.clone(),
+            contribution_id: "progress-advisory".into(),
+            sequence: 1,
+            producer_id: producer.clone(),
+            schema: "bcode.loop.progress-monitoring/v1".into(),
+            schema_version: 1,
+            operation: bcode_session_models::ToolContributionOperation::Upsert,
+            persistence: bcode_session_models::ToolContributionPersistence::Transient,
+            artifact: None,
+            payload,
+        },
+    );
+    append_tool_contribution_envelope(
+        invoker.state,
+        invoker.session_id,
+        &call.id,
+        &producer,
+        envelope,
+    )
+    .await;
 }
 
 async fn deliver_diagnostic_advisory(
@@ -31917,6 +32368,12 @@ fn session_has_active_plugin_invocations(state: &ServerState, session_id: Sessio
 }
 
 fn clear_session_live_state(state: &ServerState, session_id: SessionId) {
+    if let Ok(mut windows) = state.progress_windows.lock() {
+        windows.remove(&session_id);
+    }
+    if let Ok(mut candidates) = state.optional_context.lock() {
+        candidates.remove(&session_id);
+    }
     if let Ok(mut registry) = state.active_contributions.lock() {
         registry
             .envelopes
@@ -32149,6 +32606,17 @@ async fn append_tool_contribution_envelope(
         );
         return;
     }
+    if envelope.contribution.schema == bcode_session_models::JudgementContextCandidate::SCHEMA {
+        let _ = append_tool_contribution_event(
+            state,
+            session_id,
+            invocation_id,
+            producer_id,
+            envelope.contribution,
+        )
+        .await;
+        return;
+    }
     let event = &envelope.contribution;
     if event.invocation_id != invocation_id || event.producer_id != producer_id {
         tracing::warn!(
@@ -32221,6 +32689,40 @@ async fn append_tool_contribution_event(
     producer_id: &str,
     event: bcode_session_models::ToolContributionEvent,
 ) -> Result<(), String> {
+    if event.schema == bcode_session_models::JudgementContextCandidate::SCHEMA {
+        if event.invocation_id != invocation_id
+            || event.producer_id != producer_id
+            || event.schema_version != 1
+            || event.artifact.is_some()
+            || event.persistence != bcode_session_models::ToolContributionPersistence::Transient
+            || event.operation != bcode_session_models::ToolContributionOperation::Upsert
+        {
+            return Err("invalid request-only context contribution".into());
+        }
+        let candidate: bcode_session_models::JudgementContextCandidate =
+            serde_json::from_value(event.payload.clone())
+                .map_err(|_| "invalid context candidate")?;
+        if !candidate.is_valid() {
+            return Err("context candidate exceeds bounds".into());
+        }
+        if let Ok(mut registry) = state.optional_context.lock() {
+            if registry.len() >= 256 && !registry.contains_key(&session_id) {
+                registry.clear();
+            }
+            let candidates = registry.entry(session_id).or_default();
+            if let Some(original) = candidates
+                .iter()
+                .find(|(_, entry)| entry.id == candidate.id)
+            {
+                if original != &(invocation_id.to_owned(), candidate.clone()) {
+                    return Err("conflicting context candidate identity".into());
+                }
+            } else if candidates.len() < 16 {
+                candidates.push((invocation_id.to_owned(), candidate));
+            }
+        }
+        return Ok(());
+    }
     if event.invocation_id != invocation_id || event.producer_id != producer_id {
         tracing::warn!(
             expected_invocation_id = invocation_id,
@@ -45647,6 +46149,10 @@ id = "bcode.test-advisory-boundary"
 name = "Advisory Boundary Fixture"
 version = "0.0.1"
 [[services]]
+interface_id = "bcode.context-selection/v1"
+[[services]]
+interface_id = "bcode.loop.progress-monitoring/v1"
+[[services]]
 interface_id = "bcode.loop.tool-result-triage/v1"
 [[services]]
 interface_id = "bcode.session-categorization/v1"
@@ -45687,6 +46193,39 @@ event_symbol = "bcode_plugin_handle_event_v1"
                             domain: "backend".into(),
                         }),
                     },
+                )
+                .unwrap();
+            }
+            if context.request.interface_id == "bcode.context-selection/v1" {
+                if context.request.operation == "prepare" {
+                    return bcode_plugin_sdk::ServiceResponse::json(
+                        &serde_json::json!({"judgement":null}),
+                    )
+                    .unwrap();
+                }
+                let candidates = payload["selection"]["candidates"].as_array().unwrap();
+                let ids = candidates
+                    .iter()
+                    .map(|candidate| candidate["id"].as_str().unwrap())
+                    .collect::<Vec<_>>();
+                return bcode_plugin_sdk::ServiceResponse::json(&serde_json::json!({
+                    "ordered_ids":ids, "included_ids":ids, "applied":false,
+                }))
+                .unwrap();
+            }
+            if context.request.interface_id == "bcode.loop.progress-monitoring/v1" {
+                let observations = payload["observations"].as_array().unwrap();
+                let latest = observations.last().unwrap();
+                let repeated = observations.len() > 1
+                    && latest["failure_key"].is_string()
+                    && observations[observations.len() - 2]["failure_key"] == latest["failure_key"];
+                let advice = repeated.then(|| serde_json::json!({
+                    "scope":payload["scope"], "through_sequence":latest["sequence"],
+                    "kind":"repeated_failure", "message":"Fixture progress advisory",
+                    "progress_probability":0.1, "stall_probability":0.9, "drift_probability":0.0,
+                }));
+                return bcode_plugin_sdk::ServiceResponse::json(
+                    &serde_json::json!({"version":1,"advice":advice}),
                 )
                 .unwrap();
             }
@@ -45750,6 +46289,154 @@ event_symbol = "bcode_plugin_handle_event_v1"
         )
         .await
         .unwrap()
+    }
+
+    #[tokio::test]
+    async fn normal_optional_context_capture_preserves_protocol_provenance_and_baseline() {
+        let state = advisory_boundary_fixture_state();
+        let session = SessionId::new();
+        let candidate = bcode_session_models::JudgementContextCandidate {
+            id: "hit-1".into(),
+            source: bcode_session_models::JudgementContextSource::Search,
+            provenance: "opaque-call:range-1".into(),
+            snippet: "optional evidence".into(),
+            protected: false,
+        };
+        let event = bcode_session_models::ToolContributionEvent {
+            invocation_id: "call-1".into(),
+            contribution_id: "candidate".into(),
+            sequence: 1,
+            producer_id: "fixture".into(),
+            schema: bcode_session_models::JudgementContextCandidate::SCHEMA.into(),
+            schema_version: 1,
+            operation: bcode_session_models::ToolContributionOperation::Upsert,
+            persistence: bcode_session_models::ToolContributionPersistence::Transient,
+            artifact: None,
+            payload: serde_json::to_value(&candidate).unwrap(),
+        };
+        append_tool_contribution_event(&state, session, "call-1", "fixture", event.clone())
+            .await
+            .unwrap();
+        let original = ModelMessage {
+            role: MessageRole::Tool,
+            content: vec![ContentBlock::ToolResult {
+                result: bcode_model::ToolResult {
+                    call_id: "call-1".into(),
+                    output: "mandatory result".into(),
+                    is_error: false,
+                    content: Vec::new(),
+                },
+            }],
+        };
+        let mut config = state.startup_config.clone();
+        config.judgement.mode = bcode_config::JudgementMode::Off;
+        let mut baseline = vec![original.clone()];
+        append_optional_context(
+            &state,
+            session,
+            &mut baseline,
+            &config,
+            &TurnCancelState::default(),
+        )
+        .await;
+        assert_eq!(baseline.len(), 1);
+        assert_eq!(baseline[0].role, MessageRole::Tool);
+        assert!(
+            matches!(&baseline[0].content[0], ContentBlock::ToolResult { result } if result.call_id == "call-1" && result.output.starts_with("mandatory result") && result.output.contains("opaque-call:range-1"))
+        );
+        config.judgement.mode = bcode_config::JudgementMode::Auto;
+        let mut auto = vec![original.clone()];
+        append_optional_context(
+            &state,
+            session,
+            &mut auto,
+            &config,
+            &TurnCancelState::default(),
+        )
+        .await;
+        assert_eq!(auto, baseline);
+        let cancel = TurnCancelState::default();
+        cancel.close();
+        let mut cancelled = vec![original.clone()];
+        append_optional_context(&state, session, &mut cancelled, &config, &cancel).await;
+        assert_eq!(cancelled, vec![original]);
+        let mut invalid = event;
+        invalid.persistence = bcode_session_models::ToolContributionPersistence::Durable;
+        assert!(
+            append_tool_contribution_event(&state, session, "call-1", "fixture", invalid)
+                .await
+                .is_err()
+        );
+        clear_session_live_state(&state, session);
+        assert!(
+            !state
+                .optional_context
+                .lock()
+                .unwrap()
+                .contains_key(&session)
+        );
+        drop(state);
+    }
+
+    #[tokio::test]
+    async fn normal_settled_session_progress_resets_distinct_failure_and_success() {
+        let state = advisory_boundary_fixture_state();
+        let session = SessionId::new();
+        let mut window = judgement::ProgressWindow::default();
+        window.set_objective("repair parser".into());
+        state
+            .progress_windows
+            .lock()
+            .unwrap()
+            .insert(session, window);
+        let cancel = TurnCancelState::default();
+        let invoker = ServerToolInvoker::new(&state, session, Path::new("."), &cancel);
+        let call = bcode_model::ToolCall {
+            id: "progress-call".into(),
+            name: "fixture.test".into(),
+            arguments: serde_json::json!({"secret":"never forwarded"}),
+        };
+        let mut result = ToolInvocationResponse {
+            output: "assertion A failed".into(),
+            is_error: true,
+            content: Vec::new(),
+            full_output: None,
+            result: None,
+        };
+        observe_settled_session_tool(&invoker, &call, &result).await;
+        assert!(
+            state.progress_windows.lock().unwrap()[&session]
+                .advice
+                .is_none()
+        );
+        observe_settled_session_tool(&invoker, &call, &result).await;
+        assert!(
+            state.progress_windows.lock().unwrap()[&session]
+                .advice
+                .is_some()
+        );
+        result.output = "assertion B failed".into();
+        observe_settled_session_tool(&invoker, &call, &result).await;
+        assert!(
+            state.progress_windows.lock().unwrap()[&session]
+                .advice
+                .is_none()
+        );
+        result.is_error = false;
+        observe_settled_session_tool(&invoker, &call, &result).await;
+        assert!(
+            state.progress_windows.lock().unwrap()[&session]
+                .advice
+                .is_none()
+        );
+        cancel.close();
+        result.is_error = true;
+        observe_settled_session_tool(&invoker, &call, &result).await;
+        assert!(
+            state.progress_windows.lock().unwrap()[&session]
+                .advice
+                .is_none()
+        );
     }
 
     #[tokio::test]

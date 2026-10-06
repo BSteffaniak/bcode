@@ -17,6 +17,8 @@ mod introspection;
 mod oracle;
 mod paired;
 mod process;
+/// Offline six-feature acceptance fixtures and measured comparative quality reports.
+pub mod quality;
 mod schedule;
 mod sdk;
 mod statistics;

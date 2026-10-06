@@ -4,6 +4,12 @@ version = "0.0.1"
 
 [[services]]
 class        = "service"
+description  = "Bounded advisory progress for ordinary sessions and applicable workflow executions"
+interface_id = "bcode.loop.progress-monitoring/v1"
+name         = "Session and Workflow Progress Monitoring"
+
+[[services]]
+class        = "service"
 description  = "Optional advisory tool result triage"
 interface_id = "bcode.loop.tool-result-triage/v1"
 name         = "Loop Tool Result Triage"

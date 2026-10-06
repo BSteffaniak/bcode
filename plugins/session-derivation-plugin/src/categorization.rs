@@ -222,6 +222,30 @@ mod tests {
     use super::*;
     use bcode_session_models::SessionId;
     #[test]
+    fn representative_label_inputs_and_ambiguity_follow_actual_signal_path() {
+        for (source, task, domain) in [
+            (
+                "Debug the database persistence failure",
+                "debugging",
+                "persistence",
+            ),
+            ("Document the frontend UI", "documentation", "frontend"),
+        ] {
+            let facts = newest_request_facts(source);
+            assert_eq!(facts.tasks, BTreeSet::from([task.to_owned()]));
+            assert_eq!(facts.domains, BTreeSet::from([domain.to_owned()]));
+            let optional = optional_request(&facts).unwrap();
+            assert_eq!(optional.feature, Feature::SessionCategorization);
+            assert_eq!(
+                optional.request.state,
+                State::Structured(serde_json::to_value(facts).unwrap())
+            );
+        }
+        // Ambiguous ordinary input has no trigger, not an invented other/other label.
+        assert!(optional_request(&newest_request_facts("Hello, can you help?")).is_none());
+    }
+
+    #[test]
     fn extraction_is_bounded_and_contains_only_fixed_signals() {
         let facts = newest_request_facts("Fix backend auth token=SECRET /private/path");
         assert_eq!(facts.tasks, BTreeSet::from(["debugging".into()]));

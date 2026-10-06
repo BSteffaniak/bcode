@@ -138,6 +138,69 @@ pub fn classify(
 #[cfg(test)]
 mod tests {
     #[test]
+    fn representative_eval_cases_use_real_diagnosis_facts_without_overwriting_oracle() {
+        use bcode_model::judgement::{Answer, OptionalResponse, Response};
+        let suite = crate::quality::representative_quality_suite().unwrap();
+        for case in suite
+            .cases
+            .iter()
+            .filter(|case| case.feature == bcode_model::judgement::Feature::EvalCategorization)
+        {
+            let oracle = &case.input["oracle"];
+            let mut diagnosis = super::classify(
+                oracle,
+                &serde_json::json!([]),
+                &serde_json::json!({}),
+                &std::collections::BTreeMap::new(),
+            );
+            let baseline = diagnosis.clone();
+            let request = super::optional_request(oracle, &diagnosis)
+                .expect("representative failure triggers actual categorization");
+            assert_eq!(
+                request.request.state,
+                bcode_model::judgement::State::Structured(oracle.clone())
+            );
+            super::attach_advisory(
+                &mut diagnosis,
+                &request.request,
+                OptionalResponse { response: None },
+            );
+            assert_eq!(diagnosis, baseline);
+            let crate::quality::Expected::Labels { values } = &case.expected else {
+                panic!("expected category")
+            };
+            let category = &values["failure_category"];
+            // This checks consumer application of an injected answer, not model quality.
+            super::attach_advisory(
+                &mut diagnosis,
+                &request.request,
+                OptionalResponse {
+                    response: Some(Response {
+                        answers: std::collections::BTreeMap::from([(
+                            "failure_category".into(),
+                            Answer::Choice {
+                                selected: category.clone(),
+                                probabilities: None,
+                                confidence: None,
+                            },
+                        )]),
+                        usage: None,
+                    }),
+                },
+            );
+            assert_eq!(
+                diagnosis["advisory_model_labels"]["failure_category"],
+                category.as_str()
+            );
+            diagnosis
+                .as_object_mut()
+                .unwrap()
+                .remove("advisory_model_labels");
+            assert_eq!(diagnosis, baseline);
+        }
+    }
+
+    #[test]
     fn advisory_labels_cannot_replace_measured_outcomes() {
         use bcode_model::judgement::{Answer, OptionalResponse, Response};
         let oracle = serde_json::json!({"status":"failed","artifact_correct":false,"capture_complete":true,"secret":"DO_NOT_SEND"});

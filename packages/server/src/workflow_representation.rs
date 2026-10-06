@@ -13,6 +13,7 @@ pub mod catalog;
 pub mod child;
 pub mod controls;
 pub mod discovery;
+pub use driver::advisory_authority_current;
 mod driver;
 mod fanout;
 pub mod gate_views;

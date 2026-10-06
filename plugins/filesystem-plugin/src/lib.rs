@@ -1788,6 +1788,11 @@ fn tool_grep(
             grep_files_with_cancellation(&request, cancellation.clone(), Some(&mut progress))
                 .map_err(serde_json::Error::io)
         });
+    if let Ok(response) = &result
+        && !cancellation.is_cancelled()
+    {
+        emit_grep_context_candidates(response, tool_call_id, events);
+    }
     json_tool_response_with_artifact(
         result,
         tool_call_id,
@@ -1795,6 +1800,169 @@ fn tool_grep(
         "bcode.filesystem.grep",
         "Text matches",
     )
+}
+
+fn grep_context_candidates(
+    response: &GrepResponse,
+    tool_call_id: &str,
+) -> Vec<bcode_session_models::JudgementContextCandidate> {
+    use bcode_session_models::{JudgementContextCandidate, JudgementContextSource};
+    response
+        .matches
+        .iter()
+        .take(32)
+        .enumerate()
+        .filter_map(|(index, found)| {
+            let candidate = JudgementContextCandidate {
+                id: format!("{tool_call_id}:grep:{index}"),
+                source: JudgementContextSource::Search,
+                provenance: format!(
+                    "filesystem.grep:{tool_call_id}:{}:line:{}",
+                    found.path, found.line_number
+                ),
+                snippet: found.line.clone(),
+                // Only the supplemental hit is optional. The explicit search request and
+                // its chronological tool response remain mandatory and untouched.
+                protected: false,
+            };
+            candidate.is_valid().then_some(candidate)
+        })
+        .collect()
+}
+
+fn emit_grep_context_candidates(
+    response: &GrepResponse,
+    tool_call_id: &str,
+    events: ServiceEventEmitter,
+) {
+    for candidate in grep_context_candidates(response, tool_call_id) {
+        let Ok(payload) = serde_json::to_value(&candidate) else {
+            continue;
+        };
+        let envelope = bcode_tool::ToolContributionEnvelope::new(
+            bcode_tool::ToolContributionPlacement::Hidden,
+            bcode_tool::ToolContributionEvent {
+                invocation_id: tool_call_id.to_owned(),
+                contribution_id: candidate.id,
+                sequence: 1,
+                producer_id: FILESYSTEM_PLUGIN_ID.to_owned(),
+                schema: bcode_session_models::JudgementContextCandidate::SCHEMA.to_owned(),
+                schema_version: 1,
+                operation: bcode_tool::ToolContributionOperation::Upsert,
+                persistence: bcode_tool::ToolContributionPersistence::Transient,
+                artifact: None,
+                payload,
+            },
+        );
+        if let Ok(bytes) = serde_json::to_vec(&envelope) {
+            events.emit(&bytes);
+        }
+    }
+}
+
+#[cfg(test)]
+mod judgement_context_producer_tests {
+    use super::*;
+    use std::sync::Mutex;
+
+    fn response(lines: &[&str]) -> GrepResponse {
+        GrepResponse {
+            matches: lines
+                .iter()
+                .enumerate()
+                .map(|(index, line)| GrepMatch {
+                    path: "/confined/parser.rs".into(),
+                    line_number: index + 1,
+                    line: (*line).into(),
+                })
+                .collect(),
+            backend: "rust".into(),
+            timed_out: false,
+            partial: false,
+            visited_entries: 1,
+            message: None,
+        }
+    }
+
+    extern "C" fn capture(payload: *const u8, len: usize, context: *mut std::ffi::c_void) {
+        // SAFETY: the emitter calls synchronously while this test's collector is alive.
+        let captured = unsafe { &*context.cast::<Mutex<Vec<Vec<u8>>>>() };
+        // SAFETY: the emitter supplies a valid payload pointer and byte length.
+        let bytes = unsafe { std::slice::from_raw_parts(payload, len) };
+        captured.lock().unwrap().push(bytes.to_vec());
+    }
+
+    #[test]
+    fn real_search_lines_emit_bounded_transient_correlated_evidence_without_mutating_response() {
+        let found = response(&[
+            "irrelevant release banner",
+            "parser token lookahead regression",
+        ]);
+        let original = serde_json::to_value(&found).unwrap();
+        let captured = Mutex::new(Vec::<Vec<u8>>::new());
+        let events = ServiceEventEmitter::new(
+            Some(capture),
+            std::ptr::from_ref(&captured).cast_mut().cast(),
+        );
+        emit_grep_context_candidates(&found, "call-a", events);
+        let messages = captured.lock().unwrap().clone();
+        assert_eq!(messages.len(), 2);
+        for (index, message) in messages.iter().enumerate() {
+            let envelope: bcode_tool::ToolContributionEnvelope =
+                serde_json::from_slice(message).unwrap();
+            let contribution = envelope.contribution;
+            assert_eq!(contribution.invocation_id, "call-a");
+            assert_eq!(contribution.producer_id, FILESYSTEM_PLUGIN_ID);
+            assert_eq!(
+                contribution.persistence,
+                bcode_tool::ToolContributionPersistence::Transient
+            );
+            assert_eq!(
+                contribution.schema,
+                bcode_session_models::JudgementContextCandidate::SCHEMA
+            );
+            assert_eq!(contribution.schema_version, 1);
+            assert!(contribution.artifact.is_none());
+            let candidate: bcode_session_models::JudgementContextCandidate =
+                serde_json::from_value(contribution.payload).unwrap();
+            assert!(candidate.is_valid());
+            assert_eq!(candidate.snippet, found.matches[index].line);
+            assert_eq!(
+                candidate.provenance,
+                format!(
+                    "filesystem.grep:call-a:/confined/parser.rs:line:{}",
+                    index + 1
+                )
+            );
+            assert!(!candidate.protected);
+        }
+        assert_eq!(serde_json::to_value(&found).unwrap(), original);
+    }
+
+    #[test]
+    fn oversize_and_blank_lines_are_declined_not_truncated_and_candidate_scan_is_bounded() {
+        let long = "界".repeat(683);
+        assert!(grep_context_candidates(&response(&[&long, " "]), "call-a").is_empty());
+        let many = response(&["original"; 40]);
+        assert_eq!(grep_context_candidates(&many, "call-a").len(), 32);
+        assert!(grep_context_candidates(&many, &"x".repeat(128)).is_empty());
+    }
+
+    #[test]
+    fn explicit_file_read_retains_original_protocol_content_and_no_optional_copy() {
+        let request: ReadRequest =
+            serde_json::from_value(json!({"path":"parser.rs", "offset":1, "limit":1})).unwrap();
+        let response = text_tool_response(
+            Path::new("parser.rs"),
+            &request,
+            b"required parser evidence\n",
+            Path::new("."),
+            "explicit-call",
+        );
+        assert!(!response.is_error);
+        assert!(response.output.contains("required parser evidence"));
+        assert!(response.result.is_some());
+    }
 }
 
 fn tool_stat(

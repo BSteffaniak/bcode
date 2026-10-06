@@ -12,6 +12,102 @@ use crate::ServerState;
 mod optional;
 pub use optional::OptionalJudgementAccess;
 
+/// Ephemeral application observation window. It is never a history projection.
+#[derive(Debug, Default)]
+pub struct ProgressWindow {
+    objective: String,
+    sequence: u64,
+    observations: std::collections::VecDeque<serde_json::Value>,
+    pub(crate) advice: Option<ProgressAdvice>,
+}
+
+/// Portable consumer reply, validated before transient presentation.
+#[derive(Debug, Clone, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProgressAdvice {
+    scope: serde_json::Value,
+    through_sequence: u64,
+    kind: String,
+    pub(crate) message: String,
+    progress_probability: f64,
+    stall_probability: f64,
+    drift_probability: f64,
+}
+
+impl ProgressWindow {
+    pub(crate) fn set_objective(&mut self, objective: String) {
+        if self.objective != objective {
+            self.objective = objective;
+            self.observations.clear();
+            self.advice = None;
+        }
+    }
+
+    pub(crate) fn observe(
+        &mut self,
+        scope: &serde_json::Value,
+        action: &str,
+        failure_key: Option<String>,
+    ) -> Option<serde_json::Value> {
+        if self.objective.is_empty() || action.is_empty() || action.len() > 256 {
+            return None;
+        }
+        if failure_key.is_none() {
+            // A settled success breaks the failure chain without claiming verified evidence.
+            self.observations.clear();
+        }
+        self.sequence = self.sequence.checked_add(1)?;
+        self.advice = None;
+        if self.observations.len() == 8 {
+            self.observations.pop_front();
+        }
+        self.observations.push_back(serde_json::json!({
+            "sequence": self.sequence,
+            "action": action,
+            "failure_key": serde_json::Value::from(failure_key),
+            "evidence_key": null,
+            "summary": "Settled outcome; no verified evidence supplied",
+        }));
+        let request = serde_json::json!({
+            "version": 1, "scope": scope, "objective": self.objective,
+            "observations": self.observations,
+        });
+        (serde_json::to_vec(&request).ok()?.len() <= 16_384).then_some(request)
+    }
+
+    pub(crate) fn accept(
+        &mut self,
+        scope: &serde_json::Value,
+        request: &serde_json::Value,
+        reply: &serde_json::Value,
+    ) -> Option<serde_json::Value> {
+        if reply.get("version")?.as_u64()? != 1
+            || request.get("objective")?.as_str()? != self.objective
+        {
+            return None;
+        }
+        let payload = reply.get("advice")?.clone();
+        let advice: ProgressAdvice = serde_json::from_value(payload.clone()).ok()?;
+        if advice.scope != *scope
+            || advice.through_sequence != self.sequence
+            || !matches!(advice.kind.as_str(), "repeated_failure" | "drift")
+            || advice.message.trim().is_empty()
+            || advice.message.len() > 1024
+            || [
+                advice.progress_probability,
+                advice.stall_probability,
+                advice.drift_probability,
+            ]
+            .iter()
+            .any(|p| !p.is_finite() || !(0.0..=1.0).contains(p))
+        {
+            return None;
+        }
+        self.advice = Some(advice);
+        Some(payload)
+    }
+}
+
 /// Cache-only bridge suitable for credential-refresh closures.
 pub type JudgementInvalidationHandle = optional::JudgementInvalidationHandle;
 

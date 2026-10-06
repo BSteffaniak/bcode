@@ -62,6 +62,7 @@ mod goal_supervision;
 mod judgement_evaluation;
 mod progress;
 mod progress_monitoring;
+pub mod session_progress;
 mod swarm;
 mod swarm_ui;
 mod tool_result_triage;
@@ -90,6 +91,11 @@ impl RustPlugin for LoopPlugin {
     }
 
     fn invoke_service(&mut self, context: NativeServiceContext) -> ServiceResponse {
+        if context.request.interface_id == session_progress::INTERFACE_ID
+            && context.request.operation == session_progress::OP_OBSERVE
+        {
+            return session_progress::invoke(&context);
+        }
         if context.request.interface_id == tool_result_triage::INTERFACE_ID
             && context.request.operation == tool_result_triage::OP_TRIAGE
         {

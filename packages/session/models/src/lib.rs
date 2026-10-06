@@ -36,6 +36,9 @@ use std::str::FromStr;
 use std::time::{SystemTime, UNIX_EPOCH};
 use uuid::Uuid;
 
+mod judgement_context;
+pub use judgement_context::{JudgementContextCandidate, JudgementContextSource};
+
 mod categorization;
 pub use categorization::{
     CATEGORIZATION_INTERFACE_ID, CategorizationRequest, CategorizationResponse,

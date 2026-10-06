@@ -48,7 +48,7 @@ fn request(input: &LoopWorkflowIteration) -> Option<OptionalRequest> {
     (bytes.len() <= INPUT_LIMIT).then_some(request)
 }
 
-fn probabilities(response: &judgement::Response) -> Option<BTreeMap<&str, f64>> {
+pub fn probabilities(response: &judgement::Response) -> Option<BTreeMap<&str, f64>> {
     if response.answers.len() != 3 {
         return None;
     }

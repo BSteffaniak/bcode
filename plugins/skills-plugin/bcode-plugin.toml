@@ -8,6 +8,12 @@ description  = "Plugin-owned optional context and skill/tool relevance ordering"
 interface_id = "bcode.skills-selection/v1"
 name         = "Bounded Advisory Selection"
 
+[[services]]
+class        = "service"
+description  = "Plugin-owned ranking and budget admission of producer-owned optional evidence"
+interface_id = "bcode.context-selection/v1"
+name         = "Bounded Evidence Selection"
+
 [[tui_surfaces]]
 description = "Plugin-owned available skills UI"
 kind        = "skills.list"

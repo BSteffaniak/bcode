@@ -4,6 +4,7 @@
 
 //! skills command palette plugin for Bcode.
 
+pub mod context_selection;
 pub mod selection;
 
 #[cfg(feature = "static-bundled")]
@@ -43,6 +44,9 @@ impl RustPlugin for SkillsPlugin {
     }
 
     fn invoke_service(&mut self, context: NativeServiceContext) -> ServiceResponse {
+        if context.request.interface_id == context_selection::INTERFACE_ID {
+            return context_selection_service(&context.request);
+        }
         if context.request.interface_id == selection::INTERFACE_ID {
             return selection_service(&context.request);
         }
@@ -119,6 +123,33 @@ fn skills_command(id: &str, title: &str, description: &str) -> CommandContributi
             plugin_id: "bcode.skills".to_string(),
             command_id: id.to_string(),
         },
+    }
+}
+
+fn context_selection_service(request: &ServiceRequest) -> ServiceResponse {
+    if request.payload.len() > 128 * 1024 {
+        return ServiceResponse::error(
+            "invalid_request",
+            "context selection input exceeds size limit",
+        );
+    }
+    match request.operation.as_str() {
+        selection::OP_PREPARE => request
+            .payload_json::<context_selection::SelectionRequest>()
+            .map_or_else(
+                |_| ServiceResponse::error("invalid_request", "invalid context selection request"),
+                |input| json_response(&context_selection::prepare(&input)),
+            ),
+        selection::OP_APPLY => request
+            .payload_json::<context_selection::ApplyRequest>()
+            .map_or_else(
+                |_| ServiceResponse::error("invalid_request", "invalid context selection advice"),
+                |input| json_response(&context_selection::apply(&input)),
+            ),
+        _ => ServiceResponse::error(
+            "unsupported_operation",
+            "unknown context selection operation",
+        ),
     }
 }
 

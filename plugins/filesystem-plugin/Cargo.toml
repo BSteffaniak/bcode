@@ -15,6 +15,7 @@ crate-type = ["cdylib", "rlib"]
 
 [dependencies]
 bcode_plugin_sdk = { workspace = true, features = ["tui"] }
+bcode_session_models = { workspace = true }
 bcode_syntax_render = { workspace = true, optional = true }
 bcode_tool = { workspace = true }
 bcode_tui_components = { workspace = true, features = [

@@ -43,9 +43,9 @@ An exact pin is never silently switched to another account.
 | Feature | Useful trigger and effect |
 | --- | --- |
 | Tool-result triage | A settled tool error with recognized diagnostic indicators. Returns fixed plugin-owned advisory text as request-only next-model context and a live Supplemental Transient frontend contribution; preserves the original result, success/error flag, and side-effect accounting. The service also supports trustworthy partial-result facts, but the current host hook does not supply a partial flag. |
-| Context ranking | Under genuine catalog byte-budget pressure, optional model-invocable **skill metadata descriptions** are ranked before the existing budget is applied. This is not general retrieval, loaded skill instructions, chronological history ranking, or compaction. |
+| Context ranking | Under catalog byte-budget pressure, optional skill metadata is ranked before budgeting. Bounded transient evidence candidates are also ranked before request-only incorporation when their whole snippets exceed the optional-context budget. `filesystem.grep` supplies original match-line candidates; explicit reads and chronological tool responses remain untouched. History and memory retrieval producers are not currently implemented by this integration. |
 | Recommendations | Relevance ordering of eligible skill metadata when catalog context ranking is not applicable, and eligible tool definitions after deterministic allowlist filtering. Ordering alone does not activate skills, authorize, or execute a tool. |
-| Progress monitoring | A nonempty bounded goal/loop workflow iteration evidence snapshot. Adds progress/stall/drift probabilities to an advisory summary, not a completion verdict. Ordinary conversational turns have no separate monitoring hook. |
+| Progress monitoring | Goal/loop iteration evidence supplies advisory progress/stall/drift probabilities. Ordinary sessions and applicable workflow activations also supply bounded ephemeral settled-work observations to the loop plugin, which can return transient/request-only stall or drift advice. Advice never changes execution, permissions, objectives, or completion authority; workflow advice is checked against current durable execution ownership. |
 | Session categorization | Recognized task/domain signals from the newest admitted request. Fixed advisory labels are separate from canonical events and do not require replaying history. |
 | Evaluation categorization | Measured failure facts with deterministic diagnosis labels in workflow evaluation. Adds a separate model-label field to `diagnosis.json`; does not replace oracle results or verify root cause. |
 
@@ -96,8 +96,8 @@ and an 8192-byte excerpt.
 ## Privacy and persistence
 
 Optional does not mean local-only. Context/recommendation ranking sends bounded task text
-and candidate descriptions to the selected provider. Progress monitoring sends bounded
-stop-condition/evidence/summary/feedback state. These inputs may contain sensitive task data;
+and candidate descriptions or optional retrieved snippets to the selected provider. Progress monitoring sends bounded
+stop-condition/evidence/summary/feedback state or recent settled-work observations and the explicit objective. These inputs may contain sensitive task data;
 turn the relevant features or all judgement off when that transfer is not appropriate.
 
 Triage reduces a transient excerpt to fixed diagnostic indicators and settled boolean facts

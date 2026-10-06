@@ -428,6 +428,37 @@ async fn finish_pass(
     Ok(())
 }
 
+pub async fn advisory_authority_current(
+    state: &ServerState,
+    run_id: &str,
+    authority: &bcode_workflow_store::WorkflowExecutionAuthority,
+) -> bool {
+    if !crate::workflow_operations::authority_targets_current_daemon(state, authority) {
+        return false;
+    }
+    let Ok(retained) = retained_store(state) else {
+        return false;
+    };
+    let Ok(db) = open(retained.path(), false) else {
+        return false;
+    };
+    if super::backpressure::queued(retained.path(), || {
+        owner_boundary::verify(&db, run_id, authority)
+    })
+    .await
+    .is_err()
+    {
+        return false;
+    }
+    matches!(
+        super::backpressure::queued(retained.path(), || {
+            representation::safety::cancellation_requested_at(&db, run_id)
+        })
+        .await,
+        Ok(None)
+    )
+}
+
 async fn observe_existing(
     state: &std::sync::Arc<ServerState>,
     authority: &bcode_workflow_store::WorkflowExecutionAuthority,
@@ -452,6 +483,65 @@ async fn observe_existing(
             | bcode_workflow_store::AttemptObservation::Failed { .. }
             | bcode_workflow_store::AttemptObservation::Cancelled
     );
+    let failed = matches!(
+        observation,
+        bcode_workflow_store::AttemptObservation::Failed { .. }
+    );
+    let cancelled = matches!(
+        observation,
+        bcode_workflow_store::AttemptObservation::Cancelled
+    );
     super::owner::settle_observation(state, dispatch, authority, observation).await?;
+    if progressed
+        && !cancelled
+        && crate::workflow_operations::authority_targets_current_daemon(state, authority)
+    {
+        let retained = retained_store(state)?;
+        let db = open(retained.path(), false)?;
+        let run_id = &dispatch.activation.run_id;
+        if super::backpressure::queued(retained.path(), || {
+            owner_boundary::verify(&db, run_id, authority)
+        })
+        .await
+        .is_ok()
+        {
+            let session = super::backpressure::queued(retained.path(), || {
+                representation::runs::association(&db, run_id)
+            })
+            .await;
+            if let Ok(Some(session)) = session
+                && let Ok(session_id) = session.parse::<crate::SessionId>()
+            {
+                Box::pin(crate::observe_settled_workflow_activation(
+                    state, session_id, dispatch, authority, failed,
+                ))
+                .await;
+            }
+        }
+    }
     Ok(progressed)
+}
+
+#[cfg(test)]
+mod advisory_fence_tests {
+    #[tokio::test]
+    async fn missing_foreign_and_stale_workflow_owners_cannot_dispatch_advice() {
+        let state = crate::tests::test_server_state(crate::SessionManager::default());
+        let foreign = bcode_workflow_store::WorkflowExecutionAuthority {
+            target_artifact_id: "foreign-artifact".into(),
+            daemon_instance_id: "foreign-daemon".into(),
+            generation: 1,
+            fencing_token: "foreign-token".into(),
+        };
+        assert!(!super::advisory_authority_current(&state, "absent", &foreign).await);
+        let current = bcode_workflow_store::WorkflowExecutionAuthority {
+            target_artifact_id: crate::workflow_operations::current_artifact_id(&state),
+            daemon_instance_id: state.daemon_status.instance_id.clone(),
+            generation: 1,
+            fencing_token: "stale-token".into(),
+        };
+        assert!(!super::advisory_authority_current(&state, "absent", &current).await);
+        assert!(state.workflow_progress_windows.lock().unwrap().is_empty());
+        drop(state);
+    }
 }
