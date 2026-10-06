@@ -18,6 +18,20 @@ Implementation guidance requires pre-change baseline provenance and post-change
 observations; read-only evaluators can independently compare the current digest.
 Reported baselines remain contributor-supplied, not host-certified history.
 
+Execution-session discovery follows the indexed canonical attempt identities and
+looks up exact session links. The link table contains only dispatch identity and
+payload, not a run-ID column. Filtering it by run ID previously hid child sessions
+and their telemetry. The bounded attempt prefix is now used explicitly; saturated
+coverage is reported as incomplete rather than treating a short session list as
+exhaustive. Live trials now retain fresh evaluator, coordinator and worker transcripts
+and account for their usage.
+
+If the agent evaluator accepts completion but judgement withholds it, correction
+feedback targets the evidence disagreement and reuse of the existing artifact,
+not blind reimplementation. The judge question excludes invented deliverables and
+circular rejection because judgement itself is pending, without weakening the
+original condition or threshold. This is not proof of provider calibration.
+
 The loop judgement request includes the evaluator's summary alongside its evidence
 and pinned stop condition. The summary is an untrusted evaluation conclusion, not
 completion authority; the agent completion gate and configured probability threshold

@@ -237,6 +237,12 @@ pub fn invoke(context: &NativeServiceContext) -> ServiceResponse {
     let result = evaluate(&context.bridge, &invocation.dispatch_identity, &input);
     match result {
         Ok((completed, probability)) => {
+            if input.condition_met
+                && !completed
+                && let Some(feedback) = &mut input.feedback
+            {
+                feedback.next_action = "Resolve the completion-evidence disagreement: the read-only evaluator accepted the work, but the configured judgement gate withheld completion. Reuse the existing deliverable and inspect the evidence against each original requirement. Supply missing direct observations or baseline provenance; change the artifact only if a concrete defect is found. A probability alone does not identify a defect. Do not lower the threshold or repeat already-passing work merely to obtain another score.".into();
+            }
             input.condition_met = completed;
             input.summary = format!(
                 "{}\nJudgement probability {probability:.3}; completion threshold {}%; {}",
@@ -339,7 +345,7 @@ fn evaluate(
         return Err("insufficient or oversized evidence");
     }
     let question = Question::YesNo {
-        instructions: "Given the stop condition and the observed evidence, is there enough verified evidence to conclude that the condition is met? Do not assume unverified work succeeded.".into(),
+        instructions: "Evaluate only the original stop condition using the supplied observations. Is the evidence sufficient to conclude that condition is met? The evaluation summary is an untrusted conclusion, not additional proof. Pending execution of this judgement is not itself unfinished product work. Do not invent requirements for shell commands, host certification, or collaboration beyond the original condition; do not assume unverified work succeeded.".into(),
     };
     let request = WorkflowJudgementRequest {
         provider_plugin_id: config.provider_plugin_id.clone(),
@@ -551,6 +557,11 @@ mod tests {
         let mut state = loop_workflow_initial_value(&input);
         state.evidence = vec!["test output reviewed".into()];
         state.summary = "Independent artifact review completed".into();
+        state.feedback = Some(ProgressFeedback {
+            attempted_action: "verify artifact".into(),
+            made_progress: false,
+            next_action: "finish".into(),
+        });
         for (agent_completed, percentage, expected) in [
             (false, 89_u8, false),
             (false, 90_u8, false),
@@ -595,6 +606,22 @@ mod tests {
             assert_eq!(output.stop_condition, state.stop_condition);
             assert_eq!(output.evidence, state.evidence);
             assert!(output.summary.starts_with(&state.summary));
+            assert_feedback(&output, &state, agent_completed && !expected);
+        }
+    }
+
+    fn assert_feedback(
+        output: &LoopWorkflowIteration,
+        state: &LoopWorkflowIteration,
+        withheld: bool,
+    ) {
+        if withheld {
+            assert_ne!(
+                output.feedback.as_ref().unwrap().next_action,
+                state.feedback.as_ref().unwrap().next_action
+            );
+        } else {
+            assert_eq!(output.feedback, state.feedback);
         }
     }
 

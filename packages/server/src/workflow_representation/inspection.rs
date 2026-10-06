@@ -70,6 +70,7 @@ pub async fn inspect(
     .await
     .map_err(|_| stage("children"))?
     .children;
+    let sessions_complete = attempts.len() < usize::from(bound);
     Ok(Some(WorkflowRunInspection {
         unavailable_collections: vec![
             "events",
@@ -83,6 +84,7 @@ pub async fn inspect(
         ]
         .into_iter()
         .map(str::to_owned)
+        .chain((!sessions_complete).then(|| "child_sessions".to_owned()))
         .collect(),
         execution_allowance: None,
         continuation: None,

@@ -330,6 +330,18 @@ async fn assert_owner_links(
         .unwrap(),
         Some(link.clone())
     );
+    assert_eq!(
+        super::super::inspection_sessions::links(db, "ledger", None, 100)
+            .await
+            .unwrap(),
+        vec![link.clone()]
+    );
+    assert!(
+        super::super::inspection_sessions::links(db, "another-run", None, 100)
+            .await
+            .unwrap()
+            .is_empty()
+    );
     let conflicting = crate::WorkflowExecutionSessionLink {
         session_id: "different".into(),
         ..link

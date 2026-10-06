@@ -2,6 +2,10 @@
 use super::{Database, DatabaseValue, RepresentationError as Error};
 use switchy_database::query::{FilterableQuery, SortDirection};
 /// Read bounded session links, rejecting malformed or conflicting identities.
+///
+/// The bound applies to scanned attempts, not returned links. A short result does
+/// not establish exhaustion when attempts without sessions occupy the scanned page.
+/// Callers must use attempt coverage to determine completeness.
 /// # Errors
 /// Rejects invalid bounds, unsupported durable state and inconsistent links.
 pub async fn links(
@@ -15,18 +19,26 @@ pub async fn links(
     }
     super::verified(db).await?;
     let mut query = db
-        .select("workflow_execution_sessions_v2")
+        .select("workflow_attempts_v2")
+        .columns(&["dispatch_identity"])
         .where_eq("run_id", run)
         .sort("dispatch_identity", SortDirection::Asc)
         .limit(usize::from(limit));
     if let Some(after) = after {
         query = query.where_gt("dispatch_identity", after);
     }
-    query
-        .execute(db)
-        .await?
-        .into_iter()
-        .map(|row| {
+    let mut links = Vec::new();
+    for attempt in query.execute(db).await? {
+        let Some(DatabaseValue::String(identity)) = attempt.get("dispatch_identity") else {
+            return Err(Error::MaintenanceRequired);
+        };
+        let rows = db
+            .select("workflow_execution_sessions_v2")
+            .where_eq("dispatch_identity", identity)
+            .limit(1)
+            .execute(db)
+            .await?;
+        for row in rows {
             let Some(DatabaseValue::String(json)) = row.get("link_json") else {
                 return Err(Error::MaintenanceRequired);
             };
@@ -48,7 +60,8 @@ pub async fn links(
             {
                 return Err(Error::MaintenanceRequired);
             }
-            Ok(link)
-        })
-        .collect()
+            links.push(link);
+        }
+    }
+    Ok(links)
 }
