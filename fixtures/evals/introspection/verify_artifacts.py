@@ -152,6 +152,41 @@ def verify(root, require_complete=False):
         assert len(observed[node]["session_turns"]) == 1, "ambiguous agent turn correlation"
     assert observed["loop.judgement.evaluate"]["availability"] == "not_observed", \
         "plugin judgement must not fabricate an agent turn"
+    observation_pages = sorted(workflow.glob("workflow-observations-*.json"))
+    assert observation_pages, "missing transactional observation coverage"
+    previous = 0
+    through = None
+    for path in observation_pages:
+        page = load(path)
+        assert page["version"] == 1 and page["origin"] == "admission"
+        assert page["run_id"] == inspection["run"]["run_id"]
+        assert page["sources"] and page["limitations"], "finite coverage must declare scope"
+        if through is None:
+            through = page["through_sequence"]
+        assert through == page["through_sequence"]
+        for row in page["observations"]:
+            assert previous < row["sequence"] <= through
+            previous = row["sequence"]
+        assert page["next_after_sequence"] in (None, previous)
+    assert page["next_after_sequence"] is None and previous > 0
+    diagnostic_files = list(workflow.glob("diagnostics-*/artifact-*.json"))
+    diagnostics = {load(path)["boundary"]: load(path) for path in diagnostic_files}
+    assert {"input", "request", "response", "outcome"} <= diagnostics.keys(), "judgement diagnostic boundaries missing"
+    assert len({diagnostics[key]["dispatch_identity"] for key in ("input", "request", "response", "outcome")}) == 1
+    assert diagnostics["input"]["payload"]["evaluator_kind"] == "loop_completion_judgement"
+    assert diagnostics["input"]["payload"]["input_role"] == "normalized_iteration"
+    answer = diagnostics["response"]["payload"]["answers"]["completion"]
+    assert answer["kind"] == "yes_no" and answer["probability"] == 0.75
+    outcome = diagnostics["outcome"]["payload"]
+    assert outcome["decision"]["condition_met"] is True and outcome["fallback_selected"] is False
+    for index_path in workflow.glob("diagnostics-*/index.json"):
+        index = load(index_path)
+        for position, artifact in enumerate(index["artifacts"]):
+            path = index_path.parent / f"artifact-{position:03}.json"
+            assert not path.is_symlink() and path.stat().st_size <= MAX_BYTES
+            content = path.read_bytes()
+            assert len(content) == artifact["byte_len"]
+            assert hashlib.sha256(content).hexdigest() == artifact["sha256"]
     workflow_summaries = list(workflow.glob("*.introspection.json"))
     assert workflow_summaries, "missing workflow session indexes"
     for summary in workflow_summaries:
@@ -174,5 +209,51 @@ def verify(root, require_complete=False):
         raise SystemExit("complete introspection not demonstrated")
 
 
+def audit_controlled(root, require_complete=False):
+    """Report every retained trial without repairing or rewriting any artifact."""
+    trials = sorted((root / "cases").glob("*/variants/*/repetitions/*"))
+    trials = [path for path in trials if path.is_dir() and not path.is_symlink()]
+    assert len(trials) == 36, "controlled audit requires all 36 trials"
+    reports = []
+    for trial in trials:
+        boundaries = {}
+        summaries = sorted(trial.glob("*.introspection.json"))
+        gaps = []
+        for summary in summaries:
+            try:
+                index = summary.with_suffix(".jsonl")
+                assert not index.is_symlink() and index.stat().st_size <= MAX_BYTES
+                rows = [json.loads(line) for line in index.read_text().splitlines()]
+                import contextlib
+                import io
+                with contextlib.redirect_stdout(io.StringIO()):
+                    verify_exports(summary, rows, True, gaps)
+            except (AssertionError, ValueError, KeyError, OSError) as error:
+                # Do not print exception text: malformed artifacts can contain secrets.
+                gaps.append(type(error).__name__)
+        boundaries["model_and_tool_exports"] = {
+            "status": "missing" if not summaries else "incomplete" if gaps else "verified_observed",
+            "sessions_observed": len(summaries),
+            "scope": "retained request boundaries only; not full-session coverage",
+        }
+        manifest = trial / "capture-completeness.json"
+        if manifest.exists():
+            document = load(manifest)
+            assert document["schema"] == "bcode.eval.capture_completeness.v1"
+            boundaries.update(document["boundaries"])
+        else:
+            for boundary in ("events", "attempts", "judgement", "provider_wire"):
+                boundaries[boundary] = {"status": "missing_manifest"}
+        reports.append({"trial": str(trial.relative_to(root)), "boundaries": boundaries,
+                        "complete": False})
+    print(json.dumps({"schema": "bcode.eval.capture_audit.v1", "trials": reports,
+                      "complete": False}, sort_keys=True))
+    if require_complete:
+        raise SystemExit("full causal capture is not certified")
+
+
 if __name__ == "__main__":
-    verify(pathlib.Path(sys.argv[1]), "--require-complete" in sys.argv[2:])
+    if "--controlled-audit" in sys.argv[2:]:
+        audit_controlled(pathlib.Path(sys.argv[1]), "--require-complete" in sys.argv[2:])
+    else:
+        verify(pathlib.Path(sys.argv[1]), "--require-complete" in sys.argv[2:])

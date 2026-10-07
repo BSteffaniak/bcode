@@ -116,7 +116,9 @@ const MAX_CHUNK_DATA_SIZE: usize = MAX_FRAME_PAYLOAD_SIZE / 2;
 /// Version 44 adds explicit child relationship maintenance and own-session activity evidence.
 /// Version 45 adds optional judgement, verification, and advisory session categorization;
 /// changed positional layouts reject older peers.
-pub const CURRENT_PROTOCOL_VERSION: u16 = 45;
+/// Version 46 adds explicit receipt-backed workflow diagnostic ranges. Older positional
+/// request/response layouts are rejected rather than interpreted as another operation.
+pub const CURRENT_PROTOCOL_VERSION: u16 = 46;
 
 /// Durable session-storage writer epoch expected by this IPC build.
 pub const CURRENT_SESSION_STORAGE_WRITER_EPOCH: u32 =
@@ -931,6 +933,13 @@ pub enum Request {
         after_sequence: Option<u64>,
         limit: usize,
     },
+    /// Return finite transactional observations with explicit coverage, not guessed history.
+    WorkflowObservations {
+        run_id: String,
+        after_sequence: Option<u64>,
+        through_sequence: Option<u64>,
+        limit: usize,
+    },
     /// Return bounded workflow live notifications after one canonical sequence.
     WorkflowLiveEventCatchUp {
         after_sequence: u64,
@@ -1153,6 +1162,14 @@ pub enum Request {
     /// Explicitly prepare or inspect a bounded mutable session working document.
     SessionWorkingDocument {
         request: bcode_session_models::SessionWorkingDocumentRequest,
+    },
+    ListWorkflowDiagnosticArtifacts {
+        run_id: String,
+        dispatch_identity: String,
+    },
+    /// Explicit sensitive diagnostic access to an immutable workflow dispatch artifact.
+    ReadWorkflowDiagnosticArtifact {
+        request: bcode_workflow::WorkflowDiagnosticArtifactRequest,
     },
     /// Explicit sensitive diagnostic access to a canonical event's retained trace blob.
     ReadSessionTraceBlob {
@@ -2443,6 +2460,9 @@ pub enum ResponsePayload {
     WorkflowEventHistory {
         events: Vec<bcode_workflow::WorkflowHistoryEvent>,
     },
+    WorkflowObservations {
+        page: bcode_workflow::WorkflowObservationPage,
+    },
     WorkflowLiveEventCatchUp {
         page: bcode_workflow_view_models::WorkflowLiveEventPage,
     },
@@ -2477,6 +2497,12 @@ pub enum ResponsePayload {
     },
     SessionWorkingDocument {
         document: Option<bcode_session_models::SessionWorkingDocument>,
+    },
+    WorkflowDiagnosticArtifacts {
+        artifacts: bcode_workflow::WorkflowDiagnosticArtifacts,
+    },
+    WorkflowDiagnosticArtifactRange {
+        range: bcode_workflow::WorkflowDiagnosticArtifactRange,
     },
     SessionTraceBlobRange {
         range: bcode_session_models::SessionTraceBlobRange,

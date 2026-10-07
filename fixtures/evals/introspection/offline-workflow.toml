@@ -12,7 +12,7 @@ paired_schedule_seed = 20261006
 [[variants]]
 id = "single"
 executor = "workflow"
-config_toml = "[observability]\npersist_model_requests = true\npersist_tool_io = true\n"
+config_toml = "[observability]\npersist_model_requests = true\npersist_tool_io = true\n[plugins.config.\"bcode.loop\"]\npersist_judgement_diagnostics = true\n"
 [variants.metadata.workflow]
 binary = "@IDENTIFIED_BINARY@"
 strategy = "no-delegation"
@@ -22,6 +22,11 @@ concurrency = 1
 worker_attempts = 4
 expected_contains = ["evaluated"]
 preserve_files = ["value.txt"]
+[variants.metadata.workflow.judge]
+provider = "bcode.fake-provider"
+model = "fake-judgement"
+account = "judgement-fixture"
+threshold = 70
 [[cases]]
 id = "scripted-loop"
 fixture = "workspaces/tiny"

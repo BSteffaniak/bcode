@@ -391,6 +391,26 @@ impl bcode_workflow::WorkflowRunApplication for WorkflowAuthoringApplication<'_>
         .await
         .map_err(run_operation_failure)
     }
+    async fn workflow_observations(
+        &self,
+        run_id: String,
+        after_sequence: Option<u64>,
+        through_sequence: Option<u64>,
+        limit: usize,
+    ) -> Result<bcode_workflow::WorkflowObservationPage, Self::Error> {
+        self.state
+            .require_workflow_store()
+            .map_err(run_operation_failure)?;
+        crate::workflow_representation::discovery::observations(
+            self.state,
+            &run_id,
+            after_sequence,
+            through_sequence,
+            limit,
+        )
+        .await
+        .map_err(run_operation_failure)
+    }
     async fn workflow_event_history(
         &self,
         run_id: String,

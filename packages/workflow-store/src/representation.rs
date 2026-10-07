@@ -9,7 +9,7 @@ use switchy_database::{Database, DatabaseValue, TransactionMode};
 mod admission_policy;
 mod admission_projection;
 mod registered;
-pub use registered::admit_registered;
+pub use registered::{admit_registered, admit_registered_observed};
 /// Monotonic execution and retry allowance controls.
 pub mod allowance;
 /// Fenced attempt ledger; not permission to dispatch unfinished representation lifecycles.
@@ -42,6 +42,8 @@ pub mod inspection_activations;
 pub mod inspection_attempts;
 /// Bounded canonical execution-session links.
 pub mod inspection_sessions;
+/// Independently versioned opt-in transactional transition observations.
+pub mod journal;
 /// Bounded lookup, association detachment and canonical terminalization.
 pub mod runs;
 /// Cancellation intent and transactional resource safety.
@@ -245,6 +247,7 @@ pub async fn install(db: &dyn Database) -> Result<(), RepresentationError> {
         .value("version", EXECUTION_VERSION)
         .execute(&*tx)
         .await?;
+    journal::install_in(&*tx).await?;
     verified(&*tx).await?;
     tx.commit().await?;
     Ok(())

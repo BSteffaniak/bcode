@@ -14,6 +14,67 @@ cumulative and duplicated; do not sum index rows. Existing canonical telemetry o
 usage accounting. Trace metadata is omitted from the index; raw transcripts and
 trace payloads are sensitive diagnostic artifacts, not public frontend contracts.
 
+## Judgement diagnostics
+
+The loop plugin accepts an explicit sensitive-capture setting:
+
+```toml
+[plugins.config."bcode.loop"]
+persist_judgement_diagnostics = true
+```
+
+It defaults to false and leaves loop input/output schemas unchanged. When enabled,
+the judgement block writes bounded version-1 generic invocation artifacts for its
+normalized iteration input, outgoing normalized request, validated normalized response,
+and decision outcome. The input records evaluator kind and input role without guessing
+upstream creation provenance.
+The outcome includes threshold, evaluator result, actual fallback selection and
+capture receipts. These are not provider-wire responses or hidden reasoning.
+Agent-only loops capture their normalized input and deterministic evidence-safeguard
+outcome under the same explicit consent, labeling provider judgement not applicable.
+Capture failures do not change completion decisions. Generic workflow-artifact
+reference discovery/export uses `workflow diagnostic-artifacts` and
+`workflow read-diagnostic-artifact`, bound to an exact immutable dispatch receipt.
+The harness exports those bytes in bounded, digest-verified pages. A daemon loss
+before receipt persistence remains explicitly unavailable; files are not scanned
+to invent provenance. Legacy receipt lookup is unavailable. These diagnostics
+certify retained bytes, not full original payload coverage or provider-wire capture.
+
+Workflow capture emits `capture-completeness.json`, separating public events,
+attempts, judgement and provider-wire availability. Unsupported history stays
+explicit; snapshots are not a substitute for a semantic journal. Audit an existing
+controlled run without rewriting it:
+
+```sh
+python3 fixtures/evals/introspection/verify_artifacts.py /absolute/run --controlled-audit
+```
+
+## Finite transactional observations
+
+`workflow observations --run-id <id> --limit 100` returns a versioned page with
+exact source coverage, exclusions, optional recorded timestamps and an exclusive
+sequence cursor. Pin `--through-sequence` from the first page on subsequent
+requests. This is a bounded diagnostic scan, not a durably resumable subscription
+or reconstructed semantic history. Sources without direct run scope remain
+explicitly excluded; unknown timestamps are never guessed.
+
+The additive observation extension leaves representation v30 and the outer store
+contract unchanged. Coverage starts atomically before new-run admission; older
+runs are never backfilled. Independent writers emit observations in their source
+transaction once coverage is enabled. Rollback removes both writes. Eval retains
+`workflow-observations-*.json`; unavailable coverage is a capture failure rather
+than evidence that no transitions occurred.
+
+## Isolation and cleanup
+
+Isolated trials override both `BCODE_STATE_DIR` and `BCODE_SESSION_STORE_DIR`;
+an inherited session-store override must not expose unrelated sessions. The harness
+restores the caller's environment and process selection after each trial.
+Represented terminal workflows release their exact local runtime registration
+under verified local authority, without taking over foreign work for cleanup.
+Idle-stop acknowledgement, endpoint disappearance and verified process exit are
+distinct evidence; cleanup records must not treat one as another.
+
 ## Exact inputs
 
 Existing domain-owned observability supports explicit request-time capture through
@@ -106,6 +167,27 @@ For one proposed change compare per-request observations, tool counts, stage
 intervals, correction cycles, output correctness and total telemetry across paired
 repetitions. Separate missing evidence from quality failures. Do not infer a causal
 fix from a single noisy pass or treat tool-call overlap as useful parallel work.
+
+### Observation allowances and paired reports
+
+Workflow post-execution capture has an independent allowance, selected by suite
+metadata `capture_allowance_ms` (positive milliseconds; default 120000). It does
+not extend task execution. Exhaustion retains partial evidence and the observed
+outcome. Reports retain capture allowance, capture duration and exhaustion; direct
+execution timing also excludes transcript export overhead.
+
+Paired report schema v3 uses authored case/repetition blocks. Scheduled, observed,
+evaluable, missing, infrastructure-failed and duplicate outcomes remain distinct.
+All-attempt success rates use scheduled denominators; conditional-evaluable rates
+are named separately. Genuine terminal workflow failures remain quality outcomes.
+Missing or conflicting capture evidence and invalid latency measurements cannot
+qualify a speed sample. Intervals are descriptive, not noninferiority claims.
+
+Diagnostic discovery distinguishes unavailable entries and omitted reference
+counts. Zero omitted references certifies only no collection overflow; historical
+unknown coverage or overflow never certifies complete capture. Direct cleanup uses
+require-running clients, own-session cancellation and isolated idle-only shutdown.
+Endpoint disappearance is evidence, not proof that execution lifetime ended.
 
 Remaining coverage includes receipt-aware summary wiring, workflow semantic history,
 complete descendant/session pagination, judgement request/answer correlation and

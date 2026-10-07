@@ -150,6 +150,26 @@ pub async fn local_authority(
     state: &ServerState,
     run_id: &str,
 ) -> Result<Option<crate::workflow_operations::AuthorityGuard>, ServerError> {
+    recorded_authority(state, run_id, true).await
+}
+
+/// Verify only an already-local owner without claiming or taking over foreign work.
+///
+/// # Errors
+/// Returns an error for incompatible state, invalid associations or stale authority.
+/// Foreign or unclaimed authority returns `None` without durable mutation.
+pub async fn settlement_authority(
+    state: &ServerState,
+    run_id: &str,
+) -> Result<Option<crate::workflow_operations::AuthorityGuard>, ServerError> {
+    recorded_authority(state, run_id, false).await
+}
+
+async fn recorded_authority(
+    state: &ServerState,
+    run_id: &str,
+    allow_takeover: bool,
+) -> Result<Option<crate::workflow_operations::AuthorityGuard>, ServerError> {
     let retained = retained_store(state)?;
     match lookup_at(retained.path(), run_id).await? {
         RunLookup::Legacy | RunLookup::Missing => return Ok(None),
@@ -158,11 +178,21 @@ pub async fn local_authority(
         RunLookup::Degraded => return Err(unavailable()),
     }
     let db = open(retained.path(), false)?;
-    let authority = super::backpressure::retry(|| owner_boundary::execution_authority(&db, run_id))
-        .await
-        .map_err(|_| unavailable())?
-        .ok_or_else(unsupported)?;
+    let Some(authority) =
+        super::backpressure::retry(|| owner_boundary::execution_authority(&db, run_id))
+            .await
+            .map_err(|_| unavailable())?
+    else {
+        return if allow_takeover {
+            Err(unsupported())
+        } else {
+            Ok(None)
+        };
+    };
     if !crate::workflow_operations::authority_targets_current_daemon(state, &authority) {
+        if !allow_takeover {
+            return Ok(None);
+        }
         return Box::pin(super::recovery::takeover(state, run_id))
             .await
             .map(Some);

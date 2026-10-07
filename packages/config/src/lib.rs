@@ -1101,6 +1101,35 @@ pub fn push_process_config_overrides(overrides: ConfigLoadOverrides) -> ConfigOv
     ConfigOverrideGuard { previous }
 }
 
+/// Add request-scoped inline configuration above the current launch selection.
+///
+/// Retains file paths, profile selection and existing inline layers. Dropping the
+/// guard restores the exact previous selection; no configuration file is written.
+///
+/// # Errors
+///
+/// Returns an error when the existing inline selection or overlay is invalid TOML.
+pub fn push_process_inline_config_overlay(
+    overlay: &str,
+) -> Result<ConfigOverrideGuard, ConfigError> {
+    let mut overrides = effective_config_overrides(&ProcessConfigEnvironment);
+    let mut value = overrides.cli_config_toml.as_deref().map_or_else(
+        || Ok(toml::Value::Table(toml::Table::new())),
+        |raw| parse_raw_toml_config(raw, "current inline selection"),
+    )?;
+    merge_toml_value(
+        &mut value,
+        parse_raw_toml_config(overlay, "request overlay")?,
+    );
+    overrides.cli_config_toml =
+        Some(
+            toml::to_string(&value).map_err(|error| ConfigError::Composition {
+                message: format!("request overlay serialization failed: {error}"),
+            })?,
+        );
+    Ok(push_process_config_overrides(overrides))
+}
+
 fn canonical_profile_id(profile_id: &str) -> String {
     profile_id.trim().to_ascii_lowercase()
 }
@@ -10281,7 +10310,38 @@ enabled = false
     static ENV_LOCK: Mutex<()> = Mutex::new(());
 
     #[test]
+    fn request_overlay_preserves_launch_layers_and_restores_them() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let original = ConfigLoadOverrides {
+            cli_config_path: Some(PathBuf::from("selected.toml")),
+            cli_config_toml: Some(
+                "[observability]\npersist_model_requests = false\n[model]\nprofile = 'sol'".into(),
+            ),
+            ..Default::default()
+        };
+        let _selection = crate::push_process_config_overrides(original.clone());
+        let overlay = crate::push_process_inline_config_overlay(
+            "[observability]\npersist_model_requests = true",
+        )
+        .unwrap();
+        let current = crate::effective_config_overrides(&crate::ProcessConfigEnvironment);
+        assert_eq!(current.cli_config_path, original.cli_config_path);
+        let value: toml::Value = toml::from_str(&current.cli_config_toml.unwrap()).unwrap();
+        assert_eq!(value["model"]["profile"].as_str(), Some("sol"));
+        assert_eq!(
+            value["observability"]["persist_model_requests"].as_bool(),
+            Some(true)
+        );
+        drop(overlay);
+        assert_eq!(
+            crate::effective_config_overrides(&crate::ProcessConfigEnvironment),
+            original
+        );
+    }
+
+    #[test]
     fn launch_provenance_and_selection_toggle_are_secret_safe() {
+        let _lock = ENV_LOCK.lock().unwrap();
         let _guard = crate::push_process_config_overrides(ConfigLoadOverrides {
             env_config_path: Some(PathBuf::from("providers/sol.toml")),
             env_config_toml: Some("secret-inline-value".into()),
@@ -11110,6 +11170,7 @@ accent_transition_curve = "ease_in_out"
 
     #[test]
     fn merges_plugin_selection_from_existing_files() {
+        let _lock = ENV_LOCK.lock().unwrap();
         let root = unique_temp_dir();
         std::fs::create_dir_all(&root).expect("temp root should be created");
         let user = root.join("user.toml");

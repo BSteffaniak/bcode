@@ -10,32 +10,49 @@ use std::path::Path;
 #[cfg(test)]
 mod tests;
 
-pub fn export_cli(
-    path: &Path,
-    events: &[SessionEvent],
+/// Prioritize model inputs across all observed sessions before optional tool I/O.
+/// Receipts remain session-scoped and unavailable boundaries are retained explicitly.
+///
+/// # Errors
+/// Returns an error if retained bytes or receipts cannot be written.
+pub fn export_cli_batch(
+    sessions: &[(std::path::PathBuf, Vec<SessionEvent>)],
     invoke: &impl Fn(
         &[String],
         &str,
         std::time::Duration,
     ) -> Result<serde_json::Value, super::EvalError>,
 ) -> Result<(), super::EvalError> {
-    let root = path.with_extension("captures");
-    let mut receipts = Vec::new();
-    for capture in super::introspection::referenced_blobs(events) {
+    let mut receipts = vec![Vec::new(); sessions.len()];
+    let mut captures = sessions
+        .iter()
+        .enumerate()
+        .flat_map(|(index, (_, events))| {
+            super::introspection::referenced_blobs(events)
+                .into_iter()
+                .map(move |capture| (index, capture))
+        })
+        .collect::<Vec<_>>();
+    captures.sort_by_key(|(_, capture)| capture.kind != "model_request");
+    for (index, capture) in captures {
+        let root = sessions[index].0.with_extension("captures");
         let range = read_cli_capture(&capture, invoke);
         if let Some(range) = range {
             std::fs::create_dir_all(&root)?;
             let name = format!("{}-{}.blob", capture.session_id, capture.sequence);
             std::fs::write(root.join(&name), &range.bytes)?;
-            receipts.push(json!({"session_id":capture.session_id,"sequence":capture.sequence,"status":"exported","file":name,"sha256":range.sha256,"byte_len":range.byte_len,"completeness":range.completeness,"redaction":range.redaction}));
+            receipts[index].push(json!({"session_id":capture.session_id,"sequence":capture.sequence,"status":"exported","file":name,"sha256":range.sha256,"byte_len":range.byte_len,"completeness":range.completeness,"redaction":range.redaction}));
         } else {
-            receipts.push(json!({"session_id":capture.session_id,"sequence":capture.sequence,"status":"unavailable"}));
+            receipts[index].push(json!({"session_id":capture.session_id,"sequence":capture.sequence,"status":"unavailable"}));
         }
     }
-    super::write_json(
-        path.with_extension("captures.json"),
-        &json!({"schema":"bcode.eval.trace_exports.v1","sensitive":true,"receipts":receipts}),
-    )
+    for ((path, _), receipts) in sessions.iter().zip(receipts) {
+        super::write_json(
+            path.with_extension("captures.json"),
+            &json!({"schema":"bcode.eval.trace_exports.v1","sensitive":true,"receipts":receipts}),
+        )?;
+    }
+    Ok(())
 }
 
 fn read_cli_capture(
@@ -49,7 +66,7 @@ fn read_cli_capture(
     use sha2::{Digest as _, Sha256};
     // Pretty-printed byte arrays expand on the CLI wire. Keep each response below
     // the subprocess reader's budget independently of the retained blob budget.
-    const CHUNK: u32 = 32 * 1024;
+    const CHUNK: u32 = 64 * 1024;
     if capture.blob.byte_len > u64::from(MAX_SESSION_TRACE_BLOB_BYTES) {
         return None;
     }
@@ -112,6 +129,7 @@ pub async fn export(
     path: &Path,
     events: &[SessionEvent],
 ) -> Result<(), super::EvalError> {
+    use sha2::{Digest as _, Sha256};
     let root = path.with_extension("captures");
     let mut receipts = Vec::new();
     for capture in super::introspection::referenced_blobs(events) {
@@ -124,7 +142,13 @@ pub async fn export(
             length: MAX_SESSION_TRACE_BLOB_BYTES,
         };
         match client.session_trace_blob_range(request).await {
-            Ok(range) if range.sha256 == reference.sha256 && range.byte_len == reference.byte_len && range.eof && range.bytes.len() as u64 == range.byte_len => {
+            Ok(range) if range.version == SESSION_TRACE_EXPORT_VERSION
+                && range.session_id == capture.session_id && range.sequence == capture.sequence
+                && range.offset == 0 && range.sha256 == reference.sha256
+                && range.byte_len == reference.byte_len
+                && range.completeness == reference.completeness && range.redaction == reference.redaction
+                && range.eof && range.bytes.len() as u64 == range.byte_len
+                && hex::encode(Sha256::digest(&range.bytes)) == reference.sha256 => {
                 std::fs::create_dir_all(&root)?;
                 let name = format!("{}-{}.blob", capture.session_id, capture.sequence);
                 std::fs::write(root.join(&name), &range.bytes)?;

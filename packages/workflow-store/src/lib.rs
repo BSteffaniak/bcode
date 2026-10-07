@@ -8138,7 +8138,6 @@ impl WorkflowStore {
             .connection
             .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         verify_store_schema(&transaction)?;
-        enforce_attempt_limits(&transaction, attempt)?;
         let existing = transaction
             .query_row(
                 "SELECT dispatch_identity, intent_checksum, side_effect FROM workflow_attempts \

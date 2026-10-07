@@ -648,6 +648,11 @@ pub enum RuntimeAndModelRequest {
     ListWorkflowRuns {
         limit: usize,
     },
+    ListWorkflowDiagnosticArtifacts {
+        run_id: String,
+        dispatch_identity: String,
+    },
+    ReadWorkflowDiagnosticArtifact(bcode_workflow::WorkflowDiagnosticArtifactRequest),
     /// Return bounded canonical validated output values for one workflow run.
     WorkflowRunOutputs {
         run_id: String,
@@ -727,6 +732,12 @@ pub enum RuntimeAndModelRequest {
         limit: usize,
     },
     /// Return one bounded page of durable workflow events.
+    WorkflowObservations {
+        run_id: String,
+        after_sequence: Option<u64>,
+        through_sequence: Option<u64>,
+        limit: usize,
+    },
     WorkflowEventHistory {
         run_id: String,
         after_sequence: Option<u64>,
@@ -1445,6 +1456,18 @@ impl RoutedRequest {
             Request::ListWorkflowRuns { limit } => {
                 Self::RuntimeAndModel(Box::new(RuntimeAndModelRequest::ListWorkflowRuns { limit }))
             }
+            Request::ListWorkflowDiagnosticArtifacts {
+                run_id,
+                dispatch_identity,
+            } => Self::RuntimeAndModel(Box::new(
+                RuntimeAndModelRequest::ListWorkflowDiagnosticArtifacts {
+                    run_id,
+                    dispatch_identity,
+                },
+            )),
+            Request::ReadWorkflowDiagnosticArtifact { request } => Self::RuntimeAndModel(Box::new(
+                RuntimeAndModelRequest::ReadWorkflowDiagnosticArtifact(request),
+            )),
             Request::WorkflowRunOutputs { run_id, limit } => {
                 Self::RuntimeAndModel(Box::new(RuntimeAndModelRequest::WorkflowRunOutputs {
                     run_id,
@@ -1543,6 +1566,17 @@ impl RoutedRequest {
             } => Self::RuntimeAndModel(Box::new(RuntimeAndModelRequest::WorkflowAttemptHistory {
                 run_id,
                 cursor,
+                limit,
+            })),
+            Request::WorkflowObservations {
+                run_id,
+                after_sequence,
+                through_sequence,
+                limit,
+            } => Self::RuntimeAndModel(Box::new(RuntimeAndModelRequest::WorkflowObservations {
+                run_id,
+                after_sequence,
+                through_sequence,
                 limit,
             })),
             Request::WorkflowEventHistory {

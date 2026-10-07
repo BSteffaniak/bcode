@@ -2,7 +2,10 @@
 //! No vendor transport or credential lookup belongs here: the application owns both.
 
 use super::*;
-use bcode_model::judgement::{self, Answer, Question, State, WorkflowJudgementRequest};
+pub mod diagnostic;
+
+use bcode_model::judgement::{self, Question, State, WorkflowJudgementRequest};
+use diagnostic::{CompletionDecision, JudgementDiagnosticCapture};
 use std::collections::BTreeMap;
 
 const OPERATION: &str = "loop.judgement.evaluate";
@@ -231,6 +234,17 @@ pub fn invoke(context: &NativeServiceContext) -> ServiceResponse {
     }
     // Agent-only loops retain the deterministic safeguard; optional monitoring is advisory.
     let Some(config) = input.judgement_evaluation.clone() else {
+        let mut capture = context
+            .config_or_default::<diagnostic::DiagnosticConfig>()
+            .ok()
+            .filter(|config| config.persist_judgement_diagnostics)
+            .map(|_| JudgementDiagnosticCapture::default());
+        if let Some(capture) = &mut capture {
+            capture.write(&context.bridge, &invocation.dispatch_identity, "input", &serde_json::json!({
+                "version":1, "evaluator_kind":"loop_agent_evidence_safeguard", "input_role":"normalized_iteration", "iteration":input,
+            }));
+        }
+        let evaluator_condition_met = input.condition_met;
         safeguard_agent_evidence(&mut input);
         super::progress_monitoring::annotate(
             &context.bridge,
@@ -240,9 +254,76 @@ pub fn invoke(context: &NativeServiceContext) -> ServiceResponse {
         if context.cancellation.is_cancelled() {
             return ServiceResponse::error("cancelled", "loop evaluation cancelled");
         }
+        if let Some(capture) = &mut capture {
+            capture.write(&context.bridge, &invocation.dispatch_identity, "outcome", &serde_json::json!({
+                "version":1, "evaluator_kind":"loop_agent_evidence_safeguard", "evaluator_condition_met":evaluator_condition_met,
+                "condition_met":input.condition_met, "provider_judgement":"not_applicable",
+                "summary":input.summary, "feedback":input.feedback,
+            }));
+        }
         return json_response(&input);
     };
-    let result = evaluate(&context.bridge, &invocation.dispatch_identity, &input);
+    invoke_configured(context, &invocation.dispatch_identity, input, &config)
+}
+
+fn invoke_configured(
+    context: &NativeServiceContext,
+    dispatch_identity: &str,
+    mut input: LoopWorkflowIteration,
+    config: &EvaluationConfig,
+) -> ServiceResponse {
+    let Ok(diagnostic_config) = context.config_or_default::<diagnostic::DiagnosticConfig>() else {
+        return ServiceResponse::error("invalid_config", "invalid loop diagnostic configuration");
+    };
+    let mut capture = diagnostic_config
+        .persist_judgement_diagnostics
+        .then(JudgementDiagnosticCapture::default);
+    if let Some(capture) = &mut capture {
+        capture.write(
+            &context.bridge,
+            dispatch_identity,
+            "input",
+            &serde_json::json!({
+                "version": 1,
+                "evaluator_kind": "loop_completion_judgement",
+                "input_role": "normalized_iteration",
+                "iteration": input,
+            }),
+        );
+    }
+    let result = evaluate(&context.bridge, dispatch_identity, &input, &mut capture);
+    let evaluator_condition_met = input.condition_met;
+    let mut fallback_selected = false;
+    let response = apply_result(context, &mut input, config, result, &mut fallback_selected);
+    if let Some(capture) = &mut capture {
+        let receipts = capture.receipts.clone();
+        capture.write(
+            &context.bridge,
+            dispatch_identity,
+            "outcome",
+            &serde_json::json!({
+                "version": 1,
+                "captures": receipts,
+                "threshold_percent": config.threshold_percent,
+                "evaluator_condition_met": evaluator_condition_met,
+                "decision": result.ok().map(|(completed, probability)| serde_json::json!({
+                    "condition_met": completed, "probability": probability,
+                })),
+                "failure": result.err(),
+                "fallback_selected": fallback_selected,
+            }),
+        );
+    }
+    response
+}
+
+fn apply_result(
+    context: &NativeServiceContext,
+    input: &mut LoopWorkflowIteration,
+    config: &EvaluationConfig,
+    result: Result<(bool, f64), &'static str>,
+    fallback_selected: &mut bool,
+) -> ServiceResponse {
     match result {
         Ok((completed, probability)) => {
             if input.condition_met
@@ -262,7 +343,7 @@ pub fn invoke(context: &NativeServiceContext) -> ServiceResponse {
                     "continue"
                 }
             );
-            json_response(&input)
+            json_response(input)
         }
         Err(_) if context.cancellation.is_cancelled() => {
             ServiceResponse::error("cancelled", "loop evaluation cancelled")
@@ -281,13 +362,14 @@ pub fn invoke(context: &NativeServiceContext) -> ServiceResponse {
                     "loop evaluation has no bounded concrete evidence",
                 );
             }
+            *fallback_selected = true;
             // A failure is not completion. The agent's original decision remains visible on
             // explicitly selected fallback; no model answer is fabricated.
             input.summary = format!(
                 "{} (judgement unavailable; agent evaluation retained)",
                 input.summary
             );
-            json_response(&input)
+            json_response(input)
         }
         Err(_) => ServiceResponse::error(
             "judgement_unavailable",
@@ -338,6 +420,7 @@ fn evaluate(
     bridge: &ServiceBridge,
     dispatch_identity: &str,
     input: &LoopWorkflowIteration,
+    capture: &mut Option<JudgementDiagnosticCapture>,
 ) -> Result<(bool, f64), &'static str> {
     let config = input
         .judgement_evaluation
@@ -370,6 +453,9 @@ fn evaluate(
         },
     };
     judgement::validate_request(&request.request)?;
+    if let Some(capture) = capture {
+        capture.write(bridge, dispatch_identity, "request", &request);
+    }
     let payload = serde_json::to_value(request).map_err(|_| "invalid request")?;
     let resolution = bridge
         .request(&ServiceBridgeRequest::InvokeService(
@@ -399,21 +485,12 @@ fn evaluate(
         }
         _ => return Err("invalid judgement service response"),
     };
-    if response.answers.len() != 1 {
-        return Err("invalid judgement answer");
+    if let Some(capture) = capture {
+        capture.write(bridge, dispatch_identity, "response", &response);
     }
-    let Some(Answer::YesNo { probability }) = response.answers.get("completion") else {
-        return Err("invalid judgement answer");
-    };
-    if !probability.is_finite() || !(0.0..=1.0).contains(probability) {
-        return Err("invalid judgement answer");
-    }
-    Ok((
-        // Model confidence is an additional gate, not authority to promote an
-        // evaluator's unresolved or unverified stop condition into completion.
-        input.condition_met && *probability >= f64::from(config.threshold_percent) / 100.0,
-        *probability,
-    ))
+    let decision =
+        CompletionDecision::parse(&response, input.condition_met, config.threshold_percent)?;
+    Ok((decision.condition_met, decision.probability))
 }
 
 #[cfg(test)]
@@ -583,7 +660,8 @@ mod tests {
                 std::ptr::from_ref(&percentage).cast_mut().cast(),
                 bcode_plugin_sdk::ServiceCancellation::default(),
             );
-            let (completed, probability) = evaluate(&bridge, "dispatch", &state).unwrap();
+            let (completed, probability) =
+                evaluate(&bridge, "dispatch", &state, &mut None).unwrap();
             assert_eq!(completed, expected);
             assert!((probability - f64::from(percentage) / 100.0).abs() < f64::EPSILON);
 
@@ -634,6 +712,122 @@ mod tests {
     }
 
     #[test]
+    fn fallback_receipt_reflects_selected_branch_not_eligibility() {
+        let mut input = LoopWorkflowInput::new("implement".into(), "complete".into(), 2).unwrap();
+        let config = parse_config("bcode.jev/jev-1.13.0/-/90/agent_fallback")
+            .unwrap()
+            .unwrap();
+        input.judgement_evaluation = Some(config.clone());
+        let mut state = loop_workflow_initial_value(&input);
+        state.condition_met = true;
+        let context = NativeServiceContext {
+            plugin_id: PLUGIN_ID.into(),
+            request: ServiceRequest {
+                interface_id: bcode_workflow::WORKFLOW_BLOCK_INTERFACE_ID.into(),
+                operation: OPERATION.into(),
+                payload: Vec::new(),
+            },
+            config: bcode_plugin_sdk::PluginConfigContext::default(),
+            events: ServiceEventEmitter::default(),
+            cancellation: bcode_plugin_sdk::ServiceCancellation::default(),
+            bridge: ServiceBridge::default(),
+            transient_progress_limits: TransientProgressLimits::default(),
+        };
+        let mut selected = false;
+        let rejected = apply_result(
+            &context,
+            &mut state,
+            &config,
+            Err("judgement service unavailable"),
+            &mut selected,
+        );
+        assert_eq!(rejected.error.unwrap().code, "insufficient_evidence");
+        assert!(!selected);
+        state.evidence = vec!["bounded direct observation".into()];
+        let retained = apply_result(
+            &context,
+            &mut state,
+            &config,
+            Err("judgement service unavailable"),
+            &mut selected,
+        );
+        assert!(retained.error.is_none());
+        assert!(selected);
+    }
+
+    #[test]
+    fn agent_safeguard_capture_is_opt_in_and_does_not_invoke_provider() {
+        use std::ffi::c_void;
+        extern "C" fn callback(
+            request_ptr: *const u8,
+            request_len: usize,
+            output_ptr: *mut u8,
+            output_capacity: usize,
+            output_len: *mut usize,
+            user_data: *mut c_void,
+        ) -> i32 {
+            let request: ServiceBridgeRequest = serde_json::from_slice(unsafe {
+                std::slice::from_raw_parts(request_ptr, request_len)
+            })
+            .unwrap();
+            let ServiceBridgeRequest::WriteArtifact(request) = request else {
+                panic!("agent safeguard must not dispatch provider work");
+            };
+            let boundaries = unsafe { &mut *user_data.cast::<Vec<String>>() };
+            let value: serde_json::Value = serde_json::from_slice(&request.bytes).unwrap();
+            boundaries.push(value["boundary"].as_str().unwrap().to_owned());
+            assert_eq!(
+                value["payload"]["evaluator_kind"],
+                "loop_agent_evidence_safeguard"
+            );
+            let response = ServiceBridgeResponse::Artifact(
+                bcode_tool::ToolArtifactWriteResolution::TooLarge { max_bytes: 1 },
+            );
+            let encoded = serde_json::to_vec(&response).unwrap();
+            assert!(encoded.len() <= output_capacity);
+            unsafe {
+                std::ptr::copy_nonoverlapping(encoded.as_ptr(), output_ptr, encoded.len());
+                *output_len = encoded.len();
+            }
+            0
+        }
+        let input = LoopWorkflowInput::new("implement".into(), "complete".into(), 2).unwrap();
+        let state = loop_workflow_initial_value(&input);
+        let invocation = bcode_workflow::WorkflowBlockInvocation {
+            version: 1,
+            dispatch_identity: "dispatch".into(),
+            workspace_root: std::env::temp_dir(),
+            input: serde_json::to_value(state).unwrap(),
+            preparation: None,
+        };
+        let mut boundaries = Vec::<String>::new();
+        let mut context = NativeServiceContext {
+            plugin_id: PLUGIN_ID.into(),
+            request: ServiceRequest {
+                interface_id: bcode_workflow::WORKFLOW_BLOCK_INTERFACE_ID.into(),
+                operation: OPERATION.into(),
+                payload: serde_json::to_vec(&invocation).unwrap(),
+            },
+            config: bcode_plugin_sdk::PluginConfigContext::default(),
+            events: ServiceEventEmitter::default(),
+            cancellation: bcode_plugin_sdk::ServiceCancellation::default(),
+            bridge: ServiceBridge::new(
+                Some(callback),
+                std::ptr::from_mut(&mut boundaries).cast(),
+                bcode_plugin_sdk::ServiceCancellation::default(),
+            ),
+            transient_progress_limits: TransientProgressLimits::default(),
+        };
+        let off = invoke(&context);
+        assert!(boundaries.is_empty());
+        context.config.config = serde_json::json!({"persist_judgement_diagnostics":true});
+        let on = invoke(&context);
+        assert_eq!(on.payload, off.payload);
+        assert!(on.error.is_none());
+        assert_eq!(boundaries, ["input", "outcome"]);
+    }
+
+    #[test]
     fn judgement_failure_pauses_or_retains_existing_agent_result() {
         let mut input = LoopWorkflowInput::new("implement".into(), "complete".into(), 2).unwrap();
         let mut config = parse_config("bcode.jev/jev-1.13.0/-/90/pause")
@@ -668,6 +862,15 @@ mod tests {
             invoke(&context(&invocation)).error.unwrap().code,
             "judgement_unavailable"
         );
+        let mut capture_off = context(&invocation);
+        capture_off.config.config = serde_json::json!({"persist_judgement_diagnostics": false});
+        assert_eq!(
+            invoke(&capture_off).error.unwrap().code,
+            "judgement_unavailable"
+        );
+        let mut invalid = context(&invocation);
+        invalid.config.config = serde_json::json!({"persist_judgement_diagnostics": "true"});
+        assert_eq!(invoke(&invalid).error.unwrap().code, "invalid_config");
         config.on_failure = FailurePolicy::AgentFallback;
         state.judgement_evaluation = Some(config);
         let fallback = invoke(&context(&bcode_workflow::WorkflowBlockInvocation {

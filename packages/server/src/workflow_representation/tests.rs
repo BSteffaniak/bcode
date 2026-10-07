@@ -292,6 +292,36 @@ async fn prepare_owner_fixture(
 }
 
 #[tokio::test]
+async fn settlement_verification_never_claims_unowned_or_foreign_authority() {
+    let (_root, state) = fixture_with_store(true);
+    admit_extension(&state).await;
+    assert!(
+        owner::settlement_authority(&state, "new")
+            .await
+            .unwrap()
+            .is_none()
+    );
+    let db = open(&crate::workflow_store_path(&state), true).unwrap();
+    let mut foreign = crate::tests::test_workflow_execution_authority();
+    foreign.daemon_instance_id = "foreign-ended-owner".into();
+    representation::attempts::claim_authority(&db, "new", &foreign)
+        .await
+        .unwrap();
+    assert!(
+        owner::settlement_authority(&state, "new")
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert_eq!(
+        representation::attempts::owner_boundary::execution_authority(&db, "new")
+            .await
+            .unwrap(),
+        Some(foreign)
+    );
+}
+
+#[tokio::test]
 async fn common_owner_adapter_fences_receipts_and_atomically_rejects_invalid_output() {
     let (_root, state) = fixture_with_store(true);
     admit_extension(&state).await;
@@ -681,6 +711,16 @@ async fn normal_start_uses_typed_family_and_rescans_two_running_agents_without_d
     })
     .await
     .expect("parallel completion");
+    assert!(
+        !state
+            .runtime_work
+            .active_all()
+            .await
+            .iter()
+            .any(|(_, work)| work.work_id
+                == bcode_session_models::WorkId::new("workflow:parallel-provider")),
+        "terminal represented workflow must release its runtime registration"
+    );
     assert!(
         state
             .workflow_store

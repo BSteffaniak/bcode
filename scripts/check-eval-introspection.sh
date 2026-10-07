@@ -63,6 +63,15 @@ mode = "off"
 [observability]
 persist_model_requests = false
 persist_tool_io = false
+[auth.profiles.judgement-fixture]
+backend = "aws"
+owner_plugin_id = "bcode.fake-provider"
+provider_id = "fake"
+scheme = "api_key"
+[auth.profiles.judgement-fixture.map.api_key]
+env = "FAKE_JUDGEMENT_KEY"
+[auth.profiles.judgement-fixture.settings]
+"env.FAKE_JUDGEMENT_KEY" = "test-only"
 EOF
 run eval run "$work/suites/offline-workflow.toml" --output-root "$work/runs" --run-id offline-workflow --fail-under-pass-rate 1
 python3 "$root/fixtures/evals/introspection/verify_artifacts.py" "$work/runs" ${mode:+"$mode"}

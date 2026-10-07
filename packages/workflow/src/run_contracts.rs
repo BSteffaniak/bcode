@@ -2,6 +2,229 @@
 //! Existing wire representations are preserved. Authored provenance compatibility is recognized
 //! by its version; run status variants are explicit and unknown variants are rejected.
 
+/// Diagnostic artifact range compatibility boundary.
+pub const WORKFLOW_DIAGNOSTIC_ARTIFACT_VERSION: u32 = 1;
+/// Maximum bytes returned by one diagnostic artifact range.
+pub const MAX_WORKFLOW_DIAGNOSTIC_RANGE_BYTES: u32 = 32_768;
+/// Maximum retained diagnostic artifact bytes accepted by this export boundary.
+pub const MAX_WORKFLOW_DIAGNOSTIC_ARTIFACT_BYTES: u64 = 524_288;
+
+/// Exact dispatch-scoped sensitive diagnostic read; never accepts a storage path.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WorkflowDiagnosticArtifactRequest {
+    /// Supported export contract version.
+    pub version: u32,
+    /// Canonical owning run.
+    pub run_id: String,
+    /// Exact persisted dispatch identity.
+    pub dispatch_identity: String,
+    /// Artifact identity recorded by the dispatch owner.
+    pub artifact_id: String,
+    /// Byte offset into the recorded artifact.
+    pub offset: u64,
+    /// Positive bounded range length.
+    pub length: u32,
+}
+
+/// Producer-declared retained content completeness, not full workflow capture coverage.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkflowDiagnosticCompleteness {
+    /// Entire declared diagnostic payload retained.
+    Complete,
+    /// All published retained bytes verified; original payload coverage is not certified.
+    Retained,
+    /// Only a bounded prefix retained.
+    Truncated,
+}
+
+/// Verified bounded diagnostic bytes; private storage references are not exposed.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WorkflowDiagnosticArtifactRange {
+    /// Export contract version.
+    pub version: u32,
+    /// Canonical owning run.
+    pub run_id: String,
+    /// Exact producing dispatch.
+    pub dispatch_identity: String,
+    /// Recorded diagnostic artifact identity.
+    pub artifact_id: String,
+    /// SHA-256 of the complete retained artifact, not this range.
+    pub sha256: String,
+    /// Complete retained artifact length.
+    pub byte_len: u64,
+    /// Producer-declared completeness.
+    pub completeness: WorkflowDiagnosticCompleteness,
+    /// Returned range offset.
+    pub offset: u64,
+    /// Sensitive bytes explicitly requested by the caller.
+    pub bytes: Vec<u8>,
+    /// Whether the returned range reaches the retained artifact end.
+    pub eof: bool,
+}
+
+/// Recorded diagnostic metadata; discovery does not verify that physical bytes remain available.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WorkflowDiagnosticArtifactSummary {
+    /// Producer-recorded artifact identity.
+    pub artifact_id: String,
+    /// Publication-time SHA-256 of retained bytes.
+    pub sha256: String,
+    /// Publication-time retained byte length.
+    pub byte_len: u64,
+    /// Retained bytes do not certify original payload coverage.
+    pub completeness: WorkflowDiagnosticCompleteness,
+}
+
+/// Bounded exact-dispatch diagnostic discovery; no private storage references are exposed.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WorkflowDiagnosticArtifacts {
+    /// Discovery contract version.
+    pub version: u32,
+    /// Canonical owning run.
+    pub run_id: String,
+    /// Exact producing dispatch identity.
+    pub dispatch_identity: String,
+    /// Exportable recorded references, bounded to 100.
+    pub artifacts: Vec<WorkflowDiagnosticArtifactSummary>,
+    /// Recorded references unavailable for export; never silently discarded.
+    pub unavailable: Vec<WorkflowDiagnosticUnavailableArtifact>,
+    /// Successful writes omitted from bounded discovery. `None` means historical coverage unknown.
+    /// `Some(0)` certifies no collection overflow, not full workflow capture.
+    #[serde(default)]
+    pub omitted_artifacts: Option<u64>,
+}
+
+/// One recorded artifact whose version, integrity metadata or size prevents export.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WorkflowDiagnosticUnavailableArtifact {
+    /// Recorded identity, not a guessed file locator.
+    pub artifact_id: String,
+    /// Normalized failure without private paths or producer error text.
+    pub reason: WorkflowDiagnosticArtifactError,
+}
+
+/// Versioned finite transactional observation page, not reconstructed execution history.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WorkflowObservationPage {
+    /// Independently evolving diagnostic contract version.
+    pub version: u32,
+    /// Owning run identity.
+    pub run_id: String,
+    /// Whether observation preceded admission; historical runs are never backfilled.
+    pub origin: WorkflowObservationOrigin,
+    /// Exact finite source scope.
+    pub sources: Vec<WorkflowObservationSource>,
+    /// Explicit exclusions; finite coverage never implies complete execution history.
+    pub limitations: Vec<String>,
+    /// Fixed scan upper sequence; not a durable resume guarantee.
+    pub through_sequence: u64,
+    /// Exclusive continuation cursor.
+    pub next_after_sequence: Option<u64>,
+    /// Actual committed scalar transitions.
+    pub observations: Vec<WorkflowTransitionObservation>,
+}
+
+/// Explicit observation start policy.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkflowObservationOrigin {
+    /// Coverage started before canonical admission.
+    Admission,
+    /// Coverage was never enabled; empty results do not prove no transitions.
+    NotEnabled,
+}
+
+/// Selected representation source facts.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WorkflowObservationSource {
+    /// Source identity.
+    pub table: String,
+    /// Exact selected scalar columns.
+    pub columns: Vec<String>,
+    /// Observed transition kinds.
+    pub operations: Vec<String>,
+}
+
+/// Selected scalar fact with explicit type and null semantics.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(tag = "kind", content = "value", rename_all = "snake_case")]
+pub enum WorkflowObservationFact {
+    /// Recorded null.
+    Null,
+    /// Recorded integer, including `SQLite` boolean representation.
+    Integer(i64),
+    /// Bounded identifier or status text.
+    Text(String),
+    /// Fact not retained, distinct from recorded null.
+    Unavailable(WorkflowObservationUnavailableReason),
+}
+
+/// Explicit bounded fact omission reason.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkflowObservationUnavailableReason {
+    /// Text exceeded the transactional byte allowance.
+    Oversized,
+    /// Unsupported source storage type.
+    UnsupportedType,
+}
+
+/// One retained transition without private owner payloads.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WorkflowTransitionObservation {
+    /// Canonical observation order, potentially sparse for this run.
+    pub sequence: u64,
+    /// Source table.
+    pub source: String,
+    /// Exact transition operation.
+    pub operation: String,
+    /// Scalar column values; unknown private payloads are not exported.
+    pub facts: std::collections::BTreeMap<String, WorkflowObservationFact>,
+    /// Actual source timestamp when available, never guessed.
+    pub recorded_at_ms: Option<u64>,
+    /// Source column for the recorded timestamp.
+    pub timestamp_source: Option<String>,
+}
+
+/// Normalized export failures; no paths, owner messages or provider metadata.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkflowDiagnosticArtifactError {
+    /// Unsupported request or recorded diagnostic version.
+    UnsupportedVersion,
+    /// Invalid identities or range bounds.
+    InvalidRequest,
+    /// No exact recorded receipt/reference, including interruption before settlement.
+    Unavailable,
+    /// Inconsistent identity, metadata or retained bytes.
+    VerificationFailed,
+    /// Storage/ownership admission could not be established.
+    StorageUnavailable,
+}
+
+impl std::fmt::Display for WorkflowDiagnosticArtifactError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(match self {
+            Self::UnsupportedVersion => "workflow diagnostic version unsupported",
+            Self::InvalidRequest => "invalid workflow diagnostic request",
+            Self::Unavailable => "workflow diagnostic artifact unavailable",
+            Self::VerificationFailed => "workflow diagnostic verification failed",
+            Self::StorageUnavailable => "workflow diagnostic storage unavailable",
+        })
+    }
+}
+
+impl std::error::Error for WorkflowDiagnosticArtifactError {}
+
 /// Keyset cursor for bounded attempt history; existing serialized shape is preserved.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct AttemptCursor {
@@ -305,6 +528,19 @@ pub trait WorkflowRunApplication: Sync {
         after_sequence: Option<u64>,
         limit: usize,
     ) -> impl std::future::Future<Output = Result<Vec<WorkflowHistoryEvent>, Self::Error>> + Send;
+
+    /// Read bounded finite transactional observations with explicit coverage.
+    ///
+    /// # Errors
+    /// Returns an error for unsupported observation contracts, missing or damaged state,
+    /// invalid bounds, or transport failure. Historical state is never reconstructed.
+    fn workflow_observations(
+        &self,
+        run_id: String,
+        after_sequence: Option<u64>,
+        through_sequence: Option<u64>,
+        limit: usize,
+    ) -> impl std::future::Future<Output = Result<WorkflowObservationPage, Self::Error>> + Send;
 
     /// Retry one exact failed attempt under verified execution authority.
     ///

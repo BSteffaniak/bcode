@@ -527,6 +527,15 @@ impl bcode_workflow::WorkflowRunApplication for BcodeClient {
     ) -> Result<Vec<bcode_workflow::AttemptSummary>, Self::Error> {
         Self::workflow_attempt_history(self, run_id, cursor, limit).await
     }
+    async fn workflow_observations(
+        &self,
+        run_id: String,
+        after_sequence: Option<u64>,
+        through_sequence: Option<u64>,
+        limit: usize,
+    ) -> Result<bcode_workflow::WorkflowObservationPage, Self::Error> {
+        Self::workflow_observations(self, run_id, after_sequence, through_sequence, limit).await
+    }
     async fn workflow_event_history(
         &self,
         run_id: String,
@@ -3014,6 +3023,69 @@ impl BcodeClient {
             .await?
         {
             ResponsePayload::InvocationInputAccepted => Ok(()),
+            _ => Err(ClientError::UnexpectedResponse),
+        }
+    }
+
+    /// Discover bounded receipt-backed diagnostic artifact identities, not their contents.
+    ///
+    /// # Errors
+    /// Rejects unavailable or mismatched receipt metadata.
+    pub async fn workflow_diagnostic_artifacts(
+        &self,
+        run_id: String,
+        dispatch_identity: String,
+    ) -> Result<bcode_workflow::WorkflowDiagnosticArtifacts, ClientError> {
+        match self
+            .send_request(Request::ListWorkflowDiagnosticArtifacts {
+                run_id: run_id.clone(),
+                dispatch_identity: dispatch_identity.clone(),
+            })
+            .await?
+        {
+            ResponsePayload::WorkflowDiagnosticArtifacts { artifacts }
+                if artifacts.version == 1
+                    && artifacts.run_id == run_id
+                    && artifacts.dispatch_identity == dispatch_identity
+                    && artifacts.artifacts.len() + artifacts.unavailable.len() <= 100 =>
+            {
+                Ok(artifacts)
+            }
+            _ => Err(ClientError::UnexpectedResponse),
+        }
+    }
+
+    /// Read an explicitly captured sensitive workflow invocation artifact.
+    ///
+    /// # Errors
+    /// Rejects unavailable, incompatible, damaged or mismatched diagnostic ranges.
+    pub async fn workflow_diagnostic_artifact(
+        &self,
+        request: bcode_workflow::WorkflowDiagnosticArtifactRequest,
+    ) -> Result<bcode_workflow::WorkflowDiagnosticArtifactRange, ClientError> {
+        let expected = request.clone();
+        match self
+            .send_request(Request::ReadWorkflowDiagnosticArtifact { request })
+            .await?
+        {
+            ResponsePayload::WorkflowDiagnosticArtifactRange { range }
+                if range.version == 1
+                    && range.run_id == expected.run_id
+                    && range.dispatch_identity == expected.dispatch_identity
+                    && range.artifact_id == expected.artifact_id
+                    && range.offset == expected.offset
+                    && range.bytes.len() <= expected.length as usize
+                    && range
+                        .offset
+                        .checked_add(range.bytes.len() as u64)
+                        .is_some_and(|end| {
+                            end <= range.byte_len && range.eof == (end == range.byte_len)
+                        })
+                    && range.sha256.len() == 64
+                    && range.sha256.bytes().all(|byte| byte.is_ascii_hexdigit()) =>
+            {
+                Ok(range)
+            }
             _ => Err(ClientError::UnexpectedResponse),
         }
     }
@@ -6192,6 +6264,38 @@ impl BcodeClient {
             .await?
         {
             ResponsePayload::WorkflowEventHistory { events } => Ok(events),
+            _ => Err(ClientError::UnexpectedResponse),
+        }
+    }
+
+    /// Read bounded finite observations with explicit coverage.
+    ///
+    /// # Errors
+    /// Returns an error for invalid bounds, incompatible or damaged state, or transport failure.
+    pub async fn workflow_observations(
+        &self,
+        run_id: String,
+        after_sequence: Option<u64>,
+        through_sequence: Option<u64>,
+        limit: usize,
+    ) -> Result<bcode_workflow::WorkflowObservationPage, ClientError> {
+        match self
+            .send_request(Request::WorkflowObservations {
+                run_id: run_id.clone(),
+                after_sequence,
+                through_sequence,
+                limit,
+            })
+            .await?
+        {
+            ResponsePayload::WorkflowObservations { page }
+                if page.version == 1
+                    && page.run_id == run_id
+                    && page.observations.len() <= limit
+                    && limit <= 100 =>
+            {
+                Ok(page)
+            }
             _ => Err(ClientError::UnexpectedResponse),
         }
     }

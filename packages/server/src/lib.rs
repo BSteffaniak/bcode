@@ -39,6 +39,7 @@ mod tool_host_retry;
 mod trace_operations;
 #[cfg(test)]
 mod workflow_admission_tests;
+mod workflow_diagnostics;
 mod workflow_operations;
 mod workflow_receipts;
 mod workflow_representation;
@@ -6241,6 +6242,8 @@ const fn request_kind(request: &Request) -> &'static str {
         Request::DeleteSession { .. } => "delete_session",
         Request::PrepareContextGeneration { .. } => "prepare_context_generation",
         Request::SessionWorkingDocument { .. } => "session_working_document",
+        Request::ListWorkflowDiagnosticArtifacts { .. } => "list_workflow_diagnostic_artifacts",
+        Request::ReadWorkflowDiagnosticArtifact { .. } => "read_workflow_diagnostic_artifact",
         Request::ReadSessionTraceBlob { .. } => "read_session_trace_blob",
         Request::ReadSessionArtifact { .. } => "read_session_artifact",
         Request::InvocationInput { .. } => "invocation_input",
@@ -6409,6 +6412,7 @@ const fn request_kind(request: &Request) -> &'static str {
         Request::ListWorkflowMutationApprovals { .. } => "list_workflow_mutation_approvals",
         Request::ResolveWorkflowMutationApproval { .. } => "resolve_workflow_mutation_approval",
         Request::WorkflowAttemptHistory { .. } => "workflow_attempt_history",
+        Request::WorkflowObservations { .. } => "workflow_observations",
         Request::WorkflowEventHistory { .. } => "workflow_event_history",
         Request::WorkflowLiveEventCatchUp { .. } => "workflow_live_event_catch_up",
         Request::SubscribeRuntimeWork { .. } => "subscribe_runtime_work",
@@ -8541,6 +8545,58 @@ async fn handle_workflow_run_request(
             };
             send_response(writer, request_id, response).await
         }
+        RuntimeAndModelRequest::ListWorkflowDiagnosticArtifacts {
+            run_id,
+            dispatch_identity,
+        } => {
+            let response = workflow_diagnostics::list(state, &run_id, &dispatch_identity)
+                .await
+                .map_or_else(
+                    |_| {
+                        Response::Err(ErrorResponse::new(
+                            "workflow_diagnostic_unavailable",
+                            "workflow diagnostic reference discovery is unavailable",
+                        ))
+                    },
+                    |artifacts| {
+                        Response::Ok(ResponsePayload::WorkflowDiagnosticArtifacts { artifacts })
+                    },
+                );
+            send_response(writer, request_id, response).await
+        }
+        RuntimeAndModelRequest::ReadWorkflowDiagnosticArtifact(request) => {
+            let response = match workflow_diagnostics::read(state, &request).await {
+                Ok(range) => {
+                    Response::Ok(ResponsePayload::WorkflowDiagnosticArtifactRange { range })
+                }
+                Err(error) => {
+                    let (code, message) = match error {
+                        bcode_workflow::WorkflowDiagnosticArtifactError::UnsupportedVersion => (
+                            "workflow_diagnostic_unsupported",
+                            "workflow diagnostic representation is unsupported",
+                        ),
+                        bcode_workflow::WorkflowDiagnosticArtifactError::InvalidRequest => (
+                            "workflow_diagnostic_invalid",
+                            "invalid workflow diagnostic range",
+                        ),
+                        bcode_workflow::WorkflowDiagnosticArtifactError::Unavailable => (
+                            "workflow_diagnostic_unavailable",
+                            "workflow diagnostic capture is unavailable",
+                        ),
+                        bcode_workflow::WorkflowDiagnosticArtifactError::VerificationFailed => (
+                            "workflow_diagnostic_damaged",
+                            "workflow diagnostic integrity verification failed",
+                        ),
+                        bcode_workflow::WorkflowDiagnosticArtifactError::StorageUnavailable => (
+                            "workflow_diagnostic_storage_unavailable",
+                            "workflow diagnostic storage is unavailable",
+                        ),
+                    };
+                    Response::Err(ErrorResponse::new(code, message))
+                }
+            };
+            send_response(writer, request_id, response).await
+        }
         RuntimeAndModelRequest::WorkflowRunOutputs { run_id, limit } => {
             let result = bcode_workflow::WorkflowRunApplication::workflow_run_outputs(
                 &workflow_operations::WorkflowAuthoringApplication::new(state, client_id),
@@ -8776,6 +8832,26 @@ async fn handle_workflow_run_request(
             .await;
             let response = match result {
                 Ok(attempts) => Response::Ok(ResponsePayload::WorkflowAttemptHistory { attempts }),
+                Err(failure) => Response::Err(ErrorResponse::new(failure.code, failure.message)),
+            };
+            send_response(writer, request_id, response).await
+        }
+        RuntimeAndModelRequest::WorkflowObservations {
+            run_id,
+            after_sequence,
+            through_sequence,
+            limit,
+        } => {
+            let result = bcode_workflow::WorkflowRunApplication::workflow_observations(
+                &workflow_operations::WorkflowAuthoringApplication::new(state, client_id),
+                run_id,
+                after_sequence,
+                through_sequence,
+                limit,
+            )
+            .await;
+            let response = match result {
+                Ok(page) => Response::Ok(ResponsePayload::WorkflowObservations { page }),
                 Err(failure) => Response::Err(ErrorResponse::new(failure.code, failure.message)),
             };
             send_response(writer, request_id, response).await
@@ -18263,6 +18339,7 @@ async fn drive_workflow_run_exclusive(
     run_id: &str,
 ) -> Result<(), ServerError> {
     if Box::pin(workflow_representation::drive_if_represented(state, run_id)).await? {
+        settle_locally_owned_represented_runtime_work(state, run_id).await?;
         return Ok(());
     }
     let authority = required_workflow_drive_authority(state, run_id).await?;
@@ -18604,15 +18681,23 @@ async fn workflow_completion_message(
 }
 
 /// Terminal runs finish their work; paused runs suspend it without losing durable state.
+async fn settle_locally_owned_represented_runtime_work(
+    state: &ServerState,
+    run_id: &str,
+) -> Result<(), ServerError> {
+    if let Some(guard) = workflow_representation::owner::settlement_authority(state, run_id).await?
+    {
+        settle_workflow_runtime_work(state, run_id).await?;
+        drop(guard);
+    }
+    Ok(())
+}
+
 async fn settle_workflow_runtime_work(
     state: &ServerState,
     run_id: &str,
 ) -> Result<(), ServerError> {
-    let run = state
-        .workflow_store
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .run_summary(run_id)?;
+    let run = workflow_representation::status(state, run_id).await?;
     let Some(run) = run else {
         return Ok(());
     };
@@ -18624,7 +18709,7 @@ async fn settle_workflow_runtime_work(
         return Ok(());
     };
     let (status, message) = match run.status {
-        bcode_workflow_store::RunStatus::Running => {
+        bcode_workflow::RunStatus::Running => {
             return Ok(());
         }
         // A paused run is durable state that needs no live process. Suspending its runtime work
@@ -25618,6 +25703,7 @@ struct StaticModelTurnContext {
     tool_catalog: Option<Arc<tool_catalog::Snapshot>>,
     system_prompt: String,
     system_messages: Vec<ModelMessage>,
+    prefix_context: Option<ModelMessage>,
     recovery_context: Option<ModelMessage>,
     tools: Vec<bcode_model::ToolDefinition>,
     prompt_profile_layers: Vec<String>,
@@ -25887,8 +25973,11 @@ async fn prepare_static_model_turn_context(
         session_summary.parent_id,
     )];
     let mut recovery_context = None;
-    if config.system_prompt.sections.config_selection {
-        system_messages.push(ModelMessage {
+    let prefix_context = config
+        .system_prompt
+        .sections
+        .config_selection
+        .then(|| ModelMessage {
             role: MessageRole::System,
             content: vec![ContentBlock::Text {
                 text: config_selection_context(
@@ -25900,7 +25989,6 @@ async fn prepare_static_model_turn_context(
                 ),
             }],
         });
-    }
     if !facts.is_empty() {
         let text = format!(
             "{}{facts}",
@@ -26061,6 +26149,7 @@ async fn prepare_static_model_turn_context(
         tool_catalog: Some(tool_catalog),
         system_prompt,
         system_messages,
+        prefix_context,
         recovery_context,
         tools,
         prompt_profile_layers: profile.applied_layers,
@@ -26166,6 +26255,12 @@ async fn build_model_turn_request(
         );
         preceding.append(&mut messages);
         messages = preceding;
+    }
+    // Configuration facts are request-only, but unchanged facts occupy a stable
+    // prefix across user turns and daemon replacement. Turn-specific reminders
+    // still accompany the current trigger rather than historical messages.
+    if let Some(context) = &static_context.prefix_context {
+        messages.insert(0, context.clone());
     }
     state.metrics.record_histogram_with_labels(
         "model.request_build.convert_events_duration_ms",
@@ -31123,6 +31218,7 @@ fn workflow_output_evidence_resolution(
     )
 }
 
+#[cfg(test)]
 fn server_workflow_plugin_bridge(
     state: Arc<ServerState>,
     config: bcode_config::BcodeConfig,
@@ -31130,6 +31226,26 @@ fn server_workflow_plugin_bridge(
     dispatch_identity: &str,
     caller_plugin_id: &str,
     run_id: &str,
+) -> PluginInvocationBridge {
+    server_workflow_plugin_bridge_observed(
+        state,
+        config,
+        parent_session_id,
+        dispatch_identity,
+        caller_plugin_id,
+        run_id,
+        None,
+    )
+}
+
+fn server_workflow_plugin_bridge_observed(
+    state: Arc<ServerState>,
+    config: bcode_config::BcodeConfig,
+    parent_session_id: SessionId,
+    dispatch_identity: &str,
+    caller_plugin_id: &str,
+    run_id: &str,
+    artifacts: Option<Arc<StdMutex<WorkflowArtifactReferences>>>,
 ) -> PluginInvocationBridge {
     let run_id = run_id.to_owned();
     let dispatch_identity = dispatch_identity.to_string();
@@ -31155,9 +31271,10 @@ fn server_workflow_plugin_bridge(
                 &dispatch_identity,
                 &cancel_state,
             );
-            Ok(ServiceBridgeResponse::Artifact(
-                futures::executor::block_on(sink.write(artifact, scope.artifact_commit_guard())),
-            ))
+            let resolution =
+                futures::executor::block_on(sink.write(artifact, scope.artifact_commit_guard()));
+            record_workflow_artifact_reference(artifacts.as_ref(), &resolution);
+            Ok(ServiceBridgeResponse::Artifact(resolution))
         }
         ServiceBridgeRequest::WriteArtifact(_) => Ok(ServiceBridgeResponse::Artifact(
             ToolArtifactWriteResolution::Failed {
@@ -31210,6 +31327,42 @@ fn server_workflow_plugin_bridge(
             },
         )),
     })
+}
+
+#[derive(Default)]
+struct WorkflowArtifactReferences {
+    references: Vec<serde_json::Value>,
+    omitted_artifacts: u64,
+}
+
+fn record_workflow_artifact_reference(
+    artifacts: Option<&Arc<StdMutex<WorkflowArtifactReferences>>>,
+    resolution: &ToolArtifactWriteResolution,
+) {
+    if let ToolArtifactWriteResolution::Written {
+        reference,
+        artifact_id,
+        byte_len,
+    } = resolution
+        && let Some(artifacts) = artifacts
+    {
+        let mut references = artifacts
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if references.references.len() < 100 {
+            references.references.push(serde_json::json!({
+                "artifact_id": artifact_id, "byte_len": byte_len,
+                "reference": {
+                    "uri": reference.get("uri"),
+                    "sha256": reference.get("sha256"),
+                    "byte_len": reference.get("byte_len"),
+                },
+            }));
+        } else {
+            references.omitted_artifacts = references.omitted_artifacts.saturating_add(1);
+        }
+        drop(references);
+    }
 }
 
 struct ServerInputRouter<'a> {
@@ -31447,6 +31600,8 @@ where
     }
     Ok(serde_json::json!({
         "uri": format!("bcode-artifact://invocation/{invocation_key}/{artifact_key}"),
+        "sha256": hex::encode(Sha256::digest(&request.bytes)),
+        "byte_len": request.bytes.len(),
         "content_type": request.content_type,
         "metadata": request.metadata,
     }))
@@ -36463,6 +36618,7 @@ async fn dispatch_workflow_plugin_block(
         input: canonical_input,
         preparation,
     })?;
+    let artifact_references = Arc::new(StdMutex::new(WorkflowArtifactReferences::default()));
     let run_work_id = WorkId::new(format!("workflow:{}", request.activation.run_id));
     let mut invocation = state
         .plugins
@@ -36472,13 +36628,14 @@ async fn dispatch_workflow_plugin_block(
             block.operation.clone(),
             payload,
             PluginInvocationScope::session(parent_session_id.to_string()),
-            Some(server_workflow_plugin_bridge(
+            Some(server_workflow_plugin_bridge_observed(
                 Arc::clone(state),
                 state.session_config(parent_session_id).await,
                 parent_session_id,
                 &request.dispatch_identity,
                 &block.plugin_id,
                 &request.activation.run_id,
+                Some(Arc::clone(&artifact_references)),
             )),
         )
         .await
@@ -36610,6 +36767,12 @@ async fn dispatch_workflow_plugin_block(
         status,
         "workflow plugin block terminal observation"
     );
+    let (artifact_references, omitted_artifacts) = {
+        let collected = artifact_references
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        (collected.references.clone(), collected.omitted_artifacts)
+    };
     Ok(serde_json::json!({
         "owner": bcode_workflow::WORKFLOW_BLOCK_INTERFACE_ID,
         "plugin_id": block.plugin_id,
@@ -36619,6 +36782,12 @@ async fn dispatch_workflow_plugin_block(
         "status": status,
         "output_schema_id": request.activation.node.output.type_name,
         "output": output,
+        "diagnostics": {
+            "version": 1,
+            "parent_session_id": parent_session_id,
+            "artifacts": artifact_references,
+            "omitted_artifacts": omitted_artifacts,
+        },
         "message": message,
         "terminal_at_ms": current_unix_millis(),
     }))
@@ -93338,7 +93507,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
         .expect("static turn context");
 
         assert!(prepared.tools.is_empty());
-        assert!(prepared.system_messages.iter().any(|message| message.content.iter().any(
+        assert!(prepared.prefix_context.as_ref().is_some_and(|message| message.content.iter().any(
             |block| matches!(block, ContentBlock::Text { text } if text.contains("/client-specific/sol.toml"))
         )));
         assert!(prepared.system_prompt.ends_with(USER_AUTHORITY_PROMPT));
@@ -95239,6 +95408,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
     fn prefix_test_context() -> StaticModelTurnContext {
         StaticModelTurnContext {
             tool_catalog: None,
+            prefix_context: None,
             recovery_context: None,
             system_prompt: "stable instructions".into(),
             system_messages: vec![ModelMessage {
@@ -95333,12 +95503,28 @@ event_symbol = "bcode_plugin_handle_event_v1"
             next.messages.len(),
             first.messages.len() + 2 * round as usize
         );
-        assert_eq!(next.messages[0].role, MessageRole::User);
+        assert_eq!(next.messages[0], context.prefix_context.clone().unwrap());
+        assert_eq!(next.messages[1].role, MessageRole::User);
         assert_eq!(next.messages.last().unwrap(), &context.system_messages[0]);
         let result_index = next.messages.len() - 2;
         assert_eq!(next.messages[result_index - 1].role, MessageRole::Assistant);
         assert!(matches!(&next.messages[result_index].content[0],
             ContentBlock::ToolResult { result } if !result.is_error && result.output == "repository contents"));
+    }
+
+    fn config_selection_message_for_test() -> ModelMessage {
+        ModelMessage {
+            role: MessageRole::System,
+            content: vec![ContentBlock::Text {
+                text: "unchanged request-only configuration".into(),
+            }],
+        }
+    }
+
+    fn assert_request_context_not_persisted(history: &[bcode_session_models::SessionEvent]) {
+        let serialized = serde_json::to_string(history).unwrap();
+        assert!(!serialized.contains("repository snapshot"));
+        assert!(!serialized.contains("unchanged request-only configuration"));
     }
 
     #[tokio::test]
@@ -95379,7 +95565,9 @@ event_symbol = "bcode_plugin_handle_event_v1"
             .unwrap()
             .request
         };
+        context.prefix_context = Some(config_selection_message_for_test());
         let first = build(&trigger, 0, &context, None).await;
+        assert_eq!(first.messages[0], context.prefix_context.clone().unwrap());
         let mut previous = first.clone();
         for round in 1..=3 {
             append_prefix_exchange(&state, summary.id, round).await;
@@ -95393,7 +95581,8 @@ event_symbol = "bcode_plugin_handle_event_v1"
             text: "timestamp and repository snapshot B".into(),
         }];
         let fresh = build(&next_trigger, 0, &context, Some("retry guidance")).await;
-        assert_eq!(fresh.messages[0].role, MessageRole::User);
+        assert_eq!(fresh.messages[0], first.messages[0]);
+        assert_eq!(fresh.messages[1].role, MessageRole::User);
         let retained_history_len = previous.messages.len() - 1;
         assert_eq!(
             &fresh.messages[..retained_history_len],
@@ -95410,10 +95599,10 @@ event_symbol = "bcode_plugin_handle_event_v1"
                 .iter()
                 .filter(|message| message.role == MessageRole::System)
                 .count(),
-            2
+            3
         );
         assert!(fresh.messages.contains(&context.system_messages[0]));
-        assert!(!fresh.messages.contains(&first.messages[1]));
+        assert!(!fresh.messages.contains(&first.messages[2]));
         assert_eq!(fresh.messages[0], first.messages[0]);
         context.recovery_context = Some(ModelMessage {
             role: MessageRole::System,
@@ -95436,11 +95625,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
             .await
             .unwrap();
         drop(state);
-        assert!(
-            !serde_json::to_string(&history)
-                .unwrap()
-                .contains("repository snapshot")
-        );
+        assert_request_context_not_persisted(&history);
     }
 
     #[tokio::test]
@@ -95481,6 +95666,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
         };
         let static_context = StaticModelTurnContext {
             tool_catalog: None,
+            prefix_context: None,
             recovery_context: None,
             system_prompt: String::new(),
             system_messages: Vec::new(),

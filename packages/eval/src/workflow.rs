@@ -9,10 +9,40 @@ use bcode_eval_models::WorkflowEvalConfig;
 use sha2::Digest;
 use std::time::Duration;
 
+fn execution_duration(start: Instant, observed_end: Instant) -> Duration {
+    observed_end.saturating_duration_since(start)
+}
+
+fn readiness_unavailable(error: &EvalError) -> bool {
+    matches!(error, EvalError::Client(message) if message.contains("server returned error workflow_capability_unavailable: workflow readiness status is temporarily unavailable; retry the workflow request (no initialization progress has been verified)"))
+}
+
+fn observe(
+    args: &[String],
+    label: &str,
+    remaining: impl Fn() -> Duration,
+    invoke: &impl Fn(&[String], &str, Duration) -> Result<serde_json::Value, EvalError>,
+    wait: impl Fn(Duration),
+) -> Result<serde_json::Value, EvalError> {
+    // Retry reads only. Admission, cancellation and other mutations never retry here.
+    let mut retries = 0;
+    loop {
+        match invoke(args, label, remaining()) {
+            Err(error)
+                if readiness_unavailable(&error) && retries < 4 && !remaining().is_zero() =>
+            {
+                retries += 1;
+                wait(Duration::from_millis(100).min(remaining()));
+            }
+            result => return result,
+        }
+    }
+}
+
 fn verify_cancellation(
     run_id: &str,
     invoke: &impl Fn(&[String], &str, Duration) -> Result<serde_json::Value, EvalError>,
-) -> bool {
+) -> Option<serde_json::Value> {
     let deadline = Instant::now() + Duration::from_secs(15);
     while Instant::now() < deadline {
         let args = [
@@ -23,21 +53,57 @@ fn verify_cancellation(
             "--limit".into(),
             "1".into(),
         ];
-        if invoke(&args, "cancel-verification", Duration::from_secs(3))
-            .is_ok_and(|value| terminal_status(&value))
+        if let Ok(value) = invoke(
+            &args,
+            "cancel-verification",
+            deadline
+                .saturating_duration_since(Instant::now())
+                .min(Duration::from_secs(3)),
+        ) && terminal_status(&value)
         {
-            return true;
+            return Some(value);
         }
         std::thread::sleep(Duration::from_millis(100));
     }
-    false
+    None
 }
 
-pub fn terminal_status(value: &serde_json::Value) -> bool {
-    value
-        .pointer("/run/status")
-        .and_then(serde_json::Value::as_str)
-        .is_some_and(|status| ["completed", "failed", "cancelled"].contains(&status))
+struct IsolatedDaemonCleanup<'a> {
+    binary: &'a Path,
+    directory: &'a Path,
+    enabled: bool,
+    environment: std::collections::BTreeMap<String, String>,
+    workspace: &'a Path,
+}
+
+impl Drop for IsolatedDaemonCleanup<'_> {
+    fn drop(&mut self) {
+        if !self.enabled {
+            return;
+        }
+        let mut command = Command::new(self.binary);
+        command
+            .args(["server", "stop-if-idle"])
+            .envs(&self.environment)
+            .current_dir(self.workspace);
+        let result = process::bounded_command(
+            command,
+            Duration::from_secs(10),
+            self.directory,
+            "daemon-cleanup",
+        );
+        let evidence = match result {
+            Ok((status, timed_out, _, _)) => serde_json::json!({
+                "requested": status == Some(0) && !timed_out,
+                "timed_out": timed_out,
+                "exit_code": status,
+                "reason": if timed_out { "cleanup_deadline_elapsed" } else if status == Some(0) { "idle_stop_request_accepted" } else { "idle_stop_request_rejected_or_unavailable" },
+                "scope": "exact isolated artifact/state; graceful idle-only stop; not proof of effect settlement",
+            }),
+            Err(_) => serde_json::json!({"requested":false,"reason":"cleanup_request_unavailable"}),
+        };
+        let _ = write_json(self.directory.join("daemon-cleanup.json"), &evidence);
+    }
 }
 
 pub fn execute(
@@ -94,6 +160,18 @@ pub fn execute(
         )));
     }
     let _environment = prepare_agent_daemon_isolation(variant, rep_dir)?;
+    let _daemon_cleanup = IsolatedDaemonCleanup {
+        binary: &config.binary,
+        directory: rep_dir,
+        enabled: super::agent_daemon_isolation_mode(variant) != "shared",
+        environment: variant
+            .env
+            .iter()
+            .chain(&case.env)
+            .map(|(key, value)| (key.clone(), value.clone()))
+            .collect(),
+        workspace,
+    };
     let preserved: Vec<_> = config
         .preserve_files
         .iter()
@@ -224,6 +302,8 @@ pub fn execute(
         .ok_or_else(|| EvalError::Validation("admission missing run identity".into()))?;
     write_json(rep_dir.join("admission.json"), &admitted)?;
     let mut timed_out = false;
+    let mut capture_failed = false;
+    let mut last_observed = None;
     let mut inspection;
     loop {
         if remaining().is_zero() {
@@ -238,7 +318,13 @@ pub fn execute(
             "--limit".into(),
             "100".into(),
         ];
-        inspection = match invoke(&inspection_args, "inspection", remaining()) {
+        inspection = match observe(
+            &inspection_args,
+            "inspection",
+            remaining,
+            &invoke,
+            std::thread::sleep,
+        ) {
             Ok(value) => value,
             Err(error) if remaining().is_zero() => {
                 timed_out = true;
@@ -257,24 +343,57 @@ pub fn execute(
                     "observation-cancellation",
                     Duration::from_secs(15),
                 );
-                let verified = verify_cancellation(run_id, &invoke);
+                let terminal = verify_cancellation(run_id, &invoke);
+                let verified = terminal.is_some();
+                if terminal.is_some() {
+                    last_observed = terminal;
+                }
                 write_json(
                     rep_dir.join("cancellation.json"),
                     &serde_json::json!({"requested":cancellation.is_ok(),"error":cancellation.err().map(|error|error.to_string()),"terminal_verified":verified,"reason":"observation_failed"}),
                 )?;
-                return Err(error);
+                capture_failed = true;
+                break;
             }
         };
+        last_observed = Some(inspection.clone());
         write_json(rep_dir.join("inspection.json"), &inspection)?;
         let status = inspection
             .pointer("/run/status")
             .and_then(serde_json::Value::as_str)
             .unwrap_or("");
-        if ["completed", "failed", "cancelled", "repair_required"].contains(&status) {
+        if ["completed", "failed", "cancelled"].contains(&status) {
+            break;
+        }
+        if status == "repair_required" {
+            let cancellation = invoke(
+                &[
+                    "workflow".into(),
+                    "cancel-run".into(),
+                    "--run-id".into(),
+                    run_id.into(),
+                ],
+                "repair-cancellation",
+                Duration::from_secs(15),
+            );
+            let terminal = verify_cancellation(run_id, &invoke);
+            let verified = terminal.is_some();
+            if terminal.is_some() {
+                last_observed = terminal;
+            }
+            write_json(
+                rep_dir.join("cancellation.json"),
+                &serde_json::json!({
+                    "requested":cancellation.is_ok(), "terminal_verified":verified,
+                    "reason":"repair_required", "error":cancellation.err().map(|error|error.to_string())
+                }),
+            )?;
+            capture_failed = true;
             break;
         }
         std::thread::sleep(Duration::from_millis(250));
     }
+    let execution_elapsed = execution_duration(start, Instant::now());
     if timed_out {
         let cancel = invoke(
             &[
@@ -287,33 +406,37 @@ pub fn execute(
             Duration::from_secs(15),
         );
         let requested = cancel.is_ok();
-        let cancellation_deadline = Instant::now() + Duration::from_secs(15);
-        let mut terminal_verified = false;
-        while requested && Instant::now() < cancellation_deadline {
-            let state = invoke(
-                &[
-                    "workflow".into(),
-                    "inspect-run".into(),
-                    "--run-id".into(),
-                    run_id.into(),
-                    "--limit".into(),
-                    "100".into(),
-                ],
-                "cancel-status",
-                Duration::from_secs(5),
-            );
-            if state.as_ref().is_ok_and(terminal_status) {
-                terminal_verified = true;
-                break;
-            }
-            std::thread::sleep(Duration::from_millis(100));
+        let terminal = verify_cancellation(run_id, &invoke);
+        let terminal_verified = terminal.is_some();
+        if terminal.is_some() {
+            last_observed = terminal;
         }
         write_json(
             rep_dir.join("cancellation.json"),
             &serde_json::json!({"requested":requested,"error":cancel.err().map(|e|e.to_string()),"terminal_verified":terminal_verified}),
         )?;
     }
-    let outputs = invoke(
+    // Post-execution capture has a separate bounded allowance. Exhaustion degrades
+    // evidence, never extends execution or changes an observed terminal outcome.
+    let capture_allowance = Duration::from_millis(
+        suite
+            .metadata
+            .get("capture_allowance_ms")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(120_000),
+    );
+    let capture_deadline = Instant::now() + capture_allowance;
+    let execution_invoke = &invoke;
+    let invoke = |args: &[String], label: &str, timeout: Duration| {
+        let allowance = capture_deadline.saturating_duration_since(Instant::now());
+        if allowance.is_zero() {
+            return Err(EvalError::Validation(
+                "post-execution capture allowance exhausted".into(),
+            ));
+        }
+        execution_invoke(args, label, timeout.min(allowance))
+    };
+    let outputs = match invoke(
         &[
             "workflow".into(),
             "run-output".into(),
@@ -324,9 +447,19 @@ pub fn execute(
         ],
         "outputs",
         Duration::from_secs(15),
-    )?;
+    ) {
+        Ok(value) => value,
+        Err(error) => {
+            capture_failed = true;
+            write_json(
+                rep_dir.join("outputs-capture-error.json"),
+                &error.to_string(),
+            )?;
+            serde_json::json!([])
+        }
+    };
     write_json(rep_dir.join("workflow-output.json"), &outputs)?;
-    let history = invoke(
+    let history = match invoke(
         &[
             "session".into(),
             "history".into(),
@@ -337,15 +470,25 @@ pub fn execute(
         ],
         "history",
         Duration::from_secs(15),
-    )?;
+    ) {
+        Ok(value) => value,
+        Err(error) => {
+            capture_failed = true;
+            write_json(
+                rep_dir.join("session-history-capture-error.json"),
+                &error.to_string(),
+            )?;
+            serde_json::Value::Null
+        }
+    };
     write_json(rep_dir.join("session-history.json"), &history)?;
     let mut measurements = EvalMeasurementSet::new();
     measurements.insert(
         "workflow.wall_time_ms".into(),
-        start.elapsed().as_millis() as f64,
+        execution_elapsed.as_millis() as f64,
     );
     measurements.insert("workflow.timed_out".into(), f64::from(timed_out));
-    let final_inspection = invoke(
+    let final_inspection = match invoke(
         &[
             "workflow".into(),
             "inspect-run".into(),
@@ -356,13 +499,22 @@ pub fn execute(
         ],
         "final",
         Duration::from_secs(15),
-    )?;
+    ) {
+        Ok(value) => value,
+        Err(error) => {
+            capture_failed = true;
+            write_json(
+                rep_dir.join("final-inspection-error.json"),
+                &error.to_string(),
+            )?;
+            last_observed.ok_or(error)?
+        }
+    };
     write_json(rep_dir.join("inspection.json"), &final_inspection)?;
     write_json(
         rep_dir.join("timing.json"),
         &super::timing::describe(&final_inspection),
     )?;
-    let mut capture_failed = false;
     if let Some(revision) = final_inspection
         .pointer("/graph/revision")
         .and_then(serde_json::Value::as_u64)
@@ -371,12 +523,41 @@ pub fn execute(
         capture_failed = true;
         write_json(rep_dir.join("graph-capture-error.json"), &error.to_string())?;
     }
+    if let Err(error) = super::capture::capture_observations(run_id, rep_dir, invoke) {
+        capture_failed = true;
+        write_json(
+            rep_dir.join("workflow-observations-error.json"),
+            &error.to_string(),
+        )?;
+    }
     if let Err(error) = super::capture::capture_history(run_id, rep_dir, invoke) {
         capture_failed = true;
         write_json(
             rep_dir.join("history-capture-error.json"),
             &error.to_string(),
         )?;
+    }
+    let mut diagnostic_receipts = Vec::new();
+    for (index, attempt) in final_inspection["attempts"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .enumerate()
+    {
+        let Some(identity) = attempt["dispatch_identity"].as_str() else {
+            continue;
+        };
+        let result = super::workflow_diagnostics::capture(
+            run_id,
+            identity,
+            &rep_dir.join(format!("diagnostics-{index:03}")),
+            &invoke,
+        );
+        diagnostic_receipts.push(serde_json::json!({
+            "dispatch_identity": identity,
+            "status": if result.is_ok() { "retained_verified" } else { "unavailable_or_partial" },
+            "error": result.err().map(|error| error.to_string()),
+        }));
     }
     let mut event_sessions = vec![session_id.to_owned()];
     event_sessions.extend(
@@ -386,7 +567,6 @@ pub fn execute(
             .flatten()
             .filter_map(|value| value["id"].as_str().map(str::to_owned)),
     );
-    let mut telemetry = EvalMeasurementSet::new();
     let mut capture_complete = !capture_failed
         && final_inspection["unavailable_collections"]
             .as_array()
@@ -403,12 +583,16 @@ pub fn execute(
                     .is_some_and(|values| values.len() < 100)
             })
         && outputs.as_array().is_some_and(|values| values.len() < 100);
+    let mut session_events = Vec::new();
     let mut correlation_events = Vec::new();
+    let mut model_exports_complete = true;
+    let mut observed_model_sessions = 0_usize;
+    let mut session_history_complete = true;
     for (index, identity) in event_sessions.iter().enumerate() {
         let mut after = 0_u64;
         let mut events = Vec::new();
         loop {
-            let page = invoke(
+            let page = match invoke(
                 &[
                     "session".into(),
                     "history".into(),
@@ -421,11 +605,41 @@ pub fn execute(
                 ],
                 &format!("history-{index}"),
                 Duration::from_secs(15),
-            )?;
-            let page_events: Vec<bcode_session_models::SessionEvent> =
-                serde_json::from_value(page["events"].clone())?;
+            ) {
+                Ok(value) => value,
+                Err(error) => {
+                    capture_complete = false;
+                    session_history_complete = false;
+                    write_json(
+                        rep_dir.join(format!("history-{index}-error.json")),
+                        &error.to_string(),
+                    )?;
+                    break;
+                }
+            };
+            let Ok(page_events) = serde_json::from_value::<Vec<bcode_session_models::SessionEvent>>(
+                page["events"].clone(),
+            ) else {
+                capture_complete = false;
+                session_history_complete = false;
+                break;
+            };
             if let Some(last) = page_events.last() {
-                after = last.sequence + 1;
+                let Some(next) = last.sequence.checked_add(1) else {
+                    capture_complete = false;
+                    session_history_complete = false;
+                    break;
+                };
+                if next <= after {
+                    capture_complete = false;
+                    session_history_complete = false;
+                    break;
+                }
+                after = next;
+            } else if page["has_more"] == true {
+                capture_complete = false;
+                session_history_complete = false;
+                break;
             }
             events.extend(page_events);
             if page["has_more"] != true {
@@ -433,24 +647,81 @@ pub fn execute(
             }
             if events.len() >= 10000 {
                 capture_complete = false;
+                session_history_complete = false;
                 break;
             }
         }
-        super::trace_exports::export_cli(
-            &rep_dir.join(format!("transcript-{index}.jsonl")),
-            &events,
-            &invoke,
-        )?;
         write_session_events_jsonl(&rep_dir.join(format!("transcript-{index}.jsonl")), &events)?;
-        for (key, value) in session_telemetry(&events).measurements {
-            *telemetry.entry(key).or_default() += value;
-        }
-        correlation_events.extend(events);
+        correlation_events.extend(events.iter().cloned());
+        session_events.push((index, events));
     }
+    let export_sessions = session_events
+        .iter()
+        .map(|(index, events)| {
+            (
+                rep_dir.join(format!("transcript-{index}.jsonl")),
+                events.clone(),
+            )
+        })
+        .collect::<Vec<_>>();
+    if let Err(error) = super::trace_exports::export_cli_batch(&export_sessions, &invoke) {
+        capture_complete = false;
+        write_json(rep_dir.join("trace-export-error.json"), &error.to_string())?;
+    }
+    for (index, events) in session_events {
+        let receipts: serde_json::Value =
+            fs::read(rep_dir.join(format!("transcript-{index}.captures.json")))
+                .ok()
+                .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+                .unwrap_or_else(|| serde_json::json!([]));
+        let capture_summary = super::introspection::summary_with_exports(&events, &receipts);
+        observed_model_sessions += 1;
+        model_exports_complete &= capture_summary["complete_model_inputs_exported"] == true;
+        write_session_events_jsonl(&rep_dir.join(format!("transcript-{index}.jsonl")), &events)?;
+    }
+    let telemetry = session_telemetry(&correlation_events).measurements;
     write_json(
         rep_dir.join("workflow-session-correlations.json"),
         &super::workflow_correlations::project(&final_inspection["attempts"], &correlation_events),
     )?;
+    let manifest_path = rep_dir.join("capture-completeness.json");
+    let mut manifest: serde_json::Value = serde_json::from_slice(&fs::read(&manifest_path)?)?;
+    let observation_pages = std::fs::read_dir(rep_dir)?
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .filter(|path| {
+            path.file_name().is_some_and(|name| {
+                name.to_string_lossy().starts_with("workflow-observations-")
+                    && !name.to_string_lossy().ends_with("error.json")
+            })
+        })
+        .collect::<Vec<_>>();
+    manifest["boundaries"]["transactional_observations"] = serde_json::json!({
+        "status": if rep_dir.join("workflow-observations-error.json").exists() || observation_pages.is_empty() {"partial_or_unavailable"} else {"verified_observed"},
+        "scope":"finite declared source transitions; not semantic execution history",
+        "pages": observation_pages.len(),
+    });
+    manifest["boundaries"]["model_exports"] = serde_json::json!({
+        "status":if model_exports_complete && observed_model_sessions > 0 {"verified_observed"} else {"incomplete_or_not_observed"},
+        "scope":"retained model request boundaries only; not provider wire or judgement",
+        "sessions_observed":observed_model_sessions
+    });
+    let judgement_status = if diagnostic_receipts.is_empty() {
+        "not_observed"
+    } else if diagnostic_receipts
+        .iter()
+        .all(|receipt| receipt["status"] == "retained_verified")
+    {
+        "verified_observed"
+    } else {
+        "unavailable_or_partial"
+    };
+    manifest["boundaries"]["judgement"] = serde_json::json!({
+        "status": judgement_status, "scope": "bounded inspected dispatches; not full run coverage",
+        "dispatches": diagnostic_receipts,
+    });
+    manifest["boundaries"]["session_history"] = serde_json::json!({"status":if session_history_complete {"complete"} else {"partial_or_unavailable"}});
+    write_json(manifest_path, &manifest)?;
     measurements.extend(telemetry);
     measurements.insert(
         "workflow.capture_complete".into(),
@@ -571,6 +842,20 @@ pub fn execute(
         }
     }
     write_json(rep_dir.join("diagnosis.json"), &diagnosis)?;
+    measurements.insert(
+        "workflow.capture_allowance_ms".into(),
+        capture_allowance.as_millis() as f64,
+    );
+    measurements.insert(
+        "workflow.capture_time_ms".into(),
+        capture_allowance
+            .saturating_sub(capture_deadline.saturating_duration_since(Instant::now()))
+            .as_millis() as f64,
+    );
+    measurements.insert(
+        "workflow.capture_allowance_exhausted".into(),
+        f64::from(Instant::now() >= capture_deadline),
+    );
     let diagnostics = if timed_out {
         vec![EvalDiagnostic {severity:EvalDiagnosticSeverity::Error,message:"workflow deadline exceeded; cancellation requested, terminal state requires verification".into()}]
     } else {
@@ -595,4 +880,111 @@ pub fn execute(
             },
         ],
     })
+}
+
+pub fn terminal_status(value: &serde_json::Value) -> bool {
+    value
+        .pointer("/run/status")
+        .and_then(serde_json::Value::as_str)
+        .is_some_and(|status| ["completed", "failed", "cancelled"].contains(&status))
+}
+
+#[cfg(test)]
+mod observation_tests {
+    use super::*;
+    use std::cell::Cell;
+
+    fn readiness_error() -> EvalError {
+        EvalError::Client("server returned error workflow_capability_unavailable: workflow readiness status is temporarily unavailable; retry the workflow request (no initialization progress has been verified)".into())
+    }
+
+    #[test]
+    fn explicit_readiness_retries_reads_but_other_errors_do_not() {
+        let calls = Cell::new(0);
+        let result = observe(
+            &[],
+            "inspection",
+            || Duration::from_secs(1),
+            &|_, _, _| {
+                calls.set(calls.get() + 1);
+                if calls.get() < 3 {
+                    Err(readiness_error())
+                } else {
+                    Ok(serde_json::json!({}))
+                }
+            },
+            |_| {},
+        );
+        assert!(result.is_ok());
+        assert_eq!(calls.get(), 3);
+        calls.set(0);
+        let result = observe(
+            &[],
+            "inspection",
+            || Duration::from_secs(1),
+            &|_, _, _| {
+                calls.set(calls.get() + 1);
+                Err(EvalError::Client(
+                    "workflow_capability_unavailable: incompatible state".into(),
+                ))
+            },
+            |_| {},
+        );
+        assert!(result.is_err());
+        assert_eq!(calls.get(), 1);
+    }
+
+    #[test]
+    fn cancellation_verification_retains_exact_terminal_snapshot() {
+        let snapshot = serde_json::json!({"run":{"status":"failed"},"attempts":[{"id":"exact"}]});
+        assert_eq!(
+            verify_cancellation("run", &|_, _, _| Ok(snapshot.clone())),
+            Some(snapshot)
+        );
+    }
+
+    #[test]
+    fn execution_timing_excludes_post_terminal_export_overhead() {
+        let start = Instant::now();
+        let terminal = start + Duration::from_millis(20);
+        let export_end = terminal + Duration::from_secs(5);
+        assert_eq!(
+            execution_duration(start, terminal),
+            Duration::from_millis(20)
+        );
+        assert_ne!(
+            execution_duration(start, terminal),
+            execution_duration(start, export_end)
+        );
+    }
+
+    #[test]
+    fn readiness_retry_count_and_deadline_are_bounded() {
+        let calls = Cell::new(0);
+        let result = observe(
+            &[],
+            "inspection",
+            || Duration::from_secs(1),
+            &|_, _, _| {
+                calls.set(calls.get() + 1);
+                Err(readiness_error())
+            },
+            |_| {},
+        );
+        assert!(result.is_err());
+        assert_eq!(calls.get(), 5);
+        calls.set(0);
+        let result = observe(
+            &[],
+            "inspection",
+            || Duration::ZERO,
+            &|_, _, _| {
+                calls.set(calls.get() + 1);
+                Err(readiness_error())
+            },
+            |_| panic!("expired observation must not wait"),
+        );
+        assert!(result.is_err());
+        assert_eq!(calls.get(), 1);
+    }
 }

@@ -192,9 +192,16 @@ pub async fn admit_prepared(
     backpressure::retry(|| representation::install(&db))
         .await
         .map_err(|_| unavailable())?;
-    backpressure::retry(|| representation::admit_registered(&db, run, &definition))
+    backpressure::retry(|| representation::journal::install(&db))
         .await
         .map_err(|_| unavailable())?;
+    let capture_observations =
+        state.observability.persist_model_requests || state.observability.persist_tool_io;
+    backpressure::retry(|| {
+        representation::admit_registered_observed(&db, run, &definition, capture_observations)
+    })
+    .await
+    .map_err(|_| unavailable())?;
     backpressure::retry(|| representation::runs::summary(&db, &run.run_id))
         .await
         .map_err(|_| unavailable())

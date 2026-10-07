@@ -1359,6 +1359,23 @@ async fn dispatch_workflow_command(command: Box<WorkflowCommand>) -> Result<(), 
         WorkflowCommand::Package { command } => {
             Box::pin(handle_workflow_package_command(&client, command)).await?;
         }
+        WorkflowCommand::Observations {
+            run_id,
+            after_sequence,
+            through_sequence,
+            limit,
+        } => {
+            print_json(
+                &bcode_workflow::WorkflowRunApplication::workflow_observations(
+                    &client,
+                    run_id,
+                    after_sequence,
+                    through_sequence,
+                    limit,
+                )
+                .await?,
+            )?;
+        }
         WorkflowCommand::Events {
             run_id,
             after_sequence,
@@ -1561,6 +1578,38 @@ async fn dispatch_workflow_command(command: Box<WorkflowCommand>) -> Result<(), 
                     ),
                 )
                 .await?,
+            )?;
+        }
+        WorkflowCommand::DiagnosticArtifacts {
+            run_id,
+            dispatch_identity,
+        } => {
+            print_json(
+                &client
+                    .workflow_diagnostic_artifacts(run_id, dispatch_identity)
+                    .await?,
+            )?;
+        }
+        WorkflowCommand::ReadDiagnosticArtifact {
+            run_id,
+            dispatch_identity,
+            artifact_id,
+            offset,
+            length,
+        } => {
+            print_json(
+                &client
+                    .workflow_diagnostic_artifact(
+                        bcode_workflow::WorkflowDiagnosticArtifactRequest {
+                            version: 1,
+                            run_id,
+                            dispatch_identity,
+                            artifact_id,
+                            offset,
+                            length,
+                        },
+                    )
+                    .await?,
             )?;
         }
         WorkflowCommand::RunOutput { run_id, limit } => {
@@ -4442,6 +4491,17 @@ enum WorkflowCommand {
         #[arg(long, value_name = "JSON_FILE")]
         input: Option<PathBuf>,
     },
+    /// Return finite committed row transitions and exact coverage as JSON.
+    Observations {
+        #[arg(long)]
+        run_id: String,
+        #[arg(long)]
+        after_sequence: Option<u64>,
+        #[arg(long)]
+        through_sequence: Option<u64>,
+        #[arg(long, default_value_t = 100)]
+        limit: usize,
+    },
     /// Return one bounded page of workflow events as JSON (not a live watch).
     Events {
         #[arg(long)]
@@ -4588,6 +4648,26 @@ enum WorkflowCommand {
         after_edge_id: Option<u64>,
         #[arg(long, default_value_t = 100)]
         limit: usize,
+    },
+    /// Discover bounded diagnostic artifact identities recorded by one exact dispatch.
+    DiagnosticArtifacts {
+        #[arg(long)]
+        run_id: String,
+        #[arg(long)]
+        dispatch_identity: String,
+    },
+    /// Explicit sensitive access to a retained workflow dispatch artifact.
+    ReadDiagnosticArtifact {
+        #[arg(long)]
+        run_id: String,
+        #[arg(long)]
+        dispatch_identity: String,
+        #[arg(long)]
+        artifact_id: String,
+        #[arg(long, default_value_t = 0)]
+        offset: u64,
+        #[arg(long, default_value_t = 32768)]
+        length: u32,
     },
     /// Return bounded canonical validated output values for one run.
     RunOutput {
@@ -5149,6 +5229,8 @@ enum ServerCommand {
         #[arg(long)]
         json: bool,
     },
+    /// Stop only the selected matching daemon if it has no active work.
+    StopIfIdle,
     Stop {
         /// Force termination if graceful shutdown does not complete.
         #[arg(long)]
@@ -6843,6 +6925,13 @@ async fn handle_server_command(command: ServerCommand) -> Result<(), CliError> {
         }
         ServerCommand::Metrics { json, report } => server_metrics(json, report).await?,
         ServerCommand::Diagnose { json } => server_diagnose(json).await?,
+        ServerCommand::StopIfIdle => {
+            let client = BcodeClient::default_endpoint()
+                .with_daemon_availability(DaemonAvailability::RequireRunning);
+            client.verified_server_status().await?;
+            client.server_stop_if_idle().await?;
+            println!("idle server stopping");
+        }
         ServerCommand::Stop { force, yes } => {
             if force && !yes {
                 return Err(CliError::InvalidArguments(

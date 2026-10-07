@@ -92,6 +92,87 @@ pub async fn attempts(
     }
 }
 
+use super::representation::journal::{CoverageOrigin, ScalarFact};
+use bcode_workflow::{
+    WorkflowObservationFact, WorkflowObservationOrigin, WorkflowObservationPage,
+    WorkflowObservationSource, WorkflowTransitionObservation,
+};
+
+pub async fn observations(
+    state: &ServerState,
+    run: &str,
+    after: Option<u64>,
+    through: Option<u64>,
+    limit: usize,
+) -> Result<bcode_workflow::WorkflowObservationPage, ServerError> {
+    let retained = retained_store(state)?;
+    if !matches!(
+        lookup_at(retained.path(), run).await?,
+        RunLookup::Available(_)
+    ) {
+        return Err(unsupported());
+    }
+    let limit = u16::try_from(limit)
+        .ok()
+        .filter(|value| (1..=100).contains(value))
+        .ok_or_else(unavailable)?;
+    let db = super::open(retained.path(), false)?;
+    let page = super::representation::journal::page(&db, run, after.unwrap_or(0), through, limit)
+        .await
+        .map_err(|_| unavailable())?;
+    Ok(WorkflowObservationPage {
+        version: page.version,
+        run_id: page.run_id,
+        origin: match page.origin {
+            CoverageOrigin::Admission => WorkflowObservationOrigin::Admission,
+            CoverageOrigin::NotEnabled => WorkflowObservationOrigin::NotEnabled,
+        },
+        sources: page
+            .sources
+            .into_iter()
+            .map(|source| WorkflowObservationSource {
+                table: source.table,
+                columns: source.columns,
+                operations: source.operations,
+            })
+            .collect(),
+        limitations: page.limitations,
+        through_sequence: page.through_sequence,
+        next_after_sequence: page.next_after_sequence,
+        observations: page
+            .observations
+            .into_iter()
+            .map(|row| WorkflowTransitionObservation {
+                sequence: row.sequence,
+                source: row.source_table,
+                operation: row.operation,
+                facts: row
+                    .facts
+                    .into_iter()
+                    .map(|(key, value)| {
+                        (
+                            key,
+                            match value {
+                                ScalarFact::Null => WorkflowObservationFact::Null,
+                                ScalarFact::Integer(value) => {
+                                    WorkflowObservationFact::Integer(value)
+                                }
+                                ScalarFact::Text(value) => WorkflowObservationFact::Text(value),
+                                ScalarFact::Unavailable(reason) => WorkflowObservationFact::Unavailable(match reason {
+                                    super::representation::journal::FactUnavailableReason::Oversized => bcode_workflow::WorkflowObservationUnavailableReason::Oversized,
+                                    super::representation::journal::FactUnavailableReason::UnsupportedType => bcode_workflow::WorkflowObservationUnavailableReason::UnsupportedType,
+                                }),
+                            },
+                        )
+                    })
+                    .collect(),
+                recorded_at_ms: row.timestamp_ms,
+                timestamp_source: row.timestamp_source,
+            })
+            .collect(),
+    })
+}
+
 pub async fn events(
     state: &ServerState,
     run: &str,

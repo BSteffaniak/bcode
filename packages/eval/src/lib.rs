@@ -11,6 +11,7 @@
 
 //! Leaf eval runner, judges, reports, comparisons, and baselines for Bcode.
 
+mod agent_cleanup;
 mod capture;
 pub mod diagnosis;
 mod introspection;
@@ -26,6 +27,7 @@ mod timing;
 mod trace_exports;
 mod workflow;
 mod workflow_correlations;
+mod workflow_diagnostics;
 
 pub use sdk::{
     AgentStepCount, LatencyAtMost, NoopSdkEvalObserver, OutputContains, SDK_EVAL_RUN_FILENAME,
@@ -178,6 +180,15 @@ pub fn validate_suite(suite: &EvalSuite) -> Result<(), EvalError> {
     if suite.cases.is_empty() {
         return Err(EvalError::Validation(
             "suite must define at least one case".into(),
+        ));
+    }
+    if suite
+        .metadata
+        .get("capture_allowance_ms")
+        .is_some_and(|value| value.as_u64().is_none_or(|value| value == 0))
+    {
+        return Err(EvalError::Validation(
+            "capture_allowance_ms must be a positive integer".into(),
         ));
     }
     if suite
@@ -415,7 +426,14 @@ pub fn run_suite(options: &EvalRunOptions) -> Result<EvalRunResult, EvalError> {
             comparison.id, comparison.passed, comparison.detail
         ));
     }
-    let paired = paired::report(&variants);
+    let planned_blocks: Vec<_> = suite
+        .cases
+        .iter()
+        .flat_map(|case| {
+            (1..=suite.run.repetitions).map(|repetition| (case.id.clone(), repetition))
+        })
+        .collect();
+    let paired = paired::report_with_schedule(&variants, &planned_blocks);
     write_json(output_dir.join("paired.json"), &paired)?;
     let paired_passed = !suite
         .metadata
@@ -886,10 +904,16 @@ fn agent_daemon_isolation_mode(variant: &EvalVariant) -> &str {
         .unwrap_or("isolated")
 }
 
+struct AgentDaemonIsolation {
+    _environment: Vec<EnvVarGuard>,
+    _state: Option<bcode_config::StateLocationGuard>,
+    _config: Option<bcode_config::ConfigOverrideGuard>,
+}
+
 fn prepare_agent_daemon_isolation(
     variant: &EvalVariant,
     rep_dir: &Path,
-) -> Result<Vec<EnvVarGuard>, EvalError> {
+) -> Result<AgentDaemonIsolation, EvalError> {
     if agent_daemon_isolation_mode(variant) == "shared" {
         if variant.config_toml.is_some() {
             return Err(EvalError::Validation(format!(
@@ -897,7 +921,11 @@ fn prepare_agent_daemon_isolation(
                 variant.id
             )));
         }
-        return Ok(Vec::new());
+        return Ok(AgentDaemonIsolation {
+            _environment: Vec::new(),
+            _state: None,
+            _config: None,
+        });
     }
     let variant_dir = variant_artifact_dir(rep_dir);
     let auth_subscriptions = bcode_config::runtime_auth_subscriptions_path();
@@ -919,6 +947,10 @@ fn prepare_agent_daemon_isolation(
         .map_err(|error| EvalError::Validation(error.to_string()))?;
     let mut guards = vec![
         EnvVarGuard::set_path("BCODE_STATE_DIR", &state_dir),
+        EnvVarGuard::set_path(
+            bcode_config::BCODE_SESSION_STORE_DIR_ENV,
+            &state_dir.join("sessions"),
+        ),
         EnvVarGuard::set_path("BCODE_AUTH_SUBSCRIPTIONS", &auth_subscriptions),
         EnvVarGuard::set_path("BCODE_AUTH_VAULT", &auth_vault),
         EnvVarGuard::set_path("BCODE_SOCKET", &socket),
@@ -944,7 +976,26 @@ fn prepare_agent_daemon_isolation(
             merged,
         ));
     }
-    Ok(guards)
+    let location = bcode_config::resolve_state_location_set(
+        &bcode_config::StateConfig::default(),
+        &bcode_config::StateLocationSelection {
+            root: Some(state_dir),
+            profile: None,
+        },
+    )
+    .map_err(|error| EvalError::Validation(error.to_string()))?;
+    Ok(AgentDaemonIsolation {
+        _environment: guards,
+        _state: Some(bcode_config::push_process_state_location(
+            location.primary(),
+        )),
+        _config: variant
+            .config_toml
+            .as_deref()
+            .map(bcode_config::push_process_inline_config_overlay)
+            .transpose()
+            .map_err(|error| EvalError::Validation(error.to_string()))?,
+    })
 }
 
 fn toml_key(key: &str) -> String {
@@ -1341,144 +1392,181 @@ async fn execute_agent_variant_async(
         "agent setup: variant={} case={} rep={} ensuring daemon",
         variant.id, case.id, repetition
     ));
-    client
-        .ensure_daemon_available()
-        .await
-        .map_err(|error| EvalError::Client(error.to_string()))?;
-    let mut policy_diagnostics = validate_agent_policy_overlay(&client, variant).await?;
-    progress(format!(
-        "agent setup: variant={} case={} rep={} creating session",
-        variant.id, case.id, repetition
-    ));
-    let session = client
-        .create_session_in_working_directory(
-            Some(format!("eval:{}:{}:{}", suite.id, case.id, variant.id)),
-            workspace.to_path_buf(),
-        )
-        .await
-        .map_err(|error| EvalError::Client(error.to_string()))?;
-    if let Some(agent_id) = variant
-        .metadata
-        .get("agent_id")
-        .and_then(serde_json::Value::as_str)
-    {
+    let mut cleanup_session = None;
+    let execution: Result<ExecutionOutput, EvalError> = async {
         client
-            .set_session_agent(session.id, agent_id.to_string())
+            .ensure_daemon_available()
             .await
             .map_err(|error| EvalError::Client(error.to_string()))?;
-    }
-    if let Some(model) = &variant.model {
-        client
-            .set_session_model(session.id, None, model.clone())
+        let mut policy_diagnostics = validate_agent_policy_overlay(&client, variant).await?;
+        progress(format!(
+            "agent setup: variant={} case={} rep={} creating session",
+            variant.id, case.id, repetition
+        ));
+        let session = client
+            .create_session_in_working_directory(
+                Some(format!("eval:{}:{}:{}", suite.id, case.id, variant.id)),
+                workspace.to_path_buf(),
+            )
             .await
             .map_err(|error| EvalError::Client(error.to_string()))?;
-    }
-    let start_sequence = latest_session_sequence(&client, session.id).await?;
-    append_observation(
-        rep_dir,
-        &EvalObservation {
-            unix_ms: unix_ms(),
-            source: "agent_session_started".into(),
-            payload: serde_json::json!({
-                "session_id": session.id,
-                "start_sequence": start_sequence,
-                "repetition": repetition,
-                "allowed_tools": variant.allowed_tools,
-            }),
-        },
-    )?;
-    let start = Instant::now();
-    progress(format!(
-        "agent turn: variant={} case={} rep={} session={} sending prompt",
-        variant.id, case.id, repetition, session.id
-    ));
-    client
-        .send_user_message(session.id, prompt, bcode_ipc::PromptPlacement::FollowUp)
-        .await
-        .map_err(|error| EvalError::Client(error.to_string()))?;
-    let timeout = std::time::Duration::from_millis(case.timeout_ms.unwrap_or(suite.run.timeout_ms));
-    let events = wait_for_agent_turn(
-        &client,
-        session.id,
-        start_sequence,
-        timeout,
-        variant,
-        rep_dir,
-    )
-    .await?;
-    let transcript_path = rep_dir.join("transcript.jsonl");
-    let tool_calls_path = rep_dir.join("tool-calls.jsonl");
-    trace_exports::export(&client, &transcript_path, &events).await?;
-    write_session_events_jsonl(&transcript_path, &events)?;
-    write_tool_calls_jsonl(&tool_calls_path, &events)?;
-    let telemetry = session_telemetry(&events);
-    let mut measurements = telemetry.measurements;
-    measurements.insert(
-        "agent_wall_time_ms".into(),
-        start.elapsed().as_millis() as f64,
-    );
-    add_cost_estimates(variant, &mut measurements);
-    let mut diagnostics = telemetry.diagnostics;
-    diagnostics.append(&mut policy_diagnostics);
-    if telemetry.timed_out {
-        diagnostics.push(EvalDiagnostic {
-            severity: EvalDiagnosticSeverity::Error,
-            message: "agent turn timed out before ModelTurnFinished".into(),
-        });
-    }
-    let mut artifacts = vec![
-        EvalArtifactRef {
-            kind: "transcript".into(),
-            path: PathBuf::from("transcript.jsonl"),
-        },
-        EvalArtifactRef {
-            kind: "tool_calls".into(),
-            path: PathBuf::from("tool-calls.jsonl"),
-        },
-    ];
-    let mut follow_up_timed_out = false;
-    if let Some(follow_up) = &variant.follow_up
-        && !telemetry.timed_out
-    {
-        let outcome = run_agent_follow_up(AgentFollowUpInput {
-            client: &client,
-            case,
-            variant,
-            repetition,
+        cleanup_session = Some(session.id);
+        if let Some(agent_id) = variant
+            .metadata
+            .get("agent_id")
+            .and_then(serde_json::Value::as_str)
+        {
+            client
+                .set_session_agent(session.id, agent_id.to_string())
+                .await
+                .map_err(|error| EvalError::Client(error.to_string()))?;
+        }
+        if let Some(model) = &variant.model {
+            client
+                .set_session_model(session.id, None, model.clone())
+                .await
+                .map_err(|error| EvalError::Client(error.to_string()))?;
+        }
+        let start_sequence = latest_session_sequence(&client, session.id).await?;
+        append_observation(
             rep_dir,
-            session_id: session.id,
-            follow_up,
+            &EvalObservation {
+                unix_ms: unix_ms(),
+                source: "agent_session_started".into(),
+                payload: serde_json::json!({
+                    "session_id": session.id,
+                    "start_sequence": start_sequence,
+                    "repetition": repetition,
+                    "allowed_tools": variant.allowed_tools,
+                }),
+            },
+        )?;
+        let start = Instant::now();
+        progress(format!(
+            "agent turn: variant={} case={} rep={} session={} sending prompt",
+            variant.id, case.id, repetition, session.id
+        ));
+        client
+            .send_user_message(session.id, prompt, bcode_ipc::PromptPlacement::FollowUp)
+            .await
+            .map_err(|error| EvalError::Client(error.to_string()))?;
+        let timeout =
+            std::time::Duration::from_millis(case.timeout_ms.unwrap_or(suite.run.timeout_ms));
+        let events = wait_for_agent_turn(
+            &client,
+            session.id,
+            start_sequence,
             timeout,
-        })
+            variant,
+            rep_dir,
+        )
         .await?;
-        follow_up_timed_out = outcome.timed_out;
-        measurements.extend(outcome.measurements);
-        diagnostics.extend(outcome.diagnostics);
-        artifacts.push(EvalArtifactRef {
-            kind: "follow_up_transcript".into(),
-            path: PathBuf::from("follow-up-transcript.jsonl"),
-        });
+        let execution_elapsed = start.elapsed();
+        let transcript_path = rep_dir.join("transcript.jsonl");
+        let tool_calls_path = rep_dir.join("tool-calls.jsonl");
+        trace_exports::export(&client, &transcript_path, &events).await?;
+        let receipts =
+            serde_json::from_slice(&fs::read(transcript_path.with_extension("captures.json"))?)?;
+        let capture_summary = introspection::summary_with_exports(&events, &receipts);
+        write_session_events_jsonl(&transcript_path, &events)?;
+        write_tool_calls_jsonl(&tool_calls_path, &events)?;
+        let telemetry = session_telemetry(&events);
+        let mut measurements = telemetry.measurements;
+        measurements.insert(
+            "agent_wall_time_ms".into(),
+            execution_elapsed.as_millis() as f64,
+        );
+        measurements.insert(
+            "eval.capture_complete".into(),
+            f64::from(capture_summary["complete_model_inputs_exported"] == true),
+        );
+        add_cost_estimates(variant, &mut measurements);
+        let mut diagnostics = telemetry.diagnostics;
+        diagnostics.append(&mut policy_diagnostics);
+        if telemetry.timed_out {
+            diagnostics.push(EvalDiagnostic {
+                severity: EvalDiagnosticSeverity::Error,
+                message: "agent turn timed out before ModelTurnFinished".into(),
+            });
+        }
+        let mut artifacts = vec![
+            EvalArtifactRef {
+                kind: "transcript".into(),
+                path: PathBuf::from("transcript.jsonl"),
+            },
+            EvalArtifactRef {
+                kind: "tool_calls".into(),
+                path: PathBuf::from("tool-calls.jsonl"),
+            },
+        ];
+        let mut follow_up_timed_out = false;
+        if let Some(follow_up) = &variant.follow_up
+            && !telemetry.timed_out
+        {
+            let outcome = run_agent_follow_up(AgentFollowUpInput {
+                client: &client,
+                case,
+                variant,
+                repetition,
+                rep_dir,
+                session_id: session.id,
+                follow_up,
+                timeout,
+            })
+            .await?;
+            follow_up_timed_out = outcome.timed_out;
+            measurements.extend(outcome.measurements);
+            diagnostics.extend(outcome.diagnostics);
+            artifacts.push(EvalArtifactRef {
+                kind: "follow_up_transcript".into(),
+                path: PathBuf::from("follow-up-transcript.jsonl"),
+            });
+        }
+        append_observation(
+            rep_dir,
+            &EvalObservation {
+                unix_ms: unix_ms(),
+                source: "agent_session_finished".into(),
+                payload: serde_json::json!({
+                    "session_id": session.id,
+                    "event_count": events.len(),
+                    "timed_out": telemetry.timed_out,
+                    "follow_up_timed_out": follow_up_timed_out,
+                }),
+            },
+        )?;
+        let timed_out = telemetry.timed_out || follow_up_timed_out;
+        Ok(ExecutionOutput {
+            exit_code: Some(if timed_out { 124 } else { 0 }),
+            measurements,
+            diagnostics,
+            artifacts,
+        })
     }
-    append_observation(
-        rep_dir,
-        &EvalObservation {
-            unix_ms: unix_ms(),
-            source: "agent_session_finished".into(),
-            payload: serde_json::json!({
-                "session_id": session.id,
-                "event_count": events.len(),
-                "timed_out": telemetry.timed_out,
-                "follow_up_timed_out": follow_up_timed_out,
-            }),
-        },
-    )?;
-    let timed_out = telemetry.timed_out || follow_up_timed_out;
-    Ok(ExecutionOutput {
-        exit_code: Some(if timed_out { 124 } else { 0 }),
-        measurements,
-        diagnostics,
-        artifacts,
-    })
+    .await;
+    let cleanup = agent_cleanup::cleanup(
+        cleanup_session,
+        agent_daemon_isolation_mode(variant) != "shared",
+    )
+    .await;
+    let persisted = write_json(rep_dir.join("agent-cleanup.json"), &cleanup);
+    match execution {
+        Ok(mut output) => {
+            if cleanup.failure.is_some() || persisted.is_err() {
+                output.diagnostics.push(EvalDiagnostic {
+                    severity: EvalDiagnosticSeverity::Error,
+                    message: "agent cleanup incomplete; observed execution outcome preserved"
+                        .into(),
+                });
+            }
+            output.artifacts.push(EvalArtifactRef {
+                kind: "agent_cleanup".into(),
+                path: PathBuf::from("agent-cleanup.json"),
+            });
+            Ok(output)
+        }
+        Err(error) => Err(error),
+    }
 }
 
 struct AgentFollowUpInput<'a> {
@@ -1519,11 +1607,13 @@ async fn run_agent_follow_up(
             "agent follow-up: variant={} case={} rep={} restarting isolated daemon",
             variant.id, case.id, repetition
         ));
-        client
-            .server_stop()
-            .await
-            .map_err(|error| EvalError::Client(format!("daemon stop before follow-up: {error}")))?;
-        wait_for_daemon_exit(timeout).await?;
+        let stopped = agent_cleanup::stop_idle(timeout).await;
+        write_json(rep_dir.join("follow-up-stop.json"), &stopped)?;
+        if !stopped.endpoint_stop_observed() {
+            return Err(EvalError::Client(
+                "idle daemon stop before follow-up was not verified".into(),
+            ));
+        }
         client.ensure_daemon_available().await.map_err(|error| {
             EvalError::Client(format!("daemon restart before follow-up: {error}"))
         })?;
@@ -1595,25 +1685,6 @@ async fn run_agent_follow_up(
         diagnostics,
         timed_out: telemetry.timed_out,
     })
-}
-
-/// Wait until the isolated daemon stops answering status requests.
-///
-/// Uses a client that never auto-starts a daemon; otherwise every status probe would resurrect
-/// the daemon it is waiting on.
-async fn wait_for_daemon_exit(timeout: std::time::Duration) -> Result<(), EvalError> {
-    let probe = bcode_client::BcodeClient::default_endpoint()
-        .with_daemon_availability(bcode_client::DaemonAvailability::RequireRunning);
-    let deadline = Instant::now() + timeout;
-    while probe.server_status().await.is_ok() {
-        if Instant::now() >= deadline {
-            return Err(EvalError::Client(
-                "isolated daemon did not exit before the follow-up timeout".into(),
-            ));
-        }
-        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-    }
-    Ok(())
 }
 
 async fn latest_session_sequence(
@@ -1773,14 +1844,15 @@ fn write_session_events_jsonl(
     events: &[bcode_session_models::SessionEvent],
 ) -> Result<(), EvalError> {
     introspection::write(&path.with_extension("introspection.jsonl"), events)?;
+    let receipts_path = path.with_extension("captures.json");
+    let receipts = match std::fs::read(&receipts_path) {
+        Ok(bytes) => serde_json::from_slice::<serde_json::Value>(&bytes)?,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => serde_json::json!([]),
+        Err(error) => return Err(error.into()),
+    };
     write_json(
         path.with_extension("introspection.json"),
-        &introspection::summary_with_exports(
-            events,
-            &serde_json::from_slice::<serde_json::Value>(&std::fs::read(
-                path.with_extension("captures.json"),
-            )?)?,
-        ),
+        &introspection::summary_with_exports(events, &receipts),
     )?;
     let mut file = File::create(path)?;
     for event in events {
@@ -1873,6 +1945,7 @@ fn session_telemetry(events: &[bcode_session_models::SessionEvent]) -> SessionTe
     let mut turn_finished = false;
     let mut cache_rounds: Vec<(Option<String>, bcode_session_models::SessionTokenUsage)> =
         Vec::new();
+    let mut session_cache_rounds = BTreeMap::new();
     let mut observed_events = std::collections::BTreeSet::new();
     for event in events {
         if !observed_events.insert((event.session_id, event.sequence)) {
@@ -1898,7 +1971,12 @@ fn session_telemetry(events: &[bcode_session_models::SessionEvent]) -> SessionTe
                 permissions += 1;
             }
             bcode_session_models::SessionEventKind::ModelUsage { usage, .. } => {
-                record_cache_round(&mut cache_rounds, usage);
+                record_cache_round(
+                    session_cache_rounds
+                        .entry(event.session_id)
+                        .or_insert_with(Vec::new),
+                    usage,
+                );
             }
             bcode_session_models::SessionEventKind::ModelTurnFinished {
                 outcome, message, ..
@@ -1916,6 +1994,9 @@ fn session_telemetry(events: &[bcode_session_models::SessionEvent]) -> SessionTe
             }
             _ => {}
         }
+    }
+    for rounds in session_cache_rounds.into_values() {
+        cache_rounds.extend(rounds);
     }
     // Usage observations are cumulative per request, not incremental charges.
     // Use the same selected observations as cache ratios for headline totals.
@@ -4368,6 +4449,34 @@ fn relative_artifact(run_dir: &Path, kind: &str, path: &Path) -> EvalArtifactRef
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn history_capture_precedes_exports_without_inventing_receipts() {
+        let directory = std::env::temp_dir().join(format!(
+            "bcode-history-before-export-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&directory).unwrap();
+        let path = directory.join("history.jsonl");
+        super::write_session_events_jsonl(&path, &[]).unwrap();
+        assert!(path.exists());
+        assert!(!path.with_extension("captures.json").exists());
+        let summary: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(path.with_extension("introspection.json")).unwrap(),
+        )
+        .unwrap();
+        assert_ne!(summary["complete_model_inputs_exported"], true);
+        std::fs::write(path.with_extension("captures.json"), b"malformed").unwrap();
+        assert!(super::write_session_events_jsonl(&path, &[]).is_err());
+        for file in [
+            path.clone(),
+            path.with_extension("captures.json"),
+            path.with_extension("introspection.json"),
+            path.with_extension("introspection.jsonl"),
+        ] {
+            std::fs::remove_file(file).unwrap();
+        }
+        std::fs::remove_dir(directory).unwrap();
+    }
     use super::*;
 
     fn minimal_suite(extra: &str) -> Result<EvalSuite, EvalError> {
@@ -4624,8 +4733,93 @@ required = false
     }
 
     #[test]
+    fn capture_allowance_rejects_zero_and_malformed_values() {
+        for value in ["0", "-1", "'unbounded'"] {
+            assert!(minimal_suite(&format!("[metadata]\ncapture_allowance_ms = {value}")).is_err());
+        }
+        assert!(minimal_suite("[metadata]\ncapture_allowance_ms = 120000").is_ok());
+    }
+
+    #[test]
+    fn isolated_agent_state_overrides_and_restores_explicit_process_selection() {
+        let root = std::env::temp_dir().join(format!("bcode-eval-state-{}", std::process::id()));
+        let outer = root.join("outer");
+        fs::create_dir_all(&outer).unwrap();
+        let locations = bcode_config::resolve_state_location_set(
+            &bcode_config::StateConfig::default(),
+            &bcode_config::StateLocationSelection {
+                root: Some(outer.clone()),
+                profile: None,
+            },
+        )
+        .unwrap();
+        let _inherited_sessions = super::EnvVarGuard::set_path(
+            bcode_config::BCODE_SESSION_STORE_DIR_ENV,
+            &outer.join("foreign-sessions"),
+        );
+        let inherited = std::env::var_os(bcode_config::BCODE_SESSION_STORE_DIR_ENV);
+        let _outer = bcode_config::push_process_state_location(locations.primary());
+        let mut suite = minimal_suite("").unwrap();
+        suite.variants[0].config_toml = None;
+        let rep = root.join("cases/task/variants/agent/repetitions/0001");
+        let isolated = prepare_agent_daemon_isolation(&suite.variants[0], &rep).unwrap();
+        assert_eq!(
+            bcode_config::default_state_dir(),
+            variant_artifact_dir(&rep)
+                .join("daemon-state")
+                .canonicalize()
+                .unwrap()
+        );
+        let expected_sessions = variant_artifact_dir(&rep).join("daemon-state/sessions");
+        assert_eq!(
+            std::env::var_os(bcode_config::BCODE_SESSION_STORE_DIR_ENV),
+            Some(expected_sessions.as_os_str().to_owned())
+        );
+        assert_eq!(
+            bcode_config::default_session_store_dir(),
+            expected_sessions.canonicalize().unwrap()
+        );
+        drop(isolated);
+        assert_eq!(
+            std::env::var_os(bcode_config::BCODE_SESSION_STORE_DIR_ENV),
+            inherited
+        );
+        assert_eq!(
+            bcode_config::default_state_dir(),
+            outer.canonicalize().unwrap()
+        );
+    }
+
+    #[test]
+    fn multi_session_cache_ratios_are_derived_once_and_request_ids_are_session_scoped() {
+        let a = bcode_session_models::SessionId::new();
+        let b = bcode_session_models::SessionId::new();
+        let mut events = vec![
+            usage_event(1, "same", 0, 100, 0, None),
+            usage_event(2, "hit", 0, 100, 100, None),
+        ];
+        for event in &mut events {
+            event.session_id = a;
+        }
+        let mut other = vec![
+            usage_event(1, "same", 0, 200, 0, None),
+            usage_event(2, "hit", 0, 200, 200, None),
+        ];
+        for event in &mut other {
+            event.session_id = b;
+        }
+        events.extend(other);
+        let measurements = session_telemetry(&events).measurements;
+        assert!((measurements["input_tokens"] - 600.0).abs() < f64::EPSILON);
+        assert!(
+            (measurements[bcode_prompt_cache::measurement::ROUND_COUNT] - 4.0).abs() < f64::EPSILON
+        );
+        assert!(measurements[bcode_prompt_cache::measurement::HIT_ROUND_RATIO] <= 1.0);
+    }
+
+    #[test]
     fn session_telemetry_derives_cache_rounds_from_latest_usage_per_request() {
-        let events = vec![
+        let mut events = vec![
             usage_event(1, "r0", 0, 1_000, 0, Some(1_000)),
             // A superseded intermediate snapshot for the same request must not add a round.
             usage_event(2, "r1", 0, 1_200, 0, None),
@@ -4635,6 +4829,10 @@ required = false
             usage_event(4, "r2", 0, 1_400, 1_200, Some(200)),
             usage_event(2, "r1", 0, 1_200, 0, None),
         ];
+        let session_id = events[0].session_id;
+        for event in &mut events {
+            event.session_id = session_id;
+        }
         let telemetry = session_telemetry(&events);
         let measurements = &telemetry.measurements;
         assert!((measurements[bcode_prompt_cache::measurement::ROUND_COUNT] - 3.0).abs() < 1e-9);
@@ -4663,11 +4861,15 @@ required = false
         {
             usage.terminal = true;
         }
-        let events = [
+        let mut events = [
             usage_event(1, "request", 0, 50, 0, None),
             terminal,
             usage_event(3, "request", 2, 200, 0, None),
         ];
+        let session_id = events[0].session_id;
+        for event in &mut events {
+            event.session_id = session_id;
+        }
         let measurements = session_telemetry(&events).measurements;
         assert!((measurements["input_tokens"] - 100.0).abs() < 1e-9);
         assert!((measurements["cached_input_tokens"] - 80.0).abs() < 1e-9);
