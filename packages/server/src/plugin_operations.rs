@@ -356,12 +356,38 @@ async fn drive_service_bridge<T>(
                 let Some(bridge_call) = bridge_call else {
                     return invocation.await;
                 };
-                let response = super::resolve_command_plugin_bridge_request(
-                    &state.sessions,
-                    authorized_session_id,
-                    bridge_call.request,
-                    &bridge_call.cancellation,
-                ).await;
+                let response = if let bcode_plugin_sdk::ServiceBridgeRequest::InvokeService(request) =
+                    &bridge_call.request
+                    && request.route_id.as_deref()
+                        == Some(bcode_model::judgement::WORKFLOW_APPLICATION_INTERFACE_ID)
+                    && request.interface_id
+                        == bcode_model::judgement::WORKFLOW_APPLICATION_INTERFACE_ID
+                    && request.operation == bcode_model::judgement::OP_OPTIONAL_JUDGE
+                {
+                    let cancel = super::TurnCancelState::default();
+                    let result = tokio::select! {
+                        biased;
+                        () = async {
+                            while !bridge_call.cancellation.is_cancelled() {
+                                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                            }
+                        } => bcode_tool::ToolInvocationServiceResolution::Cancelled,
+                        result = super::optional_judgement_payload_resolution(
+                            state,
+                            &state.startup_config,
+                            request.payload.clone(),
+                            &cancel,
+                        ) => result,
+                    };
+                    Ok(bcode_plugin_sdk::ServiceBridgeResponse::Service(result))
+                } else {
+                    super::resolve_command_plugin_bridge_request(
+                        &state.sessions,
+                        authorized_session_id,
+                        bridge_call.request,
+                        &bridge_call.cancellation,
+                    ).await
+                };
                 let _sent = bridge_call.response.send(response);
             }
         }
@@ -383,19 +409,14 @@ pub async fn call_service(
             message: "activity projection requires an explicitly selected producer",
         });
     }
-    let labels = plugin_service_metric_labels(None, interface_id, &operation);
-    state
-        .metrics
-        .time_result_async(
-            "plugin.service",
-            labels,
-            state
-                .plugins
-                .invoke_service_by_interface(interface_id, operation, payload),
-        )
-        .await
-        .map(project_service_response)
-        .map_err(|error| normalize_error(&error))
+    let plugin_id = state
+        .plugins
+        .registry()
+        .service_registry()
+        .unique_provider(interface_id)
+        .map_err(|error| normalize_error(&error))?
+        .to_owned();
+    invoke_service(state, &plugin_id, interface_id, operation, payload).await
 }
 
 /// Publish one plugin event through host routing.
@@ -707,6 +728,80 @@ mod tests {
         .await;
         drop(state);
         assert_eq!(value, 42);
+    }
+
+    #[tokio::test]
+    async fn public_service_bridge_routes_only_optional_application_requests() {
+        use bcode_model::judgement;
+        let mut state = crate::tests::test_server_state(bcode_session::SessionManager::default());
+        state.startup_config.judgement.mode = bcode_config::judgement::JudgementMode::Off;
+        for (operation, cancelled) in [
+            (judgement::OP_OPTIONAL_JUDGE, false),
+            (judgement::OP_OPTIONAL_JUDGE, true),
+            (judgement::OP_WORKFLOW_JUDGE, false),
+        ] {
+            let (sender, requests) = tokio::sync::mpsc::unbounded_channel();
+            let (response, received) = std::sync::mpsc::sync_channel(1);
+            let cancellation = bcode_plugin_sdk::ServiceCancellation::default();
+            if cancelled {
+                cancellation.cancel();
+            }
+            sender.send(crate::ServerPluginBridgeCall {
+                request: bcode_plugin_sdk::ServiceBridgeRequest::InvokeService(
+                    bcode_tool::ToolInvocationServiceRequest {
+                        invocation_id: "optional-test".into(),
+                        request_id: "optional-test-request".into(),
+                        route_id: Some(judgement::WORKFLOW_APPLICATION_INTERFACE_ID.into()),
+                        interface_id: judgement::WORKFLOW_APPLICATION_INTERFACE_ID.into(),
+                        operation: operation.into(),
+                        payload: serde_json::json!({"feature":"recommendations",
+                            "request":{"model_id":"jev-1.13.0","state":{"kind":"text","value":"bounded"},
+                                "questions":{"q":{"kind":"yes_no","instructions":"Relevant?"}}}}),
+                    }),
+                cancellation,
+                response,
+            }).unwrap();
+            drop(sender);
+            let (complete, result) = tokio::sync::oneshot::channel::<()>();
+            let driver = super::drive_service_bridge(&state, None, requests, result);
+            tokio::pin!(driver);
+            let mut context = std::task::Context::from_waker(std::task::Waker::noop());
+            assert!(std::future::Future::poll(driver.as_mut(), &mut context).is_pending());
+            let answer = received.try_recv().unwrap().unwrap();
+            if cancelled {
+                assert!(matches!(
+                    answer,
+                    bcode_plugin_sdk::ServiceBridgeResponse::Service(
+                        bcode_tool::ToolInvocationServiceResolution::Cancelled
+                    )
+                ));
+            } else if operation == judgement::OP_WORKFLOW_JUDGE {
+                assert!(matches!(
+                    answer,
+                    bcode_plugin_sdk::ServiceBridgeResponse::Service(
+                        bcode_tool::ToolInvocationServiceResolution::Unsupported
+                    )
+                ));
+            } else {
+                let bcode_plugin_sdk::ServiceBridgeResponse::Service(
+                    bcode_tool::ToolInvocationServiceResolution::Responded { payload },
+                ) = answer
+                else {
+                    panic!("optional response expected");
+                };
+                let response: judgement::OptionalResponse =
+                    serde_json::from_value(payload).unwrap();
+                let observation = response.observation.unwrap();
+                assert_eq!(
+                    observation.outcome,
+                    judgement::OptionalOperationOutcome::Disabled
+                );
+                assert_eq!(observation.inference_invocations, 0);
+            }
+            complete.send(()).unwrap();
+            driver.await.unwrap();
+        }
+        drop(state);
     }
 
     #[tokio::test]

@@ -46,6 +46,7 @@ fn advised(selection: SelectionRequest) -> ApplyRequest {
     ApplyRequest {
         selection,
         judgement: OptionalResponse {
+            observation: None,
             response: Some(Response {
                 answers: BTreeMap::from([
                     ("candidate_0".into(), Answer::YesNo { probability: 0.1 }),
@@ -97,7 +98,10 @@ fn off_no_key_error_uncertainty_and_malformed_advice_have_identical_baseline() {
     let input = fixture();
     let baseline = apply(&ApplyRequest {
         selection: input.clone(),
-        judgement: OptionalResponse { response: None },
+        judgement: OptionalResponse {
+            observation: None,
+            response: None,
+        },
     });
     assert_eq!(baseline.included_ids, ["read-distractor", "explicit"]);
     assert!(!baseline.applied);

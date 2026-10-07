@@ -6,7 +6,10 @@ use std::{
     time::{Duration, Instant},
 };
 
-use bcode_model::judgement::{self, OptionalRequest, OptionalResponse, SetupSelection};
+use bcode_model::judgement::{
+    self, OptionalOperationObservation, OptionalOperationOutcome, OptionalRequest,
+    OptionalResponse, SetupSelection,
+};
 use bcode_plugin::PluginInvocationScope;
 use sha2::{Digest as _, Sha256};
 
@@ -136,24 +139,57 @@ impl OptionalJudgementAccess {
         config: &bcode_config::BcodeConfig,
         input: OptionalRequest,
     ) -> OptionalResponse {
-        let response = if config.judgement.enabled(input.feature)
-            && self.cache.lock().is_ok_and(|cache| {
-                cache
-                    .retry_after
-                    .is_none_or(|until| until <= Instant::now())
-            }) {
-            if let Ok(_permit) = self.permit.try_acquire() {
-                tokio::time::timeout(TOTAL_TIMEOUT, self.evaluate(state, config, input))
-                    .await
-                    .ok()
-                    .flatten()
-            } else {
-                None
+        let started = Instant::now();
+        let mut observation = OptionalOperationObservation::default();
+        let _permit = match self.begin(config.judgement.enabled(input.feature)) {
+            Ok(permit) => permit,
+            Err(outcome) => {
+                observation.outcome = outcome;
+                observation.elapsed_ms =
+                    u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
+                return OptionalResponse {
+                    response: None,
+                    observation: Some(observation),
+                };
             }
+        };
+        let response = if let Ok(response) = tokio::time::timeout(
+            TOTAL_TIMEOUT,
+            self.evaluate(state, config, input, &mut observation),
+        )
+        .await
+        {
+            response
         } else {
+            observation.outcome = OptionalOperationOutcome::TimedOut;
             None
         };
-        OptionalResponse { response }
+        observation.elapsed_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
+        OptionalResponse {
+            response,
+            observation: Some(observation),
+        }
+    }
+
+    fn begin(
+        &self,
+        enabled: bool,
+    ) -> Result<tokio::sync::SemaphorePermit<'_>, OptionalOperationOutcome> {
+        if !enabled {
+            return Err(OptionalOperationOutcome::Disabled);
+        }
+        let allowed = self
+            .cache
+            .lock()
+            .map_err(|_| OptionalOperationOutcome::Unavailable)?
+            .retry_after
+            .is_none_or(|until| until <= Instant::now());
+        if !allowed {
+            return Err(OptionalOperationOutcome::Backoff);
+        }
+        self.permit
+            .try_acquire()
+            .map_err(|_| OptionalOperationOutcome::Busy)
     }
 
     async fn evaluate(
@@ -161,6 +197,7 @@ impl OptionalJudgementAccess {
         state: &ServerState,
         config: &bcode_config::BcodeConfig,
         mut input: OptionalRequest,
+        observation: &mut OptionalOperationObservation,
     ) -> Option<judgement::Response> {
         // Bound input before even discovery. Auto callers may use a nonempty placeholder model.
         judgement::validate_request(&input.request).ok()?;
@@ -170,7 +207,8 @@ impl OptionalJudgementAccess {
         {
             selection
         } else {
-            let catalog = super::setup_catalog_with_config(state, config).await;
+            let catalog =
+                super::setup_catalog_with_config_observed(state, config, observation).await;
             let mut candidates = Vec::new();
             for provider in catalog.providers {
                 for model in provider.models {
@@ -209,19 +247,21 @@ impl OptionalJudgementAccess {
         };
         input.request.model_id = selection.model_id.clone();
         if !self
-            .verify_inner(state, config, &selection)
+            .verify_inner(state, config, &selection, observation)
             .await?
             .ok()?
             .is_ready()
         {
             return None;
         }
-        let result = super::invoke_judgement_model_with_config(
+        observation.outcome = OptionalOperationOutcome::InferenceFailed;
+        let result = super::invoke_judgement_model_with_config_observed(
             state,
             config,
             &selection.provider_plugin_id,
             &selection.auth_profile,
             input.request,
+            observation,
         )
         .await
         .ok();
@@ -229,6 +269,9 @@ impl OptionalJudgementAccess {
             && let Ok(mut cache) = self.cache.lock()
         {
             cache.retry_after = Some(Instant::now() + FAILURE_BACKOFF);
+        }
+        if result.is_some() {
+            observation.outcome = OptionalOperationOutcome::Advice;
         }
         result
     }
@@ -238,6 +281,7 @@ impl OptionalJudgementAccess {
         state: &ServerState,
         config: &bcode_config::BcodeConfig,
         selection: &SetupSelection,
+        observation: &mut OptionalOperationObservation,
     ) -> Option<Result<judgement::VerificationResult, &'static str>> {
         if selection.provider_plugin_id.is_empty()
             || selection.model_id.is_empty()
@@ -247,6 +291,8 @@ impl OptionalJudgementAccess {
         {
             return None;
         }
+        observation.effective_provider = Some(selection.provider_plugin_id.clone());
+        observation.effective_model = Some(selection.model_id.clone());
         let manifest = state
             .plugins
             .registry()
@@ -280,6 +326,7 @@ impl OptionalJudgementAccess {
             .ok()?
         };
         context.auth.as_ref()?;
+        observation.model_listing_invocations += 1;
         let listing: judgement::ModelList = state
             .plugins
             .invoke_service_json_scoped_with_timeout(
@@ -306,25 +353,40 @@ impl OptionalJudgementAccess {
             model_id: selection.model_id.clone(),
             provider_context: context,
         };
+        self.verify_cached(state, config, selection, &verification, observation)
+            .await
+    }
+
+    async fn verify_cached(
+        &self,
+        state: &ServerState,
+        config: &bcode_config::BcodeConfig,
+        selection: &SetupSelection,
+        verification: &judgement::VerificationRequest,
+        observation: &mut OptionalOperationObservation,
+    ) -> Option<Result<judgement::VerificationResult, &'static str>> {
         // Digest credential/settings identity; never retain raw credentials in cache or diagnostics.
         let key: [u8; 32] = Sha256::digest(
-            serde_json::to_vec(&(&config.active_context, &selection, &verification)).ok()?,
+            serde_json::to_vec(&(&config.active_context, selection, verification)).ok()?,
         )
         .into();
         let (epoch, cached) = {
             let cache = self.cache.lock().ok()?;
             (cache.epoch, cache.get(&key, Instant::now()))
         };
+        observation.outcome = OptionalOperationOutcome::VerificationFailed;
         let result = if let Some(result) = cached {
+            observation.verification_cache_hit = true;
             result
         } else {
+            observation.verification_invocations += 1;
             let result = state
                 .plugins
                 .invoke_service_json_scoped_with_timeout(
                     &selection.provider_plugin_id,
                     judgement::VERIFICATION_INTERFACE_ID,
                     judgement::OP_VERIFY,
-                    &verification,
+                    verification,
                     PluginInvocationScope::Global,
                     VERIFY_TIMEOUT,
                 )
@@ -353,9 +415,10 @@ impl OptionalJudgementAccess {
             .permit
             .try_acquire()
             .map_err(|_| "judgement verification busy")?;
+        let mut observation = OptionalOperationObservation::default();
         tokio::time::timeout(
             TOTAL_TIMEOUT,
-            self.verify_inner(state, &state.startup_config, selection),
+            self.verify_inner(state, &state.startup_config, selection, &mut observation),
         )
         .await
         .map_err(|_| "judgement verification timed out")?
@@ -366,6 +429,65 @@ impl OptionalJudgementAccess {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn admission_outcomes_preserve_off_backoff_and_permit_order() {
+        let access = OptionalJudgementAccess::new();
+        let permit = access.begin(true).unwrap();
+        assert_eq!(
+            access.begin(true).unwrap_err(),
+            OptionalOperationOutcome::Busy
+        );
+        access.cache.lock().unwrap().retry_after = Some(Instant::now() + FAILURE_BACKOFF);
+        assert_eq!(
+            access.begin(true).unwrap_err(),
+            OptionalOperationOutcome::Backoff
+        );
+        assert_eq!(
+            access.begin(false).unwrap_err(),
+            OptionalOperationOutcome::Disabled
+        );
+        drop(permit);
+        access.invalidate();
+        assert!(access.begin(true).is_ok());
+    }
+
+    #[test]
+    fn poisoned_cache_is_unavailable_but_disabled_still_short_circuits() {
+        let access = OptionalJudgementAccess::new();
+        let cache = Arc::clone(&access.cache);
+        let _ = std::thread::spawn(move || {
+            let _guard = cache.lock().unwrap();
+            panic!("poison fixture cache");
+        })
+        .join();
+        assert_eq!(
+            access.begin(true).unwrap_err(),
+            OptionalOperationOutcome::Unavailable
+        );
+        assert_eq!(
+            access.begin(false).unwrap_err(),
+            OptionalOperationOutcome::Disabled
+        );
+    }
+
+    #[tokio::test]
+    async fn timeout_retains_attempted_invocations_and_cancels_borrowed_work() {
+        let mut observation = OptionalOperationObservation::default();
+        let attempted = tokio::time::timeout(Duration::from_millis(1), async {
+            observation.model_listing_invocations += 1;
+            observation.verification_invocations += 1;
+            std::future::pending::<()>().await;
+            observation.inference_invocations += 1;
+        })
+        .await;
+        assert!(attempted.is_err());
+        assert_eq!(observation.model_listing_invocations, 1);
+        assert_eq!(observation.verification_invocations, 1);
+        assert_eq!(observation.inference_invocations, 0);
+        assert_eq!(observation.inference_usage, None);
+        assert_eq!(observation.transport_attempts, None);
+    }
 
     #[test]
     fn cloned_refresh_handle_invalidates_shared_generation_and_backoff() {

@@ -9062,7 +9062,10 @@ async fn handle_core_runtime_request(
             {
                 state.optional_judgement.judge(state, input).await
             } else {
-                bcode_model::judgement::OptionalResponse { response: None }
+                bcode_model::judgement::OptionalResponse {
+                    observation: None,
+                    response: None,
+                }
             };
             let response = serde_json::to_string(&result).map_or_else(
                 |_| {
@@ -20191,9 +20194,14 @@ async fn run_model_turn_inner(
                 &cancel_state,
             )
             .await
-            && let Ok(response) =
-                serde_json::from_value::<bcode_session_models::CategorizationResponse>(value)
-            && let Some(labels) = response.categorization
+            && let Ok(labels) =
+                serde_json::from_value::<Option<bcode_session_models::SessionCategorization>>(
+                    value
+                        .get("categorization")
+                        .cloned()
+                        .unwrap_or(serde_json::Value::Null),
+                )
+            && let Some(labels) = labels
             && labels.source_sequence == trigger_event.sequence
             && labels.task.len() <= 64
             && labels.domain.len() <= 64
@@ -29324,7 +29332,10 @@ async fn select_optional_context(
     }) {
         tokio::select! { biased; () = cancel.cancelled() => return baseline(), response = state.optional_judgement.judge_with_config(state, config, request) => response }
     } else {
-        bcode_model::judgement::OptionalResponse { response: None }
+        bcode_model::judgement::OptionalResponse {
+            observation: None,
+            response: None,
+        }
     };
     let Some(applied) = invoke_optional_feature_service(
         state,
@@ -29421,7 +29432,10 @@ async fn append_optional_context(
             reply = state.optional_judgement.judge_with_config(state, config, input) => reply,
         }
     } else {
-        bcode_model::judgement::OptionalResponse { response: None }
+        bcode_model::judgement::OptionalResponse {
+            observation: None,
+            response: None,
+        }
     };
     let baseline = || {
         let mut remaining = budget_bytes;

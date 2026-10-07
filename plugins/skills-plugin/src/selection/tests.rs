@@ -28,6 +28,7 @@ fn advice(selection: SelectionRequest, low: f64, high: f64) -> ApplyRequest {
     ApplyRequest {
         selection,
         judgement: OptionalResponse {
+            observation: None,
             response: Some(judgement::Response {
                 answers: BTreeMap::from([
                     ("candidate_0".into(), Answer::YesNo { probability: low }),

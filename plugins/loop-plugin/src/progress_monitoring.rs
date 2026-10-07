@@ -91,6 +91,7 @@ pub fn annotate(
         return;
     };
     let Ok(OptionalResponse {
+        observation: _,
         response: Some(response),
     }) = serde_json::from_value(payload)
     else {
@@ -171,6 +172,7 @@ mod tests {
             assert!(optional.selection.is_none());
             let mode = unsafe { *user_data.cast::<u8>() };
             let response = OptionalResponse {
+                observation: None,
                 response: (mode == 1).then(|| judgement::Response {
                     answers: ["progress", "stall", "drift"]
                         .into_iter()

@@ -205,6 +205,20 @@ async fn setup_catalog_with_config(
     state: &ServerState,
     config: &bcode_config::BcodeConfig,
 ) -> judgement::SetupCatalog {
+    setup_catalog_with_config_observed(
+        state,
+        config,
+        &mut judgement::OptionalOperationObservation::default(),
+    )
+    .await
+}
+
+async fn setup_catalog_with_config_observed(
+    state: &ServerState,
+    config: &bcode_config::BcodeConfig,
+    observation: &mut judgement::OptionalOperationObservation,
+) -> judgement::SetupCatalog {
+    observation.discovery_invocations += 1;
     let mut providers = Vec::new();
     for (plugin_id, manifest) in state.plugins.registry().manifests() {
         if providers.len() >= 32 {
@@ -217,7 +231,7 @@ async fn setup_catalog_with_config(
         {
             continue;
         }
-        if let Some(provider) = setup_provider(state, config, plugin_id).await {
+        if let Some(provider) = setup_provider(state, config, plugin_id, observation).await {
             providers.push(provider);
             if serde_json::to_vec(&judgement::SetupCatalog {
                 providers: providers.clone(),
@@ -285,6 +299,7 @@ async fn setup_provider(
     state: &ServerState,
     config: &bcode_config::BcodeConfig,
     plugin_id: &str,
+    observation: &mut judgement::OptionalOperationObservation,
 ) -> Option<judgement::SetupProvider> {
     let matching: Vec<_> = state
         .plugins
@@ -322,6 +337,7 @@ async fn setup_provider(
     // Model discovery is optional: an unavailable auth account still permits static
     // capability discovery, but does not permit judgement execution.
     let discovery_context = context.unwrap_or_default();
+    observation.model_listing_invocations += 1;
     let listing: Result<ModelList, _> = state
         .plugins
         .invoke_service_json_scoped_with_timeout(
@@ -401,6 +417,25 @@ async fn invoke_judgement_model_with_config(
     auth_profile: &str,
     request: Request,
 ) -> Result<Response, &'static str> {
+    invoke_judgement_model_with_config_observed(
+        state,
+        config,
+        provider_plugin_id,
+        auth_profile,
+        request,
+        &mut judgement::OptionalOperationObservation::default(),
+    )
+    .await
+}
+
+async fn invoke_judgement_model_with_config_observed(
+    state: &ServerState,
+    config: &bcode_config::BcodeConfig,
+    provider_plugin_id: &str,
+    auth_profile: &str,
+    request: Request,
+    observation: &mut judgement::OptionalOperationObservation,
+) -> Result<Response, &'static str> {
     judgement::validate_request(&request)?;
     if provider_plugin_id.is_empty()
         || provider_plugin_id.len() > 256
@@ -444,6 +479,7 @@ async fn invoke_judgement_model_with_config(
     if provider_context.auth.is_none() {
         return Err("judgement provider credentials are unavailable");
     }
+    observation.model_listing_invocations += 1;
     let listing: ModelList = state
         .plugins
         .invoke_service_json_scoped_with_timeout(
@@ -468,6 +504,9 @@ async fn invoke_judgement_model_with_config(
         judgement: resolved.clone(),
         provider_context,
     };
+    observation.effective_provider = Some(provider_plugin_id.to_owned());
+    observation.effective_model = Some(resolved.model_id.clone());
+    observation.inference_invocations += 1;
     let result: Response = state
         .plugins
         .invoke_service_json_scoped_with_timeout(
@@ -481,5 +520,6 @@ async fn invoke_judgement_model_with_config(
         .await
         .map_err(|_| "judgement provider invocation failed")?;
     judgement::validate_response(&resolved, model, &result)?;
+    observation.inference_usage.clone_from(&result.usage);
     Ok(result)
 }

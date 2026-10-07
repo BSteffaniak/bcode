@@ -1,0 +1,8 @@
+{
+  "schema_version": 1,
+  "dataset": "held-out.json",
+  "sha256": "0c1383c21250cc1a2aa1d60cbb142cbb3b59facd25082e7cce0042df7a6ddaa1",
+  "truth_provenance": "authored_synthetic",
+  "independent_collection": false,
+  "status": "authored_freeze_pending_external_review"
+}

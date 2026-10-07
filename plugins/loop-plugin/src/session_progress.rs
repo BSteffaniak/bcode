@@ -100,6 +100,9 @@ pub struct ProgressResponse {
     pub version: u32,
     /// Request-only/live-only payload; must not be appended to canonical history.
     pub advice: Option<ProgressAdvice>,
+    /// Transient central operation facts; absent for no trigger or legacy replies.
+    #[serde(default)]
+    pub observation: Option<judgement::OptionalOperationObservation>,
 }
 
 fn bounded_text(text: &str, limit: usize) -> bool {
@@ -225,7 +228,7 @@ fn observe(
     bridge: &ServiceBridge,
     identity: &str,
     input: &ProgressRequest,
-) -> Option<ProgressAdvice> {
+) -> Option<ProgressResponse> {
     let payload = serde_json::to_value(prepare(input)?).ok()?;
     let ServiceBridgeResponse::Service(bcode_tool::ToolInvocationServiceResolution::Responded {
         payload,
@@ -244,13 +247,19 @@ fn observe(
     else {
         return None;
     };
-    let OptionalResponse {
-        response: Some(response),
-    } = serde_json::from_value(payload).ok()?
-    else {
-        return None;
-    };
-    apply(input, &response)
+    let response = serde_json::from_value::<OptionalResponse>(payload).ok()?;
+    Some(apply_optional(input, response))
+}
+
+fn apply_optional(input: &ProgressRequest, response: OptionalResponse) -> ProgressResponse {
+    ProgressResponse {
+        version: 1,
+        advice: response
+            .response
+            .as_ref()
+            .and_then(|response| apply(input, response)),
+        observation: response.observation,
+    }
 }
 
 pub(crate) fn invoke(context: &NativeServiceContext) -> ServiceResponse {
@@ -266,13 +275,21 @@ pub(crate) fn invoke(context: &NativeServiceContext) -> ServiceResponse {
             "unsupported or oversized progress input",
         );
     }
-    let advice = if context.cancellation.is_cancelled() {
+    let mut response = if context.cancellation.is_cancelled() {
         None
     } else {
         let (ProgressScope::Session { id } | ProgressScope::Workflow { id }) = &input.scope;
-        observe(&context.bridge, id, &input).filter(|_| !context.cancellation.is_cancelled())
-    };
-    super::json_response(&ProgressResponse { version: 1, advice })
+        observe(&context.bridge, id, &input)
+    }
+    .unwrap_or(ProgressResponse {
+        version: 1,
+        advice: None,
+        observation: None,
+    });
+    if context.cancellation.is_cancelled() {
+        response.advice = None;
+    }
+    super::json_response(&response)
 }
 
 #[cfg(test)]
@@ -405,46 +422,81 @@ mod tests {
     }
 
     #[test]
-    fn service_routes_central_optional_access_and_returns_transient_advice() {
-        extern "C" fn callback(
-            input_ptr: *const u8,
-            input_len: usize,
-            output_ptr: *mut u8,
-            output_capacity: usize,
-            output_len: *mut usize,
-            user_data: *mut std::ffi::c_void,
-        ) -> i32 {
-            let bytes = unsafe { std::slice::from_raw_parts(input_ptr, input_len) };
-            let ServiceBridgeRequest::InvokeService(request) =
-                serde_json::from_slice(bytes).unwrap()
-            else {
-                panic!("expected central optional request");
-            };
-            assert_eq!(
-                request.interface_id,
-                judgement::WORKFLOW_APPLICATION_INTERFACE_ID
-            );
-            assert_eq!(request.operation, judgement::OP_OPTIONAL_JUDGE);
-            let optional: OptionalRequest = serde_json::from_value(request.payload).unwrap();
-            assert_eq!(optional.feature, Feature::ProgressMonitoring);
-            assert!(optional.selection.is_none());
-            let mode = unsafe { *user_data.cast::<u8>() };
-            let optional = OptionalResponse {
-                response: (mode == 1).then(|| answers(0.1, 0.95, 0.1)),
-            };
-            let response = ServiceBridgeResponse::Service(
-                bcode_tool::ToolInvocationServiceResolution::Responded {
-                    payload: serde_json::to_value(optional).unwrap(),
+    fn legacy_and_uncertain_progress_preserve_observation_semantics() {
+        let legacy: ProgressResponse = serde_json::from_value(serde_json::json!({
+            "version": 1, "advice": null
+        }))
+        .unwrap();
+        assert!(legacy.observation.is_none());
+        let input = input(ProgressScope::Session {
+            id: "session".into(),
+        });
+        let observation = judgement::OptionalOperationObservation {
+            outcome: judgement::OptionalOperationOutcome::Advice,
+            inference_invocations: 1,
+            ..judgement::OptionalOperationObservation::default()
+        };
+        let response = apply_optional(
+            &input,
+            OptionalResponse {
+                response: Some(answers(0.5, 0.5, 0.5)),
+                observation: Some(observation.clone()),
+            },
+        );
+        assert!(response.advice.is_none());
+        assert_eq!(response.observation, Some(observation));
+    }
+
+    extern "C" fn progress_callback(
+        input_ptr: *const u8,
+        input_len: usize,
+        output_ptr: *mut u8,
+        output_capacity: usize,
+        output_len: *mut usize,
+        user_data: *mut std::ffi::c_void,
+    ) -> i32 {
+        let bytes = unsafe { std::slice::from_raw_parts(input_ptr, input_len) };
+        let ServiceBridgeRequest::InvokeService(request) = serde_json::from_slice(bytes).unwrap()
+        else {
+            panic!("expected central optional request");
+        };
+        assert_eq!(
+            request.interface_id,
+            judgement::WORKFLOW_APPLICATION_INTERFACE_ID
+        );
+        assert_eq!(request.operation, judgement::OP_OPTIONAL_JUDGE);
+        let optional: OptionalRequest = serde_json::from_value(request.payload).unwrap();
+        assert_eq!(optional.feature, Feature::ProgressMonitoring);
+        assert!(optional.selection.is_none());
+        let mode = unsafe { *user_data.cast::<u8>() };
+        let optional = OptionalResponse {
+            observation: Some(judgement::OptionalOperationObservation {
+                outcome: if mode == 1 {
+                    judgement::OptionalOperationOutcome::Advice
+                } else {
+                    judgement::OptionalOperationOutcome::TimedOut
                 },
-            );
-            let encoded = serde_json::to_vec(&response).unwrap();
-            assert!(encoded.len() <= output_capacity);
-            unsafe {
-                std::ptr::copy_nonoverlapping(encoded.as_ptr(), output_ptr, encoded.len());
-                *output_len = encoded.len();
-            }
-            0
+                verification_invocations: 1,
+                elapsed_ms: 37,
+                ..judgement::OptionalOperationObservation::default()
+            }),
+            response: (mode == 1).then(|| answers(0.1, 0.95, 0.1)),
+        };
+        let response = ServiceBridgeResponse::Service(
+            bcode_tool::ToolInvocationServiceResolution::Responded {
+                payload: serde_json::to_value(optional).unwrap(),
+            },
+        );
+        let encoded = serde_json::to_vec(&response).unwrap();
+        assert!(encoded.len() <= output_capacity);
+        unsafe {
+            std::ptr::copy_nonoverlapping(encoded.as_ptr(), output_ptr, encoded.len());
+            *output_len = encoded.len();
         }
+        0
+    }
+    #[test]
+    fn service_routes_central_optional_access_and_returns_transient_advice() {
         for mut mode in [0_u8, 1] {
             for scope in [
                 ProgressScope::Session {
@@ -464,7 +516,7 @@ mod tests {
                     events: ServiceEventEmitter::default(),
                     cancellation: bcode_plugin_sdk::ServiceCancellation::default(),
                     bridge: ServiceBridge::new(
-                        Some(callback),
+                        Some(progress_callback),
                         (&raw mut mode).cast(),
                         bcode_plugin_sdk::ServiceCancellation::default(),
                     ),
@@ -475,6 +527,17 @@ mod tests {
                 let response: ProgressResponse = serde_json::from_slice(&response.payload).unwrap();
                 assert_eq!(response.version, 1);
                 assert_eq!(response.advice.is_some(), mode == 1);
+                let observation = response.observation.unwrap();
+                assert_eq!(observation.verification_invocations, 1);
+                assert_eq!(observation.elapsed_ms, 37);
+                assert_eq!(
+                    observation.outcome,
+                    if mode == 1 {
+                        judgement::OptionalOperationOutcome::Advice
+                    } else {
+                        judgement::OptionalOperationOutcome::TimedOut
+                    }
+                );
                 if let Some(advice) = response.advice {
                     assert_eq!(advice.scope, input.scope);
                     assert_eq!(advice.kind, ProgressAdviceKind::RepeatedFailure);

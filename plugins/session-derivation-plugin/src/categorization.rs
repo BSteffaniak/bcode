@@ -7,8 +7,8 @@ use bcode_plugin_sdk::{
     NativeServiceContext, ServiceBridgeRequest, ServiceBridgeResponse, ServiceResponse,
 };
 use bcode_session_models::{
-    CategorizationRequest, CategorizationResponse, MAX_CATEGORIZATION_REQUEST_BYTES,
-    MAX_CATEGORIZATION_SOURCE_BYTES, SessionCategorization,
+    CategorizationRequest, MAX_CATEGORIZATION_REQUEST_BYTES, MAX_CATEGORIZATION_SOURCE_BYTES,
+    SessionCategorization,
 };
 use bcode_tool::{ToolInvocationServiceRequest, ToolInvocationServiceResolution};
 use serde::{Deserialize, Serialize};
@@ -163,6 +163,26 @@ fn labels(
     })
 }
 
+/// Transient service envelope; operation facts are not portable session labels or history.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+struct CategorizationServiceResponse {
+    categorization: Option<SessionCategorization>,
+    #[serde(default)]
+    observation: Option<judgement::OptionalOperationObservation>,
+}
+
+fn apply_optional(
+    request: &CategorizationRequest,
+    query: &Request,
+    mut response: OptionalResponse,
+) -> CategorizationServiceResponse {
+    let observation = response.observation.take();
+    CategorizationServiceResponse {
+        categorization: labels(request, query, response),
+        observation,
+    }
+}
+
 pub(crate) fn invoke(context: &NativeServiceContext) -> ServiceResponse {
     // Reject oversized or unknown fields without echoing untrusted payloads.
     let result = (|| {
@@ -202,12 +222,13 @@ pub(crate) fn invoke(context: &NativeServiceContext) -> ServiceResponse {
         else {
             return None;
         };
-        labels(&request, &query, serde_json::from_value(payload).ok()?)
+        Some(apply_optional(
+            &request,
+            &query,
+            serde_json::from_value(payload).ok()?,
+        ))
     })();
-    serde_json::to_value(CategorizationResponse {
-        categorization: result,
-    })
-    .map_or_else(
+    serde_json::to_value(result.unwrap_or_default()).map_or_else(
         |_| ServiceResponse::error("serialization_failed", "categorization unavailable"),
         |payload| {
             ServiceResponse::json(&payload).unwrap_or_else(|_| {
@@ -221,6 +242,110 @@ pub(crate) fn invoke(context: &NativeServiceContext) -> ServiceResponse {
 mod tests {
     use super::*;
     use bcode_session_models::SessionId;
+    extern "C" fn optional_callback(
+        input_ptr: *const u8,
+        input_len: usize,
+        output_ptr: *mut u8,
+        output_capacity: usize,
+        output_len: *mut usize,
+        user_data: *mut std::ffi::c_void,
+    ) -> i32 {
+        let bytes = unsafe { std::slice::from_raw_parts(input_ptr, input_len) };
+        let ServiceBridgeRequest::InvokeService(request) = serde_json::from_slice(bytes).unwrap()
+        else {
+            panic!("expected optional application invocation");
+        };
+        assert_eq!(request.operation, judgement::OP_OPTIONAL_JUDGE);
+        let optional: OptionalRequest = serde_json::from_value(request.payload).unwrap();
+        assert_eq!(optional.feature, Feature::SessionCategorization);
+        assert_eq!(
+            optional.request.state,
+            State::Structured(serde_json::json!({
+                "tasks": ["debugging"], "domains": ["backend"]
+            }))
+        );
+        let payload = unsafe { &*user_data.cast::<serde_json::Value>() };
+        let encoded = serde_json::to_vec(&ServiceBridgeResponse::Service(
+            ToolInvocationServiceResolution::Responded {
+                payload: payload.clone(),
+            },
+        ))
+        .unwrap();
+        assert!(encoded.len() <= output_capacity);
+        unsafe {
+            std::ptr::copy_nonoverlapping(encoded.as_ptr(), output_ptr, encoded.len());
+            *output_len = encoded.len();
+        }
+        0
+    }
+
+    #[test]
+    fn service_decode_preserves_transient_observation_and_legacy_unknown() {
+        let observation = judgement::OptionalOperationObservation {
+            outcome: judgement::OptionalOperationOutcome::TimedOut,
+            verification_invocations: 1,
+            elapsed_ms: 37,
+            ..judgement::OptionalOperationObservation::default()
+        };
+        for payload in [
+            serde_json::json!({"response": null}),
+            serde_json::to_value(OptionalResponse {
+                response: None,
+                observation: Some(observation.clone()),
+            })
+            .unwrap(),
+            serde_json::to_value(OptionalResponse {
+                response: Some(judgement::Response {
+                    answers: BTreeMap::new(),
+                    usage: None,
+                }),
+                observation: Some(observation),
+            })
+            .unwrap(),
+        ] {
+            let expected = serde_json::from_value::<OptionalResponse>(payload.clone())
+                .unwrap()
+                .observation;
+            let request = CategorizationRequest {
+                session_id: SessionId::new(),
+                source_sequence: 7,
+                newest_request: "fix backend private-token-marker".into(),
+            };
+            let context = NativeServiceContext {
+                plugin_id: "bcode.session-derivation".into(),
+                request: bcode_plugin_sdk::ServiceRequest {
+                    interface_id: "bcode.session-categorization/v1".into(),
+                    operation: "categorize".into(),
+                    payload: serde_json::to_vec(&request).unwrap(),
+                },
+                config: bcode_plugin_sdk::PluginConfigContext::default(),
+                events: bcode_plugin_sdk::ServiceEventEmitter::default(),
+                cancellation: bcode_plugin_sdk::ServiceCancellation::default(),
+                bridge: bcode_plugin_sdk::ServiceBridge::new(
+                    Some(optional_callback),
+                    std::ptr::from_ref(&payload).cast_mut().cast(),
+                    bcode_plugin_sdk::ServiceCancellation::default(),
+                ),
+                transient_progress_limits: bcode_plugin_sdk::TransientProgressLimits::default(),
+            };
+            let reply = invoke(&context);
+            assert!(reply.error.is_none());
+            let decoded: CategorizationServiceResponse =
+                serde_json::from_slice(&reply.payload).unwrap();
+            assert!(decoded.categorization.is_none());
+            assert_eq!(decoded.observation, expected);
+            let value: serde_json::Value = serde_json::from_slice(&reply.payload).unwrap();
+            let portable: bcode_session_models::CategorizationResponse = serde_json::from_value(
+                serde_json::json!({"categorization": value["categorization"]}),
+            )
+            .unwrap();
+            assert!(portable.categorization.is_none());
+        }
+        let old: CategorizationServiceResponse =
+            serde_json::from_value(serde_json::json!({"categorization": null})).unwrap();
+        assert!(old.observation.is_none());
+    }
+
     #[test]
     fn representative_label_inputs_and_ambiguity_follow_actual_signal_path() {
         for (source, task, domain) in [
@@ -290,6 +415,7 @@ mod tests {
             .unwrap()
             .request;
         let response = OptionalResponse {
+            observation: None,
             response: Some(judgement::Response {
                 answers: BTreeMap::from([
                     (
@@ -361,6 +487,7 @@ mod tests {
                     &request,
                     &query,
                     OptionalResponse {
+                        observation: None,
                         response: Some(judgement::Response {
                             answers,
                             usage: None
@@ -382,12 +509,23 @@ mod tests {
         let query = optional_request(&newest_request_facts(&request.newest_request))
             .unwrap()
             .request;
-        assert!(labels(&request, &query, OptionalResponse { response: None }).is_none());
         assert!(
             labels(
                 &request,
                 &query,
                 OptionalResponse {
+                    observation: None,
+                    response: None
+                }
+            )
+            .is_none()
+        );
+        assert!(
+            labels(
+                &request,
+                &query,
+                OptionalResponse {
+                    observation: None,
                     response: Some(judgement::Response {
                         answers: BTreeMap::new(),
                         usage: None

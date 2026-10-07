@@ -130,6 +130,85 @@ pub struct OptionalRequest {
 pub struct OptionalResponse {
     /// Validated answer set, or unavailable/disabled/failed.
     pub response: Option<Response>,
+    /// Transient operation facts; absent on responses from older implementations.
+    #[serde(default)]
+    pub observation: Option<OptionalOperationObservation>,
+}
+
+/// Normalized outcome of an optional operation, without provider errors or request content.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OptionalOperationOutcome {
+    /// Configuration disabled the operation before any provider work.
+    Disabled,
+    /// Another operation held the shared permit.
+    Busy,
+    /// Failure backoff prevented provider work.
+    Backoff,
+    /// No unambiguous usable selection or capability was available.
+    Unavailable,
+    /// Verification failed or did not establish readiness.
+    VerificationFailed,
+    /// Inference or answer validation failed.
+    InferenceFailed,
+    /// The total optional operation deadline elapsed.
+    TimedOut,
+    /// A validated advisory answer set was returned.
+    Advice,
+}
+
+/// Bounded, secret-free facts attached only to the transient optional request result.
+///
+/// Invocation counts measure application/service entries attempted, not HTTP attempts or retries.
+/// Provider-private transport and verification billing are unknown at this boundary.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct OptionalOperationObservation {
+    /// Normalized terminal result of this operation.
+    pub outcome: OptionalOperationOutcome,
+    /// Attempted application discovery operations.
+    pub discovery_invocations: u64,
+    /// Attempted provider model-listing service invocations, including discovery.
+    pub model_listing_invocations: u64,
+    /// Attempted provider verification service invocations.
+    pub verification_invocations: u64,
+    /// Attempted provider inference service invocations.
+    pub inference_invocations: u64,
+    /// Total elapsed monotonic time in milliseconds, including unsuccessful work.
+    pub elapsed_ms: u64,
+    /// A verification result (positive or negative) came from the verification cache.
+    pub verification_cache_hit: bool,
+    /// Exact selected provider plugin ID, never an auth account or profile.
+    pub effective_provider: Option<String>,
+    /// Exact selected model ID.
+    pub effective_model: Option<String>,
+    /// Provider-reported usage from successful validated inference only.
+    pub inference_usage: Option<Usage>,
+    /// Unknown: the verification contract does not report token usage.
+    pub verification_usage: Option<Usage>,
+    /// Unknown: the verification contract does not report billing.
+    pub verification_cost_usd: Option<f64>,
+    /// Unknown: application invocation counts do not expose transport attempts.
+    pub transport_attempts: Option<u64>,
+}
+
+impl Default for OptionalOperationObservation {
+    fn default() -> Self {
+        Self {
+            outcome: OptionalOperationOutcome::Unavailable,
+            discovery_invocations: 0,
+            model_listing_invocations: 0,
+            verification_invocations: 0,
+            inference_invocations: 0,
+            elapsed_ms: 0,
+            verification_cache_hit: false,
+            effective_provider: None,
+            effective_model: None,
+            inference_usage: None,
+            verification_usage: None,
+            verification_cost_usd: None,
+            transport_attempts: None,
+        }
+    }
 }
 
 /// Host application service for bounded, non-conversational judgement from authorized workflow
@@ -514,6 +593,69 @@ fn valid_confidence(value: Option<f64>) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn optional_response_legacy_compatibility_and_unknown_measurements() {
+        let legacy: OptionalResponse = serde_json::from_value(serde_json::json!({
+            "response": null
+        }))
+        .unwrap();
+        assert_eq!(legacy.response, None);
+        assert_eq!(legacy.observation, None);
+
+        let observation = OptionalOperationObservation::default();
+        assert_eq!(observation.discovery_invocations, 0);
+        assert_eq!(observation.model_listing_invocations, 0);
+        assert_eq!(observation.verification_invocations, 0);
+        assert_eq!(observation.inference_invocations, 0);
+        assert!(!observation.verification_cache_hit);
+        assert_eq!(observation.verification_usage, None);
+        assert_eq!(observation.verification_cost_usd, None);
+        assert_eq!(observation.transport_attempts, None);
+        let response = OptionalResponse {
+            response: None,
+            observation: Some(observation),
+        };
+        let encoded = serde_json::to_value(&response).unwrap();
+        assert!(encoded["observation"]["verification_usage"].is_null());
+        assert!(encoded["observation"]["verification_cost_usd"].is_null());
+        assert!(encoded["observation"]["transport_attempts"].is_null());
+        assert_eq!(
+            serde_json::from_value::<OptionalResponse>(encoded).unwrap(),
+            response
+        );
+    }
+
+    #[test]
+    fn optional_observation_round_trips_successful_usage_and_outcomes() {
+        for outcome in [
+            OptionalOperationOutcome::Disabled,
+            OptionalOperationOutcome::Busy,
+            OptionalOperationOutcome::Backoff,
+            OptionalOperationOutcome::Unavailable,
+            OptionalOperationOutcome::VerificationFailed,
+            OptionalOperationOutcome::InferenceFailed,
+            OptionalOperationOutcome::TimedOut,
+            OptionalOperationOutcome::Advice,
+        ] {
+            let observation = OptionalOperationObservation {
+                outcome,
+                inference_invocations: 1,
+                inference_usage: Some(Usage {
+                    input_tokens: 12,
+                    output_tokens: 3,
+                }),
+                effective_provider: Some("fake".into()),
+                effective_model: Some("model".into()),
+                ..OptionalOperationObservation::default()
+            };
+            let encoded = serde_json::to_value(&observation).unwrap();
+            assert_eq!(
+                serde_json::from_value::<OptionalOperationObservation>(encoded).unwrap(),
+                observation
+            );
+        }
+    }
 
     fn fixture() -> (Request, Model, Response) {
         let request = Request {

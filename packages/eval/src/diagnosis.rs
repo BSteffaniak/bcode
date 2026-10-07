@@ -168,7 +168,10 @@ mod tests {
             super::attach_advisory(
                 &mut diagnosis,
                 &request.request,
-                OptionalResponse { response: None },
+                OptionalResponse {
+                    observation: None,
+                    response: None,
+                },
             );
             assert_eq!(diagnosis, baseline);
             let crate::quality::Expected::Labels { values } = &case.expected else {
@@ -180,6 +183,7 @@ mod tests {
                 &mut diagnosis,
                 &request.request,
                 OptionalResponse {
+                    observation: None,
                     response: Some(Response {
                         answers: std::collections::BTreeMap::from([(
                             "failure_category".into(),
@@ -225,13 +229,17 @@ mod tests {
         super::attach_advisory(
             &mut diagnosis,
             &optional.request,
-            OptionalResponse { response: None },
+            OptionalResponse {
+                observation: None,
+                response: None,
+            },
         );
         assert_eq!(diagnosis, baseline);
         super::attach_advisory(
             &mut diagnosis,
             &optional.request,
             OptionalResponse {
+                observation: None,
                 response: Some(Response {
                     answers: std::collections::BTreeMap::from([(
                         "failure_category".into(),
@@ -298,6 +306,7 @@ mod tests {
                 &mut diagnosis,
                 &query,
                 OptionalResponse {
+                    observation: None,
                     response: Some(Response {
                         answers,
                         usage: None,
@@ -323,6 +332,7 @@ mod tests {
             &mut diagnosis,
             &optional.request,
             bcode_model::judgement::OptionalResponse {
+                observation: None,
                 response: Some(bcode_model::judgement::Response {
                     answers: std::collections::BTreeMap::new(),
                     usage: None,

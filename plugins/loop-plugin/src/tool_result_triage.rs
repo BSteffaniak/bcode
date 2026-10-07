@@ -94,11 +94,14 @@ pub struct Advisory {
 }
 
 /// Absence retains baseline behavior for disabled, unavailable, invalid or failed judgement.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct TriageResponse {
     /// Optional diagnostic only.
     pub advisory: Option<Advisory>,
+    /// Transient central operation facts; absent for no trigger or legacy replies.
+    #[serde(default)]
+    pub observation: Option<judgement::OptionalOperationObservation>,
 }
 
 /// Invoke the diagnostic service. Unsupported envelopes fail closed; optional access failures
@@ -120,12 +123,15 @@ pub fn invoke(context: &NativeServiceContext) -> ServiceResponse {
             "unsupported or oversized diagnostic input",
         );
     }
-    let advisory = if context.cancellation.is_cancelled() {
-        None
+    let mut response = if context.cancellation.is_cancelled() {
+        TriageResponse::default()
     } else {
-        classify(&context.bridge, &input).filter(|_| !context.cancellation.is_cancelled())
+        classify(&context.bridge, &input).unwrap_or_default()
     };
-    super::json_response(&TriageResponse { advisory })
+    if context.cancellation.is_cancelled() {
+        response.advisory = None;
+    }
+    super::json_response(&response)
 }
 
 fn valid_input(input: &TriageRequest) -> bool {
@@ -265,7 +271,7 @@ fn judgement_request(input: &TriageRequest) -> Option<OptionalRequest> {
     })
 }
 
-fn classify(bridge: &ServiceBridge, input: &TriageRequest) -> Option<Advisory> {
+fn classify(bridge: &ServiceBridge, input: &TriageRequest) -> Option<TriageResponse> {
     let request = judgement_request(input)?;
     let payload = serde_json::to_value(&request).ok()?;
     let resolution = bridge
@@ -286,15 +292,27 @@ fn classify(bridge: &ServiceBridge, input: &TriageRequest) -> Option<Advisory> {
     else {
         return None;
     };
-    let response = serde_json::from_value::<OptionalResponse>(payload)
-        .ok()?
-        .response?;
+    let response = serde_json::from_value::<OptionalResponse>(payload).ok()?;
+    Some(apply_optional(&request, response))
+}
+
+fn apply_optional(request: &OptionalRequest, response: OptionalResponse) -> TriageResponse {
+    TriageResponse {
+        advisory: response
+            .response
+            .as_ref()
+            .and_then(|response| apply(request, response)),
+        observation: response.observation,
+    }
+}
+
+fn apply(request: &OptionalRequest, response: &judgement::Response) -> Option<Advisory> {
     // Validate shape again at the plugin boundary without discovering or selecting a model.
     let shape = judgement::Model {
         model_id: request.request.model_id.clone(),
         question_kinds: BTreeSet::from([judgement::QuestionKind::Choice]),
     };
-    judgement::validate_response(&request.request, &shape, &response).ok()?;
+    judgement::validate_response(&request.request, &shape, response).ok()?;
     let Answer::Choice { selected, .. } = response.answers.get(QUESTION_ID)? else {
         return None;
     };
@@ -392,6 +410,41 @@ mod tests {
     }
 
     #[test]
+    fn service_preserves_central_observation_without_advice_and_legacy_is_unknown() {
+        let legacy: TriageResponse = serde_json::from_value(serde_json::json!({
+            "advisory": null
+        }))
+        .unwrap();
+        assert!(legacy.observation.is_none());
+        for outcome in [
+            judgement::OptionalOperationOutcome::Disabled,
+            judgement::OptionalOperationOutcome::TimedOut,
+        ] {
+            let observation = judgement::OptionalOperationObservation {
+                outcome,
+                model_listing_invocations: 2,
+                verification_invocations: 1,
+                elapsed_ms: 37,
+                ..judgement::OptionalOperationObservation::default()
+            };
+            let fixture = Fixture {
+                calls: AtomicUsize::new(0),
+                response: serde_json::to_value(OptionalResponse {
+                    response: None,
+                    observation: Some(observation.clone()),
+                })
+                .unwrap(),
+            };
+            let response = invoke(&context(&input(), bridge(&fixture)));
+            assert!(response.error.is_none());
+            let response: TriageResponse = serde_json::from_slice(&response.payload).unwrap();
+            assert!(response.advisory.is_none());
+            assert_eq!(response.observation, Some(observation));
+            assert_eq!(fixture.calls.load(Ordering::SeqCst), 1);
+        }
+    }
+
+    #[test]
     fn six_classifications_are_advisory_and_preserve_original_facts() {
         for category in [
             Category::Code,
@@ -410,7 +463,10 @@ mod tests {
             };
             let original = input();
             let unchanged = original.clone();
-            let advisory = classify(&bridge(&fixture), &original).unwrap();
+            let advisory = classify(&bridge(&fixture), &original)
+                .unwrap()
+                .advisory
+                .unwrap();
             assert_eq!(advisory.category, category);
             assert_eq!(advisory.message, category.message());
             assert_eq!(original, unchanged);
@@ -431,7 +487,10 @@ mod tests {
                 calls: AtomicUsize::new(0),
                 response,
             };
-            assert!(classify(&bridge(&fixture), &input()).is_none());
+            assert!(
+                classify(&bridge(&fixture), &input())
+                    .is_none_or(|response| response.advisory.is_none())
+            );
         }
         assert!(classify(&ServiceBridge::default(), &input()).is_none());
     }

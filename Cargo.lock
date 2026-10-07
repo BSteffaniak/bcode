@@ -1593,6 +1593,7 @@ dependencies = [
  "bcode_command",
  "bcode_config",
  "bcode_daemon_lifecycle",
+ "bcode_eval",
  "bcode_hyperchad",
  "bcode_ipc",
  "bcode_mermaid_render",

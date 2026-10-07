@@ -15,6 +15,10 @@ mod agent_cleanup;
 mod capture;
 pub mod diagnosis;
 mod introspection;
+/// Independently scored per-feature judgement comparisons.
+pub mod judgement_benchmark;
+/// Bounded public-consumer benchmark capture.
+pub mod judgement_capture;
 mod oracle;
 mod paired;
 mod process;

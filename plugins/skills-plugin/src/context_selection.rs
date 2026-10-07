@@ -94,7 +94,10 @@ pub fn apply(input: &ApplyRequest) -> SelectionResult {
     let advice = if prepare(&input.selection).judgement.is_some() {
         input.judgement.clone()
     } else {
-        OptionalResponse { response: None }
+        OptionalResponse {
+            observation: None,
+            response: None,
+        }
     };
     let order = selection::apply(&selection::ApplyRequest {
         selection: ranking(&input.selection),

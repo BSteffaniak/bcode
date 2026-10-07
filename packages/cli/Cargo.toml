@@ -17,6 +17,7 @@ bcode_client = { workspace = true }
 bcode_command = { workspace = true }
 bcode_config = { workspace = true }
 bcode_daemon_lifecycle = { workspace = true }
+bcode_eval = { workspace = true }
 bcode_hyperchad = { workspace = true, optional = true }
 bcode_ipc = { workspace = true }
 bcode_mermaid_render = { workspace = true }

@@ -7216,6 +7216,26 @@ mod optional_judgement_cli_tests {
     use clap::Parser as _;
 
     #[test]
+    fn benchmark_commands_require_bounded_file_input() {
+        for operation in ["benchmark-capture", "benchmark-compare"] {
+            assert!(super::Cli::try_parse_from(["bcode", "judgement", operation]).is_err());
+            assert!(
+                super::Cli::try_parse_from(["bcode", "judgement", operation, "--file", "job.json"])
+                    .is_ok()
+            );
+        }
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("job.json");
+        std::fs::write(&path, b"{}").unwrap();
+        assert_eq!(
+            super::read_judgement_benchmark_input(&path, 2).unwrap(),
+            b"{}"
+        );
+        assert!(super::read_judgement_benchmark_input(&path, 1).is_err());
+        assert!(super::read_judgement_benchmark_input(&root.path().join("missing"), 2).is_err());
+    }
+
+    #[test]
     fn optional_judge_requires_exactly_one_input_source() {
         let prefix = ["bcode", "judgement", "optional-judge"];
         assert!(super::Cli::try_parse_from(prefix).is_err());
@@ -8343,6 +8363,16 @@ fn list_ignored_models(provider: Option<&str>, json: bool) -> Result<(), CliErro
 
 #[derive(Debug, Subcommand)]
 enum JudgementCommand {
+    /// Capture one bounded actual-consumer benchmark job on an already-running subject.
+    BenchmarkCapture {
+        #[arg(long)]
+        file: PathBuf,
+    },
+    /// Compare captured benchmark observations offline without provider work.
+    BenchmarkCompare {
+        #[arg(long)]
+        file: PathBuf,
+    },
     /// Request optional judgement; disabled or unavailable returns a null response.
     OptionalJudge {
         #[arg(long, required_unless_present = "file", conflicts_with = "file")]
@@ -8354,8 +8384,67 @@ enum JudgementCommand {
     },
 }
 
+fn read_judgement_benchmark_input(path: &Path, limit: usize) -> Result<Vec<u8>, CliError> {
+    use std::io::Read as _;
+    let file = std::fs::File::open(path)
+        .map_err(|_| CliError::InvalidArguments("cannot open benchmark input".into()))?;
+    let mut bytes = Vec::new();
+    file.take(u64::try_from(limit).unwrap_or(u64::MAX).saturating_add(1))
+        .read_to_end(&mut bytes)
+        .map_err(|_| CliError::InvalidArguments("cannot read benchmark input".into()))?;
+    if bytes.len() > limit {
+        return Err(CliError::InvalidArguments(
+            "benchmark input exceeds bound".into(),
+        ));
+    }
+    Ok(bytes)
+}
+
 async fn handle_judgement_command(command: JudgementCommand) -> Result<(), CliError> {
     match command {
+        JudgementCommand::BenchmarkCapture { file } => {
+            let bytes = read_judgement_benchmark_input(
+                &file,
+                bcode_eval::judgement_capture::MAX_CAPTURE_BYTES,
+            )?;
+            let job = bcode_eval::judgement_capture::decode_capture_job(&bytes)
+                .map_err(|error| CliError::InvalidArguments(error.into()))?;
+            let (executable, digest) = bcode_daemon_lifecycle::current_executable_identity()
+                .map_err(|_| {
+                    CliError::InvalidArguments("cannot verify subject executable".into())
+                })?;
+            if job.request.subject.executable != executable
+                || job.request.subject.executable_sha256 != digest
+                || job.request.subject.artifact_id != bcode_ipc::ArtifactId::current().to_string()
+                || job.request.subject.state_id != bcode_ipc::state_location_id()
+            {
+                return Err(CliError::InvalidArguments(
+                    "benchmark subject identity mismatch".into(),
+                ));
+            }
+            let client = BcodeClient::default_endpoint()
+                .with_daemon_availability(DaemonAvailability::RequireRunning);
+            let result = bcode_eval::judgement_capture::execute_capture_job(&client, job)
+                .await
+                .map_err(|error| CliError::InvalidArguments(error.into()))?;
+            println!(
+                "{}",
+                serde_json::to_string(&result).map_err(|_| {
+                    CliError::InvalidArguments("cannot encode benchmark capture".into())
+                })?
+            );
+        }
+        JudgementCommand::BenchmarkCompare { file } => {
+            let bytes = read_judgement_benchmark_input(&file, 8 * 1024 * 1024)?;
+            let report = bcode_eval::judgement_capture::compare_capture_job(&bytes)
+                .map_err(CliError::InvalidArguments)?;
+            println!(
+                "{}",
+                serde_json::to_string(&report).map_err(|_| {
+                    CliError::InvalidArguments("cannot encode benchmark report".into())
+                })?
+            );
+        }
         JudgementCommand::OptionalJudge {
             request_json,
             file,
