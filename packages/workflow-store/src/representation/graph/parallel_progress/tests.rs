@@ -1,5 +1,171 @@
 use super::super::super::{attempts, tests::run};
 use super::*;
+
+#[tokio::test]
+async fn missing_next_member_releases_reduction_until_source_propagates() {
+    use super::super::tests::{admitted, success, task};
+    let definition = bcode_workflow::WorkflowBuilder::new(
+        "source-wait",
+        bcode_workflow::parallel_named("join", task("source").then(task("worker")), task("other")),
+    )
+    .build()
+    .unwrap()
+    .definition()
+    .clone();
+    let (db, owner) = admitted(&definition).await;
+    let source = super::super::activation_id(&*db, "graph", "source")
+        .await
+        .unwrap()
+        .unwrap();
+    let prepared = crate::PreparedAttempt {
+        run_id: "graph".into(),
+        node_id: "source".into(),
+        activation_id: source,
+        attempt: 1,
+        side_effect: bcode_workflow::DispatchSideEffect::ReadOnly,
+        intent: serde_json::json!({}),
+        prepared_at_ms: 1,
+    };
+    let dispatch = attempts::prepare(&*db, &owner, &prepared).await.unwrap();
+    attempts::attach_receipt(
+        &*db,
+        &owner,
+        &crate::DispatchReceipt {
+            run_id: "graph".into(),
+            node_id: "source".into(),
+            activation_id: prepared.activation_id.clone(),
+            attempt: 1,
+            dispatch_identity: dispatch.clone(),
+            receipt: serde_json::json!({"owner":"fixture"}),
+            admitted_at_ms: 2,
+        },
+    )
+    .await
+    .unwrap();
+    assert!(
+        super::super::activation_id(&*db, "graph", "worker")
+            .await
+            .unwrap()
+            .is_none()
+    );
+    for _ in 0..3 {
+        assert!(
+            !super::super::parallel::settle(&*db, &owner, "graph", "join", 1)
+                .await
+                .unwrap()
+        );
+        assert!(!pending(&*db, "graph", "join", 1).await.unwrap());
+    }
+    invalidate(&*db, "graph").await.unwrap();
+    assert!(pending(&*db, "graph", "join", 1).await.unwrap());
+    assert!(
+        !super::super::parallel::settle(&*db, &owner, "graph", "join", 1)
+            .await
+            .unwrap()
+    );
+    assert!(!pending(&*db, "graph", "join", 1).await.unwrap());
+    attempts::settle(
+        &*db,
+        &owner,
+        "graph",
+        &dispatch,
+        attempts::TerminalOutcome::Succeeded,
+        3,
+    )
+    .await
+    .unwrap();
+    super::super::settle_output(&*db, &owner, "graph", "source", 1, &serde_json::json!(9))
+        .await
+        .unwrap();
+    super::super::frontier::advance(&*db, &owner, "graph", 32)
+        .await
+        .unwrap();
+    for member in ["worker", "other"] {
+        success(&*db, &owner, member).await;
+        super::super::settle_output(&*db, &owner, "graph", member, 1, &serde_json::json!(9))
+            .await
+            .unwrap();
+    }
+    drain_join_completion(&*db, &owner, definition.nodes.len()).await;
+    assert!(!pending(&*db, "graph", "join", 1).await.unwrap());
+}
+
+#[tokio::test]
+async fn completed_join_does_not_resume_stale_reduction_after_epoch_invalidation() {
+    use super::super::tests::{admitted, success, task};
+    let definition = bcode_workflow::WorkflowBuilder::new(
+        "parallel",
+        bcode_workflow::parallel_named("join", task("left"), task("right")),
+    )
+    .build()
+    .unwrap()
+    .definition()
+    .clone();
+    let (db, owner) = admitted(&definition).await;
+    assert!(
+        !super::super::parallel::settle(&*db, &owner, "graph", "join", 1)
+            .await
+            .unwrap()
+    );
+    assert!(!pending(&*db, "graph", "join", 1).await.unwrap());
+    invalidate(&*db, "graph").await.unwrap();
+    assert!(pending(&*db, "graph", "join", 1).await.unwrap());
+    for member in ["left", "right"] {
+        success(&*db, &owner, member).await;
+        super::super::settle_output(&*db, &owner, "graph", member, 1, &serde_json::json!(9))
+            .await
+            .unwrap();
+    }
+    drain_join_completion(&*db, &owner, definition.nodes.len()).await;
+    let output = super::super::output(&*db, "graph", "join")
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(!pending(&*db, "graph", "join", 1).await.unwrap());
+    invalidate(&*db, "graph").await.unwrap();
+    for _ in 0..3 {
+        assert!(
+            !super::super::parallel::settle(&*db, &owner, "graph", "join", 1)
+                .await
+                .unwrap()
+        );
+        assert!(!pending(&*db, "graph", "join", 1).await.unwrap());
+    }
+    assert!(pending(&*db, "graph", "join", 2).await.is_err());
+    assert!(!pending(&*db, "graph", "other-join", 1).await.unwrap());
+    assert!(pending(&*db, "other-run", "join", 1).await.is_err());
+    assert_eq!(
+        super::super::output(&*db, "graph", "join").await.unwrap(),
+        Some(output)
+    );
+}
+async fn drain_join_completion(
+    db: &dyn Database,
+    owner: &crate::WorkflowExecutionAuthority,
+    node_count: usize,
+) {
+    // Drain canonical propagation before reduction, as the production driver does.
+    // The bound derives from this finite fixture, not a production retry allowance.
+    for _ in 0..=node_count {
+        super::super::frontier::advance(db, owner, "graph", 32)
+            .await
+            .unwrap();
+        super::super::parallel::settle(db, owner, "graph", "join", 1)
+            .await
+            .unwrap();
+        if let Some(value) = super::super::output(db, "graph", "join").await.unwrap() {
+            assert_eq!(value, serde_json::json!([9, 9]));
+            return;
+        }
+        assert!(
+            super::super::frontier::pending(db, "graph").await.unwrap()
+                || pending(db, "graph", "join", 1).await.unwrap(),
+            "unfinished join must have canonical local work"
+        );
+    }
+    panic!("fixture propagation and reduction did not commit join output");
+}
+
 #[tokio::test]
 async fn reduction_pages_waiting_members_survives_reopen_and_resets_after_retry() {
     let temp = tempfile::tempdir().unwrap();
@@ -174,7 +340,9 @@ async fn assert_completed_budget(
     names: &[&str],
     state: &super::super::parallel::MemberState,
 ) {
-    assert!(!pending(db, "many", "join", 1).await.unwrap());
+    // This reducer-only fixture has no canonical join node; public controller discovery
+    // must reject it rather than infer membership from an accumulator job.
+    assert!(pending(db, "many", "join", 1).await.is_err());
     let repeated = reduce(db, "many", "join", 1, names, OutputPolicy::default())
         .await
         .unwrap()

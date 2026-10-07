@@ -63,6 +63,26 @@ fn summary_provenance_must_match_every_execution_identity() {
 }
 
 #[test]
+fn generated_selector_requires_exact_complete_authenticated_page() {
+    let mut worker = reference();
+    worker.graph_revision = 2;
+    worker.execution.node_id = "worker".into();
+    let mut page = GeneratedContributorPage {
+        mutation_id: "publication".into(),
+        source_activation_id: "original".into(),
+        contributors: vec![worker.clone()],
+        next_node_id: None,
+    };
+    assert_eq!(selected_reference(&page, "worker"), Some(&worker));
+    assert!(selected_reference(&page, "sibling").is_none());
+    page.next_node_id = Some("worker".into());
+    assert!(selected_reference(&page, "worker").is_none());
+    page.next_node_id = None;
+    page.contributors.push(worker);
+    assert!(selected_reference(&page, "worker").is_none());
+}
+
+#[test]
 fn unavailable_contract_does_not_return_partial_evidence() {
     let result = unavailable();
     assert_eq!(result.contract, CONTRACT_ID);
@@ -107,6 +127,7 @@ async fn application_authenticates_and_reads_original_canonical_receipt_without_
         &ExecutionContributorEvidenceRequest {
             expected_revision: 1,
             action: ContributorEvidenceAction::Discover {
+                contributor_node_id: None,
                 after_sequence: None,
                 limit: 100,
             },
@@ -166,6 +187,201 @@ async fn application_authenticates_and_reads_original_canonical_receipt_without_
     assert_eq!(
         before, after,
         "evidence retrieval must not append another invocation"
+    );
+}
+
+#[tokio::test]
+async fn authenticated_generated_publication_reads_exact_worker_not_equal_sibling() {
+    let fixture = Box::pin(fixture::Fixture::generated()).await;
+    let token = TurnCancelState::default();
+    let listing_request = ExecutionContributorEvidenceRequest {
+        expected_revision: 2,
+        action: ContributorEvidenceAction::Contributors {
+            after_node_id: None,
+            limit: 100,
+        },
+    };
+    let listing = from_invocation(&fixture.state, fixture.caller, &listing_request, &token)
+        .await
+        .unwrap();
+    let source_session_id = fixture.source.to_string();
+    let mut request = fixture.read_request();
+    request.expected_revision = 2;
+    if let ContributorEvidenceAction::Read {
+        contributor_node_id,
+        ..
+    } = &mut request.action
+    {
+        *contributor_node_id = Some("worker".into());
+    }
+    let before = fixture
+        .state
+        .sessions
+        .current_session_generation(fixture.source)
+        .await
+        .unwrap();
+    let response = from_invocation(&fixture.state, fixture.caller, &request, &token)
+        .await
+        .unwrap();
+    let after = fixture
+        .state
+        .sessions
+        .current_session_generation(fixture.source)
+        .await
+        .unwrap();
+
+    if let ContributorEvidenceAction::Read {
+        contributor_node_id,
+        ..
+    } = &mut request.action
+    {
+        *contributor_node_id = Some("sibling".into());
+    }
+    let rejected = from_invocation(&fixture.state, fixture.caller, &request, &token)
+        .await
+        .unwrap();
+    drop(fixture);
+    assert_eq!(
+        listing.scope_kind,
+        Some(ContributorScopeKind::GeneratedExecution)
+    );
+    assert_eq!(
+        listing.generated_provenance.unwrap().mutation_id,
+        "generated-publication"
+    );
+    assert_eq!(
+        listing
+            .contributors
+            .iter()
+            .map(|scope| scope.node_id.as_str())
+            .collect::<Vec<_>>(),
+        vec!["integrate", "source", "worker"]
+    );
+    assert_eq!(
+        before, after,
+        "evidence retrieval must not rerun or append worker history"
+    );
+    assert_eq!(response.status, ContributorEvidenceStatus::Available);
+    assert_eq!(response.scope.unwrap().session_id, source_session_id);
+    assert_eq!(
+        response.evidence.unwrap().model_output.text,
+        "{\"exit_code\":0,\"output\":\"persisted intermediate consumed; PASS\"}"
+    );
+    assert_eq!(
+        rejected.status,
+        ContributorEvidenceStatus::ProvenanceUnavailable
+    );
+    assert!(rejected.evidence.is_none());
+    assert!(rejected.scope.is_none());
+}
+
+#[tokio::test]
+async fn missing_or_corrupt_introducing_publication_never_releases_history() {
+    for corrupt in [false, true] {
+        let fixture = Box::pin(fixture::Fixture::generated()).await;
+        fixture.damage_publication(corrupt).await;
+        let mut request = fixture.read_request();
+        request.expected_revision = 2;
+        if let ContributorEvidenceAction::Read {
+            contributor_node_id,
+            ..
+        } = &mut request.action
+        {
+            *contributor_node_id = Some("worker".into());
+        }
+        let result = from_invocation(
+            &fixture.state,
+            fixture.caller,
+            &request,
+            &TurnCancelState::default(),
+        )
+        .await;
+        drop(fixture);
+        if let Ok(response) = result {
+            assert_eq!(
+                response.status,
+                ContributorEvidenceStatus::ProvenanceUnavailable
+            );
+            assert!(response.scope.is_none());
+            assert!(response.evidence.is_none());
+            assert!(response.contributors.is_empty());
+            assert!(response.events.is_empty());
+        } else {
+            assert!(
+                corrupt,
+                "missing publication is an explicit unavailable observation"
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn generated_selected_receipt_reads_canonical_history_without_rerunning() {
+    let fixture = Box::pin(fixture::Fixture::new()).await;
+    let mut worker = reference();
+    worker.execution.session_id = fixture.source.to_string();
+    // Obtain the exact host-proved identity from the ordinary fixture; selection cannot
+    // substitute another session or node even when supplied as an untrusted selector.
+    let token = TurnCancelState::default();
+    let ordinary = from_invocation(
+        &fixture.state,
+        fixture.caller,
+        &fixture.read_request(),
+        &token,
+    )
+    .await
+    .unwrap();
+    let proved = ordinary.scope.unwrap();
+    worker.run_id = proved.run_id.clone();
+    worker.consumer_activation_id = proved.consumer_activation_id;
+    worker.execution.run_id = proved.run_id;
+    worker.execution.node_id = proved.node_id;
+    worker.execution.activation_id = proved.activation_id;
+    worker.execution.attempt = proved.attempt;
+    let summary = fixture
+        .state
+        .sessions
+        .session_summary(fixture.source)
+        .await
+        .unwrap();
+    worker.execution.workspace_snapshot = summary
+        .execution
+        .unwrap()
+        .provenance
+        .workspace_snapshot
+        .unwrap();
+    let page = GeneratedContributorPage {
+        mutation_id: "proved-publication".into(),
+        source_activation_id: "retained-source".into(),
+        contributors: vec![worker],
+        next_node_id: None,
+    };
+    let mut request = fixture.read_request();
+    if let ContributorEvidenceAction::Read {
+        contributor_node_id,
+        ..
+    } = &mut request.action
+    {
+        *contributor_node_id = Some(page.contributors[0].execution.node_id.clone());
+    }
+    let selected = generated_response(&fixture.state, &page, &request, &token)
+        .await
+        .unwrap();
+    if let ContributorEvidenceAction::Read {
+        contributor_node_id,
+        ..
+    } = &mut request.action
+    {
+        *contributor_node_id = Some("unrelated-sibling".into());
+    }
+    let rejected = generated_response(&fixture.state, &page, &request, &token)
+        .await
+        .unwrap();
+    drop(fixture);
+    assert_eq!(selected.evidence, ordinary.evidence);
+    assert_eq!(
+        rejected.status,
+        ContributorEvidenceStatus::ProvenanceUnavailable
     );
 }
 

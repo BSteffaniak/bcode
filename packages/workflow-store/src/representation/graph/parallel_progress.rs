@@ -198,27 +198,96 @@ pub(super) async fn reduce(
 }
 
 /// Whether a controller has resumable member work rather than only external waiting.
+///
+/// A schema-valid output on the current activation ends reduction even if its job epoch is stale.
+/// A same-epoch cursor blocked on a missing member activation is external waiting; a stale epoch
+/// permits a fresh reduction before availability is reconsidered.
 /// # Errors
-/// Returns storage failures. Caller must continue under ordinary execution authority.
+/// Rejects stale revisions, invalid committed controller output and incompatible durable state,
+/// and propagates storage failures. Caller must continue under ordinary execution authority.
 pub async fn pending(
     db: &dyn Database,
     run: &str,
     join: &str,
     revision: u64,
 ) -> Result<bool, Error> {
+    let tx = db.begin_transaction().await?;
+    let current = scan_version_in(&*tx, run).await?;
+    if current.revision != revision {
+        return Err(Error::InvalidAdmission);
+    }
+    if let Some(value) = super::output(&*tx, run, join).await? {
+        let node = super::super::graph_pages::node(&*tx, run, revision, join)
+            .await?
+            .ok_or(Error::MaintenanceRequired)?;
+        if node.kind != bcode_workflow::NodeKind::Parallel {
+            return Err(Error::InvalidAdmission);
+        }
+        super::schema(&node.output.schema, &value)?;
+        tx.commit().await?;
+        return Ok(false);
+    }
     let completed = encode(&(run, join, revision))?;
-    let rows = db
+    let rows = tx
         .select(JOBS)
         .where_eq("identity", completed)
         .limit(1)
-        .execute(db)
+        .execute(&*tx)
         .await?;
-    let Some(row) = rows.first() else {
-        return Ok(false);
+    let current_epoch = i64::try_from(current.epoch).map_err(|_| Error::MaintenanceRequired)?;
+    let result = if let Some(row) = rows.first() {
+        reduction_pending(&*tx, run, join, revision, current_epoch, row).await?
+    } else {
+        false
     };
-    Ok(
-        row.get("epoch") != Some(DatabaseValue::Int64(epoch(db, run).await?))
-            || row.get("complete") == Some(DatabaseValue::Bool(false))
-            || row.get("complete") == Some(DatabaseValue::Int64(0)),
-    )
+    tx.commit().await?;
+    Ok(result)
+}
+
+async fn reduction_pending(
+    db: &dyn Database,
+    run: &str,
+    join: &str,
+    revision: u64,
+    current_epoch: i64,
+    row: &switchy_database::Row,
+) -> Result<bool, Error> {
+    let integer = |field| match row.get(field) {
+        Some(DatabaseValue::Int64(value)) if value >= 0 => Ok(value),
+        _ => Err(Error::MaintenanceRequired),
+    };
+    let job_epoch = integer("epoch")?;
+    if job_epoch > current_epoch {
+        return Err(Error::MaintenanceRequired);
+    }
+    let next = usize::try_from(integer("next_member")?).map_err(|_| Error::MaintenanceRequired)?;
+    let _bytes = integer("state_bytes")?;
+    let complete = match row.get("complete") {
+        Some(DatabaseValue::Bool(value)) => value,
+        Some(DatabaseValue::Int64(0)) => false,
+        Some(DatabaseValue::Int64(1)) => true,
+        _ => return Err(Error::MaintenanceRequired),
+    };
+    let node = super::super::graph_pages::node(db, run, revision, join)
+        .await?
+        .ok_or(Error::MaintenanceRequired)?;
+    if node.kind != bcode_workflow::NodeKind::Parallel {
+        return Err(Error::InvalidAdmission);
+    }
+    let members =
+        bcode_workflow::parallel_join_member_ids(&node).map_err(|_| Error::MaintenanceRequired)?;
+    if next > members.len() || complete != (next == members.len()) {
+        return Err(Error::MaintenanceRequired);
+    }
+    if job_epoch != current_epoch {
+        return Ok(true);
+    }
+    if complete {
+        return Ok(false);
+    }
+    // A missing activation is external waiting, not another reduction quantum.
+    // Use the reducer's exact availability contract, including skipped/terminal members.
+    Ok(super::parallel::members_state(db, run, &[members[next]])
+        .await?
+        .is_some())
 }

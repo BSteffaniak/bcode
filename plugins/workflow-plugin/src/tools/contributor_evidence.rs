@@ -20,16 +20,17 @@ mod tests;
 pub(super) fn definition() -> ToolDefinition {
     let tool = ToolDefinition {
         name: NAME.into(),
-        description: "Read bounded recorded tool request/result evidence from the authenticated prior direct contributor to this active workflow execution. Discover canonical event references, then read an exact invocation pair. The host selects the contributor/session; callers cannot choose them. Requires the current inspected graph revision. Generated delegation and other unproved scopes return explicit unsupported or provenance_unavailable; missing or truncated evidence never proves completion. Does not mutate, replay history, or open artifacts.".into(),
+        description: "Read bounded recorded tool request/result evidence from authenticated contributors to this active workflow execution. Ordinary direct discovery/read needs no extra listing round. For supported generated execution lineage, list contributors or select a discovered contributor_node_id; the host proves the entire bounded scope and selects the session. Contributors action returns portable scope identities and introducing provenance. Requires the current inspected graph revision. Unproved scopes return explicit unsupported or provenance_unavailable; missing or truncated evidence never proves completion or integration. Does not mutate, replay history, or open artifacts.".into(),
         input_schema: json!({"type":"object","additionalProperties":false,
             "required":["expected_revision","action"],"properties":{
                 "expected_revision":{"type":"integer","minimum":1},
                 "action":{"oneOf":[
+                    {"type":"object","additionalProperties":false,"required":["kind","after_node_id","limit"],"properties":{"kind":{"const":"contributors"},"after_node_id":{"type":["string","null"],"maxLength":256},"limit":{"type":"integer","minimum":1,"maximum":100}}},
                     {"type":"object","additionalProperties":false,"required":["kind","after_sequence","limit"],
-                     "properties":{"kind":{"const":"discover"},"after_sequence":{"type":["integer","null"],"minimum":0},
+                     "properties":{"kind":{"const":"discover"},"contributor_node_id":{"type":["string","null"],"maxLength":256},"after_sequence":{"type":["integer","null"],"minimum":0},
                          "limit":{"type":"integer","minimum":1,"maximum":100}}},
                     {"type":"object","additionalProperties":false,"required":["kind","invocation_id","request_sequence","result_sequence","byte_limit"],
-                     "properties":{"kind":{"const":"read"},"invocation_id":{"type":"string","minLength":1,"maxLength":1024},
+                     "properties":{"kind":{"const":"read"},"contributor_node_id":{"type":["string","null"],"maxLength":256},"invocation_id":{"type":"string","minLength":1,"maxLength":1024},
                          "request_sequence":{"type":"integer","minimum":0},"result_sequence":{"type":"integer","minimum":0},
                          "byte_limit":{"type":"integer","minimum":1,"maximum":65536}}}
                 ]}
@@ -166,6 +167,72 @@ fn render(
     })
 }
 
+fn valid_listing(
+    response: &ExecutionContributorEvidenceResponse,
+    query: &ExecutionContributorEvidenceRequest,
+) -> bool {
+    let limit = match &query.action {
+        ContributorEvidenceAction::Contributors { limit, .. } => usize::from(*limit),
+        ContributorEvidenceAction::Discover {
+            contributor_node_id: None,
+            ..
+        }
+        | ContributorEvidenceAction::Read {
+            contributor_node_id: None,
+            ..
+        } => 100,
+        _ => return false,
+    };
+    response.contributors.len() <= limit
+        && response.contributors.iter().all(|scope| {
+            scope.graph_revision == query.expected_revision
+                && scope.attempt > 0
+                && !scope.node_id.is_empty()
+                && scope.node_id.len() <= 256
+        })
+        && response
+            .contributors
+            .windows(2)
+            .all(|pair| pair[0].node_id < pair[1].node_id)
+        && response.next_node_id.as_ref().is_none_or(|cursor| {
+            response
+                .contributors
+                .last()
+                .is_some_and(|scope| &scope.node_id == cursor)
+        })
+        && response.events.is_empty()
+        && response.scanned_events == 0
+        && response.next_sequence.is_none()
+        && response.evidence.is_none()
+}
+
+/// Verify generated provenance presence and bind selected contributors to their scope.
+fn valid_generated_metadata(
+    response: &ExecutionContributorEvidenceResponse,
+    query: &ExecutionContributorEvidenceRequest,
+) -> bool {
+    let generated = response.scope_kind
+        == Some(bcode_workflow::contributor_evidence::ContributorScopeKind::GeneratedExecution);
+    if generated != response.generated_provenance.is_some() {
+        return false;
+    }
+    let Some(scope) = &response.scope else {
+        return true;
+    };
+    let selected_node = match &query.action {
+        ContributorEvidenceAction::Discover {
+            contributor_node_id,
+            ..
+        }
+        | ContributorEvidenceAction::Read {
+            contributor_node_id,
+            ..
+        } => contributor_node_id.as_deref(),
+        ContributorEvidenceAction::Contributors { .. } => None,
+    };
+    selected_node.is_none_or(|node| generated && scope.node_id == node)
+}
+
 fn valid_response(
     response: &ExecutionContributorEvidenceResponse,
     query: &ExecutionContributorEvidenceRequest,
@@ -175,10 +242,26 @@ fn valid_response(
     }
     if response.status != ContributorEvidenceStatus::Available {
         return response.scope.is_none()
+            && response.contributors.is_empty()
+            && response.next_node_id.is_none()
+            && response.scope_kind.is_none()
+            && response.generated_provenance.is_none()
             && response.events.is_empty()
             && response.scanned_events == 0
             && response.next_sequence.is_none()
             && response.evidence.is_none();
+    }
+    if !valid_generated_metadata(response, query) {
+        return false;
+    }
+    if response.scope_kind
+        == Some(bcode_workflow::contributor_evidence::ContributorScopeKind::GeneratedExecution)
+        && response.scope.is_none()
+    {
+        return valid_listing(response, query);
+    }
+    if !response.contributors.is_empty() || response.next_node_id.is_some() {
+        return false;
     }
     let Some(scope) = &response.scope else {
         return false;
@@ -200,6 +283,7 @@ fn valid_response(
         return false;
     }
     match &query.action {
+        ContributorEvidenceAction::Contributors { .. } => false,
         ContributorEvidenceAction::Discover { limit, .. } => {
             response.evidence.is_none()
                 && response.scanned_events <= usize::from(*limit)
@@ -217,6 +301,7 @@ fn valid_response(
             request_sequence,
             result_sequence,
             byte_limit,
+            ..
         } => {
             let Some(evidence) = &response.evidence else {
                 return false;

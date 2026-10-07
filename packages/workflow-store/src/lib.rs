@@ -42043,10 +42043,12 @@ mod tests {
         let before = store.connection.total_changes();
         run_graph::validate_reconciliation_targets(&store.connection, &request)
             .expect("explicit completed-result binding");
+        request.reconciliation = vec![Disposition::Retain {
+            activation_id: activation_id(),
+        }];
+        run_graph::validate_reconciliation_targets(&store.connection, &request)
+            .expect("completed retention without new bindings");
         for disposition in [
-            Disposition::Retain {
-                activation_id: activation_id(),
-            },
             Disposition::Cancel {
                 activation_id: activation_id(),
             },
@@ -42069,6 +42071,10 @@ mod tests {
             .connection
             .execute("UPDATE workflow_outputs SET checksum_sha256 = 'bad'", [])
             .expect("damage");
+        assert!(run_graph::validate_reconciliation_targets(&store.connection, &request).is_err());
+        request.reconciliation = vec![Disposition::Retain {
+            activation_id: activation_id(),
+        }];
         assert!(run_graph::validate_reconciliation_targets(&store.connection, &request).is_err());
     }
 

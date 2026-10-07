@@ -28,6 +28,7 @@ pub use run_contracts::{
     WORKFLOW_DIAGNOSTIC_ARTIFACT_VERSION, WORKFLOW_OUTPUT_INSPECTION_VERSION,
     WORKFLOW_TERMINAL_OUTPUT_INSPECTION_VERSION, WaitingActivation, WaitingResolutionResult,
     WorkflowActivationInputSummary, WorkflowActivationObservation, WorkflowActivationSummary,
+    WorkflowAdmissionCategory, WorkflowAdmissionObservation, WorkflowAdmissionPhase,
     WorkflowApprovalContinuation, WorkflowAttemptAdmissionObservation,
     WorkflowAttemptPreparationObservation, WorkflowAuthorityTransferObservation,
     WorkflowContinuationLineage, WorkflowContinuationRequest, WorkflowContinuationSource,

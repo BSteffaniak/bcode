@@ -495,7 +495,7 @@ async fn admission_family_selection_never_installs_or_dispatches_unsupported_lif
     );
 }
 
-async fn typed_provider_fixture() -> (
+pub(super) async fn typed_provider_fixture() -> (
     tempfile::TempDir,
     tempfile::TempDir,
     std::sync::Arc<ServerState>,

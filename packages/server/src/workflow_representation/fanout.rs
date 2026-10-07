@@ -7,15 +7,16 @@ pub(super) async fn advance(
     authority: &bcode_workflow_store::WorkflowExecutionAuthority,
     run_id: &str,
     revision: u64,
-    activation: &representation::graph::Activation,
-) -> Result<bool, ServerError> {
+    node_id: &str,
+    activation_id: &str,
+) -> Result<(bool, bool), ServerError> {
     let created = super::backpressure::queued(path, || {
         representation::graph::fanout::materialize(
             db,
             authority,
             run_id,
-            &activation.node_id,
-            &activation.activation_id,
+            node_id,
+            activation_id,
             revision,
             32,
         )
@@ -27,17 +28,17 @@ pub(super) async fn advance(
             db,
             authority,
             run_id,
-            &activation.node_id,
-            &activation.activation_id,
+            node_id,
+            activation_id,
             revision,
         )
     })
     .await
     .map_err(super::backpressure::normalize)?;
     let pending = super::backpressure::retry(|| {
-        representation::graph::fanout_progress::pending(db, run_id, &activation.activation_id)
+        representation::graph::fanout_progress::pending(db, run_id, activation_id)
     })
     .await
     .map_err(super::backpressure::normalize)?;
-    Ok(created > 0 || settled || pending)
+    Ok((created > 0 || settled, pending))
 }

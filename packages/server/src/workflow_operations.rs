@@ -11882,6 +11882,8 @@ pub async fn inspect_run(
     };
     Ok(bcode_workflow::WorkflowRunInspection {
         unavailable_collections: vec![],
+        admission_observations: vec![],
+        admission_observations_complete: None,
         execution_allowance,
         continuation,
         replacement_readiness,

@@ -5,6 +5,11 @@ use bcode_workflow_store::{
     PreparedAttempt,
 };
 use representation::attempts::owner_boundary;
+#[path = "driver_admission/mod.rs"]
+mod admission;
+#[path = "driver_scan/mod.rs"]
+mod leaf_scan;
+use representation::admission_observation::{Category, Phase};
 
 /// Drive a canonical new run under an already-verified local authority. No admission bypass.
 pub async fn drive(state: &std::sync::Arc<ServerState>, run_id: &str) -> Result<(), ServerError> {
@@ -24,31 +29,15 @@ pub async fn drive(state: &std::sync::Arc<ServerState>, run_id: &str) -> Result<
     let mut cancellation_scanned = false;
     let mut cancellation_cursor = None;
     let mut controllers = super::parallel::Scan::default();
-    let mut after = None;
-    let mut scan_progress = false;
+    let mut fanouts = leaf_scan::FanOutScan::default();
+    let mut leaves = leaf_scan::Scan::default();
     loop {
-        if state
-            .shutdown_requested
-            .load(std::sync::atomic::Ordering::SeqCst)
-        {
-            return Ok(());
-        }
-        super::backpressure::queued(&crate::workflow_store_path(state), || {
-            owner_boundary::verify(&db, run_id, &guard.authority)
-        })
-        .await
-        .map_err(super::backpressure::normalize)?;
-        if super::backpressure::queued(&crate::workflow_store_path(state), || {
-            representation::controls::user_paused(&db, run_id)
-        })
-        .await
-        .map_err(super::backpressure::normalize)?
-        {
+        if !pass_allowed(state, &db, run_id, &guard.authority).await? {
             return Ok(());
         }
         let (advanced, frontier_pending) =
             advance_frontier(retained.path(), &db, &guard.authority, run_id).await?;
-        scan_progress |= advanced;
+        leaves.observe_progress(advanced);
         if frontier_pending {
             tokio::task::yield_now().await;
             continue;
@@ -62,17 +51,28 @@ pub async fn drive(state: &std::sync::Arc<ServerState>, run_id: &str) -> Result<
         {
             return Ok(());
         }
-        let (revision, page) =
-            super::backpressure::queued(&crate::workflow_store_path(state), || {
-                representation::graph::ready_nodes(&db, run_id, after.as_deref(), 32)
-            })
-            .await
-            .map_err(super::backpressure::normalize)?;
-        let next = page
-            .last()
-            .map(|(activation, _)| activation.node_id.clone());
-        let progressed = drive_page(state, &db, &guard.authority, run_id, revision, page).await?;
-        scan_progress |= progressed;
+        // Drain lifecycle pages without revisiting unchanged receipt-backed leaves.
+        // Actual frontier, leaf or controller progress reopens the cursor after exhaustion.
+        leaves.restart_if_progressed();
+        if !leaves.exhausted {
+            let (revision, page) =
+                super::backpressure::queued(&crate::workflow_store_path(state), || {
+                    representation::graph::ready_nodes(&db, run_id, leaves.after.as_deref(), 32)
+                })
+                .await
+                .map_err(super::backpressure::normalize)?;
+            let next = page
+                .last()
+                .map(|(activation, _)| activation.node_id.clone());
+            let progressed =
+                drive_page(state, &db, &guard.authority, run_id, revision, page).await?;
+            leaves.finish_page(next, progressed);
+        }
+        let (fanout_progress, fanout_pending) = fanouts
+            .advance(retained.path(), &db, &guard.authority, run_id)
+            .await?;
+        leaves.observe_progress(fanout_progress);
+        leaves.restart_if_progressed();
         let (control_progress, control_pending) = advance_controllers(
             state,
             &db,
@@ -83,26 +83,47 @@ pub async fn drive(state: &std::sync::Arc<ServerState>, run_id: &str) -> Result<
             &mut cancellation_scanned,
         )
         .await?;
-        scan_progress |= control_progress;
-        if next.is_none() {
-            if !scan_progress
-                && !control_pending
-                && !super::backpressure::queued(&crate::workflow_store_path(state), || {
-                    representation::graph::terminal_scan::pending(&db, run_id)
-                })
-                .await
-                .map_err(super::backpressure::normalize)?
-            {
-                break;
-            }
-            scan_progress = false;
-            after = None;
-        } else {
-            after = next;
+        leaves.observe_progress(control_progress);
+        leaves.restart_if_progressed();
+        if leaves.exhausted
+            && !fanout_pending
+            && !control_pending
+            && !super::backpressure::queued(&crate::workflow_store_path(state), || {
+                representation::graph::terminal_scan::pending(&db, run_id)
+            })
+            .await
+            .map_err(super::backpressure::normalize)?
+        {
+            break;
         }
         tokio::task::yield_now().await;
     }
     finish_pass(retained.path(), &db, &guard.authority, run_id).await
+}
+
+async fn pass_allowed(
+    state: &ServerState,
+    db: &dyn switchy_database::Database,
+    run_id: &str,
+    authority: &bcode_workflow_store::WorkflowExecutionAuthority,
+) -> Result<bool, ServerError> {
+    if state
+        .shutdown_requested
+        .load(std::sync::atomic::Ordering::SeqCst)
+    {
+        return Ok(false);
+    }
+    super::backpressure::queued(&crate::workflow_store_path(state), || {
+        owner_boundary::verify(db, run_id, authority)
+    })
+    .await
+    .map_err(super::backpressure::normalize)?;
+    let paused = super::backpressure::queued(&crate::workflow_store_path(state), || {
+        representation::controls::user_paused(db, run_id)
+    })
+    .await
+    .map_err(super::backpressure::normalize)?;
+    Ok(!paused)
 }
 
 async fn agent(
@@ -216,8 +237,21 @@ pub async fn dispatch_and_record(
     // Admission time denotes the handoff, not the later receipt persistence time.
     // Synchronous plugin owners may already return a terminal result from dispatch.
     let admitted_at_ms = crate::current_unix_millis();
-    let receipt = owner.dispatch(dispatch).await?;
-    super::owner::persist_receipt(
+    let receipt = match owner.dispatch(dispatch).await {
+        Ok(receipt) => receipt,
+        Err(error) => {
+            admission::record(
+                state,
+                authority,
+                dispatch,
+                Phase::OwnerDispatch,
+                admission::owner_category(&error),
+            )
+            .await?;
+            return Err(error.into());
+        }
+    };
+    let persisted = super::owner::persist_receipt(
         state,
         &bcode_workflow_store::DispatchReceipt {
             run_id: dispatch.activation.run_id.clone(),
@@ -230,7 +264,18 @@ pub async fn dispatch_and_record(
         },
         authority,
     )
-    .await?;
+    .await;
+    if let Err(error) = persisted {
+        admission::record(
+            state,
+            authority,
+            dispatch,
+            Phase::ReceiptPersistence,
+            Category::ReceiptPersistenceUnavailable,
+        )
+        .await?;
+        return Err(error.into());
+    }
     Ok(())
 }
 
@@ -292,15 +337,8 @@ async fn drive_activation(
             return agent(state, db, authority, run_id, activation, node).await;
         }
         bcode_workflow::NodeKind::FanOut => {
-            return super::fanout::advance(
-                &crate::workflow_store_path(state),
-                db,
-                authority,
-                run_id,
-                revision,
-                &activation,
-            )
-            .await;
+            // Fan-out lifecycle pages are drained separately from leaf receipt observation.
+            return Ok(false);
         }
         // Parallel joins settle atomically with predecessor outputs in the store.
         bcode_workflow::NodeKind::Input

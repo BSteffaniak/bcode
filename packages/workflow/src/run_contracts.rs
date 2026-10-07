@@ -2045,9 +2045,59 @@ impl WorkflowExecutionAllowanceObservation {
     }
 }
 
+/// Admission boundary whose acceptance could not be verified.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkflowAdmissionPhase {
+    /// Owner dispatch did not return an admission receipt.
+    OwnerDispatch,
+    /// Receipt persistence did not establish the durable handoff.
+    ReceiptPersistence,
+}
+
+/// Secret-safe category, not a retry decision or a claim of no effects.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkflowAdmissionCategory {
+    /// Owner access was explicitly deferred.
+    OwnerAccessDeferred,
+    /// Owner returned an error; private details are withheld.
+    OwnerError,
+    /// Durable receipt persistence was unavailable.
+    ReceiptPersistenceUnavailable,
+}
+
+/// Immutable normalized observation. Side effects and acceptance remain unverified.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WorkflowAdmissionObservation {
+    /// Owning run identity.
+    pub run_id: String,
+    /// Exact prepared node identity.
+    pub node_id: String,
+    /// Exact prepared activation identity.
+    pub activation_id: String,
+    /// Exact prepared attempt number.
+    pub attempt: u32,
+    /// Validated dispatch digest for correlation, not authority.
+    pub dispatch_identity: String,
+    /// Boundary observed, without guessed ordering or event sequence.
+    pub phase: WorkflowAdmissionPhase,
+    /// Normalized category; never raw owner error text.
+    pub category: WorkflowAdmissionCategory,
+    /// First durable observation time in Unix milliseconds.
+    pub observed_at_ms: u64,
+}
+
 /// Bounded aggregate workflow inspection snapshot.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WorkflowRunInspection {
+    /// Normalized admission diagnostics; absent older senders do not prove absence.
+    #[serde(default)]
+    pub admission_observations: Vec<WorkflowAdmissionObservation>,
+    /// Complete bounded observation at read time; None means unavailable/older sender.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub admission_observations_complete: Option<bool>,
     /// Collections not supported by this representation; empty values are not evidence of absence.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub unavailable_collections: Vec<String>,

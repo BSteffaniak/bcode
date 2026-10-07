@@ -22,8 +22,18 @@ pub struct ExecutionContributorEvidenceRequest {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum ContributorEvidenceAction {
+    /// List a bounded authenticated generated execution scope.
+    Contributors {
+        /// Exclusive node cursor within the proved introducing publication.
+        after_node_id: Option<String>,
+        /// Maximum returned scopes, between 1 and 100.
+        limit: u16,
+    },
     /// Scan at most 100 canonical events; short output does not imply no execution.
     Discover {
+        /// Optional node selected only within the host-proved generated scope.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        contributor_node_id: Option<String>,
         /// Canonical history cursor; null starts at the beginning.
         after_sequence: Option<u64>,
         /// Maximum canonical events scanned, between 1 and 100.
@@ -31,6 +41,9 @@ pub enum ContributorEvidenceAction {
     },
     /// Inspect an exact invocation pair, not an arbitrary session window.
     Read {
+        /// Optional node selected only within the host-proved generated scope.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        contributor_node_id: Option<String>,
         /// Invocation identity discovered in the authorized contributor.
         invocation_id: String,
         /// Exact canonical request sequence.
@@ -50,8 +63,28 @@ impl ExecutionContributorEvidenceRequest {
         if self.expected_revision == 0 {
             return Err("expected_revision must be positive");
         }
+        let selector = match &self.action {
+            ContributorEvidenceAction::Contributors { after_node_id, .. } => after_node_id,
+            ContributorEvidenceAction::Discover {
+                contributor_node_id,
+                ..
+            }
+            | ContributorEvidenceAction::Read {
+                contributor_node_id,
+                ..
+            } => contributor_node_id,
+        };
+        if selector
+            .as_ref()
+            .is_some_and(|id| id.trim().is_empty() || id.len() > 256)
+        {
+            return Err("invalid contributor node selector");
+        }
         match &self.action {
-            ContributorEvidenceAction::Discover { limit, .. } if !(1..=100).contains(limit) => {
+            ContributorEvidenceAction::Contributors { limit, .. }
+            | ContributorEvidenceAction::Discover { limit, .. }
+                if !(1..=100).contains(limit) =>
+            {
                 Err("discovery limit must be between 1 and 100")
             }
             ContributorEvidenceAction::Read {
@@ -59,6 +92,7 @@ impl ExecutionContributorEvidenceRequest {
                 request_sequence,
                 result_sequence,
                 byte_limit,
+                ..
             } if invocation_id.trim().is_empty()
                 || invocation_id.len() > 1_024
                 || result_sequence <= request_sequence
@@ -167,10 +201,42 @@ pub struct ContributorInvocationEvidence {
     pub producer_capture_complete: Option<bool>,
 }
 
+/// Evidence authority kind; absent on older v1 responses means ordinary direct.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ContributorScopeKind {
+    /// Unique direct predecessor execution.
+    OrdinaryDirect,
+    /// Execution lineage proved through an immutable introducing publication.
+    GeneratedExecution,
+}
+
+/// Portable introducing-publication provenance; never a completion claim.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct GeneratedContributorProvenance {
+    /// Exact committed introducing mutation.
+    pub mutation_id: String,
+    /// Exact retained original source activation.
+    pub source_activation_id: String,
+}
+
 /// Typed service response without persistence/provider implementation types.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ExecutionContributorEvidenceResponse {
+    /// Optional additive authority kind, absent on historical ordinary responses.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scope_kind: Option<ContributorScopeKind>,
+    /// Authenticated generated contributor scopes for listing actions.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub contributors: Vec<ContributorEvidenceScope>,
+    /// Exclusive generated scope cursor.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next_node_id: Option<String>,
+    /// Exact introducing provenance for generated scope only.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub generated_provenance: Option<GeneratedContributorProvenance>,
     /// Must equal [`CONTRACT_ID`]; unknown contracts must not be guessed.
     pub contract: String,
     /// Explicit proof/coverage status.

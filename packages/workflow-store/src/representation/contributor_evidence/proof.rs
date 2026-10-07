@@ -125,7 +125,7 @@ async fn admitted_output(
     Ok(Some(output))
 }
 
-async fn successful_execution(
+pub(super) async fn successful_execution(
     db: &dyn Database,
     caller: &WorkflowExecutionSessionLink,
     source_node_id: &str,

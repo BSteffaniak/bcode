@@ -1,3 +1,4 @@
+mod generated;
 use super::super::{
     ContributorEvidenceAction, EXECUTION_SESSION_PROVENANCE_VERSION,
     ExecutionContributorEvidenceRequest, ExecutionSessionProvenance, ServerState, SessionId,
@@ -12,6 +13,7 @@ use bcode_workflow_store::{
     WorkflowStore,
     representation::{self, attempts, graph},
 };
+use generated::generated_publication;
 
 pub struct Fixture {
     pub state: ServerState,
@@ -20,6 +22,7 @@ pub struct Fixture {
     pub request_sequence: u64,
     pub result_sequence: u64,
     _root: tempfile::TempDir,
+    path: std::path::PathBuf,
 }
 
 fn admission(parent: SessionId) -> (NewWorkflowRun, bcode_workflow::WorkflowDefinition) {
@@ -170,8 +173,38 @@ async fn seed_receipt(state: &ServerState, source: SessionId) -> (u64, u64) {
     (request.sequence, result.sequence)
 }
 
+/// Configure the fixture topology and keep its admission identity in sync.
+fn configured_admission(
+    parent: SessionId,
+    generated: bool,
+) -> (NewWorkflowRun, bcode_workflow::WorkflowDefinition) {
+    let (mut run, mut definition) = admission(parent);
+    if generated {
+        let mut sibling = definition.nodes["source"].clone();
+        sibling.id = "sibling".into();
+        definition.nodes.insert("sibling".into(), sibling);
+        definition.entries.push("sibling".into());
+        let identity = bcode_workflow::WorkflowDefinitionIdentity::for_definition(
+            "contributor-application",
+            &definition,
+        )
+        .unwrap();
+        run.definition_id = identity.definition_id;
+        run.definition_version = identity.definition_version;
+    }
+    (run, definition)
+}
+
 impl Fixture {
     pub async fn new() -> Self {
+        Box::pin(Self::create(false)).await
+    }
+
+    pub async fn generated() -> Self {
+        Box::pin(Self::create(true)).await
+    }
+
+    async fn create(generated: bool) -> Self {
         let root = tempfile::tempdir().expect("root");
         let sessions = SessionManager::default();
         let parent = sessions
@@ -194,7 +227,7 @@ impl Fixture {
         )
         .expect("database");
         representation::install(&db).await.expect("representation");
-        let (run, definition) = admission(parent.id);
+        let (run, definition) = configured_admission(parent.id, generated);
         representation::admit(&db, &run, &definition)
             .await
             .expect("admit");
@@ -212,11 +245,14 @@ impl Fixture {
             .session_id
             .parse::<SessionId>()
             .expect("source id");
-        let (request_sequence, result_sequence) = seed_receipt(&state, source).await;
+        if generated {
+            generated_publication(&db, &owner, &source_link, &definition).await;
+        }
+        let (mut request_sequence, mut result_sequence) = seed_receipt(&state, source).await;
         graph::completion::complete(
             &db,
             &owner,
-            1,
+            if generated { 2 } else { 1 },
             &bcode_workflow_store::dispatch_identity(
                 &run.run_id,
                 "source",
@@ -237,6 +273,12 @@ impl Fixture {
         )
         .await
         .expect("source complete");
+        let mut evidence_source = source;
+        if generated {
+            (evidence_source, request_sequence, result_sequence) =
+                generated::seed_contributors(&state, &db, &owner, &run, parent.id, &definition)
+                    .await;
+        }
         let caller = dispatch(&state, &db, &owner, &run, "evaluate", parent.id)
             .await
             .session_id
@@ -245,10 +287,11 @@ impl Fixture {
         Self {
             state,
             caller,
-            source,
+            source: evidence_source,
             request_sequence,
             result_sequence,
             _root: root,
+            path,
         }
     }
 
@@ -256,6 +299,7 @@ impl Fixture {
         ExecutionContributorEvidenceRequest {
             expected_revision: 1,
             action: ContributorEvidenceAction::Read {
+                contributor_node_id: None,
                 invocation_id: "validated-operation".into(),
                 request_sequence: self.request_sequence,
                 result_sequence: self.result_sequence,

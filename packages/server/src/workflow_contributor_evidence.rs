@@ -9,12 +9,13 @@ use bcode_session_models::{
 use bcode_workflow::contributor_evidence::{
     CONTRACT_ID, ContributorEventReference, ContributorEventRole, ContributorEvidenceAction,
     ContributorEvidenceScope, ContributorEvidenceStatus, ContributorEvidenceText,
-    ContributorInvocationEvidence, ExecutionContributorEvidenceRequest,
-    ExecutionContributorEvidenceResponse,
+    ContributorInvocationEvidence, ContributorScopeKind, ExecutionContributorEvidenceRequest,
+    ExecutionContributorEvidenceResponse, GeneratedContributorProvenance,
 };
 use bcode_workflow_store::WorkflowExecutionSessionLink;
 use bcode_workflow_store::representation::contributor_evidence::{
-    DirectContributorObservation, DirectContributorReference,
+    DirectContributorObservation, DirectContributorReference, GeneratedContributorObservation,
+    GeneratedContributorPage,
 };
 
 use crate::{ServerError, ServerState, TurnCancelState, workflow_contributor_events as events};
@@ -31,6 +32,10 @@ fn cancelled(cancellation: &TurnCancelState) -> Result<(), ServerError> {
 
 fn unavailable() -> ExecutionContributorEvidenceResponse {
     ExecutionContributorEvidenceResponse {
+        scope_kind: None,
+        contributors: Vec::new(),
+        next_node_id: None,
+        generated_provenance: None,
         contract: CONTRACT_ID.into(),
         status: ContributorEvidenceStatus::ProvenanceUnavailable,
         scope: None,
@@ -140,6 +145,10 @@ fn discovery(
     ExecutionContributorEvidenceResponse {
         contract: CONTRACT_ID.into(),
         status: ContributorEvidenceStatus::Available,
+        scope_kind: Some(ContributorScopeKind::OrdinaryDirect),
+        contributors: Vec::new(),
+        next_node_id: None,
+        generated_provenance: None,
         scope: Some(scope(reference)),
         scanned_events: value.scanned_events,
         next_sequence: value.next_sequence,
@@ -166,6 +175,10 @@ fn read_response(
     ExecutionContributorEvidenceResponse {
         contract: CONTRACT_ID.into(),
         status: ContributorEvidenceStatus::Available,
+        scope_kind: Some(ContributorScopeKind::OrdinaryDirect),
+        contributors: Vec::new(),
+        next_node_id: None,
+        generated_provenance: None,
         scope: Some(scope(reference)),
         scanned_events: 2,
         next_sequence: None,
@@ -202,9 +215,11 @@ pub async fn compose(
         return Ok(unavailable());
     }
     let projected = match &request.action {
+        ContributorEvidenceAction::Contributors { .. } => return Ok(unavailable()),
         ContributorEvidenceAction::Discover {
             after_sequence,
             limit,
+            ..
         } => {
             let after = after_sequence.unwrap_or(0);
             let Some(history) = page(state, id, after, usize::from(*limit), cancellation).await?
@@ -219,6 +234,7 @@ pub async fn compose(
             request_sequence,
             result_sequence,
             byte_limit,
+            ..
         } => {
             let Some(request_page) = page(state, id, *request_sequence, 1, cancellation).await?
             else {
@@ -275,6 +291,111 @@ async fn caller_provenance(
     Ok(provenance)
 }
 
+#[derive(Debug, PartialEq, Eq)]
+enum Selection {
+    Direct(Box<DirectContributorReference>),
+    Generated(Box<GeneratedContributorPage>),
+    Unsupported,
+    Unavailable,
+}
+
+fn node_selector(request: &ExecutionContributorEvidenceRequest) -> Option<&str> {
+    match &request.action {
+        ContributorEvidenceAction::Discover {
+            contributor_node_id,
+            ..
+        }
+        | ContributorEvidenceAction::Read {
+            contributor_node_id,
+            ..
+        } => contributor_node_id.as_deref(),
+        ContributorEvidenceAction::Contributors { .. } => None,
+    }
+}
+
+async fn select(
+    execution: &crate::workflow_representation::graph::AuthenticatedExecution,
+    request: &ExecutionContributorEvidenceRequest,
+) -> Result<Selection, ServerError> {
+    if node_selector(request).is_none()
+        && !matches!(
+            request.action,
+            ContributorEvidenceAction::Contributors { .. }
+        )
+        && let DirectContributorObservation::Available(reference) = execution
+            .direct_contributor(request.expected_revision)
+            .await?
+    {
+        return Ok(Selection::Direct(reference));
+    }
+    let (after, limit) = match &request.action {
+        ContributorEvidenceAction::Contributors {
+            after_node_id,
+            limit,
+        } => (after_node_id.as_deref(), *limit),
+        _ => (None, 100),
+    };
+    Ok(
+        match execution
+            .generated_contributors(request.expected_revision, after, limit)
+            .await?
+        {
+            GeneratedContributorObservation::Available(page) => Selection::Generated(page),
+            GeneratedContributorObservation::Unsupported => Selection::Unsupported,
+            GeneratedContributorObservation::ProvenanceUnavailable => Selection::Unavailable,
+        },
+    )
+}
+
+fn generated_provenance(page: &GeneratedContributorPage) -> GeneratedContributorProvenance {
+    GeneratedContributorProvenance {
+        mutation_id: page.mutation_id.clone(),
+        source_activation_id: page.source_activation_id.clone(),
+    }
+}
+
+async fn generated_response(
+    state: &ServerState,
+    page: &GeneratedContributorPage,
+    request: &ExecutionContributorEvidenceRequest,
+    cancellation: &TurnCancelState,
+) -> Result<ExecutionContributorEvidenceResponse, ServerError> {
+    if matches!(
+        request.action,
+        ContributorEvidenceAction::Contributors { .. }
+    ) || node_selector(request).is_none()
+    {
+        let mut response = unavailable();
+        response.status = ContributorEvidenceStatus::Available;
+        response.contributors = page.contributors.iter().map(scope).collect();
+        response.next_node_id.clone_from(&page.next_node_id);
+        return Ok(response);
+    }
+    let Some(reference) = selected_reference(page, node_selector(request).unwrap_or_default())
+    else {
+        return Ok(unavailable());
+    };
+    compose(state, reference, request, cancellation).await
+}
+
+fn selected_reference<'a>(
+    page: &'a GeneratedContributorPage,
+    node: &str,
+) -> Option<&'a DirectContributorReference> {
+    if page.next_node_id.is_some() {
+        return None;
+    }
+    let mut matching = page
+        .contributors
+        .iter()
+        .filter(|reference| reference.execution.node_id == node);
+    let selected = matching.next()?;
+    if matching.next().is_some() {
+        return None;
+    }
+    Some(selected)
+}
+
 /// Authenticate the invoking execution, fence cancellation, and re-prove identical scope
 /// after bounded evidence retrieval. Legacy execution has no supported proof and never falls back.
 pub async fn from_invocation(
@@ -302,19 +423,27 @@ pub async fn from_invocation(
             response.status = ContributorEvidenceStatus::Unsupported;
             return Ok(response);
         };
-        let observed = execution
-            .direct_contributor(request.expected_revision)
-            .await?;
-        let reference = match observed {
-            DirectContributorObservation::Available(reference) => reference,
-            DirectContributorObservation::Unsupported => {
+        let selection = select(&execution, request).await?;
+        let mut response = match &selection {
+            Selection::Direct(reference) => {
+                compose(state, reference, request, cancellation).await?
+            }
+            Selection::Generated(page) => {
+                generated_response(state, page, request, cancellation).await?
+            }
+            Selection::Unavailable => return Ok(unavailable()),
+            Selection::Unsupported => {
                 let mut response = unavailable();
                 response.status = ContributorEvidenceStatus::Unsupported;
                 return Ok(response);
             }
-            DirectContributorObservation::ProvenanceUnavailable => return Ok(unavailable()),
         };
-        let response = compose(state, &reference, request, cancellation).await?;
+        if let Selection::Generated(page) = &selection
+            && response.status == ContributorEvidenceStatus::Available
+        {
+            response.scope_kind = Some(ContributorScopeKind::GeneratedExecution);
+            response.generated_provenance = Some(generated_provenance(page));
+        }
         let current = caller_provenance(state, session_id).await?;
         if current != provenance {
             return Ok(unavailable());
@@ -325,10 +454,8 @@ pub async fn from_invocation(
         else {
             return Ok(unavailable());
         };
-        let reobserved = reauthenticated
-            .direct_contributor(request.expected_revision)
-            .await?;
-        if reobserved != DirectContributorObservation::Available(reference) {
+        let reobserved = select(&reauthenticated, request).await?;
+        if reobserved != selection {
             return Ok(unavailable());
         }
         cancelled(cancellation)?;

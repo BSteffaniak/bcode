@@ -38,6 +38,38 @@ fn portable_envelope_normalizes_and_preserves_strict_typed_validation() {
 }
 
 #[test]
+fn additive_generated_listing_and_old_response_compatibility() {
+    use bcode_workflow::contributor_evidence::{
+        ContributorScopeKind, GeneratedContributorProvenance,
+    };
+    let old = serde_json::to_value(response()).unwrap();
+    let decoded: ExecutionContributorEvidenceResponse = serde_json::from_value(old).unwrap();
+    assert!(decoded.contributors.is_empty());
+    let query = parse(json!({"expected_revision":2,"action":{"kind":"contributors","after_node_id":null,"limit":1}})).unwrap();
+    let mut listing = response();
+    let mut scope = listing.scope.take().unwrap();
+    scope.graph_revision = 2;
+    listing.scope_kind = Some(ContributorScopeKind::GeneratedExecution);
+    listing.generated_provenance = Some(GeneratedContributorProvenance {
+        mutation_id: "delegate".into(),
+        source_activation_id: "original".into(),
+    });
+    listing.contributors.push(scope);
+    assert!(valid_response(&listing, &query));
+    listing.generated_provenance = None;
+    assert!(!valid_response(&listing, &query));
+    let selected = parse(json!({"expected_revision":2,"action":{"kind":"discover","contributor_node_id":"worker","after_sequence":null,"limit":1}})).unwrap();
+    assert!(matches!(
+        selected.action,
+        ContributorEvidenceAction::Discover {
+            contributor_node_id: Some(_),
+            ..
+        }
+    ));
+    assert!(parse(json!({"expected_revision":2,"action":{"kind":"discover","contributor_node_id":"worker","session_id":"forged","after_sequence":null,"limit":1}})).is_err());
+}
+
+#[test]
 fn preparation_binds_exact_action_revision_and_operation() {
     let payload = serde_json::to_value(request()).unwrap();
     let descriptor = json!({"operation":OPERATION,"edit":payload,"route_id":"authenticated"});
@@ -80,6 +112,10 @@ fn bounded_actions_reject_selectors_unknown_fields_and_invalid_pairs() {
 fn response() -> ExecutionContributorEvidenceResponse {
     ExecutionContributorEvidenceResponse {
         contract: CONTRACT_ID.into(),
+        scope_kind: None,
+        contributors: Vec::new(),
+        next_node_id: None,
+        generated_provenance: None,
         status: ContributorEvidenceStatus::Available,
         scope: Some(
             bcode_workflow::contributor_evidence::ContributorEvidenceScope {

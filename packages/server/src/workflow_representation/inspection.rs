@@ -10,6 +10,8 @@ use bcode_workflow::{
 };
 use sha2::Digest;
 
+mod admission;
+
 fn stage(name: &str) -> ServerError {
     ServerError::WorkflowStorageUnavailable(format!("workflow inspection unavailable at {name}"))
 }
@@ -70,8 +72,12 @@ pub async fn inspect(
     .await
     .map_err(|_| stage("children"))?
     .children;
+    let (admission_observations, admission_observations_complete) =
+        admission::inspect(&db, run_id, bound).await;
     let sessions_complete = attempts.len() < usize::from(bound);
     Ok(Some(WorkflowRunInspection {
+        admission_observations,
+        admission_observations_complete,
         unavailable_collections: vec![
             "events",
             "waits",
@@ -84,6 +90,11 @@ pub async fn inspect(
         ]
         .into_iter()
         .map(str::to_owned)
+        .chain(
+            admission_observations_complete
+                .is_none()
+                .then(|| "admission_observations".to_owned()),
+        )
         .chain((!sessions_complete).then(|| "child_sessions".to_owned()))
         .collect(),
         execution_allowance: None,

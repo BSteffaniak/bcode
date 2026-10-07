@@ -19,6 +19,7 @@ pub mod controls;
 #[cfg(test)]
 mod deployment_tests;
 pub use admission_policy::GraphAdmissionPolicy;
+pub mod admission_observation;
 #[cfg(test)]
 mod coexistence_tests;
 /// Authenticated bounded direct contributor identity proof.
@@ -193,6 +194,7 @@ pub async fn install(db: &dyn Database) -> Result<(), RepresentationError> {
         .await?;
     if !existing.is_empty() {
         verified(&*tx).await?;
+        admission_observation::install_in(&*tx).await?;
         tx.commit().await?;
         return Ok(());
     }
@@ -250,6 +252,7 @@ pub async fn install(db: &dyn Database) -> Result<(), RepresentationError> {
         .execute(&*tx)
         .await?;
     journal::install_in(&*tx).await?;
+    admission_observation::install_in(&*tx).await?;
     verified(&*tx).await?;
     tx.commit().await?;
     Ok(())

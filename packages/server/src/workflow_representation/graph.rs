@@ -174,6 +174,27 @@ impl AuthenticatedExecution {
         .map_err(|_| unavailable())
     }
 
+    pub async fn generated_contributors(
+        &self,
+        expected_revision: u64,
+        after_node_id: Option<&str>,
+        limit: u16,
+    ) -> Result<representation::contributor_evidence::GeneratedContributorObservation, ServerError>
+    {
+        self.verify_retained_path()?;
+        let db = open(&self.path, false)?;
+        representation::contributor_evidence::generated_contributors(
+            &db,
+            &self.authority,
+            &self.link,
+            expected_revision,
+            after_node_id,
+            limit,
+        )
+        .await
+        .map_err(|_| unavailable())
+    }
+
     pub async fn stage(
         &self,
         batch: &bcode_workflow::WorkflowRunGraphEditBatch,
