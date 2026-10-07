@@ -1535,6 +1535,75 @@ impl BcodeRuntimeModel {
         }
     }
 
+    fn markdown_selection_has_visible_coverage(
+        &self,
+        snapshot: &bmux_tui::selection::SelectionSnapshot,
+    ) -> bool {
+        let Some(layout) = self.committed_layout else {
+            return false;
+        };
+        let fragments = self.committed_selection.fragments();
+        for item in self.chat.app.transcript() {
+            let prefix = format!("bcode.transcript.item.{}.markdown.code.", item.id().get());
+            let has_code_slices = snapshot
+                .slices
+                .iter()
+                .any(|slice| slice.content_id.as_str().starts_with(&prefix));
+            if !has_code_slices {
+                continue;
+            }
+            let Some(projection) = super::render::transcript_markdown_selection_projection(
+                &self.chat.app,
+                item,
+                layout.body().width,
+            ) else {
+                return false;
+            };
+            if !projection.has_selection_source(item.text()) {
+                return false;
+            }
+            let Some(resolved) = resolved_transcript_selection_ranges(item, snapshot) else {
+                return false;
+            };
+            let item_prefix = format!("bcode.transcript.item.{}.markdown", item.id().get());
+            for unit in projection.selection_provenance() {
+                if !matches!(
+                    unit.kind,
+                    bcode_markdown_render::MarkdownSelectionKind::Text
+                        | bcode_markdown_render::MarkdownSelectionKind::Code
+                ) {
+                    continue;
+                }
+                for range in &unit.source_ranges {
+                    if !resolved
+                        .iter()
+                        .any(|selected| selected.start < range.end && range.start < selected.end)
+                    {
+                        continue;
+                    }
+                    let Some(source) = item.text().get(range.clone()) else {
+                        return false;
+                    };
+                    // Source breaks and indentation consumed by layout have no cells.
+                    // Every non-whitespace source unit must have committed, unclipped
+                    // provenance; interval expansion may not restore unavailable text.
+                    if source.chars().all(char::is_whitespace) && unit.rects.is_empty() {
+                        continue;
+                    }
+                    if !fragments.iter().any(|fragment| {
+                        fragment.content_id.as_str().starts_with(&item_prefix)
+                            && fragment.source_range.start <= range.start
+                            && fragment.source_range.end >= range.end
+                            && fragment.revision == item.revision()
+                    }) {
+                        return false;
+                    }
+                }
+            }
+        }
+        true
+    }
+
     fn refresh_selected_plain_text(&mut self) {
         if self
             .transcript_selection
@@ -1548,6 +1617,9 @@ impl BcodeRuntimeModel {
             .transcript_selection
             .snapshot(&self.committed_selection)
             .and_then(|snapshot| {
+                if !self.markdown_selection_has_visible_coverage(&snapshot) {
+                    return None;
+                }
                 let mut parts = Vec::new();
                 let mut start = 0;
                 while start < snapshot.slices.len() {
@@ -2517,6 +2589,7 @@ fn register_transcript_selection_scene(
                     ),
                 )
                 .parent(TRANSCRIPT_SELECTION_SCOPE_ID)
+                .capture(bmux_tui::selection::SelectionCapture::Delegate)
                 .order(u64::try_from(visible.entry_index).unwrap_or(u64::MAX))
                 .revision(item.revision()),
             );
@@ -2575,8 +2648,12 @@ fn register_transcript_selection_scene(
                 .and_then(|row| u16::try_from(row).ok());
             if let Some(document_row) = document_row {
                 let projection =
-                    super::render::transcript_markdown_projection_for_layout(app, item, body.width);
+                    super::render::transcript_markdown_selection_projection(app, item, body.width);
                 if let Some(projection) = projection {
+                    if !projection.has_selection_source(item.text()) {
+                        y = y.saturating_add(1);
+                        continue;
+                    }
                     let origin = bmux_tui::geometry::Point::new(
                         body.x.saturating_add(layout.markdown_x()),
                         body.y.saturating_add(
@@ -2592,7 +2669,7 @@ fn register_transcript_selection_scene(
                         &scope_id,
                         &format!("bcode.transcript.item.{}.markdown", item.id().get()),
                         &projection,
-                        origin,
+                        bmux_tui::geometry::Point::new(origin.x, 0),
                         u64::try_from(visible.entry_index)
                             .unwrap_or(u64::MAX)
                             .saturating_mul(1_000_000),
@@ -2600,9 +2677,14 @@ fn register_transcript_selection_scene(
                         Some(document_row),
                     )
                     .into_iter()
-                    .filter(|fragment| {
-                        fragment.area.y == y
-                            && document_row == fragment.area.y.saturating_sub(origin.y)
+                    .filter_map(|mut fragment| {
+                        if fragment.area.y != document_row {
+                            return None;
+                        }
+                        fragment.area.y = y;
+                        // A partially clipped unit cannot claim its full source.
+                        (fragment.area.x >= body.x && fragment.area.right() <= body.right())
+                            .then_some(fragment)
                     }) {
                         scene.push_fragment(fragment);
                     }
@@ -2610,6 +2692,10 @@ fn register_transcript_selection_scene(
                     continue;
                 }
             }
+            // Markdown title/chrome and unavailable accepted source have no
+            // canonical plain-row mapping. Never fabricate offset-zero source.
+            y = y.saturating_add(1);
+            continue;
         }
         let ranges = source_ranges.entry(visible.entry_index).or_insert_with(|| {
             transcript_plain_row_source_ranges(
@@ -2619,7 +2705,7 @@ fn register_transcript_selection_scene(
                     .unwrap_or(0),
             )
         });
-        let (source, source_offset) = ranges
+        let source_mapping = ranges
             .get(visible.row_in_entry)
             .and_then(Clone::clone)
             .and_then(|range| {
@@ -2627,12 +2713,38 @@ fn register_transcript_selection_scene(
                     .get(range.clone())
                     .map(|source| (source, range.start))
             })
-            .unwrap_or((text.as_str(), 0));
+            .or_else(|| {
+                let mut offset = 0;
+                item.text().split_inclusive('\n').find_map(|line| {
+                    let source = line.trim_end_matches(['\r', '\n']);
+                    let start = offset;
+                    offset += line.len();
+                    (!source.is_empty() && text.contains(source)).then_some((source, start))
+                })
+            });
+        let Some((source, source_offset)) = source_mapping else {
+            y = y.saturating_add(1);
+            continue;
+        };
+        let prefix = text
+            .find(source)
+            .and_then(|start| text.get(..start))
+            .unwrap_or("");
+        let prefix_width =
+            u16::try_from(bmux_tui::text::Line::raw(prefix).width()).unwrap_or(u16::MAX);
         for fragment in bmux_tui::selection::plain_text_fragments(
             scope_id,
             format!("bcode.transcript.item.{}.plain", item.id().get()),
-            bmux_tui::geometry::Rect::new(body.x, y, body.width, 1),
-            u64::try_from(visible.row_in_entry).unwrap_or(u64::MAX),
+            bmux_tui::geometry::Rect::new(
+                body.x.saturating_add(prefix_width),
+                y,
+                body.width.saturating_sub(prefix_width),
+                1,
+            ),
+            u64::try_from(visible.entry_index)
+                .unwrap_or(u64::MAX)
+                .saturating_mul(1_000_000)
+                .saturating_add(u64::try_from(source_offset).unwrap_or(u64::MAX)),
             source,
             source_offset,
             item.revision(),
@@ -2713,13 +2825,104 @@ fn visual_copy_joins_soft_rows_and_rejects_stale_source() {
     assert_eq!(export_visual_slices(&slices, &rows), None);
 }
 
+fn resolved_transcript_selection_ranges(
+    item: &super::transcript::TranscriptItem,
+    snapshot: &bmux_tui::selection::SelectionSnapshot,
+) -> Option<Vec<std::ops::Range<usize>>> {
+    let prefix = format!("bcode.transcript.item.{}.", item.id().get());
+    let endpoints = [&snapshot.anchor, &snapshot.focus];
+    for endpoint in endpoints {
+        if endpoint.content_id.as_str().starts_with(&prefix) && endpoint.revision != item.revision()
+        {
+            return None;
+        }
+    }
+    let blocks = bcode_markdown_render::markdown_code_block_selections(item.text());
+    let mut ranges = Vec::new();
+    for slice in &snapshot.slices {
+        let Some(kind) = slice.content_id.as_str().strip_prefix(&prefix) else {
+            continue;
+        };
+        if slice.revision != item.revision() {
+            return None;
+        }
+        let selected = if kind.starts_with("markdown.code.")
+            && kind.rsplit('.').next() == Some("body")
+        {
+            let offsets = endpoints
+                .into_iter()
+                .filter(|endpoint| endpoint.content_id.as_str().starts_with(&prefix))
+                .map(|endpoint| endpoint.offset)
+                .collect::<Vec<_>>();
+            match offsets.as_slice() {
+                [anchor, focus] => (*anchor).min(*focus)..(*anchor).max(*focus),
+                [offset] => {
+                    if snapshot.anchor.content_id.as_str().starts_with(&prefix) == snapshot.reversed
+                    {
+                        0..*offset
+                    } else {
+                        *offset..item.text().len()
+                    }
+                }
+                [] => 0..item.text().len(),
+                _ => return None,
+            }
+        } else {
+            slice.source_range.clone()
+        };
+        if let Some(suffix) = kind.strip_prefix("markdown.") {
+            ranges.extend(super::markdown_selection::expand_code_selection_range(
+                item.text(),
+                &blocks,
+                suffix,
+                selected,
+            )?);
+        } else if kind == "markdown" || kind == "plain" {
+            item.text().get(selected.clone())?;
+            ranges.push(selected);
+        } else {
+            return None;
+        }
+    }
+    if snapshot.anchor.content_id != snapshot.focus.content_id
+        && endpoints.into_iter().all(|endpoint| {
+            endpoint
+                .content_id
+                .as_str()
+                .starts_with(&format!("{prefix}markdown"))
+        })
+        && endpoints.into_iter().any(|endpoint| {
+            endpoint
+                .content_id
+                .as_str()
+                .starts_with(&format!("{prefix}markdown.code."))
+        })
+    {
+        let interval = snapshot.anchor.offset.min(snapshot.focus.offset)
+            ..snapshot.anchor.offset.max(snapshot.focus.offset);
+        item.text().get(interval.clone())?;
+        ranges.push(interval);
+    }
+    ranges.sort_by_key(|range| (range.start, range.end));
+    let mut disjoint: Vec<std::ops::Range<usize>> = Vec::new();
+    for range in ranges {
+        if let Some(previous) = disjoint.last_mut()
+            && range.start <= previous.end
+        {
+            previous.end = previous.end.max(range.end);
+        } else {
+            disjoint.push(range);
+        }
+    }
+    Some(disjoint)
+}
+
 #[must_use]
 fn export_plain_transcript_selection<'a>(
     items: impl IntoIterator<Item = &'a super::transcript::TranscriptItem>,
     snapshot: &bmux_tui::selection::SelectionSnapshot,
 ) -> Option<String> {
-    let mut selected =
-        std::collections::BTreeMap::<u64, Vec<(String, std::ops::Range<usize>)>>::new();
+    let mut selected = std::collections::BTreeSet::new();
     for slice in &snapshot.slices {
         let content = slice.content_id.as_str();
         let remainder = content.strip_prefix("bcode.transcript.item.")?;
@@ -2728,55 +2931,24 @@ fn export_plain_transcript_selection<'a>(
         if kind != "plain" && kind != "markdown" && !kind.starts_with("markdown.code.") {
             return None;
         }
-        selected
-            .entry(item_id)
-            .or_default()
-            .push((kind.to_owned(), slice.source_range.clone()));
+        selected.insert(item_id);
     }
     let mut output = Vec::new();
     for item in items {
-        let Some(selections) = selected.remove(&item.id().get()) else {
+        if !selected.remove(&item.id().get()) {
             continue;
-        };
-        // Code newlines and blank-line indentation have no painted fragments.
-        // Restore only canonical whitespace gaps within the same code body;
-        // never infer line breaks from screen rows or cross semantic boundaries.
-        let mut ranges: Vec<(String, std::ops::Range<usize>)> = Vec::new();
-        for (kind, range) in selections {
-            if let Some((previous_kind, previous)) = ranges.last_mut()
-                && *previous_kind == kind
-                && kind.starts_with("markdown.code.")
-                && kind.rsplit('.').next() == Some("body")
-                && previous.end <= range.start
-                && item
-                    .text()
-                    .get(previous.end..range.start)?
-                    .chars()
-                    .all(char::is_whitespace)
-            {
-                previous.end = range.end;
-            } else {
-                ranges.push((kind, range));
-            }
         }
+        let disjoint = resolved_transcript_selection_ranges(item, snapshot)?;
         let mut text = String::new();
-        for (kind, range) in ranges {
-            if let Some(suffix) = kind.strip_prefix("markdown.") {
-                let ranges = super::markdown_selection::expand_markdown_selection_range(
-                    item.text(),
-                    suffix,
-                    range,
-                )?;
-                for range in ranges {
-                    text.push_str(item.text().get(range)?);
-                }
-            } else {
-                text.push_str(item.text().get(range)?);
-            }
+        for range in disjoint {
+            text.push_str(item.text().get(range)?);
         }
         if !text.is_empty() {
             output.push(format_transcript_selection_item(item, &text));
         }
+    }
+    if !selected.is_empty() {
+        return None;
     }
     (!output.is_empty()).then(|| output.join("\n\n"))
 }
@@ -5455,6 +5627,503 @@ mod tests {
         assert_eq!(export(19..38).as_deref(), Some("https://example.com"));
     }
 
+    fn dispatch_selection_gesture(
+        model: &mut super::BcodeRuntimeModel,
+        start: bmux_tui::geometry::Point,
+        end: bmux_tui::geometry::Point,
+    ) {
+        use bmux_tui::event::{Event, MouseButton, MouseEvent, MouseEventKind};
+        for (kind, point) in [
+            (MouseEventKind::Down(MouseButton::Left), start),
+            (MouseEventKind::Drag(MouseButton::Left), end),
+            (MouseEventKind::Up(MouseButton::Left), end),
+        ] {
+            model.handle_basic_terminal_event(Event::Mouse(MouseEvent::new(kind, point)));
+        }
+    }
+
+    fn production_code_gesture(
+        source: &str,
+        width: u16,
+        selected: std::ops::Range<usize>,
+        reverse: bool,
+    ) -> String {
+        use bmux_tui::{
+            event::{Event, MouseButton, MouseEvent, MouseEventKind},
+            geometry::{Point, Rect},
+        };
+        use bmux_tui_runtime::Presenter;
+
+        let session_id = bcode_session_models::SessionId::new();
+        let history = [bcode_session_models::SessionEvent {
+            schema_version: bcode_session_models::CURRENT_SESSION_EVENT_SCHEMA_VERSION,
+            sequence: 1,
+            timestamp_ms: 1,
+            session_id,
+            provenance: None,
+            kind: bcode_session_models::SessionEventKind::AssistantMessage {
+                text: source.to_owned(),
+            },
+        }];
+        let mut model = root_test_model_with_history(session_id, &history);
+        let area = Rect::new(0, 0, width, 40);
+        let mut bytes = Vec::new();
+        let mut terminal = bmux_tui::terminal::Terminal::new(&mut bytes, area);
+        super::BcodeRuntimePresenter::new(&mut terminal)
+            .present(&mut model)
+            .expect("production presentation");
+        let fragments = model.committed_selection.fragments();
+        let first = fragments
+            .iter()
+            .find(|fragment| {
+                fragment.source_range.start == selected.start
+                    && (fragment.content_id.as_str().rsplit('.').next() == Some("body")
+                        || fragment.content_id.as_str().rsplit('.').next() == Some("header")
+                        || fragment.content_id.as_str().rsplit('.').next() == Some("footer"))
+            })
+            .expect("visible first source unit");
+        let last = fragments
+            .iter()
+            .find(|fragment| {
+                fragment.source_range.end == selected.end
+                    && (fragment.content_id.as_str().rsplit('.').next() == Some("body")
+                        || fragment.content_id.as_str().rsplit('.').next() == Some("footer")
+                        || fragment.content_id.as_str().rsplit('.').next() == Some("header"))
+            })
+            .expect("visible last source unit");
+        let body_only = first.content_id.as_str().rsplit('.').next() == Some("body")
+            && last.content_id.as_str().rsplit('.').next() == Some("body");
+        let start = Point::new(first.area.x, first.area.y);
+        let end = Point::new(last.area.right().saturating_sub(1), last.area.y);
+        let reverse_start = fragments
+            .iter()
+            .find(|fragment| fragment.source_range.start == selected.end)
+            .map(|fragment| Point::new(fragment.area.x, fragment.area.y));
+        assert!(
+            fragments
+                .iter()
+                .any(|fragment| fragment.content_id.as_str().rsplit('.').next() == Some("header"))
+        );
+        assert!(
+            fragments
+                .iter()
+                .any(|fragment| fragment.content_id.as_str().rsplit('.').next() == Some("footer"))
+        );
+        assert!(
+            !fragments
+                .iter()
+                .any(|fragment| fragment.content_id.as_str().rsplit('.').next() == Some("whole"))
+        );
+        let (start, end) = if reverse {
+            (
+                reverse_start.expect("reverse gesture requires a visible exclusive end boundary"),
+                start,
+            )
+        } else {
+            (start, end)
+        };
+        for (kind, point) in [
+            (MouseEventKind::Down(MouseButton::Left), start),
+            (MouseEventKind::Drag(MouseButton::Left), end),
+            (MouseEventKind::Up(MouseButton::Left), end),
+        ] {
+            model.handle_basic_terminal_event(Event::Mouse(MouseEvent::new(kind, point)));
+        }
+        let snapshot = model
+            .transcript_selection
+            .snapshot(&model.committed_selection)
+            .expect("complete-scene gesture");
+        assert!(
+            !body_only
+                || snapshot.anchor.content_id != snapshot.focus.content_id
+                || snapshot
+                    .slices
+                    .iter()
+                    .all(|slice| slice.content_id.as_str().rsplit('.').next() == Some("body")),
+            "body gesture selected chrome: {snapshot:?}"
+        );
+        model.selected_plain_text.take().expect("production export")
+    }
+
+    #[tokio::test]
+    async fn production_previous_markdown_projection_is_not_selectable() {
+        use bmux_tui::geometry::{Point, Rect};
+        use bmux_tui_runtime::Presenter;
+        let session_id = bcode_session_models::SessionId::new();
+        let mut model = root_test_model_with_history(session_id, &[]);
+        let event = |sequence, text: &str| bcode_session_models::SessionEvent {
+            schema_version: bcode_session_models::CURRENT_SESSION_EVENT_SCHEMA_VERSION,
+            sequence,
+            timestamp_ms: sequence,
+            session_id,
+            provenance: None,
+            kind: bcode_session_models::SessionEventKind::AssistantDelta {
+                text: text.to_owned(),
+            },
+        };
+        model
+            .chat
+            .app
+            .absorb_session_event(&event(1, "```text\nold body\n"));
+        let area = Rect::new(0, 0, 70, 40);
+        let mut bytes = Vec::new();
+        let mut terminal = bmux_tui::terminal::Terminal::new(&mut bytes, area);
+        super::BcodeRuntimePresenter::new(&mut terminal)
+            .present(&mut model)
+            .expect("accepted streaming frame");
+        let old_fragments = model.committed_selection.fragments().to_vec();
+        let item = model
+            .chat
+            .app
+            .transcript()
+            .iter()
+            .next_back()
+            .expect("stream");
+        let id = item.id().get();
+        let width = model.committed_layout.expect("layout").body().width;
+        let previous = super::super::render::transcript_markdown_selection_projection(
+            &model.chat.app,
+            item,
+            width,
+        )
+        .expect("accepted projection");
+        let previous_revision = item.revision();
+        model.chat.app.absorb_session_event(&event(2, "new tail"));
+        let item = model
+            .chat
+            .app
+            .transcript()
+            .iter()
+            .next_back()
+            .expect("new stream revision");
+        assert_eq!(id, item.id().get());
+        let options = super::super::render::markdown_render_options(&model.chat.app, item, width);
+        // Match the current render options while preserving the previous source
+        // revision, so the fixture exercises previous-compatible presentation
+        // rather than a legitimate synchronous new-option projection.
+        model.chat.app.transcript_markdown_cache().install(
+            id,
+            previous_revision,
+            options,
+            std::sync::Arc::clone(&previous),
+        );
+        let frame_options =
+            super::super::render::markdown_render_options(&model.chat.app, item, area.width);
+        model.chat.app.transcript_markdown_cache().install(
+            id,
+            previous_revision,
+            frame_options,
+            previous,
+        );
+        model.presentation_damage = bmux_tui::damage::Damage::Full;
+        assert!(
+            super::super::render::transcript_markdown_selection_projection(
+                &model.chat.app,
+                item,
+                width
+            )
+            .is_none()
+        );
+        super::BcodeRuntimePresenter::new(&mut terminal)
+            .present(&mut model)
+            .expect("previous compatible frame");
+        assert!(
+            model
+                .committed_selection
+                .fragments()
+                .iter()
+                .all(|fragment| {
+                    !fragment
+                        .content_id
+                        .as_str()
+                        .starts_with(&format!("bcode.transcript.item.{id}."))
+                })
+        );
+        for fragment in old_fragments {
+            dispatch_selection_gesture(
+                &mut model,
+                Point::new(fragment.area.x, fragment.area.y),
+                Point::new(fragment.area.right(), fragment.area.y),
+            );
+            assert!(model.selected_plain_text.is_none());
+        }
+        drop(model);
+    }
+
+    #[tokio::test]
+    async fn production_clipped_code_unicode_fails_closed() {
+        use bmux_tui::geometry::{Point, Rect};
+        use bmux_tui_runtime::Presenter;
+        let mut model = root_test_model_with_history(bcode_session_models::SessionId::new(), &[]);
+        model
+            .chat
+            .app
+            .push_ephemeral_system_markdown("```\na界b\n```\n".to_owned());
+        let mut bytes = Vec::new();
+        let mut terminal = bmux_tui::terminal::Terminal::new(&mut bytes, Rect::new(0, 0, 7, 30));
+        super::BcodeRuntimePresenter::new(&mut terminal)
+            .present(&mut model)
+            .expect("narrow frame");
+        let fragments = model.committed_selection.fragments();
+        let first = fragments
+            .iter()
+            .find(|fragment| {
+                fragment.content_id.as_str().rsplit('.').next() == Some("body")
+                    && fragment.source_range == (4..5)
+            })
+            .cloned()
+            .expect("narrow first ASCII source unit");
+        let last = fragments
+            .iter()
+            .find(|fragment| {
+                fragment.content_id.as_str().rsplit('.').next() == Some("body")
+                    && fragment.source_range == (8..9)
+            })
+            .cloned()
+            .expect("narrow last ASCII source unit");
+        {
+            dispatch_selection_gesture(
+                &mut model,
+                Point::new(first.area.x, first.area.y),
+                Point::new(last.area.right(), last.area.y),
+            );
+            let wide_visible = model
+                .committed_selection
+                .fragments()
+                .iter()
+                .any(|fragment| {
+                    fragment.content_id.as_str().rsplit('.').next() == Some("body")
+                        && fragment.source_range == (5..8)
+                });
+            if wide_visible {
+                assert_eq!(model.selected_plain_text.as_deref(), Some("a界b"));
+            } else {
+                assert!(
+                    model.selected_plain_text.is_none(),
+                    "clipped interior source must not be restored"
+                );
+            }
+        }
+        let fragment = model
+            .committed_selection
+            .fragments()
+            .iter()
+            .find(|fragment| fragment.content_id.as_str().rsplit('.').next() == Some("header"))
+            .cloned()
+            .expect("narrow fence geometry");
+        let footer = model
+            .committed_selection
+            .fragments()
+            .iter()
+            .find(|fragment| fragment.content_id.as_str().rsplit('.').next() == Some("footer"))
+            .cloned()
+            .expect("narrow footer geometry");
+        model.clear_transcript_selection();
+        dispatch_selection_gesture(
+            &mut model,
+            Point::new(fragment.area.x, fragment.area.y),
+            Point::new(footer.area.x, footer.area.y),
+        );
+        let wide_visible = model
+            .committed_selection
+            .fragments()
+            .iter()
+            .any(|fragment| {
+                fragment.content_id.as_str().rsplit('.').next() == Some("body")
+                    && fragment.source_range == (5..8)
+            });
+        if wide_visible {
+            assert_eq!(
+                model.selected_plain_text.as_deref(),
+                Some("```\na界b\n```\n")
+            );
+        } else {
+            assert!(
+                model.selected_plain_text.is_none(),
+                "fence traversal may not restore clipped code"
+            );
+        }
+        drop(model);
+    }
+
+    #[tokio::test]
+    async fn production_mixed_plain_markdown_gesture_preserves_item_order() {
+        use bmux_tui::{
+            event::{Event, MouseButton, MouseEvent, MouseEventKind},
+            geometry::{Point, Rect},
+        };
+        use bmux_tui_runtime::Presenter;
+        for reverse in [false, true] {
+            let mut model =
+                root_test_model_with_history(bcode_session_models::SessionId::new(), &[]);
+            model
+                .chat
+                .app
+                .push_ephemeral_system_plain("plain-before".to_owned());
+            model
+                .chat
+                .app
+                .push_ephemeral_system_markdown("```\ncode-middle\n```\n".to_owned());
+            model
+                .chat
+                .app
+                .push_ephemeral_system_plain("plain-after!".to_owned());
+            let mut bytes = Vec::new();
+            let mut terminal =
+                bmux_tui::terminal::Terminal::new(&mut bytes, Rect::new(0, 0, 70, 40));
+            super::BcodeRuntimePresenter::new(&mut terminal)
+                .present(&mut model)
+                .expect("mixed frame");
+            let items = model.chat.app.transcript().iter().collect::<Vec<_>>();
+            let first_id = format!("bcode.transcript.item.{}.plain", items[0].id().get());
+            let last_id = format!("bcode.transcript.item.{}.plain", items[2].id().get());
+            let fragments = model.committed_selection.fragments();
+            let first = fragments
+                .iter()
+                .find(|fragment| {
+                    fragment.content_id.as_str() == first_id && fragment.source_range.start == 0
+                })
+                .expect("first plain source");
+            let last = fragments
+                .iter()
+                .find(|fragment| {
+                    fragment.content_id.as_str() == last_id
+                        && fragment.source_range.end == "plain-after".len()
+                })
+                .expect("last plain source");
+            let start = Point::new(first.area.x, first.area.y);
+            let end = Point::new(last.area.x, last.area.y);
+            let reverse_start = Point::new(last.area.right(), last.area.y);
+            let (start, end) = if reverse {
+                (reverse_start, start)
+            } else {
+                (start, end)
+            };
+            for (kind, point) in [
+                (MouseEventKind::Down(MouseButton::Left), start),
+                (MouseEventKind::Drag(MouseButton::Left), end),
+                (MouseEventKind::Up(MouseButton::Left), end),
+            ] {
+                model.handle_basic_terminal_event(Event::Mouse(MouseEvent::new(kind, point)));
+            }
+            assert_eq!(
+                model.selected_plain_text.as_deref(),
+                Some("plain-before\n\n```\ncode-middle\n```\n\n\nplain-after")
+            );
+            drop(model);
+        }
+    }
+
+    #[tokio::test]
+    async fn production_body_prose_body_selection_checks_each_source_interval() {
+        let source = "```\nfirst\n```\n\nprose between\n\n```\nsecond!\n```\n";
+        let start = source.find("first").expect("first body");
+        let end = source.find("second!").expect("second body") + "second".len();
+        for reverse in [false, true] {
+            assert_eq!(
+                production_code_gesture(source, 70, start..end, reverse),
+                &source[start..end]
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn production_mermaid_does_not_steal_following_code_fences() {
+        let source = "```mermaid\ngraph LR; A-->B\n```\n\n```rust\nlet value = 1;\n```\n";
+        let header = source.find("```rust").expect("ordinary header");
+        let body = source.find("let value").expect("ordinary body");
+        let footer = source.rfind("```").expect("ordinary footer");
+        assert_eq!(
+            production_code_gesture(source, 70, header..body, false),
+            "```rust\n"
+        );
+        assert_eq!(
+            production_code_gesture(source, 70, footer..source.len(), false),
+            "```\n"
+        );
+    }
+
+    #[tokio::test]
+    async fn production_code_drag_preserves_source_intervals() {
+        for newline in ["\n", "\r\n"] {
+            let body = format!("first 界e\u{301}{newline}  {newline}\tsecond{newline}third");
+            let source = format!("```text{newline}{body}!{newline}```{newline}\nfollowing prose");
+            let start = source.find("first").expect("body start");
+            for reverse in [false, true] {
+                assert_eq!(
+                    production_code_gesture(&source, 70, 0..start + body.len(), reverse),
+                    &source[..start + body.len()]
+                );
+                let footer_end = source
+                    .find("following prose")
+                    .expect("prose")
+                    .saturating_sub(1);
+                if !reverse {
+                    assert_eq!(
+                        production_code_gesture(&source, 70, start + 2..footer_end, reverse),
+                        &source[start + 2..footer_end]
+                    );
+                }
+                assert_eq!(
+                    production_code_gesture(&source, 70, start..start + body.len(), reverse),
+                    body
+                );
+                assert_eq!(
+                    production_code_gesture(&source, 70, start + 2..start + body.len(), reverse),
+                    &body[2..]
+                );
+            }
+        }
+        let body = "abcdefghijklmnopqrstuvwxyz0123456789";
+        let source = format!("```text\n{body}!\n```\n");
+        for reverse in [false, true] {
+            assert_eq!(
+                production_code_gesture(&source, 24, 8..8 + body.len(), reverse),
+                body
+            );
+        }
+    }
+
+    #[test]
+    fn production_export_rejects_stale_or_unresolved_source() {
+        let item = crate::transcript::TranscriptItem::with_format(
+            "Assistant",
+            "```\nbody\n```\n".to_owned(),
+            bcode_session_view_models::TextFormat::Markdown,
+        );
+        let id = format!(
+            "bcode.transcript.item.{}.markdown.code.0.body",
+            item.id().get()
+        );
+        let endpoint = |offset| bmux_tui::selection::SelectionEndpoint {
+            scope_id: bmux_tui::selection::SelectionScopeId::new("bcode.transcript"),
+            content_id: bmux_tui::selection::SelectionContentId::new(&id),
+            offset,
+            order: u64::try_from(offset).expect("offset"),
+            affinity: bmux_tui::selection::SelectionAffinity::Before,
+            revision: item.revision(),
+        };
+        let mut snapshot = bmux_tui::selection::SelectionSnapshot {
+            scope_id: bmux_tui::selection::SelectionScopeId::new("bcode.transcript"),
+            anchor: endpoint(4),
+            focus: endpoint(8),
+            reversed: false,
+            slices: vec![bmux_tui::selection::SelectionSlice {
+                content_id: bmux_tui::selection::SelectionContentId::new(&id),
+                source_range: 4..8,
+                revision: item.revision(),
+            }],
+            visible_highlights: Vec::new(),
+        };
+        assert_eq!(
+            super::export_plain_transcript_selection([&item], &snapshot).as_deref(),
+            Some("body")
+        );
+        assert!(super::export_plain_transcript_selection(std::iter::empty(), &snapshot).is_none());
+        snapshot.slices[0].revision += 1;
+        assert!(super::export_plain_transcript_selection([&item], &snapshot).is_none());
+    }
+
     #[test]
     fn markdown_code_body_selection_exports_exact_canonical_bytes() {
         let source = "```rust\r\nfn main() {\r\n\tprintln!(\"hi\");\r\n}\r\n```\r\n";
@@ -5506,7 +6175,7 @@ mod tests {
     #[test]
     fn transcript_export_preserves_indented_and_incomplete_code_source() {
         for (source, expected) in [
-            ("    first\n\tsecond\n\nnext", "    first\n\tsecond\n"),
+            ("    first\n\tsecond\n\nnext", "    first\n\tsecond\n\n"),
             ("```\npartial", "partial"),
         ] {
             let item = super::super::transcript::TranscriptItem::with_format(

@@ -838,6 +838,8 @@ fn ephemeral_markdown_selection_scene_reflows_without_changing_source_ranges() {
     let mut app = BmuxApp::new_with_history(None, &[], &[], false);
     app.push_ephemeral_system_markdown("[alpha beta](https://example.com)".to_owned());
     let wide_layout = prepare_frame(&mut app, Rect::new(0, 0, 20, 10)).expect("wide layout");
+    let item = app.transcript().iter().next_back().expect("notice");
+    let _ = transcript_markdown_projection_for_layout(&app, item, wide_layout.body().width);
     let wide = super::root_program::transcript_selection_scene(&app, wide_layout.body());
     let wide_ranges = wide
         .fragments()
@@ -846,6 +848,8 @@ fn ephemeral_markdown_selection_scene_reflows_without_changing_source_ranges() {
         .collect::<Vec<_>>();
 
     let narrow_layout = prepare_frame(&mut app, Rect::new(0, 0, 16, 10)).expect("narrow layout");
+    let item = app.transcript().iter().next_back().expect("notice");
+    let _ = transcript_markdown_projection_for_layout(&app, item, narrow_layout.body().width);
     let narrow = super::root_program::transcript_selection_scene(&app, narrow_layout.body());
     drop(app);
     let narrow_ranges = narrow
@@ -2123,6 +2127,19 @@ pub fn transcript_markdown_projection_for_layout(
             })
             .unwrap_or_else(|| app.transcript_markdown_cache().project(item, options))
     })
+}
+
+/// Return only the accepted projection for this exact source revision.
+/// Previous streaming geometry remains paintable, but is not selectable.
+pub fn transcript_markdown_selection_projection(
+    app: &BmuxApp,
+    item: &TranscriptItem,
+    width: u16,
+) -> Option<std::sync::Arc<bcode_markdown_render::MarkdownRenderResult>> {
+    let options = markdown_render_options(app, item, width);
+    app.transcript_markdown_cache()
+        .get(item.id().get(), item.revision(), &options)
+        .filter(|projection| projection.has_selection_source(item.text()))
 }
 
 fn transcript_markdown_projection(

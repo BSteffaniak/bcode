@@ -836,6 +836,57 @@ pub struct MarkdownCodeBlockSelection {
     pub kind: MarkdownCodeBlockSelectionKind,
 }
 
+/// Semantic content selected within a canonical Markdown code block.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MarkdownCodeSelectionContent {
+    /// Code only, excluding the opening and closing fences.
+    Body,
+    /// Opening fence and language annotation.
+    Header,
+    /// Closing fence.
+    Footer,
+    /// Complete original block.
+    Whole,
+}
+
+impl MarkdownCodeBlockSelection {
+    /// Resolve a source interval against the selected canonical content.
+    ///
+    /// Endpoints are UTF-8 source offsets, independent of presentation order or
+    /// wrapping. Reversed endpoints have the same canonical result. Invalid or
+    /// unavailable source boundaries fail closed.
+    #[allow(
+        clippy::must_use_candidate,
+        reason = "Repository API policy forbids redundant must_use attributes on Option-returning methods"
+    )]
+    pub fn selection_ranges(
+        &self,
+        source: &str,
+        content: MarkdownCodeSelectionContent,
+        anchor: usize,
+        focus: usize,
+    ) -> Option<Vec<Range<usize>>> {
+        let selected = anchor.min(focus)..anchor.max(focus);
+        source.get(selected.clone())?;
+        let ranges = match content {
+            MarkdownCodeSelectionContent::Body => self.body_ranges.as_slice(),
+            MarkdownCodeSelectionContent::Header => self.header_range.as_slice(),
+            MarkdownCodeSelectionContent::Footer => self.footer_range.as_slice(),
+            MarkdownCodeSelectionContent::Whole => std::slice::from_ref(&self.whole_range),
+        };
+        ranges.iter().try_fold(Vec::new(), |mut output, range| {
+            source.get(range.clone())?;
+            let start = range.start.max(selected.start);
+            let end = range.end.min(selected.end);
+            if start < end {
+                source.get(start..end)?;
+                output.push(start..end);
+            }
+            Some(output)
+        })
+    }
+}
+
 /// Canonical Markdown code-block representation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum MarkdownCodeBlockSelectionKind {
@@ -1012,12 +1063,7 @@ fn markdown_code_block_selections_from_document(
                 id: format!("code-block:{whole_start}"),
                 whole_range: whole_start..whole_end,
                 header_range: None,
-                body_ranges: lines[start_index..cursor]
-                    .iter()
-                    .filter_map(|(start, end, content_end)| {
-                        (*start < *content_end).then_some(*start..*end)
-                    })
-                    .collect(),
+                body_ranges: std::iter::once(whole_start..whole_end).collect(),
                 footer_range: None,
                 kind: MarkdownCodeBlockSelectionKind::Indented,
             });
@@ -1207,7 +1253,12 @@ fn assign_selection_geometry(
             projected.push(unit);
             continue;
         };
-        if canonical != visible {
+        let matches_source = canonical == visible
+            || unit
+                .containers
+                .contains(&MarkdownSelectionContainer::CodeBlock)
+                && canonical.replace("\r\n", "\n") == *visible;
+        if !matches_source {
             projected.push(unit);
             continue;
         }
@@ -1218,7 +1269,7 @@ fn assign_selection_geometry(
         let unit_containers = unit.containers;
         let unit_semantic_expansion = unit.semantic_expansion;
         let unit_kind = unit.kind;
-        for grapheme in visible.graphemes(true) {
+        for grapheme in canonical.graphemes(true) {
             let source_range = source_offset..source_offset.saturating_add(grapheme.len());
             source_offset = source_range.end;
             // Line breaks carry no display cell. Whitespace consumed by wrapping
@@ -1298,12 +1349,18 @@ pub struct MarkdownRenderResult {
     pub contributions: Vec<MarkdownContribution>,
     /// Post-layout document-relative cell rectangles for rich contributions.
     pub geometry: Vec<MarkdownContributionGeometry>,
+    /// Renderer-owned code fence geometry and traversal identities, separate
+    /// from rich contribution geometry.
+    pub code_block_geometry: Vec<MarkdownContributionGeometry>,
     /// Post-layout document anchors for internal fragment navigation.
     pub anchors: Vec<MarkdownDocumentAnchor>,
     /// Options the projection was rendered with, retained for the signature.
     options: MarkdownRenderOptions,
     /// Retained inputs for on-demand provenance derivation.
     provenance_inputs: Option<MarkdownProvenanceInputs>,
+    /// Original canonical source for retained selection provenance, even when
+    /// presentation fallback text differs.
+    selection_source: String,
     /// Provenance for the whole document, derived on first use.
     selection_provenance: OnceLock<Vec<MarkdownSelectionProvenance>>,
     /// Code-block selections for the whole document, derived on first use.
@@ -1318,9 +1375,11 @@ impl Clone for MarkdownRenderResult {
             lines: self.lines.clone(),
             contributions: self.contributions.clone(),
             geometry: self.geometry.clone(),
+            code_block_geometry: self.code_block_geometry.clone(),
             anchors: self.anchors.clone(),
             options: self.options.clone(),
             provenance_inputs: self.provenance_inputs.clone(),
+            selection_source: self.selection_source.clone(),
             // Derived data is carried over when already computed so a clone
             // never repeats work, and stays unset otherwise.
             selection_provenance: self.selection_provenance.get().cloned().map_or_else(
@@ -1360,6 +1419,7 @@ impl PartialEq for MarkdownRenderResult {
         self.lines == other.lines
             && self.contributions == other.contributions
             && self.geometry == other.geometry
+            && self.code_block_geometry == other.code_block_geometry
             && self.anchors == other.anchors
             && self.selection_provenance() == other.selection_provenance()
             && self.code_block_selections() == other.code_block_selections()
@@ -1369,6 +1429,12 @@ impl PartialEq for MarkdownRenderResult {
 impl Eq for MarkdownRenderResult {}
 
 impl MarkdownRenderResult {
+    /// Whether retained selection provenance refers to the caller's canonical source.
+    #[must_use]
+    pub fn has_selection_source(&self, source: &str) -> bool {
+        self.selection_source == source
+    }
+
     /// Return selection provenance for the whole document.
     ///
     /// Derived on first use and retained. Prefer
@@ -1638,6 +1704,7 @@ impl MarkdownStreamingRenderState {
             lines,
             contributions: Vec::new(),
             geometry: Vec::new(),
+            code_block_geometry: Vec::new(),
             anchors: Vec::new(),
             options: options.clone(),
             provenance_inputs: Some(MarkdownProvenanceInputs {
@@ -1646,6 +1713,7 @@ impl MarkdownStreamingRenderState {
                 // a selection actually asks for provenance.
                 document: None,
             }),
+            selection_source: markdown.to_owned(),
             selection_provenance: OnceLock::new(),
             code_block_selections: OnceLock::new(),
             layout_signature: OnceLock::new(),
@@ -1800,10 +1868,8 @@ pub fn render_markdown(markdown: &str, options: &MarkdownRenderOptions) -> Markd
     };
     let (lines, mut geometry, heading_rows) =
         render_markdown_projection(&projected_markdown, options);
-    if projected_markdown.as_ref() == markdown {
-        selection_provenance =
-            assign_selection_geometry(selection_provenance, &document, markdown, &lines);
-    }
+    selection_provenance =
+        assign_selection_geometry(selection_provenance, &document, markdown, &lines);
     #[cfg(test)]
     record_markdown_stage(
         |diagnostics, elapsed| {
@@ -1821,6 +1887,12 @@ pub fn render_markdown(markdown: &str, options: &MarkdownRenderOptions) -> Markd
         &projection.contributions,
     ));
     let geometry = assign_contribution_geometry(geometry, &contributions);
+    let (code_block_geometry, geometry): (Vec<_>, Vec<_>) =
+        geometry.into_iter().partition(|geometry| {
+            geometry.contribution_id.starts_with("code-block:")
+                || geometry.contribution_id.starts_with("code-header:")
+                || geometry.contribution_id.starts_with("code-footer:")
+        });
     #[cfg(test)]
     record_markdown_stage(
         |diagnostics, elapsed| diagnostics.geometry = elapsed,
@@ -1854,9 +1926,11 @@ pub fn render_markdown(markdown: &str, options: &MarkdownRenderOptions) -> Markd
         lines,
         contributions,
         geometry,
+        code_block_geometry,
         anchors,
         options: options.clone(),
         provenance_inputs,
+        selection_source: markdown.to_owned(),
         selection_provenance: OnceLock::new(),
         code_block_selections: OnceLock::new(),
         layout_signature: OnceLock::new(),
@@ -2236,6 +2310,12 @@ fn assign_contribution_geometry(
             .then_some(contribution.id.as_str())
     });
     geometry.retain_mut(|item| {
+        if item.contribution_id.starts_with("code-block:")
+            || item.contribution_id.starts_with("code-header:")
+            || item.contribution_id.starts_with("code-footer:")
+        {
+            return true;
+        }
         if contribution_ids.contains(item.contribution_id.as_str()) {
             return true;
         }
@@ -3811,6 +3891,7 @@ struct TerminalMarkdownRenderer {
     next_table_index: usize,
     alert_kinds: Rc<Vec<Option<BlockQuoteKind>>>,
     next_blockquote_index: Rc<Cell<usize>>,
+    next_code_block_index: Rc<Cell<usize>>,
     image_reserved_rows: usize,
     mermaid_reserved_rows: usize,
     theme: MarkdownTheme,
@@ -3844,6 +3925,7 @@ impl TerminalMarkdownRenderer {
             next_table_index: 0,
             alert_kinds: Rc::new(alert_kinds),
             next_blockquote_index: Rc::new(Cell::new(0)),
+            next_code_block_index: Rc::new(Cell::new(0)),
             image_reserved_rows: usize::from(image_reserved_rows.max(1)),
             mermaid_reserved_rows: usize::from(mermaid_reserved_rows.max(1)),
             theme,
@@ -3869,6 +3951,7 @@ impl TerminalMarkdownRenderer {
             next_table_index: 0,
             alert_kinds: Rc::clone(&self.alert_kinds),
             next_blockquote_index: Rc::clone(&self.next_blockquote_index),
+            next_code_block_index: Rc::clone(&self.next_code_block_index),
             image_reserved_rows: self.image_reserved_rows,
             mermaid_reserved_rows: self.mermaid_reserved_rows,
             theme: self.theme,
@@ -4193,8 +4276,13 @@ impl TerminalMarkdownRenderer {
         let geometry_start = (language == Some("mermaid"))
             .then(|| (self.rows.len(), 0, self.geometry.borrow().len()));
         let header = language.map_or_else(|| "┌─".to_owned(), |language| format!("┌─ {language}"));
+        let block_index = self.next_code_block_index.get();
+        self.next_code_block_index
+            .set(block_index.saturating_add(1));
+        let header_row = self.rows.len();
         self.rows
             .push(Line::from_spans(vec![Span::styled(header, border_style)]).truncate(self.width));
+        self.record_geometry(&format!("code-header:{block_index}"), header_row, 0);
 
         let prefix = Line::raw("│ ")
             .viewport(0, self.width.saturating_sub(1))
@@ -4226,8 +4314,10 @@ impl TerminalMarkdownRenderer {
             spans.extend(line.spans);
             self.rows.push(Line::from_spans(spans));
         }
+        let footer_row = self.rows.len();
         self.rows
             .push(Line::from_spans(vec![Span::styled("└─", border_style)]).truncate(self.width));
+        self.record_geometry(&format!("code-footer:{block_index}"), footer_row, 0);
         self.ensure_blank_line();
         if language == Some("mermaid") {
             while self
@@ -4243,6 +4333,15 @@ impl TerminalMarkdownRenderer {
             self.geometry.borrow_mut().truncate(geometry_start);
             self.record_geometry("mermaid", start_row, start_column);
         }
+        // Retain semantic traversal evidence even when rich rendering removes
+        // the block's fence cells. Ordinal association is allowed only when all
+        // rendered blocks correspond to canonical selections.
+        self.geometry
+            .borrow_mut()
+            .push(MarkdownContributionGeometry {
+                contribution_id: format!("code-block:{block_index}"),
+                rects: Vec::new(),
+            });
     }
 
     fn render_horizontal_rule(&mut self) {
@@ -5564,6 +5663,50 @@ mod tests {
     }
 
     #[test]
+    fn code_intervals_are_portable_reversible_and_byte_exact() {
+        use super::MarkdownCodeSelectionContent as Content;
+        for newline in ["\n", "\r\n"] {
+            let body = format!("α界e\u{301}{newline}{newline}  tail{newline}");
+            let source = format!("```{newline}{body}```{newline}");
+            let block = super::markdown_code_block_selections(&source).remove(0);
+            let start = block.body_ranges[0].start;
+            let end = block.body_ranges[0].end;
+            for (anchor, focus) in [(start, end), (end, start)] {
+                let ranges = block
+                    .selection_ranges(&source, Content::Body, anchor, focus)
+                    .expect("interval");
+                assert_eq!(
+                    ranges
+                        .iter()
+                        .map(|range| &source[range.clone()])
+                        .collect::<String>(),
+                    body
+                );
+            }
+            assert!(
+                block
+                    .selection_ranges(&source, Content::Body, start + 1, end)
+                    .is_none()
+            );
+            assert!(
+                block
+                    .selection_ranges(&source, Content::Body, start, source.len() + 1)
+                    .is_none()
+            );
+            assert_eq!(
+                block.selection_ranges(&source, Content::Header, 0, source.len()),
+                Some(vec![block.header_range.clone().expect("fence")])
+            );
+        }
+        let source = "    first\n\n    second\n";
+        let block = super::markdown_code_block_selections(source).remove(0);
+        assert_eq!(
+            block.selection_ranges(source, Content::Body, 0, source.len()),
+            Some(std::iter::once(0..source.len()).collect())
+        );
+    }
+
+    #[test]
     fn code_block_selection_distinguishes_exact_fence_body_and_footer() {
         let markdown = "```rust\r\nfn main() {\r\n\tprintln!(\"hi\");\r\n}\r\n```\r\n";
         let rendered = render_markdown(markdown, &MarkdownRenderOptions::new(80));
@@ -5602,7 +5745,7 @@ mod tests {
             ),
             (
                 "    first\n\tsecond\n\nnext",
-                "    first\n\tsecond\n",
+                "    first\n\tsecond\n\n",
                 "    first\n\tsecond\n\n",
             ),
             ("~~~\npartial", "partial", "~~~\npartial"),

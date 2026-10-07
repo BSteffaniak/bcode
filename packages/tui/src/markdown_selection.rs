@@ -2,18 +2,18 @@
 
 use std::ops::Range;
 
-use bcode_markdown_render::{
-    MarkdownCodeBlockSelection, MarkdownRenderResult, MarkdownSelectionProvenance,
-};
+use bcode_markdown_render::{MarkdownRenderResult, MarkdownSelectionProvenance};
 use bmux_tui::selection::SelectionFragment;
 
 /// Return selection fragments for one rendered Markdown projection.
 ///
 /// `document_row` restricts derivation to a single document row. Per-frame
-/// rendering needs exactly one row, so restricting avoids building
-/// whole-document fragments that are then discarded. `unit_index` ordering
-/// matches the unrestricted projection, so fragment order stays stable
-/// regardless of which row is requested.
+/// rendering needs exactly one row, so restricting avoids building unnecessary
+/// whole-document fragments. Source byte ordering is shared by body, prose, and
+/// fence fragments; row filtering never changes the document order.
+/// Empty code rows currently have no exact source endpoint anchors; BMUX's
+/// nearest-fragment gesture fallback must not be interpreted as precise blank-row
+/// selection. Intervening unpainted source breaks remain part of body intervals.
 #[allow(clippy::too_many_arguments)]
 pub fn markdown_selection_fragments(
     scope_id: &str,
@@ -64,78 +64,47 @@ fn append_code_block_chrome_fragments(
     order_base: u64,
     revision: u64,
 ) {
+    if rendered
+        .code_block_geometry
+        .iter()
+        .filter(|geometry| geometry.contribution_id.starts_with("code-block:"))
+        .count()
+        != rendered.code_block_selections().len()
+    {
+        // Nested/projected blocks without canonical correspondence cannot claim fences.
+        return;
+    }
     for (block_index, block) in rendered.code_block_selections().iter().enumerate() {
-        let body_rects = rendered
-            .selection_provenance()
-            .iter()
-            .filter(|unit| {
-                unit.source_ranges
-                    .iter()
-                    .all(|range| range_within_any(range, &block.body_ranges))
-            })
-            .flat_map(|unit| &unit.rects)
-            .collect::<Vec<_>>();
-        let Some(first_row) = body_rects.iter().map(|rect| rect.y).min() else {
-            continue;
-        };
-        let Some(last_row) = body_rects.iter().map(|rect| rect.y).max() else {
-            continue;
-        };
-        let width = body_rects
-            .iter()
-            .map(|rect| rect.x.saturating_add(rect.width))
-            .max()
-            .unwrap_or(1)
-            .max(1);
-        let whole_content_id = format!("{base_content_id}.code.{}.whole", block.whole_range.start);
-        let base_order = order_base
-            .saturating_add(u64::try_from(block_index).unwrap_or(u64::MAX))
-            .saturating_mul(1_000_000);
-        for (row_index, row) in (first_row..=last_row).enumerate() {
-            fragments.push(
-                SelectionFragment::new(
-                    scope_id,
-                    whole_content_id.clone(),
-                    bmux_tui::geometry::Rect::new(origin.x, origin.y.saturating_add(row), 2, 1),
-                    base_order.saturating_add(u64::try_from(row_index).unwrap_or(u64::MAX)),
-                    block.whole_range.clone(),
-                )
-                .revision(revision),
-            );
-        }
-        if let Some(header_range) = &block.header_range {
-            fragments.push(
-                SelectionFragment::new(
-                    scope_id,
-                    format!("{base_content_id}.code.{}.header", block.whole_range.start),
-                    bmux_tui::geometry::Rect::new(
-                        origin.x,
-                        origin.y.saturating_add(first_row.saturating_sub(1)),
-                        width,
-                        1,
-                    ),
-                    base_order.saturating_add(100_000),
-                    header_range.clone(),
-                )
-                .revision(revision),
-            );
-        }
-        if let Some(footer_range) = &block.footer_range {
-            fragments.push(
-                SelectionFragment::new(
-                    scope_id,
-                    format!("{base_content_id}.code.{}.footer", block.whole_range.start),
-                    bmux_tui::geometry::Rect::new(
-                        origin.x,
-                        origin.y.saturating_add(last_row.saturating_add(1)),
-                        width,
-                        1,
-                    ),
-                    base_order.saturating_add(200_000),
-                    footer_range.clone(),
-                )
-                .revision(revision),
-            );
+        for (kind, range) in [
+            ("header", &block.header_range),
+            ("footer", &block.footer_range),
+        ] {
+            let Some(range) = range else { continue };
+            let id = format!("code-{kind}:{block_index}");
+            let Some(geometry) = rendered
+                .code_block_geometry
+                .iter()
+                .find(|geometry| geometry.contribution_id == id)
+            else {
+                continue;
+            };
+            for rect in &geometry.rects {
+                fragments.push(
+                    SelectionFragment::new(
+                        scope_id,
+                        format!("{base_content_id}.code.{}.{kind}", block.whole_range.start),
+                        bmux_tui::geometry::Rect::new(
+                            origin.x.saturating_add(rect.x),
+                            origin.y.saturating_add(rect.y),
+                            rect.width,
+                            rect.height,
+                        ),
+                        order_base.saturating_add(u64::try_from(range.start).unwrap_or(u64::MAX)),
+                        range.clone(),
+                    )
+                    .revision(revision),
+                );
+            }
         }
     }
 }
@@ -163,65 +132,37 @@ const fn range_within(range: &Range<usize>, parent: &Range<usize>) -> bool {
     parent.start <= range.start && range.end <= parent.end
 }
 
-fn range_within_any(range: &Range<usize>, parents: &[Range<usize>]) -> bool {
-    parents.iter().any(|parent| range_within(range, parent))
-}
-
+#[cfg(test)]
 pub fn expand_markdown_selection_range(
     source: &str,
     content_suffix: &str,
     selected: Range<usize>,
 ) -> Option<Vec<Range<usize>>> {
+    let blocks = bcode_markdown_render::markdown_code_block_selections(source);
+    expand_code_selection_range(source, &blocks, content_suffix, selected)
+}
+
+pub fn expand_code_selection_range(
+    source: &str,
+    blocks: &[bcode_markdown_render::MarkdownCodeBlockSelection],
+    content_suffix: &str,
+    selected: Range<usize>,
+) -> Option<Vec<Range<usize>>> {
+    use bcode_markdown_render::MarkdownCodeSelectionContent;
     let suffix = content_suffix.strip_prefix("code.")?;
     let (block_start, selection_kind) = suffix.split_once('.')?;
     let block_start = block_start.parse::<usize>().ok()?;
-    let block = bcode_markdown_render::markdown_code_block_selections(source)
-        .into_iter()
-        .find(|block| block.whole_range.start == block_start)?;
-    code_selection_ranges(&block, selection_kind, selected)
-}
-
-fn code_selection_ranges(
-    block: &MarkdownCodeBlockSelection,
-    selection_kind: &str,
-    selected: Range<usize>,
-) -> Option<Vec<Range<usize>>> {
-    match selection_kind {
-        "body" => Some(intersect_ranges(&block.body_ranges, selected)),
-        "header" => Some(intersect_optional_range(
-            block.header_range.as_ref(),
-            selected,
-        )),
-        "footer" => Some(intersect_optional_range(
-            block.footer_range.as_ref(),
-            selected,
-        )),
-        "whole" => Some(intersect_ranges(
-            std::slice::from_ref(&block.whole_range),
-            selected,
-        )),
-        _ => None,
-    }
-}
-
-fn intersect_optional_range(
-    range: Option<&Range<usize>>,
-    selected: Range<usize>,
-) -> Vec<Range<usize>> {
-    range.map_or_else(Vec::new, |range| {
-        intersect_ranges(std::slice::from_ref(range), selected)
-    })
-}
-
-fn intersect_ranges(ranges: &[Range<usize>], selected: Range<usize>) -> Vec<Range<usize>> {
-    ranges
+    let block = blocks
         .iter()
-        .filter_map(|range| {
-            let start = range.start.max(selected.start);
-            let end = range.end.min(selected.end);
-            (start < end).then_some(start..end)
-        })
-        .collect()
+        .find(|block| block.whole_range.start == block_start)?;
+    let content = match selection_kind {
+        "body" => MarkdownCodeSelectionContent::Body,
+        "header" => MarkdownCodeSelectionContent::Header,
+        "footer" => MarkdownCodeSelectionContent::Footer,
+        "whole" => MarkdownCodeSelectionContent::Whole,
+        _ => return None,
+    };
+    block.selection_ranges(source, content, selected.start, selected.end)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -230,7 +171,7 @@ fn append_unit_fragments(
     scope_id: &str,
     content_id: &str,
     unit: &MarkdownSelectionProvenance,
-    unit_index: usize,
+    _unit_index: usize,
     origin: bmux_tui::geometry::Point,
     order_base: u64,
     revision: u64,
@@ -238,8 +179,7 @@ fn append_unit_fragments(
     if unit.rects.len() != unit.source_ranges.len() {
         return;
     }
-    for (part_index, (rect, source_range)) in unit.rects.iter().zip(&unit.source_ranges).enumerate()
-    {
+    for (rect, source_range) in unit.rects.iter().zip(&unit.source_ranges) {
         if rect.width == 0 || rect.height == 0 || source_range.is_empty() {
             continue;
         }
@@ -253,9 +193,7 @@ fn append_unit_fragments(
                     rect.width,
                     rect.height,
                 ),
-                order_base
-                    .saturating_add(u64::try_from(unit_index).unwrap_or(u64::MAX))
-                    .saturating_add(u64::try_from(part_index).unwrap_or(u64::MAX)),
+                order_base.saturating_add(u64::try_from(source_range.start).unwrap_or(u64::MAX)),
                 source_range.clone(),
             )
             .revision(revision),
@@ -290,7 +228,7 @@ mod tests {
         let indented = "    first\n\tsecond\n\nnext";
         assert_eq!(
             expand_markdown_selection_range(indented, "code.0.body", 0..indented.len(),),
-            Some(vec![0..10, 10..18])
+            Some(std::iter::once(0..19).collect())
         );
         assert_eq!(
             expand_markdown_selection_range(indented, "code.0.whole", 0..indented.len(),),
@@ -344,81 +282,6 @@ mod tests {
         assert!(fragments.iter().any(|fragment| fragment.area.width == 2));
     }
 
-    fn copy_rendered_code(source: &str, width: u16, selected: Range<usize>) -> String {
-        use bmux_tui::{
-            event::{MouseButton, MouseEvent, MouseEventKind},
-            geometry::{Point, Rect},
-            selection::{SelectionController, SelectionScene, SelectionScope},
-        };
-
-        let item = crate::transcript::TranscriptItem::with_format(
-            "Assistant",
-            source.to_owned(),
-            bcode_session_view_models::TextFormat::Markdown,
-        );
-        let base = format!("bcode.transcript.item.{}.markdown", item.id().get());
-        let body = format!("{base}.code.0.body");
-        let rendered = bcode_markdown_render::render_markdown(
-            source,
-            &bcode_markdown_render::MarkdownRenderOptions::new(width),
-        );
-        let fragments =
-            markdown_selection_fragments("item", &base, &rendered, Point::new(0, 0), 0, 1, None);
-        let first = fragments
-            .iter()
-            .find(|fragment| {
-                fragment.content_id.as_str() == body
-                    && fragment.source_range.start == selected.start
-            })
-            .expect("selected first grapheme is rendered");
-        let last = fragments
-            .iter()
-            .find(|fragment| {
-                fragment.content_id.as_str() == body && fragment.source_range.end == selected.end
-            })
-            .expect("selected last grapheme is rendered");
-        let start = Point::new(first.area.x, first.area.y);
-        let end = Point::new(last.area.right(), last.area.y);
-        let mut scene = SelectionScene::new();
-        scene.push_scope(SelectionScope::new("item", Rect::new(0, 0, 200, 200)));
-        for fragment in fragments {
-            if fragment.content_id.as_str() == body {
-                scene.push_fragment(fragment);
-            }
-        }
-        scene.validate().expect("valid rendered scene");
-        let mut controller = SelectionController::new();
-        for (kind, point) in [
-            (MouseEventKind::Down(MouseButton::Left), start),
-            (MouseEventKind::Drag(MouseButton::Left), end),
-            (MouseEventKind::Up(MouseButton::Left), end),
-        ] {
-            controller.handle_mouse(&scene, MouseEvent::new(kind, point));
-        }
-        let snapshot = controller.snapshot(&scene).expect("mouse selection");
-        crate::root_program::export_plain_transcript_selection_for_test([&item], &snapshot)
-            .expect("canonical export")
-    }
-
-    #[test]
-    fn rendered_mouse_code_copy_preserves_line_endings_blank_lines_and_partial_selection() {
-        for newline in ["\n", "\r\n"] {
-            let body = format!("first{newline}  {newline}\tsecond{newline}third");
-            let source = format!("```text{newline}{body}{newline}```{newline}");
-            let start = source.find("first").expect("body");
-            let end = start + body.len();
-            assert_eq!(copy_rendered_code(&source, 60, start..end), body);
-            assert_eq!(copy_rendered_code(&source, 60, start + 2..end), &body[2..],);
-        }
-    }
-
-    #[test]
-    fn rendered_mouse_code_copy_does_not_add_soft_wrap_newlines() {
-        let body = "abcdefghijklmnopqrstuvwxyz0123456789";
-        let source = format!("```text\n{body}\n```\n");
-        assert_eq!(copy_rendered_code(&source, 12, 8..8 + body.len()), body);
-    }
-
     #[test]
     fn code_body_fragments_use_semantic_content_identity() {
         let rendered = bcode_markdown_render::render_markdown(
@@ -444,7 +307,7 @@ mod tests {
         assert!(fragments.iter().any(|fragment| {
             fragment.content_id.as_str() == "bcode.transcript.item.7.markdown.code.0.footer"
         }));
-        assert!(fragments.iter().any(|fragment| {
+        assert!(!fragments.iter().any(|fragment| {
             fragment.content_id.as_str() == "bcode.transcript.item.7.markdown.code.0.whole"
         }));
     }

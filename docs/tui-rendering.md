@@ -47,6 +47,15 @@ default. After a successful copy, the selection highlight clears after 1000 mill
 Source text comes from BMUX selection/export APIs, not reconstructed painted rows. Composer
 editing and interactive controls keep their existing mouse and copy behavior.
 
+Code selections resolve logical source intervals against canonical Markdown code-body and fence
+ranges. Copying preserves original line endings, blank lines, and indentation; soft wraps do not
+introduce line breaks. BMUX supplies mouse endpoints and highlight geometry, while Bcode resolves
+source content. Fence geometry comes from the accepted render pass, not body-adjacent guesses.
+Export and provenance-coverage checks use the same resolved intervals, rejecting stale or
+unavailable source mappings rather than reconstructing text from painted rows. Body drags do not
+implicitly select fences through the gutter. Precise endpoints on empty rows still follow BMUX's
+nearest-fragment behavior; intervening blank lines are preserved by source intervals.
+
 ```toml
 [tui.selection]
 auto_copy_on_mouse_release = true
