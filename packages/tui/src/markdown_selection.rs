@@ -344,6 +344,81 @@ mod tests {
         assert!(fragments.iter().any(|fragment| fragment.area.width == 2));
     }
 
+    fn copy_rendered_code(source: &str, width: u16, selected: Range<usize>) -> String {
+        use bmux_tui::{
+            event::{MouseButton, MouseEvent, MouseEventKind},
+            geometry::{Point, Rect},
+            selection::{SelectionController, SelectionScene, SelectionScope},
+        };
+
+        let item = crate::transcript::TranscriptItem::with_format(
+            "Assistant",
+            source.to_owned(),
+            bcode_session_view_models::TextFormat::Markdown,
+        );
+        let base = format!("bcode.transcript.item.{}.markdown", item.id().get());
+        let body = format!("{base}.code.0.body");
+        let rendered = bcode_markdown_render::render_markdown(
+            source,
+            &bcode_markdown_render::MarkdownRenderOptions::new(width),
+        );
+        let fragments =
+            markdown_selection_fragments("item", &base, &rendered, Point::new(0, 0), 0, 1, None);
+        let first = fragments
+            .iter()
+            .find(|fragment| {
+                fragment.content_id.as_str() == body
+                    && fragment.source_range.start == selected.start
+            })
+            .expect("selected first grapheme is rendered");
+        let last = fragments
+            .iter()
+            .find(|fragment| {
+                fragment.content_id.as_str() == body && fragment.source_range.end == selected.end
+            })
+            .expect("selected last grapheme is rendered");
+        let start = Point::new(first.area.x, first.area.y);
+        let end = Point::new(last.area.right(), last.area.y);
+        let mut scene = SelectionScene::new();
+        scene.push_scope(SelectionScope::new("item", Rect::new(0, 0, 200, 200)));
+        for fragment in fragments {
+            if fragment.content_id.as_str() == body {
+                scene.push_fragment(fragment);
+            }
+        }
+        scene.validate().expect("valid rendered scene");
+        let mut controller = SelectionController::new();
+        for (kind, point) in [
+            (MouseEventKind::Down(MouseButton::Left), start),
+            (MouseEventKind::Drag(MouseButton::Left), end),
+            (MouseEventKind::Up(MouseButton::Left), end),
+        ] {
+            controller.handle_mouse(&scene, MouseEvent::new(kind, point));
+        }
+        let snapshot = controller.snapshot(&scene).expect("mouse selection");
+        crate::root_program::export_plain_transcript_selection_for_test([&item], &snapshot)
+            .expect("canonical export")
+    }
+
+    #[test]
+    fn rendered_mouse_code_copy_preserves_line_endings_blank_lines_and_partial_selection() {
+        for newline in ["\n", "\r\n"] {
+            let body = format!("first{newline}  {newline}\tsecond{newline}third");
+            let source = format!("```text{newline}{body}{newline}```{newline}");
+            let start = source.find("first").expect("body");
+            let end = start + body.len();
+            assert_eq!(copy_rendered_code(&source, 60, start..end), body);
+            assert_eq!(copy_rendered_code(&source, 60, start + 2..end), &body[2..],);
+        }
+    }
+
+    #[test]
+    fn rendered_mouse_code_copy_does_not_add_soft_wrap_newlines() {
+        let body = "abcdefghijklmnopqrstuvwxyz0123456789";
+        let source = format!("```text\n{body}\n```\n");
+        assert_eq!(copy_rendered_code(&source, 12, 8..8 + body.len()), body);
+    }
+
     #[test]
     fn code_body_fragments_use_semantic_content_identity() {
         let rendered = bcode_markdown_render::render_markdown(

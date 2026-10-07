@@ -2738,8 +2738,29 @@ fn export_plain_transcript_selection<'a>(
         let Some(selections) = selected.remove(&item.id().get()) else {
             continue;
         };
-        let mut text = String::new();
+        // Code newlines and blank-line indentation have no painted fragments.
+        // Restore only canonical whitespace gaps within the same code body;
+        // never infer line breaks from screen rows or cross semantic boundaries.
+        let mut ranges: Vec<(String, std::ops::Range<usize>)> = Vec::new();
         for (kind, range) in selections {
+            if let Some((previous_kind, previous)) = ranges.last_mut()
+                && *previous_kind == kind
+                && kind.starts_with("markdown.code.")
+                && kind.rsplit('.').next() == Some("body")
+                && previous.end <= range.start
+                && item
+                    .text()
+                    .get(previous.end..range.start)?
+                    .chars()
+                    .all(char::is_whitespace)
+            {
+                previous.end = range.end;
+            } else {
+                ranges.push((kind, range));
+            }
+        }
+        let mut text = String::new();
+        for (kind, range) in ranges {
             if let Some(suffix) = kind.strip_prefix("markdown.") {
                 let ranges = super::markdown_selection::expand_markdown_selection_range(
                     item.text(),
