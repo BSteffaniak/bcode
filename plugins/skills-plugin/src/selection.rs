@@ -187,10 +187,13 @@ pub fn apply(input: &ApplyRequest) -> SelectionResult {
         {
             return baseline();
         }
-        ranked.push((candidate.id.clone(), *probability));
+        // This is the probability of usefulness, not confidence in a pairwise ordering.
+        // Only a confident useful/not-useful separation supports overriding baseline.
+        ranked.push((candidate.id.clone(), *probability > 0.65));
     }
-    // Stable sort preserves deterministic baseline ties.
-    ranked.sort_by(|left, right| right.1.total_cmp(&left.1));
+    // Stable partition preserves baseline within each band; small probability differences
+    // between two useful (or two unhelpful) candidates are not calibrated ranking evidence.
+    ranked.sort_by_key(|candidate| std::cmp::Reverse(candidate.1));
     let mut ranked = ranked.into_iter();
     let ordered_ids: Option<Vec<_>> = input
         .selection

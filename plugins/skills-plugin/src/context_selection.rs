@@ -58,10 +58,17 @@ fn valid(input: &SelectionRequest) -> bool {
 /// Prepare relevance advice only under real optional byte-budget pressure.
 #[must_use]
 pub fn prepare(input: &SelectionRequest) -> selection::PreparedSelection {
+    // Oversized whole snippets cannot be admitted in any ordering. Only pressure
+    // among individually admissible optional snippets creates an admission choice.
     let bytes = input
         .candidates
         .iter()
-        .filter(|candidate| !candidate.protected)
+        .filter(|candidate| {
+            !candidate.protected
+                && input
+                    .budget_bytes
+                    .is_none_or(|budget| candidate.snippet.len() <= budget)
+        })
         .fold(0usize, |sum, candidate| {
             sum.saturating_add(candidate.snippet.len())
         });

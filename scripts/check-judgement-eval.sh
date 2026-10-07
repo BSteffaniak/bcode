@@ -20,6 +20,7 @@ if [[ "$mode" = report ]]; then
         BCODE_JUDGEMENT_PLAN="$BCODE_JUDGEMENT_PLAN" \
         BCODE_JUDGEMENT_CAPTURES="$BCODE_JUDGEMENT_CAPTURES" \
         BCODE_JUDGEMENT_REPORT_OUTPUT="$BCODE_JUDGEMENT_REPORT_OUTPUT" \
+        BCODE_JUDGEMENT_REPORT_MODE="${BCODE_JUDGEMENT_REPORT_MODE:-full_readiness}" \
         "$BCODE_JUDGEMENT_TEST_BINARY" --ignored --exact report_captured_benchmark --test-threads=1
     exit
 fi

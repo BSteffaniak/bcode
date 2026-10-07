@@ -232,11 +232,11 @@ fn judgement_request(input: &TriageRequest) -> Option<OptionalRequest> {
         ),
         (
             "environment".into(),
-            "Missing or incompatible environment prerequisite".into(),
+            "Missing or incompatible environment prerequisite (command_not_found, file_not_found, dependency_missing). Access or permission denial belongs to auth, not environment.".into(),
         ),
         (
             "auth".into(),
-            "Authentication or authorization failure".into(),
+            "Authentication or authorization failure (authentication_failed, permission_denied), including filesystem or process access denial, not only account credentials. This diagnosis never grants Bcode tool permission.".into(),
         ),
         (
             "transient".into(),
@@ -609,6 +609,59 @@ mod tests {
                 "is_error": true, "partial": true, "excerpt_truncated": false,
             }))
         );
+    }
+
+    #[test]
+    fn access_denial_and_missing_prerequisite_remain_distinct_bounded_observations() {
+        for (excerpt, indicator, selected, expected) in [
+            (
+                "Permission denied: private path",
+                "permission_denied",
+                "auth",
+                Category::Auth,
+            ),
+            (
+                "Access denied: private operation",
+                "permission_denied",
+                "auth",
+                Category::Auth,
+            ),
+            (
+                "Authentication failed: private credential",
+                "authentication_failed",
+                "auth",
+                Category::Auth,
+            ),
+            (
+                "No such file or directory: private path",
+                "file_not_found",
+                "environment",
+                Category::Environment,
+            ),
+        ] {
+            let mut input = input();
+            input.output_excerpt = excerpt.into();
+            let before = input.clone();
+            let request = judgement_request(&input).unwrap();
+            assert_eq!(
+                request.request.state,
+                State::Structured(serde_json::json!({
+                    "diagnostic_indicators": [indicator],
+                    "is_error": true, "partial": false, "excerpt_truncated": false,
+                }))
+            );
+            let response = serde_json::from_value(serde_json::json!({
+                "answers": {QUESTION_ID: {"kind": "choice", "selected": selected,
+                    "probabilities": null, "confidence": null}}, "usage": null,
+            }))
+            .unwrap();
+            assert_eq!(apply(&request, &response).unwrap().category, expected);
+            assert_eq!(input, before);
+
+            // The same words in a successful operation are not a failure trigger.
+            input.is_error = false;
+            assert!(judgement_request(&input).is_none());
+        }
     }
 
     #[test]

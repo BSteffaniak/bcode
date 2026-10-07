@@ -153,7 +153,7 @@ pub fn parse_corpus_plan(
     if corpus.schema_version != 1
         || !matches!(
             corpus.split.as_str(),
-            "development" | "held_out" | "held-out"
+            "development" | "held_out" | "held-out" | "independent_public"
         )
         || corpus.truth_provenance != "authored_synthetic"
     {

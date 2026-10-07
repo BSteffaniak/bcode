@@ -6,8 +6,8 @@
 use bcode_eval::judgement_benchmark::{Arm, EvidenceSource, TerminalOutcome};
 use bcode_eval::judgement_capture::{
     CAPTURE_SCHEMA_VERSION, CacheCondition, CallMeasurement, CaptureRequest, CaptureScope,
-    CaptureStatus, CaptureTelemetry, ConsumerCapture, ConsumerRequest, MAX_CAPTURE_BYTES,
-    SubjectIdentity, capture_bounded,
+    CaptureStatus, CaptureTelemetry, ConsumerCapture, ConsumerRequest, DecisionCapture,
+    MAX_CAPTURE_BYTES, SubjectIdentity, capture_bounded,
 };
 use bcode_model::judgement::Feature;
 use std::{fs::File, io::Read, path::Path};
@@ -69,6 +69,8 @@ fn unknown_telemetry_is_not_free_or_zero() {
 fn off_work_future_versions_and_unverified_provenance_fail_closed() {
     let mut capture = capture();
     capture.telemetry = CaptureTelemetry {
+        // Synthetic calibration supplies no decision-stage evidence.
+        decisions: DecisionCapture::default(),
         calls_complete: true,
         discovery_calls: Some(0),
         verification_calls: Some(0),
@@ -79,6 +81,8 @@ fn off_work_future_versions_and_unverified_provenance_fail_closed() {
         optional_counts_incomplete: false,
         calls: vec![],
     };
+    assert!(capture.telemetry.decisions.stages.is_empty());
+    assert_eq!(capture.telemetry.decisions.omitted_stages, 0);
     let observation = capture.benchmark_observation().unwrap();
     assert_eq!(observation.latency_ms, None);
     assert_eq!(observation.cost_usd, Some(0.0)); // Explicitly complete, empty ledger only.
@@ -91,9 +95,10 @@ fn off_work_future_versions_and_unverified_provenance_fail_closed() {
     capture.telemetry.inference_calls = None;
     assert!(capture.benchmark_observation().is_err());
     capture.telemetry.inference_calls = Some(0);
-    capture.schema_version = 2;
+    capture.schema_version = CAPTURE_SCHEMA_VERSION.checked_add(1).unwrap();
     assert!(capture.benchmark_observation().is_err());
-    capture.schema_version = 1;
+    capture.schema_version = CAPTURE_SCHEMA_VERSION;
+    assert!(capture.benchmark_observation().is_ok());
     capture.request.subject.configuration_complete = false;
     assert!(capture.benchmark_observation().is_err());
 }
@@ -276,8 +281,23 @@ fn report_captured_benchmark() {
     let captures: Vec<ConsumerCapture> = bounded_json(Path::new(
         &std::env::var("BCODE_JUDGEMENT_CAPTURES").unwrap(),
     ));
+    bcode_eval::judgement_benchmark::validate_service_oracle_vocabulary(&plan)
+        .expect("service oracle vocabulary mapping gap; not a model quality failure");
     let (report, gaps) = bcode_eval::judgement_capture::compare_captures(&plan, &captures).unwrap();
-    let artifact = serde_json::json!({"report":report,"capture_gaps":gaps});
+    let artifact = match std::env::var("BCODE_JUDGEMENT_REPORT_MODE").as_deref() {
+        Ok("quality_only") => {
+            let quality = bcode_eval::judgement_benchmark::compare_benchmark_quality_only(
+                &plan,
+                &report.observations,
+            )
+            .unwrap();
+            serde_json::json!({"quality_report":quality,"capture_gaps":gaps})
+        }
+        Ok("full_readiness") | Err(std::env::VarError::NotPresent) => {
+            serde_json::json!({"report":report,"capture_gaps":gaps})
+        }
+        _ => panic!("unsupported BCODE_JUDGEMENT_REPORT_MODE"),
+    };
     let mut output = std::fs::OpenOptions::new()
         .write(true)
         .create_new(true)

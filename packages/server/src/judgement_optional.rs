@@ -21,6 +21,102 @@ const TOTAL_TIMEOUT: Duration = Duration::from_secs(40);
 const VERIFY_TIMEOUT: Duration = Duration::from_secs(10);
 const MAX_CACHE_ENTRIES: usize = 64;
 
+fn project_request(request: &judgement::Request) -> judgement::DecisionProjection {
+    let questions: Vec<_> = request
+        .questions
+        .values()
+        .take(judgement::MAX_DECISION_QUESTIONS)
+        .enumerate()
+        .map(|(ordinal, question)| judgement::DecisionQuestion {
+            ordinal,
+            kind: question.kind(),
+            alternatives: match question {
+                judgement::Question::Choice { options, .. } => options.len(),
+                judgement::Question::Score { levels, .. } => levels.len(),
+                judgement::Question::YesNo { .. } => 0,
+            },
+        })
+        .collect();
+    judgement::DecisionProjection {
+        schema_version: judgement::DECISION_PROJECTION_VERSION,
+        question_count: request.questions.len(),
+        omitted_questions: request.questions.len().saturating_sub(questions.len()),
+        questions,
+        answers: None,
+        omitted_answers: None,
+        producer_omitted_evidence: None,
+        applied: None,
+    }
+}
+
+fn project_answers(
+    projection: &mut judgement::DecisionProjection,
+    mapping: &[(String, Vec<String>)],
+    response: &judgement::Response,
+) {
+    let mut answers = Vec::new();
+    for (ordinal, (id, options)) in mapping.iter().enumerate() {
+        let Some(answer) = response.answers.get(id) else {
+            continue;
+        };
+        let mut projected = judgement::DecisionAnswer {
+            question: ordinal,
+            kind: projection.questions[ordinal].kind,
+            value: None,
+            selected_option: None,
+            probabilities: None,
+            omitted_probabilities: 0,
+            confidence: None,
+        };
+        let probabilities = match answer {
+            judgement::Answer::Choice {
+                selected,
+                probabilities,
+                confidence,
+            } => {
+                projected.selected_option = options.iter().position(|id| id == selected);
+                projected.confidence = *confidence;
+                if let Some(values) = probabilities {
+                    if values.len() <= judgement::MAX_DECISION_PROBABILITIES {
+                        projected.probabilities = Some(
+                            options
+                                .iter()
+                                .filter_map(|id| values.get(id).copied())
+                                .collect(),
+                        );
+                    } else {
+                        projected.omitted_probabilities = values.len();
+                    }
+                }
+                None
+            }
+            judgement::Answer::Score {
+                value,
+                probabilities,
+                confidence,
+            } => {
+                projected.value = Some(*value);
+                projected.confidence = *confidence;
+                probabilities.as_ref()
+            }
+            judgement::Answer::YesNo { probability } => {
+                projected.value = Some(*probability);
+                None
+            }
+        };
+        if let Some(values) = probabilities {
+            if values.len() <= judgement::MAX_DECISION_PROBABILITIES {
+                projected.probabilities = Some(values.clone());
+            } else {
+                projected.omitted_probabilities = values.len();
+            }
+        }
+        answers.push(projected);
+    }
+    projection.omitted_answers = Some(response.answers.len().saturating_sub(answers.len()));
+    projection.answers = Some(answers);
+}
+
 #[derive(Debug, Default)]
 struct VerificationCache {
     epoch: u64,
@@ -140,7 +236,35 @@ impl OptionalJudgementAccess {
         input: OptionalRequest,
     ) -> OptionalResponse {
         let started = Instant::now();
-        let mut observation = OptionalOperationObservation::default();
+        let mut observation = OptionalOperationObservation {
+            decision: Some(project_request(&input.request)),
+            ..OptionalOperationObservation::default()
+        };
+        // Retain only bounded question/option keys transiently to map validated answers after
+        // evaluation consumes the request. These keys never enter the exported projection.
+        let mapping: Vec<_> = if judgement::validate_request(&input.request).is_ok() {
+            input
+                .request
+                .questions
+                .iter()
+                .take(judgement::MAX_DECISION_QUESTIONS)
+                .map(|(id, question)| {
+                    (
+                        id.clone(),
+                        match question {
+                            judgement::Question::Choice { options, .. } => options
+                                .keys()
+                                .take(judgement::MAX_OPTIONS)
+                                .cloned()
+                                .collect::<Vec<_>>(),
+                            _ => vec![],
+                        },
+                    )
+                })
+                .collect()
+        } else {
+            vec![]
+        };
         let _permit = match self.begin(config.judgement.enabled(input.feature)) {
             Ok(permit) => permit,
             Err(outcome) => {
@@ -164,6 +288,9 @@ impl OptionalJudgementAccess {
             observation.outcome = OptionalOperationOutcome::TimedOut;
             None
         };
+        if let (Some(projection), Some(response)) = (&mut observation.decision, &response) {
+            project_answers(projection, &mapping, response);
+        }
         observation.elapsed_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
         OptionalResponse {
             response,
@@ -429,6 +556,93 @@ impl OptionalJudgementAccess {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn decision_projection_is_content_free_and_bounded() {
+        let request = judgement::Request {
+            model_id: "arbitrary-secret-model".into(),
+            state: judgement::State::Text("arbitrary-secret-state".into()),
+            questions: BTreeMap::from([(
+                "arbitrary-secret-question".into(),
+                judgement::Question::Choice {
+                    instructions: "arbitrary-secret-instructions".into(),
+                    options: (0..judgement::MAX_OPTIONS)
+                        .map(|index| {
+                            (
+                                format!("arbitrary-secret-option-{index:03}"),
+                                "arbitrary-secret-description".into(),
+                            )
+                        })
+                        .collect(),
+                },
+            )]),
+        };
+        let mut projection = project_request(&request);
+        let mapping: Vec<(String, Vec<String>)> = vec![(
+            "arbitrary-secret-question".into(),
+            request
+                .questions
+                .values()
+                .next()
+                .and_then(|question| match question {
+                    judgement::Question::Choice { options, .. } => {
+                        Some(options.keys().cloned().collect())
+                    }
+                    _ => None,
+                })
+                .unwrap(),
+        )];
+        let response = judgement::Response {
+            usage: None,
+            answers: BTreeMap::from([(
+                "arbitrary-secret-question".into(),
+                judgement::Answer::Choice {
+                    selected: "arbitrary-secret-option-001".into(),
+                    probabilities: Some(
+                        mapping[0]
+                            .1
+                            .iter()
+                            .map(|id| (id.clone(), 1.0 / 128.0))
+                            .collect(),
+                    ),
+                    confidence: Some(0.5),
+                },
+            )]),
+        };
+        project_answers(&mut projection, &mapping, &response);
+        assert_eq!(
+            projection.answers.as_ref().unwrap()[0].selected_option,
+            Some(1)
+        );
+        assert_eq!(
+            projection.answers.as_ref().unwrap()[0].omitted_probabilities,
+            judgement::MAX_OPTIONS
+        );
+        assert!(
+            projection.answers.as_ref().unwrap()[0]
+                .probabilities
+                .is_none()
+        );
+        assert!(projection.applied.is_none());
+        assert!(projection.producer_omitted_evidence.is_none());
+        let encoded = serde_json::to_string(&projection).unwrap();
+        assert!(!encoded.contains("arbitrary-secret"));
+        assert!(encoded.len() < 16_384);
+        let mut large = request;
+        large.questions = (0..=judgement::MAX_DECISION_QUESTIONS)
+            .map(|index| {
+                (
+                    index.to_string(),
+                    judgement::Question::YesNo {
+                        instructions: String::new(),
+                    },
+                )
+            })
+            .collect();
+        let bounded = project_request(&large);
+        assert_eq!(bounded.questions.len(), judgement::MAX_DECISION_QUESTIONS);
+        assert_eq!(bounded.omitted_questions, 1);
+    }
 
     #[test]
     fn admission_outcomes_preserve_off_backoff_and_permit_order() {

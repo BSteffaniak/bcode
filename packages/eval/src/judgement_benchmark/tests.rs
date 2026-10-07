@@ -193,7 +193,12 @@ fn progress_penalizes_false_early_late_and_missing_advice() {
         output(Some("drift"), Some(100)),
         output(None, None),
     ] {
-        near(score_output(&oracle, &value).quality, 0.0);
+        let scored = score_output(&oracle, &value);
+        near(scored.quality, 0.0);
+        if matches!(value, ConsumerOutput::Progress { label: Some(_), .. }) {
+            assert!(!scored.constraints_passed);
+        }
+        assert_eq!(scored.detection_delay_ms, None);
     }
     let negative = Oracle::Progress {
         label: None,

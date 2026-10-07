@@ -76,6 +76,18 @@ async fn service(
     serde_json::from_slice(&response.payload).map_err(|_| ())
 }
 
+pub(super) async fn judge(
+    client: &BcodeClient,
+    query: &OptionalRequest,
+    capture: &mut ConsumerCapture,
+) -> Result<bcode_model::judgement::OptionalResponse, ()> {
+    let stage = capture.telemetry.decisions.begin(query);
+    let response = client.optional_judge(query).await.map_err(|_| ())?;
+    capture.telemetry.decisions.finish(stage, query, &response);
+    capture.telemetry.retain_optional_response(&response);
+    Ok(response)
+}
+
 pub(super) async fn execute(
     client: &BcodeClient,
     input: ServiceConsumer,
@@ -181,6 +193,7 @@ pub(super) async fn execute(
             let prepared = service(client, "bcode.context-selection/v1", "prepare", &input).await?;
             let prepared = prepared.get("judgement").ok_or(())?;
             let result = if prepared.is_null() {
+                capture.telemetry.decisions.skipped();
                 json!({"response":null})
             } else {
                 let query: OptionalRequest =
@@ -188,8 +201,7 @@ pub(super) async fn execute(
                 if query.feature != Feature::ContextReranking {
                     return Err(());
                 }
-                let response = client.optional_judge(&query).await.map_err(|_| ())?;
-                capture.telemetry.retain_optional_response(&response);
+                let response = judge(client, &query, capture).await?;
                 serde_json::to_value(response).map_err(|_| ())?
             };
             let response = service(
@@ -199,6 +211,10 @@ pub(super) async fn execute(
                 &json!({"selection":input,"judgement":result}),
             )
             .await?;
+            capture
+                .telemetry
+                .decisions
+                .applied(response.get("applied").and_then(Value::as_bool));
             ConsumerOutput::Ranking {
                 order: serde_json::from_value(response.get("ordered_ids").ok_or(())?.clone())
                     .map_err(|_| ())?,
@@ -214,6 +230,7 @@ pub(super) async fn execute(
             let prepared = service(client, "bcode.skills-selection/v1", "prepare", &input).await?;
             let prepared = prepared.get("judgement").ok_or(())?;
             let result = if prepared.is_null() {
+                capture.telemetry.decisions.skipped();
                 json!({"response":null})
             } else {
                 let query: OptionalRequest =
@@ -221,8 +238,7 @@ pub(super) async fn execute(
                 if query.feature != Feature::Recommendations {
                     return Err(());
                 }
-                let response = client.optional_judge(&query).await.map_err(|_| ())?;
-                capture.telemetry.retain_optional_response(&response);
+                let response = judge(client, &query, capture).await?;
                 serde_json::to_value(response).map_err(|_| ())?
             };
             let response = service(
@@ -232,6 +248,10 @@ pub(super) async fn execute(
                 &json!({"selection":input,"judgement":result}),
             )
             .await?;
+            capture
+                .telemetry
+                .decisions
+                .applied(response.get("applied").and_then(Value::as_bool));
             let order: Vec<String> =
                 serde_json::from_value(response.get("ordered_ids").ok_or(())?.clone())
                     .map_err(|_| ())?;

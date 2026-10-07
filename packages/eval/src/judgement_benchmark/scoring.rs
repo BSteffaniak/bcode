@@ -118,7 +118,7 @@ pub fn score_output(oracle: &Oracle, output: &ConsumerOutput) -> OutputScore {
             if label != expected
                 || detected_ms.is_none_or(|time| time < *onset_ms || time > *deadline_ms)
             {
-                return score(0.0, detected_ms.is_some(), None);
+                return score(0.0, false, None);
             }
             let delay = detected_ms.unwrap_or(*onset_ms) - onset_ms;
             let window = deadline_ms - onset_ms;

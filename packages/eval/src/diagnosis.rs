@@ -1,4 +1,9 @@
 //! Deterministic failure labels from observations; not an LLM verdict.
+//!
+//! Default policy is Auto, not Off: eligible verified providers may add advisory
+//! grouping. Unavailable/off leaves deterministic labels unchanged. Categories
+//! neither alter oracle verdicts nor establish root cause; provider probabilities
+//! are not calibrated evidence and are not used as application thresholds.
 use bcode_model::judgement::{
     Answer, Feature, OptionalRequest, OptionalResponse, Question, Request, State,
 };
@@ -45,6 +50,21 @@ pub fn optional_request(oracle: &Value, diagnosis: &Value) -> Option<OptionalReq
     {
         facts.insert("status".to_owned(), json!(status));
     }
+    if let Some(labels) = diagnosis["labels"].as_array() {
+        // Forward only fixed measured predicates, never summaries, attempts, or paths.
+        for label in [
+            "independent_oracle_completion_disagreement",
+            "judgement_gate_withheld_completion",
+            "repeated_worker_activation_observed",
+        ] {
+            if labels.iter().any(|value| value.as_str() == Some(label)) {
+                facts.insert(label.to_owned(), json!(true));
+            }
+        }
+    }
+    if facts.is_empty() {
+        return None;
+    }
     Some(OptionalRequest {
         feature: Feature::EvalCategorization,
         selection: None,
@@ -52,7 +72,7 @@ pub fn optional_request(oracle: &Value, diagnosis: &Value) -> Option<OptionalReq
             model_id: "auto".to_owned(),
             state: State::Structured(Value::Object(facts)),
             questions: std::collections::BTreeMap::from([("failure_category".to_owned(), Question::Choice {
-                instructions: "Label these measured evaluation failure facts for advisory grouping only. Do not infer root cause or change measured outcomes; choose uncertain when evidence is insufficient.".to_owned(),
+                instructions: "Label measured evaluation failure facts for advisory grouping only, never root cause. evidence_gap means incomplete capture or unobservable artifact, not proven incorrect work; artifact_failure requires observed incorrect work. deadline means measured timeout; preservation_failure means measured preservation violation; completion_disagreement means false completion, correct work not terminalized, or a measured oracle/gate disagreement. coordination means repeated worker activation, not proof that repetition caused failure. execution_failure means terminal failure without a more specific measured category. Prefer specific measured facts over generic terminal status; choose uncertain if none is supported or competing facts cannot be resolved. Do not change measured outcomes.".to_owned(),
                 options: FAILURE_CATEGORIES.iter().map(|label| ((*label).to_owned(), (*label).to_owned())).collect(),
             })]),
         },
@@ -142,6 +162,107 @@ pub fn classify(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn measured_coordination_and_gate_facts_reach_advisory_without_raw_evidence() {
+        let oracle = serde_json::json!({"artifact_correct":true,"completion_claimed":false});
+        let diagnosis = super::classify(
+            &oracle,
+            &serde_json::json!([{"node_id":"loop.judgement.evaluate","value":{"condition_met":false,"summary":"DO_NOT_SEND"}}]),
+            &serde_json::json!({"attempts":[{"node_id":"PRIVATE_NODE"}]}),
+            &std::collections::BTreeMap::from([(
+                "workflow.repeated_worker_activations".into(),
+                1.0,
+            )]),
+        );
+        let optional = super::optional_request(&oracle, &diagnosis).unwrap();
+        assert_eq!(
+            optional.request.state,
+            bcode_model::judgement::State::Structured(serde_json::json!({
+                "artifact_correct":true,
+                "completion_claimed":false,
+                "independent_oracle_completion_disagreement":true,
+                "judgement_gate_withheld_completion":true,
+                "repeated_worker_activation_observed":true
+            }))
+        );
+        let encoded = serde_json::to_string(&optional).unwrap();
+        assert!(!encoded.contains("DO_NOT_SEND"));
+        assert!(!encoded.contains("PRIVATE_NODE"));
+    }
+
+    #[test]
+    fn unknown_diagnosis_labels_cannot_create_empty_provider_work() {
+        assert!(
+            super::optional_request(
+                &serde_json::json!({"secret":"DO_NOT_SEND"}),
+                &serde_json::json!({"labels":["DO_NOT_SEND"]})
+            )
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn advisory_probabilities_do_not_override_selected_label_or_verify_root_cause() {
+        let oracle = serde_json::json!({"status":"failed"});
+        let mut diagnosis = super::classify(
+            &oracle,
+            &serde_json::json!([]),
+            &serde_json::json!({}),
+            &std::collections::BTreeMap::new(),
+        );
+        let baseline = diagnosis.clone();
+        let query = super::optional_request(&oracle, &diagnosis)
+            .unwrap()
+            .request;
+        let bcode_model::judgement::Question::Choice { options, .. } =
+            &query.questions["failure_category"]
+        else {
+            panic!("expected choice");
+        };
+        let probabilities = options
+            .keys()
+            .map(|key| {
+                (
+                    key.clone(),
+                    if key == "execution_failure" {
+                        0.9
+                    } else if key == "uncertain" {
+                        0.1
+                    } else {
+                        0.0
+                    },
+                )
+            })
+            .collect();
+        super::attach_advisory(
+            &mut diagnosis,
+            &query,
+            bcode_model::judgement::OptionalResponse {
+                observation: None,
+                response: Some(bcode_model::judgement::Response {
+                    answers: std::collections::BTreeMap::from([(
+                        "failure_category".into(),
+                        bcode_model::judgement::Answer::Choice {
+                            selected: "uncertain".into(),
+                            probabilities: Some(probabilities),
+                            confidence: Some(0.1),
+                        },
+                    )]),
+                    usage: None,
+                }),
+            },
+        );
+        assert_eq!(
+            diagnosis["advisory_model_labels"],
+            serde_json::json!({"failure_category":"uncertain","root_cause_verified":false})
+        );
+        diagnosis
+            .as_object_mut()
+            .unwrap()
+            .remove("advisory_model_labels");
+        assert_eq!(diagnosis, baseline);
+    }
+
     #[test]
     fn representative_eval_cases_use_real_diagnosis_facts_without_overwriting_oracle() {
         use bcode_model::judgement::{Answer, OptionalResponse, Response};

@@ -50,11 +50,16 @@ def safe_name(value):
 
 
 def load(split):
-    filename = "held-out.json" if split == "held_out" else "development.json"
+    filenames = {"development": "development.json", "held_out": "held-out.json",
+                 "independent_public": "independent-public.json"}
+    if split not in filenames:
+        raise ValueError("unsupported dataset split")
+    filename = filenames[split]
+    graded = split in {"development", "independent_public"}
     data = read_json(ROOT / filename)
     if set(data) != {"schema_version", "split", "truth_provenance", "cases"}:
         raise ValueError("unknown dataset fields")
-    if (data["schema_version"] != (3 if split == "development" else 1) or data["split"] != split
+    if (data["schema_version"] != (3 if graded else 1) or data["split"] != split
             or data["truth_provenance"] != "authored_synthetic"):
         raise ValueError("unsupported dataset compatibility/provenance")
     frozen = read_json(ROOT / "freeze.json")
@@ -64,7 +69,7 @@ def load(split):
     coverage = {feature: set() for feature in FEATURES}
     required = {"id", "feature", "control", "input", "expected", "rationale",
                 "task", "files", "answer"}
-    if split == "development":
+    if graded:
         required |= {"family_id", "fault"}
     for case in data["cases"]:
         if set(case) != required or not safe_name(case["id"]) or case["id"] in ids:
@@ -92,7 +97,7 @@ def load(split):
                 raise ValueError("label oracle fields")
         elif expected["kind"] == "ranking":
             ranking_fields = {"kind", "prefix", "all_ids"}
-            if split == "development":
+            if graded:
                 ranking_fields |= {"relevance", "costs", "budget", "k", "required",
                                    "protected_positions", "ideal_admission_gain"}
             if set(expected) != ranking_fields:
@@ -104,7 +109,7 @@ def load(split):
                     or not set(expected["prefix"]) <= set(all_ids)
                     or len(expected["prefix"]) != len(set(expected["prefix"]))):
                 raise ValueError("ranking oracle incomplete/duplicate")
-            if split == "development":
+            if graded:
                 import itertools
                 if set(expected["relevance"]) != set(all_ids) or set(expected["costs"]) != set(all_ids):
                     raise ValueError("incomplete independent admission annotations")
@@ -139,7 +144,7 @@ def load(split):
                         gains.append(sum(2 ** expected["relevance"][i] - 1 for i in admitted))
                 if not gains or max(gains) != expected["ideal_admission_gain"]:
                     raise ValueError("independent admission optimum mismatch")
-        elif expected["kind"] == "progress" and split == "development":
+        elif expected["kind"] == "progress" and graded:
             if (set(expected) != {"kind", "label", "onset_ms", "deadline_ms"}
                     or type(expected["onset_ms"]) is not int
                     or type(expected["deadline_ms"]) is not int
@@ -147,10 +152,24 @@ def load(split):
                 raise ValueError("invalid progress detection window")
         else:
             raise ValueError("unsupported oracle kind")
-    if any("positive" not in c or not c & {"negative", "adversarial"}
+    if split != "independent_public" and any("positive" not in c or not c & {"negative", "adversarial"}
            for c in coverage.values()):
         raise ValueError("each feature needs positive and negative/adversarial coverage")
     return data
+
+
+def service_vocabulary_gaps(data):
+    """Explicit triage-only producer mapping audit; never rewrite independent truth."""
+    vocabulary = {"code", "environment", "auth", "transient", "partial", "inconclusive"}
+    gaps = []
+    for case in data["cases"]:
+        expected = case["expected"]
+        if case["feature"] == "tool_result_triage" and expected["kind"] == "labels":
+            values = expected["values"]
+            if set(values) != {"category"} or values["category"] not in vocabulary:
+                gaps.append({"case_id": case["id"], "reason": "triage producer vocabulary mapping gap",
+                             "independent_truth": expected})
+    return gaps
 
 
 def semantic_score(expected, output):
@@ -160,7 +179,7 @@ def semantic_score(expected, output):
     if expected["kind"] == "absent":
         return output == {"kind": "absent"}
     if expected["kind"] == "labels":
-        return output == expected
+        return typed_equal(output, expected)
     if expected["kind"] == "progress":
         label = output.get("label")
         detected = output.get("detected_ms")
@@ -393,25 +412,25 @@ def main():
     sub = parser.add_subparsers(dest="action", required=True)
     sub.add_parser("validate")
     p = sub.add_parser("oracle")
-    p.add_argument("split", choices=("development", "held_out"))
+    p.add_argument("split", choices=("development", "held_out", "independent_public"))
     p.add_argument("case_id")
     p.add_argument("--workspace", default=".")
     p = sub.add_parser("materialize")
-    p.add_argument("split", choices=("development", "held_out"))
+    p.add_argument("split", choices=("development", "held_out", "independent_public"))
     p.add_argument("mode", choices=("direct", "swarm", "editing"))
     p.add_argument("destination")
     p.add_argument("--subject-binary", help="absolute fresh approved workflow subject; not executed here")
     p.add_argument("--seed", type=int, default=20261007)
     p.add_argument("--repetitions", type=int, default=2)
     p = sub.add_parser("oracle-controls")
-    p.add_argument("split", choices=("development", "held_out"))
+    p.add_argument("split", choices=("development", "held_out", "independent_public"))
     p.add_argument("destination")
     p = sub.add_parser("summarize")
-    p.add_argument("split", choices=("development", "held_out"))
+    p.add_argument("split", choices=("development", "held_out", "independent_public"))
     p.add_argument("capture")
     args = parser.parse_args()
     if args.action == "validate":
-        for split in ("development", "held_out"):
+        for split in ("development", "held_out", "independent_public"):
             print(split, len(load(split)["cases"]), "cases: valid")
     elif args.action == "materialize":
         materialize(args)

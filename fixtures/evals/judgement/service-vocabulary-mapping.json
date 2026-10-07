@@ -1,0 +1,13 @@
+{
+  "schema_version": 1,
+  "scope": "public_authored_synthetic_service_mapping_not_blinded",
+  "triage_producer_vocabulary": ["code", "environment", "auth", "transient", "partial", "inconclusive"],
+  "explicit_mappings": [
+    {"case_id": "audit-authority-not-keywords", "independent_semantic_label": "test", "producer_label": "code", "reason": "Current assertion failure is a code failure; retain original editing answer and reserved semantic truth."}
+  ],
+  "known_mapping_gaps": [
+    {"corpus": "development", "independent_semantic_label": "permission", "producer_mapping": "auth", "status": "requires_explicit_case_review_not_automatically_rewritten"},
+    {"corpus": "development_or_held_out", "independent_semantic_label": "test", "producer_mapping": "code", "status": "requires_explicit_case_review_not_automatically_rewritten"}
+  ],
+  "policy": "Never relabel unsupported independent truth automatically. Vocabulary mismatch is an oracle mapping gap, not a model failure. Original independent-audit.json and editing answer remain authoritative for their semantic scope. Other feature vocabularies require their own typed-contract review; this preflight only validates triage."
+}

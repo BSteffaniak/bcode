@@ -189,6 +189,125 @@ pub struct OptionalOperationObservation {
     pub verification_cost_usd: Option<f64>,
     /// Unknown: application invocation counts do not expose transport attempts.
     pub transport_attempts: Option<u64>,
+    /// Content-free central request/answer projection. Older observations have no projection.
+    /// This does not establish producer omissions or downstream application.
+    #[serde(default)]
+    pub decision: Option<DecisionProjection>,
+}
+
+/// Compatibility version of the independently evolving content-free projection.
+pub const DECISION_PROJECTION_VERSION: u32 = 1;
+/// Maximum retained question/answer projections per invocation.
+pub const MAX_DECISION_QUESTIONS: usize = 16;
+/// Maximum retained probabilities per answer.
+pub const MAX_DECISION_PROBABILITIES: usize = 32;
+
+/// Content-free prepared request and validated answer facts. No caller-controlled strings.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DecisionProjection {
+    /// Unknown future versions reject during deserialization.
+    #[serde(deserialize_with = "deserialize_decision_version")]
+    pub schema_version: u32,
+    /// Total prepared question count before projection truncation.
+    pub question_count: usize,
+    /// Sorted request-map order; IDs, instructions and state are never retained.
+    #[serde(deserialize_with = "deserialize_decision_questions")]
+    pub questions: Vec<DecisionQuestion>,
+    /// Number of question shapes omitted by the projection bound.
+    pub omitted_questions: usize,
+    /// Validated answer projections; None means no validated response, not empty advice.
+    #[serde(deserialize_with = "deserialize_decision_answers")]
+    pub answers: Option<Vec<DecisionAnswer>>,
+    /// Answers omitted by the projection bound; None before a validated response.
+    pub omitted_answers: Option<usize>,
+    /// Unknown to the central service: evidence omitted by the producer.
+    pub producer_omitted_evidence: Option<u64>,
+    /// Unknown to the central service: downstream producer application truth.
+    pub applied: Option<bool>,
+}
+
+/// Prepared question shape, without instructions, rubric descriptions or option IDs.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DecisionQuestion {
+    /// Request-local ordinal in sorted question-map order.
+    pub ordinal: usize,
+    /// Portable semantic kind.
+    pub kind: QuestionKind,
+    /// Choice option or score rubric count; zero for yes/no.
+    pub alternatives: usize,
+}
+
+/// Numeric validated answer evidence using request-local ordinals only.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DecisionAnswer {
+    /// Request-local question ordinal.
+    pub question: usize,
+    /// Portable answer kind.
+    pub kind: QuestionKind,
+    /// Score or yes/no probability; absent for choice.
+    pub value: Option<f64>,
+    /// Choice ordinal in sorted option-map order; absent for other kinds.
+    pub selected_option: Option<usize>,
+    /// Complete reported distribution, absent if unavailable or exceeding the bound.
+    #[serde(deserialize_with = "deserialize_decision_probabilities")]
+    pub probabilities: Option<Vec<f64>>,
+    /// Explicit number of reported probabilities omitted by the projection bound.
+    pub omitted_probabilities: usize,
+    /// Reported confidence, not calibrated task-success probability.
+    pub confidence: Option<f64>,
+}
+
+fn deserialize_decision_version<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<u32, D::Error> {
+    let version = u32::deserialize(deserializer)?;
+    if version != DECISION_PROJECTION_VERSION {
+        return Err(serde::de::Error::custom(
+            "unsupported decision projection version",
+        ));
+    }
+    Ok(version)
+}
+
+fn deserialize_decision_questions<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Vec<DecisionQuestion>, D::Error> {
+    let values = Vec::<DecisionQuestion>::deserialize(deserializer)?;
+    if values.len() > MAX_DECISION_QUESTIONS {
+        return Err(serde::de::Error::custom("decision question bound exceeded"));
+    }
+    Ok(values)
+}
+
+fn deserialize_decision_answers<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<Vec<DecisionAnswer>>, D::Error> {
+    let values = Option::<Vec<DecisionAnswer>>::deserialize(deserializer)?;
+    if values
+        .as_ref()
+        .is_some_and(|values| values.len() > MAX_DECISION_QUESTIONS)
+    {
+        return Err(serde::de::Error::custom("decision answer bound exceeded"));
+    }
+    Ok(values)
+}
+
+fn deserialize_decision_probabilities<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<Vec<f64>>, D::Error> {
+    let values = Option::<Vec<f64>>::deserialize(deserializer)?;
+    if values.as_ref().is_some_and(|values| {
+        values.len() > MAX_DECISION_PROBABILITIES
+            || values
+                .iter()
+                .any(|value| !value.is_finite() || !(0.0..=1.0).contains(value))
+    }) {
+        return Err(serde::de::Error::custom("invalid decision probabilities"));
+    }
+    Ok(values)
 }
 
 impl Default for OptionalOperationObservation {
@@ -207,6 +326,7 @@ impl Default for OptionalOperationObservation {
             verification_usage: None,
             verification_cost_usd: None,
             transport_attempts: None,
+            decision: None,
         }
     }
 }
@@ -770,6 +890,57 @@ mod tests {
         validate_response(&request, selected, &response).unwrap();
         listing.models.clear();
         assert!(select_supported_model(&request, &listing).is_err());
+    }
+
+    #[test]
+    fn projection_legacy_future_and_bounds() {
+        let mut legacy = serde_json::to_value(OptionalOperationObservation::default()).unwrap();
+        legacy.as_object_mut().unwrap().remove("decision");
+        assert!(
+            serde_json::from_value::<OptionalOperationObservation>(legacy)
+                .unwrap()
+                .decision
+                .is_none()
+        );
+        let projection = DecisionProjection {
+            schema_version: DECISION_PROJECTION_VERSION,
+            question_count: 0,
+            questions: vec![],
+            omitted_questions: 0,
+            answers: None,
+            omitted_answers: None,
+            producer_omitted_evidence: None,
+            applied: None,
+        };
+        let mut future = serde_json::to_value(&projection).unwrap();
+        future["schema_version"] = serde_json::json!(DECISION_PROJECTION_VERSION + 1);
+        assert!(serde_json::from_value::<DecisionProjection>(future).is_err());
+        let mut oversized = projection;
+        oversized.questions = vec![
+            DecisionQuestion {
+                ordinal: 0,
+                kind: QuestionKind::YesNo,
+                alternatives: 0
+            };
+            MAX_DECISION_QUESTIONS + 1
+        ];
+        assert!(
+            serde_json::from_value::<DecisionProjection>(serde_json::to_value(oversized).unwrap())
+                .is_err()
+        );
+        let answer = DecisionAnswer {
+            question: 0,
+            kind: QuestionKind::YesNo,
+            value: Some(0.5),
+            selected_option: None,
+            probabilities: Some(vec![0.5; MAX_DECISION_PROBABILITIES + 1]),
+            omitted_probabilities: 0,
+            confidence: None,
+        };
+        assert!(
+            serde_json::from_value::<DecisionAnswer>(serde_json::to_value(answer).unwrap())
+                .is_err()
+        );
     }
 
     #[test]

@@ -1,4 +1,10 @@
 //! Advisory categorization of bounded, allowlisted newest-request facts.
+//!
+//! Default policy is Auto: off/unavailable produces no labels, not a heuristic
+//! fallback. Ordered fixed-vocabulary signals retain local negation and boundaries,
+//! but do not fully resolve intent; `other` is an abstention,
+//! not evidence of an actual miscellaneous task. Probabilities are provider-reported
+//! metadata, not calibrated evidence, and do not change label application.
 
 use bcode_model::judgement::{
     self, Answer, Feature, OptionalRequest, OptionalResponse, Question, Request, State,
@@ -40,6 +46,10 @@ pub struct NewestRequestFacts {
     pub tasks: BTreeSet<String>,
     /// Recognized domain signals.
     pub domains: BTreeSet<String>,
+    /// Ordered fixed-vocabulary cues; `gap` marks omitted words, not their contents.
+    /// Negation is a lexical cue, not a claim about its scope or resolved intent.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub sequence: Vec<String>,
 }
 
 /// Extract signals from at most 8192 characters and 512 words of one request.
@@ -48,8 +58,8 @@ pub struct NewestRequestFacts {
 pub fn newest_request_facts(input: &str) -> NewestRequestFacts {
     let bounded: String = input.chars().take(8192).collect();
     let mut facts = NewestRequestFacts::default();
-    for word in bounded.split_whitespace().take(512) {
-        let word = word
+    for source_word in bounded.split_whitespace().take(512) {
+        let word = source_word
             .trim_matches(|c: char| !c.is_ascii_alphabetic())
             .to_ascii_lowercase();
         let task = match word.as_str() {
@@ -69,6 +79,27 @@ pub fn newest_request_facts(input: &str) -> NewestRequestFacts {
             "cli" | "tooling" | "cargo" | "plugin" => Some("tooling"),
             _ => None,
         };
+        let cue = match word.as_str() {
+            "no" | "not" | "never" | "without" | "don't" | "cannot" | "can't" | "avoid" => {
+                Some("negation")
+            }
+            "but" | "instead" | "rather" => Some("contrast"),
+            "only" => Some("only"),
+            _ => None,
+        };
+        let signal = task.or(domain).or(cue).unwrap_or("gap");
+        // Collapse omitted spans, but preserve repeated recognized cues and order.
+        if signal != "gap"
+            || facts
+                .sequence
+                .last()
+                .is_none_or(|previous| previous != "gap")
+        {
+            facts.sequence.push(signal.to_owned());
+        }
+        if source_word.ends_with([';', '.', '!', '?']) {
+            facts.sequence.push("boundary".to_owned());
+        }
         if let Some(task) = task {
             facts.tasks.insert(task.to_owned());
         }
@@ -76,11 +107,20 @@ pub fn newest_request_facts(input: &str) -> NewestRequestFacts {
             facts.domains.insert(domain.to_owned());
         }
     }
+    if facts.tasks.is_empty() && facts.domains.is_empty() {
+        facts.sequence.clear();
+    }
     facts
 }
 
 fn optional_request(facts: &NewestRequestFacts) -> Option<OptionalRequest> {
     if facts.tasks.is_empty() && facts.domains.is_empty()
+        || facts.sequence.len() > 1024
+        || facts.sequence.iter().any(|signal| {
+            !facts.tasks.contains(signal)
+                && !facts.domains.contains(signal)
+                && !["negation", "contrast", "only", "gap", "boundary"].contains(&signal.as_str())
+        })
         || facts
             .tasks
             .iter()
@@ -92,11 +132,17 @@ fn optional_request(facts: &NewestRequestFacts) -> Option<OptionalRequest> {
     {
         return None;
     }
-    let choice = |instructions: &str, labels: &[&str]| Question::Choice {
+    // Lexical cues cannot justify an unobserved label. Keep an explicit
+    // abstention for missing axes and conflicts; these are not resolved intent.
+    let choice = |instructions: &str, signals: &BTreeSet<String>| Question::Choice {
         instructions: instructions.to_owned(),
-        options: labels
+        options: signals
             .iter()
-            .map(|label| ((*label).to_owned(), (*label).to_owned()))
+            .map(|label| (label.clone(), label.clone()))
+            .chain([(
+                "other".to_owned(),
+                "Insufficient or ambiguous signals".to_owned(),
+            )])
             .collect(),
     };
     Some(OptionalRequest {
@@ -109,15 +155,15 @@ fn optional_request(facts: &NewestRequestFacts) -> Option<OptionalRequest> {
                 (
                     "task".to_owned(),
                     choice(
-                        "Choose an advisory task label from these bounded signals; use other when ambiguous.",
-                        TASKS,
+                        "Choose the requested advisory task from ordered lexical cues, not every mentioned task. negation marks a negative cue, boundary marks punctuation, contrast and only preserve those cues, and gap means omitted unknown words. These cues do not establish negation scope; use other when ambiguous or only prohibited tasks are supported.",
+                        &facts.tasks,
                     ),
                 ),
                 (
                     "domain".to_owned(),
                     choice(
-                        "Choose an advisory domain label from these bounded signals; use other when ambiguous.",
-                        DOMAINS,
+                        "Choose the domain of the requested task using ordered lexical cues, not a domain mentioned only in a prohibition. gap means omitted unknown words, not adjacency in the source; use other when intent or domain association is ambiguous.",
+                        &facts.domains,
                     ),
                 ),
             ]),
@@ -261,7 +307,8 @@ mod tests {
         assert_eq!(
             optional.request.state,
             State::Structured(serde_json::json!({
-                "tasks": ["debugging"], "domains": ["backend"]
+                "tasks": ["debugging"], "domains": ["backend"],
+                "sequence": ["debugging", "backend", "gap"]
             }))
         );
         let payload = unsafe { &*user_data.cast::<serde_json::Value>() };
@@ -371,6 +418,145 @@ mod tests {
     }
 
     #[test]
+    fn choices_cannot_invent_missing_or_unobserved_signals() {
+        for (source, tasks, domains) in [
+            ("Fix this", vec!["debugging", "other"], vec!["other"]),
+            ("backend", vec!["other"], vec!["backend", "other"]),
+            (
+                "Review and test backend security",
+                vec!["other", "review", "testing"],
+                vec!["backend", "other", "security"],
+            ),
+        ] {
+            let query = optional_request(&newest_request_facts(source))
+                .unwrap()
+                .request;
+            for (id, expected) in [("task", tasks), ("domain", domains)] {
+                let Question::Choice { options, .. } = &query.questions[id] else {
+                    panic!("expected choice");
+                };
+                assert_eq!(
+                    options.keys().map(String::as_str).collect::<Vec<_>>(),
+                    expected
+                );
+            }
+        }
+        let request = CategorizationRequest {
+            session_id: SessionId::new(),
+            source_sequence: 12,
+            newest_request: "Fix this".into(),
+        };
+        let query = optional_request(&newest_request_facts(&request.newest_request))
+            .unwrap()
+            .request;
+        for (domain, accepted) in [("backend", false), ("other", true)] {
+            let result = labels(
+                &request,
+                &query,
+                OptionalResponse {
+                    observation: None,
+                    response: Some(judgement::Response {
+                        answers: BTreeMap::from([
+                            (
+                                "task".into(),
+                                Answer::Choice {
+                                    selected: "debugging".into(),
+                                    probabilities: None,
+                                    confidence: None,
+                                },
+                            ),
+                            (
+                                "domain".into(),
+                                Answer::Choice {
+                                    selected: domain.into(),
+                                    probabilities: None,
+                                    confidence: None,
+                                },
+                            ),
+                        ]),
+                        usage: None,
+                    }),
+                },
+            );
+            assert_eq!(result.is_some(), accepted);
+        }
+    }
+
+    #[test]
+    fn ordered_cues_distinguish_opposite_intent_without_resolving_scope() {
+        let review = newest_request_facts("Review backend; do not implement frontend");
+        let implement = newest_request_facts("Implement frontend; do not review backend");
+        assert_eq!(review.tasks, implement.tasks);
+        assert_eq!(review.domains, implement.domains);
+        assert_eq!(
+            review.sequence,
+            [
+                "review",
+                "backend",
+                "boundary",
+                "gap",
+                "negation",
+                "implementation",
+                "frontend"
+            ]
+        );
+        assert_eq!(
+            implement.sequence,
+            [
+                "implementation",
+                "frontend",
+                "boundary",
+                "gap",
+                "negation",
+                "review",
+                "backend"
+            ]
+        );
+        assert_ne!(
+            optional_request(&review).unwrap().request.state,
+            optional_request(&implement).unwrap().request.state
+        );
+        // Unknown words remain explicitly omitted: this representation cannot fully
+        // interpret quotations, scope, hypotheticals, or arbitrary language.
+        assert_eq!(
+            newest_request_facts("review backend if SECRET_CONDITION"),
+            newest_request_facts("review backend because PRIVATE_REASON")
+        );
+    }
+
+    #[test]
+    fn ordered_cues_are_bounded_secret_safe_and_reject_injected_text() {
+        let facts = newest_request_facts(
+            "Do not fix backend token=DO_NOT_SEND /private/customer; instead review frontend only.",
+        );
+        assert_eq!(
+            facts.sequence,
+            [
+                "gap",
+                "negation",
+                "debugging",
+                "backend",
+                "gap",
+                "boundary",
+                "contrast",
+                "review",
+                "frontend",
+                "only",
+                "boundary"
+            ]
+        );
+        let encoded = serde_json::to_string(&optional_request(&facts).unwrap()).unwrap();
+        assert!(!encoded.contains("DO_NOT_SEND"));
+        assert!(!encoded.contains("/private/customer"));
+        let bounded = newest_request_facts(&"fix; ".repeat(600));
+        assert_eq!(bounded.sequence.len(), 1024);
+        assert_eq!(bounded.tasks, BTreeSet::from(["debugging".into()]));
+        let mut injected = facts;
+        injected.sequence.push("DO_NOT_SEND".into());
+        assert!(optional_request(&injected).is_none());
+    }
+
+    #[test]
     fn extraction_is_bounded_and_contains_only_fixed_signals() {
         let facts = newest_request_facts("Fix backend auth token=SECRET /private/path");
         assert_eq!(facts.tasks, BTreeSet::from(["debugging".into()]));
@@ -399,7 +585,8 @@ mod tests {
         assert!(
             optional_request(&NewestRequestFacts {
                 tasks: BTreeSet::from(["SECRET".into()]),
-                domains: BTreeSet::new()
+                domains: BTreeSet::new(),
+                sequence: Vec::new(),
             })
             .is_none()
         );

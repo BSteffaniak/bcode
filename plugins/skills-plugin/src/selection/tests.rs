@@ -185,6 +185,54 @@ fn context_advice_changes_actual_optional_catalog_prompt_without_loading_instruc
 }
 
 #[test]
+fn usefulness_probabilities_do_not_rank_within_the_same_band() {
+    for purpose in [Purpose::Context, Purpose::Recommendations] {
+        for (low, high) in [(0.7, 0.99), (0.01, 0.3), (0.0, 0.34), (0.66, 1.0)] {
+            let result = apply(&advice(selection(purpose), low, high));
+            assert_eq!(result.ordered_ids, ["low", "explicit", "high"]);
+            assert!(!result.applied);
+        }
+        let result = apply(&advice(selection(purpose), 0.34, 0.66));
+        assert_eq!(result.ordered_ids, ["high", "explicit", "low"]);
+        assert!(result.applied);
+    }
+}
+
+#[test]
+fn stable_usefulness_partition_retains_each_band_and_protected_slots() {
+    let mut input = selection(Purpose::Recommendations);
+    input.candidates.extend([
+        Candidate {
+            id: "other-low".into(),
+            description: "Other irrelevant candidate".into(),
+            protected: false,
+        },
+        Candidate {
+            id: "other-high".into(),
+            description: "Other useful candidate".into(),
+            protected: false,
+        },
+    ]);
+    let mut request = advice(input, 0.01, 0.7);
+    request
+        .judgement
+        .response
+        .as_mut()
+        .unwrap()
+        .answers
+        .extend([
+            ("candidate_3".into(), Answer::YesNo { probability: 0.3 }),
+            ("candidate_4".into(), Answer::YesNo { probability: 0.99 }),
+        ]);
+    let result = apply(&request);
+    assert_eq!(
+        result.ordered_ids,
+        ["high", "explicit", "other-high", "low", "other-low"]
+    );
+    assert!(result.applied);
+}
+
+#[test]
 fn actual_service_dispatch_roundtrip_supports_both_features() {
     use bcode_plugin_sdk::prelude::*;
     for purpose in [Purpose::Context, Purpose::Recommendations] {

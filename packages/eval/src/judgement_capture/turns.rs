@@ -72,7 +72,6 @@ pub(super) async fn execute(
     };
     let mut label = None;
     let mut detected_ms = None;
-    let mut settled_tools = 0_usize;
     for _ in 0..input.max_events {
         match connection
             .recv_event_without_reconnect()
@@ -114,9 +113,6 @@ pub(super) async fn execute(
                 }
             }
             Event::Session(event) if event.session_id == input.session_id => {
-                if let SessionEventKind::ToolInvocationResultRecorded { .. } = &event.kind {
-                    settled_tools += 1;
-                }
                 if let SessionEventKind::ModelTurnFinished {
                     turn_id, outcome, ..
                 } = event.kind
@@ -124,10 +120,11 @@ pub(super) async fn execute(
                     if turn_id != receipt.turn_id.0 {
                         continue;
                     }
+                    // Tool counts prove eligible activity, not that an optional consumer ran.
+                    // Until the stream exposes activation-bound decision facts, only an observed
+                    // contribution establishes execution; silence (including disabled) is unknown.
                     capture.consumer_executed = match capture.request.feature {
-                        Feature::ToolResultTriage => settled_tools > 0,
-                        Feature::ProgressMonitoring => settled_tools >= 2,
-                        Feature::SessionCategorization => true,
+                        Feature::ToolResultTriage | Feature::ProgressMonitoring => label.is_some(),
                         _ => false,
                     };
                     capture.trial_latency_ms = Some(started.elapsed().as_secs_f64() * 1000.0);
@@ -155,6 +152,7 @@ pub(super) async fn execute(
                                     super::CategorizationDimension::Task => value.task,
                                     super::CategorizationDimension::Domain => value.domain,
                                 });
+                            capture.consumer_executed = label.is_some();
                             Some(ConsumerOutput::Classification { label })
                         }
                         // Current public stream lacks the final available-tool permutation. The turn ran,

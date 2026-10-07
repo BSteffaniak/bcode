@@ -169,15 +169,46 @@ fn invalid_duplicate_unprovenanced_or_oversized_sources_are_not_ranked() {
 }
 
 #[test]
-fn whole_utf8_snippets_never_split_and_protected_content_is_not_transferred() {
+fn pressure_is_only_among_snippets_that_can_fit_individually() {
+    for budget in [1, 2, 3, 4] {
+        let mut input = fixture();
+        input.candidates[0].snippet = "xxxxx".into();
+        input.candidates[2].snippet = "xx".into();
+        input.budget_bytes = Some(budget);
+        assert!(prepare(&input).judgement.is_none());
+        let baseline = apply(&ApplyRequest {
+            selection: input.clone(),
+            judgement: OptionalResponse {
+                observation: None,
+                response: None,
+            },
+        });
+        assert_eq!(apply(&advised(input)), baseline);
+        assert!(!baseline.applied);
+    }
+}
+
+#[test]
+fn producer_owned_pressure_and_protected_data_keep_the_existing_contract() {
     let mut input = fixture();
-    input.candidates[0].snippet = "界🦀".into();
-    input.candidates[2].snippet = "界".into();
-    input.budget_bytes = Some(3);
+    input.budget_bytes = None;
     let prepared = prepare(&input).judgement.unwrap();
     let serialized = serde_json::to_string(&prepared).unwrap();
     assert!(!serialized.contains("explicit user requested evidence"));
     assert!(!serialized.contains("tool:call-explicit"));
     let result = apply(&advised(input));
-    assert_eq!(result.included_ids, ["search-relevant", "explicit"]);
+    assert_eq!(result.included_ids, result.ordered_ids);
+    assert!(result.applied);
+}
+
+#[test]
+fn whole_utf8_snippets_never_split_and_protected_content_is_not_transferred() {
+    let mut input = fixture();
+    input.candidates[0].snippet = "界🦀".into();
+    input.candidates[2].snippet = "界".into();
+    input.budget_bytes = Some(3);
+    assert!(prepare(&input).judgement.is_none());
+    let result = apply(&advised(input));
+    assert_eq!(result.included_ids, ["explicit", "search-relevant"]);
+    assert!(!result.applied);
 }

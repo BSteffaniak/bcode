@@ -142,12 +142,13 @@ fn repeated_failure(input: &ProgressRequest) -> bool {
     let Some(key) = &last.failure_key else {
         return false;
     };
-    // Evidence at or after the preceding matching failure breaks the unsuccessful streak.
+    // Only a consecutive matching failure streak supports advice about repeating an approach.
+    // Success, a different failure, or new evidence resets it; A -> B -> A is not repetition.
     for previous in input.observations.iter().rev() {
-        if previous.evidence_key.is_some() {
+        if previous.evidence_key.is_some() || previous.failure_key.as_ref() != Some(key) {
             return false;
         }
-        if previous.sequence != last.sequence && previous.failure_key.as_ref() == Some(key) {
+        if previous.sequence != last.sequence {
             return true;
         }
     }
@@ -163,6 +164,7 @@ fn prepare(input: &ProgressRequest) -> Option<OptionalRequest> {
         && !input.observations.windows(2).any(|pair| {
             pair[0].action != pair[1].action
                 || pair[0].summary != pair[1].summary
+                || pair[0].failure_key != pair[1].failure_key
                 || pair[0].evidence_key != pair[1].evidence_key
         })
     {
@@ -365,6 +367,43 @@ mod tests {
             assert_eq!(advice.through_sequence, 3);
             assert_eq!(input, before);
         }
+    }
+
+    #[test]
+    fn success_and_distinct_failure_reset_repetition_at_the_latest_observation() {
+        for middle_failure in [None, Some("different-failure".into())] {
+            let mut input = input(ProgressScope::Session {
+                id: "session".into(),
+            });
+            input.observations[1].failure_key = middle_failure;
+            assert!(!repeated_failure(&input));
+            assert!(apply(&input, &answers(0.1, 0.95, 0.1)).is_none());
+            // A second matching failure after the reset is a fresh streak.
+            let mut next = input.observations[2].clone();
+            next.sequence = 4;
+            input.observations.push(next);
+            assert!(repeated_failure(&input));
+            let advice = apply(&input, &answers(0.1, 0.95, 0.1)).unwrap();
+            assert_eq!(advice.through_sequence, 4);
+            assert_eq!(advice.kind, ProgressAdviceKind::RepeatedFailure);
+        }
+    }
+
+    #[test]
+    fn changed_failure_is_a_trigger_even_with_identical_action_and_summary() {
+        let mut input = input(ProgressScope::Session {
+            id: "session".into(),
+        });
+        input.observations.truncate(2);
+        input.observations[1].failure_key = Some("different-failure".into());
+        assert!(!repeated_failure(&input));
+        let prepared = prepare(&input).expect("changed settled failure is new observation data");
+        judgement::validate_request(&prepared.request).unwrap();
+        assert!(apply(&input, &answers(0.1, 0.95, 0.1)).is_none());
+        // Probabilities alone cannot turn a distinct failure into repetition advice.
+        input.observations[1].failure_key = None;
+        assert!(prepare(&input).is_some());
+        assert!(apply(&input, &answers(0.1, 0.95, 0.1)).is_none());
     }
 
     #[test]

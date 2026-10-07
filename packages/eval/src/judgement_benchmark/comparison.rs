@@ -144,7 +144,11 @@ fn success(row: &BenchmarkObservation) -> f64 {
     }
 }
 
-fn verdict(report: &FeatureReport, gates: &Gates) -> Verdict {
+pub(super) fn quality_verdict(report: &FeatureReport, gates: &Gates) -> Verdict {
+    verdict(report, gates, true)
+}
+
+fn verdict(report: &FeatureReport, gates: &Gates, quality_only: bool) -> Verdict {
     let Some(limits) = gates
         .feature_limits
         .iter()
@@ -180,6 +184,22 @@ fn verdict(report: &FeatureReport, gates: &Gates) -> Verdict {
     };
     if quality < -limits.quality_loss || reliability < -limits.reliability_loss {
         return Verdict::Regressed;
+    }
+    // Quality-only evidence never asserts efficiency or full readiness. Resource
+    // measurements and their unknown coverage remain untouched in the nested report.
+    if quality_only {
+        return match (
+            report.quality.confidence_interval,
+            report.reliability.confidence_interval,
+        ) {
+            (Some(quality_ci), Some(reliability_ci))
+                if quality_ci[0] >= limits.quality_gain
+                    && reliability_ci[0] >= -limits.reliability_loss =>
+            {
+                Verdict::Improved
+            }
+            _ => Verdict::Inconclusive,
+        };
     }
     // Unknown pricing/timing cannot be presented as an efficient improvement.
     if report.cost_usd.pairs != report.scheduled_pairs
@@ -397,7 +417,7 @@ fn feature_report(
     report.detection_delay_ms = metrics.delay.report(&plan.gates.bootstrap);
     report.completeness =
         (scheduled_pairs > 0).then(|| report.quality.pairs as f64 / scheduled_pairs as f64);
-    report.verdict = verdict(&report, &plan.gates);
+    report.verdict = verdict(&report, &plan.gates, false);
     report
 }
 

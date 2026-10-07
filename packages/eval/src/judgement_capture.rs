@@ -4,6 +4,8 @@
 //! treatment configuration and independent ground truth. A public response without telemetry
 //! is useful raw evidence but cannot be promoted into a complete benchmark observation.
 
+mod decision;
+pub use decision::{AnswerShape, DecisionCapture, DecisionStage, QuestionShape, RequestShape};
 mod jobs;
 pub use jobs::{
     CaptureComparison, CaptureJob, ComparisonJob, compare_capture_job, decode_capture_job,
@@ -12,7 +14,7 @@ pub use jobs::{
 mod raw;
 pub use raw::{RawCaptureScore, raw_capture_scores};
 mod report;
-pub use report::compare_captures;
+pub use report::{compare_captures, compare_captures_quality_only};
 mod turns;
 pub use turns::NormalTurnRequest;
 mod services;
@@ -27,8 +29,9 @@ use bcode_session_models::{ContextSelectionRequest, SessionId};
 use serde::{Deserialize, Serialize};
 use std::time::{Duration, Instant};
 
-/// Capture envelopes reject unknown versions at promotion, independently of report versions.
-pub const CAPTURE_SCHEMA_VERSION: u32 = 1;
+/// Version two adds content-free decision evidence; version one reads with empty decision stages.
+/// Older readers must reject version two rather than assume complete decision coverage.
+pub const CAPTURE_SCHEMA_VERSION: u32 = 2;
 /// Maximum serialized input/output envelope; source input is never retained in the capture.
 pub const MAX_CAPTURE_BYTES: usize = 128 * 1024;
 
@@ -102,6 +105,9 @@ pub struct CallMeasurement {
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct CaptureTelemetry {
+    /// Content-free request/score/application evidence; older captures contain no stages.
+    #[serde(default)]
+    pub decisions: DecisionCapture,
     /// All calls, including verification, retries and ordinary model work, observed.
     pub calls_complete: bool,
     /// Complete optional discovery count.
@@ -167,12 +173,24 @@ impl CaptureTelemetry {
         response: &serde_json::Value,
     ) -> Result<(), ()> {
         if let Some(value) = response.get("observation").filter(|value| !value.is_null()) {
-            let observation = serde_json::from_value(value.clone()).map_err(|_| ())?;
+            let observation: bcode_model::judgement::OptionalOperationObservation =
+                serde_json::from_value(value.clone()).map_err(|_| ())?;
+            if let Some(projection) = &observation.decision {
+                self.decisions
+                    .observe_projection(projection, observation.outcome);
+            } else {
+                self.decisions
+                    .observe_service(Some(observation.outcome), None);
+            }
             self.retain_optional_response(&bcode_model::judgement::OptionalResponse {
                 response: None,
                 observation: Some(observation),
             });
         } else {
+            self.decisions.observe_service(
+                None,
+                response.get("applied").and_then(serde_json::Value::as_bool),
+            );
             self.retain_optional_response(&bcode_model::judgement::OptionalResponse {
                 response: None,
                 observation: None,
@@ -425,6 +443,10 @@ async fn execute_public(
                 .select_optional_context(&request)
                 .await
                 .map_err(|_| ())?;
+            capture
+                .telemetry
+                .decisions
+                .observe_service(None, Some(response.applied));
             capture.consumer_executed = true;
             capture.status = if response.applied {
                 CaptureStatus::Captured
@@ -450,7 +472,9 @@ async fn execute_public(
             let Some(query) = crate::diagnosis::optional_request(&oracle, &diagnosis) else {
                 return Ok(());
             };
+            let stage = capture.telemetry.decisions.begin(&query);
             let response = client.optional_judge(&query).await.map_err(|_| ())?;
+            capture.telemetry.decisions.finish(stage, &query, &response);
             capture.telemetry.retain_optional_response(&response);
             crate::diagnosis::attach_advisory(&mut diagnosis, &query.request, response);
             let label = diagnosis["advisory_model_labels"]["failure_category"]
@@ -498,7 +522,7 @@ impl ConsumerCapture {
         if self.scope == CaptureScope::ServiceMicrobenchmark && self.trial_latency_ms.is_some() {
             return Err("service latency is not whole-task efficiency");
         }
-        if self.schema_version != CAPTURE_SCHEMA_VERSION {
+        if !matches!(self.schema_version, 1 | CAPTURE_SCHEMA_VERSION) {
             return Err("unsupported capture version");
         }
         if !self.consumer_executed {
