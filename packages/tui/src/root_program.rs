@@ -315,7 +315,12 @@ impl BcodeRuntimeModel {
     }
 
     #[allow(dead_code)]
-    pub fn new(chat: ActiveChat, settings: TuiRuntimeSettings, loop_state: ChatLoopState) -> Self {
+    pub fn new(
+        chat: ActiveChat,
+        settings: TuiRuntimeSettings,
+        mut loop_state: ChatLoopState,
+    ) -> Self {
+        loop_state.set_slash_palette_settings(settings.completion_settings());
         let draft_autosave = DraftAutosave::new(
             settings.launch_working_directory().to_path_buf(),
             chat.app.composer().text().to_owned(),

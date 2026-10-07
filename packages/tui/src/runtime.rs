@@ -256,6 +256,7 @@ fn apply_initial_config(
         );
     };
     settings.apply_tui_config(&config.tui);
+    settings.set_completion_settings(config.presentation.completion);
     chat.app.apply_tui_config(config.tui.clone());
     let declarative = config.presentation.streaming.policy();
     let effective_override = match streaming_override {

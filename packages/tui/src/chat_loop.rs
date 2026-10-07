@@ -231,6 +231,7 @@ pub enum InteractiveSurfaceOpenCompletion {
 pub struct ChatLoopState {
     palette: Option<BmuxCommandPalette>,
     slash_palette: Option<slash_palette::SlashPalette>,
+    slash_completion: slash_palette::SlashCompletionState,
     foreground_client: BcodeClient,
     passive_client: BcodeClient,
     viewport_input_task: Option<tokio::task::JoinHandle<()>>,
@@ -296,6 +297,7 @@ impl ChatLoopState {
         Self {
             palette: None,
             slash_palette: None,
+            slash_completion: slash_palette::SlashCompletionState::default(),
             foreground_client: foreground_client.clone(),
             passive_client: passive_client.clone(),
             viewport_input_task: None,
@@ -611,6 +613,20 @@ impl ChatLoopState {
         self.artifact_stream.start_due_fetches(now);
     }
 
+    /// Apply renderer-neutral completion configuration on startup or reload.
+    pub fn set_slash_palette_settings(&mut self, settings: bcode_config::CompletionConfig) {
+        self.slash_completion.settings = settings;
+        if let Some(palette) = self.slash_palette.as_mut() {
+            let query = palette.query().to_owned();
+            palette.refilter(&query, settings);
+        }
+    }
+
+    /// Invalidate discovery after configuration, plugin, skill or catalog changes.
+    pub fn invalidate_slash_palette_discovery(&mut self) {
+        self.slash_completion.invalidate();
+    }
+
     pub fn refresh_slash_palette(&mut self, chat: &mut ActiveChat) -> bool {
         update_slash_palette_async(chat, self)
     }
@@ -805,6 +821,13 @@ impl ChatLoopState {
         chat: &mut ActiveChat,
         stroke: KeyStroke,
     ) -> SlashPaletteRootOutcome {
+        if stroke.key == bmux_keyboard::KeyCode::Escape && stroke.modifiers.is_empty() {
+            self.slash_completion.dismiss(chat.app.composer().text());
+            if self.slash_palette.take().is_some() {
+                chat.app.set_status("slash completions hidden".to_owned());
+                return SlashPaletteRootOutcome::Handled;
+            }
+        }
         let Some(palette) = self.slash_palette.as_mut() else {
             return SlashPaletteRootOutcome::Unhandled;
         };
@@ -819,6 +842,7 @@ impl ChatLoopState {
             }
             bmux_keyboard::KeyCode::Tab if stroke.modifiers.is_empty() => {
                 let command = palette.selected_command().map(str::to_owned);
+                self.slash_completion.dismiss(chat.app.composer().text());
                 self.slash_palette = None;
                 if let Some(command) = command {
                     chat.app.reset_input_history_navigation();
@@ -828,11 +852,13 @@ impl ChatLoopState {
             }
             bmux_keyboard::KeyCode::Enter if stroke.modifiers.is_empty() => {
                 if palette.selected_matches(chat.app.composer().text()) {
+                    self.slash_completion.dismiss(chat.app.composer().text());
                     self.slash_palette = None;
                     chat.app.stage_submission();
                     SlashPaletteRootOutcome::Submit
                 } else {
                     let command = palette.selected_command().map(str::to_owned);
+                    self.slash_completion.dismiss(chat.app.composer().text());
                     self.slash_palette = None;
                     if let Some(command) = command {
                         chat.app.reset_input_history_navigation();
@@ -842,6 +868,7 @@ impl ChatLoopState {
                 }
             }
             bmux_keyboard::KeyCode::Escape if stroke.modifiers.is_empty() => {
+                self.slash_completion.dismiss(chat.app.composer().text());
                 self.slash_palette = None;
                 chat.app.set_status("slash completions hidden".to_owned());
                 SlashPaletteRootOutcome::Handled
@@ -866,16 +893,25 @@ impl ChatLoopState {
             mouse.position.y,
             palette.item_count(),
         ) else {
+            self.slash_completion.dismiss(chat.app.composer().text());
             self.slash_palette = None;
             return true;
         };
+        let Some(list_area) = slash_palette_render::slash_palette_list_area(
+            frame_area,
+            chat.app.composer_content_area(),
+            palette.item_count(),
+        ) else {
+            return false;
+        };
         if let Some(command) = palette
-            .select_visible_row(row, usize::from(frame_area.height))
+            .select_visible_row(row, usize::from(list_area.height))
             .map(str::to_owned)
         {
             chat.app.reset_input_history_navigation();
             chat.app.replace_composer_with(&command);
         }
+        self.slash_completion.dismiss(chat.app.composer().text());
         self.slash_palette = None;
         true
     }
@@ -2391,6 +2427,7 @@ pub struct TuiRuntimeSettings {
     mouse_scroll_rows: usize,
     selection_autoscroll: bool,
     selection: bcode_config::TuiSelectionConfig,
+    completion_settings: bcode_config::CompletionConfig,
     frame_interval: Option<Duration>,
     runtime_config: bmux_tui_runtime::RuntimeConfig,
     metrics_enabled: bool,
@@ -2411,6 +2448,7 @@ impl TuiRuntimeSettings {
             mouse_scroll_rows: tui_config.mouse.effective_scroll_rows(),
             selection_autoscroll: tui_config.mouse.selection_autoscroll,
             selection: tui_config.selection,
+            completion_settings: bcode_config::CompletionConfig::default(),
             frame_interval: tui_config.render.frame_interval(),
             runtime_config: super::runtime_adapter::config(&tui_config),
             metrics_enabled: false,
@@ -2425,6 +2463,17 @@ impl TuiRuntimeSettings {
     pub const fn with_launch_options(mut self, launch_options: super::TuiLaunchOptions) -> Self {
         self.launch_options = launch_options;
         self
+    }
+
+    /// Return renderer-neutral command completion preferences.
+    #[must_use]
+    pub const fn completion_settings(&self) -> bcode_config::CompletionConfig {
+        self.completion_settings
+    }
+
+    /// Update command completion preferences without rereading configuration.
+    pub const fn set_completion_settings(&mut self, settings: bcode_config::CompletionConfig) {
+        self.completion_settings = settings;
     }
 
     pub fn apply_tui_config(&mut self, tui_config: &TuiConfig) {
@@ -2834,8 +2883,12 @@ pub fn apply_effect_result(
         TuiEffectResult::SaveDraft { text, result } => {
             apply_save_draft_result(chat, draft_autosave, text, result);
         }
-        TuiEffectResult::SlashPaletteLoaded { query, palette } => {
-            apply_slash_palette_result(chat, loop_state, &query, palette);
+        TuiEffectResult::SlashPaletteLoaded {
+            query,
+            palette,
+            generation,
+        } => {
+            apply_slash_palette_result(chat, loop_state, &query, palette, generation);
         }
         TuiEffectResult::CommandPaletteLoaded { result } => {
             if loop_state.palette.is_some() {
@@ -3296,6 +3349,10 @@ pub fn apply_config_result(
         Ok(config) => {
             let previous_interactions = chat.app.tui_config().interactions;
             settings.apply_tui_config(&config.tui);
+            settings.set_completion_settings(config.presentation.completion);
+            loop_state.set_slash_palette_settings(settings.completion_settings());
+            loop_state.invalidate_slash_palette_discovery();
+            loop_state.refresh_slash_palette(chat);
             settings.set_metrics_enabled(config.metrics.enabled);
             loop_state.telemetry.set_enabled(config.metrics.enabled);
             let default_plugin_ids =
@@ -3632,24 +3689,64 @@ fn apply_save_draft_result(
     }
 }
 
+fn slash_completion_context(chat: &ActiveChat) -> slash_palette::SlashCompletionContext {
+    slash_palette::SlashCompletionContext {
+        session_id: chat.app.session_id(),
+        working_directory: chat
+            .app
+            .working_directory()
+            .map(std::path::Path::to_path_buf),
+        provider_plugin_id: chat.app.selected_provider_plugin_id().map(str::to_owned),
+        model_id: chat.app.selected_model_id().map(str::to_owned),
+    }
+}
+
 fn apply_slash_palette_result(
     chat: &ActiveChat,
     loop_state: &mut ChatLoopState,
     query: &str,
-    mut palette: slash_palette::SlashPalette,
+    palette: slash_palette::SlashPalette,
+    generation: u64,
 ) {
-    if query != chat.app.composer().text() {
+    if loop_state
+        .slash_completion
+        .set_context(slash_completion_context(chat))
+    {
+        loop_state.slash_palette = None;
+    }
+    let fallback = palette.clone();
+    if !loop_state
+        .slash_completion
+        .accept(generation, query, palette)
+    {
         return;
     }
-    if let Some(previous) = loop_state
-        .slash_palette
-        .as_ref()
-        .filter(|current| current.query() == query)
-        .and_then(|current| current.selected_command().map(str::to_owned))
-    {
-        palette.select_command(&previous);
+    let current_query = chat.app.composer().text();
+    if !current_query.starts_with('/') || loop_state.slash_completion.is_dismissed(current_query) {
+        return;
     }
-    loop_state.slash_palette = (!palette.is_empty()).then_some(palette);
+    if let Some(mut palette) = loop_state
+        .slash_completion
+        .cached(current_query)
+        .or_else(|| loop_state.slash_completion.snapshot(current_query))
+        .or_else(|| {
+            (slash_palette::discovery_scope(query) == slash_palette::discovery_scope(current_query))
+                .then(|| {
+                    let mut palette = fallback;
+                    palette.refilter(current_query, loop_state.slash_completion.settings);
+                    palette
+                })
+        })
+    {
+        if let Some(previous) = loop_state
+            .slash_palette
+            .as_ref()
+            .and_then(slash_palette::SlashPalette::explicit_selection)
+        {
+            palette.select_command(previous);
+        }
+        loop_state.slash_palette = (!palette.is_empty()).then_some(palette);
+    }
 }
 
 #[allow(clippy::too_many_lines)]
@@ -4400,31 +4497,72 @@ pub fn start_draft_save(chat: &mut ActiveChat, draft_autosave: &mut DraftAutosav
 }
 
 fn update_slash_palette_async(chat: &mut ActiveChat, loop_state: &mut ChatLoopState) -> bool {
-    let current_query = chat.app.composer().text();
-    if !current_query.starts_with('/') {
+    let context = slash_completion_context(chat);
+    if loop_state.slash_completion.set_context(context) {
+        loop_state.slash_palette = None;
+    }
+    let query = chat.app.composer().text().to_owned();
+    if !query.starts_with('/') {
+        loop_state.slash_completion.dismiss(&query);
         loop_state.slash_palette = None;
         ChatLoopState::queue_effect_cancellation(
             chat,
             TuiEffect::LoadSlashPalette {
+                provider_plugin_id: None,
                 query: String::new(),
                 session_id: None,
+                generation: 0,
             },
         );
         return true;
     }
-    let query = current_query.to_owned();
-    let previous = loop_state
-        .slash_palette
-        .as_ref()
-        .filter(|palette| palette.query() == current_query)
-        .and_then(|palette| palette.selected_command().map(str::to_owned));
-    if previous.is_none() {
-        loop_state.slash_palette = None;
+    if loop_state.slash_completion.is_dismissed(&query) {
+        return false;
     }
-    chat.replace_effect(TuiEffect::LoadSlashPalette {
-        query,
-        session_id: chat.app.session_id(),
-    });
+    if let Some(mut palette) = loop_state.slash_completion.cached(&query) {
+        if let Some(previous) = loop_state
+            .slash_palette
+            .as_ref()
+            .and_then(slash_palette::SlashPalette::explicit_selection)
+        {
+            palette.select_command(previous);
+        }
+        loop_state.slash_palette = (!palette.is_empty()).then_some(palette);
+        return true;
+    }
+    // Expiry triggers discovery without discarding the last scoped snapshot.
+    if let Some(mut palette) = loop_state.slash_completion.snapshot(&query) {
+        if let Some(previous) = loop_state
+            .slash_palette
+            .as_ref()
+            .and_then(slash_palette::SlashPalette::explicit_selection)
+        {
+            palette.select_command(previous);
+        }
+        loop_state.slash_palette = (!palette.is_empty()).then_some(palette);
+    }
+    // Retain a same-scope popup while discovery is pending; never hide/fetch/show on typing.
+    if let Some(palette) = loop_state.slash_palette.as_mut() {
+        if slash_palette::discovery_scope(palette.query()) == slash_palette::discovery_scope(&query)
+        {
+            palette.refilter(&query, loop_state.slash_completion.settings);
+        } else {
+            loop_state.slash_palette = None;
+        }
+    }
+    if loop_state.slash_palette.is_none() {
+        let palette =
+            slash_palette::SlashPalette::immediate(&query, loop_state.slash_completion.settings);
+        loop_state.slash_palette = (!palette.is_empty()).then_some(palette);
+    }
+    if let Some(generation) = loop_state.slash_completion.request(&query) {
+        chat.replace_effect(TuiEffect::LoadSlashPalette {
+            provider_plugin_id: chat.app.selected_provider_plugin_id().map(str::to_owned),
+            query,
+            session_id: chat.app.session_id(),
+            generation,
+        });
+    }
     true
 }
 

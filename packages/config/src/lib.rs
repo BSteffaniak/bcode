@@ -2547,6 +2547,60 @@ pub struct PresentationConfig {
     #[config_doc(nested)]
     #[serde(default)]
     pub streaming: PresentationStreamingConfig,
+    /// Renderer-neutral command completion matching and ordering.
+    #[config_doc(nested)]
+    #[serde(default)]
+    pub completion: CompletionConfig,
+}
+
+/// Command completion matching and ordering preferences.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, ConfigDoc)]
+#[config_doc(section = "completion")]
+pub struct CompletionConfig {
+    /// Matching algorithm used for command names and descriptions.
+    #[serde(default)]
+    pub match_mode: CompletionMatchMode,
+    /// Ordering when the search query is empty.
+    #[serde(default)]
+    pub sort_order: CompletionSortOrder,
+    /// Ordering for nonempty searches; relevance prioritizes command names.
+    #[serde(default)]
+    pub filtered_sort_order: CompletionFilteredSortOrder,
+}
+
+/// Supported completion matching algorithms.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, ConfigDocEnum)]
+#[serde(rename_all = "snake_case")]
+pub enum CompletionMatchMode {
+    /// Match ordered subsequences, ranking contiguous and boundary matches higher.
+    #[default]
+    Fuzzy,
+    /// Match only prefixes.
+    Prefix,
+    /// Match contiguous substrings.
+    Substring,
+}
+
+/// Ordering for an empty completion query.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, ConfigDocEnum)]
+#[serde(rename_all = "snake_case")]
+pub enum CompletionSortOrder {
+    /// Order by normalized command name, independent of discovery source.
+    #[default]
+    Alphabetical,
+}
+
+/// Ordering for a nonempty completion query.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, ConfigDocEnum)]
+#[serde(rename_all = "snake_case")]
+pub enum CompletionFilteredSortOrder {
+    /// Rank command-name matches before description-only matches.
+    #[default]
+    Relevance,
+    /// Order matching commands alphabetically.
+    Alphabetical,
+    /// Use the configured empty-query order.
+    Inherit,
 }
 
 /// Renderer-neutral live text stream presentation configuration.
@@ -8044,6 +8098,34 @@ fn write_presentation_toml(output: &mut String, presentation: PresentationConfig
     if presentation == PresentationConfig::default() {
         return;
     }
+    if presentation.completion != CompletionConfig::default() {
+        let completion = presentation.completion;
+        writeln!(output, "[presentation.completion]").expect("writing to string should not fail");
+        let match_mode = match completion.match_mode {
+            CompletionMatchMode::Fuzzy => "fuzzy",
+            CompletionMatchMode::Prefix => "prefix",
+            CompletionMatchMode::Substring => "substring",
+        };
+        writeln!(output, "match_mode = {}", toml_string(match_mode))
+            .expect("writing to string should not fail");
+        writeln!(output, "sort_order = {}", toml_string("alphabetical"))
+            .expect("writing to string should not fail");
+        let filtered_sort_order = match completion.filtered_sort_order {
+            CompletionFilteredSortOrder::Relevance => "relevance",
+            CompletionFilteredSortOrder::Alphabetical => "alphabetical",
+            CompletionFilteredSortOrder::Inherit => "inherit",
+        };
+        writeln!(
+            output,
+            "filtered_sort_order = {}",
+            toml_string(filtered_sort_order)
+        )
+        .expect("writing to string should not fail");
+        output.push('\n');
+    }
+    if presentation.streaming == PresentationStreamingConfig::default() {
+        return;
+    }
     let streaming = presentation.streaming;
     writeln!(output, "[presentation.streaming]").expect("writing to string should not fail");
     writeln!(output, "enabled = {}", streaming.enabled).expect("writing to string should not fail");
@@ -10026,6 +10108,32 @@ max_lag_ms = 5000
         assert!(rendered.contains("max_lag_ms = 5000"), "{rendered}");
         let reparsed: BcodeConfig = toml::from_str(&rendered).expect("rendered config parses");
         assert_eq!(reparsed.presentation, config.presentation);
+    }
+
+    #[test]
+    fn completion_configuration_defaults_and_round_trips() {
+        assert_eq!(
+            BcodeConfig::default().presentation.completion,
+            super::CompletionConfig::default()
+        );
+        for mode in ["fuzzy", "prefix", "substring"] {
+            for order in ["relevance", "alphabetical", "inherit"] {
+                let input = format!(
+                    "[presentation.completion]\nmatch_mode = {mode:?}\nsort_order = \"alphabetical\"\nfiltered_sort_order = {order:?}\n"
+                );
+                let config: BcodeConfig = toml::from_str(&input).expect("completion config parses");
+                let rendered = super::config_to_toml(&config);
+                let reparsed: BcodeConfig = toml::from_str(&rendered).expect("config round trips");
+                assert_eq!(reparsed.presentation, config.presentation);
+            }
+        }
+        for input in [
+            "[presentation.completion]\nmatch_mode = 'unknown'",
+            "[presentation.completion]\nsort_order = 'unknown'",
+            "[presentation.completion]\nfiltered_sort_order = 'unknown'",
+        ] {
+            assert!(toml::from_str::<BcodeConfig>(input).is_err());
+        }
     }
 
     #[test]

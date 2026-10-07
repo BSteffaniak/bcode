@@ -10,6 +10,8 @@
 #[cfg(test)]
 mod bpdl_contract_tests;
 
+pub mod completion;
+
 use bcode_model::ReasoningEffort;
 use bcode_session_models::SessionId;
 use serde::{Deserialize, Serialize};

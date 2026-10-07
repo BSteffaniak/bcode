@@ -168,6 +168,24 @@ exact revision is whatever `Cargo.lock` records rather than a value duplicated h
 limits presentation only and never delays semantic updates, authorization, cancellation dispatch, or
 canonical execution.
 
+## Command completion presentation
+
+Command completion preferences are renderer-neutral and configured separately from terminal
+geometry and theme roles:
+
+```toml
+[presentation.completion]
+match_mode = "fuzzy"               # fuzzy, prefix, substring
+sort_order = "alphabetical"        # empty query
+filtered_sort_order = "relevance"  # relevance, alphabetical, inherit
+```
+
+Relevance ranks command-name matches ahead of description-only matches. Within each field,
+exact matches precede prefixes, boundary substrings, other substrings, and scored fuzzy matches.
+Equal matches use deterministic command-name ordering rather than discovery source priority.
+`inherit` uses the empty-query order. These preferences do not change command execution or
+permission semantics.
+
 ## Session picker and search scope
 
 The TUI keeps local canonical-summary filtering distinct from transcript search. Local filtering is

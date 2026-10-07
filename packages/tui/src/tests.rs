@@ -2959,15 +2959,226 @@ fn slash_palette_renders_above_composer() {
     );
     let output = rendered_text(&buffer);
 
-    assert!(output.contains("Commands & Skills"));
+    assert!(output.contains("Commands"));
     assert!(output.contains("/plan"));
     assert!(buffer.row_symbols(0).unwrap().trim().is_empty());
+    assert!(buffer.row_symbols(13).unwrap().contains("Commands"));
+}
+
+#[test]
+fn slash_palette_layout_is_bounded_at_tiny_sizes() {
+    let palette = slash_palette::SlashPalette::from_items(vec![("/界👩‍💻e\u{301}", "Description")]);
+    for width in 0..16 {
+        for composer_y in 1..6 {
+            let bounds = Rect::new(0, 0, width, 8);
+            let composer = Rect::new(2, composer_y, width.saturating_sub(4), 1);
+            let area = slash_palette_render::slash_palette_area(
+                bounds,
+                slash_palette_render::composer_panel_area(composer),
+                palette.item_count(),
+            );
+            if let Some(area) = area {
+                assert!(area.right() <= bounds.right());
+                assert!(area.bottom() <= composer_y.saturating_sub(1));
+                assert!(area.height >= 3);
+            }
+            let mut buffer = Buffer::empty(bounds);
+            let mut frame = Frame::new(&mut buffer);
+            slash_palette_render::render_palette(
+                &palette,
+                composer,
+                &mut bmux_tui::paint::PaintCx::new(&mut frame),
+                render::TuiTheme::for_agent("build", None, true),
+            );
+            if area.is_none() {
+                assert!(buffer.cells().iter().all(|cell| cell.symbol == " "));
+            }
+        }
+    }
+}
+
+#[test]
+fn slash_palette_mouse_agrees_with_painted_scrolled_rows() {
+    let mut palette = slash_palette::SlashPalette::from_items(vec![
+        ("/zero", "Zero"),
+        ("/one", "One"),
+        ("/two", "Two"),
+        ("/three", "Three"),
+        ("/four", "Four"),
+        ("/five", "Five"),
+        ("/six", "Six"),
+        ("/seven", "Seven"),
+        ("/eight", "Eight"),
+    ]);
+    palette.select_command("/eight");
+    let bounds = Rect::new(0, 0, 50, 20);
+    let composer = Rect::new(2, 18, 46, 1);
+    let area = slash_palette_render::slash_palette_area(
+        bounds,
+        slash_palette_render::composer_panel_area(composer),
+        palette.item_count(),
+    )
+    .unwrap();
+    let list =
+        slash_palette_render::slash_palette_list_area(bounds, composer, palette.item_count())
+            .unwrap();
+    let mut buffer = Buffer::empty(bounds);
+    let mut frame = Frame::new(&mut buffer);
+    slash_palette_render::render_palette(
+        &palette,
+        composer,
+        &mut bmux_tui::paint::PaintCx::new(&mut frame),
+        render::TuiTheme::for_agent("build", None, true),
+    );
+    for y in area.y..area.bottom() {
+        for x in area.x..area.right() {
+            let hit = slash_palette_render::slash_palette_row_from_mouse(
+                bounds,
+                composer,
+                x,
+                y,
+                palette.item_count(),
+            );
+            if y == area.y || y == area.bottom() - 1 || x < area.x + 2 || x >= area.right() - 2 {
+                assert_eq!(hit, None, "chrome/padding must not select at {x},{y}");
+            } else {
+                let row = usize::from(y - list.y);
+                assert_eq!(hit, Some(row));
+                let source = palette
+                    .visible_items(usize::from(list.height))
+                    .nth(row)
+                    .unwrap();
+                assert!(
+                    buffer
+                        .row_symbols(y)
+                        .unwrap()
+                        .contains(source.item.command())
+                );
+                let mut clicked = palette.clone();
+                assert_eq!(
+                    clicked.select_visible_row(row, usize::from(list.height)),
+                    Some(source.item.command())
+                );
+            }
+        }
+    }
     assert!(
         buffer
-            .row_symbols(13)
+            .row_symbols(area.bottom() - 2)
             .unwrap()
-            .contains("Commands & Skills")
+            .contains("› /eight")
     );
+}
+
+#[test]
+fn slash_palette_command_first_unicode_clipping_and_styles() {
+    use bmux_tui::geometry::Point;
+    use bmux_tui::style::Modifier;
+
+    let palette = slash_palette::SlashPalette::from_items(vec![
+        ("/selected", "Selection"),
+        ("/界👩‍💻e\u{301}", "Muted description"),
+        ("/this-command-is-longer-than-thirty-columns", "Details"),
+    ]);
+    let theme = render::TuiTheme::for_agent("build", None, true);
+    for width in [9, 16, 28, 80] {
+        let bounds = Rect::new(0, 0, width, 20);
+        let composer = Rect::new(2, 18, width - 4, 1);
+        let mut buffer = Buffer::empty(bounds);
+        let mut frame = Frame::new(&mut buffer);
+        slash_palette_render::render_palette(
+            &palette,
+            composer,
+            &mut bmux_tui::paint::PaintCx::new(&mut frame),
+            theme,
+        );
+        let area = slash_palette_render::slash_palette_area(
+            bounds,
+            slash_palette_render::composer_panel_area(composer),
+            palette.item_count(),
+        )
+        .unwrap();
+        for y in area.y..area.bottom() {
+            assert_eq!(
+                buffer.get(Point::new(area.right() - 1, y)).unwrap().symbol,
+                if y == area.y {
+                    "┐"
+                } else if y == area.bottom() - 1 {
+                    "┘"
+                } else {
+                    "│"
+                }
+            );
+        }
+        if width == 80 {
+            let output = rendered_text(&buffer);
+            assert!(output.contains("/界👩‍💻e\u{301}  [cmd]  Muted description"));
+            assert!(output.contains("/this-command-is-longer-than-thirty-columns"));
+            let command = buffer.get(Point::new(area.x + 4, area.y + 2)).unwrap();
+            assert!(command.style.modifiers.contains(Modifier::BOLD));
+            assert_eq!(command.style.fg, theme.text.fg);
+            let description_x = area.x
+                + 4
+                + u16::try_from(bmux_tui::text_width::display_width("/界👩‍💻e\u{301}")).unwrap()
+                + 9;
+            let description = buffer.get(Point::new(description_x, area.y + 2)).unwrap();
+            assert_eq!(description.style.fg, theme.muted.fg);
+            assert!(!description.style.modifiers.contains(Modifier::BOLD));
+            assert_eq!(description.style.bg, theme.raised.bg);
+        }
+    }
+}
+
+#[test]
+fn slash_palette_repaints_presented_focus_and_selection_styles() {
+    use bmux_tui::geometry::Point;
+    use bmux_tui::style::Color;
+
+    let palette =
+        slash_palette::SlashPalette::from_items(vec![("/plan", "Plan"), ("/build", "Build")]);
+    let bounds = Rect::new(0, 0, 50, 20);
+    let composer = Rect::new(2, 18, 46, 1);
+    let area = slash_palette_render::slash_palette_area(
+        bounds,
+        slash_palette_render::composer_panel_area(composer),
+        palette.item_count(),
+    )
+    .unwrap();
+    let mut buffer = Buffer::empty(bounds);
+    for accent in [Color::Red, Color::Green] {
+        let mut theme = render::TuiTheme::for_agent("build", None, true);
+        theme.focused = theme.focused.fg(accent).bg(Color::Yellow);
+        theme.selection = theme.selection.bg(Color::Blue);
+        let mut frame = Frame::new(&mut buffer);
+        slash_palette_render::render_palette(
+            &palette,
+            composer,
+            &mut bmux_tui::paint::PaintCx::new(&mut frame),
+            theme,
+        );
+        for point in [
+            Point::new(area.x, area.y + 1),
+            Point::new(area.x + 3, area.y),
+            Point::new(area.x + 2, area.y + 1),
+        ] {
+            assert_eq!(buffer.get(point).unwrap().style.fg, Some(accent));
+        }
+        for x in area.x + 2..area.right() - 2 {
+            assert_eq!(
+                buffer.get(Point::new(x, area.y + 1)).unwrap().style.bg,
+                Some(Color::Blue),
+                "selected row background at {x}"
+            );
+        }
+        assert_eq!(
+            buffer
+                .get(Point::new(area.right() - 3, area.y + 2))
+                .unwrap()
+                .style
+                .bg,
+            theme.raised.bg
+        );
+    }
 }
 
 #[test]

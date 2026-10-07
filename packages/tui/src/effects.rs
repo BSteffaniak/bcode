@@ -286,6 +286,10 @@ pub enum TuiEffect {
     },
     /// Load slash command completions for a composer query.
     LoadSlashPalette {
+        /// Active provider scope for model discovery.
+        provider_plugin_id: Option<String>,
+        /// Composer discovery generation.
+        generation: u64,
         /// Current slash query.
         query: String,
         /// Active session, if any.
@@ -717,6 +721,8 @@ pub enum TuiEffectResult {
     },
     /// Slash palette load completed.
     SlashPaletteLoaded {
+        /// Composer discovery generation.
+        generation: u64,
         /// Query used to build completions.
         query: String,
         /// Loaded palette state.
@@ -1894,9 +1900,24 @@ impl TuiEffect {
                 .map(|_| ());
                 TuiEffectResult::SaveDraft { text, result }
             }
-            Self::LoadSlashPalette { query, session_id } => {
-                let palette = slash_palette::SlashPalette::new(&client, session_id, &query).await;
-                TuiEffectResult::SlashPaletteLoaded { query, palette }
+            Self::LoadSlashPalette {
+                query,
+                session_id,
+                generation,
+                provider_plugin_id,
+            } => {
+                let palette = slash_palette::SlashPalette::discover(
+                    &client,
+                    session_id,
+                    provider_plugin_id,
+                    &query,
+                )
+                .await;
+                TuiEffectResult::SlashPaletteLoaded {
+                    query,
+                    palette,
+                    generation,
+                }
             }
             Self::LoadCommandPalette => TuiEffectResult::CommandPaletteLoaded {
                 result: client

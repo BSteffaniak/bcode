@@ -5,10 +5,139 @@ use bcode_client::BcodeClient;
 use bcode_command::{CommandContribution, CommandSurface};
 use bcode_session_models::SessionId;
 
+use bcode_command::completion::{
+    CompletionMatchMode, completion_match_rank, normalize_completion as normalize,
+};
+use bcode_config::{CompletionConfig, CompletionFilteredSortOrder};
+use std::collections::BTreeMap;
+
+/// Discovery scope; argument edits reuse candidates without another RPC.
+pub fn discovery_scope(query: &str) -> String {
+    let parts = query
+        .trim_start_matches('/')
+        .split_whitespace()
+        .collect::<Vec<_>>();
+    match parts.first().copied() {
+        Some("agent" | "skill" | "model" | "set-model" | "provider" | "set-provider") => {
+            parts[0].to_owned()
+        }
+        Some("thinking") if matches!(parts.get(1), Some(&"effort" | &"summary")) => {
+            format!("thinking {}", parts[1])
+        }
+        _ => String::new(),
+    }
+}
+
+/// Facts that affect candidate discovery, without presentation-derived identities.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct SlashCompletionContext {
+    pub session_id: Option<SessionId>,
+    pub working_directory: Option<std::path::PathBuf>,
+    pub provider_plugin_id: Option<String>,
+    pub model_id: Option<String>,
+}
+
+/// Composer-local discovery cache and stale-result fence.
+///
+/// Only the finite built-in discovery scopes are retained. Successful discovery stays
+/// fresh for 60 seconds; the next composer refresh renews expired discovery atomically.
+/// Reload and catalog-change notifications can explicitly invalidate it sooner. Failed
+/// discovery is never retained as a successful cache entry.
+#[derive(Debug, Default)]
+pub struct SlashCompletionState {
+    context: SlashCompletionContext,
+    candidates: BTreeMap<String, (std::time::Instant, SlashPalette)>,
+    pending: Option<(u64, String)>,
+    generation: u64,
+    dismissed_query: Option<String>,
+    pub settings: CompletionConfig,
+}
+
+impl SlashCompletionState {
+    pub fn set_context(&mut self, context: SlashCompletionContext) -> bool {
+        if self.context != context {
+            self.context = context;
+            self.candidates.clear();
+            self.pending = None;
+            self.dismissed_query = None;
+            self.generation = self.generation.wrapping_add(1);
+            return true;
+        }
+        false
+    }
+
+    pub fn invalidate(&mut self) {
+        self.candidates.clear();
+        self.pending = None;
+        self.generation = self.generation.wrapping_add(1);
+    }
+
+    pub fn dismiss(&mut self, query: &str) {
+        self.generation = self.generation.wrapping_add(1);
+        self.pending = None;
+        self.dismissed_query = Some(query.to_owned());
+    }
+
+    pub fn is_dismissed(&mut self, query: &str) -> bool {
+        if self.dismissed_query.as_deref() == Some(query) {
+            true
+        } else {
+            self.dismissed_query = None;
+            false
+        }
+    }
+
+    pub fn snapshot(&self, query: &str) -> Option<SlashPalette> {
+        let (_, cached) = self.candidates.get(&discovery_scope(query))?;
+        let mut palette = cached.clone();
+        palette.refilter(query, self.settings);
+        Some(palette)
+    }
+
+    pub fn cached(&self, query: &str) -> Option<SlashPalette> {
+        let (discovered_at, cached) = self.candidates.get(&discovery_scope(query))?;
+        if discovered_at.elapsed() >= std::time::Duration::from_mins(1) {
+            return None;
+        }
+        let mut palette = cached.clone();
+        palette.refilter(query, self.settings);
+        Some(palette)
+    }
+
+    pub fn request(&mut self, query: &str) -> Option<u64> {
+        let scope = discovery_scope(query);
+        if self
+            .pending
+            .as_ref()
+            .is_some_and(|(_, pending)| *pending == scope)
+        {
+            return None;
+        }
+        self.generation = self.generation.wrapping_add(1);
+        self.pending = Some((self.generation, scope));
+        Some(self.generation)
+    }
+
+    pub fn accept(&mut self, generation: u64, query: &str, palette: SlashPalette) -> bool {
+        if self.pending.as_ref() != Some(&(generation, discovery_scope(query))) {
+            return false;
+        }
+        self.pending = None;
+        if palette.discovery_complete {
+            self.candidates
+                .insert(discovery_scope(query), (std::time::Instant::now(), palette));
+        }
+        true
+    }
+}
+
 /// Slash completion picker.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SlashPalette {
+    discovery_complete: bool,
+    candidates: Vec<SlashItem>,
     items: Vec<SlashItem>,
+    explicitly_selected: bool,
     selected: usize,
     query: String,
 }
@@ -31,13 +160,66 @@ pub struct VisibleSlashItem<'a> {
 }
 
 impl SlashPalette {
-    /// Create slash completion state.
-    pub async fn new(client: &BcodeClient, session_id: Option<SessionId>, query: &str) -> Self {
-        let items = slash_items(client, session_id, query).await;
-        Self {
-            items,
+    /// Discover candidates for the active provider and session.
+    pub(super) async fn discover(
+        client: &BcodeClient,
+        session_id: Option<SessionId>,
+        provider_plugin_id: Option<String>,
+        query: &str,
+    ) -> Self {
+        let discovery = slash_items(client, session_id, provider_plugin_id, query).await;
+        let discovery_complete = discovery.is_some();
+        let candidates = discovery.unwrap_or_else(|| Self::fallback_candidates(query));
+        let mut palette = Self {
+            discovery_complete,
+            candidates,
+            items: Vec::new(),
+            explicitly_selected: false,
             selected: 0,
-            query: query.to_owned(),
+            query: String::new(),
+        };
+        palette.refilter(query, CompletionConfig::default());
+        palette
+    }
+
+    fn fallback_candidates(query: &str) -> Vec<SlashItem> {
+        if discovery_scope(query).is_empty() {
+            static_items()
+        } else {
+            Vec::new()
+        }
+    }
+
+    pub(super) fn immediate(query: &str, settings: CompletionConfig) -> Self {
+        let mut palette = Self {
+            discovery_complete: false,
+            candidates: Self::fallback_candidates(query),
+            items: Vec::new(),
+            explicitly_selected: false,
+            selected: 0,
+            query: String::new(),
+        };
+        palette.refilter(query, settings);
+        palette
+    }
+
+    /// Refilter cached discovery synchronously, retaining only intentional navigation.
+    pub fn refilter(&mut self, query: &str, settings: CompletionConfig) {
+        let previous = self.explicit_selection().map(str::to_owned);
+        self.items = filter_items_with_settings(self.candidates.clone(), query, settings);
+        query.clone_into(&mut self.query);
+        self.selected = 0;
+        self.explicitly_selected = false;
+        if let Some(previous) = previous {
+            self.select_command(&previous);
+        }
+    }
+
+    pub(super) fn explicit_selection(&self) -> Option<&str> {
+        if self.explicitly_selected {
+            self.selected_command()
+        } else {
+            None
         }
     }
 
@@ -57,12 +239,6 @@ impl SlashPalette {
     #[must_use]
     pub fn query(&self) -> &str {
         &self.query
-    }
-
-    /// Number of discovered skill completions in this result.
-    #[must_use]
-    pub fn skill_count(&self) -> usize {
-        self.items.iter().filter(|item| item.is_skill()).count()
     }
 
     /// Return the number of completion items.
@@ -95,6 +271,7 @@ impl SlashPalette {
     pub fn select_command(&mut self, command: &str) {
         if let Some(index) = self.items.iter().position(|item| item.command == command) {
             self.selected = index;
+            self.explicitly_selected = true;
         }
     }
 
@@ -102,6 +279,7 @@ impl SlashPalette {
     pub fn select_visible_row(&mut self, row: usize, height: usize) -> Option<&str> {
         let selected = self.selected_index();
         let start = selected.saturating_sub(height.saturating_sub(1));
+        self.explicitly_selected = true;
         self.selected = start
             .saturating_add(row)
             .min(self.items.len().saturating_sub(1));
@@ -110,11 +288,13 @@ impl SlashPalette {
 
     /// Move selection to previous item.
     pub const fn move_previous(&mut self) {
+        self.explicitly_selected = true;
         self.selected = self.selected.saturating_sub(1);
     }
 
     /// Move selection to next item.
     pub fn move_next(&mut self) {
+        self.explicitly_selected = true;
         self.selected = self
             .selected
             .saturating_add(1)
@@ -130,11 +310,15 @@ impl SlashPalette {
 
     #[cfg(test)]
     pub fn from_items(items: Vec<(&str, &str)>) -> Self {
+        let items: Vec<_> = items
+            .into_iter()
+            .map(|(command, description)| item(command, description))
+            .collect();
         Self {
-            items: items
-                .into_iter()
-                .map(|(command, description)| item(command, description))
-                .collect(),
+            candidates: items.clone(),
+            items,
+            discovery_complete: true,
+            explicitly_selected: false,
             selected: 0,
             query: String::new(),
         }
@@ -164,20 +348,19 @@ impl SlashItem {
 async fn slash_items(
     client: &BcodeClient,
     session_id: Option<SessionId>,
+    provider_plugin_id: Option<String>,
     query: &str,
-) -> Vec<SlashItem> {
+) -> Option<Vec<SlashItem>> {
     let trimmed = query.trim_start_matches('/');
     let parts = trimmed.split_whitespace().collect::<Vec<_>>();
-    let candidates = if parts.first() == Some(&"agent")
-        && let Ok(agents) = client.list_agents().await
-    {
+    let candidates = if parts.first() == Some(&"agent") {
+        let agents = client.list_agents().await.ok()?;
         agents
             .into_iter()
             .map(|agent| item(format!("/agent {}", agent.id), agent.name))
             .collect()
-    } else if matches!(parts.first(), Some(&"skill"))
-        && let Ok(skills) = client.list_skills().await
-    {
+    } else if matches!(parts.first(), Some(&"skill")) {
+        let skills = client.list_skills().await.ok()?;
         skills
             .skills
             .into_iter()
@@ -191,39 +374,43 @@ async fn slash_items(
                 ]
             })
             .collect()
-    } else if matches!(parts.first(), Some(&"model" | &"set-model"))
-        && let Ok(models) = client.session_model_list(None).await
-    {
+    } else if matches!(parts.first(), Some(&"model" | &"set-model")) {
+        let models = client.session_model_list(provider_plugin_id).await.ok()?;
         models
             .models
             .into_iter()
-            .map(|model| item(format!("/model {}", model.model_id), model.display_name))
+            .map(|model| {
+                item(
+                    format!("/{} {}", parts[0], model.model_id),
+                    model.display_name,
+                )
+            })
             .collect()
-    } else if matches!(parts.first(), Some(&"provider" | &"set-provider"))
-        && let Ok(services) = client.plugin_services().await
-    {
+    } else if matches!(parts.first(), Some(&"provider" | &"set-provider")) {
+        let services = client.plugin_services().await.ok()?;
         services
             .into_iter()
             .filter(|service| service.interface_id == bcode_model::MODEL_PROVIDER_INTERFACE_ID)
             .map(|service| {
                 item(
-                    format!("/provider {}", service.plugin_id),
+                    format!("/{} {}", parts[0], service.plugin_id),
                     service.name.unwrap_or_else(|| "model provider".to_owned()),
                 )
             })
             .collect()
     } else if matches!(parts.first(), Some(&"thinking"))
         && matches!(parts.get(1), Some(&"effort" | &"summary"))
-        && let Some(session_id) = session_id
-        && let Ok(status) = client.session_model_status(session_id).await
     {
+        let status = client.session_model_status(session_id?).await.ok()?;
         thinking_items(parts[1], status.reasoning.as_ref())
     } else {
         let mut items = static_items();
-        if let Ok(contributions) = client.plugin_contributions().await {
+        {
+            let contributions = client.plugin_contributions().await.ok()?;
             items.extend(plugin_slash_items(contributions.command_contributions));
         }
-        if let Ok(skills) = client.list_skills().await {
+        {
+            let skills = client.list_skills().await.ok()?;
             items.extend(skills.skills.into_iter().filter_map(|skill| {
                 slash_registry::is_non_conflicting_skill_alias(&skill.id).then(|| {
                     let description = skill
@@ -235,7 +422,7 @@ async fn slash_items(
         }
         items
     };
-    filter_items(candidates, trimmed)
+    Some(candidates)
 }
 
 fn thinking_items(
@@ -258,74 +445,43 @@ fn thinking_items(
         .collect()
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-enum MatchRank {
-    Exact,
-    Prefix,
-    Fuzzy,
+#[cfg(test)]
+fn filter_items(items: Vec<SlashItem>, query: &str) -> Vec<SlashItem> {
+    filter_items_with_settings(items, query, CompletionConfig::default())
 }
 
-fn filter_items(items: Vec<SlashItem>, query: &str) -> Vec<SlashItem> {
-    let normalized_query = normalize(query);
-    if normalized_query.is_empty() {
-        return items;
-    }
+fn filter_items_with_settings(
+    items: Vec<SlashItem>,
+    query: &str,
+    settings: CompletionConfig,
+) -> Vec<SlashItem> {
+    let mode = match settings.match_mode {
+        bcode_config::CompletionMatchMode::Fuzzy => CompletionMatchMode::Fuzzy,
+        bcode_config::CompletionMatchMode::Prefix => CompletionMatchMode::Prefix,
+        bcode_config::CompletionMatchMode::Substring => CompletionMatchMode::Substring,
+    };
+    let relevance = !normalize(query).is_empty()
+        && settings.filtered_sort_order == CompletionFilteredSortOrder::Relevance;
     let mut matches = items
         .into_iter()
-        .enumerate()
-        .filter_map(|(index, item)| {
-            match_rank(&item, &normalized_query).map(|rank| (rank, index, item))
+        .filter_map(|item| {
+            completion_match_rank(&item.command, &item.description, query, mode)
+                .map(|rank| (rank, normalize(&item.command), item))
         })
         .collect::<Vec<_>>();
-    matches.sort_by_key(|(rank, index, _item)| (*rank, *index));
-    matches
-        .into_iter()
-        .map(|(_rank, _index, item)| item)
-        .collect()
-}
-
-fn match_rank(item: &SlashItem, normalized_query: &str) -> Option<MatchRank> {
-    let command = normalize(&item.command);
-    let description = normalize(&item.description);
-    if command == normalized_query || description == normalized_query {
-        Some(MatchRank::Exact)
-    } else if command.starts_with(normalized_query) || description.starts_with(normalized_query) {
-        Some(MatchRank::Prefix)
-    } else if fuzzy_matches(&command, normalized_query)
-        || command.contains(normalized_query)
-        || fuzzy_matches(&description, normalized_query)
-        || description.contains(normalized_query)
-    {
-        Some(MatchRank::Fuzzy)
-    } else {
-        None
-    }
-}
-
-fn fuzzy_matches(value: &str, query: &str) -> bool {
-    let mut query_chars = query.chars();
-    let Some(mut next_query_char) = query_chars.next() else {
-        return true;
-    };
-    for value_char in value.chars() {
-        if value_char == next_query_char {
-            if let Some(query_char) = query_chars.next() {
-                next_query_char = query_char;
+    matches.sort_by(
+        |(left_rank, left_name, left), (right_rank, right_name, right)| {
+            (if relevance {
+                left_rank.cmp(right_rank)
             } else {
-                return true;
-            }
-        }
-    }
-    false
-}
-
-fn normalize(value: &str) -> String {
-    value
-        .trim_start_matches('/')
-        .to_ascii_lowercase()
-        .split_whitespace()
-        .collect::<Vec<_>>()
-        .join(" ")
+                std::cmp::Ordering::Equal
+            })
+            .then_with(|| left_name.cmp(right_name))
+            .then_with(|| left.command.cmp(&right.command))
+            .then_with(|| left.description.cmp(&right.description))
+        },
+    );
+    matches.into_iter().map(|(_, _, item)| item).collect()
 }
 
 fn plugin_slash_items(
@@ -369,6 +525,162 @@ fn item(command: impl Into<String>, description: impl Into<String>) -> SlashItem
 
 #[cfg(test)]
 mod tests {
+    fn palette(commands: &[&str]) -> super::SlashPalette {
+        let candidates = commands
+            .iter()
+            .map(|command| super::item(*command, ""))
+            .collect();
+        let mut palette = super::SlashPalette {
+            discovery_complete: true,
+            candidates,
+            items: Vec::new(),
+            explicitly_selected: false,
+            selected: 0,
+            query: String::new(),
+        };
+        palette.refilter("/", bcode_config::CompletionConfig::default());
+        palette
+    }
+
+    #[test]
+    fn typing_refilters_and_only_preserves_explicit_navigation() {
+        let mut palette = palette(&["/other", "/resume-progress-doc", "/workflow.resume"]);
+        palette.refilter("/resume", bcode_config::CompletionConfig::default());
+        assert_eq!(palette.selected_command(), Some("/resume-progress-doc"));
+        palette.move_next();
+        palette.refilter("/resum", bcode_config::CompletionConfig::default());
+        assert_eq!(palette.selected_command(), Some("/workflow.resume"));
+        palette.refilter(
+            "/resume-progress",
+            bcode_config::CompletionConfig::default(),
+        );
+        assert_eq!(palette.selected_command(), Some("/resume-progress-doc"));
+    }
+
+    #[test]
+    fn discovery_cache_refilters_without_reloading() {
+        let mut state = super::SlashCompletionState::default();
+        let generation = state.request("/r").unwrap();
+        assert!(state.request("/re").is_none());
+        assert!(state.accept(generation, "/r", palette(&["/resume", "/other"])));
+        assert_eq!(
+            state.cached("/resume").unwrap().selected_command(),
+            Some("/resume")
+        );
+        assert!(state.cached("/model x").is_none());
+    }
+
+    #[test]
+    fn dismissal_and_context_changes_fence_late_results() {
+        let mut state = super::SlashCompletionState::default();
+        state.set_context(super::SlashCompletionContext {
+            model_id: Some("a".to_owned()),
+            ..Default::default()
+        });
+        let generation = state.request("/r").unwrap();
+        state.dismiss("/r");
+        assert!(!state.accept(generation, "/r", palette(&["/resume"])));
+        assert!(state.is_dismissed("/r"));
+        assert!(!state.is_dismissed("/re"));
+        let generation = state.request("/re").unwrap();
+        state.set_context(super::SlashCompletionContext {
+            model_id: Some("b".to_owned()),
+            ..Default::default()
+        });
+        assert!(!state.accept(generation, "/re", palette(&["/resume"])));
+        assert!(state.cached("/re").is_none());
+    }
+
+    #[test]
+    fn deterministic_ties_ignore_discovery_order() {
+        let first = super::filter_items(
+            vec![
+                super::skill_item("/zresume", ""),
+                super::item("/aresume", ""),
+            ],
+            "resume",
+        );
+        let second = super::filter_items(
+            vec![
+                super::item("/aresume", ""),
+                super::skill_item("/zresume", ""),
+            ],
+            "resume",
+        );
+        assert_eq!(first, second);
+        assert_eq!(first[0].command(), "/aresume");
+    }
+
+    #[test]
+    fn alphabetical_and_inherit_override_filtered_relevance() {
+        for order in [
+            bcode_config::CompletionFilteredSortOrder::Alphabetical,
+            bcode_config::CompletionFilteredSortOrder::Inherit,
+        ] {
+            let mut palette = palette(&["/resume", "/aresume"]);
+            palette.refilter(
+                "/resume",
+                bcode_config::CompletionConfig {
+                    filtered_sort_order: order,
+                    ..Default::default()
+                },
+            );
+            assert_eq!(palette.selected_command(), Some("/aresume"));
+        }
+    }
+
+    #[test]
+    fn static_candidates_are_immediate_and_failed_discovery_is_retryable() {
+        let immediate =
+            super::SlashPalette::immediate("/think", bcode_config::CompletionConfig::default());
+        assert!(!immediate.is_empty());
+        let mut state = super::SlashCompletionState::default();
+        let generation = state.request("/think").unwrap();
+        assert!(state.accept(generation, "/think", immediate));
+        assert!(state.cached("/think").is_none());
+        assert!(state.request("/think").is_some());
+    }
+
+    #[test]
+    fn invalidation_and_expiry_refresh_same_context() {
+        let mut state = super::SlashCompletionState::default();
+        let generation = state.request("/r").unwrap();
+        state.accept(generation, "/r", palette(&["/resume"]));
+        state.candidates.get_mut("").unwrap().0 = std::time::Instant::now()
+            .checked_sub(std::time::Duration::from_secs(61))
+            .expect("test clock supports cache expiry");
+        assert!(state.cached("/r").is_none());
+        assert_eq!(
+            state.snapshot("/resume").unwrap().selected_command(),
+            Some("/resume")
+        );
+        let generation = state.request("/r").unwrap();
+        state.invalidate();
+        assert!(!state.accept(generation, "/r", palette(&["/resume"])));
+        let generation = state.request("/r").unwrap();
+        assert!(state.accept(generation, "/r", palette(&["/replacement"])));
+        assert_eq!(
+            state.cached("/r").unwrap().selected_command(),
+            Some("/replacement")
+        );
+    }
+
+    #[test]
+    fn dynamic_scopes_separate_aliases_and_thinking_values() {
+        assert_eq!(
+            super::discovery_scope("/model foo"),
+            super::discovery_scope("/model bar")
+        );
+        assert_ne!(
+            super::discovery_scope("/model foo"),
+            super::discovery_scope("/set-model foo")
+        );
+        assert_ne!(
+            super::discovery_scope("/thinking effort high"),
+            super::discovery_scope("/thinking summary auto")
+        );
+    }
+
     #[test]
     fn skills_retain_their_source_and_are_searchable() {
         let items = super::filter_items(
