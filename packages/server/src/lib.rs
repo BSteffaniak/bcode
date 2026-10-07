@@ -21574,24 +21574,26 @@ fn provider_retry_delay(
     error: &bcode_model::ProviderError,
     attempt: u64,
 ) -> Duration {
-    let max_delay = Duration::from_millis(policy.max_delay_ms);
+    let exponent = u32::try_from(attempt.saturating_sub(1)).unwrap_or(u32::MAX);
+    let multiplier = 1_u64.checked_shl(exponent).unwrap_or(u64::MAX);
+    let attempt_delay = Duration::from_millis(policy.initial_delay_ms.saturating_mul(multiplier))
+        .min(Duration::from_millis(policy.max_delay_ms));
+    // Provider hints must not skip the configured exponential ramp-up.
     if policy.use_provider_retry_hint
         && let Some(retry) = error.retry.as_deref()
     {
         if let Some(retry_after_ms) = retry.retry_after_ms {
-            return Duration::from_millis(retry_after_ms).min(max_delay);
+            return Duration::from_millis(retry_after_ms).min(attempt_delay);
         }
         if let Some(retry_at_unix) = retry.retry_at_unix {
             let now = unix_timestamp();
             if retry_at_unix > now {
-                return Duration::from_secs(retry_at_unix.saturating_sub(now)).min(max_delay);
+                return Duration::from_secs(retry_at_unix.saturating_sub(now)).min(attempt_delay);
             }
         }
     }
 
-    let exponent = u32::try_from(attempt.saturating_sub(1)).unwrap_or(u32::MAX);
-    let multiplier = 1_u64.checked_shl(exponent).unwrap_or(u64::MAX);
-    Duration::from_millis(policy.initial_delay_ms.saturating_mul(multiplier)).min(max_delay)
+    attempt_delay
 }
 
 #[cfg(test)]
@@ -56064,7 +56066,7 @@ library = "test"
     }
 
     #[test]
-    fn overload_retry_delay_uses_retry_hint_with_config_cap() {
+    fn overload_retry_delay_caps_provider_hints_at_each_attempt() {
         let error = bcode_model::ProviderError {
             code: "server_is_overloaded".to_string(),
             category: bcode_model::ProviderErrorCategory::Overloaded,
@@ -56088,10 +56090,27 @@ library = "test"
             ..bcode_config::ModelRetryConfig::default()
         };
 
-        assert_eq!(
-            overload_retry_delay(&config, &error, 1),
-            Duration::from_secs(10)
-        );
+        for retry in [
+            bcode_model::ProviderRetryHint {
+                retry_after_ms: Some(600_000),
+                retry_at_unix: None,
+                source: Some("header".to_string()),
+            },
+            bcode_model::ProviderRetryHint {
+                retry_after_ms: None,
+                retry_at_unix: Some(unix_timestamp().saturating_add(3_600)),
+                source: Some("header".to_string()),
+            },
+        ] {
+            let mut error = error.clone();
+            error.retry = Some(Box::new(retry));
+            for (attempt, seconds) in [(1, 1), (2, 2), (3, 4), (4, 8), (5, 10), (u64::MAX, 10)] {
+                assert_eq!(
+                    overload_retry_delay(&config, &error, attempt),
+                    Duration::from_secs(seconds)
+                );
+            }
+        }
     }
 
     #[test]
