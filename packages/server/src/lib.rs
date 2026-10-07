@@ -6627,7 +6627,16 @@ async fn handle_request_inner(
         SessionLifecycleRequest::CreateSession {
             name,
             working_directory,
-        } => handle_create_session(request_id, state, writer, name, working_directory).await,
+        } => {
+            Box::pin(handle_create_session(
+                request_id,
+                state,
+                writer,
+                name,
+                working_directory,
+            ))
+            .await
+        }
         SessionLifecycleRequest::CreateChildSession { request } => {
             Box::pin(handle_create_child_session(
                 request_id, state, writer, request,

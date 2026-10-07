@@ -1202,29 +1202,7 @@ async fn exhausted_goal_resumes_after_idempotent_ipc_allowance_grant() {
         }
     })
     .await
-    .unwrap_or_else(|error| {
-        let attempts = state
-            .workflow_store
-            .lock()
-            .unwrap()
-            .attempt_history(&run_id, None, 100)
-            .unwrap();
-        let (failure, terminal, outputs) = {
-            let store = state.workflow_store.lock().unwrap();
-            (
-                store.failure_history(&run_id, 10).unwrap(),
-                store.canonical_terminal_output(&run_id).unwrap(),
-                store.validated_outputs(&run_id, 100).unwrap(),
-            )
-        };
-        let output_facts = outputs
-            .iter()
-            .map(|output| (&output.node_id, output.value.get("condition_met")))
-            .collect::<Vec<_>>();
-        panic!(
-            "renewed goal must settle correction and the completion decision: {error}; terminal_present: {}; output_facts: {output_facts:?}; attempts: {attempts:?}; failures: {failure:?}", terminal.is_some()
-        );
-    });
+    .unwrap_or_else(|error| panic_renewed_goal_timeout(&state, &run_id, &error));
     let attempts = state
         .workflow_store
         .lock()
@@ -1235,6 +1213,30 @@ async fn exhausted_goal_resumes_after_idempotent_ipc_allowance_grant() {
     drop(state);
     assert_integrated_files(root.path());
     server.abort();
+}
+
+fn panic_renewed_goal_timeout(
+    state: &ServerState,
+    run_id: &str,
+    error: &tokio::time::error::Elapsed,
+) -> ! {
+    let (attempts, failure, terminal, outputs) = {
+        let store = state.workflow_store.lock().unwrap();
+        (
+            store.attempt_history(run_id, None, 100).unwrap(),
+            store.failure_history(run_id, 10).unwrap(),
+            store.canonical_terminal_output(run_id).unwrap(),
+            store.validated_outputs(run_id, 100).unwrap(),
+        )
+    };
+    let output_facts = outputs
+        .iter()
+        .map(|output| (&output.node_id, output.value.get("condition_met")))
+        .collect::<Vec<_>>();
+    panic!(
+        "renewed goal must settle correction and the completion decision: {error}; terminal_present: {}; output_facts: {output_facts:?}; attempts: {attempts:?}; failures: {failure:?}",
+        terminal.is_some()
+    );
 }
 
 #[tokio::test]
