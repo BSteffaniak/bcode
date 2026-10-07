@@ -582,6 +582,18 @@ impl GlobalSessionDb {
                 });
             }
         }
+        // Table existence alone is not compatibility: current writers require these
+        // columns even when an older catalog has the same table names. Validate without
+        // reading rows or mutating/migrating derived state.
+        for column in ["session_id", "parent_id", "db_path", "updated_at_ms"] {
+            if !self.db.column_exists("sessions", column).await? {
+                return Err(SessionDbError::MigrationHistoryIncompatible {
+                    reason: format!(
+                        "global catalog lacks required column {column}; explicit catalog maintenance required"
+                    ),
+                });
+            }
+        }
         Ok(())
     }
 
@@ -9867,6 +9879,30 @@ mod tests {
         assert_eq!(evidence.report_count, 1);
         assert_eq!(evidence.capture_issue, None);
         assert!(!serde_json::to_string(&page).unwrap().contains("future"));
+    }
+
+    #[tokio::test]
+    async fn global_catalog_missing_parent_column_is_rejected_without_repair() {
+        let root = tempfile::tempdir().expect("catalog root");
+        let catalog = GlobalSessionDb::initialize_turso_in_root(root.path())
+            .await
+            .expect("initialize");
+        switchy::database::schema::drop_index("idx_sessions_parent_id", "sessions")
+            .execute(&**catalog.db)
+            .await
+            .expect("drop derived index");
+        switchy::database::schema::alter_table("sessions")
+            .drop_column("parent_id".into())
+            .execute(&**catalog.db)
+            .await
+            .expect("legacy catalog fixture");
+        catalog.close().await.expect("close");
+        for _ in 0..2 {
+            assert!(matches!(
+                GlobalSessionDb::open_existing_turso_in_root(root.path()).await,
+                Err(SessionDbError::MigrationHistoryIncompatible { .. })
+            ));
+        }
     }
 
     #[tokio::test]

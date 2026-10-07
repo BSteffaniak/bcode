@@ -5439,6 +5439,7 @@ async fn run_constructed_server(
     state.request_shutdown();
     // Let admitted requests and registered-client cleanup finish before deactivating
     // the plugins they may still be using. Cancellation is not completion.
+    tracing::info!(target: "bcode_server::shutdown", "draining client connections");
     while let Some(completed) = clients.join_next().await {
         if let Err(error) = completed {
             tracing::warn!(%error, "client connection task failed during shutdown");
@@ -5493,19 +5494,25 @@ async fn shutdown_constructed_server(
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
         .take();
+    tracing::info!(target: "bcode_server::shutdown", "stopping storage maintenance");
     if state.storage_worker.stop().await.is_err() {
         tracing::warn!("storage maintenance worker failed during shutdown");
     }
+    tracing::info!(target: "bcode_server::shutdown", "stopping search ingestion");
     let ingestion = state.stop_session_search_ingestion().await;
     let driver_task = state.workflow_driver_task.lock().await.take();
     if let Some(task) = driver_task {
         task.abort();
         let _ = task.await;
     }
+    tracing::info!(target: "bcode_server::shutdown", "stopping workflow forwarder");
     let workflow_forwarder = state.stop_workflow_event_forwarder().await;
+    tracing::info!(target: "bcode_server::shutdown", "stopping catalog workers");
     let catalog_workers = state.stop_catalog_workers().await;
+    tracing::info!(target: "bcode_server::shutdown", "stopping idle watcher");
     let idle_watcher = state.stop_idle_shutdown_watcher().await;
     stop_catalog_refresh(&state).await;
+    tracing::info!(target: "bcode_server::shutdown", "flushing catalog updates");
     state.sessions.shutdown_catalog_updates().await;
     tracing::debug!(target: "bcode_server::startup", "shutdown requested; deactivating plugins");
     let deactivation = state.plugins.deactivate_all().await;

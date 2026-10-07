@@ -3235,6 +3235,39 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn catalog_shutdown_failure_is_bounded_and_repeated_shutdown_is_safe() {
+        let root = unique_temp_dir();
+        let manager = SessionManager::persistent(&root).expect("persistent manager");
+        let session = manager
+            .create_session(Some("shutdown".into()), test_working_directory())
+            .await
+            .expect("create");
+        manager.flush_catalog_updates().await;
+        manager.fail_next_catalog_flush_before_commit();
+        manager
+            .append_event(
+                session.id,
+                SessionEventKind::SystemMessage {
+                    text: "canonical event survives derived failure".into(),
+                },
+            )
+            .await
+            .expect("canonical append");
+        tokio::time::timeout(Duration::from_secs(3), manager.shutdown_catalog_updates())
+            .await
+            .expect("failed derived flush must not hang shutdown");
+        tokio::time::timeout(Duration::from_secs(1), manager.shutdown_catalog_updates())
+            .await
+            .expect("repeat shutdown");
+        tokio::time::timeout(Duration::from_secs(1), manager.flush_catalog_updates())
+            .await
+            .expect("flush after stop");
+        assert!(manager.session_history(session.id).await.expect("history").iter().any(|event| {
+            matches!(&event.kind, SessionEventKind::SystemMessage { text } if text == "canonical event survives derived failure")
+        }));
+    }
+
+    #[tokio::test]
     async fn catalog_draft_listing_and_timestamp_conflicts_preserve_newer_state() {
         let root = unique_temp_dir();
         let catalog = db::GlobalSessionDb::initialize_turso_in_root(&root)

@@ -43,6 +43,7 @@ struct CatalogUpdateState {
     flush_waiters: Vec<oneshot::Sender<()>>,
     started: bool,
     shutting_down: bool,
+    stopped: bool,
 }
 
 impl CatalogUpdateCoordinator {
@@ -158,6 +159,9 @@ impl CatalogUpdateCoordinator {
         self.start();
         let (sender, receiver) = oneshot::channel();
         let mut state = self.shared.state.lock().await;
+        if state.stopped {
+            return;
+        }
         state.flush_waiters.push(sender);
         state.started = true;
         drop(state);
@@ -169,6 +173,9 @@ impl CatalogUpdateCoordinator {
         self.start();
         let (sender, receiver) = oneshot::channel();
         let mut state = self.shared.state.lock().await;
+        if state.stopped {
+            return;
+        }
         state.shutting_down = true;
         state.flush_waiters.push(sender);
         state.started = true;
@@ -207,6 +214,11 @@ impl CatalogUpdateShared {
                         let _ = waiter.send(());
                     }
                     if shutting_down {
+                        let mut state = self.state.lock().await;
+                        state.stopped = true;
+                        for waiter in state.flush_waiters.drain(..) {
+                            let _ = waiter.send(());
+                        }
                         return;
                     }
                     break;
@@ -234,8 +246,12 @@ impl CatalogUpdateShared {
                             let _ = waiter.send(());
                         }
                         if shutting_down {
-                            let state = self.state.lock().await;
+                            let mut state = self.state.lock().await;
                             if state.pending.is_empty() && state.pending_deletes.is_empty() {
+                                state.stopped = true;
+                                for waiter in state.flush_waiters.drain(..) {
+                                    let _ = waiter.send(());
+                                }
                                 drop(state);
                                 self.metrics
                                     .set_gauge("session.catalog.pending_sessions", 0);
@@ -252,8 +268,12 @@ impl CatalogUpdateShared {
                             let _ = waiter.send(());
                         }
                         if shutting_down {
-                            let state = self.state.lock().await;
+                            let mut state = self.state.lock().await;
                             if state.pending.is_empty() && state.pending_deletes.is_empty() {
+                                state.stopped = true;
+                                for waiter in state.flush_waiters.drain(..) {
+                                    let _ = waiter.send(());
+                                }
                                 drop(state);
                                 self.metrics
                                     .set_gauge("session.catalog.pending_sessions", 0);
@@ -299,7 +319,20 @@ impl CatalogUpdateShared {
                             "session.catalog.pending_sessions",
                             i64::try_from(state.pending.len()).unwrap_or(i64::MAX),
                         );
+                        let stop = state.shutting_down;
+                        if stop {
+                            state.stopped = true;
+                            // Catalog summaries are disposable derived state. Retain pending
+                            // work for diagnostics, but do not hold daemon ownership forever.
+                            state.flush_waiters.clear();
+                        }
                         drop(state);
+                        if stop {
+                            tracing::warn!(
+                                "derived catalog flush failed; shutdown continues without claiming persistence"
+                            );
+                            return;
+                        }
                         tokio::time::sleep(CATALOG_RETRY_DELAY).await;
                     }
                 }
@@ -355,6 +388,42 @@ impl CatalogUpdateShared {
             Err(error) => Err(CatalogFlushError::BeforeCommit(error)),
             Ok(()) => close_result.map_err(CatalogFlushError::AfterCommit),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn permanent_catalog_failure_releases_all_shutdown_waiters() {
+        let directory = tempfile::tempdir().expect("directory");
+        let root = directory.path().join("not-a-directory");
+        std::fs::write(&root, b"preserve existing data").expect("fixture");
+        let manager = crate::SessionManager::default();
+        let session = manager
+            .create_session(Some("catalog".into()), directory.path().to_path_buf())
+            .await
+            .expect("session");
+        let summary = manager.session_summary(session.id).await.expect("summary");
+        let coordinator = CatalogUpdateCoordinator::new(root.clone(), MetricsRegistry::disabled());
+        coordinator.schedule(summary).await;
+        tokio::time::timeout(Duration::from_secs(3), async {
+            tokio::join!(coordinator.shutdown(), coordinator.shutdown());
+        })
+        .await
+        .expect("permanent derived failure cannot block shutdown");
+        let state = coordinator.shared.state.lock().await;
+        assert!(state.stopped);
+        assert_eq!(state.pending.len(), 1);
+        drop(state);
+        tokio::time::timeout(Duration::from_secs(1), coordinator.flush())
+            .await
+            .expect("stopped flush");
+        assert_eq!(
+            std::fs::read(root).expect("unchanged fixture"),
+            b"preserve existing data"
+        );
     }
 }
 
