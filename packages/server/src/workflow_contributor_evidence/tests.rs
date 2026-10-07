@@ -431,6 +431,124 @@ async fn generated_selected_receipt_reads_canonical_history_without_rerunning() 
 }
 
 #[tokio::test]
+async fn entry_context_uses_current_authenticated_revision_without_history_writes() {
+    let fixture = Box::pin(fixture::Fixture::new()).await;
+    let token = TurnCancelState::default();
+    let before = fixture
+        .state
+        .sessions
+        .current_session_generation(fixture.source)
+        .await
+        .unwrap();
+    let response = entry_context(&fixture.state, fixture.caller, &token)
+        .await
+        .unwrap()
+        .unwrap();
+    let after = fixture
+        .state
+        .sessions
+        .current_session_generation(fixture.source)
+        .await
+        .unwrap();
+    let source = fixture.source.to_string();
+    drop(fixture);
+    assert_eq!(before, after);
+    assert_eq!(response.status, ContributorEvidenceStatus::Available);
+    assert_eq!(
+        response.scope_kind,
+        Some(ContributorScopeKind::OrdinaryDirect)
+    );
+    let scope = response.scope.unwrap();
+    assert_eq!(scope.graph_revision, 1);
+    assert_eq!(scope.session_id, source);
+    assert!(response.scanned_events <= 20);
+    assert!(response.evidence.is_none());
+}
+
+#[tokio::test]
+async fn entry_context_generated_listing_excludes_equal_output_sibling() {
+    let fixture = Box::pin(fixture::Fixture::generated()).await;
+    let response = entry_context(&fixture.state, fixture.caller, &TurnCancelState::default())
+        .await
+        .unwrap()
+        .unwrap();
+    drop(fixture);
+    assert_eq!(response.status, ContributorEvidenceStatus::Available);
+    assert_eq!(
+        response.scope_kind,
+        Some(ContributorScopeKind::GeneratedExecution)
+    );
+    assert!(response.generated_provenance.is_some());
+    assert!(response.scope.is_none());
+    assert!(response.evidence.is_none());
+    assert!(response.events.is_empty());
+    assert_eq!(
+        response
+            .contributors
+            .iter()
+            .map(|scope| scope.node_id.as_str())
+            .collect::<Vec<_>>(),
+        vec!["integrate", "source", "worker"]
+    );
+    assert!(
+        response
+            .contributors
+            .iter()
+            .all(|scope| scope.graph_revision == 2)
+    );
+    assert!(response.next_node_id.is_none());
+}
+
+#[tokio::test]
+async fn entry_context_damaged_publication_never_releases_contributors() {
+    let fixture = Box::pin(fixture::Fixture::generated()).await;
+    fixture.damage_publication(false).await;
+    let response = entry_context(&fixture.state, fixture.caller, &TurnCancelState::default())
+        .await
+        .unwrap()
+        .unwrap();
+    drop(fixture);
+    assert_eq!(
+        response.status,
+        ContributorEvidenceStatus::ProvenanceUnavailable
+    );
+    assert!(response.scope.is_none());
+    assert!(response.contributors.is_empty());
+    assert!(response.events.is_empty());
+    assert!(response.evidence.is_none());
+}
+
+#[tokio::test]
+async fn entry_context_distinguishes_nonworkflow_missing_foreign_and_cancelled() {
+    let mut fixture = Box::pin(fixture::Fixture::new()).await;
+    let root = tempfile::tempdir().unwrap();
+    let ordinary = fixture
+        .state
+        .sessions
+        .create_session(None, root.path().to_path_buf())
+        .await
+        .unwrap();
+    let token = TurnCancelState::default();
+    let nonworkflow = entry_context(&fixture.state, ordinary.id, &token)
+        .await
+        .unwrap();
+    let missing = entry_context(&fixture.state, SessionId::new(), &token).await;
+    fixture.state.daemon_status.instance_id = "foreign-daemon".into();
+    let foreign = entry_context(&fixture.state, fixture.caller, &token).await;
+    token.close();
+    let cancelled = entry_context(&fixture.state, ordinary.id, &token).await;
+    drop(fixture);
+    drop(root);
+    assert!(nonworkflow.is_none());
+    assert!(missing.is_err());
+    assert!(foreign.is_err());
+    assert!(matches!(
+        cancelled,
+        Err(ServerError::WorkflowComputationCancelled(_))
+    ));
+}
+
+#[tokio::test]
 async fn application_foreign_authority_cancel_and_stale_revision_fail_closed() {
     let mut fixture = Box::pin(fixture::Fixture::new()).await;
     let token = TurnCancelState::default();

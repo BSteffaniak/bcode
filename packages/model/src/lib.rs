@@ -2753,6 +2753,34 @@ pub struct ProviderAttemptTiming {
     pub first_semantic_ms: Option<u64>,
     /// First normalized text/tool output, excluding reasoning activity.
     pub first_output_ms: Option<u64>,
+    /// Last normalized text/tool lifecycle event, including empty deltas.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_output_ms: Option<u64>,
+    /// First nonempty text or tool-argument delta (not a tokenizer measurement).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub first_output_bytes_ms: Option<u64>,
+    /// Last nonempty text or tool-argument delta.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_output_bytes_ms: Option<u64>,
+    /// Normalized text/tool lifecycle events observed; excludes reasoning and metadata.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output_event_count: Option<u64>,
+    /// UTF-8 bytes in text/tool-argument deltas; excludes tool names and final-call copies.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output_delta_bytes: Option<u64>,
+    /// HTTP body chunk arrivals observed by the adapter, including nonsemantic chunks.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stream_chunk_count: Option<u64>,
+    /// HTTP body bytes delivered to the adapter; not socket/upload bytes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stream_body_bytes: Option<u64>,
+    /// Maximum interval between consecutive HTTP chunk arrivals. Absent before two chunks.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_inter_chunk_gap_ms: Option<u64>,
+    /// Successful provider-terminal stream observation, before attempt finalization.
+    /// Absent for interrupted/failed streams; not the host's canonical terminal state.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stream_terminal_ms: Option<u64>,
     /// Terminal elapsed time, including interrupted attempts.
     pub terminal_ms: u64,
     /// Terminal classification without provider error text.

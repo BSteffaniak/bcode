@@ -5206,6 +5206,7 @@ async fn read_stream_events(
                 let Some(chunk) = chunk.map_err(|error| stream_read_error(&error))? else {
                     return Err(incomplete_provider_stream_error(&response, &buffer));
                 };
+                turn.timing.lock().expect("timing lock").chunk(chunk.len());
                 buffer.push_str(&String::from_utf8_lossy(&chunk));
                 let outcome = process_stream_buffer(
                     &mut buffer,
@@ -5215,6 +5216,7 @@ async fn read_stream_events(
                     &name_map,
                 )?;
                 if outcome.is_provider_terminal() {
+                    turn.timing.lock().expect("timing lock").stream_terminal();
                     return Ok(outcome);
                 }
             }
@@ -5261,6 +5263,7 @@ async fn read_responses_stream_events(
                 let Some(chunk) = chunk.map_err(|error| stream_read_error(&error))? else {
                     return Err(incomplete_provider_stream_error(&response, &buffer));
                 };
+                turn.timing.lock().expect("timing lock").chunk(chunk.len());
                 buffer.push_str(&String::from_utf8_lossy(&chunk));
                 let outcome = process_responses_stream_buffer(
                     &mut buffer,
@@ -5270,6 +5273,7 @@ async fn read_responses_stream_events(
                     &mut saw_tool_call,
                 )?;
                 if outcome.is_provider_terminal() {
+                    turn.timing.lock().expect("timing lock").stream_terminal();
                     return Ok(outcome);
                 }
             }

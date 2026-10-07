@@ -538,5 +538,67 @@ pub async fn from_invocation(
     }
 }
 
+/// Build bounded request-only contributor context from the caller's authenticated revision.
+///
+/// Ordinary contributors receive an initial event-reference page. Supported generated scopes
+/// receive the existing bounded listing; unsupported scopes remain explicit. This is neither
+/// a completion claim nor a persisted message and must be recomputed on resume.
+///
+/// # Errors
+/// Returns failures for cancellation, unavailable session/storage, or rejected execution identity.
+/// Only a successfully read session without execution provenance returns `None`.
+pub async fn entry_context(
+    state: &ServerState,
+    session_id: SessionId,
+    cancellation: &TurnCancelState,
+) -> Result<Option<ExecutionContributorEvidenceResponse>, ServerError> {
+    cancelled(cancellation)?;
+    let summary = tokio::select! {
+        biased;
+        () = cancellation.cancelled() => return Err(ServerError::WorkflowComputationCancelled("contributor entry context".into())),
+        result = state.sessions.session_summary(session_id) => result?,
+    };
+    cancelled(cancellation)?;
+    if summary.id != session_id {
+        return Err(denied());
+    }
+    if summary.execution.is_none() {
+        return Ok(None);
+    }
+    let context = tokio::select! {
+        biased;
+        () = cancellation.cancelled() => return Err(ServerError::WorkflowComputationCancelled("contributor entry context".into())),
+        result = state.workflow_execution_context_from_invocation(
+            session_id,
+            bcode_workflow::WorkflowExecutionContextRequest {
+                source_local: true,
+                output_id: None,
+                after_output_id: None,
+                expected_revision: None,
+                after_node_id: None,
+                after_edge_id: None,
+                limit: 1,
+            },
+            cancellation,
+        ) => result?,
+    };
+    let response = from_invocation(
+        state,
+        session_id,
+        &ExecutionContributorEvidenceRequest {
+            expected_revision: context.graph.revision,
+            action: ContributorEvidenceAction::Discover {
+                contributor_node_id: None,
+                after_sequence: None,
+                limit: 20,
+            },
+        },
+        cancellation,
+    )
+    .await?;
+    cancelled(cancellation)?;
+    Ok(Some(response))
+}
+
 #[cfg(test)]
 mod tests;
