@@ -9,6 +9,8 @@
 //! Execution is intentionally host-neutral: agent, plugin, and application behavior enters through
 //! ordinary typed steps instead of scheduler-specific branches.
 
+/// Authenticated model-only contributor evidence operation contracts.
+pub mod contributor_evidence;
 mod scheduling_page;
 pub use scheduling_page::{
     WORKFLOW_SCHEDULING_PAGE_VERSION, WorkflowSchedulingPage, WorkflowSchedulingPageRequest,

@@ -15,6 +15,7 @@ mod confined;
 #[cfg(unix)]
 mod coordination;
 mod replacement;
+mod write_receipt;
 
 use bcode_plugin_sdk::path::display;
 use bcode_plugin_sdk::prelude::*;
@@ -1624,7 +1625,7 @@ fn tool_write(
                 |bytes_written| {
                     let summary = format!("wrote {bytes_written} bytes");
                     ToolInvocationResponse {
-                        output: summary.clone(),
+                        output: write_receipt::model_output(&summary, &request.contents),
                         is_error: false,
                         content: Vec::new(),
                         full_output: None,

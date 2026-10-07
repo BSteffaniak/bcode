@@ -21,9 +21,11 @@ mod deployment_tests;
 pub use admission_policy::GraphAdmissionPolicy;
 #[cfg(test)]
 mod coexistence_tests;
+/// Authenticated bounded direct contributor identity proof.
+pub mod contributor_evidence;
 /// Canonical bounded scheduling explanations.
 pub mod diagnostics;
-/// Authenticated execution graph snapshots and exact staged publication.
+/// Receipt-backed execution graph staging and publication.
 pub mod execution_graph;
 /// Canonical static activation graphs and deterministic settlement.
 pub mod graph;

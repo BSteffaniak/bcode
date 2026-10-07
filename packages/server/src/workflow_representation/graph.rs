@@ -6,6 +6,9 @@ use super::{
 use bcode_session_models::ExecutionSessionProvenance;
 use bcode_workflow_store::{WorkflowExecutionAuthority, WorkflowExecutionSessionLink};
 
+#[path = "graph_diagnostics.rs"]
+pub mod diagnostics;
+
 pub struct AuthenticatedExecution {
     pub link: WorkflowExecutionSessionLink,
     pub authority: WorkflowExecutionAuthority,
@@ -154,6 +157,23 @@ impl AuthenticatedExecution {
         })
     }
 
+    pub async fn direct_contributor(
+        &self,
+        expected_revision: u64,
+    ) -> Result<representation::contributor_evidence::DirectContributorObservation, ServerError>
+    {
+        self.verify_retained_path()?;
+        let db = open(&self.path, false)?;
+        representation::contributor_evidence::direct_contributor(
+            &db,
+            &self.authority,
+            &self.link,
+            expected_revision,
+        )
+        .await
+        .map_err(|_| unavailable())
+    }
+
     pub async fn stage(
         &self,
         batch: &bcode_workflow::WorkflowRunGraphEditBatch,
@@ -193,7 +213,7 @@ impl AuthenticatedExecution {
             )
         })
         .await
-        .map_err(super::backpressure::normalize)
+        .map_err(|error| diagnostics::normalize(&error))
     }
 
     pub async fn publish(
@@ -209,7 +229,7 @@ impl AuthenticatedExecution {
             &self.link,
         )
         .await
-        .map_err(|_| unavailable())
+        .map_err(|error| diagnostics::normalize(&error))
     }
 }
 

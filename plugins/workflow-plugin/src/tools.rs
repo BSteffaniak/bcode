@@ -8,7 +8,10 @@ use bcode_tool::{
 use bcode_workflow::{WORKFLOW_APPLICATION_INTERFACE_ID, WorkflowRunGraphEditBatch};
 use serde_json::json;
 
+mod contributor_evidence;
 mod delegation;
+mod output_projection;
+mod schema_documentation;
 mod task_group;
 const GROUP_NAME: &str = "workflow.stage_task_group";
 
@@ -18,9 +21,11 @@ const CONTEXT_OPERATION: &str = "execution_context";
 fn parse_context(
     mut arguments: serde_json::Value,
 ) -> Result<bcode_workflow::WorkflowExecutionContextRequest, String> {
+    output_projection::selector(&arguments)?;
     let object = arguments
         .as_object_mut()
         .ok_or("execution context request must be an object")?;
+    object.remove("output_pointer");
     // Strict tool schemas require every property. Only optional selectors may
     // use null to represent omission; retain unknown fields for fail-closed decoding.
     for field in ["delegation_part", "after_node_id", "after_edge_id"] {
@@ -87,6 +92,7 @@ fn context_definition() -> ToolDefinition {
         name: CONTEXT_NAME.to_owned(),
         description: "Read this active workflow execution's authenticated identity and bounded graph page. Omit revision and cursors initially; continue with the returned revision and last node/edge identities. Restart on revision conflict. This grants no mutation authority.".to_owned(),
         input_schema: json!({"type":"object", "additionalProperties":false,
+            "required":["delegation_part","delegation_offset","delegation_only","compact","output_only","outputs_only","after_output_id","output_pointer","output_id","limit","expected_revision","after_node_id","after_edge_id"],
             "properties": {
                 "delegation_part":{"type":["string","null"],"enum":[null,"bindings","input","reconnect","serialized"],"description":"Use null when not reading a delegation recipe. Read recipe fields, or use serialized for bounded JSON string chunks. Concatenate chunks in order and parse once; do not reconstruct schemas. Follow next_arguments unchanged at the pinned revision."},
                 "delegation_offset":{"type":"integer","minimum":0,"description":"Character offset for serialized recipe chunks; use returned next_arguments."},
@@ -95,6 +101,7 @@ fn context_definition() -> ToolDefinition {
                 "output_only":{"type":"boolean","default":false,"description":"With output_id, return only authenticated identity, revision and the exact checksum-verified output. Omits graph, discovery and delegation payloads; does not truncate the value or grant authority."},
                 "outputs_only":{"type":"boolean","default":false,"description":"Discover bounded canonical output references without graph or delegation payloads. Follow next_page_arguments, then each inspection_arguments to verify values. Rescan for later arrivals; this is not complete graph discovery."},
                 "after_output_id":{"type":["string","null"], "description":"Exclusive last output ID. Outputs arriving behind the cursor require a fresh scan; this is not a durable event stream."},
+                "output_pointer":{"type":["string","null"],"maxLength":256,"description":"Optional RFC 6901 pointer relative to the verified canonical output value; requires output_only and output_id. Returns bounded selection with explicit missing/oversized completeness and whole-value checksum metadata, not execution proof. Oversized selections omit value: retry with a smaller child pointer for objects/arrays; scalar paging is unavailable. Null preserves full-output behavior."},
                 "output_id":{"type":["string","null"], "description":"Exact canonical output identity from this run; returns checksum-verified value without opening artifacts."},
                 "limit":{"type":"integer", "minimum":1, "maximum":100, "default":50},
                 "expected_revision":{"type":["integer","null"], "minimum":1},
@@ -278,7 +285,11 @@ fn task_definition() -> ToolDefinition {
 fn portable_task_definition(mut tool: ToolDefinition) -> ToolDefinition {
     // Task payloads contain caller-authored schemas and configuration. Keep those
     // opaque to provider schema rewriting, but validate them normally after decoding.
-    let payload_schema = tool.input_schema.to_string();
+    let payload_schema = if matches!(tool.name.as_str(), GROUP_NAME | delegation::NAME) {
+        schema_documentation::compact(&tool.input_schema).to_string()
+    } else {
+        tool.input_schema.to_string()
+    };
     tool.input_schema = json!({
         "type":"object", "additionalProperties":false, "required":["request_json"],
         "properties":{"request_json":{"type":"string","description":format!(
@@ -469,6 +480,7 @@ fn tool_definitions() -> Vec<ToolDefinition> {
         publication_definition(),
         acceptance_definition(),
         context_definition(),
+        contributor_evidence::definition(),
         portable_task_definition(task_definition()),
         portable_task_definition(prompt_task_definition()),
         portable_task_definition(task_group::definition()),
@@ -481,18 +493,27 @@ pub fn invoke(context: &NativeServiceContext) -> ServiceResponse {
     match context.request.operation.as_str() {
         bcode_tool::OP_LIST_TOOLS => super::json_response(
             &ToolList::with_runtime_stable_discovery(tool_definitions(), |tool| {
-                bcode_tool::ToolDiscoveryPolicy::new(tool.name == CONTEXT_NAME)
+                bcode_tool::ToolDiscoveryPolicy::new(
+                    tool.name == CONTEXT_NAME || tool.name == contributor_evidence::NAME,
+                )
             }),
         ),
         bcode_tool::OP_PREPARE_TOOL => {
             prepare_tool_service_response(&context.request, tool_definitions(), |request, _| {
                 let is_context = request.invocation.tool_name == CONTEXT_NAME;
-                let operation = if is_context {
+                let is_evidence = request.invocation.tool_name == contributor_evidence::NAME;
+                let is_read = is_context || is_evidence;
+                let operation = if is_evidence {
+                    bcode_workflow::contributor_evidence::OPERATION
+                } else if is_context {
                     CONTEXT_OPERATION
                 } else {
                     operation(&request.invocation.tool_name)?
                 };
-                let payload = if is_context {
+                let payload = if is_evidence {
+                    let query = contributor_evidence::parse(request.invocation.arguments.clone())?;
+                    serde_json::to_value(query).map_err(|error| error.to_string())?
+                } else if is_context {
                     let context = parse_context(request.invocation.arguments.clone())?;
                     serde_json::to_value(context).map_err(|error| error.to_string())?
                 } else if request.invocation.tool_name == delegation::NAME {
@@ -527,17 +548,23 @@ pub fn invoke(context: &NativeServiceContext) -> ServiceResponse {
                             && route.operations.iter().any(|op| op == operation)
                     })
                     .ok_or_else(|| "workflow staging route is unavailable".to_owned())?;
+                let mut descriptor =
+                    json!({"route_id":route.route_id, "operation": operation, "edit": payload});
+                if is_context {
+                    descriptor["output_pointer"] = serde_json::to_value(
+                        output_projection::selector(&request.invocation.arguments)?,
+                    )
+                    .map_err(|_| "invalid output projection selector".to_owned())?;
+                }
                 Ok(bcode_plugin_sdk::ToolPolicyPreparation::new(
-                    !is_context,
-                    if is_context {
+                    !is_read,
+                    if is_read {
                         bcode_plugin_sdk::ToolPolicyOperation::ReadOnly
                     } else {
                         bcode_plugin_sdk::ToolPolicyOperation::Mutating
                     },
                 )
-                .with_descriptor(
-                    json!({"route_id":route.route_id, "operation": operation, "edit": payload}),
-                ))
+                .with_descriptor(descriptor))
             })
         }
         bcode_tool::OP_INVOKE_TOOL => invoke_edit(context),
@@ -604,6 +631,9 @@ fn invoke_context(
     context: &NativeServiceContext,
     request: ToolInvocationRequest,
 ) -> ServiceResponse {
+    let Ok(output_pointer) = output_projection::selector(&request.arguments) else {
+        return ServiceResponse::error("invalid_request", "invalid output projection selector");
+    };
     let compact = request.arguments.get("compact") == Some(&json!(true));
     let discovery_only = request.arguments.get("outputs_only") == Some(&json!(true));
     let output_only = request.arguments.get("output_only") == Some(&json!(true));
@@ -630,6 +660,7 @@ fn invoke_context(
         .and_then(serde_json::Value::as_str)
         != Some(CONTEXT_OPERATION)
         || descriptor.get("edit") != Some(&payload)
+        || !output_projection::matches(descriptor, output_pointer.as_deref())
         || context.cancellation.is_cancelled()
     {
         return ServiceResponse::error(
@@ -659,16 +690,34 @@ fn invoke_context(
             .map_or_else(
                 |_| ServiceResponse::error("invalid_response", "invalid workflow context"),
                 |context| {
+                    let projected = if let Some(pointer) = output_pointer.as_deref() {
+                        match output_projection::render(&context, pointer) {
+                            Ok(output) => Some(output),
+                            Err(_) => {
+                                return ServiceResponse::error(
+                                    "invalid_response",
+                                    "output projection exceeds response limit",
+                                );
+                            }
+                        }
+                    } else {
+                        None
+                    };
                     super::json_response(&bcode_tool::ToolInvocationResponse {
-                        output: if discovery_only {
-                            output_discovery_view(&context, &query)
-                        } else if output_only {
-                            exact_output_view(&context)
-                        } else if delegation_only || delegation_part.is_some() {
-                            json!({"delegation": if delegation_part.as_deref() == Some("serialized") { serialized_delegation_recipe(&context, &query, delegation_offset) } else { delegation_recipe_part(&context, &query, delegation_part.as_deref()) }}).to_string()
-                        } else {
-                            context_output_with_navigation(&context, compact, &query)
-                        },
+                        output: projected.map_or_else(
+                            || {
+                                if discovery_only {
+                                    output_discovery_view(&context, &query)
+                                } else if output_only {
+                                    exact_output_view(&context)
+                                } else if delegation_only || delegation_part.is_some() {
+                                    json!({"delegation": if delegation_part.as_deref() == Some("serialized") { serialized_delegation_recipe(&context, &query, delegation_offset) } else { delegation_recipe_part(&context, &query, delegation_part.as_deref()) }}).to_string()
+                                } else {
+                                    context_output_with_navigation(&context, compact, &query)
+                                }
+                            },
+                            std::convert::identity,
+                        ),
                         is_error: false,
                         content: Vec::new(),
                         full_output: None,
@@ -974,6 +1023,9 @@ fn invoke_edit(context: &NativeServiceContext) -> ServiceResponse {
     let Ok(request) = context.request.payload_json::<ToolInvocationRequest>() else {
         return ServiceResponse::error("invalid_request", "invalid workflow tool invocation");
     };
+    if request.name == contributor_evidence::NAME {
+        return contributor_evidence::invoke(context, request);
+    }
     if request.name == CONTEXT_NAME {
         return invoke_context(context, request);
     }
@@ -2136,7 +2188,7 @@ mod tests {
         let defaults = json!({
             "compact": false, "delegation_only": false, "delegation_part": null,
             "delegation_offset": 0, "output_only": false, "outputs_only": false,
-            "after_output_id": null, "output_id": null, "limit": 50,
+            "after_output_id": null, "output_id": null, "output_pointer": null, "limit": 50,
             "expected_revision": null, "after_node_id": null, "after_edge_id": null
         });
         for sparse in [
@@ -2146,6 +2198,7 @@ mod tests {
             json!({"outputs_only": true}),
             json!({"outputs_only": true, "after_output_id": "output", "expected_revision": 7}),
             json!({"output_only": true, "output_id": "output"}),
+            json!({"output_only": true, "output_id": "output", "output_pointer": "/summary"}),
             json!({"delegation_only": true}),
             json!({"delegation_part": "bindings"}),
             json!({"delegation_part": "input"}),

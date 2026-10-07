@@ -9,6 +9,9 @@ use bcode_eval_models::WorkflowEvalConfig;
 use sha2::Digest;
 use std::time::Duration;
 
+#[path = "workflow_capture/mod.rs"]
+mod workflow_capture;
+
 fn execution_duration(start: Instant, observed_end: Instant) -> Duration {
     observed_end.saturating_duration_since(start)
 }
@@ -585,31 +588,37 @@ pub fn execute(
         && outputs.as_array().is_some_and(|values| values.len() < 100);
     let mut session_events = Vec::new();
     let mut correlation_events = Vec::new();
-    let mut model_exports_complete = true;
-    let mut observed_model_sessions = 0_usize;
+    let mut model_coverage = workflow_capture::ModelCoverage::default();
     let mut session_history_complete = true;
     for (index, identity) in event_sessions.iter().enumerate() {
         let mut after = 0_u64;
         let mut events = Vec::new();
+        let mut history_complete = true;
+        let mut first_page = (index == 0).then(|| history.clone());
         loop {
-            let page = match invoke(
-                &[
-                    "session".into(),
-                    "history".into(),
-                    identity.clone(),
-                    "--after".into(),
-                    after.to_string(),
-                    "--limit".into(),
-                    "100".into(),
-                    "--json".into(),
-                ],
-                &format!("history-{index}"),
-                Duration::from_secs(15),
-            ) {
+            let cached_prefix = first_page.is_some();
+            let result = workflow_capture::first_or_fetch(&mut first_page, || {
+                invoke(
+                    &[
+                        "session".into(),
+                        "history".into(),
+                        identity.clone(),
+                        "--after".into(),
+                        after.to_string(),
+                        "--limit".into(),
+                        "100".into(),
+                        "--json".into(),
+                    ],
+                    &format!("history-{index}"),
+                    Duration::from_secs(15),
+                )
+            });
+            let page = match result {
                 Ok(value) => value,
                 Err(error) => {
                     capture_complete = false;
                     session_history_complete = false;
+                    history_complete = false;
                     write_json(
                         rep_dir.join(format!("history-{index}-error.json")),
                         &error.to_string(),
@@ -617,47 +626,32 @@ pub fn execute(
                     break;
                 }
             };
-            let Ok(page_events) = serde_json::from_value::<Vec<bcode_session_models::SessionEvent>>(
-                page["events"].clone(),
-            ) else {
+            let Some(page) = workflow_capture::history_page(&page, identity, after) else {
                 capture_complete = false;
                 session_history_complete = false;
+                history_complete = false;
                 break;
             };
-            if let Some(last) = page_events.last() {
-                let Some(next) = last.sequence.checked_add(1) else {
-                    capture_complete = false;
-                    session_history_complete = false;
-                    break;
-                };
-                if next <= after {
-                    capture_complete = false;
-                    session_history_complete = false;
-                    break;
-                }
-                after = next;
-            } else if page["has_more"] == true {
-                capture_complete = false;
-                session_history_complete = false;
+            let next = workflow_capture::continuation(&page, cached_prefix);
+            events.extend(page.events);
+            let Some(next) = next else {
                 break;
-            }
-            events.extend(page_events);
-            if page["has_more"] != true {
-                break;
-            }
+            };
+            after = next;
             if events.len() >= 10000 {
                 capture_complete = false;
                 session_history_complete = false;
+                history_complete = false;
                 break;
             }
         }
         write_session_events_jsonl(&rep_dir.join(format!("transcript-{index}.jsonl")), &events)?;
         correlation_events.extend(events.iter().cloned());
-        session_events.push((index, events));
+        session_events.push((index, events, history_complete));
     }
     let export_sessions = session_events
         .iter()
-        .map(|(index, events)| {
+        .map(|(index, events, _)| {
             (
                 rep_dir.join(format!("transcript-{index}.jsonl")),
                 events.clone(),
@@ -668,16 +662,18 @@ pub fn execute(
         capture_complete = false;
         write_json(rep_dir.join("trace-export-error.json"), &error.to_string())?;
     }
-    for (index, events) in session_events {
+    for (index, events, history_complete) in session_events {
         let receipts: serde_json::Value =
             fs::read(rep_dir.join(format!("transcript-{index}.captures.json")))
                 .ok()
                 .and_then(|bytes| serde_json::from_slice(&bytes).ok())
                 .unwrap_or_else(|| serde_json::json!([]));
         let capture_summary = super::introspection::summary_with_exports(&events, &receipts);
-        observed_model_sessions += 1;
-        model_exports_complete &= capture_summary["complete_model_inputs_exported"] == true;
+        model_coverage.observe(&events, &capture_summary, index != 0, history_complete);
         write_session_events_jsonl(&rep_dir.join(format!("transcript-{index}.jsonl")), &events)?;
+    }
+    if !model_coverage.complete() {
+        capture_complete = false;
     }
     let telemetry = session_telemetry(&correlation_events).measurements;
     write_json(
@@ -702,9 +698,13 @@ pub fn execute(
         "pages": observation_pages.len(),
     });
     manifest["boundaries"]["model_exports"] = serde_json::json!({
-        "status":if model_exports_complete && observed_model_sessions > 0 {"verified_observed"} else {"incomplete_or_not_observed"},
-        "scope":"retained model request boundaries only; not provider wire or judgement",
-        "sessions_observed":observed_model_sessions
+        "status":if model_coverage.complete() {"verified_observed"} else {"incomplete_or_not_observed"},
+        "scope":"retained request-build observations; child execution identity without model facts remains unknown; parent excluded only after complete fresh-tail capture; not provider wire or judgement",
+        "sessions_observed":model_coverage.applicable_sessions,
+        "sessions_complete":model_coverage.complete_sessions,
+        "non_model_sessions":model_coverage.non_model_sessions,
+        "sessions_unknown_applicability":model_coverage.unknown_sessions,
+        "sessions_missing_request_boundaries":model_coverage.missing_boundaries
     });
     let judgement_status = if diagnostic_receipts.is_empty() {
         "not_observed"

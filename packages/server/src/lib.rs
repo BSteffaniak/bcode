@@ -39,6 +39,8 @@ mod tool_host_retry;
 mod trace_operations;
 #[cfg(test)]
 mod workflow_admission_tests;
+mod workflow_contributor_events;
+mod workflow_contributor_evidence;
 mod workflow_diagnostics;
 mod workflow_operations;
 mod workflow_receipts;
@@ -268,6 +270,11 @@ pub enum ServerError {
     /// Bounded persistence backpressure exhausted; durable work remains unchanged or pending.
     #[error("workflow storage is busy; retry the exact operation")]
     WorkflowStorageBusy,
+    /// Typed, secret-safe rejection of execution-scoped graph publication.
+    #[error("{0}")]
+    WorkflowGraphPublicationFailure(
+        workflow_representation::graph::diagnostics::PublicationFailure,
+    ),
     #[error("authored-workflow application operation is unauthorized: {0}")]
     WorkflowApplicationOperationUnauthorized(String),
     #[error("authored-workflow computation timed out: {0}")]
@@ -5901,6 +5908,9 @@ fn request_error_response(error: &ServerError) -> ErrorResponse {
             "workflow_storage_busy",
             "workflow storage is busy; retry the exact operation",
         ),
+        ServerError::WorkflowGraphPublicationFailure(failure) => {
+            return ErrorResponse::new(failure.code(), failure.to_string());
+        }
         ServerError::WorkflowStorageUnavailable(message) => {
             return ErrorResponse::new("workflow_capability_unavailable", message.clone());
         }
@@ -28390,12 +28400,17 @@ fn project_tool_result_for_model_context(
         return result.to_string();
     }
 
-    let path = full_output_path.map_or_else(
-        || "the session trace blob store".to_string(),
-        |path| display_from_current_dir(path).to_string(),
+    let recovery = full_output_path.map_or_else(
+        || {
+            "No readable artifact locator is available in this model context. Retained trace data, if captured, requires an explicitly authorized trace-read API; do not treat the trace store as a filesystem path or assume omitted content was inspected.".to_string()
+        },
+        |path| format!(
+            "Full retained output saved at: {}. Prefer artifact.metadata, artifact.grep, or artifact.read with max_bytes/from_end for saved tool-output artifacts; filesystem.grep or filesystem.read with offset/limit also work for regular files. Avoid reading the whole file unless necessary.",
+            display_from_current_dir(path)
+        ),
     );
     let footer = format!(
-        "\n\n[tool output truncated for model context: original {char_count} chars / {} bytes. Full retained output saved at: {path}. Bcode already includes the beginning and end of long tool output when possible; do not rerun the same shell command with sed/head/tail just to inspect omitted output. Prefer artifact.metadata, artifact.grep, or artifact.read with max_bytes/from_end for saved tool-output artifacts; filesystem.grep or filesystem.read with offset/limit also work for regular files. Avoid reading the whole file unless necessary.]\n\n",
+        "\n\n[tool output truncated for model context: original {char_count} chars / {} bytes. Bcode already includes the beginning and end of long tool output when possible; do not rerun the same shell command with sed/head/tail just to inspect omitted output. {recovery}]\n\n",
         result.len()
     );
     if max_context_chars == 0 {
@@ -28756,7 +28771,10 @@ async fn invocation_service_routes(
     session_id: SessionId,
 ) -> Vec<ServerInvocationServiceRoute> {
     let mut routes = provider_invocation_service_routes(state, session_id).await;
-    let mut workflow_operations = vec!["execution_context".to_owned()];
+    let mut workflow_operations = vec![
+        "execution_context".to_owned(),
+        bcode_workflow::contributor_evidence::OPERATION.to_owned(),
+    ];
     if state.workflow_run_graph_edit_policy.is_some() {
         workflow_operations.push("stage_run_graph_edit".to_owned());
     }
@@ -31888,6 +31906,12 @@ fn workflow_invocation_failure() -> ToolInvocationServiceResolution {
 }
 
 fn workflow_operation_failure(error: &ServerError) -> ToolInvocationServiceResolution {
+    if let ServerError::WorkflowGraphPublicationFailure(failure) = error {
+        return ToolInvocationServiceResolution::Failed {
+            code: failure.code().into(),
+            message: failure.to_string(),
+        };
+    }
     let (code, message) = match error {
         ServerError::WorkflowApplicationOperationUnauthorized(_) => (
             "workflow_authorization_failed",
@@ -32003,6 +32027,48 @@ async fn invoke_run_graph_operation(
     }
 }
 
+async fn resolve_execution_read(
+    state: &ServerState,
+    session_id: SessionId,
+    operation: &str,
+    payload: serde_json::Value,
+    cancellation: &TurnCancelState,
+) -> ToolInvocationServiceResolution {
+    if operation == bcode_workflow::contributor_evidence::OPERATION {
+        resolve_contributor_evidence(state, session_id, payload, cancellation).await
+    } else {
+        resolve_execution_context(state, session_id, payload, cancellation).await
+    }
+}
+
+async fn resolve_contributor_evidence(
+    state: &ServerState,
+    session_id: SessionId,
+    payload: serde_json::Value,
+    cancellation: &TurnCancelState,
+) -> ToolInvocationServiceResolution {
+    let Ok(request) = serde_json::from_value::<
+        bcode_workflow::contributor_evidence::ExecutionContributorEvidenceRequest,
+    >(payload) else {
+        return workflow_invocation_failure();
+    };
+    let result =
+        workflow_contributor_evidence::from_invocation(state, session_id, &request, cancellation)
+            .await;
+    result.map_or_else(
+        |_| ToolInvocationServiceResolution::Failed {
+            code: "workflow_contributor_evidence_unavailable".to_owned(),
+            message: "authenticated contributor evidence is unavailable".to_owned(),
+        },
+        |response| {
+            serde_json::to_value(response).map_or_else(
+                |_| workflow_invocation_failure(),
+                |payload| ToolInvocationServiceResolution::Responded { payload },
+            )
+        },
+    )
+}
+
 async fn resolve_execution_context(
     state: &ServerState,
     session_id: SessionId,
@@ -32024,6 +32090,80 @@ async fn resolve_execution_context(
                 )
             },
         )
+}
+
+async fn resolve_workflow_application_request(
+    state: &ServerState,
+    session_id: SessionId,
+    call: &bcode_model::ToolCall,
+    plugin_id: &str,
+    request: ToolInvocationServiceRequest,
+    cancel_state: &TurnCancelState,
+) -> ToolInvocationServiceResolution {
+    if request.invocation_id != call.id {
+        return ToolInvocationServiceResolution::Failed {
+            code: "invocation_id_mismatch".to_owned(),
+            message: "service request does not belong to the active invocation".to_owned(),
+        };
+    }
+    if cancel_state.is_cancelled() {
+        return ToolInvocationServiceResolution::Cancelled;
+    }
+    if request.route_id.as_deref() != Some(bcode_workflow::WORKFLOW_APPLICATION_INTERFACE_ID)
+        || !matches!(
+            request.operation.as_str(),
+            "execution_context"
+                | "execution_contributor_evidence"
+                | "stage_run_graph_edit"
+                | "publish_run_graph_edit"
+                | "accept_run_graph_publication"
+        )
+    {
+        return ToolInvocationServiceResolution::Unsupported;
+    }
+    if matches!(
+        request.operation.as_str(),
+        "execution_context" | "execution_contributor_evidence"
+    ) {
+        return resolve_execution_read(
+            state,
+            session_id,
+            &request.operation,
+            request.payload,
+            cancel_state,
+        )
+        .await;
+    }
+    let Ok(edit) = resolve_invocation_graph_edit(
+        state,
+        session_id,
+        &request.operation,
+        request.payload,
+        cancel_state,
+    )
+    .await
+    else {
+        return ToolInvocationServiceResolution::Failed {
+            code: "invalid_request".to_owned(),
+            message: "invalid workflow graph edit request".to_owned(),
+        };
+    };
+    match invoke_run_graph_operation(
+        state,
+        session_id,
+        plugin_id,
+        &request.operation,
+        edit,
+        cancel_state,
+    )
+    .await
+    {
+        Ok(payload) => ToolInvocationServiceResolution::Responded { payload },
+        Err(ServerError::WorkflowComputationCancelled(_)) => {
+            ToolInvocationServiceResolution::Cancelled
+        }
+        Err(error) => workflow_operation_failure(&error),
+    }
 }
 
 async fn resolve_server_plugin_bridge_request(
@@ -32057,57 +32197,15 @@ async fn resolve_server_plugin_bridge_request(
         ServiceBridgeRequest::InvokeService(request)
             if request.interface_id == bcode_workflow::WORKFLOW_APPLICATION_INTERFACE_ID =>
         {
-            let resolution = if request.invocation_id != call.id {
-                ToolInvocationServiceResolution::Failed {
-                    code: "invocation_id_mismatch".to_owned(),
-                    message: "service request does not belong to the active invocation".to_owned(),
-                }
-            } else if cancel_state.is_cancelled() {
-                ToolInvocationServiceResolution::Cancelled
-            } else if request.route_id.as_deref()
-                != Some(bcode_workflow::WORKFLOW_APPLICATION_INTERFACE_ID)
-                || !matches!(
-                    request.operation.as_str(),
-                    "execution_context"
-                        | "stage_run_graph_edit"
-                        | "publish_run_graph_edit"
-                        | "accept_run_graph_publication"
-                )
-            {
-                ToolInvocationServiceResolution::Unsupported
-            } else if request.operation == "execution_context" {
-                resolve_execution_context(state, session_id, request.payload, cancel_state).await
-            } else if let Ok(edit) = resolve_invocation_graph_edit(
+            let resolution = resolve_workflow_application_request(
                 state,
                 session_id,
-                &request.operation,
-                request.payload,
+                call,
+                plugin_id,
+                request,
                 cancel_state,
             )
-            .await
-            {
-                let result = invoke_run_graph_operation(
-                    state,
-                    session_id,
-                    plugin_id,
-                    &request.operation,
-                    edit,
-                    cancel_state,
-                )
-                .await;
-                match result {
-                    Ok(payload) => ToolInvocationServiceResolution::Responded { payload },
-                    Err(ServerError::WorkflowComputationCancelled(_)) => {
-                        ToolInvocationServiceResolution::Cancelled
-                    }
-                    Err(error) => workflow_operation_failure(&error),
-                }
-            } else {
-                ToolInvocationServiceResolution::Failed {
-                    code: "invalid_request".to_owned(),
-                    message: "invalid workflow graph edit request".to_owned(),
-                }
-            };
+            .await;
             ServiceBridgeResponse::Service(resolution)
         }
         ServiceBridgeRequest::InvokeService(request) => {
@@ -57663,6 +57761,17 @@ library = "test"
         assert!(truncated.contains("/tmp/full-output.txt"));
         assert!(truncated.ends_with("necessary.]\n\n") || truncated.contains('z'));
         assert!(truncated.contains('z'));
+    }
+
+    #[test]
+    fn truncated_tool_context_without_locator_does_not_promise_filesystem_recovery() {
+        let output = "unavailable middle evidence".repeat(400);
+        let truncated = project_tool_result_for_model_context(&output, None, 1_000);
+        assert!(truncated.chars().count() <= 1_000);
+        assert!(truncated.contains("No readable artifact locator"));
+        assert!(truncated.contains("explicitly authorized trace-read API"));
+        assert!(!truncated.contains("artifact.read"));
+        assert!(!truncated.contains("Full retained output saved at:"));
     }
 
     #[test]

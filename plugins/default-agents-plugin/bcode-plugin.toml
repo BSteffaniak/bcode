@@ -31,6 +31,7 @@ build_tools = [
     "worktree.create",
     "worktree.remove",
     "workflow.execution_context",
+    "workflow.contributor_evidence",
     "workflow.stage_delegation",
     "workflow.stage_task_group",
     "workflow.stage_agent_task",

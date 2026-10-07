@@ -1058,6 +1058,31 @@ tools = { "filesystem.read" = true }
     }
 
     #[test]
+    fn contributor_evidence_is_selected_for_default_plan_and_build_and_disableable() {
+        let _guard = ENV_LOCK.lock().expect("env lock");
+        let root = unique_temp_dir();
+        let _state = StateGuard::set(&root.join("missing-permissions.toml"));
+        let (config, tools_config) = policy_and_tools_from_effective_toml(Some("")).unwrap();
+        let name = "workflow.contributor_evidence";
+        let available = vec![bcode_tool::ToolDefinition {
+            name: name.into(),
+            description: "bounded contributor evidence".into(),
+            input_schema: serde_json::json!({"type":"object","properties":{},"additionalProperties":false}),
+        }];
+        for profile in [PLAN_AGENT, BUILD_AGENT] {
+            let mut agent = agent_config(&config, profile);
+            apply_tool_selection(&mut agent, &tools_config, &available);
+            assert!(active_tools_for(&agent).contains(&name.into()));
+            let disabled = bcode_config::ToolsConfig {
+                disabled: BTreeSet::from([name.into()]),
+                ..Default::default()
+            };
+            apply_tool_selection(&mut agent, &disabled, &available);
+            assert!(!active_tools_for(&agent).contains(&name.into()));
+        }
+    }
+
+    #[test]
     fn coordination_tools_are_build_only_and_explicitly_disableable() {
         let _guard = ENV_LOCK.lock().expect("env lock");
         let root = unique_temp_dir();
