@@ -96,6 +96,51 @@ fn unavailable_contract_does_not_return_partial_evidence() {
 }
 
 #[test]
+fn typed_service_failures_are_bounded_and_secret_safe() {
+    let cases = [
+        (
+            ServerError::WorkflowComputationCancelled("secret".into()),
+            EvidenceFailure::Cancelled,
+        ),
+        (
+            ServerError::WorkflowApplicationOperationUnauthorized("secret".into()),
+            EvidenceFailure::Unauthorized,
+        ),
+        (
+            ServerError::WorkflowComputationTimedOut("secret".into()),
+            EvidenceFailure::TimedOut,
+        ),
+        (
+            ServerError::WorkflowStorageBusy,
+            EvidenceFailure::StorageBusy,
+        ),
+        (
+            ServerError::WorkflowStore(bcode_workflow_store::WorkflowStoreError::InvalidData(
+                "secret".into(),
+            )),
+            EvidenceFailure::StorageUnavailable,
+        ),
+        (
+            ServerError::WorkflowCapabilityUnavailable("secret".into()),
+            EvidenceFailure::Unavailable,
+        ),
+    ];
+    let mut codes = std::collections::BTreeSet::new();
+    for (error, expected) in cases {
+        let category = EvidenceFailure::from_error(&error);
+        assert_eq!(category, expected);
+        let bcode_tool::ToolInvocationServiceResolution::Failed { code, message } =
+            category.resolution()
+        else {
+            panic!("failure must not release evidence");
+        };
+        assert!(codes.insert(code));
+        assert!(!message.contains("secret"));
+        assert!(message.len() <= 128);
+    }
+}
+
+#[test]
 fn cancellation_prevents_evidence_release() {
     let token = TurnCancelState::default();
     assert!(cancelled(&token).is_ok());

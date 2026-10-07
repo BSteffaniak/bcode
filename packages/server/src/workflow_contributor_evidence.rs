@@ -20,6 +20,75 @@ use bcode_workflow_store::representation::contributor_evidence::{
 
 use crate::{ServerError, ServerState, TurnCancelState, workflow_contributor_events as events};
 
+/// Secret-safe service failure categories; no underlying messages or identities are exposed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EvidenceFailure {
+    /// The cancellation token closed before evidence release.
+    Cancelled,
+    /// Caller authorization was rejected.
+    Unauthorized,
+    /// The application computation timed out.
+    TimedOut,
+    /// Typed persistence backpressure was reported.
+    StorageBusy,
+    /// Storage or proof query failed; finer causes were not retained.
+    StorageUnavailable,
+    /// An otherwise unclassified failure; no cause is inferred.
+    Unavailable,
+}
+
+impl EvidenceFailure {
+    /// Classify only facts retained in the typed application error.
+    #[must_use]
+    pub const fn from_error(error: &ServerError) -> Self {
+        match error {
+            ServerError::WorkflowComputationCancelled(_) => Self::Cancelled,
+            ServerError::WorkflowApplicationOperationUnauthorized(_) => Self::Unauthorized,
+            ServerError::WorkflowComputationTimedOut(_) => Self::TimedOut,
+            ServerError::WorkflowStorageBusy => Self::StorageBusy,
+            ServerError::WorkflowStore(_) | ServerError::WorkflowStorageUnavailable(_) => {
+                Self::StorageUnavailable
+            }
+            _ => Self::Unavailable,
+        }
+    }
+
+    /// Bounded existing service failure envelope, independent of error presentation text.
+    #[must_use]
+    pub fn resolution(self) -> bcode_tool::ToolInvocationServiceResolution {
+        let (code, message) = match self {
+            Self::Cancelled => (
+                "workflow_contributor_evidence_cancelled",
+                "contributor evidence retrieval cancelled",
+            ),
+            Self::Unauthorized => (
+                "workflow_contributor_evidence_unauthorized",
+                "contributor evidence requires matching active execution authorization",
+            ),
+            Self::TimedOut => (
+                "workflow_contributor_evidence_timed_out",
+                "contributor evidence retrieval timed out",
+            ),
+            Self::StorageBusy => (
+                "workflow_contributor_evidence_storage_busy",
+                "contributor evidence storage is busy",
+            ),
+            Self::StorageUnavailable => (
+                "workflow_contributor_evidence_storage_unavailable",
+                "contributor evidence storage or proof query unavailable",
+            ),
+            Self::Unavailable => (
+                "workflow_contributor_evidence_unavailable",
+                "authenticated contributor evidence is unavailable",
+            ),
+        };
+        bcode_tool::ToolInvocationServiceResolution::Failed {
+            code: code.into(),
+            message: message.into(),
+        }
+    }
+}
+
 fn cancelled(cancellation: &TurnCancelState) -> Result<(), ServerError> {
     if cancellation.is_cancelled() {
         Err(ServerError::WorkflowComputationCancelled(

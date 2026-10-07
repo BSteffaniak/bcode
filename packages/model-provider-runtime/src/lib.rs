@@ -543,11 +543,59 @@ impl ProviderOutputPositionAllocator {
 }
 
 /// Queued event/cancellation state for one provider turn.
+#[cfg(test)]
+mod attempt_timing_transport_tests {
+    use super::*;
+
+    #[test]
+    fn timing_transport_requires_explicit_acceptance() {
+        let state = TurnState::default();
+        let event = ProviderTurnEvent::AttemptTiming {
+            timing: bcode_model::ProviderAttemptTiming {
+                attempt: 1,
+                retry_wait_before_ms: 0,
+                auth_ready_ms: None,
+                http_send_ms: None,
+                response_headers_ms: None,
+                first_semantic_ms: None,
+                first_output_ms: None,
+                terminal_ms: 0,
+                outcome: bcode_model::ProviderAttemptOutcome::Cancelled,
+            },
+        };
+        state.push(event.clone());
+        assert!(state.drain().is_empty());
+        state.enable_attempt_timing();
+        state.push(event.clone());
+        assert_eq!(state.drain(), vec![event]);
+        state.push(ProviderTurnEvent::TurnFinished {
+            stop_reason: bcode_model::StopReason::Cancelled,
+        });
+        assert_eq!(state.drain().len(), 1);
+        state.push(ProviderTurnEvent::AttemptTiming {
+            timing: bcode_model::ProviderAttemptTiming {
+                attempt: 2,
+                retry_wait_before_ms: 0,
+                auth_ready_ms: None,
+                http_send_ms: None,
+                response_headers_ms: None,
+                first_semantic_ms: None,
+                first_output_ms: None,
+                terminal_ms: 0,
+                outcome: bcode_model::ProviderAttemptOutcome::Cancelled,
+            },
+        });
+        assert!(state.drain().is_empty());
+    }
+}
+
+/// Queued event/cancellation state for one provider turn.
 #[derive(Debug, Clone, Default)]
 pub struct TurnState {
     events: Arc<Mutex<VecDeque<ProviderTurnEvent>>>,
     output_positions: Arc<Mutex<ProviderOutputPositionAllocator>>,
     original_usage_enabled: Arc<AtomicBool>,
+    attempt_timing_enabled: Arc<AtomicBool>,
     positioned_output: Arc<AtomicBool>,
     cancelled: Arc<AtomicBool>,
     terminal: Arc<AtomicBool>,
@@ -560,6 +608,11 @@ impl TurnState {
     /// Events published after `TurnFinished` are ignored, even after the terminal
     /// event has been drained. Terminal publication does not acknowledge worker release.
     pub fn push(&self, event: ProviderTurnEvent) {
+        if matches!(event, ProviderTurnEvent::AttemptTiming { .. })
+            && !self.attempt_timing_enabled.load(Ordering::Acquire)
+        {
+            return;
+        }
         if matches!(event, ProviderTurnEvent::OriginalUsage { .. })
             && !self.original_usage_enabled.load(Ordering::Acquire)
         {
@@ -594,6 +647,12 @@ impl TurnState {
     /// Opt in to private billing evidence on this provider turn.
     pub fn enable_original_usage(&self) {
         self.original_usage_enabled.store(true, Ordering::Release);
+    }
+
+    /// Accept version-1 attempt timing events after capability negotiation.
+    /// Disabled by default; does not enable provider instrumentation by itself.
+    pub fn enable_attempt_timing(&self) {
+        self.attempt_timing_enabled.store(true, Ordering::Release);
     }
 
     /// Enable positioned v2 semantic output for this turn.

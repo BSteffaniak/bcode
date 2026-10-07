@@ -5,6 +5,40 @@ fn request() -> ExecutionContributorEvidenceRequest {
 }
 
 #[test]
+fn service_failure_codes_survive_without_untrusted_messages() {
+    for code in [
+        "workflow_contributor_evidence_cancelled",
+        "workflow_contributor_evidence_unauthorized",
+        "workflow_contributor_evidence_timed_out",
+        "workflow_contributor_evidence_storage_busy",
+        "workflow_contributor_evidence_storage_unavailable",
+        "workflow_contributor_evidence_unavailable",
+        "future-secret-code",
+    ] {
+        let wire = ServiceBridgeResponse::Service(ToolInvocationServiceResolution::Failed {
+            code: code.into(),
+            message: "secret prompt /private/path".into(),
+        });
+        let decoded = serde_json::from_slice(&serde_json::to_vec(&wire).unwrap()).unwrap();
+        let response = invocation_response(decoded, &request());
+        assert!(response.payload.is_empty());
+        let error = response.error.unwrap();
+        let expected = if matches!(
+            code,
+            "future-secret-code" | "workflow_contributor_evidence_unavailable"
+        ) {
+            "evidence_unavailable"
+        } else {
+            code
+        };
+        assert_eq!(error.code, expected);
+        assert!(!error.message.contains("secret"));
+        assert!(!error.message.contains("/private"));
+        assert!(error.message.len() <= 128);
+    }
+}
+
+#[test]
 fn portable_envelope_normalizes_and_preserves_strict_typed_validation() {
     let tool = definition();
     let normalized = bcode_model_schema::normalize(

@@ -119,11 +119,36 @@ fn invocation_response(
         ServiceBridgeResponse::Service(ToolInvocationServiceResolution::Responded { payload }) => {
             render(payload, query)
         }
+        ServiceBridgeResponse::Service(ToolInvocationServiceResolution::Failed {
+            code, ..
+        }) => normalized_failure(&code),
         _ => ServiceResponse::error(
             "evidence_unavailable",
             "authenticated contributor evidence unavailable",
         ),
     }
+}
+
+/// Preserve recognized service categories without exposing service messages or unknown codes.
+fn normalized_failure(code: &str) -> ServiceResponse {
+    let message = match code {
+        "workflow_contributor_evidence_cancelled" => "contributor evidence retrieval cancelled",
+        "workflow_contributor_evidence_unauthorized" => {
+            "contributor evidence requires matching active execution authorization"
+        }
+        "workflow_contributor_evidence_timed_out" => "contributor evidence retrieval timed out",
+        "workflow_contributor_evidence_storage_busy" => "contributor evidence storage is busy",
+        "workflow_contributor_evidence_storage_unavailable" => {
+            "contributor evidence storage or proof query unavailable"
+        }
+        _ => {
+            return ServiceResponse::error(
+                "evidence_unavailable",
+                "authenticated contributor evidence unavailable",
+            );
+        }
+    };
+    ServiceResponse::error(code, message)
 }
 
 fn prepared_matches(descriptor: &serde_json::Value, payload: &serde_json::Value) -> bool {

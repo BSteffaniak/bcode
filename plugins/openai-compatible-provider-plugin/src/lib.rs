@@ -212,8 +212,11 @@ impl Default for OpenAiCompatibleProviderPlugin {
     }
 }
 
+mod attempt_timing;
+
 #[derive(Debug, Clone, Default)]
 struct TurnState {
+    timing: Arc<Mutex<attempt_timing::Recorder>>,
     routing: turn_routing::TurnRouting,
     events: Arc<Mutex<VecDeque<ProviderTurnEvent>>>,
     output_positions: Arc<Mutex<ProviderOutputPositionAllocator>>,
@@ -270,6 +273,7 @@ struct OpenAiAuthTokenResponse {
 
 impl TurnState {
     fn push(&self, event: ProviderTurnEvent) {
+        self.timing.lock().expect("timing lock").observe(&event);
         if let ProviderTurnEvent::TextDelta { text } = &event {
             let mut buffered = self.structured_text.lock().expect("structured text lock");
             if let Some(result) = buffered.as_mut() {
@@ -4026,12 +4030,26 @@ async fn wait_for_retry_or_cancel(turn: &TurnState, wait_seconds: u64) -> bool {
     if wait_seconds == 0 {
         return false;
     }
+    let started = Instant::now();
     let sleep = tokio::time::sleep(Duration::from_secs(wait_seconds));
     tokio::pin!(sleep);
-    tokio::select! {
+    let cancelled = tokio::select! {
         () = &mut sleep => false,
         () = turn.cancelled() => true,
+    };
+    let timing = {
+        let mut recorder = turn.timing.lock().expect("timing lock");
+        recorder.waited(u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX));
+        if cancelled {
+            recorder.cancelled_wait()
+        } else {
+            None
+        }
+    };
+    if let Some(timing) = timing {
+        turn.push(ProviderTurnEvent::AttemptTiming { timing });
     }
+    cancelled
 }
 
 fn quota_error_retry_at_unix(error: &ProviderError) -> Option<u64> {
@@ -4576,11 +4594,33 @@ async fn stream_chat_completion_inner(
     request: &ModelTurnRequest,
     turn: &TurnState,
 ) -> Result<StreamOutcome, ProviderError> {
-    tokio::select! {
+    turn.timing.lock().expect("timing lock").begin(
+        request
+            .metadata
+            .get(bcode_model::PROVIDER_ATTEMPT_TIMING_V1)
+            .is_some_and(|value| value == "true"),
+    );
+    let outcome = tokio::select! {
         biased;
         () = turn.cancelled() => Ok(StreamOutcome::Cancelled),
         outcome = stream_chat_completion_attempt(request, turn) => outcome,
+    };
+    let classification = match &outcome {
+        Ok(StreamOutcome::Finished | StreamOutcome::ToolCall | StreamOutcome::MaxTokens) => {
+            bcode_model::ProviderAttemptOutcome::Completed
+        }
+        Ok(StreamOutcome::Cancelled) => bcode_model::ProviderAttemptOutcome::Cancelled,
+        Err(_) => bcode_model::ProviderAttemptOutcome::Failed,
+    };
+    let timing = turn
+        .timing
+        .lock()
+        .expect("timing lock")
+        .finish(classification);
+    if let Some(timing) = timing {
+        turn.push(ProviderTurnEvent::AttemptTiming { timing });
     }
+    outcome
 }
 
 async fn stream_chat_completion_attempt(
@@ -4588,6 +4628,7 @@ async fn stream_chat_completion_attempt(
     turn: &TurnState,
 ) -> Result<StreamOutcome, ProviderError> {
     let settings = settings_for_context(&request.provider_context);
+    turn.timing.lock().expect("timing lock").auth_ready();
     // Trace auth resolution before validation so a dialect/auth-gated rejection still leaves a
     // record of how this request resolved.
     turn.push(ProviderTurnEvent::ProviderMetadata {
@@ -4795,16 +4836,23 @@ async fn send_chat_completion_request(
         bytes.len() as u64,
         request_body.messages.len(),
     );
-    let response = prepare_http_body(
+    let builder = prepare_http_body(
         client.post(url).bearer_auth(api_key),
         bytes,
         request,
         projection,
         turn,
-    )?
-    .send()
-    .await
-    .map_err(|error| reqwest_provider_error("request_failed", &error))?;
+    )?;
+    if let Some(turn) = turn {
+        turn.timing.lock().expect("timing lock").send();
+    }
+    let response = builder
+        .send()
+        .await
+        .map_err(|error| reqwest_provider_error("request_failed", &error))?;
+    if let Some(turn) = turn {
+        turn.timing.lock().expect("timing lock").headers();
+    }
     let status = response.status();
     if !status.is_success() {
         let headers = response.headers().clone();
@@ -4902,10 +4950,16 @@ async fn send_responses_request_to(
     {
         builder = builder.header("ChatGPT-Account-Id", account_id);
     }
+    if let Some(turn) = turn {
+        turn.timing.lock().expect("timing lock").send();
+    }
     let response = builder
         .send()
         .await
         .map_err(|error| reqwest_provider_error("request_failed", &error))?;
+    if let Some(turn) = turn {
+        turn.timing.lock().expect("timing lock").headers();
+    }
     let status = response.status();
     let headers = response.headers().clone();
     if !status.is_success() {
@@ -6985,7 +7039,14 @@ fn capabilities_for_settings(settings: &Settings) -> ProviderCapabilities {
             .into_iter()
             .collect(),
         retry_rules: vec![unsupported_content_type_retry_rule()],
-        metadata: diagnostics_metadata(settings, None),
+        metadata: {
+            let mut metadata = diagnostics_metadata(settings, None);
+            metadata.insert(
+                bcode_model::PROVIDER_ATTEMPT_TIMING_V1.into(),
+                "true".into(),
+            );
+            metadata
+        },
     }
 }
 

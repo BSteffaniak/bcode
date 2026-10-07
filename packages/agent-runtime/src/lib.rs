@@ -4376,7 +4376,9 @@ fn normalize_provider_event(
         ProviderTurnEvent::ToolCallFinished { call } => Ok(EventDisposition::Continue(
             AgentRuntimeEvent::ToolCallFinished(call),
         )),
-        ProviderTurnEvent::OriginalUsage { .. } => Ok(EventDisposition::PrivateMetadata),
+        ProviderTurnEvent::AttemptTiming { .. } | ProviderTurnEvent::OriginalUsage { .. } => {
+            Ok(EventDisposition::PrivateMetadata)
+        }
         ProviderTurnEvent::Usage { usage } => {
             *usage_buffer = Some(usage.clone());
             Ok(EventDisposition::Continue(AgentRuntimeEvent::Usage(usage)))

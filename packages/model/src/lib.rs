@@ -2730,6 +2730,47 @@ impl ResolvedModelFeatureCapabilities {
 /// turn and is distinct from the per-request `ModelTurnRequest::turn_id`.
 pub const APPLICATION_TURN_ID_METADATA_KEY: &str = "application_turn_id";
 
+/// Versioned capability advertisement and explicit host acceptance of timing events.
+/// Hosts must check provider capability metadata before setting this request metadata key.
+pub const PROVIDER_ATTEMPT_TIMING_V1: &str = "bcode_provider_attempt_timing_v1";
+
+/// Secret-free terminal snapshot for one adapter attempt. Times are monotonic offsets
+/// from attempt entry, not remote queue measurements. `None` means not observed.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProviderAttemptTiming {
+    /// One-based attempt ordinal within the provider invocation. An interrupted retry
+    /// wait also receives an ordinal, with absent authentication/HTTP milestones.
+    pub attempt: u64,
+    /// Measured local retry waiting preceding this attempt (zero when none).
+    pub retry_wait_before_ms: u64,
+    /// Authentication/settings resolution finished.
+    pub auth_ready_ms: Option<u64>,
+    /// HTTP send future started; not proof of socket transmission.
+    pub http_send_ms: Option<u64>,
+    /// HTTP response headers received.
+    pub response_headers_ms: Option<u64>,
+    /// First normalized semantic activity, excluding usage and metadata.
+    pub first_semantic_ms: Option<u64>,
+    /// First normalized text/tool output, excluding reasoning activity.
+    pub first_output_ms: Option<u64>,
+    /// Terminal elapsed time, including interrupted attempts.
+    pub terminal_ms: u64,
+    /// Terminal classification without provider error text.
+    pub outcome: ProviderAttemptOutcome,
+}
+
+/// Terminal classification for provider attempt timing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProviderAttemptOutcome {
+    /// The adapter completed the stream.
+    Completed,
+    /// Cancellation interrupted the attempt.
+    Cancelled,
+    /// The attempt failed.
+    Failed,
+}
+
 /// Start a provider model turn.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ModelTurnRequest {
@@ -3110,6 +3151,11 @@ pub enum ProviderOutputEvent {
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ProviderTurnEvent {
+    /// Opt-in version-1 adapter timing. Emit only after explicit host acceptance.
+    AttemptTiming {
+        /// Bounded secret-free terminal attempt snapshot.
+        timing: ProviderAttemptTiming,
+    },
     TurnStarted,
     /// Positioned semantic output from a v2 provider.
     Output {

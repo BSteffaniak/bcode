@@ -337,7 +337,8 @@ impl ProviderEventValidator {
             ProviderTurnEvent::RequestProjection { projection } => {
                 self.request_projections.push(projection.clone());
             }
-            ProviderTurnEvent::ExactRequestInputTokens { .. }
+            ProviderTurnEvent::AttemptTiming { .. }
+            | ProviderTurnEvent::ExactRequestInputTokens { .. }
             | ProviderTurnEvent::ContextCompacted { .. }
             | ProviderTurnEvent::ProviderMetadata { .. }
             | ProviderTurnEvent::Warning { .. } => {}

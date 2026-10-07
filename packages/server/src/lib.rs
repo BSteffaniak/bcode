@@ -8580,10 +8580,10 @@ async fn handle_workflow_run_request(
             let response = workflow_diagnostics::list(state, &run_id, &dispatch_identity)
                 .await
                 .map_or_else(
-                    |_| {
+                    |error| {
                         Response::Err(ErrorResponse::new(
                             "workflow_diagnostic_unavailable",
-                            "workflow diagnostic reference discovery is unavailable",
+                            error.to_string(),
                         ))
                     },
                     |artifacts| {
@@ -22399,6 +22399,7 @@ const fn provider_turn_event_kind(event: &ProviderTurnEvent) -> &'static str {
         ProviderTurnEvent::OriginalUsage { .. } => "original_usage",
         ProviderTurnEvent::Usage { .. } => "usage",
         ProviderTurnEvent::ExactRequestInputTokens { .. } => "exact_request_input_tokens",
+        ProviderTurnEvent::AttemptTiming { .. } => "attempt_timing",
         ProviderTurnEvent::RequestProjection { .. } => "request_projection",
         ProviderTurnEvent::ContextCompacted { .. } => "context_compacted",
         ProviderTurnEvent::ProviderMetadata { .. } => "provider_metadata",
@@ -23305,7 +23306,8 @@ const fn model_event_is_progress(event: &ProviderTurnEvent) -> bool {
         | ProviderTurnEvent::ToolCallStarted { .. }
         | ProviderTurnEvent::ToolCallFinished { .. } => true,
         ProviderTurnEvent::ToolCallDelta { delta, .. } => !delta.is_empty(),
-        ProviderTurnEvent::RequestProjection { .. }
+        ProviderTurnEvent::AttemptTiming { .. }
+        | ProviderTurnEvent::RequestProjection { .. }
         | ProviderTurnEvent::ContextCompacted { .. }
         | ProviderTurnEvent::TurnStarted
         | ProviderTurnEvent::OriginalUsage { .. }
@@ -23866,6 +23868,16 @@ async fn handle_provider_turn_event(
                 snapshot,
                 compacted_through_sequence: active_turn.context_through_sequence,
             });
+        }
+        ProviderTurnEvent::AttemptTiming { timing } => {
+            append_provider_event_trace(
+                state,
+                session_id,
+                turn_id,
+                "attempt_timing",
+                serde_json::to_string(&timing).ok(),
+            )
+            .await;
         }
         ProviderTurnEvent::RequestProjection { projection } => {
             handle_provider_request_projection_event(state, session_id, turn_id, projection).await;
@@ -26638,6 +26650,21 @@ async fn build_model_turn_request(
         &provider_context,
     ))
     .await;
+    if std::env::var_os("BCODE_PROVIDER_ATTEMPT_TIMING").as_deref()
+        == Some(std::ffi::OsStr::new("1"))
+        && feature_negotiation.as_ref().is_some_and(|negotiation| {
+            negotiation
+                .provider
+                .metadata
+                .get(bcode_model::PROVIDER_ATTEMPT_TIMING_V1)
+                .is_some_and(|value| value == "true")
+        })
+    {
+        metadata.insert(
+            bcode_model::PROVIDER_ATTEMPT_TIMING_V1.into(),
+            "true".into(),
+        );
+    }
     let parallel_capabilities =
         parallel_tool_call_capabilities_from_negotiation(feature_negotiation.as_ref(), true);
     let desired_structured_output =
@@ -32056,10 +32083,7 @@ async fn resolve_contributor_evidence(
         workflow_contributor_evidence::from_invocation(state, session_id, &request, cancellation)
             .await;
     result.map_or_else(
-        |_| ToolInvocationServiceResolution::Failed {
-            code: "workflow_contributor_evidence_unavailable".to_owned(),
-            message: "authenticated contributor evidence is unavailable".to_owned(),
-        },
+        |error| workflow_contributor_evidence::EvidenceFailure::from_error(&error).resolution(),
         |response| {
             serde_json::to_value(response).map_or_else(
                 |_| workflow_invocation_failure(),
@@ -34418,8 +34442,15 @@ async fn append_trace_event_inner(
     phase: SessionTracePhase,
     payload: SessionTracePayload,
 ) {
+    let opted_in_attempt_timing = matches!(
+        &payload,
+        SessionTracePayload::ProviderEvent { event_type, .. } if event_type == "attempt_timing"
+    ) && std::env::var_os("BCODE_PROVIDER_ATTEMPT_TIMING").as_deref()
+        == Some(std::ffi::OsStr::new("1"));
     if !state.observability.enabled()
-        || (!state.observability.debug_enabled() && !standard_trace_phase(phase))
+        || (!state.observability.debug_enabled()
+            && !standard_trace_phase(phase)
+            && !opted_in_attempt_timing)
     {
         return;
     }
