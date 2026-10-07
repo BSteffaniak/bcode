@@ -2650,6 +2650,10 @@ pub struct TuiConfig {
     #[config_doc(nested)]
     #[serde(default)]
     pub mouse: TuiMouseConfig,
+    /// Transcript selection copy and clearing configuration.
+    #[config_doc(nested)]
+    #[serde(default)]
+    pub selection: TuiSelectionConfig,
     /// Rich Markdown image and diagram presentation configuration.
     #[config_doc(nested)]
     #[serde(default)]
@@ -3328,6 +3332,46 @@ impl Default for TuiMarkdownConfig {
 
 const fn default_tui_markdown_mermaid() -> bool {
     true
+}
+
+/// Terminal UI transcript selection configuration.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ConfigDoc)]
+#[config_doc(section = "selection")]
+pub struct TuiSelectionConfig {
+    /// Copy valid, nonempty selected source text on transcript mouse drag release.
+    /// Defaults to true; false keeps copying keyboard-only via `tui.transcript.copySelection`.
+    #[serde(default = "default_tui_selection_auto_copy_on_mouse_release")]
+    pub auto_copy_on_mouse_release: bool,
+    /// Clear transcript selection after successful automatic or manual copying.
+    /// Defaults to true; failed copying always retains selection.
+    #[serde(default = "default_tui_selection_clear_after_copy")]
+    pub clear_after_copy: bool,
+    /// Milliseconds before clearing successfully copied selection. Defaults to 1000.
+    /// Zero clears immediately; ignored when `clear_after_copy` is false.
+    #[serde(default = "default_tui_selection_clear_delay_ms")]
+    pub clear_delay_ms: u64,
+}
+
+impl Default for TuiSelectionConfig {
+    fn default() -> Self {
+        Self {
+            auto_copy_on_mouse_release: default_tui_selection_auto_copy_on_mouse_release(),
+            clear_after_copy: default_tui_selection_clear_after_copy(),
+            clear_delay_ms: default_tui_selection_clear_delay_ms(),
+        }
+    }
+}
+
+const fn default_tui_selection_auto_copy_on_mouse_release() -> bool {
+    true
+}
+
+const fn default_tui_selection_clear_after_copy() -> bool {
+    true
+}
+
+const fn default_tui_selection_clear_delay_ms() -> u64 {
+    1000
 }
 
 /// Terminal UI mouse interaction configuration.
@@ -8002,6 +8046,7 @@ fn write_tui_toml(output: &mut String, tui: &TuiConfig) {
         write_tui_keybinding_section(output, "session_picker", &tui.keybindings.session_picker);
     }
     write_tui_mouse_toml(output, &tui.mouse);
+    write_tui_selection_toml(output, tui.selection);
     write_tui_interactions_toml(output, tui.interactions);
     write_tui_markdown_toml(output, tui.markdown);
     writeln!(output, "[tui.thinking]").expect("writing to string should not fail");
@@ -8012,6 +8057,23 @@ fn write_tui_toml(output: &mut String, tui: &TuiConfig) {
         tui_thinking_mode_name(tui.thinking.mode)
     )
     .expect("writing to string should not fail");
+}
+
+fn write_tui_selection_toml(output: &mut String, selection: TuiSelectionConfig) {
+    if selection == TuiSelectionConfig::default() {
+        return;
+    }
+    writeln!(output, "[tui.selection]").expect("writing to string should not fail");
+    writeln!(
+        output,
+        "auto_copy_on_mouse_release = {}",
+        selection.auto_copy_on_mouse_release
+    )
+    .expect("writing to string should not fail");
+    writeln!(output, "clear_after_copy = {}", selection.clear_after_copy)
+        .expect("writing to string should not fail");
+    writeln!(output, "clear_delay_ms = {}", selection.clear_delay_ms)
+        .expect("writing to string should not fail");
 }
 
 fn write_tui_theme_toml(output: &mut String, theme: &TuiThemeConfig) {
@@ -10544,6 +10606,129 @@ enabled = false
                 "unexpected default for {key}"
             );
         }
+    }
+
+    #[test]
+    fn tui_selection_defaults_and_partial_tables() {
+        let default = super::TuiSelectionConfig::default();
+        assert!(default.auto_copy_on_mouse_release);
+        assert!(default.clear_after_copy);
+        assert_eq!(default.clear_delay_ms, 1000);
+        for input in ["", "[tui]", "[tui.selection]"] {
+            let config: BcodeConfig = toml::from_str(input).expect("config parses");
+            assert_eq!(config.tui.selection, default);
+        }
+        for (input, expected) in [
+            (
+                "auto_copy_on_mouse_release = false",
+                super::TuiSelectionConfig {
+                    auto_copy_on_mouse_release: false,
+                    ..default
+                },
+            ),
+            (
+                "clear_after_copy = false",
+                super::TuiSelectionConfig {
+                    clear_after_copy: false,
+                    ..default
+                },
+            ),
+            (
+                "clear_delay_ms = 0",
+                super::TuiSelectionConfig {
+                    clear_delay_ms: 0,
+                    ..default
+                },
+            ),
+            (
+                "clear_delay_ms = 2750",
+                super::TuiSelectionConfig {
+                    clear_delay_ms: 2750,
+                    ..default
+                },
+            ),
+        ] {
+            let config: BcodeConfig = toml::from_str(&format!("[tui.selection]\n{input}\n"))
+                .expect("partial selection config parses");
+            assert_eq!(config.tui.selection, expected);
+        }
+        assert_nested_defaults(
+            &BcodeConfig::field_docs(),
+            "tui",
+            "selection",
+            &[
+                ("auto_copy_on_mouse_release", "true"),
+                ("clear_after_copy", "true"),
+                ("clear_delay_ms", "1000"),
+            ],
+        );
+    }
+
+    #[test]
+    fn tui_selection_writing_and_transport_preserve_settings() {
+        for clear_delay_ms in [0, 1000, 2750, i64::MAX.cast_unsigned()] {
+            for (auto_copy_on_mouse_release, clear_after_copy) in
+                [(true, true), (false, true), (true, false), (false, false)]
+            {
+                let mut config = BcodeConfig::default();
+                config.tui.selection = super::TuiSelectionConfig {
+                    auto_copy_on_mouse_release,
+                    clear_after_copy,
+                    clear_delay_ms,
+                };
+                for encoded in [
+                    super::config_to_toml(&config),
+                    super::encode_effective_config(&config).expect("effective config encodes"),
+                ] {
+                    let decoded: BcodeConfig =
+                        toml::from_str(&encoded).expect("written config parses");
+                    assert_eq!(decoded.tui.selection, config.tui.selection);
+                }
+            }
+        }
+        // JSON can represent the full public u64 range; TOML integers are signed 64-bit.
+        let extreme = super::TuiSelectionConfig {
+            clear_delay_ms: u64::MAX,
+            ..Default::default()
+        };
+        let encoded = serde_json::to_string(&extreme).expect("selection serializes");
+        let decoded: super::TuiSelectionConfig =
+            serde_json::from_str(&encoded).expect("selection parses");
+        assert_eq!(decoded, extreme);
+        assert!(toml::from_str::<super::TuiSelectionConfig>("clear_delay_ms = -1").is_err());
+    }
+
+    #[test]
+    fn tui_selection_layers_merge_individual_fields() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let user = temp.path().join("user.toml");
+        let project = temp.path().join("project.toml");
+        std::fs::write(&user, "[tui.selection]\nauto_copy_on_mouse_release = false\nclear_after_copy = false\nclear_delay_ms = 2750\n").expect("user config writes");
+        std::fs::write(&project, "[tui.selection]\nclear_delay_ms = 0\n")
+            .expect("project config writes");
+        let paths = [user, project];
+        let config = load_config_from_paths_with_overrides(&paths, &ConfigLoadOverrides::default())
+            .expect("layers load");
+        assert_eq!(
+            config.tui.selection,
+            super::TuiSelectionConfig {
+                auto_copy_on_mouse_release: false,
+                clear_after_copy: false,
+                clear_delay_ms: 0,
+            }
+        );
+        let overrides = ConfigLoadOverrides::default().with_cli_config_toml(Some(
+            "[tui.selection]\nclear_after_copy = true\n".to_owned(),
+        ));
+        let overridden =
+            load_config_from_paths_with_overrides(&paths, &overrides).expect("override loads");
+        assert_eq!(
+            overridden.tui.selection,
+            super::TuiSelectionConfig {
+                clear_after_copy: true,
+                ..config.tui.selection
+            }
+        );
     }
 
     #[test]

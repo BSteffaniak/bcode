@@ -31,11 +31,26 @@ unambiguous, while unsupported transformed visuals use an explicit rendered-text
 than inventing source ranges. Copy success, absence of a selection, and clipboard failures are
 reported in the normal status area.
 
-The copy binding is configurable:
+By default, releasing the left mouse button after dragging a nonempty transcript selection copies
+it automatically. Successful automatic or keyboard copying keeps the highlight for one second,
+then clears the selection. Failed copying preserves the selection for retry. Configure this under
+`[tui.selection]`; see [selection configuration](tui-rendering.md#transcript-selection-copying).
+
+The copy binding is configurable, and clearing can be bound explicitly without changing the
+existing Escape or Ctrl+C behavior:
 
 ```toml
 [tui.keybindings.chat]
 "ctrl+shift+c" = "tui.transcript.copySelection"
+"alt+x" = "tui.transcript.clearSelection" # Optional; no default clear-selection binding.
+```
+
+For keyboard-only copying and persistent highlighting:
+
+```toml
+[tui.selection]
+auto_copy_on_mouse_release = false
+clear_after_copy = false
 ```
 
 The composer is Unicode-aware. Arrow keys move by grapheme; `Alt+Left` / `Alt+Right` and `Ctrl+Left` / `Ctrl+Right` move by word. `Ctrl+A` / `Ctrl+E` move to the start or end, while standard character, word, and line deletion bindings are available. Active plugin text inputs consume these same configured edit, selection, newline, and submit actions.

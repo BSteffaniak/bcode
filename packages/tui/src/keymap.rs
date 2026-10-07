@@ -29,6 +29,8 @@ pub enum BmuxAction {
     AppInterrupt,
     ClipboardPasteImage,
     TranscriptCopySelection,
+    /// Explicitly clear transcript selection without copying.
+    TranscriptClearSelection,
     CommandPaletteOpen,
     SessionSearchOpen,
     AgentCycle,
@@ -90,6 +92,7 @@ impl BmuxAction {
             "app.interrupt" => Self::AppInterrupt,
             "app.clipboard.pasteImage" => Self::ClipboardPasteImage,
             "tui.transcript.copySelection" => Self::TranscriptCopySelection,
+            "tui.transcript.clearSelection" => Self::TranscriptClearSelection,
             "app.command_palette" => Self::CommandPaletteOpen,
             "tui.session.search" => Self::SessionSearchOpen,
             "tui.agent.cycle" => Self::AgentCycle,
@@ -275,7 +278,8 @@ impl BmuxKeyMap {
             BmuxAction::EditorDeleteWordForward => TextEditCommand::Delete(TextDelete::WordForward),
             BmuxAction::EditorDeleteToStart => TextEditCommand::Delete(TextDelete::ToStart),
             BmuxAction::EditorDeleteToEnd => TextEditCommand::Delete(TextDelete::ToEnd),
-            BmuxAction::InputSubmitSteering
+            BmuxAction::TranscriptClearSelection
+            | BmuxAction::InputSubmitSteering
             | BmuxAction::InputSubmitFollowUp
             | BmuxAction::InputHistoryPrevious
             | BmuxAction::InputHistoryNext
@@ -336,7 +340,8 @@ impl BmuxKeyMap {
             BmuxAction::EditorSelectWordRight => TextMotion::WordRight,
             BmuxAction::EditorSelectUp => TextMotion::VisualUp,
             BmuxAction::EditorSelectDown => TextMotion::VisualDown,
-            BmuxAction::InputSubmitSteering
+            BmuxAction::TranscriptClearSelection
+            | BmuxAction::InputSubmitSteering
             | BmuxAction::InputSubmitFollowUp
             | BmuxAction::InputHistoryPrevious
             | BmuxAction::InputHistoryNext

@@ -158,6 +158,7 @@ pub fn handle_chat_action(app: &mut BmuxApp, action: Option<BmuxAction>) -> Opti
         },
         BmuxAction::ClipboardPasteImage
         | BmuxAction::TranscriptCopySelection
+        | BmuxAction::TranscriptClearSelection
         | BmuxAction::CommandPaletteOpen
         | BmuxAction::SessionSearchOpen
         | BmuxAction::PermissionApprove

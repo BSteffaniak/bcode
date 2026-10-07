@@ -2390,6 +2390,7 @@ pub struct TuiRuntimeSettings {
     keymap: BmuxKeyMap,
     mouse_scroll_rows: usize,
     selection_autoscroll: bool,
+    selection: bcode_config::TuiSelectionConfig,
     frame_interval: Option<Duration>,
     runtime_config: bmux_tui_runtime::RuntimeConfig,
     metrics_enabled: bool,
@@ -2409,6 +2410,7 @@ impl TuiRuntimeSettings {
             keymap: BmuxKeyMap::from_config(&tui_config),
             mouse_scroll_rows: tui_config.mouse.effective_scroll_rows(),
             selection_autoscroll: tui_config.mouse.selection_autoscroll,
+            selection: tui_config.selection,
             frame_interval: tui_config.render.frame_interval(),
             runtime_config: super::runtime_adapter::config(&tui_config),
             metrics_enabled: false,
@@ -2429,6 +2431,7 @@ impl TuiRuntimeSettings {
         self.keymap = BmuxKeyMap::from_config(tui_config);
         self.mouse_scroll_rows = tui_config.mouse.effective_scroll_rows();
         self.selection_autoscroll = tui_config.mouse.selection_autoscroll;
+        self.selection = tui_config.selection;
         self.frame_interval = tui_config.render.frame_interval();
         self.runtime_config = super::runtime_adapter::config(tui_config);
     }
@@ -2449,6 +2452,12 @@ impl TuiRuntimeSettings {
 
     pub const fn keymap(&self) -> &BmuxKeyMap {
         &self.keymap
+    }
+
+    /// Current transcript copy and clearing policy.
+    #[must_use]
+    pub const fn selection(&self) -> &bcode_config::TuiSelectionConfig {
+        &self.selection
     }
 
     pub const fn selection_autoscroll(&self) -> bool {

@@ -244,6 +244,11 @@ pub struct BcodeRuntimeModel {
     child_refresh_cursor: Option<bcode_session_models::SessionId>,
     scheduled_deadlines: BTreeMap<bmux_tui_runtime::TimerId, Instant>,
     temporal_registry: TemporalRegistry,
+    selection_clear_at: Option<Instant>,
+    selection_clear_generation: u64,
+    selection_session: Option<bcode_session_models::SessionId>,
+    selection_policy: (bool, bool, u64),
+    transcript_clipboard: fn(&str) -> Result<(), String>,
 }
 
 enum RootTimer {
@@ -256,10 +261,14 @@ enum RootTimer {
     TelemetryFlush,
     ThemeReload,
     ChildActivity,
+    SelectionClear(u64),
 }
 
 impl RootTimer {
     fn id(self) -> bmux_tui_runtime::TimerId {
+        if let Self::SelectionClear(generation) = self {
+            return bmux_tui_runtime::TimerId::new(format!("bcode.selection_clear.{generation}"));
+        }
         bmux_tui_runtime::TimerId::new(match self {
             Self::Invalidations => "bcode.invalidations",
             Self::ArtifactRetry => "bcode.artifact_retry",
@@ -270,6 +279,7 @@ impl RootTimer {
             Self::TelemetryFlush => "bcode.telemetry_flush",
             Self::ThemeReload => "bcode.theme_reload",
             Self::ChildActivity => "bcode.child_activity",
+            Self::SelectionClear(_) => unreachable!("selection timer handled above"),
         })
     }
 }
@@ -309,7 +319,27 @@ impl BcodeRuntimeModel {
         );
         let theme_input_signature = super::theme::active_theme_input_signature(&chat.app);
         let theme_reload_at = Instant::now() + Duration::from_millis(750);
+        let selection_session = chat.app.session_id();
+        let selection_policy = (
+            settings.selection().auto_copy_on_mouse_release,
+            settings.selection().clear_after_copy,
+            settings.selection().clear_delay_ms,
+        );
         Self {
+            selection_clear_at: None,
+            selection_clear_generation: 0,
+            selection_session,
+            selection_policy,
+            transcript_clipboard: {
+                #[cfg(not(test))]
+                let copy: fn(&str) -> Result<(), String> = |text| {
+                    super::markdown_activation::copy_text(text).map_err(|error| error.to_string())
+                };
+                #[cfg(test)]
+                let copy: fn(&str) -> Result<(), String> =
+                    |_| Err("test clipboard not injected".to_owned());
+                copy
+            },
             chat,
             loop_state,
             settings,
@@ -350,6 +380,7 @@ impl BcodeRuntimeModel {
     }
 
     fn synchronize_screen(&mut self) -> super::invalidation::UiInvalidation {
+        self.synchronize_selection_lifecycle();
         let next = self.active_screen();
         if next == self.screen {
             return super::invalidation::UiInvalidation::None;
@@ -570,6 +601,7 @@ impl BcodeRuntimeModel {
 
     #[allow(clippy::let_and_return, clippy::too_many_lines)]
     fn handle_basic_terminal_event(&mut self, event: Event) -> super::invalidation::UiInvalidation {
+        self.synchronize_selection_lifecycle();
         if self.loop_state.has_root_plugin_surface()
             && !self.loop_state.root_plugin_surface_is_suspended()
         {
@@ -1189,6 +1221,15 @@ impl BcodeRuntimeModel {
                     .settings
                     .keymap()
                     .action_for_key(super::keymap::BmuxScope::Chat, stroke)
+                    == Some(super::keymap::BmuxAction::TranscriptClearSelection)
+                {
+                    self.clear_transcript_selection();
+                    return super::invalidation::UiInvalidation::Paint;
+                }
+                if self
+                    .settings
+                    .keymap()
+                    .action_for_key(super::keymap::BmuxScope::Chat, stroke)
                     == Some(super::keymap::BmuxAction::TranscriptCopySelection)
                 {
                     self.copy_transcript_selection();
@@ -1431,14 +1472,31 @@ impl BcodeRuntimeModel {
         {
             return None;
         }
+        self.synchronize_selection_lifecycle();
+        let had_selection = self
+            .selected_plain_text
+            .as_ref()
+            .is_some_and(|text| !text.is_empty());
         let outcome = self
             .transcript_selection
             .handle_mouse(&self.committed_selection, mouse);
         match outcome {
-            bmux_tui::selection::SelectionOutcome::Ignored
-            | bmux_tui::selection::SelectionOutcome::Click => None,
+            bmux_tui::selection::SelectionOutcome::Ignored => None,
+            bmux_tui::selection::SelectionOutcome::Click => {
+                self.cancel_selection_clear();
+                self.refresh_selected_plain_text();
+                None
+            }
             bmux_tui::selection::SelectionOutcome::Armed => {
-                Some(super::invalidation::UiInvalidation::None)
+                self.cancel_selection_clear();
+                self.refresh_selected_plain_text();
+                if had_selection {
+                    self.presentation_damage = bmux_tui::damage::Damage::Full;
+                    self.fast_temporal_presentation = false;
+                    Some(super::invalidation::UiInvalidation::Paint)
+                } else {
+                    Some(super::invalidation::UiInvalidation::None)
+                }
             }
             bmux_tui::selection::SelectionOutcome::Changed { .. } => {
                 self.refresh_selected_plain_text();
@@ -1460,14 +1518,16 @@ impl BcodeRuntimeModel {
             }
             bmux_tui::selection::SelectionOutcome::Completed => {
                 self.refresh_selected_plain_text();
+                if self.settings.selection().auto_copy_on_mouse_release {
+                    self.copy_transcript_selection();
+                }
                 self.presentation_damage = bmux_tui::damage::Damage::Full;
                 self.fast_temporal_presentation = false;
                 Some(super::invalidation::UiInvalidation::Paint)
             }
             bmux_tui::selection::SelectionOutcome::Cleared
             | bmux_tui::selection::SelectionOutcome::Invalidated => {
-                self.selected_plain_text = None;
-                self.chat.app.set_transcript_selection_pinned(false);
+                self.clear_transcript_selection();
                 self.presentation_damage = bmux_tui::damage::Damage::Full;
                 self.fast_temporal_presentation = false;
                 Some(super::invalidation::UiInvalidation::Paint)
@@ -1476,6 +1536,14 @@ impl BcodeRuntimeModel {
     }
 
     fn refresh_selected_plain_text(&mut self) {
+        if self
+            .transcript_selection
+            .reconcile(&self.committed_selection)
+            == bmux_tui::selection::SelectionOutcome::Invalidated
+        {
+            self.clear_transcript_selection();
+            return;
+        }
         self.selected_plain_text = self
             .transcript_selection
             .snapshot(&self.committed_selection)
@@ -1507,7 +1575,8 @@ impl BcodeRuntimeModel {
                     start = end;
                 }
                 (!parts.is_empty()).then(|| parts.join("\n\n"))
-            });
+            })
+            .filter(|text| !text.is_empty());
         self.chat
             .app
             .set_transcript_selection_pinned(self.selected_plain_text.is_some());
@@ -1554,23 +1623,97 @@ impl BcodeRuntimeModel {
             .set_status("loading timeline message…".to_owned());
     }
 
+    fn synchronize_selection_lifecycle(&mut self) {
+        let session = self.chat.app.session_id();
+        let config = self.settings.selection();
+        let policy = (
+            config.auto_copy_on_mouse_release,
+            config.clear_after_copy,
+            config.clear_delay_ms,
+        );
+        if self.selection_session != session {
+            self.clear_transcript_selection();
+            self.committed_selection = bmux_tui::selection::SelectionScene::new();
+            self.selection_session = session;
+        }
+        if self.selection_policy != policy {
+            self.cancel_selection_clear();
+            self.selection_policy = policy;
+        }
+    }
+
+    fn cancel_selection_clear(&mut self) {
+        let id = RootTimer::SelectionClear(self.selection_clear_generation).id();
+        if let Some(handle) = &self.runtime_handle {
+            let _cancelled = handle.cancel_timer(&id);
+        }
+        self.scheduled_deadlines.remove(&id);
+        self.selection_clear_at = None;
+        self.selection_clear_generation = self.selection_clear_generation.wrapping_add(1);
+    }
+
+    fn clear_transcript_selection(&mut self) {
+        self.cancel_selection_clear();
+        self.transcript_selection.clear();
+        self.invalidation = self
+            .invalidation
+            .merge(super::invalidation::UiInvalidation::Paint);
+        self.selected_plain_text = None;
+        self.chat.app.set_transcript_selection_pinned(false);
+        self.presentation_damage = bmux_tui::damage::Damage::Full;
+        self.fast_temporal_presentation = false;
+    }
+
+    fn clear_transcript_selection_if_due(
+        &mut self,
+        now: Instant,
+    ) -> super::invalidation::UiInvalidation {
+        self.synchronize_selection_lifecycle();
+        if self
+            .selection_clear_at
+            .is_some_and(|deadline| deadline <= now)
+        {
+            self.clear_transcript_selection();
+            super::invalidation::UiInvalidation::Paint
+        } else {
+            super::invalidation::UiInvalidation::None
+        }
+    }
+
     fn copy_transcript_selection(&mut self) {
-        let Some(text) = self.selected_plain_text.as_deref() else {
+        self.synchronize_selection_lifecycle();
+        self.refresh_selected_plain_text();
+        self.cancel_selection_clear();
+        let Some(text) = self
+            .selected_plain_text
+            .as_deref()
+            .filter(|text| !text.is_empty())
+        else {
             self.chat
                 .app
                 .set_status("no transcript selection".to_owned());
             return;
         };
-        let result = super::markdown_activation::copy_text(text);
+        let result = (self.transcript_clipboard)(text);
         self.report_transcript_copy_result(result);
     }
 
     fn report_transcript_copy_result<E: std::fmt::Display>(&mut self, result: Result<(), E>) {
         match result {
-            Ok(()) => self
-                .chat
-                .app
-                .set_status("transcript selection copied".to_owned()),
+            Ok(()) => {
+                self.chat
+                    .app
+                    .set_status("transcript selection copied".to_owned());
+                if self.settings.selection().clear_after_copy {
+                    let delay = self.settings.selection().clear_delay_ms;
+                    if delay == 0 {
+                        self.clear_transcript_selection();
+                    } else {
+                        self.selection_clear_at =
+                            Instant::now().checked_add(Duration::from_millis(delay));
+                    }
+                }
+            }
             Err(error) => self.chat.app.set_status(format!("copy failed: {error}")),
         }
     }
@@ -1801,6 +1944,9 @@ impl BcodeRuntimeModel {
     }
 
     fn handle_session_changed(&mut self) {
+        self.clear_transcript_selection();
+        self.selection_session = self.chat.app.session_id();
+        self.committed_selection = bmux_tui::selection::SelectionScene::new();
         self.loop_state
             .session_changed(self.chat.viewing_session_id());
         self.draft_autosave.reset_for_session_change();
@@ -1862,11 +2008,26 @@ impl BcodeRuntimeModel {
     }
 
     fn schedule_deadlines(&mut self) {
+        self.synchronize_selection_lifecycle();
         self.reconcile_temporal_registry();
         let invalidation_at = self.temporal_registry.next_at();
         let Some(handle) = &self.runtime_handle else {
             return;
         };
+        let selection_id = RootTimer::SelectionClear(self.selection_clear_generation).id();
+        let obsolete: Vec<_> = self
+            .scheduled_deadlines
+            .keys()
+            .filter(|id| {
+                id.as_str().starts_with("bcode.selection_clear.")
+                    && (**id != selection_id || self.selection_clear_at.is_none())
+            })
+            .cloned()
+            .collect();
+        for id in obsolete {
+            let _cancelled = handle.cancel_timer(&id);
+            self.scheduled_deadlines.remove(&id);
+        }
         let now = Instant::now();
         let deadlines = [
             (RootTimer::Invalidations, invalidation_at),
@@ -1881,6 +2042,10 @@ impl BcodeRuntimeModel {
             (
                 RootTimer::StreamingPresentation,
                 self.chat.app.next_streaming_presentation_deadline(now),
+            ),
+            (
+                RootTimer::SelectionClear(self.selection_clear_generation),
+                self.selection_clear_at,
             ),
             (RootTimer::DraftSave, self.draft_autosave.next_save_at()),
             (
@@ -2004,6 +2169,15 @@ impl BcodeRuntimeModel {
     ) {
         self.scheduled_deadlines.remove(timer);
         let now = Instant::now();
+        if timer.as_str().starts_with("bcode.selection_clear.") {
+            let damage =
+                if *timer == RootTimer::SelectionClear(self.selection_clear_generation).id() {
+                    self.clear_transcript_selection_if_due(now)
+                } else {
+                    super::invalidation::UiInvalidation::None
+                };
+            return (damage, Vec::new());
+        }
         let invalidation = match timer.as_str() {
             "bcode.invalidations" => {
                 let due = self.temporal_registry.take_due(now);
@@ -2110,6 +2284,7 @@ impl<W: std::io::Write> bmux_tui_runtime::Presenter<BcodeRuntimeModel>
         &mut self,
         program: &mut BcodeRuntimeModel,
     ) -> Result<bmux_tui_runtime::PresentReport, Self::Error> {
+        program.synchronize_selection_lifecycle();
         let frame_interval = program.settings.bmux_runtime_config().frame_interval;
         let damage = std::mem::replace(
             &mut program.presentation_damage,
@@ -2193,8 +2368,7 @@ impl<W: std::io::Write> bmux_tui_runtime::Presenter<BcodeRuntimeModel>
             .transcript_selection
             .reconcile(&program.committed_selection);
         if reconciliation == bmux_tui::selection::SelectionOutcome::Invalidated {
-            program.selected_plain_text = None;
-            program.chat.app.set_transcript_selection_pinned(false);
+            program.clear_transcript_selection();
             program.presentation_damage = bmux_tui::damage::Damage::Full;
             program.fast_temporal_presentation = false;
         } else if program.transcript_selection.phase()
@@ -2704,6 +2878,7 @@ impl bmux_tui_runtime::Program for BcodeRuntimeModel {
         &mut self,
         event: bmux_tui_runtime::RuntimeEvent<Self::Message>,
     ) -> Result<bmux_tui_runtime::Update<Self::Message>, Self::Error> {
+        self.synchronize_selection_lifecycle();
         let mut temporal_damage = Vec::new();
         let damage = match event {
             bmux_tui_runtime::RuntimeEvent::Message(BcodeRuntimeMessage::Bootstrap { handle }) => {
@@ -4063,6 +4238,481 @@ mod tests {
         );
     }
 
+    fn selected_test_model(config: &bcode_config::TuiConfig) -> super::BcodeRuntimeModel {
+        let mut model = root_test_model_with_tui_config(config);
+        model
+            .chat
+            .app
+            .push_ephemeral_system_plain("abcdef".to_owned());
+        let item = model
+            .chat
+            .app
+            .transcript()
+            .iter()
+            .next_back()
+            .expect("source item");
+        let item_id = item.id().get();
+        let item_revision = item.revision();
+        model.transcript_clipboard = |text| {
+            assert_eq!(text, "abcdef");
+            Ok(())
+        };
+        let layout = super::super::render::prepare_frame(
+            &mut model.chat.app,
+            bmux_tui::geometry::Rect::new(0, 0, 20, 12),
+        )
+        .expect("layout");
+        let body = layout.body();
+        model.committed_layout = Some(layout);
+        model
+            .committed_selection
+            .push_scope(bmux_tui::selection::SelectionScope::new(
+                "bcode.transcript",
+                body,
+            ));
+        for fragment in bmux_tui::selection::plain_text_fragments(
+            "bcode.transcript",
+            format!("bcode.transcript.item.{item_id}.plain"),
+            bmux_tui::geometry::Rect::new(body.x, body.y + 1, 6, 1),
+            0,
+            "abcdef",
+            0,
+            item_revision,
+        ) {
+            model.committed_selection.push_fragment(fragment);
+        }
+        assert!(model.committed_selection.validate().is_ok());
+        for (kind, x) in [
+            (
+                bmux_tui::event::MouseEventKind::Down(bmux_tui::event::MouseButton::Left),
+                body.x,
+            ),
+            (
+                bmux_tui::event::MouseEventKind::Drag(bmux_tui::event::MouseButton::Left),
+                body.x + 5,
+            ),
+            (
+                bmux_tui::event::MouseEventKind::Up(bmux_tui::event::MouseButton::Left),
+                body.x + 5,
+            ),
+        ] {
+            model.handle_transcript_selection_mouse(bmux_tui::event::MouseEvent::new(
+                kind,
+                bmux_tui::geometry::Point::new(x, body.y + 1),
+            ));
+        }
+        model
+    }
+
+    fn rendered_selection_test_model(
+        terminal: &mut bmux_tui::terminal::Terminal<&mut Vec<u8>>,
+    ) -> (super::BcodeRuntimeModel, bmux_tui::geometry::Point) {
+        use bmux_tui_runtime::Presenter;
+
+        let mut config = bcode_config::TuiConfig::default();
+        config.mouse.selection_autoscroll = false;
+        let mut model = root_test_model_with_tui_config(&config);
+        model
+            .chat
+            .app
+            .push_ephemeral_system_markdown("abcdef".to_owned());
+        let content_id = format!(
+            "bcode.transcript.item.{}.markdown",
+            model
+                .chat
+                .app
+                .transcript()
+                .iter()
+                .next_back()
+                .expect("item")
+                .id()
+                .get()
+        );
+        model.transcript_clipboard = |text| {
+            assert_eq!(text, "abcdef");
+            Ok(())
+        };
+        super::BcodeRuntimePresenter::new(terminal)
+            .present(&mut model)
+            .expect("initial frame");
+        let fragment = model
+            .committed_selection
+            .fragments()
+            .iter()
+            .find(|fragment| {
+                fragment.content_id.as_str() == content_id && fragment.source_range.start == 0
+            })
+            .expect("source fragment");
+        let point = bmux_tui::geometry::Point::new(fragment.area.x, fragment.area.y);
+        assert_eq!(
+            terminal
+                .retained_buffer()
+                .expect("frame")
+                .get(point)
+                .expect("cell")
+                .symbol,
+            "a"
+        );
+        assert!(model.committed_selection.validate().is_ok());
+        assert!(model.committed_selection.initiation_scope(point).is_some());
+        (model, point)
+    }
+
+    #[tokio::test]
+    async fn starting_a_click_repaints_old_highlight_and_removes_timer_registry_entry() {
+        use bmux_tui_runtime::Presenter;
+
+        let mut bytes = Vec::new();
+        let mut terminal = bmux_tui::terminal::Terminal::new(
+            &mut bytes,
+            bmux_tui::geometry::Rect::new(0, 0, 40, 12),
+        );
+        let (mut model, point) = rendered_selection_test_model(&mut terminal);
+        let initial_style = terminal
+            .retained_buffer()
+            .expect("frame")
+            .get(point)
+            .expect("cell")
+            .style;
+        for (kind, position) in [
+            (
+                bmux_tui::event::MouseEventKind::Down(bmux_tui::event::MouseButton::Left),
+                point,
+            ),
+            (
+                bmux_tui::event::MouseEventKind::Drag(bmux_tui::event::MouseButton::Left),
+                bmux_tui::geometry::Point::new(point.x + 5, point.y),
+            ),
+            (
+                bmux_tui::event::MouseEventKind::Up(bmux_tui::event::MouseButton::Left),
+                bmux_tui::geometry::Point::new(point.x + 5, point.y),
+            ),
+        ] {
+            model.handle_transcript_selection_mouse(bmux_tui::event::MouseEvent::new(
+                kind, position,
+            ));
+        }
+        assert_eq!(model.selected_plain_text.as_deref(), Some("abcdef"));
+        super::BcodeRuntimePresenter::new(&mut terminal)
+            .present(&mut model)
+            .expect("selected frame");
+        assert_ne!(
+            terminal
+                .retained_buffer()
+                .expect("frame")
+                .get(point)
+                .expect("cell")
+                .style,
+            initial_style
+        );
+        let timer = super::RootTimer::SelectionClear(model.selection_clear_generation).id();
+        model
+            .scheduled_deadlines
+            .insert(timer.clone(), model.selection_clear_at.expect("deadline"));
+        assert_eq!(
+            model.handle_transcript_selection_mouse(bmux_tui::event::MouseEvent::new(
+                bmux_tui::event::MouseEventKind::Down(bmux_tui::event::MouseButton::Left),
+                point,
+            )),
+            Some(super::super::invalidation::UiInvalidation::Paint)
+        );
+        assert!(!model.scheduled_deadlines.contains_key(&timer));
+        assert!(model.selected_plain_text.is_none());
+        super::BcodeRuntimePresenter::new(&mut terminal)
+            .present(&mut model)
+            .expect("cleared frame");
+        assert_eq!(
+            terminal
+                .retained_buffer()
+                .expect("frame")
+                .get(point)
+                .expect("cell")
+                .style,
+            initial_style
+        );
+        assert_eq!(
+            model.handle_transcript_selection_mouse(bmux_tui::event::MouseEvent::new(
+                bmux_tui::event::MouseEventKind::Up(bmux_tui::event::MouseButton::Left),
+                point,
+            )),
+            None
+        );
+        assert!(
+            model
+                .chat
+                .app
+                .can_trim_resident_transcript_window_for_test()
+        );
+        drop(model);
+    }
+
+    #[tokio::test]
+    async fn release_copies_source_and_clears_only_when_due() {
+        let mut model = selected_test_model(&bcode_config::TuiConfig::default());
+        assert_eq!(model.chat.app.status(), "transcript selection copied");
+        assert_eq!(model.selected_plain_text.as_deref(), Some("abcdef"));
+        assert!(
+            !model
+                .chat
+                .app
+                .can_trim_resident_transcript_window_for_test()
+        );
+        let deadline = model.selection_clear_at.expect("scheduled clear");
+        assert_eq!(
+            model.clear_transcript_selection_if_due(
+                deadline
+                    .checked_sub(std::time::Duration::from_millis(1))
+                    .expect("earlier instant")
+            ),
+            super::super::invalidation::UiInvalidation::None
+        );
+        assert_eq!(
+            model.clear_transcript_selection_if_due(deadline),
+            super::super::invalidation::UiInvalidation::Paint
+        );
+        assert!(model.selected_plain_text.is_none());
+        assert_eq!(
+            model.transcript_selection.phase(),
+            bmux_tui::selection::SelectionGesturePhase::Idle
+        );
+        assert!(
+            model
+                .chat
+                .app
+                .can_trim_resident_transcript_window_for_test()
+        );
+        drop(model);
+    }
+
+    #[tokio::test]
+    async fn manual_copy_obeys_disabled_auto_copy_and_clear_policy() {
+        let mut config = bcode_config::TuiConfig::default();
+        config.selection.auto_copy_on_mouse_release = false;
+        let mut model = selected_test_model(&config);
+        assert!(model.selection_clear_at.is_none());
+        model.copy_transcript_selection();
+        assert!(model.selection_clear_at.is_some());
+        config.selection.clear_after_copy = false;
+        model.settings.apply_tui_config(&config);
+        model.copy_transcript_selection();
+        assert!(model.selection_clear_at.is_none());
+        assert_eq!(model.selected_plain_text.as_deref(), Some("abcdef"));
+        config.selection.clear_after_copy = true;
+        config.selection.clear_delay_ms = 0;
+        model.settings.apply_tui_config(&config);
+        model.copy_transcript_selection();
+        assert!(model.selected_plain_text.is_none());
+        assert!(
+            model
+                .chat
+                .app
+                .can_trim_resident_transcript_window_for_test()
+        );
+        drop(model);
+    }
+
+    #[tokio::test]
+    async fn release_clear_policy_supports_disabled_and_immediate_clearing() {
+        let mut config = bcode_config::TuiConfig::default();
+        config.selection.clear_after_copy = false;
+        let retained = selected_test_model(&config);
+        assert_eq!(retained.chat.app.status(), "transcript selection copied");
+        assert_eq!(retained.selected_plain_text.as_deref(), Some("abcdef"));
+        assert!(retained.selection_clear_at.is_none());
+        drop(retained);
+        config.selection.clear_after_copy = true;
+        config.selection.clear_delay_ms = 0;
+        let cleared = selected_test_model(&config);
+        assert!(cleared.selected_plain_text.is_none());
+        assert!(cleared.selection_clear_at.is_none());
+        assert!(
+            cleared
+                .chat
+                .app
+                .can_trim_resident_transcript_window_for_test()
+        );
+        drop(cleared);
+    }
+
+    #[tokio::test]
+    async fn click_without_drag_does_not_copy() {
+        let mut config = bcode_config::TuiConfig::default();
+        config.selection.auto_copy_on_mouse_release = false;
+        let mut model = selected_test_model(&config);
+        config.selection.auto_copy_on_mouse_release = true;
+        model.settings.apply_tui_config(&config);
+        model.transcript_clipboard = |_| panic!("click must not copy");
+        let body = model.committed_layout.expect("layout").body();
+        let point = bmux_tui::geometry::Point::new(body.x, body.y + 1);
+        model.handle_transcript_selection_mouse(bmux_tui::event::MouseEvent::new(
+            bmux_tui::event::MouseEventKind::Down(bmux_tui::event::MouseButton::Left),
+            point,
+        ));
+        assert_eq!(
+            model.handle_transcript_selection_mouse(bmux_tui::event::MouseEvent::new(
+                bmux_tui::event::MouseEventKind::Up(bmux_tui::event::MouseButton::Left),
+                point,
+            )),
+            None
+        );
+        assert!(model.selection_clear_at.is_none());
+        assert!(model.selected_plain_text.is_none());
+        assert!(
+            model
+                .chat
+                .app
+                .can_trim_resident_transcript_window_for_test()
+        );
+        drop(model);
+    }
+
+    #[tokio::test]
+    async fn failed_copy_retains_selection_and_cancels_prior_clear() {
+        let mut model = selected_test_model(&bcode_config::TuiConfig::default());
+        let deadline = model.selection_clear_at.expect("deadline");
+        model.transcript_clipboard = |_| Err("fake failure".to_owned());
+        model.copy_transcript_selection();
+        assert_eq!(model.chat.app.status(), "copy failed: fake failure");
+        assert_eq!(model.selected_plain_text.as_deref(), Some("abcdef"));
+        assert!(model.selection_clear_at.is_none());
+        model.clear_transcript_selection_if_due(deadline);
+        assert!(
+            !model
+                .chat
+                .app
+                .can_trim_resident_transcript_window_for_test()
+        );
+        drop(model);
+    }
+
+    #[tokio::test]
+    async fn stale_clear_does_not_erase_new_gesture_or_later_copy() {
+        let mut model = selected_test_model(&bcode_config::TuiConfig::default());
+        let old = model.selection_clear_at.expect("deadline");
+        model.selection_clear_at = Some(old + std::time::Duration::from_secs(1));
+        model.clear_transcript_selection_if_due(old);
+        assert!(model.selected_plain_text.is_some());
+        let body = model.committed_layout.expect("layout").body();
+        model.handle_transcript_selection_mouse(bmux_tui::event::MouseEvent::new(
+            bmux_tui::event::MouseEventKind::Down(bmux_tui::event::MouseButton::Left),
+            bmux_tui::geometry::Point::new(body.x, body.y + 1),
+        ));
+        assert!(model.selection_clear_at.is_none());
+        model.clear_transcript_selection_if_due(old + std::time::Duration::from_secs(2));
+        assert_eq!(
+            model.transcript_selection.phase(),
+            bmux_tui::selection::SelectionGesturePhase::Armed
+        );
+        drop(model);
+    }
+
+    #[tokio::test]
+    async fn reload_and_session_change_cancel_selection_deadlines() {
+        let mut model = selected_test_model(&bcode_config::TuiConfig::default());
+        let mut config = bcode_config::TuiConfig::default();
+        config.selection.clear_delay_ms = 25;
+        model.settings.apply_tui_config(&config);
+        model.synchronize_selection_lifecycle();
+        assert!(model.selection_clear_at.is_none());
+        assert!(model.selected_plain_text.is_some());
+        model.copy_transcript_selection();
+        let timer = super::RootTimer::SelectionClear(model.selection_clear_generation).id();
+        model
+            .scheduled_deadlines
+            .insert(timer.clone(), model.selection_clear_at.expect("deadline"));
+        model.chat.app = super::super::app::BmuxApp::new_with_history(
+            Some(bcode_session_models::SessionId::new()),
+            &[],
+            &[],
+            false,
+        );
+        model.synchronize_selection_lifecycle();
+        assert!(!model.scheduled_deadlines.contains_key(&timer));
+        assert!(model.selection_clear_at.is_none());
+        assert!(model.selected_plain_text.is_none());
+        assert!(model.committed_selection.scopes().is_empty());
+        assert!(
+            model
+                .chat
+                .app
+                .can_trim_resident_transcript_window_for_test()
+        );
+        drop(model);
+    }
+
+    #[tokio::test]
+    async fn empty_or_invalidated_selection_never_reaches_clipboard() {
+        let mut model = selected_test_model(&bcode_config::TuiConfig::default());
+        model.transcript_clipboard = |_| panic!("empty selection must not copy");
+        model.committed_selection = bmux_tui::selection::SelectionScene::new();
+        let timer = super::RootTimer::SelectionClear(model.selection_clear_generation).id();
+        model
+            .scheduled_deadlines
+            .insert(timer.clone(), model.selection_clear_at.expect("deadline"));
+        model.copy_transcript_selection();
+        assert!(!model.scheduled_deadlines.contains_key(&timer));
+        assert_eq!(model.chat.app.status(), "no transcript selection");
+        model.clear_transcript_selection();
+        assert!(model.selection_clear_at.is_none());
+        assert!(
+            model
+                .chat
+                .app
+                .can_trim_resident_transcript_window_for_test()
+        );
+        model.copy_transcript_selection();
+        assert!(model.selected_plain_text.is_none());
+        drop(model);
+    }
+
+    #[tokio::test]
+    async fn clear_key_routes_without_copying_or_modifying_composer() {
+        let mut config = bcode_config::TuiConfig::default();
+        config.keybindings.chat.insert(
+            "ctrl+shift+x".to_owned(),
+            "tui.transcript.clearSelection".to_owned(),
+        );
+        let mut model = selected_test_model(&config);
+        model.transcript_clipboard = |_| panic!("clear must not copy");
+        let input = model.chat.app.composer().text().to_owned();
+        assert_eq!(
+            model.handle_basic_terminal_event(bmux_tui::event::Event::Key(
+                bmux_keyboard::parse_key_stroke("ctrl+shift+x").expect("key"),
+            )),
+            super::super::invalidation::UiInvalidation::Paint
+        );
+        assert_eq!(model.chat.app.composer().text(), input);
+        assert!(model.selected_plain_text.is_none());
+        assert!(model.selection_clear_at.is_none());
+        assert!(
+            model
+                .chat
+                .app
+                .can_trim_resident_transcript_window_for_test()
+        );
+        drop(model);
+    }
+
+    #[tokio::test]
+    async fn old_timer_identity_cannot_clear_even_after_new_deadline() {
+        let mut model = selected_test_model(&bcode_config::TuiConfig::default());
+        let old = super::RootTimer::SelectionClear(model.selection_clear_generation).id();
+        model.copy_transcript_selection();
+        model.selection_clear_at = Some(std::time::Instant::now());
+        assert_eq!(
+            model.handle_timer(&old).0,
+            super::super::invalidation::UiInvalidation::None
+        );
+        assert!(model.selected_plain_text.is_some());
+        let current = super::RootTimer::SelectionClear(model.selection_clear_generation).id();
+        assert_eq!(
+            model.handle_timer(&current).0,
+            super::super::invalidation::UiInvalidation::Paint
+        );
+        assert!(model.selected_plain_text.is_none());
+        drop(model);
+    }
+
     #[tokio::test]
     async fn clipboard_failure_reports_user_visible_status() {
         let mut model = root_test_model();
@@ -4074,6 +4724,25 @@ mod tests {
             "copy failed: clipboard unavailable"
         );
         drop(model);
+    }
+
+    #[test]
+    fn clear_selection_is_bindable_without_a_default_binding() {
+        use super::super::keymap::{BmuxAction, BmuxKeyMap, BmuxScope};
+        let mut config = bcode_config::TuiConfig::default();
+        let key = bmux_keyboard::parse_key_stroke("ctrl+shift+x").expect("key");
+        assert_eq!(
+            BmuxKeyMap::from_config(&config).action_for_key(BmuxScope::Chat, key),
+            None
+        );
+        config.keybindings.chat.insert(
+            "ctrl+shift+x".to_owned(),
+            "tui.transcript.clearSelection".to_owned(),
+        );
+        assert_eq!(
+            BmuxKeyMap::from_config(&config).action_for_key(BmuxScope::Chat, key),
+            Some(BmuxAction::TranscriptClearSelection)
+        );
     }
 
     #[test]

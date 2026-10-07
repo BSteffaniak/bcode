@@ -40,6 +40,46 @@ including `scroll-view`, `selectable-list`, and `text-input`.
 BMUX dependencies continue to follow `branch = "master"`. Cargo.lock records the resolved published
 commit; no local path override or fixed `rev` dependency is required.
 
+## Transcript selection copying
+
+Releasing a mouse drag in the transcript now copies valid, nonempty selected source text by
+default. After a successful copy, the selection highlight clears after 1000 milliseconds.
+Source text comes from BMUX selection/export APIs, not reconstructed painted rows. Composer
+editing and interactive controls keep their existing mouse and copy behavior.
+
+```toml
+[tui.selection]
+auto_copy_on_mouse_release = true
+clear_after_copy = true
+clear_delay_ms = 1000
+```
+
+* `auto_copy_on_mouse_release = false` opts out of automatic copying: select with the mouse,
+  then copy explicitly with the keyboard.
+* `clear_after_copy = false` retains the selection after successful copies, ignoring the delay.
+* `clear_delay_ms` customizes the delay in milliseconds; `0` clears immediately after success.
+
+Manual copying uses the same success-only clear policy. A failed copy retains the selection;
+invalid or empty selections are not copied. The existing `tui.transcript.copySelection` action
+remains bound to **Ctrl+Shift+C**. The bindable `tui.transcript.clearSelection` action has no
+default binding and clears both selected text and transcript selection pinning. For example:
+
+```toml
+[tui.keybindings.chat]
+"ctrl+shift+x" = "tui.transcript.clearSelection"
+```
+
+To retain the previous explicit-copy and persistent-highlight behavior, set both
+`auto_copy_on_mouse_release = false` and `clear_after_copy = false` under `[tui.selection]`.
+A pending clear belongs to the copied selection, never a newer selection: starting a new
+selection gesture, invalidating selection, or switching sessions cancels it. Automatic clearing
+also releases transcript selection pinning and selected text. These are ephemeral TUI policies;
+they do not change canonical session state or write declarative configuration interactively.
+
+The generated configuration reference derives these settings and defaults from the Rust
+`ConfigDoc` schema; this guide documents the interaction policy rather than duplicating a
+generated reference.
+
 ## Markdown text layout
 
 The terminal Markdown adapter collects styled logical lines and contribution byte ranges.
