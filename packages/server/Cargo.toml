@@ -93,6 +93,7 @@ bcode_compressed_session_search_plugin = { workspace = true, features = [
 bcode_default_agents_plugin = { workspace = true, features = [
     "static-bundled",
 ] }
+bcode_eval = { workspace = true }
 bcode_fake_provider_plugin = { workspace = true, features = ["static-bundled"] }
 bcode_filesystem_plugin = { workspace = true, features = ["static-bundled"] }
 bcode_hyperchad = { workspace = true, features = [
@@ -109,9 +110,13 @@ bcode_prompt_profile_plugin = { workspace = true, features = [
     "static-bundled",
 ] }
 bcode_question_plugin = { workspace = true, features = ["static-bundled"] }
+bcode_session_derivation_plugin = { workspace = true, features = [
+    "static-bundled",
+] }
 bcode_session_view = { workspace = true }
 bcode_session_view_models = { workspace = true }
 bcode_shell_plugin = { workspace = true, features = ["static-bundled"] }
+bcode_skills_plugin = { workspace = true, features = ["static-bundled"] }
 bcode_tantivy_session_search_plugin = { workspace = true, features = [
     "static-bundled",
 ] }

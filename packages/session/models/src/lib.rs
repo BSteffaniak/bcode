@@ -37,7 +37,10 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use uuid::Uuid;
 
 mod judgement_context;
-pub use judgement_context::{JudgementContextCandidate, JudgementContextSource};
+pub use judgement_context::{
+    ContextSelectionRequest, ContextSelectionResponse, JudgementContextCandidate,
+    JudgementContextSource,
+};
 
 mod categorization;
 pub use categorization::{

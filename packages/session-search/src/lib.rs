@@ -461,6 +461,43 @@ pub struct SessionSearchHit {
     pub preview_truncated: bool,
 }
 
+impl SessionSearchHit {
+    /// Produce an optional request-only history candidate from an actual indexed hit.
+    ///
+    /// Callers must already authorize optional snippet transfer and publish this through the
+    /// transient context-candidate schema, never as canonical history. Explicit search responses
+    /// remain mandatory and unchanged. No hydration, canonical replay, truncation or repair occurs.
+    /// Missing, truncated or oversized previews are not eligible.
+    #[must_use]
+    pub fn judgement_context_candidate(
+        &self,
+    ) -> Option<bcode_session_models::JudgementContextCandidate> {
+        if self.preview_truncated {
+            return None;
+        }
+        let snippet = self.preview.clone()?;
+        let provenance = serde_json::to_string(&(
+            &self.provider_id,
+            &self.locator,
+            self.content_kind,
+            self.matched_field,
+        ))
+        .ok()?;
+        let id = format!(
+            "history-{}",
+            hex::encode(Sha256::digest(provenance.as_bytes()))
+        );
+        let candidate = bcode_session_models::JudgementContextCandidate {
+            id,
+            source: bcode_session_models::JudgementContextSource::History,
+            provenance,
+            snippet,
+            protected: false,
+        };
+        candidate.is_valid().then_some(candidate)
+    }
+}
+
 /// Search execution behavior advertised by a provider.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -2201,6 +2238,56 @@ fn validate_nonempty_bounded(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn indexed_history_candidate_preserves_exact_locator_and_whole_preview() {
+        let mut hit = SessionSearchHit {
+            locator: SessionSearchLocator {
+                session_id: SessionId::new(),
+                sequence: 17,
+                record_id: Some("record-2".into()),
+            },
+            content_kind: SearchContentKind::UserMessage,
+            matched_field: SearchField::Text,
+            provider_id: "indexed-history".into(),
+            provider_rank: 1,
+            provider_score: None,
+            preview: Some("original indexed excerpt".into()),
+            preview_truncated: false,
+        };
+        let candidate = hit.judgement_context_candidate().expect("whole hit");
+        assert_eq!(
+            candidate.source,
+            bcode_session_models::JudgementContextSource::History
+        );
+        assert_eq!(candidate.snippet, hit.preview.as_deref().expect("preview"));
+        let provenance: (String, SessionSearchLocator, SearchContentKind, SearchField) =
+            serde_json::from_str(&candidate.provenance).expect("exact provenance");
+        assert_eq!(provenance.0, hit.provider_id);
+        assert_eq!(provenance.1, hit.locator);
+        assert_eq!(provenance.2, hit.content_kind);
+        assert_eq!(provenance.3, hit.matched_field);
+        let original = hit.clone();
+        assert_eq!(
+            candidate,
+            hit.judgement_context_candidate().expect("stable candidate")
+        );
+        hit.locator.sequence += 1;
+        assert_ne!(
+            candidate.id,
+            hit.judgement_context_candidate()
+                .expect("different locator")
+                .id
+        );
+        hit = original;
+        hit.preview_truncated = true;
+        assert!(hit.judgement_context_candidate().is_none());
+        hit.preview_truncated = false;
+        hit.preview = Some("x".repeat(2049));
+        assert!(hit.judgement_context_candidate().is_none());
+        hit.preview = None;
+        assert!(hit.judgement_context_candidate().is_none());
+    }
 
     #[test]
     fn chunk_identity_requires_a_bounded_ordinal_and_count_pair() {

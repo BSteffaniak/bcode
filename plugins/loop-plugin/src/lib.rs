@@ -65,7 +65,8 @@ mod progress_monitoring;
 pub mod session_progress;
 mod swarm;
 mod swarm_ui;
-mod tool_result_triage;
+/// Typed loop-owned settled-result advisory service.
+pub mod tool_result_triage;
 
 const START_COMMAND: &str = "loop";
 const STATUS_COMMAND: &str = "loop.status";

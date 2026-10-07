@@ -228,7 +228,19 @@ async fn goal_workers_recover_real_git_conflict_in_isolated_integration_checkout
         }
     })
     .await
-    .expect("isolated goal recovery must reach evaluation");
+    .unwrap_or_else(|error| {
+        let (attempts, outputs, terminal) = {
+            let store = state.workflow_store.lock().unwrap();
+            (store.attempt_history(&run_id, None, 100).unwrap(), store.validated_outputs(&run_id, 100).unwrap(), store.canonical_terminal_output(&run_id).unwrap())
+        };
+        let output_facts = outputs.iter().map(|output| (&output.node_id, output.value.get("condition_met"))).collect::<Vec<_>>();
+        let failures = state.workflow_store.lock().unwrap().failure_history(&run_id, 10).unwrap();
+        let failure_facts = failures.iter().map(|event| {
+            let error = event.payload.get("error").or_else(|| event.payload.get("message")).map_or_else(|| "unavailable".into(), serde_json::Value::to_string);
+            (&event.event_type, event.payload.get("node_id"), error[..error.floor_char_boundary(error.len().min(1024))].to_owned())
+        }).collect::<Vec<_>>();
+        panic!("isolated goal recovery must reach evaluation: {error}; terminal_present: {}; output_facts: {output_facts:?}; failures: {failure_facts:?}; attempts: {attempts:?}", terminal.is_some());
+    });
     drop(state);
     assert_eq!(git(root.path(), &["rev-parse", "HEAD"]), base);
     assert_eq!(git(root.path(), &status_args), source_status);

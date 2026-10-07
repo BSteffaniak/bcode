@@ -27,6 +27,7 @@ printf 'prompt cache eval binary: %s\n' "${bcode}"
 # an externally supplied release is older than the checkout driving the suite.
 {
     printf 'binary: %s\n' "${bcode}"
+    shasum -a 256 "${bcode}"
     "${bcode}" --version
     printf 'fixture revision: '
     git -C "${root}" rev-parse HEAD
@@ -44,6 +45,25 @@ enabled = ["bcode.fake-provider", "bcode.filesystem", "bcode.default-agents"]
 provider_plugin_id = "bcode.fake-provider"
 model_id = "${model}"
 EOF
+# Diagnostic capture is explicit and restricted to the offline fake provider.
+if [[ -n "${BCODE_PROMPT_CACHE_TRACE_DIR:-}" ]]; then
+    python3 - "${BCODE_PROMPT_CACHE_TRACE_DIR}" "${workdir}/bcode.toml" <<'PY'
+import json
+import pathlib
+import sys
+
+root = pathlib.Path(sys.argv[1])
+if not root.is_absolute() or root.is_symlink() or not root.is_dir():
+    raise SystemExit("BCODE_PROMPT_CACHE_TRACE_DIR must be an existing absolute directory")
+with open(sys.argv[2], "a", encoding="utf-8") as config:
+    config.write('\nauth_profile = "fake-cache-trace"\n')
+    config.write('\n[auth.profiles.fake-cache-trace]\nbackend = "env"\n')
+    config.write('owner_plugin_id = "bcode.fake-provider"\nprovider_id = "fake"\n')
+    config.write('[auth.profiles.fake-cache-trace.settings]\n')
+    config.write('"env.FAKE_PROMPT_CACHE_TRACE_DIR" = ' + json.dumps(str(root.resolve())) + '\n')
+    config.write('[auth.bindings.fake]\nprofile = "fake-cache-trace"\n')
+PY
+fi
 mkdir -p "${workdir}/home" "${workdir}/xdg" "${workdir}/state"
 
 # Evals own isolated process state: run with a scrubbed environment so no BCODE_* setting,

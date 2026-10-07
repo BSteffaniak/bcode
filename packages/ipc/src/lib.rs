@@ -967,6 +967,11 @@ pub enum Request {
     OptionalJudge {
         request_json: String,
     },
+    /// Select bounded request-only evidence; producers retain admission ownership.
+    SelectOptionalContext {
+        /// Codec-safe encoding of the portable context selection request.
+        request_json: String,
+    },
     /// Verify authentication and model readiness for one exact selection.
     JudgementVerify {
         selection_json: String,
@@ -2111,6 +2116,10 @@ pub enum ResponsePayload {
     },
     /// Failure-optional normalized judgement result.
     OptionalJudgement {
+        result_json: String,
+    },
+    /// Codec-safe encoding of the portable context selection response.
+    OptionalContextSelection {
         result_json: String,
     },
     /// Normalized authentication and model readiness result.

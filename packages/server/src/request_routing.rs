@@ -783,6 +783,9 @@ pub enum CoreRuntimeRequest {
     JudgementSetupValidate {
         selection_json: String,
     },
+    SelectOptionalContext {
+        request_json: String,
+    },
     OptionalJudge {
         request_json: String,
     },
@@ -1600,6 +1603,11 @@ impl RoutedRequest {
             Request::JudgementSetupValidate { selection_json } => {
                 Self::CoreRuntime(Box::new(CoreRuntimeRequest::JudgementSetupValidate {
                     selection_json,
+                }))
+            }
+            Request::SelectOptionalContext { request_json } => {
+                Self::CoreRuntime(Box::new(CoreRuntimeRequest::SelectOptionalContext {
+                    request_json,
                 }))
             }
             Request::OptionalJudge { request_json } => {

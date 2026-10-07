@@ -118,6 +118,45 @@ pub const COMPACTION_MAX_CARRIED_SUMMARY_CHARS: usize = 6_000;
 pub const COMPACTION_MAX_EVENT_CONTENT_CHARS: usize = 4_000;
 pub const COMPACTION_TOOL_RESULT_CHARS: usize = 2_000;
 
+fn net_compaction_reclaimable_tokens(transcript: &CompactionTranscript, summary: &str) -> u64 {
+    let summary_tokens = estimated_model_messages_tokens(&[ModelMessage {
+        role: MessageRole::System,
+        content: vec![ContentBlock::Text {
+            text: format!("Previous conversation summary:\n{summary}"),
+        }],
+    }]);
+    transcript
+        .estimated_reclaimable_tokens
+        .saturating_sub(summary_tokens)
+}
+
+#[cfg(test)]
+mod net_progress_tests {
+    use super::*;
+
+    #[test]
+    fn actual_summary_cost_not_maximum_reserve_controls_net_progress() {
+        let transcript = CompactionTranscript {
+            previous_summary: None,
+            summary_input: Vec::new(),
+            compacted_through_sequence: 29,
+            estimated_reclaimable_tokens: 7564,
+            event_count: 28,
+        };
+        assert!(
+            net_compaction_reclaimable_tokens(
+                &transcript,
+                "Retain the objective and verified facts."
+            ) >= 6815
+        );
+        assert!(net_compaction_reclaimable_tokens(&transcript, &"x".repeat(6000)) < 6815);
+        assert_eq!(
+            net_compaction_reclaimable_tokens(&transcript, &"x".repeat(40000)),
+            0
+        );
+    }
+}
+
 pub fn compaction_plan_meets_progress_requirement(
     transcript: &CompactionTranscript,
     requirement: CompactionProgressRequirement,
@@ -337,6 +376,15 @@ async fn compact_session_context_with_policy(
             }
             summary
         };
+        if let Some(requirement) = progress_requirement {
+            let net_reclaimable = net_compaction_reclaimable_tokens(&transcript, &portable_summary);
+            if net_reclaimable < requirement.minimum_reclaimable_tokens {
+                return Err(CompactionError::InsufficientProgress {
+                    message: format!("proposed summary reclaims approximately {net_reclaimable} tokens, below required {}", requirement.minimum_reclaimable_tokens),
+                    compacted_through_sequence: transcript.compacted_through_sequence,
+                });
+            }
+        }
         let marker_commit = cancel_state.marker_commit.lock().await;
         if cancel_state.is_cancelled() {
             return Err(CompactionError::Cancelled);
@@ -902,14 +950,7 @@ pub async fn maybe_auto_compact_session_context(
         Some(command_context),
         cancel_state,
         Some(CompactionProgressRequirement {
-            minimum_reclaimable_tokens: projected_context_tokens
-                .saturating_sub(threshold_tokens)
-                .saturating_add(estimated_model_messages_tokens(&[ModelMessage {
-                    role: MessageRole::System,
-                    content: vec![ContentBlock::Text {
-                        text: "x".repeat(COMPACTION_MAX_CARRIED_SUMMARY_CHARS),
-                    }],
-                }])),
+            minimum_reclaimable_tokens: projected_context_tokens.saturating_sub(threshold_tokens),
             previous_compacted_through_sequence: evaluation.previous_compacted_through_sequence,
         }),
     ))

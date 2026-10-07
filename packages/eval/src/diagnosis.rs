@@ -16,6 +16,10 @@ const FAILURE_CATEGORIES: &[&str] = &[
 ];
 
 /// Build one advisory request from measured failure facts, never raw output or prompts.
+#[allow(
+    clippy::must_use_candidate,
+    reason = "Option already enforces must-use; repository policy forbids redundant attributes on Option-returning APIs"
+)]
 pub fn optional_request(oracle: &Value, diagnosis: &Value) -> Option<OptionalRequest> {
     if diagnosis["labels"].as_array()?.is_empty() {
         return None;
@@ -78,6 +82,7 @@ pub fn attach_advisory(diagnosis: &mut Value, query: &Request, result: OptionalR
         json!({"failure_category":selected,"root_cause_verified":false});
 }
 
+#[must_use]
 pub fn classify(
     oracle: &Value,
     outputs: &Value,

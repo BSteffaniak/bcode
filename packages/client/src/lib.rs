@@ -3984,6 +3984,83 @@ impl BcodeClient {
         }
     }
 
+    /// Select original request-only context through plugin policy and central access.
+    ///
+    /// # Errors
+    /// Returns transport errors or rejects oversized/malformed boundary responses.
+    pub async fn select_optional_context(
+        &self,
+        request: &bcode_session_models::ContextSelectionRequest,
+    ) -> Result<bcode_session_models::ContextSelectionResponse, ClientError> {
+        let request_json =
+            serde_json::to_string(request).map_err(|_| ClientError::UnexpectedResponse)?;
+        if request_json.len() > bcode_model::judgement::MAX_REQUEST_BYTES {
+            return Err(ClientError::UnexpectedResponse);
+        }
+        match self
+            .send_request(Request::SelectOptionalContext { request_json })
+            .await?
+        {
+            ResponsePayload::OptionalContextSelection { result_json }
+                if result_json.len() <= bcode_model::judgement::MAX_RESPONSE_BYTES =>
+            {
+                let response: bcode_session_models::ContextSelectionResponse =
+                    serde_json::from_str(&result_json)
+                        .map_err(|_| ClientError::UnexpectedResponse)?;
+                let original: std::collections::BTreeSet<_> = request
+                    .candidates
+                    .iter()
+                    .map(|candidate| &candidate.id)
+                    .collect();
+                let ordered: std::collections::BTreeSet<_> = response.ordered_ids.iter().collect();
+                let matching_order_length = response.ordered_ids.len() == request.candidates.len();
+                if original != ordered
+                    || !matching_order_length
+                    || request
+                        .candidates
+                        .iter()
+                        .zip(&response.ordered_ids)
+                        .any(|(candidate, id)| candidate.protected && candidate.id != *id)
+                    || response.included_ids.iter().any(|id| !ordered.contains(id))
+                    || response
+                        .included_ids
+                        .iter()
+                        .collect::<std::collections::BTreeSet<_>>()
+                        .len()
+                        != response.included_ids.len()
+                    || request.candidates.iter().any(|candidate| {
+                        candidate.protected && !response.included_ids.contains(&candidate.id)
+                    })
+                {
+                    return Err(ClientError::UnexpectedResponse);
+                }
+                Ok(response)
+            }
+            _ => Err(ClientError::UnexpectedResponse),
+        }
+    }
+
+    /// Rank already pressure-checked bounded evidence; admission stays with the producer.
+    /// Absence preserves baseline on off, no-key, error, or unavailable consumer.
+    /// Dropping this request future does not promise daemon-side cancellation.
+    ///
+    /// # Errors
+    /// Returns transport errors or rejects malformed/oversized requests and responses.
+    pub async fn rank_optional_context(
+        &self,
+        task: &str,
+        candidates: &[bcode_session_models::JudgementContextCandidate],
+    ) -> Result<Option<Vec<String>>, ClientError> {
+        let response = self
+            .select_optional_context(&bcode_session_models::ContextSelectionRequest {
+                task: task.into(),
+                candidates: candidates.to_vec(),
+                budget_bytes: None,
+            })
+            .await?;
+        Ok(response.applied.then_some(response.ordered_ids))
+    }
+
     /// Probe one exact judgement selection without changing session state.
     ///
     /// # Errors

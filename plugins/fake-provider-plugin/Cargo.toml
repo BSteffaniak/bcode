@@ -22,10 +22,12 @@ bcode_prompt_cache           = { workspace = true, features = ["simulation"] }
 bcode_provider_auth_models   = { workspace = true }
 bcode_session_models         = { workspace = true }
 bcode_tool                   = { workspace = true }
+hex                          = { workspace = true }
 image                        = { workspace = true }
 jsonschema                   = { workspace = true }
 serde                        = { workspace = true, features = ["derive", "std"] }
 serde_json                   = { workspace = true }
+sha2                         = { workspace = true }
 tempfile                     = { workspace = true }
 tokio                        = { workspace = true, features = ["sync"] }
 

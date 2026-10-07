@@ -12,7 +12,7 @@
 //! Leaf eval runner, judges, reports, comparisons, and baselines for Bcode.
 
 mod capture;
-mod diagnosis;
+pub mod diagnosis;
 mod introspection;
 mod oracle;
 mod paired;

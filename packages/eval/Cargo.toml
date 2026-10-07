@@ -29,6 +29,9 @@ thiserror            = { workspace = true, features = ["std"] }
 tokio                = { workspace = true, features = ["rt", "time"] }
 toml                 = { workspace = true, features = ["parse", "display", "serde"] }
 
+[dev-dependencies]
+tempfile = { workspace = true }
+
 [features]
 default          = []
 fail-on-warnings = []

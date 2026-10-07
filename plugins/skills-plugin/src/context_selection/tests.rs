@@ -38,7 +38,7 @@ fn fixture() -> SelectionRequest {
     SelectionRequest {
         task: "Fix parser lookahead regression".into(),
         candidates,
-        budget_bytes,
+        budget_bytes: Some(budget_bytes),
     }
 }
 
@@ -135,7 +135,7 @@ fn off_no_key_error_uncertainty_and_malformed_advice_have_identical_baseline() {
 #[test]
 fn no_budget_pressure_no_optional_advice_and_protected_slots_survive_zero_budget() {
     let mut input = fixture();
-    input.budget_bytes = 0;
+    input.budget_bytes = Some(0);
     assert!(prepare(&input).judgement.is_none());
     let zero = apply(&advised(input.clone()));
     assert_eq!(zero.included_ids, ["explicit"]);
@@ -143,7 +143,7 @@ fn no_budget_pressure_no_optional_advice_and_protected_slots_survive_zero_budget
         zero.ordered_ids,
         ["read-distractor", "explicit", "search-relevant"]
     );
-    input.budget_bytes = usize::MAX;
+    input.budget_bytes = Some(usize::MAX);
     assert!(prepare(&input).judgement.is_none());
     let all = apply(&advised(input));
     assert_eq!(all.included_ids, all.ordered_ids);
@@ -169,7 +169,7 @@ fn whole_utf8_snippets_never_split_and_protected_content_is_not_transferred() {
     let mut input = fixture();
     input.candidates[0].snippet = "界🦀".into();
     input.candidates[2].snippet = "界".into();
-    input.budget_bytes = 3;
+    input.budget_bytes = Some(3);
     let prepared = prepare(&input).judgement.unwrap();
     let serialized = serde_json::to_string(&prepared).unwrap();
     assert!(!serialized.contains("explicit user requested evidence"));

@@ -176,7 +176,7 @@ fn prepare(input: &ProgressRequest) -> Option<OptionalRequest> {
         feature: Feature::ProgressMonitoring,
         selection: None,
         request: judgement::Request {
-            model_id: String::new(),
+            model_id: "auto".to_owned(),
             state: State::Structured(serde_json::json!({
                 "objective": input.objective,
                 "recent_observations": input.observations,
@@ -295,6 +295,27 @@ mod tests {
                 })
                 .collect(),
         }
+    }
+
+    #[test]
+    fn prepared_repeated_failure_is_valid_before_central_model_resolution() {
+        let input = input(ProgressScope::Session {
+            id: "ordinary-session".into(),
+        });
+        let optional =
+            prepare(&input).expect("repeated settled failures are a useful bounded trigger");
+        assert_eq!(optional.feature, Feature::ProgressMonitoring);
+        judgement::validate_request(&optional.request)
+            .expect("automatic consumer input must pass central pre-resolution validation");
+        assert_eq!(
+            optional
+                .request
+                .questions
+                .keys()
+                .map(String::as_str)
+                .collect::<Vec<_>>(),
+            vec!["drift", "progress", "stall"]
+        );
     }
 
     fn answers(progress: f64, stall: f64, drift: f64) -> judgement::Response {

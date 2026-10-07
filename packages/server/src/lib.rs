@@ -5987,6 +5987,7 @@ async fn run_client_operation(
         &request,
         Request::Judge { .. }
             | Request::OptionalJudge { .. }
+            | Request::SelectOptionalContext { .. }
             | Request::JudgementVerify { .. }
             | Request::JudgementSetup
     );
@@ -6426,6 +6427,7 @@ const fn request_kind(request: &Request) -> &'static str {
         Request::SessionModelList { .. } => "session_model_list",
         Request::JudgementSetup => "judgement_setup",
         Request::JudgementSetupValidate { .. } => "judgement_setup_validate",
+        Request::SelectOptionalContext { .. } => "select_optional_context",
         Request::OptionalJudge { .. } => "optional_judge",
         Request::JudgementVerify { .. } => "judgement_verify",
         Request::Judge { .. } => "judge",
@@ -8926,6 +8928,36 @@ async fn handle_core_runtime_request(
                 Response::Ok(ResponsePayload::JudgementSetupValidated { available }),
             )
             .await
+        }
+        CoreRuntimeRequest::SelectOptionalContext { request_json } => {
+            let result = if request_json.len() <= bcode_model::judgement::MAX_REQUEST_BYTES {
+                serde_json::from_str::<bcode_session_models::ContextSelectionRequest>(&request_json)
+                    .ok()
+            } else {
+                None
+            };
+            let response = if let Some(input) = result {
+                let cancel = TurnCancelState::default();
+                let selected =
+                    select_optional_context(state, &input, &state.startup_config, &cancel).await;
+                serde_json::to_string(&selected).map_or_else(
+                    |_| {
+                        Response::Err(ErrorResponse::new(
+                            "invalid_context_selection",
+                            "context selection cannot be encoded",
+                        ))
+                    },
+                    |result_json| {
+                        Response::Ok(ResponsePayload::OptionalContextSelection { result_json })
+                    },
+                )
+            } else {
+                Response::Err(ErrorResponse::new(
+                    "invalid_context_selection",
+                    "invalid bounded context selection",
+                ))
+            };
+            send_response(writer, request_id, response).await
         }
         CoreRuntimeRequest::OptionalJudge { request_json } => {
             let result = if request_json.len() <= bcode_model::judgement::MAX_REQUEST_BYTES
@@ -29067,6 +29099,121 @@ mod advisory_selection_boundary_tests {
     }
 }
 
+fn baseline_context_selection(
+    input: &bcode_session_models::ContextSelectionRequest,
+) -> bcode_session_models::ContextSelectionResponse {
+    let mut remaining = input.budget_bytes.unwrap_or(usize::MAX);
+    let included_ids = input
+        .candidates
+        .iter()
+        .filter_map(|candidate| {
+            if candidate.protected {
+                return Some(candidate.id.clone());
+            }
+            if candidate.snippet.len() > remaining {
+                return None;
+            }
+            remaining -= candidate.snippet.len();
+            Some(candidate.id.clone())
+        })
+        .collect();
+    bcode_session_models::ContextSelectionResponse {
+        ordered_ids: input
+            .candidates
+            .iter()
+            .map(|candidate| candidate.id.clone())
+            .collect(),
+        included_ids,
+        applied: false,
+    }
+}
+
+/// Transport-neutral optional evidence selection. Disabled features exit before plugin dispatch.
+async fn select_optional_context(
+    state: &ServerState,
+    input: &bcode_session_models::ContextSelectionRequest,
+    config: &bcode_config::BcodeConfig,
+    cancel: &TurnCancelState,
+) -> bcode_session_models::ContextSelectionResponse {
+    let baseline = || baseline_context_selection(input);
+    if !config
+        .judgement
+        .enabled(bcode_model::judgement::Feature::ContextReranking)
+        || cancel.is_cancelled()
+        || input.task.is_empty()
+        || input.task.len() > 8192
+        || input.candidates.len() > 32
+        || input
+            .candidates
+            .iter()
+            .any(|candidate| !candidate.is_valid())
+        || input
+            .candidates
+            .iter()
+            .map(|candidate| &candidate.id)
+            .collect::<BTreeSet<_>>()
+            .len()
+            != input.candidates.len()
+    {
+        return baseline();
+    }
+    let payload = serde_json::to_value(input).unwrap_or_default();
+    let Some(prepared) = invoke_optional_feature_service(
+        state,
+        "bcode.context-selection/v1",
+        "prepare",
+        payload.clone(),
+        config,
+        cancel,
+    )
+    .await
+    else {
+        return baseline();
+    };
+    let judgement = if let Some(request) = prepared.get("judgement").and_then(|value| {
+        serde_json::from_value::<bcode_model::judgement::OptionalRequest>(value.clone()).ok()
+    }) {
+        tokio::select! { biased; () = cancel.cancelled() => return baseline(), response = state.optional_judgement.judge_with_config(state, config, request) => response }
+    } else {
+        bcode_model::judgement::OptionalResponse { response: None }
+    };
+    let Some(applied) = invoke_optional_feature_service(
+        state,
+        "bcode.context-selection/v1",
+        "apply",
+        serde_json::json!({"selection": payload, "judgement": judgement}),
+        config,
+        cancel,
+    )
+    .await
+    else {
+        return baseline();
+    };
+    let originals = input
+        .candidates
+        .iter()
+        .map(serde_json::to_value)
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap_or_default();
+    let Ok(response) =
+        serde_json::from_value::<bcode_session_models::ContextSelectionResponse>(applied.clone())
+    else {
+        return baseline();
+    };
+    if !valid_advisory_permutation(&originals, &response.ordered_ids)
+        || validated_context_admission(
+            &input.candidates,
+            &applied,
+            input.budget_bytes.unwrap_or(usize::MAX),
+        )
+        .is_none()
+        || cancel.is_cancelled()
+    {
+        return baseline();
+    }
+    response
+}
+
 async fn append_optional_context(
     state: &ServerState,
     session_id: SessionId,
@@ -33477,7 +33624,7 @@ fn session_events_to_sanitized_model_messages(
     format_version: Option<u16>,
     compatibility_key: Option<&str>,
     fallback_tool_argument_chars: usize,
-    mut turn_context: Option<(u64, &[ModelMessage])>,
+    turn_context: Option<(u64, &[ModelMessage])>,
 ) -> Vec<ModelMessage> {
     let mut messages = Vec::new();
     let mut seen_tool_call_ids = BTreeSet::new();
@@ -33485,15 +33632,8 @@ fn session_events_to_sanitized_model_messages(
     let mut pending_tool_exchange = PendingModelToolExchange::default();
 
     for event in events {
-        // When compaction removed the trigger, anchor before the retained
-        // continuation. Otherwise insert after the trigger below, preserving
-        // its potentially large user content across refreshed turns.
-        if turn_context.is_some_and(|(sequence, _)| event.sequence > sequence) {
-            append_pending_tool_exchange(&mut messages, &mut pending_tool_exchange);
-            if let Some((_, context)) = turn_context.take() {
-                messages.extend_from_slice(context);
-            }
-        }
+        // Project canonical chronology first. Current request-only guidance follows
+        // the complete projection, never replacing a historical prefix on resume.
         match &event.kind {
             SessionEventKind::AgentChanged { agent_id } => {
                 previous_agent = Some(agent_id);
@@ -33628,12 +33768,6 @@ fn session_events_to_sanitized_model_messages(
                     append_pending_tool_exchange(&mut messages, &mut pending_tool_exchange);
                     messages.push(message);
                 }
-            }
-        }
-        if turn_context.is_some_and(|(sequence, _)| event.sequence == sequence) {
-            append_pending_tool_exchange(&mut messages, &mut pending_tool_exchange);
-            if let Some((_, context)) = turn_context.take() {
-                messages.extend_from_slice(context);
             }
         }
     }
@@ -40660,6 +40794,7 @@ fn default_session_artifact_dir(session_id: SessionId) -> PathBuf {
 mod tests {
     mod collaboration_execution;
     mod goal_entry;
+    mod judgement_quality;
     mod scheduler;
     // Destructured bindings below avoid significant_drop_tightening false positives on moved
     // owners and non-owning adapters. Actual resource owners retain explicit teardown drops.
@@ -53299,14 +53434,14 @@ library = "test"
         let messages = project();
         assert_eq!(messages, project(), "reconstruction must be deterministic");
         assert_eq!(messages.len(), 4);
-        assert_eq!(messages[0], context.system_messages[0]);
+        assert_eq!(messages[3], context.system_messages[0]);
         assert!(
-            matches!(&messages[1].content[0], ContentBlock::Text { text } if text.contains("retained summary"))
+            matches!(&messages[0].content[0], ContentBlock::Text { text } if text.contains("retained summary"))
         );
-        assert_eq!(messages[2].role, MessageRole::Assistant);
-        assert_eq!(messages[3].role, MessageRole::Tool);
+        assert_eq!(messages[1].role, MessageRole::Assistant);
+        assert_eq!(messages[2].role, MessageRole::Tool);
         assert!(
-            matches!(&messages[3].content[0], ContentBlock::ToolResult { result }
+            matches!(&messages[2].content[0], ContentBlock::ToolResult { result }
             if result.call_id == "retained-call" && result.output == "retained result" && !result.is_error)
         );
         assert_eq!(
@@ -91216,6 +91351,12 @@ event_symbol = "bcode_plugin_handle_event_v1"
             .await
             .expect("append trigger event");
         let mut state = test_server_state_with_fake_provider(sessions);
+        state.selected_provider_plugin_id = Some("bcode.fake-provider".to_owned());
+        state.selected_model_id = Some("fake-echo".to_owned());
+        state.selected_provider_context.settings.insert(
+            "fake_compaction_summary".to_owned(),
+            "Older context contains fourteen synthetic historical user/assistant pairs, indexed 0 through 13, with repeated x/y padding. No tools, file changes, or validation were recorded in those pairs.".to_owned(),
+        );
         state
             .startup_config
             .system_prompt
@@ -91273,7 +91414,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
         assert_eq!(
             completion.outcome,
             ModelTurnOutcome::Completed,
-            "{:?}",
+            "normalized completion: {:?}",
             completion.message
         );
 
@@ -95166,8 +95307,32 @@ event_symbol = "bcode_plugin_handle_event_v1"
             .unwrap();
     }
 
+    fn assert_prefix_exchange_preserves_history(
+        previous: &ModelTurnRequest,
+        next: &ModelTurnRequest,
+        first: &ModelTurnRequest,
+        context: &StaticModelTurnContext,
+        round: u32,
+    ) {
+        let previous_history_len = previous.messages.len() - context.system_messages.len();
+        assert_eq!(
+            &next.messages[..previous_history_len],
+            &previous.messages[..previous_history_len]
+        );
+        assert_eq!(
+            next.messages.len(),
+            first.messages.len() + 2 * round as usize
+        );
+        assert_eq!(next.messages[0].role, MessageRole::User);
+        assert_eq!(next.messages.last().unwrap(), &context.system_messages[0]);
+        let result_index = next.messages.len() - 2;
+        assert_eq!(next.messages[result_index - 1].role, MessageRole::Assistant);
+        assert!(matches!(&next.messages[result_index].content[0],
+            ContentBlock::ToolResult { result } if !result.is_error && result.output == "repository contents"));
+    }
+
     #[tokio::test]
-    async fn ordinary_turn_request_keeps_context_before_tool_continuations() {
+    async fn ordinary_turn_request_keeps_request_only_context_after_paired_history() {
         let sessions = SessionManager::default();
         let summary = sessions
             .create_session(Some("prefix".into()), PathBuf::from("."))
@@ -95209,18 +95374,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
         for round in 1..=3 {
             append_prefix_exchange(&state, summary.id, round).await;
             let next = build(&trigger, round, &context, None).await;
-            assert_eq!(
-                &next.messages[..previous.messages.len()],
-                previous.messages.as_slice()
-            );
-            assert_eq!(
-                next.messages.len(),
-                first.messages.len() + 2 * round as usize
-            );
-            assert_eq!(next.messages[0].role, MessageRole::User);
-            assert_eq!(next.messages[1].role, MessageRole::System);
-            assert!(matches!(&next.messages.last().unwrap().content[0],
-                ContentBlock::ToolResult { result } if !result.is_error && result.output == "repository contents"));
+            assert_prefix_exchange_preserves_history(&previous, &next, &first, &context, round);
             previous = next;
         }
         let next_trigger =
@@ -95230,6 +95384,16 @@ event_symbol = "bcode_plugin_handle_event_v1"
         }];
         let fresh = build(&next_trigger, 0, &context, Some("retry guidance")).await;
         assert_eq!(fresh.messages[0].role, MessageRole::User);
+        let retained_history_len = previous.messages.len() - 1;
+        assert_eq!(
+            &fresh.messages[..retained_history_len],
+            &previous.messages[..retained_history_len],
+            "new request guidance must not replace the historical prefix"
+        );
+        assert_eq!(
+            fresh.messages[fresh.messages.len() - 2],
+            context.system_messages[0]
+        );
         assert_eq!(
             fresh
                 .messages

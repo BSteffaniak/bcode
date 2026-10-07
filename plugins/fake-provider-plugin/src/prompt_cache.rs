@@ -164,6 +164,107 @@ pub struct CacheStore {
 
 const SIMULATOR_STATE_FILE: &str = "fake-provider-prompt-cache.json";
 
+// Explicit request-scoped fake-provider diagnostics, never response/session metadata.
+const TRACE_ENV: &str = "FAKE_PROMPT_CACHE_TRACE_DIR";
+const TRACE_LIMIT: usize = 32;
+
+fn trace_prefixes(
+    request: &ModelTurnRequest,
+    usage: &bcode_model::TokenUsage,
+) -> Result<(), ProviderError> {
+    use sha2::{Digest, Sha256};
+    use std::io::Write;
+
+    let Some(directory) = request.provider_context.env.get(TRACE_ENV) else {
+        return Ok(());
+    };
+    let directory = Path::new(directory);
+    if !directory.is_absolute()
+        || !std::fs::symlink_metadata(directory).is_ok_and(|metadata| metadata.file_type().is_dir())
+    {
+        return Err(state_error());
+    }
+    let root = directory.canonicalize().map_err(|_| state_error())?;
+    let mut file = None;
+    for index in 0..TRACE_LIMIT {
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        match options.open(root.join(format!("fake-cache-prefix-{index:02}.json"))) {
+            Ok(created) => {
+                file = Some(created);
+                break;
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(_) => return Err(state_error()),
+        }
+    }
+    let Some(mut file) = file else {
+        return Ok(());
+    };
+    let mut hasher = Sha256::new();
+    let mut tokens = 0_u64;
+    let mut prefixes = Vec::new();
+    let mut add = |value: &serde_json::Value,
+                   index: Option<usize>,
+                   point: bool,
+                   retain: bool|
+     -> Result<(), ProviderError> {
+        let bytes = serde_json::to_vec(value).map_err(|_| state_error())?;
+        hasher.update(u64::try_from(bytes.len()).unwrap_or(u64::MAX).to_le_bytes());
+        hasher.update(&bytes);
+        tokens = tokens.saturating_add(
+            u64::try_from(String::from_utf8_lossy(&bytes).split_whitespace().count())
+                .unwrap_or(u64::MAX),
+        );
+        if retain {
+            prefixes.push(serde_json::json!({"message_index": index, "sha256": hex::encode(hasher.clone().finalize()), "simulated_prefix_tokens": tokens, "ends_with_cache_point": point}));
+        }
+        Ok(())
+    };
+    add(
+        &serde_json::to_value((&request.system_prompt, &request.tools))
+            .map_err(|_| state_error())?,
+        None,
+        false,
+        true,
+    )?;
+    for (index, message) in request.messages.iter().enumerate() {
+        let content = message
+            .content
+            .iter()
+            .filter(|block| !matches!(block, ContentBlock::CachePoint { .. }))
+            .collect::<Vec<_>>();
+        add(
+            &serde_json::to_value((&message.role, content)).map_err(|_| state_error())?,
+            Some(index),
+            matches!(
+                message.content.last(),
+                Some(ContentBlock::CachePoint { .. })
+            ),
+            index < TRACE_LIMIT - 2 || index + 1 == request.messages.len(),
+        )?;
+    }
+    let record = serde_json::json!({
+        "version": 1,
+        "message_count": request.messages.len(),
+        "prefixes_truncated": request.messages.len() + 1 > TRACE_LIMIT,
+        "prefixes": prefixes,
+        "cache_system_prompt": request.prompt_cache.cache_system_prompt,
+        "cache_tools": request.prompt_cache.cache_tools,
+        "input_tokens": usage.input_tokens,
+        "cached_input_tokens": usage.cached_input_tokens,
+        "cache_write_input_tokens": usage.cache_write_input_tokens,
+        "request_input_tokens": usage.pricing_context.request_input_tokens,
+    });
+    let bytes = serde_json::to_vec(&record).map_err(|_| state_error())?;
+    file.write_all(&bytes).map_err(|_| state_error())
+}
+
 fn state_error() -> ProviderError {
     ProviderError {
         code: "fake_cache_state_unavailable".into(),
@@ -335,6 +436,13 @@ pub fn serve_turn(
                 return;
             }
         };
+    if let Err(error) = trace_prefixes(request, &usage) {
+        push(ProviderTurnEvent::Error { error });
+        push(ProviderTurnEvent::TurnFinished {
+            stop_reason: StopReason::Error,
+        });
+        return;
+    }
     push(ProviderTurnEvent::RequestProjection { projection });
     if let Some(call) = tool_call {
         push(ProviderTurnEvent::ToolCallStarted {
@@ -488,6 +596,143 @@ mod tests {
                 .serve(None, &profile, &request, 1)
                 .unwrap()
                 .usage
+        );
+    }
+
+    #[test]
+    fn explicit_conversation_prefix_survives_reconstruction_and_store_restart() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let profile = profile_for(FAKE_CACHE_EXPLICIT_MODEL_ID).unwrap();
+        let mut original = request();
+        original.model_id = FAKE_CACHE_EXPLICIT_MODEL_ID.into();
+        original.messages = vec![ModelMessage {
+            role: MessageRole::User,
+            content: vec![ContentBlock::Text {
+                text: "synthetic older context ".repeat(400),
+            }],
+        }];
+        original.messages[0].content.push(ContentBlock::CachePoint {
+            hint: bcode_model::PromptCachePoint {
+                ttl_seconds: Some(300),
+                label: None,
+            },
+        });
+        let cold = CacheStore::default()
+            .serve(Some(&root), &profile, &original, 1)
+            .unwrap();
+        let encoded = serde_json::to_vec(&original).unwrap();
+        let mut resumed: ModelTurnRequest = serde_json::from_slice(&encoded).unwrap();
+        resumed.turn_id = "resumed-user-turn".into();
+        resumed.messages.push(ModelMessage {
+            role: MessageRole::User,
+            content: vec![ContentBlock::Text {
+                text: "continue synthetic history".into(),
+            }],
+        });
+        let warm = CacheStore::default()
+            .serve(Some(&root), &profile, &resumed, 1)
+            .unwrap();
+        assert_eq!(cold.usage.cached_input_tokens, Some(0));
+        assert!(
+            warm.usage.cached_input_tokens.unwrap_or_default()
+                > warm.usage.input_tokens.unwrap_or_default() / 2
+        );
+    }
+
+    #[test]
+    fn prefix_trace_is_request_opt_in_bounded_and_content_free() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let mut original = request();
+        let usage = bcode_model::TokenUsage::default();
+        trace_prefixes(&original, &usage).unwrap();
+        assert_eq!(std::fs::read_dir(&root).unwrap().count(), 0);
+        original
+            .provider_context
+            .env
+            .insert(TRACE_ENV.into(), root.to_string_lossy().into_owned());
+        original.provider_context.env.insert(
+            "PRIVATE_CREDENTIAL".into(),
+            "synthetic-secret-do-not-export".into(),
+        );
+        original.messages = (0..40)
+            .map(|_| ModelMessage {
+                role: MessageRole::User,
+                content: vec![ContentBlock::Text {
+                    text: "synthetic-private-text-do-not-export".into(),
+                }],
+            })
+            .collect();
+        for _ in 0..=TRACE_LIMIT {
+            trace_prefixes(&original, &usage).unwrap();
+        }
+        assert_eq!(std::fs::read_dir(&root).unwrap().count(), TRACE_LIMIT);
+        let bytes = std::fs::read(root.join("fake-cache-prefix-00.json")).unwrap();
+        let text = String::from_utf8(bytes.clone()).unwrap();
+        assert!(!text.contains("synthetic-private-text-do-not-export"));
+        assert!(!text.contains("synthetic-secret-do-not-export"));
+        assert!(!text.contains("PRIVATE_CREDENTIAL"));
+        let record: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(record["prefixes_truncated"], true);
+        assert_eq!(record["prefixes"].as_array().unwrap().len(), TRACE_LIMIT);
+        assert_eq!(record["prefixes"][TRACE_LIMIT - 1]["message_index"], 39);
+    }
+
+    #[test]
+    fn prefix_trace_distinguishes_static_and_ordered_history_drift() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let mut original = request();
+        original
+            .provider_context
+            .env
+            .insert(TRACE_ENV.into(), root.to_string_lossy().into_owned());
+        original.messages = vec![ModelMessage {
+            role: MessageRole::User,
+            content: vec![ContentBlock::Text {
+                text: "synthetic first turn".into(),
+            }],
+        }];
+        let usage = bcode_model::TokenUsage::default();
+        trace_prefixes(&original, &usage).unwrap();
+        let mut resumed: ModelTurnRequest =
+            serde_json::from_slice(&serde_json::to_vec(&original).unwrap()).unwrap();
+        resumed.messages.push(ModelMessage {
+            role: MessageRole::User,
+            content: vec![ContentBlock::Text {
+                text: "synthetic next turn".into(),
+            }],
+        });
+        trace_prefixes(&resumed, &usage).unwrap();
+        resumed.messages[0].content = vec![ContentBlock::Text {
+            text: "changed synthetic history".into(),
+        }];
+        trace_prefixes(&resumed, &usage).unwrap();
+        resumed.system_prompt = Some("changed synthetic system".into());
+        trace_prefixes(&resumed, &usage).unwrap();
+        let read = |index| -> serde_json::Value {
+            serde_json::from_slice(
+                &std::fs::read(root.join(format!("fake-cache-prefix-{index:02}.json"))).unwrap(),
+            )
+            .unwrap()
+        };
+        let cold = read(0);
+        let warm = read(1);
+        let history = read(2);
+        let system = read(3);
+        assert_eq!(
+            cold["prefixes"],
+            serde_json::json!(&warm["prefixes"].as_array().unwrap()[..2])
+        );
+        assert_eq!(warm["prefixes"][0], history["prefixes"][0]);
+        assert_ne!(
+            warm["prefixes"][1]["sha256"],
+            history["prefixes"][1]["sha256"]
+        );
+        assert_ne!(
+            history["prefixes"][0]["sha256"],
+            system["prefixes"][0]["sha256"]
         );
     }
 

@@ -1209,9 +1209,20 @@ async fn exhausted_goal_resumes_after_idempotent_ipc_allowance_grant() {
             .unwrap()
             .attempt_history(&run_id, None, 100)
             .unwrap();
-        let failure = state.workflow_store.lock().unwrap().failure_history(&run_id, 10).unwrap();
+        let (failure, terminal, outputs) = {
+            let store = state.workflow_store.lock().unwrap();
+            (
+                store.failure_history(&run_id, 10).unwrap(),
+                store.canonical_terminal_output(&run_id).unwrap(),
+                store.validated_outputs(&run_id, 100).unwrap(),
+            )
+        };
+        let output_facts = outputs
+            .iter()
+            .map(|output| (&output.node_id, output.value.get("condition_met")))
+            .collect::<Vec<_>>();
         panic!(
-            "renewed goal must settle correction and the completion decision: {error}; attempts: {attempts:?}; failures: {failure:?}"
+            "renewed goal must settle correction and the completion decision: {error}; terminal_present: {}; output_facts: {output_facts:?}; attempts: {attempts:?}; failures: {failure:?}", terminal.is_some()
         );
     });
     let attempts = state

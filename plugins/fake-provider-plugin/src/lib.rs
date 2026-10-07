@@ -1065,11 +1065,38 @@ impl FakeTurnWorker {
     }
 }
 
+fn configured_fake_compaction_summary(request: &ModelTurnRequest) -> Option<&str> {
+    if request
+        .metadata
+        .get("bcode_request_kind")
+        .is_none_or(|kind| kind != "compaction")
+    {
+        return None;
+    }
+    request
+        .provider_context
+        .settings
+        .get("fake_compaction_summary")
+        .map(String::as_str)
+}
+
+fn validate_fake_compaction_summary(summary: &str) -> Result<&str, ProviderError> {
+    if summary.trim().is_empty() || summary.chars().take(901).count() > 900 {
+        return Err(fake_structured_output_error(
+            &"fake compaction summary must contain 1 to 900 characters of nonblank text",
+        ));
+    }
+    Ok(summary)
+}
+
 fn fake_response_text(
     request: &ModelTurnRequest,
     tool_result: Option<&str>,
     user_text: &str,
 ) -> Result<String, ProviderError> {
+    if let Some(summary) = configured_fake_compaction_summary(request) {
+        return validate_fake_compaction_summary(summary).map(str::to_owned);
+    }
     if request.model_id == vision::MODEL {
         return vision::answer(request, user_text)
             .map_err(|message| fake_structured_output_error(&message));
@@ -1257,11 +1284,36 @@ fn current_tool_evidence(messages: &[ModelMessage], expected: &str) -> bool {
         .flat_map(|message| &message.content)
         .find_map(|block| match block {
             ContentBlock::ToolResult { result } => {
-                Some(!result.is_error && result.output == expected)
+                Some(!result.is_error && exact_tool_evidence(&result.output, expected))
             }
             _ => None,
         })
         .unwrap_or(false)
+}
+
+// Recognize only a complete current reader footer whose digest authenticates the exact
+// expected source (including its original trailing newline). Partial presentations fail.
+fn exact_tool_evidence(output: &str, expected: &str) -> bool {
+    output == expected || complete_reader_body(output).is_some_and(|body| body == expected)
+}
+
+fn complete_reader_body(output: &str) -> Option<&str> {
+    use sha2::Digest as _;
+    let (body, footer) = output.rsplit_once("\n\n[Source bytes: ")?;
+    if body.contains("\n\n[Showing lines ") {
+        return None;
+    }
+    [body.to_owned(), format!("{body}\n")]
+        .iter()
+        .any(|source| {
+            footer
+                == format!(
+                    "{}; SHA-256: {}. Digest covers the entire file, not only displayed lines.]",
+                    source.len(),
+                    hex::encode(sha2::Sha256::digest(source.as_bytes()))
+                )
+        })
+        .then_some(body)
 }
 
 fn apply_loop_tool_evidence(
@@ -2576,7 +2628,9 @@ fn bind_prompt_results(value: &mut serde_json::Value, results: &[&str]) -> Optio
             }
             let index = usize::try_from(reference.get("index")?.as_u64()?).ok()?;
             let pointer = reference.get("pointer")?.as_str()?;
-            let result: serde_json::Value = serde_json::from_str(results.get(index)?).ok()?;
+            let output = results.get(index)?;
+            let result: serde_json::Value =
+                serde_json::from_str(complete_reader_body(output).unwrap_or(output)).ok()?;
             let mut selected = result.pointer(pointer)?;
             if reference.len() >= 4 {
                 let predicate = reference.get("where")?.as_object()?;
@@ -3034,6 +3088,34 @@ mod tests {
     }
 
     #[test]
+    fn complete_reader_evidence_requires_exact_body_and_source_digest() {
+        use sha2::Digest as _;
+        let expected = "first\nsecond";
+        let source = format!("{expected}\n");
+        let output = format!(
+            "{expected}\n\n[Source bytes: {}; SHA-256: {}. Digest covers the entire file, not only displayed lines.]",
+            source.len(),
+            hex::encode(sha2::Sha256::digest(source.as_bytes()))
+        );
+        assert!(exact_tool_evidence(&output, expected));
+        assert!(!exact_tool_evidence(&output, "first"));
+        assert!(!exact_tool_evidence(
+            &output.replace("Source bytes: 13", "Source bytes: 14"),
+            expected
+        ));
+        assert!(!exact_tool_evidence(
+            &output.replace("SHA-256: ", "SHA-256: 0"),
+            expected
+        ));
+        assert!(!exact_tool_evidence(
+            &format!(
+                "{expected}\n\n[Showing lines 1-2 of 3.]\n\n[Source bytes: 13; SHA-256: invalid]"
+            ),
+            expected
+        ));
+    }
+
+    #[test]
     fn matching_input_fixture_finds_nested_schema_value_without_synthesizing_product_data() {
         let schema = serde_json::json!({
             "type": "object",
@@ -3184,6 +3266,28 @@ mod tests {
             bind_prompt_results(&mut reference(0, ""), &["not JSON"]),
             None
         );
+    }
+
+    #[test]
+    fn prompt_bindings_accept_only_authentic_complete_reader_json() {
+        use sha2::Digest as _;
+        let body = r#""actual-revision""#;
+        let footer = format!(
+            "{body}\n\n[Source bytes: {}; SHA-256: {}. Digest covers the entire file, not only displayed lines.]",
+            body.len(),
+            hex::encode(sha2::Sha256::digest(body.as_bytes()))
+        );
+        let reference = || serde_json::json!({"$fake_result":{"index":0,"pointer":""}});
+        let mut valid = reference();
+        assert_eq!(bind_prompt_results(&mut valid, &[&footer]), Some(()));
+        assert_eq!(valid, "actual-revision");
+        for invalid in [
+            footer.replace("SHA-256: ", "SHA-256: 0"),
+            footer.replace("Source bytes: 17", "Source bytes: 18"),
+            format!("{body}\n\n[Showing lines 1-1 of 2.]\n\n[Source bytes: 17; SHA-256: invalid]"),
+        ] {
+            assert_eq!(bind_prompt_results(&mut reference(), &[&invalid]), None);
+        }
     }
 
     #[test]
@@ -3644,6 +3748,63 @@ tool-call publish {"$fake_result":{"index":0,"pointer":"/publication_arguments"}
             " ".repeat(1_048_577),
         );
         assert!(fake_event_script(&request).is_err());
+    }
+
+    #[test]
+    fn configured_compaction_summary_rejects_blank_and_oversized_text() {
+        for invalid in [
+            String::new(),
+            " \n\t".to_owned(),
+            "x".repeat(901),
+            "界".repeat(901),
+        ] {
+            assert!(validate_fake_compaction_summary(&invalid).is_err());
+        }
+        let maximum = "界".repeat(900);
+        assert_eq!(validate_fake_compaction_summary(&maximum).unwrap(), maximum);
+    }
+
+    #[test]
+    fn configured_compaction_summary_requires_compaction_metadata() {
+        let mut request: ModelTurnRequest = serde_json::from_value(serde_json::json!({
+            "session_id": "00000000-0000-0000-0000-000000000000",
+            "turn_id": "turn", "model_id": "fake-echo", "messages": []
+        }))
+        .expect("test request");
+        assert_eq!(
+            fake_response_text(&request, None, "input").unwrap(),
+            "fake: input"
+        );
+        request.provider_context.settings.insert(
+            "fake_compaction_summary".to_owned(),
+            "Older turns contained synthetic user and assistant padding.".to_owned(),
+        );
+        assert_eq!(
+            fake_response_text(&request, None, "input").unwrap(),
+            "fake: input"
+        );
+        request
+            .metadata
+            .insert("bcode_request_kind".to_owned(), "chat".to_owned());
+        assert_eq!(
+            fake_response_text(&request, None, "input").unwrap(),
+            "fake: input"
+        );
+        request
+            .metadata
+            .insert("bcode_request_kind".to_owned(), "compaction".to_owned());
+        assert_eq!(
+            fake_response_text(&request, None, "input").unwrap(),
+            "Older turns contained synthetic user and assistant padding."
+        );
+        request
+            .provider_context
+            .settings
+            .remove("fake_compaction_summary");
+        assert_eq!(
+            fake_response_text(&request, None, "input").unwrap(),
+            "fake: input"
+        );
     }
 
     #[test]

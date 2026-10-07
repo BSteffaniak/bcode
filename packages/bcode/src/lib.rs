@@ -8,6 +8,11 @@
 //! The facade is intentionally small and delegates reusable turn behavior to
 //! `bcode_agent_runtime`.
 
+#[cfg(feature = "daemon-client")]
+mod history_context;
+#[cfg(feature = "daemon-client")]
+pub use history_context::DaemonHistoryContextProvider;
+
 use bcode_agent_permissions::{PermissionAskCallback, ask_callback};
 use bcode_agent_policy::active_tools_for;
 use bcode_agent_runtime::{
@@ -7212,6 +7217,92 @@ pub trait MemoryProvider: Send + Sync {
     fn retrieve(&self, request: &MemoryRetrievalRequest) -> Result<Vec<MemoryItem>>;
 }
 
+/// Future returned by an application-owned memory ranking adapter.
+pub type MemoryRankingFuture<'a> =
+    std::pin::Pin<Box<dyn std::future::Future<Output = Result<Option<Vec<String>>>> + Send + 'a>>;
+
+/// Application-owned adapter to central optional judgement and plugin-owned ranking policy.
+///
+/// Implementations must resolve off/no-key/error, cancellation and timeouts through the central
+/// application boundary, not a provider transport. Inputs are request-only and must not persist.
+/// A missing or invalid permutation preserves ordinary relevance ranking.
+pub trait MemoryContextRanker: Send + Sync {
+    /// Rank original bounded candidates; `None` means advisory ranking is unavailable.
+    ///
+    /// # Errors
+    ///
+    /// An advisory failure is ignored by the SDK and preserves baseline memory incorporation.
+    fn rank<'a>(
+        &'a self,
+        task: &'a str,
+        candidates: &'a [bcode_session_models::JudgementContextCandidate],
+        budget_bytes: usize,
+    ) -> MemoryRankingFuture<'a>;
+}
+
+/// Daemon-backed adapter using the public application context-ranking boundary.
+///
+/// Central access owns configuration, credentials, cancellation and timeouts; SDK code never
+/// constructs provider requests. Attach explicitly with [`AgentSession::with_memory_context_ranker`]
+/// to grant a separate judgement-transfer privacy policy. Private/sensitive memory is not
+/// transferred unless the caller explicitly grants that additional transfer.
+///
+/// With the `daemon-client` feature, attach it to a session that already has memory providers:
+///
+/// ```no_run
+/// # #[cfg(feature = "daemon-client")]
+/// # {
+/// use bcode::{Agent, BcodeClient, DaemonMemoryContextRanker, MemoryPrivacy};
+/// use std::sync::Arc;
+///
+/// // Use your existing caller-resolved client when targeting a particular state location.
+/// let client = BcodeClient::default_endpoint();
+/// let session = Agent::builder().build().session().with_memory_context_ranker(
+///     Arc::new(DaemonMemoryContextRanker::new(client)),
+///     MemoryPrivacy::Public, // Separate consent; does not change chat memory admission.
+/// );
+/// # let _ = session;
+/// # }
+/// ```
+///
+/// Ranking is awaited before the conversational runtime starts. Dropping the SDK send future
+/// drops this local wait; this adapter does not propagate a remote cancellation request or prove
+/// remote judgement has stopped. Central application access remains responsible for its timeout
+/// and cancellation policy.
+#[cfg(feature = "daemon-client")]
+pub struct DaemonMemoryContextRanker {
+    client: BcodeClient,
+}
+
+#[cfg(feature = "daemon-client")]
+impl DaemonMemoryContextRanker {
+    /// Use a caller-resolved client, preserving its artifact and state-location identity.
+    #[must_use]
+    pub const fn new(client: BcodeClient) -> Self {
+        Self { client }
+    }
+}
+
+#[cfg(feature = "daemon-client")]
+impl MemoryContextRanker for DaemonMemoryContextRanker {
+    fn rank<'a>(
+        &'a self,
+        task: &'a str,
+        candidates: &'a [bcode_session_models::JudgementContextCandidate],
+        _budget_bytes: usize,
+    ) -> MemoryRankingFuture<'a> {
+        Box::pin(async move {
+            // Advisory transport failure is not a conversational model failure.
+            Ok(self
+                .client
+                .rank_optional_context(task, candidates)
+                .await
+                .ok()
+                .flatten())
+        })
+    }
+}
+
 /// Behavior when one memory provider fails or returns invalid items.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum MemoryFailurePolicy {
@@ -7295,20 +7386,28 @@ pub struct AgentSession {
     session: InMemorySession,
     persistence: Option<Arc<dyn SessionPersistenceAdapter>>,
     context_providers: Vec<Arc<dyn SessionContextProvider>>,
+    #[cfg(feature = "daemon-client")]
+    history_providers: Vec<DaemonHistoryContextProvider>,
     memory_providers: Vec<Arc<dyn MemoryProvider>>,
     memory_policy: MemoryPolicy,
     memory_report: MemoryRetrievalReport,
+    memory_ranker: Option<Arc<dyn MemoryContextRanker>>,
+    memory_judgement_privacy: MemoryPrivacy,
 }
 
 impl fmt::Debug for AgentSession {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter
-            .debug_struct("AgentSession")
+        let mut debug = formatter.debug_struct("AgentSession");
+        #[cfg(feature = "daemon-client")]
+        debug.field("history_providers", &self.history_providers.len());
+        debug
             .field("agent", &self.agent)
             .field("session", &self.session)
             .field("persistence", &self.persistence.is_some())
             .field("context_providers", &self.context_providers.len())
             .field("memory_providers", &self.memory_providers.len())
+            .field("memory_ranker", &self.memory_ranker.is_some())
+            .field("memory_judgement_privacy", &self.memory_judgement_privacy)
             .field("memory_policy", &self.memory_policy)
             .field("memory_report", &self.memory_report)
             .finish()
@@ -7324,6 +7423,8 @@ impl AgentSession {
             session,
             persistence: None,
             context_providers: Vec::new(),
+            #[cfg(feature = "daemon-client")]
+            history_providers: Vec::new(),
             memory_providers: Vec::new(),
             memory_policy: MemoryPolicy {
                 max_items: 16,
@@ -7332,6 +7433,8 @@ impl AgentSession {
                 max_privacy: MemoryPrivacy::Private,
                 failure_policy: MemoryFailurePolicy::FailTurn,
             },
+            memory_ranker: None,
+            memory_judgement_privacy: MemoryPrivacy::Public,
             memory_report: MemoryRetrievalReport {
                 accepted: Vec::new(),
                 diagnostics: Vec::new(),
@@ -7360,6 +7463,17 @@ impl AgentSession {
         self
     }
 
+    /// Attach explicitly scoped indexed-history retrieval for normal SDK requests.
+    ///
+    /// Retain a clone of the provider to inspect bounded search coverage/failure reports.
+    /// This does not hydrate hits, persist retrieved context, or broaden caller search scope.
+    #[cfg(feature = "daemon-client")]
+    #[must_use]
+    pub fn with_history_context_provider(mut self, provider: DaemonHistoryContextProvider) -> Self {
+        self.history_providers.push(provider);
+        self
+    }
+
     /// Attach an application-owned typed memory provider.
     #[must_use]
     pub fn with_memory_provider<P>(mut self, provider: P) -> Self
@@ -7381,6 +7495,22 @@ impl AgentSession {
     #[must_use]
     pub const fn with_memory_policy(mut self, policy: MemoryPolicy) -> Self {
         self.memory_policy = policy;
+        self
+    }
+
+    /// Opt into request-only judgement transfer for optional retrieved memory.
+    ///
+    /// `max_transfer_privacy` is separate from conversational memory admission. Only whole,
+    /// bounded text messages at or below this privacy class may reach the adapter. Ineligible
+    /// memories keep their baseline slots; explicit context and transcript are never ranked.
+    #[must_use]
+    pub fn with_memory_context_ranker(
+        mut self,
+        ranker: Arc<dyn MemoryContextRanker>,
+        max_transfer_privacy: MemoryPrivacy,
+    ) -> Self {
+        self.memory_ranker = Some(ranker);
+        self.memory_judgement_privacy = max_transfer_privacy;
         self
     }
 
@@ -7516,7 +7646,7 @@ impl AgentSession {
         Ok(())
     }
 
-    fn request_messages(
+    async fn request_messages(
         &mut self,
         transcript: &[ModelMessage],
         query: &str,
@@ -7525,14 +7655,21 @@ impl AgentSession {
         for provider in &self.context_providers {
             messages.extend(provider.context_messages(&self.session)?);
         }
+        #[cfg(feature = "daemon-client")]
+        for provider in &self.history_providers {
+            messages.extend(provider.context_messages(query).await);
+        }
         let (memory, report) = retrieve_memory(
             &self.memory_providers,
             &self.memory_policy,
+            self.memory_ranker.as_deref(),
+            self.memory_judgement_privacy,
             &MemoryRetrievalRequest {
                 query: query.to_string(),
                 transcript: transcript.to_vec(),
             },
-        )?;
+        )
+        .await?;
         self.memory_report = report;
         messages.extend(memory.into_iter().map(|item| item.message));
         messages.extend_from_slice(transcript);
@@ -7572,7 +7709,7 @@ impl AgentSession {
             )
         })?;
         let transcript = self.session.messages[..user_index].to_vec();
-        let prior_messages = self.request_messages(&transcript, &prompt)?;
+        let prior_messages = self.request_messages(&transcript, &prompt).await?;
         let session_span = tracing::info_span!(
             target: "bcode::sdk",
             "bcode.session_turn",
@@ -7628,7 +7765,7 @@ impl AgentSession {
     {
         let prompt = prompt.into();
         let transcript = self.session.messages.clone();
-        let messages = self.request_messages(&transcript, &prompt)?;
+        let messages = self.request_messages(&transcript, &prompt).await?;
         let session_span = tracing::info_span!(
             target: "bcode::sdk",
             "bcode.session_turn",
@@ -7704,9 +7841,90 @@ fn memory_item_validation_code(
     None
 }
 
-fn retrieve_memory(
+type MemoryCandidate = (usize, usize, MemoryItem, usize);
+
+fn eligible_memory_candidates(
+    candidates: &[MemoryCandidate],
+    transfer_privacy: MemoryPrivacy,
+) -> Vec<(usize, bcode_session_models::JudgementContextCandidate)> {
+    candidates
+        .iter()
+        .enumerate()
+        .filter_map(|(slot, (_, _, item, _))| {
+            if item.privacy > transfer_privacy {
+                return None;
+            }
+            let [ModelContentBlock::Text { text }] = item.message.content.as_slice() else {
+                return None;
+            };
+            let candidate = bcode_session_models::JudgementContextCandidate {
+                id: format!("memory-{slot}"),
+                source: bcode_session_models::JudgementContextSource::Memory,
+                provenance: serde_json::to_string(&(&item.provenance, &item.id)).ok()?,
+                snippet: text.clone(),
+                protected: false,
+            };
+            candidate.is_valid().then_some((slot, candidate))
+        })
+        .take(33)
+        .collect::<Vec<_>>()
+}
+
+async fn rank_memory_candidates(
+    candidates: &mut [MemoryCandidate],
+    policy: &MemoryPolicy,
+    ranker: Option<&dyn MemoryContextRanker>,
+    transfer_privacy: MemoryPrivacy,
+    request: &MemoryRetrievalRequest,
+) {
+    // Only optional incorporation pressure warrants judgement. Never transfer transcript,
+    // multimodal payloads, or memory beyond the separately granted transfer privacy.
+    if let Some(ranker) = ranker
+        && request.query.len() <= 8192
+        && (candidates.len() > policy.max_items
+            || candidates.iter().fold(0usize, |total, (_, _, _, bytes)| {
+                total.saturating_add(*bytes)
+            }) > policy.max_total_bytes)
+    {
+        let eligible = eligible_memory_candidates(candidates, transfer_privacy);
+        if (2..=32).contains(&eligible.len()) {
+            let inputs = eligible
+                .iter()
+                .map(|(_, candidate)| candidate.clone())
+                .collect::<Vec<_>>();
+            if let Ok(Some(order)) = ranker
+                .rank(&request.query, &inputs, policy.max_total_bytes)
+                .await
+            {
+                let unique = order.iter().collect::<std::collections::BTreeSet<_>>();
+                if order.len() == inputs.len()
+                    && unique.len() == inputs.len()
+                    && inputs
+                        .iter()
+                        .all(|candidate| unique.contains(&candidate.id))
+                {
+                    // Reorder only eligible slots: non-transferred memory retains its exact slot.
+                    let originals = eligible
+                        .iter()
+                        .map(|(slot, _)| candidates[*slot].clone())
+                        .collect::<Vec<_>>();
+                    for ((slot, _), id) in eligible.iter().zip(order) {
+                        if let Some(index) = inputs.iter().position(|candidate| candidate.id == id)
+                        {
+                            candidates[*slot] = originals[index].clone();
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+async fn retrieve_memory(
     providers: &[Arc<dyn MemoryProvider>],
     policy: &MemoryPolicy,
+    ranker: Option<&dyn MemoryContextRanker>,
+    transfer_privacy: MemoryPrivacy,
     request: &MemoryRetrievalRequest,
 ) -> Result<(Vec<MemoryItem>, MemoryRetrievalReport)> {
     let mut report = MemoryRetrievalReport::default();
@@ -7766,6 +7984,7 @@ fn retrieve_memory(
                 .then_with(|| left_item.cmp(right_item))
         },
     );
+    rank_memory_candidates(&mut candidates, policy, ranker, transfer_privacy, request).await;
     let mut accepted = Vec::new();
     for (_, _, item, bytes) in candidates {
         if accepted.len() >= policy.max_items {

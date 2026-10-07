@@ -34,6 +34,30 @@ pub struct JudgementContextCandidate {
     pub protected: bool,
 }
 
+/// Bounded request-only optional evidence selection at the application boundary.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ContextSelectionRequest {
+    /// Current bounded task, never canonical history.
+    pub task: String,
+    /// Original producer-owned candidates; at most 32 unique IDs.
+    pub candidates: Vec<JudgementContextCandidate>,
+    /// Whole-snippet byte admission; None means the producer already measured pressure.
+    pub budget_bytes: Option<usize>,
+}
+
+/// Original identities only; unavailable advice preserves deterministic baseline.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ContextSelectionResponse {
+    /// Full original-ID permutation, with protected slots unchanged.
+    pub ordered_ids: Vec<String>,
+    /// Admitted IDs, or the full ordering for producer-owned admission.
+    pub included_ids: Vec<String>,
+    /// Confident advice changed the baseline ordering.
+    pub applied: bool,
+}
+
 impl JudgementContextCandidate {
     /// Compatibility schema for transient producer contributions containing one candidate.
     pub const SCHEMA: &str = "bcode.context-candidate/v1";

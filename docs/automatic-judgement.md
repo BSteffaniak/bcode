@@ -43,7 +43,7 @@ An exact pin is never silently switched to another account.
 | Feature | Useful trigger and effect |
 | --- | --- |
 | Tool-result triage | A settled tool error with recognized diagnostic indicators. Returns fixed plugin-owned advisory text as request-only next-model context and a live Supplemental Transient frontend contribution; preserves the original result, success/error flag, and side-effect accounting. The service also supports trustworthy partial-result facts, but the current host hook does not supply a partial flag. |
-| Context ranking | Under catalog byte-budget pressure, optional skill metadata is ranked before budgeting. Bounded transient evidence candidates are also ranked before request-only incorporation when their whole snippets exceed the optional-context budget. `filesystem.grep` supplies original match-line candidates; explicit reads and chronological tool responses remain untouched. History and memory retrieval producers are not currently implemented by this integration. |
+| Context ranking | Under catalog byte-budget pressure, optional skill metadata is ranked before budgeting. Bounded transient evidence candidates are also ranked before request-only incorporation when their whole snippets exceed the optional-context budget. `filesystem.grep` supplies original match-line candidates; explicit reads and chronological tool responses remain untouched. SDK memory retrieval and `SessionHistoryContextRetriever` rank bounded optional candidates before admission. History retrieval uses the client search boundary without hydrating or replaying canonical history; unavailable or invalid advice preserves baseline ordering. |
 | Recommendations | Relevance ordering of eligible skill metadata when catalog context ranking is not applicable, and eligible tool definitions after deterministic allowlist filtering. Ordering alone does not activate skills, authorize, or execute a tool. |
 | Progress monitoring | Goal/loop iteration evidence supplies advisory progress/stall/drift probabilities. Ordinary sessions and applicable workflow activations also supply bounded ephemeral settled-work observations to the loop plugin, which can return transient/request-only stall or drift advice. Advice never changes execution, permissions, objectives, or completion authority; workflow advice is checked against current durable execution ownership. |
 | Session categorization | Recognized task/domain signals from the newest admitted request. Fixed advisory labels are separate from canonical events and do not require replaying history. |
@@ -111,6 +111,25 @@ outputs have separate lifetimes: request-only next-model tool diagnostics and li
 frontend contributions (not history), disposable in-memory session
 labels, workflow-owned iteration summaries, and explicit evaluation report fields. Canonical
 history, permissions, terminal outcomes, and completion authority remain unchanged.
+
+## Validation scope
+
+Offline comparative tests exercise all six consumers across global-off, feature-off,
+no-key, provider-error, and eligible-provider modes. Normal session tests capture
+categorization, tool recommendation order, and request-only triage/progress advice;
+client-boundary tests capture constrained context admission and evaluation diagnosis.
+Controlled fixture probabilities demonstrate relevant candidate promotion, not live-model
+quality improvement. Cancellation and authority-transfer tests reject late advice.
+
+The public evaluation runner also compares all five modes using an explicitly selected
+fake-provider CLI artifact. Its ordinary model turns complete, while unavailable workflow
+history collections remain explicitly degraded (`workflow_unavailable`). Advisory labels
+must not change that capture status, independent oracle failure, preservation result,
+timeout status, or deterministic diagnosis. This is not complete workflow-capture support.
+
+Current request-only guidance follows paired canonical history in model requests. It is
+not persisted or reconstructed as historical guidance. Restart-cache validation checks
+that removing old ephemeral guidance does not invalidate the canonical history prefix.
 
 See [the provider contract](judgement-model-provider-contract.md) for typed interfaces and
 [goal/loop judgement evaluation](loop-judgement-evaluation.md) for explicitly selected

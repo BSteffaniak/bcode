@@ -190,7 +190,7 @@ pub(crate) fn invoke(context: &NativeServiceContext) -> ServiceResponse {
                         "categorize-{}-{}",
                         request.session_id, request.source_sequence
                     ),
-                    route_id: None,
+                    route_id: Some(judgement::WORKFLOW_APPLICATION_INTERFACE_ID.to_owned()),
                     interface_id: judgement::WORKFLOW_APPLICATION_INTERFACE_ID.to_owned(),
                     operation: judgement::OP_OPTIONAL_JUDGE.to_owned(),
                     payload: serde_json::to_value(optional).ok()?,
