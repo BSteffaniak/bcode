@@ -21,7 +21,7 @@ pub async fn authenticate(
     session_id: crate::SessionId,
     provenance: &ExecutionSessionProvenance,
 ) -> Result<Option<AuthenticatedExecution>, ServerError> {
-    let retained = retained_store(state)?;
+    let retained = retained_store(state).await?;
     match lookup_at(retained.path(), &provenance.run_id).await? {
         RunLookup::Legacy => return Ok(None),
         RunLookup::Available(_) => {}
@@ -218,7 +218,7 @@ pub async fn candidate(
     run_id: &str,
     mutation_id: &str,
 ) -> Result<Option<bcode_workflow::WorkflowRunGraphEditBatch>, ServerError> {
-    let retained = retained_store(state)?;
+    let retained = retained_store(state).await?;
     let db = open(retained.path(), false)?;
     match lookup_at(retained.path(), run_id).await? {
         RunLookup::Legacy => {

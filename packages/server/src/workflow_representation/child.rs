@@ -15,7 +15,7 @@ pub async fn observe(
     let authority = super::owner::local_authority(state, &request.run_id)
         .await?
         .ok_or_else(unsupported)?;
-    let retained = retained_store(state)?;
+    let retained = retained_store(state).await?;
     let db = open(retained.path(), false)?;
     let node = super::backpressure::retry(|| {
         representation::graph::execution_node(&db, &request.run_id, &request.node_id)
@@ -66,7 +66,7 @@ pub async fn dispatch(
     let guard = super::owner::local_authority(state, &request.activation.run_id)
         .await?
         .ok_or_else(unsupported)?;
-    let retained = retained_store(state)?;
+    let retained = retained_store(state).await?;
     let db = open(retained.path(), true)?;
     let context = super::backpressure::retry(|| {
         representation::hierarchy::parent_context(&db, &guard.authority, &request.activation.run_id)
@@ -131,7 +131,7 @@ pub async fn dispatch(
 
 /// Read the canonical parent only; discovery grants no execution authority.
 pub async fn parent_run(state: &ServerState, run_id: &str) -> Result<Option<String>, ServerError> {
-    let retained = retained_store(state)?;
+    let retained = retained_store(state).await?;
     if !recovery::is_represented(state, run_id).await? {
         return Ok(retained
             .parent_run_link(run_id)?

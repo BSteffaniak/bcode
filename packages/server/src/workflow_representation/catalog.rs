@@ -26,7 +26,7 @@ pub async fn page(
     {
         return Err(unavailable());
     }
-    let retained = retained_store(state)?;
+    let retained = retained_store(state).await?;
     let db = open(retained.path(), false)?;
     let page = store::page(&db, request.after.as_deref(), request.limit)
         .await

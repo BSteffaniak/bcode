@@ -14,7 +14,7 @@ pub async fn page(
     state: &ServerState,
     request: &WorkflowRunGraphPageRequest,
 ) -> Result<WorkflowRunGraphInspection, ServerError> {
-    let retained = retained_store(state)?;
+    let retained = retained_store(state).await?;
     match lookup_at(retained.path(), &request.run_id).await? {
         RunLookup::Legacy => {
             return crate::workflow_operations::inspect_graph_page(state, request)

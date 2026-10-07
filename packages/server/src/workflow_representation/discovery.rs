@@ -4,7 +4,7 @@ use super::{
 };
 
 pub async fn check_repair_identity(state: &ServerState, identity: &str) -> Result<(), ServerError> {
-    let retained = retained_store(state)?;
+    let retained = retained_store(state).await?;
     let db = super::open(retained.path(), false)?;
     if super::representation::supports_admission(&db)
         .await
@@ -55,7 +55,7 @@ pub async fn attempts(
     cursor: Option<&bcode_workflow::AttemptCursor>,
     limit: usize,
 ) -> Result<Vec<bcode_workflow::AttemptSummary>, ServerError> {
-    let retained = retained_store(state)?;
+    let retained = retained_store(state).await?;
     match lookup_at(retained.path(), run).await? {
         RunLookup::Legacy => crate::workflow_operations::attempt_history(state, run, cursor, limit)
             .map_err(Into::into),
@@ -105,7 +105,7 @@ pub async fn observations(
     through: Option<u64>,
     limit: usize,
 ) -> Result<bcode_workflow::WorkflowObservationPage, ServerError> {
-    let retained = retained_store(state)?;
+    let retained = retained_store(state).await?;
     if !matches!(
         lookup_at(retained.path(), run).await?,
         RunLookup::Available(_)
@@ -179,7 +179,7 @@ pub async fn events(
     after: Option<u64>,
     limit: usize,
 ) -> Result<Vec<bcode_workflow::WorkflowHistoryEvent>, ServerError> {
-    let retained = retained_store(state)?;
+    let retained = retained_store(state).await?;
     match lookup_at(retained.path(), run).await? {
         RunLookup::Legacy => {
             crate::workflow_operations::event_history(state, run, after, limit).map_err(Into::into)

@@ -230,6 +230,19 @@ def configuration(arm):
         for feature in FEATURES)
 
 
+def task_prompt(case):
+    """Expose output vocabulary, not the expected answer or scoring labels."""
+    prompt = case["task"]
+    if case["feature"] == "session_categorization":
+        prompt += (" For a task label, use implementation, debugging, review, testing, "
+                   "documentation, planning, other, or unknown. For a domain label, use "
+                   "frontend, backend, persistence, security, tooling, other, or unknown. "
+                   "Boolean fields must be JSON booleans, not prose.")
+    fields = ", ".join(sorted(case["answer"]))
+    prompt += f" Write exactly these top-level answer.json keys, with no extra keys: {fields}."
+    return prompt
+
+
 def materialize(args):
     data = load(args.split)
     destination = Path(args.destination).resolve()
@@ -295,7 +308,7 @@ def materialize(args):
             command = "python3 " + shlex.quote(str(ROOT / "benchmark.py")) + " oracle " + shlex.quote(args.split) + " " + shlex.quote(case["id"])
             text += ["[[cases]]", "id = " + json.dumps(case["id"]),
                      "fixture = " + json.dumps(str(fixture)),
-                     "prompt = " + json.dumps(case["task"])]
+                     "prompt = " + json.dumps(task_prompt(case))]
             if args.mode == "swarm":
                 text += ["[cases.metadata.workflow_oracle]", "oracle_command = " + json.dumps(command),
                          "preserve_files = " + json.dumps(list(case["files"]))]

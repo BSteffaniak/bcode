@@ -71,17 +71,33 @@ fn open(
 
 /// Retain the domain's shared maintenance fence independently of server handle replacement.
 /// Readiness is checked before reading the path so degraded placeholder stores cannot route.
-fn retained_store(state: &ServerState) -> Result<bcode_workflow_store::WorkflowStore, ServerError> {
+async fn retained_store(
+    state: &ServerState,
+) -> Result<bcode_workflow_store::WorkflowStore, ServerError> {
     state.poll_workflow_initialization(false)?;
-    let store = state
-        .workflow_store
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    if !store.path().is_file() {
-        return Err(unavailable());
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        // A synchronous lock wait here can occupy every runtime worker while the
+        // owner is awaiting database work on that same runtime. Yield contenders
+        // instead; retaining a handle still uses the canonical maintenance fence.
+        {
+            let store = match state.workflow_store.try_lock() {
+                Ok(store) => Some(store),
+                Err(std::sync::TryLockError::Poisoned(error)) => Some(error.into_inner()),
+                Err(std::sync::TryLockError::WouldBlock) => None,
+            };
+            if let Some(store) = store {
+                if !store.path().is_file() {
+                    return Err(unavailable());
+                }
+                return Ok(store.retained_handle()?);
+            }
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return Err(unavailable());
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
     }
-    // Retain the verified handle's shared maintenance fence without schema traversal.
-    Ok(store.retained_handle()?)
 }
 
 async fn lookup_at(path: &Path, run_id: &str) -> Result<RunLookup, ServerError> {
@@ -96,7 +112,7 @@ pub async fn status(
     state: &ServerState,
     run_id: &str,
 ) -> Result<Option<bcode_workflow::WorkflowRunSummary>, ServerError> {
-    let retained = retained_store(state)?;
+    let retained = retained_store(state).await?;
     let path = retained.path();
     match lookup_at(path, run_id).await? {
         RunLookup::Legacy => Ok(crate::workflow_operations::run_status(state, run_id)?),
@@ -114,7 +130,7 @@ pub async fn status(
 
 /// Guard operations which currently have only a legacy implementation.
 pub async fn require_legacy(state: &ServerState, run_id: &str) -> Result<(), ServerError> {
-    let retained = retained_store(state)?;
+    let retained = retained_store(state).await?;
     match lookup_at(retained.path(), run_id).await? {
         RunLookup::Legacy | RunLookup::Missing => Ok(()),
         RunLookup::Available(_) | RunLookup::UnsupportedRepresentation => Err(unsupported()),
@@ -138,7 +154,7 @@ async fn detach_at(path: &Path, run_id: &str) -> Result<bool, ServerError> {
 /// Return `None` only for legacy routing. Detachment never obtains execution authority.
 /// Authorization is enforced by the invoking application operation, not this store adapter.
 pub async fn detach(state: &ServerState, run_id: &str) -> Result<Option<bool>, ServerError> {
-    let retained = retained_store(state)?;
+    let retained = retained_store(state).await?;
     let path = retained.path();
     match lookup_at(path, run_id).await? {
         RunLookup::Legacy => Ok(None),
@@ -157,7 +173,7 @@ pub async fn admit_prepared(
     run: &bcode_workflow_store::NewWorkflowRun,
 ) -> Result<Option<bcode_workflow::WorkflowRunSummary>, ServerError> {
     use representation::AdmissionFamily;
-    let retained = retained_store(state)?;
+    let retained = retained_store(state).await?;
     let db = open(retained.path(), false)?;
     match backpressure::retry(|| representation::admission_family(&db))
         .await
@@ -212,7 +228,7 @@ pub async fn drive_if_represented(
     state: &std::sync::Arc<ServerState>,
     run_id: &str,
 ) -> Result<bool, ServerError> {
-    let retained = retained_store(state)?;
+    let retained = retained_store(state).await?;
     match lookup_at(retained.path(), run_id).await? {
         RunLookup::Legacy | RunLookup::Missing => Ok(false),
         RunLookup::Available(run) if run.state != representation::runs::RunState::Paused => {

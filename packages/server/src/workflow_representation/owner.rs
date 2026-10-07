@@ -19,7 +19,7 @@ pub async fn check_owner_admission(
     request: &PreparedActivationDispatch,
     authority: &WorkflowExecutionAuthority,
 ) -> Result<Option<serde_json::Value>, WorkflowStoreError> {
-    let retained = retained_store(state).map_err(store_error)?;
+    let retained = retained_store(state).await.map_err(store_error)?;
     match lookup_at(retained.path(), &request.activation.run_id)
         .await
         .map_err(store_error)?
@@ -45,7 +45,7 @@ pub async fn execution_session_link(
     activation_id: &str,
     attempt: u32,
 ) -> Result<Option<WorkflowExecutionSessionLink>, WorkflowStoreError> {
-    let retained = retained_store(state).map_err(store_error)?;
+    let retained = retained_store(state).await.map_err(store_error)?;
     match lookup_at(retained.path(), run_id)
         .await
         .map_err(store_error)?
@@ -72,7 +72,7 @@ pub async fn link_execution_session(
     authority: &WorkflowExecutionAuthority,
     link: &WorkflowExecutionSessionLink,
 ) -> Result<(), WorkflowStoreError> {
-    let mut retained = retained_store(state).map_err(store_error)?;
+    let mut retained = retained_store(state).await.map_err(store_error)?;
     match lookup_at(retained.path(), &link.run_id)
         .await
         .map_err(store_error)?
@@ -102,7 +102,7 @@ pub async fn persist_receipt(
     receipt: &bcode_workflow_store::DispatchReceipt,
     authority: &WorkflowExecutionAuthority,
 ) -> Result<(), WorkflowStoreError> {
-    let retained = retained_store(state).map_err(store_error)?;
+    let retained = retained_store(state).await.map_err(store_error)?;
     match lookup_at(retained.path(), &receipt.run_id)
         .await
         .map_err(store_error)?
@@ -170,7 +170,7 @@ async fn recorded_authority(
     run_id: &str,
     allow_takeover: bool,
 ) -> Result<Option<crate::workflow_operations::AuthorityGuard>, ServerError> {
-    let retained = retained_store(state)?;
+    let retained = retained_store(state).await?;
     match lookup_at(retained.path(), run_id).await? {
         RunLookup::Legacy | RunLookup::Missing => return Ok(None),
         RunLookup::Available(_) => {}
@@ -227,7 +227,7 @@ pub async fn settle_observation(
 ) -> Result<bcode_workflow_store::ReceiptReconciliationSummary, WorkflowStoreError> {
     use bcode_workflow_store::AttemptObservation as Observation;
     use representation::attempts::TerminalOutcome;
-    let retained = retained_store(state).map_err(store_error)?;
+    let retained = retained_store(state).await.map_err(store_error)?;
     match lookup_at(retained.path(), &request.activation.run_id)
         .await
         .map_err(store_error)?
@@ -324,7 +324,7 @@ pub async fn settle_observation(
 /// Commit cancellation intent and signal a bounded receipt page through existing operation owners.
 /// A signal never settles an attempt; terminal evidence remains receipt-observer owned.
 pub async fn cancel(state: &ServerState, run_id: &str) -> Result<Option<bool>, ServerError> {
-    let retained = retained_store(state)?;
+    let retained = retained_store(state).await?;
     match lookup_at(retained.path(), run_id).await? {
         RunLookup::Legacy | RunLookup::Missing => return Ok(None),
         RunLookup::Available(_) => {}
@@ -395,7 +395,7 @@ pub async fn dispatch_intent(
     run_id: &str,
     dispatch_identity: &str,
 ) -> Result<serde_json::Value, WorkflowStoreError> {
-    let retained = retained_store(state).map_err(store_error)?;
+    let retained = retained_store(state).await.map_err(store_error)?;
     match lookup_at(retained.path(), run_id)
         .await
         .map_err(store_error)?
@@ -419,7 +419,7 @@ pub async fn cancellation_intended(
     run_id: &str,
     dispatch_identity: &str,
 ) -> Result<bool, WorkflowStoreError> {
-    let retained = retained_store(state).map_err(store_error)?;
+    let retained = retained_store(state).await.map_err(store_error)?;
     match lookup_at(retained.path(), run_id)
         .await
         .map_err(store_error)?

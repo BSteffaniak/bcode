@@ -17,7 +17,7 @@ pub async fn pause(
     let authority = super::owner::local_authority(state, run_id)
         .await?
         .ok_or_else(unsupported)?;
-    let retained = retained_store(state)?;
+    let retained = retained_store(state).await?;
     let db = open(retained.path(), true)?;
     let expected_revision = representation::graph_pages::revision(&db, run_id)
         .await
@@ -69,7 +69,7 @@ pub async fn resolve_gate(
     let authority = super::owner::local_authority(state, run_id)
         .await?
         .ok_or_else(unsupported)?;
-    let retained = retained_store(state)?;
+    let retained = retained_store(state).await?;
     let db = open(retained.path(), true)?;
     let expected_revision = representation::graph_pages::revision(&db, run_id)
         .await
@@ -138,7 +138,7 @@ pub async fn increase_allowance(
         .ok_or_else(unsupported)?
         .try_reserve()
         .map_err(|_| unsupported())?;
-    let retained = retained_store(state)?;
+    let retained = retained_store(state).await?;
     let db = open(retained.path(), true)?;
     let now = crate::current_unix_millis();
     let changed = super::backpressure::queued(retained.path(), || {
@@ -180,7 +180,7 @@ pub async fn retry_node(
         .ok_or_else(unsupported)?
         .try_reserve()
         .map_err(|_| unsupported())?;
-    let retained = retained_store(state)?;
+    let retained = retained_store(state).await?;
     let db = open(retained.path(), true)?;
     let result = super::backpressure::queued(retained.path(), || {
         representation::attempts::owner_boundary::schedule_retry(

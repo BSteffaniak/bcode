@@ -59,7 +59,7 @@ pub async fn takeover(
     state: &ServerState,
     run_id: &str,
 ) -> Result<workflow_operations::AuthorityGuard, ServerError> {
-    let retained = retained_store(state)?;
+    let retained = retained_store(state).await?;
     let db = open(retained.path(), true)?;
     let expected = owner_boundary::execution_authority(&db, run_id)
         .await
@@ -125,7 +125,7 @@ pub async fn reconcile(
     authority: &bcode_workflow_store::WorkflowExecutionAuthority,
 ) -> Result<(), ServerError> {
     use bcode_workflow_store::AsyncAttemptStatusObserver;
-    let retained = retained_store(state)?;
+    let retained = retained_store(state).await?;
     let db = open(retained.path(), true)?;
     let mut after = None;
     loop {
@@ -206,7 +206,7 @@ pub async fn can_observe(
     state: &ServerState,
     request: &bcode_workflow_store::AttemptReconciliationRequest,
 ) -> Result<Option<bool>, ServerError> {
-    let retained = retained_store(state)?;
+    let retained = retained_store(state).await?;
     match super::lookup_at(retained.path(), &request.run_id).await? {
         super::RunLookup::Legacy | super::RunLookup::Missing => return Ok(None),
         super::RunLookup::Available(_) => {}
@@ -267,7 +267,7 @@ pub async fn discover(
     after: &mut Option<String>,
     limit: usize,
 ) -> Result<Vec<String>, ServerError> {
-    let retained = retained_store(state)?;
+    let retained = retained_store(state).await?;
     let db = open(retained.path(), false)?;
     if representation::admission_family(&db)
         .await
@@ -289,7 +289,7 @@ pub async fn discover(
 }
 
 pub async fn is_represented(state: &ServerState, run_id: &str) -> Result<bool, ServerError> {
-    let retained = retained_store(state)?;
+    let retained = retained_store(state).await?;
     match super::lookup_at(retained.path(), run_id).await? {
         super::RunLookup::Legacy | super::RunLookup::Missing => Ok(false),
         super::RunLookup::Available(_) => Ok(true),

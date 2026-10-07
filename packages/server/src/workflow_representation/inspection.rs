@@ -19,7 +19,7 @@ pub async fn inspect(
     run_id: &str,
     limit: usize,
 ) -> Result<Option<WorkflowRunInspection>, ServerError> {
-    let retained = retained_store(state)?;
+    let retained = retained_store(state).await?;
     match lookup_at(retained.path(), run_id).await? {
         RunLookup::Legacy => return Ok(None),
         RunLookup::Available(_) => {}

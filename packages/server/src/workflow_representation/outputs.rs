@@ -15,7 +15,7 @@ pub async fn run_outputs(
     run_id: &str,
     limit: usize,
 ) -> Result<Vec<bcode_workflow::WorkflowOutputInspection>, ServerError> {
-    let retained = retained_store(state)?;
+    let retained = retained_store(state).await?;
     match lookup_at(retained.path(), run_id).await? {
         RunLookup::Legacy | RunLookup::Missing => {
             return crate::workflow_operations::run_outputs(state, run_id, limit)

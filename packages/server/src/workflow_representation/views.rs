@@ -16,7 +16,7 @@ pub async fn populate_nodes(
         .ok()
         .filter(|limit| (1..=100).contains(limit))
         .ok_or_else(unavailable)?;
-    let retained = retained_store(state)?;
+    let retained = retained_store(state).await?;
     let db = open(retained.path(), false)?;
     let tx = db.begin_transaction().await.map_err(|_| unavailable())?;
     let revision = representation::graph_pages::revision(&*tx, run_id)

@@ -15,7 +15,7 @@ pub async fn run_view(
     run_id: &str,
     limit: usize,
 ) -> Result<Option<WorkflowRunView>, ServerError> {
-    let retained = retained_store(state)?;
+    let retained = retained_store(state).await?;
     match lookup_at(retained.path(), run_id).await? {
         RunLookup::Legacy | RunLookup::Missing => return Ok(None),
         RunLookup::Available(_) => {}

@@ -13,7 +13,7 @@ pub async fn populate(
     limit: usize,
     view: &mut WorkflowRunView,
 ) -> Result<(), super::ServerError> {
-    let retained = super::retained_store(state)?;
+    let retained = super::retained_store(state).await?;
     let db = super::open(retained.path(), false)?;
     let limit = u16::try_from(limit)
         .ok()

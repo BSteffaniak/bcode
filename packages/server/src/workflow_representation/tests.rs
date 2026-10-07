@@ -236,10 +236,43 @@ async fn public_control_detaches_unknown_execution_without_fabricating_status() 
     );
 }
 
+#[tokio::test(flavor = "current_thread")]
+async fn retained_handle_contention_does_not_block_runtime_progress() {
+    let (_root, state) = fixture_with_store(true);
+    state
+        .poll_workflow_initialization(false)
+        .expect("ready store");
+    let state = std::sync::Arc::new(state);
+    let (locked, acquired) = tokio::sync::oneshot::channel();
+    let (release, released) = std::sync::mpsc::channel();
+    let owner = std::sync::Arc::clone(&state);
+    let thread = std::thread::spawn(move || {
+        let _guard = owner.workflow_store.lock().expect("store");
+        locked.send(()).expect("notify lock");
+        released.recv().expect("release lock");
+    });
+    acquired.await.expect("locked");
+    let mut retain = Box::pin(retained_store(&state));
+    tokio::select! {
+        biased;
+        result = &mut retain => panic!("locked store unexpectedly completed: {}", result.is_ok()),
+        () = tokio::time::sleep(std::time::Duration::from_millis(30)) => {}
+    }
+    release.send(()).expect("release");
+    thread.join().expect("lock owner");
+    tokio::time::timeout(std::time::Duration::from_secs(1), retain)
+        .await
+        .expect("runtime remained responsive")
+        .expect("retained handle");
+    drop(state);
+}
+
 #[tokio::test]
 async fn retained_adapter_handle_survives_server_handle_replacement() {
     let (_root, state) = fixture_with_store(true);
-    let retained = retained_store(&state).expect("retained maintenance fence");
+    let retained = retained_store(&state)
+        .await
+        .expect("retained maintenance fence");
     let path = retained.path().to_path_buf();
     let other = tempfile::tempdir().expect("replacement root");
     *state.workflow_store.lock().expect("store") =

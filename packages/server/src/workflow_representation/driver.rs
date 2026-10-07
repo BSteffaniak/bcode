@@ -8,7 +8,7 @@ use representation::attempts::owner_boundary;
 
 /// Drive a canonical new run under an already-verified local authority. No admission bypass.
 pub async fn drive(state: &std::sync::Arc<ServerState>, run_id: &str) -> Result<(), ServerError> {
-    let retained = retained_store(state)?;
+    let retained = retained_store(state).await?;
     let db = open(retained.path(), true)?;
     let guard = super::owner::local_authority(state, run_id)
         .await?
@@ -436,7 +436,7 @@ pub async fn advisory_authority_current(
     if !crate::workflow_operations::authority_targets_current_daemon(state, authority) {
         return false;
     }
-    let Ok(retained) = retained_store(state) else {
+    let Ok(retained) = retained_store(state).await else {
         return false;
     };
     let Ok(db) = open(retained.path(), false) else {
@@ -496,7 +496,7 @@ async fn observe_existing(
         && !cancelled
         && crate::workflow_operations::authority_targets_current_daemon(state, authority)
     {
-        let retained = retained_store(state)?;
+        let retained = retained_store(state).await?;
         let db = open(retained.path(), false)?;
         let run_id = &dispatch.activation.run_id;
         if super::backpressure::queued(retained.path(), || {

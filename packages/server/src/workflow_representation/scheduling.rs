@@ -71,7 +71,7 @@ pub async fn page(
 > {
     use bcode_workflow_view_models::{WorkflowCapacityScope, WorkflowSchedulingPolicy};
     request.validate().map_err(|_| unavailable())?;
-    let retained = super::retained_store(state)?;
+    let retained = super::retained_store(state).await?;
     match super::lookup_at(retained.path(), &request.run_id).await? {
         super::RunLookup::Legacy | super::RunLookup::Missing => {
             return crate::workflow_operations::scheduling_page(state, request);

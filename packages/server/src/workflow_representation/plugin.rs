@@ -7,7 +7,7 @@ pub async fn check_supported(
     run_id: &str,
     block: &bcode_workflow::WorkflowBlockDefinition,
 ) -> Result<bool, WorkflowStoreError> {
-    let retained = retained_store(state).map_err(|_| unavailable())?;
+    let retained = retained_store(state).await.map_err(|_| unavailable())?;
     match lookup_at(retained.path(), run_id)
         .await
         .map_err(|_| unavailable())?

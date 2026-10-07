@@ -11,6 +11,18 @@ import benchmark as b
 
 
 class DatasetTests(unittest.TestCase):
+    def test_categorization_prompt_defines_vocabulary_independent_of_truth(self):
+        case = next(c for c in b.load("development")["cases"]
+                    if c["id"] == "dev-session-frontend-doc")
+        prompt = b.task_prompt(case)
+        self.assertIn("documentation", prompt)
+        self.assertIn("debugging", prompt)
+        self.assertIn("unknown", prompt)
+        changed_truth = dict(case, answer={"task": "debugging"}, expected={})
+        self.assertEqual(prompt, b.task_prompt(changed_truth))
+        self.assertIn("exactly these top-level answer.json keys", prompt)
+        self.assertIn("no extra keys: task", prompt)
+
     def test_all_features_disjoint_splits(self):
         development = b.load("development")["cases"]
         held = b.load("held_out")["cases"]
