@@ -6,8 +6,8 @@ use switchy_database::{
 };
 use switchy_database_connection::{SqliteAccess, SqliteOpenOptions, open_sqlite_rusqlite};
 
-fn fixture(path: &Path) {
-    let db = open_sqlite_rusqlite(
+fn writable_fixture(path: &Path) -> impl Database {
+    open_sqlite_rusqlite(
         path,
         &SqliteOpenOptions {
             access: SqliteAccess::ReadWriteCreate,
@@ -17,7 +17,11 @@ fn fixture(path: &Path) {
             connections: std::num::NonZeroUsize::MIN,
         },
     )
-    .unwrap();
+    .unwrap()
+}
+
+fn fixture(path: &Path) {
+    let db = writable_fixture(path);
     block_on(async {
         for (table, columns) in [
             (
@@ -118,7 +122,10 @@ fn discovery_and_selected_load_preserve_source_bytes() {
     assert_eq!(summaries[1].message_count, Some(0));
     assert_eq!(summaries[0].title.as_deref(), Some("title"));
     let loaded = load_opencode_session(path.to_str().unwrap(), "newer").unwrap();
-    assert!(!loaded.events.is_empty());
+    assert!(loaded.events.iter().any(|event| matches!(
+        &event.kind,
+        ImportableSessionEventKind::AssistantMessage { text } if text == "hello"
+    )));
     assert_eq!(loaded.summary.message_count, Some(2));
     assert!(load_opencode_session(path.to_str().unwrap(), "missing").is_err());
     assert!(load_opencode_session(path.to_str().unwrap(), "archived").is_ok());
@@ -132,4 +139,89 @@ fn missing_source_is_not_created() {
     let path = dir.path().join("missing.db");
     assert!(open_read_only(&path).is_err());
     assert!(!path.exists());
+}
+
+#[test]
+fn source_connection_rejects_writes() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("source.db");
+    fixture(&path);
+    let before = std::fs::read(&path).unwrap();
+    let db = open_read_only(&path).unwrap();
+    assert!(
+        block_on(
+            db.insert("session")
+                .value("id", "forbidden")
+                .execute(db.as_ref())
+        )
+        .is_err()
+    );
+    drop(db);
+    assert_eq!(std::fs::read(&path).unwrap(), before);
+}
+
+#[test]
+fn unsupported_column_types_are_rejected_without_mutation() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("source.db");
+    fixture(&path);
+    let db = writable_fixture(&path);
+    block_on(async {
+        db.update("session")
+            .value("time_updated", "future-representation")
+            .where_eq("id", "newer")
+            .execute(&db)
+            .await
+            .unwrap();
+        db.close().await.unwrap();
+    });
+    let before = std::fs::read(&path).unwrap();
+    assert!(discover_database_sessions(&path, None).is_err());
+    assert!(load_opencode_session(path.to_str().unwrap(), "newer").is_err());
+    assert_eq!(std::fs::read(&path).unwrap(), before);
+}
+
+#[test]
+fn malformed_and_unknown_payloads_report_warnings_and_preserve_fallback() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("source.db");
+    fixture(&path);
+    let db = writable_fixture(&path);
+    block_on(async {
+        db.update("message")
+            .value("data", r#"{"role":"assistant","text":"fallback"}"#)
+            .where_eq("id", "m2")
+            .execute(&db)
+            .await
+            .unwrap();
+        for (id, data) in [("p2", "not-json"), ("p3", r#"{"type":"future-part"}"#)] {
+            db.insert("part")
+                .value("id", id)
+                .value("message_id", "m2")
+                .value("time_created", 4)
+                .value("data", data)
+                .execute(&db)
+                .await
+                .unwrap();
+        }
+        db.close().await.unwrap();
+    });
+    let before = std::fs::read(&path).unwrap();
+    let loaded = load_opencode_session(path.to_str().unwrap(), "newer").unwrap();
+    assert!(loaded.events.iter().any(|event| matches!(&event.kind,
+        ImportableSessionEventKind::AssistantMessage { text } if text == "fallback")));
+    assert_eq!(loaded.warnings.len(), 2);
+    assert_eq!(std::fs::read(&path).unwrap(), before);
+}
+
+#[test]
+fn corrupt_source_is_not_repaired() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("source.db");
+    let bytes = b"not a SQLite database";
+    std::fs::write(&path, bytes).unwrap();
+    assert!(discover_database_sessions(&path, None).is_err());
+    assert!(load_opencode_session(path.to_str().unwrap(), "newer").is_err());
+    assert_eq!(std::fs::read(&path).unwrap(), bytes);
+    assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
 }

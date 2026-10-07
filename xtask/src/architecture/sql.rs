@@ -1,4 +1,4 @@
-//! SQL transition rules over resolved metadata. See docs/database-sql-transition.md.
+//! SQL boundaries over resolved metadata. See docs/architecture-validation.md.
 
 use super::Graph;
 
@@ -25,37 +25,8 @@ fn raw_feature(feature: &str) -> bool {
     feature == "raw-sql" || feature.ends_with("/raw-sql") || feature.ends_with("-raw-sql")
 }
 
-fn transitional_driver(owner: &str, dependency: &str, kind: Option<&str>) -> bool {
-    dependency == "rusqlite"
-        && matches!(
-            (owner, kind),
-            (
-                "bcode_workflow_store"
-                    | "bcode_workflow_discovery"
-                    | "bcode_opencode_session_import_plugin",
-                None
-            )
-        )
-}
-
-// Existing migration consumers only, not permission to add raw calls. Remove entries as migrated.
-fn transitional_requester(owner: &str) -> bool {
-    matches!(
-        owner,
-        "bcode_session"
-            | "bcode_database_observability"
-            | "brouter_telemetry"
-            | "bcode_blims_plugin"
-            | "bcode_cli"
-            | "bcode_server"
-            | "bcode_settings"
-            | "bcode_ralph"
-            | "bcode_code_review_plugin"
-    )
-}
-
 impl Graph {
-    pub(super) fn check_sql(&self, strict: bool, label: &str, failures: &mut Vec<String>) {
+    pub(super) fn check_sql(&self, _strict: bool, label: &str, failures: &mut Vec<String>) {
         for (id, node) in &self.nodes {
             let package = &self.packages[id];
             let owner = package.name.as_str();
@@ -64,17 +35,8 @@ impl Graph {
                 || owner.starts_with("brouter_")
                 || owner == "bcode";
             for feature in &node.features {
-                if raw_feature(feature)
-                    && (strict
-                        || !matches!(
-                            owner,
-                            "switchy"
-                                | "switchy_database"
-                                | "switchy_database_connection"
-                                | "bcode_database_observability"
-                        ))
-                {
-                    failures.push(format!("{label}: {owner} [{id}] activates {feature}; remove raw-SQL enablement (docs/database-sql-transition.md)"));
+                if raw_feature(feature) {
+                    failures.push(format!("{label}: {owner} [{id}] activates {feature}; remove raw-SQL enablement (docs/architecture-validation.md)"));
                 }
             }
             if !bcode_package {
@@ -82,7 +44,7 @@ impl Graph {
             }
             for feature in &node.features {
                 for forwarded in package.features.get(feature).into_iter().flatten() {
-                    if raw_feature(forwarded) && (strict || !transitional_requester(owner)) {
+                    if raw_feature(forwarded) {
                         failures.push(format!("{label}: {owner} feature {feature} -> {forwarded}; unapproved raw-SQL forwarding"));
                     }
                 }
@@ -92,7 +54,7 @@ impl Graph {
                     failures.push(format!("{label}: {owner} -> {} enables upstream defaults; use default-features = false to avoid additive raw-sql", dependency.name));
                 }
                 for feature in &dependency.features {
-                    if raw_feature(feature) && (strict || !transitional_requester(owner)) {
+                    if raw_feature(feature) {
                         failures.push(format!("{label}: {owner} -> {} requests {feature}; specific user approval is required, not a missing capability", dependency.name));
                     }
                 }
@@ -104,9 +66,7 @@ impl Graph {
                     continue;
                 }
                 for kind in &dependency.dep_kinds {
-                    if strict || !transitional_driver(owner, name, kind.kind.as_deref()) {
-                        failures.push(format!("{label}: {owner} -> {name} ({}, {}); direct SQL driver edge is forbidden by the selected SQL policy; use Switchy typed APIs", kind.kind.as_deref().unwrap_or("normal"), package.manifest_path));
-                    }
+                    failures.push(format!("{label}: {owner} -> {name} ({}, {}); direct SQL driver edge is forbidden by the selected SQL policy; use Switchy typed APIs", kind.kind.as_deref().unwrap_or("normal"), package.manifest_path));
                 }
             }
         }
@@ -147,17 +107,13 @@ mod tests {
     }
 
     #[test]
-    fn transition_is_kind_specific_and_strict_closure_rejects_it() {
+    fn migrated_workflow_rejects_driver_edges_in_every_dependency_kind() {
+        for kind in [None, Some("dev"), Some("build")] {
+            let mut failures = Vec::new();
+            graph("bcode_workflow_store", kind, "schema").check_sql(false, "test", &mut failures);
+            assert_eq!(failures.len(), 1);
+        }
         let mut failures = Vec::new();
-        graph("bcode_workflow_store", None, "raw-sql").check_sql(false, "test", &mut failures);
-        assert!(failures.is_empty());
-        graph("bcode_workflow_store", Some("dev"), "schema").check_sql(
-            false,
-            "test",
-            &mut failures,
-        );
-        assert_eq!(failures.len(), 1);
-        failures.clear();
         graph("bcode_workflow_store", None, "raw-sql").check_sql(true, "test", &mut failures);
         assert_eq!(failures.len(), 2);
     }
@@ -177,7 +133,7 @@ mod tests {
     }
 
     #[test]
-    fn observability_forwarder_remains_transition_only() {
+    fn migrated_consumers_cannot_request_or_forward_raw_features() {
         let mut graph = graph("bcode_database_observability", Some("dev"), "raw-sql");
         graph.nodes.get_mut("owner").unwrap().deps.clear();
         graph.nodes.get_mut("owner").unwrap().features = vec!["raw-sql".into()];
@@ -189,7 +145,8 @@ mod tests {
             .insert("raw-sql".into(), vec!["switchy_database/raw-sql".into()]);
         let mut failures = Vec::new();
         graph.check_sql(false, "test", &mut failures);
-        assert!(failures.is_empty());
+        assert_eq!(failures.len(), 3);
+        failures.clear();
         graph.check_sql(true, "test", &mut failures);
         assert_eq!(failures.len(), 3);
     }

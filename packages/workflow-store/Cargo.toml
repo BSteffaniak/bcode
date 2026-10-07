@@ -11,23 +11,25 @@ repository  = { workspace = true }
 version     = { workspace = true }
 
 [dependencies]
-bcode_config     = { workspace = true }
-bcode_metrics    = { workspace = true }
-bcode_workflow   = { workspace = true }
-hex              = { workspace = true }
-jsonschema       = { workspace = true }
-rusqlite         = { workspace = true }
-serde            = { workspace = true, features = ["derive", "std"] }
-serde_json       = { workspace = true, features = ["std"] }
-sha2             = { workspace = true }
-switchy_database = { workspace = true }
-thiserror        = { workspace = true }
-tracing          = { workspace = true }
+bcode_config                = { workspace = true }
+bcode_metrics               = { workspace = true }
+bcode_workflow              = { workspace = true }
+futures                     = { workspace = true, features = ["executor"] }
+hex                         = { workspace = true }
+jsonschema                  = { workspace = true }
+serde                       = { workspace = true, features = ["derive", "std"] }
+serde_json                  = { workspace = true, features = ["std"] }
+sha2                        = { workspace = true }
+switchy_database            = { workspace = true }
+switchy_database_connection = { workspace = true }
+thiserror                   = { workspace = true }
+tokio                       = { workspace = true, features = ["rt"] }
+tracing                     = { workspace = true }
 
 [dev-dependencies]
-switchy_database_connection = { workspace = true }
-tempfile                    = { workspace = true }
-tokio                       = { workspace = true, features = ["macros", "rt"] }
+switchy_database = { workspace = true, features = ["sqlite-test-fixtures"] }
+tempfile         = { workspace = true }
+tokio            = { workspace = true, features = ["macros", "rt"] }
 
 [features]
 default          = []

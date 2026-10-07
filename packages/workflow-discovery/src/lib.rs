@@ -10,8 +10,13 @@
 //! cache. It is never reopened or treated as canonical; normal drop removes its directory.
 //! Abrupt process death may leave temporary files for operating-system cleanup.
 
+mod index;
 mod launch_previews;
+use futures::executor::block_on;
 pub use launch_previews::{LaunchPreviewPage, LaunchPreviewSpool, MAX_PREVIEW_PAGE_BYTES};
+use switchy_database::Database;
+use switchy_database::query::{FilterableQuery, SortDirection};
+use switchy_database::schema::DataType;
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
@@ -41,7 +46,9 @@ pub enum WorkflowDiscoveryError {
     #[error("workflow discovery TOML error: {0}")]
     Toml(#[from] toml::de::Error),
     #[error("workflow discovery temporary index failure")]
-    Index(#[from] rusqlite::Error),
+    Index(#[from] switchy_database::DatabaseError),
+    #[error("workflow discovery index opening error: {0}")]
+    IndexOpen(#[from] switchy_database_connection::InitSqliteRusqliteError),
     #[error("workflow discovery failed: {0}")]
     Invalid(String),
 }
@@ -194,7 +201,7 @@ pub fn discover_workflows(
 /// The private temporary directory is removed after the connection closes.
 #[derive(Debug)]
 struct PackageMemberIndex {
-    connection: rusqlite::Connection,
+    connection: Box<dyn Database>,
     directory: tempfile::TempDir,
 }
 
@@ -211,24 +218,60 @@ impl PackageMemberIndex {
         let directory = tempfile::Builder::new()
             .prefix("bcode-discovery-")
             .tempdir()?;
-        let connection = rusqlite::Connection::open(directory.path().join("members.sqlite"))?;
-        connection.execute_batch("PRAGMA journal_mode=OFF; PRAGMA synchronous=OFF; PRAGMA cache_size=-1024; PRAGMA mmap_size=0; CREATE TABLE members(path BLOB PRIMARY KEY) WITHOUT ROWID; CREATE TABLE ambiguous_packages(id TEXT PRIMARY KEY) WITHOUT ROWID; CREATE TABLE packages(id TEXT PRIMARY KEY, precedence INTEGER NOT NULL, slot INTEGER NOT NULL, metadata TEXT NOT NULL) WITHOUT ROWID;")?;
+        let connection = index::open(&directory.path().join("members.sqlite"))?;
+        index::table(
+            connection.as_ref(),
+            "members",
+            &[("path", DataType::Text)],
+            &["path"],
+        )?;
+        index::table(
+            connection.as_ref(),
+            "ambiguous_packages",
+            &[("id", DataType::Text)],
+            &["id"],
+        )?;
+        index::table(
+            connection.as_ref(),
+            "packages",
+            &[
+                ("id", DataType::Text),
+                ("precedence", DataType::BigInt),
+                ("slot", DataType::BigInt),
+                ("metadata", DataType::Text),
+            ],
+            &["id"],
+        )?;
         Ok(Self {
             connection,
             directory,
         })
     }
 
-    fn insert(&mut self, members: BTreeSet<PathBuf>) -> Result<(), WorkflowDiscoveryError> {
-        let transaction = self.connection.transaction()?;
-        for member in members {
-            transaction.execute(
-                "INSERT OR IGNORE INTO members(path) VALUES (?1)",
-                [member.as_os_str().as_encoded_bytes()],
-            )?;
-        }
-        transaction.commit()?;
-        Ok(())
+    fn insert(&self, members: BTreeSet<PathBuf>) -> Result<(), WorkflowDiscoveryError> {
+        block_on(async {
+            let transaction = self.connection.begin_transaction().await?;
+            let result: Result<(), WorkflowDiscoveryError> = async {
+                for member in members {
+                    let key = serde_json::to_string(member.as_os_str().as_encoded_bytes())?;
+                    transaction
+                        .upsert("members")
+                        .value("path", key.clone())
+                        .where_eq("path", key)
+                        .unique(&["path"])
+                        .execute(transaction.as_ref())
+                        .await?;
+                }
+                Ok(())
+            }
+            .await;
+            if let Err(error) = result {
+                transaction.rollback().await?;
+                return Err(error);
+            }
+            transaction.commit().await?;
+            Ok(())
+        })
     }
 
     fn store_closure(
@@ -261,15 +304,23 @@ impl PackageMemberIndex {
     }
 
     fn package_position(&self, id: &str) -> Result<Option<(u32, usize)>, WorkflowDiscoveryError> {
-        use rusqlite::OptionalExtension;
-        Ok(self
-            .connection
-            .query_row(
-                "SELECT precedence, slot FROM packages WHERE id=?1",
-                [id],
-                |row| Ok((row.get(0)?, row.get(1)?)),
-            )
-            .optional()?)
+        let row = block_on(
+            self.connection
+                .select("packages")
+                .columns(&["precedence", "slot"])
+                .where_eq("id", id)
+                .limit(1)
+                .execute_first(self.connection.as_ref()),
+        )?;
+        row.map(|row| {
+            Ok((
+                u32::try_from(index::integer(&row, "precedence")?).map_err(|_| {
+                    WorkflowDiscoveryError::Invalid("invalid package precedence".into())
+                })?,
+                index::integer(&row, "slot")?,
+            ))
+        })
+        .transpose()
     }
 
     fn store_package(
@@ -283,34 +334,50 @@ impl PackageMemberIndex {
         // This index is request-local and never reopened on another platform. Serde's
         // native OS-string representation preserves paths that are not Unicode.
         let metadata = serde_json::to_string(&(label, path.as_os_str()))?;
-        self.connection.execute("INSERT INTO packages(id, precedence, slot, metadata) VALUES (?1, ?2, ?3, ?4) ON CONFLICT(id) DO UPDATE SET precedence=excluded.precedence, slot=excluded.slot, metadata=excluded.metadata", rusqlite::params![id, precedence, slot, metadata])?;
+        block_on(
+            self.connection
+                .upsert("packages")
+                .value("id", id)
+                .value("precedence", i64::from(precedence))
+                .value(
+                    "slot",
+                    i64::try_from(slot).map_err(|_| {
+                        WorkflowDiscoveryError::Invalid("invalid package slot".into())
+                    })?,
+                )
+                .value("metadata", metadata)
+                .where_eq("id", id)
+                .unique(&["id"])
+                .execute(self.connection.as_ref()),
+        )?;
         Ok(())
     }
 
     fn pop_package(&self) -> Result<Option<IndexedPackage>, WorkflowDiscoveryError> {
-        use rusqlite::OptionalExtension;
-        let row = self
-            .connection
-            .query_row(
-                "SELECT id, precedence, slot, metadata FROM packages ORDER BY id LIMIT 1",
-                [],
-                |row| {
-                    Ok((
-                        row.get::<_, String>(0)?,
-                        row.get::<_, u32>(1)?,
-                        row.get::<_, usize>(2)?,
-                        row.get::<_, String>(3)?,
-                    ))
-                },
-            )
-            .optional()?;
-        let Some((id, precedence, slot, metadata)) = row else {
+        let row = block_on(
+            self.connection
+                .select("packages")
+                .columns(&["id", "precedence", "slot", "metadata"])
+                .sort("id", SortDirection::Asc)
+                .limit(1)
+                .execute_first(self.connection.as_ref()),
+        )?;
+        let Some(row) = row else {
             return Ok(None);
         };
+        let id = index::text(&row, "id")?;
+        let precedence = u32::try_from(index::integer(&row, "precedence")?)
+            .map_err(|_| WorkflowDiscoveryError::Invalid("invalid package precedence".into()))?;
+        let slot = index::integer(&row, "slot")?;
+        let metadata = index::text(&row, "metadata")?;
         let (label, path): (String, std::ffi::OsString) = serde_json::from_str(&metadata)?;
         let path = PathBuf::from(path);
-        self.connection
-            .execute("DELETE FROM packages WHERE id=?1", [&id])?;
+        block_on(
+            self.connection
+                .delete("packages")
+                .where_eq("id", id.clone())
+                .execute(self.connection.as_ref()),
+        )?;
         Ok(Some(IndexedPackage {
             id,
             label,
@@ -321,27 +388,42 @@ impl PackageMemberIndex {
     }
 
     fn mark_ambiguous(&self, id: &str) -> Result<(), WorkflowDiscoveryError> {
-        self.connection.execute(
-            "INSERT OR IGNORE INTO ambiguous_packages(id) VALUES (?1)",
-            [id],
+        block_on(
+            self.connection
+                .upsert("ambiguous_packages")
+                .value("id", id)
+                .where_eq("id", id)
+                .unique(&["id"])
+                .execute(self.connection.as_ref()),
         )?;
         Ok(())
     }
 
     fn is_ambiguous(&self, id: &str) -> Result<bool, WorkflowDiscoveryError> {
-        Ok(self.connection.query_row(
-            "SELECT EXISTS(SELECT 1 FROM ambiguous_packages WHERE id=?1)",
-            [id],
-            |row| row.get(0),
-        )?)
+        Ok(block_on(
+            self.connection
+                .select("ambiguous_packages")
+                .columns(&["id"])
+                .where_eq("id", id)
+                .limit(1)
+                .execute_first(self.connection.as_ref()),
+        )?
+        .is_some())
     }
 
     fn contains(&self, path: &Path) -> Result<bool, WorkflowDiscoveryError> {
-        Ok(self.connection.query_row(
-            "SELECT EXISTS(SELECT 1 FROM members WHERE path=?1)",
-            [path.as_os_str().as_encoded_bytes()],
-            |row| row.get(0),
-        )?)
+        Ok(block_on(
+            self.connection
+                .select("members")
+                .columns(&["path"])
+                .where_eq(
+                    "path",
+                    serde_json::to_string(path.as_os_str().as_encoded_bytes())?,
+                )
+                .limit(1)
+                .execute_first(self.connection.as_ref()),
+        )?
+        .is_some())
     }
 }
 
@@ -1311,6 +1393,18 @@ mod tests {
         let path = std::path::PathBuf::from(std::ffi::OsString::from_vec(
             b"/workflow-\xff/manifest.json".to_vec(),
         ));
+        index
+            .insert(std::collections::BTreeSet::from([path.clone()]))
+            .unwrap();
+        index
+            .insert(std::collections::BTreeSet::from([path.clone()]))
+            .unwrap();
+        assert!(index.contains(&path).unwrap());
+        assert!(
+            !index
+                .contains(std::path::Path::new("/workflow-other/manifest.json"))
+                .unwrap()
+        );
         index
             .store_package("package", "repository", 10, &path, 7)
             .unwrap();

@@ -1,9 +1,10 @@
 //! Typed, run-scoped scheduler discovery on the store's existing connection.
 use super::{
-    ActivationDispatchOwner, ActivationDispatchSummary, Connection, ControlSettlementSummary,
+    ActivationDispatchOwner, ActivationDispatchSummary, ControlSettlementSummary,
     NoopWorkflowDispatchFault, PendingActivation, WorkflowExecutionAuthority, WorkflowStore,
     WorkflowStoreError, run_graph, validate_id,
 };
+use crate::database;
 use switchy_database::{
     DatabaseValue, Row,
     query::{FilterableQuery as _, SortDirection, select},
@@ -36,12 +37,10 @@ fn integer(row: &Row, name: &str) -> Result<u64, WorkflowStoreError> {
     }
 }
 fn rows(
-    connection: &Connection,
+    connection: &dyn switchy_database::Database,
     query: &switchy_database::query::SelectQuery<'_>,
 ) -> Result<Vec<Row>, WorkflowStoreError> {
-    switchy_database::rusqlite::select_on_connection(connection, query).map_err(|error| {
-        WorkflowStoreError::InvalidData(format!("scheduler discovery failed: {error}"))
-    })
+    super::database::rows(connection, query)
 }
 /// One consistent read observation of run-level concurrency capacity.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -92,24 +91,27 @@ impl WorkflowStore {
         if let Some(after) = after {
             validate_id("activation cursor", after)?;
         }
-        let transaction = self
-            .connection
-            .is_autocommit()
-            .then(|| self.connection.unchecked_transaction())
-            .transpose()?;
-        let capacity = self.concurrency_snapshot(run_id)?;
-        let paused = self
-            .run_summary(run_id)?
+        let transaction = super::database::begin(
+            &self.connection,
+            switchy_database::TransactionMode::Deferred,
+        )?;
+        let db: &dyn switchy_database::Database = &*transaction;
+        let capacity = Self::concurrency_snapshot_in(db, run_id)?;
+        let paused = Self::run_summary_in(db, run_id)?
             .is_some_and(|run| run.status == super::RunStatus::Paused);
         let mut query = select("workflow_activations")
-            .columns(&["node_id", "activation_id", "status"])
+            .projections(database::projections(&[
+                "node_id",
+                "activation_id",
+                "status",
+            ]))
             .where_eq("run_id", run_id)
             .sort("activation_id", SortDirection::Asc)
             .limit(limit + 1);
         if let Some(after) = after {
             query = query.where_gt("activation_id", after);
         }
-        let mut discovered = rows(&self.connection, &query)?;
+        let mut discovered = rows(db, &query)?;
         let more = discovered.len() > limit;
         discovered.truncate(limit);
         let next_activation_id = if more {
@@ -122,11 +124,9 @@ impl WorkflowStore {
         };
         let activations = discovered
             .iter()
-            .map(|row| self.scheduling_activation(run_id, row))
+            .map(|row| Self::scheduling_activation(db, run_id, row))
             .collect::<Result<Vec<_>, _>>()?;
-        if let Some(transaction) = transaction {
-            transaction.commit()?;
-        }
+        super::database::commit(transaction)?;
         Ok(WorkflowSchedulingSnapshot {
             capacity,
             paused,
@@ -136,16 +136,16 @@ impl WorkflowStore {
     }
 
     fn scheduling_activation(
-        &self,
+        db: &dyn switchy_database::Database,
         run_id: &str,
         row: &Row,
     ) -> Result<WorkflowSchedulingActivation, WorkflowStoreError> {
         let node_id = text(row, "node_id")?;
         let activation_id = text(row, "activation_id")?;
         let attempt = rows(
-            &self.connection,
+            db,
             &select("workflow_attempts")
-                .columns(&["dispatch_identity"])
+                .projections(database::projections(&["dispatch_identity"]))
                 .where_eq("run_id", run_id)
                 .where_eq("node_id", node_id.clone())
                 .where_eq("activation_id", activation_id.clone())
@@ -155,13 +155,14 @@ impl WorkflowStore {
         let latest_attempt = attempt
             .first()
             .map(|attempt| {
-                self.attempt_by_dispatch_identity(&text(attempt, "dispatch_identity")?)?
+                Self::attempt_by_dispatch_identity_in(db, &text(attempt, "dispatch_identity")?)?
                     .ok_or_else(|| {
                         WorkflowStoreError::InvalidData("snapshot attempt disappeared".into())
                     })
             })
             .transpose()?;
-        let automatic_retry = self.automatic_retry_schedule(run_id, &node_id, &activation_id)?;
+        let automatic_retry =
+            super::automatic_retry_schedule(db, run_id, &node_id, &activation_id)?;
         Ok(WorkflowSchedulingActivation {
             node_id,
             activation_id,
@@ -177,16 +178,24 @@ impl WorkflowStore {
         &self,
         run_id: &str,
     ) -> Result<WorkflowConcurrencySnapshot, WorkflowStoreError> {
-        validate_id("run_id", run_id)?;
-        let transaction = self
-            .connection
-            .is_autocommit()
-            .then(|| self.connection.unchecked_transaction())
-            .transpose()?;
-        let stored = rows(
+        let transaction = super::database::begin(
             &self.connection,
+            switchy_database::TransactionMode::Deferred,
+        )?;
+        let result = Self::concurrency_snapshot_in(&*transaction, run_id)?;
+        super::database::commit(transaction)?;
+        Ok(result)
+    }
+
+    pub(crate) fn concurrency_snapshot_in(
+        db: &dyn switchy_database::Database,
+        run_id: &str,
+    ) -> Result<WorkflowConcurrencySnapshot, WorkflowStoreError> {
+        validate_id("run_id", run_id)?;
+        let stored = rows(
+            db,
             &select("workflow_runs")
-                .columns(&["concurrency_cap"])
+                .projections(database::projections(&["concurrency_cap"]))
                 .where_eq("run_id", run_id)
                 .limit(1),
         )?;
@@ -209,13 +218,10 @@ impl WorkflowStore {
                 ));
             }
         };
-        let graph_revision = run_graph::graph_revision(&self.connection, run_id)?
+        let graph_revision = run_graph::graph_revision(db, run_id)?
             .ok_or_else(|| WorkflowStoreError::InvalidData("capacity graph is missing".into()))?;
         let occupied_count =
-            super::typed_attempt_count(&self.connection, run_id, i64::MAX.cast_unsigned(), true)?;
-        if let Some(transaction) = transaction {
-            transaction.commit()?;
-        }
+            super::typed_attempt_count(db, run_id, i64::MAX.cast_unsigned(), true)?;
         Ok(WorkflowConcurrencySnapshot {
             graph_revision,
             concurrency_cap,
@@ -226,7 +232,10 @@ impl WorkflowStore {
         let run = rows(
             &self.connection,
             &select("workflow_runs")
-                .columns(&["status", "cancellation_requested_at_ms"])
+                .projections(database::projections(&[
+                    "status",
+                    "cancellation_requested_at_ms",
+                ]))
                 .where_eq("run_id", run_id)
                 .limit(1),
         )?;
@@ -257,7 +266,7 @@ impl WorkflowStore {
             ));
         }
         let mut query = select("workflow_attempts")
-            .columns(&["dispatch_identity"])
+            .projections(database::projections(&["dispatch_identity"]))
             .where_eq("run_id", run_id)
             .where_eq("status", "prepared")
             .where_eq("side_effect", "read_only")
@@ -314,13 +323,23 @@ impl WorkflowStore {
             return Ok((Vec::new(), None));
         }
         let mut query = select("workflow_activations")
-            .columns(&[
-                "node_id",
-                "activation_id",
-                "dependency_generation",
-                "input_json",
-                "created_at_ms",
-            ])
+            .projections(
+                [
+                    "node_id",
+                    "activation_id",
+                    "dependency_generation",
+                    "input_json",
+                    "created_at_ms",
+                ]
+                .into_iter()
+                .map(|column| {
+                    switchy_database::query::Projection::new(switchy_database::query::identifier(
+                        column,
+                    ))
+                    .alias(column)
+                })
+                .collect(),
+            )
             .where_eq("run_id", run_id)
             .where_eq("status", "pending")
             .sort("activation_id", SortDirection::Asc)
@@ -341,58 +360,7 @@ impl WorkflowStore {
         };
         let pending = discovered
             .iter()
-            .map(|row| {
-                let activation_id = text(row, "activation_id")?;
-                let node_id = text(row, "node_id")?;
-                let member = rows(
-                    &self.connection,
-                    &select("workflow_fan_out_members")
-                        .columns(&["controller_node_id", "controller_activation_id"])
-                        .where_eq("run_id", run_id)
-                        .where_eq("member_activation_id", activation_id.clone())
-                        .limit(1),
-                )?;
-                let node = if let Some(member) = member.first() {
-                    let controller = self
-                        .activation_graph_node(
-                            run_id,
-                            &text(member, "controller_node_id")?,
-                            &text(member, "controller_activation_id")?,
-                        )?
-                        .ok_or_else(|| {
-                            WorkflowStoreError::InvalidData(
-                                "missing fan-out controller binding".into(),
-                            )
-                        })?;
-                    let config: bcode_workflow::WorkflowFanOutConfiguration =
-                        serde_json::from_value(controller.node.configuration)?;
-                    let mut node = *config.member_node;
-                    node.id.clone_from(&node_id);
-                    node
-                } else {
-                    run_graph::reconciled_activation_exit(
-                        &self.connection,
-                        run_id,
-                        &node_id,
-                        &activation_id,
-                    )?;
-                    self.activation_graph_node(run_id, &node_id, &activation_id)?
-                        .ok_or_else(|| {
-                            WorkflowStoreError::InvalidData("missing executable binding".into())
-                        })?
-                        .node
-                };
-                let input = optional_json(row, "input_json")?;
-                Ok(PendingActivation {
-                    run_id: run_id.into(),
-                    node_id,
-                    activation_id,
-                    dependency_generation: integer(row, "dependency_generation")?,
-                    input,
-                    node,
-                    created_at_ms: integer(row, "created_at_ms")?,
-                })
-            })
+            .map(|row| self.pending_scheduler_activation(run_id, row))
             .collect::<Result<Vec<_>, WorkflowStoreError>>()?;
         Ok((pending, cursor))
     }
@@ -435,5 +403,62 @@ impl WorkflowStore {
         self.verify_execution_authority(run_id, authority)?;
         let (pending, cursor) = self.pending_activations_page_for_run(run_id, page)?;
         Ok((self.settle_control_activations(pending, now)?, cursor))
+    }
+    fn pending_scheduler_activation(
+        &self,
+        run_id: &str,
+        row: &switchy_database::Row,
+    ) -> Result<PendingActivation, WorkflowStoreError> {
+        let activation_id = text(row, "activation_id")?;
+        let node_id = text(row, "node_id")?;
+        let member = rows(
+            &self.connection,
+            &select("workflow_fan_out_members")
+                .projections(database::projections(&[
+                    "controller_node_id",
+                    "controller_activation_id",
+                ]))
+                .where_eq("run_id", run_id)
+                .where_eq("member_activation_id", activation_id.clone())
+                .limit(1),
+        )?;
+        let node = if let Some(member) = member.first() {
+            let controller = self
+                .activation_graph_node(
+                    run_id,
+                    &text(member, "controller_node_id")?,
+                    &text(member, "controller_activation_id")?,
+                )?
+                .ok_or_else(|| {
+                    WorkflowStoreError::InvalidData("missing fan-out controller binding".into())
+                })?;
+            let config: bcode_workflow::WorkflowFanOutConfiguration =
+                serde_json::from_value(controller.node.configuration)?;
+            let mut node = *config.member_node;
+            node.id.clone_from(&node_id);
+            node
+        } else {
+            run_graph::reconciled_activation_exit(
+                &self.connection,
+                run_id,
+                &node_id,
+                &activation_id,
+            )?;
+            self.activation_graph_node(run_id, &node_id, &activation_id)?
+                .ok_or_else(|| {
+                    WorkflowStoreError::InvalidData("missing executable binding".into())
+                })?
+                .node
+        };
+        let input = optional_json(row, "input_json")?;
+        Ok(PendingActivation {
+            run_id: run_id.into(),
+            node_id,
+            activation_id,
+            dependency_generation: integer(row, "dependency_generation")?,
+            input,
+            node,
+            created_at_ms: integer(row, "created_at_ms")?,
+        })
     }
 }

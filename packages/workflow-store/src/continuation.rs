@@ -1,24 +1,54 @@
 //! Bounded exhausted-repeat checkpoints and atomic, terminal-preserving successor admission.
 use super::{
-    Connection, MAX_INLINE_JSON_BYTES, NewWorkflowRun, OptionalExtension, RunStatus,
-    WorkflowDefinition, WorkflowExecutionAuthority, WorkflowRunBindingKey, WorkflowRunLimits,
-    WorkflowRunSummary, WorkflowStore, WorkflowStoreError, append_event, create_run_in_transaction,
-    recovery, sha256_hex, validate_id, validate_run,
+    MAX_INLINE_JSON_BYTES, NewWorkflowRun, RunStatus, WorkflowDefinition,
+    WorkflowExecutionAuthority, WorkflowRunBindingKey, WorkflowRunLimits, WorkflowRunSummary,
+    WorkflowStore, WorkflowStoreError, append_event_in, create_run_in_transaction, database,
+    definition_in, recovery, sha256_hex, validate_id, validate_run, verify_execution_authority_in,
 };
 use bcode_workflow::{
     WorkflowContinuationLineage, WorkflowContinuationRequest, WorkflowContinuationSource,
 };
 
-pub fn initialize(connection: &Connection) -> Result<(), WorkflowStoreError> {
-    connection.execute_batch(
-        "CREATE TABLE IF NOT EXISTS workflow_continuations (
-            successor_run_id TEXT PRIMARY KEY REFERENCES workflow_runs(run_id),
-            predecessor_run_id TEXT NOT NULL UNIQUE REFERENCES workflow_runs(run_id),
-            request_json TEXT NOT NULL,
-            lineage_json TEXT NOT NULL
-         );
-         CREATE INDEX IF NOT EXISTS workflow_events_kind_sequence
-         ON workflow_events(run_id, event_type, event_seq);",
+use crate::database::block_on;
+use switchy_database::query::{
+    FilterableQuery, SortDirection, bounded_text, identifier, insert, select, update, where_eq,
+};
+use switchy_database::schema::{Column, DataType, create_index, create_table};
+use switchy_database::{Database, DatabaseValue, TransactionMode};
+
+pub fn initialize(connection: &dyn Database) -> Result<(), WorkflowStoreError> {
+    crate::database::block_on(
+        create_table("workflow_continuations")
+            .if_not_exists(true)
+            .columns(
+                [
+                    "successor_run_id",
+                    "predecessor_run_id",
+                    "request_json",
+                    "lineage_json",
+                ]
+                .into_iter()
+                .map(|name| Column {
+                    name: name.into(),
+                    nullable: name == "successor_run_id",
+                    auto_increment: false,
+                    data_type: DataType::Text,
+                    default: None,
+                })
+                .collect(),
+            )
+            .primary_key("successor_run_id")
+            .unique_columns(["predecessor_run_id"])
+            .foreign_key_column("successor_run_id", "workflow_runs", "run_id")
+            .foreign_key_column("predecessor_run_id", "workflow_runs", "run_id")
+            .execute(connection),
+    )?;
+    crate::database::block_on(
+        create_index("workflow_events_kind_sequence")
+            .if_not_exists(true)
+            .table("workflow_events")
+            .columns(vec!["run_id", "event_type", "event_seq"])
+            .execute(connection),
     )?;
     Ok(())
 }
@@ -38,24 +68,28 @@ fn invalid(message: &str) -> WorkflowStoreError {
 }
 
 pub fn admission_execution_cap(
-    connection: &Connection,
+    connection: &dyn Database,
     run_id: &str,
     current_cap: u64,
 ) -> Result<u64, WorkflowStoreError> {
-    let first: Option<Option<String>> = connection
-        .query_row(
-            "SELECT CASE WHEN length(CAST(payload_json AS BLOB)) <= 1024 THEN payload_json END
-         FROM workflow_events WHERE run_id = ?1 AND event_type = 'execution_allowance_increased'
-         ORDER BY event_seq ASC LIMIT 1",
-            [run_id],
-            |row| row.get(0),
-        )
-        .optional()?;
-    let Some(first) = first else {
+    let first = database::rows(
+        connection,
+        &select("workflow_events")
+            .project_as(
+                bounded_text(identifier("payload_json"), 1024, DatabaseValue::Null),
+                "payload_json",
+            )
+            .where_eq("run_id", run_id)
+            .where_eq("event_type", "execution_allowance_increased")
+            .sort("event_seq", SortDirection::Asc)
+            .limit(1),
+    )?;
+    let Some(first) = first.first() else {
         return Ok(current_cap);
     };
     let value: serde_json::Value = serde_json::from_str(
-        &first.ok_or_else(|| invalid("oversized allowance admission evidence"))?,
+        &database::text(first, "payload_json")
+            .map_err(|_| invalid("oversized allowance admission evidence"))?,
     )
     .map_err(|_| invalid("invalid allowance admission evidence"))?;
     match (
@@ -97,32 +131,55 @@ impl WorkflowStore {
         if expected_cap == 0 || target_cap <= expected_cap || target_cap > i64::MAX as u64 {
             return Err(invalid("invalid execution allowance increase"));
         }
-        let transaction = self.connection.unchecked_transaction()?;
-        self.verify_execution_authority(run_id, authority)?;
-        let run = self
-            .run_summary(run_id)?
-            .ok_or_else(|| invalid("run not found"))?;
+        let transaction = database::begin(&self.connection, TransactionMode::Immediate)?;
+        let db: &dyn Database = transaction.as_ref();
+        verify_execution_authority_in(db, run_id, authority)?;
+        let run = super::run_summary_in(db, run_id)?.ok_or_else(|| invalid("run not found"))?;
         if !matches!(run.status, RunStatus::Running | RunStatus::Paused)
             || run.cancellation_requested_at_ms.is_some()
-            || self.is_recovery_only(run_id)?
+            || !database::rows(
+                db,
+                &select("workflow_recovery_barriers")
+                    .columns(&["run_id"])
+                    .where_eq("run_id", run_id)
+                    .limit(1),
+            )?
+            .is_empty()
         {
             return Err(invalid(
                 "run is not eligible for an execution allowance increase",
             ));
         }
-        let current: u64 = transaction.query_row(
-            "SELECT node_execution_cap FROM workflow_runs WHERE run_id = ?1",
-            [run_id],
-            |row| row.get(0),
+        let current_rows = database::rows(
+            db,
+            &select("workflow_runs")
+                .columns(&["node_execution_cap"])
+                .where_eq("run_id", run_id)
+                .limit(1),
+        )?;
+        let current = database::unsigned(
+            current_rows
+                .first()
+                .ok_or_else(|| invalid("run not found"))?,
+            "node_execution_cap",
         )?;
         let observation = serde_json::json!({"version": 1, "previous_cap": expected_cap, "target_cap": target_cap});
         if current == target_cap {
-            let previous: Option<String> = transaction.query_row(
-                "SELECT CASE WHEN length(CAST(payload_json AS BLOB)) <= 1024 THEN payload_json END
-                 FROM workflow_events WHERE run_id = ?1 AND event_type = 'execution_allowance_increased'
-                 ORDER BY event_seq DESC LIMIT 1",
-                [run_id], |row| row.get(0),
-            ).optional()?.flatten();
+            let previous = database::rows(
+                db,
+                &select("workflow_events")
+                    .project_as(
+                        bounded_text(identifier("payload_json"), 1024, DatabaseValue::Null),
+                        "payload_json",
+                    )
+                    .where_eq("run_id", run_id)
+                    .where_eq("event_type", "execution_allowance_increased")
+                    .sort("event_seq", SortDirection::Desc)
+                    .limit(1),
+            )?;
+            let previous = previous
+                .first()
+                .and_then(|row| database::text(row, "payload_json").ok());
             if previous
                 .and_then(|json| serde_json::from_str::<serde_json::Value>(&json).ok())
                 .as_ref()
@@ -139,18 +196,20 @@ impl WorkflowStore {
                 "execution allowance changed; inspect before retrying",
             ));
         }
-        transaction.execute(
-            "UPDATE workflow_runs SET node_execution_cap = ?2 WHERE run_id = ?1",
-            (run_id, target_cap),
+        block_on(
+            update("workflow_runs")
+                .value("node_execution_cap", target_cap)
+                .where_eq("run_id", run_id)
+                .execute(db),
         )?;
-        append_event(
-            &transaction,
+        append_event_in(
+            db,
             run_id,
             "execution_allowance_increased",
             &observation.to_string(),
             now_ms,
         )?;
-        transaction.commit()?;
+        database::commit(transaction)?;
         Ok(())
     }
 
@@ -162,17 +221,33 @@ impl WorkflowStore {
         &self,
         run_id: &str,
     ) -> Result<Option<WorkflowContinuationLineage>, WorkflowStoreError> {
+        Self::continuation_lineage_in(&self.connection, run_id)
+    }
+
+    fn continuation_lineage_in(
+        db: &dyn Database,
+        run_id: &str,
+    ) -> Result<Option<WorkflowContinuationLineage>, WorkflowStoreError> {
         validate_id("run_id", run_id)?;
-        let json: Option<String> = self
-            .connection
-            .query_row(
-                "SELECT CASE WHEN length(CAST(lineage_json AS BLOB)) <= ?2 THEN lineage_json END
-             FROM workflow_continuations WHERE successor_run_id=?1",
-                (run_id, MAX_INLINE_JSON_BYTES),
-                |row| row.get(0),
-            )
-            .optional()?;
-        json.map(|json| serde_json::from_str(&json).map_err(Into::into))
+        let rows = database::rows(
+            db,
+            &select("workflow_continuations")
+                .project_as(
+                    bounded_text(
+                        identifier("lineage_json"),
+                        MAX_INLINE_JSON_BYTES as u64,
+                        DatabaseValue::Null,
+                    ),
+                    "lineage_json",
+                )
+                .where_eq("successor_run_id", run_id)
+                .limit(1),
+        )?;
+        rows.first()
+            .map(|row| {
+                let json = database::text(row, "lineage_json")?;
+                serde_json::from_str(&json).map_err(Into::into)
+            })
             .transpose()
     }
 
@@ -187,65 +262,204 @@ impl WorkflowStore {
         run_id: &str,
     ) -> Result<WorkflowContinuationSource, WorkflowStoreError> {
         validate_id("run_id", run_id)?;
-        let _snapshot = self
-            .connection
-            .is_autocommit()
-            .then(|| self.connection.unchecked_transaction())
-            .transpose()?;
-        let run = self
-            .run_summary(run_id)?
-            .ok_or_else(|| invalid("continuation source not found"))?;
-        if run.status != RunStatus::Failed || run.cancellation_requested_at_ms.is_some() {
-            return Err(WorkflowStoreError::ContinuationIneligible);
-        }
-        let blocked: bool = self.connection.query_row(
-            "SELECT EXISTS(SELECT 1 FROM workflow_attempts WHERE run_id=?1 AND status NOT IN ('succeeded','failed','cancelled'))
-             OR EXISTS(SELECT 1 FROM workflow_activations WHERE run_id=?1 AND status NOT IN ('completed','failed','cancelled'))
-             OR EXISTS(SELECT 1 FROM workflow_run_links WHERE parent_run_id=?1 OR child_run_id=?1)
-             OR EXISTS(SELECT 1 FROM workflow_replacement_intents WHERE old_run_id=?1)
-             OR EXISTS(SELECT 1 FROM workflow_resource_leases WHERE run_id=?1 AND released_at_ms IS NULL)",
-            [run_id], |row| row.get(0),
+        let snapshot = database::begin(&self.connection, TransactionMode::Deferred)?;
+        Self::continuation_source_in(snapshot.as_ref(), run_id)
+    }
+
+    fn validate_continuation_source_quiescence(
+        db: &dyn Database,
+        run_id: &str,
+    ) -> Result<(), WorkflowStoreError> {
+        let blocked = [
+            select("workflow_attempts")
+                .columns(&["run_id"])
+                .where_eq("run_id", run_id)
+                .where_not_in("status", vec!["succeeded", "failed", "cancelled"])
+                .limit(1),
+            select("workflow_activations")
+                .columns(&["run_id"])
+                .where_eq("run_id", run_id)
+                .where_not_in("status", vec!["completed", "failed", "cancelled"])
+                .limit(1),
+            select("workflow_run_links")
+                .columns(&["child_run_id"])
+                .where_or(vec![
+                    Box::new(where_eq("parent_run_id", run_id)),
+                    Box::new(where_eq("child_run_id", run_id)),
+                ])
+                .limit(1),
+            select("workflow_replacement_intents")
+                .columns(&["old_run_id"])
+                .where_eq("old_run_id", run_id)
+                .limit(1),
+            select("workflow_resource_leases")
+                .columns(&["run_id"])
+                .where_eq("run_id", run_id)
+                .where_eq("released_at_ms", DatabaseValue::Null)
+                .limit(1),
+        ]
+        .iter()
+        .try_fold(
+            false,
+            |blocked, query| -> Result<bool, WorkflowStoreError> {
+                Ok(blocked || !database::rows(db, query)?.is_empty())
+            },
         )?;
         if blocked {
             return Err(invalid(
                 "continuation source has unsettled work, composition, or replacement intent",
             ));
         }
-        let failure: String = self.connection.query_row(
-            "SELECT CASE WHEN length(CAST(payload_json AS BLOB)) <= ?2 THEN payload_json END
-             FROM workflow_events WHERE run_id=?1 AND event_type='run_failed' ORDER BY event_seq DESC LIMIT 1",
-            (run_id, MAX_INLINE_JSON_BYTES), |row| row.get(0),
-        ).optional()?.ok_or_else(|| invalid("continuation source has no durable exhaustion reason"))?;
+        Ok(())
+    }
+
+    fn exhausted_repeat_output(
+        db: &dyn Database,
+        run_id: &str,
+    ) -> Result<(serde_json::Value, String, u64, serde_json::Value, String), WorkflowStoreError>
+    {
+        let failures = database::rows(
+            db,
+            &select("workflow_events")
+                .project_as(
+                    bounded_text(
+                        identifier("payload_json"),
+                        MAX_INLINE_JSON_BYTES as u64,
+                        DatabaseValue::Null,
+                    ),
+                    "payload_json",
+                )
+                .where_eq("run_id", run_id)
+                .where_eq("event_type", "run_failed")
+                .sort("event_seq", SortDirection::Desc)
+                .limit(1),
+        )?;
+        let failure = database::text(
+            failures
+                .first()
+                .ok_or_else(|| invalid("continuation source has no durable exhaustion reason"))?,
+            "payload_json",
+        )?;
         let failure: serde_json::Value = serde_json::from_str(&failure)?;
         if failure["reason"] != "repeat_iteration_limit_exhausted" {
             return Err(WorkflowStoreError::ContinuationIneligible);
         }
         let node_id = failure["node_id"]
             .as_str()
-            .ok_or_else(|| invalid("missing exhausted repeat identity"))?;
+            .ok_or_else(|| invalid("missing exhausted repeat identity"))?
+            .to_owned();
         let generation = failure["generation"]
             .as_u64()
             .ok_or_else(|| invalid("missing exhausted repeat generation"))?;
         let iterations = generation
             .checked_add(1)
             .ok_or_else(|| invalid("iteration overflow"))?;
-        let (json, checksum): (String, String) = self.connection.query_row(
-            "SELECT CASE WHEN length(CAST(o.value_json AS BLOB)) <= ?4 THEN o.value_json END, o.checksum_sha256
-             FROM workflow_activations a JOIN workflow_outputs o ON o.output_id=a.output_id
-             WHERE a.run_id=?1 AND a.node_id=?2 AND a.dependency_generation=?3 AND a.status='completed'
-             AND o.run_id=a.run_id AND o.node_id=a.node_id AND o.activation_id=a.activation_id",
-            (run_id, node_id, generation, MAX_INLINE_JSON_BYTES), |row| Ok((row.get(0)?, row.get(1)?)),
+        let activations = database::rows(
+            db,
+            &select("workflow_activations")
+                .columns(&["output_id", "activation_id"])
+                .where_eq("run_id", run_id)
+                .where_eq("node_id", node_id.as_str())
+                .where_eq("dependency_generation", generation)
+                .where_eq("status", "completed")
+                .limit(1),
         )?;
+        let activation = activations
+            .first()
+            .ok_or_else(|| invalid("exhausted repeat activation missing"))?;
+        let output_id = database::text(activation, "output_id")?;
+        let activation_id = database::text(activation, "activation_id")?;
+        let outputs = database::rows(
+            db,
+            &select("workflow_outputs")
+                .project_as(
+                    bounded_text(
+                        identifier("value_json"),
+                        MAX_INLINE_JSON_BYTES as u64,
+                        DatabaseValue::Null,
+                    ),
+                    "value_json",
+                )
+                .project(identifier("checksum_sha256"))
+                .where_eq("output_id", output_id.as_str())
+                .where_eq("run_id", run_id)
+                .where_eq("node_id", node_id.as_str())
+                .where_eq("activation_id", activation_id.as_str())
+                .limit(1),
+        )?;
+        let output = outputs
+            .first()
+            .ok_or_else(|| invalid("exhausted repeat output missing"))?;
+        let json = database::text(output, "value_json")?;
+        let checksum = database::text(output, "checksum_sha256")?;
         if sha256_hex(json.as_bytes()) != checksum {
             return Err(invalid("exhausted repeat output checksum mismatch"));
         }
         let input: serde_json::Value = serde_json::from_str(&json)?;
-        let graph = self.current_run_graph_page(run_id, None, None, None, 1_000)?;
+        Ok((failure, node_id, iterations, input, checksum))
+    }
+
+    fn continuation_run_limits(
+        db: &dyn Database,
+        run_id: &str,
+    ) -> Result<WorkflowRunLimits, WorkflowStoreError> {
+        let limit_rows = database::rows(
+            db,
+            &select("workflow_runs")
+                .columns(&[
+                    "deadline_at_ms",
+                    "node_execution_cap",
+                    "concurrency_cap",
+                    "cycle_cap",
+                    "retry_cap",
+                    "recursion_depth_cap",
+                    "descendant_cap",
+                ])
+                .where_eq("run_id", run_id)
+                .limit(1),
+        )?;
+        let row = limit_rows
+            .first()
+            .ok_or_else(|| invalid("run limits missing"))?;
+        let optional = |column| -> Result<Option<u64>, WorkflowStoreError> {
+            if matches!(row.get(column), Some(DatabaseValue::Null)) {
+                Ok(None)
+            } else {
+                database::unsigned(row, column).map(Some)
+            }
+        };
+        let narrow =
+            |value: u64| u32::try_from(value).map_err(|_| invalid("run limit exceeds u32"));
+        let limits = WorkflowRunLimits {
+            deadline_at_ms: optional("deadline_at_ms")?,
+            node_execution_cap: database::unsigned(row, "node_execution_cap")?,
+            concurrency_cap: optional("concurrency_cap")?.map(narrow).transpose()?,
+            cycle_cap: narrow(database::unsigned(row, "cycle_cap")?)?,
+            retry_cap: narrow(database::unsigned(row, "retry_cap")?)?,
+            recursion_depth_cap: narrow(database::unsigned(row, "recursion_depth_cap")?)?,
+            descendant_cap: narrow(database::unsigned(row, "descendant_cap")?)?,
+        };
+        Ok(limits)
+    }
+
+    fn continuation_source_in(
+        db: &dyn Database,
+        run_id: &str,
+    ) -> Result<WorkflowContinuationSource, WorkflowStoreError> {
+        validate_id("run_id", run_id)?;
+        let run = super::run_summary_in(db, run_id)?
+            .ok_or_else(|| invalid("continuation source not found"))?;
+        if run.status != RunStatus::Failed || run.cancellation_requested_at_ms.is_some() {
+            return Err(WorkflowStoreError::ContinuationIneligible);
+        }
+        Self::validate_continuation_source_quiescence(db, run_id)?;
+        let (failure, node_id, iterations, input, checksum) =
+            Self::exhausted_repeat_output(db, run_id)?;
+        let graph = Self::current_run_graph_page_in(db, run_id, None, None, None, 1_000)?;
         if !graph.nodes_complete || !graph.edges_complete {
             return Err(invalid("continuation graph exceeds bounded admission size"));
         }
-        let stored = self
-            .definition(&run.definition_id, run.definition_version)?
+        let stored = definition_in(db, &run.definition_id, run.definition_version)?
             .ok_or_else(|| invalid("source definition missing"))?;
         let mut definition: WorkflowDefinition = serde_json::from_str(&stored.definition_json)?;
         definition.entries = graph
@@ -268,7 +482,7 @@ impl WorkflowStore {
         definition.edges = graph.edges.into_iter().map(|edge| edge.edge).collect();
         let repeat = definition
             .nodes
-            .get(node_id)
+            .get(&node_id)
             .ok_or_else(|| invalid("exhausted repeat missing from graph"))?;
         if repeat.kind != bcode_workflow::NodeKind::Repeat {
             return Err(invalid("exhaustion does not reference a repeat"));
@@ -281,10 +495,7 @@ impl WorkflowStore {
         {
             return Err(invalid("exhausted repeat predicate has cleared"));
         }
-        let limits = self.connection.query_row(
-            "SELECT deadline_at_ms,node_execution_cap,concurrency_cap,cycle_cap,retry_cap,recursion_depth_cap,descendant_cap FROM workflow_runs WHERE run_id=?1",
-            [run_id], |row| Ok(WorkflowRunLimits { deadline_at_ms: row.get(0)?, node_execution_cap: row.get(1)?, concurrency_cap: row.get(2)?, cycle_cap: row.get(3)?, retry_cap: row.get(4)?, recursion_depth_cap: row.get(5)?, descendant_cap: row.get(6)? }),
-        )?;
+        let limits = Self::continuation_run_limits(db, run_id)?;
         let bound = repeat.configuration["max_iterations"]
             .as_u64()
             .ok_or_else(|| invalid("missing repeat bound"))?
@@ -292,7 +503,7 @@ impl WorkflowStore {
         if iterations != bound || failure["effective_iteration_bound"].as_u64() != Some(bound) {
             return Err(invalid("inconsistent exhaustion boundary"));
         }
-        let lineage = self.continuation_lineage(run_id)?;
+        let lineage = Self::continuation_lineage_in(db, run_id)?;
         let total = lineage
             .as_ref()
             .map_or(0, |value| value.prior_iterations)
@@ -304,7 +515,7 @@ impl WorkflowStore {
             run,
             definition,
             input,
-            repeat_node_id: node_id.into(),
+            repeat_node_id: node_id,
             graph_revision: graph.revision,
             output_checksum: checksum,
             iterations_completed: iterations,
@@ -322,25 +533,50 @@ impl WorkflowStore {
         &self,
         request: &WorkflowContinuationRequest,
     ) -> Result<Option<WorkflowRunSummary>, WorkflowStoreError> {
+        Self::continuation_retry_in(&self.connection, request)
+    }
+
+    fn continuation_retry_in(
+        db: &dyn Database,
+        request: &WorkflowContinuationRequest,
+    ) -> Result<Option<WorkflowRunSummary>, WorkflowStoreError> {
         let run_id = request
             .successor
             .run_id
             .as_deref()
             .ok_or_else(|| invalid("continuation requires a stable successor ID"))?;
-        let stored: Option<(String, String)> = self.connection.query_row(
-            "SELECT successor_run_id, CASE WHEN length(CAST(request_json AS BLOB)) <= ?3 THEN request_json END
-             FROM workflow_continuations WHERE successor_run_id=?1 OR predecessor_run_id=?2 LIMIT 1",
-            (run_id, &request.source_run_id, MAX_INLINE_JSON_BYTES), |row| Ok((row.get(0)?, row.get(1)?)),
-        ).optional()?;
-        let Some((id, json)) = stored else {
+        let stored = database::rows(
+            db,
+            &select("workflow_continuations")
+                .project(identifier("successor_run_id"))
+                .project_as(
+                    bounded_text(
+                        identifier("request_json"),
+                        MAX_INLINE_JSON_BYTES as u64,
+                        DatabaseValue::Null,
+                    ),
+                    "request_json",
+                )
+                .where_or(vec![
+                    Box::new(where_eq("successor_run_id", run_id)),
+                    Box::new(where_eq(
+                        "predecessor_run_id",
+                        request.source_run_id.as_str(),
+                    )),
+                ])
+                .limit(1),
+        )?;
+        let Some(stored) = stored.first() else {
             return Ok(None);
         };
+        let id = database::text(stored, "successor_run_id")?;
+        let json = database::text(stored, "request_json")?;
         if id != run_id || serde_json::from_str::<WorkflowContinuationRequest>(&json)? != *request {
             return Err(invalid(
                 "conflicting continuation; source already has a successor",
             ));
         }
-        self.run_summary(&id)?
+        super::run_summary_in(db, &id)?
             .ok_or_else(|| invalid("continuation successor missing"))
             .map(Some)
     }
@@ -357,13 +593,14 @@ impl WorkflowStore {
         authority: &WorkflowExecutionAuthority,
     ) -> Result<bool, WorkflowStoreError> {
         validate_run(successor)?;
-        let tx = self.connection.unchecked_transaction()?;
-        if self.continuation_retry(request)?.is_some() {
+        let tx = database::begin(&self.connection, TransactionMode::Immediate)?;
+        let db: &dyn Database = tx.as_ref();
+        if Self::continuation_retry_in(db, request)?.is_some() {
             return Ok(false);
         }
-        self.verify_execution_authority(&request.source_run_id, authority)?;
-        recovery::require_execution(&tx, &request.source_run_id)?;
-        let source = self.continuation_source(&request.source_run_id)?;
+        verify_execution_authority_in(db, &request.source_run_id, authority)?;
+        recovery::require_execution(db, &request.source_run_id)?;
+        let source = Self::continuation_source_in(db, &request.source_run_id)?;
         let binding = source
             .run
             .binding
@@ -374,9 +611,7 @@ impl WorkflowStore {
             workflow_kind: binding.workflow_kind.clone(),
             scope_key: binding.scope_key.clone(),
         };
-        if self
-            .associated_run(&key)?
-            .is_none_or(|run| run.run_id != request.source_run_id)
+        if super::associated_run_in(db, &key)?.is_none_or(|run| run.run_id != request.source_run_id)
         {
             return Err(invalid("session association changed; refresh status"));
         }
@@ -436,24 +671,23 @@ impl WorkflowStore {
         if json.len() > MAX_INLINE_JSON_BYTES {
             return Err(invalid("continuation request exceeds durable byte limit"));
         }
-        create_run_in_transaction(&tx, successor)?;
-        tx.execute(
-            "INSERT INTO workflow_continuations VALUES (?1,?2,?3,?4)",
-            (
-                &successor.run_id,
-                &request.source_run_id,
-                &json,
-                serde_json::to_string(&lineage)?,
-            ),
+        create_run_in_transaction(db, successor)?;
+        block_on(
+            insert("workflow_continuations")
+                .value("successor_run_id", successor.run_id.as_str())
+                .value("predecessor_run_id", request.source_run_id.as_str())
+                .value("request_json", json.as_str())
+                .value("lineage_json", serde_json::to_string(&lineage)?)
+                .execute(db),
         )?;
-        append_event(
-            &tx,
+        append_event_in(
+            db,
             &successor.run_id,
             "run_continued",
             &serde_json::to_string(&lineage)?,
             successor.created_at_ms,
         )?;
-        tx.commit()?;
+        database::commit(tx)?;
         Ok(true)
     }
 }

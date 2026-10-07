@@ -1,5 +1,11 @@
 use super::*;
-use crate::{ValidatedOutput, WorkflowRunBinding};
+use crate::database::block_on;
+use crate::{ValidatedOutput, WorkflowRunBinding, append_event_in};
+use switchy_database::query::{FilterableQuery, update};
+use switchy_database::schema::{
+    SchemaComparison as C, SchemaExpression as E, create_trigger, drop_index, drop_table,
+};
+use switchy_database::{Database, DatabaseValue, TransactionMode};
 
 #[test]
 fn admission_allowance_evidence_is_bounded_and_fails_closed() {
@@ -16,17 +22,18 @@ fn admission_allowance_evidence_is_bounded_and_fails_closed() {
         "invalid".into(),
         "x".repeat(1025),
     ] {
-        let tx = store.connection.unchecked_transaction().unwrap();
-        append_event(
-            &tx,
+        let tx = database::begin(&store.connection, TransactionMode::Deferred).unwrap();
+        let db: &dyn Database = tx.as_ref();
+        append_event_in(
+            db,
             &run.run_id,
             "execution_allowance_increased",
             &payload,
             20,
         )
         .unwrap();
-        assert!(admission_execution_cap(&tx, &run.run_id, 10).is_err());
-        tx.rollback().unwrap();
+        assert!(admission_execution_cap(db, &run.run_id, 10).is_err());
+        block_on(tx.rollback()).unwrap();
     }
 }
 
@@ -284,7 +291,14 @@ fn continuation_failed_admission_rolls_back_and_duplicate_ignores_later_state() 
     let (request, run, definition) = successor(&mut store, &original);
     // Fail after all source validation, while inserting the successor. The enclosing
     // transaction must publish neither a run nor lineage, so the exact request is retryable.
-    store.connection.execute_batch("CREATE TRIGGER reject_test_successor BEFORE INSERT ON workflow_runs WHEN NEW.run_id='successor' BEGIN SELECT RAISE(ABORT, 'test admission failure'); END;").unwrap();
+    block_on(
+        create_trigger("reject_test_successor", "workflow_runs")
+            .before_insert()
+            .when(E::new_column("run_id").compare(C::Equal, E::Text("successor".into())))
+            .raise_abort("test admission failure")
+            .execute(&store.connection),
+    )
+    .unwrap();
     assert!(
         store
             .continue_run_owned(
@@ -296,10 +310,12 @@ fn continuation_failed_admission_rolls_back_and_duplicate_ignores_later_state() 
     );
     assert!(store.continuation_retry(&request).unwrap().is_none());
     assert!(store.run_summary(&run.run_id).unwrap().is_none());
-    store
-        .connection
-        .execute_batch("DROP TRIGGER reject_test_successor")
-        .unwrap();
+    block_on(
+        store
+            .connection
+            .drop_trigger("reject_test_successor", false),
+    )
+    .unwrap();
     store
         .continue_run_owned(
             &request,
@@ -327,7 +343,17 @@ fn continuation_schema_upgrade_preserves_history_and_rejects_damage() {
     let (temp, mut store, original, definition) = fixture();
     execute(&mut store, &original, &definition, 2, false);
     let before = store.run_summary(&original.run_id).unwrap();
-    store.connection.execute_batch("DROP TABLE workflow_continuations; DROP INDEX workflow_events_kind_sequence; UPDATE workflow_store_contract SET schema_version=39").unwrap();
+    block_on(drop_table("workflow_continuations").execute(&store.connection)).unwrap();
+    block_on(
+        drop_index("workflow_events_kind_sequence", "workflow_events").execute(&store.connection),
+    )
+    .unwrap();
+    block_on(
+        update("workflow_store_contract")
+            .value("schema_version", 39)
+            .execute(&store.connection),
+    )
+    .unwrap();
     drop(store);
     assert!(WorkflowStore::open_in_state_dir(temp.path()).is_err());
     let store = WorkflowStore::initialize_in_state_dir(temp.path(), 100).unwrap();
@@ -339,7 +365,14 @@ fn continuation_schema_upgrade_preserves_history_and_rejects_damage() {
             .iterations_completed,
         2
     );
-    store.connection.execute("UPDATE workflow_outputs SET checksum_sha256='damaged' WHERE run_id=?1 AND node_id='repeat'", [&original.run_id]).unwrap();
+    block_on(
+        update("workflow_outputs")
+            .value("checksum_sha256", "damaged")
+            .where_eq("run_id", original.run_id.as_str())
+            .where_eq("node_id", "repeat")
+            .execute(&store.connection),
+    )
+    .unwrap();
     assert!(store.continuation_source(&original.run_id).is_err());
 }
 
@@ -347,28 +380,29 @@ fn continuation_schema_upgrade_preserves_history_and_rejects_damage() {
 fn continuation_rejects_cancellation_and_unsettled_work() {
     let (_temp, mut store, original, definition) = fixture();
     execute(&mut store, &original, &definition, 2, false);
-    store
-        .connection
-        .execute(
-            "UPDATE workflow_runs SET cancellation_requested_at_ms=20 WHERE run_id=?1",
-            [&original.run_id],
-        )
-        .unwrap();
+    block_on(
+        update("workflow_runs")
+            .value("cancellation_requested_at_ms", 20)
+            .where_eq("run_id", original.run_id.as_str())
+            .execute(&store.connection),
+    )
+    .unwrap();
     assert!(store.continuation_source(&original.run_id).is_err());
-    store
-        .connection
-        .execute(
-            "UPDATE workflow_runs SET cancellation_requested_at_ms=NULL WHERE run_id=?1",
-            [&original.run_id],
-        )
-        .unwrap();
-    store
-        .connection
-        .execute(
-            "UPDATE workflow_activations SET status='pending' WHERE run_id=?1 AND node_id='body'",
-            [&original.run_id],
-        )
-        .unwrap();
+    block_on(
+        update("workflow_runs")
+            .value("cancellation_requested_at_ms", DatabaseValue::Null)
+            .where_eq("run_id", original.run_id.as_str())
+            .execute(&store.connection),
+    )
+    .unwrap();
+    block_on(
+        update("workflow_activations")
+            .value("status", "pending")
+            .where_eq("run_id", original.run_id.as_str())
+            .where_eq("node_id", "body")
+            .execute(&store.connection),
+    )
+    .unwrap();
     assert!(store.continuation_source(&original.run_id).is_err());
 }
 

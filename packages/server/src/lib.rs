@@ -5976,7 +5976,8 @@ fn workflow_store_error_response(error: &WorkflowStoreError) -> ErrorResponse {
             "workflow_concurrency_capacity_reached",
             "workflow execution slots are occupied; pending work waits for settlement",
         ),
-        WorkflowStoreError::Database(_)
+        WorkflowStoreError::StructuredDatabase(_)
+        | WorkflowStoreError::DatabaseInitialization(_)
         | WorkflowStoreError::Io(_)
         | WorkflowStoreError::Serialization(_)
         | WorkflowStoreError::InvalidData(_) => {

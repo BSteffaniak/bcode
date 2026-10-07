@@ -218,19 +218,13 @@ fn diagnosed_start_failure(
 ) -> bcode_workflow::WorkflowRunOperationFailure {
     // Never format the underlying error: it can contain SQL, paths, or workflow inputs.
     let category = match &error {
-        super::ServerError::WorkflowStore(WorkflowStoreError::Database(_)) => "database",
+        super::ServerError::WorkflowStore(WorkflowStoreError::StructuredDatabase(_)) => "database",
         super::ServerError::WorkflowStore(WorkflowStoreError::Io(_)) => "io",
         super::ServerError::WorkflowStore(WorkflowStoreError::Serialization(_)) => "serialization",
         super::ServerError::WorkflowStore(WorkflowStoreError::InvalidData(_)) => "invalid_data",
         _ => return run_operation_failure(error),
     };
-    let sqlite_extended_code = match &error {
-        super::ServerError::WorkflowStore(WorkflowStoreError::Database(error)) => {
-            error.sqlite_error().map(|error| error.extended_code)
-        }
-        _ => None,
-    };
-    tracing::warn!(target: "bcode_server::workflow_start", stage, category, sqlite_extended_code, "workflow start failed");
+    tracing::warn!(target: "bcode_server::workflow_start", stage, category, "workflow start failed");
     let mut failure = run_operation_failure(error);
     failure.message =
         format!("workflow state is unavailable (start stage: {stage}; category: {category})");

@@ -14,9 +14,15 @@ use bcode_session_import::{
     LoadImportableSessionRequest, OP_DISCOVER_IMPORTABLE_SESSIONS, OP_LIST_IMPORT_SOURCES,
     OP_LOAD_IMPORTABLE_SESSION, SESSION_IMPORT_INTERFACE_ID,
 };
-use rusqlite::{Connection, OpenFlags, OptionalExtension as _, Row};
+use futures::executor::block_on;
 use serde_json::Value;
 use std::path::{Path, PathBuf};
+use switchy_database::query::{
+    FilterableQuery as _, SelectQuery, Sort, SortDirection, count, join_columns, qualified_column,
+    where_eq_expression,
+};
+use switchy_database::{Database, DatabaseError, DatabaseValue, Row};
+use switchy_database_connection::{SqliteAccess, SqliteOpenOptions, open_sqlite_rusqlite};
 
 const MANIFEST: &str = include_str!("../bcode-plugin.toml");
 const SOURCE_ID: &str = "opencode";
@@ -137,17 +143,21 @@ fn discover_opencode_sessions(
 fn discover_database_sessions(
     path: &Path,
     working_directory: Option<&Path>,
-) -> Result<Vec<ImportableSessionSummary>, rusqlite::Error> {
+) -> Result<Vec<ImportableSessionSummary>, ImportDatabaseError> {
     let connection = open_read_only(path)?;
-    let mut statement = connection.prepare(
-        "select s.id, s.title, s.directory, s.time_created, s.time_updated, \
-         count(m.id) as message_count \
-         from session s left join message m on m.session_id = s.id \
-         where s.time_archived is null \
-         group by s.id \
-         order by s.time_updated desc",
+    let rows = block_on(
+        summary_query()
+            .filter(Box::new(where_eq_expression(
+                qualified_column("session", "time_archived"),
+                DatabaseValue::Null,
+            )))
+            .sorts(vec![Sort {
+                expression: qualified_column("session", "time_updated").into(),
+                direction: SortDirection::Desc,
+            }])
+            .execute(connection.as_ref()),
     )?;
-    let summaries = statement.query_map([], |row| summary_from_row(path, row))?;
+    let summaries = rows.iter().map(|row| summary_from_row(path, row));
     let mut sessions = Vec::new();
     for summary in summaries {
         let summary = summary?;
@@ -163,14 +173,14 @@ fn discover_database_sessions(
 
 fn summary_from_row(
     path: &Path,
-    row: &Row<'_>,
-) -> Result<ImportableSessionSummary, rusqlite::Error> {
-    let external_session_id: String = row.get(0)?;
-    let title: String = row.get(1)?;
-    let directory: String = row.get(2)?;
-    let created_at_ms = i64_to_u64(row.get(3)?);
-    let updated_at_ms = i64_to_u64(row.get(4)?);
-    let message_count = i64_to_u64(row.get(5)?);
+    row: &Row,
+) -> Result<ImportableSessionSummary, ImportDatabaseError> {
+    let external_session_id: String = required_string(row, "id")?;
+    let title: String = required_string(row, "title")?;
+    let directory: String = required_string(row, "directory")?;
+    let created_at_ms = i64_to_u64(required_i64(row, "time_created")?);
+    let updated_at_ms = i64_to_u64(required_i64(row, "time_updated")?);
+    let message_count = i64_to_u64(required_i64(row, "message_count")?);
     Ok(ImportableSessionSummary {
         source_id: SOURCE_ID.to_string(),
         source_display_name: SOURCE_DISPLAY_NAME.to_string(),
@@ -190,38 +200,63 @@ fn summary_from_row(
 fn load_opencode_session(
     locator: &str,
     external_session_id: &str,
-) -> Result<ImportableSession, rusqlite::Error> {
+) -> Result<ImportableSession, ImportDatabaseError> {
     let path = PathBuf::from(locator);
     let connection = open_read_only(&path)?;
-    let summary = load_summary(&connection, &path, external_session_id)?;
+    let summary = load_summary(connection.as_ref(), &path, external_session_id)?;
     let mut events = Vec::new();
     let mut warnings = Vec::new();
     let mut malformed_messages = 0_u64;
     let mut malformed_parts = 0_u64;
     let mut unknown_parts = 0_u64;
 
-    let mut statement = connection.prepare(
-        "select m.id, m.time_created, m.data, p.id, p.time_created, p.data \
-         from message m left join part p on p.message_id = m.id \
-         where m.session_id = ?1 \
-         order by m.time_created, m.id, p.time_created, p.id",
+    let rows = block_on(
+        switchy_database::query::select("message")
+            .project_as(qualified_column("message", "id"), "message_id")
+            .project_as(qualified_column("message", "time_created"), "message_time")
+            .project_as(qualified_column("message", "data"), "message_data")
+            .project_as(qualified_column("part", "id"), "part_id")
+            .project_as(qualified_column("part", "time_created"), "part_time")
+            .project_as(qualified_column("part", "data"), "part_data")
+            .left_joins(vec![join_columns(
+                "part",
+                qualified_column("part", "message_id"),
+                qualified_column("message", "id"),
+                true,
+            )])
+            .filter(Box::new(where_eq_expression(
+                qualified_column("message", "session_id"),
+                DatabaseValue::String(external_session_id.to_owned()),
+            )))
+            .sorts(
+                [
+                    ("message", "time_created"),
+                    ("message", "id"),
+                    ("part", "time_created"),
+                    ("part", "id"),
+                ]
+                .into_iter()
+                .map(|(table, column)| Sort {
+                    expression: qualified_column(table, column).into(),
+                    direction: SortDirection::Asc,
+                })
+                .collect(),
+            )
+            .execute(connection.as_ref()),
     )?;
-    let rows = statement.query_map([external_session_id], |row| {
-        Ok(MessagePartRow {
-            message_id: row.get(0)?,
-            message_time: row.get(1)?,
-            message_data: row.get(2)?,
-            part_id: row.get(3)?,
-            part_time: row.get(4)?,
-            part_data: row.get(5)?,
-        })
-    })?;
 
     let mut current_message_id: Option<String> = None;
     let mut current_message: Option<Value> = None;
     let mut emitted_message = false;
     for row in rows {
-        let row = row?;
+        let row = MessagePartRow {
+            message_id: required_string(&row, "message_id")?,
+            message_time: required_i64(&row, "message_time")?,
+            message_data: required_string(&row, "message_data")?,
+            part_id: optional_string(&row, "part_id")?,
+            part_time: optional_i64(&row, "part_time")?,
+            part_data: optional_string(&row, "part_data")?,
+        };
         if current_message_id.as_deref() != Some(row.message_id.as_str()) {
             if let Some(message) = current_message.take()
                 && !emitted_message
@@ -288,22 +323,65 @@ fn load_opencode_session(
     })
 }
 
+fn summary_query() -> SelectQuery<'static> {
+    switchy_database::query::select("session")
+        .project(qualified_column("session", "id"))
+        .project(qualified_column("session", "title"))
+        .project(qualified_column("session", "directory"))
+        .project(qualified_column("session", "time_created"))
+        .project(qualified_column("session", "time_updated"))
+        .project_as(count(qualified_column("message", "id")), "message_count")
+        .left_joins(vec![join_columns(
+            "message",
+            qualified_column("message", "session_id"),
+            qualified_column("session", "id"),
+            true,
+        )])
+        .group_by(qualified_column("session", "id"))
+}
+
 fn load_summary(
-    connection: &Connection,
+    connection: &dyn Database,
     path: &Path,
     external_session_id: &str,
-) -> Result<ImportableSessionSummary, rusqlite::Error> {
-    connection
-        .query_row(
-            "select s.id, s.title, s.directory, s.time_created, s.time_updated, \
-             count(m.id) as message_count \
-             from session s left join message m on m.session_id = s.id \
-             where s.id = ?1 group by s.id",
-            [external_session_id],
-            |row| summary_from_row(path, row),
-        )
-        .optional()?
-        .ok_or(rusqlite::Error::QueryReturnedNoRows)
+) -> Result<ImportableSessionSummary, ImportDatabaseError> {
+    let row = block_on(
+        summary_query()
+            .filter(Box::new(where_eq_expression(
+                qualified_column("session", "id"),
+                DatabaseValue::String(external_session_id.to_owned()),
+            )))
+            .execute_first(connection),
+    )?
+    .ok_or(DatabaseError::NoRow)?;
+    summary_from_row(path, &row)
+}
+
+// Database values are decoded strictly: unsupported external representations remain errors.
+type ImportDatabaseError = Box<dyn std::error::Error + Send + Sync>;
+
+fn optional_string(row: &Row, column: &str) -> Result<Option<String>, ImportDatabaseError> {
+    match row.get(column) {
+        Some(DatabaseValue::String(value)) => Ok(Some(value)),
+        Some(DatabaseValue::Null) => Ok(None),
+        _ => Err(format!("invalid OpenCode column {column}: expected text").into()),
+    }
+}
+
+fn required_string(row: &Row, column: &str) -> Result<String, ImportDatabaseError> {
+    optional_string(row, column)?.ok_or_else(|| format!("null OpenCode column {column}").into())
+}
+
+fn optional_i64(row: &Row, column: &str) -> Result<Option<i64>, ImportDatabaseError> {
+    match row.get(column) {
+        Some(DatabaseValue::Int64(value)) => Ok(Some(value)),
+        Some(DatabaseValue::Null) => Ok(None),
+        _ => Err(format!("invalid OpenCode column {column}: expected integer").into()),
+    }
+}
+
+fn required_i64(row: &Row, column: &str) -> Result<i64, ImportDatabaseError> {
+    optional_i64(row, column)?.ok_or_else(|| format!("null OpenCode column {column}").into())
 }
 
 #[derive(Debug)]
@@ -576,11 +654,17 @@ fn dedupe_paths(paths: Vec<PathBuf>) -> Vec<PathBuf> {
     deduped
 }
 
-fn open_read_only(path: &Path) -> Result<Connection, rusqlite::Error> {
-    Connection::open_with_flags(
+fn open_read_only(path: &Path) -> Result<Box<dyn Database>, ImportDatabaseError> {
+    Ok(Box::new(open_sqlite_rusqlite(
         path,
-        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_URI,
-    )
+        &SqliteOpenOptions {
+            access: SqliteAccess::ReadOnly,
+            allow_uri: true,
+            busy_timeout: std::time::Duration::from_secs(5),
+            foreign_keys: false,
+            connections: std::num::NonZeroUsize::MIN,
+        },
+    )?))
 }
 
 fn clean_title(title: &str) -> Option<String> {

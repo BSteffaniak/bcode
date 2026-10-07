@@ -2,7 +2,14 @@
 
 use bcode_workflow::WorkflowLaunchCatalogItem;
 
-use crate::WorkflowDiscoveryError;
+use crate::{WorkflowDiscoveryError, index};
+use futures::executor::block_on;
+use switchy_database::Database;
+use switchy_database::query::{
+    FilterableQuery, Projection, SortDirection, byte_length, identifier, where_and, where_eq,
+    where_gt, where_or,
+};
+use switchy_database::schema::{DataType, create_index};
 
 /// Maximum encoded JSON bytes decoded by one preview window (1 MiB).
 ///
@@ -23,10 +30,19 @@ pub struct LaunchPreviewPage {
 /// Rows are ordered by the application-supplied semantic title and source key. Drop
 /// closes the database before removing its private directory. Process death may leave
 /// temporary files for operating-system cleanup; they are never reopened.
-#[derive(Debug)]
 pub struct LaunchPreviewSpool {
-    connection: rusqlite::Connection,
-    _directory: tempfile::TempDir,
+    connection: Box<dyn Database>,
+    directory: tempfile::TempDir,
+}
+
+impl std::fmt::Debug for LaunchPreviewSpool {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("LaunchPreviewSpool")
+            .field("connection", &self.connection)
+            .field("directory", &self.directory)
+            .finish()
+    }
 }
 
 impl LaunchPreviewSpool {
@@ -38,11 +54,27 @@ impl LaunchPreviewSpool {
         let directory = tempfile::Builder::new()
             .prefix("bcode-launch-previews-")
             .tempdir()?;
-        let connection = rusqlite::Connection::open(directory.path().join("previews.sqlite"))?;
-        connection.execute_batch("PRAGMA journal_mode=OFF; PRAGMA synchronous=OFF; PRAGMA cache_size=-1024; PRAGMA mmap_size=0; PRAGMA temp_store=FILE; CREATE TABLE previews(title TEXT NOT NULL, source_key TEXT NOT NULL, payload TEXT NOT NULL, PRIMARY KEY(title, source_key)) WITHOUT ROWID; CREATE UNIQUE INDEX preview_identity ON previews(source_key);")?;
+        let connection = index::open(&directory.path().join("previews.sqlite"))?;
+        index::table(
+            connection.as_ref(),
+            "previews",
+            &[
+                ("title", DataType::Text),
+                ("source_key", DataType::Text),
+                ("payload", DataType::Text),
+            ],
+            &["title", "source_key"],
+        )?;
+        block_on(
+            create_index("preview_identity")
+                .table("previews")
+                .column("source_key")
+                .unique(true)
+                .execute(connection.as_ref()),
+        )?;
         Ok(Self {
             connection,
-            _directory: directory,
+            directory,
         })
     }
 
@@ -79,19 +111,25 @@ impl LaunchPreviewSpool {
             }
         };
         check()?;
-        let mut statement = self.connection.prepare(
-            "SELECT length(CAST(payload AS BLOB)), CASE WHEN length(CAST(payload AS BLOB)) <= ?2 THEN payload END FROM previews WHERE source_key = ?1",
+        let row = block_on(
+            self.connection
+                .select("previews")
+                .projections(vec![
+                    Projection::new(byte_length(identifier("payload"))).alias("bytes"),
+                ])
+                .where_eq("source_key", source_key)
+                .limit(1)
+                .execute_first(self.connection.as_ref()),
         )?;
-        let mut rows = statement.query(rusqlite::params![source_key, MAX_PREVIEW_PAGE_BYTES])?;
-        let result = if let Some(row) = rows.next()? {
+        let result = if let Some(row) = row {
             check()?;
-            if row.get::<_, usize>(0)? > MAX_PREVIEW_PAGE_BYTES {
+            if index::integer(&row, "bytes")? > MAX_PREVIEW_PAGE_BYTES {
                 return Err(WorkflowDiscoveryError::Invalid(
                     "preview item exceeds page byte budget".into(),
                 ));
             }
-            let payload = row.get_ref(1)?.as_str().map_err(rusqlite::Error::from)?;
-            Some(serde_json::from_str(payload)?)
+            let payload = self.payload(source_key, MAX_PREVIEW_PAGE_BYTES)?;
+            Some(serde_json::from_str(&payload)?)
         } else {
             None
         };
@@ -124,10 +162,7 @@ impl LaunchPreviewSpool {
         let payload = std::str::from_utf8(&buffer[..length]).map_err(|error| {
             WorkflowDiscoveryError::Invalid(format!("invalid preview encoding: {error}"))
         })?;
-        self.connection.execute(
-            "INSERT INTO previews(title, source_key, payload) VALUES (?1, ?2, ?3)",
-            rusqlite::params![item.title, source_key, payload],
-        )?;
+        self.insert_payload(&item.title, source_key, payload)?;
         Ok(())
     }
 
@@ -209,26 +244,37 @@ impl LaunchPreviewSpool {
                 "invalid preview window limit".into(),
             ));
         }
-        let (sql, title, key) = after.map_or(
-            ("SELECT length(CAST(payload AS BLOB)), CASE WHEN length(CAST(payload AS BLOB)) <= ?4 THEN payload END FROM previews ORDER BY title, source_key LIMIT ?3", "", ""),
-            |(title, key)| ("SELECT length(CAST(payload AS BLOB)), CASE WHEN length(CAST(payload AS BLOB)) <= ?4 THEN payload END FROM previews WHERE (title, source_key) > (?1, ?2) ORDER BY title, source_key LIMIT ?3", title, key),
-        );
-        let mut statement = self.connection.prepare(sql)?;
-        let mut rows = statement.query(rusqlite::params![title, key, limit + 1, byte_budget])?;
+        let mut query = self
+            .connection
+            .select("previews")
+            .projections(vec![
+                Projection::new(identifier("source_key")),
+                Projection::new(byte_length(identifier("payload"))).alias("bytes"),
+            ])
+            .sort("title", SortDirection::Asc)
+            .sort("source_key", SortDirection::Asc)
+            .limit(limit + 1);
+        if let Some((title, key)) = after {
+            query = query.filter(Box::new(where_or(vec![
+                Box::new(where_gt("title", title)),
+                Box::new(where_and(vec![
+                    Box::new(where_eq("title", title)),
+                    Box::new(where_gt("source_key", key)),
+                ])),
+            ])));
+        }
+        let rows = block_on(query.execute(self.connection.as_ref()))?;
         let mut items = Vec::new();
         let mut remaining = byte_budget;
         let mut has_more = false;
-        loop {
+        for row in rows {
             check()?;
-            let Some(row) = rows.next()? else {
-                break;
-            };
             check()?;
             if items.len() == limit {
                 has_more = true;
                 break;
             }
-            let payload_bytes = row.get::<_, usize>(0)?;
+            let payload_bytes = index::integer(&row, "bytes")?;
             if payload_bytes > remaining {
                 if items.is_empty() {
                     return Err(WorkflowDiscoveryError::Invalid(
@@ -238,12 +284,49 @@ impl LaunchPreviewSpool {
                 has_more = true;
                 break;
             }
+            let payload = self.payload(&index::text(&row, "source_key")?, remaining)?;
             remaining -= payload_bytes;
-            let payload = row.get_ref(1)?.as_str().map_err(rusqlite::Error::from)?;
-            items.push(serde_json::from_str(payload)?);
+            items.push(serde_json::from_str(&payload)?);
         }
         check()?;
         Ok(LaunchPreviewPage { items, has_more })
+    }
+    fn insert_payload(
+        &self,
+        title: &str,
+        key: &str,
+        payload: &str,
+    ) -> Result<(), WorkflowDiscoveryError> {
+        block_on(
+            self.connection
+                .insert("previews")
+                .value("title", title)
+                .value("source_key", key)
+                .value("payload", payload)
+                .execute(self.connection.as_ref()),
+        )?;
+        Ok(())
+    }
+
+    // This request-local index has no concurrent writers; preflight byte lengths
+    // are therefore valid until the payload read completes.
+    fn payload(&self, key: &str, budget: usize) -> Result<String, WorkflowDiscoveryError> {
+        let row = block_on(
+            self.connection
+                .select("previews")
+                .columns(&["payload"])
+                .where_eq("source_key", key)
+                .limit(1)
+                .execute_first(self.connection.as_ref()),
+        )?
+        .ok_or_else(|| WorkflowDiscoveryError::Invalid("preview payload missing".into()))?;
+        let payload = index::text(&row, "payload")?;
+        if payload.len() > budget {
+            return Err(WorkflowDiscoveryError::Invalid(
+                "preview payload oversized".into(),
+            ));
+        }
+        Ok(payload)
     }
 }
 
@@ -307,13 +390,7 @@ mod tests {
         spool.insert("a", &a).unwrap();
         assert_eq!(spool.find("a").unwrap(), Some(a));
         assert_eq!(spool.find("missing").unwrap(), None);
-        spool
-            .connection
-            .execute(
-                "INSERT INTO previews VALUES ('bad', 'bad', 'invalid json')",
-                [],
-            )
-            .unwrap();
+        spool.insert_payload("bad", "bad", "invalid json").unwrap();
         let calls = std::cell::Cell::new(0);
         let result = spool.find_with_cancellation("bad", &|| {
             calls.set(calls.get() + 1);
@@ -323,13 +400,7 @@ mod tests {
             matches!(result, Err(WorkflowDiscoveryError::Invalid(message)) if message == "preview lookup cancelled")
         );
         let oversized = "x".repeat(MAX_PREVIEW_PAGE_BYTES + 1);
-        spool
-            .connection
-            .execute(
-                "INSERT INTO previews VALUES ('large', 'large', ?1)",
-                [oversized],
-            )
-            .unwrap();
+        spool.insert_payload("large", "large", &oversized).unwrap();
         assert!(
             matches!(spool.find("large"), Err(WorkflowDiscoveryError::Invalid(message)) if message == "preview item exceeds page byte budget")
         );
@@ -366,11 +437,7 @@ mod tests {
     fn cancellation_prevents_decoding_the_next_row() {
         let spool = LaunchPreviewSpool::new().unwrap();
         spool
-            .connection
-            .execute(
-                "INSERT INTO previews VALUES ('title', 'key', 'invalid json')",
-                [],
-            )
+            .insert_payload("title", "key", "invalid json")
             .unwrap();
         let calls = std::cell::Cell::new(0);
         let result = spool.page_with_cancellation(None, 1, &|| {
@@ -385,12 +452,35 @@ mod tests {
     }
 
     #[test]
+    fn semantic_keyset_preserves_equal_titles_and_unique_source_identity() {
+        let spool = LaunchPreviewSpool::new().unwrap();
+        let preview = item("same");
+        spool.insert("b", &preview).unwrap();
+        spool.insert("a", &preview).unwrap();
+        assert!(spool.insert("a", &item("different")).is_err());
+        let page = spool
+            .bounded_page(None, 1, MAX_PREVIEW_PAGE_BYTES, &|| false)
+            .unwrap();
+        assert_eq!(page.items, vec![preview.clone()]);
+        assert!(page.has_more);
+        let next = spool
+            .bounded_page(Some(("same", "a")), 1, MAX_PREVIEW_PAGE_BYTES, &|| false)
+            .unwrap();
+        assert_eq!(next.items, vec![preview]);
+        assert!(!next.has_more);
+        assert!(
+            spool
+                .bounded_page(Some(("same", "b")), 1, MAX_PREVIEW_PAGE_BYTES, &|| false)
+                .unwrap()
+                .items
+                .is_empty()
+        );
+    }
+
+    #[test]
     fn preview_spool_is_private_bounded_and_removed_on_drop() {
         let spool = LaunchPreviewSpool::new().unwrap();
-        let path = std::path::PathBuf::from(spool.connection.path().unwrap())
-            .parent()
-            .unwrap()
-            .to_path_buf();
+        let path = spool.directory.path().to_path_buf();
         assert!(path.join("previews.sqlite").is_file());
         assert!(spool.first(1).unwrap().is_empty());
         assert!(spool.first(0).is_err());

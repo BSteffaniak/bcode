@@ -55,13 +55,12 @@ app/distribution/CLI/web profiles and each independently resolved plugin run the
 Isolated probes copy root Cargo patches (including absolute local paths) so they inspect the
 resolved dependency graph rather than silently selecting unpatched upstream code.
 
-The existing SQL allowances are defined in `xtask/src/architecture/sql.rs`; contribution
-requirements are in `AGENTS.md`. Use
-`BCODE_ARCHITECTURE_SQL_CLOSURE=1 cargo run -p xtask -- architecture [--target <triple>]`
-to reject all raw activation/requests and all Bcode driver edges now. The default transition gate
-is not final absence; remove its allowances and make closure unconditional after migration.
+SQL contribution requirements are in `AGENTS.md`. Raw SQL activation, requests, forwarding,
+upstream default enablement, and every Bcode-owned direct-driver edge are rejected unconditionally.
+There are no direct-driver transition allowances. The legacy
+`BCODE_ARCHITECTURE_SQL_CLOSURE=1` selection remains compatible but adds no exceptions or checks.
 Run `cargo test -p xtask architecture` for metadata behavior tests (normal/dev/build edges,
-feature forwarding/defaults, strict closure and allowed Switchy internals).
+feature forwarding/defaults, closure and allowed Switchy internals).
 
 Cargo metadata describes additive feature resolution, not per-call authorization or API exclusion.
 Compile upstream no-raw probes and migrated downstream consumers/tests in isolated workspaces;
