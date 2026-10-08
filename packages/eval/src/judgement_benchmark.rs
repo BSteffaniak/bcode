@@ -8,6 +8,8 @@ mod comparison;
 mod contracts;
 mod corpus;
 mod diagnostics;
+/// Independent task-correctness comparison, distinct from service calibration.
+pub mod effectiveness;
 pub use diagnostics::{ArmDiagnostics, ClassMetrics, RankingMetrics};
 mod vocabulary;
 pub use vocabulary::validate_service_oracle_vocabulary;

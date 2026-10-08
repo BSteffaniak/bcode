@@ -1,9 +1,25 @@
 //! Offline comparative captures from real consumer services and central optional access.
+mod history_context;
 
 async fn run_capture_turn(
     state: &ServerState,
     session: SessionId,
     text: String,
+) -> ModelTurnCompletion {
+    run_capture_turn_with_execution(
+        state,
+        session,
+        text,
+        bcode_session_models::TurnExecutionOptions::default(),
+    )
+    .await
+}
+
+async fn run_capture_turn_with_execution(
+    state: &ServerState,
+    session: SessionId,
+    text: String,
+    execution: bcode_session_models::TurnExecutionOptions,
 ) -> ModelTurnCompletion {
     let (_, accepted) = state
         .sessions
@@ -11,7 +27,10 @@ async fn run_capture_turn(
             session,
             ClientId::new(),
             text,
-            bcode_session_models::TurnAdmissionMetadata::default(),
+            bcode_session_models::TurnAdmissionMetadata {
+                execution,
+                ..Default::default()
+            },
         )
         .await
         .unwrap();

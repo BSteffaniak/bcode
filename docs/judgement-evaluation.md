@@ -1,5 +1,37 @@
 # Optional judgement evaluation: corpus v3 and readiness
 
+## Supplemental history and independent task scaffolding
+
+Ordinary turns can opt into `TurnExecutionOptions` v8 `historical_context` references
+(`session_id`, `sequence`). The default is empty; v1–v7 remain supported without
+references. At most sixteen unique nonzero references are accepted. The server hydrates
+only exact, earlier, same-session canonical events through bounded reads, without replay
+or repair. Missing, unsupported or unavailable evidence is not certified as successful
+empty retrieval. Excerpts already in mandatory messages are excluded. Admitted excerpts
+are request-only, explicitly untrusted quotations; mandatory content is not rewritten.
+There is no automatic memory retrieval or dedicated CLI reference flag yet.
+
+`packages/server/src/tests/judgement_quality/history_context.rs` verifies actual base-model
+request content for off/on admission, missing credentials, provider errors and missing judge
+models, together with protected mandatory content and unavailable-reference observations.
+Grep contributions alone cannot establish admission benefit: their original tool output may
+already expose the candidate to the base model regardless of optional selection.
+
+`fixtures/evals/judgement/context_scenarios.py` defines three development-only pure-expression
+coding microtasks, equivalent-pair manifests and a typed candidate adapter. The independent
+bounded AST oracle in `context_oracle.py` rejects missing, incorrect and unsafe artifacts.
+Materialization and declared source identities are not proof of ordinary-turn execution.
+These microtasks are not representative repository tasks; independent review remains pending.
+Frozen development, held-out and audit fixtures are unchanged.
+
+`judgement_benchmark::effectiveness` compares independent binary test outcomes separately
+from service-ranking scores. It retains wins/losses/ties/inconclusive results and clusters
+permutations by task family. Its version-two report explicitly labels evidence as
+`caller_declarations_only`: promotion is always blocked, including when callers claim live
+provenance and confirmed measurements. An authenticated producer-to-oracle conversion is
+still required; neither manifests nor aggregate status flags establish execution or billing.
+This scaffolding does not demonstrate live gains or six-feature quality improvements.
+
 ## Implemented eval-attempt producer evidence
 
 Workflow evaluation writes `eval-judgement-observation.json` after the independent oracle

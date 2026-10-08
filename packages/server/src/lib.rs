@@ -19,6 +19,7 @@ mod image_input;
 mod interaction_operations;
 mod invariant_guidance;
 mod judgement;
+mod judgement_history;
 mod milestones;
 mod model_check;
 mod model_evidence;
@@ -921,12 +922,6 @@ impl TurnCancelState {
             .ok()?
             .as_ref()?
             .begin_operation(feature, trigger);
-        if trigger != bcode_model::judgement::TriggerDisposition::Triggered {
-            operation.finish(
-                bcode_model::judgement::ApplicationDisposition::BaselineRetained,
-                None,
-            );
-        }
         Some(operation)
     }
 
@@ -6791,18 +6786,9 @@ async fn handle_request_inner(
         SessionLifecycleRequest::CreateSession {
             name,
             working_directory,
-        } => {
-            Box::pin(handle_create_session(
-                request_id,
-                state,
-                writer,
-                name,
-                working_directory,
-            ))
-            .await
-        }
+        } => handle_create_session(request_id, state, writer, name, working_directory).await,
         SessionLifecycleRequest::CreateChildSession { request } => {
-            handle_create_child_session_boxed(request_id, state, writer, request).await
+            handle_create_child_session(request_id, state, writer, request).await
         }
         SessionLifecycleRequest::SessionSummary { session_id } => {
             Box::pin(handle_session_summary(
@@ -10177,30 +10163,32 @@ async fn handle_composer_draft(
     .await
 }
 
-async fn handle_create_session(
+fn handle_create_session<'a>(
     request_id: u64,
-    state: &ServerState,
-    writer: &SharedWriter,
+    state: &'a ServerState,
+    writer: &'a SharedWriter,
     name: Option<String>,
     working_directory: PathBuf,
-) -> Result<(), ServerError> {
-    let session = match session_operations::create(state, name, working_directory).await {
-        Ok(session) => session,
-        Err(error) => {
-            return send_response(
-                writer,
-                request_id,
-                Response::Err(ErrorResponse::new(error.code(), error.message())),
-            )
-            .await;
-        }
-    };
-    send_response(
-        writer,
-        request_id,
-        Response::Ok(ResponsePayload::SessionCreated { session }),
-    )
-    .await
+) -> ProviderCallFuture<'a, Result<(), ServerError>> {
+    Box::pin(async move {
+        let session = match session_operations::create(state, name, working_directory).await {
+            Ok(session) => session,
+            Err(error) => {
+                return send_response(
+                    writer,
+                    request_id,
+                    Response::Err(ErrorResponse::new(error.code(), error.message())),
+                )
+                .await;
+            }
+        };
+        send_response(
+            writer,
+            request_id,
+            Response::Ok(ResponsePayload::SessionCreated { session }),
+        )
+        .await
+    })
 }
 
 async fn handle_reconcile_session_children(
@@ -10250,28 +10238,19 @@ async fn handle_session_summary(
     send_response(writer, request_id, response).await
 }
 
-fn handle_create_child_session_boxed<'a>(
+fn handle_create_child_session<'a>(
     request_id: u64,
     state: &'a ServerState,
     writer: &'a SharedWriter,
     request: bcode_session_models::SessionChildCreateRequest,
-) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), ServerError>> + Send + 'a>> {
-    Box::pin(handle_create_child_session(
-        request_id, state, writer, request,
-    ))
-}
-
-async fn handle_create_child_session(
-    request_id: u64,
-    state: &ServerState,
-    writer: &SharedWriter,
-    request: bcode_session_models::SessionChildCreateRequest,
-) -> Result<(), ServerError> {
-    let response = match session_operations::create_child(state, request).await {
-        Ok(session) => Response::Ok(ResponsePayload::SessionCreated { session }),
-        Err(error) => Response::Err(ErrorResponse::new(error.code(), error.message())),
-    };
-    send_response(writer, request_id, response).await
+) -> ProviderCallFuture<'a, Result<(), ServerError>> {
+    Box::pin(async move {
+        let response = match session_operations::create_child(state, request).await {
+            Ok(session) => Response::Ok(ResponsePayload::SessionCreated { session }),
+            Err(error) => Response::Err(ErrorResponse::new(error.code(), error.message())),
+        };
+        send_response(writer, request_id, response).await
+    })
 }
 
 fn session_observation_error_tag(error: &bcode_session::SessionError) -> &'static str {
@@ -27275,6 +27254,16 @@ async fn build_model_turn_request(
             ..TurnCancelState::default()
         };
         append_optional_context(state, session_id, &mut messages, config, &cancel).await;
+        judgement_history::append(
+            state,
+            session_id,
+            trigger_event.sequence,
+            execution,
+            &mut messages,
+            config,
+            &cancel,
+        )
+        .await;
     }
     // Recovery observations must follow historical snapshots to supersede them.
     if let Some(context) = &static_context.recovery_context {
@@ -30408,7 +30397,6 @@ async fn append_optional_context(
         .unwrap_or_default();
     let candidates = captured
         .iter()
-        .filter(|(_, candidate)| !candidate.protected)
         .map(|(_, candidate)| candidate.clone())
         .collect::<Vec<_>>();
     let budget_bytes = config.model.tool_output.context_chars;
@@ -30445,7 +30433,16 @@ async fn append_optional_context(
             })
             .collect::<Vec<_>>()
     };
-    let mut final_selection = None;
+    let originals = candidates
+        .iter()
+        .map(serde_json::to_value)
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap_or_default();
+    let mut order = candidates
+        .iter()
+        .map(|candidate| candidate.id.clone())
+        .collect::<Vec<_>>();
+    let mut advisory_applied = false;
     let included = if config
         .judgement
         .enabled(bcode_model::judgement::Feature::ContextReranking)
@@ -30461,14 +30458,9 @@ async fn append_optional_context(
         .await
         && let Some(admitted) = validated_context_admission(&candidates, &applied, budget_bytes)
     {
-        let originals = candidates
-            .iter()
-            .map(serde_json::to_value)
-            .collect::<Result<Vec<_>, _>>()
-            .unwrap_or_default();
-        let order: Vec<String> =
-            serde_json::from_value(applied["ordered_ids"].clone()).unwrap_or_default();
-        final_selection = selection_observation(&originals, &order, &admitted);
+        order = serde_json::from_value(applied["ordered_ids"].clone()).unwrap_or_default();
+        advisory_applied =
+            applied.get("applied").and_then(serde_json::Value::as_bool) == Some(true);
         admitted
     } else {
         baseline()
@@ -30476,12 +30468,10 @@ async fn append_optional_context(
     if cancel.is_cancelled() {
         return;
     }
-    incorporate_optional_context(messages, &captured, &included);
+    let incorporated = incorporate_optional_context(messages, &captured, &included);
+    let final_selection = selection_observation(&originals, &order, &incorporated);
     observation.finish(
-        final_selection.is_some()
-            && config
-                .judgement
-                .enabled(bcode_model::judgement::Feature::ContextReranking),
+        advisory_applied && incorporated == included,
         final_selection,
     );
 }
@@ -30571,7 +30561,8 @@ fn incorporate_optional_context(
     messages: &mut [ModelMessage],
     captured: &[(String, bcode_session_models::JudgementContextCandidate)],
     included: &[String],
-) {
+) -> Vec<String> {
+    let mut incorporated = Vec::new();
     for id in included {
         if let Some((invocation_id, candidate)) =
             captured.iter().find(|(_, candidate)| candidate.id == *id)
@@ -30595,9 +30586,11 @@ fn incorporate_optional_context(
                 if !result.output.contains(&candidate.snippet) {
                     result.output.push_str(&evidence);
                 }
+                incorporated.push(id.clone());
             }
         }
     }
+    incorporated
 }
 
 /// Invoke one uniquely discovered advisory service without granting tool or artifact authority.
@@ -48184,15 +48177,15 @@ event_symbol = "bcode_plugin_handle_event_v1"
         };
         let mut config = state.startup_config.clone();
         config.judgement.mode = bcode_config::JudgementMode::Off;
+        let cancel = TurnCancelState::default();
+        let mut observations = judgement::TurnObservationStore::default();
+        *cancel.judgement_observation.lock().unwrap() = observations.begin(session, "context-off");
         let mut baseline = vec![original.clone()];
-        append_optional_context(
-            &state,
-            session,
-            &mut baseline,
-            &config,
-            &TurnCancelState::default(),
-        )
-        .await;
+        append_optional_context(&state, session, &mut baseline, &config, &cancel).await;
+        let snapshot: bcode_model::judgement::TurnJudgementObservation =
+            serde_json::from_str(&observations.snapshot_json(session, "context-off").unwrap())
+                .unwrap();
+        assert_optional_context_off_receipt(&snapshot);
         assert_eq!(baseline.len(), 1);
         assert_eq!(baseline[0].role, MessageRole::Tool);
         assert!(
@@ -48209,6 +48202,16 @@ event_symbol = "bcode_plugin_handle_event_v1"
         )
         .await;
         assert_eq!(auto, baseline);
+        assert_optional_context_protected_and_absent(
+            &state,
+            session,
+            &candidate,
+            &event,
+            &original,
+            &mut config,
+            &mut observations,
+        )
+        .await;
         let cancel = TurnCancelState::default();
         cancel.close();
         let mut cancelled = vec![original.clone()];
@@ -48230,6 +48233,82 @@ event_symbol = "bcode_plugin_handle_event_v1"
                 .contains_key(&session)
         );
         drop(state);
+    }
+
+    fn assert_optional_context_off_receipt(
+        snapshot: &bcode_model::judgement::TurnJudgementObservation,
+    ) {
+        let operation = &snapshot.operations[0];
+        assert_eq!(
+            operation.trigger,
+            bcode_model::judgement::TriggerDisposition::Disabled
+        );
+        assert_eq!(
+            operation.application,
+            Some(bcode_model::judgement::ApplicationDisposition::BaselineRetained)
+        );
+        assert!(operation.inference.is_empty());
+        assert_eq!(operation.selection.as_ref().unwrap().admitted, vec![0]);
+    }
+
+    async fn assert_optional_context_protected_and_absent(
+        state: &ServerState,
+        session: SessionId,
+        candidate: &bcode_session_models::JudgementContextCandidate,
+        event: &bcode_session_models::ToolContributionEvent,
+        original: &ModelMessage,
+        config: &mut bcode_config::BcodeConfig,
+        observations: &mut judgement::TurnObservationStore,
+    ) {
+        let captured = vec![("call-1".into(), candidate.clone())];
+        let mut absent = vec![ModelMessage {
+            role: MessageRole::User,
+            content: vec![ContentBlock::Text {
+                text: "protected newest request".into(),
+            }],
+        }];
+        let unchanged = absent.clone();
+        assert!(
+            incorporate_optional_context(
+                &mut absent,
+                &captured,
+                std::slice::from_ref(&candidate.id)
+            )
+            .is_empty()
+        );
+        assert_eq!(
+            absent, unchanged,
+            "no fabricated protocol result or privileged context"
+        );
+        let mut protected = candidate.clone();
+        protected.id = "protected-hit".into();
+        protected.protected = true;
+        let mut protected_event = event.clone();
+        protected_event.contribution_id = protected.id.clone();
+        protected_event.payload = serde_json::to_value(&protected).unwrap();
+        append_tool_contribution_event(state, session, "call-1", "fixture", protected_event)
+            .await
+            .unwrap();
+        config.judgement.mode = bcode_config::JudgementMode::Off;
+        config.model.tool_output.context_chars = 0;
+        let cancel = TurnCancelState::default();
+        *cancel.judgement_observation.lock().unwrap() =
+            observations.begin(session, "protected-off");
+        let mut protected_messages = vec![original.clone()];
+        append_optional_context(state, session, &mut protected_messages, config, &cancel).await;
+        let snapshot: bcode_model::judgement::TurnJudgementObservation = serde_json::from_str(
+            &observations
+                .snapshot_json(session, "protected-off")
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            snapshot.operations[0].selection.as_ref().unwrap().admitted,
+            vec![1]
+        );
+        assert!(
+            matches!(&protected_messages[0].content[0], ContentBlock::ToolResult { result } if result.output.starts_with("mandatory result") && result.output.contains(&protected.snippet))
+        );
     }
 
     #[tokio::test]

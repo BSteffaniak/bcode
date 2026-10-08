@@ -1945,12 +1945,27 @@ pub enum TurnPermissionMode {
     Bypass,
 }
 
+/// Exact same-session canonical history reference for optional request-only evidence.
+/// No content, provider preview, or filesystem locator is accepted.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HistoricalContextReference {
+    /// Must equal the consuming session; checked by the application before reads.
+    pub session_id: SessionId,
+    /// Exact earlier canonical event sequence; never interpreted as a range.
+    pub sequence: u64,
+}
+
 /// Generic execution options applied to one admitted turn.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TurnExecutionOptions {
     /// Persisted execution-options schema version.
     #[serde(default = "turn_execution_options_schema_version")]
     pub schema_version: u32,
+    /// Opt-in supplemental canonical history, bounded to 16 exact same-session references.
+    /// Requires execution-options v8; absent on older options means no retrieval prerequisite.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub historical_context: Vec<HistoricalContextReference>,
     /// Whether tools declaring `ask_user` may be exposed or executed.
     #[serde(default = "default_allow_user_questions")]
     pub allow_user_questions: bool,
@@ -1994,7 +2009,7 @@ pub struct TurnExecutionOptions {
 /// Earliest persisted turn execution-options schema version accepted by this build.
 pub const MIN_TURN_EXECUTION_OPTIONS_SCHEMA_VERSION: u32 = 1;
 /// Current persisted turn execution-options schema version.
-pub const TURN_EXECUTION_OPTIONS_SCHEMA_VERSION: u32 = 7;
+pub const TURN_EXECUTION_OPTIONS_SCHEMA_VERSION: u32 = 8;
 
 const fn default_allow_user_questions() -> bool {
     true
@@ -2008,6 +2023,7 @@ impl Default for TurnExecutionOptions {
     fn default() -> Self {
         Self {
             schema_version: TURN_EXECUTION_OPTIONS_SCHEMA_VERSION,
+            historical_context: Vec::new(),
             allow_user_questions: true,
             interaction_route: None,
             tools: TurnToolPolicy::default(),
@@ -2111,6 +2127,7 @@ pub enum TurnAdmissionMetadataError {
     EmptyAllowedTool,
     AllowedToolTooLong,
     DuplicateAllowedTool,
+    InvalidHistoricalContext,
     UnsupportedExecutionOptionsVersion,
     EmptyExecutionId,
     ExecutionIdTooLong,
@@ -2154,6 +2171,9 @@ impl Display for TurnAdmissionMetadataError {
             Self::EmptyAllowedTool => "turn tool allowlist entries must not be empty",
             Self::AllowedToolTooLong => "turn tool allowlist entry is too long",
             Self::DuplicateAllowedTool => "turn tool allowlist contains a duplicate entry",
+            Self::InvalidHistoricalContext => {
+                "historical context requires at most 16 unique nonzero exact references"
+            }
             Self::UnsupportedExecutionOptionsVersion => {
                 "turn execution options schema version is unsupported"
             }
@@ -2262,6 +2282,21 @@ impl TurnAdmissionMetadata {
             .contains(&self.execution.schema_version)
         {
             return Err(TurnAdmissionMetadataError::UnsupportedExecutionOptionsVersion);
+        }
+        if !self.execution.historical_context.is_empty() && self.execution.schema_version < 8 {
+            return Err(TurnAdmissionMetadataError::UnsupportedExecutionOptionsVersion);
+        }
+        let references = &self.execution.historical_context;
+        if references.len() > 16
+            || references.iter().any(|reference| reference.sequence == 0)
+            || references
+                .iter()
+                .map(|reference| (reference.session_id, reference.sequence))
+                .collect::<std::collections::BTreeSet<_>>()
+                .len()
+                != references.len()
+        {
+            return Err(TurnAdmissionMetadataError::InvalidHistoricalContext);
         }
         if let Some(route) = &self.execution.interaction_route
             && (self.execution.schema_version < 7 || route.version != 1)
@@ -5483,6 +5518,30 @@ mod tests {
         let provenance: ExecutionSessionProvenance =
             serde_json::from_value(encoded).expect("portable future provenance");
         assert_eq!(provenance.version, EXECUTION_SESSION_PROVENANCE_VERSION + 1);
+    }
+
+    #[test]
+    fn historical_references_require_v8_and_reject_unknown_content_fields() {
+        let mut admission = TurnAdmissionMetadata::default();
+        admission
+            .execution
+            .historical_context
+            .push(HistoricalContextReference {
+                session_id: SessionId::new(),
+                sequence: 1,
+            });
+        assert!(admission.validate().is_ok());
+        admission.execution.schema_version = 7;
+        assert_eq!(
+            admission.validate(),
+            Err(TurnAdmissionMetadataError::UnsupportedExecutionOptionsVersion)
+        );
+        admission.execution.historical_context.clear();
+        assert!(admission.validate().is_ok());
+        let old: TurnExecutionOptions =
+            serde_json::from_value(serde_json::json!({"schema_version":7})).unwrap();
+        assert!(old.historical_context.is_empty());
+        assert!(serde_json::from_value::<HistoricalContextReference>(serde_json::json!({"session_id": SessionId::new(), "sequence":1, "snippet":"untrusted injected answer"})).is_err());
     }
 
     #[test]
