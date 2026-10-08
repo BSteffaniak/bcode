@@ -97,6 +97,27 @@ impl ExecutionMaintenance {
         Ok(())
     }
 
+    /// Remove disposable executable snapshots under this fenced state location.
+    /// The caller must separately verify that durable workflow retention permits removal.
+    /// Canonical state and lifetime evidence are never removed.
+    ///
+    /// # Errors
+    /// Rejects a symlinked/non-directory image root and reports filesystem failures.
+    pub fn remove_daemon_images(&self) -> io::Result<()> {
+        let _image_guard = super::try_acquire_daemon_image_cleanup_lock(&self.root)
+            .map_err(|_| invalid())?
+            .ok_or_else(|| io::Error::new(io::ErrorKind::WouldBlock, "image publication active"))?;
+        let images = self.root.join("daemon-images");
+        match fs::symlink_metadata(&images) {
+            Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => {
+                fs::remove_dir_all(images)
+            }
+            Ok(_) => Err(invalid()),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(error),
+        }
+    }
+
     /// Fence execution and startup for explicit offline maintenance.
     ///
     /// # Errors

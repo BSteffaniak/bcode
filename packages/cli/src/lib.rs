@@ -5313,9 +5313,14 @@ enum ServerCommand {
         json: bool,
     },
     /// Stop only the selected matching daemon if it has no active work.
-    StopIfIdle,
+    StopIfIdle {
+        /// Wait for verified execution-lifetime release before returning.
+        #[arg(long)]
+        wait: bool,
+    },
+    /// Remove disposable executable images after offline ownership verification.
+    PruneIdleImages,
     Stop {
-        /// Force termination if graceful shutdown does not complete.
         #[arg(long)]
         force: bool,
         /// Confirm forceful daemon termination.
@@ -7020,13 +7025,24 @@ async fn handle_server_command(command: ServerCommand) -> Result<(), CliError> {
         }
         ServerCommand::Metrics { json, report } => server_metrics(json, report).await?,
         ServerCommand::Diagnose { json } => server_diagnose(json).await?,
-        ServerCommand::StopIfIdle => {
+        ServerCommand::StopIfIdle { wait } => {
             let client = BcodeClient::default_endpoint()
                 .with_daemon_availability(DaemonAvailability::RequireRunning);
-            client.verified_server_status().await?;
+            let status = client.verified_server_status().await?;
+            let root = bcode_config::default_state_dir();
+            let record = bcode_daemon_lifecycle::read_records_strict(&root, 4096)?
+                .into_iter()
+                .find(|record| daemon_status_matches(record, &status.daemon))
+                .ok_or_else(|| {
+                    CliError::InvalidArguments("daemon registry identity unavailable".to_owned())
+                })?;
             client.server_stop_if_idle().await?;
+            if wait {
+                wait_for_execution_release(&root, &record).await?;
+            }
             println!("idle server stopping");
         }
+        ServerCommand::PruneIdleImages => prune_idle_images().await?,
         ServerCommand::Stop { force, yes } => {
             if force && !yes {
                 return Err(CliError::InvalidArguments(
@@ -15062,6 +15078,94 @@ fn refuse_foreign_daemon_delegation(
         "refusing to launch another Bcode executable for daemon {}; control it from a separately started matching Bcode process",
         expected.instance_id
     )))
+}
+
+async fn prune_idle_images() -> Result<(), CliError> {
+    let root = bcode_config::default_state_dir();
+    let records = bcode_daemon_lifecycle::read_records_strict(&root, 4096)?;
+    for record in &records {
+        if record_execution_lifetime(&root, record)
+            == bcode_daemon_lifecycle::ExecutionLifetimeStatus::Live
+        {
+            let client = BcodeClient::new(bcode_daemon_lifecycle::pinned_daemon_endpoint(record)?)
+                .with_daemon_availability(DaemonAvailability::RequireRunning);
+            match client.verified_server_status().await {
+                Ok(status) if daemon_status_matches(record, &status.daemon) => {
+                    client.server_stop_if_idle().await?;
+                }
+                Err(error) if error.is_daemon_unavailable() => {}
+                _ => {
+                    return Err(CliError::InvalidArguments(
+                        "daemon identity unavailable".to_owned(),
+                    ));
+                }
+            }
+            wait_for_execution_release(&root, record).await?;
+        }
+    }
+    let maintenance = bcode_daemon_lifecycle::ExecutionMaintenance::acquire(&root)?;
+    for record in &records {
+        if record_execution_lifetime(&root, record)
+            != bcode_daemon_lifecycle::ExecutionLifetimeStatus::Released
+        {
+            return Err(CliError::InvalidArguments(
+                "daemon lifetime is not verifiably released".to_owned(),
+            ));
+        }
+    }
+    let workflow_path = bcode_workflow_store::workflow_database_path(&root);
+    if workflow_path.exists() {
+        let artifacts = bcode_workflow_store::WorkflowStore::open_at_path(&workflow_path)
+            .and_then(|store| store.active_target_artifact_ids(1_000))
+            .map_err(|_| {
+                CliError::InvalidArguments("workflow retention evidence unavailable".to_owned())
+            })?;
+        if !artifacts.is_empty() {
+            return Err(CliError::InvalidArguments(
+                "workflow artifacts must be retained".to_owned(),
+            ));
+        }
+    }
+    // The maintenance guard fences new launch and execution throughout removal.
+    maintenance.remove_daemon_images()?;
+    drop(maintenance);
+
+    Ok(())
+}
+
+fn record_execution_lifetime(
+    root: &Path,
+    record: &bcode_daemon_lifecycle::DaemonRecord,
+) -> bcode_daemon_lifecycle::ExecutionLifetimeStatus {
+    match (&record.artifact_id, &record.state_location_id) {
+        (Some(artifact), Some(location)) => bcode_daemon_lifecycle::execution_lifetime_status(
+            root,
+            &record.instance_id,
+            artifact.as_str(),
+            location,
+        ),
+        _ => bcode_daemon_lifecycle::ExecutionLifetimeStatus::Unverifiable,
+    }
+}
+
+async fn wait_for_execution_release(
+    root: &Path,
+    record: &bcode_daemon_lifecycle::DaemonRecord,
+) -> Result<(), CliError> {
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        match record_execution_lifetime(root, record) {
+            bcode_daemon_lifecycle::ExecutionLifetimeStatus::Released => return Ok(()),
+            bcode_daemon_lifecycle::ExecutionLifetimeStatus::Live if Instant::now() < deadline => {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+            _ => {
+                return Err(CliError::InvalidArguments(
+                    "daemon execution release not verified".to_owned(),
+                ));
+            }
+        }
+    }
 }
 
 async fn wait_for_daemon_exit(

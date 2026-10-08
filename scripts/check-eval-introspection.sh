@@ -23,6 +23,14 @@ PY
 umask 077
 work="$(mktemp -d "${TMPDIR:-/tmp}/bcode-introspection.XXXXXX")"
 echo "private artifacts retained: $work"
+# Preserve reports on either outcome; release heavy runtime snapshots only after fencing.
+cleanup_runtime() {
+    local status=$?
+    trap - EXIT
+    python3 "$root/scripts/cleanup-eval-runtime.py" "$binary" "$work" || echo "runtime cleanup incomplete; scratch preserved" >&2
+    exit "$status"
+}
+trap cleanup_runtime EXIT
 mkdir -p "$work/home" "$work/state" "$work/xdg"
 printf 'executable=%s\nsha256=%s\n' "$binary" "$expected" > "$work/artifact-identity.txt"
 python3 "$root/fixtures/evals/introspection/materialize.py" "$binary" "$work/suites"

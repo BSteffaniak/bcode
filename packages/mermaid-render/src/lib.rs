@@ -462,8 +462,13 @@ struct PinnedWorker {
 }
 
 fn worker_digest(path: &std::path::Path) -> std::io::Result<Vec<u8>> {
+    worker_file_digest(&mut std::fs::File::open(path)?)
+}
+
+fn worker_file_digest(file: &mut std::fs::File) -> std::io::Result<Vec<u8>> {
     use sha2::Digest as _;
-    let mut file = std::fs::File::open(path)?;
+    use std::io::Seek as _;
+    file.rewind()?;
     let mut hash = sha2::Sha256::new();
     let mut buffer = [0_u8; 8192];
     loop {
@@ -476,8 +481,42 @@ fn worker_digest(path: &std::path::Path) -> std::io::Result<Vec<u8>> {
     Ok(hash.finalize().to_vec())
 }
 
-static PACKAGED_WORKER: OnceLock<Result<IsolatedMermaidRenderer, MermaidRenderError>> =
+struct PackagedWorker {
+    // Keep the opened installation bytes, not a temporary snapshot, at bootstrap.
+    source: std::fs::File,
+    digest: Vec<u8>,
+    snapshot: std::sync::Weak<PinnedWorker>,
+    executable: std::path::PathBuf,
+}
+
+static PACKAGED_WORKER: OnceLock<Mutex<Result<PackagedWorker, MermaidRenderError>>> =
     OnceLock::new();
+
+impl PackagedWorker {
+    fn acquire(&mut self) -> Result<IsolatedMermaidRenderer, MermaidRenderError> {
+        if let Some(pinned) = self.snapshot.upgrade() {
+            return Ok(IsolatedMermaidRenderer {
+                executable: self.executable.clone(),
+                pinned: Some(pinned),
+            });
+        }
+        let renderer = IsolatedMermaidRenderer::pin_source(&mut self.source)?;
+        if renderer
+            .pinned
+            .as_ref()
+            .is_none_or(|pinned| pinned.digest != self.digest)
+        {
+            return Err(MermaidRenderError::WorkerUnavailable {
+                message: "packaged worker changed after bootstrap".to_owned(),
+            });
+        }
+        if let Some(pinned) = &renderer.pinned {
+            self.snapshot = Arc::downgrade(pinned);
+        }
+        self.executable.clone_from(&renderer.executable);
+        Ok(renderer)
+    }
+}
 
 impl IsolatedMermaidRenderer {
     /// Copy a packaged worker into private process-owned storage and pin its bytes.
@@ -485,8 +524,17 @@ impl IsolatedMermaidRenderer {
     /// # Errors
     /// Returns unavailable when the source cannot be opened or the snapshot cannot be published.
     pub fn pin(path: &std::path::Path) -> Result<Self, MermaidRenderError> {
-        let capture = || -> std::io::Result<Self> {
-            let mut source = std::fs::File::open(path)?;
+        let mut source =
+            std::fs::File::open(path).map_err(|error| MermaidRenderError::WorkerUnavailable {
+                message: error.to_string(),
+            })?;
+        Self::pin_source(&mut source)
+    }
+
+    fn pin_source(source: &mut std::fs::File) -> Result<Self, MermaidRenderError> {
+        use std::io::Seek as _;
+        let mut capture = || -> std::io::Result<Self> {
+            source.rewind()?;
             let directory = tempfile::tempdir()?;
             let executable = directory.path().join(if cfg!(windows) {
                 "worker.exe"
@@ -494,7 +542,7 @@ impl IsolatedMermaidRenderer {
                 "worker"
             });
             let mut target = std::fs::File::create(&executable)?;
-            std::io::copy(&mut source, &mut target)?;
+            std::io::copy(source, &mut target)?;
             target.sync_all()?;
             std::fs::set_permissions(&executable, source.metadata()?.permissions())?;
             let digest = worker_digest(&executable)?;
@@ -515,36 +563,68 @@ impl IsolatedMermaidRenderer {
     /// # Errors
     /// Returns the retained capture failure, or unavailable if the host did not initialize it.
     pub fn packaged() -> Result<Self, MermaidRenderError> {
-        PACKAGED_WORKER.get().cloned().unwrap_or_else(|| {
-            Err(MermaidRenderError::WorkerUnavailable {
-                message: "packaged worker was not captured at process bootstrap".to_owned(),
-            })
-        })
+        let registry =
+            PACKAGED_WORKER
+                .get()
+                .ok_or_else(|| MermaidRenderError::WorkerUnavailable {
+                    message: "packaged worker was not captured at process bootstrap".to_owned(),
+                })?;
+        let mut registry = registry
+            .lock()
+            .map_err(|_| MermaidRenderError::WorkerUnavailable {
+                message: "packaged worker registry unavailable".to_owned(),
+            })?;
+        let worker = registry.as_mut().map_err(|error| error.clone())?;
+        let renderer = worker.acquire();
+        drop(registry);
+        renderer
     }
 
-    /// Snapshot the optional packaged worker once, using the bootstrap installation directory.
-    /// Both success and failure remain fixed for this process lifetime.
+    /// Retain opened installation bytes at bootstrap without creating temporary files.
+    /// Snapshots are created only when rendering is requested and owned by active renderers.
+    /// Both bootstrap success and failure remain fixed for this process lifetime.
     ///
     /// # Errors
-    /// Returns unavailable if the selected worker cannot be captured.
-    pub fn initialize_packaged(directory: &std::path::Path) -> Result<Self, MermaidRenderError> {
-        PACKAGED_WORKER
-            .get_or_init(|| Self::capture_packaged(directory))
-            .clone()
+    /// Returns unavailable if the selected worker cannot be opened.
+    pub fn initialize_packaged(directory: &std::path::Path) -> Result<(), MermaidRenderError> {
+        let registry =
+            PACKAGED_WORKER.get_or_init(|| Mutex::new(Self::capture_packaged(directory)));
+        let registry = registry
+            .lock()
+            .map_err(|_| MermaidRenderError::WorkerUnavailable {
+                message: "packaged worker registry unavailable".to_owned(),
+            })?;
+        registry.as_ref().map(|_| ()).map_err(Clone::clone)
     }
 
-    fn capture_packaged(directory: &std::path::Path) -> Result<Self, MermaidRenderError> {
-        if let Some(path) =
-            std::env::var_os(MERMAID_RENDERER_PATH_ENV).filter(|value| !value.is_empty())
-        {
-            return Self::pin(std::path::Path::new(&path));
-        }
-        let name = if cfg!(windows) {
-            "bcode-mermaid-worker.exe"
-        } else {
-            "bcode-mermaid-worker"
-        };
-        Self::pin(&directory.join(name))
+    fn capture_packaged(directory: &std::path::Path) -> Result<PackagedWorker, MermaidRenderError> {
+        let path = std::env::var_os(MERMAID_RENDERER_PATH_ENV)
+            .filter(|value| !value.is_empty())
+            .map_or_else(
+                || {
+                    directory.join(if cfg!(windows) {
+                        "bcode-mermaid-worker.exe"
+                    } else {
+                        "bcode-mermaid-worker"
+                    })
+                },
+                std::path::PathBuf::from,
+            );
+        let mut source =
+            std::fs::File::open(&path).map_err(|error| MermaidRenderError::WorkerUnavailable {
+                message: error.to_string(),
+            })?;
+        let digest = worker_file_digest(&mut source).map_err(|error| {
+            MermaidRenderError::WorkerUnavailable {
+                message: error.to_string(),
+            }
+        })?;
+        Ok(PackagedWorker {
+            source,
+            digest,
+            snapshot: std::sync::Weak::new(),
+            executable: std::path::PathBuf::new(),
+        })
     }
 
     /// Use an explicit renderer executable path.
@@ -1095,6 +1175,77 @@ mod tests {
         let path = cloned.executable().to_path_buf();
         drop(cloned);
         assert!(!path.exists());
+    }
+
+    #[test]
+    fn packaged_snapshot_is_lazy_shared_and_released_while_registry_survives() {
+        let installation = tempfile::tempdir().unwrap();
+        let path = installation.path().join("worker");
+        std::fs::write(&path, b"original").unwrap();
+        let mut registry = super::PackagedWorker {
+            source: std::fs::File::open(&path).unwrap(),
+            digest: super::worker_digest(&path).unwrap(),
+            snapshot: std::sync::Weak::new(),
+            executable: std::path::PathBuf::new(),
+        };
+        assert!(registry.executable.as_os_str().is_empty());
+        let replacement = installation.path().join("replacement");
+        std::fs::write(&replacement, b"replacement").unwrap();
+        std::fs::rename(replacement, path).unwrap();
+        let first = registry.acquire().unwrap();
+        let second = registry.acquire().unwrap();
+        let snapshot = first.executable().to_path_buf();
+        assert_eq!(second.executable(), snapshot);
+        assert_eq!(std::fs::read(&snapshot).unwrap(), b"original");
+        drop(first);
+        assert!(snapshot.exists());
+        drop(second);
+        assert!(!snapshot.exists());
+        let next = registry.acquire().unwrap();
+        assert_eq!(std::fs::read(next.executable()).unwrap(), b"original");
+        let next_path = next.executable().to_path_buf();
+        drop(next);
+        assert!(!next_path.exists());
+    }
+
+    #[test]
+    fn packaged_worker_subprocess_fixture() {
+        let Some(directory) = std::env::var_os("BCODE_WORKER_LIFECYCLE_FIXTURE") else {
+            return;
+        };
+        IsolatedMermaidRenderer::initialize_packaged(std::path::Path::new(&directory)).unwrap();
+        if std::env::var_os("BCODE_WORKER_LIFECYCLE_RENDER").is_some() {
+            drop(IsolatedMermaidRenderer::packaged().unwrap());
+        }
+    }
+
+    #[test]
+    fn ordinary_process_exit_leaves_no_packaged_worker_snapshots() {
+        let installation = tempfile::tempdir().unwrap();
+        let scratch = tempfile::tempdir().unwrap();
+        let name = if cfg!(windows) {
+            "bcode-mermaid-worker.exe"
+        } else {
+            "bcode-mermaid-worker"
+        };
+        std::fs::write(installation.path().join(name), b"fixture worker").unwrap();
+        for render in [false, true, false, true] {
+            let mut child = std::process::Command::new(std::env::current_exe().unwrap());
+            child
+                .args(["tests::packaged_worker_subprocess_fixture", "--exact"])
+                .env("BCODE_WORKER_LIFECYCLE_FIXTURE", installation.path())
+                .env("TMPDIR", scratch.path())
+                .env("TMP", scratch.path())
+                .env("TEMP", scratch.path())
+                .env_remove(super::MERMAID_RENDERER_PATH_ENV);
+            if render {
+                child.env("BCODE_WORKER_LIFECYCLE_RENDER", "1");
+            } else {
+                child.env_remove("BCODE_WORKER_LIFECYCLE_RENDER");
+            }
+            assert!(child.output().unwrap().status.success());
+            assert_eq!(std::fs::read_dir(scratch.path()).unwrap().count(), 0);
+        }
     }
 
     #[test]

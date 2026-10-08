@@ -4,6 +4,14 @@ root="$(cd "$(dirname "$0")/.." && pwd)"
 binary="${BCODE_SWARM_EVAL_BINARY:?Set an absolute identified Bcode binary}"
 work="$(mktemp -d "${TMPDIR:-/tmp}/bcode-swarm-eval.XXXXXX")"
 mkdir -p "$work/home" "$work/state" "$work/xdg"
+# Preserve reports on either outcome; release heavy runtime snapshots only after fencing.
+cleanup_runtime() {
+    local status=$?
+    trap - EXIT
+    python3 "$root/scripts/cleanup-eval-runtime.py" "$binary" "$work" || echo "runtime cleanup incomplete; scratch preserved" >&2
+    exit "$status"
+}
+trap cleanup_runtime EXIT
 cat > "$work/config.toml" <<'EOF'
 [plugins]
 enabled = ["bcode.fake-provider", "bcode.filesystem", "bcode.default-agents", "bcode.loop", "bcode.workflow", "bcode.eval"]

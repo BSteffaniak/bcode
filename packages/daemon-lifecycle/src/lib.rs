@@ -323,6 +323,19 @@ pub fn read_records_strict(
         let entry = entry?;
         let path = entry.path();
         let metadata = fs::symlink_metadata(&path)?;
+        // Launch coordination and image publication locks share this directory with records.
+        // They carry no registry identity, but must still be ordinary bounded files.
+        if metadata.is_file()
+            && metadata.len() <= MAX_RECORD_BYTES
+            && (entry.file_name() == "daemon-images.lock"
+                || (path.extension().and_then(|value| value.to_str()) == Some("lock")
+                    && path
+                        .file_stem()
+                        .and_then(|value| value.to_str())
+                        .is_some_and(|name| name.starts_with("ipc-v"))))
+        {
+            continue;
+        }
         if !metadata.is_file()
             || metadata.len() > MAX_RECORD_BYTES
             || path.extension().and_then(|value| value.to_str()) != Some("json")
@@ -1644,6 +1657,25 @@ fn endpoint_record(endpoint: &IpcEndpoint) -> DaemonEndpointRecord {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn strict_inventory_accepts_coordination_locks_but_rejects_unknown_files() {
+        let root = tempfile::tempdir().unwrap();
+        let directory = registry_dir(root.path());
+        fs::create_dir(&directory).unwrap();
+        let record = record_with_writer_epoch(Some(10));
+        fs::write(
+            directory.join("test.json"),
+            serde_json::to_vec(&record).unwrap(),
+        )
+        .unwrap();
+        fs::write(directory.join("daemon-images.lock"), b"").unwrap();
+        fs::write(directory.join("ipc-v49-fixture.lock"), b"1234").unwrap();
+        assert_eq!(read_records_strict(root.path(), 16).unwrap(), vec![record]);
+        assert!(read_records_strict(root.path(), 2).is_err());
+        fs::write(directory.join("unexpected"), b"").unwrap();
+        assert!(read_records_strict(root.path(), 16).is_err());
+    }
 
     #[test]
     fn strict_inventory_never_converts_damage_or_partial_scans_to_absence() {

@@ -79,6 +79,14 @@ run() {
         "${bcode}" "$@"
 }
 
+# Preserve reports on either outcome; release heavy runtime snapshots only after fencing.
+cleanup_runtime() {
+    local status=$?
+    trap - EXIT
+    python3 "$root/scripts/cleanup-eval-runtime.py" "$bcode" "$workdir" || echo "runtime cleanup incomplete; scratch preserved" >&2
+    exit "$status"
+}
+trap cleanup_runtime EXIT
 suite="${root}/fixtures/evals/prompt-cache/suite.toml"
 if [[ "${model}" == "fake-cache-prefix" ]]; then
     suite="${root}/fixtures/evals/prompt-cache/prefix.toml"
@@ -100,7 +108,7 @@ if run eval run "${suite}" \
     if [[ "${BCODE_PROMPT_CACHE_EVAL_KEEP_ARTIFACTS:-0}" == "1" ]]; then
         echo "prompt cache eval artifacts: ${workdir}/runs/ci-prompt-cache"
     else
-        rm -rf "${workdir}"
+        echo "prompt cache reports retained: ${workdir}/runs"
     fi
     echo "prompt cache eval passed (${model})"
 else

@@ -757,15 +757,28 @@ impl Drop for IsolatedDaemonCleanup<'_> {
         }
         let mut command = Command::new(self.binary);
         command
-            .args(["server", "stop-if-idle"])
+            .args(["server", "stop-if-idle", "--wait"])
             .envs(&self.environment)
             .current_dir(self.workspace);
         let result = process::bounded_command(
             command,
-            Duration::from_secs(10),
+            Duration::from_secs(35),
             self.directory,
             "daemon-cleanup",
         );
+        if matches!(&result, Ok((Some(0), false, _, _))) {
+            let mut prune = Command::new(self.binary);
+            prune
+                .args(["server", "prune-idle-images"])
+                .envs(&self.environment)
+                .current_dir(self.workspace);
+            let _ = process::bounded_command(
+                prune,
+                Duration::from_secs(10),
+                self.directory,
+                "daemon-image-cleanup",
+            );
+        }
         let evidence = match result {
             Ok((status, timed_out, _, _)) => serde_json::json!({
                 "requested": status == Some(0) && !timed_out,
