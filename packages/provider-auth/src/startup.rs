@@ -100,6 +100,14 @@ fn selected_environment_with_loader(
         || selection.auth_profile != state.auth_profile
         || selection.auth_pool.is_some()
         || config.active_context != state.context
+        || [
+            ("base_url", &state.base_url),
+            ("dialect", &state.dialect),
+            ("auth_mode", &state.auth_mode),
+            ("catalog_provider_id", &state.catalog_provider_id),
+        ]
+        .into_iter()
+        .any(|(key, remembered)| selection.settings.get(key) != remembered.as_ref())
     {
         return Err(startup_error(
             "remembered startup selection changed after configuration was loaded",
@@ -502,13 +510,17 @@ mod tests {
                 .unwrap()
                 .is_some()
         );
-        for change in 0..4 {
+        for change in 0..8 {
             let mut changed = state.clone();
             match change {
                 0 => changed.provider_plugin_id = "foreign.plugin".to_owned(),
                 1 => changed.model_id = "different".to_owned(),
                 2 => changed.auth_profile = Some("another-account".to_owned()),
-                _ => changed.context = Some("different-context".to_owned()),
+                3 => changed.context = Some("different-context".to_owned()),
+                4 => changed.base_url = Some("https://different.example/v1".to_owned()),
+                5 => changed.dialect = Some("different-dialect".to_owned()),
+                6 => changed.auth_mode = Some("different-mode".to_owned()),
+                _ => changed.catalog_provider_id = Some("different-catalog".to_owned()),
             }
             let result =
                 selected_environment_with_loader(&config, &selection, || Ok(Some(changed)));

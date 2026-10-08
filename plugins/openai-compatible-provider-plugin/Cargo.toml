@@ -43,6 +43,9 @@ tokio = { workspace = true, features = [
     "time",
 ] }
 
+[dev-dependencies]
+tempfile = { workspace = true }
+
 [features]
 default          = []
 fail-on-warnings = []

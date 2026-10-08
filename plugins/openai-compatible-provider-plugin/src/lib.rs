@@ -86,7 +86,6 @@ mod turn_routing;
 
 const DEFAULT_BASE_URL: &str = "https://api.openai.com/v1";
 const DEFAULT_XAI_BASE_URL: &str = "https://api.x.ai/v1";
-const DEFAULT_XAI_MODEL_ID: &str = "grok-4.3"; // from https://docs.x.ai/developers/models/grok-4.3
 const PROVIDER_ID: &str = "bcode.openai-compatible";
 const OPENAI_CODEX_CLIENT_ID: &str = "app_EMoamEEZ73f0CkXaXp7hrann";
 const OPENAI_CODEX_AUTHORIZE_URL: &str = "https://auth.openai.com/oauth/authorize";
@@ -1450,6 +1449,7 @@ impl OpenAiCompatibleProviderPlugin {
             }
             OP_MODELS => self.models_response(&context.request),
             bcode_model::OP_STARTUP_RECOMMENDATION => startup::response(&context.request),
+            bcode_model::OP_STARTUP_MODEL_CHOICES => startup::choices_response(&context.request),
             bcode_model::OP_STARTUP_READINESS => startup::readiness_response(&context.request),
             OP_VALIDATE_CONFIG => Self::validate_config(&context.request),
             bcode_model::image_upload::OP_VERIFY_IMAGE_UPLOAD => self.verify_image_upload(context),
@@ -7086,10 +7086,7 @@ impl OpenAiCompatibleProviderPlugin {
                 request.selected_model_id.as_deref(),
             )
             .unwrap_or_else(|| {
-                model_infos_from_ids_without_catalog(
-                    &settings.model_ids,
-                    settings.default_model.as_deref(),
-                )
+                discovery::offline_models(&settings, request.selected_model_id.as_deref())
             });
         ModelList {
             models: apply_provider_static_metadata(&settings, models),
@@ -7101,8 +7098,8 @@ impl OpenAiCompatibleProviderPlugin {
 fn catalog_hints(settings: &Settings) -> ModelCatalogHints {
     let provider_id = catalog_provider_id(settings).map(str::to_string);
     let support = provider_id.as_deref().and_then(|provider_id| {
-        (provider_id == "openai").then(|| ModelCatalogSupportHint {
-            provider: "openai".to_string(),
+        matches!(provider_id, "openai" | "xai").then(|| ModelCatalogSupportHint {
+            provider: provider_id.to_string(),
             auth_mode: if matches!(settings.auth, AuthSettings::ChatGpt { .. }) {
                 "chatgpt_subscription"
             } else {
@@ -7157,44 +7154,19 @@ fn apply_provider_static_metadata(settings: &Settings, models: Vec<ModelInfo>) -
     models
         .into_iter()
         .map(|mut model| {
-            model.cache = openai_model_cache_info(settings.dialect);
-            if matches!(provider_id, Some("openai" | "xai")) {
+            if provider_id != Some("xai") {
+                model.cache = openai_model_cache_info(settings.dialect);
+            }
+            if provider_id == Some("openai") {
                 model.capabilities.extend([
                     ModelCapability::ToolCalls,
                     ModelCapability::ParallelToolCalls,
                     ModelCapability::JsonMode,
                 ]);
             }
-            if provider_id == Some("xai") {
-                model = apply_xai_static_metadata(model);
-            }
             model
         })
         .collect()
-}
-
-fn apply_xai_static_metadata(mut model: ModelInfo) -> ModelInfo {
-    if model.context_window.is_none()
-        && let Some(context_window) = xai_static_context_window(&model.model_id)
-    {
-        model.context_window = Some(context_window);
-        model.metadata_source = Some(ModelMetadataSource::ProviderDefault);
-    }
-    model
-}
-
-fn xai_static_context_window(model_id: &str) -> Option<u32> {
-    let model_id = model_id.trim();
-    if model_id == "grok-4.3"
-        || model_id.starts_with("grok-4.20")
-        || model_id.starts_with("grok-4.3-")
-    {
-        return Some(1_000_000);
-    }
-    if model_id == "grok-build-0.1" || model_id.starts_with("grok-build-0.1-") {
-        return Some(256_000);
-    }
-    None
 }
 
 /// Returns true if the given model id is an xAI Grok model that must be routed to api.x.ai.
@@ -7293,6 +7265,8 @@ fn catalog_provider_id(settings: &Settings) -> Option<&str> {
         || settings.base_url.contains("chatgpt.com")
     {
         Some("openai")
+    } else if discovery::is_xai_provider(Some(&settings.base_url), None) {
+        Some("xai")
     } else {
         None
     }
@@ -7619,37 +7593,23 @@ async fn resolve_model_candidates(
     selected_model_id: Option<&str>,
 ) -> Result<Vec<ModelInfo>, ProviderError> {
     let configured_model_ids = model_ids_with_selected(&settings.model_ids, selected_model_id);
-
-    // For discoverable providers (xAI etc.), always attempt live discovery first.
-    // Users can opt out by setting live_discovery=false via declarative provider config.
-    // The value is read from context.settings (populated from bcode.toml) during
-    // settings_for_context and stored in Settings.live_discovery_disabled.
-    let live_disabled = settings.live_discovery_disabled;
-
-    // Detect xAI via base_url or dialect metadata value
-    let dialect_str = settings.dialect.metadata_value();
-    let is_xai = discovery::is_discoverable_provider(Some(&settings.base_url), Some(dialect_str))
-        || settings.base_url.contains("x.ai");
-
-    if is_xai
-        && !live_disabled
-        && let Ok(live_items) = fetch_provider_model_items(settings, api_key).await
-    {
-        let mut models = model_infos_from_items(live_items, settings.default_model.as_deref());
-        discovery::tag_as_live(&mut models);
-        append_missing_model_items_from_ids(&mut models, &configured_model_ids);
-        return Ok(models);
+    let catalog = startup::offline_catalog();
+    let baseline =
+        discovery::offline_models_with_catalog(settings, selected_model_id, catalog.as_ref());
+    if settings.model_ids_are_explicit || settings.live_discovery_disabled || api_key.is_empty() {
+        return Ok(baseline);
     }
-    // Live fetch failed – fall back to previous behavior
-
-    if settings.model_ids_are_explicit {
-        return Ok(model_infos_from_ids_without_catalog(
-            &configured_model_ids,
-            settings.default_model.as_deref(),
+    // One bounded enrichment attempt; errors and empty lists retain the offline baseline.
+    let live_items = fetch_provider_model_items(settings, api_key).await;
+    if catalog_provider_id(settings) == Some("xai") {
+        return Ok(discovery::merge_live(
+            settings,
+            baseline,
+            live_items.unwrap_or_default(),
+            catalog.as_ref(),
         ));
     }
-
-    let mut models = fetch_provider_model_items(settings, api_key).await?;
+    let mut models = live_items?;
     append_missing_model_items(&mut models, &configured_model_ids);
     Ok(model_infos_from_items(
         models,
@@ -7673,7 +7633,7 @@ async fn fetch_provider_model_items(
     api_key: &str,
 ) -> Result<Vec<ModelResponseItem>, ProviderError> {
     let client = Client::builder()
-        .timeout(Duration::from_secs(20))
+        .timeout(discovery::LIVE_TIMEOUT)
         .build()
         .map_err(|error| {
             provider_error(
@@ -7691,10 +7651,23 @@ async fn fetch_provider_model_items(
         .map_err(|error| reqwest_provider_error("models_request_failed", &error))?;
     let status = response.status();
     let headers = response.headers().clone();
-    let body = response
-        .text()
+    let mut response = response;
+    let mut bytes = Vec::new();
+    while let Some(chunk) = response
+        .chunk()
         .await
-        .map_err(|error| reqwest_provider_error("models_response_read_failed", &error))?;
+        .map_err(|error| reqwest_provider_error("models_response_read_failed", &error))?
+    {
+        if bytes.len().saturating_add(chunk.len()) > discovery::MAX_RESPONSE_BYTES {
+            return Err(provider_error(
+                "models_response_too_large",
+                ProviderErrorCategory::ProviderInternal,
+                "Model discovery response exceeds its bounded size",
+            ));
+        }
+        bytes.extend_from_slice(&chunk);
+    }
+    let body = String::from_utf8_lossy(&bytes);
     if !status.is_success() {
         return Err(error_from_status_and_headers(
             status.as_u16(),
@@ -7709,6 +7682,13 @@ async fn fetch_provider_model_items(
             error.to_string(),
         )
     })?;
+    if body.data.len() > discovery::MAX_LIVE_MODELS {
+        return Err(provider_error(
+            "models_response_too_large",
+            ProviderErrorCategory::ProviderInternal,
+            "Model discovery response exceeds its bounded model count",
+        ));
+    }
     Ok(body.data)
 }
 
@@ -7908,11 +7888,8 @@ fn settings_for_context(context: &ProviderRequestContext) -> Settings {
     let saved = SavedOpenAiAuth::default();
     let allow_saved_auth = context.auth.is_none();
     let xai_mode = env_has_xai_keys(context) || (allow_saved_auth && saved_has_xai_keys(&saved));
-    let chatgpt_mode = (context_has_chatgpt_auth(context)
-        || (allow_saved_auth && saved_openai_auth_is_chatgpt(&saved)))
-        && !xai_mode;
     let fallback_model = if xai_mode {
-        DEFAULT_XAI_MODEL_ID.to_string()
+        String::new()
     } else {
         "model".to_string()
     };
@@ -7934,10 +7911,9 @@ fn settings_for_context(context: &ProviderRequestContext) -> Settings {
             "OPENAI_MODELS",
         ],
     );
-    let mut model_ids = model_ids_env.as_deref().map_or_else(
-        || default_model_ids(chatgpt_mode, xai_mode),
-        parse_model_list,
-    );
+    let mut model_ids = model_ids_env
+        .as_deref()
+        .map_or_else(Vec::new, parse_model_list);
     let extra_model_ids = first_context_env(
         context,
         [
@@ -8405,13 +8381,6 @@ fn saved_chatgpt_auth_settings(saved: &SavedOpenAiAuth) -> (AuthSettings, AuthDi
         },
         saved_auth_diagnostics(saved, "chatgpt", "saved sshenv ChatGPT/Codex auth"),
     )
-}
-
-fn default_model_ids(_chatgpt_mode: bool, xai_mode: bool) -> Vec<String> {
-    if xai_mode {
-        return vec![DEFAULT_XAI_MODEL_ID.to_string()];
-    }
-    Vec::new()
 }
 
 #[derive(Debug, Deserialize)]
@@ -8964,30 +8933,6 @@ fn append_missing_model_items(models: &mut Vec<ModelResponseItem>, model_ids: &[
                 id: model_id.clone(),
                 created: None,
                 metadata: BTreeMap::new(),
-            });
-        }
-    }
-}
-
-/// Same as `append_missing_model_items` but operates on already-converted `ModelInfo` list.
-fn append_missing_model_items_from_ids(models: &mut Vec<ModelInfo>, model_ids: &[String]) {
-    for model_id in model_ids {
-        if models.iter().all(|m| m.model_id != *model_id) {
-            models.push(ModelInfo {
-                model_id: model_id.clone(),
-                display_name: model_id.clone(),
-                is_default: false,
-                context_window: None,
-                max_output_tokens: None,
-                max_image_input_base64_bytes: None,
-                capabilities: std::collections::BTreeSet::new(),
-                feature_support: bcode_model::ModelFeatureSupport::default(),
-                reasoning: None,
-                cache: bcode_model::ModelCacheInfo::default(),
-                metadata_source: Some(ModelMetadataSource::ProviderLive),
-                pricing: None,
-                api_surface: None,
-                visibility: bcode_model::ModelVisibility::Visible,
             });
         }
     }
@@ -12307,21 +12252,23 @@ mod tests {
     }
 
     #[test]
-    fn xai_model_candidates_advertise_documented_tool_capabilities() {
-        let mut settings =
-            test_settings(test_api_key_auth(), OpenAiCompatibleDialect::ResponsesApi);
+    fn unknown_xai_candidates_do_not_assume_documented_tool_capabilities() {
+        let mut settings = test_settings(
+            test_api_key_auth(),
+            OpenAiCompatibleDialect::ChatCompletions,
+        );
         settings.base_url = DEFAULT_XAI_BASE_URL.to_owned();
-        let models = apply_provider_static_metadata(
-            &settings,
-            model_infos_from_ids(&["grok-4.5".to_owned()], Some("grok-4.5")),
-        );
-
-        assert!(models[0].capabilities.contains(&ModelCapability::ToolCalls));
-        assert!(
-            models[0]
-                .capabilities
-                .contains(&ModelCapability::ParallelToolCalls)
-        );
+        settings.model_ids = vec!["fixture-unknown-xai".to_owned()];
+        settings.default_model = Some("fixture-unknown-xai".to_owned());
+        let models =
+            apply_provider_static_metadata(&settings, discovery::offline_models(&settings, None));
+        let unknown = models
+            .iter()
+            .find(|model| model.model_id == "fixture-unknown-xai")
+            .unwrap();
+        assert!(unknown.capabilities.is_empty());
+        assert!(unknown.pricing.is_none());
+        assert!(unknown.context_window.is_none());
     }
 
     #[test]

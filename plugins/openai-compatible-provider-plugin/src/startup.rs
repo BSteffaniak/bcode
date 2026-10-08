@@ -1,7 +1,6 @@
 //! Offline startup selection. This path does not construct a provider client or read credentials.
 
 use std::collections::BTreeMap;
-use std::sync::OnceLock;
 
 use bcode_model::{
     ModelCapability, StartupModelReadiness, StartupReadinessRequest, StartupReadinessResponse,
@@ -59,17 +58,53 @@ pub fn response(request: &ServiceRequest) -> ServiceResponse {
         Err(error) => return invalid_request(&error),
     };
     let recommendation = routing(&request).and_then(|routing| {
-        embedded_catalog().and_then(|catalog| recommend(catalog, &request, &routing))
+        offline_catalog().and_then(|catalog| recommend(&catalog, &request, &routing))
     });
     json_response(&StartupRecommendationResponse { recommendation })
 }
 
-fn embedded_catalog() -> Option<&'static ModelCatalog> {
-    // Cache both success and failure. No environment, credentials, overlays or live snapshots.
-    static CATALOG: OnceLock<Option<ModelCatalog>> = OnceLock::new();
-    CATALOG
-        .get_or_init(|| ModelCatalog::load_bundled().ok())
-        .as_ref()
+pub fn choices_response(request: &ServiceRequest) -> ServiceResponse {
+    let request = match request.payload_json::<StartupRecommendationRequest>() {
+        Ok(request) => request,
+        Err(error) => return invalid_request(&error),
+    };
+    let choices = routing(&request)
+        .and_then(|routing| {
+            let catalog = offline_catalog()?;
+            let recommendation = recommend(&catalog, &request, &routing)?;
+            let target = ModelSupportTarget::new(
+                request.auth_provider_id.as_str(),
+                routing.support_auth_mode,
+                routing.dialect,
+                Some("bcode"),
+            );
+            let mut choices = vec![recommendation.clone()];
+            for model in catalog.provider_models_for_support_target(
+                &request.auth_provider_id,
+                &target,
+                false,
+            ) {
+                if model.model_id != recommendation.model_id
+                    && model.capabilities.contains(&ModelCapability::ToolCalls)
+                {
+                    choices.push(StartupRecommendation {
+                        model_id: model.model_id,
+                        ..recommendation.clone()
+                    });
+                }
+            }
+            Some(choices)
+        })
+        .unwrap_or_default();
+    json_response(&bcode_model::StartupModelChoicesResponse { choices })
+}
+
+pub fn offline_catalog() -> Option<ModelCatalog> {
+    // Bounded read-only overlays: no refresh, credential access, or permanently stale cache.
+    bcode_model_catalog::load_cached_catalog(bcode_model_catalog::RemoteCatalogOptions::from_env())
+        .map(ModelCatalog::new)
+        .ok()
+        .or_else(|| ModelCatalog::load_bundled().ok())
 }
 
 pub fn readiness_response(request: &ServiceRequest) -> ServiceResponse {
@@ -77,8 +112,8 @@ pub fn readiness_response(request: &ServiceRequest) -> ServiceResponse {
         Ok(request) => request,
         Err(error) => return invalid_request(&error),
     };
-    let model = embedded_catalog().map_or(StartupModelReadiness::Unknown, |catalog| {
-        readiness(catalog, &request)
+    let model = offline_catalog().map_or(StartupModelReadiness::Unknown, |catalog| {
+        readiness(&catalog, &request)
     });
     json_response(&StartupReadinessResponse { model })
 }
@@ -209,6 +244,62 @@ mod tests {
             auth_provider_id: provider.to_owned(),
             method_id: method.to_owned(),
         }
+    }
+
+    #[test]
+    fn startup_choices_are_recommendation_first_and_ready() {
+        for (provider, method) in [
+            ("xai", "api_key"),
+            ("openai", "api_key"),
+            ("openai", "device"),
+        ] {
+            let payload = serde_json::to_vec(&request(provider, method)).unwrap();
+            let service = ServiceRequest {
+                interface_id: bcode_model::MODEL_PROVIDER_INTERFACE_ID.into(),
+                operation: bcode_model::OP_STARTUP_MODEL_CHOICES.into(),
+                payload,
+            };
+            let response = choices_response(&service);
+            assert!(response.error.is_none());
+            let decoded: bcode_model::StartupModelChoicesResponse =
+                serde_json::from_slice(&response.payload).unwrap();
+            let recommendation: StartupRecommendationResponse =
+                serde_json::from_slice(&super::response(&service).payload).unwrap();
+            assert_eq!(
+                decoded.choices.first(),
+                recommendation.recommendation.as_ref()
+            );
+            assert!(!decoded.choices.is_empty());
+            let catalog = offline_catalog().unwrap();
+            for choice in decoded.choices {
+                assert_eq!(
+                    readiness(
+                        &catalog,
+                        &StartupReadinessRequest {
+                            model_id: choice.model_id,
+                            settings: choice.settings
+                        }
+                    ),
+                    StartupModelReadiness::Available
+                );
+            }
+        }
+        let unsupported = ServiceRequest {
+            interface_id: bcode_model::MODEL_PROVIDER_INTERFACE_ID.into(),
+            operation: bcode_model::OP_STARTUP_MODEL_CHOICES.into(),
+            payload: serde_json::to_vec(&request("unknown", "api_key")).unwrap(),
+        };
+        let decoded: bcode_model::StartupModelChoicesResponse =
+            serde_json::from_slice(&choices_response(&unsupported).payload).unwrap();
+        assert!(decoded.choices.is_empty());
+        assert!(
+            choices_response(&ServiceRequest {
+                payload: b"{}".to_vec(),
+                ..unsupported
+            })
+            .error
+            .is_some()
+        );
     }
 
     #[test]

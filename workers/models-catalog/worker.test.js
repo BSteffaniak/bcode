@@ -57,6 +57,33 @@ test('copies pricing by exact model id and leaves new models unpriced', () => {
   assert.equal(newlyIntroduced.pricing, null);
 });
 
+test('xai live overlays supplement curated inventory without inventing future pricing', () => {
+  const baseline = {
+    model_id: 'grok-4.7',
+    pricing,
+    deployments: [{ provider: 'xai', auth_mode: 'api_key', api_surface: 'responses_api', integration: 'bcode' }],
+  };
+  const catalog = { providers: { xai: {
+    default_model_id: 'grok-4.7',
+    fallback_model_ids: ['grok-4.7', 'grok-4.3'],
+    models: { 'grok-4.7': baseline, 'grok-4.3': { model_id: 'grok-4.3' } },
+  } } };
+  mergeSnapshot(catalog, {
+    provider_id: 'xai', generated_at: '2026-10-08T00:00:00Z',
+    models: {
+      'grok-4.7': { model_id: 'grok-4.7', pricing: null, capabilities: {} },
+      'grok-future-discovered': { model_id: 'grok-future-discovered', capabilities: {} },
+    },
+  });
+  assert.deepEqual(catalog.providers.xai.models['grok-4.7'].pricing, pricing);
+  assert.equal(catalog.providers.xai.models['grok-4.7'].deployments.length, 1);
+  assert.equal(catalog.providers.xai.models['grok-future-discovered'].pricing, null);
+  assert.equal(catalog.providers.xai.models['grok-future-discovered'].context_window, null);
+  assert.equal(catalog.providers.xai.models['grok-future-discovered'].bcode_support, 'unknown');
+  assert.deepEqual(catalog.providers.xai.fallback_model_ids, ['grok-4.7', 'grok-4.3']);
+  assert.equal(catalog.providers.xai.default_model_id, 'grok-4.7');
+});
+
 test('merged catalog carries live pricing', () => {
   const catalog = { providers: { bedrock: { models: {} } } };
   mergeSnapshot(catalog, {

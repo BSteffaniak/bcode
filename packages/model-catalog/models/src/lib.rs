@@ -7,7 +7,7 @@
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 
-pub use live::{LiveCatalogSnapshot, LiveModel, LiveModelMetadata};
+pub use live::{LIVE_SNAPSHOT_SCHEMA_VERSION, LiveCatalogSnapshot, LiveModel, LiveModelMetadata};
 
 mod live;
 

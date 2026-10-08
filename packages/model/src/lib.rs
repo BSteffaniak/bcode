@@ -84,6 +84,9 @@ pub const OP_MODELS: &str = "models";
 /// Implementations must not read credentials or make network requests.
 pub const OP_STARTUP_RECOMMENDATION: &str = "startup_recommendation";
 
+/// Optional operation listing local coding model choices without credential access or network.
+pub const OP_STARTUP_MODEL_CHOICES: &str = "startup_model_choices";
+
 /// Optional offline validation of one selected model; never remote authentication.
 pub const OP_STARTUP_READINESS: &str = "startup_readiness";
 
@@ -145,6 +148,18 @@ pub struct StartupRecommendation {
 pub struct StartupRecommendationResponse {
     /// Available recommendation; unsupported providers or methods return `None`.
     pub recommendation: Option<StartupRecommendation>,
+}
+
+/// Optional local model-choice extension response.
+///
+/// Uses [`StartupRecommendationRequest`]. Choices carry provider-owned routing and
+/// local coding support, not proof of authentication or account availability.
+/// Unsupported methods return an empty list. Providers order their recommendation first.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct StartupModelChoicesResponse {
+    /// Offline catalog choices, with the recommended choice first when available.
+    pub choices: Vec<StartupRecommendation>,
 }
 
 /// Operation for validating provider configuration.
@@ -235,6 +250,13 @@ pub const MODEL_PROVIDER_OPERATIONS: &[ProviderOperationContract] = &[
         response_type: "StartupRecommendationResponse",
         requirement: ProviderOperationRequirement::Optional,
         behavior: "recommend a catalog-recognized coding model and nonsecret routing settings without credentials or network; unsupported methods return no recommendation",
+    },
+    ProviderOperationContract {
+        operation: OP_STARTUP_MODEL_CHOICES,
+        request_type: "StartupRecommendationRequest",
+        response_type: "StartupModelChoicesResponse",
+        requirement: ProviderOperationRequirement::Optional,
+        behavior: "list local catalog coding choices with nonsecret routing and recommendation first, without credentials or network; unsupported methods return no choices",
     },
     ProviderOperationContract {
         operation: history::OP_HISTORY_CAPABILITIES,

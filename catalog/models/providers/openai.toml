@@ -2075,6 +2075,8 @@ default_effort = "medium"
 summary_values = ["auto", "concise", "detailed"]
 default_summary = "auto"
 
+# These Grok patterns enrich explicitly discovered compatibility deployments only.
+# xAI-owned concrete offline inventory and authoritative pricing live in xai.toml.
 [models."grok-4"]
 model_id = "grok-4"
 display_name = "Grok 4"

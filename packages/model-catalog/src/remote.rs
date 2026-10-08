@@ -5,6 +5,7 @@ use bcode_model_catalog_models::{
     CatalogDocument, LiveCatalogSnapshot, LiveModelMetadata, ModelCatalogEntry, ProviderCatalog,
 };
 use std::fs;
+use std::io::Read;
 use std::path::PathBuf;
 use std::time::Duration;
 
@@ -17,6 +18,7 @@ const CACHE_DIR_ENV: &str = "BCODE_MODEL_CATALOG_CACHE_DIR";
 const DEFAULT_TIMEOUT_SECONDS: u64 = 3;
 const DEFAULT_FRESH_SECONDS: u64 = 900;
 const DEFAULT_MAX_STALE_SECONDS: u64 = 21_600;
+const MAX_CACHED_JSON_BYTES: u64 = 16 * 1024 * 1024;
 
 /// Runtime remote catalog overlay configuration.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -335,10 +337,12 @@ fn overlay_provider(local: &mut ProviderCatalog, remote: &ProviderCatalog) {
             .default_codex_model_id
             .clone_from(&remote.default_codex_model_id);
     }
-    if !remote.fallback_model_ids.is_empty() {
-        local
-            .fallback_model_ids
-            .clone_from(&remote.fallback_model_ids);
+    // Remote inventory supplements the embedded offline baseline; a partial refresh must not
+    // remove known fallback choices or change their stable ordering.
+    for model_id in &remote.fallback_model_ids {
+        if !local.fallback_model_ids.contains(model_id) {
+            local.fallback_model_ids.push(model_id.clone());
+        }
     }
     if remote.defaults.is_some() {
         local.defaults.clone_from(&remote.defaults);
@@ -525,7 +529,21 @@ fn read_cached_json<T>(path: &PathBuf) -> Result<T>
 where
     T: serde::de::DeserializeOwned,
 {
-    serde_json::from_str(&fs::read_to_string(path)?).map_err(Error::Json)
+    let file = fs::File::open(path)?;
+    if file.metadata()?.len() > MAX_CACHED_JSON_BYTES {
+        return Err(Error::RemoteCatalog(
+            "cached catalog exceeds size limit".to_string(),
+        ));
+    }
+    let mut bytes = Vec::new();
+    file.take(MAX_CACHED_JSON_BYTES + 1)
+        .read_to_end(&mut bytes)?;
+    if bytes.len() as u64 > MAX_CACHED_JSON_BYTES {
+        return Err(Error::RemoteCatalog(
+            "cached catalog exceeds size limit".to_string(),
+        ));
+    }
+    serde_json::from_slice(&bytes).map_err(Error::Json)
 }
 
 fn cache_is_fresh(path: &PathBuf, fresh_for: Duration) -> bool {

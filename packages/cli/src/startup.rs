@@ -31,12 +31,7 @@ pub async fn route(no_discovery: bool) -> Result<bool, CliError> {
     let mut host = load_cli_plugin_host()?;
     register_enabled(&host)?;
     let readiness = local_readiness(&config, &host);
-    let selection = config.resolved_model_selection();
-    let explicit_selection = !config.startup_selection_applied
-        && (selection.provider_plugin_id.is_some()
-            || selection.model_id.is_some()
-            || selection.auth_profile.is_some()
-            || selection.auth_pool.is_some());
+    let explicit_selection = has_explicit_selection(&config);
     let route = startup_route(readiness.is_ok(), explicit_selection, remembered.is_ok());
     if route == StartupRoute::Continue {
         host.deactivate_all()?;
@@ -172,14 +167,15 @@ async fn launch_connected(
         CliError::InvalidArguments("Enrolled account metadata could not be resolved".to_owned())
     })?;
     let method = super::resolved_auth_method(&provider, &resolved)?;
-    let Some(selection) = recommendation(
+    let selections = model_choices(
         &host,
         config,
         &provider_id,
         method.method_id(),
         Some(profile),
         None,
-    ) else {
+    );
+    if selections.is_empty() {
         host.deactivate_all()?;
         Box::pin(super::handle_onboard_command(&super::OnboardOptions {
             provider: Some(provider_id),
@@ -189,19 +185,76 @@ async fn launch_connected(
         }))
         .await?;
         return Ok(());
-    };
+    }
     host.deactivate_all()?;
-    bcode_config::startup::save(&selection).map_err(|_| {
-        CliError::InvalidArguments(
-            "Startup selection could not be saved; existing state was preserved".to_owned(),
-        )
-    })?;
+    let outcome = Box::pin(bcode_tui::run_quick_onboarding(enrolled_input(
+        &provider.contribution.display_name,
+        &selections,
+    )))
+    .await?;
+    match outcome {
+        bcode_tui::QuickOnboardingOutcome::Advanced => {
+            return Box::pin(advanced(no_discovery)).await;
+        }
+        bcode_tui::QuickOnboardingOutcome::Connected {
+            provider_id,
+            profile,
+        } => {
+            return Box::pin(launch_connected(
+                config,
+                provider_id,
+                profile,
+                false,
+                state_valid,
+                no_discovery,
+            ))
+            .await;
+        }
+        _ => {}
+    }
+    if !consent_enrolled_selection(&outcome, &selections, |selection| {
+        bcode_config::startup::save(selection)
+            .map(|_| ())
+            .map_err(|_| "Startup selection could not be saved; existing state was preserved")
+    })
+    .map_err(|message| CliError::InvalidArguments(message.to_owned()))?
+    {
+        return Ok(());
+    }
     Box::pin(super::run_new_session_tui(
         None,
         bcode_tui::TuiLaunchOptions::default(),
     ))
     .await?;
     Ok(())
+}
+
+fn enrolled_input(
+    provider_name: &str,
+    selections: &[bcode_config::startup::StartupSelection],
+) -> bcode_tui::QuickOnboardingInput {
+    bcode_tui::QuickOnboardingInput {
+        choices: selections.iter().enumerate().map(|(index, selection)| bcode_tui::QuickConnectionChoice {
+            label: format!("{provider_name} — {}{}", selection.model_id, if index == 0 { " (recommended)" } else { "" }),
+            detail: "Use the enrolled account with this model. API usage may incur provider charges; credentials have not been checked remotely.".to_owned(),
+        }).collect(),
+        recovery: None,
+    }
+}
+
+fn consent_enrolled_selection(
+    outcome: &bcode_tui::QuickOnboardingOutcome,
+    selections: &[bcode_config::startup::StartupSelection],
+    mut save: impl FnMut(&bcode_config::startup::StartupSelection) -> Result<(), &'static str>,
+) -> Result<bool, &'static str> {
+    let bcode_tui::QuickOnboardingOutcome::Selected(index) = outcome else {
+        return Ok(false);
+    };
+    let selection = selections
+        .get(*index)
+        .ok_or("Selected enrolled model is unavailable")?;
+    save(selection)?;
+    Ok(true)
 }
 
 fn quick_input(
@@ -244,12 +297,14 @@ fn quick_input(
         choices: if state_valid {
             choices
                 .iter()
-                .map(|(selection, candidate)| bcode_tui::QuickConnectionChoice {
-                    label: format!("{} — use {}", candidate.provider_name, selection.model_id),
+                .enumerate()
+                .map(|(index, (selection, candidate))| bcode_tui::QuickConnectionChoice {
+                    label: format!("{} — {}{}", candidate.provider_name, selection.model_id,
+                        if choices[..index].iter().any(|(_, previous)| previous == candidate) { "" } else { " (recommended)" }),
                     detail: match &candidate.source {
                         bcode_provider_auth::startup::StartupCredentialSource::Environment {
                             name,
-                        } => format!("Found {name}. API usage may incur provider charges. The variable must remain available in each launch environment; no key is copied."),
+                        } => format!("Found {name}; not authenticated. API usage may incur provider charges. The variable must remain available in each launch environment; no key is copied."),
                         bcode_provider_auth::startup::StartupCredentialSource::Import {
                             ..
                         } => unreachable!(),
@@ -312,19 +367,18 @@ fn candidate_selections(
 )> {
     candidates
         .iter()
-        .filter_map(|candidate| {
+        .flat_map(|candidate| {
             if candidate.availability
                 != bcode_provider_auth::startup::StartupCredentialAvailability::Available
                 || !candidate.completes_method
+                || !matches!(
+                    candidate.source,
+                    bcode_provider_auth::startup::StartupCredentialSource::Environment { .. }
+                )
             {
-                return None;
+                return Vec::new();
             }
-            let bcode_provider_auth::startup::StartupCredentialSource::Environment { .. } =
-                &candidate.source
-            else {
-                return None;
-            };
-            recommendation(
+            model_choices(
                 host,
                 config,
                 &candidate.provider_id,
@@ -332,9 +386,62 @@ fn candidate_selections(
                 None,
                 Some(candidate),
             )
+            .into_iter()
             .map(|selection| (selection, candidate.clone()))
+            .collect()
         })
         .collect()
+}
+
+fn model_choices(
+    host: &bcode_plugin::PluginHost,
+    config: &BcodeConfig,
+    provider_id: &str,
+    method_id: &str,
+    profile: Option<String>,
+    candidate: Option<&StartupAuthCandidate>,
+) -> Vec<bcode_config::startup::StartupSelection> {
+    let Some(provider) = host.auth_provider(provider_id) else {
+        return Vec::new();
+    };
+    let response: Result<bcode_model::StartupModelChoicesResponse, _> = host.invoke_service_json(
+        &provider.plugin_id,
+        bcode_model::MODEL_PROVIDER_INTERFACE_ID,
+        bcode_model::OP_STARTUP_MODEL_CHOICES,
+        &bcode_model::StartupRecommendationRequest {
+            auth_provider_id: provider_id.to_owned(),
+            method_id: method_id.to_owned(),
+        },
+    );
+    let mut selections: Vec<_> = response
+        .ok()
+        .into_iter()
+        .flat_map(|response| response.choices)
+        .filter_map(|recommended| {
+            recommended_selection(
+                config,
+                &provider.plugin_id,
+                provider_id,
+                method_id,
+                profile.clone(),
+                candidate,
+                bcode_model::StartupRecommendationResponse {
+                    recommendation: Some(recommended),
+                },
+            )
+        })
+        .collect();
+    if selections.is_empty() {
+        selections.extend(recommendation(
+            host,
+            config,
+            provider_id,
+            method_id,
+            profile,
+            candidate,
+        ));
+    }
+    selections
 }
 
 fn recommendation(
@@ -403,6 +510,17 @@ fn recommended_selection(
         environment_variable: environment,
         context: config.active_context.clone(),
     })
+}
+
+fn has_explicit_selection(config: &BcodeConfig) -> bool {
+    let selection = config.resolved_model_selection();
+    !config.startup_selection_applied
+        && (selection.provider_plugin_id.is_some()
+            || selection.model_id.is_some()
+            || selection.model_profile.is_some()
+            || selection.auth_profile.is_some()
+            || selection.auth_pool.is_some()
+            || !selection.settings.is_empty())
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -832,6 +950,163 @@ mod tests {
                 }
             )
             .is_none()
+        );
+    }
+
+    #[test]
+    fn fake_xai_detection_offers_provider_owned_offline_choice() {
+        let mut choices = choices();
+        let candidate = &mut choices[0].1;
+        candidate.provider_id = "xai".to_owned();
+        candidate.provider_name = "xAI".to_owned();
+        candidate.source = bcode_provider_auth::startup::StartupCredentialSource::Environment {
+            name: "XAI_API_KEY".to_owned(),
+        };
+        let recommended = bcode_model::StartupRecommendation {
+            provider_plugin_id: "fake.provider".to_owned(),
+            model_id: "fixture-catalog-model".to_owned(),
+            settings: std::collections::BTreeMap::new(),
+        };
+        let selection = super::recommended_selection(
+            &bcode_config::BcodeConfig::default(),
+            "fake.provider",
+            "xai",
+            "key",
+            None,
+            Some(candidate),
+            bcode_model::StartupRecommendationResponse {
+                recommendation: Some(recommended),
+            },
+        )
+        .unwrap();
+        let input = super::quick_input(
+            true,
+            Err("Choose a model to get started."),
+            std::slice::from_ref(candidate),
+            &[(selection.clone(), candidate.clone())],
+        );
+        assert_eq!(input.choices.len(), 1);
+        assert!(input.choices[0].detail.contains("XAI_API_KEY"));
+        assert!(input.choices[0].detail.contains("not authenticated"));
+        assert!(input.choices[0].label.ends_with(" (recommended)"));
+        let mut alternative = selection.clone();
+        alternative.model_id = "fixture-alternative".to_owned();
+        let alternatives = super::quick_input(
+            true,
+            Ok(()),
+            std::slice::from_ref(candidate),
+            &[
+                (selection.clone(), candidate.clone()),
+                (alternative, candidate.clone()),
+            ],
+        );
+        assert!(!alternatives.choices[1].label.contains("recommended"));
+        assert_eq!(
+            selection.environment_variable.as_deref(),
+            Some("XAI_API_KEY")
+        );
+        assert_eq!(selection.environment_auth_provider.as_deref(), Some("xai"));
+        assert_eq!(selection.auth_profile, None);
+    }
+
+    #[test]
+    fn routing_preserves_explicit_settings_and_model_profiles() {
+        let mut config = bcode_config::BcodeConfig::default();
+        config.model.settings.insert(
+            "base_url".to_owned(),
+            "https://explicit.example/v1".to_owned(),
+        );
+        assert!(super::has_explicit_selection(&config));
+        assert_eq!(
+            super::startup_route(false, super::has_explicit_selection(&config), true),
+            super::StartupRoute::Recover {
+                allow_choices: false
+            }
+        );
+        config.model.settings.clear();
+        config.model.profile = Some("explicit-profile".to_owned());
+        assert!(super::has_explicit_selection(&config));
+        config.startup_selection_applied = true;
+        assert!(!super::has_explicit_selection(&config));
+    }
+
+    #[test]
+    fn accepted_selection_never_changes_declarative_config() {
+        let directory = tempfile::tempdir().unwrap();
+        let config_path = directory.path().join("bcode.toml");
+        let original = "# user-owned configuration\n";
+        std::fs::write(&config_path, original).unwrap();
+        let state_path = directory.path().join("state/startup.toml");
+        let choices = choices();
+        super::consent_selection(
+            &bcode_tui::QuickOnboardingOutcome::Selected(0),
+            super::startup_route(false, false, true),
+            &choices,
+            |selection| {
+                bcode_config::startup::save_to(&state_path, selection)
+                    .map(|_| ())
+                    .map_err(|_| "save failed")
+            },
+        )
+        .unwrap();
+        assert_eq!(std::fs::read_to_string(config_path).unwrap(), original);
+        assert_eq!(
+            bcode_config::startup::load_from(&state_path)
+                .unwrap()
+                .unwrap(),
+            choices[0].0
+        );
+    }
+
+    #[test]
+    fn enrolled_account_offers_alternatives_and_saves_only_confirmed_model() {
+        let mut recommended = choices().remove(0).0;
+        recommended.auth_profile = Some("enrolled-fixture".to_owned());
+        recommended.environment_variable = None;
+        recommended.environment_auth_provider = None;
+        recommended.environment_method = None;
+        recommended.environment_credential = None;
+        let mut alternate = recommended.clone();
+        alternate.model_id = "alternate-fixture".to_owned();
+        let selections = vec![recommended, alternate.clone()];
+        let input = super::enrolled_input("Fixture", &selections);
+        assert_eq!(input.choices.len(), 2);
+        assert!(input.choices[0].label.ends_with(" (recommended)"));
+        assert!(input.choices[1].label.contains("alternate-fixture"));
+        for outcome in [
+            bcode_tui::QuickOnboardingOutcome::Close,
+            bcode_tui::QuickOnboardingOutcome::Advanced,
+        ] {
+            assert!(
+                !super::consent_enrolled_selection(&outcome, &selections, |_| panic!(
+                    "unconfirmed model must not save"
+                ))
+                .unwrap()
+            );
+        }
+        assert!(
+            super::consent_enrolled_selection(
+                &bcode_tui::QuickOnboardingOutcome::Selected(2),
+                &selections,
+                |_| panic!("invalid choice must not save")
+            )
+            .is_err()
+        );
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("startup.toml");
+        assert!(
+            super::consent_enrolled_selection(
+                &bcode_tui::QuickOnboardingOutcome::Selected(1),
+                &selections,
+                |selection| bcode_config::startup::save_to(&path, selection)
+                    .map(|_| ())
+                    .map_err(|_| "save failed")
+            )
+            .unwrap()
+        );
+        assert_eq!(
+            bcode_config::startup::load_from(&path).unwrap(),
+            Some(alternate)
         );
     }
 

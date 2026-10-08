@@ -1,0 +1,840 @@
+# Verified against public xAI model Markdown pages on 2026-10-08.
+# No wildcard aliases: future discovered IDs must retain unknown metadata.
+provider_id = "xai"
+display_name = "xAI"
+kind = "open_ai_compatible"
+website_url = "https://x.ai"
+default_model_id = "grok-4.7"
+fallback_model_ids = ["grok-4.7", "grok-4.6", "grok-4.5", "grok-4.3", "grok-4.20-0309-reasoning", "grok-4.20-0309-non-reasoning", "grok-4.20-multi-agent-0309", "grok-build-0.1"]
+
+[models."grok-4.7"]
+model_id = "grok-4.7"
+display_name = "Grok 4.7"
+aliases = []
+status = "stable"
+bcode_support = "supported"
+family = "grok"
+context_window = 500000
+documentation_url = "https://docs.x.ai/developers/models/grok-4.7"
+notes = "Maximum output tokens are not documented. Pricing threshold is inclusive at 200,000 prompt tokens; rate limits and regional availability are account-dependent. See authoritative documentation."
+
+[models."grok-4.7".capabilities]
+text_input = true
+image_input = true
+text_output = true
+tool_use = true
+structured_outputs = true
+reasoning = true
+prompt_cache = true
+
+[models."grok-4.7".reasoning]
+effort_values = ["low", "medium", "high", "xhigh"]
+default_effort = "high"
+
+[models."grok-4.7".pricing]
+currency = "USD"
+unit = "per_million_tokens"
+input_micros = 2000000
+cached_input_micros = 500000
+output_micros = 6000000
+context_threshold_tokens = 200000
+
+[[models."grok-4.7".pricing.rules]]
+bucket = "input"
+max_request_input_tokens = 199999
+price_micros = 2000000
+
+[[models."grok-4.7".pricing.rules]]
+bucket = "input"
+min_request_input_tokens = 200000
+price_micros = 4000000
+
+[[models."grok-4.7".pricing.rules]]
+bucket = "cache_read_input"
+max_request_input_tokens = 199999
+price_micros = 500000
+
+[[models."grok-4.7".pricing.rules]]
+bucket = "cache_read_input"
+min_request_input_tokens = 200000
+price_micros = 1000000
+
+[[models."grok-4.7".pricing.rules]]
+bucket = "output"
+max_request_input_tokens = 199999
+price_micros = 6000000
+
+[[models."grok-4.7".pricing.rules]]
+bucket = "output"
+min_request_input_tokens = 200000
+price_micros = 12000000
+
+[[models."grok-4.7".deployments]]
+provider = "xai"
+auth_mode = "api_key"
+api_surface = "chat_completions"
+integration = "bcode"
+
+[[models."grok-4.7".deployments]]
+provider = "xai"
+auth_mode = "api_key"
+api_surface = "responses_api"
+integration = "bcode"
+
+[models."grok-4.7".source]
+pricing = "https://docs.x.ai/developers/models/grok-4.7.md"
+metadata = "https://docs.x.ai/developers/models/grok-4.7.md"
+last_verified_at = "2026-10-08T00:00:00Z"
+
+[models."grok-4.6"]
+model_id = "grok-4.6"
+display_name = "Grok 4.6"
+aliases = []
+status = "stable"
+bcode_support = "supported"
+family = "grok"
+context_window = 500000
+documentation_url = "https://docs.x.ai/developers/models/grok-4.6"
+notes = "Maximum output tokens are not documented. Pricing threshold is inclusive at 200,000 prompt tokens; rate limits and regional availability are account-dependent. See authoritative documentation."
+
+[models."grok-4.6".capabilities]
+text_input = true
+image_input = true
+text_output = true
+tool_use = true
+structured_outputs = true
+reasoning = true
+prompt_cache = true
+
+[models."grok-4.6".reasoning]
+effort_values = ["low", "medium", "high", "xhigh"]
+default_effort = "high"
+
+[models."grok-4.6".pricing]
+currency = "USD"
+unit = "per_million_tokens"
+input_micros = 2000000
+cached_input_micros = 500000
+output_micros = 6000000
+context_threshold_tokens = 200000
+
+[[models."grok-4.6".pricing.rules]]
+bucket = "input"
+max_request_input_tokens = 199999
+price_micros = 2000000
+
+[[models."grok-4.6".pricing.rules]]
+bucket = "input"
+min_request_input_tokens = 200000
+price_micros = 4000000
+
+[[models."grok-4.6".pricing.rules]]
+bucket = "cache_read_input"
+max_request_input_tokens = 199999
+price_micros = 500000
+
+[[models."grok-4.6".pricing.rules]]
+bucket = "cache_read_input"
+min_request_input_tokens = 200000
+price_micros = 1000000
+
+[[models."grok-4.6".pricing.rules]]
+bucket = "output"
+max_request_input_tokens = 199999
+price_micros = 6000000
+
+[[models."grok-4.6".pricing.rules]]
+bucket = "output"
+min_request_input_tokens = 200000
+price_micros = 12000000
+
+[[models."grok-4.6".deployments]]
+provider = "xai"
+auth_mode = "api_key"
+api_surface = "chat_completions"
+integration = "bcode"
+
+[[models."grok-4.6".deployments]]
+provider = "xai"
+auth_mode = "api_key"
+api_surface = "responses_api"
+integration = "bcode"
+
+[models."grok-4.6".source]
+pricing = "https://docs.x.ai/developers/models/grok-4.6.md"
+metadata = "https://docs.x.ai/developers/models/grok-4.6.md"
+last_verified_at = "2026-10-08T00:00:00Z"
+
+[models."grok-4.5"]
+model_id = "grok-4.5"
+display_name = "Grok 4.5"
+aliases = ["grok-4.5-latest", "grok-build-latest"]
+status = "stable"
+bcode_support = "supported"
+family = "grok"
+context_window = 500000
+documentation_url = "https://docs.x.ai/developers/models/grok-4.5"
+notes = "Maximum output tokens are not documented. Pricing threshold is inclusive at 200,000 prompt tokens; rate limits and regional availability are account-dependent. See authoritative documentation."
+
+[models."grok-4.5".capabilities]
+text_input = true
+image_input = true
+text_output = true
+tool_use = true
+structured_outputs = true
+reasoning = true
+prompt_cache = true
+
+[models."grok-4.5".reasoning]
+effort_values = ["low", "medium", "high", "xhigh"]
+default_effort = "high"
+
+[models."grok-4.5".pricing]
+currency = "USD"
+unit = "per_million_tokens"
+input_micros = 2000000
+cached_input_micros = 300000
+output_micros = 6000000
+context_threshold_tokens = 200000
+
+[[models."grok-4.5".pricing.rules]]
+bucket = "input"
+max_request_input_tokens = 199999
+price_micros = 2000000
+
+[[models."grok-4.5".pricing.rules]]
+bucket = "input"
+min_request_input_tokens = 200000
+price_micros = 4000000
+
+[[models."grok-4.5".pricing.rules]]
+bucket = "cache_read_input"
+max_request_input_tokens = 199999
+price_micros = 300000
+
+[[models."grok-4.5".pricing.rules]]
+bucket = "cache_read_input"
+min_request_input_tokens = 200000
+price_micros = 600000
+
+[[models."grok-4.5".pricing.rules]]
+bucket = "output"
+max_request_input_tokens = 199999
+price_micros = 6000000
+
+[[models."grok-4.5".pricing.rules]]
+bucket = "output"
+min_request_input_tokens = 200000
+price_micros = 12000000
+
+[[models."grok-4.5".deployments]]
+provider = "xai"
+auth_mode = "api_key"
+api_surface = "chat_completions"
+integration = "bcode"
+
+[[models."grok-4.5".deployments]]
+provider = "xai"
+auth_mode = "api_key"
+api_surface = "responses_api"
+integration = "bcode"
+
+[models."grok-4.5".source]
+pricing = "https://docs.x.ai/developers/models/grok-4.5.md"
+metadata = "https://docs.x.ai/developers/models/grok-4.5.md"
+last_verified_at = "2026-10-08T00:00:00Z"
+
+[models."grok-4.3"]
+model_id = "grok-4.3"
+display_name = "Grok 4.3"
+aliases = ["grok-4.3-latest"]
+status = "stable"
+bcode_support = "supported"
+family = "grok"
+context_window = 1000000
+documentation_url = "https://docs.x.ai/developers/models/grok-4.3"
+notes = "Maximum output tokens are not documented. Pricing threshold is inclusive at 200,000 prompt tokens; rate limits and regional availability are account-dependent. See authoritative documentation."
+
+[models."grok-4.3".capabilities]
+text_input = true
+image_input = true
+text_output = true
+tool_use = true
+structured_outputs = true
+reasoning = true
+prompt_cache = true
+
+[models."grok-4.3".reasoning]
+effort_values = ["none", "low", "medium", "high", "xhigh"]
+default_effort = "low"
+
+[models."grok-4.3".pricing]
+currency = "USD"
+unit = "per_million_tokens"
+input_micros = 1250000
+cached_input_micros = 200000
+output_micros = 2500000
+context_threshold_tokens = 200000
+
+[[models."grok-4.3".pricing.rules]]
+bucket = "input"
+max_request_input_tokens = 199999
+price_micros = 1250000
+
+[[models."grok-4.3".pricing.rules]]
+bucket = "input"
+invocation_class = "batch"
+max_request_input_tokens = 199999
+price_micros = 1000000
+
+[[models."grok-4.3".pricing.rules]]
+bucket = "input"
+min_request_input_tokens = 200000
+price_micros = 2500000
+
+[[models."grok-4.3".pricing.rules]]
+bucket = "input"
+invocation_class = "batch"
+min_request_input_tokens = 200000
+price_micros = 2000000
+
+[[models."grok-4.3".pricing.rules]]
+bucket = "cache_read_input"
+max_request_input_tokens = 199999
+price_micros = 200000
+
+[[models."grok-4.3".pricing.rules]]
+bucket = "cache_read_input"
+invocation_class = "batch"
+max_request_input_tokens = 199999
+price_micros = 160000
+
+[[models."grok-4.3".pricing.rules]]
+bucket = "cache_read_input"
+min_request_input_tokens = 200000
+price_micros = 400000
+
+[[models."grok-4.3".pricing.rules]]
+bucket = "cache_read_input"
+invocation_class = "batch"
+min_request_input_tokens = 200000
+price_micros = 320000
+
+[[models."grok-4.3".pricing.rules]]
+bucket = "output"
+max_request_input_tokens = 199999
+price_micros = 2500000
+
+[[models."grok-4.3".pricing.rules]]
+bucket = "output"
+invocation_class = "batch"
+max_request_input_tokens = 199999
+price_micros = 2000000
+
+[[models."grok-4.3".pricing.rules]]
+bucket = "output"
+min_request_input_tokens = 200000
+price_micros = 5000000
+
+[[models."grok-4.3".pricing.rules]]
+bucket = "output"
+invocation_class = "batch"
+min_request_input_tokens = 200000
+price_micros = 4000000
+
+[[models."grok-4.3".deployments]]
+provider = "xai"
+auth_mode = "api_key"
+api_surface = "chat_completions"
+integration = "bcode"
+
+[[models."grok-4.3".deployments]]
+provider = "xai"
+auth_mode = "api_key"
+api_surface = "responses_api"
+integration = "bcode"
+
+[models."grok-4.3".source]
+pricing = "https://docs.x.ai/developers/models/grok-4.3.md"
+metadata = "https://docs.x.ai/developers/models/grok-4.3.md"
+last_verified_at = "2026-10-08T00:00:00Z"
+
+[models."grok-4.20-0309-reasoning"]
+model_id = "grok-4.20-0309-reasoning"
+display_name = "Grok 4.20"
+aliases = ["grok-4.20-reasoning-latest", "grok-4.20", "grok-4.20-reasoning", "grok-4.20-0309", "grok-4.20-beta-0309-reasoning", "grok-4.20-beta", "grok-4.20-beta-0309", "grok-4.20-beta-latest", "grok-4.20-beta-latest-reasoning", "grok-4.20-beta-reasoning", "grok-4.20-experimental-beta-0304-reasoning", "grok-4.20-experimental-beta-0304", "grok-4.20-experimental-beta-reasoning-latest", "grok-4.20-experimental-beta-latest", "grok-4.20-reasoning-gv2"]
+status = "stable"
+bcode_support = "supported"
+family = "grok"
+context_window = 1000000
+documentation_url = "https://docs.x.ai/developers/models/grok-4.20-0309-reasoning"
+notes = "Maximum output tokens are not documented. Pricing threshold is inclusive at 200,000 prompt tokens; rate limits and regional availability are account-dependent. See authoritative documentation."
+
+[models."grok-4.20-0309-reasoning".capabilities]
+text_input = true
+image_input = true
+text_output = true
+tool_use = true
+structured_outputs = true
+reasoning = true
+prompt_cache = true
+
+[models."grok-4.20-0309-reasoning".pricing]
+currency = "USD"
+unit = "per_million_tokens"
+input_micros = 1250000
+cached_input_micros = 200000
+output_micros = 2500000
+context_threshold_tokens = 200000
+
+[[models."grok-4.20-0309-reasoning".pricing.rules]]
+bucket = "input"
+max_request_input_tokens = 199999
+price_micros = 1250000
+
+[[models."grok-4.20-0309-reasoning".pricing.rules]]
+bucket = "input"
+invocation_class = "batch"
+max_request_input_tokens = 199999
+price_micros = 1000000
+
+[[models."grok-4.20-0309-reasoning".pricing.rules]]
+bucket = "input"
+min_request_input_tokens = 200000
+price_micros = 2500000
+
+[[models."grok-4.20-0309-reasoning".pricing.rules]]
+bucket = "input"
+invocation_class = "batch"
+min_request_input_tokens = 200000
+price_micros = 2000000
+
+[[models."grok-4.20-0309-reasoning".pricing.rules]]
+bucket = "cache_read_input"
+max_request_input_tokens = 199999
+price_micros = 200000
+
+[[models."grok-4.20-0309-reasoning".pricing.rules]]
+bucket = "cache_read_input"
+invocation_class = "batch"
+max_request_input_tokens = 199999
+price_micros = 160000
+
+[[models."grok-4.20-0309-reasoning".pricing.rules]]
+bucket = "cache_read_input"
+min_request_input_tokens = 200000
+price_micros = 400000
+
+[[models."grok-4.20-0309-reasoning".pricing.rules]]
+bucket = "cache_read_input"
+invocation_class = "batch"
+min_request_input_tokens = 200000
+price_micros = 320000
+
+[[models."grok-4.20-0309-reasoning".pricing.rules]]
+bucket = "output"
+max_request_input_tokens = 199999
+price_micros = 2500000
+
+[[models."grok-4.20-0309-reasoning".pricing.rules]]
+bucket = "output"
+invocation_class = "batch"
+max_request_input_tokens = 199999
+price_micros = 2000000
+
+[[models."grok-4.20-0309-reasoning".pricing.rules]]
+bucket = "output"
+min_request_input_tokens = 200000
+price_micros = 5000000
+
+[[models."grok-4.20-0309-reasoning".pricing.rules]]
+bucket = "output"
+invocation_class = "batch"
+min_request_input_tokens = 200000
+price_micros = 4000000
+
+[[models."grok-4.20-0309-reasoning".deployments]]
+provider = "xai"
+auth_mode = "api_key"
+api_surface = "chat_completions"
+integration = "bcode"
+
+[[models."grok-4.20-0309-reasoning".deployments]]
+provider = "xai"
+auth_mode = "api_key"
+api_surface = "responses_api"
+integration = "bcode"
+
+[models."grok-4.20-0309-reasoning".source]
+pricing = "https://docs.x.ai/developers/models/grok-4.20-0309-reasoning.md"
+metadata = "https://docs.x.ai/developers/models/grok-4.20-0309-reasoning.md"
+last_verified_at = "2026-10-08T00:00:00Z"
+
+[models."grok-4.20-0309-non-reasoning"]
+model_id = "grok-4.20-0309-non-reasoning"
+display_name = "Grok 4.20 (Non-Reasoning)"
+aliases = ["grok-4.20-non-reasoning", "grok-4.20-non-reasoning-latest", "grok-4.20-beta-non-reasoning", "grok-4.20-beta-latest-non-reasoning", "grok-4.20-experimental-beta-0304-non-reasoning", "grok-4.20-experimental-beta-non-reasoning-latest", "grok-4.20-beta-0309-non-reasoning", "grok-4.20-non-reasoning-gv2"]
+status = "stable"
+bcode_support = "supported"
+family = "grok"
+context_window = 1000000
+documentation_url = "https://docs.x.ai/developers/models/grok-4.20-0309-non-reasoning"
+notes = "Maximum output tokens are not documented. Pricing threshold is inclusive at 200,000 prompt tokens; rate limits and regional availability are account-dependent. See authoritative documentation."
+
+[models."grok-4.20-0309-non-reasoning".capabilities]
+text_input = true
+image_input = true
+text_output = true
+tool_use = true
+structured_outputs = true
+reasoning = false
+prompt_cache = true
+
+[models."grok-4.20-0309-non-reasoning".pricing]
+currency = "USD"
+unit = "per_million_tokens"
+input_micros = 1250000
+cached_input_micros = 200000
+output_micros = 2500000
+context_threshold_tokens = 200000
+
+[[models."grok-4.20-0309-non-reasoning".pricing.rules]]
+bucket = "input"
+max_request_input_tokens = 199999
+price_micros = 1250000
+
+[[models."grok-4.20-0309-non-reasoning".pricing.rules]]
+bucket = "input"
+invocation_class = "batch"
+max_request_input_tokens = 199999
+price_micros = 1000000
+
+[[models."grok-4.20-0309-non-reasoning".pricing.rules]]
+bucket = "input"
+min_request_input_tokens = 200000
+price_micros = 2500000
+
+[[models."grok-4.20-0309-non-reasoning".pricing.rules]]
+bucket = "input"
+invocation_class = "batch"
+min_request_input_tokens = 200000
+price_micros = 2000000
+
+[[models."grok-4.20-0309-non-reasoning".pricing.rules]]
+bucket = "cache_read_input"
+max_request_input_tokens = 199999
+price_micros = 200000
+
+[[models."grok-4.20-0309-non-reasoning".pricing.rules]]
+bucket = "cache_read_input"
+invocation_class = "batch"
+max_request_input_tokens = 199999
+price_micros = 160000
+
+[[models."grok-4.20-0309-non-reasoning".pricing.rules]]
+bucket = "cache_read_input"
+min_request_input_tokens = 200000
+price_micros = 400000
+
+[[models."grok-4.20-0309-non-reasoning".pricing.rules]]
+bucket = "cache_read_input"
+invocation_class = "batch"
+min_request_input_tokens = 200000
+price_micros = 320000
+
+[[models."grok-4.20-0309-non-reasoning".pricing.rules]]
+bucket = "output"
+max_request_input_tokens = 199999
+price_micros = 2500000
+
+[[models."grok-4.20-0309-non-reasoning".pricing.rules]]
+bucket = "output"
+invocation_class = "batch"
+max_request_input_tokens = 199999
+price_micros = 2000000
+
+[[models."grok-4.20-0309-non-reasoning".pricing.rules]]
+bucket = "output"
+min_request_input_tokens = 200000
+price_micros = 5000000
+
+[[models."grok-4.20-0309-non-reasoning".pricing.rules]]
+bucket = "output"
+invocation_class = "batch"
+min_request_input_tokens = 200000
+price_micros = 4000000
+
+[[models."grok-4.20-0309-non-reasoning".deployments]]
+provider = "xai"
+auth_mode = "api_key"
+api_surface = "chat_completions"
+integration = "bcode"
+
+[[models."grok-4.20-0309-non-reasoning".deployments]]
+provider = "xai"
+auth_mode = "api_key"
+api_surface = "responses_api"
+integration = "bcode"
+
+[models."grok-4.20-0309-non-reasoning".source]
+pricing = "https://docs.x.ai/developers/models/grok-4.20-0309-non-reasoning.md"
+metadata = "https://docs.x.ai/developers/models/grok-4.20-0309-non-reasoning.md"
+last_verified_at = "2026-10-08T00:00:00Z"
+
+[models."grok-4.20-multi-agent-0309"]
+model_id = "grok-4.20-multi-agent-0309"
+display_name = "Grok 4.20 Multi-Agent Beta"
+aliases = ["grok-4.20-multi-agent", "grok-4.20-multi-agent-latest", "grok-4.20-multi-agent-beta-latest", "grok-4.20-multi-agent-experimental-beta-0304", "grok-4.20-multi-agent-experimental-beta-latest", "grok-4.20-multi-agent-beta-0309"]
+status = "preview"
+bcode_support = "unsupported"
+family = "grok"
+context_window = 1000000
+documentation_url = "https://docs.x.ai/developers/models/grok-4.20-multi-agent-0309"
+notes = "Research-only variant: no client-side function/custom tools, no Chat Completions, and no max_tokens parameter. Bcode coding tools are unsupported. Use Responses with provider built-in or remote MCP tools only. Maximum output tokens are not documented. Pricing threshold is inclusive at 200,000 prompt tokens."
+
+[models."grok-4.20-multi-agent-0309".capabilities]
+text_input = true
+image_input = true
+text_output = true
+tool_use = false
+structured_outputs = true
+reasoning = true
+prompt_cache = true
+
+[models."grok-4.20-multi-agent-0309".pricing]
+currency = "USD"
+unit = "per_million_tokens"
+input_micros = 1250000
+cached_input_micros = 200000
+output_micros = 2500000
+context_threshold_tokens = 200000
+
+[[models."grok-4.20-multi-agent-0309".pricing.rules]]
+bucket = "input"
+max_request_input_tokens = 199999
+price_micros = 1250000
+
+[[models."grok-4.20-multi-agent-0309".pricing.rules]]
+bucket = "input"
+invocation_class = "batch"
+max_request_input_tokens = 199999
+price_micros = 1000000
+
+[[models."grok-4.20-multi-agent-0309".pricing.rules]]
+bucket = "input"
+min_request_input_tokens = 200000
+price_micros = 2500000
+
+[[models."grok-4.20-multi-agent-0309".pricing.rules]]
+bucket = "input"
+invocation_class = "batch"
+min_request_input_tokens = 200000
+price_micros = 2000000
+
+[[models."grok-4.20-multi-agent-0309".pricing.rules]]
+bucket = "cache_read_input"
+max_request_input_tokens = 199999
+price_micros = 200000
+
+[[models."grok-4.20-multi-agent-0309".pricing.rules]]
+bucket = "cache_read_input"
+invocation_class = "batch"
+max_request_input_tokens = 199999
+price_micros = 160000
+
+[[models."grok-4.20-multi-agent-0309".pricing.rules]]
+bucket = "cache_read_input"
+min_request_input_tokens = 200000
+price_micros = 400000
+
+[[models."grok-4.20-multi-agent-0309".pricing.rules]]
+bucket = "cache_read_input"
+invocation_class = "batch"
+min_request_input_tokens = 200000
+price_micros = 320000
+
+[[models."grok-4.20-multi-agent-0309".pricing.rules]]
+bucket = "output"
+max_request_input_tokens = 199999
+price_micros = 2500000
+
+[[models."grok-4.20-multi-agent-0309".pricing.rules]]
+bucket = "output"
+invocation_class = "batch"
+max_request_input_tokens = 199999
+price_micros = 2000000
+
+[[models."grok-4.20-multi-agent-0309".pricing.rules]]
+bucket = "output"
+min_request_input_tokens = 200000
+price_micros = 5000000
+
+[[models."grok-4.20-multi-agent-0309".pricing.rules]]
+bucket = "output"
+invocation_class = "batch"
+min_request_input_tokens = 200000
+price_micros = 4000000
+
+[models."grok-4.20-multi-agent-0309".source]
+pricing = "https://docs.x.ai/developers/models/grok-4.20-multi-agent-0309.md"
+metadata = "https://docs.x.ai/developers/model-capabilities/text/multi-agent.md"
+last_verified_at = "2026-10-08T00:00:00Z"
+
+[models."grok-build-0.1"]
+model_id = "grok-build-0.1"
+display_name = "Grok Build 0.1"
+aliases = ["grok-code-fast-1", "grok-code-fast", "grok-code-fast-1-0825"]
+status = "stable"
+bcode_support = "supported"
+family = "grok"
+context_window = 256000
+documentation_url = "https://docs.x.ai/developers/models/grok-build-0.1"
+notes = "Maximum output tokens are not documented. Pricing threshold is inclusive at 200,000 prompt tokens; rate limits and regional availability are account-dependent. See authoritative documentation."
+
+[models."grok-build-0.1".capabilities]
+text_input = true
+image_input = true
+text_output = true
+tool_use = true
+structured_outputs = true
+reasoning = true
+prompt_cache = true
+
+[models."grok-build-0.1".pricing]
+currency = "USD"
+unit = "per_million_tokens"
+input_micros = 1000000
+cached_input_micros = 200000
+output_micros = 2000000
+context_threshold_tokens = 200000
+
+[[models."grok-build-0.1".pricing.rules]]
+bucket = "input"
+max_request_input_tokens = 199999
+price_micros = 1000000
+
+[[models."grok-build-0.1".pricing.rules]]
+bucket = "input"
+min_request_input_tokens = 200000
+price_micros = 2000000
+
+[[models."grok-build-0.1".pricing.rules]]
+bucket = "cache_read_input"
+max_request_input_tokens = 199999
+price_micros = 200000
+
+[[models."grok-build-0.1".pricing.rules]]
+bucket = "cache_read_input"
+min_request_input_tokens = 200000
+price_micros = 400000
+
+[[models."grok-build-0.1".pricing.rules]]
+bucket = "output"
+max_request_input_tokens = 199999
+price_micros = 2000000
+
+[[models."grok-build-0.1".pricing.rules]]
+bucket = "output"
+min_request_input_tokens = 200000
+price_micros = 4000000
+
+[[models."grok-build-0.1".deployments]]
+provider = "xai"
+auth_mode = "api_key"
+api_surface = "chat_completions"
+integration = "bcode"
+
+[[models."grok-build-0.1".deployments]]
+provider = "xai"
+auth_mode = "api_key"
+api_surface = "responses_api"
+integration = "bcode"
+
+[models."grok-build-0.1".source]
+pricing = "https://docs.x.ai/developers/models/grok-build-0.1.md"
+metadata = "https://docs.x.ai/developers/models/grok-build-0.1.md"
+last_verified_at = "2026-10-08T00:00:00Z"
+
+# Legacy concrete IDs remain selectable; current availability and prices are unverified.
+[models."grok-4"]
+model_id = "grok-4"
+display_name = "Grok 4 (legacy)"
+aliases = ["grok-4-latest"]
+status = "unknown"
+bcode_support = "supported"
+family = "grok"
+context_window = 256000
+documentation_url = "https://x.ai/news/grok-4"
+notes = "Historical 256k context documented by xAI. Current availability, output cap and pricing are not verified; current model page is unavailable. Legacy chat-completions documentation still demonstrates this ID."
+
+[models."grok-4".capabilities]
+text_input = true
+image_input = true
+text_output = true
+reasoning = true
+
+[[models."grok-4".deployments]]
+provider = "xai"
+auth_mode = "api_key"
+api_surface = "chat_completions"
+integration = "bcode"
+
+[models."grok-4".source]
+metadata = "https://docs.x.ai/developers/model-capabilities/legacy/chat-completions.md"
+last_verified_at = "2026-10-08T00:00:00Z"
+
+[models."grok-3"]
+model_id = "grok-3"
+display_name = "Grok 3 (legacy)"
+status = "unknown"
+bcode_support = "unknown"
+family = "grok"
+documentation_url = "https://docs.x.ai/developers/rest-api-reference/inference/legacy"
+notes = "Concrete ID named in current xAI legacy reference; April 2025 release notes announced API availability. Current availability, support route, context/output limits and prices are unverified. No inferred Grok family metadata."
+
+[models."grok-3".capabilities]
+text_input = true
+text_output = true
+
+[models."grok-3".source]
+metadata = "https://docs.x.ai/developers/rest-api-reference/inference/legacy.md"
+last_verified_at = "2026-10-08T00:00:00Z"
+
+[models."grok-4-fast-reasoning"]
+model_id = "grok-4-fast-reasoning"
+display_name = "Grok 4 Fast Reasoning (legacy)"
+status = "unknown"
+bcode_support = "unknown"
+family = "grok"
+context_window = 2000000
+documentation_url = "https://x.ai/news/grok-4-fast"
+notes = "Exact ID and historical 2M context verified in xAI's September 2025 announcement. Current availability, pricing, output cap and Bcode support route are not verified; historical launch pricing is not assumed current."
+
+[models."grok-4-fast-reasoning".capabilities]
+text_input = true
+text_output = true
+reasoning = true
+
+[models."grok-4-fast-reasoning".source]
+metadata = "https://x.ai/news/grok-4-fast"
+last_verified_at = "2026-10-08T00:00:00Z"
+
+[models."grok-4-fast-non-reasoning"]
+model_id = "grok-4-fast-non-reasoning"
+display_name = "Grok 4 Fast Non-Reasoning (legacy)"
+status = "unknown"
+bcode_support = "unknown"
+family = "grok"
+context_window = 2000000
+documentation_url = "https://x.ai/news/grok-4-fast"
+notes = "Exact ID and historical 2M context verified in xAI's September 2025 announcement. Current availability, pricing, output cap and Bcode support route are not verified; historical launch pricing is not assumed current."
+
+[models."grok-4-fast-non-reasoning".capabilities]
+text_input = true
+text_output = true
+reasoning = false
+
+[models."grok-4-fast-non-reasoning".source]
+metadata = "https://x.ai/news/grok-4-fast"
+last_verified_at = "2026-10-08T00:00:00Z"
+

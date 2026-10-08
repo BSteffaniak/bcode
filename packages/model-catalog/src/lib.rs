@@ -30,6 +30,10 @@ const EMBEDDED_PROVIDER_CATALOGS: &[(&str, &str)] = &[
         include_str!("../../../catalog/models/providers/bedrock.toml"),
     ),
     (
+        "xai.toml",
+        include_str!("../../../catalog/models/providers/xai.toml"),
+    ),
+    (
         "openai.toml",
         include_str!("../../../catalog/models/providers/openai.toml"),
     ),
@@ -1716,6 +1720,40 @@ pub fn load_embedded_catalog() -> Result<CatalogDocument> {
     stamp_missing_pricing_revisions(&mut catalog);
     validate_catalog(&catalog)?;
     Ok(catalog)
+}
+
+/// Load the embedded baseline with usable overlays from the existing remote cache.
+///
+/// Never performs network I/O or writes. Missing, expired, oversized, corrupt or incompatible
+/// overlays are ignored. Live reads are limited to embedded provider IDs, not remote paths.
+///
+/// # Errors
+///
+/// Returns an error if the embedded catalog is invalid.
+pub fn load_cached_catalog(options: RemoteCatalogOptions) -> Result<CatalogDocument> {
+    let mut document = load_embedded_catalog()?;
+    if options.disabled {
+        return Ok(document);
+    }
+    let provider_ids = document.providers.keys().cloned().collect::<Vec<_>>();
+    let Ok(client) = RemoteCatalogClient::new(options) else {
+        return Ok(document);
+    };
+    if let Ok(remote) = client.cached_catalog()
+        && remote.schema_version == document.schema_version
+        && validate_catalog(&remote).is_ok()
+    {
+        overlay_remote_catalog(&mut document, &remote);
+    }
+    for provider_id in provider_ids {
+        if let Ok(snapshot) = client.cached_live_snapshot(&provider_id)
+            && snapshot.schema_version == bcode_model_catalog_models::LIVE_SNAPSHOT_SCHEMA_VERSION
+            && snapshot.provider_id == provider_id
+        {
+            overlay_remote_live(&mut document, &[snapshot]);
+        }
+    }
+    Ok(document)
 }
 
 /// Load a catalog from provider TOML files in a source directory.

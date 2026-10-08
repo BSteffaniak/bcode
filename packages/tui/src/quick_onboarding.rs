@@ -3,14 +3,16 @@
 use std::io::{self, Write};
 
 use bmux_keyboard::KeyCode;
+use bmux_tui::component::{Component, Constraints, LayoutCx};
 use bmux_tui::damage::Damage;
 use bmux_tui::event::Event;
 use bmux_tui::geometry::Rect;
 use bmux_tui::paint::{LocalRect, PaintCx};
-use bmux_tui::prelude::{Line, Style};
+use bmux_tui::prelude::{Line, Style, TextBlock, TextWrap};
 use bmux_tui::terminal::Terminal;
 use bmux_tui_components::selectable_list::{
-    SelectableList, SelectableListItem, SelectableListState, SelectableListStyles,
+    SelectableList, SelectableListHighlightPolicy, SelectableListItem, SelectableListPolicy,
+    SelectableListState, SelectableListStyles,
 };
 use bmux_tui_runtime::{
     Invalidation, Lifecycle, PresentReport, Presenter, Program, RuntimeEvent, Update,
@@ -59,6 +61,7 @@ struct QuickProgram {
     selected: usize,
     list: SelectableListState,
     area: Rect,
+    choice_area: Rect,
     outcome: QuickOnboardingOutcome,
     form: Option<ConnectionForm>,
     theme: PresentedTheme,
@@ -76,6 +79,7 @@ impl QuickProgram {
             selected: 0,
             list: SelectableListState::new(Some(0)),
             area: Rect::new(0, 0, 0, 0),
+            choice_area: Rect::new(0, 0, 0, 0),
             outcome: QuickOnboardingOutcome::Close,
             form: None,
             theme: *theme,
@@ -97,10 +101,15 @@ impl QuickProgram {
                 return Lifecycle::Exit;
             }
             KeyCode::Char('c') => self.form = Some(ConnectionForm::quick()),
-            KeyCode::Up | KeyCode::Down => {
+            KeyCode::Up
+            | KeyCode::Down
+            | KeyCode::PageUp
+            | KeyCode::PageDown
+            | KeyCode::Home
+            | KeyCode::End => {
                 let items = self.items();
                 let area = self.list_area();
-                let _ = SelectableList::new(&items).handle_event(
+                let _ = choice_list(&items).handle_event(
                     area,
                     &mut self.list,
                     &Event::Key(bmux_keyboard::KeyStroke::simple(key)),
@@ -125,7 +134,12 @@ impl QuickProgram {
             .choices
             .iter()
             .enumerate()
-            .map(|(index, choice)| SelectableListItem::new(index.to_string(), choice.label.clone()))
+            .map(|(index, choice)| {
+                SelectableListItem::multiline(
+                    index.to_string(),
+                    wrapped_rows(&choice.label, self.area.width, self.theme.text),
+                )
+            })
             .collect()
     }
 
@@ -152,45 +166,87 @@ impl QuickProgram {
     }
 
     const fn list_area(&self) -> Rect {
-        Rect::new(0, 3, self.area.width, self.area.height.saturating_sub(8))
+        self.choice_area
     }
 
     fn render(&mut self, frame: &mut PaintCx<'_, '_>) {
-        // SelectableList's area is interpreted relative to the supplied PaintCx.
-        // Retain the local extent, not the terminal-space clip/origin.
         let local = frame.area();
         self.area = Rect::new(0, 0, local.width, local.height);
+        self.choice_area = Rect::new(0, 0, 0, 0);
         if let Some(form) = &mut self.form {
             form.render(frame, &self.theme);
             return;
         }
-        // Explicit overflow policy: each line is clipped by BMUX's bounded viewport;
-        // an indivisible wide grapheme is omitted rather than spilling or being split.
-        let line = |frame: &mut PaintCx<'_, '_>, row: u16, text: &str, style: Style| {
-            if row < frame.area().height {
-                frame.write_line_with_fallback_style(
-                    LocalRect::new(0, i64::from(row), frame.area().width, 1),
-                    &Line::from(text),
-                    style,
-                );
-            }
-        };
-        line(frame, 0, "Welcome to Bcode", self.theme.focused);
-        line(
-            frame,
-            1,
+        let width = self.area.width;
+        let mut header = wrapped_rows("Welcome to Bcode", width, self.theme.focused);
+        header.extend(wrapped_rows(
             self.input
                 .recovery
                 .as_deref()
-                .unwrap_or("Choose an account to start coding."),
+                .unwrap_or("Choose an account and model to start coding."),
+            width,
             self.theme.text,
-        );
-        if self.input.choices.is_empty() {
-            line(frame, 3, "No usable account is available.", self.theme.text);
-            line(frame, 4, "Enter: Sign in / Add key", self.theme.focused);
+        ));
+        let mut footer = Vec::new();
+        if let Some(choice) = self.input.choices.get(self.selected) {
+            footer.extend(wrapped_rows(&choice.detail, width, self.theme.muted));
+            footer.extend(wrapped_rows(
+                "Enter: Use this and start",
+                width,
+                self.theme.focused,
+            ));
         } else {
+            header.extend(wrapped_rows(
+                "No usable account is available.",
+                width,
+                self.theme.text,
+            ));
+            footer.extend(wrapped_rows(
+                "Enter: Sign in / Add key",
+                width,
+                self.theme.focused,
+            ));
+        }
+        footer.extend(wrapped_rows(
+            "c: Connect another (Sign in / Add key) • F2: Advanced",
+            width,
+            self.theme.text,
+        ));
+        footer.extend(wrapped_rows(
+            "↑/↓: choose • Esc: Close",
+            width,
+            self.theme.muted,
+        ));
+        let reserved = header.len().saturating_add(footer.len());
+        let minimum = reserved.saturating_add(usize::from(!self.input.choices.is_empty()));
+        if width == 0 || minimum > usize::from(self.area.height) {
+            // Explicit tiny-layout degradation: no invisible choice hit regions.
+            paint_rows(
+                frame,
+                0,
+                &wrapped_rows(
+                    "Resize to choose • Enter: continue • c: connect • F2: Advanced • Esc: close",
+                    width,
+                    self.theme.text,
+                ),
+            );
+            return;
+        }
+        let header_height = u16::try_from(header.len()).unwrap_or(u16::MAX);
+        let footer_height = u16::try_from(footer.len()).unwrap_or(u16::MAX);
+        self.choice_area = Rect::new(
+            0,
+            header_height,
+            width,
+            self.area
+                .height
+                .saturating_sub(header_height)
+                .saturating_sub(footer_height),
+        );
+        paint_rows(frame, 0, &header);
+        if !self.input.choices.is_empty() {
             let items = self.items();
-            SelectableList::new(&items)
+            choice_list(&items)
                 .styles(SelectableListStyles {
                     normal: self.theme.text,
                     focused: self.theme.focused,
@@ -198,33 +254,61 @@ impl QuickProgram {
                     background: self.theme.canvas,
                     ..SelectableListStyles::default()
                 })
-                .paint(self.list_area(), &self.list, self.theme.text, frame);
-            let height = self.area.height;
-            line(
-                frame,
-                height.saturating_sub(4),
-                &self.input.choices[self.selected].detail,
-                self.theme.muted,
-            );
-            line(
-                frame,
-                height.saturating_sub(3),
-                "Enter: Use this and start",
-                self.theme.focused,
-            );
+                .paint(self.choice_area, &self.list, self.theme.text, frame);
         }
-        let height = self.area.height;
-        line(
+        paint_rows(
             frame,
-            height.saturating_sub(2),
-            "c: Connect another (Sign in / Add key) • F2: Advanced",
-            self.theme.text,
+            self.area.height.saturating_sub(footer_height),
+            &footer,
         );
-        line(
-            frame,
-            height.saturating_sub(1),
-            "↑/↓: choose • Esc: Close",
-            self.theme.muted,
+    }
+}
+
+// No prefix is reserved: the focused/selected style identifies choices, and the
+// entire measured width is available to their labels, even on narrow terminals.
+fn choice_list(items: &[SelectableListItem]) -> SelectableList<'_> {
+    SelectableList::new(items).policy(SelectableListPolicy {
+        highlight: SelectableListHighlightPolicy::new("", false),
+        ..SelectableListPolicy::default()
+    })
+}
+
+fn wrapped_rows(text: &str, width: u16, style: Style) -> Vec<Line> {
+    if width == 0 {
+        return Vec::new();
+    }
+    let text = TextBlock::new(text).style(style).wrap(TextWrap::Word);
+    let layout = text.layout(
+        Constraints::new(0, u64::from(width), 0, None),
+        &mut LayoutCx::new(),
+    );
+    text.projection(&layout)
+        .into_iter()
+        .map(|row| {
+            let mut line = row.line;
+            for span in &mut line.spans {
+                span.style = style.patch(span.style);
+            }
+            line
+        })
+        .collect()
+}
+
+fn paint_rows(frame: &mut PaintCx<'_, '_>, start: u16, rows: &[Line]) {
+    for (offset, row) in rows
+        .iter()
+        .take(usize::from(frame.area().height.saturating_sub(start)))
+        .enumerate()
+    {
+        frame.write_line_with_fallback_style(
+            LocalRect::new(
+                0,
+                i64::from(start) + i64::try_from(offset).unwrap_or(i64::MAX),
+                frame.area().width,
+                1,
+            ),
+            row,
+            Style::new(),
         );
     }
 }
@@ -460,6 +544,110 @@ mod tests {
         assert!(program.form.is_none());
         assert!(update.commands.is_empty());
         assert_eq!(program.outcome, QuickOnboardingOutcome::Close);
+    }
+
+    #[test]
+    fn wrapped_guidance_details_and_actions_remain_complete() {
+        let mut program = program();
+        program.input.recovery =
+            Some("Choose the detected account, or connect another account.".to_owned());
+        program.input.choices[0].detail =
+            "Unknown metadata remains unknown; detection is not authentication.".to_owned();
+        let mut buffer = bmux_tui::buffer::Buffer::empty(Rect::new(0, 0, 24, 30));
+        program.render(&mut PaintCx::new(&mut bmux_tui::frame::Frame::new(
+            &mut buffer,
+        )));
+        let text = (0..30)
+            .map(|y| buffer.row_symbols(y).unwrap())
+            .collect::<Vec<_>>()
+            .join(" ");
+        for word in ["detected", "authentication.", "Advanced", "Close", "start"] {
+            assert!(text.contains(word), "missing {word}: {text}");
+        }
+        assert!(program.choice_area.height > 0);
+    }
+
+    #[test]
+    fn measured_styled_unicode_rows_are_painted_without_rewrapping() {
+        let style = Style::new().fg(bmux_tui::style::Color::Red);
+        let rows = wrapped_rows("账户 🦀 e\u{301} styled words", 8, style);
+        assert!(rows.len() > 1);
+        assert!(
+            rows.iter()
+                .flat_map(|row| &row.spans)
+                .all(|span| span.style == style)
+        );
+        let mut buffer = bmux_tui::buffer::Buffer::empty(Rect::new(0, 0, 8, 10));
+        paint_rows(
+            &mut PaintCx::new(&mut bmux_tui::frame::Frame::new(&mut buffer)),
+            0,
+            &rows,
+        );
+        let text = (0..10)
+            .map(|y| buffer.row_symbols(y).unwrap())
+            .collect::<Vec<_>>()
+            .join(" ");
+        for word in ["账户", "🦀", "e\u{301}", "styled", "words"] {
+            assert!(text.contains(word));
+        }
+        assert!(wrapped_rows("🦀", 0, style).is_empty());
+    }
+
+    #[test]
+    fn multiline_catalog_scroll_resize_and_hits_share_visible_rows() {
+        let mut program = program();
+        program.input.choices = (0..100)
+            .map(|index| QuickConnectionChoice {
+                label: format!("Model choice {index} 账户 🦀 e\u{301}"),
+                detail: "Ready".to_owned(),
+            })
+            .collect();
+        for (width, height) in [(24, 20), (50, 16), (2, 2), (0, 0), (24, 20)] {
+            let mut buffer = bmux_tui::buffer::Buffer::empty(Rect::new(0, 0, width, height));
+            program.render(&mut PaintCx::new(&mut bmux_tui::frame::Frame::new(
+                &mut buffer,
+            )));
+            if program.choice_area.height == 0 {
+                assert!(
+                    choice_list(&program.items())
+                        .visible_semantic_regions(program.choice_area, &program.list)
+                        .is_empty()
+                );
+                continue;
+            }
+            for _ in 0..30 {
+                program.key(KeyCode::Down);
+            }
+            program.render(&mut PaintCx::new(&mut bmux_tui::frame::Frame::new(
+                &mut buffer,
+            )));
+            let items = program.items();
+            let list = choice_list(&items);
+            let hits = list.visible_semantic_regions(program.choice_area, &program.list);
+            assert!(!hits.is_empty());
+            assert!(
+                hits.iter()
+                    .any(|hit| hit.key == program.selected.to_string())
+            );
+            for hit in hits {
+                assert!(hit.rect.y >= program.choice_area.y);
+                assert!(hit.rect.bottom() <= program.choice_area.bottom());
+                assert_eq!(
+                    list.semantic_id_at(
+                        program.choice_area,
+                        &program.list,
+                        bmux_tui::geometry::Point::new(hit.rect.x, hit.rect.y)
+                    ),
+                    Some(hit.key)
+                );
+                assert!(!buffer.row_symbols(hit.rect.y).unwrap().trim().is_empty());
+            }
+        }
+        assert_eq!(program.key(KeyCode::Enter), Lifecycle::Exit);
+        assert_eq!(
+            program.outcome,
+            QuickOnboardingOutcome::Selected(program.selected)
+        );
     }
 
     #[test]
