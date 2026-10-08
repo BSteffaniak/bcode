@@ -320,6 +320,8 @@ impl BcodeRuntimeModel {
         settings: TuiRuntimeSettings,
         mut loop_state: ChatLoopState,
     ) -> Self {
+        loop_state
+            .set_session_picker_launch_directory(settings.launch_working_directory().to_path_buf());
         loop_state.set_slash_palette_settings(settings.completion_settings());
         let draft_autosave = DraftAutosave::new(
             settings.launch_working_directory().to_path_buf(),
@@ -711,6 +713,18 @@ impl BcodeRuntimeModel {
             return super::invalidation::UiInvalidation::Structural;
         }
         if self.loop_state.has_session_picker() {
+            if let Event::Mouse(mouse) = &event
+                && matches!(
+                    mouse.kind,
+                    bmux_tui::event::MouseEventKind::Down(bmux_tui::event::MouseButton::Left)
+                )
+                && let Some(id) = super::mouse_flow::mouse_hit_id(&self.committed_hits, *mouse)
+                && self
+                    .loop_state
+                    .handle_session_catalog_control(&mut self.chat, &id)
+            {
+                return super::invalidation::UiInvalidation::Structural;
+            }
             match self.loop_state.handle_session_picker_event(
                 &mut self.chat,
                 self.settings.keymap(),
@@ -10561,6 +10575,61 @@ mod tests {
         });
         let _damage = model.route_terminal_event(escape);
         assert_eq!(model.screen, super::BcodeRuntimeScreen::Chat);
+        drop(model);
+    }
+
+    #[tokio::test]
+    async fn session_scope_keyboard_and_measured_mouse_controls_replace_loads() {
+        use super::super::effects::TuiEffect;
+        use bmux_tui::event::{Event, MouseButton, MouseEvent, MouseEventKind};
+        use bmux_tui::geometry::{Point, Rect};
+        use bmux_tui_runtime::Presenter as _;
+        let _scope_guard = super::super::session_picker::SCOPE_TEST_LOCK
+            .lock()
+            .unwrap();
+        let mut model = root_test_model();
+        model.loop_state.open_session_picker(&mut model.chat);
+        model
+            .loop_state
+            .handle_session_catalog_control(&mut model.chat, "session.scope.local");
+        let _initial = model.chat.pending_effects.drain_runtime();
+        let _damage = model.route_terminal_event(Event::Key(bmux_keyboard::KeyStroke {
+            key: bmux_keyboard::KeyCode::Tab,
+            modifiers: bmux_keyboard::Modifiers::NONE,
+        }));
+        let (effects, _) = model.chat.pending_effects.drain_runtime();
+        assert!(effects.iter().any(|(_, effect)| matches!(
+            effect,
+            TuiEffect::LoadSessionPicker {
+                scope: bcode_session_models::SessionDiscoveryScope::AllWorkingDirectories,
+                ..
+            }
+        )));
+        let mut bytes = Vec::new();
+        let mut terminal = bmux_tui::terminal::Terminal::new(&mut bytes, Rect::new(0, 0, 100, 24));
+        let _invalidation = model.synchronize_screen();
+        super::BcodeRuntimePresenter::new(&mut terminal)
+            .present(&mut model)
+            .expect("picker");
+        let hit = model
+            .committed_hits
+            .regions()
+            .iter()
+            .find(|hit| hit.id.as_str() == "session.scope.local")
+            .expect("local control");
+        let point = Point::new(hit.area.x, hit.area.y);
+        let _damage = model.route_terminal_event(Event::Mouse(MouseEvent::new(
+            MouseEventKind::Down(MouseButton::Left),
+            point,
+        )));
+        let (effects, _) = model.chat.pending_effects.drain_runtime();
+        assert!(effects.iter().any(|(_, effect)| matches!(
+            effect,
+            TuiEffect::LoadSessionPicker {
+                scope: bcode_session_models::SessionDiscoveryScope::WorkingDirectory(_),
+                ..
+            }
+        )));
         drop(model);
     }
 

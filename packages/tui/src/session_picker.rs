@@ -1,6 +1,13 @@
 //! TUI session picker state.
 
 use std::collections::BTreeSet;
+use std::sync::atomic::{AtomicBool, Ordering};
+
+// Presentation state only: never persisted to configuration or user state.
+static ALL_DIRECTORIES: AtomicBool = AtomicBool::new(false);
+
+#[cfg(test)]
+pub static SCOPE_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 use bcode_plugin_sdk::path::display_from_current_dir;
 use bcode_session_models::{SessionId, SessionSummary};
@@ -26,10 +33,19 @@ pub enum SessionPickerMode {
     TranscriptSearch,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CatalogScope {
+    Directory,
+    AllDirectories,
+}
+
 /// Session picker state.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SessionPickerApp {
     sessions: Vec<SessionSummary>,
+    catalog_scope: CatalogScope,
+    catalog_cursor: Option<bcode_session_models::SessionCatalogCursor>,
+    catalog_next_cursor: Option<bcode_session_models::SessionCatalogCursor>,
     child_loaded: Vec<SessionNavigationKey>,
     expanded: BTreeSet<SessionNavigationKey>,
     tree_rows: Vec<SessionTreeRow>,
@@ -37,6 +53,7 @@ pub struct SessionPickerApp {
     filter: TextInputState,
     rename: TextInputState,
     list: FilteredListState,
+    list_area: Option<bmux_tui::geometry::Rect>,
     status: String,
     empty_message: String,
     last_import: Option<(SessionSummary, Vec<bcode_ipc::SessionImportWarning>)>,
@@ -67,6 +84,10 @@ impl SessionPickerApp {
             status: "Select a session or press Ctrl-N to create one".to_owned(),
             empty_message: "No matching sessions. Press Ctrl-N to create a new session.".to_owned(),
             last_import: None,
+            list_area: None,
+            catalog_cursor: None,
+            catalog_next_cursor: None,
+            catalog_scope: CatalogScope::Directory,
             search_results: Vec::new(),
             search_query_complete: true,
             search_coverage_complete: true,
@@ -84,6 +105,84 @@ impl SessionPickerApp {
             child_cursors: std::collections::BTreeMap::new(),
             mode: SessionPickerMode::Filter,
         }
+    }
+
+    /// Open a picker with this process's remembered discovery scope.
+    #[must_use]
+    pub fn remembered(sessions: Vec<SessionSummary>) -> Self {
+        let mut app = Self::new(sessions);
+        app.catalog_scope = if ALL_DIRECTORIES.load(Ordering::Relaxed) {
+            CatalogScope::AllDirectories
+        } else {
+            CatalogScope::Directory
+        };
+        app.refresh_filter();
+        app
+    }
+
+    /// Whether discovery includes all working directories.
+    #[must_use]
+    pub const fn all_directories(&self) -> bool {
+        matches!(self.catalog_scope, CatalogScope::AllDirectories)
+    }
+
+    /// Change discovery scope without losing the query or retaining stale rows.
+    pub fn set_all_directories(&mut self, all: bool) -> bool {
+        if self.all_directories() == all || self.mode != SessionPickerMode::Filter {
+            return false;
+        }
+        self.catalog_scope = if all {
+            CatalogScope::AllDirectories
+        } else {
+            CatalogScope::Directory
+        };
+        ALL_DIRECTORIES.store(all, Ordering::Relaxed);
+        self.restart_catalog();
+        self.sessions.clear();
+        self.child_loaded.clear();
+        self.expanded.clear();
+        self.tree_rows.clear();
+        self.child_cursors.clear();
+        self.refresh_filter();
+        self.set_loading_status("Loading sessions…".to_owned());
+        true
+    }
+
+    /// Whether the current candidate window has a continuation, even when empty.
+    #[must_use]
+    pub const fn has_catalog_continuation(&self) -> bool {
+        self.catalog_next_cursor.is_some()
+    }
+
+    /// Current bounded catalog page cursor.
+    #[must_use]
+    pub const fn catalog_cursor(&self) -> Option<&bcode_session_models::SessionCatalogCursor> {
+        self.catalog_cursor.as_ref()
+    }
+
+    /// Apply continuation, including for an empty filtered page.
+    pub fn set_catalog_next_cursor(
+        &mut self,
+        cursor: Option<bcode_session_models::SessionCatalogCursor>,
+    ) {
+        self.catalog_next_cursor = cursor;
+    }
+
+    /// Advance to the next bounded page, discarding resident rows.
+    pub fn next_catalog_page(&mut self) -> bool {
+        let Some(cursor) = self.catalog_next_cursor.take() else {
+            return false;
+        };
+        self.catalog_cursor = Some(cursor);
+        self.replace_sessions(Vec::new());
+        self.set_loading_status("Loading next page…".to_owned());
+        true
+    }
+
+    /// Restart discovery after a query or catalog revision change.
+    pub fn restart_catalog(&mut self) {
+        self.catalog_cursor = None;
+        self.catalog_next_cursor = None;
     }
 
     /// Return picker mode.
@@ -121,6 +220,20 @@ impl SessionPickerApp {
             | SessionPickerMode::DeleteConfirm
             | SessionPickerMode::TranscriptSearch => &mut self.filter,
             SessionPickerMode::Rename => &mut self.rename,
+        }
+    }
+
+    /// Retain the visible list bounds used for painting and mouse dispatch.
+    pub const fn set_list_area(&mut self, area: Option<bmux_tui::geometry::Rect>) {
+        self.list_area = area;
+    }
+
+    /// Select only a visible painted row, including the retained scroll offset.
+    pub fn select_mouse(&mut self, mouse: bmux_tui::event::MouseEvent) {
+        if let Some(area) = self.list_area
+            && let Some(row) = super::picker_mouse::command_palette_row_in_area(mouse, area)
+        {
+            let _ = self.select_visible(self.list.offset().saturating_add(row));
         }
     }
 
@@ -640,8 +753,16 @@ impl SessionPickerApp {
 
     /// Recompute filtered sessions after filter edits.
     pub fn refresh_filter(&mut self) {
+        if self.all_directories() {
+            // Catalog candidate windows are flat: child rows must remain reachable
+            // even when their parent is outside this page.
+            self.tree_rows.clear();
+            self.list
+                .replace_indices((0..self.sessions.len()).collect());
+            return;
+        }
         let query = self.filter.buffer().text().trim().to_ascii_lowercase();
-        let matches = (!query.is_empty()).then(|| {
+        let matches = (!self.all_directories() && !query.is_empty()).then(|| {
             self.sessions
                 .iter()
                 .enumerate()
@@ -835,6 +956,55 @@ mod tests {
             ambiguous,
         });
         session
+    }
+
+    #[test]
+    fn scope_toggle_retains_query_clears_rows_and_is_remembered_on_reopen() {
+        let _scope_guard = SCOPE_TEST_LOCK.lock().unwrap();
+        let mut app = SessionPickerApp::new(vec![summary("東京 👩‍💻", "/tmp/B")]);
+        app.filter = super::super::text_input_flow::state_with_text("東京 query".to_owned(), false);
+        let initial = app.all_directories();
+        assert!(app.set_all_directories(!initial));
+        assert_eq!(app.filter().buffer().text(), "東京 query");
+        assert!(app.sessions.is_empty());
+        assert_eq!(
+            SessionPickerApp::remembered(Vec::new()).all_directories(),
+            !initial
+        );
+        assert!(!app.set_all_directories(!initial));
+        app.set_all_directories(initial);
+    }
+
+    #[test]
+    fn global_page_retains_backend_matches_and_children_without_resident_parents() {
+        let mut child = summary("child", "/tmp/B");
+        child.parent_id = Some(SessionId::new());
+        let mut app = SessionPickerApp::new(Vec::new());
+        app.catalog_scope = CatalogScope::AllDirectories;
+        app.filter = super::super::text_input_flow::state_with_text("backend-only match", false);
+        app.replace_sessions(vec![child.clone()]);
+        assert_eq!(app.selected_session_id(), Some(child.id));
+        assert_eq!(app.list.indices().len(), 1);
+    }
+
+    #[test]
+    fn empty_page_continuation_is_navigable_and_restart_discards_cursor() {
+        let mut app = SessionPickerApp::new(Vec::new());
+        let cursor = bcode_session_models::SessionCatalogCursor {
+            scope: bcode_session_models::SessionDiscoveryScope::AllWorkingDirectories,
+            query: bcode_session_models::SessionCatalogQuery::default(),
+            revision: 7,
+            location_index: 0,
+            after: None,
+        };
+        app.set_catalog_next_cursor(Some(cursor.clone()));
+        assert!(app.has_catalog_continuation());
+        assert!(app.next_catalog_page());
+        assert_eq!(app.catalog_cursor(), Some(&cursor));
+        assert!(!app.next_catalog_page());
+        app.restart_catalog();
+        assert!(app.catalog_cursor().is_none());
+        assert!(!app.has_catalog_continuation());
     }
 
     #[test]

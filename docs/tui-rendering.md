@@ -188,6 +188,20 @@ permission semantics.
 
 ## Session picker and search scope
 
+The session picker defaults to **This directory** and offers a TUI control for switching to
+**All directories**, both at startup and when opened during a session. Discovery scope is
+process-local presentation state, not a change to declarative configuration or session cwd.
+All-directory discovery covers native Bcode sessions in the selected state location and configured
+readable locations; it does not search the filesystem for stores or enumerate external imports
+across unknown directories. Foreign-location sessions remain discovery-only in this picker:
+opening them requires connecting to their owning state location. Catalog pages and their
+continuations keep global browsing bounded; global metadata filtering uses substring matches
+against ID, title, and cwd rather than the local match-mode preference.
+
+Opening a session preserves its canonical working directory, including tool execution and project
+context, regardless of where the client was launched. A missing directory must not implicitly
+be replaced with the launch directory. New-session creation still uses the launch directory.
+
 The TUI keeps local canonical-summary filtering distinct from transcript search. Local filtering is
 renderer-owned ephemeral state and may match title, session ID, working directory, import source,
 and generic derivation metadata already present in portable summaries or plugin contributions. It does not invoke providers or imply

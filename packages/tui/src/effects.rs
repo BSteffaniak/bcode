@@ -2,7 +2,7 @@
 
 use std::collections::{BTreeMap, VecDeque};
 
-use bcode_client::{BcodeClient, ClientError, MessageAcceptance, SessionList};
+use bcode_client::{BcodeClient, ClientError, MessageAcceptance};
 use bcode_ipc::{ComposerDraftScope, PermissionSummary, PromptPlacement};
 use bcode_session_models::{
     ProjectionWindowAnchor, ProjectionWindowDirection, ProjectionWindowLimits,
@@ -310,7 +310,12 @@ pub enum TuiEffect {
         generation: u64,
     },
     /// Load the bounded session catalog for the root session picker.
-    LoadSessionPicker { generation: u64 },
+    LoadSessionPicker {
+        generation: u64,
+        scope: bcode_session_models::SessionDiscoveryScope,
+        query: bcode_session_models::SessionCatalogQuery,
+        cursor: Option<bcode_session_models::SessionCatalogCursor>,
+    },
     /// Import one external session selected by the root picker.
     ImportSession {
         source_id: String,
@@ -738,7 +743,9 @@ pub enum TuiEffectResult {
         /// Subscription generation that produced the result.
         generation: u64,
         /// Bounded catalog result from the application client boundary.
-        result: Result<SessionList, ClientError>,
+        result: Result<bcode_session_models::SessionCatalogPage, ClientError>,
+        /// Catalog invalidation restarts navigation rather than reusing a stale cursor.
+        restart: bool,
     },
     /// External session import completed.
     SessionImported {
@@ -1925,14 +1932,57 @@ impl TuiEffect {
                     .await
                     .map(|contributions| contributions.command_contributions),
             },
-            Self::LoadSessionPicker { generation } => {
+            Self::LoadSessionPicker {
+                generation,
+                scope,
+                query,
+                cursor,
+            } => {
                 let result = async {
-                    let mut watcher = client.watch_session_catalog().await?;
-                    let initial = watcher.initial_snapshot().await?;
+                    if let bcode_session_models::SessionDiscoveryScope::WorkingDirectory(_) = &scope
+                    {
+                        let mut watcher = client.watch_session_catalog_with_scope(scope).await?;
+                        let mut snapshot = watcher.initial_snapshot().await?;
+                        loop {
+                            let page = bcode_session_models::SessionCatalogPage {
+                                sessions: snapshot.sessions,
+                                catalog_status: snapshot.catalog_status,
+                                catalog_sources: snapshot.catalog_sources,
+                                catalog_revision: snapshot.catalog_revision,
+                                next_cursor: None,
+                            };
+                            if streaming_sender
+                                .send(TuiEffectResult::SessionPickerLoaded {
+                                    result: Ok(page),
+                                    generation,
+                                    restart: false,
+                                })
+                                .await
+                                .is_err()
+                            {
+                                return Err(ClientError::Protocol(
+                                    "session picker receiver closed".into(),
+                                ));
+                            }
+                            snapshot = watcher.next_snapshot().await?;
+                        }
+                    }
+                    let mut watcher = client
+                        .watch_session_catalog_with_scope(scope.clone())
+                        .await?;
+                    let initial = client
+                        .list_sessions_page_with_scope(
+                            scope.clone(),
+                            query.clone(),
+                            cursor.clone(),
+                            100,
+                        )
+                        .await?;
                     if streaming_sender
                         .send(TuiEffectResult::SessionPickerLoaded {
                             result: Ok(initial),
                             generation,
+                            restart: false,
                         })
                         .await
                         .is_err()
@@ -1942,11 +1992,15 @@ impl TuiEffect {
                         ));
                     }
                     loop {
-                        let snapshot = watcher.next_snapshot().await?;
+                        watcher.next_revision().await?;
+                        let snapshot = client
+                            .list_sessions_page_with_scope(scope.clone(), query.clone(), None, 100)
+                            .await?;
                         if streaming_sender
                             .send(TuiEffectResult::SessionPickerLoaded {
                                 result: Ok(snapshot),
                                 generation,
+                                restart: true,
                             })
                             .await
                             .is_err()
@@ -1958,7 +2012,11 @@ impl TuiEffect {
                     }
                 }
                 .await;
-                TuiEffectResult::SessionPickerLoaded { result, generation }
+                TuiEffectResult::SessionPickerLoaded {
+                    result,
+                    generation,
+                    restart: false,
+                }
             }
             Self::ImportSession {
                 source_id,
@@ -3222,16 +3280,25 @@ mod projection_paging_tests {
 mod progress_routing_tests {
     use super::*;
 
+    fn picker_effect() -> TuiEffect {
+        TuiEffect::LoadSessionPicker {
+            generation: 1,
+            scope: bcode_session_models::SessionDiscoveryScope::AllWorkingDirectories,
+            query: bcode_session_models::SessionCatalogQuery::default(),
+            cursor: None,
+        }
+    }
+
     #[test]
     fn session_picker_subscription_replacement_and_cancellation_are_coalesced() {
         let mut queue = TuiEffectQueue::default();
-        queue.replace(TuiEffect::LoadSessionPicker { generation: 1 });
-        queue.replace(TuiEffect::LoadSessionPicker { generation: 1 });
+        queue.replace(picker_effect());
+        queue.replace(picker_effect());
         let (effects, _) = queue.drain_runtime();
         assert_eq!(effects.len(), 1);
         assert!(matches!(effects[0].0, EffectSchedule::Replace));
-        queue.replace(TuiEffect::LoadSessionPicker { generation: 1 });
-        queue.cancel(TuiEffect::LoadSessionPicker { generation: 1 });
+        queue.replace(picker_effect());
+        queue.cancel(picker_effect());
         let (effects, _) = queue.drain_runtime();
         assert_eq!(effects.len(), 1);
         assert!(matches!(effects[0].0, EffectSchedule::Cancel));

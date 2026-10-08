@@ -2016,6 +2016,23 @@ impl SessionManager {
             .collect()
     }
 
+    /// Read a bounded window of already-loaded summaries without cloning all handles.
+    pub async fn loaded_catalog_page(
+        &self,
+        after: Option<SessionId>,
+        limit: usize,
+    ) -> Vec<SessionSummary> {
+        use std::ops::Bound::{Excluded, Unbounded};
+        let inner = self.inner.lock().await;
+        let bounds = (after.map_or(Unbounded, Excluded), Unbounded);
+        inner
+            .sessions
+            .range(bounds)
+            .take(limit.min(256))
+            .map(|(_, handle)| handle.snapshot().summary)
+            .collect()
+    }
+
     pub async fn all_session_catalog_entries(&self) -> Vec<SessionCatalogEntry> {
         self.start_catalog_load();
         let handles = {

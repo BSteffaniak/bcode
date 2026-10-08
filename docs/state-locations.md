@@ -128,6 +128,19 @@ is refused rather than silently sharing a daemon across config directories.
 
 ## Aggregated discovery
 
+Working-directory scope is independent of state-location selection. The TUI session picker can
+switch between **This directory** and **All directories**. For scripting,
+`bcode session list --all-directories` streams native session summaries across working directories
+in the already-selected and configured readable locations; it conflicts with `--cwd` and is not a
+global startup flag. `--json` emits one session per JSON line, while `--json --with-status` emits
+one bounded catalog page per line, including health and continuation metadata. Existing local
+listing output is unchanged. Global native pages use ascending session-ID order within each
+configured location, not a global recent-first sort. A failed paginated listing may have emitted
+partial output and must
+be restarted explicitly; its cursor is not a durable snapshot or authority token.
+
+Discovery never changes a session's canonical cwd or owning state location.
+
 `[state] readable_profiles` lists locations whose sessions participate in aggregated discovery.
 Aggregation is read-only: per `Aggregated session discovery does not confer authority`, a session's
 mutations, ownership, and repair apply only to the location that owns its canonical storage. When more

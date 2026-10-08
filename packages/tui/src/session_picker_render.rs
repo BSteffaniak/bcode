@@ -1,8 +1,13 @@
 //! TUI session picker rendering.
 
+use bmux_tui::component::{Component, Constraints, LayoutCx};
+use bmux_tui::geometry::Rect;
 use bmux_tui::paint::{LocalRect, PaintCx};
 use bmux_tui::prelude::{Line, Span, Style};
 use bmux_tui::style::Modifier;
+use bmux_tui_components::action_row::{
+    ActionButton, ActionRowComponent, ActionRowState, ActionRowStyles,
+};
 
 use super::picker_render::{
     picker_list_area, render_picker_chrome, render_picker_list_with_selection, render_picker_status,
@@ -12,9 +17,14 @@ use super::session_picker::{SessionPickerApp, SessionPickerMode};
 
 /// Render the session picker.
 pub fn render_picker(app: &mut SessionPickerApp, frame: &mut PaintCx<'_, '_>, theme: TuiTheme) {
+    app.set_list_area(None);
     let mode = app.mode();
     let Some((inner, list_y)) = render_picker_chrome(
-        " Sessions ",
+        if app.all_directories() {
+            " Sessions · All directories (native) "
+        } else {
+            " Sessions · This directory "
+        },
         &header_line(mode),
         app.active_input_mut(),
         input_placeholder(mode),
@@ -24,6 +34,9 @@ pub fn render_picker(app: &mut SessionPickerApp, frame: &mut PaintCx<'_, '_>, th
         return;
     };
 
+    if mode == SessionPickerMode::Filter && inner.height > 1 {
+        render_scope_controls(app.all_directories(), inner, frame, theme);
+    }
     let bottom_y = render_picker_status(inner, app.status(), theme.muted, frame, theme);
     if let Some((session, warnings)) = app.last_import()
         && !warnings.is_empty()
@@ -70,6 +83,7 @@ pub fn render_picker(app: &mut SessionPickerApp, frame: &mut PaintCx<'_, '_>, th
     let Some(list_area) = picker_list_area(inner, list_y, bottom_y) else {
         return;
     };
+    app.set_list_area(Some(list_area));
     let items = app.list_items(theme.muted);
     render_picker_list_with_selection(
         &items,
@@ -80,6 +94,46 @@ pub fn render_picker(app: &mut SessionPickerApp, frame: &mut PaintCx<'_, '_>, th
         // Keep the row on the raised surface; the BMUX selection marker and
         // accent text identify it without a competing full-width color block.
         theme.raised.patch(theme.focused),
+    );
+}
+
+fn render_scope_controls(all: bool, inner: Rect, frame: &mut PaintCx<'_, '_>, theme: TuiTheme) {
+    let buttons = [
+        ActionButton::new(
+            "local",
+            if all {
+                "This directory"
+            } else {
+                "● This directory"
+            },
+        ),
+        ActionButton::new(
+            "all",
+            if all {
+                "● All directories"
+            } else {
+                "All directories"
+            },
+        ),
+        ActionButton::new("next", "Next page Alt-P"),
+        ActionButton::new("restart", "Restart Alt-R"),
+    ];
+    let state = std::cell::Cell::new(ActionRowState::new());
+    let component =
+        ActionRowComponent::new("session.scope", &buttons, &state).styles(ActionRowStyles {
+            normal: theme.text,
+            focused: theme.focused,
+            hovered: theme.focused,
+            pressed: theme.focused,
+            disabled: theme.muted,
+        });
+    let area = Rect::new(inner.x, inner.y.saturating_add(1), inner.width, 1);
+    let layout = component.layout(Constraints::tight(area.size()), &mut LayoutCx::new());
+    frame.with_child(
+        i32::from(area.x),
+        i64::from(area.y),
+        LocalRect::new(0, 0, area.width, 1),
+        |cx| component.paint(&layout, cx),
     );
 }
 
@@ -94,7 +148,7 @@ const fn input_placeholder(mode: SessionPickerMode) -> &'static str {
 fn header_line(mode: SessionPickerMode) -> Line {
     let help = match mode {
         SessionPickerMode::Filter => {
-            "  ↑↓ browse  ·  → expand  ·  ← parent  ·  Alt-N more children  ·  Enter open  ·  Ctrl-F search  ·  Ctrl-N new  ·  Ctrl-R rename  ·  Ctrl-D delete  ·  Esc close"
+            "  Tab scope · All: native/ID-order/substring · Alt-P next · Alt-R restart · Enter open · Ctrl-F search · Ctrl-N new · Ctrl-R rename · Ctrl-D delete · Esc close"
         }
         SessionPickerMode::Rename => "  Rename  ·  Enter save  ·  Esc cancel",
         SessionPickerMode::DeleteConfirm => "  Delete session?  ·  Y confirm  ·  N/Esc cancel",
@@ -216,6 +270,44 @@ mod tests {
                 .expect("selection marker");
             assert_eq!(marker.style.bg, theme.raised.bg, "{theme_id}");
             assert_eq!(marker.style.fg, theme.focused.fg, "{theme_id}");
+        }
+    }
+
+    #[test]
+    fn scope_controls_have_visible_bounded_hits_at_tiny_and_unicode_widths() {
+        for width in [0, 1, 2, 12, 45, 90] {
+            let mut app = SessionPickerApp::new(Vec::new());
+            let area = Rect::new(0, 0, width, 12);
+            let mut buffer = Buffer::empty(area);
+            let mut frame = Frame::new(&mut buffer);
+            render_picker(
+                &mut app,
+                &mut bmux_tui::paint::PaintCx::new(&mut frame),
+                TuiTheme::for_theme_id("terminal-native"),
+            );
+            for hit in frame.hits().regions() {
+                assert!(hit.area.right() <= area.right());
+                assert!(hit.area.bottom() <= area.bottom());
+            }
+            if width == 90 {
+                let text = buffer_text(frame.buffer(), area);
+                assert!(text.contains("This directory"));
+                assert!(text.contains("All directories"));
+                assert!(
+                    frame
+                        .hits()
+                        .regions()
+                        .iter()
+                        .any(|hit| hit.id.as_str() == "session.scope.local")
+                );
+                assert!(
+                    frame
+                        .hits()
+                        .regions()
+                        .iter()
+                        .any(|hit| hit.id.as_str() == "session.scope.all")
+                );
+            }
         }
     }
 

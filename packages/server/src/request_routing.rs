@@ -108,6 +108,15 @@ pub enum SessionLifecycleRequest {
     ListSessions {
         working_directory: PathBuf,
     },
+    ListSessionsWithScope {
+        scope: bcode_session_models::SessionDiscoveryScope,
+    },
+    ListSessionsPageWithScope {
+        scope: bcode_session_models::SessionDiscoveryScope,
+        query: bcode_session_models::SessionCatalogQuery,
+        cursor: Option<bcode_session_models::SessionCatalogCursor>,
+        limit: usize,
+    },
     SubscribeCatalogUpdates,
     ChangeSessionWorkingDirectory {
         session_id: SessionId,
@@ -967,6 +976,24 @@ impl RoutedRequest {
             Request::SessionChildren { query } => {
                 Self::SessionLifecycle(Box::new(SessionLifecycleRequest::SessionChildren { query }))
             }
+            Request::ListSessionsWithScope { scope } => {
+                Self::SessionLifecycle(Box::new(SessionLifecycleRequest::ListSessionsWithScope {
+                    scope,
+                }))
+            }
+            Request::ListSessionsPageWithScope {
+                scope,
+                query,
+                cursor,
+                limit,
+            } => Self::SessionLifecycle(Box::new(
+                SessionLifecycleRequest::ListSessionsPageWithScope {
+                    scope,
+                    query,
+                    cursor,
+                    limit,
+                },
+            )),
             Request::ListSessions { working_directory } => {
                 Self::SessionLifecycle(Box::new(SessionLifecycleRequest::ListSessions {
                     working_directory,

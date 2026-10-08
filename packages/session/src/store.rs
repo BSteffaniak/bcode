@@ -233,7 +233,7 @@ impl SessionStore {
         if !path.exists() {
             return Ok(None);
         }
-        let contents = fs::read(&path)?;
+        let contents = read_confined_manifest(&self.root, session_id)?;
         let value: serde_json::Value = serde_json::from_slice(&contents)
             .map_err(|error| SessionStoreError::CatalogLoad(error.to_string()))?;
         let schema_version = value
@@ -438,6 +438,59 @@ impl SessionStore {
         (receiver, completion)
     }
 
+    /// Read one indexed native catalog candidate window without replay, repair, or traversal.
+    ///
+    /// Missing or unsupported manifests degrade the page and are not interpreted as visible.
+    /// The continuation advances over candidates, including hidden or damaged entries.
+    ///
+    /// # Errors
+    /// Returns catalog open/query/close errors, preserving incompatible state.
+    pub async fn discovery_page(
+        &self,
+        after: Option<SessionId>,
+        limit: usize,
+    ) -> Result<(Vec<SessionSummary>, Option<SessionId>, bool), SessionStoreError> {
+        if !(1..=256).contains(&limit) {
+            return Err(SessionStoreError::CatalogLoad(
+                "catalog page limit must be 1..=256".into(),
+            ));
+        }
+        let root = self.root.canonicalize()?;
+        let path = db::global_catalog_db_path(&root);
+        if fs::symlink_metadata(&path)?.file_type().is_symlink()
+            || path.canonicalize()?.parent() != Some(root.as_path())
+        {
+            return Err(SessionStoreError::CatalogLoad("unsafe catalog path".into()));
+        }
+        let catalog = db::GlobalSessionDb::open_existing_turso_in_root(&root)
+            .await
+            .map_err(|error| SessionStoreError::CatalogLoad(error.to_string()))?;
+        let result = catalog.list_sessions_page(after, limit).await;
+        let close = catalog.close().await;
+        let candidates =
+            result.map_err(|error| SessionStoreError::CatalogLoad(error.to_string()))?;
+        close.map_err(|error| SessionStoreError::CatalogLoad(error.to_string()))?;
+        let next = if candidates.len() == limit {
+            candidates.last().map(|summary| summary.id)
+        } else {
+            None
+        };
+        let store = self.clone();
+        tokio::task::spawn_blocking(move || {
+            let mut degraded = false;
+            let mut summaries = Vec::with_capacity(candidates.len());
+            for candidate in candidates {
+                match store.load_session_manifest(candidate.id) {
+                    Ok(Some(summary)) => summaries.push(summary),
+                    Ok(None) | Err(_) => degraded = true,
+                }
+            }
+            Ok((summaries, next, degraded))
+        })
+        .await
+        .map_err(|error| SessionStoreError::CatalogLoad(error.to_string()))?
+    }
+
     pub(crate) fn root(&self) -> &Path {
         self.root.as_path()
     }
@@ -452,10 +505,136 @@ impl SessionStore {
     }
 }
 
+#[cfg(unix)]
+fn read_confined_manifest(root: &Path, session_id: SessionId) -> std::io::Result<Vec<u8>> {
+    use std::io::Read as _;
+    use std::os::fd::{AsRawFd as _, FromRawFd as _};
+    use std::os::unix::fs::MetadataExt as _;
+    fn child(
+        parent: &fs::File,
+        name: &std::ffi::CStr,
+        directory: bool,
+    ) -> std::io::Result<fs::File> {
+        // SAFETY: parent remains open and name is NUL-terminated; returned descriptor is owned.
+        let fd = unsafe {
+            libc::openat(
+                parent.as_raw_fd(),
+                name.as_ptr(),
+                libc::O_RDONLY
+                    | libc::O_NOFOLLOW
+                    | libc::O_NONBLOCK
+                    | libc::O_CLOEXEC
+                    | if directory { libc::O_DIRECTORY } else { 0 },
+            )
+        };
+        if fd < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        // SAFETY: successful openat returned an owned descriptor.
+        Ok(unsafe { fs::File::from_raw_fd(fd) })
+    }
+    let root = fs::File::open(root)?;
+    let id = std::ffi::CString::new(session_id.to_string()).map_err(std::io::Error::other)?;
+    let directory = child(&root, &id, true)?;
+    let canonical = child(&directory, c"session.db", false)?;
+    if !canonical.metadata()?.is_file() && !canonical.metadata()?.is_dir() {
+        return Err(std::io::Error::other("invalid canonical session path"));
+    }
+    let manifest = child(&directory, c"manifest.json", false)?;
+    let metadata = manifest.metadata()?;
+    if !metadata.is_file() || metadata.nlink() != 1 {
+        return Err(std::io::Error::other("invalid catalog manifest file"));
+    }
+    let mut bytes = Vec::new();
+    manifest.take(1024 * 1024 + 1).read_to_end(&mut bytes)?;
+    if bytes.len() > 1024 * 1024 {
+        return Err(std::io::Error::other(
+            "catalog manifest exceeds read budget",
+        ));
+    }
+    Ok(bytes)
+}
+
+#[cfg(not(unix))]
+fn read_confined_manifest(_root: &Path, _session_id: SessionId) -> std::io::Result<Vec<u8>> {
+    Err(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "confined catalog manifest reads unavailable",
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use super::SessionStore;
     use bcode_session_models::SessionId;
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn discovery_pages_preserve_candidates_and_degrade_bad_manifests() {
+        let root = tempfile::tempdir().unwrap();
+        let store = SessionStore::new(root.path());
+        let mut expected = Vec::new();
+        for index in 0..5 {
+            let id = SessionId::new();
+            std::fs::create_dir(root.path().join(id.to_string())).unwrap();
+            std::fs::write(
+                root.path().join(id.to_string()).join("session.db"),
+                b"not replayed",
+            )
+            .unwrap();
+            let mut summary = store.canonical_summary(id);
+            summary.name = Some(format!("page {index}"));
+            store.write_session_manifest(&summary).unwrap();
+            expected.push(summary);
+        }
+        expected.sort_by_key(|summary| summary.id);
+        let catalog = super::db::GlobalSessionDb::initialize_turso_in_root(root.path())
+            .await
+            .unwrap();
+        catalog
+            .upsert_sessions(root.path(), &expected)
+            .await
+            .unwrap();
+        catalog.close().await.unwrap();
+        let mut found = Vec::new();
+        let mut after = None;
+        loop {
+            let (page, next, degraded) = store.discovery_page(after, 2).await.unwrap();
+            assert!(!degraded);
+            assert!(page.len() <= 2);
+            found.extend(page.into_iter().map(|summary| summary.id));
+            if next.is_none() {
+                break;
+            }
+            after = next;
+        }
+        assert_eq!(
+            found,
+            expected
+                .iter()
+                .map(|summary| summary.id)
+                .collect::<Vec<_>>()
+        );
+        let victim = expected[0].id;
+        std::fs::write(
+            root.path().join(victim.to_string()).join("manifest.json"),
+            vec![b'x'; 1024 * 1024 + 1],
+        )
+        .unwrap();
+        let (page, next, degraded) = store.discovery_page(None, 1).await.unwrap();
+        assert!(page.is_empty());
+        assert!(next.is_some());
+        assert!(degraded);
+        let other = root.path().join("outside.json");
+        std::fs::write(&other, b"{}").unwrap();
+        std::fs::remove_file(root.path().join(victim.to_string()).join("manifest.json")).unwrap();
+        std::os::unix::fs::symlink(
+            &other,
+            root.path().join(victim.to_string()).join("manifest.json"),
+        )
+        .unwrap();
+        assert!(store.discovery_page(None, 1).await.unwrap().2);
+    }
 
     #[test]
     fn catalog_loader_retains_rows_across_database_pages() {

@@ -258,6 +258,7 @@ pub struct ChatLoopState {
     pinned_interaction_viewport: Option<(String, u16)>,
     session_picker: Option<super::session_picker::SessionPickerApp>,
     session_picker_generation: u64,
+    session_picker_launch_directory: std::path::PathBuf,
     interactive_surface_queue: InteractiveSurfaceQueue,
     artifact_stream: ArtifactStreamCoordinator,
     markdown_projection: super::markdown_projection_coordinator::MarkdownProjectionCoordinator,
@@ -323,6 +324,7 @@ impl ChatLoopState {
             pinned_interaction_viewport: None,
             session_picker: None,
             session_picker_generation: 0,
+            session_picker_launch_directory: std::path::PathBuf::new(),
             interactive_surface_queue: InteractiveSurfaceQueue::default(),
             artifact_stream: ArtifactStreamCoordinator::new(passive_client.clone()),
             markdown_projection:
@@ -545,6 +547,9 @@ impl ChatLoopState {
         if !self.has_session_picker() {
             chat.pending_effects.cancel(TuiEffect::LoadSessionPicker {
                 generation: self.session_picker_generation,
+                scope: bcode_session_models::SessionDiscoveryScope::AllWorkingDirectories,
+                query: bcode_session_models::SessionCatalogQuery::default(),
+                cursor: None,
             });
         }
         let (effects, notes) = chat.pending_effects.drain_runtime();
@@ -1677,6 +1682,10 @@ impl ChatLoopState {
         self.session_picker.is_some()
     }
 
+    pub fn set_session_picker_launch_directory(&mut self, directory: std::path::PathBuf) {
+        self.session_picker_launch_directory = directory;
+    }
+
     pub fn open_session_picker(&mut self, chat: &mut ActiveChat) {
         self.open_session_picker_with_mode(chat, false);
     }
@@ -1686,7 +1695,7 @@ impl ChatLoopState {
     }
 
     fn open_session_picker_with_mode(&mut self, chat: &mut ActiveChat, search: bool) {
-        let mut picker = super::session_picker::SessionPickerApp::new(Vec::new());
+        let mut picker = super::session_picker::SessionPickerApp::remembered(Vec::new());
         if search {
             picker.start_transcript_search();
         } else {
@@ -1706,15 +1715,45 @@ impl ChatLoopState {
             .session_picker_generation
             .checked_add(1)
             .expect("picker generation exhausted");
+        let Some(picker) = self.session_picker.as_ref() else {
+            return;
+        };
         chat.replace_effect(TuiEffect::LoadSessionPicker {
             generation: self.session_picker_generation,
+            scope: if picker.all_directories() {
+                bcode_session_models::SessionDiscoveryScope::AllWorkingDirectories
+            } else {
+                bcode_session_models::SessionDiscoveryScope::WorkingDirectory(
+                    self.session_picker_launch_directory.clone(),
+                )
+            },
+            query: bcode_session_models::SessionCatalogQuery {
+                text: Some(picker.filter().buffer().text().to_owned()),
+            },
+            cursor: picker.catalog_cursor().cloned(),
         });
+    }
+
+    fn apply_session_catalog_update(
+        &mut self,
+        generation: u64,
+        result: Result<bcode_session_models::SessionCatalogPage, bcode_client::ClientError>,
+        restart: bool,
+    ) {
+        if generation != self.session_picker_generation {
+            return;
+        }
+        if restart && let Some(picker) = self.session_picker.as_mut() {
+            picker.restart_catalog();
+            picker.replace_sessions(Vec::new());
+        }
+        self.apply_session_picker_result(generation, result);
     }
 
     pub fn apply_session_picker_result(
         &mut self,
         generation: u64,
-        result: Result<bcode_client::SessionList, bcode_client::ClientError>,
+        result: Result<bcode_session_models::SessionCatalogPage, bcode_client::ClientError>,
     ) {
         if generation != self.session_picker_generation {
             return;
@@ -1725,6 +1764,7 @@ impl ChatLoopState {
         match result {
             Ok(session_list) => {
                 let previous_mode = picker.mode();
+                picker.set_catalog_next_cursor(session_list.next_cursor);
                 picker.replace_sessions(session_list.sessions);
                 let canceled = matches!(
                     previous_mode,
@@ -1734,11 +1774,27 @@ impl ChatLoopState {
                     == super::session_picker::SessionPickerMode::Filter;
                 let cancellation = canceled.then(|| picker.status().to_owned());
                 picker.set_catalog_status(&session_list.catalog_status);
+                if picker.all_directories() {
+                    let continuation = if picker.has_catalog_continuation() {
+                        "Next page: Alt-P (including empty windows)"
+                    } else {
+                        "End of catalog"
+                    };
+                    picker.set_status(format!(
+                        "{}; Native only · location/ID order; {continuation}",
+                        picker.status()
+                    ));
+                }
                 if let Some(cancellation) = cancellation {
                     picker.set_status(format!("{cancellation}; {}", picker.status()));
                 }
             }
-            Err(error) => picker.set_status(format!("Session catalog unavailable: {error}")),
+            Err(error) => {
+                picker.restart_catalog();
+                picker.set_status(format!(
+                    "Session catalog unavailable: {error}; Alt-R restarts discovery"
+                ));
+            }
         }
     }
 
@@ -1813,6 +1869,31 @@ impl ChatLoopState {
         }
     }
 
+    /// Handle a catalog control from the same measured hit map used for painting.
+    pub fn handle_session_catalog_control(&mut self, chat: &mut ActiveChat, id: &str) -> bool {
+        let Some(picker) = self.session_picker.as_mut() else {
+            return false;
+        };
+        if picker.mode() != super::session_picker::SessionPickerMode::Filter {
+            return false;
+        }
+        let changed = match id {
+            "session.scope.local" => picker.set_all_directories(false),
+            "session.scope.all" => picker.set_all_directories(true),
+            "session.scope.next" => picker.next_catalog_page(),
+            "session.scope.restart" => {
+                picker.restart_catalog();
+                picker.replace_sessions(Vec::new());
+                true
+            }
+            _ => return false,
+        };
+        if changed {
+            self.restart_session_picker_subscription(chat);
+        }
+        true
+    }
+
     #[allow(clippy::too_many_lines)]
     pub fn handle_session_picker_event(
         &mut self,
@@ -1820,9 +1901,32 @@ impl ChatLoopState {
         keymap: &super::keymap::BmuxKeyMap,
         event: &Event,
     ) -> SessionPickerRootOutcome {
+        if let Event::Key(stroke) = event {
+            let control = if stroke.key == bmux_keyboard::KeyCode::Tab {
+                self.session_picker.as_ref().map(|picker| {
+                    if picker.all_directories() {
+                        "session.scope.local"
+                    } else {
+                        "session.scope.all"
+                    }
+                })
+            } else if stroke.modifiers.alt && stroke.key == bmux_keyboard::KeyCode::Char('p') {
+                Some("session.scope.next")
+            } else if stroke.modifiers.alt && stroke.key == bmux_keyboard::KeyCode::Char('r') {
+                Some("session.scope.restart")
+            } else {
+                None
+            };
+            if let Some(control) = control
+                && self.handle_session_catalog_control(chat, control)
+            {
+                return SessionPickerRootOutcome::Handled;
+            }
+        }
         let Some(picker) = self.session_picker.as_mut() else {
             return SessionPickerRootOutcome::Unhandled;
         };
+        let previous_query = picker.filter().buffer().text().to_owned();
         match event {
             Event::Paste(text) => {
                 let _ = super::text_input_flow::handle_paste(picker.active_input_mut(), text);
@@ -1840,7 +1944,10 @@ impl ChatLoopState {
                                 ..bmux_keyboard::Modifiers::NONE
                             },
                         );
-                    if stroke.key == bmux_keyboard::KeyCode::Char('n') && stroke.modifiers.alt {
+                    if stroke.key == bmux_keyboard::KeyCode::Char('n')
+                        && stroke.modifiers.alt
+                        && !picker.all_directories()
+                    {
                         if let Some((parent_id, after)) = picker.next_child_page() {
                             chat.replace_effect(TuiEffect::LoadSessionChildren {
                                 parent_id,
@@ -1850,7 +1957,7 @@ impl ChatLoopState {
                         }
                         return SessionPickerRootOutcome::Handled;
                     }
-                    if stroke.key == bmux_keyboard::KeyCode::Right {
+                    if stroke.key == bmux_keyboard::KeyCode::Right && !picker.all_directories() {
                         if let Some(parent_id) = picker.toggle_selected_branch() {
                             chat.replace_effect(TuiEffect::LoadSessionChildren {
                                 parent_id,
@@ -2088,12 +2195,16 @@ impl ChatLoopState {
                     }
                 },
             },
-            Event::Mouse(mouse) => {
-                if let Some(row) = super::picker_mouse::picker_row_from_mouse(*mouse) {
-                    let _selected = picker.select_visible(row);
-                }
-            }
+            Event::Mouse(mouse) => picker.select_mouse(*mouse),
             Event::Focus(_) | Event::Resize(_) | Event::Tick | Event::User(_) => {}
+        }
+        if picker.mode() == super::session_picker::SessionPickerMode::Filter
+            && picker.all_directories()
+            && previous_query != picker.filter().buffer().text()
+        {
+            picker.restart_catalog();
+            picker.replace_sessions(Vec::new());
+            self.restart_session_picker_subscription(chat);
         }
         SessionPickerRootOutcome::Handled
     }
@@ -2904,8 +3015,12 @@ pub fn apply_effect_result(
                 }
             }
         }
-        TuiEffectResult::SessionPickerLoaded { result, generation } => {
-            loop_state.apply_session_picker_result(generation, result);
+        TuiEffectResult::SessionPickerLoaded {
+            result,
+            generation,
+            restart,
+        } => {
+            loop_state.apply_session_catalog_update(generation, result, restart);
         }
         TuiEffectResult::SessionImported { result } => {
             if let Some(session_id) = loop_state.apply_session_import_result(result) {
@@ -6189,6 +6304,50 @@ mod scheduler_tests {
         state
             .apply_session_picker_result(2, Err(ClientError::Protocol("closed connection".into())));
         assert!(state.session_picker.is_none());
+    }
+
+    #[tokio::test]
+    async fn catalog_restart_updates_are_fenced_and_preserve_scope_and_query() {
+        use super::super::session_picker::SessionPickerApp;
+        use bcode_session_models::{
+            SessionCatalogCursor, SessionCatalogPage, SessionCatalogQuery, SessionCatalogStatus,
+            SessionDiscoveryScope,
+        };
+        let mut state = loop_state();
+        state.session_picker_generation = 4;
+        let mut picker = SessionPickerApp::new(Vec::new());
+        *picker.filter_mut() = super::super::text_input_flow::state_with_text("東京 query", false);
+        let cursor = SessionCatalogCursor {
+            scope: SessionDiscoveryScope::AllWorkingDirectories,
+            query: SessionCatalogQuery {
+                text: Some("東京 query".to_owned()),
+            },
+            revision: 1,
+            location_index: 0,
+            after: None,
+        };
+        picker.set_catalog_next_cursor(Some(cursor.clone()));
+        assert!(picker.next_catalog_page());
+        state.session_picker = Some(picker);
+        let page = || SessionCatalogPage {
+            sessions: Vec::new(),
+            catalog_status: SessionCatalogStatus::Loaded,
+            catalog_sources: Vec::new(),
+            catalog_revision: 2,
+            next_cursor: Some(cursor.clone()),
+        };
+        // A result from a previous scope/query/page load cannot reset navigation.
+        state.apply_session_catalog_update(3, Ok(page()), true);
+        assert_eq!(
+            state.session_picker.as_ref().unwrap().catalog_cursor(),
+            Some(&cursor)
+        );
+        state.apply_session_catalog_update(4, Ok(page()), true);
+        let picker = state.session_picker.as_ref().unwrap();
+        assert!(picker.catalog_cursor().is_none());
+        assert!(picker.has_catalog_continuation());
+        assert!(!picker.all_directories());
+        assert_eq!(picker.filter().buffer().text(), "東京 query");
     }
 
     fn surface(interaction_id: &str) -> InteractiveSurfaceState {

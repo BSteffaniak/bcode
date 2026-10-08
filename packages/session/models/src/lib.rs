@@ -101,6 +101,54 @@ pub use context_management::{
     RequestContextTokenCount,
 };
 
+/// Read-only discovery selection; does not change session execution context.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SessionDiscoveryScope {
+    /// Include sessions and imports in this directory.
+    WorkingDirectory(PathBuf),
+    /// Native Bcode sessions across configured readable locations.
+    AllWorkingDirectories,
+}
+
+/// Catalog filtering, applied to bounded candidate pages.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionCatalogQuery {
+    /// Case-insensitive title or working-directory substring.
+    pub text: Option<String>,
+}
+
+/// Restartable catalog continuation, not a durable snapshot or authority token.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionCatalogCursor {
+    /// Selection that produced this cursor.
+    pub scope: SessionDiscoveryScope,
+    /// Filter that produced this cursor.
+    pub query: SessionCatalogQuery,
+    /// Catalog revision; changed revisions require restarting.
+    pub revision: u64,
+    /// Next readable location index.
+    pub location_index: usize,
+    /// Last examined native candidate ID, including filtered candidates.
+    pub after: Option<SessionId>,
+}
+
+/// One bounded catalog candidate window, ordered by configured location then ascending session ID.
+/// Empty results may still have a continuation. This is not recent-activity ordering.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionCatalogPage {
+    /// Visible session summaries; never more than the requested bounded limit.
+    pub sessions: Vec<SessionSummary>,
+    /// Discovery degradation remains visible.
+    pub catalog_status: SessionCatalogStatus,
+    /// Per-location discovery status.
+    pub catalog_sources: Vec<SessionCatalogSourceStatus>,
+    /// Revision for invalidation, not durable snapshot isolation.
+    pub catalog_revision: u64,
+    /// Continue, or restart with no cursor. No total-result ceiling is imposed.
+    pub next_cursor: Option<SessionCatalogCursor>,
+}
+
 /// Session catalog discovery status, versioned by the enclosing application protocol.
 ///
 /// This describes derived discovery state, not canonical session validity or authority.

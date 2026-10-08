@@ -70,6 +70,14 @@ pub enum CliError {
         #[source]
         source: ClientError,
     },
+    /// A bounded global listing stopped; emitted rows must not be treated as complete.
+    #[error(
+        "session listing stopped; output may be partial. If the catalog changed, rerun `bcode session list --all-directories` with the same output options to restart: {source}"
+    )]
+    SessionListingInterrupted {
+        #[source]
+        source: ClientError,
+    },
     /// A normalized workflow application failure, independent of its transport.
     #[error("workflow operation failed ({code}): {message}")]
     WorkflowApplication { code: String, message: String },
@@ -259,6 +267,7 @@ impl CliError {
             | Self::SurfaceRepoPath(_)
             | Self::AuthPrimeFailed(_)
             | Self::Sshenv(_)
+            | Self::SessionListingInterrupted { .. }
             | Self::WorkflowApplication { .. }
             | Self::WorkflowDraftEditNotApplied
             | Self::SessionDerivationNotSucceeded
@@ -5450,12 +5459,17 @@ enum SessionCommand {
     },
     List {
         /// Discover sessions for this working directory instead of the current directory.
-        #[arg(long)]
+        #[arg(long, conflicts_with = "all_directories")]
         cwd: Option<PathBuf>,
+        /// Discover sessions across all working directories.
+        #[arg(long)]
+        all_directories: bool,
         /// Include catalog health, source statuses, and revision in the JSON result.
+        /// With --all-directories, emit one catalog page per JSON line.
         #[arg(long, requires = "json")]
         with_status: bool,
-        /// Print the session summaries as JSON.
+        /// Print session summaries as JSON.
+        /// With --all-directories, emit one session summary per JSON line (JSONL).
         #[arg(long)]
         json: bool,
     },
@@ -7741,9 +7755,10 @@ async fn dispatch_session_command(command: Box<SessionCommand>) -> Result<(), Cl
         }
         SessionCommand::List {
             cwd,
+            all_directories,
             with_status,
             json,
-        } => Box::pin(list_sessions(cwd, with_status, json)).await?,
+        } => Box::pin(list_sessions(cwd, all_directories, with_status, json)).await?,
         SessionCommand::Refresh { cwd, sources, json } => {
             Box::pin(refresh_session_catalog(cwd, sources, json)).await?;
         }
@@ -15351,10 +15366,40 @@ fn write_created_session<W: std::io::Write>(
 
 async fn list_sessions(
     cwd: Option<PathBuf>,
+    all_directories: bool,
     with_status: bool,
     json: bool,
 ) -> Result<(), CliError> {
     let client = BcodeClient::default_endpoint();
+    if all_directories {
+        let mut cursor = None;
+        let mut found_sessions = false;
+        loop {
+            let page = client
+                .list_sessions_page_with_scope(
+                    bcode_session_models::SessionDiscoveryScope::AllWorkingDirectories,
+                    bcode_session_models::SessionCatalogQuery::default(),
+                    cursor,
+                    100,
+                )
+                .await
+                .map_err(|source| CliError::SessionListingInterrupted { source })?;
+            found_sessions |= !page.sessions.is_empty();
+            {
+                let mut output = std::io::stdout().lock();
+                write_global_session_page(&mut output, &page, with_status, json)?;
+                if page.next_cursor.is_none() && !found_sessions && !json {
+                    writeln!(output, "no sessions")?;
+                    output.flush()?;
+                }
+            }
+            cursor = page.next_cursor;
+            if cursor.is_none() {
+                break;
+            }
+        }
+        return Ok(());
+    }
     let catalog = match cwd {
         Some(directory) => {
             client
@@ -15369,6 +15414,26 @@ async fn list_sessions(
     } else {
         write_session_list(&mut output, &catalog.sessions, json)
     }
+}
+
+fn write_global_session_page<W: std::io::Write>(
+    output: &mut W,
+    page: &bcode_session_models::SessionCatalogPage,
+    with_status: bool,
+    json: bool,
+) -> Result<(), CliError> {
+    if with_status {
+        return write_json_stream_record(output, page);
+    }
+    if json {
+        for session in &page.sessions {
+            write_json_stream_record(output, session)?;
+        }
+    } else if !page.sessions.is_empty() {
+        write_session_list(output, &page.sessions, false)?;
+    }
+    output.flush()?;
+    Ok(())
 }
 
 fn write_catalog_refresh<W: std::io::Write>(
@@ -25000,9 +25065,82 @@ mod session_configuration_cli_tests {
         ] {
             let parsed = Cli::try_parse_from(args).expect("list parses");
             assert!(matches!(parsed.command, Some(Commands::Session {
-                command: SessionCommand::List { cwd, json: true, with_status: false }
+                command: SessionCommand::List { cwd, all_directories: false, json: true, with_status: false }
             }) if cwd == expected));
         }
+    }
+
+    #[test]
+    fn session_list_all_directories_is_command_local_and_conflicts_with_cwd() {
+        let parsed = Cli::try_parse_from([
+            "bcode",
+            "session",
+            "list",
+            "--all-directories",
+            "--json",
+            "--with-status",
+        ])
+        .expect("all-directory list parses");
+        assert!(matches!(
+            parsed.command,
+            Some(Commands::Session {
+                command: SessionCommand::List {
+                    cwd: None,
+                    all_directories: true,
+                    json: true,
+                    with_status: true,
+                }
+            })
+        ));
+        for args in [
+            vec![
+                "bcode",
+                "session",
+                "list",
+                "--all-directories",
+                "--cwd",
+                "other",
+            ],
+            vec![
+                "bcode",
+                "session",
+                "list",
+                "--cwd",
+                "other",
+                "--all-directories",
+            ],
+        ] {
+            assert_eq!(
+                Cli::try_parse_from(args).unwrap_err().kind(),
+                clap::error::ErrorKind::ArgumentConflict,
+            );
+        }
+        for args in [
+            vec!["bcode", "--all-directories"],
+            vec!["bcode", "session", "create", "--all-directories"],
+        ] {
+            assert_eq!(
+                Cli::try_parse_from(args).unwrap_err().kind(),
+                clap::error::ErrorKind::UnknownArgument,
+            );
+        }
+    }
+
+    #[test]
+    fn session_list_defaults_to_local_scope() {
+        let parsed =
+            Cli::try_parse_from(["bcode", "session", "list"]).expect("default list parses");
+        assert!(matches!(
+            parsed.command,
+            Some(Commands::Session {
+                command: SessionCommand::List {
+                    cwd: None,
+                    all_directories: false,
+                    json: false,
+                    with_status: false,
+                }
+            })
+        ));
     }
 
     #[test]
@@ -25158,6 +25296,74 @@ mod session_configuration_cli_tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn global_session_pages_stream_rows_and_preserve_empty_continuations() {
+        use bcode_session_models::{
+            SessionCatalogCursor, SessionCatalogPage, SessionCatalogQuery, SessionCatalogStatus,
+            SessionDiscoveryScope, SessionSummary,
+        };
+        let cursor = SessionCatalogCursor {
+            scope: SessionDiscoveryScope::AllWorkingDirectories,
+            query: SessionCatalogQuery::default(),
+            revision: 42,
+            location_index: 0,
+            after: Some(bcode_session_models::SessionId::new()),
+        };
+        let mut page = SessionCatalogPage {
+            sessions: vec![],
+            catalog_status: SessionCatalogStatus::Degraded("unavailable location".into()),
+            catalog_sources: vec![],
+            catalog_revision: 42,
+            next_cursor: Some(cursor),
+        };
+        for json in [false, true] {
+            let mut output = Vec::new();
+            super::write_global_session_page(&mut output, &page, false, json).unwrap();
+            assert!(
+                output.is_empty(),
+                "empty intermediate pages are not exhaustion"
+            );
+        }
+        let mut output = Vec::new();
+        super::write_global_session_page(&mut output, &page, true, true).unwrap();
+        let value: serde_json::Value = serde_json::from_slice(&output).unwrap();
+        assert_eq!(value, serde_json::to_value(&page).unwrap());
+        assert!(!value["next_cursor"].is_null());
+        assert!(
+            super::write_global_session_page(
+                &mut std::io::Cursor::new(&mut [0_u8; 1][..]),
+                &page,
+                true,
+                true,
+            )
+            .is_err()
+        );
+
+        let session: SessionSummary = serde_json::from_value(serde_json::json!({
+            "id": bcode_session_models::SessionId::new(), "name": "global session",
+            "client_count": 2, "created_at_ms": 0, "updated_at_ms": 0,
+        }))
+        .unwrap();
+        page.sessions = vec![session.clone()];
+        page.next_cursor = None;
+        let mut output = Vec::new();
+        for _ in 0..2 {
+            super::write_global_session_page(&mut output, &page, false, true).unwrap();
+        }
+        let text = String::from_utf8(output).unwrap();
+        let records: Vec<serde_json::Value> = text
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        assert_eq!(records, vec![serde_json::to_value(&session).unwrap(); 2]);
+        let mut output = Vec::new();
+        super::write_global_session_page(&mut output, &page, false, false).unwrap();
+        assert_eq!(
+            String::from_utf8(output).unwrap(),
+            format!("global session\t{}\t2 clients\n", session.id)
+        );
     }
 
     #[test]

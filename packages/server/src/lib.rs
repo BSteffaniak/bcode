@@ -6250,6 +6250,8 @@ const fn request_kind(request: &Request) -> &'static str {
         Request::SessionActivity { .. } => "session_activity",
         Request::ReconcileSessionChildren { .. } => "reconcile_session_children",
         Request::SessionChildren { .. } => "session_children",
+        Request::ListSessionsWithScope { .. } => "list_sessions_with_scope",
+        Request::ListSessionsPageWithScope { .. } => "list_sessions_page_with_scope",
         Request::ListSessions { .. } => "list_sessions",
         Request::SessionBulkMigrationStart { .. } => "session_bulk_migration_start",
         Request::SessionBulkMigrationStatus { .. } => "session_bulk_migration_status",
@@ -6686,6 +6688,20 @@ async fn handle_request_inner(
         }
         SessionLifecycleRequest::SessionChildren { query } => {
             Box::pin(handle_session_children(request_id, state, writer, query)).await
+        }
+        SessionLifecycleRequest::ListSessionsWithScope { scope } => {
+            Box::pin(handle_scoped_session_list(request_id, state, writer, scope)).await
+        }
+        SessionLifecycleRequest::ListSessionsPageWithScope {
+            scope,
+            query,
+            cursor,
+            limit,
+        } => {
+            Box::pin(handle_session_catalog_page(
+                request_id, state, writer, scope, query, cursor, limit,
+            ))
+            .await
         }
         SessionLifecycleRequest::ListSessions { working_directory } => {
             handle_list_sessions(request_id, state, writer, &working_directory).await
@@ -9967,6 +9983,67 @@ async fn handle_session_activity(
             "session_activity_unavailable",
             "activity unavailable; verify the query budget and session health",
         )),
+    };
+    send_response(writer, request_id, response).await
+}
+
+async fn handle_scoped_session_list(
+    request_id: u64,
+    state: &Arc<ServerState>,
+    writer: &SharedWriter,
+    scope: bcode_session_models::SessionDiscoveryScope,
+) -> Result<(), ServerError> {
+    match scope {
+        bcode_session_models::SessionDiscoveryScope::WorkingDirectory(path) => {
+            handle_list_sessions(request_id, state, writer, &path).await
+        }
+        scope @ bcode_session_models::SessionDiscoveryScope::AllWorkingDirectories => {
+            let response = match Box::pin(state.session_catalog.page_with_scope(
+                state,
+                scope,
+                bcode_session_models::SessionCatalogQuery::default(),
+                None,
+                256,
+            ))
+            .await
+            {
+                Ok(page) => Response::Ok(ResponsePayload::SessionList {
+                    sessions: page.sessions,
+                    catalog_status: if page.next_cursor.is_some() {
+                        bcode_session_models::SessionCatalogStatus::Degraded(
+                            "more sessions available; use the paginated catalog API".into(),
+                        )
+                    } else {
+                        page.catalog_status
+                    },
+                    catalog_sources: page.catalog_sources,
+                    catalog_revision: page.catalog_revision,
+                }),
+                Err(error) => {
+                    Response::Err(ErrorResponse::new("session_catalog_page_rejected", error))
+                }
+            };
+            send_response(writer, request_id, response).await
+        }
+    }
+}
+
+async fn handle_session_catalog_page(
+    request_id: u64,
+    state: &Arc<ServerState>,
+    writer: &SharedWriter,
+    scope: bcode_session_models::SessionDiscoveryScope,
+    query: bcode_session_models::SessionCatalogQuery,
+    cursor: Option<bcode_session_models::SessionCatalogCursor>,
+    limit: usize,
+) -> Result<(), ServerError> {
+    let response = match state
+        .session_catalog
+        .page_with_scope(state, scope, query, cursor, limit)
+        .await
+    {
+        Ok(page) => Response::Ok(ResponsePayload::SessionCatalogPage { page }),
+        Err(error) => Response::Err(ErrorResponse::new("session_catalog_page_rejected", error)),
     };
     send_response(writer, request_id, response).await
 }
@@ -14105,16 +14182,39 @@ fn database_error_requires_repair(error: &bcode_session::db::SessionDbError) -> 
 
 /// Build a refusal response when a session ID is claimed by multiple state locations.
 ///
-/// Returns `None` when the session is unambiguous. Reads already-loaded catalog state only,
-/// so it starts no discovery and opens no canonical storage.
+/// Returns `None` when the session is unambiguous in the primary location. Checks bounded
+/// exact directory claims across configured readable locations and already-loaded catalog state;
+/// it starts no discovery and opens no canonical session database.
 async fn ambiguous_session_location_response(
     state: &Arc<ServerState>,
     session_id: SessionId,
 ) -> Option<Response> {
-    let locations = state
-        .session_catalog
-        .ambiguous_location_ids(session_id)
-        .await;
+    let Ok(claims) = session_catalog::exact_location_claims(state, session_id) else {
+        return Some(Response::Err(ErrorResponse::new(
+            "session_location_unverifiable",
+            "session storage location claims cannot be verified",
+        )));
+    };
+    if claims.len() == 1
+        && state
+            .daemon_status
+            .state_location_id
+            .as_ref()
+            .is_some_and(|primary| primary != &claims[0])
+    {
+        return Some(Response::Err(ErrorResponse::new(
+            "session_location_not_primary",
+            "session belongs to a readable state location; connect to its owning state location to attach",
+        )));
+    }
+    let locations = if claims.len() > 1 {
+        claims
+    } else {
+        state
+            .session_catalog
+            .ambiguous_location_ids(session_id)
+            .await
+    };
     if locations.is_empty() {
         return None;
     }

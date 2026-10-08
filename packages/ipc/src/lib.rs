@@ -120,7 +120,7 @@ const MAX_CHUNK_DATA_SIZE: usize = MAX_FRAME_PAYLOAD_SIZE / 2;
 /// request/response layouts are rejected rather than interpreted as another operation.
 /// Version 47 adds read-only projection history pages to both positional envelopes.
 /// Older peers are rejected rather than interpreting the combined payload layout.
-pub const CURRENT_PROTOCOL_VERSION: u16 = 47;
+pub const CURRENT_PROTOCOL_VERSION: u16 = 48;
 
 /// Durable session-storage writer epoch expected by this IPC build.
 pub const CURRENT_SESSION_STORAGE_WRITER_EPOCH: u32 =
@@ -510,6 +510,17 @@ pub enum Request {
     },
     ListSessions {
         working_directory: PathBuf,
+    },
+    /// Explicit selection; never changes an attached session's cwd.
+    ListSessionsWithScope {
+        scope: bcode_session_models::SessionDiscoveryScope,
+    },
+    /// Bounded catalog candidate window with restartable continuation.
+    ListSessionsPageWithScope {
+        scope: bcode_session_models::SessionDiscoveryScope,
+        query: bcode_session_models::SessionCatalogQuery,
+        cursor: Option<bcode_session_models::SessionCatalogCursor>,
+        limit: usize,
     },
     RenameSession {
         session_id: SessionId,
@@ -2027,6 +2038,9 @@ pub enum ResponsePayload {
         catalog_sources: Vec<SessionCatalogSourceStatus>,
         #[serde(default)]
         catalog_revision: u64,
+    },
+    SessionCatalogPage {
+        page: bcode_session_models::SessionCatalogPage,
     },
     SessionRenamed {
         session: SessionSummary,

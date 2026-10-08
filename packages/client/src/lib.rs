@@ -1516,7 +1516,10 @@ impl From<ErrorResponse> for ClientError {
 }
 
 /// Compatibility export for the session-owned message acceptance result.
-pub use bcode_session_models::MessageAcceptance;
+pub use bcode_session_models::{
+    MessageAcceptance, SessionCatalogCursor, SessionCatalogPage, SessionCatalogQuery,
+    SessionDiscoveryScope,
+};
 
 const fn decode_message_acceptance(
     response: &ResponsePayload,
@@ -1540,6 +1543,34 @@ const fn decode_message_acceptance(
             disposition: *disposition,
         }),
         ResponsePayload::MessageSent => Ok(MessageAcceptance::sent()),
+        _ => Err(ClientError::UnexpectedResponse),
+    }
+}
+
+fn normalize_discovery_scope(
+    scope: SessionDiscoveryScope,
+) -> Result<SessionDiscoveryScope, ClientError> {
+    match scope {
+        SessionDiscoveryScope::WorkingDirectory(path) => std::path::absolute(path)
+            .map(SessionDiscoveryScope::WorkingDirectory)
+            .map_err(|_| ClientError::Protocol("cannot resolve catalog working directory".into())),
+        SessionDiscoveryScope::AllWorkingDirectories => Ok(scope),
+    }
+}
+
+fn decode_scoped_session_list(response: ResponsePayload) -> Result<SessionList, ClientError> {
+    match response {
+        ResponsePayload::SessionList {
+            sessions,
+            catalog_status,
+            catalog_sources,
+            catalog_revision,
+        } => Ok(SessionList {
+            sessions,
+            catalog_status,
+            catalog_sources,
+            catalog_revision,
+        }),
         _ => Err(ClientError::UnexpectedResponse),
     }
 }
@@ -1572,6 +1603,7 @@ pub enum DaemonAvailability {
 pub struct SessionCatalogWatcher {
     connection: ClientConnection,
     last_revision: u64,
+    scope: SessionDiscoveryScope,
 }
 
 impl SessionCatalogWatcher {
@@ -1581,9 +1613,27 @@ impl SessionCatalogWatcher {
     ///
     /// Returns an error when the daemon cannot be reached or rejects the request.
     pub async fn initial_snapshot(&mut self) -> Result<SessionList, ClientError> {
-        let snapshot = self.connection.list_sessions_with_status().await?;
+        let snapshot = self
+            .connection
+            .list_sessions_with_scope(self.scope.clone())
+            .await?;
         self.last_revision = snapshot.catalog_revision;
         Ok(snapshot)
+    }
+
+    /// Wait for invalidation without fetching or accumulating catalog rows.
+    ///
+    /// # Errors
+    /// Returns a transport error if the subscription closes.
+    pub async fn next_revision(&mut self) -> Result<u64, ClientError> {
+        loop {
+            if let Event::SessionCatalogUpdated { revision } = self.connection.recv_event().await?
+                && revision > self.last_revision
+            {
+                self.last_revision = revision;
+                return Ok(revision);
+            }
+        }
     }
 
     /// Wait for the next catalog revision and fetch its snapshot.
@@ -1595,7 +1645,10 @@ impl SessionCatalogWatcher {
         loop {
             match self.connection.recv_event().await? {
                 Event::SessionCatalogUpdated { revision } if revision > self.last_revision => {
-                    let snapshot = self.connection.list_sessions_with_status().await?;
+                    let snapshot = self
+                        .connection
+                        .list_sessions_with_scope(self.scope.clone())
+                        .await?;
                     self.last_revision = snapshot.catalog_revision.max(revision);
                     return Ok(snapshot);
                 }
@@ -1985,11 +2038,27 @@ impl BcodeClient {
     ///
     /// Returns an error when the daemon cannot be reached or rejects the subscription.
     pub async fn watch_session_catalog(&self) -> Result<SessionCatalogWatcher, ClientError> {
+        self.watch_session_catalog_with_scope(SessionDiscoveryScope::WorkingDirectory(
+            current_working_directory(),
+        ))
+        .await
+    }
+
+    /// Subscribe to catalog invalidation for an explicit discovery selection.
+    ///
+    /// # Errors
+    /// Returns transport or subscription errors.
+    pub async fn watch_session_catalog_with_scope(
+        &self,
+        scope: SessionDiscoveryScope,
+    ) -> Result<SessionCatalogWatcher, ClientError> {
+        let scope = normalize_discovery_scope(scope)?;
         let mut connection = self.connect("bcode-session-catalog").await?;
         connection.subscribe_catalog_updates().await?;
         Ok(SessionCatalogWatcher {
             connection,
             last_revision: 0,
+            scope,
         })
     }
 
@@ -2440,6 +2509,47 @@ impl BcodeClient {
     pub async fn list_sessions_with_status(&self) -> Result<SessionList, ClientError> {
         self.list_sessions_in_working_directory(current_working_directory())
             .await
+    }
+
+    /// List a scoped catalog window. Global callers should use the page API to continue.
+    ///
+    /// # Errors
+    /// Returns transport, selection, or daemon errors.
+    pub async fn list_sessions_with_scope(
+        &self,
+        scope: SessionDiscoveryScope,
+    ) -> Result<SessionList, ClientError> {
+        let scope = normalize_discovery_scope(scope)?;
+        decode_scoped_session_list(
+            self.send_request(Request::ListSessionsWithScope { scope })
+                .await?,
+        )
+    }
+
+    /// Read a bounded candidate page. Empty filtered pages can have a continuation.
+    ///
+    /// # Errors
+    /// Returns transport errors or rejects stale/mismatched cursors and invalid limits.
+    pub async fn list_sessions_page_with_scope(
+        &self,
+        scope: SessionDiscoveryScope,
+        query: SessionCatalogQuery,
+        cursor: Option<SessionCatalogCursor>,
+        limit: usize,
+    ) -> Result<SessionCatalogPage, ClientError> {
+        let scope = normalize_discovery_scope(scope)?;
+        match self
+            .send_request(Request::ListSessionsPageWithScope {
+                scope,
+                query,
+                cursor,
+                limit,
+            })
+            .await?
+        {
+            ResponsePayload::SessionCatalogPage { page } => Ok(page),
+            _ => Err(ClientError::UnexpectedResponse),
+        }
     }
 
     /// List sessions and catalog status for an explicit working directory.
@@ -7428,6 +7538,47 @@ impl ClientConnection {
             .await
     }
 
+    /// List a scoped catalog window. Global callers should use the page API to continue.
+    ///
+    /// # Errors
+    /// Returns transport, selection, or daemon errors.
+    pub async fn list_sessions_with_scope(
+        &mut self,
+        scope: SessionDiscoveryScope,
+    ) -> Result<SessionList, ClientError> {
+        let scope = normalize_discovery_scope(scope)?;
+        decode_scoped_session_list(
+            self.send_request(Request::ListSessionsWithScope { scope })
+                .await?,
+        )
+    }
+
+    /// Read a bounded candidate page. Empty filtered pages can have a continuation.
+    ///
+    /// # Errors
+    /// Returns transport errors or rejects stale/mismatched cursors and invalid limits.
+    pub async fn list_sessions_page_with_scope(
+        &mut self,
+        scope: SessionDiscoveryScope,
+        query: SessionCatalogQuery,
+        cursor: Option<SessionCatalogCursor>,
+        limit: usize,
+    ) -> Result<SessionCatalogPage, ClientError> {
+        let scope = normalize_discovery_scope(scope)?;
+        match self
+            .send_request(Request::ListSessionsPageWithScope {
+                scope,
+                query,
+                cursor,
+                limit,
+            })
+            .await?
+        {
+            ResponsePayload::SessionCatalogPage { page } => Ok(page),
+            _ => Err(ClientError::UnexpectedResponse),
+        }
+    }
+
     /// List sessions and catalog status for an explicit working directory on this connection.
     ///
     /// This selects discovery scope only; it does not confer authority over returned sessions.
@@ -9135,7 +9286,9 @@ mod client_timeout_tests {
                 let request = bcode_ipc::recv_envelope(&mut stream).await.unwrap();
                 assert!(matches!(
                     bcode_ipc::decode_request(&request.payload).unwrap(),
-                    bcode_ipc::Request::ListSessions { .. }
+                    bcode_ipc::Request::ListSessionsWithScope {
+                        scope: bcode_session_models::SessionDiscoveryScope::WorkingDirectory(_)
+                    }
                 ));
                 if revision == 1 {
                     for queued in [1, 3] {

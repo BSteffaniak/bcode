@@ -22,7 +22,7 @@ pub async fn record(
     phase: Phase,
     category: Category,
 ) -> Result<(), ServerError> {
-    let retained = retained_store(state)?;
+    let retained = retained_store(state).await?;
     let db = open(retained.path(), true)?;
     let observation = Observation {
         version: admission_observation::VERSION,

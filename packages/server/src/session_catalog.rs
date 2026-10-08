@@ -172,6 +172,116 @@ impl SessionCatalog {
         *self.revision_rx.borrow()
     }
 
+    /// Read native candidates directly, without starting full catalog discovery.
+    /// Empty filtered windows may carry a continuation; each request examines at most 256 candidates.
+    ///
+    /// # Errors
+    /// Returns an error for invalid limits, oversized queries, relative directory scopes,
+    /// changed cursor selections or revisions, and unavailable cursor locations.
+    pub async fn page_with_scope(
+        &self,
+        state: &Arc<ServerState>,
+        scope: bcode_session_models::SessionDiscoveryScope,
+        query: bcode_session_models::SessionCatalogQuery,
+        cursor: Option<bcode_session_models::SessionCatalogCursor>,
+        limit: usize,
+    ) -> Result<bcode_session_models::SessionCatalogPage, String> {
+        use bcode_session_models::{
+            SessionCatalogCursor, SessionCatalogPage, SessionDiscoveryScope,
+        };
+        validate_catalog_selection(&scope, &query, limit)?;
+        let revision = *self.revision_rx.borrow();
+        // Local compatibility APIs retain import discovery. This native page endpoint does not
+        // scan unknown import directories or silently claim that external coverage is complete.
+        let local_import_gap = matches!(scope, SessionDiscoveryScope::WorkingDirectory(_));
+        if let Some(cursor) = &cursor
+            && (cursor.revision != revision || cursor.scope != scope || cursor.query != query)
+        {
+            return Err("catalog cursor changed; restart from the first page".into());
+        }
+        let locations = native_locations(state);
+        let index = cursor.as_ref().map_or(0, |cursor| cursor.location_index);
+        let after = cursor.as_ref().and_then(|cursor| cursor.after);
+        if index >= locations.len().max(1) {
+            return Err("catalog cursor location is no longer available; restart".into());
+        }
+        let mut sources = Vec::new();
+        let (mut sessions, next, degraded) = if let Some(location) = locations.get(index) {
+            let result = bcode_session::SessionStore::new(&location.sessions_root)
+                .discovery_page(after, limit)
+                .await;
+            let (mut sessions, next, degraded) =
+                result.unwrap_or_else(|_| (Vec::new(), None, true));
+            for session in &mut sessions {
+                session.location = Some(location.summary());
+                let claims = exact_location_claims(state, session.id);
+                if let Some(location) = &mut session.location {
+                    location.ambiguous = claims.as_ref().map_or(true, |claims| claims.len() > 1);
+                }
+            }
+            sources.push(SessionCatalogSourceStatus {
+                source_id: location.source_id(), display_name: location.display_name(),
+                status: if degraded { SessionCatalogStatus::Degraded("native catalog metadata missing or unsupported; explicit maintenance required".into()) } else { SessionCatalogStatus::Loaded },
+                updated_at_ms: 0,
+            });
+            (sessions, next, degraded)
+        } else {
+            let sessions = state.sessions.loaded_catalog_page(after, limit).await;
+            let next = if sessions.len() == limit {
+                sessions.last().map(|session| session.id)
+            } else {
+                None
+            };
+            (sessions, next, false)
+        };
+        let text = query.text.as_ref().map(|text| text.to_lowercase());
+        sessions.retain(|session| {
+            session.is_picker_visible()
+                && match &scope {
+                    SessionDiscoveryScope::AllWorkingDirectories => true,
+                    SessionDiscoveryScope::WorkingDirectory(path) => {
+                        normalize_path(&session.working_directory) == normalize_path(path)
+                    }
+                }
+                && text.as_ref().is_none_or(|text| {
+                    session.id.to_string().contains(text)
+                        || session
+                            .title()
+                            .is_some_and(|name| name.to_lowercase().contains(text))
+                        || session
+                            .working_directory
+                            .to_string_lossy()
+                            .to_lowercase()
+                            .contains(text)
+                })
+        });
+        let next_cursor = if next.is_some() || index + 1 < locations.len() {
+            Some(SessionCatalogCursor {
+                scope,
+                query,
+                revision,
+                location_index: if next.is_some() { index } else { index + 1 },
+                after: next,
+            })
+        } else {
+            None
+        };
+        if *self.revision_rx.borrow() != revision {
+            return Err("catalog changed during page read; restart".into());
+        }
+        Ok(SessionCatalogPage {
+            sessions,
+            catalog_status: if degraded || local_import_gap {
+                SessionCatalogStatus::Degraded("native catalog requires maintenance or local imports require the compatibility listing API".into())
+            } else {
+                SessionCatalogStatus::Loaded
+            },
+            catalog_sources: sources,
+            catalog_revision: revision,
+            next_cursor,
+        })
+    }
+
     /// Return the current coherent catalog snapshot for a working directory.
     pub async fn snapshot(
         &self,
@@ -795,6 +905,21 @@ fn native_locations(state: &ServerState) -> Vec<NativeLocation> {
     locations
 }
 
+/// Exact, non-discovering canonical-directory claims across the configured readable roots.
+/// Unavailable roots fail closed: they are not evidence of an absent claim.
+pub(crate) fn exact_location_claims(state: &ServerState, id: SessionId) -> Result<Vec<String>, ()> {
+    let mut claims = Vec::new();
+    for location in native_locations(state) {
+        std::fs::metadata(&location.sessions_root).map_err(|_| ())?;
+        match std::fs::symlink_metadata(location.sessions_root.join(id.to_string())) {
+            Ok(_) => claims.push(location.location_id),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(_) => return Err(()),
+        }
+    }
+    Ok(claims)
+}
+
 async fn load_in_memory_source(state: &ServerState) -> Result<SourceLoadResult, String> {
     let entries = state.sessions.all_session_catalog_entries().await;
     Ok(SourceLoadResult {
@@ -1295,6 +1420,22 @@ async fn notify_planning_retry(
     }
 }
 
+fn validate_catalog_selection(
+    scope: &bcode_session_models::SessionDiscoveryScope,
+    query: &bcode_session_models::SessionCatalogQuery,
+    limit: usize,
+) -> Result<(), String> {
+    if !(1..=256).contains(&limit) || query.text.as_ref().is_some_and(|text| text.len() > 4096) {
+        return Err("catalog page limit must be 1..=256 and query at most 4096 bytes".into());
+    }
+    if let bcode_session_models::SessionDiscoveryScope::WorkingDirectory(path) = scope
+        && !path.is_absolute()
+    {
+        return Err("catalog working directory must be absolute".into());
+    }
+    Ok(())
+}
+
 fn normalize_path(path: &Path) -> PathBuf {
     path.canonicalize().unwrap_or_else(|_| path.to_path_buf())
 }
@@ -1309,6 +1450,226 @@ fn current_unix_millis() -> u64 {
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test]
+    async fn native_pages_continue_empty_filters_and_reject_changed_selection() {
+        use bcode_session_models::{SessionCatalogQuery, SessionDiscoveryScope};
+        let manager = bcode_session::SessionManager::default();
+        let first = manager
+            .create_session(None, std::path::PathBuf::from("/project-b"))
+            .await
+            .unwrap();
+        let second = manager
+            .create_session(None, std::path::PathBuf::from("/project-b"))
+            .await
+            .unwrap();
+        let state = std::sync::Arc::new(crate::tests::test_server_state(manager));
+        let scope = SessionDiscoveryScope::AllWorkingDirectories;
+        let query = SessionCatalogQuery {
+            text: Some("not-a-session-title".into()),
+        };
+        let page = state
+            .session_catalog
+            .page_with_scope(&state, scope.clone(), query.clone(), None, 1)
+            .await
+            .unwrap();
+        assert!(page.sessions.is_empty());
+        let cursor = page.next_cursor.unwrap();
+        assert!(
+            state
+                .session_catalog
+                .page_with_scope(
+                    &state,
+                    scope.clone(),
+                    SessionCatalogQuery::default(),
+                    Some(cursor.clone()),
+                    1
+                )
+                .await
+                .is_err()
+        );
+        assert!(
+            state
+                .session_catalog
+                .page_with_scope(
+                    &state,
+                    SessionDiscoveryScope::WorkingDirectory("/project-b".into()),
+                    query.clone(),
+                    Some(cursor.clone()),
+                    1
+                )
+                .await
+                .is_err()
+        );
+        let next = state
+            .session_catalog
+            .page_with_scope(&state, scope.clone(), query, Some(cursor), 1)
+            .await
+            .unwrap();
+        assert!(next.sessions.is_empty());
+        let one = state
+            .session_catalog
+            .page_with_scope(
+                &state,
+                scope.clone(),
+                SessionCatalogQuery::default(),
+                None,
+                1,
+            )
+            .await
+            .unwrap();
+        let two = state
+            .session_catalog
+            .page_with_scope(
+                &state,
+                scope,
+                SessionCatalogQuery::default(),
+                one.next_cursor,
+                1,
+            )
+            .await
+            .unwrap();
+        let mut ids = vec![one.sessions[0].id, two.sessions[0].id];
+        ids.sort();
+        let mut expected = vec![first.id, second.id];
+        expected.sort();
+        assert_eq!(ids, expected);
+        assert!(
+            two.sessions
+                .iter()
+                .all(|session| session.working_directory == std::path::Path::new("/project-b"))
+        );
+        drop(state);
+    }
+
+    #[tokio::test]
+    async fn global_discovery_attach_preserves_cwd_and_history() {
+        use bcode_session_models::{SessionCatalogQuery, SessionDiscoveryScope};
+        let manager = bcode_session::SessionManager::default();
+        let first = manager
+            .create_session(None, "/project-b".into())
+            .await
+            .unwrap();
+        let missing_root = tempfile::tempdir().unwrap();
+        let missing_cwd = missing_root.path().join("unavailable-project-b");
+        let missing = manager
+            .create_session(None, missing_cwd.clone())
+            .await
+            .unwrap();
+        let missing_attachment = manager
+            .attach_session(missing.id, bcode_session_models::ClientId::new())
+            .await
+            .unwrap();
+        assert_eq!(missing_attachment.session.working_directory, missing_cwd);
+        assert!(!missing_attachment.session.working_directory.exists());
+        drop(missing_attachment);
+        drop(missing_root);
+        let state = std::sync::Arc::new(crate::tests::test_server_state(manager));
+        let before = state.sessions.session_history(first.id).await.unwrap();
+        let attached = state
+            .sessions
+            .attach_session(first.id, bcode_session_models::ClientId::new())
+            .await
+            .unwrap();
+        assert_eq!(
+            attached.session.working_directory,
+            std::path::Path::new("/project-b")
+        );
+        assert_eq!(
+            state.sessions.session_history(first.id).await.unwrap(),
+            before
+        );
+        assert!(
+            state
+                .session_catalog
+                .page_with_scope(
+                    &state,
+                    SessionDiscoveryScope::AllWorkingDirectories,
+                    SessionCatalogQuery {
+                        text: Some(first.id.to_string())
+                    },
+                    None,
+                    256
+                )
+                .await
+                .unwrap()
+                .sessions
+                .iter()
+                .any(|summary| summary.id == first.id)
+        );
+        drop(attached);
+        drop(state);
+    }
+
+    #[tokio::test]
+    async fn direct_page_claim_checks_reject_duplicate_and_unavailable_locations() {
+        let primary = tempfile::tempdir().unwrap();
+        let foreign = tempfile::tempdir().unwrap();
+        let config = bcode_config::StateConfig {
+            root: Some(primary.path().to_path_buf()),
+            sessions_root: Some(primary.path().to_path_buf()),
+            profile: std::collections::BTreeMap::from([(
+                "foreign".into(),
+                bcode_config::StateProfileConfig {
+                    root: Some(foreign.path().to_path_buf()),
+                    sessions_root: Some(foreign.path().to_path_buf()),
+                },
+            )]),
+            readable_profiles: vec!["foreign".into()],
+            ..Default::default()
+        };
+        let state = crate::tests::test_server_state(
+            bcode_session::SessionManager::persistent_lazy(primary.path()),
+        );
+        let resolved = bcode_config::resolve_state_location_set(
+            &config,
+            &bcode_config::StateLocationSelection::default(),
+        )
+        .unwrap();
+        let state = std::sync::Arc::new({
+            let mut state = state;
+            state.daemon_status.state_location_id =
+                Some(resolved.primary().id().as_str().to_owned());
+            state.locations = Some(resolved);
+            state
+        });
+        let id = SessionId::new();
+        std::fs::create_dir(primary.path().join(id.to_string())).unwrap();
+        std::fs::create_dir(foreign.path().join(id.to_string())).unwrap();
+        let page = state
+            .session_catalog
+            .page_with_scope(
+                &state,
+                bcode_session_models::SessionDiscoveryScope::AllWorkingDirectories,
+                bcode_session_models::SessionCatalogQuery::default(),
+                None,
+                1,
+            )
+            .await
+            .unwrap();
+        assert!(matches!(
+            page.catalog_status,
+            bcode_session_models::SessionCatalogStatus::Degraded(_)
+        ));
+        assert!(
+            state
+                .session_catalog
+                .ambiguous_location_ids(id)
+                .await
+                .is_empty()
+        );
+        assert_eq!(super::exact_location_claims(&state, id).unwrap().len(), 2);
+        assert!(
+            matches!(crate::ambiguous_session_location_response(&state, id).await, Some(bcode_ipc::Response::Err(error)) if error.code == "session_location_ambiguous")
+        );
+        std::fs::remove_dir(foreign.path().join(id.to_string())).unwrap();
+        assert!(super::exact_location_claims(&state, id).is_ok());
+        drop(foreign);
+        assert!(
+            matches!(crate::ambiguous_session_location_response(&state, id).await, Some(bcode_ipc::Response::Err(error)) if error.code == "session_location_unverifiable")
+        );
+        drop(state);
+    }
+
     #[test]
     fn retry_pages_replace_matching_rows_without_losing_other_results() {
         let first = summary(SessionId::new(), None);
