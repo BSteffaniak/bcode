@@ -94,6 +94,9 @@ pub enum SessionLifecycleRequest {
     SessionSummary {
         session_id: SessionId,
     },
+    SessionProgressSnapshot {
+        session_id: SessionId,
+    },
     SessionActivity {
         session_id: SessionId,
         query: bcode_session_models::SessionActivityQuery,
@@ -961,6 +964,11 @@ impl RoutedRequest {
             }
             Request::SessionSummary { session_id } => {
                 Self::SessionLifecycle(Box::new(SessionLifecycleRequest::SessionSummary {
+                    session_id,
+                }))
+            }
+            Request::SessionProgressSnapshot { session_id } => {
+                Self::SessionLifecycle(Box::new(SessionLifecycleRequest::SessionProgressSnapshot {
                     session_id,
                 }))
             }

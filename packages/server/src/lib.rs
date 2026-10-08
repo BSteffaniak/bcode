@@ -416,6 +416,7 @@ pub struct ServerState {
     turn_skills: Mutex<BTreeMap<(SessionId, u64), SkillTurnInvocation>>,
     session_runtimes: Mutex<BTreeMap<SessionId, SessionRuntimeHandle>>,
     // Disposable bounded observations of successfully committed terminal work.
+    progress_observations: StdMutex<workflow_representation::activity::SessionProgressRegistry>,
     activity_observations: Mutex<session_activity::ActivityObservations>,
     turn_admission_locks: Mutex<BTreeMap<SessionId, Arc<Mutex<()>>>>,
     workflow_prompt_admissions: StdMutex<BTreeMap<String, std::sync::Weak<Mutex<()>>>>,
@@ -2481,6 +2482,11 @@ impl ServerState {
             active_skills: Mutex::default(),
             turn_skills: Mutex::default(),
             session_runtimes: Mutex::default(),
+            progress_observations: StdMutex::new(
+                workflow_representation::activity::SessionProgressRegistry::new(
+                    std::num::NonZeroUsize::new(4096).expect("positive retention budget"),
+                ),
+            ),
             activity_observations: Mutex::default(),
             turn_admission_locks: Mutex::default(),
             workflow_prompt_admissions: StdMutex::default(),
@@ -6247,6 +6253,7 @@ const fn request_kind(request: &Request) -> &'static str {
         Request::CreateSession { .. } => "create_session",
         Request::CreateChildSession { .. } => "create_child_session",
         Request::SessionSummary { .. } => "session_summary",
+        Request::SessionProgressSnapshot { .. } => "session_progress_snapshot",
         Request::SessionActivity { .. } => "session_activity",
         Request::ReconcileSessionChildren { .. } => "reconcile_session_children",
         Request::SessionChildren { .. } => "session_children",
@@ -6672,6 +6679,24 @@ async fn handle_request_inner(
             Box::pin(handle_session_summary(
                 request_id, state, writer, session_id,
             ))
+            .await
+        }
+        SessionLifecycleRequest::SessionProgressSnapshot { session_id } => {
+            let mut snapshot = state
+                .progress_observations
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .snapshot(session_id);
+            if !state.sessions.session_is_owned(session_id).await {
+                snapshot.observation = bcode_workflow_view_models::SessionProgressObservation::Unavailable {
+                    reason: bcode_workflow_view_models::SessionProgressUnavailableReason::CoverageUnavailable,
+                };
+            }
+            send_response(
+                writer,
+                request_id,
+                Response::Ok(ResponsePayload::SessionProgressSnapshot { snapshot }),
+            )
             .await
         }
         SessionLifecycleRequest::SessionActivity { session_id, query } => {
@@ -22573,6 +22598,13 @@ async fn ingest_provider_stream_event_payload(
     outcome.stream.events_decoded = outcome.stream.events_decoded.saturating_add(1);
     outcome.stream.last_decoded_event = Some(provider_turn_event_kind(&event).to_string());
     let is_progress = model_event_is_progress(&event);
+    if is_progress {
+        state
+            .progress_observations
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .observe(session_id);
+    }
     let event = rebase_provider_output_event(event, output_position_base);
     handle_provider_turn_event(
         state,
@@ -30663,6 +30695,11 @@ async fn persist_scoped_turn_event(
             }
             let invocation_id = event.invocation_id.clone();
             if event.stage == bcode_session_models::ToolInvocationLifecycleStage::Progress {
+                state
+                    .progress_observations
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .observe_tool_progress(session_id, &event.invocation_id, event.sequence);
                 let _ = state
                     .sessions
                     .publish_live_event(
@@ -32768,6 +32805,11 @@ async fn append_plugin_tool_lifecycle_event(
     }
     match event.stage {
         bcode_session_models::ToolInvocationLifecycleStage::Progress => {
+            state
+                .progress_observations
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .observe_tool_progress(session_id, &event.invocation_id, event.sequence);
             let _ = state
                 .sessions
                 .publish_live_event(
@@ -39863,6 +39905,18 @@ fn plugin_service_response(
 
 async fn publish_session_event(state: &ServerState, event: &bcode_session_models::SessionEvent) {
     state.activity_observations.lock().await.observe(event);
+    if matches!(
+        event.kind,
+        SessionEventKind::ModelTurnStarted { .. }
+            | SessionEventKind::ModelTurnFinished { .. }
+            | SessionEventKind::ToolInvocationResultRecorded { .. }
+    ) {
+        state
+            .progress_observations
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .observe_event(event.session_id, event.sequence);
+    }
     state
         .metrics
         .record_event("session.event", 1, session_event_metric_labels(event));

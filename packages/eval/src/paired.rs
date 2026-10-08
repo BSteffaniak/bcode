@@ -177,6 +177,7 @@ mod tests {
                     .iter()
                     .enumerate()
                     .map(|(index, passed)| EvalRepetitionResult {
+                        timeout: None,
                         case_id: "case".into(),
                         variant_id: id.into(),
                         repetition: u32::try_from(index + 1).unwrap(),

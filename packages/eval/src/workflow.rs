@@ -1,11 +1,12 @@
 //! Real product workflow execution. Never reads daemon databases or private sidecars.
+use super::idle_timeout::{ExecutionClock, ProgressMark, TimeoutReason};
 use super::{
     Command, EvalArtifactRef, EvalCase, EvalDiagnostic, EvalDiagnosticSeverity, EvalError,
     EvalMeasurementSet, EvalSuite, EvalVariant, ExecutionOutput, Instant, Path, fs,
     prepare_agent_daemon_isolation, process, rendered_prompt, session_telemetry, write_json,
     write_session_events_jsonl,
 };
-use bcode_eval_models::WorkflowEvalConfig;
+use bcode_eval_models::{EvalTimeoutMode, WorkflowEvalConfig};
 use sha2::Digest;
 use std::time::Duration;
 
@@ -14,6 +15,197 @@ mod workflow_capture;
 
 fn execution_duration(start: Instant, observed_end: Instant) -> Duration {
     observed_end.saturating_duration_since(start)
+}
+
+// Adapter-local wire validation until the coordinator registers the public model
+// dependency. Only this adapter consumes the independent session progress contract.
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ProgressSnapshot {
+    version: u32,
+    session_id: String,
+    observation: ProgressObservation,
+}
+
+#[derive(serde::Deserialize)]
+#[serde(tag = "status", rename_all = "snake_case", deny_unknown_fields)]
+enum ProgressObservation {
+    Available { epoch: String, counter: u64 },
+    Unavailable { reason: String },
+}
+
+fn progress_mark(
+    value: serde_json::Value,
+    session: &str,
+) -> Result<ProgressMark<String>, EvalError> {
+    let snapshot: ProgressSnapshot = serde_json::from_value(value)?;
+    if snapshot.version != 1 || snapshot.session_id != session {
+        return Err(EvalError::Validation(
+            "unsupported or mismatched session progress snapshot".into(),
+        ));
+    }
+    match snapshot.observation {
+        ProgressObservation::Available { epoch, counter } if !epoch.is_empty() => {
+            Ok(ProgressMark {
+                epoch,
+                count: counter,
+            })
+        }
+        ProgressObservation::Unavailable { reason } => {
+            // Do not persist untrusted reason text as a public diagnostic.
+            let _ = reason;
+            Err(EvalError::Validation(
+                "session progress coverage unavailable; idle timeout cannot be established".into(),
+            ))
+        }
+        ProgressObservation::Available { .. } => Err(EvalError::Validation(
+            "session progress epoch missing".into(),
+        )),
+    }
+}
+
+fn clock_error(error: super::idle_timeout::ClockError) -> EvalError {
+    EvalError::Validation(format!("execution activity observation failed: {error:?}"))
+}
+
+/// One independently bounded recursive scan through public session contracts.
+/// No inspection timestamps, status polls or event-sequence hashes count as progress.
+fn scan_progress(
+    root: &str,
+    clock: &mut ExecutionClock<String>,
+    now: &impl Fn() -> Duration,
+    remaining: &impl Fn() -> Duration,
+    invoke: &impl Fn(&[String], &str, Duration) -> Result<serde_json::Value, EvalError>,
+    max_sessions: std::num::NonZeroUsize,
+) -> Result<(), EvalError> {
+    use bcode_session_models::{
+        SessionActivityCoverage, SessionActivityPage, SessionActivityState, SessionChildPage,
+    };
+    let mut pending = std::collections::VecDeque::from([root.to_owned()]);
+    let mut visited = std::collections::BTreeSet::new();
+    while let Some(session) = pending.pop_front() {
+        if !visited.insert(session.clone()) {
+            return Err(EvalError::Validation(
+                "ambiguous or cyclic session subtree discovery".into(),
+            ));
+        }
+        if visited.len() > max_sessions.get() {
+            return Err(EvalError::Validation(
+                "session progress scan budget exhausted; idle coverage incomplete".into(),
+            ));
+        }
+        let read = |args: &[String], label: &str| {
+            let allowance = remaining().min(Duration::from_secs(3));
+            if allowance.is_zero() {
+                return Err(EvalError::Validation(
+                    "session progress scan allowance exhausted".into(),
+                ));
+            }
+            invoke(args, label, allowance)
+        };
+        let activity: SessionActivityPage = serde_json::from_value(read(
+            &[
+                "session".into(),
+                "activity".into(),
+                session.clone(),
+                "--json".into(),
+            ],
+            "idle-activity",
+        )?)?;
+        if activity.own.session_id.to_string() != session
+            || activity.coverage != SessionActivityCoverage::Complete
+            || !activity.issues.is_empty()
+            || activity.next_after.is_some()
+            || activity.own.states.is_empty()
+            || activity.own.states.contains(&SessionActivityState::Unknown)
+            || !activity
+                .own
+                .evidence
+                .as_ref()
+                .is_some_and(|evidence| evidence.counts_complete)
+        {
+            return Err(EvalError::Validation(
+                "session activity coverage incomplete; idle timeout cannot be established".into(),
+            ));
+        }
+        // A verified own-session idle state needs no live marker. This is not a
+        // claim that descendants are settled: discovery always traverses them.
+        let settled = activity.own.states.iter().all(|state| {
+            matches!(
+                state,
+                SessionActivityState::Idle
+                    | SessionActivityState::Failed
+                    | SessionActivityState::Interrupted
+            )
+        }) && activity.own.evidence.as_ref().is_some_and(|evidence| {
+            evidence.running == 0
+                && evidence.queued == 0
+                && evidence.permission_waits == 0
+                && evidence.input_waits == 0
+        });
+        if settled {
+            clock.retire(&session);
+        } else {
+            let value = read(
+                &[
+                    "session".into(),
+                    "progress".into(),
+                    session.clone(),
+                    "--json".into(),
+                ],
+                "idle-progress",
+            )?;
+            let mark = progress_mark(value, &session)?;
+            if clock.contains(&session) {
+                clock.observe(now(), &session, mark).map_err(clock_error)?;
+            } else {
+                clock.baseline(session.clone(), mark).map_err(clock_error)?;
+            }
+        }
+        let mut after = None::<String>;
+        loop {
+            let mut args = vec![
+                "session".into(),
+                "children".into(),
+                session.clone(),
+                "--limit".into(),
+                "100".into(),
+                "--json".into(),
+            ];
+            if let Some(cursor) = &after {
+                args.extend(["--after".into(), cursor.clone()]);
+            }
+            let page: SessionChildPage = serde_json::from_value(read(&args, "idle-children")?)?;
+            if !page.complete || !page.issues.is_empty() {
+                return Err(EvalError::Validation(
+                    "session child discovery degraded; idle timeout cannot be established".into(),
+                ));
+            }
+            for child in page.children {
+                if child.parent_id.map(|id| id.to_string()).as_deref() != Some(session.as_str()) {
+                    return Err(EvalError::Validation(
+                        "session child parent mismatch".into(),
+                    ));
+                }
+                if visited.len() + pending.len() >= max_sessions.get() {
+                    return Err(EvalError::Validation(
+                        "session progress scan budget exhausted; idle coverage incomplete".into(),
+                    ));
+                }
+                pending.push_back(child.id.to_string());
+            }
+            let Some(next) = page.next_after.map(|id| id.to_string()) else {
+                break;
+            };
+            if after.as_ref().is_some_and(|previous| next <= *previous) {
+                return Err(EvalError::Validation(
+                    "session child cursor did not advance".into(),
+                ));
+            }
+            after = Some(next);
+        }
+    }
+    Ok(())
 }
 
 fn readiness_unavailable(error: &EvalError) -> bool {
@@ -209,8 +401,35 @@ pub fn execute(
         rep_dir.join("subject.json"),
         &serde_json::json!({"schema_version":1,"binary":config.binary,"sha256":digest,"strategy":config.strategy,"judge":config.judge,"acceptance":config.stop_condition}),
     )?;
-    let deadline =
-        Instant::now() + Duration::from_millis(case.timeout_ms.unwrap_or(suite.run.timeout_ms));
+    let timeout_policy = suite.run.resolved_timeout(case);
+    if timeout_policy.timeout_ms == 0 || timeout_policy.max_duration_ms == Some(0) {
+        return Err(EvalError::Validation(
+            "execution timeout durations must be positive".into(),
+        ));
+    }
+    write_json(rep_dir.join("timeout-policy.json"), &timeout_policy)?;
+    let idle_mode = timeout_policy.timeout_mode == EvalTimeoutMode::Idle;
+    let session_budget = std::num::NonZeroUsize::new(
+        suite
+            .metadata
+            .get("activity_scan_session_budget")
+            .and_then(serde_json::Value::as_u64)
+            .and_then(|value| usize::try_from(value).ok())
+            .unwrap_or(4096),
+    )
+    .ok_or_else(|| EvalError::Validation("activity scan session budget must be positive".into()))?;
+    let setup_start = Instant::now();
+    // Idle interval is not a setup or admission wall limit.
+    let setup_allowance = if idle_mode {
+        Duration::from_mins(2)
+    } else {
+        Duration::from_millis(
+            timeout_policy
+                .timeout_ms
+                .min(timeout_policy.max_duration_ms.unwrap_or(u64::MAX)),
+        )
+    };
+    let deadline = setup_start + setup_allowance;
     let invoke =
         |args: &[String], label: &str, timeout: Duration| -> Result<serde_json::Value, EvalError> {
             let mut command = Command::new(&config.binary);
@@ -304,15 +523,51 @@ pub fn execute(
         .as_str()
         .ok_or_else(|| EvalError::Validation("admission missing run identity".into()))?;
     write_json(rep_dir.join("admission.json"), &admitted)?;
+    let execution_origin = if idle_mode {
+        Instant::now()
+    } else {
+        setup_start
+    };
+    let interval = Duration::from_millis(timeout_policy.timeout_ms);
+    let wall_limit = if idle_mode {
+        timeout_policy.max_duration_ms.map(Duration::from_millis)
+    } else {
+        Some(Duration::from_millis(
+            timeout_policy
+                .timeout_ms
+                .min(timeout_policy.max_duration_ms.unwrap_or(u64::MAX)),
+        ))
+    };
+    let mut execution_clock = ExecutionClock::new(
+        Duration::ZERO,
+        idle_mode.then_some(interval),
+        wall_limit,
+        session_budget,
+    );
+    let now = || execution_origin.elapsed();
+    let mut timeout_reason = None;
     let mut timed_out = false;
+    let mut activity_observation_failed = false;
     let mut capture_failed = false;
     let mut last_observed = None;
     let mut inspection;
     loop {
-        if remaining().is_zero() {
+        // Before a fresh subtree scan only an explicit wall limit can expire.
+        // Reaching the previous idle boundary triggers observation, not a verdict.
+        if wall_limit.is_some_and(|limit| now() >= limit) {
             timed_out = true;
+            timeout_reason = Some(TimeoutReason::Wall);
             break;
         }
+        let inspection_remaining = || {
+            let remaining =
+                wall_limit.map_or(Duration::from_secs(3), |limit| limit.saturating_sub(now()));
+            if idle_mode {
+                remaining.min(Duration::from_secs(3))
+            } else {
+                remaining
+            }
+        };
         let inspection_args = vec![
             "workflow".into(),
             "inspect-run".into(),
@@ -324,13 +579,14 @@ pub fn execute(
         inspection = match observe(
             &inspection_args,
             "inspection",
-            remaining,
+            inspection_remaining,
             &invoke,
             std::thread::sleep,
         ) {
             Ok(value) => value,
-            Err(error) if remaining().is_zero() => {
+            Err(error) if wall_limit.is_some_and(|limit| now() >= limit) => {
                 timed_out = true;
+                timeout_reason = Some(TimeoutReason::Wall);
                 write_json(rep_dir.join("observation-error.json"), &error.to_string())?;
                 break;
             }
@@ -394,7 +650,74 @@ pub fn execute(
             capture_failed = true;
             break;
         }
-        std::thread::sleep(Duration::from_millis(250));
+        let activity_result = if idle_mode {
+            let scan_deadline = Instant::now() + Duration::from_secs(15);
+            scan_progress(
+                session_id,
+                &mut execution_clock,
+                &now,
+                &|| {
+                    scan_deadline
+                        .saturating_duration_since(Instant::now())
+                        .min(wall_limit.map_or(Duration::MAX, |limit| limit.saturating_sub(now())))
+                },
+                &invoke,
+                session_budget,
+            )
+        } else {
+            Ok(())
+        };
+        if let Err(error) = activity_result {
+            if wall_limit.is_some_and(|limit| now() >= limit) {
+                timed_out = true;
+                timeout_reason = Some(TimeoutReason::Wall);
+            } else {
+                activity_observation_failed = true;
+                write_json(
+                    rep_dir.join("activity-observation-error.json"),
+                    &error.to_string(),
+                )?;
+                let cancellation = invoke(
+                    &[
+                        "workflow".into(),
+                        "cancel-run".into(),
+                        "--run-id".into(),
+                        run_id.into(),
+                    ],
+                    "activity-observation-cancellation",
+                    Duration::from_secs(15),
+                );
+                let terminal = verify_cancellation(run_id, &invoke);
+                let verified = terminal.is_some();
+                if terminal.is_some() {
+                    last_observed = terminal;
+                }
+                write_json(
+                    rep_dir.join("cancellation.json"),
+                    &serde_json::json!({
+                        "requested": cancellation.is_ok(), "terminal_verified": verified,
+                        "reason": "activity_observation_failed", "error": cancellation.err().map(|error| error.to_string())
+                    }),
+                )?;
+                capture_failed = true;
+            }
+            break;
+        }
+        let observed_now = now();
+        if let Some(reason) = execution_clock
+            .expired(observed_now, true)
+            .map_err(clock_error)?
+        {
+            timed_out = true;
+            timeout_reason = Some(reason);
+            break;
+        }
+        let sleep = execution_clock
+            .remaining(observed_now, true)
+            .map_err(clock_error)?
+            .unwrap_or(Duration::from_millis(250))
+            .min(Duration::from_millis(250));
+        std::thread::sleep(sleep);
     }
     let execution_elapsed = execution_duration(start, Instant::now());
     if timed_out {
@@ -419,6 +742,20 @@ pub fn execute(
             &serde_json::json!({"requested":requested,"error":cancel.err().map(|e|e.to_string()),"terminal_verified":terminal_verified}),
         )?;
     }
+    let timeout_reason_name = timeout_reason.map(|reason| match reason {
+        TimeoutReason::Idle => "idle",
+        TimeoutReason::Wall => "wall",
+    });
+    write_json(
+        rep_dir.join("timeout-outcome.json"),
+        &serde_json::json!({
+            "policy": timeout_policy, "timed_out": timed_out, "reason": timeout_reason_name,
+            "activity_observation_failed": activity_observation_failed,
+            "setup_allowance_ms": setup_allowance.as_millis(),
+            "activity_scan_allowance_ms": 15000, "operation_allowance_ms": 3000,
+            "activity_scan_session_budget": session_budget.get()
+        }),
+    )?;
     // Post-execution capture has a separate bounded allowance. Exhaustion degrades
     // evidence, never extends execution or changes an observed terminal outcome.
     let capture_allowance = Duration::from_millis(
@@ -491,6 +828,22 @@ pub fn execute(
         execution_elapsed.as_millis() as f64,
     );
     measurements.insert("workflow.timed_out".into(), f64::from(timed_out));
+    measurements.insert(
+        "workflow.timeout_idle".into(),
+        f64::from(timeout_reason == Some(TimeoutReason::Idle)),
+    );
+    measurements.insert(
+        "workflow.timeout_wall".into(),
+        f64::from(timeout_reason == Some(TimeoutReason::Wall)),
+    );
+    measurements.insert(
+        "workflow.timeout_interval_ms".into(),
+        timeout_policy.timeout_ms as f64,
+    );
+    measurements.insert("workflow.timeout_mode_idle".into(), f64::from(idle_mode));
+    if let Some(limit) = timeout_policy.max_duration_ms {
+        measurements.insert("workflow.max_duration_ms".into(), limit as f64);
+    }
     let final_inspection = match invoke(
         &[
             "workflow".into(),
@@ -857,7 +1210,13 @@ pub fn execute(
         f64::from(Instant::now() >= capture_deadline),
     );
     let diagnostics = if timed_out {
-        vec![EvalDiagnostic {severity:EvalDiagnosticSeverity::Error,message:"workflow deadline exceeded; cancellation requested, terminal state requires verification".into()}]
+        vec![EvalDiagnostic {
+            severity: EvalDiagnosticSeverity::Error,
+            message: format!(
+                "workflow {} timeout exceeded; cancellation requested, terminal state requires verification",
+                timeout_reason_name.unwrap_or("unknown")
+            ),
+        }]
     } else {
         Vec::new()
     };
@@ -893,6 +1252,252 @@ pub fn terminal_status(value: &serde_json::Value) -> bool {
 mod observation_tests {
     use super::*;
     use std::cell::Cell;
+
+    #[test]
+    fn public_subtree_scan_compares_nested_progress_not_poll_metadata() {
+        let root = "00000000-0000-0000-0000-000000000001";
+        let child = "00000000-0000-0000-0000-000000000002";
+        let grandchild = "00000000-0000-0000-0000-000000000003";
+        let counter = Cell::new(1_u64);
+        let timestamp = Cell::new(0_u64);
+        let invoke = |args: &[String], _: &str, allowance: Duration| {
+            assert!(allowance <= Duration::from_secs(3));
+            let id = &args[2];
+            Ok(match args[1].as_str() {
+                "activity" => serde_json::json!({
+                    "own": {"session_id": id, "parent_id": null, "states": ["running"],
+                        "evidence": {"running":1,"queued":0,"permission_waits":0,"input_waits":0,
+                            "counts_complete":true,"observed_event_sequence": timestamp.get(),"current_operation":null}},
+                    "descendants":[],"coverage":"complete","next_after":null,
+                    "observed_at_ms":timestamp.get(),"issues":[]
+                }),
+                "progress" => serde_json::json!({"version":1,"session_id":id,
+                    "observation":{"status":"available","epoch":"epoch",
+                        "counter": if id == grandchild {counter.get()} else {1}}}),
+                "children" => {
+                    let next = if id == root {
+                        Some(child)
+                    } else if id == child {
+                        Some(grandchild)
+                    } else {
+                        None
+                    };
+                    let children = next.map(|next| serde_json::json!({
+                        "id":next,"parent_id":id,"name":null,"client_count":0,"created_at_ms":0,"updated_at_ms":0
+                    })).into_iter().collect::<Vec<_>>();
+                    serde_json::json!({"children":children,"complete":true,"issues":[],"next_after":null})
+                }
+                _ => panic!("unexpected public read"),
+            })
+        };
+        let budget = std::num::NonZeroUsize::new(8).unwrap();
+        let mut clock =
+            ExecutionClock::new(Duration::ZERO, Some(Duration::from_mins(3)), None, budget);
+        scan_progress(
+            root,
+            &mut clock,
+            &|| Duration::ZERO,
+            &|| Duration::from_secs(15),
+            &invoke,
+            budget,
+        )
+        .unwrap();
+        timestamp.set(9999);
+        scan_progress(
+            root,
+            &mut clock,
+            &|| Duration::from_secs(100),
+            &|| Duration::from_secs(15),
+            &invoke,
+            budget,
+        )
+        .unwrap();
+        assert_eq!(
+            clock.remaining(Duration::from_secs(100), true).unwrap(),
+            Some(Duration::from_secs(80))
+        );
+        counter.set(2);
+        scan_progress(
+            root,
+            &mut clock,
+            &|| Duration::from_secs(170),
+            &|| Duration::from_secs(15),
+            &invoke,
+            budget,
+        )
+        .unwrap();
+        assert_eq!(clock.expired(Duration::from_secs(250), true).unwrap(), None);
+        assert_eq!(
+            clock.expired(Duration::from_secs(350), true).unwrap(),
+            Some(TimeoutReason::Idle)
+        );
+    }
+
+    #[test]
+    fn settled_child_retires_marker_before_unavailable_progress_lookup() {
+        let root = "00000000-0000-0000-0000-000000000001";
+        let child = "00000000-0000-0000-0000-000000000002";
+        let grandchild = "00000000-0000-0000-0000-000000000003";
+        let settled = Cell::new(false);
+        let counter = Cell::new(1_u64);
+        let invoke = |args: &[String], _: &str, _: Duration| {
+            let id = &args[2];
+            Ok(match args[1].as_str() {
+                "activity" => {
+                    let inactive = id == root || (id == child && settled.get());
+                    serde_json::json!({
+                        "own":{"session_id":id,"parent_id":null,
+                            "states":if inactive {vec!["idle"]} else {vec!["running"]},
+                            "evidence":{"running":u32::from(!inactive),"queued":0,"permission_waits":0,"input_waits":0,
+                                "counts_complete":true,"observed_event_sequence":null,"current_operation":null}},
+                        "descendants":[],"coverage":"complete","next_after":null,"observed_at_ms":0,"issues":[]
+                    })
+                }
+                "progress" => {
+                    assert_ne!(
+                        id, root,
+                        "nonexecuting parent must not require live progress"
+                    );
+                    // Released owners return unavailable, but the adapter must not ask.
+                    assert!(
+                        !(id == child && settled.get()),
+                        "settled child progress would be unavailable after ownership release"
+                    );
+                    serde_json::json!({"version":1,"session_id":id,"observation":{
+                        "status":"available","epoch":"e","counter":counter.get()}})
+                }
+                "children" => {
+                    let next = if id == root {
+                        Some(child)
+                    } else if id == child {
+                        Some(grandchild)
+                    } else {
+                        None
+                    };
+                    let children = next
+                        .map(|next| {
+                            serde_json::json!({"id":next,"parent_id":id,
+                        "name":null,"client_count":0,"created_at_ms":0,"updated_at_ms":0})
+                        })
+                        .into_iter()
+                        .collect::<Vec<_>>();
+                    serde_json::json!({"children":children,"complete":true,"next_after":null,"issues":[]})
+                }
+                _ => panic!("unexpected public read"),
+            })
+        };
+        let budget = std::num::NonZeroUsize::new(4).unwrap();
+        let mut clock =
+            ExecutionClock::new(Duration::ZERO, Some(Duration::from_mins(3)), None, budget);
+        scan_progress(
+            root,
+            &mut clock,
+            &|| Duration::ZERO,
+            &|| Duration::from_secs(15),
+            &invoke,
+            budget,
+        )
+        .unwrap();
+        assert!(clock.contains(child));
+        settled.set(true);
+        counter.set(2);
+        scan_progress(
+            root,
+            &mut clock,
+            &|| Duration::from_secs(170),
+            &|| Duration::from_secs(15),
+            &invoke,
+            budget,
+        )
+        .unwrap();
+        assert!(!clock.contains(child));
+        assert!(clock.contains(grandchild));
+        assert_eq!(clock.expired(Duration::from_secs(250), true).unwrap(), None);
+    }
+
+    #[test]
+    fn public_progress_rejects_unavailable_future_and_mismatched_snapshots() {
+        assert!(
+            progress_mark(
+                serde_json::json!({"version":1,"session_id":"s",
+            "observation":{"status":"unavailable","reason":"coverage_unavailable"}}),
+                "s"
+            )
+            .is_err()
+        );
+        for (version, id) in [(2, "s"), (1, "other")] {
+            assert!(
+                progress_mark(
+                    serde_json::json!({"version":version,"session_id":id,
+                "observation":{"status":"available","epoch":"e","counter":1}}),
+                    "s"
+                )
+                .is_err()
+            );
+        }
+    }
+
+    #[test]
+    fn public_scan_rejects_incomplete_discovery_and_cursor_replay() {
+        let root = "00000000-0000-0000-0000-000000000001";
+        let budget = std::num::NonZeroUsize::new(8).unwrap();
+        for incomplete in [true, false] {
+            let mut clock =
+                ExecutionClock::new(Duration::ZERO, Some(Duration::from_mins(3)), None, budget);
+            let invoke = |args: &[String], _: &str, _: Duration| {
+                Ok(if args[1] == "activity" {
+                    serde_json::json!({"own":{"session_id":root,"parent_id":null,"states":["idle"],
+                        "evidence":{"running":0,"queued":0,"permission_waits":0,"input_waits":0,
+                            "counts_complete":true,"observed_event_sequence":null,"current_operation":null}},
+                        "descendants":[],"next_after":null,"coverage":"complete","observed_at_ms":0,"issues":[]})
+                } else {
+                    serde_json::json!({"children":[],"next_after":root,"complete":!incomplete,"issues":[]})
+                })
+            };
+            assert!(
+                scan_progress(
+                    root,
+                    &mut clock,
+                    &|| Duration::ZERO,
+                    &|| Duration::from_secs(15),
+                    &invoke,
+                    budget
+                )
+                .is_err()
+            );
+        }
+    }
+
+    #[test]
+    fn active_session_with_unavailable_progress_fails_observation_not_idle() {
+        let root = "00000000-0000-0000-0000-000000000001";
+        let budget = std::num::NonZeroUsize::new(8).unwrap();
+        let mut clock =
+            ExecutionClock::new(Duration::ZERO, Some(Duration::from_mins(3)), None, budget);
+        let invoke = |args: &[String], _: &str, _: Duration| {
+            Ok(if args[1] == "activity" {
+                serde_json::json!({"own":{"session_id":root,"parent_id":null,"states":["running"],
+                    "evidence":{"running":1,"queued":0,"permission_waits":0,"input_waits":0,
+                        "counts_complete":true,"observed_event_sequence":null,"current_operation":null}},
+                    "descendants":[],"next_after":null,"coverage":"complete","observed_at_ms":0,"issues":[]})
+            } else {
+                serde_json::json!({"version":1,"session_id":root,"observation":{
+                    "status":"unavailable","reason":"not_observed_or_evicted"}})
+            })
+        };
+        assert!(
+            scan_progress(
+                root,
+                &mut clock,
+                &|| Duration::from_secs(200),
+                &|| Duration::from_secs(15),
+                &invoke,
+                budget
+            )
+            .is_err()
+        );
+        assert!(clock.expired(Duration::from_secs(200), false).is_err());
+    }
 
     fn readiness_error() -> EvalError {
         EvalError::Client("server returned error workflow_capability_unavailable: workflow readiness status is temporarily unavailable; retry the workflow request (no initialization progress has been verified)".into())

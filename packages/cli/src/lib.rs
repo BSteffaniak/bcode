@@ -5466,6 +5466,13 @@ enum SessionCommand {
         #[arg(long)]
         json: bool,
     },
+    /// Read a content-free own-session progress marker; unavailable never means idle.
+    Progress {
+        session_id: SessionId,
+        /// Print the exact typed progress snapshot as JSON.
+        #[arg(long)]
+        json: bool,
+    },
     /// Observe own activity, optionally including one bounded direct-child page.
     Activity {
         session_id: SessionId,
@@ -7715,6 +7722,9 @@ async fn dispatch_session_command(command: Box<SessionCommand>) -> Result<(), Cl
             json,
         } => {
             Box::pin(reconcile_children(parent_id, apply, yes, json)).await?;
+        }
+        SessionCommand::Progress { session_id, json } => {
+            Box::pin(show_session_progress(session_id, json)).await?;
         }
         SessionCommand::Activity {
             session_id,
@@ -15215,6 +15225,24 @@ async fn refresh_session_catalog(
         )
         .await?;
     write_catalog_refresh(&mut std::io::stdout().lock(), &catalog, json)
+}
+
+async fn show_session_progress(session_id: SessionId, json: bool) -> Result<(), CliError> {
+    let snapshot = BcodeClient::default_endpoint()
+        .session_progress(session_id)
+        .await?;
+    let mut output = std::io::stdout().lock();
+    if json {
+        return write_json_stream_record(&mut output, &snapshot);
+    }
+    writeln!(
+        output,
+        "{}\t{}",
+        snapshot.session_id,
+        serde_json::to_string(&snapshot.observation)?
+    )?;
+    output.flush()?;
+    Ok(())
 }
 
 async fn show_session_activity(

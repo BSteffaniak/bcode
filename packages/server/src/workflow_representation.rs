@@ -8,6 +8,7 @@ use switchy_database_connection::{SqliteAccess, SqliteOpenOptions, open_sqlite_r
 
 use crate::{ServerError, ServerState};
 
+pub mod activity;
 mod backpressure;
 pub mod catalog;
 pub mod child;

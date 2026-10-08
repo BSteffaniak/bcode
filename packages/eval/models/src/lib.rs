@@ -126,8 +126,14 @@ pub struct EvalComparisonResult {
 pub struct EvalRunConfig {
     /// Repetitions per case/variant pair.
     pub repetitions: u32,
-    /// Per-repetition timeout in milliseconds.
+    /// Per-repetition wall-clock limit, or idle interval under explicit idle mode.
     pub timeout_ms: u64,
+    /// Interpretation of `timeout_ms`; omitted modes retain legacy wall-clock behavior.
+    #[serde(default)]
+    pub timeout_mode: EvalTimeoutMode,
+    /// Optional independent total execution limit in milliseconds.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_duration_ms: Option<u64>,
     /// Workspace isolation strategy.
     pub isolation: EvalIsolation,
     /// Randomize case order before execution.
@@ -141,9 +147,59 @@ impl Default for EvalRunConfig {
         Self {
             repetitions: 1,
             timeout_ms: 60_000,
+            timeout_mode: EvalTimeoutMode::WallClock,
+            max_duration_ms: None,
             isolation: EvalIsolation::TempCopy,
             randomize_case_order: false,
             fail_fast: false,
+        }
+    }
+}
+
+/// Interpretation of an eval execution timeout.
+///
+/// This is opt-in: historical `timeout_ms` values remain wall-clock limits.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EvalTimeoutMode {
+    /// Bound total execution elapsed time by `timeout_ms`.
+    #[default]
+    WallClock,
+    /// Bound inactivity by `timeout_ms`, resetting only on substantive progress.
+    ///
+    /// Model, tool, and stage progress includes descendants. Polling, heartbeats,
+    /// and merely observing a running state do not reset the interval.
+    Idle,
+}
+
+/// Effective timeout settings retained with newly observed execution results.
+///
+/// Execution adapters validate positive durations and own runtime scheduling
+/// and progress observation; resolution alone does not validate these settings.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct EvalResolvedTimeout {
+    /// Interpretation of `timeout_ms`.
+    pub timeout_mode: EvalTimeoutMode,
+    /// Wall-clock limit or idle interval in milliseconds; must be validated positive.
+    pub timeout_ms: u64,
+    /// Optional total execution limit, independent of idle resets; validate positive.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_duration_ms: Option<u64>,
+}
+
+impl EvalRunConfig {
+    /// Resolve independently inherited case overrides without validation.
+    ///
+    /// A case mode override does not change the inherited interval or total
+    /// limit. An omitted case total limit inherits the run limit; it does not
+    /// disable it. No total limit is inferred from an idle interval.
+    #[must_use]
+    pub fn resolved_timeout(&self, case: &EvalCase) -> EvalResolvedTimeout {
+        EvalResolvedTimeout {
+            timeout_mode: case.timeout_mode.unwrap_or(self.timeout_mode),
+            timeout_ms: case.timeout_ms.unwrap_or(self.timeout_ms),
+            max_duration_ms: case.max_duration_ms.or(self.max_duration_ms),
         }
     }
 }
@@ -386,9 +442,15 @@ pub struct EvalCase {
     /// Prompt/task text.
     #[serde(default)]
     pub prompt: Option<String>,
-    /// Optional per-case timeout override.
+    /// Optional per-case wall-clock limit or idle interval override.
     #[serde(default)]
     pub timeout_ms: Option<u64>,
+    /// Optional mode override; omission inherits the run mode.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timeout_mode: Option<EvalTimeoutMode>,
+    /// Optional total execution limit override; omission inherits the run limit.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_duration_ms: Option<u64>,
     /// Optional case command override.
     #[serde(default)]
     pub command: Option<String>,
@@ -598,6 +660,12 @@ pub struct EvalRepetitionResult {
     pub exit_code: Option<i32>,
     /// Wall time in milliseconds.
     pub wall_time_ms: u128,
+    /// Effective execution timeout policy for newly labeled results.
+    ///
+    /// Absence means historical or unrecorded policy, not an inferred idle or
+    /// wall-clock failure classification. Labels do not rewrite prior outcomes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timeout: Option<EvalResolvedTimeout>,
     /// Measurements.
     #[serde(default)]
     pub measurements: EvalMeasurementSet,
@@ -959,4 +1027,151 @@ pub struct EvalImprovementProposal {
 
 const fn default_true() -> bool {
     true
+}
+
+#[cfg(test)]
+mod timeout_tests {
+    use super::{
+        EvalCase, EvalRepetitionResult, EvalResolvedTimeout, EvalRunConfig, EvalTimeoutMode,
+    };
+    use serde_json::json;
+
+    fn case() -> EvalCase {
+        serde_json::from_value(json!({ "id": "case" })).unwrap()
+    }
+
+    #[test]
+    fn historical_configuration_keeps_wall_clock_semantics() {
+        let run: EvalRunConfig = serde_json::from_value(json!({
+            "repetitions": 1,
+            "timeout_ms": 180_000,
+            "isolation": "temp_copy",
+            "randomize_case_order": false,
+            "fail_fast": false
+        }))
+        .unwrap();
+        assert_eq!(run.timeout_mode, EvalTimeoutMode::WallClock);
+        assert_eq!(run.max_duration_ms, None);
+        assert_eq!(EvalRunConfig::default().timeout_ms, 60_000);
+        assert_eq!(
+            EvalRunConfig::default().timeout_mode,
+            EvalTimeoutMode::WallClock
+        );
+        let resolved = run.resolved_timeout(&case());
+        assert_eq!(resolved.timeout_mode, EvalTimeoutMode::WallClock);
+        assert_eq!(resolved.timeout_ms, 180_000);
+        assert_eq!(resolved.max_duration_ms, None);
+    }
+
+    #[test]
+    fn explicit_idle_mode_round_trips_without_an_implicit_total_limit() {
+        let mut value = serde_json::to_value(EvalRunConfig::default()).unwrap();
+        value["timeout_mode"] = json!("idle");
+        value["timeout_ms"] = json!(180_000);
+        let run: EvalRunConfig = serde_json::from_value(value).unwrap();
+        let resolved = run.resolved_timeout(&case());
+        assert_eq!(
+            serde_json::to_value(resolved).unwrap(),
+            json!({ "timeout_mode": "idle", "timeout_ms": 180_000 })
+        );
+        let encoded = serde_json::to_value(&run).unwrap();
+        assert_eq!(encoded["timeout_mode"], "idle");
+        assert!(encoded.get("max_duration_ms").is_none());
+        assert_eq!(
+            serde_json::from_value::<EvalRunConfig>(encoded).unwrap(),
+            run
+        );
+    }
+
+    #[test]
+    fn case_overrides_inherit_independently() {
+        let run = EvalRunConfig {
+            timeout_mode: EvalTimeoutMode::Idle,
+            timeout_ms: 180_000,
+            max_duration_ms: Some(900_000),
+            ..EvalRunConfig::default()
+        };
+        let mut task = case();
+        assert_eq!(run.resolved_timeout(&task).max_duration_ms, Some(900_000));
+        task.timeout_ms = Some(45_000);
+        let interval_override = run.resolved_timeout(&task);
+        assert_eq!(interval_override.timeout_mode, EvalTimeoutMode::Idle);
+        assert_eq!(interval_override.timeout_ms, 45_000);
+        assert_eq!(interval_override.max_duration_ms, Some(900_000));
+        task.timeout_mode = Some(EvalTimeoutMode::WallClock);
+        task.max_duration_ms = Some(30_000);
+        assert_eq!(
+            run.resolved_timeout(&task),
+            EvalResolvedTimeout {
+                timeout_mode: EvalTimeoutMode::WallClock,
+                timeout_ms: 45_000,
+                max_duration_ms: Some(30_000),
+            }
+        );
+        let encoded = serde_json::to_value(&task).unwrap();
+        assert_eq!(encoded["timeout_mode"], "wall_clock");
+        assert_eq!(encoded["max_duration_ms"], 30_000);
+        assert_eq!(serde_json::from_value::<EvalCase>(encoded).unwrap(), task);
+    }
+
+    #[test]
+    fn resolution_preserves_values_for_adapter_validation() {
+        let run = EvalRunConfig {
+            timeout_ms: 0,
+            max_duration_ms: Some(0),
+            ..EvalRunConfig::default()
+        };
+        let resolved = run.resolved_timeout(&case());
+        assert_eq!(resolved.timeout_ms, 0);
+        assert_eq!(resolved.max_duration_ms, Some(0));
+    }
+
+    #[test]
+    fn unknown_future_modes_and_resolved_fields_fail_closed() {
+        assert!(serde_json::from_value::<EvalTimeoutMode>(json!("future")).is_err());
+        let mut run = serde_json::to_value(EvalRunConfig::default()).unwrap();
+        run["timeout_mode"] = json!("future");
+        assert!(serde_json::from_value::<EvalRunConfig>(run).is_err());
+        assert!(
+            serde_json::from_value::<EvalCase>(json!({
+                "id": "case", "timeout_mode": "future"
+            }))
+            .is_err()
+        );
+        assert!(
+            serde_json::from_value::<EvalResolvedTimeout>(json!({
+                "timeout_mode": "idle", "timeout_ms": 180_000, "future": true
+            }))
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn result_labels_do_not_reinterpret_historical_failures() {
+        let historical = json!({
+            "case_id": "case", "variant_id": "direct", "repetition": 1,
+            "passed": false, "wall_time_ms": 180_001
+        });
+        let mut result: EvalRepetitionResult = serde_json::from_value(historical).unwrap();
+        assert_eq!(result.timeout, None);
+        assert!(
+            serde_json::to_value(&result)
+                .unwrap()
+                .get("timeout")
+                .is_none()
+        );
+        result.timeout = Some(EvalResolvedTimeout {
+            timeout_mode: EvalTimeoutMode::Idle,
+            timeout_ms: 180_000,
+            max_duration_ms: Some(900_000),
+        });
+        let encoded = serde_json::to_value(&result).unwrap();
+        assert_eq!(encoded["timeout"]["timeout_mode"], "idle");
+        assert!(!result.passed);
+        assert_eq!(result.wall_time_ms, 180_001);
+        assert_eq!(
+            serde_json::from_value::<EvalRepetitionResult>(encoded).unwrap(),
+            result
+        );
+    }
 }

@@ -48,7 +48,26 @@ const DEFAULT_CLIENT_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 const DEFAULT_CLIENT_DAEMON_START_TIMEOUT: Duration = Duration::from_secs(30);
 const LONG_POLL_TRANSPORT_GRACE: Duration = Duration::from_secs(5);
 
+pub use bcode_ipc::SessionProgressSnapshot;
 pub use bcode_session_models::SessionArtifactRange;
+
+fn decode_session_progress_response(
+    payload: ResponsePayload,
+    session_id: SessionId,
+) -> Result<SessionProgressSnapshot, ClientError> {
+    match payload {
+        ResponsePayload::SessionProgressSnapshot { snapshot }
+            if snapshot.version == bcode_workflow_view_models::SESSION_PROGRESS_VERSION
+                && snapshot.session_id == session_id.to_string() =>
+        {
+            Ok(snapshot)
+        }
+        ResponsePayload::SessionProgressSnapshot { .. } => Err(ClientError::Protocol(
+            "unsupported or mismatched session progress snapshot".to_owned(),
+        )),
+        _ => Err(ClientError::UnexpectedResponse),
+    }
+}
 
 fn validate_artifact_range_response(
     range: &SessionArtifactRange,
@@ -2530,6 +2549,24 @@ impl BcodeClient {
             ResponsePayload::SessionActivity { page } => Ok(page),
             _ => Err(ClientError::UnexpectedResponse),
         }
+    }
+
+    /// Read an exact content-free live progress marker without attaching or owning the session.
+    ///
+    /// Unavailable observations and epoch discontinuities must not be interpreted as idle.
+    /// This own-session snapshot makes no claim about subtree or live-hook coverage.
+    ///
+    /// # Errors
+    /// Returns transport/daemon errors, unexpected responses, unsupported contract versions,
+    /// or a response naming a different session.
+    pub async fn session_progress(
+        &self,
+        session_id: SessionId,
+    ) -> Result<SessionProgressSnapshot, ClientError> {
+        let payload = self
+            .send_request(Request::SessionProgressSnapshot { session_id })
+            .await?;
+        decode_session_progress_response(payload, session_id)
     }
 
     /// Discover a bounded page of direct children without opening or controlling them.
@@ -8444,6 +8481,92 @@ fn select_pending_tool_exchange(
         ));
     }
     Ok(exchange)
+}
+
+#[cfg(test)]
+mod session_progress_tests {
+    use super::*;
+    use bcode_workflow_view_models::{
+        SESSION_PROGRESS_VERSION, SessionProgressObservation, SessionProgressUnavailableReason,
+    };
+
+    fn snapshot(id: SessionId) -> SessionProgressSnapshot {
+        SessionProgressSnapshot {
+            version: SESSION_PROGRESS_VERSION,
+            session_id: id.to_string(),
+            observation: SessionProgressObservation::Available {
+                epoch: "public-epoch".into(),
+                counter: 7,
+            },
+        }
+    }
+
+    fn wire_decode(value: SessionProgressSnapshot) -> ResponsePayload {
+        let response = Response::Ok(ResponsePayload::SessionProgressSnapshot { snapshot: value });
+        let envelope = bcode_ipc::response_envelope(1, &response).unwrap();
+        match decode_response(&envelope.payload).unwrap() {
+            Response::Ok(payload) => payload,
+            Response::Err(_) => panic!("expected successful progress response"),
+        }
+    }
+
+    #[test]
+    fn decodes_exact_content_free_public_snapshot_through_the_wire() {
+        let id = SessionId::new();
+        let expected = snapshot(id);
+        let decoded = decode_session_progress_response(wire_decode(expected.clone()), id).unwrap();
+        assert_eq!(decoded, expected);
+        assert_eq!(
+            serde_json::to_value(&decoded).unwrap(),
+            serde_json::json!({
+                "version": SESSION_PROGRESS_VERSION,
+                "session_id": id.to_string(),
+                "observation": {
+                    "status": "available", "epoch": "public-epoch", "counter": 7
+                }
+            })
+        );
+        let request =
+            bcode_ipc::request_envelope(1, &Request::SessionProgressSnapshot { session_id: id })
+                .unwrap();
+        assert!(matches!(
+            bcode_ipc::decode_request(&request.payload).unwrap(),
+            Request::SessionProgressSnapshot { session_id } if session_id == id
+        ));
+    }
+
+    #[test]
+    fn preserves_unavailable_coverage_without_inventing_a_counter() {
+        let id = SessionId::new();
+        let expected = SessionProgressSnapshot {
+            observation: SessionProgressObservation::Unavailable {
+                reason: SessionProgressUnavailableReason::CoverageUnavailable,
+            },
+            ..snapshot(id)
+        };
+        let decoded = decode_session_progress_response(wire_decode(expected.clone()), id).unwrap();
+        assert_eq!(decoded, expected);
+        assert_eq!(decoded.advanced_since(&snapshot(id)), None);
+    }
+
+    #[test]
+    fn rejects_wrong_identity_future_versions_and_unexpected_payloads() {
+        let id = SessionId::new();
+        assert!(matches!(
+            decode_session_progress_response(wire_decode(snapshot(SessionId::new())), id),
+            Err(ClientError::Protocol(_))
+        ));
+        let mut future = snapshot(id);
+        future.version += 1;
+        assert!(matches!(
+            decode_session_progress_response(wire_decode(future), id),
+            Err(ClientError::Protocol(_))
+        ));
+        assert!(matches!(
+            decode_session_progress_response(ResponsePayload::PresentationNoteAppended, id),
+            Err(ClientError::UnexpectedResponse)
+        ));
+    }
 }
 
 #[cfg(test)]

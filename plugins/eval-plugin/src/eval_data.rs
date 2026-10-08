@@ -694,6 +694,7 @@ mod tests {
 
     fn repetition(path: PathBuf) -> EvalRepetitionResult {
         EvalRepetitionResult {
+            timeout: None,
             case_id: "case".to_string(),
             variant_id: "variant".to_string(),
             repetition: 1,

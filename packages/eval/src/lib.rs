@@ -12,8 +12,10 @@
 //! Leaf eval runner, judges, reports, comparisons, and baselines for Bcode.
 
 mod agent_cleanup;
+mod agent_progress;
 mod capture;
 pub mod diagnosis;
+mod idle_timeout;
 mod introspection;
 /// Independently scored per-feature judgement comparisons.
 pub mod judgement_benchmark;
@@ -179,6 +181,17 @@ pub fn validate_suite(suite: &EvalSuite) -> Result<(), EvalError> {
     if suite.run.repetitions == 0 {
         return Err(EvalError::Validation(
             "run.repetitions must be at least 1".into(),
+        ));
+    }
+    if suite.run.timeout_ms == 0
+        || suite.run.max_duration_ms == Some(0)
+        || suite
+            .cases
+            .iter()
+            .any(|case| case.timeout_ms == Some(0) || case.max_duration_ms == Some(0))
+    {
+        return Err(EvalError::Validation(
+            "execution timeout intervals must be positive".into(),
         ));
     }
     if suite.cases.is_empty() {
@@ -680,6 +693,7 @@ fn run_repetition(
     let wall_time_ms = start.elapsed().as_millis();
     measurements.insert("wall_time_ms".into(), wall_time_ms as f64);
     Ok(EvalRepetitionResult {
+        timeout: Some(suite.run.resolved_timeout(case)),
         case_id: case.id.clone(),
         variant_id: variant.id.clone(),
         repetition,
@@ -780,9 +794,12 @@ fn execute_command_variant(
                 .and_then(serde_json::Value::as_str)
                 .unwrap_or(""),
         );
-    let (exit_code, timed_out, stdout, stderr) = process::bounded_command(
+    let policy = suite.run.resolved_timeout(case);
+    let (exit_code, timed_out, stdout, stderr) = process::bounded_command_policy(
         process,
-        std::time::Duration::from_millis(case.timeout_ms.unwrap_or(suite.run.timeout_ms)),
+        std::time::Duration::from_millis(policy.timeout_ms),
+        policy.max_duration_ms.map(std::time::Duration::from_millis),
+        policy.timeout_mode == bcode_eval_models::EvalTimeoutMode::Idle,
         rep_dir,
         "command",
     )?;
@@ -1463,6 +1480,7 @@ async fn execute_agent_variant_async(
             timeout,
             variant,
             rep_dir,
+            Some(suite.run.resolved_timeout(case)),
         )
         .await?;
         let execution_elapsed = start.elapsed();
@@ -1651,6 +1669,7 @@ async fn run_agent_follow_up(
         timeout,
         variant,
         rep_dir,
+        None,
     )
     .await?;
     trace_exports::export(client, &rep_dir.join("follow-up-transcript.jsonl"), &events).await?;
@@ -1716,8 +1735,17 @@ async fn wait_for_agent_turn(
     timeout: std::time::Duration,
     variant: &EvalVariant,
     rep_dir: &Path,
+    timeout_policy: Option<bcode_eval_models::EvalResolvedTimeout>,
 ) -> Result<Vec<bcode_session_models::SessionEvent>, EvalError> {
     let start = Instant::now();
+    let policy = timeout_policy.unwrap_or_else(|| bcode_eval_models::EvalResolvedTimeout {
+        timeout_mode: bcode_eval_models::EvalTimeoutMode::WallClock,
+        timeout_ms: u64::try_from(timeout.as_millis()).unwrap_or(u64::MAX),
+        max_duration_ms: None,
+    });
+    let idle = policy.timeout_mode == bcode_eval_models::EvalTimeoutMode::Idle;
+    let mut idle_since = Instant::now();
+    let mut progress_snapshot = BTreeMap::new();
     let mut cursor = Some(bcode_session_models::SessionHistoryCursor {
         sequence: start_sequence,
     });
@@ -1765,7 +1793,19 @@ async fn wait_for_agent_turn(
             ));
             last_progress = Instant::now();
         }
-        if start.elapsed() >= timeout {
+        if idle {
+            agent_progress::observe(client, session_id, &mut progress_snapshot, &mut idle_since)
+                .await?;
+        }
+        if (if idle {
+            idle_since.elapsed()
+        } else {
+            start.elapsed()
+        }) >= timeout
+            || policy
+                .max_duration_ms
+                .is_some_and(|limit| start.elapsed() >= std::time::Duration::from_millis(limit))
+        {
             let cancelled = client
                 .cancel_session_turn(session_id)
                 .await

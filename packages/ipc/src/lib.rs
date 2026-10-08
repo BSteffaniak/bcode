@@ -17,6 +17,7 @@ use bcode_session_models::{
     SessionSummary, WorkId,
 };
 use bcode_skill_models::{SkillContextResponse, SkillId, SkillList, SkillManifest};
+pub use bcode_workflow_view_models::SessionProgressSnapshot;
 pub use bcode_worktree_models::{
     WorktreeCreateOperationStatus, WorktreeCreateRequest, WorktreeCreateResponse,
     WorktreeListRequest, WorktreeListResponse, WorktreeRemoveRequest, WorktreeRemoveResponse,
@@ -120,7 +121,9 @@ const MAX_CHUNK_DATA_SIZE: usize = MAX_FRAME_PAYLOAD_SIZE / 2;
 /// request/response layouts are rejected rather than interpreted as another operation.
 /// Version 47 adds read-only projection history pages to both positional envelopes.
 /// Older peers are rejected rather than interpreting the combined payload layout.
-pub const CURRENT_PROTOCOL_VERSION: u16 = 48;
+/// Version 48 adds scoped session discovery and bounded catalog pages.
+/// Version 49 adds content-free session progress snapshots; version 48 peers are rejected.
+pub const CURRENT_PROTOCOL_VERSION: u16 = 49;
 
 /// Durable session-storage writer epoch expected by this IPC build.
 pub const CURRENT_SESSION_STORAGE_WRITER_EPOCH: u32 =
@@ -1391,6 +1394,10 @@ pub enum Request {
         parent_id: SessionId,
         apply: bool,
     },
+    /// Read a content-free ephemeral progress marker without acquiring session ownership.
+    SessionProgressSnapshot {
+        session_id: SessionId,
+    },
 }
 
 /// Server stop request policy.
@@ -2653,6 +2660,10 @@ pub enum ResponsePayload {
     /// Explicit relationship maintenance result.
     SessionChildrenReconciled {
         result: bcode_session_models::SessionChildReconciliation,
+    },
+    /// Own-session progress only; unavailable coverage is not silence or idleness.
+    SessionProgressSnapshot {
+        snapshot: SessionProgressSnapshot,
     },
 }
 

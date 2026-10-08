@@ -14,6 +14,27 @@ cumulative and duplicated; do not sum index rows. Existing canonical telemetry o
 usage accounting. Trace metadata is omitted from the index; raw transcripts and
 trace payloads are sensitive diagnostic artifacts, not public frontend contracts.
 
+## Timeout diagnosis
+
+New repetition results can retain resolved `timeout` settings: `timeout_mode`,
+`timeout_ms`, and optional `max_duration_ms`. Missing labels on historical
+results mean unrecorded policy, not permission to reinterpret a prior failure.
+The default mode remains `wall_clock`; only explicit `idle` selection changes
+`timeout_ms` into an inactivity interval. An independent total limit remains
+separate from that interval.
+
+Diagnose idle exhaustion separately from wall-clock or total-limit exhaustion.
+Idle progress must reflect substantive model, tool, or stage activity, including
+descendants; polling, heartbeat traffic, and running-state observations are not
+progress. Correlate retained evidence with execution provenance rather than
+inferring resets from duration or observation frequency. Missing progress
+coverage prevents a complete causal attribution. Idle exhaustion alone is not
+evidence of remote-provider queueing or a provider failure.
+
+These model labels and diagnostic rules do not establish that all execution
+methods implement idle tracking. Runtime observation, cancellation, and result
+wiring require adapter-specific verification; no live validation is implied.
+
 ## Judgement diagnostics
 
 The loop plugin accepts an explicit sensitive-capture setting:

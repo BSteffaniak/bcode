@@ -4,6 +4,9 @@
 
 //! Portable, renderer-neutral workflow projection contracts.
 
+mod activity;
+pub use activity::*;
+
 mod basic_catalog;
 pub use basic_catalog::*;
 mod identity_catalog;

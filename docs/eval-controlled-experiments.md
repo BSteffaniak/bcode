@@ -51,6 +51,39 @@ profile name reproduces it. Changing a selected provider requires authorization.
 Never put credentials in these manifests. The controlled suite deliberately has
 an executable marker; materialization requires an explicitly identified binary.
 
+## Execution timeout contract
+
+Timeout mode is explicit. Omitting `timeout_mode` retains the legacy
+`"wall_clock"` meaning of `timeout_ms`; a historical 180,000 ms deadline does
+not become an idle interval. Opt-in configuration uses:
+
+```toml
+[run]
+timeout_mode = "idle"
+timeout_ms = 180000
+# Optional independent total execution limit:
+# max_duration_ms = 900000
+```
+
+Case `timeout_mode`, `timeout_ms`, and `max_duration_ms` overrides inherit
+independently from the run. An omitted case total limit inherits the run cap;
+it does not disable it. Resolution is a lightweight model utility; execution
+validation must reject zero intervals and zero supplied total limits before
+admission. Unknown mode variants are rejected rather than guessed.
+
+Idle mode specifies 180 seconds without substantive model, tool, or stage
+progress, including descendants, not 180 seconds of total elapsed execution.
+Polls, heartbeats, and observations that work is running do not reset it. A
+separate total limit does not reset with progress. This contract does not certify
+that every executor has implemented idle observation or cancellation; adapter
+wiring and validation must be verified before claiming an idle-controlled run.
+Judge deadlines and post-execution capture allowances are separate budgets.
+
+Record resolved timeout settings on new results. Keep idle exhaustion, total
+limit exhaustion, and legacy wall-clock exhaustion distinct in diagnostics;
+do not relabel old failures or infer an idle diagnosis from elapsed time alone.
+The example above does not change the checked-in experiment suite or its grading.
+
 ## Offline validation (coordinator only until validation is released)
 
 The following commands are proposed, **not evidence of validation already run**.
