@@ -589,6 +589,7 @@ async fn handle_cli(cli: Cli) -> Result<(), CliError> {
     let _ = (&cli.state_root, &cli.state_profile);
     let launch_options = cli.launch_options();
     validate_cli_execution_mode(&cli, launch_options)?;
+    startup::prepare_remembered_source()?;
     if cli.new {
         if cli.command.is_some() {
             return Err(CliError::NewSessionWithCommand);
@@ -596,12 +597,11 @@ async fn handle_cli(cli: Cli) -> Result<(), CliError> {
         Box::pin(run_new_session_tui(cli.worktree, launch_options)).await?;
         return Ok(());
     }
-    if cli.onboard || (cli.command.is_none() && should_auto_start_onboarding()?) {
-        handle_onboard_command(&OnboardOptions {
-            no_credential_discovery: cli.no_credential_discovery,
-            ..OnboardOptions::default()
-        })
-        .await?;
+    if cli.onboard {
+        startup::advanced(cli.no_credential_discovery).await?;
+        return Ok(());
+    }
+    if cli.command.is_none() && Box::pin(startup::route(cli.no_credential_discovery)).await? {
         return Ok(());
     }
     match cli.command.unwrap_or_default() {
@@ -3569,23 +3569,6 @@ const fn onboard_output_mode(dry_run: bool, non_interactive: bool) -> OnboardOut
     } else {
         OnboardOutputMode::Preview
     }
-}
-
-fn should_auto_start_onboarding() -> Result<bool, CliError> {
-    if std::env::var_os("CI").is_some() || std::env::var_os("BCODE_NO_ONBOARD").is_some() {
-        return Ok(false);
-    }
-    let store = bcode_settings::SettingsStore::default();
-    let config = bcode_config::load_config()?;
-    let summary = bcode_settings::SetupConfigSummary::from_config(&config);
-    let progress = store.onboarding_progress()?;
-    Ok(bcode_settings::should_auto_start_onboarding(
-        bcode_settings::OnboardingStartupCommand::NormalTui,
-        std::io::stdout().is_terminal(),
-        progress.as_ref(),
-        &summary,
-    )
-    .should_start)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -10622,6 +10605,7 @@ fn auth_pool_profile_vault(config: &bcode_config::BcodeConfig, profile: &str) ->
 }
 
 mod credential_setup;
+mod startup;
 
 fn auth_providers() -> Result<(), CliError> {
     let mut host = load_cli_plugin_host()?;

@@ -80,6 +80,73 @@ pub const OP_NORMALIZE_USAGE: &str = "normalize_usage";
 
 pub const OP_MODELS: &str = "models";
 
+/// Optional offline recommendation for a provider-owned authentication method.
+/// Implementations must not read credentials or make network requests.
+pub const OP_STARTUP_RECOMMENDATION: &str = "startup_recommendation";
+
+/// Optional offline validation of one selected model; never remote authentication.
+pub const OP_STARTUP_READINESS: &str = "startup_readiness";
+
+/// Exact normalized selection to check against a provider's local catalog.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct StartupReadinessRequest {
+    /// Exact model, not an alias or suggested replacement.
+    pub model_id: String,
+    /// Nonsecret routing settings of the selected provider surface.
+    pub settings: BTreeMap<String, String>,
+}
+
+/// Local catalog knowledge, not proof of provider availability or account access.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum StartupModelReadiness {
+    /// The exact model supports coding tools on this surface.
+    Available,
+    /// This catalog authoritatively excludes the model or required coding capability.
+    Unavailable,
+    /// No authoritative local catalog exists; callers must not invent a replacement.
+    Unknown,
+}
+
+/// Typed optional local readiness response.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct StartupReadinessResponse {
+    /// Local knowledge for the exact selected model.
+    pub model: StartupModelReadiness,
+}
+
+/// Request a coding model recommendation without authenticating or discovering remotely.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct StartupRecommendationRequest {
+    /// Provider-owned authentication contribution identifier.
+    pub auth_provider_id: String,
+    /// Authentication method identifier from that contribution.
+    pub method_id: String,
+}
+
+/// Nonsecret normalized selection proposed by the provider and its local catalog.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct StartupRecommendation {
+    /// Owning model-provider plugin identifier.
+    pub provider_plugin_id: String,
+    /// Catalog-recognized provider-native coding model identifier.
+    pub model_id: String,
+    /// Nonsecret routing settings; never credentials or opaque authentication data.
+    pub settings: BTreeMap<String, String>,
+}
+
+/// Optional extension response. Absence means the method has no offline recommendation.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct StartupRecommendationResponse {
+    /// Available recommendation; unsupported providers or methods return `None`.
+    pub recommendation: Option<StartupRecommendation>,
+}
+
 /// Operation for validating provider configuration.
 pub const OP_VALIDATE_CONFIG: &str = "validate_config";
 
@@ -155,6 +222,20 @@ pub struct ProviderOperationContract {
 /// advertised. Optional operations are extensions and callers must tolerate an
 /// `unsupported_operation` service error.
 pub const MODEL_PROVIDER_OPERATIONS: &[ProviderOperationContract] = &[
+    ProviderOperationContract {
+        operation: OP_STARTUP_READINESS,
+        request_type: "StartupReadinessRequest",
+        response_type: "StartupReadinessResponse",
+        requirement: ProviderOperationRequirement::Optional,
+        behavior: "check the exact model against authoritative local provider catalog without credentials or network; unknown surfaces remain unknown and never select a replacement",
+    },
+    ProviderOperationContract {
+        operation: OP_STARTUP_RECOMMENDATION,
+        request_type: "StartupRecommendationRequest",
+        response_type: "StartupRecommendationResponse",
+        requirement: ProviderOperationRequirement::Optional,
+        behavior: "recommend a catalog-recognized coding model and nonsecret routing settings without credentials or network; unsupported methods return no recommendation",
+    },
     ProviderOperationContract {
         operation: history::OP_HISTORY_CAPABILITIES,
         request_type: "HistoryCapabilitiesRequest",

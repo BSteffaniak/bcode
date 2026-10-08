@@ -26,6 +26,8 @@ pub const BCODE_CONFIG_TOML_ENV: &str = "BCODE_CONFIG_TOML";
 pub mod contexts;
 pub mod edit;
 pub mod judgement;
+/// Versioned remembered startup choices and optional fallback support.
+pub mod startup;
 pub use judgement::{JudgementConfig, JudgementMode};
 
 /// Environment variable selecting the active model profile.
@@ -211,6 +213,10 @@ const PROVIDER_ENVIRONMENT_SPECS: &[ProviderEnvironmentSpec] = &[
 /// Top-level Bcode configuration.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct BcodeConfig {
+    /// Request-local provenance: a remembered startup choice supplied the fallback.
+    /// Clones retain this marker; serialization and effective-config transport omit it.
+    #[serde(skip)]
+    pub startup_selection_applied: bool,
     /// Stable identity of the resolved context, retained across client/server transport.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub active_context: Option<String>,
@@ -282,6 +288,7 @@ pub struct BcodeConfig {
 impl Default for BcodeConfig {
     fn default() -> Self {
         Self {
+            startup_selection_applied: false,
             active_context: None,
             contexts: None,
             composition: CompositionConfig::default(),
@@ -9073,9 +9080,10 @@ pub fn load_config_with_environment(
     environment: &impl ConfigEnvironment,
 ) -> Result<BcodeConfig, ConfigError> {
     let overrides = effective_config_overrides(environment);
-    load_config_from_paths_with_overrides(
+    load_config_from_paths_with_overrides_and_environment(
         &default_config_paths_with_environment(environment),
         &overrides,
+        environment,
     )
 }
 
@@ -9099,9 +9107,10 @@ pub fn load_config_with_environment_and_overrides(
     environment: &impl ConfigEnvironment,
     overrides: &ConfigLoadOverrides,
 ) -> Result<BcodeConfig, ConfigError> {
-    load_config_from_paths_with_overrides(
+    load_config_from_paths_with_overrides_and_environment(
         &default_config_paths_with_environment(environment),
         overrides,
+        environment,
     )
 }
 
@@ -9127,15 +9136,23 @@ pub fn load_config_from_paths(paths: &[PathBuf]) -> Result<BcodeConfig, ConfigEr
 /// Returns an error if an existing config layer cannot be read, parsed, or composed.
 pub fn load_config_from_paths_with_environment(
     paths: &[PathBuf],
-    _environment: &impl ConfigEnvironment,
+    environment: &impl ConfigEnvironment,
 ) -> Result<BcodeConfig, ConfigError> {
     let process_overrides = process_config_overrides()
         .read()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
         .clone();
     process_overrides.as_ref().map_or_else(
-        || load_config_from_paths_with_overrides(paths, &ConfigLoadOverrides::default()),
-        |overrides| load_config_from_paths_with_overrides(paths, overrides),
+        || {
+            load_config_from_paths_with_overrides_and_environment(
+                paths,
+                &ConfigLoadOverrides::default(),
+                environment,
+            )
+        },
+        |overrides| {
+            load_config_from_paths_with_overrides_and_environment(paths, overrides, environment)
+        },
     )
 }
 
@@ -9208,10 +9225,28 @@ pub fn load_config_from_paths_with_overrides(
     paths: &[PathBuf],
     overrides: &ConfigLoadOverrides,
 ) -> Result<BcodeConfig, ConfigError> {
+    load_config_from_paths_with_overrides_and_environment(
+        paths,
+        overrides,
+        &ProcessConfigEnvironment,
+    )
+}
+
+fn load_config_from_paths_with_overrides_and_environment(
+    paths: &[PathBuf],
+    overrides: &ConfigLoadOverrides,
+    environment: &impl ConfigEnvironment,
+) -> Result<BcodeConfig, ConfigError> {
     let raw = merged_raw_config_value_with_overrides(paths, overrides)?;
     let (mut resolved, _resolution) = resolve_composed_config_value(&raw)?;
     contexts::apply_profile_override(&mut resolved, overrides)?;
-    validate_config_value(resolved, "composed config")
+    let mut config = validate_config_value(resolved, "composed config")?;
+    // Optional domain damage does not block core startup. Onboarding inspects the typed
+    // startup::load API and must obtain explicit repair before replacing invalid bytes.
+    if let Ok(Some(selection)) = startup::load_from(&startup::path_with_environment(environment)) {
+        let _ = startup::apply_fallback(&mut config, &selection, environment);
+    }
+    Ok(config)
 }
 
 fn merged_raw_config_value_with_overrides(

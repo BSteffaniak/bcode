@@ -20,6 +20,7 @@ pub mod lifecycle;
 pub mod native_device;
 pub mod operations;
 pub mod security;
+pub mod startup;
 pub mod store;
 
 /// Load portable auth-pool status without exposing configuration diagnostics.
@@ -188,6 +189,26 @@ pub struct ProviderRequestContextResolution<'a> {
 pub fn resolve_provider_request_context(
     request: ProviderRequestContextResolution<'_>,
 ) -> bcode_model::ProviderRequestContext {
+    match startup::resolve_remembered_environment(request.config, &request.selection) {
+        Ok(Some(context)) => return context,
+        Err(_) => return bcode_model::ProviderRequestContext {
+            settings: request.selection.settings,
+            auth_profile: Some("environment".to_owned()),
+            auth: Some(bcode_model::ProviderAuthContext {
+                profile: Some("environment".to_owned()),
+                backend: Some("environment".to_owned()),
+                diagnostics: vec![bcode_model::ProviderAuthDiagnostic {
+                    severity: "error".to_owned(),
+                    code: "startup_environment_unavailable".to_owned(),
+                    remediation: Some("Reconnect the selected launch environment credential".to_owned()),
+                    message: "Selected launch environment credential is unavailable; no alternate source was selected".to_owned(),
+                }],
+                ..Default::default()
+            }),
+            ..Default::default()
+        },
+        Ok(None) => {}
+    }
     resolve_provider_request_context_with_registry_loader(
         request,
         bcode_config::load_runtime_auth_subscriptions,
@@ -204,6 +225,11 @@ pub fn resolve_provider_request_context(
 pub fn try_resolve_provider_request_context(
     request: ProviderRequestContextResolution<'_>,
 ) -> Result<bcode_model::ProviderRequestContext, bcode_config::ConfigError> {
+    if let Some(context) =
+        startup::resolve_remembered_environment(request.config, &request.selection)?
+    {
+        return Ok(context);
+    }
     try_resolve_with_registry_loader(request, bcode_config::try_load_runtime_auth_subscriptions)
 }
 

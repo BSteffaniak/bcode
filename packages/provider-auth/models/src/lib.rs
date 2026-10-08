@@ -7,6 +7,8 @@
 //! These types describe provider registration and normalized interactive authentication flows.
 //! They intentionally contain no vault access, plugin loading, networking, prompting, or UI logic.
 
+pub mod startup;
+
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::fmt::{Display, Formatter};

@@ -34,7 +34,7 @@ Use the build helper for executable builds: it assigns a fresh artifact identity
 new builds can coexist with already-running daemons. See
 [Release builds](docs/release-builds.md) for raw-Cargo identity requirements.
 
-The first interactive launch opens Bcode's setup flow for provider, model, authentication, and permission choices. The bundled provider integrations cover OpenAI-compatible APIs—including OpenAI API keys and ChatGPT subscription login—and Amazon Bedrock.
+The first interactive launch offers a quick connection choice: confirm a detected provider key, sign in, or add a key, then start working. Nonsecret choices are remembered in the resolved state root's `startup.toml`, separate from `bcode.toml`; healthy returning launches skip setup. Advanced setup remains available with `bcode --onboard`. The bundled provider integrations cover OpenAI-compatible APIs—including OpenAI API keys and ChatGPT subscription login—and Amazon Bedrock.
 
 See [Getting started](docs/getting-started.md) for build choices and initial setup, or jump to the [CLI](#documentation) and configuration references.
 

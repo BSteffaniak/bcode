@@ -2313,6 +2313,8 @@ dependencies = [
  "base64 0.22.1",
  "bcode_config",
  "bcode_model",
+ "bcode_model_catalog",
+ "bcode_model_catalog_models",
  "bcode_model_provider_runtime",
  "bcode_model_schema",
  "bcode_openai_responses",

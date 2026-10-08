@@ -40,7 +40,13 @@ On Windows with the MSVC toolchain:
 .\target\x86_64-pc-windows-msvc\release\bcode.exe
 ```
 
-The first normal interactive launch opens Bcode's setup flow. It detects existing configuration and environment hints, then walks through provider, model, authentication, permissions, optional session imports, and plugin choices.
+The first interactive launch offers a quick connection choice. When a supported provider key is detected, Bcode shows its source, a recommended coding model, and billing guidance; one confirmation remembers the choice and opens the composer. You can instead sign in with a supported subscription, enter an API key, or open Advanced setup.
+
+Bcode remembers nonsecret connection and model references in `<resolved state root>/startup.toml`, not in `bcode.toml`. Environment-backed connections require the selected variable to remain available on future launches; Bcode does not copy that key into the state file. Entered credentials and subscription tokens use the authentication backend. Explicit configuration, model profiles, and request overrides remain authoritative over remembered defaults.
+
+Healthy returning launches skip setup. Missing selected credentials, disabled providers, and locally known unsupported models produce targeted connection guidance rather than silently choosing another account. Detection and local catalog checks are not proof of remote authentication or credit. Providers without a bundled offline recommendation require explicit model selection in Advanced setup.
+
+Advanced setup remains available through `bcode --onboard` or `bcode onboard`. Permissions, optional session imports, and plugin customization are not prerequisites for the first prompt. Automation and noninteractive invocations do not open the quick chooser.
 
 Running `bcode` after setup opens the TUI. The client starts a matching local daemon automatically when needed; normal use does not require a separate server command.
 

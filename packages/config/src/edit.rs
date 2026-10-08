@@ -45,20 +45,26 @@ impl ConfigEdit {
                 "Configuration changed since review; review the changes again",
             ));
         }
-        let mut temporary =
-            tempfile::NamedTempFile::new_in(parent).map_err(|source| io_error(parent, source))?;
-        temporary
-            .write_all(self.updated.as_bytes())
+        atomic_replace(&self.path, self.updated.as_bytes())
             .map_err(|source| io_error(&self.path, source))?;
-        temporary
-            .as_file()
-            .sync_all()
-            .map_err(|source| io_error(&self.path, source))?;
-        temporary
-            .persist(&self.path)
-            .map_err(|error| io_error(&self.path, error.error))?;
         Ok(self.path)
     }
+}
+
+/// Replace a file with synced contents on the same filesystem. Caller owns locking.
+pub(crate) fn atomic_replace(path: &Path, contents: &[u8]) -> std::io::Result<()> {
+    let parent = path.parent().ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "file parent is unavailable",
+        )
+    })?;
+    let mut temporary = tempfile::NamedTempFile::new_in(parent)?;
+    temporary.write_all(contents)?;
+    temporary.as_file().sync_all()?;
+    temporary.persist(path).map_err(|error| error.error)?;
+    std::fs::File::open(parent)?.sync_all()?;
+    Ok(())
 }
 
 /// Plan one explicit non-secret TOML field edit or override removal.

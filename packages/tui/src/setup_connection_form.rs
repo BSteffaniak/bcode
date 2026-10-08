@@ -20,6 +20,18 @@ enum Presentation {
     Advanced,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum EnrollmentMode {
+    Quick,
+    Configurable,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum EnrollmentStatus {
+    Pending,
+    Completed,
+}
+
 pub struct ConnectionForm {
     presentation: Presentation,
     providers: Vec<bcode_provider_auth_models::AuthProviderContribution>,
@@ -35,22 +47,74 @@ pub struct ConnectionForm {
     review: bool,
     pending_declaration: Option<bcode_config::edit::ConfigEdit>,
     status: String,
+    completed: EnrollmentStatus,
+    mode: EnrollmentMode,
 }
 
 impl ConnectionForm {
     pub fn new(importing: bool) -> Self {
-        let providers = load_connection_choices().unwrap_or_default();
+        let (providers, status) = match load_connection_choices() {
+            Ok(providers) if providers.is_empty() => (
+                providers,
+                "No enabled authentication provider is available. Use Advanced to review plugins."
+                    .to_owned(),
+            ),
+            Ok(providers) => (
+                providers,
+                "Choose a provider to connect. Esc returns.".to_owned(),
+            ),
+            Err(message) => (Vec::new(), message),
+        };
         Self {
             presentation: Presentation::Guided,
-            providers, picker: Some(false), selected: 0, query: String::new(), interactive: false,
+            providers,
+            picker: Some(false),
+            selected: 0,
+            query: String::new(),
+            interactive: false,
             device: None,
             importing,
-            fields: [String::new(), "api_key".to_owned(), String::new(), bcode_config::default_auth_vault_path().display().to_string()]
-                .map(|text| TextInputState::new(TextEditBuffer::from_text(text))),
-            focus: 0, secret: zeroize::Zeroizing::new(String::new()), review: false,
+            fields: [
+                String::new(),
+                "api_key".to_owned(),
+                String::new(),
+                bcode_config::default_auth_vault_path()
+                    .display()
+                    .to_string(),
+            ]
+            .map(|text| TextInputState::new(TextEditBuffer::from_text(text))),
+            focus: 0,
+            secret: zeroize::Zeroizing::new(String::new()),
+            review: false,
             pending_declaration: None,
-            status: "Provider ID, method, profile, vault, then secret. Tab moves fields; Enter reviews; Esc returns.".to_owned(),
+            status,
+            completed: EnrollmentStatus::Pending,
+            mode: EnrollmentMode::Configurable,
         }
+    }
+
+    /// Construct enrollment without declarative configuration editing.
+    #[must_use]
+    pub fn quick() -> Self {
+        let mut form = Self::new(false);
+        form.mode = EnrollmentMode::Quick;
+        form
+    }
+
+    /// Return references only after credential persistence and publication succeed.
+    pub fn completion(&mut self) -> Option<(String, String)> {
+        if let Some(device) = &mut self.device {
+            device.refresh();
+            if device.succeeded {
+                self.completed = EnrollmentStatus::Completed;
+            }
+        }
+        (self.completed == EnrollmentStatus::Completed).then(|| {
+            (
+                self.fields[0].buffer().text().to_owned(),
+                self.fields[2].buffer().text().to_owned(),
+            )
+        })
     }
 
     pub fn handle_event(&mut self, event: &Event) -> bool {
@@ -61,28 +125,8 @@ impl ConnectionForm {
         if self.picker.is_some() {
             return self.handle_picker(event);
         }
-        if let Some(device) = &mut self.device {
-            device.refresh();
-            handle_auth_prompt(device, event);
-            if device.terminal {
-                if matches!(event, Event::Key(key) if matches!(key.key, KeyCode::Enter | KeyCode::Escape | KeyCode::Char('r' | 'b' | 'q')))
-                {
-                    if device.succeeded {
-                        return true;
-                    }
-                    self.device = None;
-                    self.review = false;
-                    self.picker = Some(true);
-                    self.query.clear();
-                    self.selected = 0;
-                    "Choose a method to retry or Esc to choose another provider."
-                        .clone_into(&mut self.status);
-                }
-            } else if matches!(event, Event::Key(key) if matches!(key.key, KeyCode::Escape | KeyCode::Char('q')))
-            {
-                device.cancel();
-            }
-            return false;
+        if self.device.is_some() {
+            return self.handle_device_event(event);
         }
         match event {
             Event::Key(key) if key.key == KeyCode::Escape => {
@@ -92,7 +136,9 @@ impl ConnectionForm {
                     return true;
                 }
             }
-            Event::Key(key) if key.key == KeyCode::F(2) => {
+            Event::Key(key)
+                if key.key == KeyCode::F(2) && self.mode == EnrollmentMode::Configurable =>
+            {
                 self.presentation = if self.presentation == Presentation::Guided {
                     Presentation::Advanced
                 } else {
@@ -112,16 +158,21 @@ impl ConnectionForm {
                 };
             }
             Event::Key(key) if key.key == KeyCode::Enter => {
-                if self.review && self.prepare_declaration_review() {
+                let confirm =
+                    self.review || (self.mode == EnrollmentMode::Quick && !self.interactive);
+                if confirm && self.prepare_declaration_review() {
                     return false;
                 }
-                if self.review && !self.importing && self.interactive {
+                if confirm && !self.importing && self.interactive {
                     self.start_device_login();
-                } else if self.review {
-                    self.status = self.save().map_or_else(
-                        |message| message,
-                        |()| "Credentials saved. Esc returns to setup.".to_owned(),
-                    );
+                } else if confirm {
+                    match self.save() {
+                        Ok(()) => {
+                            self.completed = EnrollmentStatus::Completed;
+                            "Account connected.".clone_into(&mut self.status);
+                        }
+                        Err(message) => self.status = message,
+                    }
                     self.secret.clear();
                     self.review = false;
                 } else {
@@ -154,6 +205,32 @@ impl ConnectionForm {
         false
     }
 
+    fn handle_device_event(&mut self, event: &Event) -> bool {
+        if let Some(device) = &mut self.device {
+            device.refresh();
+            handle_auth_prompt(device, event);
+            if device.terminal {
+                if matches!(event, Event::Key(key) if matches!(key.key, KeyCode::Enter | KeyCode::Escape | KeyCode::Char('r' | 'b' | 'q')))
+                {
+                    if device.succeeded {
+                        return true;
+                    }
+                    self.device = None;
+                    self.review = false;
+                    self.picker = Some(true);
+                    self.query.clear();
+                    self.selected = 0;
+                    "Choose a method to retry or Esc to choose another provider."
+                        .clone_into(&mut self.status);
+                }
+            } else if matches!(event, Event::Key(key) if matches!(key.key, KeyCode::Escape | KeyCode::Char('q')))
+            {
+                device.cancel();
+            }
+        }
+        false
+    }
+
     fn start_device_login(&mut self) {
         self.device = Some(super::setup_device_login::DeviceLogin::start(
             self.fields[0].buffer().text().to_owned(),
@@ -165,6 +242,24 @@ impl ConnectionForm {
     }
 
     fn prepare_declaration_review(&mut self) -> bool {
+        if self.mode == EnrollmentMode::Quick {
+            return match bcode_config::load_config() {
+                Ok(config) if config.active_context.is_some() => {
+                    "This explicit context requires a declared account. Use Advanced to review configuration; no credentials changed.".clone_into(&mut self.status);
+                    true
+                }
+                Ok(_) if self.fields[2].buffer().text().is_empty() => {
+                    "Could not allocate an account profile. Return to provider selection or use Advanced; no credentials changed.".clone_into(&mut self.status);
+                    true
+                }
+                Ok(_) => false,
+                Err(_) => {
+                    "Configuration unavailable; no credentials changed."
+                        .clone_into(&mut self.status);
+                    true
+                }
+            };
+        }
         match self.context_declaration() {
             Ok(Some(edit)) => {
                 self.status = format!(
@@ -512,6 +607,13 @@ impl ConnectionForm {
         write(
             frame,
             area,
+            area.height.saturating_sub(3),
+            &self.status,
+            theme.muted,
+        );
+        write(
+            frame,
+            area,
             area.height.saturating_sub(2),
             "Type to search • ↑/↓ select • Enter continue • Esc back",
             theme.muted,
@@ -851,6 +953,8 @@ mod tests {
             secret: zeroize::Zeroizing::new(String::new()),
             review: false,
             pending_declaration: None,
+            completed: EnrollmentStatus::Pending,
+            mode: EnrollmentMode::Configurable,
             status: String::new(),
         };
         assert!(
@@ -859,6 +963,37 @@ mod tests {
             )))
         );
         assert_eq!(form.picker, None);
+        assert!(form.completion().is_some());
+    }
+
+    #[test]
+    fn cancelled_form_has_no_success_reference() {
+        let mut form = ConnectionForm {
+            presentation: Presentation::Guided,
+            providers: Vec::new(),
+            picker: None,
+            selected: 0,
+            query: String::new(),
+            interactive: false,
+            device: None,
+            importing: false,
+            fields: std::array::from_fn(|_| {
+                TextInputState::new(TextEditBuffer::from_text(String::new()))
+            }),
+            focus: 4,
+            secret: zeroize::Zeroizing::new(String::new()),
+            review: false,
+            pending_declaration: None,
+            completed: EnrollmentStatus::Pending,
+            mode: EnrollmentMode::Quick,
+            status: String::new(),
+        };
+        assert!(
+            form.handle_event(&Event::Key(bmux_keyboard::KeyStroke::simple(
+                KeyCode::Escape
+            )))
+        );
+        assert!(form.completion().is_none());
     }
 
     #[test]
@@ -885,6 +1020,8 @@ mod tests {
                 secret: zeroize::Zeroizing::new(String::new()),
                 review: false,
                 pending_declaration: None,
+                completed: EnrollmentStatus::Pending,
+                mode: EnrollmentMode::Configurable,
                 status: String::new(),
             };
             assert!(!form.handle_event(&Event::Key(bmux_keyboard::KeyStroke::simple(key))));

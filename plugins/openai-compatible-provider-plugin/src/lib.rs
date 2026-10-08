@@ -12,6 +12,7 @@
 mod discovery;
 /// Provider-owned conversion of external conversation history.
 pub mod history;
+mod startup;
 
 use base64::Engine as _;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
@@ -1448,6 +1449,8 @@ impl OpenAiCompatibleProviderPlugin {
                 )
             }
             OP_MODELS => self.models_response(&context.request),
+            bcode_model::OP_STARTUP_RECOMMENDATION => startup::response(&context.request),
+            bcode_model::OP_STARTUP_READINESS => startup::readiness_response(&context.request),
             OP_VALIDATE_CONFIG => Self::validate_config(&context.request),
             bcode_model::image_upload::OP_VERIFY_IMAGE_UPLOAD => self.verify_image_upload(context),
             OP_VERIFY_MODEL => self.verify_model(&context.request),

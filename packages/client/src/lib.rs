@@ -1285,6 +1285,60 @@ fn resolve_path_from(
     path.canonicalize().unwrap_or(path)
 }
 
+// A remembered environment account is materialized into normalized authentication by
+// the auth domain. Do not also transmit other process credentials that could select a
+// different account or cause provider-specific routing to infer a different service.
+fn caller_provider_environment(
+    selected_environment: Option<&str>,
+    mut read: impl FnMut(&str) -> Option<String>,
+) -> BTreeMap<String, String> {
+    if selected_environment.is_some() {
+        // The normalized selected context already contains its credential and routing
+        // settings. Process overrides from other accounts must not alter either.
+        return BTreeMap::new();
+    }
+    CLIENT_RUNTIME_ENV_VARS
+        .iter()
+        .filter_map(|name| {
+            read(name)
+                .filter(|value| !value.trim().is_empty())
+                .map(|value| ((*name).to_owned(), value))
+        })
+        .collect()
+}
+
+#[cfg(test)]
+mod startup_environment_tests {
+    use super::caller_provider_environment;
+
+    #[test]
+    fn selected_account_never_reads_or_transmits_other_process_accounts() {
+        let env = caller_provider_environment(Some("OPENROUTER_API_KEY"), |_| {
+            panic!("selected normalized authentication must not inspect process overrides")
+        });
+        assert!(env.is_empty());
+    }
+
+    #[test]
+    fn explicit_configuration_retains_existing_process_environment_behavior() {
+        let env = caller_provider_environment(None, |name| match name {
+            "OPENAI_API_KEY" => Some("fake-test-key".to_owned()),
+            "BCODE_OPENAI_BASE_URL" => Some("https://example.invalid/v1".to_owned()),
+            "AWS_SESSION_TOKEN" => Some(" ".to_owned()),
+            _ => None,
+        });
+        assert_eq!(
+            env.get("OPENAI_API_KEY").map(String::as_str),
+            Some("fake-test-key")
+        );
+        assert_eq!(
+            env.get("BCODE_OPENAI_BASE_URL").map(String::as_str),
+            Some("https://example.invalid/v1")
+        );
+        assert!(!env.contains_key("AWS_SESSION_TOKEN"));
+    }
+}
+
 fn current_runtime_context() -> Result<ClientRuntimeContext, ClientError> {
     let working_directory = current_working_directory();
     let config = bcode_config::load_config().map_err(|_| {
@@ -1300,14 +1354,20 @@ fn current_runtime_context() -> Result<ClientRuntimeContext, ClientError> {
                     .to_owned(),
             )
         })?);
-    let env = CLIENT_RUNTIME_ENV_VARS
-        .iter()
-        .filter_map(|name| match std::env::var(name) {
-            Ok(value) if !value.trim().is_empty() => Some(((*name).to_string(), value)),
-            _ => None,
-        })
-        .collect::<BTreeMap<_, _>>();
     let resolved = config.resolved_model_selection();
+    let selected_environment = bcode_provider_auth::startup::selected_environment_for_selection(
+        &config,
+        &resolved,
+    )
+    .map_err(|_| ClientError::Protocol(
+        "The remembered environment connection is inconsistent; reconnect that account. No substitute account was selected.".to_owned(),
+    ))?;
+    let env = caller_provider_environment(
+        selected_environment
+            .as_ref()
+            .map(|source| source.name.as_str()),
+        |name| std::env::var(name).ok(),
+    );
     let provider_context = bcode_provider_auth::try_resolve_provider_request_context(
         bcode_provider_auth::ProviderRequestContextResolution {
             config: &config,
