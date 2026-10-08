@@ -8,7 +8,6 @@ use bcode_metrics::dashboard::{
 use bcode_metrics::{MetricsEventLogConfig, MetricsRegistry, MetricsReport};
 use bcode_plugin_sdk::path::display_from_current_dir;
 use bcode_plugin_sdk::tui::{PluginTuiAction, PluginTuiHost, PluginTuiSurface, PluginTuiTheme};
-use bmux_keyboard::KeyCode;
 use bmux_tui::component::{Component, Constraints, LayoutCx};
 use bmux_tui::event::{Event, MouseEventKind};
 #[cfg(test)]
@@ -107,6 +106,7 @@ fn purple() -> Color {
 /// Persisted metrics dashboard surface.
 #[derive(Debug)]
 pub struct MetricsDashboardSurface {
+    shortcuts: Vec<(String, String)>,
     metrics_path: PathBuf,
     report: MetricsReport,
     dashboard: MetricsDashboardData,
@@ -148,10 +148,21 @@ pub fn dashboard_query_from_options(options: &serde_json::Value) -> MetricsDashb
 }
 
 impl MetricsDashboardSurface {
+    fn update_shortcuts(&mut self, host: &dyn PluginTuiHost) {
+        self.shortcuts = crate::tui::dashboard_keymap_actions()
+            .into_iter()
+            .filter_map(|action| {
+                let keys = host.keymap_keys(&action.scope, &action.id);
+                (!keys.is_empty()).then(|| (keys.join("/"), action.description))
+            })
+            .collect();
+    }
+
     #[must_use]
     pub fn load(metrics_path: PathBuf, query: MetricsDashboardQuery) -> Self {
         let (report, query_result, status) = load_report(&metrics_path, &query);
         Self {
+            shortcuts: Vec::new(),
             metrics_path,
             report,
             dashboard: query_result.dashboard,
@@ -256,7 +267,7 @@ impl MetricsDashboardSurface {
         let component = ActionRowComponent::new("metrics.actions", &actions, &state)
             .styles(metric_button_styles());
         paint_dashboard_component(&component, action_area, frame);
-        render_status(status_area, frame);
+        render_status(status_area, frame, &self.shortcuts);
     }
 
     fn render_domain(&mut self, area: Rect, frame: &mut PaintCx<'_, '_>) {
@@ -486,66 +497,90 @@ impl MetricsDashboardSurface {
         )
     }
 
-    fn handle_key_event(&mut self, event: &Event) -> Option<PluginTuiAction> {
+    fn handle_key_event(
+        &mut self,
+        event: &Event,
+        host: &dyn PluginTuiHost,
+    ) -> Option<PluginTuiAction> {
         let Event::Key(stroke) = event else {
             return None;
         };
-        match stroke.key {
-            KeyCode::Char('q') | KeyCode::Escape => Some(PluginTuiAction::Close { outcome: None }),
-            KeyCode::Char('r') => {
+        match host.keymap_action("metrics-dashboard", *stroke)?.as_str() {
+            "bcode.metrics.previous_row"
+            | "bcode.metrics.next_row"
+            | "bcode.metrics.first_row"
+            | "bcode.metrics.last_row" => {
+                let count = self
+                    .selected_summary()
+                    .map_or(0, |summary| summary.rows.len());
+                if count > 0 {
+                    let selected = self.row_state.selected().unwrap_or(0);
+                    let action = host.keymap_action("metrics-dashboard", *stroke)?;
+                    let next = match action.as_str() {
+                        "bcode.metrics.previous_row" => selected.saturating_sub(1),
+                        "bcode.metrics.next_row" => selected.saturating_add(1).min(count - 1),
+                        "bcode.metrics.first_row" => 0,
+                        _ => count - 1,
+                    };
+                    self.row_state.set_selected(Some(next));
+                }
+                Some(PluginTuiAction::Redraw)
+            }
+            "bcode.metrics.close" => Some(PluginTuiAction::Close { outcome: None }),
+            "bcode.metrics.refresh" => {
                 self.reload();
                 Some(PluginTuiAction::Redraw)
             }
-            KeyCode::Char('s') => {
+            "bcode.metrics.sort" => {
                 self.cycle_sort();
                 Some(PluginTuiAction::Redraw)
             }
-            KeyCode::Char('d') => {
+            "bcode.metrics.sort_direction" => {
                 self.toggle_sort_direction();
                 Some(PluginTuiAction::Redraw)
             }
-            KeyCode::Char('g') => {
+            "bcode.metrics.group" => {
                 self.cycle_group_by();
                 Some(PluginTuiAction::Redraw)
             }
-            KeyCode::Char('f') => {
+            "bcode.metrics.filter" => {
                 self.filter_by_selected_row_label();
                 Some(PluginTuiAction::Redraw)
             }
-            KeyCode::Char('c') => {
+            "bcode.metrics.clear_filters" => {
                 self.query.filters.clear();
                 self.reload();
                 Some(PluginTuiAction::Redraw)
             }
-            KeyCode::Char('1') => {
+            "bcode.metrics.tab.1" => {
                 self.tab_state.set_selected(Some(0));
                 Some(PluginTuiAction::Redraw)
             }
-            KeyCode::Char('2') => {
+            "bcode.metrics.tab.2" => {
                 self.tab_state.set_selected(Some(1));
                 Some(PluginTuiAction::Redraw)
             }
-            KeyCode::Char('3') => {
+            "bcode.metrics.tab.3" => {
                 self.tab_state.set_selected(Some(2));
                 Some(PluginTuiAction::Redraw)
             }
-            KeyCode::Char('4') => {
+            "bcode.metrics.tab.4" => {
                 self.tab_state.set_selected(Some(3));
                 Some(PluginTuiAction::Redraw)
             }
-            KeyCode::Char('5') => {
+            "bcode.metrics.tab.5" => {
                 self.tab_state.set_selected(Some(4));
                 Some(PluginTuiAction::Redraw)
             }
-            KeyCode::Char('6') => {
+            "bcode.metrics.tab.6" => {
                 self.tab_state.set_selected(Some(5));
                 Some(PluginTuiAction::Redraw)
             }
-            KeyCode::Char('7') => {
+            "bcode.metrics.tab.7" => {
                 self.tab_state.set_selected(Some(6));
                 Some(PluginTuiAction::Redraw)
             }
-            KeyCode::Char('8') => {
+            "bcode.metrics.tab.8" => {
                 self.tab_state.set_selected(Some(7));
                 Some(PluginTuiAction::Redraw)
             }
@@ -555,6 +590,16 @@ impl MetricsDashboardSurface {
 }
 
 impl PluginTuiSurface for MetricsDashboardSurface {
+    fn poll(&mut self, host: &dyn PluginTuiHost) -> PluginTuiAction {
+        let previous = self.shortcuts.clone();
+        self.update_shortcuts(host);
+        if self.shortcuts == previous {
+            PluginTuiAction::None
+        } else {
+            PluginTuiAction::Redraw
+        }
+    }
+
     fn id(&self) -> &'static str {
         "bcode.metrics-dashboard"
     }
@@ -582,7 +627,15 @@ impl PluginTuiSurface for MetricsDashboardSurface {
         ACTIVE_THEME.with(|active| active.set(None));
     }
 
-    fn handle_event(&mut self, event: &Event, _host: &dyn PluginTuiHost) -> PluginTuiAction {
+    fn handle_event(&mut self, event: &Event, host: &dyn PluginTuiHost) -> PluginTuiAction {
+        self.update_shortcuts(host);
+        if let Some(action) = self.handle_key_event(event, host) {
+            return action;
+        }
+        // Keyboard actions are resolved above; generic controls receive pointer events only.
+        if matches!(event, Event::Key(_)) {
+            return PluginTuiAction::None;
+        }
         match TabBar::new(&dashboard_tabs())
             .styles(metric_tab_styles())
             .handle_event(self.tab_area, &mut self.tab_state, event)
@@ -603,9 +656,6 @@ impl PluginTuiSurface for MetricsDashboardSurface {
             _ => {}
         }
         if let Some(action) = self.handle_mouse_scroll(event) {
-            return action;
-        }
-        if let Some(action) = self.handle_key_event(event) {
             return action;
         }
         PluginTuiAction::None
@@ -879,15 +929,11 @@ fn render_header(area: Rect, frame: &mut PaintCx<'_, '_>, title: &str, status: &
     }
 }
 
-fn render_status(area: Rect, frame: &mut PaintCx<'_, '_>) {
-    let hints = [
-        KeyHint::new("r", "refresh"),
-        KeyHint::new("s/d", "sort"),
-        KeyHint::new("g", "group"),
-        KeyHint::new("f/c", "filter"),
-        KeyHint::new("1-8", "tab"),
-        KeyHint::new("q", "close"),
-    ];
+fn render_status(area: Rect, frame: &mut PaintCx<'_, '_>, shortcuts: &[(String, String)]) {
+    let hints = shortcuts
+        .iter()
+        .map(|(keys, description)| KeyHint::new(keys.as_str(), description.as_str()))
+        .collect::<Vec<_>>();
     let hints = KeyHintBarComponent::new("metrics.hints", &hints).styles(metric_hint_styles());
     paint_dashboard_component(&hints, area, frame);
 }
@@ -1216,6 +1262,56 @@ mod tests {
 
     use super::*;
 
+    #[test]
+    fn remapped_close_dispatch_and_hints_use_the_same_registry() {
+        struct Host(bcode_plugin_sdk::tui::keymap::KeymapRegistry);
+        impl PluginTuiHost for Host {
+            fn spawn(&self, _task: bcode_plugin_sdk::tui::PluginTask) {}
+            fn spawn_blocking(&self, _task: Box<dyn FnOnce() + Send + 'static>) {}
+            fn request_redraw(&self) {}
+            fn keymap_action(
+                &self,
+                scope: &str,
+                stroke: bmux_keyboard::KeyStroke,
+            ) -> Option<String> {
+                self.0.action_for_key(scope, stroke).map(str::to_owned)
+            }
+            fn keymap_keys(&self, scope: &str, action: &str) -> Vec<String> {
+                self.0
+                    .keys_for_action(scope, action)
+                    .into_iter()
+                    .map(str::to_owned)
+                    .collect()
+            }
+        }
+        let mut registry = bcode_plugin_sdk::tui::keymap::KeymapRegistry::default();
+        for action in crate::tui::dashboard_keymap_actions() {
+            registry.register(action).unwrap();
+        }
+        registry
+            .configure(std::collections::BTreeMap::from([(
+                "metrics-dashboard".into(),
+                std::collections::BTreeMap::from([("ctrl+x".into(), "bcode.metrics.close".into())]),
+            )]))
+            .unwrap();
+        let host = Host(registry);
+        let mut surface =
+            MetricsDashboardSurface::load(PathBuf::new(), MetricsDashboardQuery::default());
+        surface.update_shortcuts(&host);
+        assert!(
+            surface
+                .shortcuts
+                .contains(&("ctrl+x".into(), "Close dashboard".into()))
+        );
+        let old_key = Event::Key(bmux_keyboard::parse_key_stroke("q").unwrap());
+        assert!(surface.handle_key_event(&old_key, &host).is_none());
+        let new_key = Event::Key(bmux_keyboard::parse_key_stroke("ctrl+x").unwrap());
+        assert!(matches!(
+            surface.handle_key_event(&new_key, &host),
+            Some(PluginTuiAction::Close { .. })
+        ));
+    }
+
     fn plugin_theme() -> PluginTuiTheme {
         let style = Style::new();
         let syntax = PluginTuiSyntaxColor::from_tui(Color::Default);
@@ -1301,10 +1397,14 @@ mod tests {
     fn status_uses_bounded_shared_key_hints() {
         let area = Rect::new(0, 0, 24, 1);
         let mut buffer = Buffer::empty(area);
-        render_status(area, &mut PaintCx::new(&mut Frame::new(&mut buffer)));
+        render_status(
+            area,
+            &mut PaintCx::new(&mut Frame::new(&mut buffer)),
+            &[("custom".into(), "close".into())],
+        );
 
         let text = buffer.row_symbols(0).expect("status row");
-        assert!(text.starts_with("r refresh"));
+        assert!(text.starts_with("custom close"));
         assert_eq!(text.chars().count(), usize::from(area.width));
     }
 }

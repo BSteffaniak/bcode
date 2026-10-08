@@ -28,6 +28,21 @@ struct InteractiveTextInputResolver {
 }
 
 impl bcode_plugin_sdk::tui::PluginTuiTextInputResolver for InteractiveTextInputResolver {
+    fn action(&self, scope: &str, stroke: bmux_keyboard::KeyStroke) -> Option<String> {
+        self.keymap
+            .registry()
+            .action_for_key(scope, stroke)
+            .map(str::to_owned)
+    }
+
+    fn keys(&self, scope: &str, action: &str) -> Vec<String> {
+        self.keymap
+            .registry()
+            .keys_for_action(scope, action)
+            .into_iter()
+            .map(str::to_owned)
+            .collect()
+    }
     fn edit_command(
         &self,
         stroke: bmux_keyboard::KeyStroke,

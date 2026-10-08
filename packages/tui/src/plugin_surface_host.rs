@@ -48,6 +48,7 @@ struct BcodePluginTuiHost {
 
 #[derive(Debug, Clone, Default)]
 pub struct FreshSessionSettings {
+    pub keymap: bcode_plugin_sdk::tui::keymap::KeymapRegistry,
     pub working_directory: std::path::PathBuf,
     pub provider: Option<String>,
     pub model: Option<String>,
@@ -118,6 +119,22 @@ fn workflow_run_limits(
 }
 
 impl PluginTuiHost for BcodePluginTuiHost {
+    fn keymap_action(&self, scope: &str, stroke: bmux_keyboard::KeyStroke) -> Option<String> {
+        self.launch
+            .keymap
+            .action_for_key(scope, stroke)
+            .map(str::to_owned)
+    }
+
+    fn keymap_keys(&self, scope: &str, action: &str) -> Vec<String> {
+        self.launch
+            .keymap
+            .keys_for_action(scope, action)
+            .into_iter()
+            .map(str::to_owned)
+            .collect()
+    }
+
     fn validate_judgement_setup(
         &self,
         selection: bcode_model::judgement::SetupSelection,

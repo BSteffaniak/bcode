@@ -3464,6 +3464,10 @@ pub fn apply_config_result(
         Ok(config) => {
             let previous_interactions = chat.app.tui_config().interactions;
             settings.apply_tui_config(&config.tui);
+            if let Some(error) = settings.keymap().error() {
+                chat.app
+                    .set_status(format!("keymap configuration invalid: {error}"));
+            }
             settings.set_completion_settings(config.presentation.completion);
             loop_state.set_slash_palette_settings(settings.completion_settings());
             loop_state.invalidate_slash_palette_discovery();
@@ -3477,6 +3481,18 @@ pub fn apply_config_result(
                 &config,
                 &default_plugin_ids,
             );
+            for extension in &settings.tui_extensions {
+                if settings.keymap().error().is_none()
+                    && selection.is_enabled(extension.plugin_id())
+                {
+                    for action in extension.registry().keymap_actions() {
+                        if let Err(error) = settings.keymap.register(action.clone()) {
+                            chat.app
+                                .set_status(format!("plugin keymap unavailable: {error}"));
+                        }
+                    }
+                }
+            }
             match super::plugin_tui::load_default_presentation_with_static_bundled(
                 &selection,
                 config.tui.visual_adapters.clone(),

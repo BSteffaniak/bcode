@@ -3567,6 +3567,14 @@ pub struct TuiKeyBindingConfig {
     #[config_doc(map_key = "<key-stroke>")]
     #[serde(default)]
     pub session_picker: BTreeMap<String, String>,
+    /// Skill picker bindings keyed by key stroke.
+    #[config_doc(map_key = "<key-stroke>")]
+    #[serde(default)]
+    pub skill_picker: BTreeMap<String, String>,
+    /// Contributor-defined scopes, each containing key-to-action overrides.
+    /// Empty action IDs disable a binding. Unknown action IDs remain pending until registration.
+    #[serde(default)]
+    pub scopes: BTreeMap<String, BTreeMap<String, String>>,
     /// Legacy `[tui.keybindings]` action-to-keys entries loaded for compatibility.
     #[config_doc(skip)]
     #[serde(skip)]
@@ -3579,6 +3587,8 @@ impl TuiKeyBindingConfig {
         self.chat.is_empty()
             && self.permission.is_empty()
             && self.session_picker.is_empty()
+            && self.skill_picker.is_empty()
+            && self.scopes.is_empty()
             && self.legacy_actions.is_empty()
     }
 }
@@ -3594,6 +3604,10 @@ impl<'de> Deserialize<'de> for TuiKeyBindingConfig {
         let mut config = Self::default();
         for (key, value) in raw {
             match key.as_str() {
+                "skill_picker" => {
+                    config.skill_picker = parse_tui_keybinding_section(value, "skill_picker")?;
+                }
+                "scopes" => config.scopes = value.try_into().map_err(D::Error::custom)?,
                 "chat" => config.chat = parse_tui_keybinding_section(value, "chat")?,
                 "permission" => {
                     config.permission = parse_tui_keybinding_section(value, "permission")?;
@@ -8168,6 +8182,10 @@ fn write_tui_toml(output: &mut String, tui: &TuiConfig) {
         write_tui_keybinding_section(output, "chat", &tui.keybindings.chat);
         write_tui_keybinding_section(output, "permission", &tui.keybindings.permission);
         write_tui_keybinding_section(output, "session_picker", &tui.keybindings.session_picker);
+        write_tui_keybinding_section(output, "skill_picker", &tui.keybindings.skill_picker);
+        for (scope, bindings) in &tui.keybindings.scopes {
+            write_tui_keybinding_section(output, &format!("scopes.{}", toml_key(scope)), bindings);
+        }
     }
     write_tui_mouse_toml(output, &tui.mouse);
     write_tui_selection_toml(output, tui.selection);
@@ -9565,6 +9583,28 @@ mod tests {
     use std::sync::Mutex;
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[test]
+    fn contributor_keymap_scopes_round_trip() {
+        let config: BcodeConfig = toml::from_str(
+            r#"
+[tui.keybindings.skill_picker]
+"ctrl+i" = "tui.skill.invoke"
+[tui.keybindings.scopes."metrics-dashboard"]
+"ctrl+x" = "bcode.metrics.close"
+"q" = ""
+"f10" = "external.plugin.action"
+"#,
+        )
+        .expect("contributor keybindings parse");
+        let serialized = toml::to_string(&config).expect("serialize config");
+        let restored: BcodeConfig = toml::from_str(&serialized).expect("parse serialized config");
+        assert_eq!(restored.tui.keybindings, config.tui.keybindings);
+        let mut rendered = String::new();
+        super::write_tui_toml(&mut rendered, &config.tui);
+        let restored: BcodeConfig = toml::from_str(&rendered).expect("parse rendered config");
+        assert_eq!(restored.tui.keybindings, config.tui.keybindings);
+    }
 
     #[test]
     fn interaction_presentation_defaults_parse_and_serialize() {

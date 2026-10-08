@@ -290,6 +290,7 @@ impl RootTimer {
 impl BcodeRuntimeModel {
     fn fresh_session_settings(&self) -> super::plugin_surface_host::FreshSessionSettings {
         super::plugin_surface_host::FreshSessionSettings {
+            keymap: self.settings.keymap().registry().clone(),
             working_directory: self
                 .chat
                 .app
@@ -1958,8 +1959,7 @@ impl BcodeRuntimeModel {
                 "help" => {
                     self.chat.append_durable_presentation_note(
                         "bcode.host",
-                        "# TUI help\n\n* Use the command palette for sessions, cancellation, and context compaction."
-                            .to_owned(),
+                        self.settings.keymap().help_markdown(),
                         bcode_command::CommandTextFormat::Markdown,
                     );
                     self.chat.app.set_status("help shown".to_owned());

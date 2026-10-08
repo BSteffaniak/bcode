@@ -14,6 +14,9 @@ pub const METRICS_DASHBOARD_SURFACE_KIND: &str = "metrics-dashboard";
 #[must_use]
 pub fn tui_registry() -> PluginTuiRegistry {
     let mut registry = PluginTuiRegistry::default();
+    for action in dashboard_keymap_actions() {
+        registry.register_keymap_action(action);
+    }
     registry.register_factory(Box::new(MetricsDashboardSurfaceFactory));
     registry
 }
@@ -56,4 +59,39 @@ fn resolve_repo_relative(path: PathBuf, repo_path: Option<&std::path::Path>) -> 
         Some(repo_path) => repo_path.join(path),
         None => path,
     }
+}
+
+/// Contributor-owned dashboard actions and default shortcuts.
+pub(crate) fn dashboard_keymap_actions() -> Vec<bcode_plugin_sdk::tui::keymap::KeymapAction> {
+    [
+        ("previous_row", "Previous row", &["up", "k"] as &[&str]),
+        ("next_row", "Next row", &["down", "j"] as &[&str]),
+        ("first_row", "First row", &["home"] as &[&str]),
+        ("last_row", "Last row", &["end"] as &[&str]),
+        ("close", "Close dashboard", &["q", "escape"] as &[&str]),
+        ("refresh", "Refresh report", &["r"] as &[&str]),
+        ("sort", "Cycle sort", &["s"] as &[&str]),
+        ("sort_direction", "Reverse sort", &["d"] as &[&str]),
+        ("group", "Cycle grouping", &["g"] as &[&str]),
+        ("filter", "Filter selected row", &["f"] as &[&str]),
+        ("clear_filters", "Clear filters", &["c"] as &[&str]),
+        ("tab.1", "Select tab 1", &["1"] as &[&str]),
+        ("tab.2", "Select tab 2", &["2"] as &[&str]),
+        ("tab.3", "Select tab 3", &["3"] as &[&str]),
+        ("tab.4", "Select tab 4", &["4"] as &[&str]),
+        ("tab.5", "Select tab 5", &["5"] as &[&str]),
+        ("tab.6", "Select tab 6", &["6"] as &[&str]),
+        ("tab.7", "Select tab 7", &["7"] as &[&str]),
+        ("tab.8", "Select tab 8", &["8"] as &[&str]),
+    ]
+    .into_iter()
+    .map(
+        |(id, description, keys)| bcode_plugin_sdk::tui::keymap::KeymapAction {
+            id: format!("bcode.metrics.{id}"),
+            scope: "metrics-dashboard".into(),
+            description: description.into(),
+            defaults: keys.iter().map(|key| (*key).into()).collect(),
+        },
+    )
+    .collect()
 }

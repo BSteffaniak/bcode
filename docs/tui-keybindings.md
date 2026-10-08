@@ -1,5 +1,39 @@
 # TUI keybindings
 
+## Contributor registry
+
+The terminal SDK exposes `tui::keymap::KeymapRegistry`. Contributors register stable
+namespaced action IDs, input scopes, descriptions, and default strokes through
+`PluginTuiRegistry::register_keymap_action`. The frontend incorporates enabled
+static TUI contributors into its effective registry. Plugin surfaces query
+`PluginTuiHost::keymap_action` for dispatch and `keymap_keys` for shortcut hints.
+Libraries can use the same registry API directly. This is frontend-owned state,
+not a process-wide singleton or a prerequisite for non-terminal operation.
+
+```toml
+[tui.keybindings.skill_picker]
+"ctrl+i" = "tui.skill.invoke"
+
+[tui.keybindings.scopes."metrics-dashboard"]
+"ctrl+x" = "bcode.metrics.close"
+"q" = ""
+"escape" = ""
+```
+
+Binding an action replaces all its default keys within that scope. An empty action
+ID unbinds a key. Configuration for unregistered actions is retained for subsequent
+registration but cannot dispatch; `unresolved_actions()` exposes these references.
+Malformed strokes and conflicting registrations return errors rather than silently
+falling back. The TUI help command lists registered actions and their effective
+bindings, including unbound actions.
+
+**Migration status:** the existing chat/permission/session/skill keymap paths and
+metrics-dashboard actions use this registry. Other dialogs, bundled plugin surfaces,
+and generic component keyboard handling still need migration; their hardcoded
+handlers and hints are not yet covered by this configuration contract. Dynamic
+plugin action contribution is not yet wired into frontend registry discovery.
+
+
 Bcode's terminal keybindings are scoped and configurable in `bcode.toml`. Each table maps a key to an action ID. Set a key to `""`, `"none"`, or `"unbind"` to remove its default binding.
 
 Key names use `modifier+key`, with `ctrl`, `alt`, and `shift` modifiers. Examples include `ctrl+d`, `alt+left`, `pageUp`, `escape`, and `enter`.

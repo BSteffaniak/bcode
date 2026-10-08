@@ -1,5 +1,7 @@
 //! Native Tokio-backed TUI surface host APIs for plugins.
 
+pub mod keymap;
+
 use std::collections::BTreeMap;
 use std::error::Error;
 use std::fmt;
@@ -693,6 +695,16 @@ pub trait PluginTuiHost: Send + Sync {
         Err(PluginTuiHostError::Unsupported(
             "clipboard writes are not available from this host".to_string(),
         ))
+    }
+
+    /// Contributor action resolution in an explicitly active input scope.
+    fn keymap_action(&self, _scope: &str, _stroke: KeyStroke) -> Option<String> {
+        None
+    }
+
+    /// Effective shortcuts for presentation. An empty list means unbound or unavailable.
+    fn keymap_keys(&self, _scope: &str, _action: &str) -> Vec<String> {
+        Vec::new()
     }
 
     /// Resolve a key stroke to one host-configured text edit command.
@@ -2484,6 +2496,7 @@ impl StaticPluginTuiExtension {
 /// Registry of native TUI surfaces contributed by one plugin.
 #[derive(Default)]
 pub struct PluginTuiRegistry {
+    keymap_actions: Vec<keymap::KeymapAction>,
     factories: BTreeMap<String, Box<dyn PluginTuiSurfaceFactory>>,
     visual_adapters: BTreeMap<String, std::sync::Arc<dyn PluginTuiVisualAdapter>>,
 }
@@ -2491,6 +2504,7 @@ pub struct PluginTuiRegistry {
 impl std::fmt::Debug for PluginTuiRegistry {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("PluginTuiRegistry")
+            .field("keymap_actions", &self.keymap_actions)
             .field("surface_kinds", &self.factories.keys().collect::<Vec<_>>())
             .field(
                 "visual_adapters",
@@ -2501,6 +2515,16 @@ impl std::fmt::Debug for PluginTuiRegistry {
 }
 
 impl PluginTuiRegistry {
+    /// Contribute an action definition to the frontend's effective keymap.
+    pub fn register_keymap_action(&mut self, action: keymap::KeymapAction) {
+        self.keymap_actions.push(action);
+    }
+
+    /// Action definitions owned by this enabled contributor.
+    #[must_use]
+    pub fn keymap_actions(&self) -> &[keymap::KeymapAction] {
+        &self.keymap_actions
+    }
     /// Register a native TUI surface factory.
     pub fn register_factory(&mut self, factory: Box<dyn PluginTuiSurfaceFactory>) {
         self.factories
@@ -2789,6 +2813,16 @@ impl std::fmt::Debug for TokioPluginTuiHost {
 
 /// Host resolver for configured composer-like text input intent.
 pub trait PluginTuiTextInputResolver: Send + Sync {
+    /// Resolve a contributor action in its active scope.
+    fn action(&self, _scope: &str, _stroke: KeyStroke) -> Option<String> {
+        None
+    }
+
+    /// Effective shortcut labels for a registered action.
+    fn keys(&self, _scope: &str, _action: &str) -> Vec<String> {
+        Vec::new()
+    }
+
     /// Resolve one configured edit command.
     fn edit_command(&self, stroke: KeyStroke) -> Option<TextEditCommand>;
 
@@ -2849,6 +2883,16 @@ impl PluginTuiHost for TokioPluginTuiHost {
 
     fn request_redraw(&self) {
         let _ = self.redraw_sender.try_send(());
+    }
+
+    fn keymap_action(&self, scope: &str, stroke: KeyStroke) -> Option<String> {
+        self.text_input.as_ref()?.action(scope, stroke)
+    }
+
+    fn keymap_keys(&self, scope: &str, action: &str) -> Vec<String> {
+        self.text_input
+            .as_ref()
+            .map_or_else(Vec::new, |resolver| resolver.keys(scope, action))
     }
 
     fn text_edit_command(&self, stroke: KeyStroke) -> Option<TextEditCommand> {
